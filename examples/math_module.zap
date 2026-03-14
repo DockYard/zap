@@ -16,6 +16,7 @@ defmodule Math do
   end
 end
 
-def main() do
+def main() :: String do
   Math.square(5)
+  |> IO.puts()
 end

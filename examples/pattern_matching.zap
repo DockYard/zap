@@ -6,15 +6,11 @@ def describe(:error) :: String do
   "failure"
 end
 
-def describe(_) :: String do
-  "unknown"
-end
-
-def classify(0 :: i64) :: String do
+def describe(0 :: i64) :: String do
   "zero"
 end
 
-def classify(n :: i64) :: String do
+def describe(n :: i64) :: String do
   if n > 0 do
     "positive"
   else
@@ -22,6 +18,20 @@ def classify(n :: i64) :: String do
   end
 end
 
+def describe(_) :: String do
+  "unknown"
+end
+
 def main() do
   describe(:ok)
+  |> IO.puts()
+
+  describe(0)
+  |> IO.puts()
+
+  describe(20)
+  |> IO.puts()
+
+  describe(-100)
+  |> IO.puts()
 end

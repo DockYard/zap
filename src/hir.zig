@@ -48,6 +48,15 @@ pub const Clause = struct {
     return_type: TypeId,
     decision: *const Decision, // compiled match decision
     body: *const Block,
+    refinement: ?*const Expr,
+    tuple_bindings: []const TupleBinding,
+};
+
+pub const TupleBinding = struct {
+    name: ast.StringId,
+    param_index: u32,
+    element_index: u32,
+    local_index: u32,
 };
 
 pub const TypedParam = struct {
@@ -110,6 +119,7 @@ pub const ExprKind = union(enum) {
     // Control flow
     branch: BranchExpr,
     match: MatchExpr,
+    case: CaseData,
     block: Block,
 
     // Error handling
@@ -138,6 +148,7 @@ pub const CallExpr = struct {
 
 pub const CallTarget = union(enum) {
     direct: DirectCall,
+    named: []const u8,
     closure: *const Expr,
     dispatch: DispatchCall,
     builtin: []const u8,
@@ -166,6 +177,30 @@ pub const BranchExpr = struct {
 pub const MatchExpr = struct {
     scrutinee: *const Expr,
     decision: *const Decision,
+};
+
+pub const CaseData = struct {
+    scrutinee: *const Expr,
+    arms: []const CaseArm,
+};
+
+pub const CaseArm = struct {
+    pattern: ?*const MatchPattern,
+    guard: ?*const Expr,
+    body: *const Block,
+    bindings: []const CaseBinding,
+};
+
+pub const CaseBinding = struct {
+    name: ast.StringId,
+    local_index: u32,
+    kind: CaseBindKind,
+    element_index: u32, // only used for tuple_element
+};
+
+pub const CaseBindKind = enum {
+    scrutinee, // bind the whole scrutinee value
+    tuple_element, // bind an element extracted from the scrutinee tuple
 };
 
 pub const MapEntry = struct {
@@ -319,6 +354,9 @@ pub const HirBuilder = struct {
     type_store: *const types_mod.TypeStore,
     next_group_id: u32,
     next_local: u32,
+    current_param_names: []const ?ast.StringId,
+    current_tuple_bindings: std.ArrayList(TupleBinding),
+    current_case_bindings: std.ArrayList(CaseBinding),
     errors: std.ArrayList(Error),
 
     pub const Error = struct {
@@ -339,6 +377,9 @@ pub const HirBuilder = struct {
             .type_store = type_store,
             .next_group_id = 0,
             .next_local = 0,
+            .current_param_names = &.{},
+            .current_tuple_bindings = .empty,
+            .current_case_bindings = .empty,
             .errors = .empty,
         };
     }
@@ -361,12 +402,29 @@ pub const HirBuilder = struct {
             try modules.append(self.allocator, try self.buildModule(mod, mod_scope));
         }
 
-        var top_fns: std.ArrayList(FunctionGroup) = .empty;
+        // Group top-level functions by name, merging clauses
+        var fn_order: std.ArrayList(ast.StringId) = .empty;
+        var fn_groups = std.AutoHashMap(ast.StringId, std.ArrayList(*const ast.FunctionDecl)).init(self.allocator);
+        defer fn_groups.deinit();
+
         for (program.top_items) |item| {
-            switch (item) {
-                .function => |func| try top_fns.append(self.allocator, try self.buildFunctionGroup(func, self.graph.prelude_scope, null)),
-                .priv_function => |func| try top_fns.append(self.allocator, try self.buildFunctionGroup(func, self.graph.prelude_scope, null)),
-                else => {},
+            const func = switch (item) {
+                .function => |f| f,
+                .priv_function => |f| f,
+                else => continue,
+            };
+            const entry = try fn_groups.getOrPut(func.name);
+            if (!entry.found_existing) {
+                entry.value_ptr.* = .empty;
+                try fn_order.append(self.allocator, func.name);
+            }
+            try entry.value_ptr.append(self.allocator, func);
+        }
+
+        var top_fns: std.ArrayList(FunctionGroup) = .empty;
+        for (fn_order.items) |name| {
+            if (fn_groups.getPtr(name)) |decls| {
+                try top_fns.append(self.allocator, try self.buildMergedFunctionGroup(decls.items, self.graph.prelude_scope));
             }
         }
 
@@ -377,13 +435,22 @@ pub const HirBuilder = struct {
     }
 
     fn buildModule(self: *HirBuilder, mod: *const ast.ModuleDecl, mod_scope: scope_mod.ScopeId) !Module {
-        var functions: std.ArrayList(FunctionGroup) = .empty;
+        // Group module functions by name
+        var fn_order: std.ArrayList(ast.StringId) = .empty;
+        var fn_groups = std.AutoHashMap(ast.StringId, std.ArrayList(*const ast.FunctionDecl)).init(self.allocator);
+        defer fn_groups.deinit();
+
         var type_defs: std.ArrayList(TypeDef) = .empty;
 
         for (mod.items) |item| {
             switch (item) {
                 .function, .priv_function => |func| {
-                    try functions.append(self.allocator, try self.buildFunctionGroup(func, mod_scope, null));
+                    const entry = try fn_groups.getOrPut(func.name);
+                    if (!entry.found_existing) {
+                        entry.value_ptr.* = .empty;
+                        try fn_order.append(self.allocator, func.name);
+                    }
+                    try entry.value_ptr.append(self.allocator, func);
                 },
                 .type_decl => |td| {
                     try type_defs.append(self.allocator, .{
@@ -410,6 +477,13 @@ pub const HirBuilder = struct {
             }
         }
 
+        var functions: std.ArrayList(FunctionGroup) = .empty;
+        for (fn_order.items) |name| {
+            if (fn_groups.getPtr(name)) |decls| {
+                try functions.append(self.allocator, try self.buildMergedFunctionGroup(decls.items, mod_scope));
+            }
+        }
+
         return .{
             .name = mod.name,
             .scope_id = mod_scope,
@@ -421,6 +495,32 @@ pub const HirBuilder = struct {
     // ============================================================
     // Function group building
     // ============================================================
+
+    fn buildMergedFunctionGroup(
+        self: *HirBuilder,
+        decls: []const *const ast.FunctionDecl,
+        scope_id: scope_mod.ScopeId,
+    ) !FunctionGroup {
+        const group_id = self.next_group_id;
+        self.next_group_id += 1;
+
+        var clauses: std.ArrayList(Clause) = .empty;
+        for (decls) |func| {
+            for (func.clauses) |clause| {
+                try clauses.append(self.allocator, try self.buildClause(&clause));
+            }
+        }
+
+        const first = decls[0];
+        return .{
+            .id = group_id,
+            .scope_id = scope_id,
+            .name = first.name,
+            .arity = if (first.clauses.len > 0) @intCast(first.clauses[0].params.len) else 0,
+            .clauses = try clauses.toOwnedSlice(self.allocator),
+            .fallback_parent = null,
+        };
+    }
 
     fn buildFunctionGroup(
         self: *HirBuilder,
@@ -451,8 +551,8 @@ pub const HirBuilder = struct {
 
         var params: std.ArrayList(TypedParam) = .empty;
         for (clause.params) |param| {
-            const type_id = if (param.type_annotation) |_|
-                types_mod.TypeStore.UNKNOWN // TODO: resolve type annotation
+            const type_id = if (param.type_annotation) |ann|
+                self.resolveTypeExpr(ann)
             else
                 types_mod.TypeStore.UNKNOWN;
 
@@ -466,15 +566,46 @@ pub const HirBuilder = struct {
             });
         }
 
-        const return_type = if (clause.return_type) |_|
-            types_mod.TypeStore.UNKNOWN
+        const return_type = if (clause.return_type) |rt|
+            self.resolveTypeExpr(rt)
         else
-            types_mod.TypeStore.UNKNOWN;
+            types_mod.TypeStore.NEVER;
+
+        // Track param names for var_ref resolution
+        var param_names: std.ArrayList(?ast.StringId) = .empty;
+        for (params.items) |p| {
+            try param_names.append(self.allocator, p.name);
+        }
+        self.current_param_names = try param_names.toOwnedSlice(self.allocator);
+
+        // Process tuple patterns to create bindings for destructured variables
+        self.current_tuple_bindings = .empty;
+        for (params.items, 0..) |param, param_idx| {
+            if (param.pattern) |pat| {
+                if (pat.* == .tuple) {
+                    for (pat.tuple, 0..) |sub_pat, elem_idx| {
+                        if (sub_pat.* == .bind) {
+                            const local_idx = self.next_local;
+                            self.next_local += 1;
+                            try self.current_tuple_bindings.append(self.allocator, .{
+                                .name = sub_pat.bind,
+                                .param_index = @intCast(param_idx),
+                                .element_index = @intCast(elem_idx),
+                                .local_index = local_idx,
+                            });
+                        }
+                    }
+                }
+            }
+        }
 
         // Build decision tree for this clause
         const decision = try self.create(Decision, .{
             .success = .{ .bindings = &.{}, .body_index = 0 },
         });
+
+        // Build refinement expression (guard predicate)
+        const refinement_expr = if (clause.refinement) |ref| try self.buildExpr(ref) else null;
 
         // Build body block
         const body = try self.buildBlock(clause.body);
@@ -484,6 +615,8 @@ pub const HirBuilder = struct {
             .return_type = return_type,
             .decision = decision,
             .body = body,
+            .refinement = refinement_expr,
+            .tuple_bindings = try self.current_tuple_bindings.toOwnedSlice(self.allocator),
         };
     }
 
@@ -605,11 +738,45 @@ pub const HirBuilder = struct {
                 .type_id = types_mod.TypeStore.NIL,
                 .span = v.meta.span,
             }),
-            .var_ref => |v| try self.create(Expr, .{
-                .kind = .{ .local_get = 0 }, // TODO: resolve to local index
-                .type_id = types_mod.TypeStore.UNKNOWN,
-                .span = v.meta.span,
-            }),
+            .var_ref => |v| {
+                // Check if this var refers to a parameter
+                for (self.current_param_names, 0..) |param_name, idx| {
+                    if (param_name) |pn| {
+                        if (pn == v.name) {
+                            return try self.create(Expr, .{
+                                .kind = .{ .param_get = @intCast(idx) },
+                                .type_id = types_mod.TypeStore.UNKNOWN,
+                                .span = v.meta.span,
+                            });
+                        }
+                    }
+                }
+                // Check if this var refers to a tuple binding (destructured variable)
+                for (self.current_tuple_bindings.items) |binding| {
+                    if (binding.name == v.name) {
+                        return try self.create(Expr, .{
+                            .kind = .{ .local_get = binding.local_index },
+                            .type_id = types_mod.TypeStore.UNKNOWN,
+                            .span = v.meta.span,
+                        });
+                    }
+                }
+                // Check if this var refers to a case binding
+                for (self.current_case_bindings.items) |binding| {
+                    if (binding.name == v.name) {
+                        return try self.create(Expr, .{
+                            .kind = .{ .local_get = binding.local_index },
+                            .type_id = types_mod.TypeStore.UNKNOWN,
+                            .span = v.meta.span,
+                        });
+                    }
+                }
+                return try self.create(Expr, .{
+                    .kind = .{ .local_get = 0 }, // TODO: resolve to local index
+                    .type_id = types_mod.TypeStore.UNKNOWN,
+                    .span = v.meta.span,
+                });
+            },
             .binary_op => |bo| try self.create(Expr, .{
                 .kind = .{ .binary = .{
                     .op = bo.op,
@@ -633,7 +800,7 @@ pub const HirBuilder = struct {
                     try args.append(self.allocator, try self.buildExpr(arg));
                 }
 
-                // Check for module-qualified stdlib call: IO.puts(...)
+                // Check for module-qualified call: IO.puts(...), Math.square(...)
                 const target: CallTarget = if (call.callee.* == .field_access) blk: {
                     const fa = call.callee.field_access;
                     if (fa.object.* == .module_ref) {
@@ -642,8 +809,26 @@ pub const HirBuilder = struct {
                         if (resolveStdlibCall(mod_name, func_name)) |runtime_name| {
                             break :blk .{ .builtin = runtime_name };
                         }
+                        // User-defined module function — emit as named call
+                        break :blk .{ .named = func_name };
                     }
                     break :blk .{ .closure = try self.buildExpr(call.callee) };
+                } else if (call.callee.* == .var_ref) blk: {
+                    // Check if callee is a parameter (function value) or a named function
+                    const vr = call.callee.var_ref;
+                    var is_param = false;
+                    for (self.current_param_names) |param_name| {
+                        if (param_name) |pn| {
+                            if (pn == vr.name) {
+                                is_param = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (is_param) {
+                        break :blk .{ .closure = try self.buildExpr(call.callee) };
+                    }
+                    break :blk .{ .named = self.interner.get(vr.name) };
                 } else .{ .closure = try self.buildExpr(call.callee) };
 
                 return try self.create(Expr, .{
@@ -671,14 +856,65 @@ pub const HirBuilder = struct {
             },
             .case_expr => |ce| {
                 const scrutinee = try self.buildExpr(ce.scrutinee);
-                // Build decision tree from case clauses
-                const decision = try self.create(Decision, .{
-                    .success = .{ .bindings = &.{}, .body_index = 0 },
-                });
+                var arms: std.ArrayList(CaseArm) = .empty;
+
+                for (ce.clauses) |clause| {
+                    // Save binding state for this arm
+                    const saved_case_bindings = self.current_case_bindings;
+                    self.current_case_bindings = .empty;
+
+                    const pattern = try self.compilePattern(clause.pattern);
+
+                    // Process bindings from the pattern
+                    if (pattern) |pat| {
+                        switch (pat.*) {
+                            .bind => |name| {
+                                const local_idx = self.next_local;
+                                self.next_local += 1;
+                                try self.current_case_bindings.append(self.allocator, .{
+                                    .name = name,
+                                    .local_index = local_idx,
+                                    .kind = .scrutinee,
+                                    .element_index = 0,
+                                });
+                            },
+                            .tuple => |sub_pats| {
+                                for (sub_pats, 0..) |sub_pat, elem_idx| {
+                                    if (sub_pat.* == .bind) {
+                                        const local_idx = self.next_local;
+                                        self.next_local += 1;
+                                        try self.current_case_bindings.append(self.allocator, .{
+                                            .name = sub_pat.bind,
+                                            .local_index = local_idx,
+                                            .kind = .tuple_element,
+                                            .element_index = @intCast(elem_idx),
+                                        });
+                                    }
+                                }
+                            },
+                            else => {},
+                        }
+                    }
+
+                    const guard_expr = if (clause.guard) |g| try self.buildExpr(g) else null;
+                    const body = try self.buildBlock(clause.body);
+                    const bindings = try self.current_case_bindings.toOwnedSlice(self.allocator);
+
+                    try arms.append(self.allocator, .{
+                        .pattern = pattern,
+                        .guard = guard_expr,
+                        .body = body,
+                        .bindings = bindings,
+                    });
+
+                    // Restore binding state
+                    self.current_case_bindings = saved_case_bindings;
+                }
+
                 return try self.create(Expr, .{
-                    .kind = .{ .match = .{
+                    .kind = .{ .case = .{
                         .scrutinee = scrutinee,
-                        .decision = decision,
+                        .arms = try arms.toOwnedSlice(self.allocator),
                     } },
                     .type_id = types_mod.TypeStore.UNKNOWN,
                     .span = ce.meta.span,
@@ -711,6 +947,76 @@ pub const HirBuilder = struct {
                     .span = l.meta.span,
                 });
             },
+            .pipe => |pe| {
+                // Desugar `a |> f(b)` into `f(a, b)`
+                const lhs = try self.buildExpr(pe.lhs);
+                // rhs should be a call — prepend lhs as first arg
+                if (pe.rhs.* == .call) {
+                    const call = pe.rhs.call;
+                    var args: std.ArrayList(*const Expr) = .empty;
+                    try args.append(self.allocator, lhs);
+                    for (call.args) |arg| {
+                        try args.append(self.allocator, try self.buildExpr(arg));
+                    }
+
+                    const target: CallTarget = if (call.callee.* == .field_access) blk: {
+                        const fa = call.callee.field_access;
+                        if (fa.object.* == .module_ref) {
+                            const mod_name = self.moduleNameToString(fa.object.module_ref.name);
+                            const func_name = self.interner.get(fa.field);
+                            if (resolveStdlibCall(mod_name, func_name)) |runtime_name| {
+                                break :blk .{ .builtin = runtime_name };
+                            }
+                            break :blk .{ .named = func_name };
+                        }
+                        break :blk .{ .closure = try self.buildExpr(call.callee) };
+                    } else .{ .closure = try self.buildExpr(call.callee) };
+
+                    return try self.create(Expr, .{
+                        .kind = .{ .call = .{
+                            .target = target,
+                            .args = try args.toOwnedSlice(self.allocator),
+                        } },
+                        .type_id = types_mod.TypeStore.UNKNOWN,
+                        .span = pe.meta.span,
+                    });
+                }
+                // Fallback: treat rhs as a function value call with lhs as arg
+                const rhs = try self.buildExpr(pe.rhs);
+                var args: std.ArrayList(*const Expr) = .empty;
+                try args.append(self.allocator, lhs);
+                return try self.create(Expr, .{
+                    .kind = .{ .call = .{
+                        .target = .{ .closure = rhs },
+                        .args = try args.toOwnedSlice(self.allocator),
+                    } },
+                    .type_id = types_mod.TypeStore.UNKNOWN,
+                    .span = pe.meta.span,
+                });
+            },
+            .field_access => |fa| {
+                // Module-qualified reference (e.g. Math.square without call parens)
+                if (fa.object.* == .module_ref) {
+                    const mod_name = self.moduleNameToString(fa.object.module_ref.name);
+                    const func_name = self.interner.get(fa.field);
+                    if (resolveStdlibCall(mod_name, func_name)) |runtime_name| {
+                        return try self.create(Expr, .{
+                            .kind = .{ .call = .{
+                                .target = .{ .builtin = runtime_name },
+                                .args = &.{},
+                            } },
+                            .type_id = types_mod.TypeStore.UNKNOWN,
+                            .span = fa.meta.span,
+                        });
+                    }
+                }
+                // Fallback for field access
+                return try self.create(Expr, .{
+                    .kind = .nil_lit,
+                    .type_id = types_mod.TypeStore.UNKNOWN,
+                    .span = fa.meta.span,
+                });
+            },
             else => {
                 const meta = expr.getMeta();
                 return try self.create(Expr, .{
@@ -725,6 +1031,18 @@ pub const HirBuilder = struct {
     // ============================================================
     // Allocation helper
     // ============================================================
+
+    fn resolveTypeExpr(self: *const HirBuilder, type_expr: *const ast.TypeExpr) TypeId {
+        return switch (type_expr.*) {
+            .name => |n| {
+                const name_str = self.interner.get(n.name);
+                return self.type_store.resolveTypeName(name_str) orelse types_mod.TypeStore.UNKNOWN;
+            },
+            .never => types_mod.TypeStore.NEVER,
+            .paren => |p| self.resolveTypeExpr(p.inner),
+            else => types_mod.TypeStore.UNKNOWN,
+        };
+    }
 
     fn moduleNameToString(self: *const HirBuilder, name: ast.ModuleName) []const u8 {
         // For single-part module names like "IO", just return the part

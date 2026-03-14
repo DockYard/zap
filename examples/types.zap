@@ -20,4 +20,5 @@ end
 
 def main() do
   Geometry.area({:circle, 5.0})
+  |> IO.puts()
 end

@@ -450,14 +450,32 @@ pub const ZapString = struct {
 // ============================================================
 
 pub const Prelude = struct {
-    pub fn println(s: []const u8) void {
+    pub fn println(value: anytype) void {
         const stdout = std.fs.File.stdout().deprecatedWriter();
-        stdout.print("{s}\n", .{s}) catch {};
+        const T = @TypeOf(value);
+        const info = @typeInfo(T);
+        if (T == []const u8 or (info == .pointer and @typeInfo(std.meta.Child(T)) == .array)) {
+            stdout.print("{s}\n", .{value}) catch {};
+        } else if (info == .int or info == .comptime_int) {
+            stdout.print("{d}\n", .{value}) catch {};
+        } else if (info == .float or info == .comptime_float) {
+            stdout.print("{d}\n", .{value}) catch {};
+        } else if (T == bool) {
+            stdout.print("{}\n", .{value}) catch {};
+        } else {
+            stdout.print("{any}\n", .{value}) catch {};
+        }
     }
 
-    pub fn print_str(s: []const u8) void {
+    pub fn print_str(value: anytype) void {
         const stdout = std.fs.File.stdout().deprecatedWriter();
-        stdout.print("{s}", .{s}) catch {};
+        const T = @TypeOf(value);
+        const info = @typeInfo(T);
+        if (T == []const u8 or (info == .pointer and @typeInfo(std.meta.Child(T)) == .array)) {
+            stdout.print("{s}", .{value}) catch {};
+        } else {
+            stdout.print("{any}", .{value}) catch {};
+        }
     }
 
     pub fn inspect(s: []const u8) []const u8 {

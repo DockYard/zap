@@ -1,6 +1,7 @@
 .DS_Store
 .zig-cache/
 zig-out/
+zap-out/
 .claude/
 .cog/
 .opencode/

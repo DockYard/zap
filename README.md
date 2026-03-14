@@ -1,59 +1,53 @@
 # Zap
 
-A statically typed, functional programming language that compiles to native code through Zig.
+Zap is a statically typed, functional programming language that compiles to native code through Zig. It is its own language with its own type system, its own dispatch model, and its own compiler pipeline. Zig is the compilation target, not the identity.
 
-Zap is a new language — not a dialect, not a transpiler shim. It has its own type system, its own dispatch model, and its own compiler pipeline. It lowers through Zig for native code generation.
+If you've written Elixir you'll feel at home with the syntax. If you've written Zig you'll appreciate what comes out the other end. The goal is to take the developer experience that makes functional languages productive and remove the runtime overhead that typically comes along for the ride. No VM, no garbage collector, no interpreter. Your Zap code becomes Zig source, and Zig gives you a native binary.
 
-## Features
+The project is still early. Not everything works yet, and some of the features described below are partially implemented. But the core pipeline is real, the examples compile and run, and the foundation is solid enough to build on.
 
-- **Static typing with inference** — Types are declared at function boundaries and inferred within bodies. No separate spec or annotation layer.
-- **Pattern matching** — First-class structural pattern matching in function heads, `case`, `with`, and assignments.
-- **Function overloading** — Multiple clauses of the same name and arity form overload families, resolved by argument type and specificity.
-- **Scope-prioritized dispatch** — Inner scopes get first right of refusal. If a local function family doesn't match, dispatch falls through to enclosing scopes, module scope, imports, and prelude — not shadowing, but fallback.
-- **Refinement predicates** — Guard-like `if` clauses in function headers that participate in dispatch and clause selection.
-- **Hygienic macros** — AST-to-AST transforms via `defmacro`, `quote`, and `unquote`. Macros expand before type checking.
-- **Tagged unions** — Algebraic data types built on tagged tuples: `type Result(a, e) = {:ok, a} | {:error, e}`
-- **Native compilation** — Compiles to Zig source, then to native machine code. No VM, no runtime interpreter.
+## Getting Started
 
-## Quick Start
-
-### Requirements
-
-- [Zig](https://ziglang.org/download/) 0.15.2 or later
-
-### Build
+You need [Zig](https://ziglang.org/download/) 0.15.2 or later.
 
 ```sh
+# Build the compiler
 zig build
-```
 
-### Run
-
-```sh
-# Compile and summarize
+# Compile a Zap program to a native binary
 zig build run -- examples/hello.zap
 
-# Emit generated Zig source
+# See the generated Zig source
 zig build run -- --emit-zig examples/hello.zap
-```
 
-### Test
-
-```sh
+# Run the tests
 zig build test
 ```
 
-## Language Overview
+## What the Language Looks Like
+
+The best way to understand Zap is to read some code.
 
 ### Hello World
 
 ```
-def main() do
-  IO.puts("Hello, world!")
+defmodule Runner do
+  def hello(word :: String) :: String do
+    "Hello" <> " " <> word
+  end
+end
+
+def main() :: String do
+  Runner.hello("World!")
+  |> IO.puts()
 end
 ```
 
-### Functions and Pattern Matching
+Functions declare their parameter types and return types at the boundary. The body is inferred. Modules group related functions. The pipe operator works like you'd expect.
+
+### Pattern Matching and Dispatch
+
+Multiple function clauses with the same name form an overload group. The compiler resolves which clause to call based on the argument values and types.
 
 ```
 def factorial(0 :: i64) :: i64 do
@@ -65,7 +59,7 @@ def factorial(n :: i64) :: i64 do
 end
 ```
 
-### Modules and Types
+This works with atoms, integers, tuples, and wildcards. You can pattern match on structure, not just values:
 
 ```
 defmodule Geometry do
@@ -81,43 +75,62 @@ defmodule Geometry do
 end
 ```
 
-### Pipe Operator
-
-```
-def main() do
-  5
-  |> double()
-  |> add_one()
-end
-```
+The tuple patterns destructure and bind in a single step. The tag atom (`:circle`, `:rectangle`) selects the clause, and the remaining elements bind to local variables inside the body.
 
 ### Refinement Predicates
 
+Function clauses can carry guard conditions that participate in dispatch:
+
 ```
-def abs(x :: i64) :: i64 if x < 0 do
-  -x
+def classify(n :: i64) :: String if n > 0 do
+  "positive"
 end
 
-def abs(x :: i64) :: i64 do
-  x
+def classify(n :: i64) :: String if n < 0 do
+  "negative"
+end
+
+def classify(_ :: i64) :: String do
+  "zero"
 end
 ```
 
-### Local Functions and Closures
+The `if` clause runs after the type check passes. If the predicate fails, dispatch continues to the next clause.
+
+### Case Expressions
+
+Pattern matching also works inside function bodies:
 
 ```
-def outer(x :: i64) :: String do
-  def inner(s :: String) :: String do
-    s <> "!"
+def check(result) :: String do
+  case result do
+    {:ok, v} ->
+      v
+    {:error, e} ->
+      e
+    _ ->
+      "unknown"
   end
-
-  inner("ok")
 end
 ```
+
+### If/Else
+
+```
+def abs(x :: i64) :: i64 do
+  if x < 0 do
+    -x
+  else
+    x
+  end
+end
+```
+
+If/else is an expression. It produces a value.
 
 ## Type System
 
-Zap supports:
+Types are declared at function boundaries. The language does not do implicit numeric coercion, all conversions must be explicit.
 
 | Category | Types |
 |----------|-------|
@@ -131,9 +144,7 @@ Zap supports:
 | Algebraic | tagged unions, opaque types |
 | Higher-order | function types, parametric types |
 
-No implicit numeric coercion — all conversions must be explicit.
-
-Type aliases and opaque types:
+Type aliases and opaque types let you give meaningful names to structures:
 
 ```
 type Result(a, e) = {:ok, a} | {:error, e}
@@ -141,44 +152,43 @@ type Pair(a, b) = {a, b}
 opaque UserId = i64
 ```
 
-## Compiler Pipeline
+## How the Compiler Works
 
-Zap compiles through a multi-phase pipeline:
+Zap compiles through several phases. The source text goes in, Zig source comes out, and then Zig takes it the rest of the way to a native binary.
 
-1. **Lexing** — Tokenization with significant whitespace (`INDENT`/`DEDENT`/`NEWLINE`)
-2. **Parsing** — Surface AST construction
-3. **Declaration collection** — Module and function registration
-4. **Macro expansion** — AST-to-AST transforms to fixed point
-5. **Type checking** — Overload resolution, type inference, exhaustiveness checking
-6. **HIR lowering** — High-level intermediate representation
-7. **IR lowering** — Lower-level intermediate representation
-8. **Code generation** — Emit Zig source code
+1. **Lexing** with significant whitespace (indent/dedent tracking)
+2. **Parsing** into a surface AST
+3. **Declaration collection** to register modules and functions
+4. **Macro expansion** (AST-to-AST transforms to fixed point)
+5. **Type checking** with overload resolution and inference
+6. **HIR lowering** into a typed intermediate representation
+7. **IR lowering** into a lower-level representation closer to Zig's semantics
+8. **Code generation** that emits Zig source
 
-The compiler is written entirely in Zig.
+The entire compiler is written in Zig.
 
-## Project Structure
+## Project Layout
 
 ```
 src/
-├── main.zig          # CLI entry point
-├── root.zig          # Public module exports
-├── lexer.zig         # Tokenizer
-├── token.zig         # Token definitions
-├── parser.zig        # Parser
-├── ast.zig           # AST node types
-├── scope.zig         # Scope management
-├── collector.zig     # Declaration collection
-├── macro.zig         # Macro expansion engine
-├── desugar.zig       # Desugaring pass
-├── resolver.zig      # Name resolution
-├── types.zig         # Type system and checking
-├── dispatch.zig      # Overload and fallback dispatch
-├── hir.zig           # High-level IR
-├── ir.zig            # Intermediate representation
-├── codegen.zig       # Zig code generation
-├── runtime.zig       # Runtime support
-└── diagnostics.zig   # Error reporting
-examples/             # Example .zap programs
+  main.zig           # CLI entry point
+  lexer.zig          # Tokenizer
+  token.zig          # Token definitions
+  parser.zig         # Parser
+  ast.zig            # AST node types
+  scope.zig          # Scope management
+  collector.zig      # Declaration collection
+  macro.zig          # Macro expansion
+  desugar.zig        # Desugaring pass
+  resolver.zig       # Name resolution
+  types.zig          # Type system
+  dispatch.zig       # Overload dispatch
+  hir.zig            # High-level IR
+  ir.zig             # Intermediate representation
+  codegen.zig        # Zig code generation
+  runtime.zig        # Runtime support
+  diagnostics.zig    # Error reporting
+examples/            # Example .zap programs
 ```
 
 ## License

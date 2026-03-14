@@ -181,7 +181,7 @@ pub const TypeStore = struct {
     }
 
     /// Resolve a type name string to a TypeId
-    pub fn resolveTypeName(_: *TypeStore, name: []const u8) ?TypeId {
+    pub fn resolveTypeName(_: *const TypeStore, name: []const u8) ?TypeId {
         if (std.mem.eql(u8, name, "Bool")) return BOOL;
         if (std.mem.eql(u8, name, "String")) return STRING;
         if (std.mem.eql(u8, name, "Atom")) return ATOM;
