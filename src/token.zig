@@ -1,0 +1,165 @@
+const std = @import("std");
+
+pub const Token = struct {
+    tag: Tag,
+    loc: Location,
+
+    pub const Location = struct {
+        start: u32,
+        end: u32,
+        line: u32 = 0,
+    };
+
+    pub const Tag = enum {
+        // Literals
+        int_literal,
+        float_literal,
+        string_literal,
+        string_literal_start, // start of interpolated string
+        string_literal_part, // middle part between interpolations
+        string_literal_end, // end of interpolated string
+        atom_literal,
+
+        // Identifiers
+        identifier,
+        module_identifier, // capitalized identifier
+
+        // Keywords
+        keyword_def,
+        keyword_defp,
+        keyword_defmodule,
+        keyword_defmacro,
+        keyword_defstruct,
+        keyword_do,
+        keyword_end,
+        keyword_if,
+        keyword_else,
+        keyword_case,
+        keyword_with,
+        keyword_cond,
+        keyword_type,
+        keyword_opaque,
+        keyword_alias,
+        keyword_import,
+        keyword_quote,
+        keyword_unquote,
+        keyword_true,
+        keyword_false,
+        keyword_nil,
+        keyword_and,
+        keyword_or,
+        keyword_not,
+        keyword_rem,
+        keyword_panic,
+        keyword_only,
+        keyword_except,
+        keyword_as,
+
+        // Operators
+        plus, // +
+        minus, // -
+        star, // *
+        slash, // /
+        equal, // =
+        equal_equal, // ==
+        not_equal, // !=
+        less, // <
+        greater, // >
+        less_equal, // <=
+        greater_equal, // >=
+        pipe_operator, // |>
+        arrow, // ->
+        back_arrow, // <-
+        double_colon, // ::
+        pipe, // |
+        diamond, // <>
+        bang, // !
+        caret, // ^
+        hash_brace, // #{
+        percent_brace, // %{
+        dot, // .
+        dot_brace, // .{
+
+        // Delimiters
+        left_paren, // (
+        right_paren, // )
+        left_bracket, // [
+        right_bracket, // ]
+        left_brace, // {
+        right_brace, // }
+        comma, // ,
+        colon, // :
+        percent, // %
+        at_sign, // @
+        hash, // #
+
+        // Layout tokens
+        newline,
+        indent,
+        dedent,
+
+        // Special
+        eof,
+        invalid,
+    };
+
+    pub fn slice(self: Token, source: []const u8) []const u8 {
+        return source[self.loc.start..self.loc.end];
+    }
+
+    pub const keywords = std.StaticStringMap(Tag).initComptime(.{
+        .{ "def", .keyword_def },
+        .{ "defp", .keyword_defp },
+        .{ "defmodule", .keyword_defmodule },
+        .{ "defmacro", .keyword_defmacro },
+        .{ "defstruct", .keyword_defstruct },
+        .{ "do", .keyword_do },
+        .{ "end", .keyword_end },
+        .{ "if", .keyword_if },
+        .{ "else", .keyword_else },
+        .{ "case", .keyword_case },
+        .{ "with", .keyword_with },
+        .{ "cond", .keyword_cond },
+        .{ "type", .keyword_type },
+        .{ "opaque", .keyword_opaque },
+        .{ "alias", .keyword_alias },
+        .{ "import", .keyword_import },
+        .{ "quote", .keyword_quote },
+        .{ "unquote", .keyword_unquote },
+        .{ "true", .keyword_true },
+        .{ "false", .keyword_false },
+        .{ "nil", .keyword_nil },
+        .{ "and", .keyword_and },
+        .{ "or", .keyword_or },
+        .{ "not", .keyword_not },
+        .{ "rem", .keyword_rem },
+        .{ "panic", .keyword_panic },
+        .{ "only", .keyword_only },
+        .{ "except", .keyword_except },
+        .{ "as", .keyword_as },
+    });
+
+    pub fn getKeyword(bytes: []const u8) ?Tag {
+        return keywords.get(bytes);
+    }
+
+    pub fn tagName(tag: Tag) []const u8 {
+        return @tagName(tag);
+    }
+};
+
+test "keyword lookup" {
+    try std.testing.expectEqual(Token.Tag.keyword_def, Token.getKeyword("def").?);
+    try std.testing.expectEqual(Token.Tag.keyword_defmodule, Token.getKeyword("defmodule").?);
+    try std.testing.expectEqual(Token.Tag.keyword_end, Token.getKeyword("end").?);
+    try std.testing.expect(Token.getKeyword("foobar") == null);
+}
+
+test "token slice" {
+    const source = "defmodule Foo do";
+    const tok = Token{
+        .tag = .keyword_defmodule,
+        .loc = .{ .start = 0, .end = 9 },
+    };
+    try std.testing.expectEqualStrings("defmodule", tok.slice(source));
+}

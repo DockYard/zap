@@ -1,0 +1,685 @@
+const std = @import("std");
+
+// ============================================================
+// Zap Runtime Support Module (spec §21, §31.7)
+//
+// Provides runtime types for generated Zig code:
+//   - Arc(T)       — generic ARC wrapper with atomic refcount
+//   - Atom         — interned atom representation
+//   - Closure      — fat pointer for function values
+//   - ZapAllocator — allocator plumbing
+//   - List(T)      — persistent list
+//   - ZapMap(K,V)  — persistent map (HAMT-based)
+//   - String       — owned string with length
+// ============================================================
+
+// ============================================================
+// ARC — Atomic Reference Counting (spec §31.4)
+// ============================================================
+
+pub const ArcHeader = struct {
+    ref_count: std.atomic.Value(u32),
+
+    pub fn init() ArcHeader {
+        return .{ .ref_count = std.atomic.Value(u32).init(1) };
+    }
+
+    pub fn retain(self: *ArcHeader) void {
+        _ = self.ref_count.fetchAdd(1, .monotonic);
+    }
+
+    pub fn release(self: *ArcHeader) bool {
+        const prev = self.ref_count.fetchSub(1, .acq_rel);
+        if (prev == 1) {
+            return true; // caller should free
+        }
+        return false;
+    }
+
+    pub fn count(self: *const ArcHeader) u32 {
+        return self.ref_count.load(.acquire);
+    }
+};
+
+pub fn Arc(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        const Inner = struct {
+            header: ArcHeader,
+            value: T,
+        };
+
+        ptr: *Inner,
+
+        pub fn init(allocator: std.mem.Allocator, value: T) !Self {
+            const inner = try allocator.create(Inner);
+            inner.* = .{
+                .header = ArcHeader.init(),
+                .value = value,
+            };
+            return .{ .ptr = inner };
+        }
+
+        pub fn retain(self: Self) Self {
+            self.ptr.header.retain();
+            return self;
+        }
+
+        pub fn release(self: Self, allocator: std.mem.Allocator) void {
+            if (self.ptr.header.release()) {
+                allocator.destroy(self.ptr);
+            }
+        }
+
+        pub fn get(self: Self) *T {
+            return &self.ptr.value;
+        }
+
+        pub fn getConst(self: Self) *const T {
+            return &self.ptr.value;
+        }
+
+        pub fn refCount(self: Self) u32 {
+            return self.ptr.header.count();
+        }
+    };
+}
+
+// ============================================================
+// Atom — Interned atom values (spec §5.6)
+// ============================================================
+
+pub const Atom = struct {
+    id: u32,
+
+    pub const nil_id: u32 = 0;
+    pub const true_id: u32 = 1;
+    pub const false_id: u32 = 2;
+    pub const ok_id: u32 = 3;
+    pub const error_id: u32 = 4;
+
+    pub const nil: Atom = .{ .id = nil_id };
+    pub const @"true": Atom = .{ .id = true_id };
+    pub const @"false": Atom = .{ .id = false_id };
+    pub const ok: Atom = .{ .id = ok_id };
+    pub const @"error": Atom = .{ .id = error_id };
+
+    pub fn eql(a: Atom, b: Atom) bool {
+        return a.id == b.id;
+    }
+};
+
+pub const AtomTable = struct {
+    allocator: std.mem.Allocator,
+    strings: std.ArrayList([]const u8),
+    lookup: std.StringHashMap(u32),
+
+    pub fn init(allocator: std.mem.Allocator) AtomTable {
+        var table = AtomTable{
+            .allocator = allocator,
+            .strings = .empty,
+            .lookup = std.StringHashMap(u32).init(allocator),
+        };
+        // Register well-known atoms
+        const builtins = [_][]const u8{ "nil", "true", "false", "ok", "error" };
+        for (builtins) |name| {
+            table.strings.append(allocator, name) catch {};
+            table.lookup.put(name, @intCast(table.strings.items.len - 1)) catch {};
+        }
+        return table;
+    }
+
+    pub fn deinit(self: *AtomTable) void {
+        self.strings.deinit(self.allocator);
+        self.lookup.deinit();
+    }
+
+    pub fn intern(self: *AtomTable, name: []const u8) !Atom {
+        if (self.lookup.get(name)) |id| {
+            return .{ .id = id };
+        }
+        const id: u32 = @intCast(self.strings.items.len);
+        const duped = try self.allocator.dupe(u8, name);
+        try self.strings.append(self.allocator, duped);
+        try self.lookup.put(duped, id);
+        return .{ .id = id };
+    }
+
+    pub fn getName(self: *const AtomTable, atom: Atom) []const u8 {
+        if (atom.id < self.strings.items.len) {
+            return self.strings.items[atom.id];
+        }
+        return "<unknown_atom>";
+    }
+};
+
+// ============================================================
+// Closure — Fat pointer for function values (spec §20.2, §31.3)
+// ============================================================
+
+pub fn Closure(comptime Args: type, comptime Ret: type) type {
+    return struct {
+        const Self = @This();
+
+        call_fn: *const fn (*anyopaque, Args) Ret,
+        env: *anyopaque,
+
+        pub fn invoke(self: Self, args: Args) Ret {
+            return self.call_fn(self.env, args);
+        }
+    };
+}
+
+/// Type-erased closure for dynamic dispatch
+pub const DynClosure = struct {
+    call_fn: *const anyopaque,
+    env: ?*anyopaque,
+    env_release: ?*const fn (*anyopaque) void,
+
+    pub fn release(self: DynClosure) void {
+        if (self.env_release) |rel| {
+            if (self.env) |e| {
+                rel(e);
+            }
+        }
+    }
+};
+
+// ============================================================
+// Tagged Value — Runtime tagged union for dynamic values
+// ============================================================
+
+pub const TaggedValue = union(enum) {
+    int: i64,
+    float: f64,
+    bool_val: bool,
+    atom: Atom,
+    string: []const u8,
+    nil: void,
+    tuple: []const TaggedValue,
+    list: *const List(TaggedValue),
+    closure: DynClosure,
+
+    pub fn isNil(self: TaggedValue) bool {
+        return self == .nil;
+    }
+
+    pub fn isTruthy(self: TaggedValue) bool {
+        return switch (self) {
+            .nil => false,
+            .bool_val => |b| b,
+            .atom => |a| !a.eql(Atom.nil) and !a.eql(Atom.@"false"),
+            else => true,
+        };
+    }
+
+    pub fn eql(a: TaggedValue, b: TaggedValue) bool {
+        const a_tag = std.meta.activeTag(a);
+        const b_tag = std.meta.activeTag(b);
+        if (a_tag != b_tag) return false;
+
+        return switch (a) {
+            .int => |v| v == b.int,
+            .float => |v| v == b.float,
+            .bool_val => |v| v == b.bool_val,
+            .atom => |v| v.eql(b.atom),
+            .string => |v| std.mem.eql(u8, v, b.string),
+            .nil => true,
+            .tuple => |v| {
+                if (v.len != b.tuple.len) return false;
+                for (v, b.tuple) |ea, eb| {
+                    if (!ea.eql(eb)) return false;
+                }
+                return true;
+            },
+            .list, .closure => false, // structural equality not supported for these
+        };
+    }
+};
+
+// ============================================================
+// List — Persistent singly-linked list (spec §30.3)
+// ============================================================
+
+pub fn List(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        pub const Node = struct {
+            value: T,
+            next: ?*const Node,
+        };
+
+        head: ?*const Node,
+        len: usize,
+
+        pub const empty: Self = .{ .head = null, .len = 0 };
+
+        /// Prepend a value. Nodes are arena-allocated; the caller's
+        /// arena owns all memory.
+        pub fn cons(self: Self, allocator: std.mem.Allocator, value: T) !Self {
+            const node = try allocator.create(Node);
+            node.* = .{
+                .value = value,
+                .next = self.head,
+            };
+            return .{ .head = node, .len = self.len + 1 };
+        }
+
+        pub fn hd(self: Self) ?T {
+            if (self.head) |h| return h.value;
+            return null;
+        }
+
+        pub fn tl(self: Self) Self {
+            if (self.head) |h| {
+                return .{
+                    .head = h.next,
+                    .len = self.len - 1,
+                };
+            }
+            return .empty;
+        }
+
+        pub fn length(self: Self) usize {
+            return self.len;
+        }
+
+        pub fn isEmpty(self: Self) bool {
+            return self.head == null;
+        }
+
+        pub fn toSlice(self: Self, allocator: std.mem.Allocator) ![]T {
+            const slice = try allocator.alloc(T, self.len);
+            var current = self.head;
+            var i: usize = 0;
+            while (current) |node| {
+                slice[i] = node.value;
+                current = node.next;
+                i += 1;
+            }
+            return slice;
+        }
+
+        pub fn fromSlice(allocator: std.mem.Allocator, items: []const T) !Self {
+            var list: Self = .empty;
+            // Build in reverse so the list order matches the slice order
+            var i = items.len;
+            while (i > 0) {
+                i -= 1;
+                list = try list.cons(allocator, items[i]);
+            }
+            return list;
+        }
+    };
+}
+
+// ============================================================
+// ZapMap — Hash Array Mapped Trie (HAMT) for persistent maps
+// (spec §30.3, §31.7)
+//
+// Simplified initial implementation using a sorted array.
+// Full HAMT can be added later for performance.
+// ============================================================
+
+pub fn ZapMap(comptime K: type, comptime V: type) type {
+    return struct {
+        const Self = @This();
+
+        const Entry = struct {
+            key: K,
+            value: V,
+        };
+
+        entries: []const Entry,
+        allocator: std.mem.Allocator,
+
+        pub fn init(allocator: std.mem.Allocator) Self {
+            return .{
+                .entries = &.{},
+                .allocator = allocator,
+            };
+        }
+
+        pub fn size(self: Self) usize {
+            return self.entries.len;
+        }
+
+        pub fn get(self: Self, key: K) ?V {
+            for (self.entries) |entry| {
+                if (keysEqual(entry.key, key)) return entry.value;
+            }
+            return null;
+        }
+
+        pub fn put(self: Self, key: K, value: V) !Self {
+            // Check if key exists — update in place (immutably)
+            for (self.entries, 0..) |entry, i| {
+                if (keysEqual(entry.key, key)) {
+                    const new_entries = try self.allocator.alloc(Entry, self.entries.len);
+                    @memcpy(new_entries, self.entries);
+                    new_entries[i] = .{ .key = key, .value = value };
+                    return .{ .entries = new_entries, .allocator = self.allocator };
+                }
+            }
+
+            // Key doesn't exist — append
+            const new_entries = try self.allocator.alloc(Entry, self.entries.len + 1);
+            @memcpy(new_entries[0..self.entries.len], self.entries);
+            new_entries[self.entries.len] = .{ .key = key, .value = value };
+            return .{ .entries = new_entries, .allocator = self.allocator };
+        }
+
+        pub fn delete(self: Self, key: K) !Self {
+            for (self.entries, 0..) |entry, i| {
+                if (keysEqual(entry.key, key)) {
+                    const new_entries = try self.allocator.alloc(Entry, self.entries.len - 1);
+                    @memcpy(new_entries[0..i], self.entries[0..i]);
+                    @memcpy(new_entries[i..], self.entries[i + 1 ..]);
+                    return .{ .entries = new_entries, .allocator = self.allocator };
+                }
+            }
+            return self;
+        }
+
+        pub fn keys(self: Self, allocator: std.mem.Allocator) ![]K {
+            const result = try allocator.alloc(K, self.entries.len);
+            for (self.entries, 0..) |entry, i| {
+                result[i] = entry.key;
+            }
+            return result;
+        }
+
+        pub fn values(self: Self, allocator: std.mem.Allocator) ![]V {
+            const result = try allocator.alloc(V, self.entries.len);
+            for (self.entries, 0..) |entry, i| {
+                result[i] = entry.value;
+            }
+            return result;
+        }
+
+        fn keysEqual(a: K, b: K) bool {
+            if (K == []const u8) return std.mem.eql(u8, a, b);
+            return a == b;
+        }
+    };
+}
+
+// ============================================================
+// ZapString — String utilities
+// ============================================================
+
+pub const ZapString = struct {
+    pub fn concat(allocator: std.mem.Allocator, a: []const u8, b: []const u8) ![]const u8 {
+        const result = try allocator.alloc(u8, a.len + b.len);
+        @memcpy(result[0..a.len], a);
+        @memcpy(result[a.len..], b);
+        return result;
+    }
+
+    pub fn length(s: []const u8) usize {
+        return s.len;
+    }
+
+    pub fn slice(s: []const u8, start: usize, end: usize) []const u8 {
+        const s_end = @min(end, s.len);
+        const s_start = @min(start, s_end);
+        return s[s_start..s_end];
+    }
+
+    pub fn contains(haystack: []const u8, needle: []const u8) bool {
+        return std.mem.indexOf(u8, haystack, needle) != null;
+    }
+
+    pub fn startsWith(s: []const u8, prefix: []const u8) bool {
+        return std.mem.startsWith(u8, s, prefix);
+    }
+
+    pub fn endsWith(s: []const u8, suffix: []const u8) bool {
+        return std.mem.endsWith(u8, s, suffix);
+    }
+
+    pub fn trim(s: []const u8) []const u8 {
+        return std.mem.trim(u8, s, " \t\n\r");
+    }
+};
+
+// ============================================================
+// Prelude / Kernel functions (spec §30.2)
+// ============================================================
+
+pub const Prelude = struct {
+    pub fn println(s: []const u8) void {
+        const stdout = std.fs.File.stdout().deprecatedWriter();
+        stdout.print("{s}\n", .{s}) catch {};
+    }
+
+    pub fn print_str(s: []const u8) void {
+        const stdout = std.fs.File.stdout().deprecatedWriter();
+        stdout.print("{s}", .{s}) catch {};
+    }
+
+    pub fn inspect(s: []const u8) []const u8 {
+        return s;
+    }
+
+    pub fn i64_to_string(allocator: std.mem.Allocator, value: i64) ![]const u8 {
+        return std.fmt.allocPrint(allocator, "{d}", .{value});
+    }
+
+    pub fn f64_to_string(allocator: std.mem.Allocator, value: f64) ![]const u8 {
+        return std.fmt.allocPrint(allocator, "{d}", .{value});
+    }
+
+    pub fn bool_to_string(value: bool) []const u8 {
+        return if (value) "true" else "false";
+    }
+
+    pub fn string_to_i64(s: []const u8) ?i64 {
+        return std.fmt.parseInt(i64, s, 10) catch null;
+    }
+
+    pub fn string_to_f64(s: []const u8) ?f64 {
+        return std.fmt.parseFloat(f64, s) catch null;
+    }
+
+    pub fn abs_i64(x: i64) i64 {
+        return if (x < 0) -x else x;
+    }
+
+    pub fn abs_f64(x: f64) f64 {
+        return @abs(x);
+    }
+
+    pub fn max_i64(a: i64, b: i64) i64 {
+        return @max(a, b);
+    }
+
+    pub fn min_i64(a: i64, b: i64) i64 {
+        return @min(a, b);
+    }
+
+    pub fn max_f64(a: f64, b: f64) f64 {
+        return @max(a, b);
+    }
+
+    pub fn min_f64(a: f64, b: f64) f64 {
+        return @min(a, b);
+    }
+
+    pub fn panic(msg: []const u8) noreturn {
+        std.debug.print("panic: {s}\n", .{msg});
+        std.process.exit(1);
+    }
+};
+
+// ============================================================
+// Tests
+// ============================================================
+
+test "Arc basic reference counting" {
+    const alloc = std.testing.allocator;
+    const arc = try Arc(i64).init(alloc, 42);
+    try std.testing.expectEqual(@as(u32, 1), arc.refCount());
+    try std.testing.expectEqual(@as(i64, 42), arc.get().*);
+
+    const arc2 = arc.retain();
+    try std.testing.expectEqual(@as(u32, 2), arc.refCount());
+
+    arc2.release(alloc);
+    try std.testing.expectEqual(@as(u32, 1), arc.refCount());
+
+    arc.release(alloc);
+}
+
+test "Arc struct value" {
+    const alloc = std.testing.allocator;
+    const Point = struct { x: f64, y: f64 };
+    const arc = try Arc(Point).init(alloc, .{ .x = 1.0, .y = 2.0 });
+    try std.testing.expectEqual(@as(f64, 1.0), arc.getConst().x);
+    try std.testing.expectEqual(@as(f64, 2.0), arc.getConst().y);
+    arc.release(alloc);
+}
+
+test "Atom well-known values" {
+    try std.testing.expectEqual(@as(u32, 0), Atom.nil.id);
+    try std.testing.expectEqual(@as(u32, 1), Atom.@"true".id);
+    try std.testing.expect(Atom.nil.eql(Atom.nil));
+    try std.testing.expect(!Atom.nil.eql(Atom.@"true"));
+}
+
+test "AtomTable intern and retrieve" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var table = AtomTable.init(alloc);
+    defer table.deinit();
+
+    const hello = try table.intern("hello");
+    const world = try table.intern("world");
+    const hello2 = try table.intern("hello");
+
+    try std.testing.expect(hello.eql(hello2));
+    try std.testing.expect(!hello.eql(world));
+    try std.testing.expectEqualStrings("hello", table.getName(hello));
+    try std.testing.expectEqualStrings("world", table.getName(world));
+
+    // Well-known atoms should exist
+    try std.testing.expectEqualStrings("nil", table.getName(Atom.nil));
+    try std.testing.expectEqualStrings("true", table.getName(Atom.@"true"));
+}
+
+test "List cons and hd/tl" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var list = List(i64).empty;
+    list = try list.cons(alloc, 3);
+    list = try list.cons(alloc, 2);
+    list = try list.cons(alloc, 1);
+
+    try std.testing.expectEqual(@as(usize, 3), list.length());
+    try std.testing.expectEqual(@as(i64, 1), list.hd().?);
+    try std.testing.expectEqual(@as(i64, 2), list.tl().hd().?);
+    try std.testing.expectEqual(@as(i64, 3), list.tl().tl().hd().?);
+    try std.testing.expect(list.tl().tl().tl().isEmpty());
+}
+
+test "List fromSlice and toSlice" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const items = [_]i64{ 10, 20, 30 };
+    const list = try List(i64).fromSlice(alloc, &items);
+
+    const slice = try list.toSlice(alloc);
+
+    try std.testing.expectEqual(@as(usize, 3), slice.len);
+    try std.testing.expectEqual(@as(i64, 10), slice[0]);
+    try std.testing.expectEqual(@as(i64, 20), slice[1]);
+    try std.testing.expectEqual(@as(i64, 30), slice[2]);
+}
+
+test "ZapMap put and get" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var map = ZapMap(i64, i64).init(alloc);
+    map = try map.put(1, 100);
+    map = try map.put(2, 200);
+
+    try std.testing.expectEqual(@as(usize, 2), map.size());
+    try std.testing.expectEqual(@as(i64, 100), map.get(1).?);
+    try std.testing.expectEqual(@as(i64, 200), map.get(2).?);
+    try std.testing.expect(map.get(3) == null);
+}
+
+test "ZapMap update existing key" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var map = ZapMap(i64, i64).init(alloc);
+    map = try map.put(1, 100);
+    const map2 = try map.put(1, 999);
+
+    try std.testing.expectEqual(@as(usize, 1), map2.size());
+    try std.testing.expectEqual(@as(i64, 999), map2.get(1).?);
+    // Original is unchanged
+    try std.testing.expectEqual(@as(i64, 100), map.get(1).?);
+}
+
+test "ZapMap delete" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var map = ZapMap(i64, i64).init(alloc);
+    map = try map.put(1, 100);
+    map = try map.put(2, 200);
+    const map2 = try map.delete(1);
+
+    try std.testing.expectEqual(@as(usize, 1), map2.size());
+    try std.testing.expect(map2.get(1) == null);
+    try std.testing.expectEqual(@as(i64, 200), map2.get(2).?);
+}
+
+test "ZapString operations" {
+    try std.testing.expect(ZapString.contains("hello world", "world"));
+    try std.testing.expect(!ZapString.contains("hello world", "xyz"));
+    try std.testing.expect(ZapString.startsWith("hello", "hel"));
+    try std.testing.expect(ZapString.endsWith("hello", "llo"));
+    try std.testing.expectEqualStrings("llo", ZapString.slice("hello", 2, 5));
+    try std.testing.expectEqualStrings("hello", ZapString.trim("  hello  "));
+}
+
+test "ZapString concat" {
+    const alloc = std.testing.allocator;
+    const result = try ZapString.concat(alloc, "hello", " world");
+    defer alloc.free(result);
+    try std.testing.expectEqualStrings("hello world", result);
+}
+
+test "TaggedValue equality" {
+    const a: TaggedValue = .{ .int = 42 };
+    const b: TaggedValue = .{ .int = 42 };
+    const c: TaggedValue = .{ .int = 99 };
+    const d: TaggedValue = .{ .string = "hello" };
+
+    try std.testing.expect(a.eql(b));
+    try std.testing.expect(!a.eql(c));
+    try std.testing.expect(!a.eql(d));
+}
+
+test "TaggedValue truthiness" {
+    try std.testing.expect(!(TaggedValue{ .nil = {} }).isTruthy());
+    try std.testing.expect(!(TaggedValue{ .bool_val = false }).isTruthy());
+    try std.testing.expect((TaggedValue{ .bool_val = true }).isTruthy());
+    try std.testing.expect((TaggedValue{ .int = 0 }).isTruthy());
+    try std.testing.expect((TaggedValue{ .string = "" }).isTruthy());
+}

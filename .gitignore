@@ -1,0 +1,8 @@
+.DS_Store
+.zig-cache/
+zig-out/
+.claude/
+.cog/
+.opencode/
+opencode.json
+.mcp.json
