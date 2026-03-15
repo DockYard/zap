@@ -97,6 +97,8 @@ pub const Instruction = union(enum) {
     switch_tag: SwitchTag,
     switch_literal: SwitchLiteral,
     match_atom: MatchAtom,
+    match_int: MatchInt,
+    match_float: MatchFloat,
     match_string: MatchString,
     match_type: MatchType,
     match_fail: MatchFail,
@@ -345,6 +347,18 @@ pub const MatchAtom = struct {
     atom_name: []const u8,
 };
 
+pub const MatchInt = struct {
+    dest: LocalId,
+    scrutinee: LocalId,
+    value: i64,
+};
+
+pub const MatchFloat = struct {
+    dest: LocalId,
+    scrutinee: LocalId,
+    value: f64,
+};
+
 pub const MatchString = struct {
     dest: LocalId,
     scrutinee: LocalId,
@@ -510,16 +524,30 @@ pub const IrBuilder = struct {
         self.next_label = 0;
         self.current_instrs = .empty;
 
-        // Use first clause for param types and return type
+        // Use first clause for arity and return type
         const first_clause = &group.clauses[0];
 
-        // Build params with generic names (__arg_N)
+        // Build params with generic names (__arg_N).
+        // If all clauses agree on a param's type, use that type.
+        // If any clause differs (or is untyped), fall back to anytype.
         var params: std.ArrayList(Param) = .empty;
         for (first_clause.params, 0..) |param, i| {
             const name = try std.fmt.allocPrint(self.allocator, "__arg_{d}", .{i});
+            var resolved_type = typeIdToZigType(param.type_id);
+            if (group.clauses.len > 1) {
+                for (group.clauses[1..]) |clause| {
+                    if (i < clause.params.len) {
+                        const other_type = typeIdToZigType(clause.params[i].type_id);
+                        if (std.meta.activeTag(other_type) != std.meta.activeTag(resolved_type)) {
+                            resolved_type = .any;
+                            break;
+                        }
+                    }
+                }
+            }
             try params.append(self.allocator, .{
                 .name = name,
-                .type_expr = typeIdToZigType(param.type_id),
+                .type_expr = resolved_type,
             });
         }
 
@@ -543,7 +571,8 @@ pub const IrBuilder = struct {
             const result_local = try self.lowerBlock(first_clause.body);
             try self.current_instrs.append(self.allocator, .{ .ret = .{ .value = result_local } });
         } else {
-            // Multiple clauses — emit pattern match dispatch
+            // Multiple clauses — emit pattern match dispatch.
+            // Clause order follows source order: first match wins.
             for (group.clauses, 0..) |clause, clause_idx| {
                 const is_last = clause_idx == group.clauses.len - 1;
 
@@ -611,9 +640,12 @@ pub const IrBuilder = struct {
                             .cond_return = .{ .condition = ref_cond, .value = result_local },
                         });
                     } else {
-                        // Untyped non-last clause — emit unconditional return
+                        // Unconditional match (wildcard/untyped, no refinement).
+                        // This always matches, so emit return and stop — any
+                        // subsequent clauses are unreachable.
                         const result_local = try self.lowerBlock(clause.body);
                         try self.current_instrs.append(self.allocator, .{ .ret = .{ .value = result_local } });
+                        break;
                     }
                 }
             }
@@ -706,30 +738,20 @@ pub const IrBuilder = struct {
                 return match_local;
             },
             .int => |v| {
-                const lit_local = self.next_local;
+                const match_local = self.next_local;
                 self.next_local += 1;
                 try self.current_instrs.append(self.allocator, .{
-                    .const_int = .{ .dest = lit_local, .value = v },
+                    .match_int = .{ .dest = match_local, .scrutinee = arg_local, .value = v },
                 });
-                const cmp_local = self.next_local;
-                self.next_local += 1;
-                try self.current_instrs.append(self.allocator, .{
-                    .binary_op = .{ .dest = cmp_local, .op = .eq, .lhs = arg_local, .rhs = lit_local },
-                });
-                return cmp_local;
+                return match_local;
             },
             .float => |v| {
-                const lit_local = self.next_local;
+                const match_local = self.next_local;
                 self.next_local += 1;
                 try self.current_instrs.append(self.allocator, .{
-                    .const_float = .{ .dest = lit_local, .value = v },
+                    .match_float = .{ .dest = match_local, .scrutinee = arg_local, .value = v },
                 });
-                const cmp_local = self.next_local;
-                self.next_local += 1;
-                try self.current_instrs.append(self.allocator, .{
-                    .binary_op = .{ .dest = cmp_local, .op = .eq, .lhs = arg_local, .rhs = lit_local },
-                });
-                return cmp_local;
+                return match_local;
             },
             .string => |v| {
                 const match_local = self.next_local;
@@ -865,30 +887,20 @@ pub const IrBuilder = struct {
                 return match_local;
             },
             .int => |v| {
-                const lit_local = self.next_local;
+                const match_local = self.next_local;
                 self.next_local += 1;
                 try self.current_instrs.append(self.allocator, .{
-                    .const_int = .{ .dest = lit_local, .value = v },
+                    .match_int = .{ .dest = match_local, .scrutinee = elem_local, .value = v },
                 });
-                const cmp_local = self.next_local;
-                self.next_local += 1;
-                try self.current_instrs.append(self.allocator, .{
-                    .binary_op = .{ .dest = cmp_local, .op = .eq, .lhs = elem_local, .rhs = lit_local },
-                });
-                return cmp_local;
+                return match_local;
             },
             .float => |v| {
-                const lit_local = self.next_local;
+                const match_local = self.next_local;
                 self.next_local += 1;
                 try self.current_instrs.append(self.allocator, .{
-                    .const_float = .{ .dest = lit_local, .value = v },
+                    .match_float = .{ .dest = match_local, .scrutinee = elem_local, .value = v },
                 });
-                const cmp_local = self.next_local;
-                self.next_local += 1;
-                try self.current_instrs.append(self.allocator, .{
-                    .binary_op = .{ .dest = cmp_local, .op = .eq, .lhs = elem_local, .rhs = lit_local },
-                });
-                return cmp_local;
+                return match_local;
             },
             .string => |v| {
                 const match_local = self.next_local;
@@ -1196,30 +1208,20 @@ pub const IrBuilder = struct {
                 return match_local;
             },
             .int => |v| {
-                const lit_local = self.next_local;
+                const match_local = self.next_local;
                 self.next_local += 1;
                 try self.current_instrs.append(self.allocator, .{
-                    .const_int = .{ .dest = lit_local, .value = v },
+                    .match_int = .{ .dest = match_local, .scrutinee = scrutinee, .value = v },
                 });
-                const cmp_local = self.next_local;
-                self.next_local += 1;
-                try self.current_instrs.append(self.allocator, .{
-                    .binary_op = .{ .dest = cmp_local, .op = .eq, .lhs = scrutinee, .rhs = lit_local },
-                });
-                return cmp_local;
+                return match_local;
             },
             .float => |v| {
-                const lit_local = self.next_local;
+                const match_local = self.next_local;
                 self.next_local += 1;
                 try self.current_instrs.append(self.allocator, .{
-                    .const_float = .{ .dest = lit_local, .value = v },
+                    .match_float = .{ .dest = match_local, .scrutinee = scrutinee, .value = v },
                 });
-                const cmp_local = self.next_local;
-                self.next_local += 1;
-                try self.current_instrs.append(self.allocator, .{
-                    .binary_op = .{ .dest = cmp_local, .op = .eq, .lhs = scrutinee, .rhs = lit_local },
-                });
-                return cmp_local;
+                return match_local;
             },
             .string => |v| {
                 const match_local = self.next_local;

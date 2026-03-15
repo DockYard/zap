@@ -131,6 +131,8 @@ Use memory as a deterministic workflow, not an optional hint:
 Memory quality guardrails:
 - complete recall before using broad code-intel exploration in unfamiliar code; only lightweight orientation is acceptable first
 - store non-obvious, durable knowledge that would save future reasoning
+- do not duplicate source code in memory — symbol names, file paths, function signatures, code patterns, project structure can be derived by reading the current project state
+- DO store anything you had to reason about or synthesize across multiple sources — architectural characteristics, design models, how subsystems interact, cross-cutting concerns — even if technically derivable from code, if it took real analysis to figure out, save it so future conversations don't repeat that work
 - do not store generic repo summaries or facts that are obvious from a quick README or file read unless they capture durable workflow or architectural conventions
 - when learning implementation details, prefer storing why plus what so recall preserves the design reason, not just the surface behavior
 - when the user explains a design decision, treat it as durable architectural context instead of collapsing it into a generic summary

@@ -13,12 +13,13 @@ pub fn main() !void {
 
     if (args.len < 2) {
         const stderr = std.fs.File.stderr().deprecatedWriter();
-        try stderr.print("Usage: zap [--emit-zig] <file.zap> [zig-flags...]\n", .{});
+        try stderr.print("Usage: zap [--emit-zig] [--lib] <file.zap> [zig-flags...]\n", .{});
         std.process.exit(1);
     }
 
     // Separate zap flags, the .zap file, and zig flags
     var emit_zig = false;
+    var lib_mode = false;
     var file_path: ?[]const u8 = null;
     var zig_flags: std.ArrayListUnmanaged([]const u8) = .empty;
     defer zig_flags.deinit(allocator);
@@ -26,6 +27,8 @@ pub fn main() !void {
     for (args[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--emit-zig")) {
             emit_zig = true;
+        } else if (std.mem.eql(u8, arg, "--lib")) {
+            lib_mode = true;
         } else if (file_path == null and std.mem.endsWith(u8, arg, ".zap")) {
             file_path = arg;
         } else {
@@ -101,6 +104,7 @@ pub fn main() !void {
     // Phase 8: Code generation
     var codegen = zap.CodeGen.init(alloc);
     defer codegen.deinit();
+    codegen.lib_mode = lib_mode;
     codegen.emitProgram(&ir_program) catch {
         const stderr = std.fs.File.stderr().deprecatedWriter();
         try stderr.print("Error during code generation\n", .{});
@@ -113,8 +117,8 @@ pub fn main() !void {
         const stdout = std.fs.File.stdout().deprecatedWriter();
         try stdout.print("{s}", .{output});
     } else {
-        // Write generated Zig + runtime to temp dir, invoke zig build-exe
-        const exit_code = compileWithZig(allocator, path, output, zig_flags.items) catch |err| {
+        // Write generated Zig + runtime to .zap-cache, invoke zig build
+        const exit_code = compileWithZig(allocator, path, output, lib_mode, zig_flags.items) catch |err| {
             const stderr = std.fs.File.stderr().deprecatedWriter();
             try stderr.print("Error invoking zig compiler: {}\n", .{err});
             std.process.exit(1);
@@ -125,29 +129,51 @@ pub fn main() !void {
     }
 }
 
-const build_zig_prefix =
-    \\const std = @import("std");
-    \\pub fn build(b: *std.Build) void {
-    \\    const target = b.standardTargetOptions(.{});
-    \\    const optimize = b.standardOptimizeOption(.{});
-    \\    const exe = b.addExecutable(.{
-    \\        .name = "
-;
+/// Write file only if content differs from what's on disk.
+/// Returns true if the file was written (content changed or didn't exist).
+fn writeIfChanged(dir: std.fs.Dir, sub_path: []const u8, content: []const u8) !bool {
+    if (dir.openFile(sub_path, .{})) |file| {
+        defer file.close();
+        const stat = try file.stat();
+        if (stat.size == content.len) {
+            // Read existing content and compare
+            const buf = try std.heap.page_allocator.alloc(u8, content.len);
+            defer std.heap.page_allocator.free(buf);
+            const bytes_read = try file.readAll(buf);
+            if (bytes_read == content.len and std.mem.eql(u8, buf[0..bytes_read], content)) {
+                return false; // unchanged
+            }
+        }
+    } else |_| {} // file doesn't exist, write it
 
-const build_zig_suffix =
-    \\",
-    \\        .root_module = b.createModule(.{
-    \\            .root_source_file = b.path("src/main.zig"),
-    \\            .target = target,
-    \\            .optimize = optimize,
-    \\        }),
-    \\    });
-    \\    b.installArtifact(exe);
-    \\}
-    \\
-;
+    try dir.writeFile(.{ .sub_path = sub_path, .data = content });
+    return true; // changed
+}
 
-fn compileWithZig(allocator: std.mem.Allocator, zap_path: []const u8, zig_source: []const u8, zig_flags: []const []const u8) !u8 {
+fn generateBuildZig(allocator: std.mem.Allocator, name: []const u8, lib_mode: bool) ![]const u8 {
+    const artifact_call = if (lib_mode) "addLibrary" else "addExecutable";
+    const source_file = if (lib_mode) "src/root.zig" else "src/main.zig";
+
+    return std.fmt.allocPrint(allocator,
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {{
+        \\    const target = b.standardTargetOptions(.{{}});
+        \\    const optimize = b.standardOptimizeOption(.{{}});
+        \\    const artifact = b.{s}(.{{
+        \\        .name = "{s}",
+        \\        .root_module = b.createModule(.{{
+        \\            .root_source_file = b.path("{s}"),
+        \\            .target = target,
+        \\            .optimize = optimize,
+        \\        }}),
+        \\    }});
+        \\    b.installArtifact(artifact);
+        \\}}
+        \\
+    , .{ artifact_call, name, source_file });
+}
+
+fn compileWithZig(allocator: std.mem.Allocator, zap_path: []const u8, zig_source: []const u8, lib_mode: bool, zig_flags: []const []const u8) !u8 {
     // Determine output name from input path
     const basename = std.fs.path.basename(zap_path);
     const stem = if (std.mem.endsWith(u8, basename, ".zap"))
@@ -155,29 +181,24 @@ fn compileWithZig(allocator: std.mem.Allocator, zap_path: []const u8, zig_source
     else
         basename;
 
-    // Create temp directory with src/ subdirectory
-    var tmp_dir = try std.fs.cwd().makeOpenPath(".zig-cache/zap-tmp", .{});
-    defer {
-        std.fs.cwd().deleteTree(".zig-cache/zap-tmp") catch {};
-    }
-    defer tmp_dir.close();
+    // Persistent cache directory — survives across runs for Zig cache reuse
+    var cache_dir = try std.fs.cwd().makeOpenPath(".zap-cache", .{});
+    defer cache_dir.close();
+    try cache_dir.makePath("src");
 
-    try tmp_dir.makePath("src");
+    // Write source files only when content changes (enables Zig cache hits)
+    const source_file = if (lib_mode) "src/root.zig" else "src/main.zig";
+    _ = try writeIfChanged(cache_dir, source_file, zig_source);
+    _ = try writeIfChanged(cache_dir, "src/zap_runtime.zig", runtime_source);
 
-    // Write generated source
-    try tmp_dir.writeFile(.{ .sub_path = "src/main.zig", .data = zig_source });
-
-    // Write runtime alongside it so @import("zap_runtime.zig") resolves
-    try tmp_dir.writeFile(.{ .sub_path = "src/zap_runtime.zig", .data = runtime_source });
-
-    // Write build.zig
-    const build_zig = try std.mem.concat(allocator, u8, &.{ build_zig_prefix, stem, build_zig_suffix });
+    // Generate and write build.zig
+    const build_zig = try generateBuildZig(allocator, stem, lib_mode);
     defer allocator.free(build_zig);
-    try tmp_dir.writeFile(.{ .sub_path = "build.zig", .data = build_zig });
+    _ = try writeIfChanged(cache_dir, "build.zig", build_zig);
 
     // Get absolute paths
-    const tmp_path = try tmp_dir.realpathAlloc(allocator, ".");
-    defer allocator.free(tmp_path);
+    const cache_path = try cache_dir.realpathAlloc(allocator, ".");
+    defer allocator.free(cache_path);
 
     const cwd_path = try std.fs.cwd().realpathAlloc(allocator, ".");
     defer allocator.free(cwd_path);
@@ -186,7 +207,7 @@ fn compileWithZig(allocator: std.mem.Allocator, zap_path: []const u8, zig_source
     const prefix = try std.fs.path.join(allocator, &.{ cwd_path, "zap-out" });
     defer allocator.free(prefix);
 
-    // Build argv: zig build --prefix <zap-out> --build-file <tmp>/build.zig [flags...]
+    // Build argv: zig build --prefix <zap-out> [flags...]
     var argv: std.ArrayListUnmanaged([]const u8) = .empty;
     defer argv.deinit(allocator);
 
@@ -203,7 +224,7 @@ fn compileWithZig(allocator: std.mem.Allocator, zap_path: []const u8, zig_source
     var child = std.process.Child.init(argv.items, allocator);
     child.stderr_behavior = .Inherit;
     child.stdout_behavior = .Inherit;
-    child.cwd = tmp_path;
+    child.cwd = cache_path;
     try child.spawn();
     const term = try child.wait();
 

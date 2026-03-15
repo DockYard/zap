@@ -11,7 +11,7 @@ def classify(_ :: i64) :: String do
 end
 
 def main() do
-  classify(42)
+  classify(-4)
   |> IO.puts()
 
   classify(-7)

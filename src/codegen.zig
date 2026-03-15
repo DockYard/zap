@@ -19,6 +19,7 @@ pub const CodeGen = struct {
     current_fn_params: []const ir.Param,
     next_block_label: u32,
     current_case_label: ?[]const u8,
+    lib_mode: bool,
 
     pub fn init(allocator: std.mem.Allocator) CodeGen {
         return .{
@@ -30,6 +31,7 @@ pub const CodeGen = struct {
             .current_fn_params = &.{},
             .next_block_label = 0,
             .current_case_label = null,
+            .lib_mode = false,
         };
     }
 
@@ -64,8 +66,13 @@ pub const CodeGen = struct {
     // ============================================================
 
     fn emitFunction(self: *CodeGen, func: *const ir.Function) !void {
-        // Function signature — main must be pub for Zig entry point
-        if (std.mem.eql(u8, func.name, "main")) {
+        const is_main = std.mem.eql(u8, func.name, "main");
+
+        // In library mode, skip main and make all other functions pub
+        if (self.lib_mode and is_main) return;
+
+        // Function signature — pub for main (exe) or all functions (lib)
+        if (is_main or self.lib_mode) {
             try self.write("pub fn ");
         } else {
             try self.write("fn ");
@@ -82,7 +89,6 @@ pub const CodeGen = struct {
 
         try self.write(") ");
         // Zig entry point must return void, !void, noreturn, u8, or !u8
-        const is_main = std.mem.eql(u8, func.name, "main");
         if (is_main) {
             try self.write("void");
         } else {
@@ -92,6 +98,24 @@ pub const CodeGen = struct {
         self.current_fn_params = func.params;
         try self.write(" {\n");
         self.indent_level += 1;
+
+        // Suppress unused parameter errors in generated Zig.
+        // Only discard params that are truly unreferenced in the body.
+        for (func.params, 0..) |param, param_idx| {
+            var used = false;
+            for (func.body) |block| {
+                if (self.isParamUsedInInstrs(block.instructions, @intCast(param_idx))) {
+                    used = true;
+                    break;
+                }
+            }
+            if (!used) {
+                try self.writeIndent();
+                try self.write("_ = ");
+                try self.write(param.name);
+                try self.write(";\n");
+            }
+        }
 
         // Emit body blocks
         for (func.body) |block| {
@@ -149,6 +173,8 @@ pub const CodeGen = struct {
                 for (cb.args) |arg| self.referenced_locals.append(self.allocator, arg) catch {};
             },
             .match_atom => |ma| self.referenced_locals.append(self.allocator, ma.scrutinee) catch {},
+            .match_int => |mi| self.referenced_locals.append(self.allocator, mi.scrutinee) catch {},
+            .match_float => |mf| self.referenced_locals.append(self.allocator, mf.scrutinee) catch {},
             .match_string => |ms| self.referenced_locals.append(self.allocator, ms.scrutinee) catch {},
             .match_type => |mt| self.referenced_locals.append(self.allocator, mt.scrutinee) catch {},
             .cond_branch => |cb| self.referenced_locals.append(self.allocator, cb.condition) catch {},
@@ -208,6 +234,33 @@ pub const CodeGen = struct {
             },
             else => {},
         }
+    }
+
+    fn isParamUsedInInstrs(self: *const CodeGen, instrs: []const ir.Instruction, param_idx: u32) bool {
+        for (instrs) |instr| {
+            switch (instr) {
+                .param_get => |pg| {
+                    if (pg.index == param_idx) return true;
+                },
+                .if_expr => |ie| {
+                    if (self.isParamUsedInInstrs(ie.then_instrs, param_idx)) return true;
+                    if (self.isParamUsedInInstrs(ie.else_instrs, param_idx)) return true;
+                },
+                .guard_block => |gb| {
+                    if (self.isParamUsedInInstrs(gb.body, param_idx)) return true;
+                },
+                .case_block => |cb| {
+                    if (self.isParamUsedInInstrs(cb.pre_instrs, param_idx)) return true;
+                    for (cb.arms) |arm| {
+                        if (self.isParamUsedInInstrs(arm.cond_instrs, param_idx)) return true;
+                        if (self.isParamUsedInInstrs(arm.body_instrs, param_idx)) return true;
+                    }
+                    if (self.isParamUsedInInstrs(cb.default_instrs, param_idx)) return true;
+                },
+                else => {},
+            }
+        }
+        return false;
     }
 
     // ============================================================
@@ -381,6 +434,34 @@ pub const CodeGen = struct {
                 try self.write(" == .@\"");
                 try self.write(ma.atom_name);
                 try self.write("\";\n");
+            },
+            .match_int => |mi| {
+                // Type-safe integer comparison for anytype params
+                try self.writeIndent();
+                try self.writeDestLocal(mi.dest);
+                try self.write(" = (@typeInfo(@TypeOf(");
+                try self.writeLocal(mi.scrutinee);
+                try self.write(")) == .int or @typeInfo(@TypeOf(");
+                try self.writeLocal(mi.scrutinee);
+                try self.write(")) == .comptime_int) and ");
+                try self.writeLocal(mi.scrutinee);
+                try self.write(" == ");
+                try self.writeInt(mi.value);
+                try self.write(";\n");
+            },
+            .match_float => |mf| {
+                // Type-safe float comparison for anytype params
+                try self.writeIndent();
+                try self.writeDestLocal(mf.dest);
+                try self.write(" = (@typeInfo(@TypeOf(");
+                try self.writeLocal(mf.scrutinee);
+                try self.write(")) == .float or @typeInfo(@TypeOf(");
+                try self.writeLocal(mf.scrutinee);
+                try self.write(")) == .comptime_float) and ");
+                try self.writeLocal(mf.scrutinee);
+                try self.write(" == ");
+                try self.writeFloat(mf.value);
+                try self.write(";\n");
             },
             .match_string => |ms| {
                 // Type-safe string comparison using std.mem.eql

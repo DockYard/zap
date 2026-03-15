@@ -2,6 +2,7 @@
 .zig-cache/
 zig-out/
 zap-out/
+.zap-cache/
 .claude/
 .cog/
 .opencode/
