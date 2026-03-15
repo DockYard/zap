@@ -1,14 +1,14 @@
 defmodule PatternMatch do
+  def describe(_) :: String do
+    "HEY YO!"
+  end
+
   def describe(0 :: i64) :: String do
-    "zero"
+    "zero
   end
 
   def describe(:ok) :: String do
     "success"
-  end
-
-  def describe(_) :: String do
-    "unknown"
   end
 
   def describe(:error) :: String do

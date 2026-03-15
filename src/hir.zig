@@ -343,6 +343,537 @@ pub const MatchPattern = union(enum) {
     pin: ast.StringId,
 };
 
+pub const PatternRow = struct {
+    patterns: []const ?*const MatchPattern,
+    body_index: u32,
+    guard: ?*const Expr,
+};
+
+pub const PatternMatrix = struct {
+    rows: []const PatternRow,
+    column_count: u32,
+};
+
+// ============================================================
+// Pattern matrix compilation — Wadler algorithm
+//
+// Compiles a matrix of patterns into a Decision tree.
+// ============================================================
+
+pub fn compilePatternMatrix(
+    allocator: std.mem.Allocator,
+    matrix: PatternMatrix,
+    scrutinee_ids: []const u32,
+    next_id: *u32,
+) anyerror!*const Decision {
+    // Base case: no rows → failure
+    if (matrix.rows.len == 0) {
+        const d = try allocator.create(Decision);
+        d.* = .failure;
+        return d;
+    }
+
+    // Base case: no columns → first row's body (success)
+    if (matrix.column_count == 0) {
+        const row = matrix.rows[0];
+        const d = try allocator.create(Decision);
+        if (row.guard) |guard_expr| {
+            // Recurse for remaining rows on guard failure
+            const success = try allocator.create(Decision);
+            success.* = .{ .success = .{ .bindings = &.{}, .body_index = row.body_index } };
+            const remaining_rows = try allocator.alloc(PatternRow, matrix.rows.len - 1);
+            @memcpy(remaining_rows, matrix.rows[1..]);
+            const failure = try compilePatternMatrix(allocator, .{
+                .rows = remaining_rows,
+                .column_count = 0,
+            }, scrutinee_ids, next_id);
+            d.* = .{ .guard = .{
+                .condition = guard_expr,
+                .success = success,
+                .failure = failure,
+            } };
+        } else {
+            d.* = .{ .success = .{ .bindings = &.{}, .body_index = row.body_index } };
+        }
+        return d;
+    }
+
+    // Classify column 0
+    const col0_class = classifyColumn(matrix);
+
+    switch (col0_class) {
+        .all_wildcard => {
+            // Variable Rule: strip column 0, recurse
+            return stripColumnAndRecurse(allocator, matrix, scrutinee_ids, next_id);
+        },
+        .all_constructor, .mixture => {
+            return compileConstructorColumn(allocator, matrix, scrutinee_ids, next_id);
+        },
+    }
+}
+
+const ColumnClass = enum { all_wildcard, all_constructor, mixture };
+
+fn classifyColumn(matrix: PatternMatrix) ColumnClass {
+    var has_constructor = false;
+    var has_wildcard = false;
+    for (matrix.rows) |row| {
+        if (row.patterns.len == 0) {
+            has_wildcard = true;
+            continue;
+        }
+        const pat = row.patterns[0];
+        if (pat == null) {
+            has_wildcard = true;
+        } else {
+            switch (pat.?.*) {
+                .wildcard, .bind => has_wildcard = true,
+                else => has_constructor = true,
+            }
+        }
+    }
+    if (has_constructor and has_wildcard) return .mixture;
+    if (has_constructor) return .all_constructor;
+    return .all_wildcard;
+}
+
+fn isWildcardPattern(pat: ?*const MatchPattern) bool {
+    if (pat == null) return true;
+    return switch (pat.?.*) {
+        .wildcard, .bind => true,
+        else => false,
+    };
+}
+
+fn stripColumnAndRecurse(
+    allocator: std.mem.Allocator,
+    matrix: PatternMatrix,
+    scrutinee_ids: []const u32,
+    next_id: *u32,
+) anyerror!*const Decision {
+    // Collect bindings from column 0 for first matching row
+    // Then strip column 0 and recurse
+    var new_rows = try allocator.alloc(PatternRow, matrix.rows.len);
+    for (matrix.rows, 0..) |row, i| {
+        const new_pats = if (row.patterns.len > 1)
+            row.patterns[1..]
+        else
+            @as([]const ?*const MatchPattern, &.{});
+        new_rows[i] = .{
+            .patterns = new_pats,
+            .body_index = row.body_index,
+            .guard = row.guard,
+        };
+    }
+
+    const new_scrutinees = if (scrutinee_ids.len > 1)
+        scrutinee_ids[1..]
+    else
+        @as([]const u32, &.{});
+
+    // Check if column 0 first row has a bind pattern that needs to be recorded
+    const first_pat = if (matrix.rows[0].patterns.len > 0) matrix.rows[0].patterns[0] else null;
+    const sub_decision = try compilePatternMatrix(allocator, .{
+        .rows = new_rows,
+        .column_count = matrix.column_count - 1,
+    }, new_scrutinees, next_id);
+
+    if (first_pat != null and first_pat.?.* == .bind) {
+        // Emit a bind node
+        const scrutinee_expr = try allocator.create(Expr);
+        scrutinee_expr.* = .{
+            .kind = .{ .param_get = scrutinee_ids[0] },
+            .type_id = types_mod.TypeStore.UNKNOWN,
+            .span = .{ .start = 0, .end = 0 },
+        };
+        const d = try allocator.create(Decision);
+        d.* = .{ .bind = .{
+            .name = first_pat.?.bind,
+            .local_index = 0, // resolved during IR lowering
+            .source = scrutinee_expr,
+            .next = sub_decision,
+        } };
+        return d;
+    }
+
+    return sub_decision;
+}
+
+fn compileConstructorColumn(
+    allocator: std.mem.Allocator,
+    matrix: PatternMatrix,
+    scrutinee_ids: []const u32,
+    next_id: *u32,
+) anyerror!*const Decision {
+    // Collect distinct constructors
+    const scrutinee_id = scrutinee_ids[0];
+
+    // Determine constructor type from first non-wildcard pattern
+    var first_constructor: ?*const MatchPattern = null;
+    for (matrix.rows) |row| {
+        if (row.patterns.len > 0 and !isWildcardPattern(row.patterns[0])) {
+            first_constructor = row.patterns[0].?;
+            break;
+        }
+    }
+
+    if (first_constructor == null) {
+        // All wildcards - use variable rule
+        return stripColumnAndRecurse(allocator, matrix, scrutinee_ids, next_id);
+    }
+
+    const scrutinee_expr = try allocator.create(Expr);
+    scrutinee_expr.* = .{
+        .kind = .{ .param_get = scrutinee_id },
+        .type_id = types_mod.TypeStore.UNKNOWN,
+        .span = .{ .start = 0, .end = 0 },
+    };
+
+    switch (first_constructor.?.*) {
+        .literal => |lit| {
+            switch (lit) {
+                .atom => {
+                    // Atom literals -> switch_tag
+                    return compileAtomSwitch(allocator, matrix, scrutinee_ids, scrutinee_expr, next_id);
+                },
+                else => {
+                    // Int/float/string/bool/nil literals -> switch_literal
+                    return compileLiteralSwitch(allocator, matrix, scrutinee_ids, scrutinee_expr, next_id);
+                },
+            }
+        },
+        .tuple => {
+            // Tuple constructors -> check_tuple
+            return compileTupleCheck(allocator, matrix, scrutinee_ids, scrutinee_expr, next_id);
+        },
+        else => {
+            // Fallback: treat as variable rule
+            return stripColumnAndRecurse(allocator, matrix, scrutinee_ids, next_id);
+        },
+    }
+}
+
+fn compileLiteralSwitch(
+    allocator: std.mem.Allocator,
+    matrix: PatternMatrix,
+    scrutinee_ids: []const u32,
+    scrutinee_expr: *const Expr,
+    next_id: *u32,
+) anyerror!*const Decision {
+    // Collect distinct literal values
+    const DistinctLit = struct {
+        value: LiteralValue,
+    };
+    var distinct: std.ArrayList(DistinctLit) = .empty;
+    for (matrix.rows) |row| {
+        if (row.patterns.len == 0) continue;
+        const pat = row.patterns[0];
+        if (isWildcardPattern(pat)) continue;
+        if (pat.?.* == .literal) {
+            const lit = pat.?.literal;
+            var found = false;
+            for (distinct.items) |d| {
+                if (literalEquals(d.value, lit)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                try distinct.append(allocator, .{ .value = lit });
+            }
+        }
+    }
+
+    // For each distinct value, collect matching+wildcard rows, strip column, recurse
+    var cases: std.ArrayList(LiteralCase) = .empty;
+    for (distinct.items) |dv| {
+        var sub_rows: std.ArrayList(PatternRow) = .empty;
+        for (matrix.rows) |row| {
+            if (row.patterns.len == 0) continue;
+            const pat = row.patterns[0];
+            if (isWildcardPattern(pat)) {
+                // Wildcard rows match every constructor
+                const new_pats = if (row.patterns.len > 1) row.patterns[1..] else @as([]const ?*const MatchPattern, &.{});
+                try sub_rows.append(allocator, .{
+                    .patterns = new_pats,
+                    .body_index = row.body_index,
+                    .guard = row.guard,
+                });
+            } else if (pat.?.* == .literal and literalEquals(pat.?.literal, dv.value)) {
+                const new_pats = if (row.patterns.len > 1) row.patterns[1..] else @as([]const ?*const MatchPattern, &.{});
+                try sub_rows.append(allocator, .{
+                    .patterns = new_pats,
+                    .body_index = row.body_index,
+                    .guard = row.guard,
+                });
+            }
+        }
+
+        const new_scrutinees = if (scrutinee_ids.len > 1) scrutinee_ids[1..] else @as([]const u32, &.{});
+        const sub_decision = try compilePatternMatrix(allocator, .{
+            .rows = try sub_rows.toOwnedSlice(allocator),
+            .column_count = matrix.column_count - 1,
+        }, new_scrutinees, next_id);
+
+        try cases.append(allocator, .{
+            .value = dv.value,
+            .next = sub_decision,
+        });
+    }
+
+    // Default: wildcard-only rows
+    var default_rows: std.ArrayList(PatternRow) = .empty;
+    for (matrix.rows) |row| {
+        if (row.patterns.len == 0) continue;
+        const pat = row.patterns[0];
+        if (isWildcardPattern(pat)) {
+            const new_pats = if (row.patterns.len > 1) row.patterns[1..] else @as([]const ?*const MatchPattern, &.{});
+            try default_rows.append(allocator, .{
+                .patterns = new_pats,
+                .body_index = row.body_index,
+                .guard = row.guard,
+            });
+        }
+    }
+
+    const new_scrutinees = if (scrutinee_ids.len > 1) scrutinee_ids[1..] else @as([]const u32, &.{});
+    const default_decision = try compilePatternMatrix(allocator, .{
+        .rows = try default_rows.toOwnedSlice(allocator),
+        .column_count = matrix.column_count - 1,
+    }, new_scrutinees, next_id);
+
+    const d = try allocator.create(Decision);
+    d.* = .{ .switch_literal = .{
+        .scrutinee = scrutinee_expr,
+        .cases = try cases.toOwnedSlice(allocator),
+        .default = default_decision,
+    } };
+    return d;
+}
+
+fn compileAtomSwitch(
+    allocator: std.mem.Allocator,
+    matrix: PatternMatrix,
+    scrutinee_ids: []const u32,
+    scrutinee_expr: *const Expr,
+    next_id: *u32,
+) anyerror!*const Decision {
+    // Collect distinct atom values
+    var distinct_atoms: std.ArrayList(ast.StringId) = .empty;
+    for (matrix.rows) |row| {
+        if (row.patterns.len == 0) continue;
+        const pat = row.patterns[0];
+        if (isWildcardPattern(pat)) continue;
+        if (pat.?.* == .literal and pat.?.literal == .atom) {
+            const atom_id = pat.?.literal.atom;
+            var found = false;
+            for (distinct_atoms.items) |existing| {
+                if (existing == atom_id) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                try distinct_atoms.append(allocator, atom_id);
+            }
+        }
+    }
+
+    var switch_cases: std.ArrayList(SwitchCase) = .empty;
+    for (distinct_atoms.items) |atom_id| {
+        var sub_rows: std.ArrayList(PatternRow) = .empty;
+        for (matrix.rows) |row| {
+            if (row.patterns.len == 0) continue;
+            const pat = row.patterns[0];
+            if (isWildcardPattern(pat)) {
+                const new_pats = if (row.patterns.len > 1) row.patterns[1..] else @as([]const ?*const MatchPattern, &.{});
+                try sub_rows.append(allocator, .{
+                    .patterns = new_pats,
+                    .body_index = row.body_index,
+                    .guard = row.guard,
+                });
+            } else if (pat.?.* == .literal and pat.?.literal == .atom and pat.?.literal.atom == atom_id) {
+                const new_pats = if (row.patterns.len > 1) row.patterns[1..] else @as([]const ?*const MatchPattern, &.{});
+                try sub_rows.append(allocator, .{
+                    .patterns = new_pats,
+                    .body_index = row.body_index,
+                    .guard = row.guard,
+                });
+            }
+        }
+
+        const new_scrutinees = if (scrutinee_ids.len > 1) scrutinee_ids[1..] else @as([]const u32, &.{});
+        const sub_decision = try compilePatternMatrix(allocator, .{
+            .rows = try sub_rows.toOwnedSlice(allocator),
+            .column_count = matrix.column_count - 1,
+        }, new_scrutinees, next_id);
+
+        try switch_cases.append(allocator, .{
+            .tag = atom_id,
+            .bindings = &.{},
+            .next = sub_decision,
+        });
+    }
+
+    // Default
+    var default_rows: std.ArrayList(PatternRow) = .empty;
+    for (matrix.rows) |row| {
+        if (row.patterns.len == 0) continue;
+        const pat = row.patterns[0];
+        if (isWildcardPattern(pat)) {
+            const new_pats = if (row.patterns.len > 1) row.patterns[1..] else @as([]const ?*const MatchPattern, &.{});
+            try default_rows.append(allocator, .{
+                .patterns = new_pats,
+                .body_index = row.body_index,
+                .guard = row.guard,
+            });
+        }
+    }
+
+    const new_scrutinees = if (scrutinee_ids.len > 1) scrutinee_ids[1..] else @as([]const u32, &.{});
+    const default_decision = try compilePatternMatrix(allocator, .{
+        .rows = try default_rows.toOwnedSlice(allocator),
+        .column_count = matrix.column_count - 1,
+    }, new_scrutinees, next_id);
+
+    const d = try allocator.create(Decision);
+    d.* = .{ .switch_tag = .{
+        .scrutinee = scrutinee_expr,
+        .cases = try switch_cases.toOwnedSlice(allocator),
+        .default = default_decision,
+    } };
+    return d;
+}
+
+fn compileTupleCheck(
+    allocator: std.mem.Allocator,
+    matrix: PatternMatrix,
+    scrutinee_ids: []const u32,
+    scrutinee_expr: *const Expr,
+    next_id: *u32,
+) anyerror!*const Decision {
+    // Find maximum arity of tuple patterns
+    var max_arity: u32 = 0;
+    for (matrix.rows) |row| {
+        if (row.patterns.len == 0) continue;
+        const pat = row.patterns[0];
+        if (!isWildcardPattern(pat) and pat.?.* == .tuple) {
+            const arity: u32 = @intCast(pat.?.tuple.len);
+            max_arity = @max(max_arity, arity);
+        }
+    }
+
+    // Success path: expand tuple sub-patterns into new columns with new scrutinee IDs
+    var success_rows: std.ArrayList(PatternRow) = .empty;
+    for (matrix.rows) |row| {
+        if (row.patterns.len == 0) continue;
+        const pat = row.patterns[0];
+
+        var new_cols: std.ArrayList(?*const MatchPattern) = .empty;
+        if (!isWildcardPattern(pat) and pat.?.* == .tuple) {
+            // Expand sub-patterns
+            for (pat.?.tuple) |sub_pat| {
+                try new_cols.append(allocator, sub_pat);
+            }
+            // Pad with wildcards if needed
+            var j: u32 = @intCast(pat.?.tuple.len);
+            while (j < max_arity) : (j += 1) {
+                const wc = try allocator.create(MatchPattern);
+                wc.* = .wildcard;
+                try new_cols.append(allocator, wc);
+            }
+        } else if (isWildcardPattern(pat)) {
+            // Wildcard matches any tuple — expand to max_arity wildcards
+            var j: u32 = 0;
+            while (j < max_arity) : (j += 1) {
+                const wc = try allocator.create(MatchPattern);
+                wc.* = .wildcard;
+                try new_cols.append(allocator, wc);
+            }
+        } else {
+            continue; // non-tuple, non-wildcard — skip in success path
+        }
+
+        // Append remaining columns
+        if (row.patterns.len > 1) {
+            for (row.patterns[1..]) |p| {
+                try new_cols.append(allocator, p);
+            }
+        }
+
+        try success_rows.append(allocator, .{
+            .patterns = try new_cols.toOwnedSlice(allocator),
+            .body_index = row.body_index,
+            .guard = row.guard,
+        });
+    }
+
+    // Build new scrutinee IDs: new IDs for tuple elements, then remaining
+    var new_scrutinee_list: std.ArrayList(u32) = .empty;
+    var elem_ids = try allocator.alloc(u32, max_arity);
+    var j: u32 = 0;
+    while (j < max_arity) : (j += 1) {
+        elem_ids[j] = next_id.*;
+        next_id.* += 1;
+        try new_scrutinee_list.append(allocator, elem_ids[j]);
+    }
+    if (scrutinee_ids.len > 1) {
+        for (scrutinee_ids[1..]) |sid| {
+            try new_scrutinee_list.append(allocator, sid);
+        }
+    }
+
+    const new_col_count = max_arity + (matrix.column_count - 1);
+    const success_decision = try compilePatternMatrix(allocator, .{
+        .rows = try success_rows.toOwnedSlice(allocator),
+        .column_count = new_col_count,
+    }, try new_scrutinee_list.toOwnedSlice(allocator), next_id);
+
+    // Failure path: wildcard-only rows
+    var failure_rows: std.ArrayList(PatternRow) = .empty;
+    for (matrix.rows) |row| {
+        if (row.patterns.len == 0) continue;
+        const pat = row.patterns[0];
+        if (isWildcardPattern(pat)) {
+            const new_pats = if (row.patterns.len > 1) row.patterns[1..] else @as([]const ?*const MatchPattern, &.{});
+            try failure_rows.append(allocator, .{
+                .patterns = new_pats,
+                .body_index = row.body_index,
+                .guard = row.guard,
+            });
+        }
+    }
+
+    const remaining_scrutinees = if (scrutinee_ids.len > 1) scrutinee_ids[1..] else @as([]const u32, &.{});
+    const failure_decision = try compilePatternMatrix(allocator, .{
+        .rows = try failure_rows.toOwnedSlice(allocator),
+        .column_count = matrix.column_count - 1,
+    }, remaining_scrutinees, next_id);
+
+    const d = try allocator.create(Decision);
+    d.* = .{ .check_tuple = .{
+        .scrutinee = scrutinee_expr,
+        .expected_arity = max_arity,
+        .success = success_decision,
+        .failure = failure_decision,
+    } };
+    return d;
+}
+
+fn literalEquals(a: LiteralValue, b: LiteralValue) bool {
+    const tag_a = std.meta.activeTag(a);
+    const tag_b = std.meta.activeTag(b);
+    if (tag_a != tag_b) return false;
+    return switch (a) {
+        .int => |v| v == b.int,
+        .float => |v| v == b.float,
+        .string => |v| v == b.string,
+        .atom => |v| v == b.atom,
+        .bool_val => |v| v == b.bool_val,
+        .nil => true,
+    };
+}
+
 // ============================================================
 // HIR builder — converts typed AST to HIR
 // ============================================================
@@ -879,18 +1410,7 @@ pub const HirBuilder = struct {
                                 });
                             },
                             .tuple => |sub_pats| {
-                                for (sub_pats, 0..) |sub_pat, elem_idx| {
-                                    if (sub_pat.* == .bind) {
-                                        const local_idx = self.next_local;
-                                        self.next_local += 1;
-                                        try self.current_case_bindings.append(self.allocator, .{
-                                            .name = sub_pat.bind,
-                                            .local_index = local_idx,
-                                            .kind = .tuple_element,
-                                            .element_index = @intCast(elem_idx),
-                                        });
-                                    }
-                                }
+                                try self.collectTuplePatternBindings(sub_pats);
                             },
                             else => {},
                         }
@@ -1051,6 +1571,29 @@ pub const HirBuilder = struct {
         }
         // For multi-part names like "IO.File", we'd need to join — for now return first part
         return self.interner.get(name.parts[0]);
+    }
+
+    /// Recursively collect bindings from tuple sub-patterns (including nested tuples).
+    fn collectTuplePatternBindings(self: *HirBuilder, sub_pats: []const *const MatchPattern) !void {
+        for (sub_pats, 0..) |sub_pat, elem_idx| {
+            switch (sub_pat.*) {
+                .bind => |name| {
+                    const local_idx = self.next_local;
+                    self.next_local += 1;
+                    try self.current_case_bindings.append(self.allocator, .{
+                        .name = name,
+                        .local_index = local_idx,
+                        .kind = .tuple_element,
+                        .element_index = @intCast(elem_idx),
+                    });
+                },
+                .tuple => |nested_pats| {
+                    // Recurse into nested tuples
+                    try self.collectTuplePatternBindings(nested_pats);
+                },
+                else => {},
+            }
+        }
     }
 
     fn create(self: *HirBuilder, comptime T: type, value: T) !*const T {

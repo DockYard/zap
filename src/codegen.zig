@@ -229,6 +229,23 @@ pub const CodeGen = struct {
             .case_break => |cbr| {
                 if (cbr.value) |v| self.referenced_locals.append(self.allocator, v) catch {};
             },
+            .switch_literal => |sl| {
+                self.referenced_locals.append(self.allocator, sl.scrutinee) catch {};
+                for (sl.cases) |case| {
+                    for (case.body_instrs) |sub_instr| self.collectReferencedLocals(&sub_instr);
+                    if (case.result) |r| self.referenced_locals.append(self.allocator, r) catch {};
+                }
+                for (sl.default_instrs) |sub_instr| self.collectReferencedLocals(&sub_instr);
+                if (sl.default_result) |r| self.referenced_locals.append(self.allocator, r) catch {};
+            },
+            .switch_return => |sr| {
+                for (sr.cases) |case| {
+                    for (case.body_instrs) |sub_instr| self.collectReferencedLocals(&sub_instr);
+                    if (case.return_value) |r| self.referenced_locals.append(self.allocator, r) catch {};
+                }
+                for (sr.default_instrs) |sub_instr| self.collectReferencedLocals(&sub_instr);
+                if (sr.default_result) |r| self.referenced_locals.append(self.allocator, r) catch {};
+            },
             .index_get => |ig| {
                 self.referenced_locals.append(self.allocator, ig.object) catch {};
             },
@@ -256,6 +273,20 @@ pub const CodeGen = struct {
                         if (self.isParamUsedInInstrs(arm.body_instrs, param_idx)) return true;
                     }
                     if (self.isParamUsedInInstrs(cb.default_instrs, param_idx)) return true;
+                },
+                .switch_literal => |sl| {
+                    for (sl.cases) |case| {
+                        if (self.isParamUsedInInstrs(case.body_instrs, param_idx)) return true;
+                    }
+                    if (self.isParamUsedInInstrs(sl.default_instrs, param_idx)) return true;
+                },
+                .switch_return => |sr| {
+                    // The scrutinee_param is used directly
+                    if (sr.scrutinee_param == param_idx) return true;
+                    for (sr.cases) |case| {
+                        if (self.isParamUsedInInstrs(case.body_instrs, param_idx)) return true;
+                    }
+                    if (self.isParamUsedInInstrs(sr.default_instrs, param_idx)) return true;
                 },
                 else => {},
             }
@@ -422,46 +453,73 @@ pub const CodeGen = struct {
                 try self.write(");\n");
             },
             .match_atom => |ma| {
-                // Type-safe atom comparison for anytype params
                 try self.writeIndent();
                 try self.writeDestLocal(ma.dest);
-                try self.write(" = @TypeOf(");
-                try self.writeLocal(ma.scrutinee);
-                try self.write(") == @TypeOf(.@\"");
-                try self.write(ma.atom_name);
-                try self.write("\") and ");
-                try self.writeLocal(ma.scrutinee);
-                try self.write(" == .@\"");
-                try self.write(ma.atom_name);
-                try self.write("\";\n");
+                if (ma.skip_type_check) {
+                    // Phase 3: known atom type — skip @TypeOf wrapper
+                    try self.write(" = ");
+                    try self.writeLocal(ma.scrutinee);
+                    try self.write(" == .@\"");
+                    try self.write(ma.atom_name);
+                    try self.write("\";\n");
+                } else {
+                    // Type-safe atom comparison for anytype params
+                    try self.write(" = @TypeOf(");
+                    try self.writeLocal(ma.scrutinee);
+                    try self.write(") == @TypeOf(.@\"");
+                    try self.write(ma.atom_name);
+                    try self.write("\") and ");
+                    try self.writeLocal(ma.scrutinee);
+                    try self.write(" == .@\"");
+                    try self.write(ma.atom_name);
+                    try self.write("\";\n");
+                }
             },
             .match_int => |mi| {
-                // Type-safe integer comparison for anytype params
                 try self.writeIndent();
                 try self.writeDestLocal(mi.dest);
-                try self.write(" = (@typeInfo(@TypeOf(");
-                try self.writeLocal(mi.scrutinee);
-                try self.write(")) == .int or @typeInfo(@TypeOf(");
-                try self.writeLocal(mi.scrutinee);
-                try self.write(")) == .comptime_int) and ");
-                try self.writeLocal(mi.scrutinee);
-                try self.write(" == ");
-                try self.writeInt(mi.value);
-                try self.write(";\n");
+                if (mi.skip_type_check) {
+                    // Phase 3: known integer type — direct comparison
+                    try self.write(" = ");
+                    try self.writeLocal(mi.scrutinee);
+                    try self.write(" == ");
+                    try self.writeInt(mi.value);
+                    try self.write(";\n");
+                } else {
+                    // Type-safe integer comparison for anytype params
+                    try self.write(" = (@typeInfo(@TypeOf(");
+                    try self.writeLocal(mi.scrutinee);
+                    try self.write(")) == .int or @typeInfo(@TypeOf(");
+                    try self.writeLocal(mi.scrutinee);
+                    try self.write(")) == .comptime_int) and ");
+                    try self.writeLocal(mi.scrutinee);
+                    try self.write(" == ");
+                    try self.writeInt(mi.value);
+                    try self.write(";\n");
+                }
             },
             .match_float => |mf| {
-                // Type-safe float comparison for anytype params
                 try self.writeIndent();
                 try self.writeDestLocal(mf.dest);
-                try self.write(" = (@typeInfo(@TypeOf(");
-                try self.writeLocal(mf.scrutinee);
-                try self.write(")) == .float or @typeInfo(@TypeOf(");
-                try self.writeLocal(mf.scrutinee);
-                try self.write(")) == .comptime_float) and ");
-                try self.writeLocal(mf.scrutinee);
-                try self.write(" == ");
-                try self.writeFloat(mf.value);
-                try self.write(";\n");
+                if (mf.skip_type_check) {
+                    // Phase 3: known float type — direct comparison
+                    try self.write(" = ");
+                    try self.writeLocal(mf.scrutinee);
+                    try self.write(" == ");
+                    try self.writeFloat(mf.value);
+                    try self.write(";\n");
+                } else {
+                    // Type-safe float comparison for anytype params
+                    try self.write(" = (@typeInfo(@TypeOf(");
+                    try self.writeLocal(mf.scrutinee);
+                    try self.write(")) == .float or @typeInfo(@TypeOf(");
+                    try self.writeLocal(mf.scrutinee);
+                    try self.write(")) == .comptime_float) and ");
+                    try self.writeLocal(mf.scrutinee);
+                    try self.write(" == ");
+                    try self.writeFloat(mf.value);
+                    try self.write(";\n");
+                }
             },
             .match_string => |ms| {
                 // Type-safe string comparison using std.mem.eql
@@ -600,6 +658,113 @@ pub const CodeGen = struct {
                 try self.write("};\n");
 
                 self.current_case_label = saved_case_label;
+            },
+            .switch_literal => |sl| {
+                // Emit: const __local_N = switch (__local_S) { ... };
+                try self.writeIndent();
+                try self.writeDestLocal(sl.dest);
+                try self.write(" = switch (");
+                try self.writeLocal(sl.scrutinee);
+                try self.write(") {\n");
+                self.indent_level += 1;
+
+                for (sl.cases, 0..) |case, case_i| {
+                    try self.writeIndent();
+                    try self.emitLiteralValue(&case.value);
+                    try self.write(" => ");
+                    const case_label = try std.fmt.allocPrint(self.allocator, "blk_sw_{d}", .{case_i});
+                    try self.write(case_label);
+                    try self.write(": {\n");
+                    self.indent_level += 1;
+                    for (case.body_instrs) |sub_instr| {
+                        try self.emitInstruction(&sub_instr);
+                    }
+                    if (case.result) |r| {
+                        try self.writeIndent();
+                        try self.write("break :");
+                        try self.write(case_label);
+                        try self.write(" ");
+                        try self.writeLocal(r);
+                        try self.write(";\n");
+                    }
+                    self.indent_level -= 1;
+                    try self.writeIndent();
+                    try self.write("},\n");
+                }
+
+                // else (default)
+                try self.writeIndent();
+                try self.write("else => blk_sw_else: {\n");
+                self.indent_level += 1;
+                for (sl.default_instrs) |sub_instr| {
+                    try self.emitInstruction(&sub_instr);
+                }
+                if (sl.default_result) |r| {
+                    try self.writeIndent();
+                    try self.write("break :blk_sw_else ");
+                    try self.writeLocal(r);
+                    try self.write(";\n");
+                }
+                self.indent_level -= 1;
+                try self.writeIndent();
+                try self.write("},\n");
+
+                self.indent_level -= 1;
+                try self.writeIndent();
+                try self.write("};\n");
+            },
+            .switch_return => |sr| {
+                // Emit: return switch (__arg_N) { ... };
+                try self.writeIndent();
+                try self.write("return switch (");
+                try self.writeParam(sr.scrutinee_param);
+                try self.write(") {\n");
+                self.indent_level += 1;
+
+                for (sr.cases, 0..) |case, case_i| {
+                    try self.writeIndent();
+                    try self.emitLiteralValue(&case.value);
+                    try self.write(" => ");
+                    const case_label = try std.fmt.allocPrint(self.allocator, "blk_sw_{d}", .{case_i});
+                    try self.write(case_label);
+                    try self.write(": {\n");
+                    self.indent_level += 1;
+                    for (case.body_instrs) |sub_instr| {
+                        try self.emitInstruction(&sub_instr);
+                    }
+                    if (case.return_value) |r| {
+                        try self.writeIndent();
+                        try self.write("break :");
+                        try self.write(case_label);
+                        try self.write(" ");
+                        try self.writeLocal(r);
+                        try self.write(";\n");
+                    }
+                    self.indent_level -= 1;
+                    try self.writeIndent();
+                    try self.write("},\n");
+                }
+
+                // else (default)
+                try self.writeIndent();
+                try self.write("else => blk_sw_else: {\n");
+                self.indent_level += 1;
+                for (sr.default_instrs) |sub_instr| {
+                    try self.emitInstruction(&sub_instr);
+                }
+                if (sr.default_result) |r| {
+                    try self.writeIndent();
+                    try self.write("break :blk_sw_else ");
+                    try self.writeLocal(r);
+                    try self.write(";\n");
+                }
+                self.indent_level -= 1;
+                try self.writeIndent();
+                try self.write("},\n");
+
+                self.indent_level -= 1;
+                try self.writeIndent();
+                try self.write("};\n");
             },
             .case_break => |cbr| {
                 if (self.current_case_label) |label| {
@@ -832,6 +997,19 @@ pub const CodeGen = struct {
     fn writeInt(self: *CodeGen, value: i64) !void {
         const str = try std.fmt.allocPrint(self.allocator, "{d}", .{value});
         try self.write(str);
+    }
+
+    fn emitLiteralValue(self: *CodeGen, value: *const ir.LiteralValue) !void {
+        switch (value.*) {
+            .int => |v| try self.writeInt(v),
+            .float => |v| try self.writeFloat(v),
+            .string => |v| {
+                try self.write("\"");
+                try self.write(v);
+                try self.write("\"");
+            },
+            .bool_val => |v| try self.write(if (v) "true" else "false"),
+        }
     }
 
     fn writeFloat(self: *CodeGen, value: f64) !void {

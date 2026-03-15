@@ -96,6 +96,7 @@ pub const Instruction = union(enum) {
     cond_branch: CondBranch,
     switch_tag: SwitchTag,
     switch_literal: SwitchLiteral,
+    switch_return: SwitchReturn,
     match_atom: MatchAtom,
     match_int: MatchInt,
     match_float: MatchFloat,
@@ -324,14 +325,30 @@ pub const TagCase = struct {
 };
 
 pub const SwitchLiteral = struct {
+    dest: LocalId,
     scrutinee: LocalId,
     cases: []const LitCase,
-    default: LabelId,
+    default_instrs: []const Instruction,
+    default_result: ?LocalId,
 };
 
 pub const LitCase = struct {
     value: LiteralValue,
-    target: LabelId,
+    body_instrs: []const Instruction,
+    result: ?LocalId,
+};
+
+pub const SwitchReturn = struct {
+    scrutinee_param: u32,
+    cases: []const ReturnCase,
+    default_instrs: []const Instruction,
+    default_result: ?LocalId,
+};
+
+pub const ReturnCase = struct {
+    value: LiteralValue,
+    body_instrs: []const Instruction,
+    return_value: ?LocalId,
 };
 
 pub const LiteralValue = union(enum) {
@@ -345,30 +362,35 @@ pub const MatchAtom = struct {
     dest: LocalId,
     scrutinee: LocalId,
     atom_name: []const u8,
+    skip_type_check: bool = false,
 };
 
 pub const MatchInt = struct {
     dest: LocalId,
     scrutinee: LocalId,
     value: i64,
+    skip_type_check: bool = false,
 };
 
 pub const MatchFloat = struct {
     dest: LocalId,
     scrutinee: LocalId,
     value: f64,
+    skip_type_check: bool = false,
 };
 
 pub const MatchString = struct {
     dest: LocalId,
     scrutinee: LocalId,
     expected: []const u8,
+    skip_type_check: bool = false,
 };
 
 pub const MatchType = struct {
     dest: LocalId,
     scrutinee: LocalId,
     expected_type: ZigType,
+    skip_type_check: bool = false,
 };
 
 pub const MatchFail = struct {
@@ -479,6 +501,7 @@ pub const IrBuilder = struct {
     current_blocks: std.ArrayList(Block),
     current_instrs: std.ArrayList(Instruction),
     interner: *const ast.StringInterner,
+    known_local_types: std.AutoHashMap(LocalId, ZigType),
 
     pub fn init(allocator: std.mem.Allocator, interner: *const ast.StringInterner) IrBuilder {
         return .{
@@ -490,6 +513,7 @@ pub const IrBuilder = struct {
             .current_blocks = .empty,
             .current_instrs = .empty,
             .interner = interner,
+            .known_local_types = std.AutoHashMap(LocalId, ZigType).init(allocator),
         };
     }
 
@@ -497,6 +521,7 @@ pub const IrBuilder = struct {
         self.functions.deinit(self.allocator);
         self.current_blocks.deinit(self.allocator);
         self.current_instrs.deinit(self.allocator);
+        self.known_local_types.deinit();
     }
 
     pub fn buildProgram(self: *IrBuilder, hir_program: *const hir_mod.Program) !Program {
@@ -523,6 +548,7 @@ pub const IrBuilder = struct {
         self.next_local = 0;
         self.next_label = 0;
         self.current_instrs = .empty;
+        self.known_local_types.clearRetainingCapacity();
 
         // Use first clause for arity and return type
         const first_clause = &group.clauses[0];
@@ -570,85 +596,105 @@ pub const IrBuilder = struct {
             try self.emitTupleBindings(first_clause);
             const result_local = try self.lowerBlock(first_clause.body);
             try self.current_instrs.append(self.allocator, .{ .ret = .{ .value = result_local } });
-        } else {
-            // Multiple clauses — emit pattern match dispatch.
-            // Clause order follows source order: first match wins.
+        } else if (self.canSwitchDispatch(group)) |switch_param| {
+            // Emit switch_return for integer literal dispatch
+            var return_cases: std.ArrayList(ReturnCase) = .empty;
+            var default_instrs_result: []const Instruction = &.{};
+            var default_result: ?LocalId = null;
+
             for (group.clauses, 0..) |clause, clause_idx| {
                 const is_last = clause_idx == group.clauses.len - 1;
 
-                // Classify clause pattern type
-                const pattern_kind = classifyClausePattern(&clause);
-
-                if (is_last and pattern_kind == .tuple) {
-                    // Last clause with tuple pattern — use guard_block for scoping,
-                    // then add match_fail fallback
-                    try self.emitTupleDispatch(&clause);
-                    try self.current_instrs.append(self.allocator, .{
-                        .match_fail = .{ .message = "no matching clause" },
-                    });
-                } else if (is_last) {
-                    // Last clause without tuple — unconditional fallback
+                if (is_last) {
+                    // Default clause — lower body into default_instrs
+                    const saved = self.current_instrs;
+                    self.current_instrs = .empty;
+                    try self.emitTupleBindings(&clause);
                     const result_local = try self.lowerBlock(clause.body);
-                    try self.current_instrs.append(self.allocator, .{ .ret = .{ .value = result_local } });
-                } else if (pattern_kind == .tuple) {
-                    // Tuple pattern dispatch — uses guard_block for scoped bindings
-                    try self.emitTupleDispatch(&clause);
-                } else if (pattern_kind == .literal) {
-                    // Literal pattern dispatch
-                    var condition_local: ?LocalId = null;
-                    condition_local = try self.emitLiteralCondition(&clause);
-
-                    if (condition_local) |cond| {
-                        // AND with refinement if present
-                        const final_cond = try self.emitRefinement(&clause, cond);
-                        const result = try self.lowerBlock(clause.body);
-                        try self.current_instrs.append(self.allocator, .{
-                            .cond_return = .{ .condition = final_cond, .value = result },
-                        });
-                    }
+                    default_instrs_result = try self.current_instrs.toOwnedSlice(self.allocator);
+                    default_result = result_local;
+                    self.current_instrs = saved;
                 } else {
-                    // Non-last, non-literal, non-tuple — check param type if typed
-                    var type_guard: ?LocalId = null;
-                    for (clause.params, 0..) |param, i| {
-                        const zig_type = typeIdToZigType(param.type_id);
-                        if (zig_type != .any) {
-                            const arg_local = self.next_local;
-                            self.next_local += 1;
-                            try self.current_instrs.append(self.allocator, .{
-                                .param_get = .{ .dest = arg_local, .index = @intCast(i) },
-                            });
-                            const guard_local = self.next_local;
-                            self.next_local += 1;
-                            try self.current_instrs.append(self.allocator, .{
-                                .match_type = .{ .dest = guard_local, .scrutinee = arg_local, .expected_type = zig_type },
-                            });
-                            type_guard = guard_local;
-                        }
-                    }
-                    if (type_guard) |guard| {
-                        // AND with refinement if present
-                        const final_cond = try self.emitRefinement(&clause, guard);
-                        const result_local = try self.lowerBlock(clause.body);
-                        try self.current_instrs.append(self.allocator, .{
-                            .cond_return = .{ .condition = final_cond, .value = result_local },
-                        });
-                    } else if (clause.refinement != null) {
-                        // Has refinement but no type guard — use refinement as condition
-                        const ref_cond = try self.lowerExpr(clause.refinement.?);
-                        const result_local = try self.lowerBlock(clause.body);
-                        try self.current_instrs.append(self.allocator, .{
-                            .cond_return = .{ .condition = ref_cond, .value = result_local },
-                        });
-                    } else {
-                        // Unconditional match (wildcard/untyped, no refinement).
-                        // This always matches, so emit return and stop — any
-                        // subsequent clauses are unreachable.
-                        const result_local = try self.lowerBlock(clause.body);
-                        try self.current_instrs.append(self.allocator, .{ .ret = .{ .value = result_local } });
-                        break;
-                    }
+                    // Literal case
+                    const pat = clause.params[switch_param].pattern.?;
+                    const lit_value: LiteralValue = switch (pat.literal) {
+                        .int => |v| .{ .int = v },
+                        else => unreachable,
+                    };
+
+                    const saved = self.current_instrs;
+                    self.current_instrs = .empty;
+                    const body_result = try self.lowerBlock(clause.body);
+                    const body_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
+                    self.current_instrs = saved;
+
+                    try return_cases.append(self.allocator, .{
+                        .value = lit_value,
+                        .body_instrs = body_instrs,
+                        .return_value = body_result,
+                    });
                 }
             }
+
+            try self.current_instrs.append(self.allocator, .{
+                .switch_return = .{
+                    .scrutinee_param = switch_param,
+                    .cases = try return_cases.toOwnedSlice(self.allocator),
+                    .default_instrs = default_instrs_result,
+                    .default_result = default_result,
+                },
+            });
+        } else {
+            // General multi-clause dispatch via decision tree
+            // Build PatternMatrix from clause params
+            var pattern_rows: std.ArrayList(hir_mod.PatternRow) = .empty;
+            for (group.clauses, 0..) |clause, clause_idx| {
+                var pats: std.ArrayList(?*const hir_mod.MatchPattern) = .empty;
+                for (clause.params) |param| {
+                    try pats.append(self.allocator, param.pattern);
+                }
+                try pattern_rows.append(self.allocator, .{
+                    .patterns = try pats.toOwnedSlice(self.allocator),
+                    .body_index = @intCast(clause_idx),
+                    .guard = clause.refinement,
+                });
+            }
+
+            // Set up scrutinee_map: param indices as scrutinee IDs
+            var scrutinee_ids: std.ArrayList(u32) = .empty;
+            for (0..group.arity) |i| {
+                try scrutinee_ids.append(self.allocator, @intCast(i));
+            }
+
+            var next_scrutinee_id: u32 = group.arity;
+            const decision = try hir_mod.compilePatternMatrix(
+                self.allocator,
+                .{
+                    .rows = try pattern_rows.toOwnedSlice(self.allocator),
+                    .column_count = group.arity,
+                },
+                try scrutinee_ids.toOwnedSlice(self.allocator),
+                &next_scrutinee_id,
+            );
+
+            // Set up scrutinee_map: map scrutinee IDs to param_get locals
+            var scrutinee_map = std.AutoHashMap(u32, LocalId).init(self.allocator);
+            defer scrutinee_map.deinit();
+            for (0..group.arity) |i| {
+                const param_local = self.next_local;
+                self.next_local += 1;
+                try self.current_instrs.append(self.allocator, .{
+                    .param_get = .{ .dest = param_local, .index = @intCast(i) },
+                });
+                // Track known types for Phase 3
+                const param_type = typeIdToZigType(first_clause.params[i].type_id);
+                if (param_type != .any) {
+                    try self.known_local_types.put(param_local, param_type);
+                }
+                try scrutinee_map.put(@intCast(i), param_local);
+            }
+
+            try self.lowerDecisionTreeForDispatch(decision, group.clauses, &scrutinee_map);
         }
 
         const entry_block = Block{
@@ -672,16 +718,63 @@ pub const IrBuilder = struct {
         });
     }
 
-    const PatternKind = enum { literal, tuple, other };
+    /// Check if multi-clause function can emit switch_return for integer literals.
+    /// Returns the param index to switch on if eligible.
+    fn canSwitchDispatch(self: *IrBuilder, group: *const hir_mod.FunctionGroup) ?u32 {
+        if (group.clauses.len < 2) return null;
 
-    fn classifyClausePattern(clause: *const hir_mod.Clause) PatternKind {
-        for (clause.params) |param| {
-            if (param.pattern) |pat| {
-                if (pat.* == .literal) return .literal;
-                if (pat.* == .tuple) return .tuple;
+        var switch_param_idx: ?u32 = null;
+
+        for (group.clauses, 0..) |clause, clause_idx| {
+            const is_last = clause_idx == group.clauses.len - 1;
+
+            if (is_last) {
+                // Last clause must be wildcard/bind fallback (no literal pattern)
+                for (clause.params) |param| {
+                    if (param.pattern) |pat| {
+                        if (pat.* == .literal) return null;
+                    }
+                }
+                break;
+            }
+
+            // Non-last clauses must have literal pattern with no refinement
+            if (clause.refinement != null) return null;
+
+            // Find the literal param
+            var found_literal_param: ?u32 = null;
+            for (clause.params, 0..) |param, i| {
+                if (param.pattern) |pat| {
+                    if (pat.* == .literal) {
+                        // Only integer literals can use switch
+                        switch (pat.literal) {
+                            .int => {},
+                            else => return null,
+                        }
+                        found_literal_param = @intCast(i);
+                    }
+                }
+            }
+
+            if (found_literal_param == null) return null;
+
+            if (switch_param_idx) |idx| {
+                if (idx != found_literal_param.?) return null; // different param positions
+            } else {
+                // Check that the param type is a known integer type
+                const param_type = typeIdToZigType(clause.params[found_literal_param.?].type_id);
+                switch (param_type) {
+                    .i8, .i16, .i32, .i64, .u8, .u16, .u32, .u64, .isize, .usize => {},
+                    else => return null,
+                }
+                switch_param_idx = found_literal_param;
             }
         }
-        return .other;
+
+        return switch_param_idx orelse {
+            _ = self; // suppress unused
+            return null;
+        };
     }
 
     /// Emit index_get instructions to populate tuple binding locals.
@@ -704,90 +797,6 @@ pub const IrBuilder = struct {
         }
     }
 
-    /// Build condition for literal patterns. Returns the condition local.
-    fn emitLiteralCondition(self: *IrBuilder, clause: *const hir_mod.Clause) !?LocalId {
-        var condition_local: ?LocalId = null;
-        for (clause.params, 0..) |param, i| {
-            if (param.pattern) |pat| {
-                if (pat.* == .literal) {
-                    const this_cond = try self.emitLiteralCheck(pat.literal, @intCast(i));
-                    condition_local = if (condition_local) |prev|
-                        try self.emitAnd(prev, this_cond)
-                    else
-                        this_cond;
-                }
-            }
-        }
-        return condition_local;
-    }
-
-    /// Emit a comparison check for a single literal pattern against a param.
-    fn emitLiteralCheck(self: *IrBuilder, lit: hir_mod.LiteralValue, param_idx: u32) !LocalId {
-        const arg_local = self.next_local;
-        self.next_local += 1;
-        try self.current_instrs.append(self.allocator, .{
-            .param_get = .{ .dest = arg_local, .index = param_idx },
-        });
-        return switch (lit) {
-            .atom => |v| {
-                const match_local = self.next_local;
-                self.next_local += 1;
-                try self.current_instrs.append(self.allocator, .{
-                    .match_atom = .{ .dest = match_local, .scrutinee = arg_local, .atom_name = self.interner.get(v) },
-                });
-                return match_local;
-            },
-            .int => |v| {
-                const match_local = self.next_local;
-                self.next_local += 1;
-                try self.current_instrs.append(self.allocator, .{
-                    .match_int = .{ .dest = match_local, .scrutinee = arg_local, .value = v },
-                });
-                return match_local;
-            },
-            .float => |v| {
-                const match_local = self.next_local;
-                self.next_local += 1;
-                try self.current_instrs.append(self.allocator, .{
-                    .match_float = .{ .dest = match_local, .scrutinee = arg_local, .value = v },
-                });
-                return match_local;
-            },
-            .string => |v| {
-                const match_local = self.next_local;
-                self.next_local += 1;
-                try self.current_instrs.append(self.allocator, .{
-                    .match_string = .{ .dest = match_local, .scrutinee = arg_local, .expected = self.interner.get(v) },
-                });
-                return match_local;
-            },
-            .bool_val => |v| {
-                const lit_local = self.next_local;
-                self.next_local += 1;
-                try self.current_instrs.append(self.allocator, .{
-                    .const_bool = .{ .dest = lit_local, .value = v },
-                });
-                const cmp_local = self.next_local;
-                self.next_local += 1;
-                try self.current_instrs.append(self.allocator, .{
-                    .binary_op = .{ .dest = cmp_local, .op = .eq, .lhs = arg_local, .rhs = lit_local },
-                });
-                return cmp_local;
-            },
-            .nil => {
-                const lit_local = self.next_local;
-                self.next_local += 1;
-                try self.current_instrs.append(self.allocator, .{ .const_nil = lit_local });
-                const cmp_local = self.next_local;
-                self.next_local += 1;
-                try self.current_instrs.append(self.allocator, .{
-                    .binary_op = .{ .dest = cmp_local, .op = .eq, .lhs = arg_local, .rhs = lit_local },
-                });
-                return cmp_local;
-            },
-        };
-    }
-
     /// AND two boolean locals together.
     fn emitAnd(self: *IrBuilder, lhs: LocalId, rhs: LocalId) !LocalId {
         const result = self.next_local;
@@ -805,74 +814,6 @@ pub const IrBuilder = struct {
             return self.emitAnd(condition, ref_local);
         }
         return condition;
-    }
-
-    /// Emit tuple pattern dispatch with guard_block for scoped bindings.
-    fn emitTupleDispatch(self: *IrBuilder, clause: *const hir_mod.Clause) !void {
-        // Build condition by checking literal sub-patterns in tuples
-        var condition_local: ?LocalId = null;
-
-        for (clause.params, 0..) |param, param_idx| {
-            if (param.pattern) |pat| {
-                if (pat.* == .tuple) {
-                    // Get the param tuple
-                    const tuple_local = self.next_local;
-                    self.next_local += 1;
-                    try self.current_instrs.append(self.allocator, .{
-                        .param_get = .{ .dest = tuple_local, .index = @intCast(param_idx) },
-                    });
-
-                    // Check each sub-pattern that's a literal
-                    for (pat.tuple, 0..) |sub_pat, elem_idx| {
-                        if (sub_pat.* == .literal) {
-                            // Extract element
-                            const elem_local = self.next_local;
-                            self.next_local += 1;
-                            try self.current_instrs.append(self.allocator, .{
-                                .index_get = .{
-                                    .dest = elem_local,
-                                    .object = tuple_local,
-                                    .index = @intCast(elem_idx),
-                                },
-                            });
-
-                            // Check the literal
-                            const check_local = try self.emitSubPatternCheck(elem_local, sub_pat.literal);
-                            condition_local = if (condition_local) |prev|
-                                try self.emitAnd(prev, check_local)
-                            else
-                                check_local;
-                        }
-                    }
-                }
-            }
-        }
-
-        if (condition_local) |cond| {
-            // AND with refinement if present
-            const final_cond = try self.emitRefinement(clause, cond);
-
-            // Build guard block body: extract bindings + lower body + return
-            const saved_instrs = self.current_instrs;
-            self.current_instrs = .empty;
-
-            // Emit tuple bindings inside the guard block
-            try self.emitTupleBindings(clause);
-
-            // Lower body
-            const result_local = try self.lowerBlock(clause.body);
-            try self.current_instrs.append(self.allocator, .{
-                .ret = .{ .value = result_local },
-            });
-
-            const guard_body = try self.current_instrs.toOwnedSlice(self.allocator);
-            self.current_instrs = saved_instrs;
-
-            // Emit guard_block
-            try self.current_instrs.append(self.allocator, .{
-                .guard_block = .{ .condition = final_cond, .body = guard_body },
-            });
-        }
     }
 
     /// Emit a check for a literal sub-pattern against an already-extracted element local.
@@ -957,27 +898,62 @@ pub const IrBuilder = struct {
         return dest;
     }
 
+    /// Check if all non-default arms are integer or bool literals of the same type with no guards.
+    const SwitchableType = enum { int, bool_val };
+    fn canSwitchLiteral(arms: []const hir_mod.CaseArm) ?SwitchableType {
+        if (arms.len < 2) return null;
+
+        var switchable_type: ?SwitchableType = null;
+
+        for (arms, 0..) |arm, arm_idx| {
+            const is_last = arm_idx == arms.len - 1;
+            const pat = arm.pattern orelse return null;
+
+            // Any arm with a guard disqualifies
+            if (arm.guard != null) return null;
+
+            if (pat.* == .wildcard or pat.* == .bind) {
+                // Wildcard/bind is allowed only as the last arm (default)
+                if (!is_last) return null;
+                // Default arm is ok
+                continue;
+            }
+
+            if (pat.* != .literal) return null;
+
+            const lit_type: SwitchableType = switch (pat.literal) {
+                .int => .int,
+                .bool_val => .bool_val,
+                else => return null, // atoms, strings, floats can't switch
+            };
+
+            if (switchable_type) |st| {
+                if (st != lit_type) return null; // mixed types
+            } else {
+                switchable_type = lit_type;
+            }
+        }
+
+        return switchable_type;
+    }
+
+
     /// Build the case_block instruction body.
     fn lowerCaseExprBody(self: *IrBuilder, dest: LocalId, scrutinee_local: LocalId, case_data: hir_mod.CaseData) !void {
-        var ir_arms: std.ArrayList(IrCaseArm) = .empty;
-        var pre_instrs_list: std.ArrayList(Instruction) = .empty;
-        var default_instrs: ?[]const Instruction = null;
-        var default_result: ?LocalId = null;
+        // Try to emit a switch for homogeneous integer/bool literals with no guards
+        if (canSwitchLiteral(case_data.arms)) |_| {
+            var lit_cases: std.ArrayList(LitCase) = .empty;
 
-        for (case_data.arms, 0..) |arm, arm_idx| {
-            const is_last = arm_idx == case_data.arms.len - 1;
-            const pat = if (arm.pattern) |p| p else null;
+            for (case_data.arms, 0..) |arm, arm_idx| {
+                const is_last = arm_idx == case_data.arms.len - 1;
+                const pat = arm.pattern.?;
 
-            // Determine if this is a default arm
-            const is_default = if (pat) |p| (p.* == .wildcard or p.* == .bind) else true;
+                if (is_last and (pat.* == .wildcard or pat.* == .bind)) {
+                    // Default arm
+                    const saved = self.current_instrs;
+                    self.current_instrs = .empty;
 
-            if (is_default and is_last) {
-                // Default arm — no condition, just body
-                const saved = self.current_instrs;
-                self.current_instrs = .empty;
-
-                if (pat) |p| {
-                    if (p.* == .bind) {
+                    if (pat.* == .bind) {
                         for (arm.bindings) |binding| {
                             if (binding.kind == .scrutinee) {
                                 try self.current_instrs.append(self.allocator, .{
@@ -986,224 +962,392 @@ pub const IrBuilder = struct {
                             }
                         }
                     }
-                }
 
-                const body_result = try self.lowerBlock(arm.body);
-                default_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
-                default_result = body_result;
-                self.current_instrs = saved;
-            } else if (pat != null and pat.?.* == .tuple) {
-                // Tuple pattern arm — emit as guarded pre_instrs with case_break.
-                // Uses nested guard_blocks: outer type check + inner tag check.
-                // This avoids indexing non-tuple types at compile time.
-                const saved = self.current_instrs;
-
-                // Build the innermost body: bindings + guard check + user body + case_break
-                self.current_instrs = .empty;
-                for (arm.bindings) |binding| {
-                    switch (binding.kind) {
-                        .scrutinee => {
-                            try self.current_instrs.append(self.allocator, .{
-                                .local_get = .{ .dest = binding.local_index, .source = scrutinee_local },
-                            });
-                        },
-                        .tuple_element => {
-                            try self.current_instrs.append(self.allocator, .{
-                                .index_get = .{
-                                    .dest = binding.local_index,
-                                    .object = scrutinee_local,
-                                    .index = binding.element_index,
-                                },
-                            });
-                        },
-                    }
-                }
-
-                if (arm.guard) |guard_expr| {
-                    // Guard present — wrap body + case_break in a guard_block
-                    const guard_local = try self.lowerExpr(guard_expr);
-                    const saved_inner = self.current_instrs;
-                    self.current_instrs = .empty;
                     const body_result = try self.lowerBlock(arm.body);
-                    try self.current_instrs.append(self.allocator, .{
-                        .case_break = .{ .value = body_result },
-                    });
-                    const guarded_body = try self.current_instrs.toOwnedSlice(self.allocator);
-                    self.current_instrs = saved_inner;
-                    try self.current_instrs.append(self.allocator, .{
-                        .guard_block = .{ .condition = guard_local, .body = guarded_body },
-                    });
-                } else {
-                    const body_result = try self.lowerBlock(arm.body);
-                    try self.current_instrs.append(self.allocator, .{
-                        .case_break = .{ .value = body_result },
-                    });
-                }
-                const inner_body = try self.current_instrs.toOwnedSlice(self.allocator);
-
-                // Build tag check condition + inner guard_block
-                self.current_instrs = .empty;
-                var tag_condition: ?LocalId = null;
-                for (pat.?.tuple, 0..) |sub_pat, elem_idx| {
-                    if (sub_pat.* == .literal) {
-                        const elem_local = self.next_local;
-                        self.next_local += 1;
-                        try self.current_instrs.append(self.allocator, .{
-                            .index_get = .{
-                                .dest = elem_local,
-                                .object = scrutinee_local,
-                                .index = @intCast(elem_idx),
-                            },
-                        });
-                        const check = try self.emitSubPatternCheck(elem_local, sub_pat.literal);
-                        tag_condition = if (tag_condition) |prev|
-                            try self.emitAnd(prev, check)
-                        else
-                            check;
-                    }
-                }
-                if (tag_condition) |tag_cond| {
-                    try self.current_instrs.append(self.allocator, .{
-                        .guard_block = .{ .condition = tag_cond, .body = inner_body },
-                    });
-                } else {
-                    // No literal sub-patterns (all binds) — just emit inner body directly
-                    for (inner_body) |instr| {
-                        try self.current_instrs.append(self.allocator, instr);
-                    }
-                }
-                const tag_check_body = try self.current_instrs.toOwnedSlice(self.allocator);
-
-                // Build outer type check: @typeInfo(@TypeOf(scrutinee)) == .@"struct"
-                self.current_instrs = .empty;
-                const type_check_local = self.next_local;
-                self.next_local += 1;
-                try self.current_instrs.append(self.allocator, .{
-                    .match_type = .{ .dest = type_check_local, .scrutinee = scrutinee_local, .expected_type = .{ .tuple = &.{} } },
-                });
-                try self.current_instrs.append(self.allocator, .{
-                    .guard_block = .{ .condition = type_check_local, .body = tag_check_body },
-                });
-
-                // Append to pre_instrs
-                const outer_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
-                for (outer_instrs) |instr| {
-                    try pre_instrs_list.append(self.allocator, instr);
-                }
-
-                self.current_instrs = saved;
-            } else {
-                // Non-tuple conditional arm (literal, bind, wildcard)
-                const saved = self.current_instrs;
-                self.current_instrs = .empty;
-                var condition_local: ?LocalId = null;
-
-                if (pat) |p| {
-                    switch (p.*) {
-                        .literal => |lit| {
-                            condition_local = try self.emitCasePatternCheck(scrutinee_local, lit);
-                        },
-                        .bind => {
-                            const true_local = self.next_local;
-                            self.next_local += 1;
-                            try self.current_instrs.append(self.allocator, .{
-                                .const_bool = .{ .dest = true_local, .value = true },
-                            });
-                            condition_local = true_local;
-                        },
-                        .wildcard => {
-                            const true_local = self.next_local;
-                            self.next_local += 1;
-                            try self.current_instrs.append(self.allocator, .{
-                                .const_bool = .{ .dest = true_local, .value = true },
-                            });
-                            condition_local = true_local;
-                        },
-                        else => {},
-                    }
-                }
-
-                if (condition_local) |cond| {
-                    if (arm.guard) |guard_expr| {
-                        const guard_local = try self.lowerExpr(guard_expr);
-                        condition_local = try self.emitAnd(cond, guard_local);
-                    }
-                }
-
-                const cond_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
-                const final_cond = condition_local orelse blk: {
+                    const default_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
                     self.current_instrs = saved;
-                    const true_local = self.next_local;
-                    self.next_local += 1;
+
                     try self.current_instrs.append(self.allocator, .{
-                        .const_bool = .{ .dest = true_local, .value = true },
+                        .switch_literal = .{
+                            .dest = dest,
+                            .scrutinee = scrutinee_local,
+                            .cases = try lit_cases.toOwnedSlice(self.allocator),
+                            .default_instrs = default_instrs,
+                            .default_result = body_result,
+                        },
                     });
-                    break :blk true_local;
+                    return;
+                }
+
+                // Literal case arm
+                const lit_value: LiteralValue = switch (pat.literal) {
+                    .int => |v| .{ .int = v },
+                    .bool_val => |v| .{ .bool_val = v },
+                    else => unreachable,
                 };
 
+                const saved = self.current_instrs;
                 self.current_instrs = .empty;
-                for (arm.bindings) |binding| {
-                    switch (binding.kind) {
-                        .scrutinee => {
-                            try self.current_instrs.append(self.allocator, .{
-                                .local_get = .{ .dest = binding.local_index, .source = scrutinee_local },
-                            });
-                        },
-                        .tuple_element => {
-                            try self.current_instrs.append(self.allocator, .{
-                                .index_get = .{
-                                    .dest = binding.local_index,
-                                    .object = scrutinee_local,
-                                    .index = binding.element_index,
-                                },
-                            });
-                        },
-                    }
-                }
-
                 const body_result = try self.lowerBlock(arm.body);
                 const body_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
                 self.current_instrs = saved;
 
-                try ir_arms.append(self.allocator, .{
-                    .cond_instrs = cond_instrs,
-                    .condition = final_cond,
+                try lit_cases.append(self.allocator, .{
+                    .value = lit_value,
                     .body_instrs = body_instrs,
                     .result = body_result,
                 });
             }
-        }
 
-        if (default_instrs == null) {
+            // All arms are literal (no default) — add match_fail as default
             const saved = self.current_instrs;
             self.current_instrs = .empty;
             try self.current_instrs.append(self.allocator, .{
                 .match_fail = .{ .message = "no matching case clause" },
             });
-            default_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
-            default_result = null;
+            const fail_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
             self.current_instrs = saved;
+
+            try self.current_instrs.append(self.allocator, .{
+                .switch_literal = .{
+                    .dest = dest,
+                    .scrutinee = scrutinee_local,
+                    .cases = try lit_cases.toOwnedSlice(self.allocator),
+                    .default_instrs = fail_instrs,
+                    .default_result = null,
+                },
+            });
+            return;
         }
 
-        try self.current_instrs.append(self.allocator, .{
-            .case_block = .{
-                .dest = dest,
-                .pre_instrs = try pre_instrs_list.toOwnedSlice(self.allocator),
-                .arms = try ir_arms.toOwnedSlice(self.allocator),
-                .default_instrs = default_instrs.?,
-                .default_result = default_result,
-            },
-        });
+        // General path: compile pattern matrix and lower decision tree
+        {
+            var pattern_rows: std.ArrayList(hir_mod.PatternRow) = .empty;
+            for (case_data.arms, 0..) |arm, arm_idx| {
+                var pats: std.ArrayList(?*const hir_mod.MatchPattern) = .empty;
+                try pats.append(self.allocator, arm.pattern);
+                try pattern_rows.append(self.allocator, .{
+                    .patterns = try pats.toOwnedSlice(self.allocator),
+                    .body_index = @intCast(arm_idx),
+                    .guard = arm.guard,
+                });
+            }
+
+            var scrutinee_map = std.AutoHashMap(u32, LocalId).init(self.allocator);
+            defer scrutinee_map.deinit();
+            try scrutinee_map.put(0, scrutinee_local);
+
+            var next_scrutinee_id: u32 = 1;
+            const decision = try hir_mod.compilePatternMatrix(
+                self.allocator,
+                .{
+                    .rows = try pattern_rows.toOwnedSlice(self.allocator),
+                    .column_count = 1,
+                },
+                try self.allocSlice(u32, &.{0}),
+                &next_scrutinee_id,
+            );
+
+            // Emit case_block wrapping the decision tree lowering
+            const saved_outer = self.current_instrs;
+            self.current_instrs = .empty;
+            try self.lowerDecisionTreeForCase(decision, case_data.arms, &scrutinee_map, dest);
+            const case_body = try self.current_instrs.toOwnedSlice(self.allocator);
+            self.current_instrs = saved_outer;
+
+            try self.current_instrs.append(self.allocator, .{
+                .case_block = .{
+                    .dest = dest,
+                    .pre_instrs = case_body,
+                    .arms = &.{},
+                    .default_instrs = &.{},
+                    .default_result = null,
+                },
+            });
+            return;
+        }
+
     }
 
-    /// Emit a comparison of a scrutinee local against a literal value (for case patterns).
-    fn emitCasePatternCheck(self: *IrBuilder, scrutinee: LocalId, lit: hir_mod.LiteralValue) !LocalId {
+    /// Lower a decision tree for case expressions, emitting case_break at leaves.
+    fn lowerDecisionTreeForCase(
+        self: *IrBuilder,
+        decision: *const hir_mod.Decision,
+        case_arms: []const hir_mod.CaseArm,
+        scrutinee_map: *std.AutoHashMap(u32, LocalId),
+        dest: LocalId,
+    ) anyerror!void {
+        _ = dest;
+        switch (decision.*) {
+            .success => |leaf| {
+                const arm = case_arms[leaf.body_index];
+                // Emit only scrutinee bindings (whole-value binds like `v -> v`).
+                // Tuple element bindings are handled by bind nodes in the
+                // decision tree path, which resolve to the correct decomposed locals.
+                for (arm.bindings) |binding| {
+                    if (binding.kind == .scrutinee) {
+                        const scr_local = scrutinee_map.get(0) orelse 0;
+                        try self.current_instrs.append(self.allocator, .{
+                            .local_get = .{ .dest = binding.local_index, .source = scr_local },
+                        });
+                    }
+                }
+                const body_result = try self.lowerBlock(arm.body);
+                try self.current_instrs.append(self.allocator, .{
+                    .case_break = .{ .value = body_result },
+                });
+            },
+            .failure => {
+                try self.current_instrs.append(self.allocator, .{
+                    .match_fail = .{ .message = "no matching case clause" },
+                });
+            },
+            .guard => |guard_node| {
+                const guard_local = try self.lowerExpr(guard_node.condition);
+                const saved = self.current_instrs;
+                self.current_instrs = .empty;
+                try self.lowerDecisionTreeForCase(guard_node.success, case_arms, scrutinee_map, 0);
+                const guard_body = try self.current_instrs.toOwnedSlice(self.allocator);
+                self.current_instrs = saved;
+                try self.current_instrs.append(self.allocator, .{
+                    .guard_block = .{ .condition = guard_local, .body = guard_body },
+                });
+                try self.lowerDecisionTreeForCase(guard_node.failure, case_arms, scrutinee_map, 0);
+            },
+            .switch_literal => |sw| {
+                const scrutinee_local = self.resolveScrutinee(sw.scrutinee, scrutinee_map);
+                for (sw.cases) |case| {
+                    const check_local = try self.emitSubPatternCheck(scrutinee_local, case.value);
+                    const saved = self.current_instrs;
+                    self.current_instrs = .empty;
+                    try self.lowerDecisionTreeForCase(case.next, case_arms, scrutinee_map, 0);
+                    const case_body = try self.current_instrs.toOwnedSlice(self.allocator);
+                    self.current_instrs = saved;
+                    try self.current_instrs.append(self.allocator, .{
+                        .guard_block = .{ .condition = check_local, .body = case_body },
+                    });
+                }
+                try self.lowerDecisionTreeForCase(sw.default, case_arms, scrutinee_map, 0);
+            },
+            .switch_tag => |sw| {
+                const scrutinee_local = self.resolveScrutinee(sw.scrutinee, scrutinee_map);
+                for (sw.cases) |case| {
+                    const tag_name = self.interner.get(case.tag);
+                    const match_local = self.next_local;
+                    self.next_local += 1;
+                    try self.current_instrs.append(self.allocator, .{
+                        .match_atom = .{ .dest = match_local, .scrutinee = scrutinee_local, .atom_name = tag_name },
+                    });
+                    const saved = self.current_instrs;
+                    self.current_instrs = .empty;
+                    try self.lowerDecisionTreeForCase(case.next, case_arms, scrutinee_map, 0);
+                    const case_body = try self.current_instrs.toOwnedSlice(self.allocator);
+                    self.current_instrs = saved;
+                    try self.current_instrs.append(self.allocator, .{
+                        .guard_block = .{ .condition = match_local, .body = case_body },
+                    });
+                }
+                try self.lowerDecisionTreeForCase(sw.default, case_arms, scrutinee_map, 0);
+            },
+            .check_tuple => |ct| {
+                const scrutinee_local = self.resolveScrutinee(ct.scrutinee, scrutinee_map);
+                const type_check_local = self.next_local;
+                self.next_local += 1;
+                try self.current_instrs.append(self.allocator, .{
+                    .match_type = .{ .dest = type_check_local, .scrutinee = scrutinee_local, .expected_type = .{ .tuple = &.{} } },
+                });
+                const saved = self.current_instrs;
+                self.current_instrs = .empty;
+                var i: u32 = 0;
+                while (i < ct.expected_arity) : (i += 1) {
+                    const elem_local = self.next_local;
+                    self.next_local += 1;
+                    try self.current_instrs.append(self.allocator, .{
+                        .index_get = .{ .dest = elem_local, .object = scrutinee_local, .index = i },
+                    });
+                    try scrutinee_map.put(findParamGetIdInDecision(ct.success, i), elem_local);
+                }
+                try self.lowerDecisionTreeForCase(ct.success, case_arms, scrutinee_map, 0);
+                const success_body = try self.current_instrs.toOwnedSlice(self.allocator);
+                self.current_instrs = saved;
+                try self.current_instrs.append(self.allocator, .{
+                    .guard_block = .{ .condition = type_check_local, .body = success_body },
+                });
+                try self.lowerDecisionTreeForCase(ct.failure, case_arms, scrutinee_map, 0);
+            },
+            .bind => |bind_node| {
+                // Emit binding: resolve scrutinee and assign to binding local
+                const scrutinee_local = self.resolveScrutinee(bind_node.source, scrutinee_map);
+                // Find matching CaseBinding by name to get the local_index
+                for (case_arms) |arm| {
+                    for (arm.bindings) |binding| {
+                        if (binding.name == bind_node.name) {
+                            try self.current_instrs.append(self.allocator, .{
+                                .local_get = .{ .dest = binding.local_index, .source = scrutinee_local },
+                            });
+                            break;
+                        }
+                    }
+                }
+                try self.lowerDecisionTreeForCase(bind_node.next, case_arms, scrutinee_map, 0);
+            },
+        }
+    }
+
+    /// Lower a decision tree for function dispatch, emitting ret at leaves.
+    fn lowerDecisionTreeForDispatch(
+        self: *IrBuilder,
+        decision: *const hir_mod.Decision,
+        clauses: []const hir_mod.Clause,
+        scrutinee_map: *std.AutoHashMap(u32, LocalId),
+    ) anyerror!void {
+        switch (decision.*) {
+            .success => |leaf| {
+                const clause = &clauses[leaf.body_index];
+                for (clause.tuple_bindings) |binding| {
+                    const tuple_local = scrutinee_map.get(binding.param_index) orelse blk: {
+                        const pl = self.next_local;
+                        self.next_local += 1;
+                        try self.current_instrs.append(self.allocator, .{
+                            .param_get = .{ .dest = pl, .index = binding.param_index },
+                        });
+                        break :blk pl;
+                    };
+                    try self.current_instrs.append(self.allocator, .{
+                        .index_get = .{
+                            .dest = binding.local_index,
+                            .object = tuple_local,
+                            .index = binding.element_index,
+                        },
+                    });
+                }
+                const result_local = try self.lowerBlock(clause.body);
+                try self.current_instrs.append(self.allocator, .{ .ret = .{ .value = result_local } });
+            },
+            .failure => {
+                try self.current_instrs.append(self.allocator, .{
+                    .match_fail = .{ .message = "no matching clause" },
+                });
+            },
+            .guard => |guard_node| {
+                const guard_local = try self.lowerExpr(guard_node.condition);
+                const saved = self.current_instrs;
+                self.current_instrs = .empty;
+                try self.lowerDecisionTreeForDispatch(guard_node.success, clauses, scrutinee_map);
+                const guard_body = try self.current_instrs.toOwnedSlice(self.allocator);
+                self.current_instrs = saved;
+                try self.current_instrs.append(self.allocator, .{
+                    .guard_block = .{ .condition = guard_local, .body = guard_body },
+                });
+                try self.lowerDecisionTreeForDispatch(guard_node.failure, clauses, scrutinee_map);
+            },
+            .switch_literal => |sw| {
+                const scrutinee_local = self.resolveScrutinee(sw.scrutinee, scrutinee_map);
+                for (sw.cases) |case| {
+                    const skip = self.shouldSkipTypeCheck(scrutinee_local, case.value);
+                    const check_local = try self.emitSubPatternCheckWithSkip(scrutinee_local, case.value, skip);
+                    const saved = self.current_instrs;
+                    self.current_instrs = .empty;
+                    try self.lowerDecisionTreeForDispatch(case.next, clauses, scrutinee_map);
+                    const case_body = try self.current_instrs.toOwnedSlice(self.allocator);
+                    self.current_instrs = saved;
+                    try self.current_instrs.append(self.allocator, .{
+                        .guard_block = .{ .condition = check_local, .body = case_body },
+                    });
+                }
+                try self.lowerDecisionTreeForDispatch(sw.default, clauses, scrutinee_map);
+            },
+            .switch_tag => |sw| {
+                const scrutinee_local = self.resolveScrutinee(sw.scrutinee, scrutinee_map);
+                for (sw.cases) |case| {
+                    const tag_name = self.interner.get(case.tag);
+                    const match_local = self.next_local;
+                    self.next_local += 1;
+                    try self.current_instrs.append(self.allocator, .{
+                        .match_atom = .{ .dest = match_local, .scrutinee = scrutinee_local, .atom_name = tag_name },
+                    });
+                    const saved = self.current_instrs;
+                    self.current_instrs = .empty;
+                    try self.lowerDecisionTreeForDispatch(case.next, clauses, scrutinee_map);
+                    const case_body = try self.current_instrs.toOwnedSlice(self.allocator);
+                    self.current_instrs = saved;
+                    try self.current_instrs.append(self.allocator, .{
+                        .guard_block = .{ .condition = match_local, .body = case_body },
+                    });
+                }
+                try self.lowerDecisionTreeForDispatch(sw.default, clauses, scrutinee_map);
+            },
+            .check_tuple => |ct| {
+                const scrutinee_local = self.resolveScrutinee(ct.scrutinee, scrutinee_map);
+                const type_check_local = self.next_local;
+                self.next_local += 1;
+                try self.current_instrs.append(self.allocator, .{
+                    .match_type = .{ .dest = type_check_local, .scrutinee = scrutinee_local, .expected_type = .{ .tuple = &.{} } },
+                });
+                const saved = self.current_instrs;
+                self.current_instrs = .empty;
+                var i: u32 = 0;
+                while (i < ct.expected_arity) : (i += 1) {
+                    const elem_local = self.next_local;
+                    self.next_local += 1;
+                    try self.current_instrs.append(self.allocator, .{
+                        .index_get = .{ .dest = elem_local, .object = scrutinee_local, .index = i },
+                    });
+                    try scrutinee_map.put(findParamGetIdInDecision(ct.success, i), elem_local);
+                }
+                try self.lowerDecisionTreeForDispatch(ct.success, clauses, scrutinee_map);
+                const success_body = try self.current_instrs.toOwnedSlice(self.allocator);
+                self.current_instrs = saved;
+                try self.current_instrs.append(self.allocator, .{
+                    .guard_block = .{ .condition = type_check_local, .body = success_body },
+                });
+                try self.lowerDecisionTreeForDispatch(ct.failure, clauses, scrutinee_map);
+            },
+            .bind => |bind_node| {
+                try self.lowerDecisionTreeForDispatch(bind_node.next, clauses, scrutinee_map);
+            },
+        }
+    }
+
+    /// Resolve a scrutinee expression from the decision tree to an IR local.
+    fn resolveScrutinee(self: *IrBuilder, expr: *const hir_mod.Expr, scrutinee_map: *std.AutoHashMap(u32, LocalId)) LocalId {
+        _ = self;
+        if (expr.kind == .param_get) {
+            if (scrutinee_map.get(expr.kind.param_get)) |local| {
+                return local;
+            }
+        }
+        return 0;
+    }
+
+    /// Check if a scrutinee has a known type that allows skipping runtime type checks (Phase 3).
+    fn shouldSkipTypeCheck(self: *IrBuilder, scrutinee: LocalId, lit: hir_mod.LiteralValue) bool {
+        const known_type = self.known_local_types.get(scrutinee) orelse return false;
+        return switch (lit) {
+            .int => switch (known_type) {
+                .i8, .i16, .i32, .i64, .u8, .u16, .u32, .u64, .isize, .usize => true,
+                else => false,
+            },
+            .float => switch (known_type) {
+                .f16, .f32, .f64 => true,
+                else => false,
+            },
+            .atom => known_type == .atom,
+            .string => known_type == .string,
+            .bool_val => known_type == .bool_type,
+            .nil => known_type == .nil,
+        };
+    }
+
+    /// Emit a sub-pattern check with optional skip_type_check flag (Phase 3).
+    fn emitSubPatternCheckWithSkip(self: *IrBuilder, elem_local: LocalId, lit: hir_mod.LiteralValue, skip: bool) !LocalId {
+        if (!skip) return self.emitSubPatternCheck(elem_local, lit);
         return switch (lit) {
             .atom => |v| {
                 const match_local = self.next_local;
                 self.next_local += 1;
                 try self.current_instrs.append(self.allocator, .{
-                    .match_atom = .{ .dest = match_local, .scrutinee = scrutinee, .atom_name = self.interner.get(v) },
+                    .match_atom = .{ .dest = match_local, .scrutinee = elem_local, .atom_name = self.interner.get(v), .skip_type_check = true },
                 });
                 return match_local;
             },
@@ -1211,7 +1355,7 @@ pub const IrBuilder = struct {
                 const match_local = self.next_local;
                 self.next_local += 1;
                 try self.current_instrs.append(self.allocator, .{
-                    .match_int = .{ .dest = match_local, .scrutinee = scrutinee, .value = v },
+                    .match_int = .{ .dest = match_local, .scrutinee = elem_local, .value = v, .skip_type_check = true },
                 });
                 return match_local;
             },
@@ -1219,7 +1363,7 @@ pub const IrBuilder = struct {
                 const match_local = self.next_local;
                 self.next_local += 1;
                 try self.current_instrs.append(self.allocator, .{
-                    .match_float = .{ .dest = match_local, .scrutinee = scrutinee, .value = v },
+                    .match_float = .{ .dest = match_local, .scrutinee = elem_local, .value = v, .skip_type_check = true },
                 });
                 return match_local;
             },
@@ -1227,34 +1371,11 @@ pub const IrBuilder = struct {
                 const match_local = self.next_local;
                 self.next_local += 1;
                 try self.current_instrs.append(self.allocator, .{
-                    .match_string = .{ .dest = match_local, .scrutinee = scrutinee, .expected = self.interner.get(v) },
+                    .match_string = .{ .dest = match_local, .scrutinee = elem_local, .expected = self.interner.get(v), .skip_type_check = true },
                 });
                 return match_local;
             },
-            .bool_val => |v| {
-                const lit_local = self.next_local;
-                self.next_local += 1;
-                try self.current_instrs.append(self.allocator, .{
-                    .const_bool = .{ .dest = lit_local, .value = v },
-                });
-                const cmp_local = self.next_local;
-                self.next_local += 1;
-                try self.current_instrs.append(self.allocator, .{
-                    .binary_op = .{ .dest = cmp_local, .op = .eq, .lhs = scrutinee, .rhs = lit_local },
-                });
-                return cmp_local;
-            },
-            .nil => {
-                const lit_local = self.next_local;
-                self.next_local += 1;
-                try self.current_instrs.append(self.allocator, .{ .const_nil = lit_local });
-                const cmp_local = self.next_local;
-                self.next_local += 1;
-                try self.current_instrs.append(self.allocator, .{
-                    .binary_op = .{ .dest = cmp_local, .op = .eq, .lhs = scrutinee, .rhs = lit_local },
-                });
-                return cmp_local;
-            },
+            else => self.emitSubPatternCheck(elem_local, lit),
         };
     }
 
@@ -1290,26 +1411,31 @@ pub const IrBuilder = struct {
                 try self.current_instrs.append(self.allocator, .{
                     .const_int = .{ .dest = dest, .value = v },
                 });
+                try self.known_local_types.put(dest, .i64);
             },
             .float_lit => |v| {
                 try self.current_instrs.append(self.allocator, .{
                     .const_float = .{ .dest = dest, .value = v },
                 });
+                try self.known_local_types.put(dest, .f64);
             },
             .string_lit => |v| {
                 try self.current_instrs.append(self.allocator, .{
                     .const_string = .{ .dest = dest, .value = self.interner.get(v) },
                 });
+                try self.known_local_types.put(dest, .string);
             },
             .atom_lit => |v| {
                 try self.current_instrs.append(self.allocator, .{
                     .const_atom = .{ .dest = dest, .value = self.interner.get(v) },
                 });
+                try self.known_local_types.put(dest, .atom);
             },
             .bool_lit => |v| {
                 try self.current_instrs.append(self.allocator, .{
                     .const_bool = .{ .dest = dest, .value = v },
                 });
+                try self.known_local_types.put(dest, .bool_type);
             },
             .nil_lit => {
                 try self.current_instrs.append(self.allocator, .{ .const_nil = dest });
@@ -1323,6 +1449,11 @@ pub const IrBuilder = struct {
                 try self.current_instrs.append(self.allocator, .{
                     .param_get = .{ .dest = dest, .index = idx },
                 });
+                // Phase 3: track known type from HIR expr type_id
+                const param_zig_type = typeIdToZigType(expr.type_id);
+                if (param_zig_type != .any) {
+                    try self.known_local_types.put(dest, param_zig_type);
+                }
             },
             .binary => |bin| {
                 const lhs = try self.lowerExpr(bin.lhs);
@@ -1475,6 +1606,62 @@ pub const IrBuilder = struct {
         return slice;
     }
 };
+
+/// Walk a Decision tree to find the param_get index used for the N-th tuple element.
+/// The decision tree's check_tuple success subtree references element scrutinee IDs
+/// via param_get nodes. This scans to find the ID associated with a given element index.
+fn findParamGetIdInDecision(decision: *const hir_mod.Decision, target_element: u32) u32 {
+    switch (decision.*) {
+        .check_tuple => |ct| {
+            // This is a nested tuple check. The scrutinee expr tells us the ID.
+            if (ct.scrutinee.kind == .param_get) {
+                return ct.scrutinee.kind.param_get;
+            }
+            return findParamGetIdInDecision(ct.success, target_element);
+        },
+        .switch_literal => |sw| {
+            if (sw.scrutinee.kind == .param_get) {
+                // The first switch_literal we encounter should be for element 0,
+                // second for element 1, etc. But we need to trace the right one.
+                // We track by counting: the decision tree puts elements in order.
+                if (target_element == 0) return sw.scrutinee.kind.param_get;
+                // For other elements, look in default/cases
+                if (sw.cases.len > 0) {
+                    return findParamGetIdInDecision(sw.cases[0].next, target_element - 1);
+                }
+                return findParamGetIdInDecision(sw.default, target_element - 1);
+            }
+            return findParamGetIdInDecision(sw.default, target_element);
+        },
+        .switch_tag => |sw| {
+            if (sw.scrutinee.kind == .param_get) {
+                if (target_element == 0) return sw.scrutinee.kind.param_get;
+                if (sw.cases.len > 0) {
+                    return findParamGetIdInDecision(sw.cases[0].next, target_element - 1);
+                }
+                return findParamGetIdInDecision(sw.default, target_element - 1);
+            }
+            return findParamGetIdInDecision(sw.default, target_element);
+        },
+        .guard => |g| return findParamGetIdInDecision(g.success, target_element),
+        .bind => |b| {
+            if (b.source.kind == .param_get) {
+                if (target_element == 0) return b.source.kind.param_get;
+                return findParamGetIdInDecision(b.next, target_element - 1);
+            }
+            return findParamGetIdInDecision(b.next, target_element);
+        },
+        .success => {
+            // We need to derive the ID from the pattern. The compilePatternMatrix
+            // allocates IDs sequentially starting from a base. The base for tuple
+            // element N of scrutinee S is: the next_id at the time of tuple expansion.
+            // Since we don't store that, use a heuristic: the first referenced param_get
+            // ID + target_element offset.
+            return target_element;
+        },
+        .failure => return target_element,
+    }
+}
 
 fn typeIdToZigType(type_id: types_mod.TypeId) ZigType {
     return switch (type_id) {
