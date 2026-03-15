@@ -1,55 +1,142 @@
-# Zap
+<p align="center">
+  <br>
+  <br>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/trycog/zap/main/.github/zap-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/trycog/zap/main/.github/zap-light.svg">
+    <img alt="Zap" width="140">
+  </picture>
+  <br>
+  <br>
+</p>
 
-Zap is a statically typed, functional programming language that compiles to native code through Zig. It is its own language with its own type system, its own dispatch model, and its own compiler pipeline. Zig is the compilation target, not the identity.
+<h3 align="center">A functional language that compiles to native code through Zig.</h3>
 
-If you've written Elixir you'll feel at home with the syntax. If you've written Zig you'll appreciate what comes out the other end. The goal is to take the developer experience that makes functional languages productive and remove the runtime overhead that typically comes along for the ride. No VM, no garbage collector, no interpreter. Your Zap code becomes Zig source, and Zig gives you a native binary.
+<p align="center">
+  Pattern matching &nbsp;·&nbsp; Type safety &nbsp;·&nbsp; No runtime &nbsp;·&nbsp; Native binaries
+</p>
 
-The project is still early. Not everything works yet, and some of the features described below are partially implemented. But the core pipeline is real, the examples compile and run, and the foundation is solid enough to build on.
+---
 
-## Getting Started
+Zap takes the developer experience of functional programming — pattern matching, pipe operators, algebraic types — and strips away the overhead. No VM, no garbage collector, no interpreter. Your code compiles to Zig, and Zig compiles to a native binary.
 
-You need [Zig](https://ziglang.org/download/) 0.15.2 or later.
+> **Early stage.** The core pipeline works and examples compile and run, but not everything described here is fully implemented yet.
+
+---
+
+## Quick Start
+
+### Prerequisites
+
+Install [Zig](https://ziglang.org/download/) **0.15.2** or later.
+
+Verify your installation:
 
 ```sh
-# Build the compiler
+zig version
+```
+
+### Step 1 — Build the Zap compiler
+
+Clone the repository and build:
+
+```sh
+git clone https://github.com/trycog/zap.git
+cd zap
 zig build
-
-# Compile a Zap program to a native binary
-zig build run -- examples/hello.zap
-
-# See the generated Zig source
-zig build run -- --emit-zig examples/hello.zap
-
-# Run the tests
-zig build test
 ```
 
-## What the Language Looks Like
+This produces the compiler binary at `zig-out/bin/zap`.
 
-The best way to understand Zap is to read some code.
+### Step 2 — Write a Zap program
 
-### Hello World
+Create a file called `hello.zap`:
 
-```
-defmodule Runner do
-  def hello(word :: String) :: String do
-    "Hello" <> " " <> word
+```elixir
+defmodule Greeter do
+  def hello(name :: String) :: String do
+    "Hello, " <> name <> "!"
   end
 end
 
 def main() :: String do
-  Runner.hello("World!")
+  Greeter.hello("World")
   |> IO.puts()
 end
 ```
 
-Functions declare their parameter types and return types at the boundary. The body is inferred. Modules group related functions. The pipe operator works like you'd expect.
+Every Zap program needs a `main` function — that's your entry point. Functions declare their parameter types and return types at the boundary. The body is type-inferred.
 
-### Pattern Matching and Dispatch
+### Step 3 — Compile and run
 
-Multiple function clauses with the same name form an overload group. The compiler resolves which clause to call based on the argument values and types.
-
+```sh
+./zig-out/bin/zap hello.zap
 ```
+
+Zap compiles your code to Zig, then invokes the Zig compiler to produce a native binary. The output lands in `zap-out/bin/`:
+
+```sh
+./zap-out/bin/hello
+# => Hello, World!
+```
+
+That's it. Source code in, native binary out.
+
+### See the generated Zig
+
+If you're curious what Zap produces under the hood:
+
+```sh
+./zig-out/bin/zap --emit-zig hello.zap
+```
+
+This prints the generated Zig source to stdout instead of compiling it.
+
+---
+
+## The Language
+
+### Modules and Functions
+
+Modules group related functions. Functions declare types at the boundary and infer everything inside.
+
+```elixir
+defmodule Math do
+  def square(x :: i64) :: i64 do
+    x * x
+  end
+
+  def double(x :: i64) :: i64 do
+    x * 2
+  end
+end
+```
+
+### Pipe Operator
+
+Chain function calls, passing the result of each step as the first argument to the next:
+
+```elixir
+def double(x :: i64) :: i64 do
+  x * 2
+end
+
+def add_one(x :: i64) :: i64 do
+  x + 1
+end
+
+def main() do
+  5
+  |> double()
+  |> add_one()
+end
+```
+
+### Pattern Matching
+
+Multiple function clauses with the same name form an overload group. The compiler resolves which clause to call based on argument values and types.
+
+```elixir
 def factorial(0 :: i64) :: i64 do
   1
 end
@@ -59,9 +146,9 @@ def factorial(n :: i64) :: i64 do
 end
 ```
 
-This works with atoms, integers, tuples, and wildcards. You can pattern match on structure, not just values:
+This works with atoms, integers, tuples, and wildcards:
 
-```
+```elixir
 defmodule Geometry do
   type Shape = {:circle, f64} | {:rectangle, f64, f64}
 
@@ -75,13 +162,13 @@ defmodule Geometry do
 end
 ```
 
-The tuple patterns destructure and bind in a single step. The tag atom (`:circle`, `:rectangle`) selects the clause, and the remaining elements bind to local variables inside the body.
+Tuple patterns destructure and bind in a single step. The tag atom selects the clause, the remaining elements bind to local variables.
 
-### Refinement Predicates
+### Guards
 
 Function clauses can carry guard conditions that participate in dispatch:
 
-```
+```elixir
 def classify(n :: i64) :: String if n > 0 do
   "positive"
 end
@@ -99,9 +186,9 @@ The `if` clause runs after the type check passes. If the predicate fails, dispat
 
 ### Case Expressions
 
-Pattern matching also works inside function bodies:
+Pattern matching inside function bodies:
 
-```
+```elixir
 def check(result) :: String do
   case result do
     {:ok, v} ->
@@ -114,9 +201,11 @@ def check(result) :: String do
 end
 ```
 
-### If/Else
+### If / Else
 
-```
+If/else is an expression — it produces a value:
+
+```elixir
 def abs(x :: i64) :: i64 do
   if x < 0 do
     -x
@@ -126,70 +215,102 @@ def abs(x :: i64) :: i64 do
 end
 ```
 
-If/else is an expression. It produces a value.
+---
 
 ## Type System
 
-Types are declared at function boundaries. The language does not do implicit numeric coercion, all conversions must be explicit.
+Types are declared at function boundaries. No implicit numeric coercion — all conversions are explicit.
 
 | Category | Types |
-|----------|-------|
-| Signed integers | `i8`, `i16`, `i32`, `i64` |
-| Unsigned integers | `u8`, `u16`, `u32`, `u64` |
-| Floats | `f16`, `f32`, `f64` |
-| Platform-sized | `usize`, `isize` |
-| Primitives | `Bool`, `String`, `Atom`, `Nil` |
+|---|---|
+| Signed integers | `i8` `i16` `i32` `i64` |
+| Unsigned integers | `u8` `u16` `u32` `u64` |
+| Floats | `f16` `f32` `f64` |
+| Platform-sized | `usize` `isize` |
+| Primitives | `Bool` `String` `Atom` `Nil` |
 | Bottom | `Never` |
 | Compound | tuples, lists, maps, structs |
 | Algebraic | tagged unions, opaque types |
 | Higher-order | function types, parametric types |
 
-Type aliases and opaque types let you give meaningful names to structures:
+Type aliases and opaque types:
 
-```
+```elixir
 type Result(a, e) = {:ok, a} | {:error, e}
 type Pair(a, b) = {a, b}
 opaque UserId = i64
 ```
 
-## How the Compiler Works
+---
 
-Zap compiles through several phases. The source text goes in, Zig source comes out, and then Zig takes it the rest of the way to a native binary.
+## Compiler Pipeline
 
-1. **Lexing** with significant whitespace (indent/dedent tracking)
-2. **Parsing** into a surface AST
-3. **Declaration collection** to register modules and functions
-4. **Macro expansion** (AST-to-AST transforms to fixed point)
-5. **Type checking** with overload resolution and inference
-6. **HIR lowering** into a typed intermediate representation
-7. **IR lowering** into a lower-level representation closer to Zig's semantics
-8. **Code generation** that emits Zig source
+Source text goes in, Zig source comes out, Zig takes it the rest of the way to a native binary.
+
+```
+  .zap source
+      │
+      ▼
+   Lexer ─────────── tokenize with indent/dedent tracking
+      │
+      ▼
+   Parser ────────── surface AST
+      │
+      ▼
+   Collector ─────── register modules and functions
+      │
+      ▼
+   Macro Expansion ─ AST→AST transforms to fixed point
+      │
+      ▼
+   Type Checker ──── overload resolution + inference
+      │
+      ▼
+   HIR Lowering ──── typed intermediate representation
+      │
+      ▼
+   IR Lowering ───── lower-level IR closer to Zig semantics
+      │
+      ▼
+   Code Gen ──────── emit Zig source
+      │
+      ▼
+   Zig Compiler ──── native binary
+```
 
 The entire compiler is written in Zig.
 
-## Project Layout
+---
+
+## CLI Reference
 
 ```
-src/
-  main.zig           # CLI entry point
-  lexer.zig          # Tokenizer
-  token.zig          # Token definitions
-  parser.zig         # Parser
-  ast.zig            # AST node types
-  scope.zig          # Scope management
-  collector.zig      # Declaration collection
-  macro.zig          # Macro expansion
-  desugar.zig        # Desugaring pass
-  resolver.zig       # Name resolution
-  types.zig          # Type system
-  dispatch.zig       # Overload dispatch
-  hir.zig            # High-level IR
-  ir.zig             # Intermediate representation
-  codegen.zig        # Zig code generation
-  runtime.zig        # Runtime support
-  diagnostics.zig    # Error reporting
-examples/            # Example .zap programs
+zap [flags] <file.zap> [zig-flags...]
 ```
+
+| Flag | Description |
+|---|---|
+| `--emit-zig` | Print generated Zig source to stdout instead of compiling |
+| `--lib` | Compile as a library instead of an executable |
+
+Any additional flags after the `.zap` file are forwarded to the Zig build system.
+
+---
+
+## Development
+
+```sh
+# Run the full test suite
+zig build test
+
+# Compile and run an example
+zig build run -- examples/factorial.zap
+
+# See generated Zig for an example
+zig build run -- --emit-zig examples/hello.zap
+```
+
+---
 
 ## License
 
