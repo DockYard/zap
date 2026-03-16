@@ -1,10 +1,13 @@
 const std = @import("std");
 const Parser = @import("parser.zig").Parser;
 const Collector = @import("collector.zig").Collector;
+const MacroEngine = @import("macro.zig").MacroEngine;
+const Desugarer = @import("desugar.zig").Desugarer;
 const types_mod = @import("types.zig");
 const hir_mod = @import("hir.zig");
 const ir = @import("ir.zig");
 const CodeGen = @import("codegen.zig").CodeGen;
+pub const stdlib = @import("stdlib.zig");
 
 // ============================================================
 // Integration tests (spec §12)
@@ -15,7 +18,9 @@ const CodeGen = @import("codegen.zig").CodeGen;
 
 /// Run the full compiler pipeline on source, return generated Zig.
 fn compile(alloc: std.mem.Allocator, source: []const u8) ![]const u8 {
-    var parser = Parser.init(alloc, source);
+    const full_source = try stdlib.prependStdlib(alloc, source);
+
+    var parser = Parser.init(alloc, full_source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
@@ -27,12 +32,21 @@ fn compile(alloc: std.mem.Allocator, source: []const u8) ![]const u8 {
     defer collector.deinit();
     try collector.collectProgram(&program);
 
+    // Macro expansion (between collection and HIR lowering)
+    var macro_engine = MacroEngine.init(alloc, &parser.interner, &collector.graph);
+    defer macro_engine.deinit();
+    const expanded_program = try macro_engine.expandProgram(&program);
+
+    // Desugaring (after macro expansion, before HIR)
+    var desugarer = Desugarer.init(alloc, &parser.interner);
+    const desugared_program = try desugarer.desugarProgram(&expanded_program);
+
     var type_store = types_mod.TypeStore.init(alloc, &parser.interner);
     defer type_store.deinit();
 
     var hir_builder = hir_mod.HirBuilder.init(alloc, &parser.interner, &collector.graph, &type_store);
     defer hir_builder.deinit();
-    const hir_program = try hir_builder.buildProgram(&program);
+    const hir_program = try hir_builder.buildProgram(&desugared_program);
 
     var ir_builder = ir.IrBuilder.init(alloc, &parser.interner);
     defer ir_builder.deinit();
@@ -124,8 +138,9 @@ test "bare println is not implicitly available" {
     ;
 
     const output = try compile(alloc, source);
-    // Should NOT resolve to a Prelude call — println is not imported
-    try expectNotContains(output, "zap_runtime.Prelude.println(");
+    // Bare println should be emitted as a named call, not a builtin
+    // (the stdlib modules use @println intrinsic, but user code can't)
+    try expectContains(output, "_ = println(");
 }
 
 // ============================================================
@@ -411,11 +426,12 @@ test "if-else generates conditional" {
 
     const output = try compile(alloc, source);
     try expectContains(output, "fn sign(");
-    // If-else lowers to a Zig if/else expression with labeled blocks
-    try expectContains(output, "if (");
+    // If-else desugars to case(true/false), which emits a Zig switch
+    try expectContains(output, "switch (");
+    try expectContains(output, "true =>");
+    try expectContains(output, "false =>");
     try expectContains(output, "\"positive\"");
     try expectContains(output, "\"non-positive\"");
-    try expectNotContains(output, "// branch");
 }
 
 // ============================================================
@@ -886,4 +902,140 @@ test "parse error produces error" {
     const source = "def (broken syntax";
     const result = compile(alloc, source);
     try std.testing.expectError(error.ParseError, result);
+}
+
+// ============================================================
+// Macro expansion
+// ============================================================
+
+test "macro expansion: unless compiles through pipeline" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Logic do
+        \\  defmacro unless(condition, body) do
+        \\    quote do
+        \\      if not unquote(condition) do
+        \\        unquote(body)
+        \\      end
+        \\    end
+        \\  end
+        \\
+        \\  def check(x :: i64) :: i64 do
+        \\    unless(x > 0, 42)
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    // The macro should expand unless into if(not(cond)), which desugars to case(true/false)
+    // `not` compiles to Zig's `!` operator
+    try expectContains(output, "switch (");
+    try expectContains(output, "!");
+    try expectNotContains(output, "// unhandled instruction");
+}
+
+test "macro expansion: expression substitution" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Math do
+        \\  defmacro double(value) do
+        \\    quote do
+        \\      unquote(value) + unquote(value)
+        \\    end
+        \\  end
+        \\
+        \\  def compute(x :: i64) :: i64 do
+        \\    double(x * 3)
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    // The macro should expand double(x * 3) into (x * 3) + (x * 3)
+    try expectContains(output, "+");
+    try expectNotContains(output, "// unhandled instruction");
+}
+
+test "Kernel.unless macro works without module prefix" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\def check(x :: i64) :: i64 do
+        \\  unless(x > 10, 42)
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    // unless should expand to: if not (x > 10) do 42 end, then if desugars to case(true/false)
+    try expectContains(output, "switch (");
+    try expectContains(output, "!");
+    try expectNotContains(output, "// unhandled instruction");
+}
+
+// ============================================================
+// Cond expression
+// ============================================================
+
+test "cond expression desugars to nested case" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\def classify(x :: i64) :: String do
+        \\  cond do
+        \\    x > 0 ->
+        \\      "positive"
+        \\    x < 0 ->
+        \\      "negative"
+        \\    true ->
+        \\      "zero"
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, "fn classify(");
+    // cond desugars to nested case(true/false) which emits switch
+    try expectContains(output, "switch (");
+    try expectContains(output, "\"positive\"");
+    try expectContains(output, "\"negative\"");
+    try expectContains(output, "\"zero\"");
+    try expectNotContains(output, "// unhandled instruction");
+}
+
+// ============================================================
+// With expression
+// ============================================================
+
+test "with expression desugars to nested case" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\def process(x) do
+        \\  with {:ok, a} <- x do
+        \\    a
+        \\  else
+        \\    {:error, e} ->
+        \\      e
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, "fn process(");
+    // with desugars to case — should have tuple matching
+    try expectContains(output, ".@\"ok\"");
+    try expectContains(output, ".@\"error\"");
+    try expectNotContains(output, "// unhandled instruction");
 }

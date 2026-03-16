@@ -140,10 +140,12 @@ pub const Desugarer = struct {
                 return self.desugarPipe(lhs, rhs, pe.meta);
             },
 
-            // Unwrap: expr! → case expr do {:ok, v} -> v; {:error, e} -> panic(e) end
+            // Unwrap: expr! → optional force-unwrap (panics if nil)
             .unwrap => |ue| {
                 const inner = try self.desugarExpr(ue.expr);
-                return self.desugarUnwrap(inner, ue.meta);
+                return try self.create(ast.Expr, .{
+                    .unwrap = .{ .meta = ue.meta, .expr = inner },
+                });
             },
 
             // String interpolation: "hello #{name}" → "hello " <> to_string(name)
@@ -185,16 +187,9 @@ pub const Desugarer = struct {
                     },
                 });
             },
-            .if_expr => |ie| {
-                return try self.create(ast.Expr, .{
-                    .if_expr = .{
-                        .meta = ie.meta,
-                        .condition = try self.desugarExpr(ie.condition),
-                        .then_block = try self.desugarBlock(ie.then_block),
-                        .else_block = if (ie.else_block) |eb| try self.desugarBlock(eb) else null,
-                    },
-                });
-            },
+            // if_expr, cond_expr, and with_expr are expanded to case by the
+            // macro engine (Kernel macros / special forms) before desugaring.
+            // They should not reach this point.
             .case_expr => |ce| {
                 var new_clauses: std.ArrayList(ast.CaseClause) = .empty;
                 for (ce.clauses) |clause| {
@@ -456,13 +451,13 @@ test "desugar unwrap operator" {
     var desugarer = Desugarer.init(alloc, &parser.interner);
     const desugared = try desugarer.desugarProgram(&program);
 
-    // Function body should now have a case expression
+    // Function body should now have an unwrap expression (passed through)
     const func = desugared.top_items[0].function;
     const body = func.clauses[0].body;
     try std.testing.expectEqual(@as(usize, 1), body.len);
-    try std.testing.expect(body[0].expr.* == .case_expr);
-    // Should have 2 clauses (ok and error)
-    try std.testing.expectEqual(@as(usize, 2), body[0].expr.case_expr.clauses.len);
+    try std.testing.expect(body[0].expr.* == .unwrap);
+    // Inner expression should be the call
+    try std.testing.expect(body[0].expr.unwrap.expr.* == .call);
 }
 
 test "desugar no-op on simple expressions" {

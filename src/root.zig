@@ -14,6 +14,7 @@ pub const ir = @import("ir.zig");
 pub const CodeGen = @import("codegen.zig").CodeGen;
 pub const runtime = @import("runtime.zig");
 pub const DiagnosticEngine = @import("diagnostics.zig").DiagnosticEngine;
+pub const stdlib = @import("stdlib.zig");
 
 test {
     _ = @import("token.zig");
@@ -32,5 +33,6 @@ test {
     _ = @import("codegen.zig");
     _ = @import("runtime.zig");
     _ = @import("diagnostics.zig");
+    _ = @import("stdlib.zig");
     _ = @import("integration_tests.zig");
 }

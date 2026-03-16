@@ -53,8 +53,14 @@ pub fn main() !void {
         std.process.exit(1);
     };
 
-    // Phase 1: Parse
-    var parser = zap.Parser.init(alloc, source);
+    // Phase 1: Parse (with stdlib prepended)
+    const full_source = zap.stdlib.prependStdlib(alloc, source) catch {
+        const stderr = std.fs.File.stderr().deprecatedWriter();
+        try stderr.print("Error loading standard library\n", .{});
+        std.process.exit(1);
+    };
+
+    var parser = zap.Parser.init(alloc, full_source);
     defer parser.deinit();
 
     const program = parser.parseProgram() catch {
@@ -79,14 +85,39 @@ pub fn main() !void {
         std.process.exit(1);
     };
 
-    // Phase 4: Type checking
+    // Phase 3: Macro expansion
+    var macro_engine = zap.MacroEngine.init(alloc, &parser.interner, &collector.graph);
+    defer macro_engine.deinit();
+    const expanded_program = macro_engine.expandProgram(&program) catch {
+        const stderr = std.fs.File.stderr().deprecatedWriter();
+        try stderr.print("Error during macro expansion\n", .{});
+        std.process.exit(1);
+    };
+
+    if (macro_engine.errors.items.len > 0) {
+        const stderr = std.fs.File.stderr().deprecatedWriter();
+        for (macro_engine.errors.items) |err| {
+            try stderr.print("{s}:{d}: error: {s}\n", .{ path, err.span.line, err.message });
+        }
+        std.process.exit(1);
+    }
+
+    // Phase 4: Desugaring
+    var desugarer = zap.Desugarer.init(alloc, &parser.interner);
+    const desugared_program = desugarer.desugarProgram(&expanded_program) catch {
+        const stderr = std.fs.File.stderr().deprecatedWriter();
+        try stderr.print("Error during desugaring\n", .{});
+        std.process.exit(1);
+    };
+
+    // Phase 5: Type checking
     var type_store = zap.types.TypeStore.init(alloc, &parser.interner);
     defer type_store.deinit();
 
     // Phase 6: HIR lowering
     var hir_builder = zap.hir.HirBuilder.init(alloc, &parser.interner, &collector.graph, &type_store);
     defer hir_builder.deinit();
-    const hir_program = hir_builder.buildProgram(&program) catch {
+    const hir_program = hir_builder.buildProgram(&desugared_program) catch {
         const stderr = std.fs.File.stderr().deprecatedWriter();
         try stderr.print("Error during HIR lowering\n", .{});
         std.process.exit(1);

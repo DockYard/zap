@@ -112,6 +112,9 @@ pub const Instruction = union(enum) {
     make_closure: MakeClosure,
     capture_get: CaptureGet,
 
+    // Optional unwrap
+    optional_unwrap: OptionalUnwrap,
+
     // Memory / ARC
     alloc_owned: AllocOwned,
     retain: Retain,
@@ -421,6 +424,11 @@ pub const CaptureGet = struct {
     index: u32,
 };
 
+pub const OptionalUnwrap = struct {
+    dest: LocalId,
+    source: LocalId,
+};
+
 pub const AllocOwned = struct {
     dest: LocalId,
     type_name: []const u8,
@@ -590,11 +598,14 @@ pub const IrBuilder = struct {
             self.next_local = max_binding_local;
         }
 
+        var body_result_local: ?LocalId = null;
+
         if (group.clauses.len == 1) {
             // Single clause — no dispatch needed
             // Emit tuple bindings if present
             try self.emitTupleBindings(first_clause);
             const result_local = try self.lowerBlock(first_clause.body);
+            body_result_local = result_local;
             try self.current_instrs.append(self.allocator, .{ .ret = .{ .value = result_local } });
         } else if (self.canSwitchDispatch(group)) |switch_param| {
             // Emit switch_return for integer literal dispatch
@@ -707,11 +718,22 @@ pub const IrBuilder = struct {
         else
             "anonymous";
 
+        // If the body result is optional (e.g., if/else with a nil branch),
+        // promote the function return type to optional.
+        var return_type = typeIdToZigType(first_clause.return_type);
+        if (body_result_local) |rl| {
+            if (self.known_local_types.get(rl)) |local_type| {
+                if (std.meta.activeTag(local_type) == .optional) {
+                    return_type = local_type;
+                }
+            }
+        }
+
         try self.functions.append(self.allocator, .{
             .id = func_id,
             .name = name_str,
             .params = try params.toOwnedSlice(self.allocator),
-            .return_type = typeIdToZigType(first_clause.return_type),
+            .return_type = return_type,
             .body = try self.allocSlice(Block, &.{entry_block}),
             .is_closure = false,
             .captures = &.{},
@@ -1439,6 +1461,7 @@ pub const IrBuilder = struct {
             },
             .nil_lit => {
                 try self.current_instrs.append(self.allocator, .{ .const_nil = dest });
+                try self.known_local_types.put(dest, .nil);
             },
             .local_get => |idx| {
                 try self.current_instrs.append(self.allocator, .{
@@ -1522,40 +1545,9 @@ pub const IrBuilder = struct {
                     },
                 }
             },
-            .branch => |br| {
-                const cond = try self.lowerExpr(br.condition);
-
-                // Save current instruction list, lower then block into a fresh list
-                const saved_instrs = self.current_instrs;
-                self.current_instrs = .empty;
-                const then_result = try self.lowerBlock(br.then_block);
-                const then_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
-
-                // Lower else block (or emit const_nil if absent)
-                self.current_instrs = .empty;
-                var else_result: ?LocalId = null;
-                if (br.else_block) |else_block| {
-                    else_result = try self.lowerBlock(else_block);
-                } else {
-                    const nil_local = self.next_local;
-                    self.next_local += 1;
-                    try self.current_instrs.append(self.allocator, .{ .const_nil = nil_local });
-                    else_result = nil_local;
-                }
-                const else_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
-
-                // Restore original instruction list and append if_expr
-                self.current_instrs = saved_instrs;
-                try self.current_instrs.append(self.allocator, .{
-                    .if_expr = .{
-                        .dest = dest,
-                        .condition = cond,
-                        .then_instrs = then_instrs,
-                        .then_result = then_result,
-                        .else_instrs = else_instrs,
-                        .else_result = else_result,
-                    },
-                });
+            .branch => {
+                // branch should be desugared to case before reaching IR
+                unreachable;
             },
             .tuple_init => |elems| {
                 var locals: std.ArrayList(LocalId) = .empty;
@@ -1586,10 +1578,49 @@ pub const IrBuilder = struct {
                     .match_fail = .{ .message = "unreachable" },
                 });
             },
+            .unwrap => |inner| {
+                const source = try self.lowerExpr(inner);
+                try self.current_instrs.append(self.allocator, .{
+                    .optional_unwrap = .{ .dest = dest, .source = source },
+                });
+                // The unwrapped type is the inner type of the optional
+                if (self.known_local_types.get(source)) |source_type| {
+                    switch (source_type) {
+                        .optional => |inner_type| try self.known_local_types.put(dest, inner_type.*),
+                        else => try self.known_local_types.put(dest, source_type),
+                    }
+                }
+            },
             .case => |case_data| {
                 // Case expressions are handled specially — see lowerExpr early return
                 // (this branch should not be reached because of the early return above)
                 try self.lowerCaseExprBody(dest, try self.lowerExpr(case_data.scrutinee), case_data);
+            },
+            .block => |blk| {
+                // Lower each statement in the block; result is the last expression value
+                var last_local: ?LocalId = null;
+                for (blk.stmts) |stmt| {
+                    switch (stmt) {
+                        .expr => |e| {
+                            last_local = try self.lowerExpr(e);
+                        },
+                        .local_set => |ls| {
+                            const val = try self.lowerExpr(ls.value);
+                            try self.current_instrs.append(self.allocator, .{
+                                .local_set = .{ .dest = ls.index, .value = val },
+                            });
+                        },
+                        else => {},
+                    }
+                }
+                if (last_local) |ll| {
+                    // Alias the block result to the destination
+                    try self.current_instrs.append(self.allocator, .{
+                        .local_set = .{ .dest = dest, .value = ll },
+                    });
+                } else {
+                    try self.current_instrs.append(self.allocator, .{ .const_nil = dest });
+                }
             },
             else => {
                 // Emit a nil placeholder for unhandled expressions

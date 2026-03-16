@@ -50,6 +50,9 @@ pub const MacroEngine = struct {
     /// Expand all macros in a program to a fixed point.
     /// Returns the expanded program.
     pub fn expandProgram(self: *MacroEngine, program: *const ast.Program) !ast.Program {
+        // Validate macro type annotations before expansion
+        try self.validateMacros();
+
         var current_modules = program.modules;
         var current_top_items = program.top_items;
         var iteration: u32 = 0;
@@ -298,34 +301,33 @@ pub const MacroEngine = struct {
 
             // Recurse into compound expressions
             .if_expr => |ie| {
-                var changed = false;
-                const cond_exp = try self.expandExpr(ie.condition);
-                if (cond_exp.changed) changed = true;
+                // Convert if_expr to Kernel.if macro call:
+                //   if cond do body end        → if(cond, body)
+                //   if cond do body else alt end → if(cond, body, alt)
+                const if_name = try self.interner.intern("if");
+                const callee = try self.create(ast.Expr, .{
+                    .var_ref = .{ .meta = ie.meta, .name = if_name },
+                });
+                const then_expr = try self.blockToExpr(ie.then_block, ie.meta);
 
-                const then_exp = try self.expandBlock(ie.then_block);
-                if (then_exp.changed) changed = true;
-
-                var else_exp: ?[]const ast.Stmt = ie.else_block;
                 if (ie.else_block) |else_block| {
-                    const e = try self.expandBlock(else_block);
-                    if (e.changed) {
-                        changed = true;
-                        else_exp = e.stmts;
-                    }
+                    const else_expr = try self.blockToExpr(else_block, ie.meta);
+                    const args = try self.allocSlice(*const ast.Expr, &.{ ie.condition, then_expr, else_expr });
+                    return .{
+                        .expr = try self.create(ast.Expr, .{
+                            .call = .{ .meta = ie.meta, .callee = callee, .args = args },
+                        }),
+                        .changed = true,
+                    };
+                } else {
+                    const args = try self.allocSlice(*const ast.Expr, &.{ ie.condition, then_expr });
+                    return .{
+                        .expr = try self.create(ast.Expr, .{
+                            .call = .{ .meta = ie.meta, .callee = callee, .args = args },
+                        }),
+                        .changed = true,
+                    };
                 }
-
-                if (!changed) return .{ .expr = expr, .changed = false };
-                return .{
-                    .expr = try self.create(ast.Expr, .{
-                        .if_expr = .{
-                            .meta = ie.meta,
-                            .condition = cond_exp.expr,
-                            .then_block = then_exp.stmts,
-                            .else_block = else_exp,
-                        },
-                    }),
-                    .changed = true,
-                };
             },
 
             .case_expr => |ce| {
@@ -421,6 +423,37 @@ pub const MacroEngine = struct {
                 };
             },
 
+            .unwrap => |ue| {
+                const inner = try self.expandExpr(ue.expr);
+                if (!inner.changed) return .{ .expr = expr, .changed = false };
+                return .{
+                    .expr = try self.create(ast.Expr, .{
+                        .unwrap = .{ .meta = ue.meta, .expr = inner.expr },
+                    }),
+                    .changed = true,
+                };
+            },
+
+            .cond_expr => |conde| {
+                // Convert cond to nested if calls (compiler special form):
+                //   cond do c1 -> b1; c2 -> b2; true -> b3 end
+                //     → if(c1, b1, if(c2, b2, b3))
+                return .{
+                    .expr = try self.condToNestedIf(conde.clauses, conde.meta),
+                    .changed = true,
+                };
+            },
+
+            .with_expr => |we| {
+                // Convert with to nested case (compiler special form):
+                //   with {:ok, a} <- foo() do a else {:error, e} -> e end
+                //     → case foo() do {:ok, a} -> a; {:error, e} -> e end
+                return .{
+                    .expr = try self.withToNestedCase(we),
+                    .changed = true,
+                };
+            },
+
             // Leaf nodes — no expansion needed
             .int_literal,
             .float_literal,
@@ -436,9 +469,6 @@ pub const MacroEngine = struct {
             .map,
             .struct_expr,
             .field_access,
-            .unwrap,
-            .with_expr,
-            .cond_expr,
             .panic_expr,
             .intrinsic,
             => return .{ .expr = expr, .changed = false },
@@ -655,6 +685,45 @@ pub const MacroEngine = struct {
                 });
             },
 
+            .case_expr => |ce| {
+                const scrutinee = try self.substituteExpr(ce.scrutinee, param_map);
+                var new_clauses: std.ArrayList(ast.CaseClause) = .empty;
+                for (ce.clauses) |clause| {
+                    var body_stmts: std.ArrayList(ast.Stmt) = .empty;
+                    for (clause.body) |s| {
+                        try body_stmts.append(self.allocator, try self.substituteStmt(s, param_map));
+                    }
+                    const guard = if (clause.guard) |g| try self.substituteExpr(g, param_map) else null;
+                    try new_clauses.append(self.allocator, .{
+                        .meta = clause.meta,
+                        .pattern = clause.pattern,
+                        .type_annotation = clause.type_annotation,
+                        .guard = guard,
+                        .body = try body_stmts.toOwnedSlice(self.allocator),
+                    });
+                }
+                return try self.create(ast.Expr, .{
+                    .case_expr = .{
+                        .meta = ce.meta,
+                        .scrutinee = scrutinee,
+                        .clauses = try new_clauses.toOwnedSlice(self.allocator),
+                    },
+                });
+            },
+
+            .block => |blk| {
+                var new_stmts: std.ArrayList(ast.Stmt) = .empty;
+                for (blk.stmts) |s| {
+                    try new_stmts.append(self.allocator, try self.substituteStmt(s, param_map));
+                }
+                return try self.create(ast.Expr, .{
+                    .block = .{
+                        .meta = blk.meta,
+                        .stmts = try new_stmts.toOwnedSlice(self.allocator),
+                    },
+                });
+            },
+
             .var_ref => |vr| {
                 // Apply hygiene: rename bindings introduced by macro
                 // For now, pass through (full hygiene requires generation tracking)
@@ -695,13 +764,322 @@ pub const MacroEngine = struct {
     }
 
     // ============================================================
-    // Allocation helper
+    // Macro type validation
+    // ============================================================
+
+    /// Validate type annotations on macro definitions.
+    /// Called before expansion to catch type errors early.
+    fn validateMacros(self: *MacroEngine) !void {
+        for (self.graph.macro_families.items) |family| {
+            for (family.clauses.items) |clause_ref| {
+                const clause = &clause_ref.decl.clauses[clause_ref.clause_index];
+                const return_type = clause.return_type orelse continue;
+
+                // Only validate macros with a quote body
+                if (clause.body.len != 1) continue;
+                switch (clause.body[0]) {
+                    .expr => |body_expr| {
+                        switch (body_expr.*) {
+                            .quote_expr => |qe| {
+                                try self.validateQuoteBody(qe.body, return_type, clause.params);
+                            },
+                            else => {},
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+    }
+
+    /// Check that all terminal expressions in a quote body are compatible
+    /// with the declared return type.
+    fn validateQuoteBody(
+        self: *MacroEngine,
+        body: []const ast.Stmt,
+        return_type: *const ast.TypeExpr,
+        params: []const ast.Param,
+    ) anyerror!void {
+        if (body.len == 0) return;
+        switch (body[body.len - 1]) {
+            .expr => |expr| try self.validateTerminalExpr(expr, return_type, params),
+            else => {},
+        }
+    }
+
+    /// Validate that a terminal expression is compatible with the expected return type.
+    fn validateTerminalExpr(
+        self: *MacroEngine,
+        expr: *const ast.Expr,
+        return_type: *const ast.TypeExpr,
+        params: []const ast.Param,
+    ) anyerror!void {
+        switch (expr.*) {
+            .nil_literal => |nl| {
+                if (!self.typeAllowsNil(return_type)) {
+                    const type_name = self.getTypeName(return_type);
+                    const msg = try std.fmt.allocPrint(
+                        self.allocator,
+                        "macro body returns 'nil' but declared return type is '{s}'",
+                        .{type_name},
+                    );
+                    try self.errors.append(self.allocator, .{
+                        .message = msg,
+                        .span = nl.meta.span,
+                    });
+                }
+            },
+            .if_expr => |ie| {
+                // Both branches must be compatible with the return type
+                try self.validateQuoteBody(ie.then_block, return_type, params);
+                if (ie.else_block) |else_block| {
+                    try self.validateQuoteBody(else_block, return_type, params);
+                } else {
+                    // No else branch implicitly returns nil
+                    if (!self.typeAllowsNil(return_type)) {
+                        const type_name = self.getTypeName(return_type);
+                        const msg = try std.fmt.allocPrint(
+                            self.allocator,
+                            "macro if-expression without else implicitly returns 'nil' but declared return type is '{s}'",
+                            .{type_name},
+                        );
+                        try self.errors.append(self.allocator, .{
+                            .message = msg,
+                            .span = ie.meta.span,
+                        });
+                    }
+                }
+            },
+            .unquote_expr => |ue| {
+                // If unquoting a typed param, check param type against return type
+                switch (ue.expr.*) {
+                    .var_ref => |vr| {
+                        for (params) |param| {
+                            switch (param.pattern.*) {
+                                .bind => |bind| {
+                                    if (bind.name == vr.name) {
+                                        if (param.type_annotation) |param_type| {
+                                            if (!self.typesMatch(param_type, return_type)) {
+                                                const pt = self.getTypeName(param_type);
+                                                const rt = self.getTypeName(return_type);
+                                                const msg = try std.fmt.allocPrint(
+                                                    self.allocator,
+                                                    "unquoted parameter type '{s}' does not match declared return type '{s}'",
+                                                    .{ pt, rt },
+                                                );
+                                                try self.errors.append(self.allocator, .{
+                                                    .message = msg,
+                                                    .span = ue.meta.span,
+                                                });
+                                            }
+                                        }
+                                        break;
+                                    }
+                                },
+                                else => {},
+                            }
+                        }
+                    },
+                    else => {},
+                }
+            },
+            // For other expression types (binary_op, call, var_ref, literals),
+            // we cannot determine types at the AST level — the type checker
+            // will catch mismatches after expansion.
+            else => {},
+        }
+    }
+
+    /// Check if a type expression allows nil values.
+    fn typeAllowsNil(self: *MacroEngine, type_expr: *const ast.TypeExpr) bool {
+        switch (type_expr.*) {
+            .name => |n| {
+                const name = self.interner.get(n.name);
+                return std.mem.eql(u8, name, "nil") or std.mem.eql(u8, name, "Nil");
+            },
+            .literal => |lit| {
+                return lit.value == .nil;
+            },
+            .union_type => |u| {
+                for (u.members) |member| {
+                    if (self.typeAllowsNil(member)) return true;
+                }
+                return false;
+            },
+            else => return false,
+        }
+    }
+
+    /// Check if type `a` is compatible with type `b`.
+    /// For union return types, `a` is compatible if it is a member of the union.
+    fn typesMatch(self: *MacroEngine, a: *const ast.TypeExpr, b: *const ast.TypeExpr) bool {
+        switch (b.*) {
+            .union_type => |u| {
+                // a is compatible if it matches any member of the union
+                for (u.members) |member| {
+                    if (self.typesMatch(a, member)) return true;
+                }
+                return false;
+            },
+            .name => |bn| {
+                switch (a.*) {
+                    .name => |an| return an.name == bn.name,
+                    else => return false,
+                }
+            },
+            .literal => |bl| {
+                switch (a.*) {
+                    .literal => |al| return std.meta.activeTag(al.value) == std.meta.activeTag(bl.value),
+                    else => return false,
+                }
+            },
+            else => return true, // For complex types, assume compatible
+        }
+    }
+
+    /// Get a human-readable name for a type expression.
+    fn getTypeName(self: *MacroEngine, type_expr: *const ast.TypeExpr) []const u8 {
+        switch (type_expr.*) {
+            .name => |n| return self.interner.get(n.name),
+            .literal => |lit| {
+                return switch (lit.value) {
+                    .nil => "nil",
+                    .bool_val => "Bool",
+                    .int => "integer",
+                    .string => "String",
+                };
+            },
+            else => return "<complex type>",
+        }
+    }
+
+    // ============================================================
+    // Special form helpers
+    // ============================================================
+
+    /// Convert a block (slice of statements) to a single expression.
+    /// Single-expression blocks return the expression directly.
+    /// Multi-statement blocks are wrapped in a block expression.
+    fn blockToExpr(self: *MacroEngine, stmts: []const ast.Stmt, meta: ast.NodeMeta) !*const ast.Expr {
+        if (stmts.len == 1) {
+            switch (stmts[0]) {
+                .expr => |e| return e,
+                else => {},
+            }
+        }
+        return try self.create(ast.Expr, .{
+            .block = .{ .meta = meta, .stmts = stmts },
+        });
+    }
+
+    /// Convert cond clauses to nested if() calls.
+    /// cond do c1 -> b1; c2 -> b2 end → if(c1, b1, if(c2, b2, nil))
+    fn condToNestedIf(self: *MacroEngine, clauses: []const ast.CondClause, meta: ast.NodeMeta) anyerror!*const ast.Expr {
+        if (clauses.len == 0) {
+            return try self.create(ast.Expr, .{
+                .nil_literal = .{ .meta = meta },
+            });
+        }
+
+        const clause = clauses[0];
+        const if_name = try self.interner.intern("if");
+        const callee = try self.create(ast.Expr, .{
+            .var_ref = .{ .meta = meta, .name = if_name },
+        });
+        const body_expr = try self.blockToExpr(clause.body, meta);
+        const rest = try self.condToNestedIf(clauses[1..], meta);
+
+        const args = try self.allocSlice(*const ast.Expr, &.{ clause.condition, body_expr, rest });
+        return try self.create(ast.Expr, .{
+            .call = .{ .meta = meta, .callee = callee, .args = args },
+        });
+    }
+
+    /// Convert with expression to nested case expressions (compiler special form).
+    fn withToNestedCase(self: *MacroEngine, we: ast.WithExpr) anyerror!*const ast.Expr {
+        var binds: std.ArrayList(ast.WithBind) = .empty;
+        for (we.items) |item| {
+            switch (item) {
+                .bind => |bind| try binds.append(self.allocator, bind),
+                .expr => {},
+            }
+        }
+
+        if (binds.items.len == 0) {
+            return try self.blockToExpr(we.body, we.meta);
+        }
+
+        // Build else clauses (reused at every nesting level)
+        var else_case_clauses: std.ArrayList(ast.CaseClause) = .empty;
+        if (we.else_clauses) |else_clauses| {
+            for (else_clauses) |ec| {
+                try else_case_clauses.append(self.allocator, .{
+                    .meta = ec.meta,
+                    .pattern = ec.pattern,
+                    .type_annotation = ec.type_annotation,
+                    .guard = ec.guard,
+                    .body = ec.body,
+                });
+            }
+        }
+        const else_slice = try else_case_clauses.toOwnedSlice(self.allocator);
+
+        return try self.buildWithChain(binds.items, we.body, else_slice, we.meta);
+    }
+
+    fn buildWithChain(
+        self: *MacroEngine,
+        binds: []const ast.WithBind,
+        body: []const ast.Stmt,
+        else_clauses: []const ast.CaseClause,
+        meta: ast.NodeMeta,
+    ) anyerror!*const ast.Expr {
+        if (binds.len == 0) {
+            return try self.blockToExpr(body, meta);
+        }
+
+        const bind = binds[0];
+        const inner = try self.buildWithChain(binds[1..], body, else_clauses, meta);
+        const success_body = try self.allocSlice(ast.Stmt, &.{
+            .{ .expr = inner },
+        });
+        const success_clause = ast.CaseClause{
+            .meta = bind.meta,
+            .pattern = bind.pattern,
+            .type_annotation = null,
+            .guard = null,
+            .body = success_body,
+        };
+
+        var all_clauses: std.ArrayList(ast.CaseClause) = .empty;
+        try all_clauses.append(self.allocator, success_clause);
+        for (else_clauses) |ec| {
+            try all_clauses.append(self.allocator, ec);
+        }
+
+        return try self.create(ast.Expr, .{
+            .case_expr = .{
+                .meta = meta,
+                .scrutinee = bind.source,
+                .clauses = try all_clauses.toOwnedSlice(self.allocator),
+            },
+        });
+    }
+
+    // ============================================================
+    // Allocation helpers
     // ============================================================
 
     fn create(self: *MacroEngine, comptime T: type, value: T) !*const T {
         const ptr = try self.allocator.create(T);
         ptr.* = value;
         return ptr;
+    }
+
+    fn allocSlice(self: *MacroEngine, comptime T: type, items: []const T) ![]const T {
+        const slice = try self.allocator.alloc(T, items.len);
+        @memcpy(slice, items);
+        return slice;
     }
 };
 
@@ -837,4 +1215,199 @@ test "macro engine reaches fixed point" {
     // Should reach fixed point immediately (no macros to expand)
     try std.testing.expectEqual(@as(usize, 0), engine.errors.items.len);
     try std.testing.expectEqual(@as(usize, 1), expanded.top_items.len);
+}
+
+test "typed macro: nil in String return position is an error" {
+    const source =
+        \\defmodule Test do
+        \\  defmacro when_positive(value :: i64, result :: String) :: String do
+        \\    quote do
+        \\      if unquote(value) > 0 do
+        \\        unquote(result)
+        \\      else
+        \\        nil
+        \\      end
+        \\    end
+        \\  end
+        \\
+        \\  def check(n :: i64) :: String do
+        \\    when_positive(n, "yes")
+        \\  end
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, &parser.interner, &collector.graph);
+    defer engine.deinit();
+    _ = try engine.expandProgram(&program);
+
+    // Should have a type error: nil incompatible with String return type
+    try std.testing.expect(engine.errors.items.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, engine.errors.items[0].message, "nil") != null);
+}
+
+test "typed macro: valid types produce no errors" {
+    const source =
+        \\defmodule Test do
+        \\  defmacro when_positive(value :: i64, result :: String) :: String do
+        \\    quote do
+        \\      if unquote(value) > 0 do
+        \\        unquote(result)
+        \\      else
+        \\        "default"
+        \\      end
+        \\    end
+        \\  end
+        \\
+        \\  def check(n :: i64) :: String do
+        \\    when_positive(n, "yes")
+        \\  end
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, &parser.interner, &collector.graph);
+    defer engine.deinit();
+    _ = try engine.expandProgram(&program);
+
+    // No errors — all types are compatible
+    try std.testing.expectEqual(@as(usize, 0), engine.errors.items.len);
+}
+
+test "typed macro: missing else branch is an error for non-nil return type" {
+    const source =
+        \\defmodule Test do
+        \\  defmacro unless(expr :: Bool, body :: i64) :: i64 do
+        \\    quote do
+        \\      if not unquote(expr) do
+        \\        unquote(body)
+        \\      end
+        \\    end
+        \\  end
+        \\
+        \\  def foo(x :: i64) :: i64 do
+        \\    unless(x > 0, 42)
+        \\  end
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, &parser.interner, &collector.graph);
+    defer engine.deinit();
+    _ = try engine.expandProgram(&program);
+
+    // Should error: if without else implicitly returns nil
+    try std.testing.expect(engine.errors.items.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, engine.errors.items[0].message, "nil") != null);
+}
+
+test "typed macro: param type mismatch with return type" {
+    const source =
+        \\defmodule Test do
+        \\  defmacro wrap(value :: i64) :: String do
+        \\    quote do
+        \\      unquote(value)
+        \\    end
+        \\  end
+        \\
+        \\  def foo(x :: i64) :: String do
+        \\    wrap(x)
+        \\  end
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, &parser.interner, &collector.graph);
+    defer engine.deinit();
+    _ = try engine.expandProgram(&program);
+
+    // Should error: i64 param used as String return
+    try std.testing.expect(engine.errors.items.len > 0);
+}
+
+test "macro substitution into case_expr and block" {
+    // A macro that produces a case expression with unquote inside
+    const source =
+        \\defmodule Test do
+        \\  defmacro match_it(val, fallback) do
+        \\    quote do
+        \\      case unquote(val) do
+        \\        0 ->
+        \\          unquote(fallback)
+        \\        x ->
+        \\          x
+        \\      end
+        \\    end
+        \\  end
+        \\
+        \\  def check(x :: i64) :: i64 do
+        \\    match_it(x, 42)
+        \\  end
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, &parser.interner, &collector.graph);
+    defer engine.deinit();
+    const expanded = try engine.expandProgram(&program);
+
+    // No errors — case_expr substitution should work
+    try std.testing.expectEqual(@as(usize, 0), engine.errors.items.len);
+    // Module should still exist with expanded content
+    try std.testing.expectEqual(@as(usize, 1), expanded.modules.len);
 }

@@ -449,6 +449,12 @@ pub const ZapString = struct {
 // Prelude / Kernel functions (spec §30.2)
 // ============================================================
 
+pub fn panic(message: []const u8) noreturn {
+    const stderr = std.fs.File.stderr().deprecatedWriter();
+    stderr.print("** (NilError) {s}\n", .{message}) catch {};
+    std.process.exit(1);
+}
+
 pub const Prelude = struct {
     pub fn println(value: anytype) void {
         const stdout = std.fs.File.stdout().deprecatedWriter();
@@ -467,6 +473,11 @@ pub const Prelude = struct {
         }
     }
 
+    pub fn inspect(value: anytype) @TypeOf(value) {
+        println(value);
+        return value;
+    }
+
     pub fn print_str(value: anytype) void {
         const stdout = std.fs.File.stdout().deprecatedWriter();
         const T = @TypeOf(value);
@@ -478,9 +489,6 @@ pub const Prelude = struct {
         }
     }
 
-    pub fn inspect(s: []const u8) []const u8 {
-        return s;
-    }
 
     pub fn i64_to_string(allocator: std.mem.Allocator, value: i64) ![]const u8 {
         return std.fmt.allocPrint(allocator, "{d}", .{value});

@@ -124,6 +124,7 @@ pub const ExprKind = union(enum) {
 
     // Error handling
     panic: *const Expr,
+    unwrap: *const Expr, // optional force-unwrap (expr!)
 
     // Special
     closure_create: ClosureCreate,
@@ -1332,16 +1333,21 @@ pub const HirBuilder = struct {
                 }
 
                 // Check for module-qualified call: IO.puts(...), Math.square(...)
+                // or :zig runtime bridge: :zig.println(...)
                 const target: CallTarget = if (call.callee.* == .field_access) blk: {
                     const fa = call.callee.field_access;
                     if (fa.object.* == .module_ref) {
-                        const mod_name = self.moduleNameToString(fa.object.module_ref.name);
                         const func_name = self.interner.get(fa.field);
-                        if (resolveStdlibCall(mod_name, func_name)) |runtime_name| {
-                            break :blk .{ .builtin = runtime_name };
-                        }
-                        // User-defined module function — emit as named call
+                        // Module-qualified call — emit as named call
                         break :blk .{ .named = func_name };
+                    }
+                    // :zig.function() — bridge to Zig runtime
+                    if (fa.object.* == .atom_literal) {
+                        const atom_name = self.interner.get(fa.object.atom_literal.value);
+                        if (std.mem.eql(u8, atom_name, "zig")) {
+                            const func_name = self.interner.get(fa.field);
+                            break :blk .{ .builtin = func_name };
+                        }
                     }
                     break :blk .{ .closure = try self.buildExpr(call.callee) };
                 } else if (call.callee.* == .var_ref) blk: {
@@ -1371,19 +1377,9 @@ pub const HirBuilder = struct {
                     .span = call.meta.span,
                 });
             },
-            .if_expr => |ie| {
-                const cond = try self.buildExpr(ie.condition);
-                const then_block = try self.buildBlock(ie.then_block);
-                const else_block = if (ie.else_block) |eb| try self.buildBlock(eb) else null;
-                return try self.create(Expr, .{
-                    .kind = .{ .branch = .{
-                        .condition = cond,
-                        .then_block = then_block,
-                        .else_block = else_block,
-                    } },
-                    .type_id = types_mod.TypeStore.UNKNOWN,
-                    .span = ie.meta.span,
-                });
+            .if_expr => {
+                // if_expr should be desugared to case_expr before reaching HIR
+                unreachable;
             },
             .case_expr => |ce| {
                 const scrutinee = try self.buildExpr(ce.scrutinee);
@@ -1467,74 +1463,44 @@ pub const HirBuilder = struct {
                     .span = l.meta.span,
                 });
             },
-            .pipe => |pe| {
-                // Desugar `a |> f(b)` into `f(a, b)`
-                const lhs = try self.buildExpr(pe.lhs);
-                // rhs should be a call — prepend lhs as first arg
-                if (pe.rhs.* == .call) {
-                    const call = pe.rhs.call;
-                    var args: std.ArrayList(*const Expr) = .empty;
-                    try args.append(self.allocator, lhs);
-                    for (call.args) |arg| {
-                        try args.append(self.allocator, try self.buildExpr(arg));
-                    }
-
-                    const target: CallTarget = if (call.callee.* == .field_access) blk: {
-                        const fa = call.callee.field_access;
-                        if (fa.object.* == .module_ref) {
-                            const mod_name = self.moduleNameToString(fa.object.module_ref.name);
-                            const func_name = self.interner.get(fa.field);
-                            if (resolveStdlibCall(mod_name, func_name)) |runtime_name| {
-                                break :blk .{ .builtin = runtime_name };
-                            }
-                            break :blk .{ .named = func_name };
-                        }
-                        break :blk .{ .closure = try self.buildExpr(call.callee) };
-                    } else .{ .closure = try self.buildExpr(call.callee) };
-
-                    return try self.create(Expr, .{
-                        .kind = .{ .call = .{
-                            .target = target,
-                            .args = try args.toOwnedSlice(self.allocator),
-                        } },
-                        .type_id = types_mod.TypeStore.UNKNOWN,
-                        .span = pe.meta.span,
-                    });
-                }
-                // Fallback: treat rhs as a function value call with lhs as arg
-                const rhs = try self.buildExpr(pe.rhs);
-                var args: std.ArrayList(*const Expr) = .empty;
-                try args.append(self.allocator, lhs);
-                return try self.create(Expr, .{
-                    .kind = .{ .call = .{
-                        .target = .{ .closure = rhs },
-                        .args = try args.toOwnedSlice(self.allocator),
-                    } },
-                    .type_id = types_mod.TypeStore.UNKNOWN,
-                    .span = pe.meta.span,
-                });
+            .pipe => {
+                // Pipe should be desugared before reaching HIR
+                unreachable;
             },
             .field_access => |fa| {
                 // Module-qualified reference (e.g. Math.square without call parens)
                 if (fa.object.* == .module_ref) {
-                    const mod_name = self.moduleNameToString(fa.object.module_ref.name);
                     const func_name = self.interner.get(fa.field);
-                    if (resolveStdlibCall(mod_name, func_name)) |runtime_name| {
-                        return try self.create(Expr, .{
-                            .kind = .{ .call = .{
-                                .target = .{ .builtin = runtime_name },
-                                .args = &.{},
-                            } },
-                            .type_id = types_mod.TypeStore.UNKNOWN,
-                            .span = fa.meta.span,
-                        });
-                    }
+                    return try self.create(Expr, .{
+                        .kind = .{ .call = .{
+                            .target = .{ .named = func_name },
+                            .args = &.{},
+                        } },
+                        .type_id = types_mod.TypeStore.UNKNOWN,
+                        .span = fa.meta.span,
+                    });
                 }
                 // Fallback for field access
                 return try self.create(Expr, .{
                     .kind = .nil_lit,
                     .type_id = types_mod.TypeStore.UNKNOWN,
                     .span = fa.meta.span,
+                });
+            },
+            .unwrap => |ue| {
+                const inner = try self.buildExpr(ue.expr);
+                return try self.create(Expr, .{
+                    .kind = .{ .unwrap = inner },
+                    .type_id = inner.type_id,
+                    .span = ue.meta.span,
+                });
+            },
+            .block => |blk| {
+                const inner = try self.buildBlock(blk.stmts);
+                return try self.create(Expr, .{
+                    .kind = .{ .block = inner.* },
+                    .type_id = inner.result_type,
+                    .span = blk.meta.span,
                 });
             },
             else => {
@@ -1603,35 +1569,8 @@ pub const HirBuilder = struct {
     }
 };
 
-// ============================================================
-// Standard library module resolution
-//
-// Maps module-qualified calls (e.g. IO.puts) to runtime
-// function names. No function is implicitly available —
-// callers must use the fully qualified ModuleName.function form.
-// ============================================================
-
-const StdlibEntry = struct {
-    module: []const u8,
-    function: []const u8,
-    runtime_name: []const u8,
-};
-
-const stdlib_functions = [_]StdlibEntry{
-    .{ .module = "IO", .function = "puts", .runtime_name = "println" },
-    .{ .module = "IO", .function = "inspect", .runtime_name = "print_str" },
-};
-
-fn resolveStdlibCall(module_name: []const u8, function_name: []const u8) ?[]const u8 {
-    for (&stdlib_functions) |entry| {
-        if (std.mem.eql(u8, module_name, entry.module) and
-            std.mem.eql(u8, function_name, entry.function))
-        {
-            return entry.runtime_name;
-        }
-    }
-    return null;
-}
+// Standard library resolution removed — IO, Kernel, etc. are now
+// real Zap modules defined in lib/ and compiled with the program.
 
 // ============================================================
 // Tests

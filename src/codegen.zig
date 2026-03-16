@@ -249,6 +249,9 @@ pub const CodeGen = struct {
             .index_get => |ig| {
                 self.referenced_locals.append(self.allocator, ig.object) catch {};
             },
+            .optional_unwrap => |ou| {
+                self.referenced_locals.append(self.allocator, ou.source) catch {};
+            },
             else => {},
         }
     }
@@ -317,7 +320,7 @@ pub const CodeGen = struct {
             .const_string => |cs| {
                 try self.writeIndent();
                 try self.writeDestLocal(cs.dest);
-                try self.write(" = \"");
+                try self.write(": []const u8 = \"");
                 try self.write(cs.value);
                 try self.write("\";\n");
             },
@@ -918,6 +921,13 @@ pub const CodeGen = struct {
                 }
                 try self.write(");\n");
             },
+            .optional_unwrap => |ou| {
+                try self.writeIndent();
+                try self.writeDestLocal(ou.dest);
+                try self.write(" = ");
+                try self.writeLocal(ou.source);
+                try self.write(" orelse zap_runtime.panic(\"attempted to unwrap nil value\");\n");
+            },
             else => {
                 try self.writeIndent();
                 try self.write("// unhandled instruction\n");
@@ -949,6 +959,10 @@ pub const CodeGen = struct {
             .string => try self.write("[]const u8"),
             .atom => try self.write("zap_runtime.Atom"),
             .nil => try self.write("?void"),
+            .optional => |inner| {
+                try self.write("?");
+                try self.emitZigType(inner);
+            },
             .any => try self.write("anytype"),
             .struct_ref => |name| try self.write(name),
             .tagged_union => |name| try self.write(name),

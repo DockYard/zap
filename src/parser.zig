@@ -447,7 +447,13 @@ pub const Parser = struct {
         const start = self.currentSpan();
         _ = try self.expect(.keyword_defmacro);
 
-        const name_tok = try self.expect(.identifier);
+        // Allow keywords as macro names (like Elixir's Kernel macros: if, cond, with)
+        const name_tok = if (self.check(.identifier))
+            self.advance()
+        else if (self.check(.keyword_if) or self.check(.keyword_cond) or self.check(.keyword_with))
+            self.advance()
+        else
+            try self.expect(.identifier); // will error with expected message
         const name = try self.internToken(name_tok);
 
         const clause = try self.parseFunctionClause();
