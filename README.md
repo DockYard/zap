@@ -13,7 +13,7 @@
 <h3 align="center">A functional language that compiles to native code through Zig.</h3>
 
 <p align="center">
-  Pattern matching &nbsp;·&nbsp; Type safety &nbsp;·&nbsp; No runtime &nbsp;·&nbsp; Native binaries
+  Pattern matching &nbsp;·&nbsp; Type safety &nbsp;·&nbsp; Native binaries
 </p>
 
 ---
