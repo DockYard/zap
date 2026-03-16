@@ -147,9 +147,14 @@ pub const CallExpr = struct {
     args: []const *const Expr,
 };
 
+pub const NamedCall = struct {
+    module: ?[]const u8,
+    name: []const u8,
+};
+
 pub const CallTarget = union(enum) {
     direct: DirectCall,
-    named: []const u8,
+    named: NamedCall,
     closure: *const Expr,
     dispatch: DispatchCall,
     builtin: []const u8,
@@ -753,91 +758,36 @@ fn compileTupleCheck(
     scrutinee_expr: *const Expr,
     next_id: *u32,
 ) anyerror!*const Decision {
-    // Find maximum arity of tuple patterns
-    var max_arity: u32 = 0;
+    // Collect unique arities from tuple patterns
+    var arities: std.ArrayList(u32) = .empty;
     for (matrix.rows) |row| {
         if (row.patterns.len == 0) continue;
         const pat = row.patterns[0];
         if (!isWildcardPattern(pat) and pat.?.* == .tuple) {
             const arity: u32 = @intCast(pat.?.tuple.len);
-            max_arity = @max(max_arity, arity);
+            var found = false;
+            for (arities.items) |a| {
+                if (a == arity) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) try arities.append(allocator, arity);
         }
     }
 
-    // Success path: expand tuple sub-patterns into new columns with new scrutinee IDs
-    var success_rows: std.ArrayList(PatternRow) = .empty;
-    for (matrix.rows) |row| {
-        if (row.patterns.len == 0) continue;
-        const pat = row.patterns[0];
+    // Sort arities ascending so we test smallest first
+    std.sort.pdq(u32, arities.items, {}, std.sort.asc(u32));
 
-        var new_cols: std.ArrayList(?*const MatchPattern) = .empty;
-        if (!isWildcardPattern(pat) and pat.?.* == .tuple) {
-            // Expand sub-patterns
-            for (pat.?.tuple) |sub_pat| {
-                try new_cols.append(allocator, sub_pat);
-            }
-            // Pad with wildcards if needed
-            var j: u32 = @intCast(pat.?.tuple.len);
-            while (j < max_arity) : (j += 1) {
-                const wc = try allocator.create(MatchPattern);
-                wc.* = .wildcard;
-                try new_cols.append(allocator, wc);
-            }
-        } else if (isWildcardPattern(pat)) {
-            // Wildcard matches any tuple — expand to max_arity wildcards
-            var j: u32 = 0;
-            while (j < max_arity) : (j += 1) {
-                const wc = try allocator.create(MatchPattern);
-                wc.* = .wildcard;
-                try new_cols.append(allocator, wc);
-            }
-        } else {
-            continue; // non-tuple, non-wildcard — skip in success path
-        }
-
-        // Append remaining columns
-        if (row.patterns.len > 1) {
-            for (row.patterns[1..]) |p| {
-                try new_cols.append(allocator, p);
-            }
-        }
-
-        try success_rows.append(allocator, .{
-            .patterns = try new_cols.toOwnedSlice(allocator),
-            .body_index = row.body_index,
-            .guard = row.guard,
-        });
-    }
-
-    // Build new scrutinee IDs: new IDs for tuple elements, then remaining
-    var new_scrutinee_list: std.ArrayList(u32) = .empty;
-    var elem_ids = try allocator.alloc(u32, max_arity);
-    var j: u32 = 0;
-    while (j < max_arity) : (j += 1) {
-        elem_ids[j] = next_id.*;
-        next_id.* += 1;
-        try new_scrutinee_list.append(allocator, elem_ids[j]);
-    }
-    if (scrutinee_ids.len > 1) {
-        for (scrutinee_ids[1..]) |sid| {
-            try new_scrutinee_list.append(allocator, sid);
-        }
-    }
-
-    const new_col_count = max_arity + (matrix.column_count - 1);
-    const success_decision = try compilePatternMatrix(allocator, .{
-        .rows = try success_rows.toOwnedSlice(allocator),
-        .column_count = new_col_count,
-    }, try new_scrutinee_list.toOwnedSlice(allocator), next_id);
-
-    // Failure path: wildcard-only rows
-    var failure_rows: std.ArrayList(PatternRow) = .empty;
+    // Build wildcard-only failure base
+    const remaining_scrutinees = if (scrutinee_ids.len > 1) scrutinee_ids[1..] else @as([]const u32, &.{});
+    var wildcard_rows: std.ArrayList(PatternRow) = .empty;
     for (matrix.rows) |row| {
         if (row.patterns.len == 0) continue;
         const pat = row.patterns[0];
         if (isWildcardPattern(pat)) {
             const new_pats = if (row.patterns.len > 1) row.patterns[1..] else @as([]const ?*const MatchPattern, &.{});
-            try failure_rows.append(allocator, .{
+            try wildcard_rows.append(allocator, .{
                 .patterns = new_pats,
                 .body_index = row.body_index,
                 .guard = row.guard,
@@ -845,20 +795,95 @@ fn compileTupleCheck(
         }
     }
 
-    const remaining_scrutinees = if (scrutinee_ids.len > 1) scrutinee_ids[1..] else @as([]const u32, &.{});
-    const failure_decision = try compilePatternMatrix(allocator, .{
-        .rows = try failure_rows.toOwnedSlice(allocator),
-        .column_count = matrix.column_count - 1,
-    }, remaining_scrutinees, next_id);
+    var current_failure: *const Decision = undefined;
+    if (wildcard_rows.items.len > 0) {
+        current_failure = try compilePatternMatrix(allocator, .{
+            .rows = try wildcard_rows.toOwnedSlice(allocator),
+            .column_count = matrix.column_count - 1,
+        }, remaining_scrutinees, next_id);
+    } else {
+        const f = try allocator.create(Decision);
+        f.* = .failure;
+        current_failure = f;
+    }
 
-    const d = try allocator.create(Decision);
-    d.* = .{ .check_tuple = .{
-        .scrutinee = scrutinee_expr,
-        .expected_arity = max_arity,
-        .success = success_decision,
-        .failure = failure_decision,
-    } };
-    return d;
+    // If all patterns have the same arity (or there's only one), use single check_tuple
+    // Otherwise, chain check_tuple nodes from largest arity to smallest
+    var i = arities.items.len;
+    while (i > 0) {
+        i -= 1;
+        const arity = arities.items[i];
+
+        // Build success rows for this specific arity
+        var success_rows: std.ArrayList(PatternRow) = .empty;
+        for (matrix.rows) |row| {
+            if (row.patterns.len == 0) continue;
+            const pat = row.patterns[0];
+
+            var new_cols: std.ArrayList(?*const MatchPattern) = .empty;
+            if (!isWildcardPattern(pat) and pat.?.* == .tuple) {
+                const pat_arity: u32 = @intCast(pat.?.tuple.len);
+                if (pat_arity != arity) continue; // Only include patterns with this arity
+
+                for (pat.?.tuple) |sub_pat| {
+                    try new_cols.append(allocator, sub_pat);
+                }
+            } else if (isWildcardPattern(pat)) {
+                // Wildcard matches any tuple — expand to this arity's worth of wildcards
+                var j: u32 = 0;
+                while (j < arity) : (j += 1) {
+                    const wc = try allocator.create(MatchPattern);
+                    wc.* = .wildcard;
+                    try new_cols.append(allocator, wc);
+                }
+            } else {
+                continue;
+            }
+
+            // Append remaining columns
+            if (row.patterns.len > 1) {
+                for (row.patterns[1..]) |p| {
+                    try new_cols.append(allocator, p);
+                }
+            }
+
+            try success_rows.append(allocator, .{
+                .patterns = try new_cols.toOwnedSlice(allocator),
+                .body_index = row.body_index,
+                .guard = row.guard,
+            });
+        }
+
+        // Build new scrutinee IDs for this arity's elements
+        var new_scrutinee_list: std.ArrayList(u32) = .empty;
+        var j: u32 = 0;
+        while (j < arity) : (j += 1) {
+            try new_scrutinee_list.append(allocator, next_id.*);
+            next_id.* += 1;
+        }
+        if (scrutinee_ids.len > 1) {
+            for (scrutinee_ids[1..]) |sid| {
+                try new_scrutinee_list.append(allocator, sid);
+            }
+        }
+
+        const new_col_count = arity + (matrix.column_count - 1);
+        const success_decision = try compilePatternMatrix(allocator, .{
+            .rows = try success_rows.toOwnedSlice(allocator),
+            .column_count = new_col_count,
+        }, try new_scrutinee_list.toOwnedSlice(allocator), next_id);
+
+        const d = try allocator.create(Decision);
+        d.* = .{ .check_tuple = .{
+            .scrutinee = scrutinee_expr,
+            .expected_arity = arity,
+            .success = success_decision,
+            .failure = current_failure,
+        } };
+        current_failure = d;
+    }
+
+    return current_failure;
 }
 
 fn literalEquals(a: LiteralValue, b: LiteralValue) bool {
@@ -889,6 +914,7 @@ pub const HirBuilder = struct {
     current_param_names: []const ?ast.StringId,
     current_tuple_bindings: std.ArrayList(TupleBinding),
     current_case_bindings: std.ArrayList(CaseBinding),
+    current_module_scope: ?scope_mod.ScopeId,
     errors: std.ArrayList(Error),
 
     pub const Error = struct {
@@ -912,12 +938,45 @@ pub const HirBuilder = struct {
             .current_param_names = &.{},
             .current_tuple_bindings = .empty,
             .current_case_bindings = .empty,
+            .current_module_scope = null,
             .errors = .empty,
         };
     }
 
     pub fn deinit(self: *HirBuilder) void {
         self.errors.deinit(self.allocator);
+    }
+
+    /// Look up a binding's type_id from the scope graph.
+    /// Returns the type_id if found, otherwise UNKNOWN.
+    fn resolveBindingType(self: *const HirBuilder, name: ast.StringId) types_mod.TypeId {
+        const scope_id = self.current_module_scope orelse self.graph.prelude_scope;
+        if (self.graph.resolveBinding(scope_id, name)) |bid| {
+            const binding = self.graph.bindings.items[bid];
+            if (binding.type_id) |tid| {
+                return tid;
+            }
+        }
+        return types_mod.TypeStore.UNKNOWN;
+    }
+
+    /// Look up a function's declared return type from the scope graph.
+    /// Searches current module scope, then prelude.
+    fn resolveFunctionReturnType(self: *const HirBuilder, name: ast.StringId, arity: u32) types_mod.TypeId {
+        const scope_id = self.current_module_scope orelse self.graph.prelude_scope;
+        if (self.graph.resolveFamily(scope_id, name, arity)) |fam_id| {
+            const family = self.graph.getFamily(fam_id);
+            if (family.clauses.items.len > 0) {
+                const first_clause = family.clauses.items[0];
+                if (first_clause.clause_index < first_clause.decl.clauses.len) {
+                    const clause = first_clause.decl.clauses[first_clause.clause_index];
+                    if (clause.return_type) |rt| {
+                        return self.resolveTypeExpr(rt);
+                    }
+                }
+            }
+        }
+        return types_mod.TypeStore.UNKNOWN;
     }
 
     // ============================================================
@@ -931,7 +990,9 @@ pub const HirBuilder = struct {
                 self.graph.modules.items[i].scope_id
             else
                 self.graph.prelude_scope;
+            self.current_module_scope = mod_scope;
             try modules.append(self.allocator, try self.buildModule(mod, mod_scope));
+            self.current_module_scope = null;
         }
 
         // Group top-level functions by name, merging clauses
@@ -1271,13 +1332,16 @@ pub const HirBuilder = struct {
                 .span = v.meta.span,
             }),
             .var_ref => |v| {
+                // Try to resolve type from scope graph binding
+                const resolved_type = self.resolveBindingType(v.name);
+
                 // Check if this var refers to a parameter
                 for (self.current_param_names, 0..) |param_name, idx| {
                     if (param_name) |pn| {
                         if (pn == v.name) {
                             return try self.create(Expr, .{
                                 .kind = .{ .param_get = @intCast(idx) },
-                                .type_id = types_mod.TypeStore.UNKNOWN,
+                                .type_id = resolved_type,
                                 .span = v.meta.span,
                             });
                         }
@@ -1288,7 +1352,7 @@ pub const HirBuilder = struct {
                     if (binding.name == v.name) {
                         return try self.create(Expr, .{
                             .kind = .{ .local_get = binding.local_index },
-                            .type_id = types_mod.TypeStore.UNKNOWN,
+                            .type_id = resolved_type,
                             .span = v.meta.span,
                         });
                     }
@@ -1298,26 +1362,45 @@ pub const HirBuilder = struct {
                     if (binding.name == v.name) {
                         return try self.create(Expr, .{
                             .kind = .{ .local_get = binding.local_index },
-                            .type_id = types_mod.TypeStore.UNKNOWN,
+                            .type_id = resolved_type,
                             .span = v.meta.span,
                         });
                     }
                 }
                 return try self.create(Expr, .{
                     .kind = .{ .local_get = 0 }, // TODO: resolve to local index
-                    .type_id = types_mod.TypeStore.UNKNOWN,
+                    .type_id = resolved_type,
                     .span = v.meta.span,
                 });
             },
-            .binary_op => |bo| try self.create(Expr, .{
-                .kind = .{ .binary = .{
-                    .op = bo.op,
-                    .lhs = try self.buildExpr(bo.lhs),
-                    .rhs = try self.buildExpr(bo.rhs),
-                } },
-                .type_id = types_mod.TypeStore.UNKNOWN,
-                .span = bo.meta.span,
-            }),
+            .binary_op => |bo| {
+                const lhs_expr = try self.buildExpr(bo.lhs);
+                const rhs_expr = try self.buildExpr(bo.rhs);
+                // Derive result type from operands and operator
+                const result_type = switch (bo.op) {
+                    // Arithmetic: same type as operands
+                    .add, .sub, .mul, .div, .rem_op => blk: {
+                        if (lhs_expr.type_id != types_mod.TypeStore.UNKNOWN)
+                            break :blk lhs_expr.type_id;
+                        if (rhs_expr.type_id != types_mod.TypeStore.UNKNOWN)
+                            break :blk rhs_expr.type_id;
+                        break :blk types_mod.TypeStore.UNKNOWN;
+                    },
+                    // Comparison/logical: Bool
+                    .equal, .not_equal, .less, .greater, .less_equal, .greater_equal, .and_op, .or_op => types_mod.TypeStore.BOOL,
+                    // String concat
+                    .concat => types_mod.TypeStore.STRING,
+                };
+                return try self.create(Expr, .{
+                    .kind = .{ .binary = .{
+                        .op = bo.op,
+                        .lhs = lhs_expr,
+                        .rhs = rhs_expr,
+                    } },
+                    .type_id = result_type,
+                    .span = bo.meta.span,
+                });
+            },
             .unary_op => |uo| try self.create(Expr, .{
                 .kind = .{ .unary = .{
                     .op = uo.op,
@@ -1338,8 +1421,9 @@ pub const HirBuilder = struct {
                     const fa = call.callee.field_access;
                     if (fa.object.* == .module_ref) {
                         const func_name = self.interner.get(fa.field);
-                        // Module-qualified call — emit as named call
-                        break :blk .{ .named = func_name };
+                        const mod_name = self.moduleNameToString(fa.object.module_ref.name);
+                        // Module-qualified call — preserve module name
+                        break :blk .{ .named = .{ .module = mod_name, .name = func_name } };
                     }
                     // :zig.function() — bridge to Zig runtime
                     if (fa.object.* == .atom_literal) {
@@ -1365,15 +1449,31 @@ pub const HirBuilder = struct {
                     if (is_param) {
                         break :blk .{ .closure = try self.buildExpr(call.callee) };
                     }
-                    break :blk .{ .named = self.interner.get(vr.name) };
+                    // Check if this bare call resolves to an imported function
+                    const import_module = self.resolveImport(vr.name, @intCast(call.args.len));
+                    break :blk .{ .named = .{ .module = import_module, .name = self.interner.get(vr.name) } };
                 } else .{ .closure = try self.buildExpr(call.callee) };
+
+                // Resolve return type for named calls
+                const call_return_type: types_mod.TypeId = switch (target) {
+                    .named => |n| blk: {
+                        // For bare calls (no module prefix), look up in scope graph
+                        if (n.module == null) {
+                            if (call.callee.* == .var_ref) {
+                                break :blk self.resolveFunctionReturnType(call.callee.var_ref.name, @intCast(call.args.len));
+                            }
+                        }
+                        break :blk types_mod.TypeStore.UNKNOWN;
+                    },
+                    else => types_mod.TypeStore.UNKNOWN,
+                };
 
                 return try self.create(Expr, .{
                     .kind = .{ .call = .{
                         .target = target,
                         .args = try args.toOwnedSlice(self.allocator),
                     } },
-                    .type_id = types_mod.TypeStore.UNKNOWN,
+                    .type_id = call_return_type,
                     .span = call.meta.span,
                 });
             },
@@ -1471,9 +1571,10 @@ pub const HirBuilder = struct {
                 // Module-qualified reference (e.g. Math.square without call parens)
                 if (fa.object.* == .module_ref) {
                     const func_name = self.interner.get(fa.field);
+                    const mod_name = self.moduleNameToString(fa.object.module_ref.name);
                     return try self.create(Expr, .{
                         .kind = .{ .call = .{
-                            .target = .{ .named = func_name },
+                            .target = .{ .named = .{ .module = mod_name, .name = func_name } },
                             .args = &.{},
                         } },
                         .type_id = types_mod.TypeStore.UNKNOWN,
@@ -1530,13 +1631,98 @@ pub const HirBuilder = struct {
         };
     }
 
+    /// Resolve a bare call to an imported module via the current scope's imports.
+    /// Returns the module name string if the function is imported, null otherwise.
+    /// Resolution follows Elixir semantics: local module > imports > Kernel/top-level.
+    fn resolveImport(self: *const HirBuilder, name: ast.StringId, arity: u32) ?[]const u8 {
+        const mod_scope_id = self.current_module_scope orelse return null;
+        const mod_scope = self.graph.getScope(mod_scope_id);
+
+        // Check if the function is defined locally in this module (local takes priority)
+        const local_key = scope_mod.FamilyKey{ .name = name, .arity = arity };
+        if (mod_scope.function_families.get(local_key) != null) return null;
+
+        // Check imports on this scope
+        for (mod_scope.imports.items) |imp| {
+            if (self.importMatchesFunction(imp, name, arity)) {
+                return self.moduleNameToString(imp.source_module);
+            }
+        }
+
+        return null;
+    }
+
+    /// Check if an import declaration makes a specific function name/arity available.
+    fn importMatchesFunction(self: *const HirBuilder, imp: scope_mod.ImportedScope, name: ast.StringId, arity: u32) bool {
+        switch (imp.filter) {
+            .all => {
+                // Import all — verify the source module actually exports this function
+                return self.sourceModuleHasFunction(imp.source_module, name, arity);
+            },
+            .only => |entries| {
+                // Only import listed functions
+                for (entries) |entry| {
+                    if (entry.name == name) {
+                        if (entry.arity) |a| {
+                            if (a == arity) return true;
+                        } else {
+                            // Type import (arity null) — doesn't match function calls
+                            continue;
+                        }
+                    }
+                }
+                return false;
+            },
+            .except => |entries| {
+                // Import all except listed — first check source module exports it
+                if (!self.sourceModuleHasFunction(imp.source_module, name, arity)) return false;
+                // Then check it's not excluded
+                for (entries) |entry| {
+                    if (entry.name == name) {
+                        if (entry.arity) |a| {
+                            if (a == arity) return false; // excluded
+                        }
+                    }
+                }
+                return true;
+            },
+        }
+    }
+
+    /// Check if a module (by name) exports a specific function.
+    fn sourceModuleHasFunction(self: *const HirBuilder, mod_name: ast.ModuleName, name: ast.StringId, arity: u32) bool {
+        // Find the module in the scope graph
+        for (self.graph.modules.items) |mod_entry| {
+            if (self.moduleNamesEqual(mod_entry.name, mod_name)) {
+                const mod_scope = self.graph.getScope(mod_entry.scope_id);
+                const key = scope_mod.FamilyKey{ .name = name, .arity = arity };
+                return mod_scope.function_families.get(key) != null;
+            }
+        }
+        return false;
+    }
+
+    /// Compare two ModuleNames for equality (all parts must match).
+    fn moduleNamesEqual(_: *const HirBuilder, a: ast.ModuleName, b: ast.ModuleName) bool {
+        if (a.parts.len != b.parts.len) return false;
+        for (a.parts, b.parts) |pa, pb| {
+            if (pa != pb) return false;
+        }
+        return true;
+    }
+
     fn moduleNameToString(self: *const HirBuilder, name: ast.ModuleName) []const u8 {
         // For single-part module names like "IO", just return the part
         if (name.parts.len == 1) {
             return self.interner.get(name.parts[0]);
         }
-        // For multi-part names like "IO.File", we'd need to join — for now return first part
-        return self.interner.get(name.parts[0]);
+        // For multi-part names like "IO.File", join with "_"
+        var buf: std.ArrayList(u8) = .empty;
+        for (name.parts, 0..) |part, i| {
+            if (i > 0) buf.appendSlice(self.allocator, "_") catch return self.interner.get(name.parts[0]);
+            buf.appendSlice(self.allocator, self.interner.get(part)) catch return self.interner.get(name.parts[0]);
+        }
+        return buf.toOwnedSlice(self.allocator) catch return self.interner.get(name.parts[0]);
     }
 
     /// Recursively collect bindings from tuple sub-patterns (including nested tuples).

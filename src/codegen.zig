@@ -549,10 +549,21 @@ pub const CodeGen = struct {
                 try self.writeIndent();
                 try self.writeDestLocal(mt.dest);
                 if (is_struct_check) {
-                    // Tuple/struct type check: @typeInfo(@TypeOf(x)) == .@"struct"
-                    try self.write(" = @typeInfo(@TypeOf(");
-                    try self.writeLocal(mt.scrutinee);
-                    try self.write(")) == .@\"struct\";\n");
+                    if (mt.expected_arity) |arity| {
+                        // Tuple/struct type check with arity: check struct AND field count
+                        try self.write(" = @typeInfo(@TypeOf(");
+                        try self.writeLocal(mt.scrutinee);
+                        try self.write(")) == .@\"struct\" and @typeInfo(@TypeOf(");
+                        try self.writeLocal(mt.scrutinee);
+                        try self.write(")).@\"struct\".fields.len == ");
+                        try self.writeInt(@intCast(arity));
+                        try self.write(";\n");
+                    } else {
+                        // Tuple/struct type check without arity
+                        try self.write(" = @typeInfo(@TypeOf(");
+                        try self.writeLocal(mt.scrutinee);
+                        try self.write(")) == .@\"struct\";\n");
+                    }
                 } else {
                     try self.write(" = @TypeOf(");
                     try self.writeLocal(mt.scrutinee);

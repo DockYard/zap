@@ -227,10 +227,8 @@ pub const Collector = struct {
             },
         } else .all;
 
-        const source_module = id_decl.module_path.parts[id_decl.module_path.parts.len - 1];
-
         try self.graph.getScopeMut(parent_scope).imports.append(self.allocator, .{
-            .source_module = source_module,
+            .source_module = id_decl.module_path,
             .filter = filter,
             .imported_families = std.AutoHashMap(scope.FamilyKey, scope.FunctionFamilyId).init(self.allocator),
             .imported_types = std.AutoHashMap(ast.StringId, scope.TypeId).init(self.allocator),

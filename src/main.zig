@@ -13,13 +13,14 @@ pub fn main() !void {
 
     if (args.len < 2) {
         const stderr = std.fs.File.stderr().deprecatedWriter();
-        try stderr.print("Usage: zap [--emit-zig] [--lib] <file.zap> [zig-flags...]\n", .{});
+        try stderr.print("Usage: zap [--emit-zig] [--lib] [--strict-types] <file.zap> [zig-flags...]\n", .{});
         std.process.exit(1);
     }
 
     // Separate zap flags, the .zap file, and zig flags
     var emit_zig = false;
     var lib_mode = false;
+    var strict_types = false;
     var file_path: ?[]const u8 = null;
     var zig_flags: std.ArrayListUnmanaged([]const u8) = .empty;
     defer zig_flags.deinit(allocator);
@@ -29,6 +30,8 @@ pub fn main() !void {
             emit_zig = true;
         } else if (std.mem.eql(u8, arg, "--lib")) {
             lib_mode = true;
+        } else if (std.mem.eql(u8, arg, "--strict-types")) {
+            strict_types = true;
         } else if (file_path == null and std.mem.endsWith(u8, arg, ".zap")) {
             file_path = arg;
         } else {
@@ -53,6 +56,10 @@ pub fn main() !void {
         std.process.exit(1);
     };
 
+    // Create shared DiagnosticEngine
+    var diag_engine = zap.DiagnosticEngine.init(alloc);
+    defer diag_engine.deinit();
+
     // Phase 1: Parse (with stdlib prepended)
     const full_source = zap.stdlib.prependStdlib(alloc, source) catch {
         const stderr = std.fs.File.stderr().deprecatedWriter();
@@ -60,75 +67,118 @@ pub fn main() !void {
         std.process.exit(1);
     };
 
+    diag_engine.setSource(full_source, path);
+
     var parser = zap.Parser.init(alloc, full_source);
     defer parser.deinit();
 
     const program = parser.parseProgram() catch {
-        const stderr = std.fs.File.stderr().deprecatedWriter();
-        for (parser.errors.items) |err| {
-            try stderr.print("{s}:{d}:{d}: error: {s}\n", .{
-                path,
-                err.span.line,
-                err.span.start,
-                err.message,
-            });
+        // Drain parser errors into DiagnosticEngine
+        for (parser.errors.items) |parse_err| {
+            diag_engine.err(parse_err.message, parse_err.span) catch {};
         }
+        try emitDiagnostics(&diag_engine, alloc);
         std.process.exit(1);
     };
+
+    // Drain any parser errors (even on success, there may be warnings)
+    for (parser.errors.items) |parse_err| {
+        try diag_engine.err(parse_err.message, parse_err.span);
+    }
+    if (diag_engine.hasErrors()) {
+        try emitDiagnostics(&diag_engine, alloc);
+        std.process.exit(1);
+    }
 
     // Phase 2: Collect declarations
     var collector = zap.Collector.init(alloc, &parser.interner);
     defer collector.deinit();
     collector.collectProgram(&program) catch {
-        const stderr = std.fs.File.stderr().deprecatedWriter();
-        try stderr.print("Error during declaration collection\n", .{});
+        for (collector.errors.items) |collect_err| {
+            diag_engine.err(collect_err.message, collect_err.span) catch {};
+        }
+        try emitDiagnostics(&diag_engine, alloc);
         std.process.exit(1);
     };
+
+    // Drain collector errors
+    for (collector.errors.items) |collect_err| {
+        try diag_engine.err(collect_err.message, collect_err.span);
+    }
+    if (diag_engine.hasErrors()) {
+        try emitDiagnostics(&diag_engine, alloc);
+        std.process.exit(1);
+    }
 
     // Phase 3: Macro expansion
     var macro_engine = zap.MacroEngine.init(alloc, &parser.interner, &collector.graph);
     defer macro_engine.deinit();
     const expanded_program = macro_engine.expandProgram(&program) catch {
-        const stderr = std.fs.File.stderr().deprecatedWriter();
-        try stderr.print("Error during macro expansion\n", .{});
+        for (macro_engine.errors.items) |macro_err| {
+            diag_engine.err(macro_err.message, macro_err.span) catch {};
+        }
+        try emitDiagnostics(&diag_engine, alloc);
         std.process.exit(1);
     };
 
-    if (macro_engine.errors.items.len > 0) {
-        const stderr = std.fs.File.stderr().deprecatedWriter();
-        for (macro_engine.errors.items) |err| {
-            try stderr.print("{s}:{d}: error: {s}\n", .{ path, err.span.line, err.message });
-        }
+    // Drain macro errors
+    for (macro_engine.errors.items) |macro_err| {
+        try diag_engine.err(macro_err.message, macro_err.span);
+    }
+    if (diag_engine.hasErrors()) {
+        try emitDiagnostics(&diag_engine, alloc);
         std.process.exit(1);
     }
 
     // Phase 4: Desugaring
     var desugarer = zap.Desugarer.init(alloc, &parser.interner);
     const desugared_program = desugarer.desugarProgram(&expanded_program) catch {
-        const stderr = std.fs.File.stderr().deprecatedWriter();
-        try stderr.print("Error during desugaring\n", .{});
+        try diag_engine.err("Error during desugaring", .{ .start = 0, .end = 0 });
+        try emitDiagnostics(&diag_engine, alloc);
         std.process.exit(1);
     };
 
     // Phase 5: Type checking
-    var type_store = zap.types.TypeStore.init(alloc, &parser.interner);
-    defer type_store.deinit();
+    var type_checker = zap.types.TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    defer type_checker.deinit();
+    type_checker.checkProgram(&desugared_program) catch {};
+
+    // Drain type checker errors as warnings (or errors if --strict-types)
+    const type_severity: zap.Severity = if (strict_types) .@"error" else .warning;
+    for (type_checker.errors.items) |type_err| {
+        try diag_engine.report(type_severity, type_err.message, type_err.span);
+    }
+    if (diag_engine.hasErrors()) {
+        try emitDiagnostics(&diag_engine, alloc);
+        std.process.exit(1);
+    }
 
     // Phase 6: HIR lowering
-    var hir_builder = zap.hir.HirBuilder.init(alloc, &parser.interner, &collector.graph, &type_store);
+    var hir_builder = zap.hir.HirBuilder.init(alloc, &parser.interner, &collector.graph, &type_checker.store);
     defer hir_builder.deinit();
     const hir_program = hir_builder.buildProgram(&desugared_program) catch {
-        const stderr = std.fs.File.stderr().deprecatedWriter();
-        try stderr.print("Error during HIR lowering\n", .{});
+        for (hir_builder.errors.items) |hir_err| {
+            diag_engine.err(hir_err.message, hir_err.span) catch {};
+        }
+        try emitDiagnostics(&diag_engine, alloc);
         std.process.exit(1);
     };
+
+    // Drain HIR errors
+    for (hir_builder.errors.items) |hir_err| {
+        try diag_engine.err(hir_err.message, hir_err.span);
+    }
+    if (diag_engine.hasErrors()) {
+        try emitDiagnostics(&diag_engine, alloc);
+        std.process.exit(1);
+    }
 
     // Phase 7: IR lowering
     var ir_builder = zap.ir.IrBuilder.init(alloc, &parser.interner);
     defer ir_builder.deinit();
     const ir_program = ir_builder.buildProgram(&hir_program) catch {
-        const stderr = std.fs.File.stderr().deprecatedWriter();
-        try stderr.print("Error during IR lowering\n", .{});
+        try diag_engine.err("Error during IR lowering", .{ .start = 0, .end = 0 });
+        try emitDiagnostics(&diag_engine, alloc);
         std.process.exit(1);
     };
 
@@ -137,10 +187,15 @@ pub fn main() !void {
     defer codegen.deinit();
     codegen.lib_mode = lib_mode;
     codegen.emitProgram(&ir_program) catch {
-        const stderr = std.fs.File.stderr().deprecatedWriter();
-        try stderr.print("Error during code generation\n", .{});
+        try diag_engine.err("Error during code generation", .{ .start = 0, .end = 0 });
+        try emitDiagnostics(&diag_engine, alloc);
         std.process.exit(1);
     };
+
+    // Emit any accumulated warnings before proceeding
+    if (diag_engine.warningCount() > 0) {
+        try emitDiagnostics(&diag_engine, alloc);
+    }
 
     const output = codegen.getOutput();
 
@@ -158,6 +213,12 @@ pub fn main() !void {
             std.process.exit(exit_code);
         }
     }
+}
+
+fn emitDiagnostics(diag_engine: *const zap.DiagnosticEngine, alloc: std.mem.Allocator) !void {
+    const output = try diag_engine.format(alloc);
+    const stderr = std.fs.File.stderr().deprecatedWriter();
+    try stderr.print("{s}", .{output});
 }
 
 /// Write file only if content differs from what's on disk.

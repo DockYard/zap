@@ -249,18 +249,21 @@ pub const TypeChecker = struct {
     allocator: std.mem.Allocator,
     store: TypeStore,
     interner: *const ast.StringInterner,
-    graph: *const scope_mod.ScopeGraph,
+    graph: *scope_mod.ScopeGraph,
     errors: std.ArrayList(Error),
 
     // Expression type mapping
     expr_types: std.AutoHashMap(usize, TypeId),
+
+    // Current scope tracking for var_ref resolution
+    current_scope: ?scope_mod.ScopeId,
 
     pub const Error = struct {
         message: []const u8,
         span: ast.SourceSpan,
     };
 
-    pub fn init(allocator: std.mem.Allocator, interner: *const ast.StringInterner, graph: *const scope_mod.ScopeGraph) TypeChecker {
+    pub fn init(allocator: std.mem.Allocator, interner: *const ast.StringInterner, graph: *scope_mod.ScopeGraph) TypeChecker {
         return .{
             .allocator = allocator,
             .store = TypeStore.init(allocator, interner),
@@ -268,6 +271,7 @@ pub const TypeChecker = struct {
             .graph = graph,
             .errors = .empty,
             .expr_types = std.AutoHashMap(usize, TypeId).init(allocator),
+            .current_scope = null,
         };
     }
 
@@ -279,6 +283,36 @@ pub const TypeChecker = struct {
 
     fn addError(self: *TypeChecker, message: []const u8, span: ast.SourceSpan) !void {
         try self.errors.append(self.allocator, .{ .message = message, .span = span });
+    }
+
+    fn addFormattedError(self: *TypeChecker, span: ast.SourceSpan, comptime fmt: []const u8, args: anytype) !void {
+        const msg = try std.fmt.allocPrint(self.allocator, fmt, args);
+        try self.addError(msg, span);
+    }
+
+    /// Convert a TypeId to a human-readable string
+    pub fn typeToString(_: *const TypeChecker, type_id: TypeId) []const u8 {
+        if (type_id == TypeStore.BOOL) return "Bool";
+        if (type_id == TypeStore.STRING) return "String";
+        if (type_id == TypeStore.ATOM) return "Atom";
+        if (type_id == TypeStore.NIL) return "Nil";
+        if (type_id == TypeStore.NEVER) return "Never";
+        if (type_id == TypeStore.I64) return "i64";
+        if (type_id == TypeStore.I32) return "i32";
+        if (type_id == TypeStore.I16) return "i16";
+        if (type_id == TypeStore.I8) return "i8";
+        if (type_id == TypeStore.U64) return "u64";
+        if (type_id == TypeStore.U32) return "u32";
+        if (type_id == TypeStore.U16) return "u16";
+        if (type_id == TypeStore.U8) return "u8";
+        if (type_id == TypeStore.F64) return "f64";
+        if (type_id == TypeStore.F32) return "f32";
+        if (type_id == TypeStore.F16) return "f16";
+        if (type_id == TypeStore.USIZE) return "usize";
+        if (type_id == TypeStore.ISIZE) return "isize";
+        if (type_id == TypeStore.UNKNOWN) return "{unknown}";
+        if (type_id == TypeStore.ERROR) return "{error}";
+        return "{type}";
     }
 
     // ============================================================
@@ -295,6 +329,10 @@ pub const TypeChecker = struct {
     }
 
     fn checkModule(self: *TypeChecker, mod: *const ast.ModuleDecl) !void {
+        const prev_scope = self.current_scope;
+        self.current_scope = mod.meta.scope_id;
+        defer self.current_scope = prev_scope;
+
         for (mod.items) |item| {
             switch (item) {
                 .function => |func| try self.checkFunctionDecl(func),
@@ -326,10 +364,23 @@ pub const TypeChecker = struct {
     }
 
     fn checkFunctionClause(self: *TypeChecker, clause: *const ast.FunctionClause) !void {
-        // Resolve parameter types
+        const prev_scope = self.current_scope;
+        self.current_scope = clause.meta.scope_id;
+        defer self.current_scope = prev_scope;
+
+        // Resolve parameter types and populate bindings
         for (clause.params) |param| {
             if (param.type_annotation) |ta| {
-                _ = try self.resolveTypeExpr(ta);
+                const param_type = try self.resolveTypeExpr(ta);
+                // Store type on the binding in scope graph if this is a bind pattern
+                if (param.pattern.* == .bind) {
+                    const bind_name = param.pattern.bind.name;
+                    if (self.current_scope) |scope_id| {
+                        if (self.graph.resolveBinding(scope_id, bind_name)) |bid| {
+                            self.graph.bindings.items[bid].type_id = param_type;
+                        }
+                    }
+                }
             }
         }
 
@@ -356,8 +407,9 @@ pub const TypeChecker = struct {
         // Verify return type matches
         if (declared_return != TypeStore.UNKNOWN and body_type != TypeStore.UNKNOWN) {
             if (!self.store.typeEquals(body_type, declared_return)) {
-                // Type mismatch — for now, just record it
-                // Full error reporting needs source span info
+                const expected = self.typeToString(declared_return);
+                const got = self.typeToString(body_type);
+                try self.addFormattedError(clause.meta.span, "expected {s}, got {s}", .{ expected, got });
             }
         }
     }
@@ -369,7 +421,19 @@ pub const TypeChecker = struct {
     fn checkStmt(self: *TypeChecker, stmt: ast.Stmt) anyerror!TypeId {
         return switch (stmt) {
             .expr => |expr| self.inferExpr(expr),
-            .assignment => |assign| self.inferExpr(assign.value),
+            .assignment => |assign| {
+                const value_type = try self.inferExpr(assign.value);
+                // Store type on the target binding if it's a bind pattern
+                if (assign.pattern.* == .bind) {
+                    const bind_name = assign.pattern.bind.name;
+                    if (self.current_scope) |scope_id| {
+                        if (self.graph.resolveBinding(scope_id, bind_name)) |bid| {
+                            self.graph.bindings.items[bid].type_id = value_type;
+                        }
+                    }
+                }
+                return value_type;
+            },
             .function_decl => |func| {
                 try self.checkFunctionDecl(func);
                 return TypeStore.NIL;
@@ -394,7 +458,18 @@ pub const TypeChecker = struct {
             .atom_literal => TypeStore.ATOM,
             .bool_literal => TypeStore.BOOL,
             .nil_literal => TypeStore.NIL,
-            .var_ref => TypeStore.UNKNOWN, // Type resolved from scope binding later
+            .var_ref => |vr| {
+                // Resolve type from scope binding
+                if (self.current_scope) |scope_id| {
+                    if (self.graph.resolveBinding(scope_id, vr.name)) |bid| {
+                        const binding = self.graph.bindings.items[bid];
+                        if (binding.type_id) |tid| {
+                            return tid;
+                        }
+                    }
+                }
+                return TypeStore.UNKNOWN;
+            },
 
             .binary_op => |bo| self.inferBinaryOp(&bo),
             .unary_op => |uo| self.inferUnaryOp(&uo),
@@ -418,6 +493,8 @@ pub const TypeChecker = struct {
                 });
             },
 
+            // if_expr, with_expr, cond_expr, pipe are desugared to case_expr
+            // before the TypeChecker runs. If we see them, return UNKNOWN.
             .if_expr => |ie| {
                 const cond_type = try self.inferExpr(ie.condition);
                 if (cond_type != TypeStore.BOOL and cond_type != TypeStore.UNKNOWN) {
@@ -432,7 +509,6 @@ pub const TypeChecker = struct {
                     for (else_block) |stmt| {
                         else_type = try self.checkStmt(stmt);
                     }
-                    // Return type is union of both branches
                     if (self.store.typeEquals(then_type, else_type)) return then_type;
                     return TypeStore.UNKNOWN;
                 }
@@ -462,18 +538,38 @@ pub const TypeChecker = struct {
                 return result_type;
             },
 
+            .field_access => |fa| {
+                // Infer object type; for known struct types, could look up field type
+                const obj_type = try self.inferExpr(fa.object);
+                if (obj_type != TypeStore.UNKNOWN) {
+                    const t = self.store.getType(obj_type);
+                    if (t == .struct_type) {
+                        // Look up the field's type in the struct definition
+                        for (t.struct_type.fields) |field| {
+                            if (field.name == fa.field) return field.type_id;
+                        }
+                    }
+                }
+                return TypeStore.UNKNOWN;
+            },
+            .map => |m| {
+                // Infer key/value types from first entry
+                if (m.fields.len > 0) {
+                    _ = try self.inferExpr(m.fields[0].key);
+                    _ = try self.inferExpr(m.fields[0].value);
+                }
+                return TypeStore.UNKNOWN;
+            },
+            .struct_expr => TypeStore.UNKNOWN,
             .panic_expr => TypeStore.NEVER,
             .unwrap => TypeStore.UNKNOWN,
-            .pipe => TypeStore.UNKNOWN,
-            .field_access => TypeStore.UNKNOWN,
-            .map => TypeStore.UNKNOWN,
-            .struct_expr => TypeStore.UNKNOWN,
+            .pipe => TypeStore.UNKNOWN, // desugared before type checking
             .module_ref => TypeStore.UNKNOWN,
             .string_interpolation => TypeStore.STRING,
             .quote_expr => TypeStore.UNKNOWN,
             .unquote_expr => TypeStore.UNKNOWN,
-            .with_expr => TypeStore.UNKNOWN,
-            .cond_expr => TypeStore.UNKNOWN,
+            .with_expr => TypeStore.UNKNOWN, // desugared before type checking
+            .cond_expr => TypeStore.UNKNOWN, // desugared before type checking
             .intrinsic => TypeStore.UNKNOWN,
         };
     }
@@ -723,4 +819,139 @@ test "type check case expression" {
     try checker.checkProgram(&program);
 
     try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+}
+
+test "type check arithmetic mismatch reported" {
+    // String + i64 should produce a type error
+    const source =
+        \\def bad() do
+        \\  "hello" + 42
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    try std.testing.expect(checker.errors.items.len > 0);
+    // Should report arithmetic type mismatch
+    const err_msg = checker.errors.items[0].message;
+    try std.testing.expect(std.mem.indexOf(u8, err_msg, "arithmetic") != null);
+}
+
+test "typeToString returns human-readable names" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var graph = scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    var checker = TypeChecker.init(std.testing.allocator, &interner, &graph);
+    defer checker.deinit();
+
+    try std.testing.expectEqualStrings("i64", checker.typeToString(TypeStore.I64));
+    try std.testing.expectEqualStrings("Bool", checker.typeToString(TypeStore.BOOL));
+    try std.testing.expectEqualStrings("String", checker.typeToString(TypeStore.STRING));
+    try std.testing.expectEqualStrings("{unknown}", checker.typeToString(TypeStore.UNKNOWN));
+    try std.testing.expectEqualStrings("f64", checker.typeToString(TypeStore.F64));
+}
+
+test "type check var_ref resolves to parameter type" {
+    // x is declared as i64, so x + 1 should not error (both i64)
+    const source =
+        \\def double(x :: i64) :: i64 do
+        \\  x + x
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    // Should have no errors — x resolves to i64 from param type
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+}
+
+test "type check if condition must be Bool" {
+    // Using an integer as if condition should produce an error
+    const source =
+        \\def bad() do
+        \\  if 42 do
+        \\    1
+        \\  end
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    try std.testing.expect(checker.errors.items.len > 0);
+    const err_msg = checker.errors.items[0].message;
+    try std.testing.expect(std.mem.indexOf(u8, err_msg, "if condition must be Bool") != null);
+}
+
+test "type check return type mismatch" {
+    // Function declares i64 return but body returns a string
+    const source =
+        \\def bad() :: i64 do
+        \\  "not a number"
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    try std.testing.expect(checker.errors.items.len > 0);
+    const err_msg = checker.errors.items[0].message;
+    try std.testing.expect(std.mem.indexOf(u8, err_msg, "expected i64") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err_msg, "got String") != null);
 }

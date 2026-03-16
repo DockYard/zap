@@ -5,6 +5,7 @@ pub const Lexer = struct {
     source: []const u8,
     pos: u32,
     line: u32,
+    line_start: u32,
 
     // Indentation tracking — simple fixed-size stack
     indent_levels: [256]u32,
@@ -21,6 +22,7 @@ pub const Lexer = struct {
             .source = source,
             .pos = 0,
             .line = 1,
+            .line_start = 0,
             .indent_levels = undefined,
             .indent_depth = 1,
             .pending_dedents = 0,
@@ -70,6 +72,7 @@ pub const Lexer = struct {
                 if (self.pos < self.source.len and self.source[self.pos] == '\n') {
                     self.pos += 1;
                     self.line += 1;
+                    self.line_start = self.pos;
                     self.at_line_start = true;
                     return self.next();
                 }
@@ -84,6 +87,7 @@ pub const Lexer = struct {
                 if (self.pos < self.source.len and self.source[self.pos] == '\n') {
                     self.pos += 1;
                     self.line += 1;
+                    self.line_start = self.pos;
                     self.at_line_start = true;
                 }
                 return self.next();
@@ -123,6 +127,7 @@ pub const Lexer = struct {
             const start = self.pos;
             self.pos += 1;
             self.line += 1;
+            self.line_start = self.pos;
             self.at_line_start = true;
             return self.makeToken(.newline, start, self.pos);
         }
@@ -236,6 +241,7 @@ pub const Lexer = struct {
             }
             if (ch == '\n') {
                 self.line += 1;
+                self.line_start = self.pos + 1;
             }
             self.pos += 1;
         }
@@ -398,7 +404,7 @@ pub const Lexer = struct {
     fn makeToken(self: *Lexer, tag: Token.Tag, start: u32, end: u32) Token {
         return .{
             .tag = tag,
-            .loc = .{ .start = start, .end = end, .line = self.line },
+            .loc = .{ .start = start, .end = end, .line = self.line, .col = start -| self.line_start + 1 },
         };
     }
 
@@ -610,4 +616,57 @@ test "lex pipe and percent" {
     try std.testing.expectEqual(Token.Tag.pipe, lexer.next().tag);
     try std.testing.expectEqual(Token.Tag.percent, lexer.next().tag);
     try std.testing.expectEqual(Token.Tag.percent_brace, lexer.next().tag);
+}
+
+test "lex column tracking on single line" {
+    const source = "def foo do";
+    var lexer = Lexer.init(source);
+
+    const t1 = lexer.next(); // def at col 1
+    try std.testing.expectEqual(Token.Tag.keyword_def, t1.tag);
+    try std.testing.expectEqual(@as(u32, 1), t1.loc.col);
+
+    const t2 = lexer.next(); // foo at col 5
+    try std.testing.expectEqual(Token.Tag.identifier, t2.tag);
+    try std.testing.expectEqual(@as(u32, 5), t2.loc.col);
+
+    const t3 = lexer.next(); // do at col 9
+    try std.testing.expectEqual(Token.Tag.keyword_do, t3.tag);
+    try std.testing.expectEqual(@as(u32, 9), t3.loc.col);
+}
+
+test "lex column tracking across lines" {
+    const source = "foo\nbar baz";
+    var lexer = Lexer.init(source);
+
+    const t1 = lexer.next(); // foo at line 1, col 1
+    try std.testing.expectEqual(Token.Tag.identifier, t1.tag);
+    try std.testing.expectEqual(@as(u32, 1), t1.loc.line);
+    try std.testing.expectEqual(@as(u32, 1), t1.loc.col);
+
+    _ = lexer.next(); // newline
+
+    const t3 = lexer.next(); // bar at line 2, col 1
+    try std.testing.expectEqual(Token.Tag.identifier, t3.tag);
+    try std.testing.expectEqual(@as(u32, 2), t3.loc.line);
+    try std.testing.expectEqual(@as(u32, 1), t3.loc.col);
+
+    const t4 = lexer.next(); // baz at line 2, col 5
+    try std.testing.expectEqual(Token.Tag.identifier, t4.tag);
+    try std.testing.expectEqual(@as(u32, 2), t4.loc.line);
+    try std.testing.expectEqual(@as(u32, 5), t4.loc.col);
+}
+
+test "lex column tracking with operators" {
+    const source = "x + y";
+    var lexer = Lexer.init(source);
+
+    const t1 = lexer.next(); // x at col 1
+    try std.testing.expectEqual(@as(u32, 1), t1.loc.col);
+
+    const t2 = lexer.next(); // + at col 3
+    try std.testing.expectEqual(@as(u32, 3), t2.loc.col);
+
+    const t3 = lexer.next(); // y at col 5
+    try std.testing.expectEqual(@as(u32, 5), t3.loc.col);
 }

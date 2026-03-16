@@ -394,6 +394,7 @@ pub const MatchType = struct {
     scrutinee: LocalId,
     expected_type: ZigType,
     skip_type_check: bool = false,
+    expected_arity: ?u32 = null,
 };
 
 pub const MatchFail = struct {
@@ -510,6 +511,8 @@ pub const IrBuilder = struct {
     current_instrs: std.ArrayList(Instruction),
     interner: *const ast.StringInterner,
     known_local_types: std.AutoHashMap(LocalId, ZigType),
+    current_module_prefix: ?[]const u8,
+    known_function_names: std.StringHashMap(void),
 
     pub fn init(allocator: std.mem.Allocator, interner: *const ast.StringInterner) IrBuilder {
         return .{
@@ -522,6 +525,8 @@ pub const IrBuilder = struct {
             .current_instrs = .empty,
             .interner = interner,
             .known_local_types = std.AutoHashMap(LocalId, ZigType).init(allocator),
+            .current_module_prefix = null,
+            .known_function_names = std.StringHashMap(void).init(allocator),
         };
     }
 
@@ -530,14 +535,33 @@ pub const IrBuilder = struct {
         self.current_blocks.deinit(self.allocator);
         self.current_instrs.deinit(self.allocator);
         self.known_local_types.deinit();
+        self.known_function_names.deinit();
     }
 
     pub fn buildProgram(self: *IrBuilder, hir_program: *const hir_mod.Program) !Program {
+        // First pass: register all qualified function names for bare call resolution
         for (hir_program.modules) |mod| {
+            const module_prefix = self.moduleNameToPrefix(mod.name);
+            for (mod.functions) |func_group| {
+                const func_name = self.interner.get(func_group.name);
+                const qualified = try std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ module_prefix, func_name });
+                try self.known_function_names.put(qualified, {});
+            }
+        }
+        for (hir_program.top_functions) |func_group| {
+            const func_name = self.interner.get(func_group.name);
+            try self.known_function_names.put(func_name, {});
+        }
+
+        // Second pass: build function bodies
+        for (hir_program.modules) |mod| {
+            const module_prefix = self.moduleNameToPrefix(mod.name);
+            self.current_module_prefix = module_prefix;
             for (mod.functions) |func_group| {
                 try self.buildFunctionGroup(&func_group);
             }
         }
+        self.current_module_prefix = null;
         for (hir_program.top_functions) |func_group| {
             try self.buildFunctionGroup(&func_group);
         }
@@ -713,10 +737,14 @@ pub const IrBuilder = struct {
             .instructions = try self.current_instrs.toOwnedSlice(self.allocator),
         };
 
-        const name_str = if (group.name < self.interner.strings.items.len)
+        const raw_name = if (group.name < self.interner.strings.items.len)
             self.interner.get(group.name)
         else
             "anonymous";
+        const name_str = if (self.current_module_prefix) |prefix|
+            try std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ prefix, raw_name })
+        else
+            raw_name;
 
         // If the body result is optional (e.g., if/else with a nil branch),
         // promote the function return type to optional.
@@ -1176,7 +1204,7 @@ pub const IrBuilder = struct {
                 const type_check_local = self.next_local;
                 self.next_local += 1;
                 try self.current_instrs.append(self.allocator, .{
-                    .match_type = .{ .dest = type_check_local, .scrutinee = scrutinee_local, .expected_type = .{ .tuple = &.{} } },
+                    .match_type = .{ .dest = type_check_local, .scrutinee = scrutinee_local, .expected_type = .{ .tuple = &.{} }, .expected_arity = ct.expected_arity },
                 });
                 const saved = self.current_instrs;
                 self.current_instrs = .empty;
@@ -1304,7 +1332,7 @@ pub const IrBuilder = struct {
                 const type_check_local = self.next_local;
                 self.next_local += 1;
                 try self.current_instrs.append(self.allocator, .{
-                    .match_type = .{ .dest = type_check_local, .scrutinee = scrutinee_local, .expected_type = .{ .tuple = &.{} } },
+                    .match_type = .{ .dest = type_check_local, .scrutinee = scrutinee_local, .expected_type = .{ .tuple = &.{} }, .expected_arity = ct.expected_arity },
                 });
                 const saved = self.current_instrs;
                 self.current_instrs = .empty;
@@ -1522,9 +1550,13 @@ pub const IrBuilder = struct {
                             .call_direct = .{ .dest = dest, .function = dc.function_group_id, .args = try args.toOwnedSlice(self.allocator) },
                         });
                     },
-                    .named => |name| {
+                    .named => |nc| {
+                        const resolved_name = if (nc.module) |mod|
+                            try std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ mod, nc.name })
+                        else
+                            try self.resolveBareCall(nc.name);
                         try self.current_instrs.append(self.allocator, .{
-                            .call_named = .{ .dest = dest, .name = name, .args = try args.toOwnedSlice(self.allocator) },
+                            .call_named = .{ .dest = dest, .name = resolved_name, .args = try args.toOwnedSlice(self.allocator) },
                         });
                     },
                     .closure => |callee| {
@@ -1629,6 +1661,39 @@ pub const IrBuilder = struct {
         }
 
         return dest;
+    }
+
+    /// Resolve a bare function call to a qualified name.
+    /// Resolution order: current module → Kernel → top-level → bare name.
+    fn resolveBareCall(self: *IrBuilder, name: []const u8) ![]const u8 {
+        // 1. Current module function
+        if (self.current_module_prefix) |prefix| {
+            const qualified = try std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ prefix, name });
+            if (self.known_function_names.contains(qualified)) return qualified;
+        }
+        // 2. Kernel auto-import
+        {
+            const kernel_name = try std.fmt.allocPrint(self.allocator, "Kernel__{s}", .{name});
+            if (self.known_function_names.contains(kernel_name)) return kernel_name;
+        }
+        // 3. Top-level function (bare name)
+        if (self.known_function_names.contains(name)) return name;
+        // 4. Keep bare name — Zig compiler will error
+        return name;
+    }
+
+    /// Convert an ast.ModuleName to a prefix string for function naming.
+    /// Single-part: "IO". Multi-part: "IO_File".
+    fn moduleNameToPrefix(self: *IrBuilder, name: ast.ModuleName) []const u8 {
+        if (name.parts.len == 1) {
+            return self.interner.get(name.parts[0]);
+        }
+        var buf: std.ArrayList(u8) = .empty;
+        for (name.parts, 0..) |part, i| {
+            if (i > 0) buf.appendSlice(self.allocator, "_") catch return self.interner.get(name.parts[0]);
+            buf.appendSlice(self.allocator, self.interner.get(part)) catch return self.interner.get(name.parts[0]);
+        }
+        return buf.toOwnedSlice(self.allocator) catch return self.interner.get(name.parts[0]);
     }
 
     fn allocSlice(self: *IrBuilder, comptime T: type, items: []const T) ![]const T {

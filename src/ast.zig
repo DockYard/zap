@@ -9,9 +9,10 @@ pub const SourceSpan = struct {
     start: u32,
     end: u32,
     line: u32 = 0,
+    col: u32 = 0,
 
     pub fn from(loc: Token.Location) SourceSpan {
-        return .{ .start = loc.start, .end = loc.end, .line = loc.line };
+        return .{ .start = loc.start, .end = loc.end, .line = loc.line, .col = loc.col };
     }
 
     pub fn merge(a: SourceSpan, b: SourceSpan) SourceSpan {
@@ -19,6 +20,7 @@ pub const SourceSpan = struct {
             .start = @min(a.start, b.start),
             .end = @max(a.end, b.end),
             .line = a.line,
+            .col = a.col,
         };
     }
 };

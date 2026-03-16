@@ -6,7 +6,7 @@ const std = @import("std");
 
 pub const lib_io =
     \\defmodule IO do
-    \\  def puts(message :: String) do
+    \\  def puts(message) do
     \\    :zig.println(message)
     \\  end
     \\end

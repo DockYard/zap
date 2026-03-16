@@ -13,7 +13,9 @@ pub const hir = @import("hir.zig");
 pub const ir = @import("ir.zig");
 pub const CodeGen = @import("codegen.zig").CodeGen;
 pub const runtime = @import("runtime.zig");
-pub const DiagnosticEngine = @import("diagnostics.zig").DiagnosticEngine;
+pub const diagnostics = @import("diagnostics.zig");
+pub const DiagnosticEngine = diagnostics.DiagnosticEngine;
+pub const Severity = diagnostics.Severity;
 pub const stdlib = @import("stdlib.zig");
 
 test {

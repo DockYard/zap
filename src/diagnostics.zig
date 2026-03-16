@@ -173,7 +173,7 @@ pub const DiagnosticEngine = struct {
                 try writer.print("{s}:", .{fp});
             }
             if (diag.span.line > 0) {
-                try writer.print("{d}:{d}: ", .{ diag.span.line, diag.span.start });
+                try writer.print("{d}:{d}: ", .{ diag.span.line, diag.span.col });
             }
 
             // Severity and message
@@ -194,7 +194,7 @@ pub const DiagnosticEngine = struct {
                     if (self.file_path) |fp| {
                         try writer.print("{s}:", .{fp});
                     }
-                    try writer.print("{d}:{d}: ", .{ s.line, s.start });
+                    try writer.print("{d}:{d}: ", .{ s.line, s.col });
                 }
                 try writer.print("note: {s}\n", .{note.message});
             }

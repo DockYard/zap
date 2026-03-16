@@ -92,8 +92,6 @@ work is an error. Combine them.
   present in prior output.
 - Prefer `cog_code_query` over raw file reads for architectural questions.
 - Budget: 2-3 code-intelligence calls before responding.
-- Do not call `cog_mem_recall` for pure codebase summarization or
-  architecture description unless memory is specifically needed.
 
 ## Debugging
 

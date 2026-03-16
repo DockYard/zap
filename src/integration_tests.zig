@@ -7,6 +7,7 @@ const types_mod = @import("types.zig");
 const hir_mod = @import("hir.zig");
 const ir = @import("ir.zig");
 const CodeGen = @import("codegen.zig").CodeGen;
+const DiagnosticEngine = @import("diagnostics.zig").DiagnosticEngine;
 pub const stdlib = @import("stdlib.zig");
 
 // ============================================================
@@ -16,15 +17,39 @@ pub const stdlib = @import("stdlib.zig");
 // and asserts on the generated Zig output.
 // ============================================================
 
+const CompileResult = struct {
+    output: []const u8,
+    diag_output: []const u8,
+};
+
 /// Run the full compiler pipeline on source, return generated Zig.
 fn compile(alloc: std.mem.Allocator, source: []const u8) ![]const u8 {
+    const result = try compileWithDiagnostics(alloc, source, false);
+    return result.output;
+}
+
+/// Run the full compiler pipeline with diagnostics support.
+fn compileWithDiagnostics(alloc: std.mem.Allocator, source: []const u8, strict_types: bool) !CompileResult {
     const full_source = try stdlib.prependStdlib(alloc, source);
+
+    // Create shared DiagnosticEngine
+    var diag_engine = DiagnosticEngine.init(alloc);
+    defer diag_engine.deinit();
+    diag_engine.setSource(full_source, "test.zap");
 
     var parser = Parser.init(alloc, full_source);
     defer parser.deinit();
-    const program = try parser.parseProgram();
+    const program = parser.parseProgram() catch {
+        for (parser.errors.items) |parse_err| {
+            diag_engine.err(parse_err.message, parse_err.span) catch {};
+        }
+        return error.ParseError;
+    };
 
     if (parser.errors.items.len > 0) {
+        for (parser.errors.items) |parse_err| {
+            try diag_engine.err(parse_err.message, parse_err.span);
+        }
         return error.ParseError;
     }
 
@@ -32,21 +57,48 @@ fn compile(alloc: std.mem.Allocator, source: []const u8) ![]const u8 {
     defer collector.deinit();
     try collector.collectProgram(&program);
 
+    // Drain collector errors
+    for (collector.errors.items) |collect_err| {
+        try diag_engine.err(collect_err.message, collect_err.span);
+    }
+    if (diag_engine.hasErrors()) return error.CollectError;
+
     // Macro expansion (between collection and HIR lowering)
     var macro_engine = MacroEngine.init(alloc, &parser.interner, &collector.graph);
     defer macro_engine.deinit();
     const expanded_program = try macro_engine.expandProgram(&program);
 
+    // Drain macro errors
+    for (macro_engine.errors.items) |macro_err| {
+        try diag_engine.err(macro_err.message, macro_err.span);
+    }
+    if (diag_engine.hasErrors()) return error.MacroError;
+
     // Desugaring (after macro expansion, before HIR)
     var desugarer = Desugarer.init(alloc, &parser.interner);
     const desugared_program = try desugarer.desugarProgram(&expanded_program);
 
-    var type_store = types_mod.TypeStore.init(alloc, &parser.interner);
-    defer type_store.deinit();
+    // Type checking (on desugared AST)
+    var type_checker = types_mod.TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    defer type_checker.deinit();
+    type_checker.checkProgram(&desugared_program) catch {};
 
-    var hir_builder = hir_mod.HirBuilder.init(alloc, &parser.interner, &collector.graph, &type_store);
+    // Drain type checker errors as warnings (or errors if strict)
+    const type_severity: @import("diagnostics.zig").Severity = if (strict_types) .@"error" else .warning;
+    for (type_checker.errors.items) |type_err| {
+        try diag_engine.report(type_severity, type_err.message, type_err.span);
+    }
+    if (diag_engine.hasErrors()) return error.TypeError;
+
+    var hir_builder = hir_mod.HirBuilder.init(alloc, &parser.interner, &collector.graph, &type_checker.store);
     defer hir_builder.deinit();
     const hir_program = try hir_builder.buildProgram(&desugared_program);
+
+    // Drain HIR errors
+    for (hir_builder.errors.items) |hir_err| {
+        try diag_engine.err(hir_err.message, hir_err.span);
+    }
+    if (diag_engine.hasErrors()) return error.HirError;
 
     var ir_builder = ir.IrBuilder.init(alloc, &parser.interner);
     defer ir_builder.deinit();
@@ -56,7 +108,12 @@ fn compile(alloc: std.mem.Allocator, source: []const u8) ![]const u8 {
     defer codegen.deinit();
     try codegen.emitProgram(&ir_program);
 
-    return alloc.dupe(u8, codegen.getOutput());
+    const diag_output = try diag_engine.format(alloc);
+
+    return .{
+        .output = try alloc.dupe(u8, codegen.getOutput()),
+        .diag_output = diag_output,
+    };
 }
 
 fn expectContains(haystack: []const u8, needle: []const u8) !void {
@@ -240,9 +297,9 @@ test "example: math module" {
     ;
 
     const output = try compile(alloc, source);
-    try expectContains(output, "fn square(");
-    try expectContains(output, "fn cube(");
-    try expectContains(output, "fn abs(");
+    try expectContains(output, "fn Math__square(");
+    try expectContains(output, "fn Math__cube(");
+    try expectContains(output, "fn Math__abs(");
     try expectContains(output, "fn main(");
     try expectContains(output, "5");
 }
@@ -344,7 +401,7 @@ test "example: type declarations" {
     ;
 
     const output = try compile(alloc, source);
-    try expectContains(output, "fn area(");
+    try expectContains(output, "fn Geometry__area(");
     try expectContains(output, "fn main(");
     try expectContains(output, "3.14159");
     // Float 5.0 may be emitted as integer 5 depending on literal parsing
@@ -460,7 +517,7 @@ test "tuple pattern destructuring" {
     ;
 
     const output = try compile(alloc, source);
-    try expectContains(output, "fn area(");
+    try expectContains(output, "fn Geometry__area(");
     // Should have guard blocks for tuple dispatch
     try expectContains(output, "if (");
     // Should have index access for element extraction
@@ -709,11 +766,13 @@ test "nested tuple patterns decompose once" {
     ;
 
     const output = try compile(alloc, source);
-    // Outer struct check should appear only once (not 3 times).
-    // Inner struct check adds one more, so total ≤ 2.
-    const struct_check_count = countOccurrences(output, "@typeInfo(@TypeOf(");
-    if (struct_check_count > 2) {
-        std.debug.print("\n=== EXPECTED ≤2 @typeInfo checks, got {d} ===\n{s}\n=== END ===\n", .{ struct_check_count, output });
+    // Outer struct check (arity 2) appears once.
+    // Inner tuples {:data, v} (arity 2) and {:empty} (arity 1) are different arities,
+    // so each gets its own check_tuple node = 2 inner struct checks.
+    // Total: 1 outer + 2 inner = 3
+    const struct_check_count = countOccurrences(output, "== .@\"struct\"");
+    if (struct_check_count > 3) {
+        std.debug.print("\n=== EXPECTED ≤3 struct checks, got {d} ===\n{s}\n=== END ===\n", .{ struct_check_count, output });
         return error.TestExpectedContains;
     }
     try std.testing.expect(struct_check_count >= 1);
@@ -738,9 +797,10 @@ test "case with tuple patterns checks struct type once" {
 
     const output = try compile(alloc, source);
     // Struct type check should appear only ONCE (not once per arm)
-    const struct_check_count = countOccurrences(output, "@typeInfo(@TypeOf(");
+    // Both arms have arity 2, so one check_tuple(arity=2) node
+    const struct_check_count = countOccurrences(output, "== .@\"struct\"");
     if (struct_check_count != 1) {
-        std.debug.print("\n=== EXPECTED 1 @typeInfo check, got {d} ===\n{s}\n=== END ===\n", .{ struct_check_count, output });
+        std.debug.print("\n=== EXPECTED 1 struct check, got {d} ===\n{s}\n=== END ===\n", .{ struct_check_count, output });
         return error.TestExpectedContains;
     }
     try expectContains(output, ".@\"ok\"");
@@ -765,9 +825,10 @@ test "multi-clause function with tuple dispatch checks once" {
 
     const output = try compile(alloc, source);
     // Struct check should appear only once for multi-clause tuple dispatch
-    const struct_check_count = countOccurrences(output, "@typeInfo(@TypeOf(");
+    // Both clauses have arity 2, so one check_tuple(arity=2) node
+    const struct_check_count = countOccurrences(output, "== .@\"struct\"");
     if (struct_check_count != 1) {
-        std.debug.print("\n=== EXPECTED 1 @typeInfo check, got {d} ===\n{s}\n=== END ===\n", .{ struct_check_count, output });
+        std.debug.print("\n=== EXPECTED 1 struct check, got {d} ===\n{s}\n=== END ===\n", .{ struct_check_count, output });
         return error.TestExpectedContains;
     }
     try expectContains(output, ".@\"ok\"");
@@ -1038,4 +1099,413 @@ test "with expression desugars to nested case" {
     try expectContains(output, ".@\"ok\"");
     try expectContains(output, ".@\"error\"");
     try expectNotContains(output, "// unhandled instruction");
+}
+
+// ============================================================
+// Mixed-arity tuple pattern matching (tagged unions)
+// ============================================================
+
+test "tagged union with different tuple arities" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Geometry do
+        \\  type Shape = {:circle, f64} | {:rectangle, f64, f64}
+        \\
+        \\  def area({:circle, radius} :: Shape) :: f64 do
+        \\    3.14159 * radius * radius
+        \\  end
+        \\
+        \\  def area({:rectangle, w, h} :: Shape) :: f64 do
+        \\    w * h
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, "fn Geometry__area(");
+    // Should have separate arity checks — 2-element and 3-element tuples
+    try expectContains(output, "fields.len == 2");
+    try expectContains(output, "fields.len == 3");
+    try expectNotContains(output, "// unhandled instruction");
+}
+
+// ============================================================
+// Module-scoped function naming
+// ============================================================
+
+test "two modules with same function name don't collide" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule A do
+        \\  def calc(x :: i64) :: i64 do
+        \\    x + 1
+        \\  end
+        \\end
+        \\
+        \\defmodule B do
+        \\  def calc(x :: i64) :: i64 do
+        \\    x * 2
+        \\  end
+        \\end
+        \\
+        \\def main() do
+        \\  A.calc(1)
+        \\  B.calc(2)
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    // Both modules get distinct prefixed function names
+    try expectContains(output, "fn A__calc(");
+    try expectContains(output, "fn B__calc(");
+    // Calls use the prefixed names
+    try expectContains(output, "A__calc(");
+    try expectContains(output, "B__calc(");
+    try expectNotContains(output, "// unhandled instruction");
+}
+
+test "bare inspect resolves to Kernel__inspect" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\def main() do
+        \\  inspect(42)
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    // Bare inspect should resolve to Kernel__inspect via auto-import
+    try expectContains(output, "Kernel__inspect(");
+    try expectNotContains(output, "// unhandled instruction");
+}
+
+test "module-qualified call emits prefixed name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Math do
+        \\  def double(x :: i64) :: i64 do
+        \\    x * 2
+        \\  end
+        \\end
+        \\
+        \\def main() do
+        \\  Math.double(5)
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, "fn Math__double(");
+    try expectContains(output, "Math__double(");
+    try expectContains(output, "fn main(");
+    try expectNotContains(output, "// unhandled instruction");
+}
+
+test "top-level functions stay bare" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\def helper(x :: i64) :: i64 do
+        \\  x + 1
+        \\end
+        \\
+        \\def main() do
+        \\  helper(5)
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    // Top-level functions should NOT be prefixed
+    try expectContains(output, "fn helper(");
+    try expectContains(output, "fn main(");
+    try expectNotContains(output, "__helper(");
+    try expectNotContains(output, "// unhandled instruction");
+}
+
+// ============================================================
+// Import resolution
+// ============================================================
+
+test "import with only filter resolves bare call to source module" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Bar do
+        \\  def run(x :: i64) :: i64 do
+        \\    x + 1
+        \\  end
+        \\end
+        \\
+        \\defmodule Foo do
+        \\  import Bar, only: [run: 1]
+        \\
+        \\  def call() :: i64 do
+        \\    run(1)
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    // run(1) inside Foo should resolve to Bar__run via import
+    try expectContains(output, "fn Bar__run(");
+    try expectContains(output, "fn Foo__call(");
+    try expectContains(output, "Bar__run(");
+    try expectNotContains(output, "// unhandled instruction");
+}
+
+test "import all resolves bare call to source module" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Utils do
+        \\  def helper(x :: i64) :: i64 do
+        \\    x * 2
+        \\  end
+        \\end
+        \\
+        \\defmodule App do
+        \\  import Utils
+        \\
+        \\  def go() :: i64 do
+        \\    helper(5)
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    // helper(5) inside App should resolve to Utils__helper via import all
+    try expectContains(output, "fn Utils__helper(");
+    try expectContains(output, "fn App__go(");
+    try expectContains(output, "Utils__helper(");
+    try expectNotContains(output, "// unhandled instruction");
+}
+
+test "import does not affect unrelated functions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Bar do
+        \\  def run(x :: i64) :: i64 do
+        \\    x + 1
+        \\  end
+        \\end
+        \\
+        \\defmodule Foo do
+        \\  import Bar, only: [run: 1]
+        \\
+        \\  def call() :: nil do
+        \\    inspect(42)
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    // inspect(42) should still resolve to Kernel__inspect, not Bar
+    try expectContains(output, "Kernel__inspect(");
+    try expectNotContains(output, "// unhandled instruction");
+}
+
+test "local function takes priority over import" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Bar do
+        \\  def run(x :: i64) :: i64 do
+        \\    x + 1
+        \\  end
+        \\end
+        \\
+        \\defmodule Foo do
+        \\  import Bar, only: [run: 1]
+        \\
+        \\  def run(x :: i64) :: i64 do
+        \\    x * 10
+        \\  end
+        \\
+        \\  def call() :: i64 do
+        \\    run(1)
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    // run(1) inside Foo should resolve to Foo__run (local takes priority)
+    try expectContains(output, "fn Foo__run(");
+    try expectContains(output, "Foo__run(");
+    try expectNotContains(output, "// unhandled instruction");
+}
+
+test "import with except filter excludes specified functions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Utils do
+        \\  def helper(x :: i64) :: i64 do
+        \\    x * 2
+        \\  end
+        \\
+        \\  def other(x :: i64) :: i64 do
+        \\    x + 1
+        \\  end
+        \\end
+        \\
+        \\defmodule App do
+        \\  import Utils, except: [helper: 1]
+        \\
+        \\  def go() :: i64 do
+        \\    other(5)
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    // other(5) should resolve to Utils__other (not excluded)
+    try expectContains(output, "Utils__other(");
+    try expectNotContains(output, "// unhandled instruction");
+}
+
+// ============================================================
+// Error reporting tests
+// ============================================================
+
+test "parse error includes file and line in diagnostics" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source = "def (broken syntax";
+    const result = compile(alloc, source);
+    try std.testing.expectError(error.ParseError, result);
+}
+
+test "diagnostic engine captures errors with line and col" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var engine = DiagnosticEngine.init(alloc);
+    defer engine.deinit();
+
+    const source = "def foo() do\n  bar()\nend\n";
+    engine.setSource(source, "test.zap");
+
+    // Simulate an error at line 2, col 3
+    try engine.err("undefined function `bar/0`", .{ .start = 15, .end = 20, .line = 2, .col = 3 });
+
+    try std.testing.expect(engine.hasErrors());
+    const output = try engine.format(alloc);
+    try expectContains(output, "test.zap:");
+    try expectContains(output, "2:3:");
+    try expectContains(output, "error: undefined function `bar/0`");
+}
+
+test "column numbers are accurate for tokens at known positions" {
+    // Verify the lexer produces correct column numbers
+    const Lexer = @import("lexer.zig").Lexer;
+    const Token = @import("token.zig").Token;
+    const ast = @import("ast.zig");
+
+    const source = "def add(x, y) do\n  x + y\nend";
+    var lexer = Lexer.init(source);
+
+    // Line 1: def at col 1
+    const def_tok = lexer.next();
+    try std.testing.expectEqual(Token.Tag.keyword_def, def_tok.tag);
+    try std.testing.expectEqual(@as(u32, 1), def_tok.loc.col);
+    try std.testing.expectEqual(@as(u32, 1), def_tok.loc.line);
+
+    // SourceSpan.from preserves col
+    const span = ast.SourceSpan.from(def_tok.loc);
+    try std.testing.expectEqual(@as(u32, 1), span.col);
+    try std.testing.expectEqual(@as(u32, 1), span.line);
+}
+
+test "type checker warnings do not halt compilation by default" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // This valid program should compile even with type checking enabled
+    const source =
+        \\def add(x :: i64, y :: i64) :: i64 do
+        \\  x + y
+        \\end
+    ;
+
+    const result = try compileWithDiagnostics(alloc, source, false);
+    try expectContains(result.output, "fn add(");
+}
+
+test "type errors produce warnings not failures by default" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Return type mismatch: declared i64, returns String
+    const source =
+        \\def bad() :: i64 do
+        \\  "not a number"
+        \\end
+    ;
+
+    // With strict_types=false (default), this should compile with warnings
+    const result = try compileWithDiagnostics(alloc, source, false);
+    try expectContains(result.output, "fn bad(");
+    // Diagnostics should contain the warning
+    try expectContains(result.diag_output, "warning:");
+    try expectContains(result.diag_output, "expected i64");
+}
+
+test "strict-types causes type error to halt compilation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Return type mismatch: declared i64, returns String
+    const source =
+        \\def bad() :: i64 do
+        \\  "not a number"
+        \\end
+    ;
+
+    // With strict_types=true, this should fail
+    const result = compileWithDiagnostics(alloc, source, true);
+    try std.testing.expectError(error.TypeError, result);
+}
+
+test "error messages contain file:line:col format" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var engine = DiagnosticEngine.init(alloc);
+    defer engine.deinit();
+    engine.setSource("def foo() :: i64 do\n  \"hello\"\nend", "example.zap");
+    try engine.err("expected i64, got String", .{ .start = 22, .end = 29, .line = 2, .col = 3 });
+
+    const output = try engine.format(alloc);
+    // Should have file:line:col format
+    try expectContains(output, "example.zap:2:3: error:");
 }

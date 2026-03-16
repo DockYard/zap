@@ -67,7 +67,7 @@ pub const Scope = struct {
 // ============================================================
 
 pub const ImportedScope = struct {
-    source_module: ast.StringId,
+    source_module: ast.ModuleName,
     filter: ImportFilter,
     imported_families: std.AutoHashMap(FamilyKey, FunctionFamilyId),
     imported_types: std.AutoHashMap(ast.StringId, TypeId),
@@ -153,6 +153,7 @@ pub const Binding = struct {
     scope_id: ScopeId,
     kind: BindingKind,
     span: ast.SourceSpan,
+    type_id: ?u32 = null,
 };
 
 pub const BindingKind = enum {
