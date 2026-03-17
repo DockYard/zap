@@ -61,13 +61,15 @@ pub fn main() !void {
     defer diag_engine.deinit();
 
     // Phase 1: Parse (with stdlib prepended)
-    const full_source = zap.stdlib.prependStdlib(alloc, source) catch {
+    const prepend_result = zap.stdlib.prependStdlib(alloc, source) catch {
         const stderr = std.fs.File.stderr().deprecatedWriter();
         try stderr.print("Error loading standard library\n", .{});
         std.process.exit(1);
     };
+    const full_source = prepend_result.source;
 
     diag_engine.setSource(full_source, path);
+    diag_engine.setLineOffset(prepend_result.stdlib_line_count);
 
     var parser = zap.Parser.init(alloc, full_source);
     defer parser.deinit();

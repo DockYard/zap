@@ -30,12 +30,14 @@ fn compile(alloc: std.mem.Allocator, source: []const u8) ![]const u8 {
 
 /// Run the full compiler pipeline with diagnostics support.
 fn compileWithDiagnostics(alloc: std.mem.Allocator, source: []const u8, strict_types: bool) !CompileResult {
-    const full_source = try stdlib.prependStdlib(alloc, source);
+    const prepend_result = try stdlib.prependStdlib(alloc, source);
+    const full_source = prepend_result.source;
 
     // Create shared DiagnosticEngine
     var diag_engine = DiagnosticEngine.init(alloc);
     defer diag_engine.deinit();
     diag_engine.setSource(full_source, "test.zap");
+    diag_engine.setLineOffset(prepend_result.stdlib_line_count);
 
     var parser = Parser.init(alloc, full_source);
     defer parser.deinit();

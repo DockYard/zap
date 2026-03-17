@@ -44,6 +44,7 @@ pub const DiagnosticEngine = struct {
     diagnostics: std.ArrayList(Diagnostic),
     source: ?[]const u8,
     file_path: ?[]const u8,
+    line_offset: u32,
 
     pub fn init(allocator: std.mem.Allocator) DiagnosticEngine {
         return .{
@@ -51,6 +52,7 @@ pub const DiagnosticEngine = struct {
             .diagnostics = .empty,
             .source = null,
             .file_path = null,
+            .line_offset = 0,
         };
     }
 
@@ -61,6 +63,12 @@ pub const DiagnosticEngine = struct {
     pub fn setSource(self: *DiagnosticEngine, source: []const u8, file_path: []const u8) void {
         self.source = source;
         self.file_path = file_path;
+    }
+
+    /// Set the number of lines prepended before user source (e.g. stdlib).
+    /// Error line numbers will be adjusted by subtracting this offset.
+    pub fn setLineOffset(self: *DiagnosticEngine, offset: u32) void {
+        self.line_offset = offset;
     }
 
     // ============================================================
@@ -168,12 +176,18 @@ pub const DiagnosticEngine = struct {
         const writer = buf.writer(allocator);
 
         for (self.diagnostics.items) |diag| {
+            // Apply line offset (subtract stdlib lines) for user-facing line numbers
+            const display_line = if (diag.span.line > self.line_offset)
+                diag.span.line - self.line_offset
+            else
+                diag.span.line;
+
             // File location
             if (self.file_path) |fp| {
                 try writer.print("{s}:", .{fp});
             }
-            if (diag.span.line > 0) {
-                try writer.print("{d}:{d}: ", .{ diag.span.line, diag.span.col });
+            if (display_line > 0) {
+                try writer.print("{d}:{d}: ", .{ display_line, diag.span.col });
             }
 
             // Severity and message
@@ -183,7 +197,7 @@ pub const DiagnosticEngine = struct {
             if (self.source) |src| {
                 if (diag.span.line > 0) {
                     if (getSourceLine(src, diag.span.line)) |line| {
-                        try writer.print(" {d} | {s}\n", .{ diag.span.line, line });
+                        try writer.print(" {d} | {s}\n", .{ display_line, line });
                     }
                 }
             }
@@ -191,10 +205,14 @@ pub const DiagnosticEngine = struct {
             // Notes
             for (diag.notes) |note| {
                 if (note.span) |s| {
+                    const note_display_line = if (s.line > self.line_offset)
+                        s.line - self.line_offset
+                    else
+                        s.line;
                     if (self.file_path) |fp| {
                         try writer.print("{s}:", .{fp});
                     }
-                    try writer.print("{d}:{d}: ", .{ s.line, s.col });
+                    try writer.print("{d}:{d}: ", .{ note_display_line, s.col });
                 }
                 try writer.print("note: {s}\n", .{note.message});
             }

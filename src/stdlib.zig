@@ -52,7 +52,20 @@ pub const lib_kernel =
     \\
 ;
 
+pub const PrependResult = struct {
+    source: []const u8,
+    stdlib_line_count: u32,
+};
+
 /// Prepend standard library source to user source for unified parsing.
-pub fn prependStdlib(allocator: std.mem.Allocator, user_source: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "{s}\n{s}\n{s}", .{ lib_kernel, lib_io, user_source });
+/// Returns the combined source and the number of lines the stdlib occupies,
+/// so error reporting can subtract the offset for user-facing line numbers.
+pub fn prependStdlib(allocator: std.mem.Allocator, user_source: []const u8) !PrependResult {
+    const stdlib_source = try std.fmt.allocPrint(allocator, "{s}\n{s}\n", .{ lib_kernel, lib_io });
+    var line_count: u32 = 0;
+    for (stdlib_source) |c| {
+        if (c == '\n') line_count += 1;
+    }
+    const full = try std.fmt.allocPrint(allocator, "{s}{s}", .{ stdlib_source, user_source });
+    return .{ .source = full, .stdlib_line_count = line_count };
 }
