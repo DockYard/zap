@@ -43,14 +43,26 @@ fn compileWithDiagnostics(alloc: std.mem.Allocator, source: []const u8, strict_t
     defer parser.deinit();
     const program = parser.parseProgram() catch {
         for (parser.errors.items) |parse_err| {
-            diag_engine.err(parse_err.message, parse_err.span) catch {};
+            diag_engine.reportDiagnostic(.{
+                .severity = .@"error",
+                .message = parse_err.message,
+                .span = parse_err.span,
+                .label = parse_err.label,
+                .help = parse_err.help,
+            }) catch {};
         }
         return error.ParseError;
     };
 
     if (parser.errors.items.len > 0) {
         for (parser.errors.items) |parse_err| {
-            try diag_engine.err(parse_err.message, parse_err.span);
+            try diag_engine.reportDiagnostic(.{
+                .severity = .@"error",
+                .message = parse_err.message,
+                .span = parse_err.span,
+                .label = parse_err.label,
+                .help = parse_err.help,
+            });
         }
         return error.ParseError;
     }
@@ -83,12 +95,21 @@ fn compileWithDiagnostics(alloc: std.mem.Allocator, source: []const u8, strict_t
     // Type checking (on desugared AST)
     var type_checker = types_mod.TypeChecker.init(alloc, &parser.interner, &collector.graph);
     defer type_checker.deinit();
+    type_checker.stdlib_line_count = prepend_result.stdlib_line_count;
     type_checker.checkProgram(&desugared_program) catch {};
+    type_checker.checkUnusedBindings() catch {};
 
-    // Drain type checker errors as warnings (or errors if strict)
+    // Drain type checker errors — hard errors always block, others respect strict flag
     const type_severity: @import("diagnostics.zig").Severity = if (strict_types) .@"error" else .warning;
     for (type_checker.errors.items) |type_err| {
-        try diag_engine.report(type_severity, type_err.message, type_err.span);
+        try diag_engine.reportDiagnostic(.{
+            .severity = type_err.severity orelse type_severity,
+            .message = type_err.message,
+            .span = type_err.span,
+            .label = type_err.label,
+            .help = type_err.help,
+            .secondary_spans = type_err.secondary_spans,
+        });
     }
     if (diag_engine.hasErrors()) return error.TypeError;
 
@@ -1418,9 +1439,8 @@ test "diagnostic engine captures errors with line and col" {
 
     try std.testing.expect(engine.hasErrors());
     const output = try engine.format(alloc);
-    try expectContains(output, "test.zap:");
-    try expectContains(output, "2:3:");
     try expectContains(output, "error: undefined function `bar/0`");
+    try expectContains(output, "test.zap:2:3");
 }
 
 test "column numbers are accurate for tokens at known positions" {
@@ -1460,7 +1480,7 @@ test "type checker warnings do not halt compilation by default" {
     try expectContains(result.output, "fn add(");
 }
 
-test "type errors produce warnings not failures by default" {
+test "return type mismatch is always an error" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -1472,28 +1492,8 @@ test "type errors produce warnings not failures by default" {
         \\end
     ;
 
-    // With strict_types=false (default), this should compile with warnings
-    const result = try compileWithDiagnostics(alloc, source, false);
-    try expectContains(result.output, "fn bad(");
-    // Diagnostics should contain the warning
-    try expectContains(result.diag_output, "warning:");
-    try expectContains(result.diag_output, "expected i64");
-}
-
-test "strict-types causes type error to halt compilation" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    // Return type mismatch: declared i64, returns String
-    const source =
-        \\def bad() :: i64 do
-        \\  "not a number"
-        \\end
-    ;
-
-    // With strict_types=true, this should fail
-    const result = compileWithDiagnostics(alloc, source, true);
+    // Return type mismatch is a hard error regardless of strict_types
+    const result = compileWithDiagnostics(alloc, source, false);
     try std.testing.expectError(error.TypeError, result);
 }
 
@@ -1508,6 +1508,7 @@ test "error messages contain file:line:col format" {
     try engine.err("expected i64, got String", .{ .start = 22, .end = 29, .line = 2, .col = 3 });
 
     const output = try engine.format(alloc);
-    // Should have file:line:col format
-    try expectContains(output, "example.zap:2:3: error:");
+    // Should have error message and file:line:col location
+    try expectContains(output, "error: expected i64, got String");
+    try expectContains(output, "example.zap:2:3");
 }

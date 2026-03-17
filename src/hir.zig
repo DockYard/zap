@@ -953,8 +953,8 @@ pub const HirBuilder = struct {
         const scope_id = self.current_module_scope orelse self.graph.prelude_scope;
         if (self.graph.resolveBinding(scope_id, name)) |bid| {
             const binding = self.graph.bindings.items[bid];
-            if (binding.type_id) |tid| {
-                return tid;
+            if (binding.type_id) |prov| {
+                return prov.type_id;
             }
         }
         return types_mod.TypeStore.UNKNOWN;

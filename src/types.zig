@@ -1,6 +1,7 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 const scope_mod = @import("scope.zig");
+const similarity = @import("similarity.zig");
 
 // ============================================================
 // Type representation
@@ -258,9 +259,21 @@ pub const TypeChecker = struct {
     // Current scope tracking for var_ref resolution
     current_scope: ?scope_mod.ScopeId,
 
+    // Track which bindings are referenced (for unused variable warnings)
+    referenced_bindings: std.AutoHashMap(scope_mod.BindingId, void),
+
+    // Number of stdlib lines prepended (bindings in these lines are skipped for unused checks)
+    stdlib_line_count: u32 = 0,
+
     pub const Error = struct {
         message: []const u8,
         span: ast.SourceSpan,
+        label: ?[]const u8 = null,
+        help: ?[]const u8 = null,
+        secondary_spans: []const @import("diagnostics.zig").SecondarySpan = &.{},
+        /// When set, overrides the pipeline's default severity (e.g. --strict-types).
+        /// Hard errors like "undefined type" are always .@"error" regardless of flags.
+        severity: ?@import("diagnostics.zig").Severity = null,
     };
 
     pub fn init(allocator: std.mem.Allocator, interner: *const ast.StringInterner, graph: *scope_mod.ScopeGraph) TypeChecker {
@@ -272,6 +285,7 @@ pub const TypeChecker = struct {
             .errors = .empty,
             .expr_types = std.AutoHashMap(usize, TypeId).init(allocator),
             .current_scope = null,
+            .referenced_bindings = std.AutoHashMap(scope_mod.BindingId, void).init(allocator),
         };
     }
 
@@ -279,10 +293,30 @@ pub const TypeChecker = struct {
         self.store.deinit();
         self.errors.deinit(self.allocator);
         self.expr_types.deinit();
+        self.referenced_bindings.deinit();
     }
 
     fn addError(self: *TypeChecker, message: []const u8, span: ast.SourceSpan) !void {
         try self.errors.append(self.allocator, .{ .message = message, .span = span });
+    }
+
+    fn addRichError(self: *TypeChecker, message: []const u8, span: ast.SourceSpan, label_text: ?[]const u8, help_text: ?[]const u8) !void {
+        try self.errors.append(self.allocator, .{
+            .message = message,
+            .span = span,
+            .label = label_text,
+            .help = help_text,
+        });
+    }
+
+    fn addHardError(self: *TypeChecker, message: []const u8, span: ast.SourceSpan, label_text: ?[]const u8, help_text: ?[]const u8) !void {
+        try self.errors.append(self.allocator, .{
+            .message = message,
+            .span = span,
+            .label = label_text,
+            .help = help_text,
+            .severity = .@"error",
+        });
     }
 
     fn addFormattedError(self: *TypeChecker, span: ast.SourceSpan, comptime fmt: []const u8, args: anytype) !void {
@@ -328,9 +362,35 @@ pub const TypeChecker = struct {
         }
     }
 
+    pub fn checkUnusedBindings(self: *TypeChecker) !void {
+        for (self.graph.bindings.items, 0..) |binding, i| {
+            const bid: scope_mod.BindingId = @intCast(i);
+            if (self.referenced_bindings.contains(bid)) continue;
+
+            const name = self.interner.get(binding.name);
+            if (name.len > 0 and name[0] == '_') continue; // _-prefix convention
+            if (binding.scope_id == self.graph.prelude_scope) continue; // stdlib
+            if (binding.span.line == 0) continue; // synthetic
+
+            // Skip bindings from stdlib (before user source)
+            if (self.stdlib_line_count > 0 and binding.span.line > 0 and binding.span.line <= self.stdlib_line_count) continue;
+
+            // Skip bindings in case clause scopes (pattern match variables)
+            const binding_scope = self.graph.getScope(binding.scope_id);
+            if (binding_scope.kind == .case_clause) continue;
+
+            try self.addRichError(
+                try std.fmt.allocPrint(self.allocator, "variable `{s}` is unused", .{name}),
+                binding.span,
+                "defined here but never used",
+                try std.fmt.allocPrint(self.allocator, "if this is intentional, prefix with underscore: `_{s}`", .{name}),
+            );
+        }
+    }
+
     fn checkModule(self: *TypeChecker, mod: *const ast.ModuleDecl) !void {
         const prev_scope = self.current_scope;
-        self.current_scope = mod.meta.scope_id;
+        self.current_scope = self.graph.node_scope_map.get(mod.meta.span.start) orelse mod.meta.scope_id;
         defer self.current_scope = prev_scope;
 
         for (mod.items) |item| {
@@ -365,7 +425,7 @@ pub const TypeChecker = struct {
 
     fn checkFunctionClause(self: *TypeChecker, clause: *const ast.FunctionClause) !void {
         const prev_scope = self.current_scope;
-        self.current_scope = clause.meta.scope_id;
+        self.current_scope = self.graph.node_scope_map.get(clause.meta.span.start) orelse clause.meta.scope_id;
         defer self.current_scope = prev_scope;
 
         // Resolve parameter types and populate bindings
@@ -377,7 +437,10 @@ pub const TypeChecker = struct {
                     const bind_name = param.pattern.bind.name;
                     if (self.current_scope) |scope_id| {
                         if (self.graph.resolveBinding(scope_id, bind_name)) |bid| {
-                            self.graph.bindings.items[bid].type_id = param_type;
+                            self.graph.bindings.items[bid].type_id = .{
+                                .type_id = param_type,
+                                .source_span = ta.getMeta().span,
+                            };
                         }
                     }
                 }
@@ -393,8 +456,13 @@ pub const TypeChecker = struct {
         // Check refinement is Bool
         if (clause.refinement) |ref| {
             const ref_type = try self.inferExpr(ref);
-            if (ref_type != TypeStore.BOOL and ref_type != TypeStore.UNKNOWN) {
-                try self.addError("refinement predicate must be Bool", ref.getMeta().span);
+            if (ref_type != TypeStore.BOOL and ref_type != TypeStore.UNKNOWN and ref_type != TypeStore.ERROR) {
+                try self.addRichError(
+                    "refinement predicate must be Bool",
+                    ref.getMeta().span,
+                    try std.fmt.allocPrint(self.allocator, "this is a `{s}`, not a `Bool`", .{self.typeToString(ref_type)}),
+                    "guard clauses must evaluate to `true` or `false`",
+                );
             }
         }
 
@@ -404,12 +472,35 @@ pub const TypeChecker = struct {
             body_type = try self.checkStmt(stmt);
         }
 
-        // Verify return type matches
-        if (declared_return != TypeStore.UNKNOWN and body_type != TypeStore.UNKNOWN) {
+        // Verify return type matches (suppress if either side is ERROR/UNKNOWN/type_var from cascading)
+        const declared_is_checkable = declared_return != TypeStore.UNKNOWN and
+            declared_return != TypeStore.ERROR and
+            self.store.getType(declared_return) != .type_var;
+        if (declared_is_checkable and body_type != TypeStore.UNKNOWN and body_type != TypeStore.ERROR)
+        {
             if (!self.store.typeEquals(body_type, declared_return)) {
                 const expected = self.typeToString(declared_return);
                 const got = self.typeToString(body_type);
-                try self.addFormattedError(clause.meta.span, "expected {s}, got {s}", .{ expected, got });
+                const diagnostics = @import("diagnostics.zig");
+
+                // Build secondary span pointing to the return type annotation
+                const secondary = if (clause.return_type) |rt| blk: {
+                    const spans = try self.allocator.alloc(diagnostics.SecondarySpan, 1);
+                    spans[0] = .{
+                        .span = rt.getMeta().span,
+                        .label = try std.fmt.allocPrint(self.allocator, "return type `{s}` declared here", .{expected}),
+                    };
+                    break :blk spans;
+                } else &[_]diagnostics.SecondarySpan{};
+
+                try self.errors.append(self.allocator, .{
+                    .message = try std.fmt.allocPrint(self.allocator, "this function returns the wrong type", .{}),
+                    .span = clause.meta.span,
+                    .label = try std.fmt.allocPrint(self.allocator, "expected `{s}`, got `{s}`", .{ expected, got }),
+                    .help = try std.fmt.allocPrint(self.allocator, "the function is declared to return `{s}` but the body produces `{s}`", .{ expected, got }),
+                    .secondary_spans = secondary,
+                    .severity = .@"error",
+                });
             }
         }
     }
@@ -428,7 +519,10 @@ pub const TypeChecker = struct {
                     const bind_name = assign.pattern.bind.name;
                     if (self.current_scope) |scope_id| {
                         if (self.graph.resolveBinding(scope_id, bind_name)) |bid| {
-                            self.graph.bindings.items[bid].type_id = value_type;
+                            self.graph.bindings.items[bid].type_id = .{
+                                .type_id = value_type,
+                                .source_span = assign.value.getMeta().span,
+                            };
                         }
                     }
                 }
@@ -462,10 +556,29 @@ pub const TypeChecker = struct {
                 // Resolve type from scope binding
                 if (self.current_scope) |scope_id| {
                     if (self.graph.resolveBinding(scope_id, vr.name)) |bid| {
+                        self.referenced_bindings.put(bid, {}) catch {};
                         const binding = self.graph.bindings.items[bid];
-                        if (binding.type_id) |tid| {
-                            return tid;
+                        if (binding.type_id) |prov| {
+                            return prov.type_id;
                         }
+                        return TypeStore.UNKNOWN;
+                    }
+                    // Variable not found — try "did you mean?"
+                    const var_name = self.interner.get(vr.name);
+                    const visible_ids = self.graph.collectVisibleBindingNames(scope_id, self.allocator) catch return TypeStore.UNKNOWN;
+                    // Build string candidates from IDs
+                    var candidates: std.ArrayList([]const u8) = .empty;
+                    for (visible_ids) |sid| {
+                        candidates.append(self.allocator, self.interner.get(sid)) catch {};
+                    }
+                    const candidate_slice = candidates.items;
+                    if (similarity.findBestMatch(var_name, candidate_slice, similarity.SUGGESTION_THRESHOLD)) |suggestion| {
+                        try self.addRichError(
+                            try std.fmt.allocPrint(self.allocator, "I cannot find a variable named `{s}`", .{var_name}),
+                            vr.meta.span,
+                            "not found in this scope",
+                            try std.fmt.allocPrint(self.allocator, "did you mean `{s}`?", .{suggestion}),
+                        );
                     }
                 }
                 return TypeStore.UNKNOWN;
@@ -497,8 +610,13 @@ pub const TypeChecker = struct {
             // before the TypeChecker runs. If we see them, return UNKNOWN.
             .if_expr => |ie| {
                 const cond_type = try self.inferExpr(ie.condition);
-                if (cond_type != TypeStore.BOOL and cond_type != TypeStore.UNKNOWN) {
-                    try self.addError("if condition must be Bool", ie.meta.span);
+                if (cond_type != TypeStore.BOOL and cond_type != TypeStore.UNKNOWN and cond_type != TypeStore.ERROR) {
+                    try self.addRichError(
+                        try std.fmt.allocPrint(self.allocator, "this condition is a `{s}`, but `if` requires a `Bool`", .{self.typeToString(cond_type)}),
+                        ie.meta.span,
+                        try std.fmt.allocPrint(self.allocator, "this is a `{s}`", .{self.typeToString(cond_type)}),
+                        "try comparing it: `if x > 0 do ...`",
+                    );
                 }
                 var then_type: TypeId = TypeStore.NIL;
                 for (ie.then_block) |stmt| {
@@ -581,9 +699,18 @@ pub const TypeChecker = struct {
         return switch (bo.op) {
             // Arithmetic: both operands must be same numeric type
             .add, .sub, .mul, .div, .rem_op => {
+                // Cascading suppression: if either operand is ERROR, propagate silently
+                if (lhs == TypeStore.ERROR or rhs == TypeStore.ERROR) return TypeStore.ERROR;
                 if (lhs == TypeStore.UNKNOWN or rhs == TypeStore.UNKNOWN) return if (lhs != TypeStore.UNKNOWN) lhs else rhs;
                 if (!self.store.typeEquals(lhs, rhs)) {
-                    try self.addError("arithmetic operands must have the same type", bo.meta.span);
+                    const lhs_name = self.typeToString(lhs);
+                    const rhs_name = self.typeToString(rhs);
+                    try self.addRichError(
+                        try std.fmt.allocPrint(self.allocator, "cannot perform arithmetic on `{s}` and `{s}`", .{ lhs_name, rhs_name }),
+                        bo.meta.span,
+                        "type mismatch between operands",
+                        try std.fmt.allocPrint(self.allocator, "both operands must be the same numeric type, but the left is `{s}` and the right is `{s}`", .{ lhs_name, rhs_name }),
+                    );
                     return TypeStore.ERROR;
                 }
                 return lhs;
@@ -606,22 +733,78 @@ pub const TypeChecker = struct {
     }
 
     fn inferCall(self: *TypeChecker, call: *const ast.CallExpr) !TypeId {
-        // Infer callee type
-        const callee_type = try self.inferExpr(call.callee);
+        const arity: u32 = @intCast(call.args.len);
 
-        // If callee has a known function type, use its return type
-        if (callee_type != TypeStore.UNKNOWN) {
+        // Special handling for direct function calls (callee is var_ref)
+        if (call.callee.* == .var_ref) {
+            const vr = call.callee.var_ref;
+
+            if (self.current_scope) |scope_id| {
+                // First check if it's a variable holding a function
+                if (self.graph.resolveBinding(scope_id, vr.name)) |bid| {
+                    self.referenced_bindings.put(bid, {}) catch {};
+                    const binding = self.graph.bindings.items[bid];
+                    if (binding.type_id) |prov| {
+                        const t = self.store.getType(prov.type_id);
+                        if (t == .function) {
+                            for (call.args) |arg| _ = try self.inferExpr(arg);
+                            return t.function.return_type;
+                        }
+                    }
+                }
+
+                // Check function families
+                if (self.graph.resolveFamily(scope_id, vr.name, arity)) |_| {
+                    for (call.args) |arg| _ = try self.inferExpr(arg);
+                    return TypeStore.UNKNOWN;
+                }
+
+                // Function not found — suggest alternatives
+                const func_name = self.interner.get(vr.name);
+                const visible = self.graph.collectVisibleFunctionNames(
+                    scope_id,
+                    self.allocator,
+                ) catch &[_]scope_mod.FamilyKey{};
+
+                var candidates: std.ArrayList([]const u8) = .empty;
+                for (visible) |fk| {
+                    if (fk.arity == arity) {
+                        candidates.append(self.allocator, self.interner.get(fk.name)) catch {};
+                    }
+                }
+
+                const help_text = if (similarity.findBestMatch(
+                    func_name,
+                    candidates.items,
+                    similarity.SUGGESTION_THRESHOLD,
+                )) |suggestion|
+                    try std.fmt.allocPrint(self.allocator, "did you mean `{s}/{d}`?", .{ suggestion, arity })
+                else
+                    null;
+
+                try self.addRichError(
+                    try std.fmt.allocPrint(self.allocator, "I cannot find a function named `{s}/{d}`", .{ func_name, arity }),
+                    call.meta.span,
+                    "not found in this scope",
+                    help_text,
+                );
+
+                for (call.args) |arg| _ = try self.inferExpr(arg);
+                return TypeStore.UNKNOWN;
+            }
+        }
+
+        // Non-var_ref callee (field access, lambda, etc.) — original path
+        const callee_type = try self.inferExpr(call.callee);
+        if (callee_type != TypeStore.UNKNOWN and callee_type != TypeStore.ERROR) {
             const ct = self.store.getType(callee_type);
             if (ct == .function) {
+                for (call.args) |arg| _ = try self.inferExpr(arg);
                 return ct.function.return_type;
             }
         }
 
-        // Infer argument types (for side effects / error checking)
-        for (call.args) |arg| {
-            _ = try self.inferExpr(arg);
-        }
-
+        for (call.args) |arg| _ = try self.inferExpr(arg);
         return TypeStore.UNKNOWN;
     }
 
@@ -649,10 +832,71 @@ pub const TypeChecker = struct {
                     }
                     return tid;
                 }
-                // User-defined type — return unknown for now
-                return TypeStore.UNKNOWN;
+                // Check user-defined types in scope graph
+                for (self.graph.types.items) |type_entry| {
+                    const type_name = self.interner.get(type_entry.name);
+                    if (std.mem.eql(u8, name, type_name)) {
+                        return TypeStore.UNKNOWN; // Known user type, just can't resolve yet
+                    }
+                }
+
+                // Unknown type — report error with suggestions
+                var candidates: std.ArrayList([]const u8) = .empty;
+                // Collect builtin type names
+                const builtins = [_][]const u8{
+                    "Bool", "String", "Atom", "Nil", "Never",
+                    "i64",  "i32",    "i16",  "i8",
+                    "u64",  "u32",    "u16",  "u8",
+                    "f64",  "f32",    "f16",
+                    "usize", "isize",
+                };
+                for (&builtins) |b| {
+                    candidates.append(self.allocator, b) catch {};
+                }
+                // Collect user-defined type names
+                for (self.graph.types.items) |type_entry| {
+                    candidates.append(self.allocator, self.interner.get(type_entry.name)) catch {};
+                }
+
+                const help_text = if (similarity.findBestMatch(
+                    name,
+                    candidates.items,
+                    similarity.SUGGESTION_THRESHOLD,
+                )) |suggestion|
+                    try std.fmt.allocPrint(self.allocator, "did you mean `{s}`?", .{suggestion})
+                else
+                    null;
+
+                try self.addHardError(
+                    try std.fmt.allocPrint(self.allocator, "I cannot find a type named `{s}`", .{name}),
+                    type_expr.getMeta().span,
+                    "not found",
+                    help_text,
+                );
+                return TypeStore.ERROR;
             },
-            .variable => try self.store.freshVar(),
+            .variable => |tv| {
+                // Check if this type variable name is a near-miss of a builtin type
+                const var_name = self.interner.get(tv.name);
+                const builtins = [_][]const u8{
+                    "Bool", "String", "Atom", "Nil", "Never",
+                    "i64",  "i32",    "i16",  "i8",
+                    "u64",  "u32",    "u16",  "u8",
+                    "f64",  "f32",    "f16",
+                    "usize", "isize",
+                };
+                // Use slightly relaxed threshold for short type names (floating point edge cases)
+                if (similarity.findBestMatch(var_name, &builtins, similarity.SUGGESTION_THRESHOLD - 0.01)) |suggestion| {
+                    try self.addHardError(
+                        try std.fmt.allocPrint(self.allocator, "I cannot find a type named `{s}`", .{var_name}),
+                        type_expr.getMeta().span,
+                        "treated as a type variable, but this looks like a typo",
+                        try std.fmt.allocPrint(self.allocator, "did you mean `{s}`?", .{suggestion}),
+                    );
+                    return TypeStore.ERROR;
+                }
+                return try self.store.freshVar();
+            },
             .tuple => |tt| {
                 var elem_types: std.ArrayList(TypeId) = .empty;
                 for (tt.elements) |elem| {
@@ -848,7 +1092,7 @@ test "type check arithmetic mismatch reported" {
     try std.testing.expect(checker.errors.items.len > 0);
     // Should report arithmetic type mismatch
     const err_msg = checker.errors.items[0].message;
-    try std.testing.expect(std.mem.indexOf(u8, err_msg, "arithmetic") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err_msg, "arithmetic") != null or std.mem.indexOf(u8, err_msg, "cannot perform") != null);
 }
 
 test "typeToString returns human-readable names" {
@@ -923,7 +1167,8 @@ test "type check if condition must be Bool" {
 
     try std.testing.expect(checker.errors.items.len > 0);
     const err_msg = checker.errors.items[0].message;
-    try std.testing.expect(std.mem.indexOf(u8, err_msg, "if condition must be Bool") != null);
+    // New contextual message mentions the actual type and if requirement
+    try std.testing.expect(std.mem.indexOf(u8, err_msg, "but `if` requires a `Bool`") != null);
 }
 
 test "type check return type mismatch" {
@@ -952,6 +1197,348 @@ test "type check return type mismatch" {
 
     try std.testing.expect(checker.errors.items.len > 0);
     const err_msg = checker.errors.items[0].message;
-    try std.testing.expect(std.mem.indexOf(u8, err_msg, "expected i64") != null);
-    try std.testing.expect(std.mem.indexOf(u8, err_msg, "got String") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err_msg, "returns the wrong type") != null);
+    // Rich label should contain the expected/got info
+    const err_label = checker.errors.items[0].label orelse "";
+    try std.testing.expect(std.mem.indexOf(u8, err_label, "i64") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err_label, "String") != null);
+}
+
+test "type provenance tracks source span on typed parameter" {
+    const source =
+        \\def add(x :: i64) do
+        \\  x
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    // Find the binding for x and check it has provenance
+    var found_x = false;
+    for (checker.graph.bindings.items) |binding| {
+        const name = checker.interner.get(binding.name);
+        if (std.mem.eql(u8, name, "x")) {
+            try std.testing.expect(binding.type_id != null);
+            const prov = binding.type_id.?;
+            try std.testing.expectEqual(TypeStore.I64, prov.type_id);
+            try std.testing.expect(prov.source_span.start > 0 or prov.source_span.end > 0);
+            found_x = true;
+        }
+    }
+    try std.testing.expect(found_x);
+}
+
+test "return type mismatch has secondary span" {
+    const source =
+        \\def bad() :: i64 do
+        \\  "not a number"
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    try std.testing.expect(checker.errors.items.len > 0);
+    const err = checker.errors.items[0];
+    try std.testing.expect(err.secondary_spans.len > 0);
+    const ss_label = err.secondary_spans[0].label;
+    try std.testing.expect(std.mem.indexOf(u8, ss_label, "return type") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ss_label, "i64") != null);
+}
+
+test "undefined function suggests similar name" {
+    const source =
+        \\def foo(a, b) do
+        \\  a + b
+        \\end
+        \\def bar() do
+        \\  fob(1, 2)
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    // Should have exactly one error about "fob/2" not found
+    var found_err = false;
+    for (checker.errors.items) |err| {
+        if (std.mem.indexOf(u8, err.message, "fob/2") != null) {
+            found_err = true;
+            // Should suggest foo/2
+            if (err.help) |help| {
+                try std.testing.expect(std.mem.indexOf(u8, help, "foo/2") != null);
+            }
+        }
+    }
+    try std.testing.expect(found_err);
+}
+
+test "undefined function no suggestion for unrelated name" {
+    const source =
+        \\def foo(a) do
+        \\  a
+        \\end
+        \\def bar() do
+        \\  zzzzz(1)
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    // Should have error but no suggestion
+    var found_err = false;
+    for (checker.errors.items) |err| {
+        if (std.mem.indexOf(u8, err.message, "zzzzz/1") != null) {
+            found_err = true;
+            try std.testing.expect(err.help == null);
+        }
+    }
+    try std.testing.expect(found_err);
+}
+
+test "valid function call produces no error" {
+    const source =
+        \\def foo(a, b) do
+        \\  a + b
+        \\end
+        \\def bar() do
+        \\  foo(1, 2)
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    // No "cannot find function" errors
+    for (checker.errors.items) |err| {
+        try std.testing.expect(std.mem.indexOf(u8, err.message, "cannot find a function") == null);
+    }
+}
+
+test "unused variable produces warning" {
+    const source =
+        \\def foo() do
+        \\  x = 42
+        \\  1
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+    try checker.checkUnusedBindings();
+
+    var found_unused = false;
+    for (checker.errors.items) |err| {
+        if (std.mem.indexOf(u8, err.message, "variable `x` is unused") != null) {
+            found_unused = true;
+            try std.testing.expect(err.help != null);
+            try std.testing.expect(std.mem.indexOf(u8, err.help.?, "_x") != null);
+        }
+    }
+    try std.testing.expect(found_unused);
+}
+
+test "underscore-prefixed variable no unused warning" {
+    const source =
+        \\def foo() do
+        \\  _x = 42
+        \\  1
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+    try checker.checkUnusedBindings();
+
+    for (checker.errors.items) |err| {
+        try std.testing.expect(std.mem.indexOf(u8, err.message, "_x") == null);
+    }
+}
+
+test "used variable no unused warning" {
+    const source =
+        \\def foo() do
+        \\  x = 42
+        \\  x + 1
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+    try checker.checkUnusedBindings();
+
+    for (checker.errors.items) |err| {
+        try std.testing.expect(std.mem.indexOf(u8, err.message, "variable `x` is unused") == null);
+    }
+}
+
+test "unknown type name produces error" {
+    const source =
+        \\def foo(x :: Other) do
+        \\  x
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var found_err = false;
+    for (checker.errors.items) |err| {
+        if (std.mem.indexOf(u8, err.message, "cannot find a type named `Other`") != null) {
+            found_err = true;
+        }
+    }
+    try std.testing.expect(found_err);
+}
+
+test "unused function parameter produces warning" {
+    const source =
+        \\def foo(x) do
+        \\  42
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+    try checker.checkUnusedBindings();
+
+    var found_unused = false;
+    for (checker.errors.items) |err| {
+        if (std.mem.indexOf(u8, err.message, "variable `x` is unused") != null) {
+            found_unused = true;
+        }
+    }
+    try std.testing.expect(found_unused);
 }

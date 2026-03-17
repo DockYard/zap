@@ -13,7 +13,7 @@ defmodule Geometry do
     2.0 * 3.14159 * radius
   end
 
-  def perimeter({:rectangle, w, h} :: Shape) :: f64 do
+  def perimeter({:rectangle, w, h} :: Shape) :: f54 do
     2.0 * (w + h)
   end
 end

@@ -2,6 +2,7 @@ const std = @import("std");
 const Lexer = @import("lexer.zig").Lexer;
 const Token = @import("token.zig").Token;
 const ast = @import("ast.zig");
+const similarity = @import("similarity.zig");
 
 pub const Parser = struct {
     allocator: std.mem.Allocator,
@@ -15,6 +16,8 @@ pub const Parser = struct {
     pub const Error = struct {
         message: []const u8,
         span: ast.SourceSpan,
+        label: ?[]const u8 = null,
+        help: ?[]const u8 = null,
     };
 
     pub fn init(allocator: std.mem.Allocator, source: []const u8) Parser {
@@ -67,9 +70,9 @@ pub const Parser = struct {
             return self.advance();
         }
         try self.addError(
-            std.fmt.allocPrint(self.allocator, "expected {s}, got {s}", .{
-                Token.tagName(tag),
-                Token.tagName(self.current.tag),
+            std.fmt.allocPrint(self.allocator, "I was expecting {s} but found {s}", .{
+                tokenHumanName(tag),
+                tokenHumanName(self.current.tag),
             }) catch "parse error",
             ast.SourceSpan.from(self.current.loc),
         );
@@ -83,9 +86,9 @@ pub const Parser = struct {
             return self.advance();
         }
         try self.addError(
-            std.fmt.allocPrint(self.allocator, "expected {s}, got {s}", .{
-                Token.tagName(tag),
-                Token.tagName(self.current.tag),
+            std.fmt.allocPrint(self.allocator, "I was expecting {s} but found {s}", .{
+                tokenHumanName(tag),
+                tokenHumanName(self.current.tag),
             }) catch "parse error",
             context_span,
         );
@@ -129,6 +132,38 @@ pub const Parser = struct {
         try self.errors.append(self.allocator, .{ .message = message, .span = span });
     }
 
+    fn addRichError(self: *Parser, message: []const u8, span: ast.SourceSpan, label_text: ?[]const u8, help_text: ?[]const u8) !void {
+        try self.errors.append(self.allocator, .{
+            .message = message,
+            .span = span,
+            .label = label_text,
+            .help = help_text,
+        });
+    }
+
+    /// Skip tokens until a statement/definition boundary is found.
+    /// Used for error recovery to find the next parseable construct.
+    fn synchronize(self: *Parser) void {
+        while (!self.check(.eof)) {
+            switch (self.peek()) {
+                .keyword_def, .keyword_defp, .keyword_defmodule, .keyword_defmacro, .keyword_end => return,
+                .newline => {
+                    _ = self.advance();
+                    // After newline, check if next token starts a new statement
+                    self.skipNewlines();
+                    switch (self.peek()) {
+                        .keyword_def, .keyword_defp, .keyword_defmodule, .keyword_defmacro,
+                        .keyword_defstruct, .keyword_type, .keyword_opaque,
+                        .keyword_alias, .keyword_import, .keyword_end, .eof,
+                        => return,
+                        else => {},
+                    }
+                },
+                else => _ = self.advance(),
+            }
+        }
+    }
+
     fn currentSpan(self: *const Parser) ast.SourceSpan {
         return ast.SourceSpan.from(self.current.loc);
     }
@@ -164,29 +199,47 @@ pub const Parser = struct {
         while (!self.check(.eof)) {
             switch (self.peek()) {
                 .keyword_defmodule => {
-                    const mod = try self.parseModuleDecl();
-                    try modules.append(self.allocator, mod);
-                    try top_items.append(self.allocator, .{ .module = try self.create(ast.ModuleDecl, mod) });
+                    if (self.parseModuleDecl()) |mod| {
+                        try modules.append(self.allocator, mod);
+                        try top_items.append(self.allocator, .{ .module = try self.create(ast.ModuleDecl, mod) });
+                    } else |_| {
+                        self.synchronize();
+                    }
                 },
                 .keyword_def => {
-                    const func = try self.parseFunctionDecl(.public);
-                    try top_items.append(self.allocator, .{ .function = func });
+                    if (self.parseFunctionDecl(.public)) |func| {
+                        try top_items.append(self.allocator, .{ .function = func });
+                    } else |_| {
+                        self.synchronize();
+                    }
                 },
                 .keyword_defp => {
-                    const func = try self.parseFunctionDecl(.private);
-                    try top_items.append(self.allocator, .{ .priv_function = func });
+                    if (self.parseFunctionDecl(.private)) |func| {
+                        try top_items.append(self.allocator, .{ .priv_function = func });
+                    } else |_| {
+                        self.synchronize();
+                    }
                 },
                 .keyword_type => {
-                    const td = try self.parseTypeDecl();
-                    try top_items.append(self.allocator, .{ .type_decl = td });
+                    if (self.parseTypeDecl()) |td| {
+                        try top_items.append(self.allocator, .{ .type_decl = td });
+                    } else |_| {
+                        self.synchronize();
+                    }
                 },
                 .keyword_opaque => {
-                    const od = try self.parseOpaqueDecl();
-                    try top_items.append(self.allocator, .{ .opaque_decl = od });
+                    if (self.parseOpaqueDecl()) |od| {
+                        try top_items.append(self.allocator, .{ .opaque_decl = od });
+                    } else |_| {
+                        self.synchronize();
+                    }
                 },
                 .keyword_defmacro => {
-                    const mac = try self.parseMacroDecl();
-                    try top_items.append(self.allocator, .{ .macro = mac });
+                    if (self.parseMacroDecl()) |mac| {
+                        try top_items.append(self.allocator, .{ .macro = mac });
+                    } else |_| {
+                        self.synchronize();
+                    }
                 },
                 .newline => {
                     _ = self.advance();
@@ -195,15 +248,37 @@ pub const Parser = struct {
                     _ = self.advance();
                 },
                 else => {
-                    try self.addError(
-                        std.fmt.allocPrint(self.allocator, "unexpected token at top level: {s}", .{
-                            Token.tagName(self.current.tag),
-                        }) catch "unexpected token",
+                    // Check for misspelled keywords
+                    if (self.current.tag == .identifier) {
+                        const text = self.current.slice(self.source);
+                        const keywords = [_][]const u8{ "defmodule", "def", "defp", "defmacro", "type", "opaque" };
+                        if (similarity.findBestMatch(text, &keywords, 0.75)) |suggestion| {
+                            try self.addRichError(
+                                std.fmt.allocPrint(self.allocator, "I was not expecting `{s}` at the top level", .{text}) catch "unexpected identifier at top level",
+                                self.currentSpan(),
+                                null,
+                                std.fmt.allocPrint(self.allocator, "did you mean `{s}`?", .{suggestion}) catch "check for typos",
+                            );
+                            _ = self.advance();
+                            continue;
+                        }
+                    }
+                    try self.addRichError(
+                        std.fmt.allocPrint(self.allocator, "I was not expecting {s} at the top level", .{
+                            tokenHumanName(self.current.tag),
+                        }) catch "unexpected token at top level",
                         self.currentSpan(),
+                        null,
+                        "the top level can contain `defmodule`, `def`, `defp`, `type`, and `opaque` declarations",
                     );
                     _ = self.advance();
                 },
             }
+        }
+
+        // If we accumulated errors during recovery, report them
+        if (self.errors.items.len > 0) {
+            return error.ParseError;
         }
 
         return .{
@@ -220,9 +295,27 @@ pub const Parser = struct {
         const start = self.currentSpan();
         _ = try self.expect(.keyword_defmodule);
 
+        if (!self.check(.module_identifier)) {
+            try self.addRichError(
+                "I was expecting a module name (like `MyModule`) after `defmodule`",
+                start,
+                "module declaration starts here",
+                "module names must start with an uppercase letter",
+            );
+            return error.ParseError;
+        }
         const name = try self.parseModuleName();
 
-        _ = try self.expectAt(.keyword_do, start);
+        if (!self.check(.keyword_do)) {
+            try self.addRichError(
+                "I was expecting `do` to start the module body",
+                start,
+                "this module declaration needs a `do` ... `end` block",
+                "add `do` after the module name",
+            );
+            return error.ParseError;
+        }
+        _ = self.advance();
         self.skipNewlines();
 
         _ = self.match(.indent);
@@ -235,36 +328,60 @@ pub const Parser = struct {
 
             switch (self.peek()) {
                 .keyword_def => {
-                    const func = try self.parseFunctionDecl(.public);
-                    try items.append(self.allocator, .{ .function = func });
+                    if (self.parseFunctionDecl(.public)) |func| {
+                        try items.append(self.allocator, .{ .function = func });
+                    } else |_| {
+                        self.synchronize();
+                    }
                 },
                 .keyword_defp => {
-                    const func = try self.parseFunctionDecl(.private);
-                    try items.append(self.allocator, .{ .priv_function = func });
+                    if (self.parseFunctionDecl(.private)) |func| {
+                        try items.append(self.allocator, .{ .priv_function = func });
+                    } else |_| {
+                        self.synchronize();
+                    }
                 },
                 .keyword_defmacro => {
-                    const mac = try self.parseMacroDecl();
-                    try items.append(self.allocator, .{ .macro = mac });
+                    if (self.parseMacroDecl()) |mac| {
+                        try items.append(self.allocator, .{ .macro = mac });
+                    } else |_| {
+                        self.synchronize();
+                    }
                 },
                 .keyword_defstruct => {
-                    const sd = try self.parseStructDecl();
-                    try items.append(self.allocator, .{ .struct_decl = sd });
+                    if (self.parseStructDecl()) |sd| {
+                        try items.append(self.allocator, .{ .struct_decl = sd });
+                    } else |_| {
+                        self.synchronize();
+                    }
                 },
                 .keyword_type => {
-                    const td = try self.parseTypeDecl();
-                    try items.append(self.allocator, .{ .type_decl = td });
+                    if (self.parseTypeDecl()) |td| {
+                        try items.append(self.allocator, .{ .type_decl = td });
+                    } else |_| {
+                        self.synchronize();
+                    }
                 },
                 .keyword_opaque => {
-                    const od = try self.parseOpaqueDecl();
-                    try items.append(self.allocator, .{ .opaque_decl = od });
+                    if (self.parseOpaqueDecl()) |od| {
+                        try items.append(self.allocator, .{ .opaque_decl = od });
+                    } else |_| {
+                        self.synchronize();
+                    }
                 },
                 .keyword_alias => {
-                    const ad = try self.parseAliasDecl();
-                    try items.append(self.allocator, .{ .alias_decl = ad });
+                    if (self.parseAliasDecl()) |ad| {
+                        try items.append(self.allocator, .{ .alias_decl = ad });
+                    } else |_| {
+                        self.synchronize();
+                    }
                 },
                 .keyword_import => {
-                    const id = try self.parseImportDecl();
-                    try items.append(self.allocator, .{ .import_decl = id });
+                    if (self.parseImportDecl()) |id| {
+                        try items.append(self.allocator, .{ .import_decl = id });
+                    } else |_| {
+                        self.synchronize();
+                    }
                 },
                 .dedent => {
                     _ = self.advance();
@@ -273,11 +390,13 @@ pub const Parser = struct {
                     _ = self.advance();
                 },
                 else => {
-                    try self.addError(
-                        std.fmt.allocPrint(self.allocator, "unexpected token in module: {s}", .{
-                            Token.tagName(self.current.tag),
-                        }) catch "unexpected token",
+                    try self.addRichError(
+                        std.fmt.allocPrint(self.allocator, "I was not expecting {s} inside a module", .{
+                            tokenHumanName(self.current.tag),
+                        }) catch "unexpected token in module",
                         self.currentSpan(),
+                        "not valid inside a module body",
+                        "modules can contain `def`, `defp`, `defstruct`, `type`, `alias`, and `import` declarations",
                     );
                     _ = self.advance();
                 },
@@ -286,7 +405,16 @@ pub const Parser = struct {
 
         _ = self.match(.dedent);
         self.skipNewlines();
-        _ = try self.expectAt(.keyword_end, start);
+        if (!self.check(.keyword_end)) {
+            try self.addRichError(
+                "I was expecting `end` to close the module that starts here",
+                start,
+                "this module was opened here",
+                "add `end` to close the module body",
+            );
+            return error.ParseError;
+        }
+        _ = self.advance();
 
         return .{
             .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
@@ -485,9 +613,27 @@ pub const Parser = struct {
     fn parseFunctionClause(self: *Parser, def_span: ast.SourceSpan) !ast.FunctionClause {
         const start = self.currentSpan();
 
-        _ = try self.expect(.left_paren);
+        if (!self.check(.left_paren)) {
+            try self.addRichError(
+                "I was expecting `(` to start the parameter list",
+                def_span,
+                "this function definition needs a parameter list",
+                "add `()` after the function name, even if there are no parameters",
+            );
+            return error.ParseError;
+        }
+        _ = self.advance();
         const params = try self.parseParamList();
-        _ = try self.expect(.right_paren);
+        if (!self.check(.right_paren)) {
+            try self.addRichError(
+                "this opening `(` was never closed",
+                start,
+                "opening `(` here",
+                "add `)` to close the parameter list",
+            );
+            return error.ParseError;
+        }
+        _ = self.advance();
 
         var return_type: ?*const ast.TypeExpr = null;
         if (self.match(.double_colon)) {
@@ -499,7 +645,16 @@ pub const Parser = struct {
             refinement = try self.parseExpr();
         }
 
-        _ = try self.expectAt(.keyword_do, def_span);
+        if (!self.check(.keyword_do)) {
+            try self.addRichError(
+                "I was expecting the `do` keyword to start the function body",
+                def_span,
+                "this function definition needs a `do` ... `end` block",
+                "add `do` after the function signature",
+            );
+            return error.ParseError;
+        }
+        _ = self.advance();
         self.skipNewlines();
         _ = self.match(.indent);
 
@@ -507,7 +662,16 @@ pub const Parser = struct {
 
         _ = self.match(.dedent);
         self.skipNewlines();
-        _ = try self.expectAt(.keyword_end, def_span);
+        if (!self.check(.keyword_end)) {
+            try self.addRichError(
+                "I was expecting `end` to close the function that starts here",
+                def_span,
+                "this function was opened here",
+                "add `end` to close the function body",
+            );
+            return error.ParseError;
+        }
+        _ = self.advance();
 
         return .{
             .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
@@ -603,7 +767,12 @@ pub const Parser = struct {
             const entries = try self.parseImportEntryList();
             return .{ .except = entries };
         }
-        try self.addError("expected 'only' or 'except'", self.currentSpan());
+        try self.addRichError(
+            "I was expecting `only:` or `except:` after the comma in this import",
+            self.currentSpan(),
+            null,
+            "import filters look like: `import Foo, only: [bar: 1]`",
+        );
         return error.ParseError;
     }
 
@@ -703,6 +872,16 @@ pub const Parser = struct {
     fn parseOrExpr(self: *Parser) !*const ast.Expr {
         var left = try self.parseAndExpr();
 
+        if (self.check(.double_pipe)) {
+            try self.addRichError(
+                "Zap uses `or` for logical OR, not `||`",
+                self.currentSpan(),
+                "this operator is from C/JavaScript",
+                "replace `||` with `or`",
+            );
+            return error.ParseError;
+        }
+
         while (self.check(.keyword_or)) {
             _ = self.advance();
             const right = try self.parseAndExpr();
@@ -721,6 +900,16 @@ pub const Parser = struct {
 
     fn parseAndExpr(self: *Parser) !*const ast.Expr {
         var left = try self.parseCompareExpr();
+
+        if (self.check(.double_ampersand)) {
+            try self.addRichError(
+                "Zap uses `and` for logical AND, not `&&`",
+                self.currentSpan(),
+                "this operator is from C/JavaScript",
+                "replace `&&` with `and`",
+            );
+            return error.ParseError;
+        }
 
         while (self.check(.keyword_and)) {
             _ = self.advance();
@@ -954,12 +1143,41 @@ pub const Parser = struct {
             .keyword_unquote => return self.parseUnquoteExpr(),
             .keyword_panic => return self.parsePanicExpr(),
             .at_sign => return self.parseIntrinsicExpr(),
-            else => {
-                try self.addError(
-                    std.fmt.allocPrint(self.allocator, "unexpected token in expression: {s}", .{
-                        Token.tagName(self.current.tag),
-                    }) catch "unexpected token",
+            .double_ampersand => {
+                try self.addRichError(
+                    "Zap uses `and` for logical AND, not `&&`",
                     self.currentSpan(),
+                    "this operator is from C/JavaScript",
+                    "replace `&&` with `and`",
+                );
+                return error.ParseError;
+            },
+            .double_pipe => {
+                try self.addRichError(
+                    "Zap uses `or` for logical OR, not `||`",
+                    self.currentSpan(),
+                    "this operator is from C/JavaScript",
+                    "replace `||` with `or`",
+                );
+                return error.ParseError;
+            },
+            .plus_plus => {
+                try self.addRichError(
+                    "Zap uses `<>` for concatenation, not `++`",
+                    self.currentSpan(),
+                    "this operator is from Elixir/Haskell",
+                    "use `<>` for string concatenation",
+                );
+                return error.ParseError;
+            },
+            else => {
+                try self.addRichError(
+                    std.fmt.allocPrint(self.allocator, "I was not expecting {s} here", .{
+                        tokenHumanName(self.current.tag),
+                    }) catch "unexpected token in expression",
+                    self.currentSpan(),
+                    "not a valid expression",
+                    "expressions start with a value (number, string, variable), an operator, or a keyword like `if`, `case`, or `with`",
                 );
                 return error.ParseError;
             },
@@ -1602,15 +1820,22 @@ pub const Parser = struct {
                         } },
                     });
                 }
-                try self.addError("expected number after '-' in pattern", self.currentSpan());
+                try self.addRichError(
+                    "I was expecting a number after `-` in this pattern",
+                    self.currentSpan(),
+                    null,
+                    "negative patterns must be followed by an integer, like `-1`",
+                );
                 return error.ParseError;
             },
             else => {
-                try self.addError(
-                    std.fmt.allocPrint(self.allocator, "unexpected token in pattern: {s}", .{
-                        Token.tagName(self.current.tag),
-                    }) catch "unexpected token",
+                try self.addRichError(
+                    std.fmt.allocPrint(self.allocator, "I was not expecting {s} in this pattern", .{
+                        tokenHumanName(self.current.tag),
+                    }) catch "unexpected token in pattern",
                     self.currentSpan(),
+                    "not valid in a pattern",
+                    "patterns can be literals, variables, tuples `{a, b}`, lists `[a, b]`, or the wildcard `_`",
                 );
                 return error.ParseError;
             },
@@ -1785,11 +2010,13 @@ pub const Parser = struct {
             .int_literal, .string_literal, .keyword_true, .keyword_false, .keyword_nil => return self.parseLiteralType(),
             .identifier, .module_identifier => return self.parseNamedType(),
             else => {
-                try self.addError(
-                    std.fmt.allocPrint(self.allocator, "unexpected token in type: {s}", .{
-                        Token.tagName(self.current.tag),
-                    }) catch "unexpected token",
+                try self.addRichError(
+                    std.fmt.allocPrint(self.allocator, "I was not expecting {s} in this type annotation", .{
+                        tokenHumanName(self.current.tag),
+                    }) catch "unexpected token in type",
                     self.currentSpan(),
+                    "not a valid type",
+                    "types look like: `i64`, `String`, `{:ok, i64}`, or `List(i64)`",
                 );
                 return error.ParseError;
             },
@@ -2120,10 +2347,89 @@ pub const Parser = struct {
         if (self.check(.identifier) or self.check(.module_identifier)) {
             return self.advance();
         }
-        try self.addError("expected identifier", self.currentSpan());
+        try self.addError("I was expecting an identifier", self.currentSpan());
         return error.ParseError;
     }
 };
+
+/// Human-readable names for token tags, used in error messages.
+fn tokenHumanName(tag: Token.Tag) []const u8 {
+    return switch (tag) {
+        .keyword_def => "`def`",
+        .keyword_defp => "`defp`",
+        .keyword_defmodule => "`defmodule`",
+        .keyword_defmacro => "`defmacro`",
+        .keyword_defstruct => "`defstruct`",
+        .keyword_do => "`do`",
+        .keyword_end => "`end`",
+        .keyword_if => "`if`",
+        .keyword_else => "`else`",
+        .keyword_case => "`case`",
+        .keyword_with => "`with`",
+        .keyword_cond => "`cond`",
+        .keyword_type => "`type`",
+        .keyword_opaque => "`opaque`",
+        .keyword_alias => "`alias`",
+        .keyword_import => "`import`",
+        .keyword_quote => "`quote`",
+        .keyword_unquote => "`unquote`",
+        .keyword_true => "`true`",
+        .keyword_false => "`false`",
+        .keyword_nil => "`nil`",
+        .keyword_and => "`and`",
+        .keyword_or => "`or`",
+        .keyword_not => "`not`",
+        .keyword_rem => "`rem`",
+        .keyword_panic => "`panic`",
+        .keyword_only => "`only`",
+        .keyword_except => "`except`",
+        .keyword_as => "`as`",
+        .left_paren => "`(`",
+        .right_paren => "`)`",
+        .left_bracket => "`[`",
+        .right_bracket => "`]`",
+        .left_brace => "`{`",
+        .right_brace => "`}`",
+        .comma => "`,`",
+        .colon => "`:`",
+        .dot => "`.`",
+        .arrow => "`->`",
+        .back_arrow => "`<-`",
+        .double_colon => "`::`",
+        .pipe => "`|`",
+        .pipe_operator => "`|>`",
+        .equal => "`=`",
+        .equal_equal => "`==`",
+        .not_equal => "`!=`",
+        .less => "`<`",
+        .greater => "`>`",
+        .less_equal => "`<=`",
+        .greater_equal => "`>=`",
+        .plus => "`+`",
+        .minus => "`-`",
+        .star => "`*`",
+        .slash => "`/`",
+        .diamond => "`<>`",
+        .bang => "`!`",
+        .caret => "`^`",
+        .at_sign => "`@`",
+        .identifier => "an identifier",
+        .module_identifier => "a module name",
+        .int_literal => "a number",
+        .float_literal => "a number",
+        .string_literal => "a string",
+        .atom_literal => "an atom",
+        .newline => "a newline",
+        .indent => "indentation",
+        .dedent => "dedentation",
+        .eof => "end of file",
+        .invalid => "an invalid token",
+        .double_ampersand => "`&&`",
+        .double_pipe => "`||`",
+        .plus_plus => "`++`",
+        else => Token.tagName(tag),
+    };
+}
 
 // ============================================================
 // Tests

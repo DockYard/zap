@@ -303,7 +303,13 @@ pub const Lexer = struct {
         self.pos += 1;
 
         switch (c) {
-            '+' => return self.makeToken(.plus, start, self.pos),
+            '+' => {
+                if (self.pos < self.source.len and self.source[self.pos] == '+') {
+                    self.pos += 1;
+                    return self.makeToken(.plus_plus, start, self.pos);
+                }
+                return self.makeToken(.plus, start, self.pos);
+            },
             '*' => return self.makeToken(.star, start, self.pos),
             '/' => return self.makeToken(.slash, start, self.pos),
             '^' => return self.makeToken(.caret, start, self.pos),
@@ -367,6 +373,10 @@ pub const Lexer = struct {
                     self.pos += 1;
                     return self.makeToken(.pipe_operator, start, self.pos);
                 }
+                if (self.pos < self.source.len and self.source[self.pos] == '|') {
+                    self.pos += 1;
+                    return self.makeToken(.double_pipe, start, self.pos);
+                }
                 return self.makeToken(.pipe, start, self.pos);
             },
             ':' => {
@@ -396,6 +406,13 @@ pub const Lexer = struct {
                     return self.makeToken(.hash_brace, start, self.pos);
                 }
                 return self.makeToken(.hash, start, self.pos);
+            },
+            '&' => {
+                if (self.pos < self.source.len and self.source[self.pos] == '&') {
+                    self.pos += 1;
+                    return self.makeToken(.double_ampersand, start, self.pos);
+                }
+                return self.makeToken(.invalid, start, self.pos);
             },
             else => return self.makeToken(.invalid, start, self.pos),
         }

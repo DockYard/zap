@@ -16,6 +16,7 @@ pub const runtime = @import("runtime.zig");
 pub const diagnostics = @import("diagnostics.zig");
 pub const DiagnosticEngine = diagnostics.DiagnosticEngine;
 pub const Severity = diagnostics.Severity;
+pub const similarity = @import("similarity.zig");
 pub const stdlib = @import("stdlib.zig");
 
 test {
@@ -35,6 +36,7 @@ test {
     _ = @import("codegen.zig");
     _ = @import("runtime.zig");
     _ = @import("diagnostics.zig");
+    _ = @import("similarity.zig");
     _ = @import("stdlib.zig");
     _ = @import("integration_tests.zig");
 }

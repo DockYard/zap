@@ -147,13 +147,18 @@ pub const MacroFamily = struct {
 // Binding
 // ============================================================
 
+pub const TypeProvenance = struct {
+    type_id: u32,
+    source_span: ast.SourceSpan,
+};
+
 pub const Binding = struct {
     id: BindingId,
     name: ast.StringId,
     scope_id: ScopeId,
     kind: BindingKind,
     span: ast.SourceSpan,
-    type_id: ?u32 = null,
+    type_id: ?TypeProvenance = null,
 };
 
 pub const BindingKind = enum {
@@ -203,6 +208,9 @@ pub const ScopeGraph = struct {
     types: std.ArrayList(TypeEntry),
     modules: std.ArrayList(ModuleEntry),
     prelude_scope: ScopeId,
+    /// Maps AST node span.start → scope_id, so the type checker can find
+    /// the scope for function clauses and modules without mutating the AST.
+    node_scope_map: std.AutoHashMap(u32, ScopeId),
 
     pub fn init(allocator: std.mem.Allocator) ScopeGraph {
         var graph = ScopeGraph{
@@ -214,6 +222,7 @@ pub const ScopeGraph = struct {
             .types = .empty,
             .modules = .empty,
             .prelude_scope = 0,
+            .node_scope_map = std.AutoHashMap(u32, ScopeId).init(allocator),
         };
         // Create prelude scope as scope 0
         const prelude = Scope.init(allocator, 0, null, .prelude);
@@ -237,6 +246,7 @@ pub const ScopeGraph = struct {
         self.macro_families.deinit(self.allocator);
         self.types.deinit(self.allocator);
         self.modules.deinit(self.allocator);
+        self.node_scope_map.deinit();
     }
 
     pub fn createScope(self: *ScopeGraph, parent: ?ScopeId, kind: ScopeKind) !ScopeId {
@@ -352,6 +362,37 @@ pub const ScopeGraph = struct {
             current = scope.parent;
         }
         return null;
+    }
+
+    /// Collect all binding names visible from a scope, walking up the chain.
+    /// Returns a list of interned string IDs (caller must resolve via interner).
+    pub fn collectVisibleBindingNames(self: *const ScopeGraph, scope_id: ScopeId, allocator: std.mem.Allocator) ![]ast.StringId {
+        var names: std.ArrayList(ast.StringId) = .empty;
+        var current: ?ScopeId = scope_id;
+        while (current) |sid| {
+            const scope = self.getScope(sid);
+            var iter = scope.bindings.iterator();
+            while (iter.next()) |entry| {
+                try names.append(allocator, entry.key_ptr.*);
+            }
+            current = scope.parent;
+        }
+        return names.toOwnedSlice(allocator);
+    }
+
+    /// Collect all function family names visible from a scope.
+    pub fn collectVisibleFunctionNames(self: *const ScopeGraph, scope_id: ScopeId, allocator: std.mem.Allocator) ![]FamilyKey {
+        var names: std.ArrayList(FamilyKey) = .empty;
+        var current: ?ScopeId = scope_id;
+        while (current) |sid| {
+            const scope = self.getScope(sid);
+            var iter = scope.function_families.iterator();
+            while (iter.next()) |entry| {
+                try names.append(allocator, entry.key_ptr.*);
+            }
+            current = scope.parent;
+        }
+        return names.toOwnedSlice(allocator);
     }
 };
 

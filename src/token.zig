@@ -102,6 +102,11 @@ pub const Token = struct {
         // Special
         eof,
         invalid,
+
+        // Foreign operators (from other languages — produce helpful errors)
+        double_ampersand, // &&
+        double_pipe, // ||
+        plus_plus, // ++
     };
 
     pub fn slice(self: Token, source: []const u8) []const u8 {

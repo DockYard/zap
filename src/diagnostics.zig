@@ -2,13 +2,15 @@ const std = @import("std");
 const ast = @import("ast.zig");
 
 // ============================================================
-// Diagnostics Engine (spec §23)
+// Diagnostics Engine
 //
-// Provides structured error reporting with:
-//   - Source location tracking
-//   - Error severity levels
-//   - Dispatch resolution traces
-//   - Contextual help messages
+// Rich error reporting with:
+//   - Caret underlines (^^^ primary, ~~~ secondary)
+//   - Box-drawing format (│, └─)
+//   - Color support (respects NO_COLOR)
+//   - Contextual labels, help text, and suggestions
+//   - Error codes (Z0001-style)
+//   - Multi-error support with configurable limit
 // ============================================================
 
 pub const Severity = enum {
@@ -27,11 +29,29 @@ pub const Severity = enum {
     }
 };
 
+pub const SecondarySpan = struct {
+    span: ast.SourceSpan,
+    label: []const u8,
+};
+
+pub const Suggestion = struct {
+    span: ast.SourceSpan,
+    replacement: []const u8,
+    description: []const u8,
+};
+
 pub const Diagnostic = struct {
     severity: Severity,
     message: []const u8,
     span: ast.SourceSpan,
-    notes: []const Note,
+    notes: []const Note = &.{},
+
+    // Rich fields
+    label: ?[]const u8 = null,
+    secondary_spans: []const SecondarySpan = &.{},
+    help: ?[]const u8 = null,
+    suggestion: ?Suggestion = null,
+    code: ?[]const u8 = null,
 
     pub const Note = struct {
         message: []const u8,
@@ -39,12 +59,70 @@ pub const Diagnostic = struct {
     };
 };
 
+// ============================================================
+// Color support
+// ============================================================
+
+const Color = struct {
+    enabled: bool,
+
+    const RESET = "\x1b[0m";
+    const BOLD = "\x1b[1m";
+    const RED = "\x1b[31m";
+    const YELLOW = "\x1b[33m";
+    const CYAN = "\x1b[36m";
+    const BOLD_RED = "\x1b[1;31m";
+    const BOLD_YELLOW = "\x1b[1;33m";
+    const BOLD_CYAN = "\x1b[1;36m";
+    const BOLD_BLUE = "\x1b[1;34m";
+
+    fn severityStyle(self: Color, severity: Severity) struct { start: []const u8, end: []const u8 } {
+        if (!self.enabled) return .{ .start = "", .end = "" };
+        return switch (severity) {
+            .@"error" => .{ .start = BOLD_RED, .end = RESET },
+            .warning => .{ .start = BOLD_YELLOW, .end = RESET },
+            .note => .{ .start = BOLD_CYAN, .end = RESET },
+            .help => .{ .start = BOLD, .end = RESET },
+        };
+    }
+
+    fn caretStyle(self: Color, severity: Severity) struct { start: []const u8, end: []const u8 } {
+        if (!self.enabled) return .{ .start = "", .end = "" };
+        return switch (severity) {
+            .@"error" => .{ .start = RED, .end = RESET },
+            .warning => .{ .start = YELLOW, .end = RESET },
+            .note, .help => .{ .start = CYAN, .end = RESET },
+        };
+    }
+
+    fn gutterStyle(self: Color) struct { start: []const u8, end: []const u8 } {
+        if (!self.enabled) return .{ .start = "", .end = "" };
+        return .{ .start = BOLD_BLUE, .end = RESET };
+    }
+
+    fn locationStyle(self: Color) struct { start: []const u8, end: []const u8 } {
+        if (!self.enabled) return .{ .start = "", .end = "" };
+        return .{ .start = CYAN, .end = RESET };
+    }
+};
+
+pub fn detectColor() bool {
+    if (std.posix.getenv("NO_COLOR")) |_| return false;
+    return std.posix.isatty(std.fs.File.stderr().handle);
+}
+
+// ============================================================
+// Diagnostic Engine
+// ============================================================
+
 pub const DiagnosticEngine = struct {
     allocator: std.mem.Allocator,
     diagnostics: std.ArrayList(Diagnostic),
     source: ?[]const u8,
     file_path: ?[]const u8,
     line_offset: u32,
+    max_errors: u32,
+    use_color: bool,
 
     pub fn init(allocator: std.mem.Allocator) DiagnosticEngine {
         return .{
@@ -53,6 +131,8 @@ pub const DiagnosticEngine = struct {
             .source = null,
             .file_path = null,
             .line_offset = 0,
+            .max_errors = 20,
+            .use_color = false,
         };
     }
 
@@ -76,11 +156,10 @@ pub const DiagnosticEngine = struct {
     // ============================================================
 
     pub fn report(self: *DiagnosticEngine, severity: Severity, message: []const u8, span: ast.SourceSpan) !void {
-        try self.diagnostics.append(self.allocator, .{
+        try self.reportDiagnostic(.{
             .severity = severity,
             .message = message,
             .span = span,
-            .notes = &.{},
         });
     }
 
@@ -91,12 +170,16 @@ pub const DiagnosticEngine = struct {
         span: ast.SourceSpan,
         notes: []const Diagnostic.Note,
     ) !void {
-        try self.diagnostics.append(self.allocator, .{
+        try self.reportDiagnostic(.{
             .severity = severity,
             .message = message,
             .span = span,
             .notes = notes,
         });
+    }
+
+    pub fn reportDiagnostic(self: *DiagnosticEngine, diag: Diagnostic) !void {
+        try self.diagnostics.append(self.allocator, diag);
     }
 
     pub fn err(self: *DiagnosticEngine, message: []const u8, span: ast.SourceSpan) !void {
@@ -108,7 +191,7 @@ pub const DiagnosticEngine = struct {
     }
 
     // ============================================================
-    // Specialized error constructors (spec §23.1)
+    // Specialized error constructors
     // ============================================================
 
     pub fn typeError(self: *DiagnosticEngine, expected: []const u8, got: []const u8, span: ast.SourceSpan) !void {
@@ -127,16 +210,16 @@ pub const DiagnosticEngine = struct {
     }
 
     pub fn ambiguousOverload(self: *DiagnosticEngine, name: []const u8, arity: u32, span: ast.SourceSpan) !void {
-        const msg = try std.fmt.allocPrint(self.allocator, "ambiguous overload for `{s}/{d}` — multiple clauses match with equal specificity", .{ name, arity });
+        const msg = try std.fmt.allocPrint(self.allocator, "ambiguous overload for `{s}/{d}` \u{2014} multiple clauses match with equal specificity", .{ name, arity });
         try self.err(msg, span);
     }
 
     pub fn nonExhaustiveMatch(self: *DiagnosticEngine, span: ast.SourceSpan) !void {
-        try self.err("non-exhaustive match — not all cases are covered", span);
+        try self.err("non-exhaustive match \u{2014} not all cases are covered", span);
     }
 
     pub fn unreachableClause(self: *DiagnosticEngine, span: ast.SourceSpan) !void {
-        try self.warn("unreachable clause — previous clauses match all inputs", span);
+        try self.warn("unreachable clause \u{2014} previous clauses match all inputs", span);
     }
 
     // ============================================================
@@ -167,6 +250,15 @@ pub const DiagnosticEngine = struct {
     }
 
     // ============================================================
+    // Display helpers
+    // ============================================================
+
+    fn displayLine(self: *const DiagnosticEngine, line: u32) u32 {
+        if (line > self.line_offset) return line - self.line_offset;
+        return line;
+    }
+
+    // ============================================================
     // Formatting
     // ============================================================
 
@@ -174,55 +266,288 @@ pub const DiagnosticEngine = struct {
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(allocator);
         const writer = buf.writer(allocator);
+        const color = Color{ .enabled = self.use_color };
+
+        var errors_shown: usize = 0;
+        var total_errors: usize = 0;
 
         for (self.diagnostics.items) |diag| {
-            // Apply line offset (subtract stdlib lines) for user-facing line numbers
-            const display_line = if (diag.span.line > self.line_offset)
-                diag.span.line - self.line_offset
-            else
-                diag.span.line;
-
-            // File location
-            if (self.file_path) |fp| {
-                try writer.print("{s}:", .{fp});
+            if (diag.severity == .@"error") {
+                total_errors += 1;
+                if (errors_shown >= self.max_errors) continue;
+                errors_shown += 1;
             }
-            if (display_line > 0) {
-                try writer.print("{d}:{d}: ", .{ display_line, diag.span.col });
-            }
+            try self.formatDiagnostic(writer, diag, color);
+        }
 
-            // Severity and message
-            try writer.print("{s}: {s}\n", .{ diag.severity.label(), diag.message });
-
-            // Source context
-            if (self.source) |src| {
-                if (diag.span.line > 0) {
-                    if (getSourceLine(src, diag.span.line)) |line| {
-                        try writer.print(" {d} | {s}\n", .{ display_line, line });
-                    }
-                }
-            }
-
-            // Notes
-            for (diag.notes) |note| {
-                if (note.span) |s| {
-                    const note_display_line = if (s.line > self.line_offset)
-                        s.line - self.line_offset
-                    else
-                        s.line;
-                    if (self.file_path) |fp| {
-                        try writer.print("{s}:", .{fp});
-                    }
-                    try writer.print("{d}:{d}: ", .{ note_display_line, s.col });
-                }
-                try writer.print("note: {s}\n", .{note.message});
-            }
+        if (total_errors > self.max_errors) {
+            const remaining = total_errors - self.max_errors;
+            try writer.print("... and {d} more error{s}\n", .{
+                remaining,
+                @as([]const u8, if (remaining == 1) "" else "s"),
+            });
         }
 
         return buf.toOwnedSlice(allocator);
     }
+
+    fn formatDiagnostic(
+        self: *const DiagnosticEngine,
+        writer: anytype,
+        diag: Diagnostic,
+        color: Color,
+    ) !void {
+        const display_line = self.displayLine(diag.span.line);
+
+        // Compute gutter width from max line number in this diagnostic
+        var max_line = display_line;
+        for (diag.secondary_spans) |ss| {
+            max_line = @max(max_line, self.displayLine(ss.span.line));
+        }
+        for (diag.notes) |note| {
+            if (note.span) |s| {
+                max_line = @max(max_line, self.displayLine(s.line));
+            }
+        }
+        const gutter = @max(digitCount(max_line), @as(u32, 1));
+
+        const has_source = self.source != null and diag.span.line > 0;
+
+        // ── Header: severity[code]: message ──
+        const sev = color.severityStyle(diag.severity);
+        try writer.writeAll(sev.start);
+        try writer.writeAll(diag.severity.label());
+        if (diag.code) |code| {
+            try writer.print("[{s}]", .{code});
+        }
+        try writer.writeAll(": ");
+        try writer.writeAll(sev.end);
+        if (color.enabled) try writer.writeAll(Color.BOLD);
+        try writer.writeAll(diag.message);
+        if (color.enabled) try writer.writeAll(Color.RESET);
+        try writer.writeByte('\n');
+
+        // ── Source context ──
+        if (has_source) {
+            if (getSourceLine(self.source.?, diag.span.line)) |line| {
+                // Empty gutter line
+                try writeGutterEmpty(writer, gutter, color);
+
+                // Context: 1 line above if available
+                if (diag.span.line > 1) {
+                    const prev_line_num = diag.span.line - 1;
+                    const prev_display = self.displayLine(prev_line_num);
+                    if (prev_display > 0) {
+                        if (getSourceLine(self.source.?, prev_line_num)) |prev_line| {
+                            if (prev_line.len > 0) {
+                                try writeGutterLine(writer, gutter, prev_display, prev_line, color);
+                            }
+                        }
+                    }
+                }
+
+                // Source line with line number
+                try writeGutterLine(writer, gutter, display_line, line, color);
+
+                // Primary underline with label
+                if (diag.span.col > 0) {
+                    const col0 = diag.span.col - 1;
+                    const line_len: u32 = @intCast(line.len);
+                    const raw_len: u32 = if (diag.span.end > diag.span.start)
+                        diag.span.end - diag.span.start
+                    else
+                        1;
+                    const clamped = if (col0 < line_len)
+                        @min(raw_len, line_len - col0)
+                    else
+                        raw_len;
+                    const underline_len = @max(clamped, @as(u32, 1));
+                    try writeGutterUnderline(writer, gutter, col0, underline_len, '^', diag.label, color, diag.severity);
+                }
+
+                // Secondary spans
+                for (diag.secondary_spans) |ss| {
+                    const ss_display = self.displayLine(ss.span.line);
+                    if (ss.span.line != diag.span.line) {
+                        if (getSourceLine(self.source.?, ss.span.line)) |ss_line| {
+                            try writeGutterLine(writer, gutter, ss_display, ss_line, color);
+                        }
+                    }
+                    if (ss.span.col > 0) {
+                        if (getSourceLine(self.source.?, ss.span.line)) |ss_line| {
+                            const ss_col0 = ss.span.col - 1;
+                            const ss_line_len: u32 = @intCast(ss_line.len);
+                            const ss_raw_len: u32 = if (ss.span.end > ss.span.start)
+                                ss.span.end - ss.span.start
+                            else
+                                1;
+                            const ss_clamped = if (ss_col0 < ss_line_len)
+                                @min(ss_raw_len, ss_line_len - ss_col0)
+                            else
+                                ss_raw_len;
+                            const ss_ulen = @max(ss_clamped, @as(u32, 1));
+                            try writeGutterUnderline(writer, gutter, ss_col0, ss_ulen, '~', ss.label, color, .note);
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Notes ──
+        for (diag.notes) |note| {
+            if (has_source) {
+                try writeGutterEmpty(writer, gutter, color);
+            }
+            try writer.writeByteNTimes(' ', gutter + 1);
+            const note_c = color.severityStyle(.note);
+            try writer.writeAll(note_c.start);
+            try writer.writeAll("= note: ");
+            try writer.writeAll(note_c.end);
+            try writer.writeAll(note.message);
+            try writer.writeByte('\n');
+        }
+
+        // ── Help ──
+        if (diag.help) |help_text| {
+            if (has_source) {
+                try writeGutterEmpty(writer, gutter, color);
+            }
+            try writer.writeByteNTimes(' ', gutter + 1);
+            if (color.enabled) try writer.writeAll(Color.BOLD);
+            try writer.writeAll("= help: ");
+            if (color.enabled) try writer.writeAll(Color.RESET);
+            try writer.writeAll(help_text);
+            try writer.writeByte('\n');
+        }
+
+        // ── Suggestion code block ──
+        if (diag.suggestion) |suggestion| {
+            if (diag.help == null) {
+                if (has_source) {
+                    try writeGutterEmpty(writer, gutter, color);
+                }
+                try writer.writeByteNTimes(' ', gutter + 1);
+                if (color.enabled) try writer.writeAll(Color.BOLD);
+                try writer.writeAll("= help: ");
+                if (color.enabled) try writer.writeAll(Color.RESET);
+                try writer.writeAll(suggestion.description);
+                try writer.writeByte('\n');
+            }
+            if (has_source) {
+                try writeGutterEmpty(writer, gutter, color);
+            }
+            const gs = color.gutterStyle();
+            var line_iter = std.mem.splitScalar(u8, suggestion.replacement, '\n');
+            while (line_iter.next()) |repl_line| {
+                try writer.writeByteNTimes(' ', gutter + 1);
+                try writer.writeAll(gs.start);
+                try writer.writeAll("\u{2502}");
+                try writer.writeAll(gs.end);
+                try writer.writeByte(' ');
+                try writer.writeAll(repl_line);
+                try writer.writeByte('\n');
+            }
+        }
+
+        // ── Footer: └─ file:line:col ──
+        if (self.file_path != null or display_line > 0) {
+            if (has_source) {
+                try writeGutterEmpty(writer, gutter, color);
+            }
+            try writer.writeByteNTimes(' ', gutter + 1);
+            const loc = color.locationStyle();
+            try writer.writeAll(loc.start);
+            try writer.writeAll("\u{2514}\u{2500} ");
+            if (self.file_path) |fp| {
+                try writer.writeAll(fp);
+            }
+            if (display_line > 0) {
+                try writer.print(":{d}:{d}", .{ display_line, diag.span.col });
+            }
+            try writer.writeAll(loc.end);
+            try writer.writeByte('\n');
+        }
+
+        // Blank line after diagnostic
+        try writer.writeByte('\n');
+    }
 };
 
-fn getSourceLine(source: []const u8, line_number: u32) ?[]const u8 {
+// ============================================================
+// Gutter rendering helpers
+// ============================================================
+
+fn writeGutterEmpty(writer: anytype, gutter_width: u32, color: Color) !void {
+    try writer.writeByteNTimes(' ', gutter_width + 1);
+    const gs = color.gutterStyle();
+    try writer.writeAll(gs.start);
+    try writer.writeAll("\u{2502}");
+    try writer.writeAll(gs.end);
+    try writer.writeByte('\n');
+}
+
+fn writeGutterLine(writer: anytype, gutter_width: u32, line_num: u32, source_line: []const u8, color: Color) !void {
+    const digits = digitCount(line_num);
+    const padding = gutter_width - digits;
+    const gs = color.gutterStyle();
+
+    try writer.writeByteNTimes(' ', padding);
+    try writer.writeAll(gs.start);
+    try writer.print("{d}", .{line_num});
+    try writer.writeAll(gs.end);
+    try writer.writeByte(' ');
+    try writer.writeAll(gs.start);
+    try writer.writeAll("\u{2502}");
+    try writer.writeAll(gs.end);
+    try writer.writeByte(' ');
+    try writer.writeAll(source_line);
+    try writer.writeByte('\n');
+}
+
+fn writeGutterUnderline(
+    writer: anytype,
+    gutter_width: u32,
+    col0: u32,
+    len: u32,
+    char: u8,
+    label_text: ?[]const u8,
+    color: Color,
+    severity: Severity,
+) !void {
+    try writer.writeByteNTimes(' ', gutter_width + 1);
+    const gs = color.gutterStyle();
+    try writer.writeAll(gs.start);
+    try writer.writeAll("\u{2502}");
+    try writer.writeAll(gs.end);
+    try writer.writeByte(' ');
+    try writer.writeByteNTimes(' ', col0);
+
+    const caret = color.caretStyle(severity);
+    try writer.writeAll(caret.start);
+    try writer.writeByteNTimes(char, len);
+    if (label_text) |lbl| {
+        try writer.writeByte(' ');
+        try writer.writeAll(lbl);
+    }
+    try writer.writeAll(caret.end);
+    try writer.writeByte('\n');
+}
+
+// ============================================================
+// Utility
+// ============================================================
+
+fn digitCount(n: u32) u32 {
+    if (n == 0) return 1;
+    var count: u32 = 0;
+    var v = n;
+    while (v > 0) : (v /= 10) {
+        count += 1;
+    }
+    return count;
+}
+
+pub fn getSourceLine(source: []const u8, line_number: u32) ?[]const u8 {
     if (line_number == 0) return null;
     var current_line: u32 = 1;
     var line_start: usize = 0;
@@ -320,4 +645,148 @@ test "diagnostic no errors" {
 
     try std.testing.expect(!engine.hasErrors());
     try std.testing.expectEqual(@as(usize, 0), engine.errorCount());
+}
+
+test "rich format with caret underlines" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var engine = DiagnosticEngine.init(alloc);
+    defer engine.deinit();
+    engine.setSource("def foo() do\n  bar()\nend\n", "test.zap");
+
+    try engine.reportDiagnostic(.{
+        .severity = .@"error",
+        .message = "I cannot find a function named `bar/0`",
+        .span = .{ .start = 15, .end = 18, .line = 2, .col = 3 },
+        .label = "not found in this scope",
+    });
+
+    const output = try engine.format(alloc);
+    // Header
+    try std.testing.expect(std.mem.indexOf(u8, output, "error: I cannot find a function named `bar/0`") != null);
+    // Source line
+    try std.testing.expect(std.mem.indexOf(u8, output, "bar()") != null);
+    // Caret underline
+    try std.testing.expect(std.mem.indexOf(u8, output, "^^^ not found in this scope") != null);
+    // Footer
+    try std.testing.expect(std.mem.indexOf(u8, output, "test.zap:2:3") != null);
+}
+
+test "rich format with help text" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var engine = DiagnosticEngine.init(alloc);
+    defer engine.deinit();
+    engine.setSource("def main()\n  1\nend\n", "test.zap");
+
+    try engine.reportDiagnostic(.{
+        .severity = .@"error",
+        .message = "I was expecting the `do` keyword to start the function body",
+        .span = .{ .start = 0, .end = 3, .line = 1, .col = 1 },
+        .label = "this function needs a `do` ... `end` block",
+        .help = "add `do` after the function signature",
+    });
+
+    const output = try engine.format(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, output, "= help: add `do` after the function signature") != null);
+}
+
+test "rich format with error code" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var engine = DiagnosticEngine.init(alloc);
+    defer engine.deinit();
+
+    try engine.reportDiagnostic(.{
+        .severity = .@"error",
+        .message = "missing `do` keyword",
+        .span = .{ .start = 0, .end = 3 },
+        .code = "Z0001",
+    });
+
+    const output = try engine.format(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, output, "error[Z0001]: missing `do` keyword") != null);
+}
+
+test "max error limit" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var engine = DiagnosticEngine.init(alloc);
+    defer engine.deinit();
+    engine.max_errors = 3;
+
+    // Add 5 errors
+    var i: u32 = 0;
+    while (i < 5) : (i += 1) {
+        try engine.err("an error", .{ .start = 0, .end = 1 });
+    }
+
+    const output = try engine.format(alloc);
+    // Should show overflow message
+    try std.testing.expect(std.mem.indexOf(u8, output, "... and 2 more errors") != null);
+}
+
+test "box drawing characters present" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var engine = DiagnosticEngine.init(alloc);
+    defer engine.deinit();
+    engine.setSource("x = 1\ny = 2\n", "test.zap");
+
+    try engine.err("something wrong", .{ .start = 0, .end = 1, .line = 1, .col = 1 });
+
+    const output = try engine.format(alloc);
+    // Box drawing vertical bar in gutter
+    try std.testing.expect(std.mem.indexOf(u8, output, "\u{2502}") != null);
+    // Footer box drawing
+    try std.testing.expect(std.mem.indexOf(u8, output, "\u{2514}\u{2500}") != null);
+}
+
+test "digitCount" {
+    try std.testing.expectEqual(@as(u32, 1), digitCount(0));
+    try std.testing.expectEqual(@as(u32, 1), digitCount(1));
+    try std.testing.expectEqual(@as(u32, 1), digitCount(9));
+    try std.testing.expectEqual(@as(u32, 2), digitCount(10));
+    try std.testing.expectEqual(@as(u32, 2), digitCount(99));
+    try std.testing.expectEqual(@as(u32, 3), digitCount(100));
+    try std.testing.expectEqual(@as(u32, 4), digitCount(1000));
+}
+
+test "secondary spans with tildes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var engine = DiagnosticEngine.init(alloc);
+    defer engine.deinit();
+    engine.setSource("name = get_input()\nnaem + 1\n", "test.zap");
+
+    try engine.reportDiagnostic(.{
+        .severity = .@"error",
+        .message = "I cannot find a variable named `naem`",
+        .span = .{ .start = 19, .end = 23, .line = 2, .col = 1 },
+        .label = "not found in this scope",
+        .secondary_spans = &[_]SecondarySpan{
+            .{
+                .span = .{ .start = 0, .end = 4, .line = 1, .col = 1 },
+                .label = "did you mean `name`?",
+            },
+        },
+        .help = "a variable with a similar name exists",
+    });
+
+    const output = try engine.format(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, output, "^^^ not found in this scope") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "~~~~ did you mean `name`?") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "= help:") != null);
 }
