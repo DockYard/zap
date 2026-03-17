@@ -76,6 +76,22 @@ pub const Parser = struct {
         return error.ParseError;
     }
 
+    /// Like expect, but reports the error at `context_span` (where the construct began)
+    /// instead of at the current token position.
+    fn expectAt(self: *Parser, tag: Token.Tag, context_span: ast.SourceSpan) !Token {
+        if (self.check(tag)) {
+            return self.advance();
+        }
+        try self.addError(
+            std.fmt.allocPrint(self.allocator, "expected {s}, got {s}", .{
+                Token.tagName(tag),
+                Token.tagName(self.current.tag),
+            }) catch "parse error",
+            context_span,
+        );
+        return error.ParseError;
+    }
+
     fn skipNewlines(self: *Parser) void {
         while (self.check(.newline)) {
             _ = self.advance();
@@ -206,7 +222,7 @@ pub const Parser = struct {
 
         const name = try self.parseModuleName();
 
-        _ = try self.expect(.keyword_do);
+        _ = try self.expectAt(.keyword_do, start);
         self.skipNewlines();
 
         _ = self.match(.indent);
@@ -270,7 +286,7 @@ pub const Parser = struct {
 
         _ = self.match(.dedent);
         self.skipNewlines();
-        _ = try self.expect(.keyword_end);
+        _ = try self.expectAt(.keyword_end, start);
 
         return .{
             .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
@@ -433,7 +449,7 @@ pub const Parser = struct {
         const name_tok = try self.expect(.identifier);
         const name = try self.internToken(name_tok);
 
-        const clause = try self.parseFunctionClause();
+        const clause = try self.parseFunctionClause(start);
 
         return self.create(ast.FunctionDecl, .{
             .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
@@ -456,7 +472,7 @@ pub const Parser = struct {
             try self.expect(.identifier); // will error with expected message
         const name = try self.internToken(name_tok);
 
-        const clause = try self.parseFunctionClause();
+        const clause = try self.parseFunctionClause(start);
 
         return self.create(ast.FunctionDecl, .{
             .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
@@ -466,7 +482,7 @@ pub const Parser = struct {
         });
     }
 
-    fn parseFunctionClause(self: *Parser) !ast.FunctionClause {
+    fn parseFunctionClause(self: *Parser, def_span: ast.SourceSpan) !ast.FunctionClause {
         const start = self.currentSpan();
 
         _ = try self.expect(.left_paren);
@@ -483,7 +499,7 @@ pub const Parser = struct {
             refinement = try self.parseExpr();
         }
 
-        _ = try self.expect(.keyword_do);
+        _ = try self.expectAt(.keyword_do, def_span);
         self.skipNewlines();
         _ = self.match(.indent);
 
@@ -491,7 +507,7 @@ pub const Parser = struct {
 
         _ = self.match(.dedent);
         self.skipNewlines();
-        _ = try self.expect(.keyword_end);
+        _ = try self.expectAt(.keyword_end, def_span);
 
         return .{
             .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
