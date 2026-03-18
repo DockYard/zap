@@ -436,11 +436,14 @@ pub const CodeGen = struct {
                 try self.write(";\n");
             },
             .local_set => |ls| {
-                try self.writeIndent();
-                try self.writeDestLocal(ls.dest);
-                try self.write(" = ");
-                try self.writeLocal(ls.value);
-                try self.write(";\n");
+                // Skip self-assignment (happens when struct init result local == variable local)
+                if (ls.dest != ls.value) {
+                    try self.writeIndent();
+                    try self.writeDestLocal(ls.dest);
+                    try self.write(" = ");
+                    try self.writeLocal(ls.value);
+                    try self.write(";\n");
+                }
             },
             .param_get => |pg| {
                 try self.writeIndent();
