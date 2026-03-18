@@ -86,6 +86,8 @@ pub const TopItem = union(enum) {
     module: *const ModuleDecl,
     type_decl: *const TypeDecl,
     opaque_decl: *const OpaqueDecl,
+    struct_decl: *const StructDecl,
+    enum_decl: *const EnumDecl,
     function: *const FunctionDecl,
     priv_function: *const FunctionDecl,
     macro: *const FunctionDecl,
@@ -98,6 +100,7 @@ pub const TopItem = union(enum) {
 pub const ModuleDecl = struct {
     meta: NodeMeta,
     name: ModuleName,
+    parent: ?StringId = null,
     items: []const ModuleItem,
 };
 
@@ -110,6 +113,7 @@ pub const ModuleItem = union(enum) {
     type_decl: *const TypeDecl,
     opaque_decl: *const OpaqueDecl,
     struct_decl: *const StructDecl,
+    enum_decl: *const EnumDecl,
     function: *const FunctionDecl,
     priv_function: *const FunctionDecl,
     macro: *const FunctionDecl,
@@ -146,6 +150,8 @@ pub const TypeParam = struct {
 
 pub const StructDecl = struct {
     meta: NodeMeta,
+    name: ?StringId = null,
+    parent: ?StringId = null,
     fields: []const StructFieldDecl,
 };
 
@@ -154,6 +160,21 @@ pub const StructFieldDecl = struct {
     name: StringId,
     type_expr: *const TypeExpr,
     default: ?*const Expr,
+};
+
+// ============================================================
+// Enum declarations
+// ============================================================
+
+pub const EnumDecl = struct {
+    meta: NodeMeta,
+    name: StringId,
+    variants: []const EnumVariant,
+};
+
+pub const EnumVariant = struct {
+    meta: NodeMeta,
+    name: StringId,
 };
 
 // ============================================================

@@ -133,6 +133,7 @@ pub const MacroEngine = struct {
             .module = .{
                 .meta = mod.meta,
                 .name = mod.name,
+                .parent = mod.parent,
                 .items = try new_items.toOwnedSlice(self.allocator),
             },
             .changed = changed,

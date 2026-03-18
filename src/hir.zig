@@ -50,12 +50,20 @@ pub const Clause = struct {
     body: *const Block,
     refinement: ?*const Expr,
     tuple_bindings: []const TupleBinding,
+    struct_bindings: []const StructBinding = &.{},
 };
 
 pub const TupleBinding = struct {
     name: ast.StringId,
     param_index: u32,
     element_index: u32,
+    local_index: u32,
+};
+
+pub const StructBinding = struct {
+    name: ast.StringId,
+    param_index: u32,
+    field_name: ast.StringId,
     local_index: u32,
 };
 
@@ -347,6 +355,17 @@ pub const MatchPattern = union(enum) {
     tuple: []const *const MatchPattern,
     list: []const *const MatchPattern,
     pin: ast.StringId,
+    struct_match: StructMatch,
+};
+
+pub const StructMatch = struct {
+    type_name: ast.StringId,
+    field_bindings: []const StructFieldBind,
+};
+
+pub const StructFieldBind = struct {
+    field_name: ast.StringId,
+    pattern: *const MatchPattern,
 };
 
 pub const PatternRow = struct {
@@ -913,6 +932,7 @@ pub const HirBuilder = struct {
     next_local: u32,
     current_param_names: []const ?ast.StringId,
     current_tuple_bindings: std.ArrayList(TupleBinding),
+    current_struct_bindings: std.ArrayList(StructBinding),
     current_case_bindings: std.ArrayList(CaseBinding),
     current_module_scope: ?scope_mod.ScopeId,
     errors: std.ArrayList(Error),
@@ -937,6 +957,7 @@ pub const HirBuilder = struct {
             .next_local = 0,
             .current_param_names = &.{},
             .current_tuple_bindings = .empty,
+            .current_struct_bindings = .empty,
             .current_case_bindings = .empty,
             .current_module_scope = null,
             .errors = .empty,
@@ -1059,11 +1080,18 @@ pub const HirBuilder = struct {
                         .kind = .opaque_type,
                     });
                 },
-                .struct_decl => {
+                .struct_decl => |sd| {
                     try type_defs.append(self.allocator, .{
-                        .name = 0,
+                        .name = sd.name orelse 0,
                         .type_id = types_mod.TypeStore.UNKNOWN,
                         .kind = .struct_type,
+                    });
+                },
+                .enum_decl => |ed| {
+                    try type_defs.append(self.allocator, .{
+                        .name = ed.name,
+                        .type_id = types_mod.TypeStore.UNKNOWN,
+                        .kind = .alias, // enums are emitted directly as type defs
                     });
                 },
                 else => {},
@@ -1074,6 +1102,29 @@ pub const HirBuilder = struct {
         for (fn_order.items) |name| {
             if (fn_groups.getPtr(name)) |decls| {
                 try functions.append(self.allocator, try self.buildMergedFunctionGroup(decls.items, mod_scope));
+            }
+        }
+
+        // Build inherited functions from scope graph (module extends)
+        // These are families in the module scope that weren't in the AST items
+        const mod_scope_data = self.graph.getScope(mod_scope);
+        var inherited_iter = mod_scope_data.function_families.iterator();
+        while (inherited_iter.next()) |entry| {
+            const family_key = entry.key_ptr.*;
+            // Skip if already built from AST items
+            if (fn_groups.contains(family_key.name)) continue;
+
+            const family_id = entry.value_ptr.*;
+            const family = self.graph.getFamily(family_id);
+            if (family.clauses.items.len == 0) continue;
+
+            // Build from the family's clause references (these point to parent's AST decls)
+            var decl_list: std.ArrayList(*const ast.FunctionDecl) = .empty;
+            for (family.clauses.items) |clause_ref| {
+                try decl_list.append(self.allocator, clause_ref.decl);
+            }
+            if (decl_list.items.len > 0) {
+                try functions.append(self.allocator, try self.buildMergedFunctionGroup(decl_list.items, mod_scope));
             }
         }
 
@@ -1149,7 +1200,34 @@ pub const HirBuilder = struct {
             else
                 types_mod.TypeStore.UNKNOWN;
 
-            const match_pattern = try self.compilePattern(param.pattern);
+            // When a struct pattern has no module_name (parsed from %{...} :: Type),
+            // inject the type name from the type annotation
+            const match_pattern = blk: {
+                if (param.pattern.* == .struct_pattern and param.type_annotation != null) {
+                    const sp = param.pattern.struct_pattern;
+                    if (sp.module_name.parts.len == 0) {
+                        const ann = param.type_annotation.?;
+                        if (ann.* == .name) {
+                            var bindings: std.ArrayList(StructFieldBind) = .empty;
+                            for (sp.fields) |field| {
+                                if (try self.compilePattern(field.pattern)) |p| {
+                                    try bindings.append(self.allocator, .{
+                                        .field_name = field.name,
+                                        .pattern = p,
+                                    });
+                                }
+                            }
+                            break :blk try self.create(MatchPattern, .{
+                                .struct_match = .{
+                                    .type_name = ann.name.name,
+                                    .field_bindings = try bindings.toOwnedSlice(self.allocator),
+                                },
+                            });
+                        }
+                    }
+                }
+                break :blk try self.compilePattern(param.pattern);
+            };
 
             const name = if (param.pattern.* == .bind) param.pattern.bind.name else null;
             try params.append(self.allocator, .{
@@ -1192,6 +1270,27 @@ pub const HirBuilder = struct {
             }
         }
 
+        // Process struct patterns to create bindings for destructured field variables
+        self.current_struct_bindings = .empty;
+        for (params.items, 0..) |param, param_idx| {
+            if (param.pattern) |pat| {
+                if (pat.* == .struct_match) {
+                    for (pat.struct_match.field_bindings) |fb| {
+                        if (fb.pattern.* == .bind) {
+                            const local_idx = self.next_local;
+                            self.next_local += 1;
+                            try self.current_struct_bindings.append(self.allocator, .{
+                                .name = fb.pattern.bind,
+                                .param_index = @intCast(param_idx),
+                                .field_name = fb.field_name,
+                                .local_index = local_idx,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
         // Build decision tree for this clause
         const decision = try self.create(Decision, .{
             .success = .{ .bindings = &.{}, .body_index = 0 },
@@ -1210,6 +1309,7 @@ pub const HirBuilder = struct {
             .body = body,
             .refinement = refinement_expr,
             .tuple_bindings = try self.current_tuple_bindings.toOwnedSlice(self.allocator),
+            .struct_bindings = try self.current_struct_bindings.toOwnedSlice(self.allocator),
         };
     }
 
@@ -1255,7 +1355,27 @@ pub const HirBuilder = struct {
             },
             .pin => |p| try self.create(MatchPattern, .{ .pin = p.name }),
             .paren => |p| self.compilePattern(p.inner),
-            .map, .struct_pattern => null, // TODO
+            .struct_pattern => |sp| {
+                // Get the type name from the module_name (first part)
+                // When module_name is empty, the type comes from param annotation (handled in buildClause)
+                const type_name = if (sp.module_name.parts.len > 0) sp.module_name.parts[0] else return null;
+                var bindings: std.ArrayList(StructFieldBind) = .empty;
+                for (sp.fields) |field| {
+                    if (try self.compilePattern(field.pattern)) |p| {
+                        try bindings.append(self.allocator, .{
+                            .field_name = field.name,
+                            .pattern = p,
+                        });
+                    }
+                }
+                return try self.create(MatchPattern, .{
+                    .struct_match = .{
+                        .type_name = type_name,
+                        .field_bindings = try bindings.toOwnedSlice(self.allocator),
+                    },
+                });
+            },
+            .map => null, // TODO
         };
     }
 
@@ -1349,6 +1469,16 @@ pub const HirBuilder = struct {
                 }
                 // Check if this var refers to a tuple binding (destructured variable)
                 for (self.current_tuple_bindings.items) |binding| {
+                    if (binding.name == v.name) {
+                        return try self.create(Expr, .{
+                            .kind = .{ .local_get = binding.local_index },
+                            .type_id = resolved_type,
+                            .span = v.meta.span,
+                        });
+                    }
+                }
+                // Check if this var refers to a struct field binding
+                for (self.current_struct_bindings.items) |binding| {
                     if (binding.name == v.name) {
                         return try self.create(Expr, .{
                             .kind = .{ .local_get = binding.local_index },
@@ -1567,11 +1697,61 @@ pub const HirBuilder = struct {
                 // Pipe should be desugared before reaching HIR
                 unreachable;
             },
+            .struct_expr => |se| {
+                // Resolve struct type from module name (e.g., %{name: "Alice"} :: User)
+                var struct_type_id = types_mod.TypeStore.UNKNOWN;
+                if (se.module_name.parts.len > 0) {
+                    const type_name_id = se.module_name.parts[se.module_name.parts.len - 1];
+                    if (self.type_store.name_to_type.get(type_name_id)) |tid| {
+                        struct_type_id = tid;
+                    }
+                }
+                // Build field expressions
+                var hir_fields: std.ArrayList(StructFieldInit) = .empty;
+                for (se.fields) |field| {
+                    const value = try self.buildExpr(field.value);
+                    try hir_fields.append(self.allocator, .{
+                        .name = field.name,
+                        .value = value,
+                    });
+                }
+                return try self.create(Expr, .{
+                    .kind = .{ .struct_init = .{
+                        .type_id = struct_type_id,
+                        .fields = try hir_fields.toOwnedSlice(self.allocator),
+                    } },
+                    .type_id = struct_type_id,
+                    .span = se.meta.span,
+                });
+            },
             .field_access => |fa| {
                 // Module-qualified reference (e.g. Math.square without call parens)
                 if (fa.object.* == .module_ref) {
                     const func_name = self.interner.get(fa.field);
                     const mod_name = self.moduleNameToString(fa.object.module_ref.name);
+
+                    // Check if this is an enum variant access (e.g. Color.Red)
+                    const mod_parts = fa.object.module_ref.name.parts;
+                    if (mod_parts.len == 1) {
+                        if (self.type_store.name_to_type.get(mod_parts[0])) |tid| {
+                            const typ = self.type_store.getType(tid);
+                            if (typ == .enum_type) {
+                                return try self.create(Expr, .{
+                                    .kind = .{ .field_get = .{
+                                        .object = try self.create(Expr, .{
+                                            .kind = .nil_lit, // placeholder for enum type ref
+                                            .type_id = tid,
+                                            .span = fa.object.getMeta().span,
+                                        }),
+                                        .field = fa.field,
+                                    } },
+                                    .type_id = tid,
+                                    .span = fa.meta.span,
+                                });
+                            }
+                        }
+                    }
+
                     return try self.create(Expr, .{
                         .kind = .{ .call = .{
                             .target = .{ .named = .{ .module = mod_name, .name = func_name } },
@@ -1581,9 +1761,13 @@ pub const HirBuilder = struct {
                         .span = fa.meta.span,
                     });
                 }
-                // Fallback for field access
+                // Struct field access (e.g. user.name)
+                const object = try self.buildExpr(fa.object);
                 return try self.create(Expr, .{
-                    .kind = .nil_lit,
+                    .kind = .{ .field_get = .{
+                        .object = object,
+                        .field = fa.field,
+                    } },
                     .type_id = types_mod.TypeStore.UNKNOWN,
                     .span = fa.meta.span,
                 });
@@ -1602,6 +1786,33 @@ pub const HirBuilder = struct {
                     .kind = .{ .block = inner.* },
                     .type_id = inner.result_type,
                     .span = blk.meta.span,
+                });
+            },
+            .module_ref => |mr| {
+                // Check for enum variant reference (e.g., Color.Red parsed as module_ref ["Color", "Red"])
+                if (mr.name.parts.len == 2) {
+                    if (self.type_store.name_to_type.get(mr.name.parts[0])) |tid| {
+                        const typ = self.type_store.getType(tid);
+                        if (typ == .enum_type) {
+                            return try self.create(Expr, .{
+                                .kind = .{ .field_get = .{
+                                    .object = try self.create(Expr, .{
+                                        .kind = .nil_lit, // placeholder for enum type ref
+                                        .type_id = tid,
+                                        .span = mr.meta.span,
+                                    }),
+                                    .field = mr.name.parts[1],
+                                } },
+                                .type_id = tid,
+                                .span = mr.meta.span,
+                            });
+                        }
+                    }
+                }
+                return try self.create(Expr, .{
+                    .kind = .nil_lit,
+                    .type_id = types_mod.TypeStore.UNKNOWN,
+                    .span = mr.meta.span,
                 });
             },
             else => {
@@ -1623,7 +1834,16 @@ pub const HirBuilder = struct {
         return switch (type_expr.*) {
             .name => |n| {
                 const name_str = self.interner.get(n.name);
-                return self.type_store.resolveTypeName(name_str) orelse types_mod.TypeStore.UNKNOWN;
+                // First check builtins
+                if (self.type_store.resolveTypeName(name_str)) |id| return id;
+                // Then check user-defined types (struct/enum) from scope graph
+                if (self.graph.resolveTypeByName(n.name)) |scope_type_id| {
+                    // Resolve scope TypeId to TypeStore TypeId via name_to_type map
+                    if (self.type_store.name_to_type.get(n.name)) |ts_id| return ts_id;
+                    // If not in TypeStore yet, it may be a forward reference
+                    _ = scope_type_id;
+                }
+                return types_mod.TypeStore.UNKNOWN;
             },
             .never => types_mod.TypeStore.NEVER,
             .paren => |p| self.resolveTypeExpr(p.inner),

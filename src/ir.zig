@@ -20,8 +20,42 @@ pub const LabelId = u32;
 // IR Program
 // ============================================================
 
+pub const TypeDef = struct {
+    name: []const u8,
+    kind: TypeDefKind,
+};
+
+pub const TypeDefKind = union(enum) {
+    struct_def: StructDef,
+    enum_def: EnumDef,
+    union_def: UnionDef,
+};
+
+pub const StructDef = struct {
+    fields: []const StructFieldDef,
+};
+
+pub const StructFieldDef = struct {
+    name: []const u8,
+    type_expr: []const u8,
+};
+
+pub const EnumDef = struct {
+    variants: []const []const u8,
+};
+
+pub const UnionDef = struct {
+    variants: []const UnionVariant,
+};
+
+pub const UnionVariant = struct {
+    name: []const u8,
+    type_name: []const u8,
+};
+
 pub const Program = struct {
     functions: []const Function,
+    type_defs: []const TypeDef,
     entry: ?FunctionId,
 };
 
@@ -73,6 +107,8 @@ pub const Instruction = union(enum) {
     list_init: AggregateInit,
     map_init: MapInit,
     struct_init: StructInit,
+    union_init: UnionInit,
+    enum_literal: EnumLiteral,
     field_get: FieldGet,
     field_set: FieldSet,
     index_get: IndexGet,
@@ -97,6 +133,7 @@ pub const Instruction = union(enum) {
     switch_tag: SwitchTag,
     switch_literal: SwitchLiteral,
     switch_return: SwitchReturn,
+    union_switch_return: UnionSwitchReturn,
     match_atom: MatchAtom,
     match_int: MatchInt,
     match_float: MatchFloat,
@@ -188,6 +225,19 @@ pub const StructInit = struct {
 pub const StructFieldInit = struct {
     name: []const u8,
     value: LocalId,
+};
+
+pub const UnionInit = struct {
+    dest: LocalId,
+    union_type: []const u8,
+    variant_name: []const u8,
+    value: LocalId,
+};
+
+pub const EnumLiteral = struct {
+    dest: LocalId,
+    type_name: []const u8,
+    variant: []const u8,
 };
 
 pub const FieldGet = struct {
@@ -354,6 +404,23 @@ pub const ReturnCase = struct {
     return_value: ?LocalId,
 };
 
+pub const UnionSwitchReturn = struct {
+    scrutinee_param: u32,
+    cases: []const UnionCase,
+};
+
+pub const UnionCase = struct {
+    variant_name: []const u8,
+    field_bindings: []const FieldBinding,
+    body_instrs: []const Instruction,
+    return_value: ?LocalId,
+};
+
+pub const FieldBinding = struct {
+    field_name: []const u8,
+    local_name: []const u8,
+};
+
 pub const LiteralValue = union(enum) {
     int: i64,
     float: f64,
@@ -510,9 +577,20 @@ pub const IrBuilder = struct {
     current_blocks: std.ArrayList(Block),
     current_instrs: std.ArrayList(Instruction),
     interner: *const ast.StringInterner,
+    type_store: ?*const types_mod.TypeStore,
     known_local_types: std.AutoHashMap(LocalId, ZigType),
     current_module_prefix: ?[]const u8,
     known_function_names: std.StringHashMap(void),
+    synthesized_type_defs: std.ArrayList(TypeDef),
+    /// Maps function name → union dispatch info for call-site wrapping
+    union_dispatch_map: std.StringHashMap(UnionDispatchInfo),
+
+    pub const UnionDispatchInfo = struct {
+        param_idx: u32,
+        union_type_name: []const u8,
+        /// Maps variant type name → variant name in the union
+        variants: std.StringHashMap(void),
+    };
 
     pub fn init(allocator: std.mem.Allocator, interner: *const ast.StringInterner) IrBuilder {
         return .{
@@ -524,9 +602,12 @@ pub const IrBuilder = struct {
             .current_blocks = .empty,
             .current_instrs = .empty,
             .interner = interner,
+            .type_store = null,
             .known_local_types = std.AutoHashMap(LocalId, ZigType).init(allocator),
             .current_module_prefix = null,
             .known_function_names = std.StringHashMap(void).init(allocator),
+            .synthesized_type_defs = .empty,
+            .union_dispatch_map = std.StringHashMap(UnionDispatchInfo).init(allocator),
         };
     }
 
@@ -535,6 +616,8 @@ pub const IrBuilder = struct {
         self.current_blocks.deinit(self.allocator);
         self.current_instrs.deinit(self.allocator);
         self.known_local_types.deinit();
+        self.synthesized_type_defs.deinit(self.allocator);
+        self.union_dispatch_map.deinit();
         self.known_function_names.deinit();
     }
 
@@ -566,8 +649,51 @@ pub const IrBuilder = struct {
             try self.buildFunctionGroup(&func_group);
         }
 
+        // Build type definitions from TypeStore
+        var type_defs: std.ArrayList(TypeDef) = .empty;
+        if (self.type_store) |ts| {
+            for (ts.types.items) |typ| {
+                switch (typ) {
+                    .struct_type => |st| {
+                        var fields: std.ArrayList(StructFieldDef) = .empty;
+                        for (st.fields) |field| {
+                            try fields.append(self.allocator, .{
+                                .name = self.interner.get(field.name),
+                                .type_expr = typeIdToZigTypeStrWithStore(field.type_id, self.type_store),
+                            });
+                        }
+                        try type_defs.append(self.allocator, .{
+                            .name = self.interner.get(st.name),
+                            .kind = .{ .struct_def = .{
+                                .fields = try fields.toOwnedSlice(self.allocator),
+                            } },
+                        });
+                    },
+                    .enum_type => |et| {
+                        var variants: std.ArrayList([]const u8) = .empty;
+                        for (et.variants) |v| {
+                            try variants.append(self.allocator, self.interner.get(v));
+                        }
+                        try type_defs.append(self.allocator, .{
+                            .name = self.interner.get(et.name),
+                            .kind = .{ .enum_def = .{
+                                .variants = try variants.toOwnedSlice(self.allocator),
+                            } },
+                        });
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        // Append synthesized union type definitions
+        for (self.synthesized_type_defs.items) |synth_td| {
+            try type_defs.append(self.allocator, synth_td);
+        }
+
         return .{
             .functions = try self.functions.toOwnedSlice(self.allocator),
+            .type_defs = try type_defs.toOwnedSlice(self.allocator),
             .entry = null,
         };
     }
@@ -587,17 +713,31 @@ pub const IrBuilder = struct {
 
         // Build params with generic names (__arg_N).
         // If all clauses agree on a param's type, use that type.
-        // If any clause differs (or is untyped), fall back to anytype.
+        // If clauses have different struct types, synthesize a union.
+        // Otherwise fall back to anytype.
         var params: std.ArrayList(Param) = .empty;
+        var union_param_idx: ?u32 = null;
         for (first_clause.params, 0..) |param, i| {
             const name = try std.fmt.allocPrint(self.allocator, "__arg_{d}", .{i});
-            var resolved_type = typeIdToZigType(param.type_id);
+            var resolved_type = typeIdToZigTypeWithStore(param.type_id, self.type_store);
             if (group.clauses.len > 1) {
                 for (group.clauses[1..]) |clause| {
                     if (i < clause.params.len) {
-                        const other_type = typeIdToZigType(clause.params[i].type_id);
-                        if (std.meta.activeTag(other_type) != std.meta.activeTag(resolved_type)) {
-                            resolved_type = .any;
+                        const other_type = typeIdToZigTypeWithStore(clause.params[i].type_id, self.type_store);
+                        const tags_differ = std.meta.activeTag(other_type) != std.meta.activeTag(resolved_type);
+                        // Also check if both are struct_ref but with different names
+                        const struct_names_differ = if (resolved_type == .struct_ref and other_type == .struct_ref)
+                            !std.mem.eql(u8, resolved_type.struct_ref, other_type.struct_ref)
+                        else
+                            false;
+                        if (tags_differ or struct_names_differ) {
+                            // Check if this is a union synthesis candidate
+                            if (try self.canUnionDispatch(group, @intCast(i))) |union_type_name| {
+                                resolved_type = .{ .struct_ref = union_type_name };
+                                union_param_idx = @intCast(i);
+                            } else {
+                                resolved_type = .any;
+                            }
                             break;
                         }
                     }
@@ -609,13 +749,16 @@ pub const IrBuilder = struct {
             });
         }
 
-        // Reserve local indices used by tuple bindings across all clauses.
+        // Reserve local indices used by tuple/struct bindings across all clauses.
         // These locals are defined inside guard_blocks (separate Zig scopes),
         // so top-level code must start allocating ABOVE this range.
         {
             var max_binding_local: u32 = 0;
             for (group.clauses) |clause| {
                 for (clause.tuple_bindings) |binding| {
+                    max_binding_local = @max(max_binding_local, binding.local_index + 1);
+                }
+                for (clause.struct_bindings) |binding| {
                     max_binding_local = @max(max_binding_local, binding.local_index + 1);
                 }
             }
@@ -679,6 +822,53 @@ pub const IrBuilder = struct {
                     .default_result = default_result,
                 },
             });
+        } else if (union_param_idx) |u_param_idx| {
+            // Union switch dispatch for struct type patterns
+            var union_cases: std.ArrayList(UnionCase) = .empty;
+
+            for (group.clauses) |clause| {
+                const param = clause.params[u_param_idx];
+                const variant_name = blk: {
+                    if (param.pattern) |pat| {
+                        if (pat.* == .struct_match) {
+                            break :blk self.interner.get(pat.struct_match.type_name);
+                        }
+                    }
+                    break :blk self.resolveTypeName(param.type_id);
+                };
+
+                // Build field bindings from struct_bindings on the clause
+                var field_bindings: std.ArrayList(FieldBinding) = .empty;
+                for (clause.struct_bindings) |sb| {
+                    if (sb.param_index == u_param_idx) {
+                        try field_bindings.append(self.allocator, .{
+                            .field_name = self.interner.get(sb.field_name),
+                            .local_name = try std.fmt.allocPrint(self.allocator, "__local_{d}", .{sb.local_index}),
+                        });
+                    }
+                }
+
+                // Lower body
+                const saved = self.current_instrs;
+                self.current_instrs = .empty;
+                const body_result = try self.lowerBlock(clause.body);
+                const body_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
+                self.current_instrs = saved;
+
+                try union_cases.append(self.allocator, .{
+                    .variant_name = variant_name,
+                    .field_bindings = try field_bindings.toOwnedSlice(self.allocator),
+                    .body_instrs = body_instrs,
+                    .return_value = body_result,
+                });
+            }
+
+            try self.current_instrs.append(self.allocator, .{
+                .union_switch_return = .{
+                    .scrutinee_param = u_param_idx,
+                    .cases = try union_cases.toOwnedSlice(self.allocator),
+                },
+            });
         } else {
             // General multi-clause dispatch via decision tree
             // Build PatternMatrix from clause params
@@ -722,7 +912,7 @@ pub const IrBuilder = struct {
                     .param_get = .{ .dest = param_local, .index = @intCast(i) },
                 });
                 // Track known types for Phase 3
-                const param_type = typeIdToZigType(first_clause.params[i].type_id);
+                const param_type = typeIdToZigTypeWithStore(first_clause.params[i].type_id, self.type_store);
                 if (param_type != .any) {
                     try self.known_local_types.put(param_local, param_type);
                 }
@@ -748,11 +938,32 @@ pub const IrBuilder = struct {
 
         // If the body result is optional (e.g., if/else with a nil branch),
         // promote the function return type to optional.
-        var return_type = typeIdToZigType(first_clause.return_type);
+        var return_type = typeIdToZigTypeWithStore(first_clause.return_type, self.type_store);
         if (body_result_local) |rl| {
             if (self.known_local_types.get(rl)) |local_type| {
                 if (std.meta.activeTag(local_type) == .optional) {
                     return_type = local_type;
+                }
+            }
+        }
+
+        // Register union dispatch info for call-site wrapping
+        if (union_param_idx) |u_idx| {
+            for (params.items) |p| {
+                if (p.type_expr == .struct_ref) {
+                    var variants = std.StringHashMap(void).init(self.allocator);
+                    for (group.clauses) |clause| {
+                        const clause_type = typeIdToZigTypeWithStore(clause.params[u_idx].type_id, self.type_store);
+                        if (clause_type == .struct_ref) {
+                            try variants.put(clause_type.struct_ref, {});
+                        }
+                    }
+                    try self.union_dispatch_map.put(name_str, .{
+                        .param_idx = u_idx,
+                        .union_type_name = p.type_expr.struct_ref,
+                        .variants = variants,
+                    });
+                    break;
                 }
             }
         }
@@ -825,6 +1036,89 @@ pub const IrBuilder = struct {
             _ = self; // suppress unused
             return null;
         };
+    }
+
+    /// Check if all clauses have distinct named struct types for a given param position.
+    /// Returns the synthesized union type name if eligible, null otherwise.
+    fn canUnionDispatch(self: *IrBuilder, group: *const hir_mod.FunctionGroup, param_idx: u32) !?[]const u8 {
+        if (group.clauses.len < 2) return null;
+        const ts = self.type_store orelse return null;
+
+        var type_names: std.ArrayList([]const u8) = .empty;
+
+        for (group.clauses) |clause| {
+            if (param_idx >= clause.params.len) return null;
+            const param = clause.params[param_idx];
+
+            // Check if this param has a struct_match pattern (struct pattern)
+            if (param.pattern) |pat| {
+                if (pat.* == .struct_match) {
+                    const type_name = self.interner.get(pat.struct_match.type_name);
+                    // Verify it's a known struct type
+                    var found = false;
+                    for (type_names.items) |existing| {
+                        if (std.mem.eql(u8, existing, type_name)) return null; // duplicate type
+                    }
+                    // Check via type_id that it's really a struct
+                    if (param.type_id < ts.types.items.len) {
+                        const typ = ts.types.items[param.type_id];
+                        if (typ == .struct_type) {
+                            found = true;
+                        }
+                    }
+                    if (!found) return null;
+                    try type_names.append(self.allocator, type_name);
+                    continue;
+                }
+            }
+
+            // Also check via type_id if the param resolves to a struct type
+            if (param.type_id < ts.types.items.len) {
+                const typ = ts.types.items[param.type_id];
+                if (typ == .struct_type) {
+                    const type_name = ts.interner.get(typ.struct_type.name);
+                    for (type_names.items) |existing| {
+                        if (std.mem.eql(u8, existing, type_name)) return null; // duplicate
+                    }
+                    try type_names.append(self.allocator, type_name);
+                    continue;
+                }
+            }
+
+            // Not a struct type — can't do union dispatch
+            return null;
+        }
+
+        if (type_names.items.len < 2) return null;
+
+        // Build the union name from the function group name
+        const raw_name = if (group.name < self.interner.strings.items.len)
+            self.interner.get(group.name)
+        else
+            "anonymous";
+        const func_name = if (self.current_module_prefix) |prefix|
+            try std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ prefix, raw_name })
+        else
+            raw_name;
+        const union_name = try std.fmt.allocPrint(self.allocator, "{s}_Union", .{func_name});
+
+        // Synthesize the union type definition
+        var variants: std.ArrayList(UnionVariant) = .empty;
+        for (type_names.items) |tn| {
+            try variants.append(self.allocator, .{
+                .name = tn,
+                .type_name = tn,
+            });
+        }
+
+        try self.synthesized_type_defs.append(self.allocator, .{
+            .name = union_name,
+            .kind = .{ .union_def = .{
+                .variants = try variants.toOwnedSlice(self.allocator),
+            } },
+        });
+
+        return union_name;
     }
 
     /// Emit index_get instructions to populate tuple binding locals.
@@ -1501,7 +1795,7 @@ pub const IrBuilder = struct {
                     .param_get = .{ .dest = dest, .index = idx },
                 });
                 // Phase 3: track known type from HIR expr type_id
-                const param_zig_type = typeIdToZigType(expr.type_id);
+                const param_zig_type = typeIdToZigTypeWithStore(expr.type_id, self.type_store);
                 if (param_zig_type != .any) {
                     try self.known_local_types.put(dest, param_zig_type);
                 }
@@ -1555,9 +1849,56 @@ pub const IrBuilder = struct {
                             try std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ mod, nc.name })
                         else
                             try self.resolveBareCall(nc.name);
-                        try self.current_instrs.append(self.allocator, .{
-                            .call_named = .{ .dest = dest, .name = resolved_name, .args = try args.toOwnedSlice(self.allocator) },
-                        });
+
+                        // Check if this function uses union dispatch — wrap args if needed
+                        if (self.union_dispatch_map.get(resolved_name)) |info| {
+                            var wrapped_args = try args.toOwnedSlice(self.allocator);
+                            if (info.param_idx < wrapped_args.len) {
+                                const arg_local = wrapped_args[info.param_idx];
+                                // Determine the variant name from the argument's known type
+                                const variant_name = blk: {
+                                    if (self.known_local_types.get(arg_local)) |local_type| {
+                                        if (local_type == .struct_ref) {
+                                            if (info.variants.contains(local_type.struct_ref)) {
+                                                break :blk local_type.struct_ref;
+                                            }
+                                        }
+                                    }
+                                    // Also check via HIR expr type_id
+                                    if (info.param_idx < call.args.len) {
+                                        const arg_type = typeIdToZigTypeWithStore(call.args[info.param_idx].type_id, self.type_store);
+                                        if (arg_type == .struct_ref) {
+                                            if (info.variants.contains(arg_type.struct_ref)) {
+                                                break :blk arg_type.struct_ref;
+                                            }
+                                        }
+                                    }
+                                    break :blk @as(?[]const u8, null);
+                                };
+                                if (variant_name) |vn| {
+                                    // Emit union_init to wrap the arg
+                                    const wrapped = self.next_local;
+                                    self.next_local += 1;
+                                    try self.current_instrs.append(self.allocator, .{
+                                        .union_init = .{
+                                            .dest = wrapped,
+                                            .union_type = info.union_type_name,
+                                            .variant_name = vn,
+                                            .value = arg_local,
+                                        },
+                                    });
+                                    try self.known_local_types.put(wrapped, .{ .struct_ref = info.union_type_name });
+                                    wrapped_args[info.param_idx] = wrapped;
+                                }
+                            }
+                            try self.current_instrs.append(self.allocator, .{
+                                .call_named = .{ .dest = dest, .name = resolved_name, .args = wrapped_args },
+                            });
+                        } else {
+                            try self.current_instrs.append(self.allocator, .{
+                                .call_named = .{ .dest = dest, .name = resolved_name, .args = try args.toOwnedSlice(self.allocator) },
+                            });
+                        }
                     },
                     .closure => |callee| {
                         const callee_local = try self.lowerExpr(callee);
@@ -1654,6 +1995,61 @@ pub const IrBuilder = struct {
                     try self.current_instrs.append(self.allocator, .{ .const_nil = dest });
                 }
             },
+            .struct_init => |si| {
+                // Lower struct initialization fields
+                var ir_fields: std.ArrayList(StructFieldInit) = .empty;
+                for (si.fields) |field| {
+                    const val = try self.lowerExpr(field.value);
+                    try ir_fields.append(self.allocator, .{
+                        .name = self.interner.get(field.name),
+                        .value = val,
+                    });
+                }
+                // Resolve type name from type_id
+                const type_name = self.resolveTypeName(si.type_id);
+                try self.current_instrs.append(self.allocator, .{
+                    .struct_init = .{
+                        .dest = dest,
+                        .type_name = type_name,
+                        .fields = try ir_fields.toOwnedSlice(self.allocator),
+                    },
+                });
+            },
+            .field_get => |fg| {
+                // Check for enum variant access (object is nil_lit placeholder with enum type)
+                if (fg.object.kind == .nil_lit and self.type_store != null) {
+                    const typ = self.type_store.?.getType(fg.object.type_id);
+                    if (typ == .enum_type) {
+                        try self.current_instrs.append(self.allocator, .{
+                            .enum_literal = .{
+                                .dest = dest,
+                                .type_name = self.interner.get(typ.enum_type.name),
+                                .variant = self.interner.get(fg.field),
+                            },
+                        });
+                        return dest;
+                    }
+                }
+                const obj = try self.lowerExpr(fg.object);
+                try self.current_instrs.append(self.allocator, .{
+                    .field_get = .{
+                        .dest = dest,
+                        .object = obj,
+                        .field = self.interner.get(fg.field),
+                    },
+                });
+            },
+            .map_init => |entries| {
+                var ir_entries: std.ArrayList(MapEntry) = .empty;
+                for (entries) |entry| {
+                    const key = try self.lowerExpr(entry.key);
+                    const value = try self.lowerExpr(entry.value);
+                    try ir_entries.append(self.allocator, .{ .key = key, .value = value });
+                }
+                try self.current_instrs.append(self.allocator, .{
+                    .map_init = .{ .dest = dest, .entries = try ir_entries.toOwnedSlice(self.allocator) },
+                });
+            },
             else => {
                 // Emit a nil placeholder for unhandled expressions
                 try self.current_instrs.append(self.allocator, .{ .const_nil = dest });
@@ -1661,6 +2057,19 @@ pub const IrBuilder = struct {
         }
 
         return dest;
+    }
+
+    /// Resolve a type_id to a string name for struct/enum types.
+    fn resolveTypeName(self: *IrBuilder, type_id: types_mod.TypeId) []const u8 {
+        if (self.type_store) |ts| {
+            const typ = ts.getType(type_id);
+            switch (typ) {
+                .struct_type => |st| return self.interner.get(st.name),
+                .enum_type => |et| return self.interner.get(et.name),
+                else => {},
+            }
+        }
+        return "UnknownType";
     }
 
     /// Resolve a bare function call to a qualified name.
@@ -1760,6 +2169,10 @@ fn findParamGetIdInDecision(decision: *const hir_mod.Decision, target_element: u
 }
 
 fn typeIdToZigType(type_id: types_mod.TypeId) ZigType {
+    return typeIdToZigTypeWithStore(type_id, null);
+}
+
+fn typeIdToZigTypeWithStore(type_id: types_mod.TypeId, type_store: ?*const types_mod.TypeStore) ZigType {
     return switch (type_id) {
         types_mod.TypeStore.BOOL => .bool_type,
         types_mod.TypeStore.STRING => .string,
@@ -1779,7 +2192,69 @@ fn typeIdToZigType(type_id: types_mod.TypeId) ZigType {
         types_mod.TypeStore.F16 => .f16,
         types_mod.TypeStore.USIZE => .usize,
         types_mod.TypeStore.ISIZE => .isize,
-        else => .any,
+        else => {
+            // Try to resolve user-defined struct/enum types
+            if (type_store) |ts| {
+                if (type_id < ts.types.items.len) {
+                    const typ = ts.types.items[type_id];
+                    switch (typ) {
+                        .struct_type => |st| {
+                            return .{ .struct_ref = ts.interner.get(st.name) };
+                        },
+                        .enum_type => |et| {
+                            return .{ .struct_ref = ts.interner.get(et.name) };
+                        },
+                        else => {},
+                    }
+                }
+            }
+            return .any;
+        },
+    };
+}
+
+fn typeIdToZigTypeStr(type_id: types_mod.TypeId) []const u8 {
+    return typeIdToZigTypeStrWithStore(type_id, null);
+}
+
+fn typeIdToZigTypeStrWithStore(type_id: types_mod.TypeId, type_store: ?*const types_mod.TypeStore) []const u8 {
+    return switch (type_id) {
+        types_mod.TypeStore.BOOL => "bool",
+        types_mod.TypeStore.STRING => "[]const u8",
+        types_mod.TypeStore.ATOM => "[]const u8",
+        types_mod.TypeStore.NIL => "?void",
+        types_mod.TypeStore.NEVER => "noreturn",
+        types_mod.TypeStore.I64 => "i64",
+        types_mod.TypeStore.I32 => "i32",
+        types_mod.TypeStore.I16 => "i16",
+        types_mod.TypeStore.I8 => "i8",
+        types_mod.TypeStore.U64 => "u64",
+        types_mod.TypeStore.U32 => "u32",
+        types_mod.TypeStore.U16 => "u16",
+        types_mod.TypeStore.U8 => "u8",
+        types_mod.TypeStore.F64 => "f64",
+        types_mod.TypeStore.F32 => "f32",
+        types_mod.TypeStore.F16 => "f16",
+        types_mod.TypeStore.USIZE => "usize",
+        types_mod.TypeStore.ISIZE => "isize",
+        else => {
+            // Try to resolve user-defined struct/enum types
+            if (type_store) |ts| {
+                if (type_id < ts.types.items.len) {
+                    const typ = ts.types.items[type_id];
+                    switch (typ) {
+                        .struct_type => |st| {
+                            return ts.interner.get(st.name);
+                        },
+                        .enum_type => |et| {
+                            return ts.interner.get(et.name);
+                        },
+                        else => {},
+                    }
+                }
+            }
+            return "anytype";
+        },
     };
 }
 

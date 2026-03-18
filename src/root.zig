@@ -18,6 +18,7 @@ pub const DiagnosticEngine = diagnostics.DiagnosticEngine;
 pub const Severity = diagnostics.Severity;
 pub const similarity = @import("similarity.zig");
 pub const stdlib = @import("stdlib.zig");
+pub const project = @import("project.zig");
 
 test {
     _ = @import("token.zig");
@@ -38,5 +39,6 @@ test {
     _ = @import("diagnostics.zig");
     _ = @import("similarity.zig");
     _ = @import("stdlib.zig");
+    _ = @import("project.zig");
     _ = @import("integration_tests.zig");
 }

@@ -32,6 +32,9 @@ pub const Type = union(enum) {
     type_var: TypeVarId,
     applied: AppliedType,
 
+    // Enum
+    enum_type: EnumType,
+
     // Opaque
     opaque_type: OpaqueType,
 
@@ -83,6 +86,11 @@ pub const Type = union(enum) {
     pub const AppliedType = struct {
         base: TypeId,
         args: []const TypeId,
+    };
+
+    pub const EnumType = struct {
+        name: ast.StringId,
+        variants: []const ast.StringId,
     };
 
     pub const OpaqueType = struct {
@@ -354,11 +362,143 @@ pub const TypeChecker = struct {
     // ============================================================
 
     pub fn checkProgram(self: *TypeChecker, program: *const ast.Program) !void {
+        // Register user-defined types (structs, enums) from scope graph into TypeStore
+        try self.registerUserTypes();
+
         for (program.modules) |*mod| {
             try self.checkModule(mod);
         }
         for (program.top_items) |item| {
+            // Only `def main()` is allowed at the top level — all other functions must be inside a module
+            switch (item) {
+                .function => |func| {
+                    const name = self.interner.get(func.name);
+                    if (!std.mem.eql(u8, name, "main")) {
+                        try self.addHardError(
+                            try std.fmt.allocPrint(self.allocator, "top-level function `{s}` is not allowed — only `def main()` can be defined outside a module", .{name}),
+                            func.meta.span,
+                            "move this function into a `defmodule`",
+                            "all functions except `main` must be defined inside a `defmodule ... do ... end` block",
+                        );
+                    }
+                },
+                .priv_function => |func| {
+                    const name = self.interner.get(func.name);
+                    try self.addHardError(
+                        try std.fmt.allocPrint(self.allocator, "top-level private function `{s}` is not allowed — functions must be inside a module", .{name}),
+                        func.meta.span,
+                        "move this function into a `defmodule`",
+                        "all functions must be defined inside a `defmodule ... do ... end` block",
+                    );
+                },
+                .macro => |mac| {
+                    const name = self.interner.get(mac.name);
+                    try self.addHardError(
+                        try std.fmt.allocPrint(self.allocator, "top-level macro `{s}` is not allowed — macros must be inside a module", .{name}),
+                        mac.meta.span,
+                        "move this macro into a `defmodule`",
+                        "all macros must be defined inside a `defmodule ... do ... end` block",
+                    );
+                },
+                else => {},
+            }
             try self.checkTopItem(item);
+        }
+    }
+
+    fn registerUserTypes(self: *TypeChecker) !void {
+        for (self.graph.types.items) |type_entry| {
+            switch (type_entry.kind) {
+                .struct_type => |sd| {
+                    const name = sd.name orelse continue;
+                    // Check if the name conflicts with a builtin type
+                    const name_str = self.interner.get(name);
+                    if (self.store.resolveTypeName(name_str) != null) {
+                        try self.errors.append(self.allocator, .{
+                            .message = try std.fmt.allocPrint(self.allocator, "`{s}` shadows a builtin type — choose a different name", .{name_str}),
+                            .span = sd.meta.span,
+                            .label = "conflicts with builtin type",
+                            .help = try std.fmt.allocPrint(self.allocator, "the builtin `{s}` type takes priority over this definition", .{name_str}),
+                            .severity = .warning,
+                        });
+                        continue; // builtin wins
+                    }
+                    // Build struct fields with resolved types
+                    var fields: std.ArrayList(Type.StructField) = .empty;
+                    // First collect parent fields if extends
+                    if (sd.parent) |parent_name| {
+                        if (self.graph.resolveTypeByName(parent_name)) |parent_scope_tid| {
+                            const parent_entry = self.graph.types.items[parent_scope_tid];
+                            if (parent_entry.kind == .struct_type) {
+                                const parent_sd = parent_entry.kind.struct_type;
+                                for (parent_sd.fields) |field| {
+                                    const field_type = self.resolveTypeExpr(field.type_expr) catch TypeStore.UNKNOWN;
+                                    try fields.append(self.allocator, .{
+                                        .name = field.name,
+                                        .type_id = field_type,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    // Then add own fields (may override parent defaults but type check happens here)
+                    for (sd.fields) |field| {
+                        const field_type = self.resolveTypeExpr(field.type_expr) catch TypeStore.UNKNOWN;
+                        // Check if this field already exists from parent
+                        var found_parent = false;
+                        for (fields.items) |*pf| {
+                            if (pf.name == field.name) {
+                                // Validate type doesn't change
+                                if (pf.type_id != field_type and pf.type_id != TypeStore.UNKNOWN and field_type != TypeStore.UNKNOWN) {
+                                    try self.addHardError(
+                                        try std.fmt.allocPrint(self.allocator, "field `{s}` type cannot be changed in extends", .{self.interner.get(field.name)}),
+                                        field.meta.span,
+                                        "type mismatch with parent field",
+                                        "the parent struct defines this field with a different type",
+                                    );
+                                }
+                                found_parent = true;
+                                break;
+                            }
+                        }
+                        if (!found_parent) {
+                            try fields.append(self.allocator, .{
+                                .name = field.name,
+                                .type_id = field_type,
+                            });
+                        }
+                    }
+                    const type_id = try self.store.addType(.{ .struct_type = .{
+                        .name = name,
+                        .fields = try fields.toOwnedSlice(self.allocator),
+                    } });
+                    try self.store.name_to_type.put(name, type_id);
+                },
+                .enum_type => |ed| {
+                    // Check if the name conflicts with a builtin type
+                    const enum_name_str = self.interner.get(ed.name);
+                    if (self.store.resolveTypeName(enum_name_str) != null) {
+                        try self.errors.append(self.allocator, .{
+                            .message = try std.fmt.allocPrint(self.allocator, "`{s}` shadows a builtin type — choose a different name", .{enum_name_str}),
+                            .span = ed.meta.span,
+                            .label = "conflicts with builtin type",
+                            .help = try std.fmt.allocPrint(self.allocator, "the builtin `{s}` type takes priority over this definition", .{enum_name_str}),
+                            .severity = .warning,
+                        });
+                        continue; // builtin wins
+                    }
+                    var variant_names: std.ArrayList(ast.StringId) = .empty;
+                    for (ed.variants) |v| {
+                        try variant_names.append(self.allocator, v.name);
+                    }
+                    const type_id = try self.store.addType(.{ .enum_type = .{
+                        .name = ed.name,
+                        .variants = try variant_names.toOwnedSlice(self.allocator),
+                    } });
+                    try self.store.name_to_type.put(ed.name, type_id);
+                },
+                else => {},
+            }
         }
     }
 
@@ -393,12 +533,75 @@ pub const TypeChecker = struct {
         self.current_scope = self.graph.node_scope_map.get(mod.meta.span.start) orelse mod.meta.scope_id;
         defer self.current_scope = prev_scope;
 
+        // Check module extends: validate overridden function return types match parent
+        if (mod.parent) |parent_name| {
+            try self.checkModuleExtendsSignatures(mod, parent_name);
+        }
+
         for (mod.items) |item| {
             switch (item) {
                 .function => |func| try self.checkFunctionDecl(func),
                 .priv_function => |func| try self.checkFunctionDecl(func),
                 .macro => |mac| try self.checkFunctionDecl(mac),
                 else => {},
+            }
+        }
+    }
+
+    fn checkModuleExtendsSignatures(self: *TypeChecker, mod: *const ast.ModuleDecl, parent_name: ast.StringId) !void {
+        // Find parent module
+        var parent_mod: ?*const ast.ModuleDecl = null;
+        for (self.graph.modules.items) |mod_entry| {
+            if (mod_entry.name.parts.len == 1 and mod_entry.name.parts[0] == parent_name) {
+                parent_mod = mod_entry.decl;
+                break;
+            }
+        }
+        const p_mod = parent_mod orelse return;
+
+        // Build map of parent function return types (name+arity → return type)
+        for (p_mod.items) |p_item| {
+            const p_func = switch (p_item) {
+                .function => |f| f,
+                else => continue,
+            };
+            for (p_func.clauses) |p_clause| {
+                const p_return = if (p_clause.return_type) |rt|
+                    self.resolveTypeExpr(rt) catch TypeStore.UNKNOWN
+                else
+                    TypeStore.UNKNOWN;
+                if (p_return == TypeStore.UNKNOWN) continue;
+
+                // Check if child has a matching override
+                for (mod.items) |c_item| {
+                    const c_func = switch (c_item) {
+                        .function => |f| f,
+                        else => continue,
+                    };
+                    if (c_func.name != p_func.name) continue;
+                    for (c_func.clauses) |c_clause| {
+                        if (c_clause.params.len != p_clause.params.len) continue;
+                        const c_return = if (c_clause.return_type) |rt|
+                            self.resolveTypeExpr(rt) catch TypeStore.UNKNOWN
+                        else
+                            TypeStore.UNKNOWN;
+                        if (c_return == TypeStore.UNKNOWN) continue;
+                        if (!self.store.typeEquals(p_return, c_return)) {
+                            const p_name = self.interner.get(p_func.name);
+                            try self.addHardError(
+                                try std.fmt.allocPrint(self.allocator, "`{s}/{d}` returns `{s}` in parent, cannot return `{s}`", .{
+                                    p_name,
+                                    p_clause.params.len,
+                                    self.typeToString(p_return),
+                                    self.typeToString(c_return),
+                                }),
+                                c_clause.meta.span,
+                                "return type mismatch",
+                                "overridden functions must have the same return type as the parent",
+                            );
+                        }
+                    }
+                }
             }
         }
     }
@@ -634,15 +837,76 @@ pub const TypeChecker = struct {
             },
 
             .case_expr => |ce| {
-                _ = try self.inferExpr(ce.scrutinee);
+                const scrutinee_type = try self.inferExpr(ce.scrutinee);
                 var result_type: TypeId = TypeStore.UNKNOWN;
+                var has_wildcard = false;
                 for (ce.clauses) |clause| {
+                    // Check for wildcard/catch-all pattern
+                    if (clause.pattern.* == .wildcard or clause.pattern.* == .bind) {
+                        has_wildcard = true;
+                    }
                     var clause_type: TypeId = TypeStore.NIL;
                     for (clause.body) |stmt| {
                         clause_type = try self.checkStmt(stmt);
                     }
                     if (result_type == TypeStore.UNKNOWN) {
                         result_type = clause_type;
+                    }
+                }
+                // Enum exhaustiveness check
+                if (!has_wildcard and scrutinee_type != TypeStore.UNKNOWN) {
+                    const scrutinee_t = self.store.getType(scrutinee_type);
+                    if (scrutinee_t == .enum_type) {
+                        const et = scrutinee_t.enum_type;
+                        // Collect matched variants from case patterns
+                        var matched_count: usize = 0;
+                        for (et.variants) |variant| {
+                            var variant_matched = false;
+                            for (ce.clauses) |clause| {
+                                // Check for module_ref pattern matching enum variant
+                                // e.g. Color.Red → literal atom pattern or module_ref pattern
+                                if (clause.pattern.* == .literal) {
+                                    if (clause.pattern.literal == .atom) {
+                                        if (clause.pattern.literal.atom.value == variant) {
+                                            variant_matched = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            if (variant_matched) matched_count += 1;
+                        }
+                        if (matched_count < et.variants.len) {
+                            // Find missing variants
+                            var missing: std.ArrayList([]const u8) = .empty;
+                            for (et.variants) |variant| {
+                                var found = false;
+                                for (ce.clauses) |clause| {
+                                    if (clause.pattern.* == .literal) {
+                                        if (clause.pattern.literal == .atom) {
+                                            if (clause.pattern.literal.atom.value == variant) {
+                                                found = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                if (!found) {
+                                    missing.append(self.allocator, self.interner.get(variant)) catch {};
+                                }
+                            }
+                            if (missing.items.len > 0) {
+                                const missing_str = std.mem.join(self.allocator, ", ", missing.items) catch "...";
+                                try self.addHardError(
+                                    try std.fmt.allocPrint(self.allocator, "non-exhaustive match on enum `{s}`", .{
+                                        self.interner.get(et.name),
+                                    }),
+                                    ce.meta.span,
+                                    try std.fmt.allocPrint(self.allocator, "missing: {s}", .{missing_str}),
+                                    "add the missing variants or a wildcard `_` pattern",
+                                );
+                            }
+                        }
                     }
                 }
                 return result_type;
@@ -657,7 +921,38 @@ pub const TypeChecker = struct {
             },
 
             .field_access => |fa| {
-                // Infer object type; for known struct types, could look up field type
+                // Check for enum variant access (e.g. Color.Red)
+                if (fa.object.* == .module_ref) {
+                    const parts = fa.object.module_ref.name.parts;
+                    if (parts.len == 1) {
+                        if (self.store.name_to_type.get(parts[0])) |tid| {
+                            const t = self.store.getType(tid);
+                            if (t == .enum_type) {
+                                // Validate variant name
+                                var valid = false;
+                                for (t.enum_type.variants) |v| {
+                                    if (v == fa.field) {
+                                        valid = true;
+                                        break;
+                                    }
+                                }
+                                if (!valid) {
+                                    try self.addHardError(
+                                        try std.fmt.allocPrint(self.allocator, "`{s}` is not a variant of enum `{s}`", .{
+                                            self.interner.get(fa.field),
+                                            self.interner.get(t.enum_type.name),
+                                        }),
+                                        fa.meta.span,
+                                        "unknown variant",
+                                        null,
+                                    );
+                                }
+                                return tid;
+                            }
+                        }
+                    }
+                }
+                // Infer object type; for known struct types, look up field type
                 const obj_type = try self.inferExpr(fa.object);
                 if (obj_type != TypeStore.UNKNOWN) {
                     const t = self.store.getType(obj_type);
@@ -678,11 +973,161 @@ pub const TypeChecker = struct {
                 }
                 return TypeStore.UNKNOWN;
             },
-            .struct_expr => TypeStore.UNKNOWN,
+            .struct_expr => |se| {
+                // Resolve struct type from module name annotation
+                if (se.module_name.parts.len > 0) {
+                    const type_name_id = se.module_name.parts[se.module_name.parts.len - 1];
+                    if (self.store.name_to_type.get(type_name_id)) |tid| {
+                        const typ = self.store.getType(tid);
+                        if (typ == .struct_type) {
+                            // Validate required fields are provided
+                            const st = typ.struct_type;
+                            for (st.fields) |req_field| {
+                                var found = false;
+                                for (se.fields) |provided| {
+                                    if (provided.name == req_field.name) {
+                                        found = true;
+                                        // Check field value type
+                                        const val_type = try self.inferExpr(provided.value);
+                                        if (val_type != TypeStore.UNKNOWN and req_field.type_id != TypeStore.UNKNOWN and
+                                            !self.store.typeEquals(val_type, req_field.type_id))
+                                        {
+                                            try self.addRichError(
+                                                try std.fmt.allocPrint(self.allocator, "field `{s}` expects `{s}`, got `{s}`", .{
+                                                    self.interner.get(req_field.name),
+                                                    self.typeToString(req_field.type_id),
+                                                    self.typeToString(val_type),
+                                                }),
+                                                provided.value.getMeta().span,
+                                                "type mismatch",
+                                                null,
+                                            );
+                                        }
+                                        break;
+                                    }
+                                }
+                                if (!found) {
+                                    // Check if field has a default in the AST
+                                    var has_default = false;
+                                    for (self.graph.types.items) |te| {
+                                        if (te.kind == .struct_type) {
+                                            const sd = te.kind.struct_type;
+                                            if (sd.name) |n| {
+                                                if (n == type_name_id) {
+                                                    for (sd.fields) |f| {
+                                                        if (f.name == req_field.name and f.default != null) {
+                                                            has_default = true;
+                                                            break;
+                                                        }
+                                                    }
+                                                    // Also check parent fields for defaults
+                                                    if (!has_default and sd.parent != null) {
+                                                        // Parent fields don't have defaults accessible here,
+                                                        // so we check the parent's AST
+                                                        if (sd.parent) |parent_name| {
+                                                            for (self.graph.types.items) |pte| {
+                                                                if (pte.kind == .struct_type) {
+                                                                    const psd = pte.kind.struct_type;
+                                                                    if (psd.name) |pn| {
+                                                                        if (pn == parent_name) {
+                                                                            for (psd.fields) |pf| {
+                                                                                if (pf.name == req_field.name and pf.default != null) {
+                                                                                    has_default = true;
+                                                                                    break;
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if (!has_default) {
+                                        try self.addRichError(
+                                            try std.fmt.allocPrint(self.allocator, "missing required field `{s}` in struct `{s}`", .{
+                                                self.interner.get(req_field.name),
+                                                self.interner.get(type_name_id),
+                                            }),
+                                            se.meta.span,
+                                            "field not provided",
+                                            try std.fmt.allocPrint(self.allocator, "add `{s}: <value>` to the struct literal", .{
+                                                self.interner.get(req_field.name),
+                                            }),
+                                        );
+                                    }
+                                }
+                            }
+                            // Check for extra fields not in struct
+                            for (se.fields) |provided| {
+                                var found = false;
+                                for (st.fields) |req_field| {
+                                    if (req_field.name == provided.name) {
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                                if (!found) {
+                                    _ = try self.inferExpr(provided.value);
+                                    try self.addRichError(
+                                        try std.fmt.allocPrint(self.allocator, "unknown field `{s}` in struct `{s}`", .{
+                                            self.interner.get(provided.name),
+                                            self.interner.get(type_name_id),
+                                        }),
+                                        provided.value.getMeta().span,
+                                        "not a field of this struct",
+                                        null,
+                                    );
+                                }
+                            }
+                            return tid;
+                        }
+                    }
+                }
+                // Infer field values even if type unknown
+                for (se.fields) |field| {
+                    _ = try self.inferExpr(field.value);
+                }
+                return TypeStore.UNKNOWN;
+            },
             .panic_expr => TypeStore.NEVER,
             .unwrap => TypeStore.UNKNOWN,
             .pipe => TypeStore.UNKNOWN, // desugared before type checking
-            .module_ref => TypeStore.UNKNOWN,
+            .module_ref => |mr| {
+                // Check for enum variant access (e.g. Color.Red parsed as module_ref ["Color", "Red"])
+                if (mr.name.parts.len == 2) {
+                    if (self.store.name_to_type.get(mr.name.parts[0])) |tid| {
+                        const t = self.store.getType(tid);
+                        if (t == .enum_type) {
+                            // Validate variant name
+                            var valid = false;
+                            for (t.enum_type.variants) |v| {
+                                if (v == mr.name.parts[1]) {
+                                    valid = true;
+                                    break;
+                                }
+                            }
+                            if (!valid) {
+                                try self.addHardError(
+                                    try std.fmt.allocPrint(self.allocator, "`{s}` is not a variant of enum `{s}`", .{
+                                        self.interner.get(mr.name.parts[1]),
+                                        self.interner.get(t.enum_type.name),
+                                    }),
+                                    mr.meta.span,
+                                    "unknown variant",
+                                    null,
+                                );
+                            }
+                            return tid;
+                        }
+                    }
+                }
+                return TypeStore.UNKNOWN;
+            },
             .string_interpolation => TypeStore.STRING,
             .quote_expr => TypeStore.UNKNOWN,
             .unquote_expr => TypeStore.UNKNOWN,
@@ -832,7 +1277,11 @@ pub const TypeChecker = struct {
                     }
                     return tid;
                 }
-                // Check user-defined types in scope graph
+                // Check user-defined types registered in TypeStore
+                if (self.store.name_to_type.get(tn.name)) |tid| {
+                    return tid;
+                }
+                // Check user-defined types in scope graph (forward reference fallback)
                 for (self.graph.types.items) |type_entry| {
                     const type_name = self.interner.get(type_entry.name);
                     if (std.mem.eql(u8, name, type_name)) {
@@ -984,8 +1433,10 @@ const Collector = @import("collector.zig").Collector;
 
 test "type check simple function" {
     const source =
-        \\def add(x :: i64, y :: i64) :: i64 do
-        \\  x + y
+        \\defmodule Test do
+        \\  def add(x :: i64, y :: i64) :: i64 do
+        \\    x + y
+        \\  end
         \\end
     ;
 
@@ -1010,8 +1461,10 @@ test "type check simple function" {
 
 test "type check literals" {
     const source =
-        \\def foo() do
-        \\  42
+        \\defmodule Test do
+        \\  def foo() do
+        \\    42
+        \\  end
         \\end
     ;
 
@@ -1036,12 +1489,14 @@ test "type check literals" {
 
 test "type check case expression" {
     const source =
-        \\def foo(x) do
-        \\  case x do
-        \\    {:ok, v} ->
-        \\      v
-        \\    {:error, e} ->
-        \\      e
+        \\defmodule Test do
+        \\  def foo(x) do
+        \\    case x do
+        \\      {:ok, v} ->
+        \\        v
+        \\      {:error, e} ->
+        \\        e
+        \\    end
         \\  end
         \\end
     ;
@@ -1068,8 +1523,10 @@ test "type check case expression" {
 test "type check arithmetic mismatch reported" {
     // String + i64 should produce a type error
     const source =
-        \\def bad() do
-        \\  "hello" + 42
+        \\defmodule Test do
+        \\  def bad() do
+        \\    "hello" + 42
+        \\  end
         \\end
     ;
 
@@ -1114,8 +1571,10 @@ test "typeToString returns human-readable names" {
 test "type check var_ref resolves to parameter type" {
     // x is declared as i64, so x + 1 should not error (both i64)
     const source =
-        \\def double(x :: i64) :: i64 do
-        \\  x + x
+        \\defmodule Test do
+        \\  def double(x :: i64) :: i64 do
+        \\    x + x
+        \\  end
         \\end
     ;
 
@@ -1142,9 +1601,11 @@ test "type check var_ref resolves to parameter type" {
 test "type check if condition must be Bool" {
     // Using an integer as if condition should produce an error
     const source =
-        \\def bad() do
-        \\  if 42 do
-        \\    1
+        \\defmodule Test do
+        \\  def bad() do
+        \\    if 42 do
+        \\      1
+        \\    end
         \\  end
         \\end
     ;
@@ -1174,8 +1635,10 @@ test "type check if condition must be Bool" {
 test "type check return type mismatch" {
     // Function declares i64 return but body returns a string
     const source =
-        \\def bad() :: i64 do
-        \\  "not a number"
+        \\defmodule Test do
+        \\  def bad() :: i64 do
+        \\    "not a number"
+        \\  end
         \\end
     ;
 
@@ -1206,8 +1669,10 @@ test "type check return type mismatch" {
 
 test "type provenance tracks source span on typed parameter" {
     const source =
-        \\def add(x :: i64) do
-        \\  x
+        \\defmodule Test do
+        \\  def add(x :: i64) do
+        \\    x
+        \\  end
         \\end
     ;
 
@@ -1244,8 +1709,10 @@ test "type provenance tracks source span on typed parameter" {
 
 test "return type mismatch has secondary span" {
     const source =
-        \\def bad() :: i64 do
-        \\  "not a number"
+        \\defmodule Test do
+        \\  def bad() :: i64 do
+        \\    "not a number"
+        \\  end
         \\end
     ;
 
@@ -1275,11 +1742,13 @@ test "return type mismatch has secondary span" {
 
 test "undefined function suggests similar name" {
     const source =
-        \\def foo(a, b) do
-        \\  a + b
-        \\end
-        \\def bar() do
-        \\  fob(1, 2)
+        \\defmodule Test do
+        \\  def foo(a, b) do
+        \\    a + b
+        \\  end
+        \\  def bar() do
+        \\    fob(1, 2)
+        \\  end
         \\end
     ;
 
@@ -1315,11 +1784,13 @@ test "undefined function suggests similar name" {
 
 test "undefined function no suggestion for unrelated name" {
     const source =
-        \\def foo(a) do
-        \\  a
-        \\end
-        \\def bar() do
-        \\  zzzzz(1)
+        \\defmodule Test do
+        \\  def foo(a) do
+        \\    a
+        \\  end
+        \\  def bar() do
+        \\    zzzzz(1)
+        \\  end
         \\end
     ;
 
@@ -1352,11 +1823,13 @@ test "undefined function no suggestion for unrelated name" {
 
 test "valid function call produces no error" {
     const source =
-        \\def foo(a, b) do
-        \\  a + b
-        \\end
-        \\def bar() do
-        \\  foo(1, 2)
+        \\defmodule Test do
+        \\  def foo(a, b) do
+        \\    a + b
+        \\  end
+        \\  def bar() do
+        \\    foo(1, 2)
+        \\  end
         \\end
     ;
 
@@ -1384,9 +1857,11 @@ test "valid function call produces no error" {
 
 test "unused variable produces warning" {
     const source =
-        \\def foo() do
-        \\  x = 42
-        \\  1
+        \\defmodule Test do
+        \\  def foo() do
+        \\    x = 42
+        \\    1
+        \\  end
         \\end
     ;
 
@@ -1420,9 +1895,11 @@ test "unused variable produces warning" {
 
 test "underscore-prefixed variable no unused warning" {
     const source =
-        \\def foo() do
-        \\  _x = 42
-        \\  1
+        \\defmodule Test do
+        \\  def foo() do
+        \\    _x = 42
+        \\    1
+        \\  end
         \\end
     ;
 
@@ -1450,9 +1927,11 @@ test "underscore-prefixed variable no unused warning" {
 
 test "used variable no unused warning" {
     const source =
-        \\def foo() do
-        \\  x = 42
-        \\  x + 1
+        \\defmodule Test do
+        \\  def foo() do
+        \\    x = 42
+        \\    x + 1
+        \\  end
         \\end
     ;
 
@@ -1480,8 +1959,10 @@ test "used variable no unused warning" {
 
 test "unknown type name produces error" {
     const source =
-        \\def foo(x :: Other) do
-        \\  x
+        \\defmodule Test do
+        \\  def foo(x :: Other) do
+        \\    x
+        \\  end
         \\end
     ;
 
@@ -1512,8 +1993,10 @@ test "unknown type name produces error" {
 
 test "unused function parameter produces warning" {
     const source =
-        \\def foo(x) do
-        \\  42
+        \\defmodule Test do
+        \\  def foo(x) do
+        \\    42
+        \\  end
         \\end
     ;
 

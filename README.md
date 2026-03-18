@@ -229,16 +229,62 @@ Types are declared at function boundaries. No implicit numeric coercion — all 
 | Platform-sized | `usize` `isize` |
 | Primitives | `Bool` `String` `Atom` `Nil` |
 | Bottom | `Never` |
-| Compound | tuples, lists, maps, structs |
-| Algebraic | tagged unions, opaque types |
-| Higher-order | function types, parametric types |
+| Compound | tuples, structs, enums |
 
-Type aliases and opaque types:
+### Structs
+
+Structs are top-level data definitions with named, typed fields:
 
 ```elixir
-type Result(a, e) = {:ok, a} | {:error, e}
-type Pair(a, b) = {a, b}
-opaque UserId = i64
+defstruct User do
+  name :: String
+  email :: String
+  age :: i64
+end
+
+user = %{name: "Alice", email: "alice@example.com", age: 30} :: User
+```
+
+Structs support inheritance via `extends`, which copies fields from a parent:
+
+```elixir
+defstruct Shape do
+  color :: String = "black"
+end
+
+defstruct Circle extends Shape do
+  radius :: f64
+end
+
+# Circle has: color, radius
+```
+
+### Enums
+
+Closed sets of named tags:
+
+```elixir
+defenum Direction do
+  North
+  South
+  East
+  West
+end
+```
+
+### Lists
+
+Lists are homogeneous — all elements must be the same type:
+
+```elixir
+numbers = [1, 2, 3]         # valid: [i64]
+names = ["alice", "bob"]     # valid: [String]
+```
+
+Mixed-type collections use tuples instead:
+
+```elixir
+mixed = {1, "two", :three}  # valid: {i64, String, Atom}
 ```
 
 ---
@@ -285,13 +331,15 @@ The entire compiler is written in Zig.
 ## CLI Reference
 
 ```
-zap [flags] <file.zap> [zig-flags...]
+zap [run] [flags] <file.zap> [zig-flags...]
 ```
 
-| Flag | Description |
+| Command / Flag | Description |
 |---|---|
+| `run` | Compile and execute the program in one step |
 | `--emit-zig` | Print generated Zig source to stdout instead of compiling |
 | `--lib` | Compile as a library instead of an executable |
+| `--strict-types` | Treat type warnings as errors |
 
 Any additional flags after the `.zap` file are forwarded to the Zig build system.
 

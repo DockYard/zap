@@ -87,6 +87,8 @@ pub const Resolver = struct {
             .macro => |mac| try self.resolveFunctionDecl(mac),
             .type_decl => |td| try self.resolveTypeDecl(td),
             .opaque_decl => |od| try self.resolveOpaqueDecl(od),
+            .struct_decl => {},
+            .enum_decl => {},
             .module => {},
         }
     }

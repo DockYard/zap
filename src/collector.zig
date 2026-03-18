@@ -61,9 +61,17 @@ pub const Collector = struct {
                 .macro => |mac| try self.collectMacro(mac, self.graph.prelude_scope),
                 .type_decl => |td| try self.collectType(td, self.graph.prelude_scope),
                 .opaque_decl => |od| try self.collectOpaque(od, self.graph.prelude_scope),
+                .struct_decl => |sd| try self.collectStruct(sd, self.graph.prelude_scope),
+                .enum_decl => |ed| try self.collectEnum(ed, self.graph.prelude_scope),
                 .module => {},
             }
         }
+
+        // Second pass: resolve struct extends (copy parent fields into children)
+        try self.resolveStructExtends();
+
+        // Third pass: resolve module extends (copy parent function families into children)
+        try self.resolveModuleExtends(program);
     }
 
     // ============================================================
@@ -83,6 +91,7 @@ pub const Collector = struct {
                 .type_decl => |td| try self.collectType(td, mod_scope),
                 .opaque_decl => |od| try self.collectOpaque(od, mod_scope),
                 .struct_decl => |sd| try self.collectStruct(sd, mod_scope),
+                .enum_decl => |ed| try self.collectEnum(ed, mod_scope),
                 .alias_decl => |ad| try self.collectAlias(ad, mod_scope),
                 .import_decl => |id_decl| try self.collectImport(id_decl, mod_scope),
             }
@@ -170,13 +179,150 @@ pub const Collector = struct {
     }
 
     fn collectStruct(self: *Collector, sd: *const ast.StructDecl, parent_scope: scope.ScopeId) !void {
+        const name = sd.name orelse 0; // Named structs use their own name; module-scoped use sentinel
         _ = try self.graph.registerType(
-            // Structs are named by their enclosing module, use a sentinel
-            0, // Will be resolved to module name later
+            name,
             parent_scope,
             .{ .struct_type = sd },
             &.{},
         );
+    }
+
+    fn collectEnum(self: *Collector, ed: *const ast.EnumDecl, parent_scope: scope.ScopeId) !void {
+        _ = try self.graph.registerType(
+            ed.name,
+            parent_scope,
+            .{ .enum_type = ed },
+            &.{},
+        );
+    }
+
+    // ============================================================
+    // Extends resolution
+    // ============================================================
+
+    fn resolveStructExtends(self: *Collector) !void {
+        // For each registered type that is a struct with a parent, resolve it
+        for (self.graph.types.items) |*type_entry| {
+            if (type_entry.kind != .struct_type) continue;
+            const sd = type_entry.kind.struct_type;
+            const parent_name = sd.parent orelse continue;
+
+            // Find parent type
+            const parent_type_id = self.graph.resolveTypeByName(parent_name) orelse {
+                try self.addError(
+                    "unknown parent struct in extends",
+                    sd.meta.span,
+                );
+                continue;
+            };
+
+            const parent_entry = self.graph.types.items[parent_type_id];
+            if (parent_entry.kind != .struct_type) {
+                try self.addError(
+                    "extends target must be a struct",
+                    sd.meta.span,
+                );
+                continue;
+            }
+
+            // Detect cycles: walk the parent chain and check for self-reference
+            const child_name = sd.name orelse continue;
+            var current_parent: ?ast.StringId = parent_name;
+            while (current_parent) |cp| {
+                if (cp == child_name) {
+                    try self.addError(
+                        "circular struct inheritance detected",
+                        sd.meta.span,
+                    );
+                    break;
+                }
+                // Walk up to grandparent
+                if (self.graph.resolveTypeByName(cp)) |cp_tid| {
+                    const cp_entry = self.graph.types.items[cp_tid];
+                    if (cp_entry.kind == .struct_type) {
+                        current_parent = cp_entry.kind.struct_type.parent;
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn resolveModuleExtends(self: *Collector, program: *const ast.Program) !void {
+        // For each module with a parent, copy parent's public function families
+        for (program.modules) |*mod| {
+            const parent_name = mod.parent orelse continue;
+
+            // Find parent module by name
+            var parent_scope_id: ?scope.ScopeId = null;
+            for (self.graph.modules.items) |mod_entry| {
+                if (mod_entry.name.parts.len == 1 and mod_entry.name.parts[0] == parent_name) {
+                    parent_scope_id = mod_entry.scope_id;
+                    break;
+                }
+            }
+
+            if (parent_scope_id == null) {
+                try self.addError(
+                    "unknown parent module in extends",
+                    mod.meta.span,
+                );
+                continue;
+            }
+
+            // Find child module scope
+            var child_scope_id: ?scope.ScopeId = null;
+            for (self.graph.modules.items) |mod_entry| {
+                if (mod_entry.decl == mod) {
+                    child_scope_id = mod_entry.scope_id;
+                    break;
+                }
+            }
+
+            const child_sid = child_scope_id orelse continue;
+            const parent_sid = parent_scope_id.?;
+
+            // Copy public function families from parent to child
+            // First collect family keys to avoid iterator invalidation
+            var family_keys: std.ArrayList(scope.FamilyKey) = .empty;
+            var family_ids: std.ArrayList(scope.FunctionFamilyId) = .empty;
+            {
+                const parent_scope_data = self.graph.getScope(parent_sid);
+                var iter = parent_scope_data.function_families.iterator();
+                while (iter.next()) |entry| {
+                    try family_keys.append(self.allocator, entry.key_ptr.*);
+                    try family_ids.append(self.allocator, entry.value_ptr.*);
+                }
+            }
+
+            for (family_keys.items, family_ids.items) |family_key, parent_family_id| {
+                const parent_family = self.graph.getFamily(parent_family_id);
+
+                // Only copy public functions
+                if (parent_family.visibility != .public) continue;
+
+                // Skip if child already has this family (override)
+                const child_scope_data = self.graph.getScope(child_sid);
+                if (child_scope_data.function_families.get(family_key) != null) continue;
+
+                // Collect clause refs before creating new family (avoids stale pointer)
+                var clause_refs: std.ArrayList(scope.FunctionClauseRef) = .empty;
+                for (parent_family.clauses.items) |clause_ref| {
+                    try clause_refs.append(self.allocator, clause_ref);
+                }
+
+                // Create a new family in the child scope that references parent clauses
+                const new_family_id = try self.graph.createFamily(child_sid, family_key.name, family_key.arity, .public);
+                const new_family = self.graph.getFamilyMut(new_family_id);
+                for (clause_refs.items) |clause_ref| {
+                    try new_family.clauses.append(self.allocator, clause_ref);
+                }
+            }
+        }
     }
 
     // ============================================================

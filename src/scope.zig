@@ -183,6 +183,7 @@ pub const TypeKind = union(enum) {
     type_alias: *const ast.TypeExpr,
     opaque_type: *const ast.TypeExpr,
     struct_type: *const ast.StructDecl,
+    enum_type: *const ast.EnumDecl,
 };
 
 // ============================================================
@@ -211,6 +212,8 @@ pub const ScopeGraph = struct {
     /// Maps AST node span.start → scope_id, so the type checker can find
     /// the scope for function clauses and modules without mutating the AST.
     node_scope_map: std.AutoHashMap(u32, ScopeId),
+    /// Maps type name (StringId) → TypeId for global type resolution
+    type_name_to_id: std.AutoHashMap(ast.StringId, TypeId),
 
     pub fn init(allocator: std.mem.Allocator) ScopeGraph {
         var graph = ScopeGraph{
@@ -223,6 +226,7 @@ pub const ScopeGraph = struct {
             .modules = .empty,
             .prelude_scope = 0,
             .node_scope_map = std.AutoHashMap(u32, ScopeId).init(allocator),
+            .type_name_to_id = std.AutoHashMap(ast.StringId, TypeId).init(allocator),
         };
         // Create prelude scope as scope 0
         const prelude = Scope.init(allocator, 0, null, .prelude);
@@ -247,6 +251,7 @@ pub const ScopeGraph = struct {
         self.types.deinit(self.allocator);
         self.modules.deinit(self.allocator);
         self.node_scope_map.deinit();
+        self.type_name_to_id.deinit();
     }
 
     pub fn createScope(self: *ScopeGraph, parent: ?ScopeId, kind: ScopeKind) !ScopeId {
@@ -312,7 +317,16 @@ pub const ScopeGraph = struct {
             .kind = kind,
             .params = params,
         });
+        // Register named types for global lookup (skip sentinel 0 for module-scoped unnamed structs)
+        if (name != 0) {
+            try self.type_name_to_id.put(name, id);
+        }
         return id;
+    }
+
+    /// Look up a type by its interned name string ID.
+    pub fn resolveTypeByName(self: *const ScopeGraph, name: ast.StringId) ?TypeId {
+        return self.type_name_to_id.get(name);
     }
 
     pub fn registerModule(self: *ScopeGraph, name: ast.ModuleName, scope_id: ScopeId, decl: *const ast.ModuleDecl) !void {

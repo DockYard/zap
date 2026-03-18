@@ -53,6 +53,12 @@ pub const Parser = struct {
         return self.current.tag;
     }
 
+    fn peekNext(self: *Parser) Token.Tag {
+        // Peek at the token after current without consuming anything
+        var lookahead = self.lexer;
+        return lookahead.next().tag;
+    }
+
     fn check(self: *const Parser, tag: Token.Tag) bool {
         return self.current.tag == tag;
     }
@@ -146,14 +152,14 @@ pub const Parser = struct {
     fn synchronize(self: *Parser) void {
         while (!self.check(.eof)) {
             switch (self.peek()) {
-                .keyword_def, .keyword_defp, .keyword_defmodule, .keyword_defmacro, .keyword_end => return,
+                .keyword_def, .keyword_defp, .keyword_defmodule, .keyword_defmacro, .keyword_defstruct, .keyword_defenum, .keyword_end => return,
                 .newline => {
                     _ = self.advance();
                     // After newline, check if next token starts a new statement
                     self.skipNewlines();
                     switch (self.peek()) {
                         .keyword_def, .keyword_defp, .keyword_defmodule, .keyword_defmacro,
-                        .keyword_defstruct, .keyword_type, .keyword_opaque,
+                        .keyword_defstruct, .keyword_defenum, .keyword_type, .keyword_opaque,
                         .keyword_alias, .keyword_import, .keyword_end, .eof,
                         => return,
                         else => {},
@@ -241,6 +247,20 @@ pub const Parser = struct {
                         self.synchronize();
                     }
                 },
+                .keyword_defstruct => {
+                    if (self.parseTopLevelStructDecl()) |sd| {
+                        try top_items.append(self.allocator, .{ .struct_decl = sd });
+                    } else |_| {
+                        self.synchronize();
+                    }
+                },
+                .keyword_defenum => {
+                    if (self.parseEnumDecl()) |ed| {
+                        try top_items.append(self.allocator, .{ .enum_decl = ed });
+                    } else |_| {
+                        self.synchronize();
+                    }
+                },
                 .newline => {
                     _ = self.advance();
                 },
@@ -251,7 +271,7 @@ pub const Parser = struct {
                     // Check for misspelled keywords
                     if (self.current.tag == .identifier) {
                         const text = self.current.slice(self.source);
-                        const keywords = [_][]const u8{ "defmodule", "def", "defp", "defmacro", "type", "opaque" };
+                        const keywords = [_][]const u8{ "defmodule", "def", "defp", "defmacro", "defstruct", "defenum", "type", "opaque" };
                         if (similarity.findBestMatch(text, &keywords, 0.75)) |suggestion| {
                             try self.addRichError(
                                 std.fmt.allocPrint(self.allocator, "I was not expecting `{s}` at the top level", .{text}) catch "unexpected identifier at top level",
@@ -269,7 +289,7 @@ pub const Parser = struct {
                         }) catch "unexpected token at top level",
                         self.currentSpan(),
                         null,
-                        "the top level can contain `defmodule`, `def`, `defp`, `type`, and `opaque` declarations",
+                        "the top level can contain `defmodule`, `def`, `defp`, `defstruct`, `defenum`, `type`, and `opaque` declarations",
                     );
                     _ = self.advance();
                 },
@@ -305,6 +325,13 @@ pub const Parser = struct {
             return error.ParseError;
         }
         const name = try self.parseModuleName();
+
+        // Parse optional extends
+        var parent: ?ast.StringId = null;
+        if (self.match(.keyword_extends)) {
+            const parent_tok = try self.expect(.module_identifier);
+            parent = try self.internToken(parent_tok);
+        }
 
         if (!self.check(.keyword_do)) {
             try self.addRichError(
@@ -355,6 +382,13 @@ pub const Parser = struct {
                         self.synchronize();
                     }
                 },
+                .keyword_defenum => {
+                    if (self.parseEnumDecl()) |ed| {
+                        try items.append(self.allocator, .{ .enum_decl = ed });
+                    } else |_| {
+                        self.synchronize();
+                    }
+                },
                 .keyword_type => {
                     if (self.parseTypeDecl()) |td| {
                         try items.append(self.allocator, .{ .type_decl = td });
@@ -396,7 +430,7 @@ pub const Parser = struct {
                         }) catch "unexpected token in module",
                         self.currentSpan(),
                         "not valid inside a module body",
-                        "modules can contain `def`, `defp`, `defstruct`, `type`, `alias`, and `import` declarations",
+                        "modules can contain `def`, `defp`, `defstruct`, `defenum`, `type`, `alias`, and `import` declarations",
                     );
                     _ = self.advance();
                 },
@@ -419,6 +453,7 @@ pub const Parser = struct {
         return .{
             .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
             .name = name,
+            .parent = parent,
             .items = try items.toOwnedSlice(self.allocator),
         };
     }
@@ -563,6 +598,102 @@ pub const Parser = struct {
         return self.create(ast.StructDecl, .{
             .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
             .fields = try fields.toOwnedSlice(self.allocator),
+        });
+    }
+
+    fn parseTopLevelStructDecl(self: *Parser) !*const ast.StructDecl {
+        const start = self.currentSpan();
+        _ = try self.expect(.keyword_defstruct);
+
+        // Parse name (required for top-level structs)
+        const name_tok = try self.expect(.module_identifier);
+        const name = try self.internToken(name_tok);
+
+        // Parse optional extends
+        var parent: ?ast.StringId = null;
+        if (self.match(.keyword_extends)) {
+            const parent_tok = try self.expect(.module_identifier);
+            parent = try self.internToken(parent_tok);
+        }
+
+        _ = try self.expectAt(.keyword_do, start);
+        self.skipNewlines();
+        _ = self.match(.indent);
+
+        var fields: std.ArrayList(ast.StructFieldDecl) = .empty;
+
+        while (!self.check(.keyword_end) and !self.check(.dedent) and !self.check(.eof)) {
+            self.skipNewlines();
+            if (self.check(.keyword_end) or self.check(.dedent)) break;
+
+            const field_tok = try self.expect(.identifier);
+            const field_name = try self.internToken(field_tok);
+            _ = try self.expect(.double_colon);
+            const type_expr = try self.parseTypeExpr();
+
+            var default: ?*const ast.Expr = null;
+            if (self.match(.equal)) {
+                default = try self.parseExpr();
+            }
+
+            try fields.append(self.allocator, .{
+                .meta = .{ .span = ast.SourceSpan.merge(ast.SourceSpan.from(field_tok.loc), self.previousSpan()) },
+                .name = field_name,
+                .type_expr = type_expr,
+                .default = default,
+            });
+
+            self.skipNewlines();
+        }
+
+        _ = self.match(.dedent);
+        self.skipNewlines();
+        _ = try self.expectAt(.keyword_end, start);
+
+        return self.create(ast.StructDecl, .{
+            .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
+            .name = name,
+            .parent = parent,
+            .fields = try fields.toOwnedSlice(self.allocator),
+        });
+    }
+
+    fn parseEnumDecl(self: *Parser) !*const ast.EnumDecl {
+        const start = self.currentSpan();
+        _ = try self.expect(.keyword_defenum);
+
+        const name_tok = try self.expect(.module_identifier);
+        const name = try self.internToken(name_tok);
+
+        _ = try self.expectAt(.keyword_do, start);
+        self.skipNewlines();
+        _ = self.match(.indent);
+
+        var variants: std.ArrayList(ast.EnumVariant) = .empty;
+
+        while (!self.check(.keyword_end) and !self.check(.dedent) and !self.check(.eof)) {
+            self.skipNewlines();
+            if (self.check(.keyword_end) or self.check(.dedent)) break;
+
+            const variant_tok = try self.expect(.module_identifier);
+            const variant_name = try self.internToken(variant_tok);
+
+            try variants.append(self.allocator, .{
+                .meta = .{ .span = ast.SourceSpan.from(variant_tok.loc) },
+                .name = variant_name,
+            });
+
+            self.skipNewlines();
+        }
+
+        _ = self.match(.dedent);
+        self.skipNewlines();
+        _ = try self.expectAt(.keyword_end, start);
+
+        return self.create(ast.EnumDecl, .{
+            .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
+            .name = name,
+            .variants = try variants.toOwnedSlice(self.allocator),
         });
     }
 
@@ -1307,22 +1438,104 @@ pub const Parser = struct {
         const start = self.currentSpan();
         _ = try self.expect(.percent_brace);
 
-        var fields: std.ArrayList(ast.MapField) = .empty;
+        // Support multiline: %{\n  field: val,\n  ...\n}
+        self.skipNewlines();
+        const indented = self.match(.indent);
+
+        // Parse key:value fields — could be map (key -> value) or struct (name: value)
+        // Detect struct fields (identifier followed by colon) vs map fields (expr followed by arrow)
+        var struct_fields: std.ArrayList(ast.StructField) = .empty;
+        var map_fields: std.ArrayList(ast.MapField) = .empty;
+        var is_struct = false;
+        var is_map = false;
 
         while (!self.check(.right_brace) and !self.check(.eof)) {
-            const key = try self.parseExpr();
-            _ = try self.expect(.arrow);
-            const value = try self.parseExpr();
-            try fields.append(self.allocator, .{ .key = key, .value = value });
-            if (!self.match(.comma)) break;
+            self.skipNewlines();
+            if (self.check(.indent)) _ = self.advance();
+            if (self.check(.dedent)) _ = self.advance();
+            self.skipNewlines();
+            if (self.check(.right_brace)) break;
+
+            // Detect if this is `identifier:` (struct field) or expr -> (map)
+            if (!is_map and self.check(.identifier)) {
+                // Speculatively check for identifier : value (struct field syntax)
+                const saved_lexer = self.lexer;
+                const saved_current = self.current;
+                const saved_previous = self.previous;
+                const field_tok = self.advance();
+                if (self.check(.colon)) {
+                    // This is struct field syntax: name: value
+                    _ = self.advance(); // consume colon
+                    is_struct = true;
+                    const field_name = try self.internToken(field_tok);
+                    const value = try self.parseExpr();
+                    try struct_fields.append(self.allocator, .{ .name = field_name, .value = value });
+                    if (!self.match(.comma)) break;
+                    self.skipNewlines();
+                    continue;
+                } else {
+                    // Not struct syntax, restore and parse as map
+                    self.lexer = saved_lexer;
+                    self.current = saved_current;
+                    self.previous = saved_previous;
+                }
+            }
+
+            if (!is_struct) {
+                is_map = true;
+                const key = try self.parseExpr();
+                _ = try self.expect(.arrow);
+                const value = try self.parseExpr();
+                try map_fields.append(self.allocator, .{ .key = key, .value = value });
+                if (!self.match(.comma)) break;
+                self.skipNewlines();
+            } else {
+                // Continuing struct fields
+                const field_tok = try self.expect(.identifier);
+                const field_name = try self.internToken(field_tok);
+                _ = try self.expect(.colon);
+                const value = try self.parseExpr();
+                try struct_fields.append(self.allocator, .{ .name = field_name, .value = value });
+                if (!self.match(.comma)) break;
+                self.skipNewlines();
+            }
         }
 
+        _ = indented;
+        while (self.check(.dedent) or self.check(.newline)) {
+            _ = self.advance();
+        }
         _ = try self.expect(.right_brace);
+
+        // Check for :: Type annotation (converts to struct expression)
+        if (self.check(.double_colon)) {
+            _ = self.advance(); // consume ::
+            const type_name = try self.parseModuleName();
+            return self.create(ast.Expr, .{
+                .struct_expr = .{
+                    .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
+                    .module_name = type_name,
+                    .update_source = null,
+                    .fields = try struct_fields.toOwnedSlice(self.allocator),
+                },
+            });
+        }
+
+        if (is_struct) {
+            // Struct fields without :: Type — error or treat as map
+            // For now, still create a struct expr with empty module name
+            return self.create(ast.Expr, .{
+                .map = .{
+                    .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
+                    .fields = &.{},
+                },
+            });
+        }
 
         return self.create(ast.Expr, .{
             .map = .{
                 .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
-                .fields = try fields.toOwnedSlice(self.allocator),
+                .fields = try map_fields.toOwnedSlice(self.allocator),
             },
         });
     }
@@ -1449,12 +1662,32 @@ pub const Parser = struct {
         }
 
         _ = try self.expect(.arrow);
+
+        // Support both single-line and multi-line case bodies:
+        // Single-line: Color.Red -> "value"
+        // Multi-line:  Color.Red ->\n    "value"
+        if (!self.check(.newline) and !self.check(.indent)) {
+            // Single-line: parse just one expression
+            const expr = try self.parseExpr();
+            const body = try self.allocator.alloc(ast.Stmt, 1);
+            body[0] = .{ .expr = expr };
+            return .{
+                .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
+                .pattern = pattern,
+                .type_annotation = type_annotation,
+                .guard = guard,
+                .body = body,
+            };
+        }
+
         self.skipNewlines();
-        _ = self.match(.indent);
+        const indented = self.match(.indent);
 
         const body = try self.parseBlock();
 
-        _ = self.match(.dedent);
+        if (indented) {
+            _ = self.match(.dedent);
+        }
 
         return .{
             .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
@@ -1725,6 +1958,44 @@ pub const Parser = struct {
                         .wildcard = .{ .meta = .{ .span = ast.SourceSpan.from(tok.loc) } },
                     });
                 }
+                // Check for module-qualified enum pattern: Color.Red
+                if (self.check(.dot)) {
+                    _ = self.advance(); // consume '.'
+                    if (self.check(.identifier) or self.check(.module_identifier)) {
+                        const variant_tok = self.advance();
+                        const variant_text = variant_tok.slice(self.source);
+                        return self.create(ast.Pattern, .{
+                            .literal = .{ .atom = .{
+                                .meta = .{ .span = ast.SourceSpan.merge(ast.SourceSpan.from(tok.loc), ast.SourceSpan.from(variant_tok.loc)) },
+                                .value = try self.interner.intern(variant_text),
+                            } },
+                        });
+                    }
+                }
+                return self.create(ast.Pattern, .{
+                    .bind = .{
+                        .meta = .{ .span = ast.SourceSpan.from(tok.loc) },
+                        .name = try self.internToken(tok),
+                    },
+                });
+            },
+            .module_identifier => {
+                const tok = self.advance();
+                // Module-qualified enum pattern: Color.Red
+                if (self.check(.dot)) {
+                    _ = self.advance(); // consume '.'
+                    if (self.check(.identifier) or self.check(.module_identifier)) {
+                        const variant_tok = self.advance();
+                        const variant_text = variant_tok.slice(self.source);
+                        return self.create(ast.Pattern, .{
+                            .literal = .{ .atom = .{
+                                .meta = .{ .span = ast.SourceSpan.merge(ast.SourceSpan.from(tok.loc), ast.SourceSpan.from(variant_tok.loc)) },
+                                .value = try self.interner.intern(variant_text),
+                            } },
+                        });
+                    }
+                }
+                // Bare module identifier in pattern — treat as bind
                 return self.create(ast.Pattern, .{
                     .bind = .{
                         .meta = .{ .span = ast.SourceSpan.from(tok.loc) },
@@ -1889,6 +2160,31 @@ pub const Parser = struct {
     fn parseMapPattern(self: *Parser) !*const ast.Pattern {
         const start = self.currentSpan();
         _ = try self.expect(.percent_brace);
+
+        // Detect struct-like pattern: %{name: pattern, ...}
+        // vs map pattern: %{expr => pattern, ...}
+        // If first element is identifier followed by colon, treat as struct pattern fields
+        if (self.check(.identifier) and self.peekNext() == .colon) {
+            // Struct-like destructuring pattern
+            var struct_fields: std.ArrayList(ast.StructPatternField) = .empty;
+            while (!self.check(.right_brace) and !self.check(.eof)) {
+                const field_tok = try self.expect(.identifier);
+                const field_name = try self.internToken(field_tok);
+                _ = try self.expect(.colon);
+                const pattern = try self.parsePattern();
+                try struct_fields.append(self.allocator, .{ .name = field_name, .pattern = pattern });
+                if (!self.match(.comma)) break;
+            }
+            _ = try self.expect(.right_brace);
+
+            return self.create(ast.Pattern, .{
+                .struct_pattern = .{
+                    .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
+                    .module_name = .{ .parts = &.{}, .span = start },
+                    .fields = try struct_fields.toOwnedSlice(self.allocator),
+                },
+            });
+        }
 
         var fields: std.ArrayList(ast.MapPatternField) = .empty;
 
@@ -2751,4 +3047,117 @@ test "parse module with types and functions" {
     const program = try parser.parseProgram();
     try std.testing.expectEqual(@as(usize, 1), program.modules.len);
     try std.testing.expectEqual(@as(usize, 3), program.modules[0].items.len);
+}
+
+test "parse top-level defstruct" {
+    const source =
+        \\defstruct User do
+        \\  name :: String
+        \\  age :: i64
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    try std.testing.expectEqual(@as(usize, 1), program.top_items.len);
+    const sd = program.top_items[0].struct_decl;
+    try std.testing.expect(sd.name != null);
+    try std.testing.expectEqual(@as(usize, 2), sd.fields.len);
+}
+
+test "parse defstruct extends" {
+    const source =
+        \\defstruct Shape do
+        \\  color :: String
+        \\end
+        \\
+        \\defstruct Circle extends Shape do
+        \\  radius :: f64
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    try std.testing.expectEqual(@as(usize, 2), program.top_items.len);
+    const circle = program.top_items[1].struct_decl;
+    try std.testing.expect(circle.parent != null);
+    try std.testing.expectEqual(@as(usize, 1), circle.fields.len);
+}
+
+test "parse defenum" {
+    const source =
+        \\defenum Color do
+        \\  Red
+        \\  Green
+        \\  Blue
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    try std.testing.expectEqual(@as(usize, 1), program.top_items.len);
+    const ed = program.top_items[0].enum_decl;
+    try std.testing.expectEqual(@as(usize, 3), ed.variants.len);
+}
+
+test "parse defmodule extends" {
+    const source =
+        \\defmodule Animal do
+        \\  def breathe() :: String do
+        \\    "inhale"
+        \\  end
+        \\end
+        \\
+        \\defmodule Dog extends Animal do
+        \\  def speak() :: String do
+        \\    "woof"
+        \\  end
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    try std.testing.expectEqual(@as(usize, 2), program.modules.len);
+    try std.testing.expect(program.modules[1].parent != null);
+}
+
+test "parse struct init with type annotation" {
+    const source =
+        \\defstruct Point do
+        \\  x :: f64
+        \\  y :: f64
+        \\end
+        \\
+        \\def main() do
+        \\  %{x: 1.0, y: 2.0} :: Point
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    // Should have defstruct + def
+    try std.testing.expectEqual(@as(usize, 2), program.top_items.len);
+    const func = program.top_items[1].function;
+    const body = func.clauses[0].body;
+    try std.testing.expect(body[0].expr.* == .struct_expr);
 }

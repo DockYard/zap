@@ -124,6 +124,7 @@ fn compileWithDiagnostics(alloc: std.mem.Allocator, source: []const u8, strict_t
     if (diag_engine.hasErrors()) return error.HirError;
 
     var ir_builder = ir.IrBuilder.init(alloc, &parser.interner);
+    ir_builder.type_store = &type_checker.store;
     defer ir_builder.deinit();
     const ir_program = try ir_builder.buildProgram(&hir_program);
 
@@ -233,21 +234,23 @@ test "example: factorial" {
     const alloc = arena.allocator();
 
     const source =
-        \\def factorial(0 :: i64) :: i64 do
-        \\  1
-        \\end
+        \\defmodule Factorial do
+        \\  def factorial(0 :: i64) :: i64 do
+        \\    1
+        \\  end
         \\
-        \\def factorial(n :: i64) :: i64 do
-        \\  n * factorial(n - 1)
+        \\  def factorial(n :: i64) :: i64 do
+        \\    n * factorial(n - 1)
+        \\  end
         \\end
         \\
         \\def main() do
-        \\  factorial(10)
+        \\  Factorial.factorial(10)
         \\end
     ;
 
     const output = try compile(alloc, source);
-    try expectContains(output, "fn factorial(");
+    try expectContains(output, "fn Factorial__factorial(");
     try expectContains(output, "fn main(");
     try expectContains(output, "10");
     try expectContains(output, "return");
@@ -263,25 +266,27 @@ test "example: fibonacci" {
     const alloc = arena.allocator();
 
     const source =
-        \\def fib(0 :: i64) :: i64 do
-        \\  0
-        \\end
+        \\defmodule Fib do
+        \\  def fib(0 :: i64) :: i64 do
+        \\    0
+        \\  end
         \\
-        \\def fib(1 :: i64) :: i64 do
-        \\  1
-        \\end
+        \\  def fib(1 :: i64) :: i64 do
+        \\    1
+        \\  end
         \\
-        \\def fib(n :: i64) :: i64 do
-        \\  fib(n - 1) + fib(n - 2)
+        \\  def fib(n :: i64) :: i64 do
+        \\    fib(n - 1) + fib(n - 2)
+        \\  end
         \\end
         \\
         \\def main() do
-        \\  fib(20)
+        \\  Fib.fib(20)
         \\end
     ;
 
     const output = try compile(alloc, source);
-    try expectContains(output, "fn fib(");
+    try expectContains(output, "fn Fib__fib(");
     try expectContains(output, "fn main(");
     try expectContains(output, "20");
 }
@@ -337,25 +342,27 @@ test "example: pattern matching" {
     const alloc = arena.allocator();
 
     const source =
-        \\def describe(:ok) :: String do
-        \\  "success"
-        \\end
+        \\defmodule Matcher do
+        \\  def describe(:ok) :: String do
+        \\    "success"
+        \\  end
         \\
-        \\def describe(:error) :: String do
-        \\  "failure"
-        \\end
+        \\  def describe(:error) :: String do
+        \\    "failure"
+        \\  end
         \\
-        \\def describe(_) :: String do
-        \\  "unknown"
+        \\  def describe(_) :: String do
+        \\    "unknown"
+        \\  end
         \\end
         \\
         \\def main() do
-        \\  describe(:ok)
+        \\  Matcher.describe(:ok)
         \\end
     ;
 
     const output = try compile(alloc, source);
-    try expectContains(output, "fn describe(");
+    try expectContains(output, "fn Matcher__describe(");
     try expectContains(output, "fn main(");
     try expectContains(output, "\"success\"");
     try expectContains(output, "\"failure\"");
@@ -372,24 +379,26 @@ test "example: multiline pipes" {
     const alloc = arena.allocator();
 
     const source =
-        \\def double(x :: i64) :: i64 do
-        \\  x * 2
-        \\end
+        \\defmodule Pipes do
+        \\  def double(x :: i64) :: i64 do
+        \\    x * 2
+        \\  end
         \\
-        \\def add_one(x :: i64) :: i64 do
-        \\  x + 1
+        \\  def add_one(x :: i64) :: i64 do
+        \\    x + 1
+        \\  end
         \\end
         \\
         \\def main() do
         \\  5
-        \\  |> double()
-        \\  |> add_one()
+        \\  |> Pipes.double()
+        \\  |> Pipes.add_one()
         \\end
     ;
 
     const output = try compile(alloc, source);
-    try expectContains(output, "fn double(");
-    try expectContains(output, "fn add_one(");
+    try expectContains(output, "fn Pipes__double(");
+    try expectContains(output, "fn Pipes__add_one(");
     try expectContains(output, "fn main(");
     // Pipe desugaring rewrites the chain — verify the functions exist
     // and the multiplication constant is present
@@ -441,7 +450,7 @@ test "all compiled output has required header" {
     const alloc = arena.allocator();
 
     const source =
-        \\def noop() do
+        \\def main() do
         \\  nil
         \\end
     ;
@@ -458,12 +467,14 @@ test "multiple function clauses produce separate functions" {
     const alloc = arena.allocator();
 
     const source =
-        \\def greet(:morning) :: String do
-        \\  "Good morning"
-        \\end
+        \\defmodule Greeter do
+        \\  def greet(:morning) :: String do
+        \\    "Good morning"
+        \\  end
         \\
-        \\def greet(:evening) :: String do
-        \\  "Good evening"
+        \\  def greet(:evening) :: String do
+        \\    "Good evening"
+        \\  end
         \\end
     ;
 
@@ -479,13 +490,15 @@ test "string concatenation in function body" {
     const alloc = arena.allocator();
 
     const source =
-        \\def greet(name :: String) :: String do
-        \\  "Hello, " <> name
+        \\defmodule Greeter do
+        \\  def greet(name :: String) :: String do
+        \\    "Hello, " <> name
+        \\  end
         \\end
     ;
 
     const output = try compile(alloc, source);
-    try expectContains(output, "fn greet(");
+    try expectContains(output, "fn Greeter__greet(");
     try expectContains(output, "\"Hello, \"");
 }
 
@@ -495,17 +508,19 @@ test "if-else generates conditional" {
     const alloc = arena.allocator();
 
     const source =
-        \\def sign(x :: i64) :: String do
-        \\  if x > 0 do
-        \\    "positive"
-        \\  else
-        \\    "non-positive"
+        \\defmodule Sign do
+        \\  def sign(x :: i64) :: String do
+        \\    if x > 0 do
+        \\      "positive"
+        \\    else
+        \\      "non-positive"
+        \\    end
         \\  end
         \\end
     ;
 
     const output = try compile(alloc, source);
-    try expectContains(output, "fn sign(");
+    try expectContains(output, "fn Sign__sign(");
     // If-else desugars to case(true/false), which emits a Zig switch
     try expectContains(output, "switch (");
     try expectContains(output, "true =>");
@@ -564,21 +579,23 @@ test "refinement guard on function clause" {
     const alloc = arena.allocator();
 
     const source =
-        \\def classify(n :: i64) :: String if n > 0 do
-        \\  "positive"
-        \\end
+        \\defmodule Classifier do
+        \\  def classify(n :: i64) :: String if n > 0 do
+        \\    "positive"
+        \\  end
         \\
-        \\def classify(n :: i64) :: String if n < 0 do
-        \\  "negative"
-        \\end
+        \\  def classify(n :: i64) :: String if n < 0 do
+        \\    "negative"
+        \\  end
         \\
-        \\def classify(_) :: String do
-        \\  "zero"
+        \\  def classify(_) :: String do
+        \\    "zero"
+        \\  end
         \\end
     ;
 
     const output = try compile(alloc, source);
-    try expectContains(output, "fn classify(");
+    try expectContains(output, "fn Classifier__classify(");
     // Should have conditional returns with type guard AND refinement
     try expectContains(output, "if (");
     try expectContains(output, "\"positive\"");
@@ -596,20 +613,22 @@ test "case expression with literal patterns" {
     const alloc = arena.allocator();
 
     const source =
-        \\def check(x :: i64) :: String do
-        \\  case x do
-        \\    0 ->
-        \\      "zero"
-        \\    1 ->
-        \\      "one"
-        \\    _ ->
-        \\      "other"
+        \\defmodule Checker do
+        \\  def check(x :: i64) :: String do
+        \\    case x do
+        \\      0 ->
+        \\        "zero"
+        \\      1 ->
+        \\        "one"
+        \\      _ ->
+        \\        "other"
+        \\    end
         \\  end
         \\end
     ;
 
     const output = try compile(alloc, source);
-    try expectContains(output, "fn check(");
+    try expectContains(output, "fn Checker__check(");
     // Integer literal case should produce a switch
     try expectContains(output, "switch (");
     try expectContains(output, "\"zero\"");
@@ -624,18 +643,20 @@ test "case expression with tuple destructuring" {
     const alloc = arena.allocator();
 
     const source =
-        \\def handle(result) do
-        \\  case result do
-        \\    {:ok, v} ->
-        \\      v
-        \\    {:error, e} ->
-        \\      e
+        \\defmodule Handler do
+        \\  def handle(result) do
+        \\    case result do
+        \\      {:ok, v} ->
+        \\        v
+        \\      {:error, e} ->
+        \\        e
+        \\    end
         \\  end
         \\end
     ;
 
     const output = try compile(alloc, source);
-    try expectContains(output, "fn handle(");
+    try expectContains(output, "fn Handler__handle(");
     try expectContains(output, "blk_case_");
     // Should have atom checks and index access
     try expectContains(output, ".@\"ok\"");
@@ -649,16 +670,18 @@ test "case expression with bind pattern" {
     const alloc = arena.allocator();
 
     const source =
-        \\def identity(x) do
-        \\  case x do
-        \\    v ->
-        \\      v
+        \\defmodule Identity do
+        \\  def identity(x) do
+        \\    case x do
+        \\      v ->
+        \\        v
+        \\    end
         \\  end
         \\end
     ;
 
     const output = try compile(alloc, source);
-    try expectContains(output, "fn identity(");
+    try expectContains(output, "fn Identity__identity(");
     // Bind pattern becomes default arm
     try expectContains(output, "blk_case_");
 }
@@ -673,14 +696,16 @@ test "case expression emits switch for integer literals" {
     const alloc = arena.allocator();
 
     const source =
-        \\def check(x :: i64) :: String do
-        \\  case x do
-        \\    0 ->
-        \\      "zero"
-        \\    1 ->
-        \\      "one"
-        \\    _ ->
-        \\      "other"
+        \\defmodule Checker do
+        \\  def check(x :: i64) :: String do
+        \\    case x do
+        \\      0 ->
+        \\        "zero"
+        \\      1 ->
+        \\        "one"
+        \\      _ ->
+        \\        "other"
+        \\    end
         \\  end
         \\end
     ;
@@ -700,16 +725,18 @@ test "function dispatch emits switch for integer literals" {
     const alloc = arena.allocator();
 
     const source =
-        \\def fib(0 :: i64) :: i64 do
-        \\  0
-        \\end
+        \\defmodule Fib do
+        \\  def fib(0 :: i64) :: i64 do
+        \\    0
+        \\  end
         \\
-        \\def fib(1 :: i64) :: i64 do
-        \\  1
-        \\end
+        \\  def fib(1 :: i64) :: i64 do
+        \\    1
+        \\  end
         \\
-        \\def fib(n :: i64) :: i64 do
-        \\  fib(n - 1) + fib(n - 2)
+        \\  def fib(n :: i64) :: i64 do
+        \\    fib(n - 1) + fib(n - 2)
+        \\  end
         \\end
     ;
 
@@ -724,14 +751,16 @@ test "case with guards falls back to if-else" {
     const alloc = arena.allocator();
 
     const source =
-        \\def check(x :: i64) :: String do
-        \\  case x do
-        \\    0 ->
-        \\      "zero"
-        \\    n if n > 0 ->
-        \\      "positive"
-        \\    _ ->
-        \\      "negative"
+        \\defmodule Checker do
+        \\  def check(x :: i64) :: String do
+        \\    case x do
+        \\      0 ->
+        \\        "zero"
+        \\      n if n > 0 ->
+        \\        "positive"
+        \\      _ ->
+        \\        "negative"
+        \\    end
         \\  end
         \\end
     ;
@@ -748,14 +777,16 @@ test "case with atom literals falls back to if-else" {
     const alloc = arena.allocator();
 
     const source =
-        \\def check(x) :: String do
-        \\  case x do
-        \\    :ok ->
-        \\      "yes"
-        \\    :error ->
-        \\      "no"
-        \\    _ ->
-        \\      "unknown"
+        \\defmodule Checker do
+        \\  def check(x) :: String do
+        \\    case x do
+        \\      :ok ->
+        \\        "yes"
+        \\      :error ->
+        \\        "no"
+        \\      _ ->
+        \\        "unknown"
+        \\    end
         \\  end
         \\end
     ;
@@ -776,14 +807,16 @@ test "nested tuple patterns decompose once" {
     const alloc = arena.allocator();
 
     const source =
-        \\def process(x) do
-        \\  case x do
-        \\    {:ok, {:data, v}} ->
-        \\      v
-        \\    {:ok, {:empty}} ->
-        \\      nil
-        \\    {:error, msg} ->
-        \\      msg
+        \\defmodule Processor do
+        \\  def process(x) do
+        \\    case x do
+        \\      {:ok, {:data, v}} ->
+        \\        v
+        \\      {:ok, {:empty}} ->
+        \\        nil
+        \\      {:error, msg} ->
+        \\        msg
+        \\    end
         \\  end
         \\end
     ;
@@ -808,12 +841,14 @@ test "case with tuple patterns checks struct type once" {
     const alloc = arena.allocator();
 
     const source =
-        \\def handle(result) do
-        \\  case result do
-        \\    {:ok, v} ->
-        \\      v
-        \\    {:error, e} ->
-        \\      e
+        \\defmodule Handler do
+        \\  def handle(result) do
+        \\    case result do
+        \\      {:ok, v} ->
+        \\        v
+        \\      {:error, e} ->
+        \\        e
+        \\    end
         \\  end
         \\end
     ;
@@ -837,12 +872,14 @@ test "multi-clause function with tuple dispatch checks once" {
     const alloc = arena.allocator();
 
     const source =
-        \\def handle({:ok, v}) do
-        \\  v
-        \\end
+        \\defmodule Handler do
+        \\  def handle({:ok, v}) do
+        \\    v
+        \\  end
         \\
-        \\def handle({:error, e}) do
-        \\  e
+        \\  def handle({:error, e}) do
+        \\    e
+        \\  end
         \\end
     ;
 
@@ -869,12 +906,14 @@ test "typed integer param skips type check in switch" {
     const alloc = arena.allocator();
 
     const source =
-        \\def f(0 :: i64) :: i64 do
-        \\  1
-        \\end
+        \\defmodule TypedSwitch do
+        \\  def f(0 :: i64) :: i64 do
+        \\    1
+        \\  end
         \\
-        \\def f(n :: i64) :: i64 do
-        \\  n
+        \\  def f(n :: i64) :: i64 do
+        \\    n
+        \\  end
         \\end
     ;
 
@@ -892,12 +931,14 @@ test "untyped param keeps type check" {
     const alloc = arena.allocator();
 
     const source =
-        \\def describe(:ok) :: String do
-        \\  "yes"
-        \\end
+        \\defmodule Describer do
+        \\  def describe(:ok) :: String do
+        \\    "yes"
+        \\  end
         \\
-        \\def describe(_) :: String do
-        \\  "no"
+        \\  def describe(_) :: String do
+        \\    "no"
+        \\  end
         \\end
     ;
 
@@ -913,12 +954,14 @@ test "typed case scrutinee skips type check" {
     const alloc = arena.allocator();
 
     const source =
-        \\def check(x :: i64) :: String do
-        \\  case x do
-        \\    0 ->
-        \\      "zero"
-        \\    _ ->
-        \\      "other"
+        \\defmodule Checker do
+        \\  def check(x :: i64) :: String do
+        \\    case x do
+        \\      0 ->
+        \\        "zero"
+        \\      _ ->
+        \\        "other"
+        \\    end
         \\  end
         \\end
     ;
@@ -938,12 +981,14 @@ test "mixed variable and constructor in case" {
     const alloc = arena.allocator();
 
     const source =
-        \\def check(x :: i64) :: i64 do
-        \\  case x do
-        \\    1 ->
-        \\      100
-        \\    y ->
-        \\      y
+        \\defmodule Checker do
+        \\  def check(x :: i64) :: i64 do
+        \\    case x do
+        \\      1 ->
+        \\        100
+        \\      y ->
+        \\        y
+        \\    end
         \\  end
         \\end
     ;
@@ -960,14 +1005,16 @@ test "case with mixed literal types falls back" {
     const alloc = arena.allocator();
 
     const source =
-        \\def check(x) :: String do
-        \\  case x do
-        \\    0 ->
-        \\      "zero"
-        \\    :ok ->
-        \\      "ok"
-        \\    _ ->
-        \\      "other"
+        \\defmodule Checker do
+        \\  def check(x) :: String do
+        \\    case x do
+        \\      0 ->
+        \\        "zero"
+        \\      :ok ->
+        \\        "ok"
+        \\      _ ->
+        \\        "other"
+        \\    end
         \\  end
         \\end
     ;
@@ -1052,8 +1099,10 @@ test "Kernel.unless macro works without module prefix" {
     const alloc = arena.allocator();
 
     const source =
-        \\def check(x :: i64) :: i64 do
-        \\  unless(x > 10, 42)
+        \\defmodule Checker do
+        \\  def check(x :: i64) :: i64 do
+        \\    unless(x > 10, 42)
+        \\  end
         \\end
     ;
 
@@ -1074,20 +1123,22 @@ test "cond expression desugars to nested case" {
     const alloc = arena.allocator();
 
     const source =
-        \\def classify(x :: i64) :: String do
-        \\  cond do
-        \\    x > 0 ->
-        \\      "positive"
-        \\    x < 0 ->
-        \\      "negative"
-        \\    true ->
-        \\      "zero"
+        \\defmodule Classifier do
+        \\  def classify(x :: i64) :: String do
+        \\    cond do
+        \\      x > 0 ->
+        \\        "positive"
+        \\      x < 0 ->
+        \\        "negative"
+        \\      true ->
+        \\        "zero"
+        \\    end
         \\  end
         \\end
     ;
 
     const output = try compile(alloc, source);
-    try expectContains(output, "fn classify(");
+    try expectContains(output, "fn Classifier__classify(");
     // cond desugars to nested case(true/false) which emits switch
     try expectContains(output, "switch (");
     try expectContains(output, "\"positive\"");
@@ -1106,18 +1157,20 @@ test "with expression desugars to nested case" {
     const alloc = arena.allocator();
 
     const source =
-        \\def process(x) do
-        \\  with {:ok, a} <- x do
-        \\    a
-        \\  else
-        \\    {:error, e} ->
-        \\      e
+        \\defmodule Processor do
+        \\  def process(x) do
+        \\    with {:ok, a} <- x do
+        \\      a
+        \\    else
+        \\      {:error, e} ->
+        \\        e
+        \\    end
         \\  end
         \\end
     ;
 
     const output = try compile(alloc, source);
-    try expectContains(output, "fn process(");
+    try expectContains(output, "fn Processor__process(");
     // with desugars to case — should have tuple matching
     try expectContains(output, ".@\"ok\"");
     try expectContains(output, ".@\"error\"");
@@ -1234,26 +1287,28 @@ test "module-qualified call emits prefixed name" {
     try expectNotContains(output, "// unhandled instruction");
 }
 
-test "top-level functions stay bare" {
+test "top-level main stays bare, module functions get prefixed" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
 
     const source =
-        \\def helper(x :: i64) :: i64 do
-        \\  x + 1
+        \\defmodule Helper do
+        \\  def helper(x :: i64) :: i64 do
+        \\    x + 1
+        \\  end
         \\end
         \\
         \\def main() do
-        \\  helper(5)
+        \\  Helper.helper(5)
         \\end
     ;
 
     const output = try compile(alloc, source);
-    // Top-level functions should NOT be prefixed
-    try expectContains(output, "fn helper(");
+    // Module functions should be prefixed
+    try expectContains(output, "fn Helper__helper(");
+    // Main stays bare
     try expectContains(output, "fn main(");
-    try expectNotContains(output, "__helper(");
     try expectNotContains(output, "// unhandled instruction");
 }
 
@@ -1471,13 +1526,15 @@ test "type checker warnings do not halt compilation by default" {
 
     // This valid program should compile even with type checking enabled
     const source =
-        \\def add(x :: i64, y :: i64) :: i64 do
-        \\  x + y
+        \\defmodule Adder do
+        \\  def add(x :: i64, y :: i64) :: i64 do
+        \\    x + y
+        \\  end
         \\end
     ;
 
     const result = try compileWithDiagnostics(alloc, source, false);
-    try expectContains(result.output, "fn add(");
+    try expectContains(result.output, "fn Adder__add(");
 }
 
 test "return type mismatch is always an error" {
@@ -1511,4 +1568,49 @@ test "error messages contain file:line:col format" {
     // Should have error message and file:line:col location
     try expectContains(output, "error: expected i64, got String");
     try expectContains(output, "example.zap:2:3");
+}
+
+test "def main inside defmodule emits pub fn main" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule App do
+        \\  def main() do
+        \\    42
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    // Should emit pub fn main(), not fn App__main()
+    try expectContains(output, "pub fn main()");
+    try expectNotContains(output, "App__main");
+}
+
+test "multiline struct literal parses correctly" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defstruct User do
+        \\  name :: String
+        \\  age :: i64
+        \\end
+        \\
+        \\def main() do
+        \\  u = %{
+        \\    name: "Alice",
+        \\    age: 30
+        \\  } :: User
+        \\  u
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, "pub const User = struct {");
+    try expectContains(output, "\"Alice\"");
+    try expectContains(output, "30");
 }

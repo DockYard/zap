@@ -55,9 +55,63 @@ pub const CodeGen = struct {
         try self.write("const zap_runtime = @import(\"zap_runtime.zig\");\n");
         try self.write("\n");
 
+        // Emit type definitions (structs, enums)
+        for (program.type_defs) |td| {
+            try self.emitTypeDef(&td);
+            try self.write("\n");
+        }
+
         for (program.functions) |func| {
             try self.emitFunction(&func);
             try self.write("\n");
+        }
+    }
+
+    fn emitTypeDef(self: *CodeGen, td: *const ir.TypeDef) !void {
+        switch (td.kind) {
+            .struct_def => |sd| {
+                try self.write("pub const ");
+                try self.write(td.name);
+                try self.write(" = struct {\n");
+                self.indent_level += 1;
+                for (sd.fields) |field| {
+                    try self.writeIndent();
+                    try self.write(field.name);
+                    try self.write(": ");
+                    try self.write(field.type_expr);
+                    try self.write(",\n");
+                }
+                self.indent_level -= 1;
+                try self.write("};\n");
+            },
+            .enum_def => |ed| {
+                try self.write("pub const ");
+                try self.write(td.name);
+                try self.write(" = enum {\n");
+                self.indent_level += 1;
+                for (ed.variants) |variant| {
+                    try self.writeIndent();
+                    try self.write(variant);
+                    try self.write(",\n");
+                }
+                self.indent_level -= 1;
+                try self.write("};\n");
+            },
+            .union_def => |ud| {
+                try self.write("pub const ");
+                try self.write(td.name);
+                try self.write(" = union(enum) {\n");
+                self.indent_level += 1;
+                for (ud.variants) |variant| {
+                    try self.writeIndent();
+                    try self.write(variant.name);
+                    try self.write(": ");
+                    try self.write(variant.type_name);
+                    try self.write(",\n");
+                }
+                self.indent_level -= 1;
+                try self.write("};\n");
+            },
         }
     }
 
@@ -66,7 +120,8 @@ pub const CodeGen = struct {
     // ============================================================
 
     fn emitFunction(self: *CodeGen, func: *const ir.Function) !void {
-        const is_main = std.mem.eql(u8, func.name, "main");
+        const is_main = std.mem.eql(u8, func.name, "main") or
+            std.mem.endsWith(u8, func.name, "__main");
 
         // In library mode, skip main and make all other functions pub
         if (self.lib_mode and is_main) return;
@@ -77,7 +132,12 @@ pub const CodeGen = struct {
         } else {
             try self.write("fn ");
         }
-        try self.write(func.name);
+        // Emit main as "main" regardless of module prefix
+        if (is_main) {
+            try self.write("main");
+        } else {
+            try self.write(func.name);
+        }
         try self.write("(");
 
         for (func.params, 0..) |param, i| {
@@ -246,11 +306,32 @@ pub const CodeGen = struct {
                 for (sr.default_instrs) |sub_instr| self.collectReferencedLocals(&sub_instr);
                 if (sr.default_result) |r| self.referenced_locals.append(self.allocator, r) catch {};
             },
+            .union_switch_return => |usr| {
+                for (usr.cases) |case| {
+                    for (case.body_instrs) |sub_instr| self.collectReferencedLocals(&sub_instr);
+                    if (case.return_value) |r| self.referenced_locals.append(self.allocator, r) catch {};
+                }
+            },
             .index_get => |ig| {
                 self.referenced_locals.append(self.allocator, ig.object) catch {};
             },
             .optional_unwrap => |ou| {
                 self.referenced_locals.append(self.allocator, ou.source) catch {};
+            },
+            .struct_init => |si| {
+                for (si.fields) |field| self.referenced_locals.append(self.allocator, field.value) catch {};
+            },
+            .union_init => |ui| {
+                self.referenced_locals.append(self.allocator, ui.value) catch {};
+            },
+            .field_get => |fg| {
+                self.referenced_locals.append(self.allocator, fg.object) catch {};
+            },
+            .map_init => |mi| {
+                for (mi.entries) |entry| {
+                    self.referenced_locals.append(self.allocator, entry.key) catch {};
+                    self.referenced_locals.append(self.allocator, entry.value) catch {};
+                }
             },
             else => {},
         }
@@ -290,6 +371,12 @@ pub const CodeGen = struct {
                         if (self.isParamUsedInInstrs(case.body_instrs, param_idx)) return true;
                     }
                     if (self.isParamUsedInInstrs(sr.default_instrs, param_idx)) return true;
+                },
+                .union_switch_return => |usr| {
+                    if (usr.scrutinee_param == param_idx) return true;
+                    for (usr.cases) |case| {
+                        if (self.isParamUsedInInstrs(case.body_instrs, param_idx)) return true;
+                    }
                 },
                 else => {},
             }
@@ -780,6 +867,54 @@ pub const CodeGen = struct {
                 try self.writeIndent();
                 try self.write("};\n");
             },
+            .union_switch_return => |usr| {
+                // Emit: return switch (__arg_N) { .Variant => |__payload| { ... }, ... };
+                try self.writeIndent();
+                try self.write("return switch (");
+                try self.writeParam(usr.scrutinee_param);
+                try self.write(") {\n");
+                self.indent_level += 1;
+
+                for (usr.cases, 0..) |case, case_i| {
+                    try self.writeIndent();
+                    try self.write(".");
+                    try self.write(case.variant_name);
+                    try self.write(" => |__payload| ");
+                    const case_label = try std.fmt.allocPrint(self.allocator, "blk_u_{d}", .{case_i});
+                    try self.write(case_label);
+                    try self.write(": {\n");
+                    self.indent_level += 1;
+
+                    // Emit field bindings from payload
+                    for (case.field_bindings) |fb| {
+                        try self.writeIndent();
+                        try self.write("const ");
+                        try self.write(fb.local_name);
+                        try self.write(" = __payload.");
+                        try self.write(fb.field_name);
+                        try self.write(";\n");
+                    }
+
+                    for (case.body_instrs) |sub_instr| {
+                        try self.emitInstruction(&sub_instr);
+                    }
+                    if (case.return_value) |r| {
+                        try self.writeIndent();
+                        try self.write("break :");
+                        try self.write(case_label);
+                        try self.write(" ");
+                        try self.writeLocal(r);
+                        try self.write(";\n");
+                    }
+                    self.indent_level -= 1;
+                    try self.writeIndent();
+                    try self.write("},\n");
+                }
+
+                self.indent_level -= 1;
+                try self.writeIndent();
+                try self.write("};\n");
+            },
             .case_break => |cbr| {
                 if (self.current_case_label) |label| {
                     try self.writeIndent();
@@ -938,6 +1073,51 @@ pub const CodeGen = struct {
                 try self.write(" = ");
                 try self.writeLocal(ou.source);
                 try self.write(" orelse zap_runtime.panic(\"attempted to unwrap nil value\");\n");
+            },
+            .struct_init => |si| {
+                try self.writeIndent();
+                try self.writeDestLocal(si.dest);
+                try self.write(" = ");
+                try self.write(si.type_name);
+                try self.write("{ ");
+                for (si.fields, 0..) |field, i| {
+                    if (i > 0) try self.write(", ");
+                    try self.write(".");
+                    try self.write(field.name);
+                    try self.write(" = ");
+                    try self.writeLocal(field.value);
+                }
+                try self.write(" };\n");
+            },
+            .union_init => |ui| {
+                // Emit: const __local_N = UnionType{ .Variant = value };
+                try self.writeIndent();
+                try self.writeDestLocal(ui.dest);
+                try self.write(": ");
+                try self.write(ui.union_type);
+                try self.write(" = .{ .");
+                try self.write(ui.variant_name);
+                try self.write(" = ");
+                try self.writeLocal(ui.value);
+                try self.write(" };\n");
+            },
+            .field_get => |fg| {
+                try self.writeIndent();
+                try self.writeDestLocal(fg.dest);
+                try self.write(" = ");
+                try self.writeLocal(fg.object);
+                try self.write(".");
+                try self.write(fg.field);
+                try self.write(";\n");
+            },
+            .enum_literal => |el| {
+                try self.writeIndent();
+                try self.writeDestLocal(el.dest);
+                try self.write(" = ");
+                try self.write(el.type_name);
+                try self.write(".");
+                try self.write(el.variant);
+                try self.write(";\n");
             },
             else => {
                 try self.writeIndent();

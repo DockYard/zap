@@ -54,6 +54,7 @@ pub const Desugarer = struct {
         return .{
             .meta = mod.meta,
             .name = mod.name,
+            .parent = mod.parent,
             .items = try new_items.toOwnedSlice(self.allocator),
         };
     }
