@@ -2170,10 +2170,24 @@ pub const Parser = struct {
 
         var elements: std.ArrayList(*const ast.Pattern) = .empty;
 
-        while (!self.check(.right_bracket) and !self.check(.eof)) {
+        while (!self.check(.right_bracket) and !self.check(.pipe) and !self.check(.eof)) {
             const elem = try self.parsePattern();
             try elements.append(self.allocator, elem);
             if (!self.match(.comma)) break;
+        }
+
+        // Check for [head | tail] cons pattern
+        if (self.check(.pipe)) {
+            _ = self.advance(); // consume |
+            const tail = try self.parsePattern();
+            _ = try self.expect(.right_bracket);
+            return self.create(ast.Pattern, .{
+                .list_cons = .{
+                    .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
+                    .heads = try elements.toOwnedSlice(self.allocator),
+                    .tail = tail,
+                },
+            });
         }
 
         _ = try self.expect(.right_bracket);

@@ -580,6 +580,7 @@ pub const Pattern = union(enum) {
     literal: LiteralPattern,
     tuple: TuplePattern,
     list: ListPattern,
+    list_cons: ListConsPattern,
     map: MapPattern,
     struct_pattern: StructPattern,
     pin: PinPattern,
@@ -592,6 +593,7 @@ pub const Pattern = union(enum) {
             .literal => |v| v.getMeta(),
             .tuple => |v| v.meta,
             .list => |v| v.meta,
+            .list_cons => |v| v.meta,
             .map => |v| v.meta,
             .struct_pattern => |v| v.meta,
             .pin => |v| v.meta,
@@ -637,6 +639,12 @@ pub const TuplePattern = struct {
 pub const ListPattern = struct {
     meta: NodeMeta,
     elements: []const *const Pattern,
+};
+
+pub const ListConsPattern = struct {
+    meta: NodeMeta,
+    heads: []const *const Pattern,
+    tail: *const Pattern,
 };
 
 pub const MapPattern = struct {

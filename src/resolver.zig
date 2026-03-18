@@ -361,6 +361,10 @@ pub const Resolver = struct {
             .list => |l| {
                 for (l.elements) |elem| try self.resolvePattern(elem);
             },
+            .list_cons => |lc| {
+                for (lc.heads) |head| try self.resolvePattern(head);
+                try self.resolvePattern(lc.tail);
+            },
             .map => |m| {
                 for (m.fields) |field| {
                     try self.resolveExpr(field.key);
@@ -392,6 +396,10 @@ pub const Resolver = struct {
             },
             .list => |l| {
                 for (l.elements) |elem| try self.bindPattern(elem);
+            },
+            .list_cons => |lc| {
+                for (lc.heads) |head| try self.bindPattern(head);
+                try self.bindPattern(lc.tail);
             },
             .map => |m| {
                 for (m.fields) |field| try self.bindPattern(field.value);

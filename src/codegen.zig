@@ -126,15 +126,22 @@ pub const CodeGen = struct {
         // In library mode, skip main and make all other functions pub
         if (self.lib_mode and is_main) return;
 
+        // main with parameters: emit as __zap_main, then generate a pub fn main() wrapper
+        const main_has_params = is_main and func.params.len > 0;
+
         // Function signature — pub for main (exe) or all functions (lib)
-        if (is_main or self.lib_mode) {
+        if (is_main and !main_has_params) {
+            try self.write("pub fn ");
+        } else if (self.lib_mode) {
             try self.write("pub fn ");
         } else {
             try self.write("fn ");
         }
-        // Emit main as "main" regardless of module prefix
-        if (is_main) {
+        // Emit main as "main" regardless of module prefix (unless it has params)
+        if (is_main and !main_has_params) {
             try self.write("main");
+        } else if (main_has_params) {
+            try self.write("__zap_main");
         } else {
             try self.write(func.name);
         }
@@ -144,7 +151,12 @@ pub const CodeGen = struct {
             if (i > 0) try self.write(", ");
             try self.write(param.name);
             try self.write(": ");
-            try self.emitZigType(&param.type_expr);
+            if (main_has_params) {
+                // main's args param is always []const []const u8
+                try self.write("[]const []const u8");
+            } else {
+                try self.emitZigType(&param.type_expr);
+            }
         }
 
         try self.write(") ");
@@ -184,6 +196,21 @@ pub const CodeGen = struct {
 
         self.indent_level -= 1;
         try self.write("}\n");
+
+        // Generate pub fn main() wrapper that collects process args
+        if (main_has_params) {
+            try self.write("\npub fn main() void {\n");
+            self.indent_level += 1;
+            try self.writeIndent();
+            try self.write("const __args = std.process.argsAlloc(std.heap.page_allocator) catch &[_][]const u8{};\n");
+            try self.writeIndent();
+            // Skip the program name (first arg)
+            try self.write("const __user_args = if (__args.len > 0) __args[1..] else __args[0..0];\n");
+            try self.writeIndent();
+            try self.write("__zap_main(__user_args);\n");
+            self.indent_level -= 1;
+            try self.write("}\n");
+        }
     }
 
     fn emitBlock(self: *CodeGen, block: *const ir.Block) !void {

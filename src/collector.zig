@@ -435,6 +435,12 @@ pub const Collector = struct {
                     try self.collectPatternBindings(elem, scope_id);
                 }
             },
+            .list_cons => |lc| {
+                for (lc.heads) |head| {
+                    try self.collectPatternBindings(head, scope_id);
+                }
+                try self.collectPatternBindings(lc.tail, scope_id);
+            },
             .map => |m| {
                 for (m.fields) |field| {
                     try self.collectPatternBindings(field.value, scope_id);

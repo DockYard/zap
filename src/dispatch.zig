@@ -339,6 +339,7 @@ pub const DispatchEngine = struct {
             .literal => true,
             .tuple => true,
             .list => true,
+            .list_cons => true,
             .map => true,
             .struct_pattern => true,
             .pin => true,

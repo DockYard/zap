@@ -355,8 +355,14 @@ pub const MatchPattern = union(enum) {
     literal: LiteralValue,
     tuple: []const *const MatchPattern,
     list: []const *const MatchPattern,
+    list_cons: ListConsMatch,
     pin: ast.StringId,
     struct_match: StructMatch,
+};
+
+pub const ListConsMatch = struct {
+    heads: []const *const MatchPattern,
+    tail: *const MatchPattern,
 };
 
 pub const StructMatch = struct {
@@ -1354,6 +1360,21 @@ pub const HirBuilder = struct {
                 }
                 return try self.create(MatchPattern, .{
                     .list = try elems.toOwnedSlice(self.allocator),
+                });
+            },
+            .list_cons => |lc| {
+                var heads: std.ArrayList(*const MatchPattern) = .empty;
+                for (lc.heads) |h| {
+                    if (try self.compilePattern(h)) |p| {
+                        try heads.append(self.allocator, p);
+                    }
+                }
+                const tail = try self.compilePattern(lc.tail);
+                return try self.create(MatchPattern, .{
+                    .list_cons = .{
+                        .heads = try heads.toOwnedSlice(self.allocator),
+                        .tail = tail orelse try self.create(MatchPattern, .wildcard),
+                    },
                 });
             },
             .pin => |p| try self.create(MatchPattern, .{ .pin = p.name }),
