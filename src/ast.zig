@@ -302,6 +302,9 @@ pub const Expr = union(enum) {
     // Intrinsics
     intrinsic: IntrinsicExpr,
 
+    // Type annotation on expression: expr :: Type
+    type_annotated: TypeAnnotatedExpr,
+
     pub fn getMeta(self: *const Expr) NodeMeta {
         return switch (self.*) {
             .int_literal => |v| v.meta,
@@ -332,6 +335,7 @@ pub const Expr = union(enum) {
             .panic_expr => |v| v.meta,
             .block => |v| v.meta,
             .intrinsic => |v| v.meta,
+            .type_annotated => |v| v.meta,
         };
     }
 };
@@ -473,6 +477,12 @@ pub const PipeExpr = struct {
 pub const UnwrapExpr = struct {
     meta: NodeMeta,
     expr: *const Expr,
+};
+
+pub const TypeAnnotatedExpr = struct {
+    meta: NodeMeta,
+    expr: *const Expr,
+    type_expr: *const TypeExpr,
 };
 
 pub const IfExpr = struct {

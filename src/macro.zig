@@ -455,6 +455,21 @@ pub const MacroEngine = struct {
                 };
             },
 
+            .type_annotated => |ta| {
+                const inner = try self.expandExpr(ta.expr);
+                if (!inner.changed) return .{ .expr = expr, .changed = false };
+                return .{
+                    .expr = try self.create(ast.Expr, .{
+                        .type_annotated = .{
+                            .meta = ta.meta,
+                            .expr = inner.expr,
+                            .type_expr = ta.type_expr,
+                        },
+                    }),
+                    .changed = true,
+                };
+            },
+
             // Leaf nodes — no expansion needed
             .int_literal,
             .float_literal,

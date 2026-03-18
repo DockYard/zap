@@ -338,6 +338,9 @@ pub const Resolver = struct {
             .unwrap => |uw| try self.resolveExpr(uw.expr),
             .quote_expr => |qe| try self.resolveBlock(qe.body),
             .unquote_expr => |ue| try self.resolveExpr(ue.expr),
+            .type_annotated => |ta| {
+                try self.resolveExpr(ta.expr);
+            },
             // Literals and module refs — no resolution needed
             .int_literal, .float_literal, .string_literal,
             .string_interpolation, .atom_literal, .bool_literal,

@@ -164,11 +164,13 @@ pub const Instruction = union(enum) {
 pub const ConstInt = struct {
     dest: LocalId,
     value: i64,
+    type_hint: ?ZigType = null,
 };
 
 pub const ConstFloat = struct {
     dest: LocalId,
     value: f64,
+    type_hint: ?ZigType = null,
 };
 
 pub const ConstString = struct {
@@ -1756,16 +1758,22 @@ pub const IrBuilder = struct {
 
         switch (expr.kind) {
             .int_lit => |v| {
+                const int_type = typeIdToZigTypeWithStore(expr.type_id, self.type_store);
+                const resolved = if (int_type == .any) .i64 else int_type;
+                const hint: ?ZigType = if (resolved != .i64) resolved else null;
                 try self.current_instrs.append(self.allocator, .{
-                    .const_int = .{ .dest = dest, .value = v },
+                    .const_int = .{ .dest = dest, .value = v, .type_hint = hint },
                 });
-                try self.known_local_types.put(dest, .i64);
+                try self.known_local_types.put(dest, resolved);
             },
             .float_lit => |v| {
+                const float_type = typeIdToZigTypeWithStore(expr.type_id, self.type_store);
+                const resolved = if (float_type == .any) .f64 else float_type;
+                const hint: ?ZigType = if (resolved != .f64) resolved else null;
                 try self.current_instrs.append(self.allocator, .{
-                    .const_float = .{ .dest = dest, .value = v },
+                    .const_float = .{ .dest = dest, .value = v, .type_hint = hint },
                 });
-                try self.known_local_types.put(dest, .f64);
+                try self.known_local_types.put(dest, resolved);
             },
             .string_lit => |v| {
                 try self.current_instrs.append(self.allocator, .{

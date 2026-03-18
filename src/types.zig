@@ -1179,6 +1179,11 @@ pub const TypeChecker = struct {
             .with_expr => TypeStore.UNKNOWN, // desugared before type checking
             .cond_expr => TypeStore.UNKNOWN, // desugared before type checking
             .intrinsic => TypeStore.UNKNOWN,
+            .type_annotated => |ta| {
+                // Infer the inner expression, but prefer the annotated type
+                _ = try self.inferExpr(ta.expr);
+                return try self.resolveTypeExpr(ta.type_expr);
+            },
         };
     }
 

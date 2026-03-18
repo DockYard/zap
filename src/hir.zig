@@ -1788,6 +1788,16 @@ pub const HirBuilder = struct {
                     .span = blk.meta.span,
                 });
             },
+            .type_annotated => |ta| {
+                // expr :: Type — lower the inner expression with the annotated type
+                const inner = try self.buildExpr(ta.expr);
+                const annotated_type = self.resolveTypeExpr(ta.type_expr);
+                return try self.create(Expr, .{
+                    .kind = inner.kind,
+                    .type_id = annotated_type,
+                    .span = ta.meta.span,
+                });
+            },
             .module_ref => |mr| {
                 // Check for enum variant reference (e.g., Color.Red parsed as module_ref ["Color", "Red"])
                 if (mr.name.parts.len == 2) {

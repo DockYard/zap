@@ -393,14 +393,26 @@ pub const CodeGen = struct {
             .const_int => |ci| {
                 try self.writeIndent();
                 try self.writeDestLocal(ci.dest);
-                try self.write(" = ");
+                if (ci.type_hint) |hint| {
+                    try self.write(": ");
+                    try self.emitZigType(&hint);
+                    try self.write(" = ");
+                } else {
+                    try self.write(" = ");
+                }
                 try self.writeInt(ci.value);
                 try self.write(";\n");
             },
             .const_float => |cf| {
                 try self.writeIndent();
                 try self.writeDestLocal(cf.dest);
-                try self.write(" = ");
+                if (cf.type_hint) |hint| {
+                    try self.write(": ");
+                    try self.emitZigType(&hint);
+                    try self.write(" = ");
+                } else {
+                    try self.write(" = ");
+                }
                 try self.writeFloat(cf.value);
                 try self.write(";\n");
             },
