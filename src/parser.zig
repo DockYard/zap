@@ -836,10 +836,16 @@ pub const Parser = struct {
             type_annotation = try self.parseTypeExpr();
         }
 
+        var default: ?*const ast.Expr = null;
+        if (self.match(.equal)) {
+            default = try self.parseExpr();
+        }
+
         return .{
             .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
             .pattern = pattern,
             .type_annotation = type_annotation,
+            .default = default,
         };
     }
 

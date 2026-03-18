@@ -71,6 +71,7 @@ pub const TypedParam = struct {
     name: ?ast.StringId,
     type_id: TypeId,
     pattern: ?*const MatchPattern,
+    default: ?*const Expr = null,
 };
 
 // ============================================================
@@ -1230,10 +1231,12 @@ pub const HirBuilder = struct {
             };
 
             const name = if (param.pattern.* == .bind) param.pattern.bind.name else null;
+            const default_expr = if (param.default) |def| try self.buildExpr(def) else null;
             try params.append(self.allocator, .{
                 .name = name,
                 .type_id = type_id,
                 .pattern = match_pattern,
+                .default = default_expr,
             });
         }
 

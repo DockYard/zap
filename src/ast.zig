@@ -202,6 +202,7 @@ pub const Param = struct {
     meta: NodeMeta,
     pattern: *const Pattern,
     type_annotation: ?*const TypeExpr,
+    default: ?*const Expr = null,
 };
 
 // ============================================================

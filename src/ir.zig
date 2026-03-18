@@ -586,6 +586,8 @@ pub const IrBuilder = struct {
     synthesized_type_defs: std.ArrayList(TypeDef),
     /// Maps function name → union dispatch info for call-site wrapping
     union_dispatch_map: std.StringHashMap(UnionDispatchInfo),
+    /// Maps "func_name:arity" → wrapper name for default-arg resolution
+    default_arg_wrappers: std.StringHashMap([]const u8),
 
     pub const UnionDispatchInfo = struct {
         param_idx: u32,
@@ -610,6 +612,7 @@ pub const IrBuilder = struct {
             .known_function_names = std.StringHashMap(void).init(allocator),
             .synthesized_type_defs = .empty,
             .union_dispatch_map = std.StringHashMap(UnionDispatchInfo).init(allocator),
+            .default_arg_wrappers = std.StringHashMap([]const u8).init(allocator),
         };
     }
 
@@ -620,6 +623,7 @@ pub const IrBuilder = struct {
         self.known_local_types.deinit();
         self.synthesized_type_defs.deinit(self.allocator);
         self.union_dispatch_map.deinit();
+        self.default_arg_wrappers.deinit();
         self.known_function_names.deinit();
     }
 
@@ -970,15 +974,127 @@ pub const IrBuilder = struct {
             }
         }
 
+        const final_params = try params.toOwnedSlice(self.allocator);
         try self.functions.append(self.allocator, .{
             .id = func_id,
             .name = name_str,
-            .params = try params.toOwnedSlice(self.allocator),
+            .params = final_params,
             .return_type = return_type,
             .body = try self.allocSlice(Block, &.{entry_block}),
             .is_closure = false,
             .captures = &.{},
         });
+
+        // Generate forwarding wrappers for default parameter values.
+        // For def foo(a :: i64, b :: i64 = 10, c :: String = "hi"):
+        //   foo/1 calls foo/3 with b=10, c="hi"
+        //   foo/2 calls foo/3 with c="hi"
+        if (group.clauses.len == 1) {
+            const clause = &group.clauses[0];
+            // Count trailing defaults
+            var num_defaults: u32 = 0;
+            var i: usize = clause.params.len;
+            while (i > 0) {
+                i -= 1;
+                if (clause.params[i].default != null) {
+                    num_defaults += 1;
+                } else break;
+            }
+
+            if (num_defaults > 0) {
+                const total_params = clause.params.len;
+                // Generate one wrapper for each shorter arity
+                var arity: usize = total_params - num_defaults;
+                while (arity < total_params) : (arity += 1) {
+                    const wrapper_id = self.next_function_id;
+                    self.next_function_id += 1;
+
+                    // Build param list for the wrapper (just the non-default params)
+                    var wrapper_params: std.ArrayList(Param) = .empty;
+                    for (0..arity) |pi| {
+                        try wrapper_params.append(self.allocator, final_params[pi]);
+                    }
+
+                    // Build the forwarding call body:
+                    // return full_func(arg0, arg1, ..., default_N, default_N+1, ...)
+                    var wrapper_instrs: std.ArrayList(Instruction) = .empty;
+                    var call_args: std.ArrayList(LocalId) = .empty;
+
+                    var next_local: LocalId = 0;
+
+                    // Forward the provided args
+                    for (0..arity) |pi| {
+                        const local = next_local;
+                        next_local += 1;
+                        try wrapper_instrs.append(self.allocator, .{
+                            .param_get = .{ .dest = local, .index = @intCast(pi) },
+                        });
+                        try call_args.append(self.allocator, local);
+                    }
+
+                    // Lower default expressions for the remaining params
+                    const saved_instrs = self.current_instrs;
+                    const saved_next_local = self.next_local;
+                    self.current_instrs = .empty;
+                    self.next_local = next_local;
+
+                    for (arity..total_params) |pi| {
+                        const default_expr = clause.params[pi].default.?;
+                        const default_local = try self.lowerExpr(default_expr);
+                        try call_args.append(self.allocator, default_local);
+                    }
+
+                    // Collect the default-lowering instructions
+                    for (self.current_instrs.items) |instr| {
+                        try wrapper_instrs.append(self.allocator, instr);
+                    }
+                    self.current_instrs = saved_instrs;
+                    self.next_local = saved_next_local;
+
+                    // Emit the forwarding call
+                    const result_local = next_local + @as(LocalId, @intCast(total_params - arity)) + @as(LocalId, @intCast(self.next_local - saved_next_local));
+                    try wrapper_instrs.append(self.allocator, .{
+                        .call_named = .{
+                            .dest = result_local,
+                            .name = name_str,
+                            .args = try call_args.toOwnedSlice(self.allocator),
+                        },
+                    });
+
+                    // Return the result
+                    if (return_type != .void) {
+                        try wrapper_instrs.append(self.allocator, .{
+                            .ret = .{ .value = result_local },
+                        });
+                    } else {
+                        try wrapper_instrs.append(self.allocator, .{
+                            .ret = .{ .value = null },
+                        });
+                    }
+
+                    const wrapper_block = Block{
+                        .label = 0,
+                        .instructions = try wrapper_instrs.toOwnedSlice(self.allocator),
+                    };
+
+                    const wrapper_name = try std.fmt.allocPrint(self.allocator, "{s}__default_{d}", .{ name_str, arity });
+
+                    try self.functions.append(self.allocator, .{
+                        .id = wrapper_id,
+                        .name = wrapper_name,
+                        .params = try wrapper_params.toOwnedSlice(self.allocator),
+                        .return_type = return_type,
+                        .body = try self.allocSlice(Block, &.{wrapper_block}),
+                        .is_closure = false,
+                        .captures = &.{},
+                    });
+
+                    // Register for call-site resolution
+                    const key = try std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ name_str, arity });
+                    try self.default_arg_wrappers.put(key, wrapper_name);
+                }
+            }
+        }
     }
 
     /// Check if multi-clause function can emit switch_return for integer literals.
@@ -1857,10 +1973,17 @@ pub const IrBuilder = struct {
                         });
                     },
                     .named => |nc| {
-                        const resolved_name = if (nc.module) |mod|
+                        var resolved_name = if (nc.module) |mod|
                             try std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ mod, nc.name })
                         else
                             try self.resolveBareCall(nc.name);
+
+                        // Check for default-arg wrapper: if calling with fewer args than
+                        // the full arity, redirect to the wrapper that fills in defaults
+                        const wrapper_key = try std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ resolved_name, args.items.len });
+                        if (self.default_arg_wrappers.get(wrapper_key)) |wrapper_name| {
+                            resolved_name = wrapper_name;
+                        }
 
                         // Check if this function uses union dispatch — wrap args if needed
                         if (self.union_dispatch_map.get(resolved_name)) |info| {
