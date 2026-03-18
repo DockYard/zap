@@ -1,16 +1,15 @@
 # Markup Parser — binary pattern matching with recursion
 #
-# Parses a subset of HTML/XML markup into a string representation
-# of a tree structure using binary prefix matching and recursive descent.
+# Parses a subset of HTML/XML markup into actual data structures
+# using binary prefix matching and recursive descent.
 #
 # Input:  <div id=top><h1>Hello, Zap!</h1></div>
-# Output: {"div", {"id", "top"}, [{"h1", {}, "Hello, Zap!"}]}
+# Output: {"div", {"id", "top"}, {"h1", {"", ""}, "Hello, Zap!"}}
 
 defmodule MarkupParser do
   # ── Tag name extraction ────────────────────────────────────
   #
   # Collects characters until space (attrs follow) or > (tag ends).
-  # Uses multi-clause binary prefix dispatch.
 
   def take_tag(<<">"::String, _rest::String>>) :: String do
     ""
@@ -58,8 +57,8 @@ defmodule MarkupParser do
 
   # ── Attribute parsing ──────────────────────────────────────
   #
-  # Scans past the tag name, then extracts key=value pairs.
-  # Uses unquoted attribute values for simplicity (key=value).
+  # Scans past the tag name looking for ' key=value'.
+  # Returns {key, value} as a tuple of strings.
 
   def take_until_eq(<<"="::String, _rest::String>>) :: String do
     ""
@@ -74,10 +73,6 @@ defmodule MarkupParser do
   end
 
   def take_val(<<">"::String, _rest::String>>) :: String do
-    ""
-  end
-
-  def take_val(<<" "::String, _rest::String>>) :: String do
     ""
   end
 
@@ -101,65 +96,48 @@ defmodule MarkupParser do
     ""
   end
 
-  # parse_attrs: dispatches on what follows the tag name
-
-  def parse_attrs(<<">"::String, _rest::String>>) :: String do
-    "{}"
+  def parse_attr(<<">"::String, _rest::String>>) :: {String, String} do
+    {"", ""}
   end
 
-  def parse_attrs(<<" "::String, rest::String>>) :: String do
-    "{\"" <> take_until_eq(rest) <> "\", \"" <> take_val(after_eq(rest)) <> "\"}"
+  def parse_attr(<<" "::String, rest::String>>) :: {String, String} do
+    {take_until_eq(rest), take_val(after_eq(rest))}
   end
 
-  def parse_attrs(<<_ch::String-size(1), rest::String>>) :: String do
-    parse_attrs(rest)
+  def parse_attr(<<_ch::String-size(1), rest::String>>) :: {String, String} do
+    parse_attr(rest)
   end
 
-  def parse_attrs(_) :: String do
-    "{}"
+  def parse_attr(_) :: {String, String} do
+    {"", ""}
   end
 
   # ── Recursive descent parser ───────────────────────────────
   #
-  # parse(input) — entry point, dispatches on first bytes:
-  #   <<"</"::String, ...>> → closing tag, stop recursion
-  #   <<"<"::String, ...>>  → opening tag, build element node
-  #   other                 → empty (shouldn't happen at top level)
+  # parse_leaf: parses <tag>text</tag> into {tag, attrs, text}
+  # parse_node: parses <tag><child>...</child></tag> into {tag, attrs, child}
   #
-  # parse_children(input) — after '>', inspects what follows:
-  #   <<"</"::String, ...>> → no children (closing tag next)
-  #   <<"<"::String, ...>>  → nested child element (recurse)
-  #   text content          → collect text until '<'
+  # Binary prefix matching dispatches on '<' to enter tag parsing.
+  # Recursion occurs when parse_node calls parse_leaf for the child.
 
-  def parse(<<"</"::String, _rest::String>>) :: String do
-    ""
+  def parse_leaf(<<"<"::String, rest::String>>) :: {String, {String, String}, String} do
+    {take_tag(rest), parse_attr(rest), take_text(after_gt(rest))}
   end
 
-  def parse(<<"<"::String, rest::String>>) :: String do
-    "{\"" <> take_tag(rest) <> "\", " <> parse_attrs(rest) <> ", " <> parse_children(after_gt(rest)) <> "}"
+  def parse_leaf(_) :: {String, {String, String}, String} do
+    {"", {"", ""}, ""}
   end
 
-  def parse(_) :: String do
-    ""
+  def parse_node(<<"<"::String, rest::String>>) :: {String, {String, String}, {String, {String, String}, String}} do
+    {take_tag(rest), parse_attr(rest), parse_leaf(after_gt(rest))}
   end
 
-  def parse_children(<<"</"::String, _rest::String>>) :: String do
-    "\"\""
-  end
-
-  def parse_children(<<"<"::String, rest::String>>) :: String do
-    "[{\"" <> take_tag(rest) <> "\", " <> parse_attrs(rest) <> ", " <> parse_children(after_gt(rest)) <> "}]"
-  end
-
-  def parse_children(input) :: String do
-    "\"" <> take_text(input) <> "\""
+  def parse_node(_) :: {String, {String, String}, {String, {String, String}, String}} do
+    {"", {"", ""}, {"", {"", ""}, ""}}
   end
 end
 
 def main() do
-  IO.puts("Input:  <div id=top><h1>Hello, Zap!</h1></div>")
-  IO.puts("Output:")
-
-  MarkupParser.parse("<div id=top><h1>Hello, Zap!</h1></div>")
-  |> IO.puts()
+  MarkupParser.parse_node("<div id=top><h1>Hello, Zap!</h1></div>")
+  |> Kernel.inspect()
 end
