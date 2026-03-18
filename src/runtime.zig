@@ -538,6 +538,33 @@ pub const Prelude = struct {
         std.debug.print("panic: {s}\n", .{msg});
         std.process.exit(1);
     }
+
+    // CLI argument access
+    var cached_args: ?[]const []const u8 = null;
+
+    fn getArgs() []const []const u8 {
+        if (cached_args) |args| return args;
+        cached_args = std.process.argsAlloc(std.heap.page_allocator) catch &.{};
+        return cached_args.?;
+    }
+
+    pub fn arg_count() i64 {
+        const args = getArgs();
+        // Subtract 1 to exclude the program name
+        return if (args.len > 0) @intCast(args.len - 1) else 0;
+    }
+
+    pub fn arg_at(index: anytype) []const u8 {
+        const args = getArgs();
+        const T = @TypeOf(index);
+        const idx: usize = if (T == comptime_int or @typeInfo(T) == .int)
+            @intCast(index)
+        else
+            0;
+        // Index 0 = first user arg (skip program name)
+        if (idx + 1 < args.len) return args[idx + 1];
+        return "";
+    }
 };
 
 // ============================================================

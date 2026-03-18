@@ -53,6 +53,8 @@ pub fn main() !void {
             file_path = arg;
         } else if (run_after_build and file_path != null) {
             // Arguments after the .zap file in run mode are passed to the program
+            // Skip the -- separator if present
+            if (std.mem.eql(u8, arg, "--")) continue;
             try run_args.append(allocator, arg);
         } else {
             try zig_flags.append(allocator, arg);

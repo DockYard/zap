@@ -500,7 +500,7 @@ fn collectTypeRefsFromTypeExpr(
 }
 
 fn isStdlibModule(name: []const u8) bool {
-    const stdlib_modules = [_][]const u8{ "Kernel", "IO" };
+    const stdlib_modules = [_][]const u8{ "Kernel", "IO", "System" };
     for (stdlib_modules) |m| {
         if (std.mem.eql(u8, name, m)) return true;
     }
