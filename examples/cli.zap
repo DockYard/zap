@@ -4,8 +4,8 @@
 # Multi-clause dispatch matches on the argument list.
 #
 # Run with:
-#   zap run cli.zap -- greet Alice
-#   zap run cli.zap -- version
+#   zap run cli.zap greet Alice
+#   zap run cli.zap version
 #   zap run cli.zap
 
 def main(["greet", name]) do
