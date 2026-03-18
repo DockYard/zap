@@ -101,6 +101,16 @@ pub const Parser = struct {
         return error.ParseError;
     }
 
+    /// Strip underscores from a numeric literal string (e.g., "1_000_000" → "1000000")
+    fn stripNumericUnderscores(self: *Parser, text: []const u8) []const u8 {
+        if (std.mem.indexOfScalar(u8, text, '_') == null) return text;
+        var buf: std.ArrayList(u8) = .empty;
+        for (text) |c| {
+            if (c != '_') buf.append(self.allocator, c) catch return text;
+        }
+        return buf.toOwnedSlice(self.allocator) catch text;
+    }
+
     fn skipNewlines(self: *Parser) void {
         while (self.check(.newline)) {
             _ = self.advance();
@@ -1340,7 +1350,7 @@ pub const Parser = struct {
 
     fn parseIntLiteral(self: *Parser) !*const ast.Expr {
         const tok = self.advance();
-        const text = tok.slice(self.source);
+        const text = self.stripNumericUnderscores(tok.slice(self.source));
         const value = std.fmt.parseInt(i64, text, 10) catch 0;
         return self.create(ast.Expr, .{
             .int_literal = .{ .meta = .{ .span = ast.SourceSpan.from(tok.loc) }, .value = value },
@@ -1349,7 +1359,7 @@ pub const Parser = struct {
 
     fn parseFloatLiteral(self: *Parser) !*const ast.Expr {
         const tok = self.advance();
-        const text = tok.slice(self.source);
+        const text = self.stripNumericUnderscores(tok.slice(self.source));
         const value = std.fmt.parseFloat(f64, text) catch 0.0;
         return self.create(ast.Expr, .{
             .float_literal = .{ .meta = .{ .span = ast.SourceSpan.from(tok.loc) }, .value = value },
@@ -2024,7 +2034,7 @@ pub const Parser = struct {
             },
             .int_literal => {
                 const tok = self.advance();
-                const text = tok.slice(self.source);
+                const text = self.stripNumericUnderscores(tok.slice(self.source));
                 const value = std.fmt.parseInt(i64, text, 10) catch 0;
                 return self.create(ast.Pattern, .{
                     .literal = .{ .int = .{
@@ -2035,7 +2045,7 @@ pub const Parser = struct {
             },
             .float_literal => {
                 const tok = self.advance();
-                const text = tok.slice(self.source);
+                const text = self.stripNumericUnderscores(tok.slice(self.source));
                 const value = std.fmt.parseFloat(f64, text) catch 0.0;
                 return self.create(ast.Pattern, .{
                     .literal = .{ .float = .{
@@ -2101,7 +2111,7 @@ pub const Parser = struct {
                 _ = self.advance();
                 if (self.check(.int_literal)) {
                     const tok = self.advance();
-                    const text = tok.slice(self.source);
+                    const text = self.stripNumericUnderscores(tok.slice(self.source));
                     const value = std.fmt.parseInt(i64, text, 10) catch 0;
                     return self.create(ast.Pattern, .{
                         .literal = .{ .int = .{

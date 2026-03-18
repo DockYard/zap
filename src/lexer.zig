@@ -260,14 +260,14 @@ pub const Lexer = struct {
 
     fn lexNumber(self: *Lexer) Token {
         const start = self.pos;
-        while (self.pos < self.source.len and isDigit(self.source[self.pos])) {
+        while (self.pos < self.source.len and (isDigit(self.source[self.pos]) or self.source[self.pos] == '_')) {
             self.pos += 1;
         }
         if (self.pos < self.source.len and self.source[self.pos] == '.' and
             self.pos + 1 < self.source.len and isDigit(self.source[self.pos + 1]))
         {
             self.pos += 1;
-            while (self.pos < self.source.len and isDigit(self.source[self.pos])) {
+            while (self.pos < self.source.len and (isDigit(self.source[self.pos]) or self.source[self.pos] == '_')) {
                 self.pos += 1;
             }
             return self.makeToken(.float_literal, start, self.pos);
