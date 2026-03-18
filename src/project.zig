@@ -208,18 +208,20 @@ pub const DependencyGraph = struct {
 };
 
 /// Discover all .zap files in the same directory as the given file.
+/// Only returns multiple files if they form a project (at least one file
+/// references a type or module defined in another file). Standalone files
+/// in a directory of unrelated .zap files stay in single-file mode.
 pub fn discoverZapFiles(allocator: std.mem.Allocator, path: []const u8) ![]const []const u8 {
     const dir_path = std.fs.path.dirname(path) orelse ".";
 
     var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch {
-        // If we can't open the directory, just return the original file
         var result = try allocator.alloc([]const u8, 1);
         result[0] = path;
         return result;
     };
     defer dir.close();
 
-    var files: std.ArrayList([]const u8) = .empty;
+    var candidate_paths: std.ArrayList([]const u8) = .empty;
     var iter = dir.iterate();
     while (try iter.next()) |entry| {
         if (entry.kind != .file) continue;
@@ -228,16 +230,54 @@ pub fn discoverZapFiles(allocator: std.mem.Allocator, path: []const u8) ![]const
             try allocator.dupe(u8, entry.name)
         else
             try std.fs.path.join(allocator, &.{ dir_path, entry.name });
-        try files.append(allocator, full_path);
+        try candidate_paths.append(allocator, full_path);
     }
 
-    if (files.items.len == 0) {
+    if (candidate_paths.items.len <= 1) {
         var result = try allocator.alloc([]const u8, 1);
         result[0] = path;
         return result;
     }
 
-    return try files.toOwnedSlice(allocator);
+    // Check if files actually reference each other (form a project).
+    // Parse each file and collect what it defines vs references.
+    const stdlib_mod = @import("stdlib.zig");
+    var all_defined: std.ArrayList([]const u8) = .empty;
+    var all_referenced: std.ArrayList([]const u8) = .empty;
+
+    for (candidate_paths.items) |cp| {
+        const source = std.fs.cwd().readFileAlloc(allocator, cp, 10 * 1024 * 1024) catch continue;
+        const prepend_result = stdlib_mod.prependStdlib(allocator, source) catch continue;
+        var parser = @import("parser.zig").Parser.init(allocator, prepend_result.source);
+        defer parser.deinit();
+        const program = parser.parseProgram() catch continue;
+        const analysis = analyzeProgram(allocator, &program, &parser.interner) catch continue;
+        for (analysis.defines_types) |dt| try all_defined.append(allocator, dt);
+        for (analysis.defines_modules) |dm| try all_defined.append(allocator, dm);
+        for (analysis.references_types) |rt| try all_referenced.append(allocator, rt);
+        for (analysis.references_modules) |rm| try all_referenced.append(allocator, rm);
+    }
+
+    // If any referenced name matches a name defined in another file, it's a project
+    var is_project = false;
+    for (all_referenced.items) |ref| {
+        for (all_defined.items) |def| {
+            if (std.mem.eql(u8, ref, def)) {
+                is_project = true;
+                break;
+            }
+        }
+        if (is_project) break;
+    }
+
+    if (!is_project) {
+        // Standalone files — single-file mode
+        var result = try allocator.alloc([]const u8, 1);
+        result[0] = path;
+        return result;
+    }
+
+    return try candidate_paths.toOwnedSlice(allocator);
 }
 
 /// Analyze a parsed program to determine what types and modules it defines and references.

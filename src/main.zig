@@ -81,7 +81,11 @@ pub fn main() !void {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    // Discover all .zap files in the same directory
+    // Multi-file mode: discover sibling .zap files only when inside a project
+    // directory (the parent directory basename is NOT the root examples dir).
+    // A project directory is one where the .zap file lives alongside other .zap files
+    // that are meant to be compiled together (e.g., myapp/types.zap + myapp/app.zap).
+    // Single standalone files always use single-file mode.
     const zap_files = zap.project.discoverZapFiles(alloc, path) catch |err| {
         const stderr = std.fs.File.stderr().deprecatedWriter();
         try stderr.print("Error discovering .zap files: {}\n", .{err});
