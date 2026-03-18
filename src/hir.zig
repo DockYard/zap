@@ -1847,6 +1847,40 @@ pub const HirBuilder = struct {
             },
             .never => types_mod.TypeStore.NEVER,
             .paren => |p| self.resolveTypeExpr(p.inner),
+            .literal => |lt| {
+                return switch (lt.value) {
+                    .int => types_mod.TypeStore.I64,
+                    .string => types_mod.TypeStore.STRING,
+                    .bool_val => types_mod.TypeStore.BOOL,
+                    .nil => types_mod.TypeStore.NIL,
+                };
+            },
+            .union_type => |ut| {
+                // Resolve each member type, then find matching union in the TypeStore
+                // (the TypeChecker already created this union type during its pass)
+                var member_types: std.ArrayList(TypeId) = .empty;
+                for (ut.members) |member| {
+                    member_types.append(self.allocator, self.resolveTypeExpr(member)) catch return types_mod.TypeStore.UNKNOWN;
+                }
+                const members = member_types.toOwnedSlice(self.allocator) catch return types_mod.TypeStore.UNKNOWN;
+                // Search the TypeStore for a matching union type
+                for (self.type_store.types.items, 0..) |typ, i| {
+                    if (typ == .union_type) {
+                        const existing = typ.union_type;
+                        if (existing.members.len == members.len) {
+                            var match = true;
+                            for (existing.members, members) |a, b| {
+                                if (a != b) {
+                                    match = false;
+                                    break;
+                                }
+                            }
+                            if (match) return @intCast(i);
+                        }
+                    }
+                }
+                return types_mod.TypeStore.UNKNOWN;
+            },
             else => types_mod.TypeStore.UNKNOWN,
         };
     }

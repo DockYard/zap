@@ -2197,7 +2197,7 @@ fn typeIdToZigTypeWithStore(type_id: types_mod.TypeId, type_store: ?*const types
         types_mod.TypeStore.USIZE => .usize,
         types_mod.TypeStore.ISIZE => .isize,
         else => {
-            // Try to resolve user-defined struct/enum types
+            // Try to resolve user-defined struct/enum/union types
             if (type_store) |ts| {
                 if (type_id < ts.types.items.len) {
                     const typ = ts.types.items[type_id];
@@ -2207,6 +2207,23 @@ fn typeIdToZigTypeWithStore(type_id: types_mod.TypeId, type_store: ?*const types
                         },
                         .enum_type => |et| {
                             return .{ .struct_ref = ts.interner.get(et.name) };
+                        },
+                        .union_type => |ut| {
+                            // T | nil → ?T (Zig optional)
+                            if (ut.members.len == 2) {
+                                var non_nil: ?types_mod.TypeId = null;
+                                for (ut.members) |m| {
+                                    if (m == types_mod.TypeStore.NIL) continue;
+                                    non_nil = m;
+                                }
+                                if (non_nil) |inner| {
+                                    const inner_zig = typeIdToZigTypeWithStore(inner, type_store);
+                                    // Allocate the inner type on the heap for the optional pointer
+                                    const inner_ptr = ts.allocator.create(ZigType) catch return .any;
+                                    inner_ptr.* = inner_zig;
+                                    return .{ .optional = inner_ptr };
+                                }
+                            }
                         },
                         else => {},
                     }

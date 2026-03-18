@@ -212,7 +212,8 @@ pub const TypeStore = struct {
         return null;
     }
 
-    /// Check if two types are the same
+    /// Check if two types are compatible.
+    /// Returns true if `a` can be used where `b` is expected (or vice versa).
     pub fn typeEquals(self: *const TypeStore, a: TypeId, b: TypeId) bool {
         if (a == b) return true;
         const ta = self.getType(a);
@@ -222,6 +223,19 @@ pub const TypeStore = struct {
         if (ta == .never or tb == .never) return true;
         // Unknown matches anything (for inference)
         if (ta == .unknown or tb == .unknown) return true;
+
+        // If either side is a union type, check if the other is a member.
+        // e.g., String is compatible with String | nil
+        if (tb == .union_type) {
+            for (tb.union_type.members) |member| {
+                if (self.typeEquals(a, member)) return true;
+            }
+        }
+        if (ta == .union_type) {
+            for (ta.union_type.members) |member| {
+                if (self.typeEquals(member, b)) return true;
+            }
+        }
 
         return false;
     }
@@ -333,7 +347,7 @@ pub const TypeChecker = struct {
     }
 
     /// Convert a TypeId to a human-readable string
-    pub fn typeToString(_: *const TypeChecker, type_id: TypeId) []const u8 {
+    pub fn typeToString(self: *const TypeChecker, type_id: TypeId) []const u8 {
         if (type_id == TypeStore.BOOL) return "Bool";
         if (type_id == TypeStore.STRING) return "String";
         if (type_id == TypeStore.ATOM) return "Atom";
@@ -354,6 +368,23 @@ pub const TypeChecker = struct {
         if (type_id == TypeStore.ISIZE) return "isize";
         if (type_id == TypeStore.UNKNOWN) return "{unknown}";
         if (type_id == TypeStore.ERROR) return "{error}";
+        // Look up user-defined and compound types
+        if (type_id < self.store.types.items.len) {
+            const typ = self.store.types.items[type_id];
+            switch (typ) {
+                .struct_type => |st| return self.interner.get(st.name),
+                .enum_type => |et| return self.interner.get(et.name),
+                .union_type => |ut| {
+                    var buf: std.ArrayList(u8) = .empty;
+                    for (ut.members, 0..) |member, i| {
+                        if (i > 0) buf.appendSlice(self.allocator, " | ") catch return "{type}";
+                        buf.appendSlice(self.allocator, self.typeToString(member)) catch return "{type}";
+                    }
+                    return buf.toOwnedSlice(self.allocator) catch return "{type}";
+                },
+                else => {},
+            }
+        }
         return "{type}";
     }
 
