@@ -1730,9 +1730,13 @@ pub const IrBuilder = struct {
                 .expr => |expr| last_local = try self.lowerExpr(expr),
                 .local_set => |ls| {
                     const val = try self.lowerExpr(ls.value);
-                    try self.current_instrs.append(self.allocator, .{
-                        .local_set = .{ .dest = ls.index, .value = val },
-                    });
+                    // Skip redundant self-assignment (e.g., struct init already in the right local)
+                    if (val != ls.index) {
+                        try self.current_instrs.append(self.allocator, .{
+                            .local_set = .{ .dest = ls.index, .value = val },
+                        });
+                    }
+                    last_local = ls.index;
                 },
                 .function_group => {},
             }

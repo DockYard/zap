@@ -303,6 +303,20 @@ pub fn main() !void {
 
     const output = codegen.getOutput();
 
+    // Validate generated Zig by parsing it — catches malformed output before
+    // writing to disk, giving a clear Zap error instead of a cryptic zig build failure.
+    if (output.len > 0) {
+        const sentinel = try alloc.dupeZ(u8, output);
+        const zig_ast = try std.zig.Ast.parse(alloc, sentinel, .zig);
+        if (zig_ast.errors.len > 0) {
+            const stderr = std.fs.File.stderr().deprecatedWriter();
+            try stderr.print("internal error: generated Zig source is malformed ({d} parse errors)\n", .{zig_ast.errors.len});
+            try stderr.print("this is a bug in the Zap compiler — please report it\n", .{});
+            try stderr.print("use --emit-zig to inspect the generated code\n", .{});
+            std.process.exit(1);
+        }
+    }
+
     if (emit_zig) {
         const stdout = std.fs.File.stdout().deprecatedWriter();
         try stdout.print("{s}", .{output});
