@@ -1,21 +1,23 @@
-def check(result) :: String do
-  case result do
-    {:ok, v} ->
-      v
-    {:error, e} ->
-      e
-    _ ->
-      "unknown"
+defmodule CaseExample do
+  def check(result) :: String do
+    case result do
+      {:ok, v} ->
+        v
+      {:error, e} ->
+        e
+      _ ->
+        "unknown"
+    end
   end
 end
 
 def main() do
-  check({:ok, "hello"})
+  CaseExample.check({:ok, "hello"})
   |> IO.puts()
 
-  check({:error, "oops"})
+  CaseExample.check({:error, "oops"})
   |> IO.puts()
 
-  check(:something)
+  CaseExample.check(:something)
   |> IO.puts()
 end

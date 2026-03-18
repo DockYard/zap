@@ -1,10 +1,12 @@
 # unless is now a Kernel macro — no need to define it yourself
 
-def check(x :: i64) :: String | nil do
-  unless(x > 10, "small number")
+defmodule UnlessExample do
+  def check(x :: i64) :: String | nil do
+    unless(x > 10, "small number")
+  end
 end
 
 def main() do
-  check(5)!
+  UnlessExample.check(5)!
   |> IO.puts()
 end
