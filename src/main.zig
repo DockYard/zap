@@ -571,6 +571,9 @@ fn compileMultiFile(
     defer cache_dir.close();
     try cache_dir.makePath("src");
 
+    // If the Zap compiler binary changed, invalidate the Zig build cache
+    invalidateCacheIfCompilerChanged(alloc, cache_dir);
+
     _ = try writeIfChanged(cache_dir, "src/zap_runtime.zig", runtime_source);
 
     const main_file = files[main_idx];
@@ -872,6 +875,38 @@ fn emitDiagnostics(diag_engine: *const zap.DiagnosticEngine, alloc: std.mem.Allo
     try stderr.print("{s}", .{output});
 }
 
+/// Check if the Zap compiler has been rebuilt since the last compilation.
+/// If so, delete the Zig build cache to force a full recompile.
+fn invalidateCacheIfCompilerChanged(allocator: std.mem.Allocator, cache_dir: std.fs.Dir) void {
+    // Get the Zap binary's modification time as its identity
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const self_path = std.fs.selfExePath(&path_buf) catch return;
+    const self_file = std.fs.cwd().openFile(self_path, .{}) catch return;
+    defer self_file.close();
+    const self_stat = self_file.stat() catch return;
+
+    // Use mtime + size as a simple identity
+    const stamp = std.fmt.allocPrint(allocator, "{d}:{d}", .{ self_stat.mtime, self_stat.size }) catch return;
+
+    // Read the stored stamp
+    const stamp_match = blk: {
+        const stamp_file = cache_dir.openFile(".zap-compiler-stamp", .{}) catch break :blk false;
+        defer stamp_file.close();
+        var buf: [64]u8 = undefined;
+        const n = stamp_file.readAll(&buf) catch break :blk false;
+        break :blk std.mem.eql(u8, buf[0..n], stamp);
+    };
+
+    if (!stamp_match) {
+        // Compiler changed — nuke the Zig cache so everything rebuilds
+        cache_dir.deleteTree(".zig-cache") catch {};
+        cache_dir.deleteTree("zig-cache") catch {};
+
+        // Write new stamp
+        cache_dir.writeFile(.{ .sub_path = ".zap-compiler-stamp", .data = stamp }) catch {};
+    }
+}
+
 /// Write file only if content differs from what's on disk.
 /// Returns true if the file was written (content changed or didn't exist).
 fn writeIfChanged(dir: std.fs.Dir, sub_path: []const u8, content: []const u8) !bool {
@@ -958,6 +993,9 @@ fn compileWithZig(allocator: std.mem.Allocator, zap_path: []const u8, zig_source
     var cache_dir = try std.fs.cwd().makeOpenPath(".zap-cache", .{});
     defer cache_dir.close();
     try cache_dir.makePath("src");
+
+    // If the Zap compiler binary changed, invalidate the Zig build cache
+    invalidateCacheIfCompilerChanged(allocator, cache_dir);
 
     // Write source files only when content changes (enables Zig cache hits)
     const source_file = if (lib_mode) "src/root.zig" else "src/main.zig";
