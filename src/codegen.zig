@@ -443,6 +443,10 @@ pub const CodeGen = struct {
                 try self.write(";\n");
             },
             .param_get => |pg| {
+                // Skip emitting param_get if the dest local is unreferenced.
+                // Writing `_ = __arg_N;` would be a pointless discard in Zig
+                // and causes a compile error if the param is used elsewhere.
+                if (!self.isLocalReferenced(pg.dest)) return;
                 try self.writeIndent();
                 try self.writeDestLocal(pg.dest);
                 try self.write(" = ");

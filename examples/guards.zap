@@ -1,22 +1,24 @@
-def classify(n :: i64) :: String if n > 0 do
-  "positive"
-end
+defmodule Guards do
+  def classify(n :: i64) :: String if n > 0 do
+    "positive"
+  end
 
-def classify(n :: i64) :: String if n < 0 do
-  "negative"
-end
+  def classify(n :: i64) :: String if n < 0 do
+    "negative"
+  end
 
-def classify(_ :: i64) :: String do
-  "zero"
+  def classify(_ :: i64) :: String do
+    "zero"
+  end
 end
 
 def main() do
-  classify(-4)
+  Guards.classify(-4)
   |> IO.puts()
 
-  classify(-7)
+  Guards.classify(-7)
   |> IO.puts()
 
-  classify(0)
+  Guards.classify(0)
   |> IO.puts()
 end
