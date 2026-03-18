@@ -194,7 +194,7 @@ pub const TypeStore = struct {
         if (std.mem.eql(u8, name, "Bool")) return BOOL;
         if (std.mem.eql(u8, name, "String")) return STRING;
         if (std.mem.eql(u8, name, "Atom")) return ATOM;
-        if (std.mem.eql(u8, name, "Nil")) return NIL;
+        if (std.mem.eql(u8, name, "Nil") or std.mem.eql(u8, name, "nil")) return NIL;
         if (std.mem.eql(u8, name, "Never")) return NEVER;
         if (std.mem.eql(u8, name, "i64")) return I64;
         if (std.mem.eql(u8, name, "i32")) return I32;
