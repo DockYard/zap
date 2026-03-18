@@ -224,6 +224,20 @@ pub const TypeStore = struct {
         // Unknown matches anything (for inference)
         if (ta == .unknown or tb == .unknown) return true;
 
+        // Structural tuple comparison
+        if (ta == .tuple and tb == .tuple) {
+            if (ta.tuple.elements.len != tb.tuple.elements.len) return false;
+            for (ta.tuple.elements, tb.tuple.elements) |ea, eb| {
+                if (!self.typeEquals(ea, eb)) return false;
+            }
+            return true;
+        }
+
+        // Structural list comparison
+        if (ta == .list and tb == .list) {
+            return self.typeEquals(ta.list.element, tb.list.element);
+        }
+
         // If either side is a union type, check if the other is a member.
         // e.g., String is compatible with String | nil
         if (tb == .union_type) {

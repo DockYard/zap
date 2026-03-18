@@ -1430,6 +1430,14 @@ pub const CodeGen = struct {
                 try self.write("?");
                 try self.emitZigType(inner);
             },
+            .tuple => |elems| {
+                try self.write("struct { ");
+                for (elems, 0..) |*elem, i| {
+                    if (i > 0) try self.write(", ");
+                    try self.emitZigType(elem);
+                }
+                try self.write(" }");
+            },
             .any => try self.write("anytype"),
             .struct_ref => |name| try self.write(name),
             .tagged_union => |name| try self.write(name),

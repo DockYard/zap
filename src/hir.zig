@@ -2299,6 +2299,15 @@ pub const HirBuilder = struct {
                 }
                 return types_mod.TypeStore.UNKNOWN;
             },
+            .tuple => |tt| {
+                var elem_types: std.ArrayList(TypeId) = .empty;
+                for (tt.elements) |elem| {
+                    elem_types.append(self.allocator, self.resolveTypeExpr(elem)) catch return types_mod.TypeStore.UNKNOWN;
+                }
+                const elements = elem_types.toOwnedSlice(self.allocator) catch return types_mod.TypeStore.UNKNOWN;
+                const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
+                return store_ptr.addType(.{ .tuple = .{ .elements = elements } }) catch types_mod.TypeStore.UNKNOWN;
+            },
             else => types_mod.TypeStore.UNKNOWN,
         };
     }

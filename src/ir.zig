@@ -3025,6 +3025,18 @@ fn typeIdToZigTypeWithStore(type_id: types_mod.TypeId, type_store: ?*const types
                         .enum_type => |et| {
                             return .{ .struct_ref = ts.interner.get(et.name) };
                         },
+                        .tuple => |tt| {
+                            var zig_elems = ts.allocator.alloc(ZigType, tt.elements.len) catch return .any;
+                            for (tt.elements, 0..) |elem, i| {
+                                zig_elems[i] = typeIdToZigTypeWithStore(elem, type_store);
+                            }
+                            return .{ .tuple = zig_elems };
+                        },
+                        .list => |lt| {
+                            const elem_zig = ts.allocator.create(ZigType) catch return .any;
+                            elem_zig.* = typeIdToZigTypeWithStore(lt.element, type_store);
+                            return .{ .list = elem_zig };
+                        },
                         .union_type => |ut| {
                             // T | nil → ?T (Zig optional)
                             if (ut.members.len == 2) {
