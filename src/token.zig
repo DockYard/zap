@@ -82,6 +82,8 @@ pub const Token = struct {
         percent_brace, // %{
         dot, // .
         dot_brace, // .{
+        left_angle_angle, // <<
+        right_angle_angle, // >>
 
         // Delimiters
         left_paren, // (

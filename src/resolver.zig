@@ -341,6 +341,14 @@ pub const Resolver = struct {
             .type_annotated => |ta| {
                 try self.resolveExpr(ta.expr);
             },
+            .binary_literal => |bl| {
+                for (bl.segments) |seg| {
+                    switch (seg.value) {
+                        .expr => |e| try self.resolveExpr(e),
+                        .pattern, .string_literal => {},
+                    }
+                }
+            },
             // Literals and module refs — no resolution needed
             .int_literal, .float_literal, .string_literal,
             .string_interpolation, .atom_literal, .bool_literal,
@@ -375,6 +383,15 @@ pub const Resolver = struct {
                 for (sp.fields) |field| try self.resolvePattern(field.pattern);
             },
             .paren => |p| try self.resolvePattern(p.inner),
+            .binary => |bin| {
+                for (bin.segments) |seg| {
+                    switch (seg.value) {
+                        .pattern => |pat| try self.resolvePattern(pat),
+                        .expr => |e| try self.resolveExpr(e),
+                        .string_literal => {},
+                    }
+                }
+            },
             .pin => |pin| {
                 // Pin references an existing variable
                 if (self.graph.resolveBinding(self.current_scope, pin.name) == null) {
@@ -408,6 +425,14 @@ pub const Resolver = struct {
                 for (sp.fields) |field| try self.bindPattern(field.pattern);
             },
             .paren => |p| try self.bindPattern(p.inner),
+            .binary => |bin| {
+                for (bin.segments) |seg| {
+                    switch (seg.value) {
+                        .pattern => |pat| try self.bindPattern(pat),
+                        .expr, .string_literal => {},
+                    }
+                }
+            },
             .wildcard, .literal, .pin => {},
         }
     }

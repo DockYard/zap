@@ -52,6 +52,7 @@ pub const Clause = struct {
     tuple_bindings: []const TupleBinding,
     struct_bindings: []const StructBinding = &.{},
     list_bindings: []const ListBinding = &.{},
+    binary_bindings: []const BinaryBinding = &.{},
 };
 
 pub const TupleBinding = struct {
@@ -73,6 +74,14 @@ pub const ListBinding = struct {
     param_index: u32,
     element_index: u32,
     local_index: u32,
+};
+
+pub const BinaryBinding = struct {
+    name: ast.StringId,
+    param_index: u32,
+    segment_index: u32,
+    local_index: u32,
+    segment: BinaryMatchSegment,
 };
 
 pub const TypedParam = struct {
@@ -289,6 +298,8 @@ pub const Decision = union(enum) {
     check_tuple: CheckTupleNode,
     /// Check list length
     check_list: CheckListNode,
+    /// Check binary data (length + segment extraction)
+    check_binary: CheckBinaryNode,
     /// Bind a variable and continue
     bind: BindNode,
 };
@@ -355,6 +366,14 @@ pub const CheckListNode = struct {
     failure: *const Decision,
 };
 
+pub const CheckBinaryNode = struct {
+    scrutinee: *const Expr,
+    min_byte_size: u32,
+    segments: []const BinaryMatchSegment,
+    success: *const Decision,
+    failure: *const Decision,
+};
+
 pub const BindNode = struct {
     name: ast.StringId,
     local_index: u32,
@@ -375,6 +394,19 @@ pub const MatchPattern = union(enum) {
     list_cons: ListConsMatch,
     pin: ast.StringId,
     struct_match: StructMatch,
+    binary_match: BinaryMatchData,
+};
+
+pub const BinaryMatchData = struct {
+    segments: []const BinaryMatchSegment,
+};
+
+pub const BinaryMatchSegment = struct {
+    pattern: ?*const MatchPattern,
+    type_spec: ast.BinarySegmentType,
+    endianness: ast.Endianness,
+    size: ?ast.BinarySegmentSize,
+    string_literal: ?ast.StringId,
 };
 
 pub const ListConsMatch = struct {
@@ -598,6 +630,10 @@ fn compileConstructorColumn(
         .list => {
             // List constructors -> check_list (same structure as check_tuple but for slices)
             return compileListCheck(allocator, matrix, scrutinee_ids, scrutinee_expr, next_id);
+        },
+        .binary_match => {
+            // Binary constructors -> check_binary
+            return compileBinaryCheck(allocator, matrix, scrutinee_ids, scrutinee_expr, next_id);
         },
         else => {
             // Fallback: treat as variable rule
@@ -1047,6 +1083,115 @@ fn compileListCheck(
     return current_failure;
 }
 
+fn compileBinaryCheck(
+    allocator: std.mem.Allocator,
+    matrix: PatternMatrix,
+    scrutinee_ids: []const u32,
+    scrutinee_expr: *const Expr,
+    next_id: *u32,
+) anyerror!*const Decision {
+    // Calculate min byte size from the first binary pattern's segments
+    // Accumulate bits for sub-byte types, then convert to bytes
+    var min_bits: u32 = 0;
+    var segments: []const BinaryMatchSegment = &.{};
+    for (matrix.rows) |row| {
+        if (row.patterns.len == 0) continue;
+        const pat = row.patterns[0];
+        if (!isWildcardPattern(pat) and pat.?.* == .binary_match) {
+            segments = pat.?.binary_match.segments;
+            for (segments) |seg| {
+                switch (seg.type_spec) {
+                    .default => min_bits += 8,
+                    .integer => |i| min_bits += i.bits,
+                    .float => |f| min_bits += f.bits,
+                    .string => {
+                        if (min_bits % 8 != 0) min_bits = (min_bits + 7) / 8 * 8;
+                        if (seg.string_literal) |sl| {
+                            _ = sl;
+                            // String literal prefix — can't easily get length here without interner
+                            // The IR emitter handles this more precisely
+                        } else if (seg.size) |sz| {
+                            switch (sz) {
+                                .literal => |n| min_bits += n * 8,
+                                .variable => {},
+                            }
+                        }
+                    },
+                    .utf8 => min_bits += 8,
+                    .utf16 => min_bits += 16,
+                    .utf32 => min_bits += 32,
+                }
+            }
+            break;
+        }
+    }
+
+    // Build wildcard-only failure base
+    const remaining_scrutinees = if (scrutinee_ids.len > 1) scrutinee_ids[1..] else @as([]const u32, &.{});
+    var wildcard_rows: std.ArrayList(PatternRow) = .empty;
+    for (matrix.rows) |row| {
+        if (row.patterns.len == 0) continue;
+        const pat = row.patterns[0];
+        if (isWildcardPattern(pat)) {
+            const new_pats = if (row.patterns.len > 1) row.patterns[1..] else @as([]const ?*const MatchPattern, &.{});
+            try wildcard_rows.append(allocator, .{
+                .patterns = new_pats,
+                .body_index = row.body_index,
+                .guard = row.guard,
+            });
+        }
+    }
+
+    var failure: *const Decision = undefined;
+    if (wildcard_rows.items.len > 0) {
+        failure = try compilePatternMatrix(allocator, .{
+            .rows = try wildcard_rows.toOwnedSlice(allocator),
+            .column_count = matrix.column_count - 1,
+        }, remaining_scrutinees, next_id);
+    } else {
+        const f = try allocator.create(Decision);
+        f.* = .failure;
+        failure = f;
+    }
+
+    // Build success rows (strip column 0, keep remaining)
+    var success_rows: std.ArrayList(PatternRow) = .empty;
+    for (matrix.rows) |row| {
+        if (row.patterns.len == 0) continue;
+        const pat = row.patterns[0];
+        if (!isWildcardPattern(pat) and pat.?.* == .binary_match) {
+            const new_pats = if (row.patterns.len > 1) row.patterns[1..] else @as([]const ?*const MatchPattern, &.{});
+            try success_rows.append(allocator, .{
+                .patterns = new_pats,
+                .body_index = row.body_index,
+                .guard = row.guard,
+            });
+        } else if (isWildcardPattern(pat)) {
+            const new_pats = if (row.patterns.len > 1) row.patterns[1..] else @as([]const ?*const MatchPattern, &.{});
+            try success_rows.append(allocator, .{
+                .patterns = new_pats,
+                .body_index = row.body_index,
+                .guard = row.guard,
+            });
+        }
+    }
+
+    const success = try compilePatternMatrix(allocator, .{
+        .rows = try success_rows.toOwnedSlice(allocator),
+        .column_count = matrix.column_count - 1,
+    }, remaining_scrutinees, next_id);
+
+    const d = try allocator.create(Decision);
+    d.* = .{ .check_binary = .{
+        .scrutinee = scrutinee_expr,
+        .min_byte_size = (min_bits + 7) / 8,
+        .segments = segments,
+        .success = success,
+        .failure = failure,
+    } };
+    return d;
+}
+
 fn literalEquals(a: LiteralValue, b: LiteralValue) bool {
     const tag_a = std.meta.activeTag(a);
     const tag_b = std.meta.activeTag(b);
@@ -1076,6 +1221,7 @@ pub const HirBuilder = struct {
     current_tuple_bindings: std.ArrayList(TupleBinding),
     current_struct_bindings: std.ArrayList(StructBinding),
     current_list_bindings: std.ArrayList(ListBinding),
+    current_binary_bindings: std.ArrayList(BinaryBinding),
     current_case_bindings: std.ArrayList(CaseBinding),
     current_module_scope: ?scope_mod.ScopeId,
     errors: std.ArrayList(Error),
@@ -1102,6 +1248,7 @@ pub const HirBuilder = struct {
             .current_tuple_bindings = .empty,
             .current_struct_bindings = .empty,
             .current_list_bindings = .empty,
+            .current_binary_bindings = .empty,
             .current_case_bindings = .empty,
             .current_module_scope = null,
             .errors = .empty,
@@ -1458,6 +1605,33 @@ pub const HirBuilder = struct {
             }
         }
 
+        // Process binary patterns to create bindings for destructured segments
+        self.current_binary_bindings = .empty;
+        for (params.items, 0..) |param, param_idx| {
+            if (param.pattern) |pat| {
+                if (pat.* == .binary_match) {
+                    for (pat.binary_match.segments, 0..) |seg, seg_idx| {
+                        if (seg.pattern) |sub_pat| {
+                            if (sub_pat.* == .bind) {
+                                // Skip _-prefixed bindings (intentionally unused)
+                                const name_str = self.interner.get(sub_pat.bind);
+                                if (name_str.len > 0 and name_str[0] == '_') continue;
+                                const local_idx = self.next_local;
+                                self.next_local += 1;
+                                try self.current_binary_bindings.append(self.allocator, .{
+                                    .name = sub_pat.bind,
+                                    .param_index = @intCast(param_idx),
+                                    .segment_index = @intCast(seg_idx),
+                                    .local_index = local_idx,
+                                    .segment = seg,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Build decision tree for this clause
         const decision = try self.create(Decision, .{
             .success = .{ .bindings = &.{}, .body_index = 0 },
@@ -1478,6 +1652,7 @@ pub const HirBuilder = struct {
             .tuple_bindings = try self.current_tuple_bindings.toOwnedSlice(self.allocator),
             .struct_bindings = try self.current_struct_bindings.toOwnedSlice(self.allocator),
             .list_bindings = try self.current_list_bindings.toOwnedSlice(self.allocator),
+            .binary_bindings = try self.current_binary_bindings.toOwnedSlice(self.allocator),
         };
     }
 
@@ -1559,7 +1734,37 @@ pub const HirBuilder = struct {
                 });
             },
             .map => null, // TODO
+            .binary => |bin| {
+                return try self.create(MatchPattern, .{
+                    .binary_match = .{
+                        .segments = try self.compileBinarySegments(bin.segments),
+                    },
+                });
+            },
         };
+    }
+
+    fn compileBinarySegments(self: *HirBuilder, segments: []const ast.BinarySegment) ![]const BinaryMatchSegment {
+        var result: std.ArrayList(BinaryMatchSegment) = .empty;
+        for (segments) |seg| {
+            const pattern: ?*const MatchPattern = switch (seg.value) {
+                .pattern => |pat| try self.compilePattern(pat),
+                .expr => null,
+                .string_literal => null,
+            };
+            const string_lit: ?ast.StringId = switch (seg.value) {
+                .string_literal => |s| s,
+                else => null,
+            };
+            try result.append(self.allocator, .{
+                .pattern = pattern,
+                .type_spec = seg.type_spec,
+                .endianness = seg.endianness,
+                .size = seg.size,
+                .string_literal = string_lit,
+            });
+        }
+        return try result.toOwnedSlice(self.allocator);
     }
 
     // ============================================================
@@ -1672,6 +1877,16 @@ pub const HirBuilder = struct {
                 }
                 // Check if this var refers to a list element binding
                 for (self.current_list_bindings.items) |binding| {
+                    if (binding.name == v.name) {
+                        return try self.create(Expr, .{
+                            .kind = .{ .local_get = binding.local_index },
+                            .type_id = resolved_type,
+                            .span = v.meta.span,
+                        });
+                    }
+                }
+                // Check if this var refers to a binary segment binding
+                for (self.current_binary_bindings.items) |binding| {
                     if (binding.name == v.name) {
                         return try self.create(Expr, .{
                             .kind = .{ .local_get = binding.local_index },

@@ -155,6 +155,14 @@ pub const Instruction = union(enum) {
     // Optional unwrap
     optional_unwrap: OptionalUnwrap,
 
+    // Binary pattern matching
+    bin_len_check: BinLenCheck,
+    bin_read_int: BinReadInt,
+    bin_read_float: BinReadFloat,
+    bin_slice: BinSlice,
+    bin_read_utf8: BinReadUtf8,
+    bin_match_prefix: BinMatchPrefix,
+
     // Memory / ARC
     alloc_owned: AllocOwned,
     retain: Retain,
@@ -519,6 +527,55 @@ pub const OptionalUnwrap = struct {
     source: LocalId,
 };
 
+pub const BinLenCheck = struct {
+    dest: LocalId,
+    scrutinee: LocalId,
+    min_len: u32,
+};
+
+pub const BinReadInt = struct {
+    dest: LocalId,
+    source: LocalId,
+    offset: BinOffset,
+    bits: u16,
+    signed: bool,
+    endianness: ast.Endianness,
+    bit_offset: u8 = 0, // bit offset within byte for sub-byte extractions
+};
+
+pub const BinReadFloat = struct {
+    dest: LocalId,
+    source: LocalId,
+    offset: BinOffset,
+    bits: u16,
+    endianness: ast.Endianness,
+};
+
+pub const BinSlice = struct {
+    dest: LocalId,
+    source: LocalId,
+    offset: BinOffset,
+    length: ?BinOffset, // null = rest of data
+};
+
+pub const BinReadUtf8 = struct {
+    dest_codepoint: LocalId,
+    dest_len: LocalId,
+    source: LocalId,
+    offset: BinOffset,
+};
+
+pub const BinMatchPrefix = struct {
+    dest: LocalId,
+    source: LocalId,
+    expected: []const u8,
+};
+
+pub const BinOffset = union(enum) {
+    static: u32,
+    dynamic: LocalId,
+};
+
 pub const AllocOwned = struct {
     dest: LocalId,
     type_name: []const u8,
@@ -790,6 +847,9 @@ pub const IrBuilder = struct {
                 for (clause.list_bindings) |binding| {
                     max_binding_local = @max(max_binding_local, binding.local_index + 1);
                 }
+                for (clause.binary_bindings) |binding| {
+                    max_binding_local = @max(max_binding_local, binding.local_index + 1);
+                }
             }
             self.next_local = max_binding_local;
         }
@@ -798,8 +858,9 @@ pub const IrBuilder = struct {
 
         if (group.clauses.len == 1) {
             // Single clause — no dispatch needed
-            // Emit tuple bindings if present
+            // Emit tuple/binary bindings if present
             try self.emitTupleBindings(first_clause);
+            try self.emitBinaryBindings(first_clause);
             const result_local = try self.lowerBlock(first_clause.body);
             body_result_local = result_local;
             try self.current_instrs.append(self.allocator, .{ .ret = .{ .value = result_local } });
@@ -1359,6 +1420,278 @@ pub const IrBuilder = struct {
         return union_name;
     }
 
+    /// Emit binary extraction instructions to populate binary binding locals.
+    fn emitBinaryBindings(self: *IrBuilder, clause: *const hir_mod.Clause) !void {
+        // Find params that have binary patterns
+        for (clause.params, 0..) |param, param_idx_usize| {
+            const param_idx: u32 = @intCast(param_idx_usize);
+            const pat = param.pattern orelse continue;
+            if (pat.* != .binary_match) continue;
+
+            // Get param local
+            const data_local = self.next_local;
+            self.next_local += 1;
+            try self.current_instrs.append(self.allocator, .{
+                .param_get = .{ .dest = data_local, .index = param_idx },
+            });
+
+            // Calculate min byte size and emit length check
+            // For sub-byte types, accumulate bits then convert to bytes
+            var min_bits: u32 = 0;
+            for (pat.binary_match.segments) |seg| {
+                switch (seg.type_spec) {
+                    .default => min_bits += 8,
+                    .integer => |i| min_bits += i.bits,
+                    .float => |f| min_bits += f.bits,
+                    .string => {
+                        // Flush any partial byte first
+                        if (min_bits % 8 != 0) min_bits = (min_bits + 7) / 8 * 8;
+                        if (seg.string_literal) |sl| {
+                            min_bits += @as(u32, @intCast(self.interner.get(sl).len)) * 8;
+                        } else if (seg.size) |sz| {
+                            switch (sz) {
+                                .literal => |n| min_bits += n * 8,
+                                .variable => {},
+                            }
+                        }
+                    },
+                    .utf8 => min_bits += 8,
+                    .utf16 => min_bits += 16,
+                    .utf32 => min_bits += 32,
+                }
+            }
+            const min_bytes = (min_bits + 7) / 8;
+            if (min_bytes > 0) {
+                const len_check = self.next_local;
+                self.next_local += 1;
+                try self.current_instrs.append(self.allocator, .{
+                    .bin_len_check = .{ .dest = len_check, .scrutinee = data_local, .min_len = min_bytes },
+                });
+                // Wrap remaining extractions in a guard block
+                // (for single-clause we just emit inline — the check ensures safety)
+            }
+
+            // Track running byte and bit offsets
+            var byte_offset: u32 = 0;
+            var bit_offset: u8 = 0; // bits consumed within current byte (for sub-byte types)
+            var offset_is_dynamic = false;
+            var dynamic_offset_local: LocalId = 0;
+
+            for (pat.binary_match.segments, 0..) |seg, seg_idx_usize| {
+                const seg_idx: u32 = @intCast(seg_idx_usize);
+
+                // Find the binding for this segment (if any)
+                var binding_local: ?LocalId = null;
+                for (clause.binary_bindings) |binding| {
+                    if (binding.param_index == param_idx and binding.segment_index == seg_idx) {
+                        binding_local = binding.local_index;
+                        break;
+                    }
+                }
+
+                // Handle string literal prefix segments
+                if (seg.string_literal) |sl| {
+                    const prefix_str = self.interner.get(sl);
+                    const prefix_check = self.next_local;
+                    self.next_local += 1;
+                    try self.current_instrs.append(self.allocator, .{
+                        .bin_match_prefix = .{
+                            .dest = prefix_check,
+                            .source = data_local,
+                            .expected = prefix_str,
+                        },
+                    });
+                    byte_offset += @intCast(prefix_str.len);
+                    continue;
+                }
+
+                const current_offset: BinOffset = if (offset_is_dynamic)
+                    .{ .dynamic = dynamic_offset_local }
+                else
+                    .{ .static = byte_offset };
+
+                switch (seg.type_spec) {
+                    .default => {
+                        // Flush any partial bit offset to byte boundary
+                        if (bit_offset > 0) {
+                            byte_offset += 1;
+                            bit_offset = 0;
+                        }
+                        if (binding_local) |dest| {
+                            try self.current_instrs.append(self.allocator, .{
+                                .bin_read_int = .{
+                                    .dest = dest,
+                                    .source = data_local,
+                                    .offset = current_offset,
+                                    .bits = 8,
+                                    .signed = false,
+                                    .endianness = .big,
+                                },
+                            });
+                        }
+                        if (!offset_is_dynamic) byte_offset += 1;
+                    },
+                    .integer => |int_spec| {
+                        if (int_spec.bits < 8) {
+                            // Sub-byte: track bit offset, compute shift
+                            // Bits are extracted MSB-first within a byte
+                            const shift: u8 = 8 - bit_offset - @as(u8, @intCast(int_spec.bits));
+                            if (binding_local) |dest| {
+                                try self.current_instrs.append(self.allocator, .{
+                                    .bin_read_int = .{
+                                        .dest = dest,
+                                        .source = data_local,
+                                        .offset = current_offset,
+                                        .bits = int_spec.bits,
+                                        .signed = int_spec.signed,
+                                        .endianness = seg.endianness,
+                                        .bit_offset = shift,
+                                    },
+                                });
+                            }
+                            bit_offset += @intCast(int_spec.bits);
+                            if (bit_offset >= 8) {
+                                byte_offset += bit_offset / 8;
+                                bit_offset = bit_offset % 8;
+                            }
+                        } else {
+                            // Flush any partial bit offset
+                            if (bit_offset > 0) {
+                                byte_offset += 1;
+                                bit_offset = 0;
+                            }
+                            if (binding_local) |dest| {
+                                try self.current_instrs.append(self.allocator, .{
+                                    .bin_read_int = .{
+                                        .dest = dest,
+                                        .source = data_local,
+                                        .offset = current_offset,
+                                        .bits = int_spec.bits,
+                                        .signed = int_spec.signed,
+                                        .endianness = seg.endianness,
+                                    },
+                                });
+                            }
+                            if (!offset_is_dynamic) byte_offset += (int_spec.bits + 7) / 8;
+                        }
+                    },
+                    .float => |float_spec| {
+                        if (binding_local) |dest| {
+                            try self.current_instrs.append(self.allocator, .{
+                                .bin_read_float = .{
+                                    .dest = dest,
+                                    .source = data_local,
+                                    .offset = current_offset,
+                                    .bits = float_spec.bits,
+                                    .endianness = seg.endianness,
+                                },
+                            });
+                        }
+                        if (!offset_is_dynamic) byte_offset += float_spec.bits / 8;
+                    },
+                    .string => {
+                        if (seg.size) |size| {
+                            switch (size) {
+                                .literal => |n| {
+                                    if (binding_local) |dest| {
+                                        try self.current_instrs.append(self.allocator, .{
+                                            .bin_slice = .{
+                                                .dest = dest,
+                                                .source = data_local,
+                                                .offset = current_offset,
+                                                .length = .{ .static = n },
+                                            },
+                                        });
+                                    }
+                                    if (!offset_is_dynamic) byte_offset += n;
+                                },
+                                .variable => |var_name| {
+                                    const var_local = self.findBinaryVarLocal(clause, var_name);
+                                    if (binding_local) |dest| {
+                                        try self.current_instrs.append(self.allocator, .{
+                                            .bin_slice = .{
+                                                .dest = dest,
+                                                .source = data_local,
+                                                .offset = current_offset,
+                                                .length = .{ .dynamic = var_local },
+                                            },
+                                        });
+                                    }
+                                    // After a dynamic-size segment, offset becomes dynamic
+                                    if (!offset_is_dynamic) {
+                                        // new_offset = byte_offset + var_local
+                                        const static_base = self.next_local;
+                                        self.next_local += 1;
+                                        try self.current_instrs.append(self.allocator, .{
+                                            .const_int = .{ .dest = static_base, .value = @intCast(byte_offset) },
+                                        });
+                                        dynamic_offset_local = self.next_local;
+                                        self.next_local += 1;
+                                        try self.current_instrs.append(self.allocator, .{
+                                            .binary_op = .{ .dest = dynamic_offset_local, .op = .add, .lhs = static_base, .rhs = var_local },
+                                        });
+                                        offset_is_dynamic = true;
+                                    }
+                                },
+                            }
+                        } else {
+                            // Rest of data
+                            if (binding_local) |dest| {
+                                try self.current_instrs.append(self.allocator, .{
+                                    .bin_slice = .{
+                                        .dest = dest,
+                                        .source = data_local,
+                                        .offset = current_offset,
+                                        .length = null,
+                                    },
+                                });
+                            }
+                        }
+                    },
+                    .utf8 => {
+                        if (binding_local) |dest| {
+                            const len_local = self.next_local;
+                            self.next_local += 1;
+                            try self.current_instrs.append(self.allocator, .{
+                                .bin_read_utf8 = .{
+                                    .dest_codepoint = dest,
+                                    .dest_len = len_local,
+                                    .source = data_local,
+                                    .offset = current_offset,
+                                },
+                            });
+                            // UTF-8 is variable width — offset becomes dynamic
+                            if (!offset_is_dynamic) {
+                                const static_base = self.next_local;
+                                self.next_local += 1;
+                                try self.current_instrs.append(self.allocator, .{
+                                    .const_int = .{ .dest = static_base, .value = @intCast(byte_offset) },
+                                });
+                                dynamic_offset_local = self.next_local;
+                                self.next_local += 1;
+                                try self.current_instrs.append(self.allocator, .{
+                                    .binary_op = .{ .dest = dynamic_offset_local, .op = .add, .lhs = static_base, .rhs = len_local },
+                                });
+                                offset_is_dynamic = true;
+                            }
+                        }
+                    },
+                    .utf16, .utf32 => {
+                        // TODO: implement utf16/utf32
+                    },
+                }
+            }
+        }
+    }
+
+    fn findBinaryVarLocal(self: *IrBuilder, clause: *const hir_mod.Clause, var_name: ast.StringId) LocalId {
+        for (clause.binary_bindings) |binding| {
+            if (binding.name == var_name) return binding.local_index;
+        }
+        _ = self;
+        return 0;
+    }
+
     /// Emit index_get instructions to populate tuple binding locals.
     fn emitTupleBindings(self: *IrBuilder, clause: *const hir_mod.Clause) !void {
         for (clause.tuple_bindings) |binding| {
@@ -1783,6 +2116,23 @@ pub const IrBuilder = struct {
                 });
                 try self.lowerDecisionTreeForCase(cl.failure, case_arms, scrutinee_map, 0);
             },
+            .check_binary => |cb| {
+                const scrutinee_local = self.resolveScrutinee(cb.scrutinee, scrutinee_map);
+                const len_check_local = self.next_local;
+                self.next_local += 1;
+                try self.current_instrs.append(self.allocator, .{
+                    .bin_len_check = .{ .dest = len_check_local, .scrutinee = scrutinee_local, .min_len = cb.min_byte_size },
+                });
+                const saved = self.current_instrs;
+                self.current_instrs = .empty;
+                try self.lowerDecisionTreeForCase(cb.success, case_arms, scrutinee_map, 0);
+                const success_body = try self.current_instrs.toOwnedSlice(self.allocator);
+                self.current_instrs = saved;
+                try self.current_instrs.append(self.allocator, .{
+                    .guard_block = .{ .condition = len_check_local, .body = success_body },
+                });
+                try self.lowerDecisionTreeForCase(cb.failure, case_arms, scrutinee_map, 0);
+            },
             .bind => |bind_node| {
                 // Emit binding: resolve scrutinee and assign to binding local
                 const scrutinee_local = self.resolveScrutinee(bind_node.source, scrutinee_map);
@@ -1847,6 +2197,8 @@ pub const IrBuilder = struct {
                         },
                     });
                 }
+                // Emit binary bindings
+                try self.emitBinaryBindings(clause);
                 const result_local = try self.lowerBlock(clause.body);
                 try self.current_instrs.append(self.allocator, .{ .ret = .{ .value = result_local } });
             },
@@ -1956,6 +2308,136 @@ pub const IrBuilder = struct {
                     .guard_block = .{ .condition = len_check_local, .body = success_body },
                 });
                 try self.lowerDecisionTreeForDispatch(cl.failure, clauses, scrutinee_map);
+            },
+            .check_binary => |cb| {
+                const scrutinee_local = self.resolveScrutinee(cb.scrutinee, scrutinee_map);
+                // Emit length check
+                const len_check_local = self.next_local;
+                self.next_local += 1;
+                try self.current_instrs.append(self.allocator, .{
+                    .bin_len_check = .{ .dest = len_check_local, .scrutinee = scrutinee_local, .min_len = cb.min_byte_size },
+                });
+                const saved = self.current_instrs;
+                self.current_instrs = .empty;
+
+                // For multi-clause dispatch, check if any segments have string literal
+                // prefixes that need guard blocks to differentiate clauses
+                var has_prefix_dispatch = false;
+                for (clauses) |clause| {
+                    for (clause.params) |param| {
+                        if (param.pattern) |pat| {
+                            if (pat.* == .binary_match) {
+                                for (pat.binary_match.segments) |seg| {
+                                    if (seg.string_literal != null) {
+                                        has_prefix_dispatch = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if (has_prefix_dispatch) break;
+                    }
+                    if (has_prefix_dispatch) break;
+                }
+
+                if (clauses.len > 1) {
+                    // Multi-clause binary dispatch: emit per-clause guarded bodies.
+                    // Each clause with a binary pattern gets its own extraction + guard.
+                    // Clauses without binary patterns (wildcards) are handled by cb.failure.
+                    for (clauses) |clause| {
+                        // Skip clauses that don't have binary patterns (handled by cb.failure)
+                        var has_binary = false;
+                        for (clause.params) |param| {
+                            if (param.pattern) |pat| {
+                                if (pat.* == .binary_match) {
+                                    has_binary = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!has_binary) continue;
+
+                        const inner_saved = self.current_instrs;
+                        self.current_instrs = .empty;
+                        try self.emitBinaryBindings(&clause);
+                        const result_local = try self.lowerBlock(clause.body);
+                        try self.current_instrs.append(self.allocator, .{ .ret = .{ .value = result_local } });
+                        const all_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
+                        self.current_instrs = inner_saved;
+
+                        // Find any guard condition (bin_match_prefix or bin_len_check)
+                        // and split instructions: pre-guard setup vs guarded body.
+                        var guard_cond: ?LocalId = null;
+                        var split_idx: usize = 0;
+                        for (all_instrs, 0..) |instr, idx| {
+                            switch (instr) {
+                                .bin_match_prefix => |bmp| {
+                                    guard_cond = bmp.dest;
+                                    split_idx = idx + 1;
+                                    break;
+                                },
+                                else => {},
+                            }
+                        }
+
+                        if (guard_cond) |cond| {
+                            // Emit setup instructions, then wrap body in guard
+                            for (all_instrs[0..split_idx]) |instr| {
+                                try self.current_instrs.append(self.allocator, instr);
+                            }
+                            try self.current_instrs.append(self.allocator, .{
+                                .guard_block = .{ .condition = cond, .body = all_instrs[split_idx..] },
+                            });
+                        } else {
+                            // No string-literal prefix guard — wrap the whole body
+                            // in a length check guard to differentiate from fallback
+                            var clause_min_bits: u32 = 0;
+                            for (clause.params) |param| {
+                                if (param.pattern) |pat| {
+                                    if (pat.* == .binary_match) {
+                                        for (pat.binary_match.segments) |seg| {
+                                            clause_min_bits += switch (seg.type_spec) {
+                                                .default => 8,
+                                                .integer => |i| i.bits,
+                                                .float => |f| f.bits,
+                                                .string => 0,
+                                                .utf8 => 8,
+                                                .utf16 => 16,
+                                                .utf32 => 32,
+                                            };
+                                        }
+                                    }
+                                }
+                            }
+                            const clause_min_bytes = (clause_min_bits + 7) / 8;
+                            if (clause_min_bytes > 0) {
+                                const clause_len_check = self.next_local;
+                                self.next_local += 1;
+                                try self.current_instrs.append(self.allocator, .{
+                                    .bin_len_check = .{ .dest = clause_len_check, .scrutinee = scrutinee_local, .min_len = clause_min_bytes },
+                                });
+                                try self.current_instrs.append(self.allocator, .{
+                                    .guard_block = .{ .condition = clause_len_check, .body = all_instrs },
+                                });
+                            } else {
+                                // Zero min bytes — just emit inline
+                                for (all_instrs) |instr| {
+                                    try self.current_instrs.append(self.allocator, instr);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // Single-clause binary: use normal decision tree
+                    try self.lowerDecisionTreeForDispatch(cb.success, clauses, scrutinee_map);
+                }
+
+                const success_body = try self.current_instrs.toOwnedSlice(self.allocator);
+                self.current_instrs = saved;
+                try self.current_instrs.append(self.allocator, .{
+                    .guard_block = .{ .condition = len_check_local, .body = success_body },
+                });
+                try self.lowerDecisionTreeForDispatch(cb.failure, clauses, scrutinee_map);
             },
             .bind => |bind_node| {
                 try self.lowerDecisionTreeForDispatch(bind_node.next, clauses, scrutinee_map);
@@ -2480,6 +2962,12 @@ fn findParamGetIdInDecision(decision: *const hir_mod.Decision, target_element: u
                 return cl.scrutinee.kind.param_get;
             }
             return findParamGetIdInDecision(cl.success, target_element);
+        },
+        .check_binary => |cb| {
+            if (cb.scrutinee.kind == .param_get) {
+                return cb.scrutinee.kind.param_get;
+            }
+            return findParamGetIdInDecision(cb.success, target_element);
         },
         .guard => |g| return findParamGetIdInDecision(g.success, target_element),
         .bind => |b| {

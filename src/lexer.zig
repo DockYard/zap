@@ -260,6 +260,16 @@ pub const Lexer = struct {
 
     fn lexNumber(self: *Lexer) Token {
         const start = self.pos;
+        // Check for hex prefix 0x/0X
+        if (self.pos + 1 < self.source.len and self.source[self.pos] == '0' and
+            (self.source[self.pos + 1] == 'x' or self.source[self.pos + 1] == 'X'))
+        {
+            self.pos += 2; // skip 0x
+            while (self.pos < self.source.len and (isHexDigit(self.source[self.pos]) or self.source[self.pos] == '_')) {
+                self.pos += 1;
+            }
+            return self.makeToken(.int_literal, start, self.pos);
+        }
         while (self.pos < self.source.len and (isDigit(self.source[self.pos]) or self.source[self.pos] == '_')) {
             self.pos += 1;
         }
@@ -347,6 +357,10 @@ pub const Lexer = struct {
                 return self.makeToken(.bang, start, self.pos);
             },
             '<' => {
+                if (self.pos < self.source.len and self.source[self.pos] == '<') {
+                    self.pos += 1;
+                    return self.makeToken(.left_angle_angle, start, self.pos);
+                }
                 if (self.pos < self.source.len and self.source[self.pos] == '=') {
                     self.pos += 1;
                     return self.makeToken(.less_equal, start, self.pos);
@@ -362,6 +376,10 @@ pub const Lexer = struct {
                 return self.makeToken(.less, start, self.pos);
             },
             '>' => {
+                if (self.pos < self.source.len and self.source[self.pos] == '>') {
+                    self.pos += 1;
+                    return self.makeToken(.right_angle_angle, start, self.pos);
+                }
                 if (self.pos < self.source.len and self.source[self.pos] == '=') {
                     self.pos += 1;
                     return self.makeToken(.greater_equal, start, self.pos);
@@ -427,6 +445,10 @@ pub const Lexer = struct {
 
     fn isDigit(c: u8) bool {
         return c >= '0' and c <= '9';
+    }
+
+    fn isHexDigit(c: u8) bool {
+        return (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
     }
 
     fn isIdentStart(c: u8) bool {

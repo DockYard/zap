@@ -369,6 +369,31 @@ pub const CodeGen = struct {
                     self.referenced_locals.append(self.allocator, entry.value) catch {};
                 }
             },
+            .bin_len_check => |blc| {
+                self.referenced_locals.append(self.allocator, blc.scrutinee) catch {};
+            },
+            .bin_read_int => |bri| {
+                self.referenced_locals.append(self.allocator, bri.source) catch {};
+                if (bri.offset == .dynamic) self.referenced_locals.append(self.allocator, bri.offset.dynamic) catch {};
+            },
+            .bin_read_float => |brf| {
+                self.referenced_locals.append(self.allocator, brf.source) catch {};
+                if (brf.offset == .dynamic) self.referenced_locals.append(self.allocator, brf.offset.dynamic) catch {};
+            },
+            .bin_slice => |bs| {
+                self.referenced_locals.append(self.allocator, bs.source) catch {};
+                if (bs.offset == .dynamic) self.referenced_locals.append(self.allocator, bs.offset.dynamic) catch {};
+                if (bs.length) |len| {
+                    if (len == .dynamic) self.referenced_locals.append(self.allocator, len.dynamic) catch {};
+                }
+            },
+            .bin_read_utf8 => |bru| {
+                self.referenced_locals.append(self.allocator, bru.source) catch {};
+                if (bru.offset == .dynamic) self.referenced_locals.append(self.allocator, bru.offset.dynamic) catch {};
+            },
+            .bin_match_prefix => |bmp| {
+                self.referenced_locals.append(self.allocator, bmp.source) catch {};
+            },
             else => {},
         }
     }
@@ -1233,6 +1258,136 @@ pub const CodeGen = struct {
                 try self.write(el.variant);
                 try self.write(";\n");
             },
+            .bin_len_check => |blc| {
+                // __local_N = __local_M.len >= min_len;
+                try self.writeIndent();
+                try self.writeDestLocal(blc.dest);
+                try self.write(" = ");
+                try self.writeLocal(blc.scrutinee);
+                try self.write(".len >= ");
+                try self.writeInt(@intCast(blc.min_len));
+                try self.write(";\n");
+            },
+            .bin_read_int => |bri| {
+                try self.writeIndent();
+                try self.writeDestLocal(bri.dest);
+                if (bri.bits >= 8 and bri.bits % 8 == 0) {
+                    // Byte-aligned: std.mem.readInt
+                    const byte_count = bri.bits / 8;
+                    const type_str = try std.fmt.allocPrint(self.allocator, "{s}{d}", .{
+                        if (bri.signed) @as([]const u8, "i") else @as([]const u8, "u"), bri.bits,
+                    });
+                    try self.write(" = std.mem.readInt(");
+                    try self.write(type_str);
+                    try self.write(", ");
+                    try self.writeLocal(bri.source);
+                    try self.write("[");
+                    try self.emitBinOffset(bri.offset);
+                    try self.write("..][0..");
+                    try self.writeInt(@intCast(byte_count));
+                    try self.write("], .");
+                    try self.write(switch (bri.endianness) {
+                        .big => "big",
+                        .little => "little",
+                        .native => "native",
+                    });
+                    try self.write(");\n");
+                } else {
+                    // Sub-byte: @as(u4, @truncate(data[byte_idx] >> shift))
+                    const type_str = try std.fmt.allocPrint(self.allocator, "{s}{d}", .{
+                        if (bri.signed) @as([]const u8, "i") else @as([]const u8, "u"), bri.bits,
+                    });
+                    try self.write(": ");
+                    try self.write(type_str);
+                    try self.write(" = @truncate(");
+                    try self.writeLocal(bri.source);
+                    try self.write("[");
+                    try self.emitBinOffset(bri.offset);
+                    try self.write("]");
+                    if (bri.bit_offset > 0) {
+                        try self.write(" >> ");
+                        try self.writeInt(@intCast(bri.bit_offset));
+                    }
+                    try self.write(");\n");
+                }
+            },
+            .bin_read_float => |brf| {
+                // @as(f64, @bitCast(std.mem.readInt(u64, data[off..][0..8], .big)))
+                try self.writeIndent();
+                try self.writeDestLocal(brf.dest);
+                const byte_count = brf.bits / 8;
+                const float_type = try std.fmt.allocPrint(self.allocator, "f{d}", .{brf.bits});
+                const int_type = try std.fmt.allocPrint(self.allocator, "u{d}", .{brf.bits});
+                try self.write(": ");
+                try self.write(float_type);
+                try self.write(" = @bitCast(std.mem.readInt(");
+                try self.write(int_type);
+                try self.write(", ");
+                try self.writeLocal(brf.source);
+                try self.write("[");
+                try self.emitBinOffset(brf.offset);
+                try self.write("..][0..");
+                try self.writeInt(@intCast(byte_count));
+                try self.write("], .");
+                try self.write(switch (brf.endianness) {
+                    .big => "big",
+                    .little => "little",
+                    .native => "native",
+                });
+                try self.write("));\n");
+            },
+            .bin_slice => |bs| {
+                try self.writeIndent();
+                try self.writeDestLocal(bs.dest);
+                try self.write(" = ");
+                try self.writeLocal(bs.source);
+                try self.write("[");
+                try self.emitBinOffset(bs.offset);
+                if (bs.length) |len| {
+                    try self.write("..][0..");
+                    try self.emitBinOffset(len);
+                    try self.write("]");
+                } else {
+                    try self.write("..]");
+                }
+                try self.write(";\n");
+            },
+            .bin_read_utf8 => |bru| {
+                // const len = std.unicode.utf8ByteSequenceLength(data[off]) catch 1;
+                // const codepoint = std.unicode.utf8Decode(data[off..][0..len]) catch 0xFFFD;
+                try self.writeIndent();
+                try self.writeDestLocal(bru.dest_len);
+                try self.write(" = std.unicode.utf8ByteSequenceLength(");
+                try self.writeLocal(bru.source);
+                try self.write("[");
+                try self.emitBinOffset(bru.offset);
+                try self.write("]) catch 1;\n");
+                try self.writeIndent();
+                try self.writeDestLocal(bru.dest_codepoint);
+                try self.write(" = std.unicode.utf8Decode(");
+                try self.writeLocal(bru.source);
+                try self.write("[");
+                try self.emitBinOffset(bru.offset);
+                try self.write("..][0..");
+                try self.writeLocal(bru.dest_len);
+                try self.write("]) catch 0xFFFD;\n");
+            },
+            .bin_match_prefix => |bmp| {
+                // __local_N = data.len >= 4 and std.mem.eql(u8, data[0..4], "GET ");
+                try self.writeIndent();
+                try self.writeDestLocal(bmp.dest);
+                try self.write(" = ");
+                try self.writeLocal(bmp.source);
+                try self.write(".len >= ");
+                try self.writeInt(@intCast(bmp.expected.len));
+                try self.write(" and std.mem.eql(u8, ");
+                try self.writeLocal(bmp.source);
+                try self.write("[0..");
+                try self.writeInt(@intCast(bmp.expected.len));
+                try self.write("], \"");
+                try self.write(bmp.expected);
+                try self.write("\");\n");
+            },
             else => {
                 try self.writeIndent();
                 try self.write("// unhandled instruction\n");
@@ -1243,6 +1398,13 @@ pub const CodeGen = struct {
     // ============================================================
     // Type emission
     // ============================================================
+
+    fn emitBinOffset(self: *CodeGen, offset: ir.BinOffset) !void {
+        switch (offset) {
+            .static => |s| try self.writeInt(@intCast(s)),
+            .dynamic => |d| try self.writeLocal(d),
+        }
+    }
 
     fn emitZigType(self: *CodeGen, zig_type: *const ir.ZigType) !void {
         switch (zig_type.*) {

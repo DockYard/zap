@@ -1589,6 +1589,220 @@ test "def main inside defmodule emits pub fn main" {
     try expectNotContains(output, "App__main");
 }
 
+test "binary pattern matching extracts bytes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Binary do
+        \\  def first_byte(<<a, _b, _c>>) do
+        \\    a
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    // Should emit std.mem.readInt for byte extraction
+    try expectContains(output, "std.mem.readInt(u8,");
+}
+
+test "binary pattern with u16 type spec" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Binary do
+        \\  def parse_port(<<port::u16>>) do
+        \\    port
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, "std.mem.readInt(u16,");
+}
+
+test "binary pattern with String rest" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Binary do
+        \\  def parse_header(<<tag::u8, rest::String>>) do
+        \\    {tag, rest}
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    // Should extract a u8 then slice the rest
+    try expectContains(output, "std.mem.readInt(u8,");
+}
+
+test "binary pattern with float extraction" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Binary do
+        \\  def parse_coord(<<lat::f64, lon::f64>>) do
+        \\    {lat, lon}
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    // Should emit @bitCast for float extraction
+    try expectContains(output, "@bitCast(std.mem.readInt(u64,");
+}
+
+test "binary pattern with endianness" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Binary do
+        \\  def parse_le(<<val::u32-little>>) do
+        \\    val
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, ".little");
+}
+
+test "binary pattern emits length check" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Binary do
+        \\  def parse_port(<<port::u16>>) do
+        \\    port
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    // Should emit a length check before extraction
+    try expectContains(output, ".len >= 2");
+}
+
+test "binary pattern with string prefix match" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule HTTP do
+        \\  def parse_method(<<"GET "::String, path::String>>) do
+        \\    path
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    // Should emit std.mem.eql for prefix matching
+    try expectContains(output, "std.mem.eql(u8,");
+    try expectContains(output, "\"GET \"");
+}
+
+test "binary pattern sub-byte extraction" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Flags do
+        \\  def parse_flags(<<syn::u1, ack::u1, fin::u1, _reserved::u5>>) do
+        \\    {syn, ack, fin}
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    // Should emit @truncate with bit shifts for sub-byte extraction
+    try expectContains(output, "@truncate(");
+    try expectContains(output, ">> 7");  // syn: bit 7
+    try expectContains(output, ">> 6");  // ack: bit 6
+    try expectContains(output, ">> 5");  // fin: bit 5
+}
+
+test "binary pattern in case emits length check" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Binary patterns in case expressions emit length checks via check_binary
+    const source =
+        \\defmodule Binary do
+        \\  def parse(data) do
+        \\    case data do
+        \\      <<_a, _b>> -> 1
+        \\      _ -> 0
+        \\    end
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, ".len >= 2");
+}
+
+test "lexer tokenizes angle brackets" {
+    const Lexer = @import("lexer.zig").Lexer;
+    const Token = @import("token.zig").Token;
+
+    const source = "<<1, 2>>";
+    var lexer = Lexer.init(source);
+
+    const t1 = lexer.next();
+    try std.testing.expectEqual(Token.Tag.left_angle_angle, t1.tag);
+
+    // 1
+    const t2 = lexer.next();
+    try std.testing.expectEqual(Token.Tag.int_literal, t2.tag);
+
+    // ,
+    const t3 = lexer.next();
+    try std.testing.expectEqual(Token.Tag.comma, t3.tag);
+
+    // 2
+    const t4 = lexer.next();
+    try std.testing.expectEqual(Token.Tag.int_literal, t4.tag);
+
+    // >>
+    const t5 = lexer.next();
+    try std.testing.expectEqual(Token.Tag.right_angle_angle, t5.tag);
+}
+
+test "hex literal parsing" {
+    const Lexer = @import("lexer.zig").Lexer;
+    const Token = @import("token.zig").Token;
+
+    const source = "0xFF 0x00 0xDEAD";
+    var lexer = Lexer.init(source);
+
+    const t1 = lexer.next();
+    try std.testing.expectEqual(Token.Tag.int_literal, t1.tag);
+    try std.testing.expectEqualStrings("0xFF", t1.slice(source));
+
+    const t2 = lexer.next();
+    try std.testing.expectEqual(Token.Tag.int_literal, t2.tag);
+    try std.testing.expectEqualStrings("0x00", t2.slice(source));
+
+    const t3 = lexer.next();
+    try std.testing.expectEqual(Token.Tag.int_literal, t3.tag);
+    try std.testing.expectEqualStrings("0xDEAD", t3.slice(source));
+}
+
 test "multiline struct literal parses correctly" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

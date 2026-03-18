@@ -1295,6 +1295,7 @@ pub const Parser = struct {
             .left_bracket => return self.parseListExpr(),
             .percent_brace => return self.parseMapExpr(),
             .percent => return self.parseStructExpr(),
+            .left_angle_angle => return self.parseBinaryExpr(),
             .keyword_if => return self.parseIfExpr(),
             .keyword_case => return self.parseCaseExpr(),
             .keyword_with => return self.parseWithExpr(),
@@ -1351,7 +1352,7 @@ pub const Parser = struct {
     fn parseIntLiteral(self: *Parser) !*const ast.Expr {
         const tok = self.advance();
         const text = self.stripNumericUnderscores(tok.slice(self.source));
-        const value = std.fmt.parseInt(i64, text, 10) catch 0;
+        const value = std.fmt.parseInt(i64, text, 0) catch 0;
         return self.create(ast.Expr, .{
             .int_literal = .{ .meta = .{ .span = ast.SourceSpan.from(tok.loc) }, .value = value },
         });
@@ -2035,7 +2036,7 @@ pub const Parser = struct {
             .int_literal => {
                 const tok = self.advance();
                 const text = self.stripNumericUnderscores(tok.slice(self.source));
-                const value = std.fmt.parseInt(i64, text, 10) catch 0;
+                const value = std.fmt.parseInt(i64, text, 0) catch 0;
                 return self.create(ast.Pattern, .{
                     .literal = .{ .int = .{
                         .meta = .{ .span = ast.SourceSpan.from(tok.loc) },
@@ -2104,6 +2105,7 @@ pub const Parser = struct {
             .left_bracket => return self.parseListPattern(),
             .percent_brace => return self.parseMapPattern(),
             .percent => return self.parseStructPattern(),
+            .left_angle_angle => return self.parseBinaryPattern(),
             .caret => return self.parsePinPattern(),
             .left_paren => return self.parseParenPattern(),
             .minus => {
@@ -2112,7 +2114,7 @@ pub const Parser = struct {
                 if (self.check(.int_literal)) {
                     const tok = self.advance();
                     const text = self.stripNumericUnderscores(tok.slice(self.source));
-                    const value = std.fmt.parseInt(i64, text, 10) catch 0;
+                    const value = std.fmt.parseInt(i64, text, 0) catch 0;
                     return self.create(ast.Pattern, .{
                         .literal = .{ .int = .{
                             .meta = .{ .span = ast.SourceSpan.merge(start, ast.SourceSpan.from(tok.loc)) },
@@ -2302,6 +2304,171 @@ pub const Parser = struct {
                 .inner = inner,
             },
         });
+    }
+
+    // ============================================================
+    // Binary expression/pattern parsing
+    // ============================================================
+
+    fn parseBinaryExpr(self: *Parser) !*const ast.Expr {
+        const start = self.currentSpan();
+        _ = try self.expect(.left_angle_angle);
+
+        var segments: std.ArrayList(ast.BinarySegment) = .empty;
+
+        if (!self.check(.right_angle_angle)) {
+            while (true) {
+                const seg = try self.parseBinarySegment(.expr);
+                try segments.append(self.allocator, seg);
+                if (!self.match(.comma)) break;
+            }
+        }
+
+        _ = try self.expect(.right_angle_angle);
+
+        return self.create(ast.Expr, .{
+            .binary_literal = .{
+                .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
+                .segments = try segments.toOwnedSlice(self.allocator),
+            },
+        });
+    }
+
+    fn parseBinaryPattern(self: *Parser) !*const ast.Pattern {
+        const start = self.currentSpan();
+        _ = try self.expect(.left_angle_angle);
+
+        var segments: std.ArrayList(ast.BinarySegment) = .empty;
+
+        if (!self.check(.right_angle_angle)) {
+            while (true) {
+                const seg = try self.parseBinarySegment(.pattern);
+                try segments.append(self.allocator, seg);
+                if (!self.match(.comma)) break;
+            }
+        }
+
+        _ = try self.expect(.right_angle_angle);
+
+        return self.create(ast.Pattern, .{
+            .binary = .{
+                .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
+                .segments = try segments.toOwnedSlice(self.allocator),
+            },
+        });
+    }
+
+    const BinarySegmentContext = enum { expr, pattern };
+
+    fn parseBinarySegment(self: *Parser, context: BinarySegmentContext) !ast.BinarySegment {
+        const seg_start = self.currentSpan();
+
+        // Parse value: could be a string literal (prefix match), int literal, or identifier (variable/wildcard)
+        const value: ast.BinarySegmentValue = blk: {
+            if (self.check(.string_literal)) {
+                // String literal in binary: <<"GET "::String, rest::String>>
+                const tok = self.advance();
+                const raw = tok.slice(self.source);
+                const str_val = if (raw.len >= 2) raw[1 .. raw.len - 1] else raw;
+                break :blk .{ .string_literal = try self.interner.intern(str_val) };
+            }
+            if (context == .pattern) {
+                break :blk .{ .pattern = try self.parsePattern() };
+            } else {
+                break :blk .{ .expr = try self.parseExpr() };
+            }
+        };
+
+        // Parse optional ::type-endianness-size(n) specifier
+        var type_spec: ast.BinarySegmentType = .default;
+        var endianness: ast.Endianness = .big;
+        var size: ?ast.BinarySegmentSize = null;
+
+        if (self.check(.double_colon)) {
+            _ = self.advance(); // consume ::
+
+            // Parse type specifier from identifier
+            if (self.check(.identifier) or self.check(.module_identifier)) {
+                const type_tok = self.advance();
+                const type_text = type_tok.slice(self.source);
+                type_spec = parseBinaryTypeSpec(type_text);
+
+                // Parse optional endianness: -big, -little, -native
+                if (self.check(.minus)) {
+                    _ = self.advance();
+                    if (self.check(.identifier)) {
+                        const end_tok = self.advance();
+                        const end_text = end_tok.slice(self.source);
+                        if (std.mem.eql(u8, end_text, "big")) {
+                            endianness = .big;
+                        } else if (std.mem.eql(u8, end_text, "little")) {
+                            endianness = .little;
+                        } else if (std.mem.eql(u8, end_text, "native")) {
+                            endianness = .native;
+                        } else if (std.mem.eql(u8, end_text, "size")) {
+                            // String-size(n) syntax
+                            _ = try self.expect(.left_paren);
+                            size = try self.parseBinarySize();
+                            _ = try self.expect(.right_paren);
+                        }
+                    }
+                }
+            }
+        }
+
+        return .{
+            .meta = .{ .span = ast.SourceSpan.merge(seg_start, self.previousSpan()) },
+            .value = value,
+            .type_spec = type_spec,
+            .endianness = endianness,
+            .size = size,
+        };
+    }
+
+    fn parseBinarySize(self: *Parser) !ast.BinarySegmentSize {
+        if (self.check(.int_literal)) {
+            const tok = self.advance();
+            const text = self.stripNumericUnderscores(tok.slice(self.source));
+            const value = std.fmt.parseInt(u32, text, 0) catch 0;
+            return .{ .literal = value };
+        }
+        if (self.check(.identifier)) {
+            const tok = self.advance();
+            return .{ .variable = try self.internToken(tok) };
+        }
+        try self.addRichError(
+            "I was expecting a size value (number or variable)",
+            self.currentSpan(),
+            null,
+            "e.g., `size(4)` or `size(length)`",
+        );
+        return error.ParseError;
+    }
+
+    fn parseBinaryTypeSpec(text: []const u8) ast.BinarySegmentType {
+        // Integer types: u8, u16, u32, u64, i8, i16, i32, i64, and arbitrary widths
+        if (text.len >= 2 and (text[0] == 'u' or text[0] == 'i')) {
+            const signed = text[0] == 'i';
+            if (std.fmt.parseInt(u16, text[1..], 10)) |bits| {
+                return .{ .integer = .{ .signed = signed, .bits = bits } };
+            } else |_| {}
+        }
+        // Float types: f16, f32, f64
+        if (text.len >= 2 and text[0] == 'f') {
+            if (std.fmt.parseInt(u16, text[1..], 10)) |bits| {
+                if (bits == 16 or bits == 32 or bits == 64) {
+                    return .{ .float = .{ .bits = bits } };
+                }
+            } else |_| {}
+        }
+        // String type
+        if (std.mem.eql(u8, text, "String")) return .string;
+        // UTF types
+        if (std.mem.eql(u8, text, "utf8")) return .utf8;
+        if (std.mem.eql(u8, text, "utf16")) return .utf16;
+        if (std.mem.eql(u8, text, "utf32")) return .utf32;
+        // Default to u8 for unknown types
+        return .default;
     }
 
     // ============================================================
@@ -2675,6 +2842,11 @@ pub const Parser = struct {
             .nil_literal => |v| {
                 return self.create(ast.Pattern, .{ .literal = .{ .nil = .{ .meta = v.meta } } });
             },
+            .binary_literal => |v| {
+                return self.create(ast.Pattern, .{
+                    .binary = .{ .meta = v.meta, .segments = v.segments },
+                });
+            },
             else => {
                 try self.addError("invalid pattern", expr.getMeta().span);
                 return error.ParseError;
@@ -2749,6 +2921,8 @@ fn tokenHumanName(tag: Token.Tag) []const u8 {
         .star => "`*`",
         .slash => "`/`",
         .diamond => "`<>`",
+        .left_angle_angle => "`<<`",
+        .right_angle_angle => "`>>`",
         .bang => "`!`",
         .caret => "`^`",
         .at_sign => "`@`",

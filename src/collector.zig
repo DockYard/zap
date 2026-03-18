@@ -454,6 +454,14 @@ pub const Collector = struct {
             .paren => |p| {
                 try self.collectPatternBindings(p.inner, scope_id);
             },
+            .binary => |bin| {
+                for (bin.segments) |seg| {
+                    switch (seg.value) {
+                        .pattern => |pat| try self.collectPatternBindings(pat, scope_id),
+                        .expr, .string_literal => {},
+                    }
+                }
+            },
             .wildcard, .literal, .pin => {},
         }
     }

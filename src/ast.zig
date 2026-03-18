@@ -303,6 +303,9 @@ pub const Expr = union(enum) {
     // Intrinsics
     intrinsic: IntrinsicExpr,
 
+    // Binary literal: <<1, 2, 3>>
+    binary_literal: BinaryLiteral,
+
     // Type annotation on expression: expr :: Type
     type_annotated: TypeAnnotatedExpr,
 
@@ -336,6 +339,7 @@ pub const Expr = union(enum) {
             .panic_expr => |v| v.meta,
             .block => |v| v.meta,
             .intrinsic => |v| v.meta,
+            .binary_literal => |v| v.meta,
             .type_annotated => |v| v.meta,
         };
     }
@@ -585,6 +589,7 @@ pub const Pattern = union(enum) {
     struct_pattern: StructPattern,
     pin: PinPattern,
     paren: ParenPattern,
+    binary: BinaryPattern,
 
     pub fn getMeta(self: *const Pattern) NodeMeta {
         return switch (self.*) {
@@ -598,6 +603,7 @@ pub const Pattern = union(enum) {
             .struct_pattern => |v| v.meta,
             .pin => |v| v.meta,
             .paren => |v| v.meta,
+            .binary => |v| v.meta,
         };
     }
 };
@@ -676,6 +682,55 @@ pub const PinPattern = struct {
 pub const ParenPattern = struct {
     meta: NodeMeta,
     inner: *const Pattern,
+};
+
+// ============================================================
+// Binary pattern matching types
+// ============================================================
+
+pub const Endianness = enum {
+    big,
+    little,
+    native,
+};
+
+pub const BinarySegmentType = union(enum) {
+    default, // bare value → u8
+    integer: struct { signed: bool, bits: u16 },
+    float: struct { bits: u16 },
+    string,
+    utf8,
+    utf16,
+    utf32,
+};
+
+pub const BinarySegmentSize = union(enum) {
+    literal: u32,
+    variable: StringId,
+};
+
+pub const BinarySegmentValue = union(enum) {
+    expr: *const Expr,
+    pattern: *const Pattern,
+    string_literal: StringId,
+};
+
+pub const BinarySegment = struct {
+    meta: NodeMeta,
+    value: BinarySegmentValue,
+    type_spec: BinarySegmentType,
+    endianness: Endianness,
+    size: ?BinarySegmentSize,
+};
+
+pub const BinaryLiteral = struct {
+    meta: NodeMeta,
+    segments: []const BinarySegment,
+};
+
+pub const BinaryPattern = struct {
+    meta: NodeMeta,
+    segments: []const BinarySegment,
 };
 
 // ============================================================

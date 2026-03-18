@@ -487,6 +487,7 @@ pub const MacroEngine = struct {
             .field_access,
             .panic_expr,
             .intrinsic,
+            .binary_literal,
             => return .{ .expr = expr, .changed = false },
         }
     }
