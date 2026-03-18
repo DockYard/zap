@@ -123,6 +123,7 @@ pub const Instruction = union(enum) {
     call_closure: CallClosure,
     call_dispatch: CallDispatch,
     call_builtin: CallBuiltin,
+    tail_call: TailCall,
 
     // Control flow
     if_expr: IfExpr,
@@ -336,6 +337,11 @@ pub const CallDirect = struct {
 
 pub const CallNamed = struct {
     dest: LocalId,
+    name: []const u8,
+    args: []const LocalId,
+};
+
+pub const TailCall = struct {
     name: []const u8,
     args: []const LocalId,
 };
@@ -928,10 +934,7 @@ pub const IrBuilder = struct {
             try self.lowerDecisionTreeForDispatch(decision, group.clauses, &scrutinee_map);
         }
 
-        const entry_block = Block{
-            .label = 0,
-            .instructions = try self.current_instrs.toOwnedSlice(self.allocator),
-        };
+        var entry_instrs: []const Instruction = try self.current_instrs.toOwnedSlice(self.allocator);
 
         const raw_name = if (group.name < self.interner.strings.items.len)
             self.interner.get(group.name)
@@ -973,6 +976,14 @@ pub const IrBuilder = struct {
                 }
             }
         }
+
+        // Rewrite tail-recursive calls: replace call_named + ret/break with tail_call
+        entry_instrs = try self.rewriteTailCalls(entry_instrs, name_str);
+
+        const entry_block = Block{
+            .label = 0,
+            .instructions = entry_instrs,
+        };
 
         const final_params = try params.toOwnedSlice(self.allocator);
         try self.functions.append(self.allocator, .{
@@ -1095,6 +1106,98 @@ pub const IrBuilder = struct {
                 }
             }
         }
+    }
+
+    /// Rewrite tail-recursive calls in a function's instruction list.
+    /// Scans for patterns where the last operation before a return/break is a
+    /// recursive call to the same function, and replaces them with tail_call.
+    fn rewriteTailCalls(self: *IrBuilder, instrs: []const Instruction, func_name: []const u8) ![]const Instruction {
+        var result: std.ArrayList(Instruction) = .empty;
+        for (instrs) |instr| {
+            switch (instr) {
+                .switch_return => |sr| {
+                    // Rewrite tail calls inside switch_return cases
+                    var new_cases: std.ArrayList(ReturnCase) = .empty;
+                    for (sr.cases) |case| {
+                        const new_body = try self.rewriteTailCallsInBody(case.body_instrs, case.return_value, func_name);
+                        if (new_body.rewritten) {
+                            try new_cases.append(self.allocator, .{
+                                .value = case.value,
+                                .body_instrs = new_body.instrs,
+                                .return_value = null, // tail_call handles the return
+                            });
+                        } else {
+                            try new_cases.append(self.allocator, case);
+                        }
+                    }
+                    // Also check default arm
+                    const new_default = try self.rewriteTailCallsInBody(sr.default_instrs, sr.default_result, func_name);
+                    try result.append(self.allocator, .{
+                        .switch_return = .{
+                            .scrutinee_param = sr.scrutinee_param,
+                            .cases = try new_cases.toOwnedSlice(self.allocator),
+                            .default_instrs = if (new_default.rewritten) new_default.instrs else sr.default_instrs,
+                            .default_result = if (new_default.rewritten) null else sr.default_result,
+                        },
+                    });
+                },
+                .ret => |r| {
+                    // Check if the previous instruction is a recursive call
+                    if (result.items.len > 0) {
+                        const prev = &result.items[result.items.len - 1];
+                        if (prev.* == .call_named) {
+                            const cn = prev.call_named;
+                            if (std.mem.eql(u8, cn.name, func_name)) {
+                                if (r.value != null and r.value.? == cn.dest) {
+                                    // Replace: call_named + ret → tail_call
+                                    prev.* = .{ .tail_call = .{
+                                        .name = cn.name,
+                                        .args = cn.args,
+                                    } };
+                                    continue; // skip the ret
+                                }
+                            }
+                        }
+                    }
+                    try result.append(self.allocator, instr);
+                },
+                else => try result.append(self.allocator, instr),
+            }
+        }
+        return try result.toOwnedSlice(self.allocator);
+    }
+
+    const TailCallRewrite = struct {
+        instrs: []const Instruction,
+        rewritten: bool,
+    };
+
+    fn rewriteTailCallsInBody(
+        self: *IrBuilder,
+        body: []const Instruction,
+        return_value: ?LocalId,
+        func_name: []const u8,
+    ) !TailCallRewrite {
+        if (body.len == 0 or return_value == null) return .{ .instrs = body, .rewritten = false };
+
+        // Check if the last instruction is a call_named to ourselves
+        // and the return_value matches the call's dest
+        const last = body[body.len - 1];
+        if (last == .call_named) {
+            const cn = last.call_named;
+            if (std.mem.eql(u8, cn.name, func_name) and cn.dest == return_value.?) {
+                // Replace the call with tail_call, drop the return_value
+                var new_body: std.ArrayList(Instruction) = .empty;
+                for (body[0 .. body.len - 1]) |bi| {
+                    try new_body.append(self.allocator, bi);
+                }
+                try new_body.append(self.allocator, .{
+                    .tail_call = .{ .name = cn.name, .args = cn.args },
+                });
+                return .{ .instrs = try new_body.toOwnedSlice(self.allocator), .rewritten = true };
+            }
+        }
+        return .{ .instrs = body, .rewritten = false };
     }
 
     /// Check if multi-clause function can emit switch_return for integer literals.

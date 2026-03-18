@@ -229,6 +229,9 @@ pub const CodeGen = struct {
             .call_dispatch => |cd_disp| {
                 for (cd_disp.args) |arg| self.referenced_locals.append(self.allocator, arg) catch {};
             },
+            .tail_call => |tc| {
+                for (tc.args) |arg| self.referenced_locals.append(self.allocator, arg) catch {};
+            },
             .call_builtin => |cb| {
                 for (cb.args) |arg| self.referenced_locals.append(self.allocator, arg) catch {};
             },
@@ -558,6 +561,18 @@ pub const CodeGen = struct {
                 }
                 try self.write(");\n");
             },
+            .tail_call => |tc| {
+                // Emit: return @call(.always_tail, func, .{args});
+                try self.writeIndent();
+                try self.write("return @call(.always_tail, ");
+                try self.write(tc.name);
+                try self.write(", .{");
+                for (tc.args, 0..) |arg, i| {
+                    if (i > 0) try self.write(", ");
+                    try self.writeLocal(arg);
+                }
+                try self.write("});\n");
+            },
             .match_atom => |ma| {
                 try self.writeIndent();
                 try self.writeDestLocal(ma.dest);
@@ -851,23 +866,33 @@ pub const CodeGen = struct {
                 self.indent_level += 1;
 
                 for (sr.cases, 0..) |case, case_i| {
+                    // Check if case body ends with tail_call (no label needed)
+                    const has_tail_call = case.body_instrs.len > 0 and
+                        case.body_instrs[case.body_instrs.len - 1] == .tail_call;
+
                     try self.writeIndent();
                     try self.emitLiteralValue(&case.value);
                     try self.write(" => ");
-                    const case_label = try std.fmt.allocPrint(self.allocator, "blk_sw_{d}", .{case_i});
-                    try self.write(case_label);
-                    try self.write(": {\n");
+                    if (!has_tail_call) {
+                        const case_label = try std.fmt.allocPrint(self.allocator, "blk_sw_{d}", .{case_i});
+                        try self.write(case_label);
+                        try self.write(": ");
+                    }
+                    try self.write("{\n");
                     self.indent_level += 1;
                     for (case.body_instrs) |sub_instr| {
                         try self.emitInstruction(&sub_instr);
                     }
-                    if (case.return_value) |r| {
-                        try self.writeIndent();
-                        try self.write("break :");
-                        try self.write(case_label);
-                        try self.write(" ");
-                        try self.writeLocal(r);
-                        try self.write(";\n");
+                    if (!has_tail_call) {
+                        const case_label2 = try std.fmt.allocPrint(self.allocator, "blk_sw_{d}", .{case_i});
+                        if (case.return_value) |r| {
+                            try self.writeIndent();
+                            try self.write("break :");
+                            try self.write(case_label2);
+                            try self.write(" ");
+                            try self.writeLocal(r);
+                            try self.write(";\n");
+                        }
                     }
                     self.indent_level -= 1;
                     try self.writeIndent();
@@ -875,17 +900,25 @@ pub const CodeGen = struct {
                 }
 
                 // else (default)
+                const default_has_tail_call = sr.default_instrs.len > 0 and
+                    sr.default_instrs[sr.default_instrs.len - 1] == .tail_call;
                 try self.writeIndent();
-                try self.write("else => blk_sw_else: {\n");
+                if (!default_has_tail_call) {
+                    try self.write("else => blk_sw_else: {\n");
+                } else {
+                    try self.write("else => {\n");
+                }
                 self.indent_level += 1;
                 for (sr.default_instrs) |sub_instr| {
                     try self.emitInstruction(&sub_instr);
                 }
-                if (sr.default_result) |r| {
-                    try self.writeIndent();
-                    try self.write("break :blk_sw_else ");
-                    try self.writeLocal(r);
-                    try self.write(";\n");
+                if (!default_has_tail_call) {
+                    if (sr.default_result) |r| {
+                        try self.writeIndent();
+                        try self.write("break :blk_sw_else ");
+                        try self.writeLocal(r);
+                        try self.write(";\n");
+                    }
                 }
                 self.indent_level -= 1;
                 try self.writeIndent();
