@@ -15,6 +15,6 @@ defmodule Counter do
 end
 
 def main() do
-  Counter.countdown(10000000)
+  Counter.countdown(100_000_000)
   |> Kernel.inspect()
 end
