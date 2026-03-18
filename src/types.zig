@@ -573,7 +573,21 @@ pub const TypeChecker = struct {
             switch (item) {
                 .function => |func| try self.checkFunctionDecl(func),
                 .priv_function => |func| try self.checkFunctionDecl(func),
-                .macro => |mac| try self.checkFunctionDecl(mac),
+                .macro => |mac| {
+                    // Mark macro params as referenced — they're used in quote/unquote,
+                    // not via normal var_ref, so the unused-binding check can't see them.
+                    for (mac.clauses) |clause| {
+                        const macro_scope = self.graph.node_scope_map.get(clause.meta.span.start) orelse clause.meta.scope_id;
+                        for (clause.params) |param| {
+                            if (param.pattern.* == .bind) {
+                                if (self.graph.resolveBinding(macro_scope, param.pattern.bind.name)) |bid| {
+                                    try self.referenced_bindings.put(bid, {});
+                                }
+                            }
+                        }
+                    }
+                    try self.checkFunctionDecl(mac);
+                },
                 else => {},
             }
         }
