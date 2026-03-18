@@ -2193,7 +2193,7 @@ fn typeIdToZigTypeWithStore(type_id: types_mod.TypeId, type_store: ?*const types
         types_mod.TypeStore.USIZE => .usize,
         types_mod.TypeStore.ISIZE => .isize,
         else => {
-            // Try to resolve user-defined struct/enum/union types
+            // Try to resolve user-defined struct/enum types
             if (type_store) |ts| {
                 if (type_id < ts.types.items.len) {
                     const typ = ts.types.items[type_id];
@@ -2203,27 +2203,6 @@ fn typeIdToZigTypeWithStore(type_id: types_mod.TypeId, type_store: ?*const types
                         },
                         .enum_type => |et| {
                             return .{ .struct_ref = ts.interner.get(et.name) };
-                        },
-                        .union_type => |ut| {
-                            // T | nil → optional(?T)
-                            var non_nil_type: ?ZigType = null;
-                            var has_nil = false;
-                            for (ut.members) |member| {
-                                if (member == types_mod.TypeStore.NIL) {
-                                    has_nil = true;
-                                } else {
-                                    non_nil_type = typeIdToZigTypeWithStore(member, type_store);
-                                }
-                            }
-                            if (has_nil) {
-                                if (non_nil_type) |inner| {
-                                    const heap_inner = ts.allocator.create(ZigType) catch return .any;
-                                    heap_inner.* = inner;
-                                    return .{ .optional = heap_inner };
-                                }
-                                return .nil;
-                            }
-                            return .any;
                         },
                         else => {},
                     }
@@ -2259,7 +2238,7 @@ fn typeIdToZigTypeStrWithStore(type_id: types_mod.TypeId, type_store: ?*const ty
         types_mod.TypeStore.USIZE => "usize",
         types_mod.TypeStore.ISIZE => "isize",
         else => {
-            // Try to resolve user-defined struct/enum/union types
+            // Try to resolve user-defined struct/enum types
             if (type_store) |ts| {
                 if (type_id < ts.types.items.len) {
                     const typ = ts.types.items[type_id];
@@ -2269,25 +2248,6 @@ fn typeIdToZigTypeStrWithStore(type_id: types_mod.TypeId, type_store: ?*const ty
                         },
                         .enum_type => |et| {
                             return ts.interner.get(et.name);
-                        },
-                        .union_type => |ut| {
-                            // T | nil → ?T
-                            var non_nil_str: ?[]const u8 = null;
-                            var has_nil = false;
-                            for (ut.members) |member| {
-                                if (member == types_mod.TypeStore.NIL) {
-                                    has_nil = true;
-                                } else {
-                                    non_nil_str = typeIdToZigTypeStrWithStore(member, type_store);
-                                }
-                            }
-                            if (has_nil) {
-                                if (non_nil_str) |inner| {
-                                    return std.fmt.allocPrint(ts.allocator, "?{s}", .{inner}) catch "anytype";
-                                }
-                                return "?void";
-                            }
-                            return "anytype";
                         },
                         else => {},
                     }

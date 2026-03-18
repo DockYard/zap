@@ -4,7 +4,7 @@ defmodule PatternMatch do
   end
 
   def describe(0 :: i64) :: String do
-    "zero"
+    "zero
   end
 
   def describe(:ok) :: String do

@@ -1834,8 +1834,6 @@ pub const HirBuilder = struct {
         return switch (type_expr.*) {
             .name => |n| {
                 const name_str = self.interner.get(n.name);
-                // Handle nil as a type name (lowercase)
-                if (std.mem.eql(u8, name_str, "nil")) return types_mod.TypeStore.NIL;
                 // First check builtins
                 if (self.type_store.resolveTypeName(name_str)) |id| return id;
                 // Then check user-defined types (struct/enum) from scope graph
@@ -1846,24 +1844,6 @@ pub const HirBuilder = struct {
                     _ = scope_type_id;
                 }
                 return types_mod.TypeStore.UNKNOWN;
-            },
-            .union_type => |ut| {
-                var member_types: std.ArrayList(types_mod.TypeId) = .empty;
-                for (ut.members) |member| {
-                    member_types.append(self.allocator, self.resolveTypeExpr(member)) catch return types_mod.TypeStore.UNKNOWN;
-                }
-                const mutable_store = @constCast(self.type_store);
-                return mutable_store.addType(.{
-                    .union_type = .{ .members = member_types.toOwnedSlice(self.allocator) catch return types_mod.TypeStore.UNKNOWN },
-                }) catch types_mod.TypeStore.UNKNOWN;
-            },
-            .literal => |lt| {
-                return switch (lt.value) {
-                    .int => types_mod.TypeStore.I64,
-                    .string => types_mod.TypeStore.STRING,
-                    .bool_val => types_mod.TypeStore.BOOL,
-                    .nil => types_mod.TypeStore.NIL,
-                };
             },
             .never => types_mod.TypeStore.NEVER,
             .paren => |p| self.resolveTypeExpr(p.inner),

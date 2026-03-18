@@ -436,14 +436,11 @@ pub const CodeGen = struct {
                 try self.write(";\n");
             },
             .local_set => |ls| {
-                // Skip self-assignment (happens when struct init result local == variable local)
-                if (ls.dest != ls.value) {
-                    try self.writeIndent();
-                    try self.writeDestLocal(ls.dest);
-                    try self.write(" = ");
-                    try self.writeLocal(ls.value);
-                    try self.write(";\n");
-                }
+                try self.writeIndent();
+                try self.writeDestLocal(ls.dest);
+                try self.write(" = ");
+                try self.writeLocal(ls.value);
+                try self.write(";\n");
             },
             .param_get => |pg| {
                 try self.writeIndent();
@@ -796,33 +793,22 @@ pub const CodeGen = struct {
                     try self.write("},\n");
                 }
 
-                // else (default) — skip if cases are exhaustive (e.g., bool true+false)
-                var has_true = false;
-                var has_false = false;
-                for (sl.cases) |case| {
-                    if (case.value == .bool_val) {
-                        if (case.value.bool_val) has_true = true else has_false = true;
-                    }
+                // else (default)
+                try self.writeIndent();
+                try self.write("else => blk_sw_else: {\n");
+                self.indent_level += 1;
+                for (sl.default_instrs) |sub_instr| {
+                    try self.emitInstruction(&sub_instr);
                 }
-                const exhaustive = has_true and has_false;
-
-                if (!exhaustive) {
+                if (sl.default_result) |r| {
                     try self.writeIndent();
-                    try self.write("else => blk_sw_else: {\n");
-                    self.indent_level += 1;
-                    for (sl.default_instrs) |sub_instr| {
-                        try self.emitInstruction(&sub_instr);
-                    }
-                    if (sl.default_result) |r| {
-                        try self.writeIndent();
-                        try self.write("break :blk_sw_else ");
-                        try self.writeLocal(r);
-                        try self.write(";\n");
-                    }
-                    self.indent_level -= 1;
-                    try self.writeIndent();
-                    try self.write("},\n");
+                    try self.write("break :blk_sw_else ");
+                    try self.writeLocal(r);
+                    try self.write(";\n");
                 }
+                self.indent_level -= 1;
+                try self.writeIndent();
+                try self.write("},\n");
 
                 self.indent_level -= 1;
                 try self.writeIndent();

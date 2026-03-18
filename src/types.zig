@@ -194,7 +194,7 @@ pub const TypeStore = struct {
         if (std.mem.eql(u8, name, "Bool")) return BOOL;
         if (std.mem.eql(u8, name, "String")) return STRING;
         if (std.mem.eql(u8, name, "Atom")) return ATOM;
-        if (std.mem.eql(u8, name, "Nil") or std.mem.eql(u8, name, "nil")) return NIL;
+        if (std.mem.eql(u8, name, "Nil")) return NIL;
         if (std.mem.eql(u8, name, "Never")) return NEVER;
         if (std.mem.eql(u8, name, "i64")) return I64;
         if (std.mem.eql(u8, name, "i32")) return I32;
@@ -212,8 +212,7 @@ pub const TypeStore = struct {
         return null;
     }
 
-    /// Check if two types are compatible.
-    /// A concrete type satisfies a union type if it is one of the union's members.
+    /// Check if two types are the same
     pub fn typeEquals(self: *const TypeStore, a: TypeId, b: TypeId) bool {
         if (a == b) return true;
         const ta = self.getType(a);
@@ -223,18 +222,6 @@ pub const TypeStore = struct {
         if (ta == .never or tb == .never) return true;
         // Unknown matches anything (for inference)
         if (ta == .unknown or tb == .unknown) return true;
-
-        // If one side is a union type, check if the other is a member
-        if (tb == .union_type) {
-            for (tb.union_type.members) |member| {
-                if (self.typeEquals(a, member)) return true;
-            }
-        }
-        if (ta == .union_type) {
-            for (ta.union_type.members) |member| {
-                if (self.typeEquals(member, b)) return true;
-            }
-        }
 
         return false;
     }
@@ -346,7 +333,7 @@ pub const TypeChecker = struct {
     }
 
     /// Convert a TypeId to a human-readable string
-    pub fn typeToString(self: *const TypeChecker, type_id: TypeId) []const u8 {
+    pub fn typeToString(_: *const TypeChecker, type_id: TypeId) []const u8 {
         if (type_id == TypeStore.BOOL) return "Bool";
         if (type_id == TypeStore.STRING) return "String";
         if (type_id == TypeStore.ATOM) return "Atom";
@@ -367,23 +354,6 @@ pub const TypeChecker = struct {
         if (type_id == TypeStore.ISIZE) return "isize";
         if (type_id == TypeStore.UNKNOWN) return "{unknown}";
         if (type_id == TypeStore.ERROR) return "{error}";
-        // Check user-defined and compound types
-        if (type_id < self.store.types.items.len) {
-            const typ = self.store.types.items[type_id];
-            switch (typ) {
-                .struct_type => |st| return self.interner.get(st.name),
-                .enum_type => |et| return self.interner.get(et.name),
-                .union_type => |ut| {
-                    var buf: std.ArrayList(u8) = .empty;
-                    for (ut.members, 0..) |member, i| {
-                        if (i > 0) buf.appendSlice(self.allocator, " | ") catch return "{union}";
-                        buf.appendSlice(self.allocator, self.typeToString(member)) catch return "{union}";
-                    }
-                    return buf.toOwnedSlice(self.allocator) catch return "{union}";
-                },
-                else => {},
-            }
-        }
         return "{type}";
     }
 
