@@ -112,6 +112,8 @@ pub const Instruction = union(enum) {
     field_get: FieldGet,
     field_set: FieldSet,
     index_get: IndexGet,
+    list_len_check: ListLenCheck,
+    list_get: ListGet,
 
     // Arithmetic / logic
     binary_op: BinaryOp,
@@ -258,6 +260,18 @@ pub const FieldSet = struct {
 pub const IndexGet = struct {
     dest: LocalId,
     object: LocalId,
+    index: u32,
+};
+
+pub const ListLenCheck = struct {
+    dest: LocalId,
+    scrutinee: LocalId,
+    expected_len: u32,
+};
+
+pub const ListGet = struct {
+    dest: LocalId,
+    list: LocalId,
     index: u32,
 };
 
@@ -771,6 +785,9 @@ pub const IrBuilder = struct {
                     max_binding_local = @max(max_binding_local, binding.local_index + 1);
                 }
                 for (clause.struct_bindings) |binding| {
+                    max_binding_local = @max(max_binding_local, binding.local_index + 1);
+                }
+                for (clause.list_bindings) |binding| {
                     max_binding_local = @max(max_binding_local, binding.local_index + 1);
                 }
             }
@@ -1740,6 +1757,32 @@ pub const IrBuilder = struct {
                 });
                 try self.lowerDecisionTreeForCase(ct.failure, case_arms, scrutinee_map, 0);
             },
+            .check_list => |cl| {
+                const scrutinee_local = self.resolveScrutinee(cl.scrutinee, scrutinee_map);
+                const len_check_local = self.next_local;
+                self.next_local += 1;
+                try self.current_instrs.append(self.allocator, .{
+                    .list_len_check = .{ .dest = len_check_local, .scrutinee = scrutinee_local, .expected_len = cl.expected_length },
+                });
+                const saved = self.current_instrs;
+                self.current_instrs = .empty;
+                var i: u32 = 0;
+                while (i < cl.expected_length) : (i += 1) {
+                    const elem_local = self.next_local;
+                    self.next_local += 1;
+                    try self.current_instrs.append(self.allocator, .{
+                        .list_get = .{ .dest = elem_local, .list = scrutinee_local, .index = i },
+                    });
+                    try scrutinee_map.put(findParamGetIdInDecision(cl.success, i), elem_local);
+                }
+                try self.lowerDecisionTreeForCase(cl.success, case_arms, scrutinee_map, 0);
+                const success_body = try self.current_instrs.toOwnedSlice(self.allocator);
+                self.current_instrs = saved;
+                try self.current_instrs.append(self.allocator, .{
+                    .guard_block = .{ .condition = len_check_local, .body = success_body },
+                });
+                try self.lowerDecisionTreeForCase(cl.failure, case_arms, scrutinee_map, 0);
+            },
             .bind => |bind_node| {
                 // Emit binding: resolve scrutinee and assign to binding local
                 const scrutinee_local = self.resolveScrutinee(bind_node.source, scrutinee_map);
@@ -1782,6 +1825,24 @@ pub const IrBuilder = struct {
                         .index_get = .{
                             .dest = binding.local_index,
                             .object = tuple_local,
+                            .index = binding.element_index,
+                        },
+                    });
+                }
+                // Emit list element bindings
+                for (clause.list_bindings) |binding| {
+                    const list_local = scrutinee_map.get(binding.param_index) orelse blk: {
+                        const pl = self.next_local;
+                        self.next_local += 1;
+                        try self.current_instrs.append(self.allocator, .{
+                            .param_get = .{ .dest = pl, .index = binding.param_index },
+                        });
+                        break :blk pl;
+                    };
+                    try self.current_instrs.append(self.allocator, .{
+                        .list_get = .{
+                            .dest = binding.local_index,
+                            .list = list_local,
                             .index = binding.element_index,
                         },
                     });
@@ -1867,6 +1928,34 @@ pub const IrBuilder = struct {
                     .guard_block = .{ .condition = type_check_local, .body = success_body },
                 });
                 try self.lowerDecisionTreeForDispatch(ct.failure, clauses, scrutinee_map);
+            },
+            .check_list => |cl| {
+                const scrutinee_local = self.resolveScrutinee(cl.scrutinee, scrutinee_map);
+                // Emit: __local_N = scrutinee.len == expected_length
+                const len_check_local = self.next_local;
+                self.next_local += 1;
+                try self.current_instrs.append(self.allocator, .{
+                    .list_len_check = .{ .dest = len_check_local, .scrutinee = scrutinee_local, .expected_len = cl.expected_length },
+                });
+                const saved = self.current_instrs;
+                self.current_instrs = .empty;
+                // Extract list elements into locals
+                var i: u32 = 0;
+                while (i < cl.expected_length) : (i += 1) {
+                    const elem_local = self.next_local;
+                    self.next_local += 1;
+                    try self.current_instrs.append(self.allocator, .{
+                        .list_get = .{ .dest = elem_local, .list = scrutinee_local, .index = i },
+                    });
+                    try scrutinee_map.put(findParamGetIdInDecision(cl.success, i), elem_local);
+                }
+                try self.lowerDecisionTreeForDispatch(cl.success, clauses, scrutinee_map);
+                const success_body = try self.current_instrs.toOwnedSlice(self.allocator);
+                self.current_instrs = saved;
+                try self.current_instrs.append(self.allocator, .{
+                    .guard_block = .{ .condition = len_check_local, .body = success_body },
+                });
+                try self.lowerDecisionTreeForDispatch(cl.failure, clauses, scrutinee_map);
             },
             .bind => |bind_node| {
                 try self.lowerDecisionTreeForDispatch(bind_node.next, clauses, scrutinee_map);
@@ -2385,6 +2474,12 @@ fn findParamGetIdInDecision(decision: *const hir_mod.Decision, target_element: u
                 return findParamGetIdInDecision(sw.default, target_element - 1);
             }
             return findParamGetIdInDecision(sw.default, target_element);
+        },
+        .check_list => |cl| {
+            if (cl.scrutinee.kind == .param_get) {
+                return cl.scrutinee.kind.param_get;
+            }
+            return findParamGetIdInDecision(cl.success, target_element);
         },
         .guard => |g| return findParamGetIdInDecision(g.success, target_element),
         .bind => |b| {

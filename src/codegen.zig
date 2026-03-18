@@ -345,6 +345,12 @@ pub const CodeGen = struct {
             .index_get => |ig| {
                 self.referenced_locals.append(self.allocator, ig.object) catch {};
             },
+            .list_len_check => |llc| {
+                self.referenced_locals.append(self.allocator, llc.scrutinee) catch {};
+            },
+            .list_get => |lg| {
+                self.referenced_locals.append(self.allocator, lg.list) catch {};
+            },
             .optional_unwrap => |ou| {
                 self.referenced_locals.append(self.allocator, ou.source) catch {};
             },
@@ -737,6 +743,26 @@ pub const CodeGen = struct {
                 try self.writeLocal(ig.object);
                 try self.write("[");
                 try self.writeInt(@intCast(ig.index));
+                try self.write("];\n");
+            },
+            .list_len_check => |llc| {
+                // Emit: const __local_N = scrutinee.len == expected;
+                try self.writeIndent();
+                try self.writeDestLocal(llc.dest);
+                try self.write(" = ");
+                try self.writeLocal(llc.scrutinee);
+                try self.write(".len == ");
+                try self.writeInt(@intCast(llc.expected_len));
+                try self.write(";\n");
+            },
+            .list_get => |lg| {
+                // Emit: const __local_N = list[index];
+                try self.writeIndent();
+                try self.writeDestLocal(lg.dest);
+                try self.write(" = ");
+                try self.writeLocal(lg.list);
+                try self.write("[");
+                try self.writeInt(@intCast(lg.index));
                 try self.write("];\n");
             },
             .guard_block => |gb| {

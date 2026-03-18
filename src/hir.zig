@@ -51,6 +51,7 @@ pub const Clause = struct {
     refinement: ?*const Expr,
     tuple_bindings: []const TupleBinding,
     struct_bindings: []const StructBinding = &.{},
+    list_bindings: []const ListBinding = &.{},
 };
 
 pub const TupleBinding = struct {
@@ -64,6 +65,13 @@ pub const StructBinding = struct {
     name: ast.StringId,
     param_index: u32,
     field_name: ast.StringId,
+    local_index: u32,
+};
+
+pub const ListBinding = struct {
+    name: ast.StringId,
+    param_index: u32,
+    element_index: u32,
     local_index: u32,
 };
 
@@ -279,6 +287,8 @@ pub const Decision = union(enum) {
     switch_literal: SwitchLiteralNode,
     /// Check tuple arity
     check_tuple: CheckTupleNode,
+    /// Check list length
+    check_list: CheckListNode,
     /// Bind a variable and continue
     bind: BindNode,
 };
@@ -334,6 +344,13 @@ pub const LiteralValue = union(enum) {
 pub const CheckTupleNode = struct {
     scrutinee: *const Expr,
     expected_arity: u32,
+    success: *const Decision,
+    failure: *const Decision,
+};
+
+pub const CheckListNode = struct {
+    scrutinee: *const Expr,
+    expected_length: u32,
     success: *const Decision,
     failure: *const Decision,
 };
@@ -577,6 +594,10 @@ fn compileConstructorColumn(
         .tuple => {
             // Tuple constructors -> check_tuple
             return compileTupleCheck(allocator, matrix, scrutinee_ids, scrutinee_expr, next_id);
+        },
+        .list => {
+            // List constructors -> check_list (same structure as check_tuple but for slices)
+            return compileListCheck(allocator, matrix, scrutinee_ids, scrutinee_expr, next_id);
         },
         else => {
             // Fallback: treat as variable rule
@@ -912,6 +933,120 @@ fn compileTupleCheck(
     return current_failure;
 }
 
+fn compileListCheck(
+    allocator: std.mem.Allocator,
+    matrix: PatternMatrix,
+    scrutinee_ids: []const u32,
+    scrutinee_expr: *const Expr,
+    next_id: *u32,
+) anyerror!*const Decision {
+    // Collect unique lengths from list patterns
+    var lengths: std.ArrayList(u32) = .empty;
+    for (matrix.rows) |row| {
+        if (row.patterns.len == 0) continue;
+        const pat = row.patterns[0];
+        if (!isWildcardPattern(pat) and pat.?.* == .list) {
+            const length: u32 = @intCast(pat.?.list.len);
+            var found = false;
+            for (lengths.items) |l| {
+                if (l == length) { found = true; break; }
+            }
+            if (!found) try lengths.append(allocator, length);
+        }
+    }
+
+    std.sort.pdq(u32, lengths.items, {}, std.sort.asc(u32));
+
+    const remaining_scrutinees = if (scrutinee_ids.len > 1) scrutinee_ids[1..] else @as([]const u32, &.{});
+
+    // Build wildcard failure base
+    var wildcard_rows: std.ArrayList(PatternRow) = .empty;
+    for (matrix.rows) |row| {
+        if (row.patterns.len == 0) continue;
+        if (isWildcardPattern(row.patterns[0])) {
+            const new_pats = if (row.patterns.len > 1) row.patterns[1..] else @as([]const ?*const MatchPattern, &.{});
+            try wildcard_rows.append(allocator, .{ .patterns = new_pats, .body_index = row.body_index, .guard = row.guard });
+        }
+    }
+    var current_failure = try compilePatternMatrix(allocator, .{
+        .rows = try wildcard_rows.toOwnedSlice(allocator),
+        .column_count = if (matrix.column_count > 0) matrix.column_count - 1 else 0,
+    }, remaining_scrutinees, next_id);
+
+    // For each unique length, build a check_list node
+    var i: usize = lengths.items.len;
+    while (i > 0) {
+        i -= 1;
+        const length = lengths.items[i];
+
+        // Allocate new scrutinee IDs for list elements
+        var new_scrutinee_list: std.ArrayList(u32) = .empty;
+        for (0..length) |_| {
+            try new_scrutinee_list.append(allocator, next_id.*);
+            next_id.* += 1;
+        }
+        for (remaining_scrutinees) |s| {
+            try new_scrutinee_list.append(allocator, s);
+        }
+
+        const new_col_count = length + (matrix.column_count - 1);
+
+        // Build rows: expand list elements for matching rows, pass wildcards through
+        var success_rows: std.ArrayList(PatternRow) = .empty;
+        for (matrix.rows) |row| {
+            if (row.patterns.len == 0) continue;
+            const pat = row.patterns[0];
+            const rest_pats = if (row.patterns.len > 1) row.patterns[1..] else @as([]const ?*const MatchPattern, &.{});
+
+            if (!isWildcardPattern(pat) and pat.?.* == .list and pat.?.list.len == length) {
+                // Matching list — expand elements into columns
+                var expanded: std.ArrayList(?*const MatchPattern) = .empty;
+                for (pat.?.list) |elem| {
+                    try expanded.append(allocator, elem);
+                }
+                for (rest_pats) |rp| {
+                    try expanded.append(allocator, rp);
+                }
+                try success_rows.append(allocator, .{
+                    .patterns = try expanded.toOwnedSlice(allocator),
+                    .body_index = row.body_index,
+                    .guard = row.guard,
+                });
+            } else if (isWildcardPattern(pat)) {
+                // Wildcards match any length — expand as N wildcards
+                var expanded: std.ArrayList(?*const MatchPattern) = .empty;
+                for (0..length) |_| {
+                    try expanded.append(allocator, null);
+                }
+                for (rest_pats) |rp| {
+                    try expanded.append(allocator, rp);
+                }
+                try success_rows.append(allocator, .{
+                    .patterns = try expanded.toOwnedSlice(allocator),
+                    .body_index = row.body_index,
+                    .guard = row.guard,
+                });
+            }
+        }
+
+        const success_decision = try compilePatternMatrix(allocator, .{
+            .rows = try success_rows.toOwnedSlice(allocator),
+            .column_count = new_col_count,
+        }, try new_scrutinee_list.toOwnedSlice(allocator), next_id);
+
+        const d = try allocator.create(Decision);
+        d.* = .{ .check_list = .{
+            .scrutinee = scrutinee_expr,
+            .expected_length = length,
+            .success = success_decision,
+            .failure = current_failure,
+        } };
+        current_failure = d;
+    }
+
+    return current_failure;
+}
+
 fn literalEquals(a: LiteralValue, b: LiteralValue) bool {
     const tag_a = std.meta.activeTag(a);
     const tag_b = std.meta.activeTag(b);
@@ -940,6 +1075,7 @@ pub const HirBuilder = struct {
     current_param_names: []const ?ast.StringId,
     current_tuple_bindings: std.ArrayList(TupleBinding),
     current_struct_bindings: std.ArrayList(StructBinding),
+    current_list_bindings: std.ArrayList(ListBinding),
     current_case_bindings: std.ArrayList(CaseBinding),
     current_module_scope: ?scope_mod.ScopeId,
     errors: std.ArrayList(Error),
@@ -965,6 +1101,7 @@ pub const HirBuilder = struct {
             .current_param_names = &.{},
             .current_tuple_bindings = .empty,
             .current_struct_bindings = .empty,
+            .current_list_bindings = .empty,
             .current_case_bindings = .empty,
             .current_module_scope = null,
             .errors = .empty,
@@ -1300,6 +1437,27 @@ pub const HirBuilder = struct {
             }
         }
 
+        // Process list patterns to create bindings for destructured list elements
+        self.current_list_bindings = .empty;
+        for (params.items, 0..) |param, param_idx| {
+            if (param.pattern) |pat| {
+                if (pat.* == .list) {
+                    for (pat.list, 0..) |sub_pat, elem_idx| {
+                        if (sub_pat.* == .bind) {
+                            const local_idx = self.next_local;
+                            self.next_local += 1;
+                            try self.current_list_bindings.append(self.allocator, .{
+                                .name = sub_pat.bind,
+                                .param_index = @intCast(param_idx),
+                                .element_index = @intCast(elem_idx),
+                                .local_index = local_idx,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
         // Build decision tree for this clause
         const decision = try self.create(Decision, .{
             .success = .{ .bindings = &.{}, .body_index = 0 },
@@ -1319,6 +1477,7 @@ pub const HirBuilder = struct {
             .refinement = refinement_expr,
             .tuple_bindings = try self.current_tuple_bindings.toOwnedSlice(self.allocator),
             .struct_bindings = try self.current_struct_bindings.toOwnedSlice(self.allocator),
+            .list_bindings = try self.current_list_bindings.toOwnedSlice(self.allocator),
         };
     }
 
@@ -1503,6 +1662,16 @@ pub const HirBuilder = struct {
                 }
                 // Check if this var refers to a struct field binding
                 for (self.current_struct_bindings.items) |binding| {
+                    if (binding.name == v.name) {
+                        return try self.create(Expr, .{
+                            .kind = .{ .local_get = binding.local_index },
+                            .type_id = resolved_type,
+                            .span = v.meta.span,
+                        });
+                    }
+                }
+                // Check if this var refers to a list element binding
+                for (self.current_list_bindings.items) |binding| {
                     if (binding.name == v.name) {
                         return try self.create(Expr, .{
                             .kind = .{ .local_get = binding.local_index },
