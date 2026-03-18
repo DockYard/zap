@@ -8,22 +8,16 @@
 #   zap run cli.zap -- version
 #   zap run cli.zap
 
-defmodule Cli do
-  def run(["greet", name]) do
-    IO.puts("Hello, " <> name <> "!")
-  end
-
-  def run(["version"]) do
-    IO.puts("zap-cli v0.1.0")
-  end
-
-  def run(_) do
-    IO.puts("Usage:")
-    IO.puts("  cli greet <name>")
-    IO.puts("  cli version")
-  end
+def main(["greet", name]) do
+  IO.puts("Hello, " <> name <> "!")
 end
 
-def main(args) do
-  Cli.run(args)
+def main(["version"]) do
+  IO.puts("zap-cli v0.1.0")
+end
+
+def main(_) do
+  IO.puts("Usage:")
+  IO.puts("  cli greet <name>")
+  IO.puts("  cli version")
 end
