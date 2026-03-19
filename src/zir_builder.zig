@@ -41,8 +41,16 @@ extern "c" fn zir_builder_emit_call(handle: ?*ZirBuilderHandle, name_ptr: [*]con
 extern "c" fn zir_builder_emit_ret(handle: ?*ZirBuilderHandle, operand: u32) i32;
 extern "c" fn zir_builder_emit_ret_void(handle: ?*ZirBuilderHandle) i32;
 
+// Import, field access, struct init, call-by-ref
+extern "c" fn zir_builder_emit_import(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32) u32;
+extern "c" fn zir_builder_emit_field_val(handle: ?*ZirBuilderHandle, object: u32, field_ptr: [*]const u8, field_len: u32) u32;
+extern "c" fn zir_builder_emit_call_ref(handle: ?*ZirBuilderHandle, callee: u32, args_ptr: [*]const u32, args_len: u32) u32;
+
 // Finalize and inject
 extern "c" fn zir_builder_inject(builder_handle: ?*ZirBuilderHandle, compilation_handle: ?*ZirContext) i32;
+
+// Module management
+extern "c" fn zir_compilation_add_module(ctx: ?*ZirContext, name: [*:0]const u8, source_path: [*:0]const u8) i32;
 
 // ---------------------------------------------------------------------------
 // Error sentinel
@@ -433,7 +441,15 @@ pub fn buildAndInject(
     allocator: Allocator,
     program: ir.Program,
     compilation_ctx: *ZirContext,
+    runtime_path: ?[:0]const u8,
 ) BuildError!void {
+    // Register the runtime module if a path was provided.
+    if (runtime_path) |rpath| {
+        if (zir_compilation_add_module(compilation_ctx, "zap_runtime", rpath) != 0) {
+            return error.ZirInjectionFailed;
+        }
+    }
+
     var driver = try ZirDriver.init(allocator);
 
     driver.buildProgram(program) catch |err| {

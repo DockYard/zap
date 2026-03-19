@@ -168,7 +168,16 @@ pub fn main() !void {
 
     // Phase 9: Build ZIR and inject via C-ABI builder
     try stdout.print("  Building and injecting ZIR...\n", .{});
-    zir_builder.buildAndInject(alloc, ir_program, ctx) catch {
+    // Locate the runtime source for module registration.
+    const runtime_path: ?[:0]const u8 = blk: {
+        const rt_path = std.fs.path.join(alloc, &.{
+            std.fs.path.dirname(@src().file) orelse "src",
+            "runtime.zig",
+        }) catch break :blk null;
+        break :blk alloc.dupeZ(u8, rt_path) catch null;
+    };
+
+    zir_builder.buildAndInject(alloc, ir_program, ctx, runtime_path) catch {
         try stdout.print("  ERROR: ZIR build/inject failed\n", .{});
         std.process.exit(1);
     };

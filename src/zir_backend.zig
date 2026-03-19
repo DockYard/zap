@@ -79,7 +79,7 @@ pub fn compile(allocator: std.mem.Allocator, program: ir.Program, options: Compi
     defer zir_compilation_destroy(ctx);
 
     // Phase 2: Build ZIR via C-ABI calls and inject into compilation.
-    try zir_builder.buildAndInject(allocator, program, ctx);
+    try zir_builder.buildAndInject(allocator, program, ctx, null);
 
     // Phase 3: Run Sema + codegen + link.
     if (zir_compilation_update(ctx) != 0) {
