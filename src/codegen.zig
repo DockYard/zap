@@ -129,11 +129,18 @@ pub const CodeGen = struct {
         // main with parameters: emit as __zap_main, then generate a pub fn main() wrapper
         const main_has_params = is_main and func.params.len > 0;
 
-        // Function signature — pub for main (exe) or all functions (lib)
+        // Use inline fn when return type is inferred (.any) — Zig can't express
+        // the return type of list-returning functions (*const [N]T) so we let
+        // Zig infer it at each call site via inline.
+        const use_inline = !is_main and func.return_type == .any;
+
+        // Function signature
         if (is_main and !main_has_params) {
             try self.write("pub fn ");
         } else if (self.lib_mode) {
             try self.write("pub fn ");
+        } else if (use_inline) {
+            try self.write("inline fn ");
         } else {
             try self.write("fn ");
         }
@@ -160,13 +167,15 @@ pub const CodeGen = struct {
         }
 
         try self.write(") ");
-        // Zig entry point must return void, !void, noreturn, u8, or !u8
         if (is_main) {
             try self.write("void");
+        } else if (use_inline) {
+            // Emit a computed return type by scanning the body for the list_init
+            try self.emitInferredListReturnType(func);
         } else {
             try self.emitZigType(&func.return_type);
         }
-        self.current_fn_is_void = is_main or func.return_type == .void;
+        self.current_fn_is_void = is_main or (func.return_type == .void and !use_inline);
         self.current_fn_params = func.params;
         try self.write(" {\n");
         self.indent_level += 1;
@@ -1169,12 +1178,20 @@ pub const CodeGen = struct {
             .list_init => |li| {
                 try self.writeIndent();
                 try self.writeDestLocal(li.dest);
-                try self.write(" = &.{");
-                for (li.elements, 0..) |elem, i| {
-                    if (i > 0) try self.write(", ");
-                    try self.writeLocal(elem);
+                if (li.elements.len > 0) {
+                    // Emit &[N]@TypeOf(first){...} for a typed runtime array
+                    try self.write(" = &[_]@TypeOf(");
+                    try self.writeLocal(li.elements[0]);
+                    try self.write("){");
+                    for (li.elements, 0..) |elem, i| {
+                        if (i > 0) try self.write(", ");
+                        try self.writeLocal(elem);
+                    }
+                    try self.write("};\n");
+                } else {
+                    // Empty list: &[_]u8{} (zero-length array)
+                    try self.write(" = &[_]u8{};\n");
                 }
-                try self.write("};\n");
             },
             .match_fail => |mf| {
                 try self.writeIndent();
@@ -1398,6 +1415,47 @@ pub const CodeGen = struct {
     // ============================================================
     // Type emission
     // ============================================================
+
+    fn emitInferredListReturnType(self: *CodeGen, func: *const ir.Function) !void {
+        // Scan the body for the list_init instruction to determine the return type.
+        // Lists in Zig are *const [N]T where T is the element type.
+        for (func.body) |block| {
+            for (block.instructions) |instr| {
+                switch (instr) {
+                    .list_init => |li| {
+                        if (li.elements.len > 0) {
+                            // Find the element type by looking for how the first
+                            // element was created (const_string → []const u8, tuple_init → struct, etc.)
+                            const elem_type = self.findLocalType(block.instructions, li.elements[0]);
+                            try self.write("*const [");
+                            try self.writeInt(@intCast(li.elements.len));
+                            try self.write("]");
+                            try self.write(elem_type);
+                        } else {
+                            try self.write("*const [0]u8");
+                        }
+                        return;
+                    },
+                    else => {},
+                }
+            }
+        }
+        try self.write("void");
+    }
+
+    fn findLocalType(_: *CodeGen, instrs: []const ir.Instruction, local: ir.LocalId) []const u8 {
+        for (instrs) |instr| {
+            switch (instr) {
+                .const_string => |cs| if (cs.dest == local) return "[]const u8",
+                .const_int => |ci| if (ci.dest == local) return "i64",
+                .const_float => |cf| if (cf.dest == local) return "f64",
+                .const_bool => |cb| if (cb.dest == local) return "bool",
+                .tuple_init => |ti| if (ti.dest == local) return "anytype",
+                else => {},
+            }
+        }
+        return "anytype";
+    }
 
     fn emitBinOffset(self: *CodeGen, offset: ir.BinOffset) !void {
         switch (offset) {

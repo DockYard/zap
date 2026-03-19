@@ -133,8 +133,9 @@ Use memory as a deterministic workflow, not an optional hint:
 2. If long-term memory does not answer it, let `cog-mem` escalate to code
    exploration.
 3. If exploration plus reasoning teaches a durable fact, workflow, constraint,
-   or design reason, call `cog_mem_learn`.
-4. During regular work, if you figure out a durable fact, call `cog_mem_learn`.
+   or design reason, call `cog_mem_learn` with an `items` array.
+4. During regular work, if you figure out a durable fact, call `cog_mem_learn`
+   with an `items` array.
 5. Before you finish, if this task created short-term memory or you explored
    code and learned something durable, delegate to `cog-mem-validate` to
    learn and consolidate in one call. Do NOT call `cog_mem_learn`,
@@ -153,18 +154,23 @@ Memory quality guardrails:
 - when a constraint or invariant is given, store it explicitly as a constraint, invariant, or workflow rule
 - when something changes or is deprecated, preserve the old-to-new relationship when the available tools can express it
 
+**All memory tools require arrays** — `items` for learn/associate, `queries` for
+recall, `engram_ids` for get/connections/reinforce/flush. Always pass an array,
+even for a single entry. Gather related operations into one batched call.
+
 Record knowledge as you work - use IF-THEN rules:
 
 - IF you completed analysis that required reasoning across multiple symbols
-  or files, THEN call `cog_mem_learn` immediately, before writing response
-  text.
+  or files, THEN call `cog_mem_learn` with an `items` array immediately,
+  before writing response text.
 - IF you do not know how to do something and prior knowledge may help, THEN
   delegate to `cog-mem` before broad exploration.
-- IF A relates to B, THEN call `cog_mem_associate` with a strong predicate.
+- IF A relates to B, THEN call `cog_mem_associate` with an `items` array
+  using a strong predicate.
 - IF you discovered a sequence A -> B -> C, THEN call `cog_mem_learn` with
-  `chain_to`.
+  `chain_to` in the items entry.
 - IF a concept connects to multiple others, THEN call `cog_mem_learn` with
-  `associations`.
+  `associations` in the items entry.
 - IF you changed code for a known concept, THEN call `cog_mem_refactor`.
 - IF a feature was deleted, THEN call `cog_mem_deprecate`.
 - IF a term or definition is wrong, THEN call `cog_mem_update`.

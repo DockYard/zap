@@ -1,5 +1,6 @@
 const std = @import("std");
 const zap = @import("zap");
+const ZirBuilder = zap.ZirBuilder;
 
 const runtime_source = @embedFile("runtime.zig");
 
@@ -19,6 +20,7 @@ pub fn main() !void {
 
     // Separate zap flags, the .zap file, and zig flags
     var emit_zig = false;
+    var emit_zir = false;
     var lib_mode = false;
     var strict_types = false;
     var run_after_build = false;
@@ -36,6 +38,8 @@ pub fn main() !void {
             run_after_build = true;
         } else if (std.mem.eql(u8, arg, "--emit-zig")) {
             emit_zig = true;
+        } else if (std.mem.eql(u8, arg, "--emit-zir")) {
+            emit_zir = true;
         } else if (std.mem.eql(u8, arg, "--lib")) {
             lib_mode = true;
         } else if (std.mem.eql(u8, arg, "--strict-types")) {
@@ -287,6 +291,33 @@ pub fn main() !void {
     };
 
     // Phase 8: Code generation
+    // --emit-zir: build ZIR arrays directly from IR (bypasses Zig source text)
+    if (emit_zir) {
+        var zir_builder = ZirBuilder.init(alloc);
+        defer zir_builder.deinit();
+        const zir_data = zir_builder.buildProgram(ir_program) catch {
+            try diag_engine.err("Error during ZIR generation", .{ .start = 0, .end = 0 });
+            try emitDiagnostics(&diag_engine, alloc);
+            std.process.exit(1);
+        };
+
+        // Emit any accumulated warnings before proceeding
+        if (diag_engine.warningCount() > 0) {
+            try emitDiagnostics(&diag_engine, alloc);
+        }
+
+        const stdout = std.fs.File.stdout().deprecatedWriter();
+        try stdout.print("ZIR generated:\n", .{});
+        try stdout.print("  instructions: {d}\n", .{zir_data.instructions_len});
+        try stdout.print("  string_bytes: {d}\n", .{zir_data.string_bytes_len});
+        try stdout.print("  extra:        {d}\n", .{zir_data.extra_len});
+
+        // To compile ZIR directly to a binary, build with:
+        //   zig build -Denable-zir-backend=true
+        // Then the zir_compile tool can be used to produce binaries.
+        return;
+    }
+
     var codegen = zap.CodeGen.init(alloc);
     defer codegen.deinit();
     codegen.lib_mode = lib_mode;

@@ -487,12 +487,27 @@ pub const Prelude = struct {
         const info = @typeInfo(T);
         if (T == []const u8) {
             writer.print("\"{s}\"", .{value}) catch {};
-        } else if (info == .pointer and @typeInfo(std.meta.Child(T)) == .array) {
-            writer.print("\"{s}\"", .{value}) catch {};
+        } else if (info == .pointer) {
+            const child_info = @typeInfo(info.pointer.child);
+            if (child_info == .array) {
+                if (child_info.array.child == u8) {
+                    // *const [N]u8 — string
+                    writer.print("\"{s}\"", .{value}) catch {};
+                } else {
+                    // *const [N]T — list
+                    writer.print("[", .{}) catch {};
+                    for (0..child_info.array.len) |i| {
+                        if (i > 0) writer.print(", ", .{}) catch {};
+                        inspectWrite(writer, value[i]);
+                    }
+                    writer.print("]", .{}) catch {};
+                }
+            } else {
+                writer.print("{any}", .{value}) catch {};
+            }
         } else if (info == .int or info == .comptime_int) {
             writer.print("{d}", .{value}) catch {};
         } else if (info == .float or info == .comptime_float) {
-            // Show at least one decimal place for floats
             const rounded: i64 = @intFromFloat(value);
             if (value == @as(@TypeOf(value), @floatFromInt(rounded))) {
                 writer.print("{d}.0", .{rounded}) catch {};
@@ -508,22 +523,6 @@ pub const Prelude = struct {
                 inspectWrite(writer, @field(value, field.name));
             }
             writer.print("}}", .{}) catch {};
-        } else if (info == .pointer) {
-            const child_info = @typeInfo(std.meta.Child(T));
-            if (child_info == .@"struct" and child_info.@"struct".is_tuple) {
-                // Pointer to a tuple — this is how Zap lists of tuples are represented
-                writer.print("[", .{}) catch {};
-                inline for (child_info.@"struct".fields, 0..) |field, i| {
-                    if (i > 0) writer.print(", ", .{}) catch {};
-                    inspectWrite(writer, @field(value.*, field.name));
-                }
-                writer.print("]", .{}) catch {};
-            } else if (child_info == .array) {
-                // Pointer to array — could be a string
-                writer.print("\"{s}\"", .{value}) catch {};
-            } else {
-                writer.print("{any}", .{value}) catch {};
-            }
         } else {
             writer.print("{any}", .{value}) catch {};
         }

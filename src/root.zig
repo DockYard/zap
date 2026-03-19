@@ -12,6 +12,8 @@ pub const DispatchEngine = @import("dispatch.zig").DispatchEngine;
 pub const hir = @import("hir.zig");
 pub const ir = @import("ir.zig");
 pub const CodeGen = @import("codegen.zig").CodeGen;
+pub const ZirBuilder = @import("zir_builder.zig").ZirBuilder;
+pub const ZirData = @import("zir_builder.zig").ZirData;
 pub const runtime = @import("runtime.zig");
 pub const diagnostics = @import("diagnostics.zig");
 pub const DiagnosticEngine = diagnostics.DiagnosticEngine;
@@ -35,6 +37,7 @@ test {
     _ = @import("hir.zig");
     _ = @import("ir.zig");
     _ = @import("codegen.zig");
+    _ = @import("zir_builder.zig");
     _ = @import("runtime.zig");
     _ = @import("diagnostics.zig");
     _ = @import("similarity.zig");

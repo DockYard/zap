@@ -1023,12 +1023,14 @@ pub const IrBuilder = struct {
         else
             raw_name;
 
-        // If the body result is optional (e.g., if/else with a nil branch),
-        // promote the function return type to optional.
+        // Determine return type: use declared type if available, otherwise infer from body.
         var return_type = typeIdToZigTypeWithStore(first_clause.return_type, self.type_store);
         if (body_result_local) |rl| {
             if (self.known_local_types.get(rl)) |local_type| {
-                if (std.meta.activeTag(local_type) == .optional) {
+                if (return_type == .void and local_type != .void) {
+                    // No return type annotation — infer from body
+                    return_type = local_type;
+                } else if (std.meta.activeTag(local_type) == .optional) {
                     return_type = local_type;
                 }
             }
@@ -2591,6 +2593,9 @@ pub const IrBuilder = struct {
                 try self.current_instrs.append(self.allocator, .{
                     .local_get = .{ .dest = dest, .source = idx },
                 });
+                if (self.known_local_types.get(idx)) |src_type| {
+                    try self.known_local_types.put(dest, src_type);
+                }
             },
             .param_get => |idx| {
                 try self.current_instrs.append(self.allocator, .{
@@ -2733,11 +2738,18 @@ pub const IrBuilder = struct {
             },
             .tuple_init => |elems| {
                 var locals: std.ArrayList(LocalId) = .empty;
+                var elem_zig_types: std.ArrayList(ZigType) = .empty;
                 for (elems) |elem| {
-                    try locals.append(self.allocator, try self.lowerExpr(elem));
+                    const local = try self.lowerExpr(elem);
+                    try locals.append(self.allocator, local);
+                    try elem_zig_types.append(self.allocator, self.known_local_types.get(local) orelse .any);
                 }
+                const elements = try locals.toOwnedSlice(self.allocator);
                 try self.current_instrs.append(self.allocator, .{
-                    .tuple_init = .{ .dest = dest, .elements = try locals.toOwnedSlice(self.allocator) },
+                    .tuple_init = .{ .dest = dest, .elements = elements },
+                });
+                try self.known_local_types.put(dest, .{
+                    .tuple = try elem_zig_types.toOwnedSlice(self.allocator),
                 });
             },
             .list_init => |elems| {
@@ -2745,9 +2757,13 @@ pub const IrBuilder = struct {
                 for (elems) |elem| {
                     try locals.append(self.allocator, try self.lowerExpr(elem));
                 }
+                const elements = try locals.toOwnedSlice(self.allocator);
                 try self.current_instrs.append(self.allocator, .{
-                    .list_init = .{ .dest = dest, .elements = try locals.toOwnedSlice(self.allocator) },
+                    .list_init = .{ .dest = dest, .elements = elements },
                 });
+                // Lists produce *const [N]T which can't be expressed as a ZigType.
+                // Mark as .any so the function becomes inline fn (Zig infers return type).
+                try self.known_local_types.put(dest, .any);
             },
             .panic => |msg| {
                 _ = try self.lowerExpr(msg);
