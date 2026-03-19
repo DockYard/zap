@@ -3,20 +3,18 @@
 //! This module provides extern declarations for the C-ABI functions exported
 //! by libzig_compiler.a (built from the forked Zig at ~/projects/zig), and a
 //! high-level `compile` function that wires up the full pipeline:
-//!   ZirBuilder output → zir_compilation_create → add_zir → update → binary
+//!   ir.Program → ZirDriver (C-ABI calls) → inject → Zig compiler → binary
 //!
 //! The library must be linked at build time with `-Denable-zir-backend=true`.
 
 const std = @import("std");
-const ZirBuilder = @import("zir_builder.zig").ZirBuilder;
-const ZirData = @import("zir_builder.zig").ZirData;
+const zir_builder = @import("zir_builder.zig");
+const ZirContext = zir_builder.ZirContext;
 const ir = @import("ir.zig");
 
 // ---------------------------------------------------------------------------
 // Extern declarations for the C-ABI functions in libzig_compiler.a
 // ---------------------------------------------------------------------------
-
-const ZirContext = opaque {};
 
 extern "c" fn zir_compilation_create(
     zig_lib_dir: [*:0]const u8,
@@ -25,12 +23,6 @@ extern "c" fn zir_compilation_create(
     output_path: [*:0]const u8,
     root_name: [*:0]const u8,
 ) ?*ZirContext;
-
-extern "c" fn zir_compilation_add_zir(
-    ctx: *ZirContext,
-    name: [*:0]const u8,
-    data: *const ZirData,
-) i32;
 
 extern "c" fn zir_compilation_update(ctx: *ZirContext) i32;
 
@@ -41,7 +33,11 @@ extern "c" fn zir_compilation_destroy(ctx: *ZirContext) void;
 // ---------------------------------------------------------------------------
 
 pub const CompileError = error{
-    ZirBuildFailed,
+    ZirCreateFailed,
+    BeginFuncFailed,
+    EndFuncFailed,
+    EmitFailed,
+    UnknownLocal,
     CompilationCreateFailed,
     ZirInjectionFailed,
     CompilationFailed,
@@ -63,15 +59,10 @@ pub const CompileOptions = struct {
 
 /// Compile a Zap IR program to a native binary via ZIR.
 ///
-/// This is the replacement for the `codegen.zig → write .zig file → zig build`
-/// flow. Instead: `ir.Program → ZirBuilder → ZIR arrays → Zig compiler library → binary`.
+/// This is the replacement for the `codegen.zig -> write .zig file -> zig build`
+/// flow. Instead: `ir.Program -> ZirDriver (C-ABI) -> inject -> Zig compiler -> binary`.
 pub fn compile(allocator: std.mem.Allocator, program: ir.Program, options: CompileOptions) CompileError!void {
-    // Phase 1: Build ZIR arrays from IR.
-    var builder = ZirBuilder.init(allocator);
-    defer builder.deinit();
-    const zir_data = builder.buildProgram(program) catch return error.ZirBuildFailed;
-
-    // Phase 2: Create compilation context.
+    // Phase 1: Create compilation context.
     const zig_lib_z = allocator.dupeZ(u8, options.zig_lib_dir) catch return error.OutOfMemory;
     defer allocator.free(zig_lib_z);
     const cache_z = allocator.dupeZ(u8, options.cache_dir) catch return error.OutOfMemory;
@@ -87,12 +78,10 @@ pub fn compile(allocator: std.mem.Allocator, program: ir.Program, options: Compi
         return error.CompilationCreateFailed;
     defer zir_compilation_destroy(ctx);
 
-    // Phase 3: Inject ZIR.
-    if (zir_compilation_add_zir(ctx, name_z, &zir_data) != 0) {
-        return error.ZirInjectionFailed;
-    }
+    // Phase 2: Build ZIR via C-ABI calls and inject into compilation.
+    try zir_builder.buildAndInject(allocator, program, ctx);
 
-    // Phase 4: Run Sema + codegen + link.
+    // Phase 3: Run Sema + codegen + link.
     if (zir_compilation_update(ctx) != 0) {
         return error.CompilationFailed;
     }

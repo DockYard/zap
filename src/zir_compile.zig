@@ -2,21 +2,22 @@
 //!
 //! This is a separate binary (`zap-zir`) that links against libzig_compiler.a
 //! and performs the full ZIR-to-binary pipeline. It reads a .zap source file,
-//! runs the Zap frontend (parse → collect → ... → IR), builds ZIR, and
-//! feeds it to the Zig compiler library to produce a native binary.
+//! runs the Zap frontend (parse -> collect -> ... -> IR), builds ZIR via
+//! C-ABI calls, and injects it into the Zig compiler library to produce a
+//! native binary.
 //!
 //! Build: zig build zir-compile
 
 const std = @import("std");
 const zap = @import("zap");
-const ZirBuilder = zap.ZirBuilder;
+const zir_builder = zap.zir_builder;
 const ir = zap.ir;
 
 // ---------------------------------------------------------------------------
 // C-ABI extern declarations for the Zig compiler library
 // ---------------------------------------------------------------------------
 
-const ZirContext = opaque {};
+const ZirContext = zir_builder.ZirContext;
 
 extern "c" fn zir_compilation_create(
     zig_lib_dir: [*:0]const u8,
@@ -25,12 +26,6 @@ extern "c" fn zir_compilation_create(
     output_path: [*:0]const u8,
     root_name: [*:0]const u8,
 ) ?*ZirContext;
-
-extern "c" fn zir_compilation_add_zir(
-    ctx: *ZirContext,
-    name: [*:0]const u8,
-    data: *const zap.ZirData,
-) i32;
 
 extern "c" fn zir_compilation_update(ctx: *ZirContext) i32;
 extern "c" fn zir_compilation_destroy(ctx: *ZirContext) void;
@@ -145,23 +140,7 @@ pub fn main() !void {
         std.process.exit(1);
     };
 
-    // Phase 8: Build ZIR
-    var zir_builder = ZirBuilder.init(alloc);
-    defer zir_builder.deinit();
-    const zir_data = zir_builder.buildProgram(ir_program) catch {
-        try stdout.print("ZIR generation error\n", .{});
-        std.process.exit(1);
-    };
-
-    try stdout.print("  ZIR: {d} instructions, {d} string bytes, {d} extra\n", .{
-        zir_data.instructions_len,
-        zir_data.string_bytes_len,
-        zir_data.extra_len,
-    });
-
-
-
-    // Phase 9: Compile via Zig library
+    // Phase 8: Create compilation context
     std.fs.cwd().makePath(".zap-cache") catch {};
 
     const stem = blk: {
@@ -187,13 +166,14 @@ pub fn main() !void {
     };
     defer zir_compilation_destroy(ctx);
 
-    try stdout.print("  Injecting ZIR...\n", .{});
-    const add_result = zir_compilation_add_zir(ctx, name_z, &zir_data);
-    if (add_result != 0) {
-        try stdout.print("  ERROR: zir_compilation_add_zir failed ({d})\n", .{add_result});
+    // Phase 9: Build ZIR and inject via C-ABI builder
+    try stdout.print("  Building and injecting ZIR...\n", .{});
+    zir_builder.buildAndInject(alloc, ir_program, ctx) catch {
+        try stdout.print("  ERROR: ZIR build/inject failed\n", .{});
         std.process.exit(1);
-    }
+    };
 
+    // Phase 10: Run Sema + codegen + link
     try stdout.print("  Running Sema + codegen + link...\n", .{});
     const update_result = zir_compilation_update(ctx);
     if (update_result != 0) {
