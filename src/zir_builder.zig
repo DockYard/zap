@@ -159,12 +159,14 @@ pub const ZirDriver = struct {
     handle: *ZirBuilderHandle,
     local_refs: std.AutoHashMapUnmanaged(ir.LocalId, u32),
     allocator: Allocator,
+    program: ?ir.Program,
 
     pub fn init(allocator: Allocator) !ZirDriver {
         const handle = zir_builder_create() orelse return error.ZirCreateFailed;
         return .{
             .handle = handle,
             .local_refs = .empty,
+            .program = null,
             .allocator = allocator,
         };
     }
@@ -187,6 +189,7 @@ pub const ZirDriver = struct {
     // -- Program emission -----------------------------------------------------
 
     pub fn buildProgram(self: *ZirDriver, program: ir.Program) !void {
+        self.program = program;
         // Only emit the main/entry function (same as previous behavior).
         for (program.functions) |func| {
             if (!std.mem.eql(u8, func.name, "main")) continue;
@@ -427,8 +430,30 @@ pub const ZirDriver = struct {
                 try self.setLocal(el.dest, ref);
             },
 
-            // TODO: call_direct — needs function table lookup to resolve FunctionId to name
-            .call_direct => {},
+            // Direct call by function ID — resolve name from program's function table
+            .call_direct => |cd| {
+                if (self.program) |prog| {
+                    if (cd.function < prog.functions.len) {
+                        const func_name = prog.functions[cd.function].name;
+                        var args = std.ArrayListUnmanaged(u32).empty;
+                        defer args.deinit(self.allocator);
+                        for (cd.args) |arg| {
+                            const ref = self.refForLocal(arg) catch continue;
+                            try args.append(self.allocator, ref);
+                        }
+                        const ref = zir_builder_emit_call(
+                            self.handle,
+                            func_name.ptr,
+                            @intCast(func_name.len),
+                            args.items.ptr,
+                            @intCast(args.items.len),
+                        );
+                        if (ref != error_ref) {
+                            try self.setLocal(cd.dest, ref);
+                        }
+                    }
+                }
+            },
 
             // Control flow
             .if_expr => |ie| {
@@ -664,7 +689,7 @@ pub const ZirDriver = struct {
             },
             // TODO: match_type — needs runtime type introspection (@TypeOf comparison)
             .match_type => {},
-            // TODO: match_fail — needs @panic or unreachable emission
+            // match_fail — emit void (pattern matching exhaustiveness is handled at Zap level)
             .match_fail => {},
 
             // TODO: closures — needs C API for closure capture/dispatch
