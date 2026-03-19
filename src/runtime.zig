@@ -469,13 +469,58 @@ pub const Prelude = struct {
         } else if (T == bool) {
             stdout.print("{}\n", .{value}) catch {};
         } else {
-            stdout.print("{any}\n", .{value}) catch {};
+            // For tuples and other compound types, use inspect formatting
+            inspectWrite(stdout, value);
+            stdout.print("\n", .{}) catch {};
         }
     }
 
     pub fn inspect(value: anytype) @TypeOf(value) {
-        println(value);
+        const stdout = std.fs.File.stdout().deprecatedWriter();
+        inspectWrite(stdout, value);
+        stdout.print("\n", .{}) catch {};
         return value;
+    }
+
+    fn inspectWrite(writer: anytype, value: anytype) void {
+        const T = @TypeOf(value);
+        const info = @typeInfo(T);
+        if (T == []const u8) {
+            writer.print("\"{s}\"", .{value}) catch {};
+        } else if (info == .pointer and @typeInfo(std.meta.Child(T)) == .array) {
+            writer.print("\"{s}\"", .{value}) catch {};
+        } else if (info == .int or info == .comptime_int) {
+            writer.print("{d}", .{value}) catch {};
+        } else if (info == .float or info == .comptime_float) {
+            writer.print("{d}", .{value}) catch {};
+        } else if (T == bool) {
+            writer.print("{}", .{value}) catch {};
+        } else if (info == .@"struct" and info.@"struct".is_tuple) {
+            writer.print("{{", .{}) catch {};
+            inline for (info.@"struct".fields, 0..) |field, i| {
+                if (i > 0) writer.print(", ", .{}) catch {};
+                inspectWrite(writer, @field(value, field.name));
+            }
+            writer.print("}}", .{}) catch {};
+        } else if (info == .pointer) {
+            const child_info = @typeInfo(std.meta.Child(T));
+            if (child_info == .@"struct" and child_info.@"struct".is_tuple) {
+                // Pointer to a tuple — this is how Zap lists of tuples are represented
+                writer.print("[", .{}) catch {};
+                inline for (child_info.@"struct".fields, 0..) |field, i| {
+                    if (i > 0) writer.print(", ", .{}) catch {};
+                    inspectWrite(writer, @field(value.*, field.name));
+                }
+                writer.print("]", .{}) catch {};
+            } else if (child_info == .array) {
+                // Pointer to array — could be a string
+                writer.print("\"{s}\"", .{value}) catch {};
+            } else {
+                writer.print("{any}", .{value}) catch {};
+            }
+        } else {
+            writer.print("{any}", .{value}) catch {};
+        }
     }
 
     pub fn print_str(value: anytype) void {

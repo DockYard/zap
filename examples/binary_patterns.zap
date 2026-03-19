@@ -138,6 +138,6 @@ defmodule MarkupParser do
 end
 
 def main() do
-  MarkupParser.parse_node("<div id=top><h1>Hello, Zap!</h1></div>")
+  [MarkupParser.parse_node("<div id=top><h1>Hello, Zap!</h1></div>")]
   |> Kernel.inspect()
 end
