@@ -311,7 +311,7 @@ pub const ZirDriver = struct {
                 try self.setLocal(cn.dest, ref);
             },
 
-            // Builtin calls — use the builtin name
+            // Builtin calls — emit @import("zap_runtime").Module.function(args)
             .call_builtin => |cb| {
                 var args = std.ArrayListUnmanaged(u32).empty;
                 defer args.deinit(self.allocator);
@@ -319,15 +319,41 @@ pub const ZirDriver = struct {
                     const ref = self.refForLocal(arg) catch continue;
                     try args.append(self.allocator, ref);
                 }
-                const ref = zir_builder_emit_call(
-                    self.handle,
-                    cb.name.ptr,
-                    @intCast(cb.name.len),
-                    args.items.ptr,
-                    @intCast(args.items.len),
-                );
-                if (ref == error_ref) return error.EmitFailed;
-                try self.setLocal(cb.dest, ref);
+
+                // Parse "Module.function" from the builtin name.
+                // e.g., "Prelude.println" → import zap_runtime, field "Prelude", field "println"
+                if (std.mem.indexOfScalar(u8, cb.name, '.')) |dot_idx| {
+                    const mod_name = cb.name[0..dot_idx];
+                    const func_name = cb.name[dot_idx + 1 ..];
+
+                    // @import("zap_runtime")
+                    const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                    if (rt_import == error_ref) return error.EmitFailed;
+
+                    // .Module (e.g., .Prelude)
+                    const mod_ref = zir_builder_emit_field_val(self.handle, rt_import, mod_name.ptr, @intCast(mod_name.len));
+                    if (mod_ref == error_ref) return error.EmitFailed;
+
+                    // .function (e.g., .println)
+                    const fn_ref = zir_builder_emit_field_val(self.handle, mod_ref, func_name.ptr, @intCast(func_name.len));
+                    if (fn_ref == error_ref) return error.EmitFailed;
+
+                    // call(fn_ref, args)
+                    const ref = zir_builder_emit_call_ref(self.handle, fn_ref, args.items.ptr, @intCast(args.items.len));
+                    if (ref == error_ref) return error.EmitFailed;
+                    try self.setLocal(cb.dest, ref);
+                } else {
+                    // Simple name — call directly
+                    const ref = zir_builder_emit_call(
+                        self.handle,
+                        cb.name.ptr,
+                        @intCast(cb.name.len),
+                        args.items.ptr,
+                        @intCast(args.items.len),
+                    );
+                    if (ref == error_ref) return error.EmitFailed;
+                    try self.setLocal(cb.dest, ref);
+                }
             },
 
             // Tail calls — call + ret

@@ -177,6 +177,12 @@ pub fn main() !void {
         break :blk alloc.dupeZ(u8, rt_path) catch null;
     };
 
+    if (runtime_path) |rp| {
+        try stdout.print("  Runtime module: {s}\n", .{rp});
+    } else {
+        try stdout.print("  Runtime module: not found\n", .{});
+    }
+
     zir_builder.buildAndInject(alloc, ir_program, ctx, runtime_path) catch {
         try stdout.print("  ERROR: ZIR build/inject failed\n", .{});
         std.process.exit(1);
