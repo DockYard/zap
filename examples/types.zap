@@ -1,4 +1,7 @@
 # Type system examples
+#
+# Demonstrates all supported types: scalars, compound types,
+# structs, enums, and module inheritance.
 
 # --- Struct definitions ---
 
@@ -36,7 +39,55 @@ defenum Direction do
   West
 end
 
-# --- Modules with behavior ---
+# --- Modules ---
+
+defmodule Scalars do
+  def int() :: i64 do
+    42
+  end
+
+  def negative() :: i64 do
+    -7
+  end
+
+  def float() :: f64 do
+    3.14
+  end
+
+  def string() :: String do
+    "hello"
+  end
+
+  def boolean_true() :: Bool do
+    true
+  end
+
+  def boolean_false() :: Bool do
+    false
+  end
+
+  def hex() :: i64 do
+    0xFF
+  end
+end
+
+defmodule Tuples do
+  def pair() :: {i64, String} do
+    {1, "one"}
+  end
+
+  def triple() :: {String, String, String} do
+    {"a", "b", "c"}
+  end
+
+  def nested() :: {String, {i64, i64}} do
+    {"point", {10, 20}}
+  end
+
+  def deep() :: {String, {String, {String, String}}} do
+    {"root", {"branch", {"leaf1", "leaf2"}}}
+  end
+end
 
 defmodule Geometry do
   def area(%{radius: r} :: Circle) :: f64 do
@@ -47,8 +98,6 @@ defmodule Geometry do
     w * h
   end
 end
-
-# --- Module inheritance ---
 
 defmodule Animal do
   def speak() :: String do
@@ -66,9 +115,50 @@ defmodule Dog extends Animal do
   end
 end
 
-# --- Main ---
+defmodule Demo do
+  def scalars() do
+    IO.puts("=== Scalars ===")
+    Scalars.int() |> Kernel.inspect()
+    Scalars.negative() |> Kernel.inspect()
+    Scalars.float() |> Kernel.inspect()
+    Scalars.string() |> Kernel.inspect()
+    Scalars.boolean_true() |> Kernel.inspect()
+    Scalars.boolean_false() |> Kernel.inspect()
+    Scalars.hex() |> Kernel.inspect()
+  end
+
+  def tuples() do
+    IO.puts("=== Tuples ===")
+    Tuples.pair() |> Kernel.inspect()
+    Tuples.triple() |> Kernel.inspect()
+    Tuples.nested() |> Kernel.inspect()
+    Tuples.deep() |> Kernel.inspect()
+  end
+
+  def structs() do
+    p = %{x: 3.0, y: 4.0} :: Point
+    Kernel.inspect(p.x)
+    Kernel.inspect(p.y)
+  end
+
+  def enums() do
+    IO.puts("=== Enums ===")
+    Kernel.inspect(Color.Red)
+    Kernel.inspect(Direction.North)
+  end
+
+  def inheritance() do
+    IO.puts("=== Inheritance ===")
+    Dog.speak() |> IO.puts()
+    Dog.breathe() |> IO.puts()
+  end
+end
 
 def main() do
-  p = %{x: 1.0, y: 2.0} :: Point
-  IO.puts(p.x)
+  Demo.scalars()
+  Demo.tuples()
+  IO.puts("=== Structs ===")
+  Demo.structs()
+  Demo.enums()
+  Demo.inheritance()
 end

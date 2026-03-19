@@ -492,7 +492,13 @@ pub const Prelude = struct {
         } else if (info == .int or info == .comptime_int) {
             writer.print("{d}", .{value}) catch {};
         } else if (info == .float or info == .comptime_float) {
-            writer.print("{d}", .{value}) catch {};
+            // Show at least one decimal place for floats
+            const rounded: i64 = @intFromFloat(value);
+            if (value == @as(@TypeOf(value), @floatFromInt(rounded))) {
+                writer.print("{d}.0", .{rounded}) catch {};
+            } else {
+                writer.print("{d}", .{value}) catch {};
+            }
         } else if (T == bool) {
             writer.print("{}", .{value}) catch {};
         } else if (info == .@"struct" and info.@"struct".is_tuple) {
