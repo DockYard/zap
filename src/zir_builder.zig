@@ -24,7 +24,7 @@ extern "c" fn zir_builder_create() ?*ZirBuilderHandle;
 extern "c" fn zir_builder_destroy(handle: ?*ZirBuilderHandle) void;
 
 // Functions
-extern "c" fn zir_builder_begin_func(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32) i32;
+extern "c" fn zir_builder_begin_func(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32, ret_type: u32) i32;
 extern "c" fn zir_builder_end_func(handle: ?*ZirBuilderHandle) i32;
 
 // Emit instructions (return u32 Ref, 0xFFFFFFFF on error)
@@ -76,6 +76,41 @@ fn mapBinopTag(op: ir.BinaryOp.Op) ?u8 {
 }
 
 // ---------------------------------------------------------------------------
+// Return type mapping (ir.ZigType -> ZIR Ref u32 value)
+// ---------------------------------------------------------------------------
+
+/// For main(), Zig requires void or u8 return type.
+/// Map integer types to u8 (exit code), keep void as void.
+fn mapMainReturnType(zig_type: ir.ZigType) u32 {
+    return switch (zig_type) {
+        .void => 0,
+        .i8, .i16, .i32, .i64, .u8, .u16, .u32, .u64, .usize, .isize => @intFromEnum(Zir.Inst.Ref.u8_type),
+        else => 0, // default to void
+    };
+}
+
+fn mapReturnType(zig_type: ir.ZigType) u32 {
+    return switch (zig_type) {
+        .void => 0,
+        .bool_type => @intFromEnum(Zir.Inst.Ref.bool_type),
+        .i8 => @intFromEnum(Zir.Inst.Ref.i8_type),
+        .i16 => @intFromEnum(Zir.Inst.Ref.i16_type),
+        .i32 => @intFromEnum(Zir.Inst.Ref.i32_type),
+        .i64 => @intFromEnum(Zir.Inst.Ref.i64_type),
+        .u8 => @intFromEnum(Zir.Inst.Ref.u8_type),
+        .u16 => @intFromEnum(Zir.Inst.Ref.u16_type),
+        .u32 => @intFromEnum(Zir.Inst.Ref.u32_type),
+        .u64 => @intFromEnum(Zir.Inst.Ref.u64_type),
+        .usize => @intFromEnum(Zir.Inst.Ref.usize_type),
+        .isize => @intFromEnum(Zir.Inst.Ref.isize_type),
+        .f16 => @intFromEnum(Zir.Inst.Ref.f16_type),
+        .f32 => @intFromEnum(Zir.Inst.Ref.f32_type),
+        .f64 => @intFromEnum(Zir.Inst.Ref.f64_type),
+        else => 0, // default to void for unsupported types
+    };
+}
+
+// ---------------------------------------------------------------------------
 // ZirDriver
 // ---------------------------------------------------------------------------
 
@@ -121,7 +156,13 @@ pub const ZirDriver = struct {
     fn emitFunction(self: *ZirDriver, func: ir.Function) !void {
         self.local_refs.clearRetainingCapacity();
 
-        if (zir_builder_begin_func(self.handle, func.name.ptr, @intCast(func.name.len)) != 0) {
+        // Zig's main must return void or u8. Map integer return types to u8 for main.
+        const is_main = std.mem.eql(u8, func.name, "main");
+        const ret_type = if (is_main)
+            mapMainReturnType(func.return_type)
+        else
+            mapReturnType(func.return_type);
+        if (zir_builder_begin_func(self.handle, func.name.ptr, @intCast(func.name.len), ret_type) != 0) {
             return error.BeginFuncFailed;
         }
 
