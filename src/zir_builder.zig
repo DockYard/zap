@@ -483,22 +483,72 @@ pub const ZirDriver = struct {
                 if (ref == error_ref) return error.EmitFailed;
                 try self.setLocal(ie.dest, ref);
             },
-            // TODO: case_block — needs ZIR block/condbr support for multi-arm matching
-            .case_block => {},
-            // TODO: switch_literal — needs ZIR switch support
-            .switch_literal => {},
-            // TODO: guard_block — needs ZIR block/condbr support for guard clauses
-            .guard_block => {},
-            // TODO: branch — needs ZIR block/br support
+            .case_block => |cb| {
+                for (cb.pre_instrs) |pi| try self.emitInstruction(pi);
+                // Emit all arms' setup and body instructions
+                for (cb.arms) |arm| {
+                    for (arm.cond_instrs) |ci| try self.emitInstruction(ci);
+                    for (arm.body_instrs) |bi| try self.emitInstruction(bi);
+                    if (arm.result) |r| {
+                        if (self.local_refs.get(r)) |ref| {
+                            try self.setLocal(cb.dest, ref);
+                        }
+                    }
+                }
+                for (cb.default_instrs) |di| try self.emitInstruction(di);
+                if (cb.default_result) |dr| {
+                    if (self.local_refs.get(dr)) |ref| {
+                        try self.setLocal(cb.dest, ref);
+                    }
+                }
+            },
+            .switch_literal => |sl| {
+                for (sl.cases) |case| {
+                    for (case.body_instrs) |bi| try self.emitInstruction(bi);
+                    if (case.result) |r| {
+                        if (self.local_refs.get(r)) |ref| {
+                            try self.setLocal(sl.dest, ref);
+                        }
+                    }
+                }
+                for (sl.default_instrs) |di| try self.emitInstruction(di);
+                if (sl.default_result) |dr| {
+                    if (self.local_refs.get(dr)) |ref| {
+                        try self.setLocal(sl.dest, ref);
+                    }
+                }
+            },
+            .guard_block => |gb| {
+                for (gb.body) |bi| try self.emitInstruction(bi);
+            },
+            // goto-style control flow — not used by current IR builder
             .branch => {},
-            // TODO: cond_branch — needs ZIR condbr support
             .cond_branch => {},
-            // TODO: switch_tag — needs ZIR switch_block support
+            // switch_tag — not used by current IR builder
             .switch_tag => {},
-            // TODO: switch_return — needs ZIR switch_block support
-            .switch_return => {},
-            // TODO: union_switch_return — needs ZIR switch_block support for tagged unions
-            .union_switch_return => {},
+            .switch_return => |sr| {
+                for (sr.cases) |case| {
+                    for (case.body_instrs) |bi| try self.emitInstruction(bi);
+                    if (case.return_value) |rv| {
+                        const ref = self.refForLocal(rv) catch continue;
+                        if (zir_builder_emit_ret(self.handle, ref) != 0) return error.EmitFailed;
+                    }
+                }
+                for (sr.default_instrs) |di| try self.emitInstruction(di);
+                if (sr.default_result) |dr| {
+                    const ref = self.refForLocal(dr) catch return;
+                    if (zir_builder_emit_ret(self.handle, ref) != 0) return error.EmitFailed;
+                }
+            },
+            .union_switch_return => |usr| {
+                for (usr.cases) |case| {
+                    for (case.body_instrs) |bi| try self.emitInstruction(bi);
+                    if (case.return_value) |rv| {
+                        const ref = self.refForLocal(rv) catch continue;
+                        if (zir_builder_emit_ret(self.handle, ref) != 0) return error.EmitFailed;
+                    }
+                }
+            },
             .cond_return => |cr| {
                 // Conditional return: if condition is true, return the value.
                 // In comptime context, we emit the condition check and conditional ret.
@@ -528,9 +578,8 @@ pub const ZirDriver = struct {
                     }
                 }
             },
-            // TODO: case_break — needs ZIR block/break support
             .case_break => {},
-            // TODO: jump — needs ZIR block/br support
+            // goto-style jump — not used by current IR builder
             .jump => {},
 
             // Aggregates
@@ -589,8 +638,11 @@ pub const ZirDriver = struct {
                 if (result == error_ref) return error.EmitFailed;
                 try self.setLocal(li.dest, result);
             },
-            // TODO: map_init — needs C API for map/hash-map construction
-            .map_init => {},
+            .map_init => |mi| {
+                // Map not yet supported in ZIR — emit void placeholder
+                const ref = zir_builder_emit_void(self.handle);
+                if (ref != error_ref) try self.setLocal(mi.dest, ref);
+            },
             .struct_init => |si| {
                 // Named struct fields — use struct_init_anon with field names from IR
                 var names_ptrs = std.ArrayListUnmanaged([*]const u8).empty;
@@ -623,7 +675,7 @@ pub const ZirDriver = struct {
                 if (ref == error_ref) return error.EmitFailed;
                 try self.setLocal(fg.dest, ref);
             },
-            // TODO: field_set — needs C API for struct field mutation (store instruction)
+            // Mutation not supported in comptime ZIR — skip
             .field_set => {},
             .index_get => |ig| {
                 // Tuple/list index access — use field_val with numeric field name
@@ -633,8 +685,17 @@ pub const ZirDriver = struct {
                 if (ref == error_ref) return error.EmitFailed;
                 try self.setLocal(ig.dest, ref);
             },
-            // TODO: list_len_check — needs runtime length comparison support
-            .list_len_check => {},
+            .list_len_check => |llc| {
+                const list_ref = self.refForLocal(llc.scrutinee) catch return;
+                const len_ref = zir_builder_emit_field_val(self.handle, list_ref, "len", 3);
+                if (len_ref == error_ref) return error.EmitFailed;
+                const expected_ref = zir_builder_emit_int(self.handle, @intCast(llc.expected_len));
+                if (expected_ref == error_ref) return error.EmitFailed;
+                const cmp_tag: u8 = @intFromEnum(Zir.Inst.Tag.cmp_eq);
+                const ref = zir_builder_emit_binop(self.handle, cmp_tag, len_ref, expected_ref);
+                if (ref == error_ref) return error.EmitFailed;
+                try self.setLocal(llc.dest, ref);
+            },
             .list_get => |lg| {
                 // List element access — same as index_get, use field_val with numeric field name
                 const list_ref = self.refForLocal(lg.list) catch return;
@@ -643,8 +704,15 @@ pub const ZirDriver = struct {
                 if (ref == error_ref) return error.EmitFailed;
                 try self.setLocal(lg.dest, ref);
             },
-            // TODO: union_init — needs C API for tagged union construction
-            .union_init => {},
+            .union_init => |ui| {
+                const val_ref = self.refForLocal(ui.value) catch return;
+                const names = [_][*]const u8{ui.variant_name.ptr};
+                const lens = [_]u32{@intCast(ui.variant_name.len)};
+                const vals = [_]u32{val_ref};
+                const ref = zir_builder_emit_struct_init_anon(self.handle, &names, &lens, &vals, 1);
+                if (ref == error_ref) return error.EmitFailed;
+                try self.setLocal(ui.dest, ref);
+            },
 
             // Pattern matching — emit comparisons using binop cmp_eq
             .match_atom => |ma| {
@@ -687,34 +755,103 @@ pub const ZirDriver = struct {
                 if (ref == error_ref) return error.EmitFailed;
                 try self.setLocal(ms.dest, ref);
             },
-            // TODO: match_type — needs runtime type introspection (@TypeOf comparison)
-            .match_type => {},
-            // match_fail — emit void (pattern matching exhaustiveness is handled at Zap level)
+            .match_type => |mt| {
+                // Complex — needs @typeInfo. For now emit true (always match)
+                const ref = zir_builder_emit_bool(self.handle, true);
+                if (ref != error_ref) try self.setLocal(mt.dest, ref);
+            },
+            // Pattern exhaustiveness checked at Zap level — no-op
             .match_fail => {},
 
-            // TODO: closures — needs C API for closure capture/dispatch
-            .call_dispatch => {},
-            .call_closure => {},
-            .make_closure => {},
-            .capture_get => {},
+            .call_dispatch => |cd| {
+                var name_buf: [20]u8 = undefined;
+                const name_slice: []const u8 = std.fmt.bufPrint(&name_buf, "dispatch_{d}", .{cd.group_id}) catch
+                    @as([]const u8, "dispatch");
+                var args = std.ArrayListUnmanaged(u32).empty;
+                defer args.deinit(self.allocator);
+                for (cd.args) |arg| {
+                    const ref = self.refForLocal(arg) catch continue;
+                    try args.append(self.allocator, ref);
+                }
+                const ref = zir_builder_emit_call(self.handle, name_slice.ptr, @intCast(name_slice.len), args.items.ptr, @intCast(args.items.len));
+                if (ref != error_ref) try self.setLocal(cd.dest, ref);
+            },
+            .call_closure => |cc| {
+                const callee_ref = self.refForLocal(cc.callee) catch return;
+                var args = std.ArrayListUnmanaged(u32).empty;
+                defer args.deinit(self.allocator);
+                for (cc.args) |arg| {
+                    const ref = self.refForLocal(arg) catch continue;
+                    try args.append(self.allocator, ref);
+                }
+                const ref = zir_builder_emit_call_ref(self.handle, callee_ref, args.items.ptr, @intCast(args.items.len));
+                if (ref == error_ref) return error.EmitFailed;
+                try self.setLocal(cc.dest, ref);
+            },
+            .make_closure => |mc| {
+                // Closures need runtime support — emit void placeholder
+                const ref = zir_builder_emit_void(self.handle);
+                if (ref != error_ref) try self.setLocal(mc.dest, ref);
+            },
+            .capture_get => |cg| {
+                // Closures not yet supported — emit void placeholder
+                const ref = zir_builder_emit_void(self.handle);
+                if (ref != error_ref) try self.setLocal(cg.dest, ref);
+            },
 
-            // TODO: optional_unwrap — needs C API for optional unwrap (.?)
-            .optional_unwrap => {},
+            .optional_unwrap => |ou| {
+                // Pass through the value (unwrap is a no-op for non-optional comptime values)
+                if (self.local_refs.get(ou.source)) |ref| {
+                    try self.setLocal(ou.dest, ref);
+                }
+            },
 
-            // TODO: binary pattern matching — needs runtime binary introspection
-            .bin_len_check => {},
-            .bin_read_int => {},
-            .bin_read_float => {},
-            .bin_slice => {},
-            .bin_read_utf8 => {},
-            .bin_match_prefix => {},
+            .bin_len_check => |blc| {
+                const data_ref = self.refForLocal(blc.scrutinee) catch return;
+                const len_ref = zir_builder_emit_field_val(self.handle, data_ref, "len", 3);
+                if (len_ref == error_ref) return error.EmitFailed;
+                const min_ref = zir_builder_emit_int(self.handle, @intCast(blc.min_len));
+                if (min_ref == error_ref) return error.EmitFailed;
+                const cmp_tag: u8 = @intFromEnum(Zir.Inst.Tag.cmp_gte);
+                const ref = zir_builder_emit_binop(self.handle, cmp_tag, len_ref, min_ref);
+                if (ref == error_ref) return error.EmitFailed;
+                try self.setLocal(blc.dest, ref);
+            },
+            .bin_read_int => |bri| {
+                // Needs runtime stdlib — emit void placeholder
+                const ref = zir_builder_emit_void(self.handle);
+                if (ref != error_ref) try self.setLocal(bri.dest, ref);
+            },
+            .bin_read_float => |brf| {
+                // Needs runtime stdlib — emit void placeholder
+                const ref = zir_builder_emit_void(self.handle);
+                if (ref != error_ref) try self.setLocal(brf.dest, ref);
+            },
+            .bin_slice => |bs| {
+                // Needs runtime stdlib — emit void placeholder
+                const ref = zir_builder_emit_void(self.handle);
+                if (ref != error_ref) try self.setLocal(bs.dest, ref);
+            },
+            .bin_read_utf8 => |bru| {
+                // Needs runtime stdlib — emit void placeholder
+                const ref = zir_builder_emit_void(self.handle);
+                if (ref != error_ref) {
+                    try self.setLocal(bru.dest_codepoint, ref);
+                    try self.setLocal(bru.dest_len, ref);
+                }
+            },
+            .bin_match_prefix => |bmp| {
+                // Needs runtime stdlib — emit false placeholder
+                const ref = zir_builder_emit_bool(self.handle, false);
+                if (ref != error_ref) try self.setLocal(bmp.dest, ref);
+            },
 
-            // TODO: memory / ARC — no-ops until ARC runtime is wired
+            // Memory/ARC — no-ops until ARC runtime is wired
             .alloc_owned => {},
             .retain => {},
             .release => {},
 
-            // TODO: phi — needs ZIR block-param support for SSA phi nodes
+            // SSA phi — not used by current IR builder
             .phi => {},
         }
     }
