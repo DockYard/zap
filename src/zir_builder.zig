@@ -300,15 +300,38 @@ pub const ZirDriver = struct {
                     const ref = self.refForLocal(arg) catch continue;
                     try args.append(self.allocator, ref);
                 }
-                const ref = zir_builder_emit_call(
-                    self.handle,
-                    cn.name.ptr,
-                    @intCast(cn.name.len),
-                    args.items.ptr,
-                    @intCast(args.items.len),
-                );
-                if (ref == error_ref) return error.EmitFailed;
-                try self.setLocal(cn.dest, ref);
+
+                // Route Kernel__* calls through @import("zap_runtime").Prelude.*
+                if (std.mem.startsWith(u8, cn.name, "Kernel__")) {
+                    const func_name = cn.name["Kernel__".len..];
+
+                    // @import("zap_runtime")
+                    const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                    if (rt_import == error_ref) return error.EmitFailed;
+
+                    // .Prelude
+                    const prelude = zir_builder_emit_field_val(self.handle, rt_import, "Prelude", 7);
+                    if (prelude == error_ref) return error.EmitFailed;
+
+                    // .println (or whatever function)
+                    const fn_ref = zir_builder_emit_field_val(self.handle, prelude, func_name.ptr, @intCast(func_name.len));
+                    if (fn_ref == error_ref) return error.EmitFailed;
+
+                    // call(fn_ref, args)
+                    const ref = zir_builder_emit_call_ref(self.handle, fn_ref, args.items.ptr, @intCast(args.items.len));
+                    if (ref == error_ref) return error.EmitFailed;
+                    try self.setLocal(cn.dest, ref);
+                } else {
+                    const ref = zir_builder_emit_call(
+                        self.handle,
+                        cn.name.ptr,
+                        @intCast(cn.name.len),
+                        args.items.ptr,
+                        @intCast(args.items.len),
+                    );
+                    if (ref == error_ref) return error.EmitFailed;
+                    try self.setLocal(cn.dest, ref);
+                }
             },
 
             // Builtin calls — emit @import("zap_runtime").Module.function(args)
