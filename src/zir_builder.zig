@@ -166,20 +166,7 @@ pub const ZirDriver = struct {
 
         // Zig's main must return void or u8. Check if body has a return value.
         const is_main = std.mem.eql(u8, func.name, "main");
-        const has_return_value = blk: {
-            for (func.body) |block| {
-                for (block.instructions) |instr| {
-                    switch (instr) {
-                        .ret => |ret| if (ret.value != null) break :blk true,
-                        else => {},
-                    }
-                }
-            }
-            break :blk false;
-        };
-        const ret_type = if (is_main and has_return_value)
-            @intFromEnum(Zir.Inst.Ref.u8_type)
-        else if (is_main)
+        const ret_type = if (is_main)
             mapMainReturnType(func.return_type)
         else
             mapReturnType(func.return_type);
