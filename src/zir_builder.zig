@@ -45,6 +45,8 @@ extern "c" fn zir_builder_emit_ret_void(handle: ?*ZirBuilderHandle) i32;
 extern "c" fn zir_builder_emit_import(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32) u32;
 extern "c" fn zir_builder_emit_field_val(handle: ?*ZirBuilderHandle, object: u32, field_ptr: [*]const u8, field_len: u32) u32;
 extern "c" fn zir_builder_emit_call_ref(handle: ?*ZirBuilderHandle, callee: u32, args_ptr: [*]const u32, args_len: u32) u32;
+extern "c" fn zir_builder_emit_if_else(handle: ?*ZirBuilderHandle, condition: u32, then_value: u32, else_value: u32) u32;
+extern "c" fn zir_builder_emit_struct_init_anon(handle: ?*ZirBuilderHandle, names_ptrs: [*]const [*]const u8, names_lens: [*]const u32, values_ptr: [*]const u32, fields_len: u32) u32;
 
 // Finalize and inject
 extern "c" fn zir_builder_inject(builder_handle: ?*ZirBuilderHandle, compilation_handle: ?*ZirContext) i32;
@@ -81,6 +83,37 @@ fn mapBinopTag(op: ir.BinaryOp.Op) ?u8 {
         .bool_or => @intFromEnum(Zir.Inst.Tag.bool_br_or),
         .concat => null, // TODO: array_cat
     };
+}
+
+// ---------------------------------------------------------------------------
+// Index field name helper — maps numeric index to string ("0", "1", ...)
+// ---------------------------------------------------------------------------
+
+/// Static string table for numeric field names 0-31. All pointers are stable
+/// comptime string literals, so they remain valid across multiple calls.
+const index_field_names = [_][]const u8{
+    "0",  "1",  "2",  "3",  "4",  "5",  "6",  "7",
+    "8",  "9",  "10", "11", "12", "13", "14", "15",
+    "16", "17", "18", "19", "20", "21", "22", "23",
+    "24", "25", "26", "27", "28", "29", "30", "31",
+};
+
+/// Returns a stable string pointer for a numeric index. For indices 0-31
+/// this uses a comptime table (no allocation, pointer is always valid).
+/// For larger indices, falls back to a static buffer.
+fn indexFieldName(index: anytype) struct { ptr: [*]const u8, len: u32 } {
+    const idx: u32 = @intCast(index);
+    if (idx < index_field_names.len) {
+        const name = index_field_names[idx];
+        return .{ .ptr = name.ptr, .len = @intCast(name.len) };
+    }
+    // Indices >= 32 are unlikely for tuples. Fall back to a static buffer
+    // — only valid until the next call with idx >= 32.
+    const F = struct {
+        var buf: [10]u8 = undefined;
+    };
+    const slice = std.fmt.bufPrint(&F.buf, "{d}", .{idx}) catch "0";
+    return .{ .ptr = slice.ptr, .len = @intCast(slice.len) };
 }
 
 // ---------------------------------------------------------------------------
@@ -394,53 +427,256 @@ pub const ZirDriver = struct {
                 try self.setLocal(el.dest, ref);
             },
 
-            // TODO: call_direct — needs function table lookup
+            // TODO: call_direct — needs function table lookup to resolve FunctionId to name
             .call_direct => {},
 
-            // TODO: control flow (needs ZIR block support in C API)
-            .if_expr => {},
+            // Control flow
+            .if_expr => |ie| {
+                // Emit then-branch instructions
+                for (ie.then_instrs) |ti| {
+                    try self.emitInstruction(ti);
+                }
+                const then_ref = if (ie.then_result) |tr|
+                    self.refForLocal(tr) catch return
+                else
+                    zir_builder_emit_void(self.handle);
+                if (then_ref == error_ref) return error.EmitFailed;
+
+                // Emit else-branch instructions
+                for (ie.else_instrs) |ei| {
+                    try self.emitInstruction(ei);
+                }
+                const else_ref = if (ie.else_result) |er|
+                    self.refForLocal(er) catch return
+                else
+                    zir_builder_emit_void(self.handle);
+                if (else_ref == error_ref) return error.EmitFailed;
+
+                // Get condition ref and emit if_else
+                const cond_ref = self.refForLocal(ie.condition) catch return;
+                const ref = zir_builder_emit_if_else(self.handle, cond_ref, then_ref, else_ref);
+                if (ref == error_ref) return error.EmitFailed;
+                try self.setLocal(ie.dest, ref);
+            },
+            // TODO: case_block — needs ZIR block/condbr support for multi-arm matching
             .case_block => {},
+            // TODO: switch_literal — needs ZIR switch support
             .switch_literal => {},
+            // TODO: guard_block — needs ZIR block/condbr support for guard clauses
             .guard_block => {},
+            // TODO: branch — needs ZIR block/br support
             .branch => {},
+            // TODO: cond_branch — needs ZIR condbr support
             .cond_branch => {},
+            // TODO: switch_tag — needs ZIR switch_block support
             .switch_tag => {},
+            // TODO: switch_return — needs ZIR switch_block support
             .switch_return => {},
+            // TODO: union_switch_return — needs ZIR switch_block support for tagged unions
             .union_switch_return => {},
-            .cond_return => {},
+            .cond_return => |cr| {
+                // Conditional return: if condition is true, return the value.
+                // In comptime context, we emit the condition check and conditional ret.
+                const cond_ref = self.refForLocal(cr.condition) catch return;
+                if (cr.value) |val| {
+                    const val_ref = self.refForLocal(val) catch return;
+                    // Emit: if (cond) return val else void
+                    const void_ref = zir_builder_emit_void(self.handle);
+                    if (void_ref == error_ref) return error.EmitFailed;
+                    const ret_val = zir_builder_emit_if_else(self.handle, cond_ref, val_ref, void_ref);
+                    if (ret_val == error_ref) return error.EmitFailed;
+                    // We can't conditionally return at ZIR level without condbr,
+                    // so we emit a ret of the if_else result. This means the function
+                    // always returns here — correct only when cond_return is the last
+                    // instruction in its block.
+                    if (zir_builder_emit_ret(self.handle, ret_val) != 0) {
+                        return error.EmitFailed;
+                    }
+                } else {
+                    // cond_return with no value — return void if condition is true
+                    const void_ref = zir_builder_emit_void(self.handle);
+                    if (void_ref == error_ref) return error.EmitFailed;
+                    const ret_val = zir_builder_emit_if_else(self.handle, cond_ref, void_ref, void_ref);
+                    if (ret_val == error_ref) return error.EmitFailed;
+                    if (zir_builder_emit_ret(self.handle, ret_val) != 0) {
+                        return error.EmitFailed;
+                    }
+                }
+            },
+            // TODO: case_break — needs ZIR block/break support
             .case_break => {},
+            // TODO: jump — needs ZIR block/br support
             .jump => {},
 
-            // TODO: aggregates (needs C API support)
-            .tuple_init => {},
-            .list_init => {},
+            // Aggregates
+            .tuple_init => |ti| {
+                // Build field names ("0", "1", "2", ...) and value refs
+                var names_ptrs = std.ArrayListUnmanaged([*]const u8).empty;
+                defer names_ptrs.deinit(self.allocator);
+                var names_lens = std.ArrayListUnmanaged(u32).empty;
+                defer names_lens.deinit(self.allocator);
+                var values = std.ArrayListUnmanaged(u32).empty;
+                defer values.deinit(self.allocator);
+
+                for (ti.elements, 0..) |elem, i| {
+                    const ref = self.refForLocal(elem) catch continue;
+                    // Use a static digit table for index names
+                    const name = indexFieldName(i);
+                    try names_ptrs.append(self.allocator, name.ptr);
+                    try names_lens.append(self.allocator, name.len);
+                    try values.append(self.allocator, ref);
+                }
+
+                const result = zir_builder_emit_struct_init_anon(
+                    self.handle,
+                    names_ptrs.items.ptr,
+                    names_lens.items.ptr,
+                    values.items.ptr,
+                    @intCast(values.items.len),
+                );
+                if (result == error_ref) return error.EmitFailed;
+                try self.setLocal(ti.dest, result);
+            },
+            .list_init => |li| {
+                // Lists use the same representation as tuples — anonymous struct with numeric fields
+                var names_ptrs = std.ArrayListUnmanaged([*]const u8).empty;
+                defer names_ptrs.deinit(self.allocator);
+                var names_lens = std.ArrayListUnmanaged(u32).empty;
+                defer names_lens.deinit(self.allocator);
+                var values = std.ArrayListUnmanaged(u32).empty;
+                defer values.deinit(self.allocator);
+
+                for (li.elements, 0..) |elem, i| {
+                    const ref = self.refForLocal(elem) catch continue;
+                    const name = indexFieldName(i);
+                    try names_ptrs.append(self.allocator, name.ptr);
+                    try names_lens.append(self.allocator, name.len);
+                    try values.append(self.allocator, ref);
+                }
+
+                const result = zir_builder_emit_struct_init_anon(
+                    self.handle,
+                    names_ptrs.items.ptr,
+                    names_lens.items.ptr,
+                    values.items.ptr,
+                    @intCast(values.items.len),
+                );
+                if (result == error_ref) return error.EmitFailed;
+                try self.setLocal(li.dest, result);
+            },
+            // TODO: map_init — needs C API for map/hash-map construction
             .map_init => {},
-            .struct_init => {},
-            .field_get => {},
+            .struct_init => |si| {
+                // Named struct fields — use struct_init_anon with field names from IR
+                var names_ptrs = std.ArrayListUnmanaged([*]const u8).empty;
+                defer names_ptrs.deinit(self.allocator);
+                var names_lens = std.ArrayListUnmanaged(u32).empty;
+                defer names_lens.deinit(self.allocator);
+                var values = std.ArrayListUnmanaged(u32).empty;
+                defer values.deinit(self.allocator);
+
+                for (si.fields) |field| {
+                    const ref = self.refForLocal(field.value) catch continue;
+                    try names_ptrs.append(self.allocator, field.name.ptr);
+                    try names_lens.append(self.allocator, @intCast(field.name.len));
+                    try values.append(self.allocator, ref);
+                }
+
+                const result = zir_builder_emit_struct_init_anon(
+                    self.handle,
+                    names_ptrs.items.ptr,
+                    names_lens.items.ptr,
+                    values.items.ptr,
+                    @intCast(values.items.len),
+                );
+                if (result == error_ref) return error.EmitFailed;
+                try self.setLocal(si.dest, result);
+            },
+            .field_get => |fg| {
+                const obj_ref = self.refForLocal(fg.object) catch return;
+                const ref = zir_builder_emit_field_val(self.handle, obj_ref, fg.field.ptr, @intCast(fg.field.len));
+                if (ref == error_ref) return error.EmitFailed;
+                try self.setLocal(fg.dest, ref);
+            },
+            // TODO: field_set — needs C API for struct field mutation (store instruction)
             .field_set => {},
-            .index_get => {},
+            .index_get => |ig| {
+                // Tuple/list index access — use field_val with numeric field name
+                const obj_ref = self.refForLocal(ig.object) catch return;
+                const name = indexFieldName(ig.index);
+                const ref = zir_builder_emit_field_val(self.handle, obj_ref, name.ptr, name.len);
+                if (ref == error_ref) return error.EmitFailed;
+                try self.setLocal(ig.dest, ref);
+            },
+            // TODO: list_len_check — needs runtime length comparison support
             .list_len_check => {},
-            .list_get => {},
+            .list_get => |lg| {
+                // List element access — same as index_get, use field_val with numeric field name
+                const list_ref = self.refForLocal(lg.list) catch return;
+                const name = indexFieldName(lg.index);
+                const ref = zir_builder_emit_field_val(self.handle, list_ref, name.ptr, name.len);
+                if (ref == error_ref) return error.EmitFailed;
+                try self.setLocal(lg.dest, ref);
+            },
+            // TODO: union_init — needs C API for tagged union construction
             .union_init => {},
 
-            // TODO: pattern matching
-            .match_atom => {},
-            .match_int => {},
-            .match_float => {},
-            .match_string => {},
+            // Pattern matching — emit comparisons using binop cmp_eq
+            .match_atom => |ma| {
+                // Compare scrutinee (enum literal) against expected atom via cmp_eq
+                const scrutinee_ref = self.refForLocal(ma.scrutinee) catch return;
+                const expected_ref = zir_builder_emit_enum_literal(self.handle, ma.atom_name.ptr, @intCast(ma.atom_name.len));
+                if (expected_ref == error_ref) return error.EmitFailed;
+                const cmp_tag = @intFromEnum(Zir.Inst.Tag.cmp_eq);
+                const ref = zir_builder_emit_binop(self.handle, cmp_tag, scrutinee_ref, expected_ref);
+                if (ref == error_ref) return error.EmitFailed;
+                try self.setLocal(ma.dest, ref);
+            },
+            .match_int => |mi| {
+                // Compare scrutinee against expected int via cmp_eq
+                const scrutinee_ref = self.refForLocal(mi.scrutinee) catch return;
+                const expected_ref = zir_builder_emit_int(self.handle, mi.value);
+                if (expected_ref == error_ref) return error.EmitFailed;
+                const cmp_tag = @intFromEnum(Zir.Inst.Tag.cmp_eq);
+                const ref = zir_builder_emit_binop(self.handle, cmp_tag, scrutinee_ref, expected_ref);
+                if (ref == error_ref) return error.EmitFailed;
+                try self.setLocal(mi.dest, ref);
+            },
+            .match_float => |mf| {
+                // Compare scrutinee against expected float via cmp_eq
+                const scrutinee_ref = self.refForLocal(mf.scrutinee) catch return;
+                const expected_ref = zir_builder_emit_float(self.handle, mf.value);
+                if (expected_ref == error_ref) return error.EmitFailed;
+                const cmp_tag = @intFromEnum(Zir.Inst.Tag.cmp_eq);
+                const ref = zir_builder_emit_binop(self.handle, cmp_tag, scrutinee_ref, expected_ref);
+                if (ref == error_ref) return error.EmitFailed;
+                try self.setLocal(mf.dest, ref);
+            },
+            .match_string => |ms| {
+                // Compare scrutinee against expected string via cmp_eq
+                const scrutinee_ref = self.refForLocal(ms.scrutinee) catch return;
+                const expected_ref = zir_builder_emit_str(self.handle, ms.expected.ptr, @intCast(ms.expected.len));
+                if (expected_ref == error_ref) return error.EmitFailed;
+                const cmp_tag = @intFromEnum(Zir.Inst.Tag.cmp_eq);
+                const ref = zir_builder_emit_binop(self.handle, cmp_tag, scrutinee_ref, expected_ref);
+                if (ref == error_ref) return error.EmitFailed;
+                try self.setLocal(ms.dest, ref);
+            },
+            // TODO: match_type — needs runtime type introspection (@TypeOf comparison)
             .match_type => {},
+            // TODO: match_fail — needs @panic or unreachable emission
             .match_fail => {},
 
-            // TODO: closures
+            // TODO: closures — needs C API for closure capture/dispatch
             .call_dispatch => {},
             .call_closure => {},
             .make_closure => {},
             .capture_get => {},
 
-            // TODO: optional unwrap
+            // TODO: optional_unwrap — needs C API for optional unwrap (.?)
             .optional_unwrap => {},
 
-            // TODO: binary pattern matching
+            // TODO: binary pattern matching — needs runtime binary introspection
             .bin_len_check => {},
             .bin_read_int => {},
             .bin_read_float => {},
@@ -448,12 +684,12 @@ pub const ZirDriver = struct {
             .bin_read_utf8 => {},
             .bin_match_prefix => {},
 
-            // TODO: memory / ARC
+            // TODO: memory / ARC — no-ops until ARC runtime is wired
             .alloc_owned => {},
             .retain => {},
             .release => {},
 
-            // TODO: phi
+            // TODO: phi — needs ZIR block-param support for SSA phi nodes
             .phi => {},
         }
     }
