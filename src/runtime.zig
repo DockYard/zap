@@ -618,6 +618,158 @@ pub const Prelude = struct {
 };
 
 // ============================================================
+// BinaryHelpers — concrete binary pattern matching operations
+// for ZIR builder (no generics, no comptime type params)
+// ============================================================
+
+pub const BinaryHelpers = struct {
+    // --- Integer reads (byte-aligned) ---
+    // Each function reads N bytes from data at the given byte offset
+    // using big-endian byte order, returning a u64/i64.
+    // The ZIR builder calls these because ZIR cannot express generic
+    // std.mem.readInt calls with comptime type parameters.
+
+    pub fn readIntU8(data: []const u8, offset: usize) u64 {
+        if (offset >= data.len) return 0;
+        return @intCast(data[offset]);
+    }
+
+    pub fn readIntU16Big(data: []const u8, offset: usize) u64 {
+        if (offset + 2 > data.len) return 0;
+        return @intCast(std.mem.readInt(u16, data[offset..][0..2], .big));
+    }
+
+    pub fn readIntU16Little(data: []const u8, offset: usize) u64 {
+        if (offset + 2 > data.len) return 0;
+        return @intCast(std.mem.readInt(u16, data[offset..][0..2], .little));
+    }
+
+    pub fn readIntU32Big(data: []const u8, offset: usize) u64 {
+        if (offset + 4 > data.len) return 0;
+        return @intCast(std.mem.readInt(u32, data[offset..][0..4], .big));
+    }
+
+    pub fn readIntU32Little(data: []const u8, offset: usize) u64 {
+        if (offset + 4 > data.len) return 0;
+        return @intCast(std.mem.readInt(u32, data[offset..][0..4], .little));
+    }
+
+    pub fn readIntU64Big(data: []const u8, offset: usize) u64 {
+        if (offset + 8 > data.len) return 0;
+        return std.mem.readInt(u64, data[offset..][0..8], .big);
+    }
+
+    pub fn readIntU64Little(data: []const u8, offset: usize) u64 {
+        if (offset + 8 > data.len) return 0;
+        return std.mem.readInt(u64, data[offset..][0..8], .little);
+    }
+
+    pub fn readIntI8(data: []const u8, offset: usize) i64 {
+        if (offset >= data.len) return 0;
+        return @intCast(@as(i8, @bitCast(data[offset])));
+    }
+
+    pub fn readIntI16Big(data: []const u8, offset: usize) i64 {
+        if (offset + 2 > data.len) return 0;
+        return @intCast(std.mem.readInt(i16, data[offset..][0..2], .big));
+    }
+
+    pub fn readIntI16Little(data: []const u8, offset: usize) i64 {
+        if (offset + 2 > data.len) return 0;
+        return @intCast(std.mem.readInt(i16, data[offset..][0..2], .little));
+    }
+
+    pub fn readIntI32Big(data: []const u8, offset: usize) i64 {
+        if (offset + 4 > data.len) return 0;
+        return @intCast(std.mem.readInt(i32, data[offset..][0..4], .big));
+    }
+
+    pub fn readIntI32Little(data: []const u8, offset: usize) i64 {
+        if (offset + 4 > data.len) return 0;
+        return @intCast(std.mem.readInt(i32, data[offset..][0..4], .little));
+    }
+
+    pub fn readIntI64Big(data: []const u8, offset: usize) i64 {
+        if (offset + 8 > data.len) return 0;
+        return std.mem.readInt(i64, data[offset..][0..8], .big);
+    }
+
+    pub fn readIntI64Little(data: []const u8, offset: usize) i64 {
+        if (offset + 8 > data.len) return 0;
+        return std.mem.readInt(i64, data[offset..][0..8], .little);
+    }
+
+    // Sub-byte read: extract `bits` bits from data[offset] >> bit_offset
+    pub fn readBitsU(data: []const u8, offset: usize, bit_offset: u3) u64 {
+        if (offset >= data.len) return 0;
+        return @intCast(data[offset] >> bit_offset);
+    }
+
+    // --- Float reads ---
+    pub fn readF32Big(data: []const u8, offset: usize) f64 {
+        if (offset + 4 > data.len) return 0.0;
+        const int_val = std.mem.readInt(u32, data[offset..][0..4], .big);
+        return @floatCast(@as(f32, @bitCast(int_val)));
+    }
+
+    pub fn readF32Little(data: []const u8, offset: usize) f64 {
+        if (offset + 4 > data.len) return 0.0;
+        const int_val = std.mem.readInt(u32, data[offset..][0..4], .little);
+        return @floatCast(@as(f32, @bitCast(int_val)));
+    }
+
+    pub fn readF64Big(data: []const u8, offset: usize) f64 {
+        if (offset + 8 > data.len) return 0.0;
+        const int_val = std.mem.readInt(u64, data[offset..][0..8], .big);
+        return @bitCast(int_val);
+    }
+
+    pub fn readF64Little(data: []const u8, offset: usize) f64 {
+        if (offset + 8 > data.len) return 0.0;
+        const int_val = std.mem.readInt(u64, data[offset..][0..8], .little);
+        return @bitCast(int_val);
+    }
+
+    // --- Slice ---
+    // Returns data[offset..offset+length], or data[offset..] if length == 0 (sentinel for "rest")
+    pub fn slice(data: []const u8, offset: usize, length: usize) []const u8 {
+        const start = @min(offset, data.len);
+        if (length == 0) return data[start..];
+        const end = @min(start + length, data.len);
+        return data[start..end];
+    }
+
+    // --- UTF-8 reads ---
+    // Returns the byte sequence length for the UTF-8 character at data[offset]
+    pub fn utf8ByteLen(data: []const u8, offset: usize) u64 {
+        if (offset >= data.len) return 1;
+        return @intCast(std.unicode.utf8ByteSequenceLength(data[offset]) catch 1);
+    }
+
+    // Returns the decoded codepoint for the UTF-8 character at data[offset..offset+len]
+    pub fn utf8Decode(data: []const u8, offset: usize, len: usize) u64 {
+        if (offset + len > data.len or len == 0 or len > 4) return 0xFFFD;
+        const end = offset + len;
+        const byte_slice = data[offset..end];
+        // utf8Decode expects a fixed-size array per length
+        return switch (len) {
+            1 => @intCast(byte_slice[0]),
+            2 => @intCast(std.unicode.utf8Decode(byte_slice[0..2].*) catch 0xFFFD),
+            3 => @intCast(std.unicode.utf8Decode(byte_slice[0..3].*) catch 0xFFFD),
+            4 => @intCast(std.unicode.utf8Decode(byte_slice[0..4].*) catch 0xFFFD),
+            else => 0xFFFD,
+        };
+    }
+
+    // --- Prefix matching ---
+    // Returns true if data starts with the expected prefix
+    pub fn matchPrefix(data: []const u8, expected: []const u8) bool {
+        if (data.len < expected.len) return false;
+        return std.mem.eql(u8, data[0..expected.len], expected);
+    }
+};
+
+// ============================================================
 // Tests
 // ============================================================
 
