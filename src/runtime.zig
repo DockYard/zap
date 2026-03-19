@@ -700,9 +700,12 @@ pub const BinaryHelpers = struct {
     }
 
     // Sub-byte read: extract `bits` bits from data[offset] >> bit_offset
-    pub fn readBitsU(data: []const u8, offset: usize, bit_offset: u3) u64 {
+    pub fn readBitsU(data: []const u8, offset: usize, bit_offset: u3, bits: u8) u64 {
         if (offset >= data.len) return 0;
-        return @intCast(data[offset] >> bit_offset);
+        const shifted: u8 = data[offset] >> bit_offset;
+        if (bits == 0 or bits >= 8) return @intCast(shifted);
+        const mask: u8 = (@as(u8, 1) << @intCast(bits)) - 1;
+        return @intCast(shifted & mask);
     }
 
     // --- Float reads ---
@@ -735,7 +738,7 @@ pub const BinaryHelpers = struct {
     pub fn slice(data: []const u8, offset: usize, length: usize) []const u8 {
         const start = @min(offset, data.len);
         if (length == 0) return data[start..];
-        const end = @min(start + length, data.len);
+        const end = @min(std.math.add(usize, start, length) catch data.len, data.len);
         return data[start..end];
     }
 

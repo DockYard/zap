@@ -5,8 +5,11 @@
 //! zir_api.zig in that fork.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const ir = @import("ir.zig");
 const Allocator = std.mem.Allocator;
+
+const native_endian: std.builtin.Endian = builtin.cpu.arch.endian();
 
 // ---------------------------------------------------------------------------
 // Opaque handles for the C-ABI boundary
@@ -1088,33 +1091,39 @@ pub const ZirDriver = struct {
                 else if (bri.signed) switch (bri.bits) {
                     8 => "readIntI8",
                     16 => switch (bri.endianness) {
-                        .big, .native => @as([]const u8, "readIntI16Big"),
+                        .big => @as([]const u8, "readIntI16Big"),
+                        .native => if (native_endian == .little) @as([]const u8, "readIntI16Little") else "readIntI16Big",
                         .little => "readIntI16Little",
                     },
                     32 => switch (bri.endianness) {
-                        .big, .native => @as([]const u8, "readIntI32Big"),
+                        .big => @as([]const u8, "readIntI32Big"),
+                        .native => if (native_endian == .little) @as([]const u8, "readIntI32Little") else "readIntI32Big",
                         .little => "readIntI32Little",
                     },
                     64 => switch (bri.endianness) {
-                        .big, .native => @as([]const u8, "readIntI64Big"),
+                        .big => @as([]const u8, "readIntI64Big"),
+                        .native => if (native_endian == .little) @as([]const u8, "readIntI64Little") else "readIntI64Big",
                         .little => "readIntI64Little",
                     },
-                    else => "readIntI64Big",
+                    else => if (native_endian == .little) @as([]const u8, "readIntI64Little") else "readIntI64Big",
                 } else switch (bri.bits) {
                     8 => @as([]const u8, "readIntU8"),
                     16 => switch (bri.endianness) {
-                        .big, .native => @as([]const u8, "readIntU16Big"),
+                        .big => @as([]const u8, "readIntU16Big"),
+                        .native => if (native_endian == .little) @as([]const u8, "readIntU16Little") else "readIntU16Big",
                         .little => "readIntU16Little",
                     },
                     32 => switch (bri.endianness) {
-                        .big, .native => @as([]const u8, "readIntU32Big"),
+                        .big => @as([]const u8, "readIntU32Big"),
+                        .native => if (native_endian == .little) @as([]const u8, "readIntU32Little") else "readIntU32Big",
                         .little => "readIntU32Little",
                     },
                     64 => switch (bri.endianness) {
-                        .big, .native => @as([]const u8, "readIntU64Big"),
+                        .big => @as([]const u8, "readIntU64Big"),
+                        .native => if (native_endian == .little) @as([]const u8, "readIntU64Little") else "readIntU64Big",
                         .little => "readIntU64Little",
                     },
-                    else => "readIntU64Big",
+                    else => if (native_endian == .little) @as([]const u8, "readIntU64Little") else "readIntU64Big",
                 };
 
                 const fn_ref = zir_builder_emit_field_val(self.handle, helpers, func_name.ptr, @intCast(func_name.len));
@@ -1128,11 +1137,13 @@ pub const ZirDriver = struct {
                 if (offset_ref == error_ref) return error.EmitFailed;
 
                 if (bri.bits < 8 or bri.bits % 8 != 0) {
-                    // Sub-byte: readBitsU(data, offset, bit_offset)
+                    // Sub-byte: readBitsU(data, offset, bit_offset, bits)
                     const bit_off_ref = zir_builder_emit_int(self.handle, @intCast(bri.bit_offset));
                     if (bit_off_ref == error_ref) return error.EmitFailed;
-                    const args = [_]u32{ source_ref, offset_ref, bit_off_ref };
-                    const ref = zir_builder_emit_call_ref(self.handle, fn_ref, &args, 3);
+                    const bits_ref = zir_builder_emit_int(self.handle, @intCast(bri.bits));
+                    if (bits_ref == error_ref) return error.EmitFailed;
+                    const args = [_]u32{ source_ref, offset_ref, bit_off_ref, bits_ref };
+                    const ref = zir_builder_emit_call_ref(self.handle, fn_ref, &args, 4);
                     if (ref == error_ref) return error.EmitFailed;
                     try self.setLocal(bri.dest, ref);
                 } else {
@@ -1151,14 +1162,16 @@ pub const ZirDriver = struct {
 
                 const func_name: []const u8 = switch (brf.bits) {
                     32 => switch (brf.endianness) {
-                        .big, .native => @as([]const u8, "readF32Big"),
+                        .big => @as([]const u8, "readF32Big"),
                         .little => "readF32Little",
+                        .native => if (native_endian == .little) @as([]const u8, "readF32Little") else "readF32Big",
                     },
                     64 => switch (brf.endianness) {
-                        .big, .native => @as([]const u8, "readF64Big"),
+                        .big => @as([]const u8, "readF64Big"),
                         .little => "readF64Little",
+                        .native => if (native_endian == .little) @as([]const u8, "readF64Little") else "readF64Big",
                     },
-                    else => "readF64Big",
+                    else => if (native_endian == .little) @as([]const u8, "readF64Little") else "readF64Big",
                 };
 
                 const fn_ref = zir_builder_emit_field_val(self.handle, helpers, func_name.ptr, @intCast(func_name.len));
