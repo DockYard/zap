@@ -295,9 +295,17 @@ pub const ZirDriver = struct {
                     if (ref == error_ref) return error.EmitFailed;
                     try self.setLocal(bo.dest, ref);
                 } else {
-                    // concat — emit @import("zap_runtime").ZapString.concat(lhs, rhs)
+                    // concat — emit @import("zap_runtime").ZapString.concat(page_allocator, lhs, rhs)
                     const lhs = self.refForLocal(bo.lhs) catch return;
                     const rhs = self.refForLocal(bo.rhs) catch return;
+
+                    // Get std.heap.page_allocator for the allocator argument
+                    const std_import = zir_builder_emit_import(self.handle, "std", 3);
+                    if (std_import == error_ref) return error.EmitFailed;
+                    const heap_mod = zir_builder_emit_field_val(self.handle, std_import, "heap", 4);
+                    if (heap_mod == error_ref) return error.EmitFailed;
+                    const alloc_ref = zir_builder_emit_field_val(self.handle, heap_mod, "page_allocator", 14);
+                    if (alloc_ref == error_ref) return error.EmitFailed;
 
                     const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                     if (rt_import == error_ref) return error.EmitFailed;
@@ -306,8 +314,8 @@ pub const ZirDriver = struct {
                     const concat_fn = zir_builder_emit_field_val(self.handle, zap_string, "concat", 6);
                     if (concat_fn == error_ref) return error.EmitFailed;
 
-                    const args = [_]u32{ lhs, rhs };
-                    const ref = zir_builder_emit_call_ref(self.handle, concat_fn, &args, 2);
+                    const args = [_]u32{ alloc_ref, lhs, rhs };
+                    const ref = zir_builder_emit_call_ref(self.handle, concat_fn, &args, 3);
                     if (ref == error_ref) return error.EmitFailed;
                     try self.setLocal(bo.dest, ref);
                 }
@@ -571,13 +579,13 @@ pub const ZirDriver = struct {
                 for (sr.cases) |case| {
                     for (case.body_instrs) |bi| try self.emitInstruction(bi);
                     if (case.return_value) |rv| {
-                        const ref = self.refForLocal(rv) catch continue;
+                        const ref = try self.refForLocal(rv);
                         if (zir_builder_emit_ret(self.handle, ref) != 0) return error.EmitFailed;
                     }
                 }
                 for (sr.default_instrs) |di| try self.emitInstruction(di);
                 if (sr.default_result) |dr| {
-                    const ref = self.refForLocal(dr) catch return;
+                    const ref = try self.refForLocal(dr);
                     if (zir_builder_emit_ret(self.handle, ref) != 0) return error.EmitFailed;
                 }
             },
@@ -585,7 +593,7 @@ pub const ZirDriver = struct {
                 for (usr.cases) |case| {
                     for (case.body_instrs) |bi| try self.emitInstruction(bi);
                     if (case.return_value) |rv| {
-                        const ref = self.refForLocal(rv) catch continue;
+                        const ref = try self.refForLocal(rv);
                         if (zir_builder_emit_ret(self.handle, ref) != 0) return error.EmitFailed;
                     }
                 }
@@ -1077,14 +1085,12 @@ pub const ZirDriver = struct {
                 const panic_call = zir_builder_emit_call_ref(self.handle, panic_fn, &panic_args, 1);
                 if (panic_call == error_ref) return error.EmitFailed;
 
-                // Use if_else as a guard: if source is void (our nil representation),
+                // Use if_else as a guard: if source is null (Zap nil = Zig null),
                 // the panic branch triggers; otherwise pass through source.
-                // Emit: if_else(source == void, panic_call, source)
-                // For comptime non-optional values, Zig will constant-fold this away.
-                const void_ref = zir_builder_emit_void(self.handle);
-                if (void_ref == error_ref) return error.EmitFailed;
+                // Emit: if_else(source == null, panic_call, source)
+                const null_ref = @as(u32, @intFromEnum(Zir.Inst.Ref.null_value));
                 const cmp_tag: u8 = @intFromEnum(Zir.Inst.Tag.cmp_eq);
-                const is_nil = zir_builder_emit_binop(self.handle, cmp_tag, source_ref, void_ref);
+                const is_nil = zir_builder_emit_binop(self.handle, cmp_tag, source_ref, null_ref);
                 if (is_nil == error_ref) return error.EmitFailed;
 
                 const result = zir_builder_emit_if_else(self.handle, is_nil, panic_call, source_ref);
@@ -1335,70 +1341,32 @@ pub const ZirDriver = struct {
                 try self.setLocal(ao.dest, marker);
             },
             .retain => |ret| {
-                // Codegen pattern: arc.retain() — increments refcount
-                //
-                // The runtime's Arc(T).retain() is a method on a generic type.
-                // In ZIR, we cannot call methods on generic instances without
-                // knowing T. The ArcHeader.retain() takes *ArcHeader, but we
-                // don't have a way to cast the value to get the header pointer.
-                //
-                // Emit: @import("zap_runtime").ArcHeader.retain(value)
-                // This works if the value is an ArcHeader pointer. For Arc(T)
-                // wrappers, the caller would need to pass value.ptr.header.
-                //
-                // Since we don't know the value's type structure in ZIR, emit
-                // a runtime call that will work when values have an .arc_header
-                // field or when a non-generic retain helper is added to runtime.
-                //
-                // TODO: Add to runtime.zig:
-                //   pub fn arc_retain(ptr: *anyopaque) void {
-                //       const header: *ArcHeader = @ptrCast(@alignCast(ptr));
-                //       header.retain();
-                //   }
-                // Then emit: @import("zap_runtime").arc_retain(value)
+                // Emit: @import("zap_runtime").ArcHeader.retainOpaque(value)
                 const val_ref = self.refForLocal(ret.value) catch return;
 
-                // Best-effort: emit field access to get .ptr.header and call retain
-                // Pattern: value.ptr.header.retain()
-                // This will work for Arc(T) values at comptime.
-                const ptr_field = zir_builder_emit_field_val(self.handle, val_ref, "ptr", 3);
-                if (ptr_field == error_ref) return; // silently skip if not an Arc
-                const header_field = zir_builder_emit_field_val(self.handle, ptr_field, "header", 6);
-                if (header_field == error_ref) return;
-                const retain_fn = zir_builder_emit_field_val(self.handle, header_field, "retain", 6);
-                if (retain_fn == error_ref) return;
+                const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                if (rt_import == error_ref) return error.EmitFailed;
+                const arc_header = zir_builder_emit_field_val(self.handle, rt_import, "ArcHeader", 9);
+                if (arc_header == error_ref) return error.EmitFailed;
+                const retain_fn = zir_builder_emit_field_val(self.handle, arc_header, "retainOpaque", 12);
+                if (retain_fn == error_ref) return error.EmitFailed;
 
-                const args = [_]u32{header_field};
+                const args = [_]u32{val_ref};
                 _ = zir_builder_emit_call_ref(self.handle, retain_fn, &args, 1);
-                // retain returns void, nothing to store
             },
             .release => |rel| {
-                // Codegen pattern: arc.release(allocator) — decrements refcount, frees if zero
-                //
-                // Same generic-type limitation as retain. The runtime's
-                // Arc(T).release() takes (self, allocator).
-                //
-                // TODO: Add to runtime.zig:
-                //   pub fn arc_release(ptr: *anyopaque) void {
-                //       const header: *ArcHeader = @ptrCast(@alignCast(ptr));
-                //       if (header.release()) { ... free ... }
-                //   }
-                // Then emit: @import("zap_runtime").arc_release(value)
+                // Emit: @import("zap_runtime").ArcHeader.releaseOpaque(value)
                 const val_ref = self.refForLocal(rel.value) catch return;
 
-                // Best-effort: emit value.ptr.header.release() pattern
-                const ptr_field = zir_builder_emit_field_val(self.handle, val_ref, "ptr", 3);
-                if (ptr_field == error_ref) return; // silently skip if not an Arc
-                const header_field = zir_builder_emit_field_val(self.handle, ptr_field, "header", 6);
-                if (header_field == error_ref) return;
-                const release_fn = zir_builder_emit_field_val(self.handle, header_field, "release", 7);
-                if (release_fn == error_ref) return;
+                const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                if (rt_import == error_ref) return error.EmitFailed;
+                const arc_header = zir_builder_emit_field_val(self.handle, rt_import, "ArcHeader", 9);
+                if (arc_header == error_ref) return error.EmitFailed;
+                const release_fn = zir_builder_emit_field_val(self.handle, arc_header, "releaseOpaque", 13);
+                if (release_fn == error_ref) return error.EmitFailed;
 
-                const args = [_]u32{header_field};
+                const args = [_]u32{val_ref};
                 _ = zir_builder_emit_call_ref(self.handle, release_fn, &args, 1);
-                // release returns bool (should_free), but ARC deallocation
-                // requires an allocator which we don't have at this level.
-                // Full implementation needs the runtime's arc_release helper.
             },
 
             // Never generated by IrBuilder — verified in ir.zig.

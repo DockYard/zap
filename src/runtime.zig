@@ -39,6 +39,18 @@ pub const ArcHeader = struct {
     pub fn count(self: *const ArcHeader) u32 {
         return self.ref_count.load(.acquire);
     }
+
+    /// Non-generic retain for use from ZIR — takes an opaque pointer to an ArcHeader.
+    pub fn retainOpaque(ptr: *anyopaque) void {
+        const header: *ArcHeader = @ptrCast(@alignCast(ptr));
+        header.retain();
+    }
+
+    /// Non-generic release for use from ZIR — returns true if the caller should free.
+    pub fn releaseOpaque(ptr: *anyopaque) bool {
+        const header: *ArcHeader = @ptrCast(@alignCast(ptr));
+        return header.release();
+    }
 };
 
 pub fn Arc(comptime T: type) type {
