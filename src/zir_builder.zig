@@ -274,6 +274,7 @@ fn inferTypeForLocal(instrs: []const ir.Instruction, local: ir.LocalId) ?u32 {
 pub const ZirDriver = struct {
     handle: *ZirBuilderHandle,
     local_refs: std.AutoHashMapUnmanaged(ir.LocalId, u32),
+    param_refs: std.ArrayListUnmanaged(u32),
     allocator: Allocator,
     program: ?ir.Program,
     /// Tracks the dest local of the enclosing case_block so that case_break
@@ -285,6 +286,7 @@ pub const ZirDriver = struct {
         return .{
             .handle = handle,
             .local_refs = .empty,
+            .param_refs = .empty,
             .program = null,
             .allocator = allocator,
         };
@@ -293,6 +295,7 @@ pub const ZirDriver = struct {
     pub fn deinit(self: *ZirDriver) void {
         zir_builder_destroy(self.handle);
         self.local_refs.deinit(self.allocator);
+        self.param_refs.deinit(self.allocator);
     }
 
     // -- Helpers --------------------------------------------------------------
@@ -316,6 +319,7 @@ pub const ZirDriver = struct {
 
     fn emitFunction(self: *ZirDriver, func: ir.Function) !void {
         self.local_refs.clearRetainingCapacity();
+        self.param_refs.clearRetainingCapacity();
 
         // Zig's main must return void or u8. Check if body has a return value.
         const is_main = std.mem.eql(u8, func.name, "main");
@@ -354,6 +358,7 @@ pub const ZirDriver = struct {
                 effective_type,
             );
             if (param_ref == error_ref) return error.EmitFailed;
+            try self.param_refs.append(self.allocator, param_ref);
             try self.setLocal(@intCast(i), param_ref);
         }
 
@@ -418,7 +423,12 @@ pub const ZirDriver = struct {
                 }
             },
             .param_get => |pg| {
-                if (self.local_refs.get(pg.index)) |ref| {
+                // Look up param ref from the dedicated param_refs array,
+                // NOT from local_refs which may have been overwritten by
+                // earlier param_get dest assignments.
+                if (pg.index < self.param_refs.items.len) {
+                    try self.setLocal(pg.dest, self.param_refs.items[pg.index]);
+                } else if (self.local_refs.get(pg.index)) |ref| {
                     try self.setLocal(pg.dest, ref);
                 }
             },
