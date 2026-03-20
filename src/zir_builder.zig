@@ -49,6 +49,7 @@ extern "c" fn zir_builder_emit_import(handle: ?*ZirBuilderHandle, name_ptr: [*]c
 extern "c" fn zir_builder_emit_field_val(handle: ?*ZirBuilderHandle, object: u32, field_ptr: [*]const u8, field_len: u32) u32;
 extern "c" fn zir_builder_emit_call_ref(handle: ?*ZirBuilderHandle, callee: u32, args_ptr: [*]const u32, args_len: u32) u32;
 extern "c" fn zir_builder_emit_typeof(handle: ?*ZirBuilderHandle, operand: u32) u32;
+extern "c" fn zir_builder_emit_type_info(handle: ?*ZirBuilderHandle, operand: u32) u32;
 extern "c" fn zir_builder_emit_if_else(handle: ?*ZirBuilderHandle, condition: u32, then_value: u32, else_value: u32) u32;
 extern "c" fn zir_builder_emit_struct_init_anon(handle: ?*ZirBuilderHandle, names_ptrs: [*]const [*]const u8, names_lens: [*]const u32, values_ptr: [*]const u32, fields_len: u32) u32;
 
@@ -916,12 +917,49 @@ pub const ZirDriver = struct {
                     return;
                 }
 
-                // For tuple types, we can't do a proper type check without @typeInfo.
-                // Emit true as a stub for now.
-                if (mt.expected_type == .tuple) {
-                    // TODO: Implement tuple arity check via @typeInfo when available.
-                    const ref = zir_builder_emit_bool(self.handle, true);
-                    if (ref != error_ref) try self.setLocal(mt.dest, ref);
+                // For tuple/struct types: check @typeInfo(@TypeOf(x)) == .@"struct"
+                // and optionally check .fields.len == expected_arity
+                if (mt.expected_type == .tuple or mt.expected_type == .struct_ref) {
+                    // Step 1: @TypeOf(scrutinee)
+                    const typeof_ref = zir_builder_emit_typeof(self.handle, scrutinee_ref);
+                    if (typeof_ref == error_ref) return error.EmitFailed;
+
+                    // Step 2: @typeInfo(typeof_result)
+                    const type_info_ref = zir_builder_emit_type_info(self.handle, typeof_ref);
+                    if (type_info_ref == error_ref) return error.EmitFailed;
+
+                    // Step 3: Compare against .@"struct" enum literal
+                    const struct_tag = zir_builder_emit_enum_literal(self.handle, "struct", 6);
+                    if (struct_tag == error_ref) return error.EmitFailed;
+
+                    const cmp_tag: u8 = @intFromEnum(Zir.Inst.Tag.cmp_eq);
+                    const is_struct = zir_builder_emit_binop(self.handle, cmp_tag, type_info_ref, struct_tag);
+                    if (is_struct == error_ref) return error.EmitFailed;
+
+                    // Step 4: If arity check requested, also check fields.len
+                    if (mt.expected_arity) |arity| {
+                        // Get .@"struct" field from typeInfo result
+                        const struct_info = zir_builder_emit_field_val(self.handle, type_info_ref, "struct", 6);
+                        if (struct_info == error_ref) return error.EmitFailed;
+                        // Get .fields from struct info
+                        const fields = zir_builder_emit_field_val(self.handle, struct_info, "fields", 6);
+                        if (fields == error_ref) return error.EmitFailed;
+                        // Get .len from fields
+                        const fields_len = zir_builder_emit_field_val(self.handle, fields, "len", 3);
+                        if (fields_len == error_ref) return error.EmitFailed;
+                        // Compare against expected arity
+                        const arity_ref = zir_builder_emit_int(self.handle, @intCast(arity));
+                        if (arity_ref == error_ref) return error.EmitFailed;
+                        const len_match = zir_builder_emit_binop(self.handle, cmp_tag, fields_len, arity_ref);
+                        if (len_match == error_ref) return error.EmitFailed;
+                        // Both conditions must be true: is_struct AND len_match
+                        const and_tag: u8 = @intFromEnum(Zir.Inst.Tag.bit_and);
+                        const ref = zir_builder_emit_binop(self.handle, and_tag, is_struct, len_match);
+                        if (ref == error_ref) return error.EmitFailed;
+                        try self.setLocal(mt.dest, ref);
+                    } else {
+                        try self.setLocal(mt.dest, is_struct);
+                    }
                     return;
                 }
 
