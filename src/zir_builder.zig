@@ -48,6 +48,7 @@ extern "c" fn zir_builder_emit_ret_void(handle: ?*ZirBuilderHandle) i32;
 extern "c" fn zir_builder_emit_import(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32) u32;
 extern "c" fn zir_builder_emit_field_val(handle: ?*ZirBuilderHandle, object: u32, field_ptr: [*]const u8, field_len: u32) u32;
 extern "c" fn zir_builder_emit_call_ref(handle: ?*ZirBuilderHandle, callee: u32, args_ptr: [*]const u32, args_len: u32) u32;
+extern "c" fn zir_builder_emit_typeof(handle: ?*ZirBuilderHandle, operand: u32) u32;
 extern "c" fn zir_builder_emit_if_else(handle: ?*ZirBuilderHandle, condition: u32, then_value: u32, else_value: u32) u32;
 extern "c" fn zir_builder_emit_struct_init_anon(handle: ?*ZirBuilderHandle, names_ptrs: [*]const [*]const u8, names_lens: [*]const u32, values_ptr: [*]const u32, fields_len: u32) u32;
 
@@ -906,24 +907,40 @@ pub const ZirDriver = struct {
                 try self.setLocal(ms.dest, ref);
             },
             .match_type => |mt| {
-                // Type checking requires ZIR builtins not yet exposed in the C-ABI:
-                //   - .typeof (Zir.Inst.Tag.typeof) to get @TypeOf(scrutinee)
-                //   - .type_info (builtin call) to get @typeInfo(typeof_result)
-                //   - .cmp_eq to compare type refs for simple types
-                //   - .field_val on typeInfo struct for .@"struct".fields.len (arity check)
-                //
-                // Codegen equivalent per type:
-                //   struct/tuple: @typeInfo(@TypeOf(x)) == .@"struct"
-                //                 optionally: ... and .@"struct".fields.len == arity
-                //   int types:    @TypeOf(x) == i64 or @typeInfo(@TypeOf(x)) == .comptime_int
-                //   float types:  @TypeOf(x) == f64 or @typeInfo(@TypeOf(x)) == .comptime_float
-                //   other:        @TypeOf(x) == ExpectedType
-                //
-                // Once the C-ABI builder exposes zir_builder_emit_typeof and
-                // zir_builder_emit_builtin (for @typeInfo), this should emit
-                // the proper comparison chain.
-                const ref = zir_builder_emit_bool(self.handle, true);
-                if (ref != error_ref) try self.setLocal(mt.dest, ref);
+                const scrutinee_ref = self.refForLocal(mt.scrutinee) catch return;
+
+                // For .any, always matches — emit true
+                if (mt.expected_type == .any) {
+                    const ref = zir_builder_emit_bool(self.handle, true);
+                    if (ref != error_ref) try self.setLocal(mt.dest, ref);
+                    return;
+                }
+
+                // For tuple types, we can't do a proper type check without @typeInfo.
+                // Emit true as a stub for now.
+                if (mt.expected_type == .tuple) {
+                    // TODO: Implement tuple arity check via @typeInfo when available.
+                    const ref = zir_builder_emit_bool(self.handle, true);
+                    if (ref != error_ref) try self.setLocal(mt.dest, ref);
+                    return;
+                }
+
+                // For simple types, emit: @TypeOf(scrutinee) == expected_type_ref
+                const expected_type_raw = mapReturnType(mt.expected_type);
+                if (expected_type_raw == 0) {
+                    // Unsupported type or void — emit true as fallback
+                    const ref = zir_builder_emit_bool(self.handle, true);
+                    if (ref != error_ref) try self.setLocal(mt.dest, ref);
+                    return;
+                }
+
+                const typeof_ref = zir_builder_emit_typeof(self.handle, scrutinee_ref);
+                if (typeof_ref == error_ref) return error.EmitFailed;
+
+                const cmp_tag: u8 = @intFromEnum(Zir.Inst.Tag.cmp_eq);
+                const ref = zir_builder_emit_binop(self.handle, cmp_tag, typeof_ref, expected_type_raw);
+                if (ref == error_ref) return error.EmitFailed;
+                try self.setLocal(mt.dest, ref);
             },
             .match_fail => |mf| {
                 // Emit @import("zap_runtime").Prelude.panic(message)
