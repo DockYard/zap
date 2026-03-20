@@ -74,7 +74,7 @@ fn mapBinopTag(op: ir.BinaryOp.Op) ?u8 {
         .add => @intFromEnum(Zir.Inst.Tag.add),
         .sub => @intFromEnum(Zir.Inst.Tag.sub),
         .mul => @intFromEnum(Zir.Inst.Tag.mul),
-        .div => @intFromEnum(Zir.Inst.Tag.div_trunc),
+        .div => @intFromEnum(Zir.Inst.Tag.div),
         .rem_op => @intFromEnum(Zir.Inst.Tag.rem),
         .eq => @intFromEnum(Zir.Inst.Tag.cmp_eq),
         .neq => @intFromEnum(Zir.Inst.Tag.cmp_neq),
@@ -82,8 +82,8 @@ fn mapBinopTag(op: ir.BinaryOp.Op) ?u8 {
         .gt => @intFromEnum(Zir.Inst.Tag.cmp_gt),
         .lte => @intFromEnum(Zir.Inst.Tag.cmp_lte),
         .gte => @intFromEnum(Zir.Inst.Tag.cmp_gte),
-        .bool_and => @intFromEnum(Zir.Inst.Tag.bool_br_and),
-        .bool_or => @intFromEnum(Zir.Inst.Tag.bool_br_or),
+        .bool_and => @intFromEnum(Zir.Inst.Tag.bit_and),
+        .bool_or => @intFromEnum(Zir.Inst.Tag.bit_or),
         .concat => null, // TODO: array_cat
     };
 }
@@ -150,6 +150,7 @@ fn mapReturnType(zig_type: ir.ZigType) u32 {
         .f16 => @intFromEnum(Zir.Inst.Ref.f16_type),
         .f32 => @intFromEnum(Zir.Inst.Ref.f32_type),
         .f64 => @intFromEnum(Zir.Inst.Ref.f64_type),
+        .string => @intFromEnum(Zir.Inst.Ref.slice_const_u8_type),
         else => 0, // default to void for unsupported types
     };
 }
@@ -188,17 +189,15 @@ pub const ZirDriver = struct {
         try self.local_refs.put(self.allocator, local, ref);
     }
 
-    fn refForLocal(self: *ZirDriver, local: ir.LocalId) !u32 {
-        return self.local_refs.get(local) orelse return error.UnknownLocal;
+    fn refForLocal(self: *ZirDriver, local: ir.LocalId) BuildError!u32 {
+        return self.local_refs.get(local) orelse return error.EmitFailed;
     }
 
     // -- Program emission -----------------------------------------------------
 
     pub fn buildProgram(self: *ZirDriver, program: ir.Program) !void {
         self.program = program;
-        // Only emit the main/entry function (same as previous behavior).
         for (program.functions) |func| {
-            if (!std.mem.eql(u8, func.name, "main")) continue;
             try self.emitFunction(func);
         }
     }
@@ -259,8 +258,9 @@ pub const ZirDriver = struct {
                 try self.setLocal(cb.dest, ref);
             },
             .const_nil => |dest| {
-                const ref = zir_builder_emit_void(self.handle);
-                if (ref == error_ref) return error.EmitFailed;
+                // Zap nil maps to Zig's null, not void.
+                // Use the well-known ZIR ref for null_value directly.
+                const ref = @intFromEnum(Zir.Inst.Ref.null_value);
                 try self.setLocal(dest, ref);
             },
             .const_atom => |ca| {
@@ -288,12 +288,29 @@ pub const ZirDriver = struct {
 
             // Binary operations
             .binary_op => |bo| {
-                const tag = mapBinopTag(bo.op) orelse return; // unsupported op (concat)
-                const lhs = self.refForLocal(bo.lhs) catch return;
-                const rhs = self.refForLocal(bo.rhs) catch return;
-                const ref = zir_builder_emit_binop(self.handle, tag, lhs, rhs);
-                if (ref == error_ref) return error.EmitFailed;
-                try self.setLocal(bo.dest, ref);
+                if (mapBinopTag(bo.op)) |tag| {
+                    const lhs = self.refForLocal(bo.lhs) catch return;
+                    const rhs = self.refForLocal(bo.rhs) catch return;
+                    const ref = zir_builder_emit_binop(self.handle, tag, lhs, rhs);
+                    if (ref == error_ref) return error.EmitFailed;
+                    try self.setLocal(bo.dest, ref);
+                } else {
+                    // concat — emit @import("zap_runtime").ZapString.concat(lhs, rhs)
+                    const lhs = self.refForLocal(bo.lhs) catch return;
+                    const rhs = self.refForLocal(bo.rhs) catch return;
+
+                    const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                    if (rt_import == error_ref) return error.EmitFailed;
+                    const zap_string = zir_builder_emit_field_val(self.handle, rt_import, "ZapString", 9);
+                    if (zap_string == error_ref) return error.EmitFailed;
+                    const concat_fn = zir_builder_emit_field_val(self.handle, zap_string, "concat", 6);
+                    if (concat_fn == error_ref) return error.EmitFailed;
+
+                    const args = [_]u32{ lhs, rhs };
+                    const ref = zir_builder_emit_call_ref(self.handle, concat_fn, &args, 2);
+                    if (ref == error_ref) return error.EmitFailed;
+                    try self.setLocal(bo.dest, ref);
+                }
             },
 
             // Unary operations
@@ -310,7 +327,7 @@ pub const ZirDriver = struct {
             // Returns
             .ret => |ret| {
                 if (ret.value) |val| {
-                    const ref = self.refForLocal(val) catch return;
+                    const ref = try self.refForLocal(val);
                     if (zir_builder_emit_ret(self.handle, ref) != 0) {
                         return error.EmitFailed;
                     }
@@ -326,7 +343,7 @@ pub const ZirDriver = struct {
                 var args = std.ArrayListUnmanaged(u32).empty;
                 defer args.deinit(self.allocator);
                 for (cn.args) |arg| {
-                    const ref = self.refForLocal(arg) catch continue;
+                    const ref = self.refForLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
                     try args.append(self.allocator, ref);
                 }
 
@@ -368,7 +385,7 @@ pub const ZirDriver = struct {
                 var args = std.ArrayListUnmanaged(u32).empty;
                 defer args.deinit(self.allocator);
                 for (cb.args) |arg| {
-                    const ref = self.refForLocal(arg) catch continue;
+                    const ref = self.refForLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
                     try args.append(self.allocator, ref);
                 }
 
@@ -413,7 +430,7 @@ pub const ZirDriver = struct {
                 var args = std.ArrayListUnmanaged(u32).empty;
                 defer args.deinit(self.allocator);
                 for (tc.args) |arg| {
-                    const ref = self.refForLocal(arg) catch continue;
+                    const ref = self.refForLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
                     try args.append(self.allocator, ref);
                 }
                 const call_ref = zir_builder_emit_call(
@@ -444,7 +461,7 @@ pub const ZirDriver = struct {
                         var args = std.ArrayListUnmanaged(u32).empty;
                         defer args.deinit(self.allocator);
                         for (cd.args) |arg| {
-                            const ref = self.refForLocal(arg) catch continue;
+                            const ref = self.refForLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
                             try args.append(self.allocator, ref);
                         }
                         const ref = zir_builder_emit_call(
@@ -490,8 +507,11 @@ pub const ZirDriver = struct {
                 try self.setLocal(ie.dest, ref);
             },
             .case_block => |cb| {
-                // Save and set current_case_dest so that case_break instructions
-                // inside pre_instrs can propagate their result to cb.dest.
+                // Linearized emission: all arms are emitted sequentially and Sema
+                // resolves which comptime-known branch to take. The last writer
+                // wins for dest, which is correct because only the matching arm
+                // sets its result locals at comptime. Runtime branching would
+                // require condbr blocks which the C-ABI builder doesn't yet support.
                 const saved_case_dest = self.current_case_dest;
                 self.current_case_dest = cb.dest;
                 for (cb.pre_instrs) |pi| try self.emitInstruction(pi);
@@ -514,6 +534,8 @@ pub const ZirDriver = struct {
                 self.current_case_dest = saved_case_dest;
             },
             .switch_literal => |sl| {
+                // Linearized emission: all cases emitted sequentially; Sema resolves
+                // the comptime-known branch. Runtime switching requires condbr blocks.
                 for (sl.cases) |case| {
                     for (case.body_instrs) |bi| try self.emitInstruction(bi);
                     if (case.result) |r| {
@@ -530,6 +552,9 @@ pub const ZirDriver = struct {
                 }
             },
             .guard_block => |gb| {
+                // Linearized emission: the body is emitted unconditionally.
+                // At comptime, Sema evaluates gb.condition and only "sees"
+                // the taken path. Runtime guarding requires condbr blocks.
                 for (gb.body) |bi| try self.emitInstruction(bi);
             },
             // Never generated by IrBuilder — verified in ir.zig:
@@ -621,7 +646,7 @@ pub const ZirDriver = struct {
                 defer values.deinit(self.allocator);
 
                 for (ti.elements, 0..) |elem, i| {
-                    const ref = self.refForLocal(elem) catch continue;
+                    const ref = self.refForLocal(elem) catch @intFromEnum(Zir.Inst.Ref.void_value);
                     // Use a static digit table for index names
                     const name = indexFieldName(i);
                     try names_ptrs.append(self.allocator, name.ptr);
@@ -649,7 +674,7 @@ pub const ZirDriver = struct {
                 defer values.deinit(self.allocator);
 
                 for (li.elements, 0..) |elem, i| {
-                    const ref = self.refForLocal(elem) catch continue;
+                    const ref = self.refForLocal(elem) catch @intFromEnum(Zir.Inst.Ref.void_value);
                     const name = indexFieldName(i);
                     try names_ptrs.append(self.allocator, name.ptr);
                     try names_lens.append(self.allocator, name.len);
@@ -678,8 +703,8 @@ pub const ZirDriver = struct {
                 defer entry_names_lens.deinit(self.allocator);
 
                 for (mi.entries, 0..) |entry, i| {
-                    const key_ref = self.refForLocal(entry.key) catch continue;
-                    const val_ref = self.refForLocal(entry.value) catch continue;
+                    const key_ref = self.refForLocal(entry.key) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                    const val_ref = self.refForLocal(entry.value) catch @intFromEnum(Zir.Inst.Ref.void_value);
 
                     // Build a 2-field anonymous struct: .{ .key = key_ref, .value = val_ref }
                     const kv_names = [_][*]const u8{ "key", "value" };
@@ -711,9 +736,9 @@ pub const ZirDriver = struct {
                     if (result == error_ref) return error.EmitFailed;
                     try self.setLocal(mi.dest, result);
                 } else {
-                    // Empty map — emit void
-                    const ref = zir_builder_emit_void(self.handle);
-                    if (ref != error_ref) try self.setLocal(mi.dest, ref);
+                    // Empty map — emit empty struct via the well-known empty_tuple ref
+                    const ref = @intFromEnum(Zir.Inst.Ref.empty_tuple);
+                    try self.setLocal(mi.dest, ref);
                 }
             },
             .struct_init => |si| {
@@ -726,7 +751,7 @@ pub const ZirDriver = struct {
                 defer values.deinit(self.allocator);
 
                 for (si.fields) |field| {
-                    const ref = self.refForLocal(field.value) catch continue;
+                    const ref = self.refForLocal(field.value) catch @intFromEnum(Zir.Inst.Ref.void_value);
                     try names_ptrs.append(self.allocator, field.name.ptr);
                     try names_lens.append(self.allocator, @intCast(field.name.len));
                     try values.append(self.allocator, ref);
@@ -917,7 +942,7 @@ pub const ZirDriver = struct {
                 var args = std.ArrayListUnmanaged(u32).empty;
                 defer args.deinit(self.allocator);
                 for (cd.args) |arg| {
-                    const ref = self.refForLocal(arg) catch continue;
+                    const ref = self.refForLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
                     try args.append(self.allocator, ref);
                 }
                 const ref = zir_builder_emit_call(self.handle, name_slice.ptr, @intCast(name_slice.len), args.items.ptr, @intCast(args.items.len));
@@ -928,7 +953,7 @@ pub const ZirDriver = struct {
                 var args = std.ArrayListUnmanaged(u32).empty;
                 defer args.deinit(self.allocator);
                 for (cc.args) |arg| {
-                    const ref = self.refForLocal(arg) catch continue;
+                    const ref = self.refForLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
                     try args.append(self.allocator, ref);
                 }
                 const ref = zir_builder_emit_call_ref(self.handle, callee_ref, args.items.ptr, @intCast(args.items.len));
@@ -957,7 +982,7 @@ pub const ZirDriver = struct {
                 defer env_values.deinit(self.allocator);
 
                 for (mc.captures, 0..) |cap, i| {
-                    const cap_ref = self.refForLocal(cap) catch continue;
+                    const cap_ref = self.refForLocal(cap) catch @intFromEnum(Zir.Inst.Ref.void_value);
                     const name = indexFieldName(i);
                     try env_names_ptrs.append(self.allocator, name.ptr);
                     try env_names_lens.append(self.allocator, name.len);
@@ -1344,7 +1369,7 @@ pub const ZirDriver = struct {
                 if (retain_fn == error_ref) return;
 
                 const args = [_]u32{header_field};
-                _ = zir_builder_emit_call_ref(self.handle, retain_fn, &args, 0);
+                _ = zir_builder_emit_call_ref(self.handle, retain_fn, &args, 1);
                 // retain returns void, nothing to store
             },
             .release => |rel| {
@@ -1370,7 +1395,7 @@ pub const ZirDriver = struct {
                 if (release_fn == error_ref) return;
 
                 const args = [_]u32{header_field};
-                _ = zir_builder_emit_call_ref(self.handle, release_fn, &args, 0);
+                _ = zir_builder_emit_call_ref(self.handle, release_fn, &args, 1);
                 // release returns bool (should_free), but ARC deallocation
                 // requires an allocator which we don't have at this level.
                 // Full implementation needs the runtime's arc_release helper.
