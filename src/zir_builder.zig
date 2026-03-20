@@ -29,6 +29,7 @@ extern "c" fn zir_builder_destroy(handle: ?*ZirBuilderHandle) void;
 // Functions
 extern "c" fn zir_builder_begin_func(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32, ret_type: u32) i32;
 extern "c" fn zir_builder_end_func(handle: ?*ZirBuilderHandle) i32;
+extern "c" fn zir_builder_emit_param(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32, type_ref: u32) u32;
 
 // Emit instructions (return u32 Ref, 0xFFFFFFFF on error)
 extern "c" fn zir_builder_emit_int(handle: ?*ZirBuilderHandle, value: i64) u32;
@@ -52,6 +53,13 @@ extern "c" fn zir_builder_emit_typeof(handle: ?*ZirBuilderHandle, operand: u32) 
 extern "c" fn zir_builder_emit_type_info(handle: ?*ZirBuilderHandle, operand: u32) u32;
 extern "c" fn zir_builder_emit_if_else(handle: ?*ZirBuilderHandle, condition: u32, then_value: u32, else_value: u32) u32;
 extern "c" fn zir_builder_emit_struct_init_anon(handle: ?*ZirBuilderHandle, names_ptrs: [*]const [*]const u8, names_lens: [*]const u32, values_ptr: [*]const u32, fields_len: u32) u32;
+
+// Body tracking control (for branch body emission)
+extern "c" fn zir_builder_set_body_tracking(handle: ?*ZirBuilderHandle, enabled: bool) void;
+extern "c" fn zir_builder_get_inst_count(handle: ?*ZirBuilderHandle) u32;
+extern "c" fn zir_builder_begin_capture(handle: ?*ZirBuilderHandle) void;
+extern "c" fn zir_builder_end_capture(handle: ?*ZirBuilderHandle, out_len: *u32) [*]const u32;
+extern "c" fn zir_builder_emit_if_else_bodies(handle: ?*ZirBuilderHandle, condition: u32, then_insts_ptr: [*]const u32, then_insts_len: u32, then_result: u32, else_insts_ptr: [*]const u32, else_insts_len: u32, else_result: u32) u32;
 
 // Finalize and inject
 extern "c" fn zir_builder_inject(builder_handle: ?*ZirBuilderHandle, compilation_handle: ?*ZirContext) i32;
@@ -217,9 +225,26 @@ pub const ZirDriver = struct {
             return error.BeginFuncFailed;
         }
 
-        // Register params as locals.
-        for (func.params, 0..) |_, i| {
-            try self.setLocal(@intCast(i), @intCast(i));
+        // Emit param instructions and register their Refs as locals.
+        // Each .param instruction in ZIR declares a parameter with a name and type.
+        // Sema reads these from the declaration value body to know the function's arity.
+        for (func.params, 0..) |param, i| {
+            const param_type_ref = mapReturnType(param.type_expr);
+            // If the type maps to 0 (void/unknown), use anytype by passing a
+            // generic param. For now, default to i64 for untyped params since
+            // Zap's dynamic types typically map to i64 in ZIR.
+            const effective_type: u32 = if (param_type_ref == 0)
+                @intFromEnum(Zir.Inst.Ref.i64_type)
+            else
+                param_type_ref;
+            const param_ref = zir_builder_emit_param(
+                self.handle,
+                param.name.ptr,
+                @intCast(param.name.len),
+                effective_type,
+            );
+            if (param_ref == error_ref) return error.EmitFailed;
+            try self.setLocal(@intCast(i), param_ref);
         }
 
         // Emit body blocks.
@@ -236,7 +261,7 @@ pub const ZirDriver = struct {
 
     // -- Instruction dispatch -------------------------------------------------
 
-    fn emitInstruction(self: *ZirDriver, instr: ir.Instruction) !void {
+    fn emitInstruction(self: *ZirDriver, instr: ir.Instruction) BuildError!void {
         switch (instr) {
             // Constants
             .const_int => |ci| {
@@ -490,31 +515,11 @@ pub const ZirDriver = struct {
 
             // Control flow
             .if_expr => |ie| {
-                // Emit then-branch instructions
-                for (ie.then_instrs) |ti| {
-                    try self.emitInstruction(ti);
-                }
-                const then_ref = if (ie.then_result) |tr|
-                    self.refForLocal(tr) catch return
-                else
-                    zir_builder_emit_void(self.handle);
-                if (then_ref == error_ref) return error.EmitFailed;
-
-                // Emit else-branch instructions
-                for (ie.else_instrs) |ei| {
-                    try self.emitInstruction(ei);
-                }
-                const else_ref = if (ie.else_result) |er|
-                    self.refForLocal(er) catch return
-                else
-                    zir_builder_emit_void(self.handle);
-                if (else_ref == error_ref) return error.EmitFailed;
-
-                // Get condition ref and emit if_else
-                const cond_ref = self.refForLocal(ie.condition) catch return;
-                const ref = zir_builder_emit_if_else(self.handle, cond_ref, then_ref, else_ref);
-                if (ref == error_ref) return error.EmitFailed;
-                try self.setLocal(ie.dest, ref);
+                // Emit branch instructions with body tracking OFF so they
+                // are NOT added to the function's main body. They will be
+                // placed inside the condbr_inline's then/else bodies, so
+                // Sema only analyzes (and executes) the taken branch.
+                try self.emitIfExpr(ie);
             },
             .case_block => |cb| {
                 // Linearized emission: all arms are emitted sequentially and Sema
@@ -1430,6 +1435,61 @@ pub const ZirDriver = struct {
             // instead of SSA phi.
             .phi => {},
         }
+    }
+
+    /// Emit an if/else expression so that only the taken branch executes.
+    ///
+    /// Branch instructions are emitted with body tracking OFF and capture ON.
+    /// The capture buffer collects only the top-level instruction indices
+    /// (excluding internal sub-body instructions like call arg bodies).
+    /// These captured indices are placed inside the condbr_inline's then/else
+    /// bodies so that Sema only analyzes the taken branch.
+    fn emitIfExpr(self: *ZirDriver, ie: ir.IfExpr) BuildError!void {
+        // --- then branch: capture top-level body instructions ---
+        zir_builder_begin_capture(self.handle);
+        for (ie.then_instrs) |ti| {
+            try self.emitInstruction(ti);
+        }
+        var then_len: u32 = 0;
+        const then_insts_ptr = zir_builder_end_capture(self.handle, &then_len);
+
+        const then_ref: u32 = if (ie.then_result) |tr|
+            try self.refForLocal(tr)
+        else
+            @intFromEnum(Zir.Inst.Ref.void_value);
+
+        // Copy then indices — the capture buffer will be reused for else branch
+        var then_insts = try std.ArrayListUnmanaged(u32).initCapacity(self.allocator, then_len);
+        defer then_insts.deinit(self.allocator);
+        then_insts.appendSliceAssumeCapacity(then_insts_ptr[0..then_len]);
+
+        // --- else branch: capture top-level body instructions ---
+        zir_builder_begin_capture(self.handle);
+        for (ie.else_instrs) |ei| {
+            try self.emitInstruction(ei);
+        }
+        var else_len: u32 = 0;
+        const else_insts_ptr = zir_builder_end_capture(self.handle, &else_len);
+
+        const else_ref: u32 = if (ie.else_result) |er|
+            try self.refForLocal(er)
+        else
+            @intFromEnum(Zir.Inst.Ref.void_value);
+
+        // Get condition ref and emit the if_else with bodies
+        const cond_ref = try self.refForLocal(ie.condition);
+        const ref = zir_builder_emit_if_else_bodies(
+            self.handle,
+            cond_ref,
+            then_insts.items.ptr,
+            @intCast(then_insts.items.len),
+            then_ref,
+            else_insts_ptr,
+            else_len,
+            else_ref,
+        );
+        if (ref == error_ref) return error.EmitFailed;
+        try self.setLocal(ie.dest, ref);
     }
 };
 
