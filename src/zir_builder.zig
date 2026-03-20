@@ -166,6 +166,108 @@ fn mapReturnType(zig_type: ir.ZigType) u32 {
 }
 
 // ---------------------------------------------------------------------------
+// Return type inference from IR body
+// ---------------------------------------------------------------------------
+
+/// Scan function body blocks for a `.ret` instruction with a value and try
+/// to infer the return type from the instruction that produced the returned
+/// local. Returns the ZIR Ref for the inferred type, or 0 if not inferable.
+fn inferReturnTypeFromBody(body: []const ir.Block) u32 {
+    for (body) |block| {
+        if (inferReturnTypeFromInstrs(block.instructions)) |t| return t;
+    }
+    return 0;
+}
+
+/// Recursively scan an instruction slice for `.ret` with a value.
+/// When found, walk backward through the same slice to determine the type
+/// of the local being returned.
+fn inferReturnTypeFromInstrs(instrs: []const ir.Instruction) ?u32 {
+    for (instrs) |instr| {
+        switch (instr) {
+            .ret => |ret| {
+                if (ret.value) |val| {
+                    // Walk the instruction list to find what produced `val`
+                    if (inferTypeForLocal(instrs, val)) |t| return t;
+                    // Fallback: default to i64 (most common Zap type)
+                    return @intFromEnum(Zir.Inst.Ref.i64_type);
+                }
+            },
+            // Recurse into nested control flow that may contain returns
+            .if_expr => |ie| {
+                if (inferReturnTypeFromInstrs(ie.then_instrs)) |t| return t;
+                if (inferReturnTypeFromInstrs(ie.else_instrs)) |t| return t;
+            },
+            .guard_block => |gb| {
+                if (inferReturnTypeFromInstrs(gb.body)) |t| return t;
+            },
+            .case_block => |cb| {
+                for (cb.arms) |arm| {
+                    if (inferReturnTypeFromInstrs(arm.body_instrs)) |t| return t;
+                }
+                if (inferReturnTypeFromInstrs(cb.default_instrs)) |t| return t;
+            },
+            .switch_literal => |sl| {
+                for (sl.cases) |case| {
+                    if (inferReturnTypeFromInstrs(case.body_instrs)) |t| return t;
+                }
+                if (inferReturnTypeFromInstrs(sl.default_instrs)) |t| return t;
+            },
+            .switch_return => |sr| {
+                for (sr.cases) |case| {
+                    if (inferReturnTypeFromInstrs(case.body_instrs)) |t| return t;
+                }
+                if (inferReturnTypeFromInstrs(sr.default_instrs)) |t| return t;
+            },
+            .union_switch_return => |usr| {
+                for (usr.cases) |case| {
+                    if (inferReturnTypeFromInstrs(case.body_instrs)) |t| return t;
+                }
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// Given an instruction slice and a local id, find the instruction that
+/// defines `local` and return the corresponding ZIR type ref.
+fn inferTypeForLocal(instrs: []const ir.Instruction, local: ir.LocalId) ?u32 {
+    for (instrs) |instr| {
+        switch (instr) {
+            .const_int => |ci| if (ci.dest == local) return @intFromEnum(Zir.Inst.Ref.i64_type),
+            .const_float => |cf| if (cf.dest == local) return @intFromEnum(Zir.Inst.Ref.f64_type),
+            .const_string => |cs| if (cs.dest == local) return @intFromEnum(Zir.Inst.Ref.slice_const_u8_type),
+            .const_bool => |cb| if (cb.dest == local) return @intFromEnum(Zir.Inst.Ref.bool_type),
+            .binary_op => |bo| if (bo.dest == local) {
+                // Arithmetic/comparison ops: infer from operands
+                return switch (bo.op) {
+                    .eq, .neq, .lt, .gt, .lte, .gte, .bool_and, .bool_or => @intFromEnum(Zir.Inst.Ref.bool_type),
+                    .concat => @intFromEnum(Zir.Inst.Ref.slice_const_u8_type),
+                    else => @intFromEnum(Zir.Inst.Ref.i64_type), // add, sub, mul, div, rem
+                };
+            },
+            .call_named => |cn| if (cn.dest == local) return @intFromEnum(Zir.Inst.Ref.i64_type),
+            .call_direct => |cd| if (cd.dest == local) return @intFromEnum(Zir.Inst.Ref.i64_type),
+            .call_builtin => |cbl| if (cbl.dest == local) return @intFromEnum(Zir.Inst.Ref.i64_type),
+            .local_get => |lg| if (lg.dest == local) {
+                // Trace through to the source local
+                return inferTypeForLocal(instrs, lg.source);
+            },
+            .local_set => |ls| if (ls.dest == local) {
+                return inferTypeForLocal(instrs, ls.value);
+            },
+            .param_get => |pg| if (pg.dest == local) {
+                // Parameter — default to i64 (Zap's default numeric type)
+                return @intFromEnum(Zir.Inst.Ref.i64_type);
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+// ---------------------------------------------------------------------------
 // ZirDriver
 // ---------------------------------------------------------------------------
 
@@ -217,10 +319,18 @@ pub const ZirDriver = struct {
 
         // Zig's main must return void or u8. Check if body has a return value.
         const is_main = std.mem.eql(u8, func.name, "main");
-        const ret_type = if (is_main)
+        var ret_type = if (is_main)
             mapMainReturnType(func.return_type)
         else
             mapReturnType(func.return_type);
+
+        // Blocker 1 fix: If the IR says void but the function body has a ret
+        // with a value, the return type wasn't inferred by the front-end.
+        // Scan the body to infer the return type from the returned expression.
+        if (ret_type == 0 and !is_main) {
+            ret_type = inferReturnTypeFromBody(func.body);
+        }
+
         if (zir_builder_begin_func(self.handle, func.name.ptr, @intCast(func.name.len), ret_type) != 0) {
             return error.BeginFuncFailed;
         }
@@ -522,55 +632,20 @@ pub const ZirDriver = struct {
                 try self.emitIfExpr(ie);
             },
             .case_block => |cb| {
-                // Linearized emission: all arms are emitted sequentially and Sema
-                // resolves which comptime-known branch to take. The last writer
-                // wins for dest, which is correct because only the matching arm
-                // sets its result locals at comptime. Runtime branching would
-                // require condbr blocks which the C-ABI builder doesn't yet support.
-                const saved_case_dest = self.current_case_dest;
-                self.current_case_dest = cb.dest;
-                for (cb.pre_instrs) |pi| try self.emitInstruction(pi);
-                // Emit all arms' setup and body instructions
-                for (cb.arms) |arm| {
-                    for (arm.cond_instrs) |ci| try self.emitInstruction(ci);
-                    for (arm.body_instrs) |bi| try self.emitInstruction(bi);
-                    if (arm.result) |r| {
-                        if (self.local_refs.get(r)) |ref| {
-                            try self.setLocal(cb.dest, ref);
-                        }
-                    }
-                }
-                for (cb.default_instrs) |di| try self.emitInstruction(di);
-                if (cb.default_result) |dr| {
-                    if (self.local_refs.get(dr)) |ref| {
-                        try self.setLocal(cb.dest, ref);
-                    }
-                }
-                self.current_case_dest = saved_case_dest;
+                // Body-tracked emission: chain if-else-bodies for each arm
+                // so Sema only analyzes the matching branch.
+                try self.emitCaseBlock(cb);
             },
             .switch_literal => |sl| {
-                // Linearized emission: all cases emitted sequentially; Sema resolves
-                // the comptime-known branch. Runtime switching requires condbr blocks.
-                for (sl.cases) |case| {
-                    for (case.body_instrs) |bi| try self.emitInstruction(bi);
-                    if (case.result) |r| {
-                        if (self.local_refs.get(r)) |ref| {
-                            try self.setLocal(sl.dest, ref);
-                        }
-                    }
-                }
-                for (sl.default_instrs) |di| try self.emitInstruction(di);
-                if (sl.default_result) |dr| {
-                    if (self.local_refs.get(dr)) |ref| {
-                        try self.setLocal(sl.dest, ref);
-                    }
-                }
+                // Body-tracked emission: chain if-else-bodies for each case
+                // so Sema only analyzes the matching branch.
+                try self.emitSwitchLiteral(sl);
             },
             .guard_block => |gb| {
-                // Linearized emission: the body is emitted unconditionally.
-                // At comptime, Sema evaluates gb.condition and only "sees"
-                // the taken path. Runtime guarding requires condbr blocks.
-                for (gb.body) |bi| try self.emitInstruction(bi);
+                // Body-tracked emission: place body instructions inside a
+                // condbr_inline's then branch so Sema only analyzes (and
+                // executes) the body when the guard condition is true.
+                try self.emitGuardBlock(gb);
             },
             // Never generated by IrBuilder — verified in ir.zig:
             // AST .branch is desugared before reaching IR (lowerExpr hits unreachable).
@@ -583,27 +658,14 @@ pub const ZirDriver = struct {
             // not to Instruction.switch_tag.
             .switch_tag => {},
             .switch_return => |sr| {
-                for (sr.cases) |case| {
-                    for (case.body_instrs) |bi| try self.emitInstruction(bi);
-                    if (case.return_value) |rv| {
-                        const ref = try self.refForLocal(rv);
-                        if (zir_builder_emit_ret(self.handle, ref) != 0) return error.EmitFailed;
-                    }
-                }
-                for (sr.default_instrs) |di| try self.emitInstruction(di);
-                if (sr.default_result) |dr| {
-                    const ref = try self.refForLocal(dr);
-                    if (zir_builder_emit_ret(self.handle, ref) != 0) return error.EmitFailed;
-                }
+                // Body-tracked emission: chain if-else-bodies for each case
+                // so Sema only analyzes the matching branch.
+                try self.emitSwitchReturn(sr);
             },
             .union_switch_return => |usr| {
-                for (usr.cases) |case| {
-                    for (case.body_instrs) |bi| try self.emitInstruction(bi);
-                    if (case.return_value) |rv| {
-                        const ref = try self.refForLocal(rv);
-                        if (zir_builder_emit_ret(self.handle, ref) != 0) return error.EmitFailed;
-                    }
-                }
+                // Body-tracked emission: chain if-else-bodies for each case
+                // so Sema only analyzes the matching branch.
+                try self.emitUnionSwitchReturn(usr);
             },
             .cond_return => |cr| {
                 // Conditional return: if condition is true, return the value.
@@ -1490,6 +1552,416 @@ pub const ZirDriver = struct {
         );
         if (ref == error_ref) return error.EmitFailed;
         try self.setLocal(ie.dest, ref);
+    }
+
+    /// Emit a guard block: if (condition) { body } else { void }.
+    /// Body instructions are captured and placed inside a condbr_inline's
+    /// then branch so Sema only analyzes them when the condition is true.
+    fn emitGuardBlock(self: *ZirDriver, gb: ir.GuardBlock) BuildError!void {
+        const cond_ref = try self.refForLocal(gb.condition);
+
+        // Capture body instructions
+        zir_builder_begin_capture(self.handle);
+        for (gb.body) |bi| try self.emitInstruction(bi);
+        var body_len: u32 = 0;
+        const body_ptr = zir_builder_end_capture(self.handle, &body_len);
+
+        // Copy body indices (capture buffer may be reused)
+        var body_insts = try std.ArrayListUnmanaged(u32).initCapacity(self.allocator, body_len);
+        defer body_insts.deinit(self.allocator);
+        body_insts.appendSliceAssumeCapacity(body_ptr[0..body_len]);
+
+        const void_ref = @intFromEnum(Zir.Inst.Ref.void_value);
+
+        // Emit: if (cond) { body } else { void }
+        // The else branch is empty with a void result.
+        const empty = [_]u32{};
+        _ = zir_builder_emit_if_else_bodies(
+            self.handle,
+            cond_ref,
+            body_insts.items.ptr,
+            @intCast(body_insts.items.len),
+            void_ref,
+            &empty,
+            0,
+            void_ref,
+        );
+    }
+
+    /// Emit a switch_literal as a chain of if-else-bodies:
+    ///   if (scrutinee == case0.value) { case0.body }
+    ///   else if (scrutinee == case1.value) { case1.body }
+    ///   else { default_body }
+    ///
+    /// Built from the last case backwards so each if-else wraps the
+    /// remaining cases as its else branch.
+    fn emitSwitchLiteral(self: *ZirDriver, sl: ir.SwitchLiteral) BuildError!void {
+        const scrutinee_ref = try self.refForLocal(sl.scrutinee);
+
+        if (sl.cases.len == 0) {
+            // No cases — just emit the default body directly
+            for (sl.default_instrs) |di| try self.emitInstruction(di);
+            if (sl.default_result) |dr| {
+                if (self.local_refs.get(dr)) |ref| {
+                    try self.setLocal(sl.dest, ref);
+                }
+            }
+            return;
+        }
+
+        // Capture the default body
+        zir_builder_begin_capture(self.handle);
+        for (sl.default_instrs) |di| try self.emitInstruction(di);
+        var default_len: u32 = 0;
+        const default_ptr = zir_builder_end_capture(self.handle, &default_len);
+        const default_result: u32 = if (sl.default_result) |dr|
+            self.refForLocal(dr) catch @intFromEnum(Zir.Inst.Ref.void_value)
+        else
+            @intFromEnum(Zir.Inst.Ref.void_value);
+
+        // Copy default instructions
+        var current_else_insts = try self.allocator.alloc(u32, default_len);
+        @memcpy(current_else_insts, default_ptr[0..default_len]);
+        var current_else_result: u32 = default_result;
+
+        // Process cases in REVERSE order, building nested if-else from inside out.
+        // Each iteration creates: if (scrutinee == case_val) { case_body } else { previous_else }
+        var i = sl.cases.len;
+        while (i > 0) {
+            i -= 1;
+            const case = sl.cases[i];
+
+            // Emit the literal value for comparison
+            const case_val_ref = switch (case.value) {
+                .int => |v| zir_builder_emit_int(self.handle, v),
+                .float => |v| zir_builder_emit_float(self.handle, v),
+                .string => |v| zir_builder_emit_str(self.handle, v.ptr, @intCast(v.len)),
+                .bool_val => |v| zir_builder_emit_bool(self.handle, v),
+            };
+            if (case_val_ref == error_ref) {
+                self.allocator.free(current_else_insts);
+                return error.EmitFailed;
+            }
+
+            // Emit: scrutinee == case_value
+            const cmp_tag: u8 = @intFromEnum(Zir.Inst.Tag.cmp_eq);
+            const cond_ref = zir_builder_emit_binop(self.handle, cmp_tag, scrutinee_ref, case_val_ref);
+            if (cond_ref == error_ref) {
+                self.allocator.free(current_else_insts);
+                return error.EmitFailed;
+            }
+
+            // Capture the case body
+            zir_builder_begin_capture(self.handle);
+            for (case.body_instrs) |bi| try self.emitInstruction(bi);
+            var case_len: u32 = 0;
+            const case_ptr = zir_builder_end_capture(self.handle, &case_len);
+
+            const case_result: u32 = if (case.result) |r|
+                self.refForLocal(r) catch @intFromEnum(Zir.Inst.Ref.void_value)
+            else
+                @intFromEnum(Zir.Inst.Ref.void_value);
+
+            // Copy case body (capture buffer will be reused)
+            const case_insts = try self.allocator.alloc(u32, case_len);
+            @memcpy(case_insts, case_ptr[0..case_len]);
+
+            // Emit: if (cond) { case_body } else { current_else }
+            const ref = zir_builder_emit_if_else_bodies(
+                self.handle,
+                cond_ref,
+                case_insts.ptr,
+                @intCast(case_insts.len),
+                case_result,
+                current_else_insts.ptr,
+                @intCast(current_else_insts.len),
+                current_else_result,
+            );
+
+            self.allocator.free(case_insts);
+            self.allocator.free(current_else_insts);
+
+            if (ref == error_ref) return error.EmitFailed;
+
+            // For the next outer case, this if-else becomes the else branch.
+            // The emit_if_else_bodies call returns a ref to the block result.
+            // We wrap it as a single-element else body for the next level.
+            // Since the block_inline result IS the ref, we use an empty else
+            // body with the ref as the result.
+            current_else_insts = try self.allocator.alloc(u32, 0);
+            current_else_result = ref;
+        }
+
+        self.allocator.free(current_else_insts);
+
+        // The last ref produced is the result of the entire switch
+        try self.setLocal(sl.dest, current_else_result);
+    }
+
+    /// Emit a case_block as a chain of if-else-bodies, one per arm.
+    /// Pre-instructions are emitted normally (they set up scrutinee bindings).
+    /// Each arm's condition instructions are emitted before the if-else that
+    /// guards that arm's body, producing a nested if-else chain.
+    fn emitCaseBlock(self: *ZirDriver, cb: ir.CaseBlock) BuildError!void {
+        const saved_case_dest = self.current_case_dest;
+        self.current_case_dest = cb.dest;
+        defer self.current_case_dest = saved_case_dest;
+
+        // Pre-instructions are setup (e.g., tuple arm guards) — emit normally
+        for (cb.pre_instrs) |pi| try self.emitInstruction(pi);
+
+        if (cb.arms.len == 0) {
+            // No arms — just emit the default body
+            for (cb.default_instrs) |di| try self.emitInstruction(di);
+            if (cb.default_result) |dr| {
+                if (self.local_refs.get(dr)) |ref| {
+                    try self.setLocal(cb.dest, ref);
+                }
+            }
+            return;
+        }
+
+        // Capture the default body
+        zir_builder_begin_capture(self.handle);
+        for (cb.default_instrs) |di| try self.emitInstruction(di);
+        var default_len: u32 = 0;
+        const default_ptr = zir_builder_end_capture(self.handle, &default_len);
+        const default_result: u32 = if (cb.default_result) |dr|
+            self.refForLocal(dr) catch @intFromEnum(Zir.Inst.Ref.void_value)
+        else
+            @intFromEnum(Zir.Inst.Ref.void_value);
+
+        var current_else_insts = try self.allocator.alloc(u32, default_len);
+        @memcpy(current_else_insts, default_ptr[0..default_len]);
+        var current_else_result: u32 = default_result;
+
+        // Process arms in REVERSE order
+        var i = cb.arms.len;
+        while (i > 0) {
+            i -= 1;
+            const arm = cb.arms[i];
+
+            // Emit condition setup instructions (these define the condition local)
+            for (arm.cond_instrs) |ci| try self.emitInstruction(ci);
+
+            // Get the condition ref
+            const cond_ref = try self.refForLocal(arm.condition);
+
+            // Capture the arm body
+            zir_builder_begin_capture(self.handle);
+            for (arm.body_instrs) |bi| try self.emitInstruction(bi);
+            var arm_len: u32 = 0;
+            const arm_ptr = zir_builder_end_capture(self.handle, &arm_len);
+
+            const arm_result: u32 = if (arm.result) |r|
+                self.refForLocal(r) catch @intFromEnum(Zir.Inst.Ref.void_value)
+            else
+                @intFromEnum(Zir.Inst.Ref.void_value);
+
+            const arm_insts = try self.allocator.alloc(u32, arm_len);
+            @memcpy(arm_insts, arm_ptr[0..arm_len]);
+
+            // Emit: if (arm.condition) { arm_body } else { current_else }
+            const ref = zir_builder_emit_if_else_bodies(
+                self.handle,
+                cond_ref,
+                arm_insts.ptr,
+                @intCast(arm_insts.len),
+                arm_result,
+                current_else_insts.ptr,
+                @intCast(current_else_insts.len),
+                current_else_result,
+            );
+
+            self.allocator.free(arm_insts);
+            self.allocator.free(current_else_insts);
+
+            if (ref == error_ref) return error.EmitFailed;
+
+            current_else_insts = try self.allocator.alloc(u32, 0);
+            current_else_result = ref;
+        }
+
+        self.allocator.free(current_else_insts);
+
+        // The last ref produced is the result of the entire case block
+        try self.setLocal(cb.dest, current_else_result);
+    }
+
+    /// Emit a switch_return as a chain of if-else-bodies.
+    /// Each case compares the scrutinee parameter against the literal value
+    /// and the body contains the return instruction.
+    fn emitSwitchReturn(self: *ZirDriver, sr: ir.SwitchReturn) BuildError!void {
+        const scrutinee_ref = try self.refForLocal(sr.scrutinee_param);
+
+        if (sr.cases.len == 0) {
+            // No cases — just emit the default body
+            for (sr.default_instrs) |di| try self.emitInstruction(di);
+            if (sr.default_result) |dr| {
+                const ref = try self.refForLocal(dr);
+                if (zir_builder_emit_ret(self.handle, ref) != 0) return error.EmitFailed;
+            }
+            return;
+        }
+
+        // Capture the default body (includes the return)
+        zir_builder_begin_capture(self.handle);
+        for (sr.default_instrs) |di| try self.emitInstruction(di);
+        if (sr.default_result) |dr| {
+            const ref = try self.refForLocal(dr);
+            if (zir_builder_emit_ret(self.handle, ref) != 0) return error.EmitFailed;
+        }
+        var default_len: u32 = 0;
+        const default_ptr = zir_builder_end_capture(self.handle, &default_len);
+        const void_ref = @intFromEnum(Zir.Inst.Ref.void_value);
+
+        var current_else_insts = try self.allocator.alloc(u32, default_len);
+        @memcpy(current_else_insts, default_ptr[0..default_len]);
+        var current_else_result: u32 = void_ref;
+
+        // Process cases in REVERSE order
+        var i = sr.cases.len;
+        while (i > 0) {
+            i -= 1;
+            const case = sr.cases[i];
+
+            // Emit the literal value for comparison
+            const case_val_ref = switch (case.value) {
+                .int => |v| zir_builder_emit_int(self.handle, v),
+                .float => |v| zir_builder_emit_float(self.handle, v),
+                .string => |v| zir_builder_emit_str(self.handle, v.ptr, @intCast(v.len)),
+                .bool_val => |v| zir_builder_emit_bool(self.handle, v),
+            };
+            if (case_val_ref == error_ref) {
+                self.allocator.free(current_else_insts);
+                return error.EmitFailed;
+            }
+
+            // Emit: scrutinee == case_value
+            const cmp_tag: u8 = @intFromEnum(Zir.Inst.Tag.cmp_eq);
+            const cond_ref = zir_builder_emit_binop(self.handle, cmp_tag, scrutinee_ref, case_val_ref);
+            if (cond_ref == error_ref) {
+                self.allocator.free(current_else_insts);
+                return error.EmitFailed;
+            }
+
+            // Capture case body (includes the return)
+            zir_builder_begin_capture(self.handle);
+            for (case.body_instrs) |bi| try self.emitInstruction(bi);
+            if (case.return_value) |rv| {
+                const ref = try self.refForLocal(rv);
+                if (zir_builder_emit_ret(self.handle, ref) != 0) {
+                    return error.EmitFailed;
+                }
+            }
+            var case_len: u32 = 0;
+            const case_ptr = zir_builder_end_capture(self.handle, &case_len);
+
+            const case_insts = try self.allocator.alloc(u32, case_len);
+            @memcpy(case_insts, case_ptr[0..case_len]);
+
+            // Emit: if (cond) { case_body_with_ret } else { current_else }
+            const ref = zir_builder_emit_if_else_bodies(
+                self.handle,
+                cond_ref,
+                case_insts.ptr,
+                @intCast(case_insts.len),
+                void_ref,
+                current_else_insts.ptr,
+                @intCast(current_else_insts.len),
+                current_else_result,
+            );
+
+            self.allocator.free(case_insts);
+            self.allocator.free(current_else_insts);
+
+            if (ref == error_ref) return error.EmitFailed;
+
+            current_else_insts = try self.allocator.alloc(u32, 0);
+            current_else_result = ref;
+        }
+
+        self.allocator.free(current_else_insts);
+    }
+
+    /// Emit a union_switch_return as a chain of if-else-bodies.
+    /// Each case checks if the scrutinee matches a variant name (via match_atom
+    /// pattern) and the body contains the return instruction.
+    fn emitUnionSwitchReturn(self: *ZirDriver, usr: ir.UnionSwitchReturn) BuildError!void {
+        const scrutinee_ref = try self.refForLocal(usr.scrutinee_param);
+        const void_ref = @intFromEnum(Zir.Inst.Ref.void_value);
+
+        if (usr.cases.len == 0) return;
+
+        // Build from the last case backwards. The innermost else is unreachable
+        // (all cases should be covered), so use an empty body with void result.
+        var current_else_insts = try self.allocator.alloc(u32, 0);
+        var current_else_result: u32 = void_ref;
+
+        var i = usr.cases.len;
+        while (i > 0) {
+            i -= 1;
+            const case = usr.cases[i];
+
+            // Emit: scrutinee == .variant_name (using enum literal comparison)
+            const variant_ref = zir_builder_emit_enum_literal(self.handle, case.variant_name.ptr, @intCast(case.variant_name.len));
+            if (variant_ref == error_ref) {
+                self.allocator.free(current_else_insts);
+                return error.EmitFailed;
+            }
+            const cmp_tag: u8 = @intFromEnum(Zir.Inst.Tag.cmp_eq);
+            const cond_ref = zir_builder_emit_binop(self.handle, cmp_tag, scrutinee_ref, variant_ref);
+            if (cond_ref == error_ref) {
+                self.allocator.free(current_else_insts);
+                return error.EmitFailed;
+            }
+
+            // Capture case body (includes field bindings + body + return)
+            zir_builder_begin_capture(self.handle);
+            // Emit field bindings from the union variant
+            for (case.field_bindings) |fb| {
+                const field_ref = zir_builder_emit_field_val(self.handle, scrutinee_ref, fb.field_name.ptr, @intCast(fb.field_name.len));
+                if (field_ref != error_ref) {
+                    // Bind the field to a local using the local_name as a key
+                    // We use the field_binding index mapped to a local id
+                    _ = fb.local_name; // consumed by setLocal below via body instructions
+                }
+            }
+            for (case.body_instrs) |bi| try self.emitInstruction(bi);
+            if (case.return_value) |rv| {
+                const ref = try self.refForLocal(rv);
+                if (zir_builder_emit_ret(self.handle, ref) != 0) {
+                    return error.EmitFailed;
+                }
+            }
+            var case_len: u32 = 0;
+            const case_ptr = zir_builder_end_capture(self.handle, &case_len);
+
+            const case_insts = try self.allocator.alloc(u32, case_len);
+            @memcpy(case_insts, case_ptr[0..case_len]);
+
+            // Emit: if (scrutinee == .variant) { case_body_with_ret } else { current_else }
+            const ref = zir_builder_emit_if_else_bodies(
+                self.handle,
+                cond_ref,
+                case_insts.ptr,
+                @intCast(case_insts.len),
+                void_ref,
+                current_else_insts.ptr,
+                @intCast(current_else_insts.len),
+                current_else_result,
+            );
+
+            self.allocator.free(case_insts);
+            self.allocator.free(current_else_insts);
+
+            if (ref == error_ref) return error.EmitFailed;
+
+            current_else_insts = try self.allocator.alloc(u32, 0);
+            current_else_result = ref;
+        }
+
+        self.allocator.free(current_else_insts);
     }
 };
 
