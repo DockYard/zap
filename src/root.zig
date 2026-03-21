@@ -13,6 +13,7 @@ pub const hir = @import("hir.zig");
 pub const ir = @import("ir.zig");
 pub const CodeGen = @import("codegen.zig").CodeGen;
 pub const zir_builder = @import("zir_builder.zig");
+pub const zir_backend = @import("zir_backend.zig");
 pub const ZirDriver = zir_builder.ZirDriver;
 pub const ZirBuilderHandle = zir_builder.ZirBuilderHandle;
 pub const ZirContext = zir_builder.ZirContext;
@@ -40,6 +41,7 @@ test {
     _ = @import("ir.zig");
     _ = @import("codegen.zig");
     _ = @import("zir_builder.zig");
+    _ = @import("zir_backend.zig");
     _ = @import("runtime.zig");
     _ = @import("diagnostics.zig");
     _ = @import("similarity.zig");

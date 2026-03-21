@@ -449,6 +449,7 @@ pub const UnionCase = struct {
 pub const FieldBinding = struct {
     field_name: []const u8,
     local_name: []const u8,
+    local_index: LocalId,
 };
 
 pub const LiteralValue = union(enum) {
@@ -854,15 +855,12 @@ pub const IrBuilder = struct {
             self.next_local = max_binding_local;
         }
 
-        var body_result_local: ?LocalId = null;
-
         if (group.clauses.len == 1) {
             // Single clause — no dispatch needed
             // Emit tuple/binary bindings if present
             try self.emitTupleBindings(first_clause);
             try self.emitBinaryBindings(first_clause);
             const result_local = try self.lowerBlock(first_clause.body);
-            body_result_local = result_local;
             try self.current_instrs.append(self.allocator, .{ .ret = .{ .value = result_local } });
         } else if (self.canSwitchDispatch(group)) |switch_param| {
             // Emit switch_return for integer literal dispatch
@@ -934,6 +932,7 @@ pub const IrBuilder = struct {
                         try field_bindings.append(self.allocator, .{
                             .field_name = self.interner.get(sb.field_name),
                             .local_name = try std.fmt.allocPrint(self.allocator, "__local_{d}", .{sb.local_index}),
+                            .local_index = sb.local_index,
                         });
                     }
                 }
@@ -1023,18 +1022,7 @@ pub const IrBuilder = struct {
         else
             raw_name;
 
-        // Determine return type: use declared type if available, otherwise infer from body.
-        var return_type = typeIdToZigTypeWithStore(first_clause.return_type, self.type_store);
-        if (body_result_local) |rl| {
-            if (self.known_local_types.get(rl)) |local_type| {
-                if (return_type == .void and local_type != .void) {
-                    // No return type annotation — infer from body
-                    return_type = local_type;
-                } else if (std.meta.activeTag(local_type) == .optional) {
-                    return_type = local_type;
-                }
-            }
-        }
+        const return_type = typeIdToZigTypeWithStore(first_clause.return_type, self.type_store);
 
         // Register union dispatch info for call-site wrapping
         if (union_param_idx) |u_idx| {
@@ -3164,4 +3152,60 @@ test "IR build simple function" {
     try std.testing.expect(ir_program.functions.len > 0);
     try std.testing.expect(ir_program.functions[0].body.len > 0);
     try std.testing.expect(ir_program.functions[0].body[0].instructions.len > 0);
+}
+
+test "IR param_get indices are unique for multi-parameter functions" {
+    const source =
+        \\def add(a, b) do
+        \\  a + b
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var type_store = types_mod.TypeStore.init(alloc, &parser.interner);
+    defer type_store.deinit();
+
+    var hir_builder = hir_mod.HirBuilder.init(alloc, &parser.interner, &collector.graph, &type_store);
+    defer hir_builder.deinit();
+    const hir_program = try hir_builder.buildProgram(&program);
+
+    var ir_builder = IrBuilder.init(alloc, &parser.interner);
+    defer ir_builder.deinit();
+    const ir_program = try ir_builder.buildProgram(&hir_program);
+
+    try std.testing.expect(ir_program.functions.len > 0);
+    const func = ir_program.functions[0];
+    try std.testing.expect(func.body.len > 0);
+
+    // Collect all param_get instructions
+    var param_gets: [2]u32 = .{ 0xFFFF, 0xFFFF };
+    var pg_count: usize = 0;
+    for (func.body[0].instructions) |instr| {
+        switch (instr) {
+            .param_get => |pg| {
+                if (pg_count < 2) {
+                    param_gets[pg_count] = pg.index;
+                }
+                pg_count += 1;
+            },
+            else => {},
+        }
+    }
+
+    // We should have exactly 2 param_get instructions
+    try std.testing.expectEqual(@as(usize, 2), pg_count);
+    // First param_get should have index 0, second should have index 1
+    try std.testing.expectEqual(@as(u32, 0), param_gets[0]);
+    try std.testing.expectEqual(@as(u32, 1), param_gets[1]);
 }

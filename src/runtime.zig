@@ -99,6 +99,52 @@ pub fn Arc(comptime T: type) type {
 }
 
 // ============================================================
+// ArcRuntime — Non-generic ARC helpers for ZIR (spec §31.4)
+//
+// ZIR cannot express generic instantiation, so ArcRuntime
+// provides concrete helper functions that take comptime T via
+// @TypeOf, making them callable from generated ZIR code.
+// ============================================================
+
+pub const ArcRuntime = struct {
+    /// Allocate and wrap a value in an Arc. Returns a pointer to the
+    /// value field inside the Arc inner struct.
+    pub fn allocAny(comptime T: type, allocator: std.mem.Allocator, value: T) *T {
+        const Inner = Arc(T).Inner;
+        const inner = allocator.create(Inner) catch @panic("ArcRuntime.allocAny: out of memory");
+        inner.* = .{
+            .header = ArcHeader.init(),
+            .value = value,
+        };
+        return &inner.value;
+    }
+
+    /// Free an Arc-managed value given a pointer to the value field.
+    /// Decrements the refcount and frees the inner allocation when it reaches zero.
+    pub fn freeAny(comptime T: type, allocator: std.mem.Allocator, ptr: *T) void {
+        const Inner = Arc(T).Inner;
+        const inner: *Inner = @fieldParentPtr("value", ptr);
+        if (inner.header.release()) {
+            allocator.destroy(inner);
+        }
+    }
+
+    /// Retain (increment refcount) an Arc-managed value given a pointer to the value field.
+    pub fn retainAny(comptime T: type, ptr: *T) void {
+        const Inner = Arc(T).Inner;
+        const inner: *Inner = @fieldParentPtr("value", ptr);
+        inner.header.retain();
+    }
+
+    /// Get the refcount of an Arc-managed value.
+    pub fn refCountAny(comptime T: type, ptr: *T) u32 {
+        const Inner = Arc(T).Inner;
+        const inner: *Inner = @fieldParentPtr("value", ptr);
+        return inner.header.count();
+    }
+};
+
+// ============================================================
 // Atom — Interned atom values (spec §5.6)
 // ============================================================
 
@@ -480,18 +526,32 @@ pub const Prelude = struct {
             stdout.print("{d}\n", .{value}) catch {};
         } else if (T == bool) {
             stdout.print("{}\n", .{value}) catch {};
+        } else if (info == .@"enum") {
+            stdout.print(":{s}\n", .{@tagName(value)}) catch {};
         } else {
-            // For tuples and other compound types, use inspect formatting
+            // For tuples, structs, and other compound types, use inspect formatting
             inspectWrite(stdout, value);
             stdout.print("\n", .{}) catch {};
         }
     }
 
-    pub fn inspect(value: anytype) @TypeOf(value) {
+    pub fn inspect(value: anytype) InspectReturn(@TypeOf(value)) {
         const stdout = std.fs.File.stdout().deprecatedWriter();
         inspectWrite(stdout, value);
         stdout.print("\n", .{}) catch {};
+        const RT = InspectReturn(@TypeOf(value));
+        if (RT == void) return;
         return value;
+    }
+
+    /// Returns `void` for comptime-only types (enum literals, comptime_int, etc.)
+    /// so that `inspect` can be called at runtime without forcing comptime evaluation.
+    /// For all other types, returns the input type to support piping.
+    fn InspectReturn(comptime T: type) type {
+        return switch (@typeInfo(T)) {
+            .enum_literal, .comptime_int, .comptime_float, .type, .null, .undefined => void,
+            else => T,
+        };
     }
 
     fn inspectWrite(writer: anytype, value: anytype) void {
@@ -535,6 +595,48 @@ pub const Prelude = struct {
                 inspectWrite(writer, @field(value, field.name));
             }
             writer.print("}}", .{}) catch {};
+        } else if (info == .@"struct") {
+            // Detect Zap map representation: struct of .{key, value} entry structs.
+            // A map is an anonymous struct where every field is a 2-field struct with "key" and "value".
+            const is_map = comptime blk: {
+                if (info.@"struct".fields.len == 0) break :blk false;
+                for (info.@"struct".fields) |f| {
+                    const inner = @typeInfo(f.type);
+                    if (inner != .@"struct") break :blk false;
+                    if (inner.@"struct".fields.len != 2) break :blk false;
+                    const has_key = for (inner.@"struct".fields) |ef| {
+                        if (std.mem.eql(u8, ef.name, "key")) break true;
+                    } else false;
+                    const has_value = for (inner.@"struct".fields) |ef| {
+                        if (std.mem.eql(u8, ef.name, "value")) break true;
+                    } else false;
+                    if (!has_key or !has_value) break :blk false;
+                }
+                break :blk true;
+            };
+            if (is_map) {
+                // Print as %{key: value, ...}
+                writer.print("%{{", .{}) catch {};
+                inline for (info.@"struct".fields, 0..) |field, i| {
+                    if (i > 0) writer.print(", ", .{}) catch {};
+                    const entry = @field(value, field.name);
+                    inspectWrite(writer, entry.key);
+                    writer.print(": ", .{}) catch {};
+                    inspectWrite(writer, entry.value);
+                }
+                writer.print("}}", .{}) catch {};
+            } else {
+                // Named struct — print as %{field: value, ...}
+                writer.print("%{{", .{}) catch {};
+                inline for (info.@"struct".fields, 0..) |field, i| {
+                    if (i > 0) writer.print(", ", .{}) catch {};
+                    writer.print("{s}: ", .{field.name}) catch {};
+                    inspectWrite(writer, @field(value, field.name));
+                }
+                writer.print("}}", .{}) catch {};
+            }
+        } else if (info == .@"enum") {
+            writer.print(":{s}", .{@tagName(value)}) catch {};
         } else {
             writer.print("{any}", .{value}) catch {};
         }
@@ -801,6 +903,27 @@ test "Arc basic reference counting" {
     try std.testing.expectEqual(@as(u32, 1), arc.refCount());
 
     arc.release(alloc);
+}
+
+test "ArcRuntime.allocAny creates arc-managed value" {
+    const val = ArcRuntime.allocAny(i64, std.testing.allocator, 42);
+    defer ArcRuntime.freeAny(i64, std.testing.allocator, val);
+    try std.testing.expectEqual(@as(i64, 42), val.*);
+}
+
+test "ArcRuntime.retainAny and refCountAny" {
+    const val = ArcRuntime.allocAny(i64, std.testing.allocator, 99);
+    try std.testing.expectEqual(@as(u32, 1), ArcRuntime.refCountAny(i64, val));
+
+    ArcRuntime.retainAny(i64, val);
+    try std.testing.expectEqual(@as(u32, 2), ArcRuntime.refCountAny(i64, val));
+
+    // First free decrements but doesn't deallocate
+    ArcRuntime.freeAny(i64, std.testing.allocator, val);
+    try std.testing.expectEqual(@as(u32, 1), ArcRuntime.refCountAny(i64, val));
+
+    // Second free deallocates
+    ArcRuntime.freeAny(i64, std.testing.allocator, val);
 }
 
 test "Arc struct value" {

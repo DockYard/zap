@@ -58,8 +58,30 @@ pub fn build(b: *std.Build) void {
     //
     // If neither case applies to you, feel free to delete the declaration you
     // don't need and to put everything under a single module.
-    const enable_zir_backend = b.option(bool, "enable-zir-backend", "Link libzig_compiler.a for direct ZIR-to-binary compilation (requires building the Zig fork with `zig build lib`)") orelse false;
     const zig_compiler_lib_path = b.option([]const u8, "zig-compiler-lib", "Path to libzig_compiler.a") orelse "../zig/zig-out/lib/libzig_compiler.a";
+
+    // Zig library directory — needed to create the embedded stdlib archive.
+    // Auto-detected from ZIG_LIB_DIR, exe-relative, or well-known paths.
+    const zig_lib_dir = b.option([]const u8, "zig-lib-dir", "Path to Zig lib directory (contains std/)") orelse
+        detectBuildZigLibDir(b);
+
+    // Create a tar archive of the Zig stdlib + compiler_rt for embedding.
+    // This makes the zap binary fully self-contained — no external Zig install needed.
+    const tar_step = b.addSystemCommand(&.{ "tar", "-cf" });
+    const tar_output = tar_step.addOutputFileArg("zig_lib.tar");
+    tar_step.addArg("-C");
+    tar_step.addArg(zig_lib_dir);
+    tar_step.addArgs(&.{ "std", "compiler_rt", "compiler_rt.zig", "c.zig", "c" });
+
+    // Create a wrapper module that @embedFile's the tar archive.
+    // The WriteFiles step places both files in the same generated directory
+    // so the relative @embedFile path resolves correctly.
+    const wf = b.addWriteFiles();
+    _ = wf.addCopyFile(tar_output, "zig_lib.tar");
+    const wrapper_source = wf.add("zig_lib_archive.zig",
+        \\pub const data = @embedFile("zig_lib.tar");
+        \\
+    );
 
     const exe = b.addExecutable(.{
         .name = "zap",
@@ -73,10 +95,110 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    if (enable_zir_backend) {
-        // Link the Zig compiler library for direct ZIR-to-binary compilation.
-        // Built via: cd ~/projects/zig && zig build lib -Denable-llvm=false
-        exe.root_module.addObjectFile(.{ .cwd_relative = zig_compiler_lib_path });
+    // Add the embedded Zig lib archive as an importable module
+    exe.root_module.addAnonymousImport("zig_lib_archive", .{
+        .root_source_file = wrapper_source,
+    });
+
+    // Always link the Zig compiler library for ZIR-to-binary compilation.
+    // Built via: cd ~/projects/zig && zig build lib -Denable-llvm=false
+    exe.root_module.addObjectFile(.{ .cwd_relative = zig_compiler_lib_path });
+
+    // When the Zig compiler library was built with LLVM, link against
+    // LLVM/Clang/LLD static libraries. Optional — if not provided, LLVM
+    // linking is skipped (sufficient for non-LLVM builds).
+    const llvm_lib_path = b.option([]const u8, "llvm-lib-path", "Path to LLVM library directory with native .a files");
+    if (llvm_lib_path) |lib_path| {
+        exe.root_module.addLibraryPath(.{ .cwd_relative = lib_path });
+
+        // Clang libraries
+        const clang_libs = [_][]const u8{
+            "clangFrontendTool", "clangCodeGen",              "clangFrontend",
+            "clangDriver",       "clangSerialization",        "clangSema",
+            "clangStaticAnalyzerFrontend", "clangStaticAnalyzerCheckers",
+            "clangStaticAnalyzerCore",     "clangAnalysis",
+            "clangASTMatchers",  "clangAST",                  "clangParse",
+            "clangAPINotes",     "clangBasic",                "clangEdit",
+            "clangLex",          "clangARCMigrate",
+            "clangRewriteFrontend", "clangRewrite",
+            "clangCrossTU",      "clangIndex",
+            "clangToolingCore",  "clangExtractAPI",
+            "clangSupport",      "clangInstallAPI",
+        };
+        for (clang_libs) |lib_name| {
+            exe.root_module.linkSystemLibrary(lib_name, .{});
+        }
+
+        // LLD libraries
+        const lld_libs = [_][]const u8{
+            "lldMinGW", "lldELF", "lldCOFF", "lldWasm", "lldMachO", "lldCommon",
+        };
+        for (lld_libs) |lib_name| {
+            exe.root_module.linkSystemLibrary(lib_name, .{});
+        }
+
+        // LLVM libraries (matching Zig 0.15.2 build.zig order)
+        const llvm_libs = [_][]const u8{
+            "LLVMWindowsManifest",  "LLVMXRay",            "LLVMLibDriver",
+            "LLVMDlltoolDriver",    "LLVMTelemetry",       "LLVMTextAPIBinaryReader",
+            "LLVMCoverage",         "LLVMLineEditor",
+            "LLVMXCoreDisassembler", "LLVMXCoreCodeGen",   "LLVMXCoreDesc",         "LLVMXCoreInfo",
+            "LLVMX86TargetMCA",     "LLVMX86Disassembler", "LLVMX86AsmParser",      "LLVMX86CodeGen",     "LLVMX86Desc",     "LLVMX86Info",
+            "LLVMWebAssemblyDisassembler", "LLVMWebAssemblyAsmParser", "LLVMWebAssemblyCodeGen", "LLVMWebAssemblyUtils", "LLVMWebAssemblyDesc", "LLVMWebAssemblyInfo",
+            "LLVMVEDisassembler",   "LLVMVEAsmParser",     "LLVMVECodeGen",         "LLVMVEDesc",         "LLVMVEInfo",
+            "LLVMSystemZDisassembler", "LLVMSystemZAsmParser", "LLVMSystemZCodeGen", "LLVMSystemZDesc",    "LLVMSystemZInfo",
+            "LLVMSPIRVCodeGen",     "LLVMSPIRVDesc",       "LLVMSPIRVInfo",         "LLVMSPIRVAnalysis",
+            "LLVMSparcDisassembler", "LLVMSparcAsmParser",  "LLVMSparcCodeGen",      "LLVMSparcDesc",      "LLVMSparcInfo",
+            "LLVMRISCVTargetMCA",   "LLVMRISCVDisassembler", "LLVMRISCVAsmParser",  "LLVMRISCVCodeGen",   "LLVMRISCVDesc",   "LLVMRISCVInfo",
+            "LLVMPowerPCDisassembler", "LLVMPowerPCAsmParser", "LLVMPowerPCCodeGen", "LLVMPowerPCDesc",    "LLVMPowerPCInfo",
+            "LLVMNVPTXCodeGen",     "LLVMNVPTXDesc",       "LLVMNVPTXInfo",
+            "LLVMMSP430Disassembler", "LLVMMSP430AsmParser", "LLVMMSP430CodeGen",   "LLVMMSP430Desc",     "LLVMMSP430Info",
+            "LLVMMipsDisassembler", "LLVMMipsAsmParser",   "LLVMMipsCodeGen",       "LLVMMipsDesc",       "LLVMMipsInfo",
+            "LLVMLoongArchDisassembler", "LLVMLoongArchAsmParser", "LLVMLoongArchCodeGen", "LLVMLoongArchDesc", "LLVMLoongArchInfo",
+            "LLVMLanaiDisassembler", "LLVMLanaiCodeGen",   "LLVMLanaiAsmParser",    "LLVMLanaiDesc",      "LLVMLanaiInfo",
+            "LLVMHexagonDisassembler", "LLVMHexagonCodeGen", "LLVMHexagonAsmParser", "LLVMHexagonDesc",    "LLVMHexagonInfo",
+            "LLVMBPFDisassembler",  "LLVMBPFAsmParser",    "LLVMBPFCodeGen",        "LLVMBPFDesc",        "LLVMBPFInfo",
+            "LLVMAVRDisassembler",  "LLVMAVRAsmParser",    "LLVMAVRCodeGen",        "LLVMAVRDesc",        "LLVMAVRInfo",
+            "LLVMARMDisassembler",  "LLVMARMAsmParser",    "LLVMARMCodeGen",        "LLVMARMDesc",        "LLVMARMUtils",    "LLVMARMInfo",
+            "LLVMAMDGPUTargetMCA",  "LLVMAMDGPUDisassembler", "LLVMAMDGPUAsmParser", "LLVMAMDGPUCodeGen", "LLVMAMDGPUDesc",  "LLVMAMDGPUUtils", "LLVMAMDGPUInfo",
+            "LLVMAArch64Disassembler", "LLVMAArch64AsmParser", "LLVMAArch64CodeGen", "LLVMAArch64Desc",   "LLVMAArch64Utils", "LLVMAArch64Info",
+            "LLVMOrcDebugging",     "LLVMOrcJIT",          "LLVMWindowsDriver",     "LLVMMCJIT",          "LLVMJITLink",
+            "LLVMInterpreter",      "LLVMExecutionEngine", "LLVMRuntimeDyld",
+            "LLVMOrcTargetProcess", "LLVMOrcShared",       "LLVMDWP",
+            "LLVMDebugInfoLogicalView", "LLVMDebugInfoGSYM",
+            "LLVMOption",           "LLVMObjectYAML",      "LLVMObjCopy",
+            "LLVMMCA",              "LLVMMCDisassembler",  "LLVMLTO",
+            "LLVMPasses",           "LLVMHipStdPar",       "LLVMCFGuard",
+            "LLVMCoroutines",       "LLVMipo",             "LLVMVectorize",
+            "LLVMSandboxIR",        "LLVMLinker",          "LLVMInstrumentation",
+            "LLVMFrontendOpenMP",   "LLVMFrontendOffloading",
+            "LLVMFrontendOpenACC",  "LLVMFrontendHLSL",   "LLVMFrontendDriver",    "LLVMFrontendAtomic",
+            "LLVMExtensions",       "Polly",               "PollyISL",
+            "LLVMDWARFLinkerParallel", "LLVMDWARFLinkerClassic", "LLVMDWARFLinker",
+            "LLVMGlobalISel",       "LLVMMIRParser",       "LLVMAsmPrinter",
+            "LLVMSelectionDAG",     "LLVMCodeGen",         "LLVMTarget",
+            "LLVMObjCARCOpts",      "LLVMCodeGenTypes",    "LLVMCGData",
+            "LLVMIRPrinter",        "LLVMInterfaceStub",   "LLVMFileCheck",
+            "LLVMFuzzMutate",       "LLVMScalarOpts",      "LLVMInstCombine",
+            "LLVMAggressiveInstCombine", "LLVMTransformUtils",
+            "LLVMBitWriter",        "LLVMAnalysis",        "LLVMProfileData",
+            "LLVMSymbolize",        "LLVMDebugInfoBTF",    "LLVMDebugInfoPDB",
+            "LLVMDebugInfoMSF",     "LLVMDebugInfoCodeView", "LLVMDebugInfoDWARF",
+            "LLVMObject",           "LLVMTextAPI",         "LLVMMCParser",
+            "LLVMIRReader",         "LLVMAsmParser",       "LLVMMC",
+            "LLVMBitReader",        "LLVMFuzzerCLI",       "LLVMCore",
+            "LLVMRemarks",          "LLVMBitstreamReader", "LLVMBinaryFormat",
+            "LLVMTargetParser",     "LLVMSupport",         "LLVMDemangle",
+        };
+        for (llvm_libs) |lib_name| {
+            exe.root_module.linkSystemLibrary(lib_name, .{});
+        }
+
+        // System dependencies
+        exe.root_module.linkSystemLibrary("z", .{});
+        exe.root_module.linkSystemLibrary("zstd", .{});
+        exe.root_module.linkSystemLibrary("xml2", .{});
+        exe.root_module.linkSystemLibrary("c++", .{ .use_pkg_config = .no });
     }
 
     // This declares intent for the executable to be installed into the
@@ -121,143 +243,41 @@ pub fn build(b: *std.Build) void {
     // A run step that will run the test executable.
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
-    // Creates an executable that will run `test` blocks from the executable's
-    // root module. Note that test executables only test one module at a time,
-    // hence why we have to create two separate ones.
-    const exe_tests = b.addTest(.{
-        .root_module = exe.root_module,
-    });
-
-    // A run step that will run the second test executable.
-    const run_exe_tests = b.addRunArtifact(exe_tests);
-
-    // A top level step for running all tests. dependOn can be called multiple
-    // times and since the two run steps do not depend on one another, this will
-    // make the two of them run in parallel.
+    // A top level step for running all tests. The exe module's only test
+    // is `_ = @import("zap")` which is already covered by mod_tests. We
+    // skip exe_tests here because it would require libzig_compiler.a at
+    // link time, which isn't always available during development.
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
-    test_step.dependOn(&run_exe_tests.step);
 
-    // ZIR compiler binary — links libzig_compiler.a for direct ZIR-to-binary.
-    // Build: zig build zir-compile -Denable-zir-backend=true
-    if (enable_zir_backend) {
-        const zir_exe = b.addExecutable(.{
-            .name = "zap-zir",
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("src/zir_compile.zig"),
-                .target = target,
-                .optimize = optimize,
-                .imports = &.{
-                    .{ .name = "zap", .module = mod },
-                },
-            }),
-        });
-        zir_exe.root_module.addObjectFile(.{ .cwd_relative = zig_compiler_lib_path });
+    // ZIR integration tests — compile Zap programs via the ZIR pipeline
+    // and verify the output. These invoke the `zap` binary as a subprocess,
+    // so they depend on the binary being built and installed first.
+    const zir_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/zir_integration_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_zir_tests = b.addRunArtifact(zir_tests);
+    run_zir_tests.setEnvironmentVariable("ZAP_BINARY", b.getInstallPath(.bin, "zap"));
+    const zir_test_step = b.step("zir-test", "Run ZIR integration tests");
+    zir_test_step.dependOn(&run_zir_tests.step);
+    // Ensure the zap binary is built and installed before running ZIR tests
+    zir_test_step.dependOn(b.getInstallStep());
 
-        // When the Zig compiler library was built with LLVM, we need to link
-        // against LLVM/Clang/LLD static libraries (native ARM64 Mach-O).
-        const llvm_lib_path = b.option([]const u8, "llvm-lib-path", "Path to LLVM library directory with native .a files");
-        if (llvm_lib_path) |lib_path| {
-            zir_exe.root_module.addLibraryPath(.{ .cwd_relative = lib_path });
+}
 
-            // Clang libraries
-            const clang_libs = [_][]const u8{
-                "clangFrontendTool", "clangCodeGen",              "clangFrontend",
-                "clangDriver",       "clangSerialization",        "clangSema",
-                "clangStaticAnalyzerFrontend", "clangStaticAnalyzerCheckers",
-                "clangStaticAnalyzerCore",     "clangAnalysis",
-                "clangASTMatchers",  "clangAST",                  "clangParse",
-                "clangAPINotes",     "clangBasic",                "clangEdit",
-                "clangLex",          "clangARCMigrate",
-                "clangRewriteFrontend", "clangRewrite",
-                "clangCrossTU",      "clangIndex",
-                "clangToolingCore",  "clangExtractAPI",
-                "clangSupport",      "clangInstallAPI",
-            };
-            for (clang_libs) |lib_name| {
-                zir_exe.root_module.linkSystemLibrary(lib_name, .{});
-            }
-
-            // LLD libraries
-            const lld_libs = [_][]const u8{
-                "lldMinGW", "lldELF", "lldCOFF", "lldWasm", "lldMachO", "lldCommon",
-            };
-            for (lld_libs) |lib_name| {
-                zir_exe.root_module.linkSystemLibrary(lib_name, .{});
-            }
-
-            // LLVM libraries (matching Zig 0.15.2 build.zig order)
-            const llvm_libs = [_][]const u8{
-                "LLVMWindowsManifest",  "LLVMXRay",            "LLVMLibDriver",
-                "LLVMDlltoolDriver",    "LLVMTelemetry",       "LLVMTextAPIBinaryReader",
-                "LLVMCoverage",         "LLVMLineEditor",
-                "LLVMXCoreDisassembler", "LLVMXCoreCodeGen",   "LLVMXCoreDesc",         "LLVMXCoreInfo",
-                "LLVMX86TargetMCA",     "LLVMX86Disassembler", "LLVMX86AsmParser",      "LLVMX86CodeGen",     "LLVMX86Desc",     "LLVMX86Info",
-                "LLVMWebAssemblyDisassembler", "LLVMWebAssemblyAsmParser", "LLVMWebAssemblyCodeGen", "LLVMWebAssemblyUtils", "LLVMWebAssemblyDesc", "LLVMWebAssemblyInfo",
-                "LLVMVEDisassembler",   "LLVMVEAsmParser",     "LLVMVECodeGen",         "LLVMVEDesc",         "LLVMVEInfo",
-                "LLVMSystemZDisassembler", "LLVMSystemZAsmParser", "LLVMSystemZCodeGen", "LLVMSystemZDesc",    "LLVMSystemZInfo",
-                "LLVMSPIRVCodeGen",     "LLVMSPIRVDesc",       "LLVMSPIRVInfo",         "LLVMSPIRVAnalysis",
-                "LLVMSparcDisassembler", "LLVMSparcAsmParser",  "LLVMSparcCodeGen",      "LLVMSparcDesc",      "LLVMSparcInfo",
-                "LLVMRISCVTargetMCA",   "LLVMRISCVDisassembler", "LLVMRISCVAsmParser",  "LLVMRISCVCodeGen",   "LLVMRISCVDesc",   "LLVMRISCVInfo",
-                "LLVMPowerPCDisassembler", "LLVMPowerPCAsmParser", "LLVMPowerPCCodeGen", "LLVMPowerPCDesc",    "LLVMPowerPCInfo",
-                "LLVMNVPTXCodeGen",     "LLVMNVPTXDesc",       "LLVMNVPTXInfo",
-                "LLVMMSP430Disassembler", "LLVMMSP430AsmParser", "LLVMMSP430CodeGen",   "LLVMMSP430Desc",     "LLVMMSP430Info",
-                "LLVMMipsDisassembler", "LLVMMipsAsmParser",   "LLVMMipsCodeGen",       "LLVMMipsDesc",       "LLVMMipsInfo",
-                "LLVMLoongArchDisassembler", "LLVMLoongArchAsmParser", "LLVMLoongArchCodeGen", "LLVMLoongArchDesc", "LLVMLoongArchInfo",
-                "LLVMLanaiDisassembler", "LLVMLanaiCodeGen",   "LLVMLanaiAsmParser",    "LLVMLanaiDesc",      "LLVMLanaiInfo",
-                "LLVMHexagonDisassembler", "LLVMHexagonCodeGen", "LLVMHexagonAsmParser", "LLVMHexagonDesc",    "LLVMHexagonInfo",
-                "LLVMBPFDisassembler",  "LLVMBPFAsmParser",    "LLVMBPFCodeGen",        "LLVMBPFDesc",        "LLVMBPFInfo",
-                "LLVMAVRDisassembler",  "LLVMAVRAsmParser",    "LLVMAVRCodeGen",        "LLVMAVRDesc",        "LLVMAVRInfo",
-                "LLVMARMDisassembler",  "LLVMARMAsmParser",    "LLVMARMCodeGen",        "LLVMARMDesc",        "LLVMARMUtils",    "LLVMARMInfo",
-                "LLVMAMDGPUTargetMCA",  "LLVMAMDGPUDisassembler", "LLVMAMDGPUAsmParser", "LLVMAMDGPUCodeGen", "LLVMAMDGPUDesc",  "LLVMAMDGPUUtils", "LLVMAMDGPUInfo",
-                "LLVMAArch64Disassembler", "LLVMAArch64AsmParser", "LLVMAArch64CodeGen", "LLVMAArch64Desc",   "LLVMAArch64Utils", "LLVMAArch64Info",
-                "LLVMOrcDebugging",     "LLVMOrcJIT",          "LLVMWindowsDriver",     "LLVMMCJIT",          "LLVMJITLink",
-                "LLVMInterpreter",      "LLVMExecutionEngine", "LLVMRuntimeDyld",
-                "LLVMOrcTargetProcess", "LLVMOrcShared",       "LLVMDWP",
-                "LLVMDebugInfoLogicalView", "LLVMDebugInfoGSYM",
-                "LLVMOption",           "LLVMObjectYAML",      "LLVMObjCopy",
-                "LLVMMCA",              "LLVMMCDisassembler",  "LLVMLTO",
-                "LLVMPasses",           "LLVMHipStdPar",       "LLVMCFGuard",
-                "LLVMCoroutines",       "LLVMipo",             "LLVMVectorize",
-                "LLVMSandboxIR",        "LLVMLinker",          "LLVMInstrumentation",
-                "LLVMFrontendOpenMP",   "LLVMFrontendOffloading",
-                "LLVMFrontendOpenACC",  "LLVMFrontendHLSL",   "LLVMFrontendDriver",    "LLVMFrontendAtomic",
-                "LLVMExtensions",       "Polly",               "PollyISL",
-                "LLVMDWARFLinkerParallel", "LLVMDWARFLinkerClassic", "LLVMDWARFLinker",
-                "LLVMGlobalISel",       "LLVMMIRParser",       "LLVMAsmPrinter",
-                "LLVMSelectionDAG",     "LLVMCodeGen",         "LLVMTarget",
-                "LLVMObjCARCOpts",      "LLVMCodeGenTypes",    "LLVMCGData",
-                "LLVMIRPrinter",        "LLVMInterfaceStub",   "LLVMFileCheck",
-                "LLVMFuzzMutate",       "LLVMScalarOpts",      "LLVMInstCombine",
-                "LLVMAggressiveInstCombine", "LLVMTransformUtils",
-                "LLVMBitWriter",        "LLVMAnalysis",        "LLVMProfileData",
-                "LLVMSymbolize",        "LLVMDebugInfoBTF",    "LLVMDebugInfoPDB",
-                "LLVMDebugInfoMSF",     "LLVMDebugInfoCodeView", "LLVMDebugInfoDWARF",
-                "LLVMObject",           "LLVMTextAPI",         "LLVMMCParser",
-                "LLVMIRReader",         "LLVMAsmParser",       "LLVMMC",
-                "LLVMBitReader",        "LLVMFuzzerCLI",       "LLVMCore",
-                "LLVMRemarks",          "LLVMBitstreamReader", "LLVMBinaryFormat",
-                "LLVMTargetParser",     "LLVMSupport",         "LLVMDemangle",
-            };
-            for (llvm_libs) |lib_name| {
-                zir_exe.root_module.linkSystemLibrary(lib_name, .{});
-            }
-
-            // System dependencies
-            zir_exe.root_module.linkSystemLibrary("z", .{});
-            zir_exe.root_module.linkSystemLibrary("zstd", .{});
-            zir_exe.root_module.linkSystemLibrary("xml2", .{});
-            zir_exe.root_module.linkSystemLibrary("c++", .{ .use_pkg_config = .no });
-        }
-
-        const install_zir_exe = b.addInstallArtifact(zir_exe, .{});
-        const zir_step = b.step("zir-compile", "Build the ZIR compiler (requires libzig_compiler.a)");
-        zir_step.dependOn(&install_zir_exe.step);
-
-        // Also add a run step.
-        const zir_run_cmd = b.addRunArtifact(zir_exe);
-        if (b.args) |a| zir_run_cmd.addArgs(a);
-        const zir_run_step = b.step("zir-run", "Run the ZIR compiler");
-        zir_run_step.dependOn(&zir_run_cmd.step);
-    }
+/// Auto-detect the Zig lib directory at build time.
+/// Uses the Zig compiler's own lib directory — the same Zig that's running
+/// the build has its lib/ alongside its binary.
+fn detectBuildZigLibDir(b: *std.Build) []const u8 {
+    return b.graph.zig_lib_directory.path orelse {
+        // Fallback: derive from zig executable path
+        const zig_exe = b.graph.zig_exe;
+        const bin_dir = std.fs.path.dirname(zig_exe) orelse ".";
+        const parent_dir = std.fs.path.dirname(bin_dir) orelse ".";
+        return b.fmt("{s}/lib", .{parent_dir});
+    };
 }

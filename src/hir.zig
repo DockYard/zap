@@ -1224,6 +1224,7 @@ pub const HirBuilder = struct {
     current_binary_bindings: std.ArrayList(BinaryBinding),
     current_case_bindings: std.ArrayList(CaseBinding),
     current_module_scope: ?scope_mod.ScopeId,
+    current_function_name: ?[]const u8,
     errors: std.ArrayList(Error),
 
     pub const Error = struct {
@@ -1251,6 +1252,7 @@ pub const HirBuilder = struct {
             .current_binary_bindings = .empty,
             .current_case_bindings = .empty,
             .current_module_scope = null,
+            .current_function_name = null,
             .errors = .empty,
         };
     }
@@ -1439,6 +1441,8 @@ pub const HirBuilder = struct {
         const group_id = self.next_group_id;
         self.next_group_id += 1;
 
+        self.current_function_name = self.interner.get(decls[0].name);
+
         var clauses: std.ArrayList(Clause) = .empty;
         for (decls) |func| {
             for (func.clauses) |clause| {
@@ -1465,6 +1469,8 @@ pub const HirBuilder = struct {
     ) !FunctionGroup {
         const group_id = self.next_group_id;
         self.next_group_id += 1;
+
+        self.current_function_name = self.interner.get(func.name);
 
         var clauses: std.ArrayList(Clause) = .empty;
         for (func.clauses) |clause| {
@@ -2099,6 +2105,22 @@ pub const HirBuilder = struct {
                     .kind = .{ .list_init = try elems.toOwnedSlice(self.allocator) },
                     .type_id = types_mod.TypeStore.UNKNOWN,
                     .span = l.meta.span,
+                });
+            },
+            .map => |m| {
+                var entries: std.ArrayList(MapEntry) = .empty;
+                for (m.fields) |field| {
+                    const key = try self.buildExpr(field.key);
+                    const value = try self.buildExpr(field.value);
+                    try entries.append(self.allocator, .{
+                        .key = key,
+                        .value = value,
+                    });
+                }
+                return try self.create(Expr, .{
+                    .kind = .{ .map_init = try entries.toOwnedSlice(self.allocator) },
+                    .type_id = types_mod.TypeStore.UNKNOWN,
+                    .span = m.meta.span,
                 });
             },
             .pipe => {

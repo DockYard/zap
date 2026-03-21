@@ -1,8 +1,28 @@
 const std = @import("std");
 const zap = @import("zap");
-const ZirBuilder = zap.ZirBuilder;
+const zir_backend = zap.zir_backend;
+const zir_builder = zap.zir_builder;
+const zig_lib_archive = @import("zig_lib_archive");
 
 const runtime_source = @embedFile("runtime.zig");
+
+// C-ABI extern declarations for the Zig compiler library (libzig_compiler.a)
+extern "c" fn zir_compilation_create(
+    zig_lib_dir: [*:0]const u8,
+    local_cache_dir: [*:0]const u8,
+    global_cache_dir: [*:0]const u8,
+    output_path: [*:0]const u8,
+    root_name: [*:0]const u8,
+) ?*zir_builder.ZirContext;
+extern "c" fn zir_compilation_update(ctx: *zir_builder.ZirContext) i32;
+extern "c" fn zir_compilation_destroy(ctx: *zir_builder.ZirContext) void;
+extern "c" fn zir_compilation_print_errors(ctx: *zir_builder.ZirContext) void;
+extern "c" fn zir_compilation_add_module_source(
+    ctx: *zir_builder.ZirContext,
+    name: [*:0]const u8,
+    source_ptr: [*]const u8,
+    source_len: u32,
+) i32;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -20,7 +40,6 @@ pub fn main() !void {
 
     // Separate zap flags, the .zap file, and zig flags
     var emit_zig = false;
-    var emit_zir = false;
     var lib_mode = false;
     var strict_types = false;
     var run_after_build = false;
@@ -38,8 +57,6 @@ pub fn main() !void {
             run_after_build = true;
         } else if (std.mem.eql(u8, arg, "--emit-zig")) {
             emit_zig = true;
-        } else if (std.mem.eql(u8, arg, "--emit-zir")) {
-            emit_zir = true;
         } else if (std.mem.eql(u8, arg, "--lib")) {
             lib_mode = true;
         } else if (std.mem.eql(u8, arg, "--strict-types")) {
@@ -290,80 +307,86 @@ pub fn main() !void {
         std.process.exit(1);
     };
 
-    // Phase 8: Code generation
-    // --emit-zir: build ZIR arrays directly from IR (bypasses Zig source text)
-    if (emit_zir) {
-        var zir_builder = ZirBuilder.init(alloc);
-        defer zir_builder.deinit();
-        const zir_data = zir_builder.buildProgram(ir_program) catch {
-            try diag_engine.err("Error during ZIR generation", .{ .start = 0, .end = 0 });
-            try emitDiagnostics(&diag_engine, alloc);
-            std.process.exit(1);
-        };
-
-        // Emit any accumulated warnings before proceeding
-        if (diag_engine.warningCount() > 0) {
-            try emitDiagnostics(&diag_engine, alloc);
-        }
-
-        const stdout = std.fs.File.stdout().deprecatedWriter();
-        try stdout.print("ZIR generated:\n", .{});
-        try stdout.print("  instructions: {d}\n", .{zir_data.instructions_len});
-        try stdout.print("  string_bytes: {d}\n", .{zir_data.string_bytes_len});
-        try stdout.print("  extra:        {d}\n", .{zir_data.extra_len});
-
-        // To compile ZIR directly to a binary, build with:
-        //   zig build -Denable-zir-backend=true
-        // Then the zir_compile tool can be used to produce binaries.
-        return;
-    }
-
-    var codegen = zap.CodeGen.init(alloc);
-    defer codegen.deinit();
-    codegen.lib_mode = lib_mode;
-    codegen.emitProgram(&ir_program) catch {
-        try diag_engine.err("Error during code generation", .{ .start = 0, .end = 0 });
-        try emitDiagnostics(&diag_engine, alloc);
-        std.process.exit(1);
-    };
-
     // Emit any accumulated warnings before proceeding
     if (diag_engine.warningCount() > 0) {
         try emitDiagnostics(&diag_engine, alloc);
     }
 
-    const output = codegen.getOutput();
-
+    // Phase 8: Code generation / compilation
     if (emit_zig) {
+        // Debug: emit generated Zig source to stdout (text codegen path)
+        var codegen = zap.CodeGen.init(alloc);
+        defer codegen.deinit();
+        codegen.lib_mode = lib_mode;
+        codegen.emitProgram(&ir_program) catch {
+            try diag_engine.err("Error during code generation", .{ .start = 0, .end = 0 });
+            try emitDiagnostics(&diag_engine, alloc);
+            std.process.exit(1);
+        };
+
+        const output = codegen.getOutput();
         const stdout = std.fs.File.stdout().deprecatedWriter();
         try stdout.print("{s}", .{output});
     } else {
-        // Validate generated Zig by parsing it — catches malformed output before
-        // writing to disk, giving a clear Zap error instead of a cryptic zig build failure.
-        if (output.len > 0) {
-            const sentinel = try alloc.dupeZ(u8, output);
-            const zig_ast = try std.zig.Ast.parse(alloc, sentinel, .zig);
-            if (zig_ast.errors.len > 0) {
-                const stderr = std.fs.File.stderr().deprecatedWriter();
-                try stderr.print("internal error: generated Zig source is malformed ({d} parse errors)\n", .{zig_ast.errors.len});
-                try stderr.print("this is a bug in the Zap compiler — please report it\n", .{});
-                try stderr.print("use --emit-zig to inspect the generated code\n", .{});
-                std.process.exit(1);
-            }
-        }
+        // Default: compile via ZIR backend
+        const basename = std.fs.path.basename(path);
+        const stem = if (std.mem.endsWith(u8, basename, ".zap"))
+            basename[0 .. basename.len - 4]
+        else
+            basename;
 
-        // Write generated Zig + runtime to .zap-cache, invoke zig build
-        const exit_code = compileWithZig(allocator, path, output, lib_mode, zig_flags.items) catch |err| {
+        const zig_lib_dir = zir_backend.detectZigLibDir(alloc) orelse blk: {
+            // No external Zig lib found — extract from embedded archive
+            break :blk extractEmbeddedZigLib(alloc) catch {
+                const stderr = std.fs.File.stderr().deprecatedWriter();
+                try stderr.print("Error: could not extract embedded Zig lib.\n", .{});
+                std.process.exit(1);
+            };
+        };
+
+        std.fs.cwd().makePath(".zap-cache") catch {};
+        std.fs.cwd().makePath("zap-out/bin") catch {};
+
+        const output_path = try std.fs.path.join(alloc, &.{ "zap-out/bin", stem });
+        const output_z = try alloc.dupeZ(u8, output_path);
+        const name_z = try alloc.dupeZ(u8, stem);
+        const zig_lib_z = try alloc.dupeZ(u8, zig_lib_dir);
+
+        const ctx = zir_compilation_create(
+            zig_lib_z,
+            ".zap-cache",
+            ".zap-cache",
+            output_z,
+            name_z,
+        ) orelse {
             const stderr = std.fs.File.stderr().deprecatedWriter();
-            try stderr.print("Error invoking zig compiler: {}\n", .{err});
+            try stderr.print("Error: failed to create ZIR compilation context\n", .{});
             std.process.exit(1);
         };
-        if (exit_code != 0) {
-            std.process.exit(exit_code);
+        defer zir_compilation_destroy(ctx);
+
+        // Register embedded runtime as a module source
+        if (zir_compilation_add_module_source(ctx, "zap_runtime", runtime_source.ptr, @intCast(runtime_source.len)) != 0) {
+            const stderr = std.fs.File.stderr().deprecatedWriter();
+            try stderr.print("Error: failed to register runtime module\n", .{});
+            std.process.exit(1);
+        }
+
+        // Build ZIR from IR and inject into compilation
+        zir_builder.buildAndInject(alloc, ir_program, ctx, null) catch |err| {
+            const stderr = std.fs.File.stderr().deprecatedWriter();
+            try stderr.print("Error during ZIR build/inject: {}\n", .{err});
+            std.process.exit(1);
+        };
+
+        // Run Sema + codegen + link
+        if (zir_compilation_update(ctx) != 0) {
+            zir_compilation_print_errors(ctx);
+            std.process.exit(1);
         }
 
         if (run_after_build) {
-            const run_exit = runBinary(allocator, path, run_args.items) catch |err| {
+            const run_exit = runBinaryByName(allocator, stem, run_args.items) catch |err| {
                 const stderr = std.fs.File.stderr().deprecatedWriter();
                 try stderr.print("Error running program: {}\n", .{err});
                 std.process.exit(1);
@@ -371,6 +394,35 @@ pub fn main() !void {
             std.process.exit(run_exit);
         }
     }
+}
+
+/// Extract the embedded Zig stdlib tar archive to a persistent cache directory.
+/// Returns the path to the extracted lib directory (e.g., ~/.cache/zap/zig-lib/).
+/// If already extracted, returns immediately without re-extracting.
+fn extractEmbeddedZigLib(allocator: std.mem.Allocator) ![]const u8 {
+    const home = std.process.getEnvVarOwned(allocator, "HOME") catch return error.FileNotFound;
+    defer allocator.free(home);
+
+    const lib_dir = try std.fs.path.join(allocator, &.{ home, ".cache", "zap", "zig-lib" });
+
+    // Check if already extracted
+    const marker = try std.fs.path.join(allocator, &.{ lib_dir, "std", "std.zig" });
+    defer allocator.free(marker);
+
+    if (std.fs.cwd().access(marker, .{})) |_| {
+        return lib_dir;
+    } else |_| {}
+
+    // Extract tar archive to cache directory
+    std.fs.cwd().makePath(lib_dir) catch {};
+
+    var dir = std.fs.cwd().openDir(lib_dir, .{}) catch return error.FileNotFound;
+    defer dir.close();
+
+    var reader = std.Io.Reader.fixed(zig_lib_archive.data);
+    std.tar.pipeToFileSystem(dir, &reader, .{}) catch return error.FileNotFound;
+
+    return lib_dir;
 }
 
 fn runBinaryByName(allocator: std.mem.Allocator, stem: []const u8, program_args: []const []const u8) !u8 {

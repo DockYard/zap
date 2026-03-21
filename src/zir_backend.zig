@@ -28,6 +28,13 @@ extern "c" fn zir_compilation_update(ctx: *ZirContext) i32;
 
 extern "c" fn zir_compilation_destroy(ctx: *ZirContext) void;
 
+extern "c" fn zir_compilation_add_module_source(
+    ctx: *ZirContext,
+    name: [*:0]const u8,
+    source_ptr: [*]const u8,
+    source_len: u32,
+) i32;
+
 // ---------------------------------------------------------------------------
 // High-level API
 // ---------------------------------------------------------------------------
@@ -55,6 +62,9 @@ pub const CompileOptions = struct {
     output_path: []const u8,
     /// Name of the compilation unit (e.g., the program name).
     name: []const u8,
+    /// Optional embedded runtime source. If provided, registered via
+    /// zir_compilation_add_module_source instead of file path.
+    runtime_source: ?[]const u8 = null,
 };
 
 /// Compile a Zap IR program to a native binary via ZIR.
@@ -78,7 +88,14 @@ pub fn compile(allocator: std.mem.Allocator, program: ir.Program, options: Compi
         return error.CompilationCreateFailed;
     defer zir_compilation_destroy(ctx);
 
-    // Phase 2: Build ZIR via C-ABI calls and inject into compilation.
+    // Phase 2a: Register embedded runtime source if provided.
+    if (options.runtime_source) |source| {
+        if (zir_compilation_add_module_source(ctx, "zap_runtime", source.ptr, @intCast(source.len)) != 0) {
+            return error.CompilationFailed;
+        }
+    }
+
+    // Phase 2b: Build ZIR via C-ABI calls and inject into compilation.
     try zir_builder.buildAndInject(allocator, program, ctx, null);
 
     // Phase 3: Run Sema + codegen + link.
@@ -88,28 +105,83 @@ pub fn compile(allocator: std.mem.Allocator, program: ir.Program, options: Compi
 }
 
 /// Detect the Zig lib directory.
-/// Checks ZIG_LIB_DIR env var, then tries to derive from the zig installation.
-/// Returns null if detection fails. Caller owns the returned memory.
+/// Checks ZAP_ZIG_LIB_DIR, ZIG_LIB_DIR env vars, exe-relative paths, then
+/// well-known installation paths. Returns null if detection fails.
+/// Caller owns the returned memory.
 pub fn detectZigLibDir(allocator: std.mem.Allocator) ?[]const u8 {
-    // Try the ZIG_LIB_DIR environment variable first.
+    // 1. Try the ZAP_ZIG_LIB_DIR environment variable (project-specific override).
+    if (std.process.getEnvVarOwned(allocator, "ZAP_ZIG_LIB_DIR")) |dir| {
+        return dir;
+    } else |_| {}
+
+    // 2. Try the ZIG_LIB_DIR environment variable.
     if (std.process.getEnvVarOwned(allocator, "ZIG_LIB_DIR")) |dir| {
         return dir;
     } else |_| {}
 
-    // Try well-known paths based on the system zig installation.
-    const candidates = [_][]const u8{
-        // asdf-managed zig
-        std.fs.path.join(allocator, &.{
-            std.process.getEnvVarOwned(allocator, "HOME") catch return null,
-            ".asdf/installs/zig/0.15.2/lib",
-        }) catch return null,
-        // System zig
+    // 3. Try paths relative to the self executable.
+    //    e.g., if exe is /usr/local/bin/zap, check:
+    //      /usr/local/lib/zig/std/std.zig  (../lib/zig/)
+    //      /usr/local/lib/std/std.zig      (../lib/)
+    if (std.fs.selfExePathAlloc(allocator)) |exe_path| {
+        defer allocator.free(exe_path);
+        const exe_dir = std.fs.path.dirname(exe_path) orelse "";
+        const parent_dir = std.fs.path.dirname(exe_dir) orelse "";
+
+        const exe_relative_candidates = [_][]const u8{
+            "lib/zig",
+            "lib",
+        };
+
+        for (exe_relative_candidates) |suffix| {
+            const candidate = std.fs.path.join(allocator, &.{ parent_dir, suffix }) catch continue;
+            const check = std.fs.path.join(allocator, &.{ candidate, "std", "std.zig" }) catch {
+                allocator.free(candidate);
+                continue;
+            };
+            defer allocator.free(check);
+
+            std.fs.cwd().access(check, .{}) catch {
+                allocator.free(candidate);
+                continue;
+            };
+
+            return candidate;
+        }
+    } else |_| {}
+
+    // 4. Try well-known paths based on the system zig installation.
+    const home_dir = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    defer if (home_dir) |h| allocator.free(h);
+
+    // Build asdf candidate only if HOME is available.
+    const asdf_candidate: ?[]const u8 = if (home_dir) |h|
+        std.fs.path.join(allocator, &.{ h, ".asdf/installs/zig/0.15.2/lib" }) catch null
+    else
+        null;
+    defer if (asdf_candidate) |c| allocator.free(c);
+
+    const static_candidates = [_][]const u8{
         "/usr/local/lib/zig",
         "/usr/lib/zig",
     };
 
-    for (candidates) |candidate| {
-        // Check if std/std.zig exists under this path.
+    // Check asdf candidate first if available.
+    if (asdf_candidate) |candidate| {
+        const check_path = std.fs.path.join(allocator, &.{ candidate, "std", "std.zig" }) catch null;
+        if (check_path) |c| {
+            defer allocator.free(c);
+            const accessible = blk: {
+                std.fs.cwd().access(c, .{}) catch break :blk false;
+                break :blk true;
+            };
+            if (accessible) {
+                return allocator.dupe(u8, candidate) catch null;
+            }
+        }
+    }
+
+    for (static_candidates) |candidate| {
         const check = std.fs.path.join(allocator, &.{ candidate, "std", "std.zig" }) catch continue;
         defer allocator.free(check);
 

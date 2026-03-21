@@ -10,7 +10,7 @@
   <br>
 </p>
 
-<h3 align="center">A functional language that compiles to native code through Zig.</h3>
+<h3 align="center">A functional language that compiles to native code.</h3>
 
 <p align="center">
   Pattern matching &nbsp;·&nbsp; Type safety &nbsp;·&nbsp; Native binaries
@@ -18,7 +18,7 @@
 
 ---
 
-Zap takes the developer experience of functional programming — pattern matching, pipe operators, algebraic types — and strips away the overhead. No VM, no garbage collector, no interpreter. Your code compiles to Zig, and Zig compiles to a native binary.
+Zap takes the developer experience of functional programming — pattern matching, pipe operators, algebraic types — and strips away the overhead. No VM, no garbage collector, no interpreter. Your code compiles directly to a native binary.
 
 > **Early stage.** The core pipeline works and examples compile and run, but not everything described here is fully implemented yet.
 
@@ -26,29 +26,28 @@ Zap takes the developer experience of functional programming — pattern matchin
 
 ## Quick Start
 
-### Prerequisites
+### Install from release
 
-Install [Zig](https://ziglang.org/download/) **0.15.2** or later.
+Download the latest release tarball for your platform. Extract it — the archive contains `bin/zap` and `lib/zig/` (the Zig standard library). Add `bin/` to your PATH. No separate Zig installation is required.
 
-Verify your installation:
+### Build from source
 
-```sh
-zig version
-```
-
-### Step 1 — Build the Zap compiler
-
-Clone the repository and build:
+Building from source requires Zig 0.15.2, LLVM 20, and the Zap Zig compiler fork.
 
 ```sh
+# 1. Build the Zig compiler library
+cd ~/projects/zig
+zig build lib -Denable-llvm -Dconfig_h=build/config.h
+
+# 2. Clone and build Zap
 git clone https://github.com/trycog/zap.git
 cd zap
-zig build
+zig build -Dllvm-lib-path=$HOME/llvm-20-native/lib
 ```
 
 This produces the compiler binary at `zig-out/bin/zap`.
 
-### Step 2 — Write a Zap program
+### Write a Zap program
 
 Create a file called `hello.zap`:
 
@@ -67,13 +66,16 @@ end
 
 Every Zap program needs a `main` function — that's your entry point. Functions declare their parameter types and return types at the boundary. The body is type-inferred.
 
-### Step 3 — Compile and run
+### Compile and run
 
 ```sh
-./zig-out/bin/zap hello.zap
-```
+# Compile a Zap program
+zap hello.zap
+# Binary produced at zap-out/bin/hello
 
-Zap compiles your code to Zig, then invokes the Zig compiler to produce a native binary. The output lands in `zap-out/bin/`:
+# Compile and run in one step
+zap run hello.zap
+```
 
 ```sh
 ./zap-out/bin/hello
@@ -82,12 +84,12 @@ Zap compiles your code to Zig, then invokes the Zig compiler to produce a native
 
 That's it. Source code in, native binary out.
 
-### See the generated Zig
+### Debug: emit generated Zig
 
 If you're curious what Zap produces under the hood:
 
 ```sh
-./zig-out/bin/zap --emit-zig hello.zap
+zap --emit-zig hello.zap
 ```
 
 This prints the generated Zig source to stdout instead of compiling it.
@@ -289,9 +291,9 @@ mixed = {1, "two", :three}  # valid: {i64, String, Atom}
 
 ---
 
-## Compiler Pipeline
+## Architecture
 
-Source text goes in, Zig source comes out, Zig takes it the rest of the way to a native binary.
+Zap includes a fork of the Zig compiler as a static library. The compiler lowers Zap IR to ZIR (Zig Intermediate Representation), then Zig's semantic analysis, code generation, and linker produce native binaries. No intermediate Zig source code is generated during normal compilation.
 
 ```
   .zap source
@@ -309,6 +311,9 @@ Source text goes in, Zig source comes out, Zig takes it the rest of the way to a
    Macro Expansion ─ AST→AST transforms to fixed point
       │
       ▼
+   Desugar ────────── simplify syntax before type checking
+      │
+      ▼
    Type Checker ──── overload resolution + inference
       │
       ▼
@@ -318,20 +323,23 @@ Source text goes in, Zig source comes out, Zig takes it the rest of the way to a
    IR Lowering ───── lower-level IR closer to Zig semantics
       │
       ▼
-   Code Gen ──────── emit Zig source
+   ZIR Emit ──────── emit Zig Intermediate Representation
       │
       ▼
-   Zig Compiler ──── native binary
+   Sema ──────────── Zig semantic analysis
+      │
+      ▼
+   Codegen ────────── native binary
 ```
 
-The entire compiler is written in Zig.
+The entire compiler is written in Zig. The binary includes the full Zig compiler toolchain — no separate Zig installation is needed at runtime.
 
 ---
 
 ## CLI Reference
 
 ```
-zap [run] [flags] <file.zap> [zig-flags...]
+zap [run] [flags] <file.zap>
 ```
 
 | Command / Flag | Description |
@@ -340,8 +348,6 @@ zap [run] [flags] <file.zap> [zig-flags...]
 | `--emit-zig` | Print generated Zig source to stdout instead of compiling |
 | `--lib` | Compile as a library instead of an executable |
 | `--strict-types` | Treat type warnings as errors |
-
-Any additional flags after the `.zap` file are forwarded to the Zig build system.
 
 ---
 
@@ -352,10 +358,10 @@ Any additional flags after the `.zap` file are forwarded to the Zig build system
 zig build test
 
 # Compile and run an example
-zig build run -- examples/factorial.zap
+zap run examples/factorial.zap
 
 # See generated Zig for an example
-zig build run -- --emit-zig examples/hello.zap
+zap --emit-zig examples/hello.zap
 ```
 
 ---

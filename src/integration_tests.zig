@@ -1828,3 +1828,124 @@ test "multiline struct literal parses correctly" {
     try expectContains(output, "\"Alice\"");
     try expectContains(output, "30");
 }
+
+test "multi-parameter function uses distinct param indices" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Typed version — goes through full pipeline including type checker
+    const source =
+        \\defmodule Math do
+        \\  def add(a :: i64, b :: i64) :: i64 do
+        \\    a + b
+        \\  end
+        \\end
+        \\
+        \\def main() do
+        \\  Math.add(20, 22)
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    // The generated Zig should reference both __arg_0 and __arg_1
+    try expectContains(output, "__arg_0");
+    try expectContains(output, "__arg_1");
+}
+
+test "multi-parameter function param_get indices in IR" {
+    // Test at the IR level with untyped params (bypasses type checker)
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\def add(a, b) do
+        \\  a + b
+        \\end
+    ;
+
+    var parser = @import("parser.zig").Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = @import("collector.zig").Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var type_store = @import("types.zig").TypeStore.init(alloc, &parser.interner);
+    defer type_store.deinit();
+
+    var hir_builder = @import("hir.zig").HirBuilder.init(alloc, &parser.interner, &collector.graph, &type_store);
+    defer hir_builder.deinit();
+    const hir_program = try hir_builder.buildProgram(&program);
+
+    var ir_builder = ir.IrBuilder.init(alloc, &parser.interner);
+    ir_builder.type_store = &type_store;
+    defer ir_builder.deinit();
+    const ir_program = try ir_builder.buildProgram(&hir_program);
+
+    try std.testing.expect(ir_program.functions.len > 0);
+    const func = ir_program.functions[0];
+    try std.testing.expect(func.body.len > 0);
+
+    // Collect all param_get instructions
+    var param_indices: std.ArrayListUnmanaged(u32) = .empty;
+    for (func.body[0].instructions) |instr| {
+        switch (instr) {
+            .param_get => |pg| try param_indices.append(alloc, pg.index),
+            else => {},
+        }
+    }
+
+    // We should have exactly 2 param_get instructions with indices 0 and 1
+    try std.testing.expectEqual(@as(usize, 2), param_indices.items.len);
+    try std.testing.expectEqual(@as(u32, 0), param_indices.items[0]);
+    try std.testing.expectEqual(@as(u32, 1), param_indices.items[1]);
+}
+
+test "top-level multi-param function called from main" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Adder do
+        \\  def add(a :: i64, b :: i64) :: i64 do
+        \\    a + b
+        \\  end
+        \\end
+        \\
+        \\def main() do
+        \\  IO.puts(Adder.add(20, 22))
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    // The add function should use both __arg_0 and __arg_1
+    try expectContains(output, "__arg_0");
+    try expectContains(output, "__arg_1");
+}
+
+test "three-parameter function uses all param indices" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Math do
+        \\  def sum3(a :: i64, b :: i64, c :: i64) :: i64 do
+        \\    a + b + c
+        \\  end
+        \\end
+        \\
+        \\def main() do
+        \\  Math.sum3(1, 2, 3)
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, "__arg_0");
+    try expectContains(output, "__arg_1");
+    try expectContains(output, "__arg_2");
+}

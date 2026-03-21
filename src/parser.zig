@@ -1552,12 +1552,21 @@ pub const Parser = struct {
         }
 
         if (is_struct) {
-            // Struct fields without :: Type — error or treat as map
-            // For now, still create a struct expr with empty module name
+            // Struct fields without :: Type — treat as map with atom keys.
+            // %{name: "alice"} is shorthand for %{:name => "alice"}.
+            for (struct_fields.items) |sf| {
+                const key_atom = try self.create(ast.Expr, .{
+                    .atom_literal = .{
+                        .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
+                        .value = sf.name,
+                    },
+                });
+                try map_fields.append(self.allocator, .{ .key = key_atom, .value = sf.value });
+            }
             return self.create(ast.Expr, .{
                 .map = .{
                     .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
-                    .fields = &.{},
+                    .fields = try map_fields.toOwnedSlice(self.allocator),
                 },
             });
         }
