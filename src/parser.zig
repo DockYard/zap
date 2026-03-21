@@ -1267,6 +1267,41 @@ pub const Parser = struct {
                 _ = self.advance();
                 const field_tok = try self.expect(.identifier);
                 const field_name = try self.internToken(field_tok);
+
+                // Check for function reference: Module.func/arity
+                if (self.check(.slash)) {
+                    const saved_lexer = self.lexer;
+                    const saved_current = self.current;
+                    const saved_previous = self.previous;
+                    _ = self.advance(); // consume /
+                    if (self.check(.int_literal)) {
+                        const arity_tok = self.advance();
+                        const arity_text = arity_tok.slice(self.source);
+                        const arity = std.fmt.parseInt(u32, arity_text, 10) catch 0;
+
+                        // Extract module name from the object expression
+                        const mod_name: ?ast.ModuleName = switch (expr.*) {
+                            .module_ref => |mr| mr.name,
+                            else => null,
+                        };
+
+                        expr = try self.create(ast.Expr, .{
+                            .function_ref = .{
+                                .meta = .{ .span = ast.SourceSpan.merge(expr.getMeta().span, ast.SourceSpan.from(arity_tok.loc)) },
+                                .module = mod_name,
+                                .function = field_name,
+                                .arity = arity,
+                            },
+                        });
+                        break;
+                    } else {
+                        // Not a function ref — restore and fall through to field_access
+                        self.lexer = saved_lexer;
+                        self.current = saved_current;
+                        self.previous = saved_previous;
+                    }
+                }
+
                 expr = try self.create(ast.Expr, .{
                     .field_access = .{
                         .meta = .{ .span = ast.SourceSpan.merge(expr.getMeta().span, ast.SourceSpan.from(field_tok.loc)) },
@@ -2748,12 +2783,33 @@ pub const Parser = struct {
 
     fn parseNamedType(self: *Parser) !*const ast.TypeExpr {
         const tok = self.advance();
-        const text = tok.slice(self.source);
+        var text = tok.slice(self.source);
 
         if (std.mem.eql(u8, text, "Never")) {
             return self.create(ast.TypeExpr, .{
                 .never = .{ .meta = .{ .span = ast.SourceSpan.from(tok.loc) } },
             });
+        }
+
+        // Handle dot-separated type names (e.g., Zap.Project)
+        if (tok.tag == .module_identifier) {
+            while (self.check(.dot)) {
+                const saved_lexer = self.lexer;
+                const saved_current = self.current;
+                const saved_previous = self.previous;
+                _ = self.advance(); // consume dot
+                if (self.check(.module_identifier) or self.check(.identifier)) {
+                    const part = self.advance();
+                    const part_text = part.slice(self.source);
+                    text = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ text, part_text });
+                } else {
+                    // Not a type name continuation — restore the dot
+                    self.lexer = saved_lexer;
+                    self.current = saved_current;
+                    self.previous = saved_previous;
+                    break;
+                }
+            }
         }
 
         const name = try self.interner.intern(text);

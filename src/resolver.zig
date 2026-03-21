@@ -352,7 +352,7 @@ pub const Resolver = struct {
             // Literals and module refs — no resolution needed
             .int_literal, .float_literal, .string_literal,
             .string_interpolation, .atom_literal, .bool_literal,
-            .nil_literal, .module_ref, .intrinsic,
+            .nil_literal, .module_ref, .function_ref, .intrinsic,
             => {},
         }
     }

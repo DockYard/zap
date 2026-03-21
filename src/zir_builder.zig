@@ -196,6 +196,7 @@ pub const ZirDriver = struct {
     param_refs: std.ArrayListUnmanaged(u32),
     allocator: Allocator,
     program: ?ir.Program,
+    lib_mode: bool = false,
     /// Tracks the dest local of the enclosing case_block so that case_break
     /// can propagate its result value to the correct destination.
     current_case_dest: ?ir.LocalId = null,
@@ -285,6 +286,9 @@ pub const ZirDriver = struct {
     }
 
     fn emitFunction(self: *ZirDriver, func: ir.Function) !void {
+        // In library mode, skip the main function.
+        if (self.lib_mode and std.mem.eql(u8, func.name, "main")) return;
+
         self.local_refs.clearRetainingCapacity();
         self.param_refs.clearRetainingCapacity();
 
@@ -2143,6 +2147,7 @@ pub fn buildAndInject(
     program: ir.Program,
     compilation_ctx: *ZirContext,
     runtime_path: ?[:0]const u8,
+    lib_mode: bool,
 ) BuildError!void {
     // Register the runtime module if a path was provided.
     if (runtime_path) |rpath| {
@@ -2152,6 +2157,7 @@ pub fn buildAndInject(
     }
 
     var driver = try ZirDriver.init(allocator);
+    driver.lib_mode = lib_mode;
 
     driver.buildProgram(program) catch |err| {
         driver.deinit(); // destroy builder on error path

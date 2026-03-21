@@ -979,6 +979,17 @@ pub const TypeChecker = struct {
                 return result_type;
             },
 
+            .function_ref => |fr| {
+                // Create a function type with known arity, unknown param/return types
+                const params = try self.allocator.alloc(TypeId, fr.arity);
+                for (params) |*p| p.* = TypeStore.UNKNOWN;
+                return try self.store.addType(.{
+                    .function = .{
+                        .params = params,
+                        .return_type = TypeStore.UNKNOWN,
+                    },
+                });
+            },
             .field_access => |fa| {
                 // Check for enum variant access (e.g. Color.Red)
                 if (fa.object.* == .module_ref) {

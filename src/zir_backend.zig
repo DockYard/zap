@@ -22,6 +22,10 @@ extern "c" fn zir_compilation_create(
     global_cache_dir: [*:0]const u8,
     output_path: [*:0]const u8,
     root_name: [*:0]const u8,
+    output_mode: u8,
+    optimize_mode: u8,
+    is_dynamic: bool,
+    link_libc: bool,
 ) ?*ZirContext;
 
 extern "c" fn zir_compilation_update(ctx: *ZirContext) i32;
@@ -65,6 +69,14 @@ pub const CompileOptions = struct {
     /// Optional embedded runtime source. If provided, registered via
     /// zir_compilation_add_module_source instead of file path.
     runtime_source: ?[]const u8 = null,
+    /// Output mode: 0=Exe, 1=Lib, 2=Obj.
+    output_mode: u8 = 0,
+    /// Optimize mode: 0=Debug, 1=ReleaseSafe, 2=ReleaseFast, 3=ReleaseSmall.
+    optimize_mode: u8 = 1,
+    /// For Lib output: true=dynamic (.so/.dylib), false=static (.a).
+    is_dynamic: bool = false,
+    /// Whether to link libc.
+    link_libc: bool = true,
 };
 
 /// Compile a Zap IR program to a native binary via ZIR.
@@ -84,7 +96,7 @@ pub fn compile(allocator: std.mem.Allocator, program: ir.Program, options: Compi
     const name_z = allocator.dupeZ(u8, options.name) catch return error.OutOfMemory;
     defer allocator.free(name_z);
 
-    const ctx = zir_compilation_create(zig_lib_z, cache_z, global_cache_z, output_z, name_z) orelse
+    const ctx = zir_compilation_create(zig_lib_z, cache_z, global_cache_z, output_z, name_z, options.output_mode, options.optimize_mode, options.is_dynamic, options.link_libc) orelse
         return error.CompilationCreateFailed;
     defer zir_compilation_destroy(ctx);
 
@@ -96,7 +108,7 @@ pub fn compile(allocator: std.mem.Allocator, program: ir.Program, options: Compi
     }
 
     // Phase 2b: Build ZIR via C-ABI calls and inject into compilation.
-    try zir_builder.buildAndInject(allocator, program, ctx, null);
+    try zir_builder.buildAndInject(allocator, program, ctx, null, options.output_mode == 1);
 
     // Phase 3: Run Sema + codegen + link.
     if (zir_compilation_update(ctx) != 0) {

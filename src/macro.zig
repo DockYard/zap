@@ -485,6 +485,7 @@ pub const MacroEngine = struct {
             .map,
             .struct_expr,
             .field_access,
+            .function_ref,
             .panic_expr,
             .intrinsic,
             .binary_literal,

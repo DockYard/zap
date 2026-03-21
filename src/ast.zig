@@ -306,6 +306,9 @@ pub const Expr = union(enum) {
     // Binary literal: <<1, 2, 3>>
     binary_literal: BinaryLiteral,
 
+    // Function reference: Module.func/arity
+    function_ref: FunctionRefExpr,
+
     // Type annotation on expression: expr :: Type
     type_annotated: TypeAnnotatedExpr,
 
@@ -340,6 +343,7 @@ pub const Expr = union(enum) {
             .block => |v| v.meta,
             .intrinsic => |v| v.meta,
             .binary_literal => |v| v.meta,
+            .function_ref => |v| v.meta,
             .type_annotated => |v| v.meta,
         };
     }
@@ -731,6 +735,13 @@ pub const BinaryLiteral = struct {
 pub const BinaryPattern = struct {
     meta: NodeMeta,
     segments: []const BinarySegment,
+};
+
+pub const FunctionRefExpr = struct {
+    meta: NodeMeta,
+    module: ?ModuleName,    // null for local function references
+    function: StringId,
+    arity: u32,
 };
 
 // ============================================================

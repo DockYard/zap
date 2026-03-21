@@ -13,6 +13,10 @@ extern "c" fn zir_compilation_create(
     global_cache_dir: [*:0]const u8,
     output_path: [*:0]const u8,
     root_name: [*:0]const u8,
+    output_mode: u8,
+    optimize_mode: u8,
+    is_dynamic: bool,
+    link_libc: bool,
 ) ?*zir_builder.ZirContext;
 extern "c" fn zir_compilation_update(ctx: *zir_builder.ZirContext) i32;
 extern "c" fn zir_compilation_destroy(ctx: *zir_builder.ZirContext) void;
@@ -156,12 +160,75 @@ pub fn main() !void {
         std.process.exit(1);
     };
 
+    // Compilation caching: hash source + options to skip the entire pipeline
+    // when the output is already up to date.
+    if (!emit_zig) {
+        const c_basename = std.fs.path.basename(path);
+        const c_stem = if (std.mem.endsWith(u8, c_basename, ".zap"))
+            c_basename[0 .. c_basename.len - 4]
+        else
+            c_basename;
+
+        const c_output_mode: u8 = if (lib_mode) 1 else 0;
+
+        std.fs.cwd().makePath(".zap-cache") catch {};
+
+        const c_out_subdir: []const u8 = if (lib_mode) "zap-out/lib" else "zap-out/bin";
+        const c_output_name = if (lib_mode)
+            try std.fmt.allocPrint(alloc, "{s}.a", .{c_stem})
+        else
+            c_stem;
+        const c_output_path = try std.fs.path.join(alloc, &.{ c_out_subdir, c_output_name });
+
+        const cache_key = blk: {
+            var hasher = std.hash.Wyhash.init(0);
+            hasher.update(source);
+            hasher.update(runtime_source);
+            hasher.update(&[_]u8{c_output_mode});
+            break :blk hasher.final();
+        };
+        const cache_key_hex = try std.fmt.allocPrint(alloc, "{x:0>16}", .{cache_key});
+        const hash_file = try std.fmt.allocPrint(alloc, ".zap-cache/{s}.hash", .{c_stem});
+
+        const cache_valid = blk: {
+            const stored = std.fs.cwd().readFileAlloc(alloc, hash_file, 16) catch break :blk false;
+            defer alloc.free(stored);
+            if (!std.mem.eql(u8, stored, cache_key_hex)) break :blk false;
+            std.fs.cwd().access(c_output_path, .{}) catch break :blk false;
+            break :blk true;
+        };
+
+        if (cache_valid) {
+            const stderr_w = std.fs.File.stderr().deprecatedWriter();
+            try stderr_w.print("Compiling {s}\n  [cached] {s}\n", .{ path, c_output_path });
+            if (run_after_build) {
+                if (lib_mode) {
+                    try stderr_w.print("Error: cannot run a library\n", .{});
+                    std.process.exit(1);
+                }
+                const run_exit = runBinaryByName(allocator, c_stem, run_args.items) catch |err| {
+                    try stderr_w.print("Error running program: {}\n", .{err});
+                    std.process.exit(1);
+                };
+                std.process.exit(run_exit);
+            }
+            return;
+        }
+    }
+
     // Create shared DiagnosticEngine
     var diag_engine = zap.DiagnosticEngine.init(alloc);
     defer diag_engine.deinit();
     diag_engine.use_color = zap.diagnostics.detectColor();
 
+    const total_steps: u32 = if (emit_zig) 8 else 10;
+    var step: u32 = 0;
+    const progress = std.fs.File.stderr().deprecatedWriter();
+    try progress.print("Compiling {s}\n", .{path});
+
     // Phase 1: Parse (with stdlib prepended)
+    step += 1;
+    try progress.print("  [{d}/{d}] Parse\n", .{ step, total_steps });
     const prepend_result = zap.stdlib.prependStdlib(alloc, source) catch {
         const stderr = std.fs.File.stderr().deprecatedWriter();
         try stderr.print("Error loading standard library\n", .{});
@@ -206,6 +273,8 @@ pub fn main() !void {
     }
 
     // Phase 2: Collect declarations
+    step += 1;
+    try progress.print("  [{d}/{d}] Collect\n", .{ step, total_steps });
     var collector = zap.Collector.init(alloc, &parser.interner);
     defer collector.deinit();
     collector.collectProgram(&program) catch {
@@ -226,6 +295,8 @@ pub fn main() !void {
     }
 
     // Phase 3: Macro expansion
+    step += 1;
+    try progress.print("  [{d}/{d}] Expand macros\n", .{ step, total_steps });
     var macro_engine = zap.MacroEngine.init(alloc, &parser.interner, &collector.graph);
     defer macro_engine.deinit();
     const expanded_program = macro_engine.expandProgram(&program) catch {
@@ -246,6 +317,8 @@ pub fn main() !void {
     }
 
     // Phase 4: Desugaring
+    step += 1;
+    try progress.print("  [{d}/{d}] Desugar\n", .{ step, total_steps });
     var desugarer = zap.Desugarer.init(alloc, &parser.interner);
     const desugared_program = desugarer.desugarProgram(&expanded_program) catch {
         try diag_engine.err("Error during desugaring", .{ .start = 0, .end = 0 });
@@ -254,6 +327,8 @@ pub fn main() !void {
     };
 
     // Phase 5: Type checking
+    step += 1;
+    try progress.print("  [{d}/{d}] Type check\n", .{ step, total_steps });
     var type_checker = zap.types.TypeChecker.init(alloc, &parser.interner, &collector.graph);
     defer type_checker.deinit();
     type_checker.stdlib_line_count = prepend_result.stdlib_line_count;
@@ -278,6 +353,8 @@ pub fn main() !void {
     }
 
     // Phase 6: HIR lowering
+    step += 1;
+    try progress.print("  [{d}/{d}] HIR\n", .{ step, total_steps });
     var hir_builder = zap.hir.HirBuilder.init(alloc, &parser.interner, &collector.graph, &type_checker.store);
     defer hir_builder.deinit();
     const hir_program = hir_builder.buildProgram(&desugared_program) catch {
@@ -298,6 +375,8 @@ pub fn main() !void {
     }
 
     // Phase 7: IR lowering
+    step += 1;
+    try progress.print("  [{d}/{d}] IR\n", .{ step, total_steps });
     var ir_builder = zap.ir.IrBuilder.init(alloc, &parser.interner);
     ir_builder.type_store = &type_checker.store;
     defer ir_builder.deinit();
@@ -314,6 +393,8 @@ pub fn main() !void {
 
     // Phase 8: Code generation / compilation
     if (emit_zig) {
+        step += 1;
+        try progress.print("  [{d}/{d}] Emit Zig\n", .{ step, total_steps });
         // Debug: emit generated Zig source to stdout (text codegen path)
         var codegen = zap.CodeGen.init(alloc);
         defer codegen.deinit();
@@ -335,6 +416,14 @@ pub fn main() !void {
         else
             basename;
 
+        const output_mode_val: u8 = if (lib_mode) 1 else 0;
+
+        if (run_after_build and lib_mode) {
+            const stderr = std.fs.File.stderr().deprecatedWriter();
+            try stderr.print("Error: cannot run a library\n", .{});
+            std.process.exit(1);
+        }
+
         const zig_lib_dir = zir_backend.detectZigLibDir(alloc) orelse blk: {
             // No external Zig lib found — extract from embedded archive
             break :blk extractEmbeddedZigLib(alloc) catch {
@@ -345,9 +434,15 @@ pub fn main() !void {
         };
 
         std.fs.cwd().makePath(".zap-cache") catch {};
-        std.fs.cwd().makePath("zap-out/bin") catch {};
 
-        const output_path = try std.fs.path.join(alloc, &.{ "zap-out/bin", stem });
+        const out_subdir: []const u8 = if (lib_mode) "zap-out/lib" else "zap-out/bin";
+        std.fs.cwd().makePath(out_subdir) catch {};
+
+        const output_name = if (lib_mode)
+            try std.fmt.allocPrint(alloc, "{s}.a", .{stem})
+        else
+            stem;
+        const output_path = try std.fs.path.join(alloc, &.{ out_subdir, output_name });
         const output_z = try alloc.dupeZ(u8, output_path);
         const name_z = try alloc.dupeZ(u8, stem);
         const zig_lib_z = try alloc.dupeZ(u8, zig_lib_dir);
@@ -358,6 +453,10 @@ pub fn main() !void {
             ".zap-cache",
             output_z,
             name_z,
+            output_mode_val,
+            1, // ReleaseSafe
+            false, // static
+            true, // link_libc
         ) orelse {
             const stderr = std.fs.File.stderr().deprecatedWriter();
             try stderr.print("Error: failed to create ZIR compilation context\n", .{});
@@ -373,16 +472,40 @@ pub fn main() !void {
         }
 
         // Build ZIR from IR and inject into compilation
-        zir_builder.buildAndInject(alloc, ir_program, ctx, null) catch |err| {
+        step += 1;
+        try progress.print("  [{d}/{d}] ZIR\n", .{ step, total_steps });
+        zir_builder.buildAndInject(alloc, ir_program, ctx, null, lib_mode) catch |err| {
             const stderr = std.fs.File.stderr().deprecatedWriter();
             try stderr.print("Error during ZIR build/inject: {}\n", .{err});
             std.process.exit(1);
         };
 
         // Run Sema + codegen + link
+        step += 1;
+        try progress.print("  [{d}/{d}] Sema + Codegen\n", .{ step, total_steps });
         if (zir_compilation_update(ctx) != 0) {
             zir_compilation_print_errors(ctx);
             std.process.exit(1);
+        }
+
+        step += 1;
+        try progress.print("  [{d}/{d}] Linked {s}\n", .{ step, total_steps, output_path });
+
+        // Save compilation cache hash
+        {
+            const save_cache_key = blk: {
+                var hasher = std.hash.Wyhash.init(0);
+                hasher.update(source);
+                hasher.update(runtime_source);
+                hasher.update(&[_]u8{output_mode_val});
+                break :blk hasher.final();
+            };
+            const save_key_hex = try std.fmt.allocPrint(alloc, "{x:0>16}", .{save_cache_key});
+            const save_hash_file = try std.fmt.allocPrint(alloc, ".zap-cache/{s}.hash", .{stem});
+            std.fs.cwd().writeFile(.{
+                .sub_path = save_hash_file,
+                .data = save_key_hex,
+            }) catch {};
         }
 
         if (run_after_build) {
