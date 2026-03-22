@@ -213,6 +213,39 @@ pub const AtomTable = struct {
 };
 
 // ============================================================
+// Global Atom Table — process-wide interned atom registry
+// ============================================================
+
+var global_atom_table: ?AtomTable = null;
+
+pub fn getAtomTable() *AtomTable {
+    if (global_atom_table == null) {
+        global_atom_table = AtomTable.init(std.heap.page_allocator);
+    }
+    return &global_atom_table.?;
+}
+
+/// Intern a string as an atom. Returns the atom's u32 ID.
+/// This is the C-ABI-friendly entry point called from generated ZIR code.
+pub fn atomIntern(name: [*]const u8, len: u32) u32 {
+    const table = getAtomTable();
+    const atom = table.intern(name[0..len]) catch return 0;
+    return atom.id;
+}
+
+/// Get the string name of an atom by its u32 ID.
+pub fn atomToString(id: u32) []const u8 {
+    const table = getAtomTable();
+    return table.getName(.{ .id = id });
+}
+
+/// Compare two atom IDs for equality. Returns true/false as the
+/// Zig bool type for use from generated code.
+pub fn atomEq(a: u32, b: u32) bool {
+    return a == b;
+}
+
+// ============================================================
 // Closure — Fat pointer for function values (spec §20.2, §31.3)
 // ============================================================
 
@@ -528,6 +561,14 @@ pub const Prelude = struct {
             stdout.print("{}\n", .{value}) catch {};
         } else if (info == .@"enum") {
             stdout.print(":{s}\n", .{@tagName(value)}) catch {};
+        } else if (T == u32) {
+            // Could be an atom ID — print as atom if it looks up
+            const name = atomToString(value);
+            if (!std.mem.eql(u8, name, "<unknown_atom>")) {
+                stdout.print(":{s}\n", .{name}) catch {};
+            } else {
+                stdout.print("{d}\n", .{value}) catch {};
+            }
         } else {
             // For tuples, structs, and other compound types, use inspect formatting
             inspectWrite(stdout, value);
@@ -696,6 +737,10 @@ pub const Prelude = struct {
 
     pub fn min_f64(a: f64, b: f64) f64 {
         return @min(a, b);
+    }
+
+    pub fn atom_name(id: u32) []const u8 {
+        return atomToString(id);
     }
 
     pub fn panic(msg: []const u8) noreturn {

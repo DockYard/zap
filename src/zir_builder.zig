@@ -422,7 +422,18 @@ pub const ZirDriver = struct {
                 try self.setLocal(dest, ref);
             },
             .const_atom => |ca| {
-                const ref = zir_builder_emit_enum_literal(self.handle, ca.value.ptr, @intCast(ca.value.len));
+                // Intern the atom string via the global atom table at runtime.
+                // Emit: @import("zap_runtime").atomIntern("name", len)
+                const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                if (rt_import == error_ref) return error.EmitFailed;
+                const intern_fn = zir_builder_emit_field_val(self.handle, rt_import, "atomIntern", 10);
+                if (intern_fn == error_ref) return error.EmitFailed;
+                const name_ref = zir_builder_emit_str(self.handle, ca.value.ptr, @intCast(ca.value.len));
+                if (name_ref == error_ref) return error.EmitFailed;
+                const len_ref = zir_builder_emit_int(self.handle, @intCast(ca.value.len));
+                if (len_ref == error_ref) return error.EmitFailed;
+                const args = [_]u32{ name_ref, len_ref };
+                const ref = zir_builder_emit_call_ref(self.handle, intern_fn, &args, 2);
                 if (ref == error_ref) return error.EmitFailed;
                 try self.setLocal(ca.dest, ref);
             },
@@ -635,9 +646,18 @@ pub const ZirDriver = struct {
                 }
             },
 
-            // Enum literal
+            // Enum literal — intern as atom
             .enum_literal => |el| {
-                const ref = zir_builder_emit_enum_literal(self.handle, el.variant.ptr, @intCast(el.variant.len));
+                const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                if (rt_import == error_ref) return error.EmitFailed;
+                const intern_fn = zir_builder_emit_field_val(self.handle, rt_import, "atomIntern", 10);
+                if (intern_fn == error_ref) return error.EmitFailed;
+                const name_ref = zir_builder_emit_str(self.handle, el.variant.ptr, @intCast(el.variant.len));
+                if (name_ref == error_ref) return error.EmitFailed;
+                const len_ref = zir_builder_emit_int(self.handle, @intCast(el.variant.len));
+                if (len_ref == error_ref) return error.EmitFailed;
+                const args = [_]u32{ name_ref, len_ref };
+                const ref = zir_builder_emit_call_ref(self.handle, intern_fn, &args, 2);
                 if (ref == error_ref) return error.EmitFailed;
                 try self.setLocal(el.dest, ref);
             },
@@ -956,12 +976,26 @@ pub const ZirDriver = struct {
                 try self.setLocal(ui.dest, ref);
             },
 
-            // Pattern matching — emit comparisons using binop cmp_eq
+            // Pattern matching — compare atom IDs (u32)
             .match_atom => |ma| {
-                // Compare scrutinee (enum literal) against expected atom via cmp_eq
+                // Scrutinee is already a u32 atom ID (from atomIntern).
+                // Intern the expected atom and compare IDs.
                 const scrutinee_ref = self.refForLocal(ma.scrutinee) catch return;
-                const expected_ref = zir_builder_emit_enum_literal(self.handle, ma.atom_name.ptr, @intCast(ma.atom_name.len));
+
+                // Intern the expected atom name
+                const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                if (rt_import == error_ref) return error.EmitFailed;
+                const intern_fn = zir_builder_emit_field_val(self.handle, rt_import, "atomIntern", 10);
+                if (intern_fn == error_ref) return error.EmitFailed;
+                const name_ref = zir_builder_emit_str(self.handle, ma.atom_name.ptr, @intCast(ma.atom_name.len));
+                if (name_ref == error_ref) return error.EmitFailed;
+                const len_ref = zir_builder_emit_int(self.handle, @intCast(ma.atom_name.len));
+                if (len_ref == error_ref) return error.EmitFailed;
+                const intern_args = [_]u32{ name_ref, len_ref };
+                const expected_ref = zir_builder_emit_call_ref(self.handle, intern_fn, &intern_args, 2);
                 if (expected_ref == error_ref) return error.EmitFailed;
+
+                // Compare u32 IDs via cmp_eq
                 const cmp_tag = @intFromEnum(Zir.Inst.Tag.cmp_eq);
                 const ref = zir_builder_emit_binop(self.handle, cmp_tag, scrutinee_ref, expected_ref);
                 if (ref == error_ref) return error.EmitFailed;
