@@ -197,6 +197,9 @@ pub const ZirDriver = struct {
     allocator: Allocator,
     program: ?ir.Program,
     lib_mode: bool = false,
+    /// Builder entry point function name (mangled). When set, this function
+    /// is emitted as "main" in ZIR so it becomes the program entry point.
+    builder_entry: ?[]const u8 = null,
     /// Tracks the dest local of the enclosing case_block so that case_break
     /// can propagate its result value to the correct destination.
     current_case_dest: ?ir.LocalId = null,
@@ -292,8 +295,16 @@ pub const ZirDriver = struct {
         self.local_refs.clearRetainingCapacity();
         self.param_refs.clearRetainingCapacity();
 
-        // Zig's main must return void or u8.
-        const is_main = std.mem.eql(u8, func.name, "main");
+        // Check if this function is the builder entry point.
+        // If so, emit it as "main" so it becomes the Zig entry point.
+        const is_builder_entry = if (self.builder_entry) |entry|
+            std.mem.eql(u8, func.name, entry)
+        else
+            false;
+
+        const emit_name = if (is_builder_entry) "main" else func.name;
+        const is_main = std.mem.eql(u8, emit_name, "main");
+
         const ret_type = if (is_main)
             mapMainReturnType(func.return_type)
         else
@@ -301,7 +312,7 @@ pub const ZirDriver = struct {
 
         self.current_ret_type = ret_type;
 
-        if (zir_builder_begin_func(self.handle, func.name.ptr, @intCast(func.name.len), ret_type) != 0) {
+        if (zir_builder_begin_func(self.handle, emit_name.ptr, @intCast(emit_name.len), ret_type) != 0) {
             return error.BeginFuncFailed;
         }
 
@@ -2228,6 +2239,7 @@ pub fn buildAndInject(
     compilation_ctx: *ZirContext,
     runtime_path: ?[:0]const u8,
     lib_mode: bool,
+    builder_entry: ?[]const u8,
 ) BuildError!void {
     // Register the runtime module if a path was provided.
     if (runtime_path) |rpath| {
@@ -2238,6 +2250,7 @@ pub fn buildAndInject(
 
     var driver = try ZirDriver.init(allocator);
     driver.lib_mode = lib_mode;
+    driver.builder_entry = builder_entry;
 
     driver.buildProgram(program) catch |err| {
         driver.deinit(); // destroy builder on error path

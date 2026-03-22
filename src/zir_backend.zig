@@ -39,6 +39,11 @@ extern "c" fn zir_compilation_add_module_source(
     source_len: u32,
 ) i32;
 
+extern "c" fn zir_compilation_set_builder_entry(
+    ctx: *ZirContext,
+    entry_name: [*:0]const u8,
+) i32;
+
 // ---------------------------------------------------------------------------
 // High-level API
 // ---------------------------------------------------------------------------
@@ -77,6 +82,9 @@ pub const CompileOptions = struct {
     is_dynamic: bool = false,
     /// Whether to link libc.
     link_libc: bool = true,
+    /// Builder mode: compile as a builder binary with a custom entry point.
+    /// The entry point function name (mangled, e.g., "FooBar__Builder__manifest").
+    builder_entry: ?[]const u8 = null,
 };
 
 /// Compile a Zap IR program to a native binary via ZIR.
@@ -100,6 +108,15 @@ pub fn compile(allocator: std.mem.Allocator, program: ir.Program, options: Compi
         return error.CompilationCreateFailed;
     defer zir_compilation_destroy(ctx);
 
+    // Configure builder mode if entry point is specified.
+    if (options.builder_entry) |entry| {
+        const entry_z = allocator.dupeZ(u8, entry) catch return error.OutOfMemory;
+        defer allocator.free(entry_z);
+        if (zir_compilation_set_builder_entry(ctx, entry_z) != 0) {
+            return error.CompilationFailed;
+        }
+    }
+
     // Phase 2a: Register embedded runtime source if provided.
     if (options.runtime_source) |source| {
         if (zir_compilation_add_module_source(ctx, "zap_runtime", source.ptr, @intCast(source.len)) != 0) {
@@ -108,7 +125,9 @@ pub fn compile(allocator: std.mem.Allocator, program: ir.Program, options: Compi
     }
 
     // Phase 2b: Build ZIR via C-ABI calls and inject into compilation.
-    try zir_builder.buildAndInject(allocator, program, ctx, null, options.output_mode == 1);
+    const lib_mode = options.output_mode == 1;
+    const entry_func = options.builder_entry;
+    try zir_builder.buildAndInject(allocator, program, ctx, null, lib_mode, entry_func);
 
     // Phase 3: Run Sema + codegen + link.
     if (zir_compilation_update(ctx) != 0) {
