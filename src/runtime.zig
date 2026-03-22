@@ -761,6 +761,10 @@ pub const Prelude = struct {
         return atomToString(id);
     }
 
+    pub fn get_env(name: []const u8) []const u8 {
+        return std.process.getEnvVarOwned(std.heap.page_allocator, name) catch "";
+    }
+
     pub fn panic(msg: []const u8) noreturn {
         std.debug.print("panic: {s}\n", .{msg});
         std.process.exit(1);

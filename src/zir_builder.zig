@@ -539,16 +539,28 @@ pub const ZirDriver = struct {
                     try args.append(self.allocator, ref);
                 }
 
-                // Route Kernel__*, IO__*, String__* calls through @import("zap_runtime")
+                // Route stdlib module calls through @import("zap_runtime")
                 const is_kernel = std.mem.startsWith(u8, cn.name, "Kernel__");
                 const is_io = std.mem.startsWith(u8, cn.name, "IO__");
                 const is_string = std.mem.startsWith(u8, cn.name, "String__");
-                if (is_kernel or is_io or is_string) {
+                const is_atom = std.mem.startsWith(u8, cn.name, "Atom__");
+                const is_integer = std.mem.startsWith(u8, cn.name, "Integer__");
+                const is_float = std.mem.startsWith(u8, cn.name, "Float__");
+                const is_system = std.mem.startsWith(u8, cn.name, "System__");
+                if (is_kernel or is_io or is_string or is_atom or is_integer or is_float or is_system) {
                     // Map function names to their runtime module.function equivalents
                     const func_name = if (is_kernel)
                         cn.name["Kernel__".len..]
                     else if (is_string)
                         cn.name["String__".len..]
+                    else if (is_atom)
+                        cn.name["Atom__".len..]
+                    else if (is_integer)
+                        cn.name["Integer__".len..]
+                    else if (is_float)
+                        cn.name["Float__".len..]
+                    else if (is_system)
+                        cn.name["System__".len..]
                     else if (std.mem.eql(u8, cn.name["IO__".len..], "puts"))
                         "println"
                     else
