@@ -1,4 +1,4 @@
-defstruct Manifest do
+defstruct Zap.Manifest do
   name :: String
   version :: String
   kind :: Atom

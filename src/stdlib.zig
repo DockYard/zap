@@ -110,20 +110,18 @@ pub const lib_string =
 ;
 
 pub const lib_zap =
-    \\defmodule Zap do
-    \\  defstruct Env do
-    \\    target :: Atom
-    \\    os :: Atom
-    \\    arch :: Atom
-    \\  end
+    \\defstruct Zap.Env do
+    \\  target :: Atom
+    \\  os :: Atom
+    \\  arch :: Atom
+    \\end
     \\
-    \\  defstruct Manifest do
-    \\    name :: String
-    \\    version :: String
-    \\    kind :: Atom
-    \\    root :: String = ""
-    \\    asset_name :: String = ""
-    \\  end
+    \\defstruct Zap.Manifest do
+    \\  name :: String
+    \\  version :: String
+    \\  kind :: Atom
+    \\  root :: String = ""
+    \\  asset_name :: String = ""
     \\end
     \\
 ;

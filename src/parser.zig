@@ -624,9 +624,25 @@ pub const Parser = struct {
         const start = self.currentSpan();
         _ = try self.expect(.keyword_defstruct);
 
-        // Parse name (required for top-level structs)
-        const name_tok = try self.expect(.module_identifier);
-        const name = try self.internToken(name_tok);
+        // Parse name (required for top-level structs), supports dotted names (Zap.Env)
+        const first_tok = try self.expect(.module_identifier);
+        var name_text = first_tok.slice(self.source);
+        while (self.check(.dot)) {
+            const saved_lexer = self.lexer;
+            const saved_current = self.current;
+            const saved_previous = self.previous;
+            _ = self.advance(); // consume dot
+            if (self.check(.module_identifier) or self.check(.identifier)) {
+                const part = self.advance();
+                name_text = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ name_text, part.slice(self.source) });
+            } else {
+                self.lexer = saved_lexer;
+                self.current = saved_current;
+                self.previous = saved_previous;
+                break;
+            }
+        }
+        const name = try self.interner.intern(name_text);
 
         // Parse optional extends
         var parent: ?ast.StringId = null;
