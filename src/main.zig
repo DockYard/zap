@@ -256,7 +256,19 @@ fn buildTarget(
         std.process.exit(1);
     };
 
-    // Find the builder module's manifest function name
+    // Extract manifest from build.zap AST.
+    // The compiled builder path (compile build.zap as binary, execute, capture
+    // output) is implemented but blocked by the Zig self-hosted linker producing
+    // zero-filled binaries. AST extraction handles static manifests correctly.
+    _ = build_opts;
+    const config = builder.extractManifestFromAST(alloc, build_source, target_name) catch {
+        std.process.exit(1);
+    };
+
+    // Compiled builder path — disabled until Zig linker produces valid binaries.
+    // When enabled, this compiles build.zap as a builder binary, spawns it with
+    // target/os/arch args, and captures the manifest output from stdout.
+    if (false) { // TODO: enable when Zig linker is fixed
     const manifest_func_name = builder.findBuilderManifestName(alloc, build_source) catch |err| {
         switch (err) {
             error.ManifestNotFound => try stderr_w.print("Error: build.zap must define manifest/1\n", .{}),
@@ -319,12 +331,19 @@ fn buildTarget(
     }
 
     // Parse the builder's stdout output into BuildConfig
-    const config = builder.parseManifestOutput(alloc, spawn_result.stdout) catch {
+    _ = builder.parseManifestOutput(alloc, spawn_result.stdout) catch {
         try stderr_w.print("Error: failed to parse builder output\n", .{});
         std.process.exit(1);
     };
+    } // end if (false) compiled builder block
 
-    _ = build_opts; // TODO: merge -D flags
+    // Detect zig lib dir
+    const zig_lib_dir = zir_backend.detectZigLibDir(alloc) orelse blk: {
+        break :blk extractEmbeddedZigLib(alloc) catch {
+            try stderr_w.print("Error: could not find or extract Zig lib\n", .{});
+            std.process.exit(1);
+        };
+    };
 
     // Scan source files from manifest paths
     var source_files: std.ArrayListUnmanaged([]const u8) = .empty;

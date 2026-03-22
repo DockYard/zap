@@ -216,33 +216,62 @@ pub const AtomTable = struct {
 // Global Atom Table — process-wide interned atom registry
 // ============================================================
 
-var global_atom_table: AtomTable = undefined;
-var global_atom_table_initialized: bool = false;
+// Simple atom table using fixed-size arrays to avoid std.HashMap/ArrayList
+// which require operations not yet implemented in the Zig self-hosted backend.
+const MAX_ATOMS = 1024;
+const MAX_ATOM_NAME_LEN = 128;
 
-pub fn getAtomTable() *AtomTable {
-    if (!global_atom_table_initialized) {
-        global_atom_table = AtomTable.init(std.heap.page_allocator);
-        global_atom_table_initialized = true;
+var atom_names: [MAX_ATOMS][MAX_ATOM_NAME_LEN]u8 = undefined;
+var atom_lengths: [MAX_ATOMS]u32 = [_]u32{0} ** MAX_ATOMS;
+var atom_count: u32 = 0;
+var atom_table_initialized: bool = false;
+
+fn initAtomTable() void {
+    if (atom_table_initialized) return;
+    // Register well-known atoms
+    const builtins = [_][]const u8{ "nil", "true", "false", "ok", "error" };
+    for (builtins) |name| {
+        const id = atom_count;
+        const len: u32 = @intCast(name.len);
+        @memcpy(atom_names[id][0..len], name);
+        atom_lengths[id] = len;
+        atom_count += 1;
     }
-    return &global_atom_table;
+    atom_table_initialized = true;
 }
 
 /// Intern a string as an atom. Returns the atom's u32 ID.
-/// This is the C-ABI-friendly entry point called from generated ZIR code.
 pub fn atomIntern(name: [*]const u8, len: u32) u32 {
-    const table = getAtomTable();
-    const atom = table.intern(name[0..len]) catch return 0;
-    return atom.id;
+    initAtomTable();
+    const name_slice = name[0..len];
+    // Search existing atoms
+    var i: u32 = 0;
+    while (i < atom_count) : (i += 1) {
+        if (atom_lengths[i] == len) {
+            if (std.mem.eql(u8, atom_names[i][0..len], name_slice)) {
+                return i;
+            }
+        }
+    }
+    // New atom
+    if (atom_count >= MAX_ATOMS) return 0;
+    const id = atom_count;
+    @memcpy(atom_names[id][0..len], name_slice);
+    atom_lengths[id] = len;
+    atom_count += 1;
+    return id;
 }
 
 /// Get the string name of an atom by its u32 ID.
 pub fn atomToString(id: u32) []const u8 {
-    const table = getAtomTable();
-    return table.getName(.{ .id = id });
+    initAtomTable();
+    if (id < atom_count) {
+        return atom_names[id][0..atom_lengths[id]];
+    }
+    return "<unknown_atom>";
 }
 
-/// Compare two atom IDs for equality. Returns true/false as the
-/// Zig bool type for use from generated code.
+/// Compare two atom IDs for equality.
 pub fn atomEq(a: u32, b: u32) bool {
     return a == b;
 }
@@ -544,20 +573,22 @@ pub fn ZapMap(comptime K: type, comptime V: type) type {
 pub const ZapString = struct {
     /// Convert a string to an atom, creating it if it doesn't exist.
     pub fn to_atom(name: []const u8) u32 {
-        const table = getAtomTable();
-        const atom = table.intern(name) catch return 0;
-        return atom.id;
+        return atomIntern(name.ptr, @intCast(name.len));
     }
 
     /// Convert a string to an existing atom. Returns null (0xFFFFFFFF)
-    /// if the atom has not been previously interned. Prevents unbounded
-    /// atom table growth from untrusted input.
+    /// if the atom has not been previously interned.
     pub fn to_existing_atom(name: []const u8) u32 {
-        const table = getAtomTable();
-        if (table.lookup.get(name)) |id| {
-            return id;
+        initAtomTable();
+        var i: u32 = 0;
+        while (i < atom_count) : (i += 1) {
+            if (atom_lengths[i] == name.len) {
+                if (std.mem.eql(u8, atom_names[i][0..name.len], name)) {
+                    return i;
+                }
+            }
         }
-        return 0xFFFFFFFF; // sentinel for "not found"
+        return 0xFFFFFFFF;
     }
 
     pub fn concat(allocator: std.mem.Allocator, a: []const u8, b: []const u8) ![]const u8 {
@@ -797,8 +828,11 @@ pub const Prelude = struct {
         return @min(a, b);
     }
 
-    pub fn atom_name(id: u32) []const u8 {
-        return atomToString(id);
+    pub fn atom_name(id: anytype) []const u8 {
+        const T = @TypeOf(id);
+        if (T == u32) return atomToString(id);
+        if (@typeInfo(T) == .int) return atomToString(@intCast(id));
+        return "<not_an_atom>";
     }
 
     pub fn get_env(name: []const u8) []const u8 {
