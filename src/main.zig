@@ -75,6 +75,7 @@ fn cmdBuild(allocator: std.mem.Allocator, args: []const []const u8) !void {
     }
 
     const project_root = try discoverBuildFile(allocator, parsed.build_file);
+    defer allocator.free(project_root);
     const output_path = try buildTarget(allocator, project_root, parsed.target.?, parsed.build_opts);
     allocator.free(output_path);
 }
@@ -94,7 +95,9 @@ fn cmdRun(allocator: std.mem.Allocator, args: []const []const u8) !void {
     }
 
     const project_root = try discoverBuildFile(allocator, parsed.build_file);
+    defer allocator.free(project_root);
     const output_path = try buildTarget(allocator, project_root, parsed.target.?, parsed.build_opts);
+    defer allocator.free(output_path);
 
     // Run the built binary
     const exit_code = compiler.runBinary(allocator, output_path, parsed.run_args) catch |err| {
@@ -296,17 +299,7 @@ fn buildTarget(
     }
     const merged_source = combined.items;
 
-    // Determine lib_mode from manifest kind
-    const lib_mode = config.kind == .lib;
-
-    // Compile through frontend
-    const result = compiler.compileFrontend(alloc, merged_source, source_files.items[0], .{
-        .lib_mode = lib_mode,
-    }) catch {
-        std.process.exit(1);
-    };
-
-    // Determine output path from manifest
+    // Determine output path from manifest (needed for cache check)
     const output_name = if (config.asset_name) |an|
         if (an.len > 0) an else config.name
     else
@@ -326,6 +319,41 @@ fn buildTarget(
         .obj => try std.fmt.allocPrint(alloc, "{s}.o", .{output_name}),
     };
     const output_path = try std.fs.path.join(alloc, &.{ out_dir, output_filename });
+
+    // Compilation caching: hash build.zap + all sources + target name
+    const cache_key = blk: {
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(build_source);
+        hasher.update(merged_source);
+        hasher.update(target_name);
+        break :blk hasher.final();
+    };
+    const cache_key_hex = try std.fmt.allocPrint(alloc, "{x:0>16}", .{cache_key});
+    const hash_file = try std.fmt.allocPrint(alloc, ".zap-cache/{s}.hash", .{target_name});
+
+    const cache_valid = blk: {
+        const stored = std.fs.cwd().readFileAlloc(alloc, hash_file, 16) catch break :blk false;
+        defer alloc.free(stored);
+        if (!std.mem.eql(u8, stored, cache_key_hex)) break :blk false;
+        std.fs.cwd().access(output_path, .{}) catch break :blk false;
+        break :blk true;
+    };
+
+    if (cache_valid) {
+        const progress = std.fs.File.stderr().deprecatedWriter();
+        progress.print("[cached] {s}\n", .{output_path}) catch {};
+        return try allocator.dupe(u8, output_path);
+    }
+
+    // Determine lib_mode from manifest kind
+    const lib_mode = config.kind == .lib;
+
+    // Compile through frontend
+    const result = compiler.compileFrontend(alloc, merged_source, source_files.items[0], .{
+        .lib_mode = lib_mode,
+    }) catch {
+        std.process.exit(1);
+    };
 
     // Map build_opts to compilation settings
     const optimize_mode: u8 = blk: {
@@ -367,6 +395,12 @@ fn buildTarget(
         try stderr.print("Error: compilation failed\n", .{});
         std.process.exit(1);
     };
+
+    // Save cache hash
+    std.fs.cwd().writeFile(.{
+        .sub_path = hash_file,
+        .data = cache_key_hex,
+    }) catch {};
 
     // Return a durable copy of the output path
     return try allocator.dupe(u8, output_path);
