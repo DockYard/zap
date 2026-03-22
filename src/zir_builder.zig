@@ -197,6 +197,10 @@ pub const ZirDriver = struct {
     allocator: Allocator,
     program: ?ir.Program,
     lib_mode: bool = false,
+    /// Builder entry point: when set, emits a `pub const zap_builder_entry`
+    /// declaration pointing to this function. start.zig checks for this
+    /// declaration to activate the builder runtime.
+    builder_entry: ?[]const u8 = null,
     /// Tracks the dest local of the enclosing case_block so that case_break
     /// can propagate its result value to the correct destination.
     current_case_dest: ?ir.LocalId = null,
@@ -282,6 +286,44 @@ pub const ZirDriver = struct {
         self.program = program;
         for (program.functions) |func| {
             try self.emitFunction(func);
+        }
+
+        // In builder mode, emit a zap_builder_entry function that delegates
+        // to the configured entry point. start.zig checks for this declaration
+        // to activate the builder runtime.
+        if (self.builder_entry) |entry_name| {
+            // Emit: pub fn zap_builder_entry(env) { return <entry_name>(env); }
+            // This is a void->anytype function that start.zig calls.
+            // The actual signature matching happens at comptime in start.zig.
+            const marker_name = "zap_builder_entry";
+            if (zir_builder_begin_func(self.handle, marker_name.ptr, @intCast(marker_name.len), 0) != 0) {
+                return error.BeginFuncFailed;
+            }
+
+            // Emit a param for env (anytype)
+            const env_name = "env";
+            const param_ref = zir_builder_emit_param(self.handle, env_name.ptr, @intCast(env_name.len), 0);
+            if (param_ref == error_ref) return error.EmitFailed;
+
+            // Call the actual entry function with the env param
+            const call_args = [_]u32{param_ref};
+            const result_ref = zir_builder_emit_call(
+                self.handle,
+                entry_name.ptr,
+                @intCast(entry_name.len),
+                &call_args,
+                1,
+            );
+            if (result_ref == error_ref) return error.EmitFailed;
+
+            // Return the result
+            if (zir_builder_emit_ret(self.handle, result_ref) != 0) {
+                return error.EmitFailed;
+            }
+
+            if (zir_builder_end_func(self.handle) != 0) {
+                return error.EndFuncFailed;
+            }
         }
     }
 
@@ -2228,6 +2270,7 @@ pub fn buildAndInject(
     compilation_ctx: *ZirContext,
     runtime_path: ?[:0]const u8,
     lib_mode: bool,
+    builder_entry: ?[]const u8,
 ) BuildError!void {
     // Register the runtime module if a path was provided.
     if (runtime_path) |rpath| {
@@ -2238,6 +2281,7 @@ pub fn buildAndInject(
 
     var driver = try ZirDriver.init(allocator);
     driver.lib_mode = lib_mode;
+    driver.builder_entry = builder_entry;
 
     driver.buildProgram(program) catch |err| {
         driver.deinit(); // destroy builder on error path
