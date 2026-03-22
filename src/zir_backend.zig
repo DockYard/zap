@@ -39,6 +39,8 @@ extern "c" fn zir_compilation_add_module_source(
     source_len: u32,
 ) i32;
 
+extern "c" fn zir_compilation_print_errors(ctx: *ZirContext) void;
+
 extern "c" fn zir_compilation_set_builder_entry(
     ctx: *ZirContext,
     entry_name: [*:0]const u8,
@@ -130,6 +132,7 @@ pub fn compile(allocator: std.mem.Allocator, program: ir.Program, options: Compi
 
     // Phase 3: Run Sema + codegen + link.
     if (zir_compilation_update(ctx) != 0) {
+        zir_compilation_print_errors(ctx);
         return error.CompilationFailed;
     }
 }

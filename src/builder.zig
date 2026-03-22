@@ -65,6 +65,63 @@ pub fn findBuilderModule(
     return error.ManifestNotFound;
 }
 
+/// Find the mangled IR function name for the manifest/1 entry point.
+/// Returns the name as it appears in the IR (e.g., "manifest" for top-level,
+/// or "FooBar__Builder__manifest" for module-scoped).
+/// The build.zap source is parsed WITHOUT stdlib prepend.
+pub fn findBuilderManifestName(
+    alloc: std.mem.Allocator,
+    build_source: []const u8,
+) ![]const u8 {
+    var parser = zap.Parser.init(alloc, build_source);
+    defer parser.deinit();
+
+    const program = parser.parseProgram() catch {
+        const stderr = std.fs.File.stderr().deprecatedWriter();
+        for (parser.errors.items) |parse_err| {
+            stderr.print("  parse error: {s}\n", .{parse_err.message}) catch {};
+        }
+        return error.ParseFailed;
+    };
+
+    // Look for manifest/1 in modules
+    for (program.modules) |mod| {
+        for (mod.items) |item| {
+            switch (item) {
+                .function => |func| {
+                    const name = parser.interner.get(func.name);
+                    if (std.mem.eql(u8, name, "manifest") and func.clauses.len > 0 and func.clauses[0].params.len == 1) {
+                        // Build the mangled name: Module__Name__manifest
+                        var mangled: std.ArrayListUnmanaged(u8) = .empty;
+                        for (mod.name.parts, 0..) |part, i| {
+                            if (i > 0) try mangled.appendSlice(alloc, "__");
+                            try mangled.appendSlice(alloc, parser.interner.get(part));
+                        }
+                        try mangled.appendSlice(alloc, "__manifest");
+                        return try mangled.toOwnedSlice(alloc);
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+
+    // Look for manifest/1 at top level
+    for (program.top_items) |item| {
+        switch (item) {
+            .function => |func| {
+                const name = parser.interner.get(func.name);
+                if (std.mem.eql(u8, name, "manifest") and func.clauses.len > 0 and func.clauses[0].params.len == 1) {
+                    return try alloc.dupe(u8, "manifest");
+                }
+            },
+            else => {},
+        }
+    }
+
+    return error.ManifestNotFound;
+}
+
 /// Generate the wrapper main source that calls the builder's manifest/1.
 /// The wrapper reads env from CLI args, calls manifest(env), and writes
 /// the result as key=value lines to stdout.

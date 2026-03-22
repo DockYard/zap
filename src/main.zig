@@ -247,23 +247,84 @@ fn buildTarget(
     const alloc = arena.allocator();
 
     const builder = zap.builder;
+    const stderr_w = std.fs.File.stderr().deprecatedWriter();
 
     // Read build.zap
     const build_file_path = try std.fs.path.join(alloc, &.{ project_root, "build.zap" });
     const build_source = std.fs.cwd().readFileAlloc(alloc, build_file_path, 10 * 1024 * 1024) catch |err| {
-        const stderr = std.fs.File.stderr().deprecatedWriter();
-        try stderr.print("Error reading build.zap: {}\n", .{err});
+        try stderr_w.print("Error reading build.zap: {}\n", .{err});
         std.process.exit(1);
     };
 
-    // Extract manifest from build.zap AST for the requested target.
-    // This is the v1 bridge — it statically extracts manifest data from the
-    // AST instead of compiling and executing build.zap as a separate binary.
-    // Phase 3 will replace this with compiled builder execution.
-    _ = build_opts;
-    const config = builder.extractManifestFromAST(alloc, build_source, target_name) catch {
+    // Find the builder module's manifest function name
+    const manifest_func_name = builder.findBuilderManifestName(alloc, build_source) catch |err| {
+        switch (err) {
+            error.ManifestNotFound => try stderr_w.print("Error: build.zap must define manifest/1\n", .{}),
+            error.ParseFailed => try stderr_w.print("Error: failed to parse build.zap\n", .{}),
+            else => try stderr_w.print("Error: {}\n", .{err}),
+        }
         std.process.exit(1);
     };
+
+    // Compile build.zap as a builder binary
+    const builder_path = try std.fs.path.join(alloc, &.{ ".zap-cache", "builder" });
+    const zig_lib_dir = zir_backend.detectZigLibDir(alloc) orelse blk: {
+        break :blk extractEmbeddedZigLib(alloc) catch {
+            try stderr_w.print("Error: could not find or extract Zig lib\n", .{});
+            std.process.exit(1);
+        };
+    };
+
+    std.fs.cwd().makePath(".zap-cache") catch {};
+
+    // Compile build.zap through the full pipeline with builder_entry set
+    const build_result = compiler.compileFrontend(alloc, build_source, build_file_path, .{
+        .show_progress = false,
+    }) catch {
+        std.process.exit(1);
+    };
+
+    zir_backend.compile(alloc, build_result.ir_program, .{
+        .zig_lib_dir = zig_lib_dir,
+        .cache_dir = ".zap-cache",
+        .global_cache_dir = ".zap-cache",
+        .output_path = builder_path,
+        .name = "builder",
+        .runtime_source = compiler.getRuntimeSource(),
+        .builder_entry = manifest_func_name,
+    }) catch {
+        try stderr_w.print("Error: failed to compile build.zap\n", .{});
+        std.process.exit(1);
+    };
+
+    // Spawn the builder binary: .zap-cache/builder <target> <os> <arch>
+    const os_name = @tagName(@import("builtin").os.tag);
+    const arch_name = @tagName(@import("builtin").cpu.arch);
+
+    const spawn_result = std.process.Child.run(.{
+        .allocator = alloc,
+        .argv = &.{ builder_path, target_name, os_name, arch_name },
+        .max_output_bytes = 1024 * 1024,
+    }) catch |err| {
+        try stderr_w.print("Error: failed to run builder: {}\n", .{err});
+        std.process.exit(1);
+    };
+
+    if (spawn_result.term != .Exited or spawn_result.term.Exited != 0) {
+        if (spawn_result.stderr.len > 0) {
+            try stderr_w.print("{s}", .{spawn_result.stderr});
+        }
+        try stderr_w.print("Error: builder failed\n", .{});
+        std.process.exit(1);
+    }
+
+    // Parse the builder's stdout output into BuildConfig
+    const config = builder.parseManifestOutput(alloc, spawn_result.stdout) catch {
+        try stderr_w.print("Error: failed to parse builder output\n", .{});
+        std.process.exit(1);
+    };
+
+    _ = build_opts; // TODO: merge -D flags
 
     // Scan source files from manifest paths
     var source_files: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -366,16 +427,7 @@ fn buildTarget(
         break :blk 1; // default: ReleaseSafe
     };
 
-    // Detect zig lib
-    const zig_lib_dir = zir_backend.detectZigLibDir(alloc) orelse blk: {
-        break :blk extractEmbeddedZigLib(alloc) catch {
-            const stderr = std.fs.File.stderr().deprecatedWriter();
-            try stderr.print("Error: could not find or extract Zig lib\n", .{});
-            std.process.exit(1);
-        };
-    };
-
-    // Compile through ZIR backend
+    // Compile through ZIR backend (zig_lib_dir already resolved above)
     const output_mode_val: u8 = switch (config.kind) {
         .bin => 0,
         .lib => 1,
