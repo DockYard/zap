@@ -246,6 +246,41 @@ pub fn atomEq(a: u32, b: u32) bool {
 }
 
 // ============================================================
+// Builder Runtime — entry point plumbing for build.zap builders
+// ============================================================
+
+pub const BuilderRuntime = struct {
+    /// Construct Zap.Env from std.os.argv.
+    /// argv[0] = binary, argv[1] = target, argv[2] = os, argv[3] = arch
+    pub fn buildEnvFromArgv() struct { target: u32, os: u32, arch: u32 } {
+        const argv = std.os.argv;
+        return .{
+            .target = if (argv.len > 1) atomIntern(argv[1], @intCast(std.mem.len(argv[1]))) else 0,
+            .os = if (argv.len > 2) atomIntern(argv[2], @intCast(std.mem.len(argv[2]))) else 0,
+            .arch = if (argv.len > 3) atomIntern(argv[3], @intCast(std.mem.len(argv[3]))) else 0,
+        };
+    }
+
+    /// Serialize a manifest struct to stdout as key=value lines.
+    pub fn serializeManifest(manifest: anytype) void {
+        const stdout = std.fs.File.stdout().deprecatedWriter();
+        inline for (@typeInfo(@TypeOf(manifest)).@"struct".fields) |field| {
+            const value = @field(manifest, field.name);
+            const T = @TypeOf(value);
+            if (T == []const u8) {
+                stdout.print("{s}={s}\n", .{ field.name, value }) catch {};
+            } else if (T == u32) {
+                stdout.print("{s}={s}\n", .{ field.name, atomToString(value) }) catch {};
+            } else if (@typeInfo(T) == .int) {
+                stdout.print("{s}={d}\n", .{ field.name, value }) catch {};
+            } else if (T == bool) {
+                stdout.print("{s}={}\n", .{ field.name, value }) catch {};
+            }
+        }
+    }
+};
+
+// ============================================================
 // Closure — Fat pointer for function values (spec §20.2, §31.3)
 // ============================================================
 

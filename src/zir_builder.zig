@@ -292,35 +292,49 @@ pub const ZirDriver = struct {
         // to the configured entry point. start.zig checks for this declaration
         // to activate the builder runtime.
         if (self.builder_entry) |entry_name| {
-            // Emit: pub fn zap_builder_entry(env) { return <entry_name>(env); }
-            // This is a void->anytype function that start.zig calls.
-            // The actual signature matching happens at comptime in start.zig.
+            // Emit zap_builder_entry() — detected by start.zig via @hasDecl.
+            //
+            // This function calls BuilderRuntime.buildAndSerialize which:
+            // 1. Reads std.os.argv
+            // 2. Constructs Zap.Env from argv
+            // 3. Returns the env struct
+            //
+            // Then we call the manifest function with that env,
+            // and pass the result to BuilderRuntime.serializeManifest.
             const marker_name = "zap_builder_entry";
             if (zir_builder_begin_func(self.handle, marker_name.ptr, @intCast(marker_name.len), 0) != 0) {
                 return error.BeginFuncFailed;
             }
 
-            // Emit a param for env (anytype)
-            const env_name = "env";
-            const param_ref = zir_builder_emit_param(self.handle, env_name.ptr, @intCast(env_name.len), 0);
-            if (param_ref == error_ref) return error.EmitFailed;
+            // Get runtime: @import("zap_runtime")
+            const rt = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+            if (rt == error_ref) return error.EmitFailed;
 
-            // Call the actual entry function with the env param
-            const call_args = [_]u32{param_ref};
-            const result_ref = zir_builder_emit_call(
-                self.handle,
-                entry_name.ptr,
-                @intCast(entry_name.len),
-                &call_args,
-                1,
+            // Call BuilderRuntime.buildEnvFromArgv() → returns env struct
+            const builder_rt = zir_builder_emit_field_val(self.handle, rt, "BuilderRuntime", 14);
+            if (builder_rt == error_ref) return error.EmitFailed;
+            const build_env_fn = zir_builder_emit_field_val(self.handle, builder_rt, "buildEnvFromArgv", 16);
+            if (build_env_fn == error_ref) return error.EmitFailed;
+            const env = zir_builder_emit_call_ref(self.handle, build_env_fn, &.{}, 0);
+            if (env == error_ref) return error.EmitFailed;
+
+            // Call manifest(env) — the user's entry point
+            const manifest_args = [_]u32{env};
+            const manifest = zir_builder_emit_call(
+                self.handle, entry_name.ptr, @intCast(entry_name.len),
+                &manifest_args, 1,
             );
-            if (result_ref == error_ref) return error.EmitFailed;
+            if (manifest == error_ref) return error.EmitFailed;
 
-            // Return the result
-            if (zir_builder_emit_ret(self.handle, result_ref) != 0) {
+            // Call BuilderRuntime.serializeManifest(manifest)
+            const serialize_fn = zir_builder_emit_field_val(self.handle, builder_rt, "serializeManifest", 17);
+            if (serialize_fn == error_ref) return error.EmitFailed;
+            const ser_args = [_]u32{manifest};
+            _ = zir_builder_emit_call_ref(self.handle, serialize_fn, &ser_args, 1);
+
+            if (zir_builder_emit_ret_void(self.handle) != 0) {
                 return error.EmitFailed;
             }
-
             if (zir_builder_end_func(self.handle) != 0) {
                 return error.EndFuncFailed;
             }
