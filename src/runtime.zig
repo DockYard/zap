@@ -216,13 +216,15 @@ pub const AtomTable = struct {
 // Global Atom Table — process-wide interned atom registry
 // ============================================================
 
-var global_atom_table: ?AtomTable = null;
+var global_atom_table: AtomTable = undefined;
+var global_atom_table_initialized: bool = false;
 
 pub fn getAtomTable() *AtomTable {
-    if (global_atom_table == null) {
+    if (!global_atom_table_initialized) {
         global_atom_table = AtomTable.init(std.heap.page_allocator);
+        global_atom_table_initialized = true;
     }
-    return &global_atom_table.?;
+    return &global_atom_table;
 }
 
 /// Intern a string as an atom. Returns the atom's u32 ID.
@@ -263,17 +265,20 @@ pub const BuilderRuntime = struct {
 
     /// Serialize a manifest struct to stdout as key=value lines.
     pub fn serializeManifest(manifest: anytype) void {
+        const T = @TypeOf(manifest);
+        const info = @typeInfo(T);
+        if (info != .@"struct") return; // void or non-struct — nothing to serialize
         const stdout = std.fs.File.stdout().deprecatedWriter();
-        inline for (@typeInfo(@TypeOf(manifest)).@"struct".fields) |field| {
+        inline for (info.@"struct".fields) |field| {
             const value = @field(manifest, field.name);
-            const T = @TypeOf(value);
-            if (T == []const u8) {
+            const FT = @TypeOf(value);
+            if (FT == []const u8) {
                 stdout.print("{s}={s}\n", .{ field.name, value }) catch {};
-            } else if (T == u32) {
+            } else if (FT == u32) {
                 stdout.print("{s}={s}\n", .{ field.name, atomToString(value) }) catch {};
-            } else if (@typeInfo(T) == .int) {
+            } else if (@typeInfo(FT) == .int) {
                 stdout.print("{s}={d}\n", .{ field.name, value }) catch {};
-            } else if (T == bool) {
+            } else if (FT == bool) {
                 stdout.print("{s}={}\n", .{ field.name, value }) catch {};
             }
         }

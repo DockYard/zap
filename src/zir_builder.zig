@@ -181,7 +181,31 @@ fn mapReturnType(zig_type: ir.ZigType) u32 {
         .f32 => @intFromEnum(Zir.Inst.Ref.f32_type),
         .f64 => @intFromEnum(Zir.Inst.Ref.f64_type),
         .string => @intFromEnum(Zir.Inst.Ref.slice_const_u8_type),
-        else => 0, // default to void for unsupported types
+        else => @intFromEnum(Zir.Inst.Ref.none), // infer type
+    };
+}
+
+/// Map a Zap type to a ZIR parameter type ref.
+/// Unlike mapReturnType, unknown types map to anytype (.none) instead of void.
+fn mapParamType(zig_type: ir.ZigType) u32 {
+    return switch (zig_type) {
+        .void => @intFromEnum(Zir.Inst.Ref.none),
+        .bool_type => @intFromEnum(Zir.Inst.Ref.bool_type),
+        .i8 => @intFromEnum(Zir.Inst.Ref.i8_type),
+        .i16 => @intFromEnum(Zir.Inst.Ref.i16_type),
+        .i32 => @intFromEnum(Zir.Inst.Ref.i32_type),
+        .i64 => @intFromEnum(Zir.Inst.Ref.i64_type),
+        .u8 => @intFromEnum(Zir.Inst.Ref.u8_type),
+        .u16 => @intFromEnum(Zir.Inst.Ref.u16_type),
+        .u32 => @intFromEnum(Zir.Inst.Ref.u32_type),
+        .u64 => @intFromEnum(Zir.Inst.Ref.u64_type),
+        .usize => @intFromEnum(Zir.Inst.Ref.usize_type),
+        .isize => @intFromEnum(Zir.Inst.Ref.isize_type),
+        .f16 => @intFromEnum(Zir.Inst.Ref.f16_type),
+        .f32 => @intFromEnum(Zir.Inst.Ref.f32_type),
+        .f64 => @intFromEnum(Zir.Inst.Ref.f64_type),
+        .string => @intFromEnum(Zir.Inst.Ref.slice_const_u8_type),
+        else => @intFromEnum(Zir.Inst.Ref.none), // anytype for unknown/struct types
     };
 }
 
@@ -420,8 +444,7 @@ pub const ZirDriver = struct {
             try self.setLocal(0, args_ref);
         } else {
             for (func.params, 0..) |param, i| {
-                const param_type_ref = mapReturnType(param.type_expr);
-                const effective_type: u32 = param_type_ref;
+                const effective_type: u32 = mapParamType(param.type_expr);
                 const param_ref = zir_builder_emit_param(
                     self.handle,
                     param.name.ptr,
