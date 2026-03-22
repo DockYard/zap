@@ -25,6 +25,7 @@ pub const similarity = @import("similarity.zig");
 pub const stdlib = @import("stdlib.zig");
 pub const project = @import("project.zig");
 pub const compiler = @import("compiler.zig");
+pub const builder = @import("builder.zig");
 
 test {
     _ = @import("token.zig");
@@ -49,5 +50,6 @@ test {
     _ = @import("stdlib.zig");
     _ = @import("project.zig");
     _ = @import("compiler.zig");
+    _ = @import("builder.zig");
     _ = @import("integration_tests.zig");
 }

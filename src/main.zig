@@ -243,6 +243,8 @@ fn buildTarget(
     defer arena.deinit();
     const alloc = arena.allocator();
 
+    const builder = zap.builder;
+
     // Read build.zap
     const build_file_path = try std.fs.path.join(alloc, &.{ project_root, "build.zap" });
     const build_source = std.fs.cwd().readFileAlloc(alloc, build_file_path, 10 * 1024 * 1024) catch |err| {
@@ -251,48 +253,37 @@ fn buildTarget(
         std.process.exit(1);
     };
 
-    // TODO: Phase 3 — Compile build.zap as a separate binary, execute it,
-    // capture the Zap.Manifest output.
-    //
-    // For now, parse build.zap to find manifest/1 and extract a minimal
-    // manifest by scanning the AST for the target's configuration.
-    // This is a temporary bridge until the builder runtime is implemented.
-
-    _ = build_source;
+    // Extract manifest from build.zap AST for the requested target.
+    // This is the v1 bridge — it statically extracts manifest data from the
+    // AST instead of compiling and executing build.zap as a separate binary.
+    // Phase 3 will replace this with compiled builder execution.
     _ = build_opts;
+    const config = builder.extractManifestFromAST(alloc, build_source, target_name) catch {
+        std.process.exit(1);
+    };
 
-    // Temporary: scan for source files in lib/ and compile directly
-    const lib_dir = try std.fs.path.join(alloc, &.{ project_root, "lib" });
+    // Scan source files from manifest paths
     var source_files: std.ArrayListUnmanaged([]const u8) = .empty;
-
-    // Scan lib/ for .zap files
-    if (std.fs.cwd().openDir(lib_dir, .{ .iterate = true })) |*dir| {
-        var iter = dir.iterate();
-        while (try iter.next()) |entry| {
-            if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".zap")) {
-                const full_path = try std.fs.path.join(alloc, &.{ lib_dir, entry.name });
-                try source_files.append(alloc, full_path);
-            }
-        }
-    } else |_| {}
-
-    // Also scan test/ if target is "test"
-    if (std.mem.eql(u8, target_name, "test")) {
-        const test_dir = try std.fs.path.join(alloc, &.{ project_root, "test" });
-        if (std.fs.cwd().openDir(test_dir, .{ .iterate = true })) |*dir| {
+    for (config.paths) |path| {
+        const full_dir = try std.fs.path.join(alloc, &.{ project_root, path });
+        if (std.fs.cwd().openDir(full_dir, .{ .iterate = true })) |*dir| {
             var iter = dir.iterate();
-            while (try iter.next()) |entry| {
+            while (iter.next() catch null) |entry| {
                 if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".zap")) {
-                    const full_path = try std.fs.path.join(alloc, &.{ test_dir, entry.name });
+                    const full_path = try std.fs.path.join(alloc, &.{ full_dir, entry.name });
                     try source_files.append(alloc, full_path);
                 }
             }
-        } else |_| {}
+        } else |_| {
+            const stderr = std.fs.File.stderr().deprecatedWriter();
+            try stderr.print("Error: source path not found: {s}\n", .{path});
+            std.process.exit(1);
+        }
     }
 
     if (source_files.items.len == 0) {
         const stderr = std.fs.File.stderr().deprecatedWriter();
-        try stderr.print("Error: no .zap source files found for target '{s}'\n", .{target_name});
+        try stderr.print("Error: no .zap source files found in paths\n", .{});
         std.process.exit(1);
     }
 
@@ -305,16 +296,47 @@ fn buildTarget(
     }
     const merged_source = combined.items;
 
+    // Determine lib_mode from manifest kind
+    const lib_mode = config.kind == .lib;
+
     // Compile through frontend
-    const result = compiler.compileFrontend(alloc, merged_source, source_files.items[0], .{}) catch {
+    const result = compiler.compileFrontend(alloc, merged_source, source_files.items[0], .{
+        .lib_mode = lib_mode,
+    }) catch {
         std.process.exit(1);
     };
 
-    // Determine output path
+    // Determine output path from manifest
+    const output_name = if (config.asset_name) |an|
+        if (an.len > 0) an else config.name
+    else
+        config.name;
+
+    const out_dir: []const u8 = switch (config.kind) {
+        .bin => "zap-out/bin",
+        .lib => "zap-out/lib",
+        .obj => "zap-out/obj",
+    };
     std.fs.cwd().makePath(".zap-cache") catch {};
-    const out_dir = "zap-out/bin";
     std.fs.cwd().makePath(out_dir) catch {};
-    const output_path = try std.fs.path.join(alloc, &.{ out_dir, target_name });
+
+    const output_filename = switch (config.kind) {
+        .bin => output_name,
+        .lib => try std.fmt.allocPrint(alloc, "{s}.a", .{output_name}),
+        .obj => try std.fmt.allocPrint(alloc, "{s}.o", .{output_name}),
+    };
+    const output_path = try std.fs.path.join(alloc, &.{ out_dir, output_filename });
+
+    // Map build_opts to compilation settings
+    const optimize_mode: u8 = blk: {
+        if (config.build_opts.get("optimize")) |opt| {
+            if (std.mem.eql(u8, opt, "debug")) break :blk 0;
+            if (std.mem.eql(u8, opt, "release_safe")) break :blk 1;
+            if (std.mem.eql(u8, opt, "release_fast")) break :blk 2;
+            if (std.mem.eql(u8, opt, "release_small")) break :blk 3;
+        }
+        break :blk 1; // default: ReleaseSafe
+    };
 
     // Detect zig lib
     const zig_lib_dir = zir_backend.detectZigLibDir(alloc) orelse blk: {
@@ -326,13 +348,20 @@ fn buildTarget(
     };
 
     // Compile through ZIR backend
+    const output_mode_val: u8 = switch (config.kind) {
+        .bin => 0,
+        .lib => 1,
+        .obj => 2,
+    };
     zir_backend.compile(alloc, result.ir_program, .{
         .zig_lib_dir = zig_lib_dir,
         .cache_dir = ".zap-cache",
         .global_cache_dir = ".zap-cache",
         .output_path = output_path,
-        .name = target_name,
+        .name = output_name,
         .runtime_source = compiler.getRuntimeSource(),
+        .output_mode = output_mode_val,
+        .optimize_mode = optimize_mode,
     }) catch {
         const stderr = std.fs.File.stderr().deprecatedWriter();
         try stderr.print("Error: compilation failed\n", .{});
