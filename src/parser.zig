@@ -1621,9 +1621,19 @@ pub const Parser = struct {
         const module_name = try self.parseModuleName();
         _ = try self.expect(.left_brace);
 
+        // Support multiline: %Name{\n  field: val,\n  ...\n}
+        self.skipNewlines();
+        const indented = self.match(.indent);
+
         var fields: std.ArrayList(ast.StructField) = .empty;
 
         while (!self.check(.right_brace) and !self.check(.eof)) {
+            self.skipNewlines();
+            if (self.check(.indent)) _ = self.advance();
+            if (self.check(.dedent)) _ = self.advance();
+            self.skipNewlines();
+            if (self.check(.right_brace)) break;
+
             const field_tok = try self.expect(.identifier);
             const field_name = try self.internToken(field_tok);
             _ = try self.expect(.colon);
@@ -1632,6 +1642,9 @@ pub const Parser = struct {
             if (!self.match(.comma)) break;
         }
 
+        self.skipNewlines();
+        if (indented) _ = self.match(.dedent);
+        self.skipNewlines();
         _ = try self.expect(.right_brace);
 
         return self.create(ast.Expr, .{
