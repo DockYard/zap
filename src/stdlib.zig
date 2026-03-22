@@ -109,6 +109,25 @@ pub const lib_string =
     \\
 ;
 
+pub const lib_zap =
+    \\defmodule Zap do
+    \\  defstruct Env do
+    \\    target :: Atom
+    \\    os :: Atom
+    \\    arch :: Atom
+    \\  end
+    \\
+    \\  defstruct Manifest do
+    \\    name :: String
+    \\    version :: String
+    \\    kind :: Atom
+    \\    root :: String = ""
+    \\    asset_name :: String = ""
+    \\  end
+    \\end
+    \\
+;
+
 pub const PrependResult = struct {
     source: []const u8,
     stdlib_line_count: u32,
@@ -118,7 +137,9 @@ pub const PrependResult = struct {
 /// Returns the combined source and the number of lines the stdlib occupies,
 /// so error reporting can subtract the offset for user-facing line numbers.
 pub fn prependStdlib(allocator: std.mem.Allocator, user_source: []const u8) !PrependResult {
-    const stdlib_source = try std.fmt.allocPrint(allocator, "{s}\n{s}\n{s}\n{s}\n{s}\n{s}\n{s}\n", .{ lib_kernel, lib_io, lib_system, lib_string, lib_atom, lib_integer, lib_float });
+    const stdlib_source = try std.fmt.allocPrint(allocator, "{s}\n{s}\n{s}\n{s}\n{s}\n{s}\n{s}\n{s}\n", .{
+        lib_kernel, lib_io, lib_system, lib_string, lib_atom, lib_integer, lib_float, lib_zap,
+    });
     var line_count: u32 = 0;
     for (stdlib_source) |c| {
         if (c == '\n') line_count += 1;

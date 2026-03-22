@@ -571,6 +571,14 @@ pub const Parser = struct {
     fn parseStructDecl(self: *Parser) !*const ast.StructDecl {
         const start = self.currentSpan();
         _ = try self.expect(.keyword_defstruct);
+
+        // Parse optional struct name (e.g., defstruct Env do ... end)
+        var struct_name: ?ast.StringId = null;
+        if (self.check(.module_identifier) or self.check(.identifier)) {
+            const name_tok = self.advance();
+            struct_name = try self.internToken(name_tok);
+        }
+
         _ = try self.expect(.keyword_do);
         self.skipNewlines();
         _ = self.match(.indent);
@@ -607,6 +615,7 @@ pub const Parser = struct {
 
         return self.create(ast.StructDecl, .{
             .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
+            .name = struct_name,
             .fields = try fields.toOwnedSlice(self.allocator),
         });
     }
