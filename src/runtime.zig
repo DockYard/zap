@@ -502,6 +502,24 @@ pub fn ZapMap(comptime K: type, comptime V: type) type {
 // ============================================================
 
 pub const ZapString = struct {
+    /// Convert a string to an atom, creating it if it doesn't exist.
+    pub fn to_atom(name: []const u8) u32 {
+        const table = getAtomTable();
+        const atom = table.intern(name) catch return 0;
+        return atom.id;
+    }
+
+    /// Convert a string to an existing atom. Returns null (0xFFFFFFFF)
+    /// if the atom has not been previously interned. Prevents unbounded
+    /// atom table growth from untrusted input.
+    pub fn to_existing_atom(name: []const u8) u32 {
+        const table = getAtomTable();
+        if (table.lookup.get(name)) |id| {
+            return id;
+        }
+        return 0xFFFFFFFF; // sentinel for "not found"
+    }
+
     pub fn concat(allocator: std.mem.Allocator, a: []const u8, b: []const u8) ![]const u8 {
         const result = try allocator.alloc(u8, a.len + b.len);
         @memcpy(result[0..a.len], a);
