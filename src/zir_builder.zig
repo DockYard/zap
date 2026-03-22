@@ -332,20 +332,50 @@ pub const ZirDriver = struct {
         // Emit param instructions and register their Refs as locals.
         // Each .param instruction in ZIR declares a parameter with a name and type.
         // Sema reads these from the declaration value body to know the function's arity.
-        for (func.params, 0..) |param, i| {
-            const param_type_ref = mapReturnType(param.type_expr);
-            // If the type maps to 0 (void/unknown), use anytype (passing 0
-            // to emit_param creates a param_anytype instruction).
-            const effective_type: u32 = param_type_ref;
-            const param_ref = zir_builder_emit_param(
-                self.handle,
-                param.name.ptr,
-                @intCast(param.name.len),
-                effective_type,
-            );
-            if (param_ref == error_ref) return error.EmitFailed;
-            try self.param_refs.append(self.allocator, param_ref);
-            try self.setLocal(@intCast(i), param_ref);
+        //
+        // Special case: main/1 — Zig's linker expects main to be void -> void,
+        // so we don't emit a real parameter. Instead, we inject code at the
+        // top of the body to get OS args via std.process.argsAlloc and store
+        // the result as the first param's local ref.
+        if (is_main and func.params.len == 1) {
+            // Inject: const args = std.process.argsAlloc(std.heap.page_allocator)
+            const std_import = zir_builder_emit_import(self.handle, "std", 3);
+            if (std_import == error_ref) return error.EmitFailed;
+            const process_mod = zir_builder_emit_field_val(self.handle, std_import, "process", 7);
+            if (process_mod == error_ref) return error.EmitFailed;
+            const args_fn = zir_builder_emit_field_val(self.handle, process_mod, "argsAlloc", 9);
+            if (args_fn == error_ref) return error.EmitFailed;
+
+            // Get allocator: std.heap.page_allocator
+            const heap_mod = zir_builder_emit_field_val(self.handle, std_import, "heap", 4);
+            if (heap_mod == error_ref) return error.EmitFailed;
+            const alloc_ref = zir_builder_emit_field_val(self.handle, heap_mod, "page_allocator", 14);
+            if (alloc_ref == error_ref) return error.EmitFailed;
+
+            // Call argsAlloc(allocator) — returns error union, unwrap with try
+            const call_args = [_]u32{alloc_ref};
+            const call_ref = zir_builder_emit_call_ref(self.handle, args_fn, &call_args, 1);
+            if (call_ref == error_ref) return error.EmitFailed;
+            const args_ref = zir_builder_emit_try(self.handle, call_ref);
+            if (args_ref == error_ref) return error.EmitFailed;
+
+            // Store as the first param's local ref
+            try self.param_refs.append(self.allocator, args_ref);
+            try self.setLocal(0, args_ref);
+        } else {
+            for (func.params, 0..) |param, i| {
+                const param_type_ref = mapReturnType(param.type_expr);
+                const effective_type: u32 = param_type_ref;
+                const param_ref = zir_builder_emit_param(
+                    self.handle,
+                    param.name.ptr,
+                    @intCast(param.name.len),
+                    effective_type,
+                );
+                if (param_ref == error_ref) return error.EmitFailed;
+                try self.param_refs.append(self.allocator, param_ref);
+                try self.setLocal(@intCast(i), param_ref);
+            }
         }
 
         // Emit body blocks.

@@ -182,7 +182,7 @@ fn cmdInit(allocator: std.mem.Allocator) !void {
         \\          name: "{s}",
         \\          version: "0.1.0",
         \\          kind: :bin,
-        \\          root: "{s}.main/0",
+        \\          root: "{s}.main/1",
         \\          paths: ["lib"]
         \\        }}
         \\      :test ->
@@ -207,7 +207,7 @@ fn cmdInit(allocator: std.mem.Allocator) !void {
     const lib_path = try std.fmt.allocPrint(allocator, "lib/{s}.zap", .{project_name});
     defer allocator.free(lib_path);
     const lib_source = try std.fmt.allocPrint(allocator,
-        \\def main() do
+        \\def main(_args :: [String]) do
         \\  IO.puts("Howdy!")
         \\end
         \\
@@ -219,7 +219,7 @@ fn cmdInit(allocator: std.mem.Allocator) !void {
     const test_path = try std.fmt.allocPrint(allocator, "test/{s}_test.zap", .{project_name});
     defer allocator.free(test_path);
     const test_source = try std.fmt.allocPrint(allocator,
-        \\def main() do
+        \\def main(_args :: [String]) do
         \\  IO.puts("Test Suite TBD")
         \\end
         \\
