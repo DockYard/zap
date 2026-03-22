@@ -539,13 +539,16 @@ pub const ZirDriver = struct {
                     try args.append(self.allocator, ref);
                 }
 
-                // Route Kernel__* and IO__* calls through @import("zap_runtime").Prelude.*
+                // Route Kernel__*, IO__*, String__* calls through @import("zap_runtime")
                 const is_kernel = std.mem.startsWith(u8, cn.name, "Kernel__");
                 const is_io = std.mem.startsWith(u8, cn.name, "IO__");
-                if (is_kernel or is_io) {
-                    // Map IO function names to their Prelude equivalents
+                const is_string = std.mem.startsWith(u8, cn.name, "String__");
+                if (is_kernel or is_io or is_string) {
+                    // Map function names to their runtime module.function equivalents
                     const func_name = if (is_kernel)
                         cn.name["Kernel__".len..]
+                    else if (is_string)
+                        cn.name["String__".len..]
                     else if (std.mem.eql(u8, cn.name["IO__".len..], "puts"))
                         "println"
                     else
@@ -555,12 +558,13 @@ pub const ZirDriver = struct {
                     const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                     if (rt_import == error_ref) return error.EmitFailed;
 
-                    // .Prelude
-                    const prelude = zir_builder_emit_field_val(self.handle, rt_import, "Prelude", 7);
-                    if (prelude == error_ref) return error.EmitFailed;
+                    // Route to the correct runtime module
+                    const mod_name: []const u8 = if (is_string) "ZapString" else "Prelude";
+                    const mod_ref = zir_builder_emit_field_val(self.handle, rt_import, mod_name.ptr, @intCast(mod_name.len));
+                    if (mod_ref == error_ref) return error.EmitFailed;
 
-                    // .println (or whatever function)
-                    const fn_ref = zir_builder_emit_field_val(self.handle, prelude, func_name.ptr, @intCast(func_name.len));
+                    // .function_name
+                    const fn_ref = zir_builder_emit_field_val(self.handle, mod_ref, func_name.ptr, @intCast(func_name.len));
                     if (fn_ref == error_ref) return error.EmitFailed;
 
                     // call(fn_ref, args)
