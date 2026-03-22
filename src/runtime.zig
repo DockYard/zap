@@ -1,6 +1,32 @@
 const std = @import("std");
 
 // ============================================================
+// Static Bump Allocator
+// Avoids std.heap.page_allocator which uses cmpxchg_strong and
+// other operations not supported by the Zig self-hosted backend.
+// ============================================================
+
+const BUMP_SIZE = 16 * 1024; // 16KB
+var bump_buf: [BUMP_SIZE]u8 = undefined;
+var bump_offset: usize = 0;
+
+fn bumpAlloc(len: usize) []u8 {
+    const aligned = (bump_offset + 7) & ~@as(usize, 7); // 8-byte align
+    if (aligned + len > BUMP_SIZE) return &.{};
+    const result = bump_buf[aligned .. aligned + len];
+    bump_offset = aligned + len;
+    return result;
+}
+
+fn bumpAllocSlice(comptime T: type, len: usize) []T {
+    const byte_len = len * @sizeOf(T);
+    const bytes = bumpAlloc(byte_len);
+    if (bytes.len == 0) return &.{};
+    const aligned: [*]T = @ptrCast(@alignCast(bytes.ptr));
+    return aligned[0..len];
+}
+
+// ============================================================
 // Zap Runtime Support Module (spec §21, §31.7)
 //
 // Provides runtime types for generated Zig code:
@@ -218,8 +244,8 @@ pub const AtomTable = struct {
 
 // Simple atom table using fixed-size arrays to avoid std.HashMap/ArrayList
 // which require operations not yet implemented in the Zig self-hosted backend.
-const MAX_ATOMS = 1024;
-const MAX_ATOM_NAME_LEN = 128;
+const MAX_ATOMS = 256;
+const MAX_ATOM_NAME_LEN = 64;
 
 var atom_names: [MAX_ATOMS][MAX_ATOM_NAME_LEN]u8 = undefined;
 var atom_lengths: [MAX_ATOMS]u32 = [_]u32{0} ** MAX_ATOMS;
@@ -598,6 +624,15 @@ pub const ZapString = struct {
         return result;
     }
 
+    /// Bump-allocated concat for ZIR-compiled code (avoids page_allocator).
+    pub fn concatBump(a: []const u8, b: []const u8) []const u8 {
+        const result = bumpAlloc(a.len + b.len);
+        if (result.len == 0) return a; // fallback: return first string
+        @memcpy(result[0..a.len], a);
+        @memcpy(result[a.len..], b);
+        return result;
+    }
+
     pub fn length(s: []const u8) usize {
         return s.len;
     }
@@ -785,11 +820,25 @@ pub const Prelude = struct {
 
 
     pub fn i64_to_string(allocator: std.mem.Allocator, value: i64) ![]const u8 {
-        return std.fmt.allocPrint(allocator, "{d}", .{value});
+        return std.fmt.allocPrint(allocator, "{d}", .{value}) catch {
+            var buf: [32]u8 = undefined;
+            const slice = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return "?";
+            const result = bumpAlloc(slice.len);
+            if (result.len == 0) return error.OutOfMemory;
+            @memcpy(result, slice);
+            return result;
+        };
     }
 
     pub fn f64_to_string(allocator: std.mem.Allocator, value: f64) ![]const u8 {
-        return std.fmt.allocPrint(allocator, "{d}", .{value});
+        return std.fmt.allocPrint(allocator, "{d}", .{value}) catch {
+            var buf: [64]u8 = undefined;
+            const slice = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return "?";
+            const result = bumpAlloc(slice.len);
+            if (result.len == 0) return error.OutOfMemory;
+            @memcpy(result, slice);
+            return result;
+        };
     }
 
     pub fn bool_to_string(value: bool) []const u8 {
@@ -836,7 +885,17 @@ pub const Prelude = struct {
     }
 
     pub fn get_env(name: []const u8) []const u8 {
-        return std.process.getEnvVarOwned(std.heap.page_allocator, name) catch "";
+        // Copy name to a null-terminated buffer, then use C getenv
+        var buf: [256]u8 = undefined;
+        if (name.len >= buf.len) return "";
+        @memcpy(buf[0..name.len], name);
+        buf[name.len] = 0;
+        const name_z: [*:0]const u8 = buf[0..name.len :0];
+        const result = std.c.getenv(name_z);
+        if (result) |ptr| {
+            return std.mem.sliceTo(ptr, 0);
+        }
+        return "";
     }
 
     pub fn panic(msg: []const u8) noreturn {
@@ -844,30 +903,21 @@ pub const Prelude = struct {
         std.process.exit(1);
     }
 
-    // CLI argument access
-    var cached_args: ?[]const []const u8 = null;
-
-    fn getArgs() []const []const u8 {
-        if (cached_args) |args| return args;
-        cached_args = std.process.argsAlloc(std.heap.page_allocator) catch &.{};
-        return cached_args.?;
-    }
-
+    // CLI argument access — use std.os.argv directly (no allocation)
     pub fn arg_count() i64 {
-        const args = getArgs();
-        // Subtract 1 to exclude the program name
-        return if (args.len > 0) @intCast(args.len - 1) else 0;
+        const argv = std.os.argv;
+        return if (argv.len > 0) @as(i64, @intCast(argv.len)) - 1 else 0;
     }
 
     pub fn arg_at(index: anytype) []const u8 {
-        const args = getArgs();
+        const argv = std.os.argv;
         const T = @TypeOf(index);
         const idx: usize = if (T == comptime_int or @typeInfo(T) == .int)
             @intCast(index)
         else
             0;
         // Index 0 = first user arg (skip program name)
-        if (idx + 1 < args.len) return args[idx + 1];
+        if (idx + 1 < argv.len) return std.mem.sliceTo(argv[idx + 1], 0);
         return "";
     }
 };
