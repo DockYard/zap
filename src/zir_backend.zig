@@ -126,8 +126,7 @@ pub fn compile(allocator: std.mem.Allocator, program: ir.Program, options: Compi
 
     // Phase 2b: Build ZIR via C-ABI calls and inject into compilation.
     const lib_mode = options.output_mode == 1;
-    const entry_func = options.builder_entry;
-    try zir_builder.buildAndInject(allocator, program, ctx, null, lib_mode, entry_func);
+    try zir_builder.buildAndInject(allocator, program, ctx, null, lib_mode);
 
     // Phase 3: Run Sema + codegen + link.
     if (zir_compilation_update(ctx) != 0) {
