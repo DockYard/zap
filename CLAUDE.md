@@ -95,10 +95,14 @@ work is an error. Combine them.
 
 ## Debugging
 
-Wrong output, unexpected state, or unclear crash: use the `cog-debug` sub-agent.
-State your hypothesis before launching.
+**Always delegate debugging to the `cog-debug` sub-agent.** Do NOT call `cog_debug_*` tools directly from the primary agent.
 
-Use the debugger instead of adding print statements, `console.log`, temporary logging, or other IO-based runtime inspection.
+When you need to investigate runtime behavior — wrong output, unexpected state, crashes, or variable inspection — delegate to the `cog-debug` sub-agent with a prompt containing:
+- **QUESTION**: what you want to understand about runtime behavior
+- **HYPOTHESIS**: your theory about what's happening
+- **TEST**: the command or binary to run
+
+The sub-agent handles all debugger operations: launching, breakpoints, stepping, inspection, and cleanup. It returns a concise report with observed values and a verdict.
 
 Prefer the debugger when:
 - you need to inspect runtime values, control flow, crash state, stack frames, or thread state
@@ -107,14 +111,9 @@ Prefer the debugger when:
 
 Prefer static reasoning instead when the issue is clearly a syntax, type, import, config, or other non-runtime problem.
 
-Fast-stack exception: if the language stack recompiles or hot-reloads so quickly that a one-bit edit-run check is cheaper than opening a debug session, a quick edit-run is acceptable. Otherwise, use the debugger.
+Fast-stack exception: if the language stack recompiles or hot-reloads so quickly that a one-bit edit-run check is cheaper than opening a debug session, a quick edit-run is acceptable. Otherwise, delegate to `cog-debug`.
 
-Debugger workflow:
-1. Locate the relevant code with `cog_code_*` tools.
-2. State a `QUESTION`, `HYPOTHESIS`, and `TEST` command.
-3. Launch one debug session, set targeted breakpoints, run, and inspect observed values.
-4. Inspect after stepping; do not step blindly.
-5. Always stop the debug session when done.
+Do NOT fall back to shell debuggers (lldb, gdb, dlv) — the `cog-debug` sub-agent handles all debugging.
 
 ## Memory
 
