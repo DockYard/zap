@@ -10,6 +10,49 @@ const similarity = @import("similarity.zig");
 pub const TypeId = u32;
 pub const TypeVarId = u32;
 
+pub const Ownership = enum {
+    shared,
+    unique,
+    borrowed,
+};
+
+pub const QualifiedType = struct {
+    type_id: TypeId,
+    ownership: Ownership = .shared,
+
+    pub fn init(type_id: TypeId, ownership: Ownership) QualifiedType {
+        return .{ .type_id = type_id, .ownership = ownership };
+    }
+};
+
+pub const BindingOwnershipState = enum {
+    available,
+    moved,
+    borrowed,
+};
+
+pub const BindingOwnershipInfo = struct {
+    qualified_type: QualifiedType,
+    state: BindingOwnershipState = .available,
+    active_borrows: u32 = 0,
+};
+
+pub const FunctionSignature = struct {
+    params: []const TypeId,
+    param_ownerships: []const Ownership,
+    return_type: TypeId,
+    return_ownership: Ownership = .shared,
+
+    pub fn toFunctionType(self: FunctionSignature) Type.FunctionType {
+        return .{
+            .params = self.params,
+            .return_type = self.return_type,
+            .param_ownerships = self.param_ownerships,
+            .return_ownership = self.return_ownership,
+        };
+    }
+};
+
 pub const Type = union(enum) {
     // Primitive types
     int: IntType,
@@ -81,6 +124,8 @@ pub const Type = union(enum) {
     pub const FunctionType = struct {
         params: []const TypeId,
         return_type: TypeId,
+        param_ownerships: ?[]const Ownership = null,
+        return_ownership: Ownership = .shared,
     };
 
     pub const AppliedType = struct {
@@ -179,6 +224,39 @@ pub const TypeStore = struct {
         return id;
     }
 
+    pub fn addFunctionType(
+        self: *TypeStore,
+        params: []const TypeId,
+        return_type: TypeId,
+        param_ownerships: ?[]const Ownership,
+        return_ownership: Ownership,
+    ) !TypeId {
+        return try self.addType(.{
+            .function = .{
+                .params = params,
+                .return_type = return_type,
+                .param_ownerships = param_ownerships,
+                .return_ownership = return_ownership,
+            },
+        });
+    }
+
+    pub fn qualify(_: *const TypeStore, type_id: TypeId, ownership: Ownership) QualifiedType {
+        return .{ .type_id = type_id, .ownership = ownership };
+    }
+
+    fn ownershipSlicesEqual(a: ?[]const Ownership, b: ?[]const Ownership) bool {
+        if (a == null and b == null) return true;
+        if (a == null or b == null) return false;
+        const lhs = a.?;
+        const rhs = b.?;
+        if (lhs.len != rhs.len) return false;
+        for (lhs, rhs) |lhs_ownership, rhs_ownership| {
+            if (lhs_ownership != rhs_ownership) return false;
+        }
+        return true;
+    }
+
     pub fn getType(self: *const TypeStore, id: TypeId) Type {
         return self.types.items[id];
     }
@@ -238,6 +316,17 @@ pub const TypeStore = struct {
             return self.typeEquals(ta.list.element, tb.list.element);
         }
 
+        // Function comparison includes ownership metadata.
+        if (ta == .function and tb == .function) {
+            if (ta.function.params.len != tb.function.params.len) return false;
+            for (ta.function.params, tb.function.params) |lhs_param, rhs_param| {
+                if (!self.typeEquals(lhs_param, rhs_param)) return false;
+            }
+            if (!self.typeEquals(ta.function.return_type, tb.function.return_type)) return false;
+            if (!ownershipSlicesEqual(ta.function.param_ownerships, tb.function.param_ownerships)) return false;
+            return ta.function.return_ownership == tb.function.return_ownership;
+        }
+
         // If either side is a union type, check if the other is a member.
         // e.g., String is compatible with String | nil
         if (tb == .union_type) {
@@ -263,15 +352,16 @@ pub const TypeStore = struct {
         // Never is a subtype of everything
         if (sub_t == .never) return true;
 
-        // Everything is a supertype of Never
-        _ = super_t;
-
         // Union subtyping: sub is a subtype if it's a member of the union
-        if (self.getType(super) == .union_type) {
-            const ut = self.getType(super).union_type;
+        if (super_t == .union_type) {
+            const ut = super_t.union_type;
             for (ut.members) |member| {
                 if (self.isSubtype(sub, member)) return true;
             }
+        }
+
+        if (sub_t == .function and super_t == .function) {
+            return self.typeEquals(sub, super);
         }
 
         return false;
@@ -298,6 +388,10 @@ pub const TypeChecker = struct {
     // Track which bindings are referenced (for unused variable warnings)
     referenced_bindings: std.AutoHashMap(scope_mod.BindingId, void),
 
+    // Ownership metadata for bindings. Phase 1 stores the foundation here,
+    // but enforcement comes later.
+    ownership_bindings: std.AutoHashMap(scope_mod.BindingId, BindingOwnershipInfo),
+
     // Number of stdlib lines prepended (bindings in these lines are skipped for unused checks)
     stdlib_line_count: u32 = 0,
 
@@ -322,6 +416,7 @@ pub const TypeChecker = struct {
             .expr_types = std.AutoHashMap(usize, TypeId).init(allocator),
             .current_scope = null,
             .referenced_bindings = std.AutoHashMap(scope_mod.BindingId, void).init(allocator),
+            .ownership_bindings = std.AutoHashMap(scope_mod.BindingId, BindingOwnershipInfo).init(allocator),
         };
     }
 
@@ -330,6 +425,197 @@ pub const TypeChecker = struct {
         self.errors.deinit(self.allocator);
         self.expr_types.deinit();
         self.referenced_bindings.deinit();
+        self.ownership_bindings.deinit();
+    }
+
+    fn defaultOwnershipForType(self: *const TypeChecker, type_id: TypeId) Ownership {
+        const typ = self.store.getType(type_id);
+        return switch (typ) {
+            .opaque_type => .unique,
+            else => .shared,
+        };
+    }
+
+    fn resolveParamOwnership(self: *const TypeChecker, param: ast.Param, resolved_type: TypeId) Ownership {
+        return switch (param.ownership) {
+            .shared => self.defaultOwnershipForType(resolved_type),
+            .unique => .unique,
+            .borrowed => .borrowed,
+        };
+    }
+
+    fn recordBindingOwnership(self: *TypeChecker, binding_id: scope_mod.BindingId, type_id: TypeId, ownership: Ownership) !void {
+        try self.ownership_bindings.put(binding_id, .{
+            .qualified_type = .{ .type_id = type_id, .ownership = ownership },
+        });
+    }
+
+    fn recordBindingType(self: *TypeChecker, binding_id: scope_mod.BindingId, type_id: TypeId, source_span: ast.SourceSpan) !void {
+        self.graph.bindings.items[binding_id].type_id = .{
+            .type_id = type_id,
+            .source_span = source_span,
+        };
+        try self.recordBindingOwnership(binding_id, type_id, self.defaultOwnershipForType(type_id));
+    }
+
+    fn recordBindingQualifiedType(self: *TypeChecker, binding_id: scope_mod.BindingId, qualified_type: QualifiedType, source_span: ast.SourceSpan) !void {
+        self.graph.bindings.items[binding_id].type_id = .{
+            .type_id = qualified_type.type_id,
+            .source_span = source_span,
+        };
+        try self.recordBindingOwnership(binding_id, qualified_type.type_id, qualified_type.ownership);
+    }
+
+    fn markBindingMoved(self: *TypeChecker, binding_id: scope_mod.BindingId) !void {
+        if (self.ownership_bindings.getPtr(binding_id)) |info| {
+            info.state = .moved;
+            info.active_borrows = 0;
+        }
+    }
+
+    fn beginBindingBorrow(self: *TypeChecker, binding_id: scope_mod.BindingId) !void {
+        if (self.ownership_bindings.getPtr(binding_id)) |info| {
+            info.state = .borrowed;
+            info.active_borrows += 1;
+        }
+    }
+
+    fn endBindingBorrow(self: *TypeChecker, binding_id: scope_mod.BindingId) !void {
+        if (self.ownership_bindings.getPtr(binding_id)) |info| {
+            if (info.active_borrows > 0) info.active_borrows -= 1;
+            if (info.active_borrows == 0 and info.state == .borrowed) {
+                info.state = .available;
+            }
+        }
+    }
+
+    fn ensureBindingAvailable(self: *TypeChecker, binding_id: scope_mod.BindingId, span: ast.SourceSpan) !bool {
+        const info = self.ownership_bindings.get(binding_id) orelse return true;
+        if (info.state == .moved) {
+            const binding = self.graph.bindings.items[binding_id];
+            const name = self.interner.get(binding.name);
+            try self.addHardError(
+                try std.fmt.allocPrint(self.allocator, "unique value `{s}` was already moved", .{name}),
+                span,
+                "used after move",
+                "this binding must be reassigned or explicitly shared before it can be used again",
+            );
+            return false;
+        }
+        return true;
+    }
+
+    fn ensureBindingMovable(self: *TypeChecker, binding_id: scope_mod.BindingId, span: ast.SourceSpan) !bool {
+        const info = self.ownership_bindings.get(binding_id) orelse return true;
+        if (!try self.ensureBindingAvailable(binding_id, span)) return false;
+        if (info.active_borrows > 0) {
+            const binding = self.graph.bindings.items[binding_id];
+            const name = self.interner.get(binding.name);
+            try self.addHardError(
+                try std.fmt.allocPrint(self.allocator, "cannot move `{s}` while it is borrowed", .{name}),
+                span,
+                "value is currently borrowed",
+                "end the borrow before consuming this value",
+            );
+            return false;
+        }
+        return true;
+    }
+
+    fn applyCallOwnership(self: *TypeChecker, args: []const *const ast.Expr, fn_type: Type.FunctionType) ![]const scope_mod.BindingId {
+        const param_ownerships = fn_type.param_ownerships orelse return &[_]scope_mod.BindingId{};
+        if (self.current_scope == null) return &[_]scope_mod.BindingId{};
+
+        const scope_id = self.current_scope.?;
+        const count = @min(args.len, param_ownerships.len);
+        var borrowed: std.ArrayList(scope_mod.BindingId) = .empty;
+        for (args[0..count], param_ownerships[0..count]) |arg, ownership| {
+            if (arg.* != .var_ref) continue;
+            const vr = arg.var_ref;
+            const binding_id = self.graph.resolveBinding(scope_id, vr.name) orelse continue;
+
+            switch (ownership) {
+                .shared => {},
+                .unique => {
+                    if (self.ownership_bindings.get(binding_id)) |info| {
+                        if (info.qualified_type.ownership == .shared) {
+                            const binding = self.graph.bindings.items[binding_id];
+                            const name = self.interner.get(binding.name);
+                            try self.addHardError(
+                                try std.fmt.allocPrint(self.allocator, "cannot pass shared value `{s}` to a unique parameter", .{name}),
+                                vr.meta.span,
+                                "expected unique ownership",
+                                "this argument must be uniquely owned before it can be consumed by the callee",
+                            );
+                            continue;
+                        }
+                    }
+                    if (try self.ensureBindingMovable(binding_id, vr.meta.span)) {
+                        try self.markBindingMoved(binding_id);
+                    }
+                },
+                .borrowed => {
+                    if (try self.ensureBindingAvailable(binding_id, vr.meta.span)) {
+                        try self.beginBindingBorrow(binding_id);
+                        try borrowed.append(self.allocator, binding_id);
+                    }
+                },
+            }
+        }
+        return try borrowed.toOwnedSlice(self.allocator);
+    }
+
+    fn endBorrowedBindings(self: *TypeChecker, borrowed_bindings: []const scope_mod.BindingId) !void {
+        for (borrowed_bindings) |binding_id| {
+            try self.endBindingBorrow(binding_id);
+        }
+    }
+
+    fn sharedOwnershipSlice(self: *TypeChecker, len: usize) ![]const Ownership {
+        const ownerships = try self.allocator.alloc(Ownership, len);
+        for (ownerships) |*ownership| ownership.* = .shared;
+        return ownerships;
+    }
+
+    fn buildFunctionType(self: *TypeChecker, params: []const TypeId, return_type: TypeId) !TypeId {
+        const param_ownerships = try self.sharedOwnershipSlice(params.len);
+        return try self.store.addFunctionType(params, return_type, param_ownerships, .shared);
+    }
+
+    fn resolveFamilySignature(self: *TypeChecker, scope_id: scope_mod.ScopeId, name: ast.StringId, arity: u32) !?FunctionSignature {
+        const family_id = self.graph.resolveFamily(scope_id, name, arity) orelse return null;
+        const family = self.graph.getFamily(family_id);
+        if (family.clauses.items.len == 0) return null;
+        const clause_ref = family.clauses.items[0];
+        if (clause_ref.clause_index >= clause_ref.decl.clauses.len) return null;
+        const clause = clause_ref.decl.clauses[clause_ref.clause_index];
+
+        var param_types: std.ArrayList(TypeId) = .empty;
+        var param_ownerships: std.ArrayList(Ownership) = .empty;
+        for (clause.params) |param| {
+            const param_type = if (param.type_annotation) |ann|
+                try self.resolveTypeExpr(ann)
+            else
+                TypeStore.UNKNOWN;
+            try param_types.append(self.allocator, param_type);
+            try param_ownerships.append(self.allocator, self.resolveParamOwnership(param, param_type));
+        }
+
+        const return_type = if (clause.return_type) |rt|
+            try self.resolveTypeExpr(rt)
+        else
+            TypeStore.UNKNOWN;
+
+        return .{
+            .params = try param_types.toOwnedSlice(self.allocator),
+            .param_ownerships = try param_ownerships.toOwnedSlice(self.allocator),
+            .return_type = return_type,
+            .return_ownership = self.defaultOwnershipForType(return_type),
+        };
+    }
+
+    pub fn bindingOwnershipInfo(self: *const TypeChecker, binding_id: scope_mod.BindingId) ?BindingOwnershipInfo {
+        return self.ownership_bindings.get(binding_id);
     }
 
     fn addError(self: *TypeChecker, message: []const u8, span: ast.SourceSpan) !void {
@@ -542,6 +828,26 @@ pub const TypeChecker = struct {
                     } });
                     try self.store.name_to_type.put(ed.name, type_id);
                 },
+                .opaque_type => |opaque_body| {
+                    const opaque_name_str = self.interner.get(type_entry.name);
+                    if (self.store.resolveTypeName(opaque_name_str) != null) {
+                        try self.errors.append(self.allocator, .{
+                            .message = try std.fmt.allocPrint(self.allocator, "`{s}` shadows a builtin type — choose a different name", .{opaque_name_str}),
+                            .span = type_entry.kind.opaque_type.getMeta().span,
+                            .label = "conflicts with builtin type",
+                            .help = try std.fmt.allocPrint(self.allocator, "the builtin `{s}` type takes priority over this definition", .{opaque_name_str}),
+                            .severity = .warning,
+                        });
+                        continue;
+                    }
+
+                    const inner_type = try self.resolveTypeExpr(opaque_body);
+                    const type_id = try self.store.addType(.{ .opaque_type = .{
+                        .name = type_entry.name,
+                        .inner = inner_type,
+                    } });
+                    try self.store.name_to_type.put(type_entry.name, type_id);
+                },
                 else => {},
             }
         }
@@ -694,15 +1000,13 @@ pub const TypeChecker = struct {
         for (clause.params) |param| {
             if (param.type_annotation) |ta| {
                 const param_type = try self.resolveTypeExpr(ta);
+                const qualified = QualifiedType.init(param_type, self.resolveParamOwnership(param, param_type));
                 // Store type on the binding in scope graph if this is a bind pattern
                 if (param.pattern.* == .bind) {
                     const bind_name = param.pattern.bind.name;
                     if (self.current_scope) |scope_id| {
                         if (self.graph.resolveBinding(scope_id, bind_name)) |bid| {
-                            self.graph.bindings.items[bid].type_id = .{
-                                .type_id = param_type,
-                                .source_span = ta.getMeta().span,
-                            };
+                            try self.recordBindingQualifiedType(bid, qualified, ta.getMeta().span);
                         }
                     }
                 }
@@ -738,8 +1042,7 @@ pub const TypeChecker = struct {
         const declared_is_checkable = declared_return != TypeStore.UNKNOWN and
             declared_return != TypeStore.ERROR and
             self.store.getType(declared_return) != .type_var;
-        if (declared_is_checkable and body_type != TypeStore.UNKNOWN and body_type != TypeStore.ERROR)
-        {
+        if (declared_is_checkable and body_type != TypeStore.UNKNOWN and body_type != TypeStore.ERROR) {
             if (!self.store.typeEquals(body_type, declared_return)) {
                 const expected = self.typeToString(declared_return);
                 const got = self.typeToString(body_type);
@@ -781,10 +1084,7 @@ pub const TypeChecker = struct {
                     const bind_name = assign.pattern.bind.name;
                     if (self.current_scope) |scope_id| {
                         if (self.graph.resolveBinding(scope_id, bind_name)) |bid| {
-                            self.graph.bindings.items[bid].type_id = .{
-                                .type_id = value_type,
-                                .source_span = assign.value.getMeta().span,
-                            };
+                            try self.recordBindingType(bid, value_type, assign.value.getMeta().span);
                         }
                     }
                 }
@@ -818,6 +1118,7 @@ pub const TypeChecker = struct {
                 // Resolve type from scope binding
                 if (self.current_scope) |scope_id| {
                     if (self.graph.resolveBinding(scope_id, vr.name)) |bid| {
+                        _ = try self.ensureBindingAvailable(bid, vr.meta.span);
                         self.referenced_bindings.put(bid, {}) catch {};
                         const binding = self.graph.bindings.items[bid];
                         if (binding.type_id) |prov| {
@@ -983,12 +1284,7 @@ pub const TypeChecker = struct {
                 // Create a function type with known arity, unknown param/return types
                 const params = try self.allocator.alloc(TypeId, fr.arity);
                 for (params) |*p| p.* = TypeStore.UNKNOWN;
-                return try self.store.addType(.{
-                    .function = .{
-                        .params = params,
-                        .return_type = TypeStore.UNKNOWN,
-                    },
-                });
+                return try self.buildFunctionType(params, TypeStore.UNKNOWN);
             },
             .field_access => |fa| {
                 // Check for enum variant access (e.g. Color.Red)
@@ -1269,15 +1565,32 @@ pub const TypeChecker = struct {
                         const t = self.store.getType(prov.type_id);
                         if (t == .function) {
                             for (call.args) |arg| _ = try self.inferExpr(arg);
+                            const borrowed = try self.applyCallOwnership(call.args, t.function);
+                            defer self.endBorrowedBindings(borrowed) catch {};
                             return t.function.return_type;
                         }
                     }
                 }
 
                 // Check function families
-                if (self.graph.resolveFamily(scope_id, vr.name, arity)) |_| {
-                    for (call.args) |arg| _ = try self.inferExpr(arg);
-                    return TypeStore.UNKNOWN;
+                if (try self.resolveFamilySignature(scope_id, vr.name, arity)) |signature| {
+                    for (call.args, 0..) |arg, idx| {
+                        const arg_type = try self.inferExpr(arg);
+                        if (idx < signature.params.len) {
+                            const expected = signature.params[idx];
+                            if (expected != TypeStore.UNKNOWN and arg_type != TypeStore.UNKNOWN and arg_type != TypeStore.ERROR and !self.store.typeEquals(arg_type, expected)) {
+                                try self.addRichError(
+                                    try std.fmt.allocPrint(self.allocator, "argument {d} expects `{s}`, got `{s}`", .{ idx + 1, self.typeToString(expected), self.typeToString(arg_type) }),
+                                    arg.getMeta().span,
+                                    "argument type mismatch",
+                                    null,
+                                );
+                            }
+                        }
+                    }
+                    const borrowed = try self.applyCallOwnership(call.args, signature.toFunctionType());
+                    defer self.endBorrowedBindings(borrowed) catch {};
+                    return signature.return_type;
                 }
 
                 // Function not found — suggest alternatives
@@ -1321,6 +1634,8 @@ pub const TypeChecker = struct {
             const ct = self.store.getType(callee_type);
             if (ct == .function) {
                 for (call.args) |arg| _ = try self.inferExpr(arg);
+                const borrowed = try self.applyCallOwnership(call.args, ct.function);
+                defer self.endBorrowedBindings(borrowed) catch {};
                 return ct.function.return_type;
             }
         }
@@ -1369,11 +1684,10 @@ pub const TypeChecker = struct {
                 var candidates: std.ArrayList([]const u8) = .empty;
                 // Collect builtin type names
                 const builtins = [_][]const u8{
-                    "Bool", "String", "Atom", "Nil", "Never",
-                    "i64",  "i32",    "i16",  "i8",
-                    "u64",  "u32",    "u16",  "u8",
-                    "f64",  "f32",    "f16",
-                    "usize", "isize",
+                    "Bool", "String", "Atom",  "Nil", "Never",
+                    "i64",  "i32",    "i16",   "i8",  "u64",
+                    "u32",  "u16",    "u8",    "f64", "f32",
+                    "f16",  "usize",  "isize",
                 };
                 for (&builtins) |b| {
                     candidates.append(self.allocator, b) catch {};
@@ -1404,11 +1718,10 @@ pub const TypeChecker = struct {
                 // Check if this type variable name is a near-miss of a builtin type
                 const var_name = self.interner.get(tv.name);
                 const builtins = [_][]const u8{
-                    "Bool", "String", "Atom", "Nil", "Never",
-                    "i64",  "i32",    "i16",  "i8",
-                    "u64",  "u32",    "u16",  "u8",
-                    "f64",  "f32",    "f16",
-                    "usize", "isize",
+                    "Bool", "String", "Atom",  "Nil", "Never",
+                    "i64",  "i32",    "i16",   "i8",  "u64",
+                    "u32",  "u16",    "u8",    "f64", "f32",
+                    "f16",  "usize",  "isize",
                 };
                 // Use slightly relaxed threshold for short type names (floating point edge cases)
                 if (similarity.findBestMatch(var_name, &builtins, similarity.SUGGESTION_THRESHOLD - 0.01)) |suggestion| {
@@ -1452,12 +1765,7 @@ pub const TypeChecker = struct {
                     try param_types.append(self.allocator, try self.resolveTypeExpr(param));
                 }
                 const return_type = try self.resolveTypeExpr(ft.return_type);
-                return try self.store.addType(.{
-                    .function = .{
-                        .params = try param_types.toOwnedSlice(self.allocator),
-                        .return_type = return_type,
-                    },
-                });
+                return try self.buildFunctionType(try param_types.toOwnedSlice(self.allocator), return_type);
             },
             .never => TypeStore.NEVER,
             .literal => |lt| {
@@ -1502,6 +1810,155 @@ test "type store resolve builtin names" {
     try std.testing.expectEqual(TypeStore.BOOL, store.resolveTypeName("Bool").?);
     try std.testing.expectEqual(TypeStore.STRING, store.resolveTypeName("String").?);
     try std.testing.expect(store.resolveTypeName("Nonexistent") == null);
+}
+
+test "qualified type defaults to shared ownership" {
+    const qualified = QualifiedType{ .type_id = TypeStore.STRING };
+
+    try std.testing.expectEqual(TypeStore.STRING, qualified.type_id);
+    try std.testing.expectEqual(Ownership.shared, qualified.ownership);
+}
+
+test "function type can carry ownership metadata" {
+    const param_ownerships = [_]Ownership{ .unique, .borrowed };
+    const fn_type = Type.FunctionType{
+        .params = &.{ TypeStore.STRING, TypeStore.I64 },
+        .return_type = TypeStore.BOOL,
+        .param_ownerships = &param_ownerships,
+        .return_ownership = .shared,
+    };
+
+    try std.testing.expectEqual(@as(usize, 2), fn_type.params.len);
+    try std.testing.expectEqual(@as(usize, 2), fn_type.param_ownerships.?.len);
+    try std.testing.expectEqual(Ownership.unique, fn_type.param_ownerships.?[0]);
+    try std.testing.expectEqual(Ownership.borrowed, fn_type.param_ownerships.?[1]);
+    try std.testing.expectEqual(Ownership.shared, fn_type.return_ownership);
+}
+
+test "binding ownership info starts available" {
+    const binding = BindingOwnershipInfo{
+        .qualified_type = .{ .type_id = TypeStore.I64, .ownership = .unique },
+    };
+
+    try std.testing.expectEqual(Ownership.unique, binding.qualified_type.ownership);
+    try std.testing.expectEqual(BindingOwnershipState.available, binding.state);
+    try std.testing.expectEqual(@as(u32, 0), binding.active_borrows);
+}
+
+test "type store qualify attaches ownership metadata" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var store = TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+
+    const qualified = store.qualify(TypeStore.I64, .borrowed);
+
+    try std.testing.expectEqual(TypeStore.I64, qualified.type_id);
+    try std.testing.expectEqual(Ownership.borrowed, qualified.ownership);
+}
+
+test "type store addFunctionType preserves ownership metadata" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var store = TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+
+    const param_ownerships = [_]Ownership{ .shared, .unique };
+    const fn_type_id = try store.addFunctionType(&.{ TypeStore.STRING, TypeStore.I64 }, TypeStore.BOOL, &param_ownerships, .borrowed);
+    const fn_type = store.getType(fn_type_id);
+
+    try std.testing.expect(fn_type == .function);
+    try std.testing.expectEqual(@as(usize, 2), fn_type.function.params.len);
+    try std.testing.expectEqual(@as(usize, 2), fn_type.function.param_ownerships.?.len);
+    try std.testing.expectEqual(Ownership.shared, fn_type.function.param_ownerships.?[0]);
+    try std.testing.expectEqual(Ownership.unique, fn_type.function.param_ownerships.?[1]);
+    try std.testing.expectEqual(Ownership.borrowed, fn_type.function.return_ownership);
+}
+
+test "type checker registers opaque types" {
+    const source =
+        \\defmodule Test do
+        \\  opaque Handle = String
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    const handle_name = try parser.interner.intern("Handle");
+    const handle_id = checker.store.name_to_type.get(handle_name).?;
+    try std.testing.expect(checker.store.getType(handle_id) == .opaque_type);
+}
+
+test "function type equality includes ownership metadata" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var store = TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+
+    const shared_param_ownerships = [_]Ownership{.shared};
+    const unique_param_ownerships = [_]Ownership{.unique};
+
+    const shared_fn = try store.addFunctionType(&.{TypeStore.STRING}, TypeStore.STRING, &shared_param_ownerships, .shared);
+    const same_shared_fn = try store.addFunctionType(&.{TypeStore.STRING}, TypeStore.STRING, &shared_param_ownerships, .shared);
+    const unique_fn = try store.addFunctionType(&.{TypeStore.STRING}, TypeStore.STRING, &unique_param_ownerships, .shared);
+    const borrowed_return_fn = try store.addFunctionType(&.{TypeStore.STRING}, TypeStore.STRING, &shared_param_ownerships, .borrowed);
+
+    try std.testing.expect(store.typeEquals(shared_fn, same_shared_fn));
+    try std.testing.expect(!store.typeEquals(shared_fn, unique_fn));
+    try std.testing.expect(!store.typeEquals(shared_fn, borrowed_return_fn));
+}
+
+test "function subtyping respects ownership metadata" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var store = TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+
+    const shared_param_ownerships = [_]Ownership{.shared};
+    const unique_param_ownerships = [_]Ownership{.unique};
+
+    const shared_fn = try store.addFunctionType(&.{TypeStore.STRING}, TypeStore.STRING, &shared_param_ownerships, .shared);
+    const same_shared_fn = try store.addFunctionType(&.{TypeStore.STRING}, TypeStore.STRING, &shared_param_ownerships, .shared);
+    const unique_fn = try store.addFunctionType(&.{TypeStore.STRING}, TypeStore.STRING, &unique_param_ownerships, .shared);
+
+    try std.testing.expect(store.isSubtype(shared_fn, same_shared_fn));
+    try std.testing.expect(!store.isSubtype(shared_fn, unique_fn));
+}
+
+test "borrow state returns to available when borrow ends" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var graph = scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    var checker = TypeChecker.init(std.testing.allocator, &interner, &graph);
+    defer checker.deinit();
+
+    try checker.recordBindingOwnership(0, TypeStore.STRING, .unique);
+    try checker.beginBindingBorrow(0);
+
+    var info = checker.bindingOwnershipInfo(0).?;
+    try std.testing.expectEqual(BindingOwnershipState.borrowed, info.state);
+    try std.testing.expectEqual(@as(u32, 1), info.active_borrows);
+
+    try checker.endBindingBorrow(0);
+    info = checker.bindingOwnershipInfo(0).?;
+    try std.testing.expectEqual(BindingOwnershipState.available, info.state);
+    try std.testing.expectEqual(@as(u32, 0), info.active_borrows);
 }
 
 const Parser = @import("parser.zig").Parser;
@@ -1781,6 +2238,365 @@ test "type provenance tracks source span on typed parameter" {
         }
     }
     try std.testing.expect(found_x);
+}
+
+test "typed parameter records shared ownership metadata" {
+    const source =
+        \\defmodule Test do
+        \\  def add(x :: i64) do
+        \\    x
+        \\  end
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var found_x = false;
+    for (checker.graph.bindings.items, 0..) |binding, i| {
+        const name = checker.interner.get(binding.name);
+        if (std.mem.eql(u8, name, "x")) {
+            const ownership = checker.bindingOwnershipInfo(@intCast(i)) orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(TypeStore.I64, ownership.qualified_type.type_id);
+            try std.testing.expectEqual(Ownership.shared, ownership.qualified_type.ownership);
+            try std.testing.expectEqual(BindingOwnershipState.available, ownership.state);
+            found_x = true;
+        }
+    }
+
+    try std.testing.expect(found_x);
+}
+
+test "function ref inference defaults param ownerships to shared" {
+    const source =
+        \\def main(args) do
+        \\  Foo.main/1
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+
+    const main_func = program.top_items[0].function;
+    const fn_ref_expr = main_func.clauses[0].body[0].expr;
+    const inferred = try checker.inferExpr(fn_ref_expr);
+    const typ = checker.store.getType(inferred);
+
+    try std.testing.expect(typ == .function);
+    try std.testing.expectEqual(@as(usize, 1), typ.function.params.len);
+    try std.testing.expectEqual(@as(usize, 1), typ.function.param_ownerships.?.len);
+    try std.testing.expectEqual(Ownership.shared, typ.function.param_ownerships.?[0]);
+    try std.testing.expectEqual(Ownership.shared, typ.function.return_ownership);
+}
+
+test "moved binding use reports ownership error" {
+    const source =
+        \\defmodule Test do
+        \\  def echo(x :: String) do
+        \\    x
+        \\  end
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    const clause = program.modules[0].items[0].function.clauses[0];
+    const expr = clause.body[0].expr;
+    const scope_id = checker.graph.node_scope_map.get(clause.meta.span.start) orelse clause.meta.scope_id;
+    checker.current_scope = scope_id;
+
+    const x_binding = checker.graph.resolveBinding(scope_id, clause.params[0].pattern.bind.name).?;
+    try checker.recordBindingOwnership(x_binding, TypeStore.STRING, .unique);
+    try checker.markBindingMoved(x_binding);
+
+    _ = try checker.inferExpr(expr);
+
+    var found = false;
+    for (checker.errors.items) |err| {
+        if (std.mem.indexOf(u8, err.message, "already moved") != null) {
+            found = true;
+            try std.testing.expect(err.help != null);
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "unique function parameter ownership moves var_ref argument" {
+    const source =
+        \\defmodule Test do
+        \\  def caller(f, x) do
+        \\    f(x)
+        \\    x
+        \\  end
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    const clause = program.modules[0].items[0].function.clauses[0];
+    const scope_id = checker.graph.node_scope_map.get(clause.meta.span.start) orelse clause.meta.scope_id;
+    checker.current_scope = scope_id;
+
+    const f_binding = checker.graph.resolveBinding(scope_id, clause.params[0].pattern.bind.name).?;
+    const x_binding = checker.graph.resolveBinding(scope_id, clause.params[1].pattern.bind.name).?;
+
+    const param_ownerships = try alloc.alloc(Ownership, 1);
+    param_ownerships[0] = .unique;
+    const fn_type_id = try checker.store.addFunctionType(&.{TypeStore.STRING}, TypeStore.STRING, param_ownerships, .shared);
+    try checker.recordBindingType(f_binding, fn_type_id, clause.params[0].meta.span);
+    try checker.recordBindingOwnership(f_binding, fn_type_id, .shared);
+    try checker.recordBindingType(x_binding, TypeStore.STRING, clause.params[1].meta.span);
+    try checker.recordBindingOwnership(x_binding, TypeStore.STRING, .unique);
+
+    checker.errors.clearRetainingCapacity();
+
+    _ = try checker.inferExpr(clause.body[0].expr);
+    _ = try checker.inferExpr(clause.body[1].expr);
+
+    var found = false;
+    for (checker.errors.items) |err| {
+        if (std.mem.indexOf(u8, err.message, "already moved") != null) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "shared binding cannot satisfy unique parameter ownership" {
+    const source =
+        \\defmodule Test do
+        \\  def caller(f, x) do
+        \\    f(x)
+        \\  end
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    const clause = program.modules[0].items[0].function.clauses[0];
+    const scope_id = checker.graph.node_scope_map.get(clause.meta.span.start) orelse clause.meta.scope_id;
+    checker.current_scope = scope_id;
+
+    const f_binding = checker.graph.resolveBinding(scope_id, clause.params[0].pattern.bind.name).?;
+    const x_binding = checker.graph.resolveBinding(scope_id, clause.params[1].pattern.bind.name).?;
+
+    const param_ownerships = try alloc.alloc(Ownership, 1);
+    param_ownerships[0] = .unique;
+    const fn_type_id = try checker.store.addFunctionType(&.{TypeStore.STRING}, TypeStore.STRING, param_ownerships, .shared);
+    try checker.recordBindingType(f_binding, fn_type_id, clause.params[0].meta.span);
+    try checker.recordBindingOwnership(f_binding, fn_type_id, .shared);
+    try checker.recordBindingType(x_binding, TypeStore.STRING, clause.params[1].meta.span);
+    try checker.recordBindingOwnership(x_binding, TypeStore.STRING, .shared);
+
+    _ = try checker.inferExpr(clause.body[0].expr);
+
+    var found = false;
+    for (checker.errors.items) |err| {
+        if (std.mem.indexOf(u8, err.message, "cannot pass shared value") != null) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "named call with unique parameter moves opaque binding" {
+    const source =
+        \\defmodule Test do
+        \\  opaque Handle = String
+        \\
+        \\  def take(handle :: Handle) do
+        \\    handle
+        \\  end
+        \\
+        \\  def run(handle :: Handle) do
+        \\    take(handle)
+        \\    handle
+        \\  end
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var found = false;
+    for (checker.errors.items) |err| {
+        if (std.mem.indexOf(u8, err.message, "already moved") != null) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "borrowed param annotation keeps binding usable after call" {
+    const source =
+        \\defmodule Test do
+        \\  opaque Handle = String
+        \\
+        \\  def inspect(handle :: borrowed Handle) do
+        \\    handle
+        \\  end
+        \\
+        \\  def run(handle :: Handle) do
+        \\    inspect(handle)
+        \\    handle
+        \\  end
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+}
+
+test "borrowed parameter does not move binding" {
+    const source =
+        \\defmodule Test do
+        \\  def caller(f, x) do
+        \\    f(x)
+        \\    x
+        \\  end
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    const clause = program.modules[0].items[0].function.clauses[0];
+    const scope_id = checker.graph.node_scope_map.get(clause.meta.span.start) orelse clause.meta.scope_id;
+    checker.current_scope = scope_id;
+
+    const f_binding = checker.graph.resolveBinding(scope_id, clause.params[0].pattern.bind.name).?;
+    const x_binding = checker.graph.resolveBinding(scope_id, clause.params[1].pattern.bind.name).?;
+
+    const param_ownerships = try alloc.alloc(Ownership, 1);
+    param_ownerships[0] = .borrowed;
+    const fn_type_id = try checker.store.addFunctionType(&.{TypeStore.STRING}, TypeStore.STRING, param_ownerships, .shared);
+    try checker.recordBindingType(f_binding, fn_type_id, clause.params[0].meta.span);
+    try checker.recordBindingOwnership(f_binding, fn_type_id, .shared);
+    try checker.recordBindingType(x_binding, TypeStore.STRING, clause.params[1].meta.span);
+    try checker.recordBindingOwnership(x_binding, TypeStore.STRING, .unique);
+
+    checker.errors.clearRetainingCapacity();
+    _ = try checker.inferExpr(clause.body[0].expr);
+    checker.errors.clearRetainingCapacity();
+    _ = try checker.inferExpr(clause.body[1].expr);
+
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+    const ownership = checker.bindingOwnershipInfo(x_binding).?;
+    try std.testing.expectEqual(BindingOwnershipState.available, ownership.state);
 }
 
 test "return type mismatch has secondary span" {

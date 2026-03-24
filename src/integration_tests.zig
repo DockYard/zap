@@ -1287,6 +1287,27 @@ test "module-qualified call emits prefixed name" {
     try expectNotContains(output, "// unhandled instruction");
 }
 
+test "shared opaque closure arg emits ARC retain and release" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Test do
+        \\  opaque Handle = String
+        \\
+        \\  def run(use_fn :: (Handle -> Handle), handle :: Handle) do
+        \\    use_fn(handle)
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, "zap_runtime.ArcRuntime.retainAny(");
+    try expectContains(output, "zap_runtime.ArcRuntime.releaseAny(");
+    try expectNotContains(output, "// unhandled instruction");
+}
+
 test "top-level main stays bare, module functions get prefixed" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1730,9 +1751,9 @@ test "binary pattern sub-byte extraction" {
     const output = try compile(alloc, source);
     // Should emit @truncate with bit shifts for sub-byte extraction
     try expectContains(output, "@truncate(");
-    try expectContains(output, ">> 7");  // syn: bit 7
-    try expectContains(output, ">> 6");  // ack: bit 6
-    try expectContains(output, ">> 5");  // fin: bit 5
+    try expectContains(output, ">> 7"); // syn: bit 7
+    try expectContains(output, ">> 6"); // ack: bit 6
+    try expectContains(output, ">> 5"); // fin: bit 5
 }
 
 test "binary pattern in case emits length check" {

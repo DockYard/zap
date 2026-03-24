@@ -13,6 +13,13 @@ const scope_mod = @import("scope.zig");
 // ============================================================
 
 pub const TypeId = types_mod.TypeId;
+pub const Ownership = types_mod.Ownership;
+
+pub const ValueMode = enum {
+    share,
+    move,
+    borrow,
+};
 
 // ============================================================
 // HIR Program
@@ -87,6 +94,7 @@ pub const BinaryBinding = struct {
 pub const TypedParam = struct {
     name: ?ast.StringId,
     type_id: TypeId,
+    ownership: Ownership = .shared,
     pattern: ?*const MatchPattern,
     default: ?*const Expr = null,
 };
@@ -170,7 +178,12 @@ pub const UnaryExpr = struct {
 
 pub const CallExpr = struct {
     target: CallTarget,
-    args: []const *const Expr,
+    args: []const CallArg,
+};
+
+pub const CallArg = struct {
+    expr: *const Expr,
+    mode: ValueMode = .share,
 };
 
 pub const NamedCall = struct {
@@ -568,12 +581,14 @@ fn stripColumnAndRecurse(
             .span = .{ .start = 0, .end = 0 },
         };
         const d = try allocator.create(Decision);
-        d.* = .{ .bind = .{
-            .name = first_pat.?.bind,
-            .local_index = 0, // resolved during IR lowering
-            .source = scrutinee_expr,
-            .next = sub_decision,
-        } };
+        d.* = .{
+            .bind = .{
+                .name = first_pat.?.bind,
+                .local_index = 0, // resolved during IR lowering
+                .source = scrutinee_expr,
+                .next = sub_decision,
+            },
+        };
         return d;
     }
 
@@ -985,7 +1000,10 @@ fn compileListCheck(
             const length: u32 = @intCast(pat.?.list.len);
             var found = false;
             for (lengths.items) |l| {
-                if (l == length) { found = true; break; }
+                if (l == length) {
+                    found = true;
+                    break;
+                }
             }
             if (!found) try lengths.append(allocator, length);
         }
@@ -1224,6 +1242,7 @@ pub const HirBuilder = struct {
     current_binary_bindings: std.ArrayList(BinaryBinding),
     current_case_bindings: std.ArrayList(CaseBinding),
     current_module_scope: ?scope_mod.ScopeId,
+    current_clause_scope: ?scope_mod.ScopeId,
     current_function_name: ?[]const u8,
     errors: std.ArrayList(Error),
 
@@ -1252,6 +1271,7 @@ pub const HirBuilder = struct {
             .current_binary_bindings = .empty,
             .current_case_bindings = .empty,
             .current_module_scope = null,
+            .current_clause_scope = null,
             .current_function_name = null,
             .errors = .empty,
         };
@@ -1264,7 +1284,7 @@ pub const HirBuilder = struct {
     /// Look up a binding's type_id from the scope graph.
     /// Returns the type_id if found, otherwise UNKNOWN.
     fn resolveBindingType(self: *const HirBuilder, name: ast.StringId) types_mod.TypeId {
-        const scope_id = self.current_module_scope orelse self.graph.prelude_scope;
+        const scope_id = self.current_clause_scope orelse self.current_module_scope orelse self.graph.prelude_scope;
         if (self.graph.resolveBinding(scope_id, name)) |bid| {
             const binding = self.graph.bindings.items[bid];
             if (binding.type_id) |prov| {
@@ -1291,6 +1311,66 @@ pub const HirBuilder = struct {
             }
         }
         return types_mod.TypeStore.UNKNOWN;
+    }
+
+    fn applyCallArgModes(self: *const HirBuilder, args: []CallArg, callee_type_id: types_mod.TypeId) void {
+        if (callee_type_id == types_mod.TypeStore.UNKNOWN) return;
+        const callee_type = self.type_store.getType(callee_type_id);
+        if (callee_type != .function) return;
+        const ownerships = callee_type.function.param_ownerships orelse return;
+        const count = @min(args.len, ownerships.len);
+        for (args[0..count], ownerships[0..count]) |*arg, ownership| {
+            arg.mode = switch (ownership) {
+                .shared => .share,
+                .unique => .move,
+                .borrowed => .borrow,
+            };
+        }
+    }
+
+    fn defaultOwnershipForType(self: *const HirBuilder, type_id: types_mod.TypeId) Ownership {
+        const typ = self.type_store.getType(type_id);
+        return switch (typ) {
+            .opaque_type => .unique,
+            else => .shared,
+        };
+    }
+
+    fn resolveParamOwnership(self: *const HirBuilder, param: ast.Param, resolved_type: types_mod.TypeId) Ownership {
+        return switch (param.ownership) {
+            .shared => self.defaultOwnershipForType(resolved_type),
+            .unique => .unique,
+            .borrowed => .borrowed,
+        };
+    }
+
+    fn resolveFunctionParamOwnerships(self: *HirBuilder, name: ast.StringId, arity: u32) ?[]const Ownership {
+        const scope_id = self.current_clause_scope orelse self.current_module_scope orelse self.graph.prelude_scope;
+        const family_id = self.graph.resolveFamily(scope_id, name, arity) orelse return null;
+        const family = self.graph.getFamily(family_id);
+        if (family.clauses.items.len == 0) return null;
+        const clause_ref = family.clauses.items[0];
+        if (clause_ref.clause_index >= clause_ref.decl.clauses.len) return null;
+        const clause = clause_ref.decl.clauses[clause_ref.clause_index];
+
+        const ownerships = self.allocator.alloc(Ownership, clause.params.len) catch return null;
+        for (clause.params, 0..) |param, idx| {
+            ownerships[idx] = blk: {
+                if (param.pattern.* == .bind) {
+                    const clause_scope = self.graph.node_scope_map.get(clause.meta.span.start) orelse clause.meta.scope_id;
+                    if (self.graph.resolveBinding(clause_scope, param.pattern.bind.name)) |binding_id| {
+                        if (self.graph.bindings.items[binding_id].type_id) |prov| {
+                            break :blk self.resolveParamOwnership(param, prov.type_id);
+                        }
+                    }
+                }
+                if (param.type_annotation) |ann| {
+                    break :blk self.resolveParamOwnership(param, self.resolveTypeExpr(ann));
+                }
+                break :blk .shared;
+            };
+        }
+        return ownerships;
     }
 
     // ============================================================
@@ -1489,6 +1569,9 @@ pub const HirBuilder = struct {
 
     fn buildClause(self: *HirBuilder, clause: *const ast.FunctionClause) !Clause {
         self.next_local = 0;
+        const prev_clause_scope = self.current_clause_scope;
+        self.current_clause_scope = self.graph.node_scope_map.get(clause.meta.span.start) orelse clause.meta.scope_id;
+        defer self.current_clause_scope = prev_clause_scope;
 
         var params: std.ArrayList(TypedParam) = .empty;
         for (clause.params) |param| {
@@ -1531,6 +1614,7 @@ pub const HirBuilder = struct {
             try params.append(self.allocator, .{
                 .name = name,
                 .type_id = type_id,
+                .ownership = self.resolveParamOwnership(param, type_id),
                 .pattern = match_pattern,
                 .default = default_expr,
             });
@@ -1954,10 +2038,15 @@ pub const HirBuilder = struct {
                 .span = uo.meta.span,
             }),
             .call => |call| {
-                var args: std.ArrayList(*const Expr) = .empty;
+                var args: std.ArrayList(CallArg) = .empty;
                 for (call.args) |arg| {
-                    try args.append(self.allocator, try self.buildExpr(arg));
+                    try args.append(self.allocator, .{
+                        .expr = try self.buildExpr(arg),
+                        .mode = .share,
+                    });
                 }
+
+                var callee_expr: ?*const Expr = null;
 
                 // Check for module-qualified call: IO.puts(...), Math.square(...)
                 // or :zig runtime bridge: :zig.println(...)
@@ -1977,7 +2066,8 @@ pub const HirBuilder = struct {
                             break :blk .{ .builtin = func_name };
                         }
                     }
-                    break :blk .{ .closure = try self.buildExpr(call.callee) };
+                    callee_expr = try self.buildExpr(call.callee);
+                    break :blk .{ .closure = callee_expr.? };
                 } else if (call.callee.* == .var_ref) blk: {
                     // Check if callee is a parameter (function value) or a named function
                     const vr = call.callee.var_ref;
@@ -1991,12 +2081,20 @@ pub const HirBuilder = struct {
                         }
                     }
                     if (is_param) {
-                        break :blk .{ .closure = try self.buildExpr(call.callee) };
+                        callee_expr = try self.buildExpr(call.callee);
+                        break :blk .{ .closure = callee_expr.? };
                     }
                     // Check if this bare call resolves to an imported function
                     const import_module = self.resolveImport(vr.name, @intCast(call.args.len));
                     break :blk .{ .named = .{ .module = import_module, .name = self.interner.get(vr.name) } };
-                } else .{ .closure = try self.buildExpr(call.callee) };
+                } else blk: {
+                    callee_expr = try self.buildExpr(call.callee);
+                    break :blk .{ .closure = callee_expr.? };
+                };
+
+                if (callee_expr) |callee| {
+                    self.applyCallArgModes(args.items, callee.type_id);
+                }
 
                 // Resolve return type for named calls
                 const call_return_type: types_mod.TypeId = switch (target) {
@@ -2011,6 +2109,22 @@ pub const HirBuilder = struct {
                     },
                     else => types_mod.TypeStore.UNKNOWN,
                 };
+
+                if (target == .named and call.callee.* == .var_ref) {
+                    const named = target.named;
+                    if (named.module == null) {
+                        if (self.resolveFunctionParamOwnerships(call.callee.var_ref.name, @intCast(call.args.len))) |ownerships| {
+                            const count = @min(args.items.len, ownerships.len);
+                            for (args.items[0..count], ownerships[0..count]) |*arg, ownership| {
+                                arg.mode = switch (ownership) {
+                                    .shared => .share,
+                                    .unique => .move,
+                                    .borrowed => .borrow,
+                                };
+                            }
+                        }
+                    }
+                }
 
                 return try self.create(Expr, .{
                     .kind = .{ .call = .{
@@ -2167,14 +2281,16 @@ pub const HirBuilder = struct {
                             const typ = self.type_store.getType(tid);
                             if (typ == .enum_type) {
                                 return try self.create(Expr, .{
-                                    .kind = .{ .field_get = .{
-                                        .object = try self.create(Expr, .{
-                                            .kind = .nil_lit, // placeholder for enum type ref
-                                            .type_id = tid,
-                                            .span = fa.object.getMeta().span,
-                                        }),
-                                        .field = fa.field,
-                                    } },
+                                    .kind = .{
+                                        .field_get = .{
+                                            .object = try self.create(Expr, .{
+                                                .kind = .nil_lit, // placeholder for enum type ref
+                                                .type_id = tid,
+                                                .span = fa.object.getMeta().span,
+                                            }),
+                                            .field = fa.field,
+                                        },
+                                    },
                                     .type_id = tid,
                                     .span = fa.meta.span,
                                 });
@@ -2235,14 +2351,16 @@ pub const HirBuilder = struct {
                         const typ = self.type_store.getType(tid);
                         if (typ == .enum_type) {
                             return try self.create(Expr, .{
-                                .kind = .{ .field_get = .{
-                                    .object = try self.create(Expr, .{
-                                        .kind = .nil_lit, // placeholder for enum type ref
-                                        .type_id = tid,
-                                        .span = mr.meta.span,
-                                    }),
-                                    .field = mr.name.parts[1],
-                                } },
+                                .kind = .{
+                                    .field_get = .{
+                                        .object = try self.create(Expr, .{
+                                            .kind = .nil_lit, // placeholder for enum type ref
+                                            .type_id = tid,
+                                            .span = mr.meta.span,
+                                        }),
+                                        .field = mr.name.parts[1],
+                                    },
+                                },
                                 .type_id = tid,
                                 .span = mr.meta.span,
                             });
@@ -2564,4 +2682,292 @@ test "HIR pattern compilation" {
     // Should have built the function with case expression
     try std.testing.expectEqual(@as(usize, 1), hir_program.top_functions.len);
     try std.testing.expectEqual(@as(usize, 0), builder.errors.items.len);
+}
+
+test "HIR typed params default to shared ownership" {
+    const source =
+        \\def add(x :: i64, y :: i64) :: i64 do
+        \\  x + y
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var type_store = types_mod.TypeStore.init(alloc, &parser.interner);
+    defer type_store.deinit();
+
+    var builder = HirBuilder.init(alloc, &parser.interner, &collector.graph, &type_store);
+    defer builder.deinit();
+    const hir_program = try builder.buildProgram(&program);
+
+    const params = hir_program.top_functions[0].clauses[0].params;
+    try std.testing.expectEqual(@as(usize, 2), params.len);
+    try std.testing.expectEqual(Ownership.shared, params[0].ownership);
+    try std.testing.expectEqual(Ownership.shared, params[1].ownership);
+}
+
+test "HIR opaque typed params default to unique ownership" {
+    const source =
+        \\defmodule Test do
+        \\  opaque Handle = String
+        \\
+        \\  def use(handle :: Handle) do
+        \\    handle
+        \\  end
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = types_mod.TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+
+    var builder = HirBuilder.init(alloc, &parser.interner, &collector.graph, &checker.store);
+    defer builder.deinit();
+    const hir_program = try builder.buildProgram(&program);
+
+    const params = hir_program.modules[0].functions[0].clauses[0].params;
+    try std.testing.expectEqual(@as(usize, 1), params.len);
+    try std.testing.expectEqual(Ownership.unique, params[0].ownership);
+}
+
+test "HIR respects borrowed param annotation" {
+    const source =
+        \\defmodule Test do
+        \\  opaque Handle = String
+        \\
+        \\  def inspect(handle :: borrowed Handle) do
+        \\    handle
+        \\  end
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = types_mod.TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var builder = HirBuilder.init(alloc, &parser.interner, &collector.graph, &checker.store);
+    defer builder.deinit();
+    const hir_program = try builder.buildProgram(&program);
+
+    const params = hir_program.modules[0].functions[0].clauses[0].params;
+    try std.testing.expectEqual(Ownership.borrowed, params[0].ownership);
+}
+
+test "HIR call args default to share mode" {
+    const source =
+        \\def foo(x) do
+        \\  x
+        \\end
+        \\
+        \\def bar(y) do
+        \\  foo(y)
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var type_store = types_mod.TypeStore.init(alloc, &parser.interner);
+    defer type_store.deinit();
+
+    var builder = HirBuilder.init(alloc, &parser.interner, &collector.graph, &type_store);
+    defer builder.deinit();
+    const hir_program = try builder.buildProgram(&program);
+
+    const bar_clause = hir_program.top_functions[1].clauses[0];
+    const call_expr = bar_clause.body.stmts[0].expr;
+    try std.testing.expect(call_expr.kind == .call);
+    try std.testing.expectEqual(@as(usize, 1), call_expr.kind.call.args.len);
+    try std.testing.expectEqual(ValueMode.share, call_expr.kind.call.args[0].mode);
+}
+
+test "HIR call args adopt function ownership modes" {
+    const source =
+        \\defmodule Test do
+        \\  def apply(f :: (String -> String), x :: String) do
+        \\    f(x)
+        \\  end
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = types_mod.TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+
+    const apply_clause = program.modules[0].items[0].function.clauses[0];
+    const clause_scope = collector.graph.node_scope_map.get(apply_clause.meta.span.start) orelse apply_clause.meta.scope_id;
+    const f_binding = collector.graph.resolveBinding(clause_scope, apply_clause.params[0].pattern.bind.name).?;
+    const f_type_id = collector.graph.bindings.items[f_binding].type_id.?.type_id;
+    const original_fn_type = checker.store.types.items[f_type_id].function;
+    const param_ownerships = try alloc.alloc(Ownership, original_fn_type.params.len);
+    for (param_ownerships, 0..) |*ownership, idx| {
+        ownership.* = original_fn_type.param_ownerships.?[idx];
+    }
+    param_ownerships[0] = .unique;
+    checker.store.types.items[f_type_id] = .{
+        .function = .{
+            .params = original_fn_type.params,
+            .return_type = original_fn_type.return_type,
+            .param_ownerships = param_ownerships,
+            .return_ownership = original_fn_type.return_ownership,
+        },
+    };
+
+    var builder = HirBuilder.init(alloc, &parser.interner, &collector.graph, &checker.store);
+    defer builder.deinit();
+    const hir_program = try builder.buildProgram(&program);
+
+    const call_expr = hir_program.modules[0].functions[0].clauses[0].body.stmts[0].expr;
+    try std.testing.expect(call_expr.kind == .call);
+    try std.testing.expectEqual(@as(usize, 1), call_expr.kind.call.args.len);
+    try std.testing.expectEqual(ValueMode.move, call_expr.kind.call.args[0].mode);
+}
+
+test "HIR named calls use resolved parameter ownership" {
+    const source =
+        \\defmodule Test do
+        \\  opaque Handle = String
+        \\
+        \\  def take(handle :: Handle) do
+        \\    handle
+        \\  end
+        \\
+        \\  def run(handle :: Handle) do
+        \\    take(handle)
+        \\  end
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = types_mod.TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+
+    var builder = HirBuilder.init(alloc, &parser.interner, &collector.graph, &checker.store);
+    defer builder.deinit();
+    const hir_program = try builder.buildProgram(&program);
+
+    const run_clause = hir_program.modules[0].functions[1].clauses[0];
+    const call_expr = run_clause.body.stmts[0].expr;
+    try std.testing.expect(call_expr.kind == .call);
+    try std.testing.expectEqual(@as(usize, 1), call_expr.kind.call.args.len);
+    try std.testing.expectEqual(ValueMode.move, call_expr.kind.call.args[0].mode);
+}
+
+test "HIR closure calls adopt borrowed ownership mode" {
+    const source =
+        \\defmodule Test do
+        \\  def apply(f :: (String -> String), x :: String) do
+        \\    f(x)
+        \\  end
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = types_mod.TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    const apply_clause = program.modules[0].items[0].function.clauses[0];
+    const clause_scope = collector.graph.node_scope_map.get(apply_clause.meta.span.start) orelse apply_clause.meta.scope_id;
+    const f_binding = collector.graph.resolveBinding(clause_scope, apply_clause.params[0].pattern.bind.name).?;
+    const f_type_id = collector.graph.bindings.items[f_binding].type_id.?.type_id;
+    const original_fn_type = checker.store.types.items[f_type_id].function;
+    const ownerships = try alloc.alloc(Ownership, original_fn_type.params.len);
+    for (ownerships, 0..) |*ownership, idx| ownership.* = original_fn_type.param_ownerships.?[idx];
+    ownerships[0] = .borrowed;
+    checker.store.types.items[f_type_id] = .{ .function = .{
+        .params = original_fn_type.params,
+        .return_type = original_fn_type.return_type,
+        .param_ownerships = ownerships,
+        .return_ownership = original_fn_type.return_ownership,
+    } };
+
+    var builder = HirBuilder.init(alloc, &parser.interner, &collector.graph, &checker.store);
+    defer builder.deinit();
+    const hir_program = try builder.buildProgram(&program);
+
+    const call_expr = hir_program.modules[0].functions[0].clauses[0].body.stmts[0].expr;
+    try std.testing.expect(call_expr.kind == .call);
+    try std.testing.expectEqual(ValueMode.borrow, call_expr.kind.call.args[0].mode);
 }

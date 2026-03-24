@@ -155,6 +155,12 @@ pub const ArcRuntime = struct {
         }
     }
 
+    /// Release (decrement refcount) an Arc-managed value given a pointer to the
+    /// value field. Frees the inner allocation when the refcount reaches zero.
+    pub fn releaseAny(comptime T: type, allocator: std.mem.Allocator, ptr: *T) void {
+        freeAny(T, allocator, ptr);
+    }
+
     /// Retain (increment refcount) an Arc-managed value given a pointer to the value field.
     pub fn retainAny(comptime T: type, ptr: *T) void {
         const Inner = Arc(T).Inner;
@@ -395,7 +401,7 @@ pub const TaggedValue = union(enum) {
         return switch (self) {
             .nil => false,
             .bool_val => |b| b,
-            .atom => |a| !a.eql(Atom.nil) and !a.eql(Atom.@"false"),
+            .atom => |a| !a.eql(Atom.nil) and !a.eql(Atom.false),
             else => true,
         };
     }
@@ -818,7 +824,6 @@ pub const Prelude = struct {
         }
     }
 
-
     pub fn i64_to_string(allocator: std.mem.Allocator, value: i64) ![]const u8 {
         return std.fmt.allocPrint(allocator, "{d}", .{value}) catch {
             var buf: [32]u8 = undefined;
@@ -1128,9 +1133,9 @@ test "Arc struct value" {
 
 test "Atom well-known values" {
     try std.testing.expectEqual(@as(u32, 0), Atom.nil.id);
-    try std.testing.expectEqual(@as(u32, 1), Atom.@"true".id);
+    try std.testing.expectEqual(@as(u32, 1), Atom.true.id);
     try std.testing.expect(Atom.nil.eql(Atom.nil));
-    try std.testing.expect(!Atom.nil.eql(Atom.@"true"));
+    try std.testing.expect(!Atom.nil.eql(Atom.true));
 }
 
 test "AtomTable intern and retrieve" {
@@ -1152,7 +1157,7 @@ test "AtomTable intern and retrieve" {
 
     // Well-known atoms should exist
     try std.testing.expectEqualStrings("nil", table.getName(Atom.nil));
-    try std.testing.expectEqualStrings("true", table.getName(Atom.@"true"));
+    try std.testing.expectEqualStrings("true", table.getName(Atom.true));
 }
 
 test "List cons and hd/tl" {

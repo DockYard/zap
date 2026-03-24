@@ -1405,6 +1405,22 @@ pub const CodeGen = struct {
                 try self.write(bmp.expected);
                 try self.write("\");\n");
             },
+            .retain => |ret| {
+                try self.writeIndent();
+                try self.write("zap_runtime.ArcRuntime.retainAny(@TypeOf(");
+                try self.writeLocal(ret.value);
+                try self.write("), ");
+                try self.writeLocal(ret.value);
+                try self.write(");\n");
+            },
+            .release => |rel| {
+                try self.writeIndent();
+                try self.write("zap_runtime.ArcRuntime.releaseAny(@TypeOf(");
+                try self.writeLocal(rel.value);
+                try self.write("), std.heap.page_allocator, ");
+                try self.writeLocal(rel.value);
+                try self.write(");\n");
+            },
             else => {
                 try self.writeIndent();
                 try self.write("// unhandled instruction\n");

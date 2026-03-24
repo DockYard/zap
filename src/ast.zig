@@ -198,10 +198,17 @@ pub const FunctionClause = struct {
     body: []const Stmt,
 };
 
+pub const Ownership = enum {
+    shared,
+    unique,
+    borrowed,
+};
+
 pub const Param = struct {
     meta: NodeMeta,
     pattern: *const Pattern,
     type_annotation: ?*const TypeExpr,
+    ownership: Ownership = .shared,
     default: ?*const Expr = null,
 };
 
@@ -739,7 +746,7 @@ pub const BinaryPattern = struct {
 
 pub const FunctionRefExpr = struct {
     meta: NodeMeta,
-    module: ?ModuleName,    // null for local function references
+    module: ?ModuleName, // null for local function references
     function: StringId,
     arity: u32,
 };

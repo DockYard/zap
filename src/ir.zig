@@ -15,6 +15,7 @@ pub const FunctionId = u32;
 pub const BlockId = u32;
 pub const LocalId = u32;
 pub const LabelId = u32;
+pub const ValueMode = hir_mod.ValueMode;
 
 // ============================================================
 // IR Program
@@ -355,12 +356,14 @@ pub const CallDirect = struct {
     dest: LocalId,
     function: FunctionId,
     args: []const LocalId,
+    arg_modes: []const ValueMode,
 };
 
 pub const CallNamed = struct {
     dest: LocalId,
     name: []const u8,
     args: []const LocalId,
+    arg_modes: []const ValueMode,
 };
 
 pub const TailCall = struct {
@@ -372,18 +375,21 @@ pub const CallClosure = struct {
     dest: LocalId,
     callee: LocalId,
     args: []const LocalId,
+    arg_modes: []const ValueMode,
 };
 
 pub const CallDispatch = struct {
     dest: LocalId,
     group_id: u32,
     args: []const LocalId,
+    arg_modes: []const ValueMode,
 };
 
 pub const CallBuiltin = struct {
     dest: LocalId,
     name: []const u8,
     args: []const LocalId,
+    arg_modes: []const ValueMode,
 };
 
 pub const Branch = struct {
@@ -1132,11 +1138,14 @@ pub const IrBuilder = struct {
 
                     // Emit the forwarding call
                     const result_local = next_local + @as(LocalId, @intCast(total_params - arity)) + @as(LocalId, @intCast(self.next_local - saved_next_local));
+                    const wrapper_modes = try self.allocator.alloc(ValueMode, call_args.items.len);
+                    for (wrapper_modes) |*mode| mode.* = .share;
                     try wrapper_instrs.append(self.allocator, .{
                         .call_named = .{
                             .dest = result_local,
                             .name = name_str,
                             .args = try call_args.toOwnedSlice(self.allocator),
+                            .arg_modes = wrapper_modes,
                         },
                     });
 
@@ -1842,7 +1851,6 @@ pub const IrBuilder = struct {
         return switchable_type;
     }
 
-
     /// Build the case_block instruction body.
     fn lowerCaseExprBody(self: *IrBuilder, dest: LocalId, scrutinee_local: LocalId, case_data: hir_mod.CaseData) !void {
         // Try to emit a switch for homogeneous integer/bool literals with no guards
@@ -1971,7 +1979,6 @@ pub const IrBuilder = struct {
             });
             return;
         }
-
     }
 
     /// Lower a decision tree for case expressions, emitting case_break at leaves.
@@ -2526,6 +2533,11 @@ pub const IrBuilder = struct {
         return last_local;
     }
 
+    fn isArcManagedType(self: *const IrBuilder, type_id: hir_mod.TypeId) bool {
+        const store = self.type_store orelse return false;
+        return store.getType(type_id) == .opaque_type;
+    }
+
     fn lowerExpr(self: *IrBuilder, expr: *const hir_mod.Expr) anyerror!LocalId {
         // Case expressions need binding locals reserved before dest allocation
         // to avoid shadowing conflicts in the generated Zig.
@@ -2630,13 +2642,23 @@ pub const IrBuilder = struct {
             },
             .call => |call| {
                 var args: std.ArrayList(LocalId) = .empty;
+                var arg_modes: std.ArrayList(ValueMode) = .empty;
+                var shared_arc_args: std.ArrayList(LocalId) = .empty;
                 for (call.args) |arg| {
-                    try args.append(self.allocator, try self.lowerExpr(arg));
+                    const arg_local = try self.lowerExpr(arg.expr);
+                    try args.append(self.allocator, arg_local);
+                    try arg_modes.append(self.allocator, arg.mode);
+                    if (arg.mode == .share and self.isArcManagedType(arg.expr.type_id)) {
+                        try self.current_instrs.append(self.allocator, .{ .retain = .{ .value = arg_local } });
+                        try shared_arc_args.append(self.allocator, arg_local);
+                    }
                 }
                 switch (call.target) {
                     .direct => |dc| {
+                        const lowered_args = try args.toOwnedSlice(self.allocator);
+                        const lowered_modes = try arg_modes.toOwnedSlice(self.allocator);
                         try self.current_instrs.append(self.allocator, .{
-                            .call_direct = .{ .dest = dest, .function = dc.function_group_id, .args = try args.toOwnedSlice(self.allocator) },
+                            .call_direct = .{ .dest = dest, .function = dc.function_group_id, .args = lowered_args, .arg_modes = lowered_modes },
                         });
                     },
                     .named => |nc| {
@@ -2668,7 +2690,7 @@ pub const IrBuilder = struct {
                                     }
                                     // Also check via HIR expr type_id
                                     if (info.param_idx < call.args.len) {
-                                        const arg_type = typeIdToZigTypeWithStore(call.args[info.param_idx].type_id, self.type_store);
+                                        const arg_type = typeIdToZigTypeWithStore(call.args[info.param_idx].expr.type_id, self.type_store);
                                         if (arg_type == .struct_ref) {
                                             if (info.variants.contains(arg_type.struct_ref)) {
                                                 break :blk arg_type.struct_ref;
@@ -2693,31 +2715,43 @@ pub const IrBuilder = struct {
                                     wrapped_args[info.param_idx] = wrapped;
                                 }
                             }
+                            const lowered_modes = try arg_modes.toOwnedSlice(self.allocator);
                             try self.current_instrs.append(self.allocator, .{
-                                .call_named = .{ .dest = dest, .name = resolved_name, .args = wrapped_args },
+                                .call_named = .{ .dest = dest, .name = resolved_name, .args = wrapped_args, .arg_modes = lowered_modes },
                             });
                         } else {
+                            const lowered_args = try args.toOwnedSlice(self.allocator);
+                            const lowered_modes = try arg_modes.toOwnedSlice(self.allocator);
                             try self.current_instrs.append(self.allocator, .{
-                                .call_named = .{ .dest = dest, .name = resolved_name, .args = try args.toOwnedSlice(self.allocator) },
+                                .call_named = .{ .dest = dest, .name = resolved_name, .args = lowered_args, .arg_modes = lowered_modes },
                             });
                         }
                     },
                     .closure => |callee| {
                         const callee_local = try self.lowerExpr(callee);
+                        const lowered_args = try args.toOwnedSlice(self.allocator);
+                        const lowered_modes = try arg_modes.toOwnedSlice(self.allocator);
                         try self.current_instrs.append(self.allocator, .{
-                            .call_closure = .{ .dest = dest, .callee = callee_local, .args = try args.toOwnedSlice(self.allocator) },
+                            .call_closure = .{ .dest = dest, .callee = callee_local, .args = lowered_args, .arg_modes = lowered_modes },
                         });
                     },
                     .dispatch => |dc| {
+                        const lowered_args = try args.toOwnedSlice(self.allocator);
+                        const lowered_modes = try arg_modes.toOwnedSlice(self.allocator);
                         try self.current_instrs.append(self.allocator, .{
-                            .call_dispatch = .{ .dest = dest, .group_id = dc.function_group_id, .args = try args.toOwnedSlice(self.allocator) },
+                            .call_dispatch = .{ .dest = dest, .group_id = dc.function_group_id, .args = lowered_args, .arg_modes = lowered_modes },
                         });
                     },
                     .builtin => |name| {
+                        const lowered_args = try args.toOwnedSlice(self.allocator);
+                        const lowered_modes = try arg_modes.toOwnedSlice(self.allocator);
                         try self.current_instrs.append(self.allocator, .{
-                            .call_builtin = .{ .dest = dest, .name = name, .args = try args.toOwnedSlice(self.allocator) },
+                            .call_builtin = .{ .dest = dest, .name = name, .args = lowered_args, .arg_modes = lowered_modes },
                         });
                     },
+                }
+                for (shared_arc_args.items) |arg_local| {
+                    try self.current_instrs.append(self.allocator, .{ .release = .{ .value = arg_local } });
                 }
             },
             .branch => {
@@ -3029,6 +3063,9 @@ fn typeIdToZigTypeWithStore(type_id: types_mod.TypeId, type_store: ?*const types
                         .enum_type => |et| {
                             return .{ .struct_ref = ts.interner.get(et.name) };
                         },
+                        .opaque_type => |ot| {
+                            return .{ .struct_ref = ts.interner.get(ot.name) };
+                        },
                         .tuple => |tt| {
                             var zig_elems = ts.allocator.alloc(ZigType, tt.elements.len) catch return .any;
                             for (tt.elements, 0..) |elem, i| {
@@ -3103,6 +3140,9 @@ fn typeIdToZigTypeStrWithStore(type_id: types_mod.TypeId, type_store: ?*const ty
                         .enum_type => |et| {
                             return ts.interner.get(et.name);
                         },
+                        .opaque_type => |ot| {
+                            return ts.interner.get(ot.name);
+                        },
                         else => {},
                     }
                 }
@@ -3146,6 +3186,7 @@ test "IR build simple function" {
     const hir_program = try hir_builder.buildProgram(&program);
 
     var ir_builder = IrBuilder.init(alloc, &parser.interner);
+    ir_builder.type_store = &type_store;
     defer ir_builder.deinit();
     const ir_program = try ir_builder.buildProgram(&hir_program);
 
@@ -3181,6 +3222,7 @@ test "IR param_get indices are unique for multi-parameter functions" {
     const hir_program = try hir_builder.buildProgram(&program);
 
     var ir_builder = IrBuilder.init(alloc, &parser.interner);
+    ir_builder.type_store = &type_store;
     defer ir_builder.deinit();
     const ir_program = try ir_builder.buildProgram(&hir_program);
 
@@ -3208,4 +3250,264 @@ test "IR param_get indices are unique for multi-parameter functions" {
     // First param_get should have index 0, second should have index 1
     try std.testing.expectEqual(@as(u32, 0), param_gets[0]);
     try std.testing.expectEqual(@as(u32, 1), param_gets[1]);
+}
+
+test "IR call preserves HIR arg modes" {
+    const source =
+        \\defmodule Test do
+        \\  def apply(f :: (String -> String), x :: String) do
+        \\    f(x)
+        \\  end
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = types_mod.TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    const apply_clause = program.modules[0].items[0].function.clauses[0];
+    const clause_scope = collector.graph.node_scope_map.get(apply_clause.meta.span.start) orelse apply_clause.meta.scope_id;
+    const f_binding = collector.graph.resolveBinding(clause_scope, apply_clause.params[0].pattern.bind.name).?;
+    const f_type_id = collector.graph.bindings.items[f_binding].type_id.?.type_id;
+    const original_fn_type = checker.store.types.items[f_type_id].function;
+    const ownerships = try alloc.alloc(types_mod.Ownership, original_fn_type.params.len);
+    for (ownerships, 0..) |*ownership, idx| ownership.* = original_fn_type.param_ownerships.?[idx];
+    ownerships[0] = .unique;
+    checker.store.types.items[f_type_id] = .{ .function = .{
+        .params = original_fn_type.params,
+        .return_type = original_fn_type.return_type,
+        .param_ownerships = ownerships,
+        .return_ownership = original_fn_type.return_ownership,
+    } };
+
+    var hir_builder = hir_mod.HirBuilder.init(alloc, &parser.interner, &collector.graph, &checker.store);
+    defer hir_builder.deinit();
+    const hir_program = try hir_builder.buildProgram(&program);
+
+    var ir_builder = IrBuilder.init(alloc, &parser.interner);
+    ir_builder.type_store = &checker.store;
+    defer ir_builder.deinit();
+    const ir_program = try ir_builder.buildProgram(&hir_program);
+
+    const func = ir_program.functions[0];
+    var found_call = false;
+    for (func.body[0].instructions) |instr| {
+        switch (instr) {
+            .call_closure => |call| {
+                try std.testing.expectEqual(@as(usize, 1), call.arg_modes.len);
+                try std.testing.expectEqual(ValueMode.move, call.arg_modes[0]);
+                found_call = true;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(found_call);
+}
+
+test "IR named call preserves move mode" {
+    const source =
+        \\defmodule Test do
+        \\  opaque Handle = String
+        \\
+        \\  def take(handle :: Handle) do
+        \\    handle
+        \\  end
+        \\
+        \\  def run(handle :: Handle) do
+        \\    take(handle)
+        \\  end
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = types_mod.TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var hir_builder = hir_mod.HirBuilder.init(alloc, &parser.interner, &collector.graph, &checker.store);
+    defer hir_builder.deinit();
+    const hir_program = try hir_builder.buildProgram(&program);
+
+    var ir_builder = IrBuilder.init(alloc, &parser.interner);
+    ir_builder.type_store = &checker.store;
+    defer ir_builder.deinit();
+    const ir_program = try ir_builder.buildProgram(&hir_program);
+
+    const run_func = ir_program.functions[1];
+    var found_call = false;
+    for (run_func.body[0].instructions) |instr| {
+        switch (instr) {
+            .call_named => |call| {
+                try std.testing.expectEqual(@as(usize, 1), call.arg_modes.len);
+                try std.testing.expectEqual(ValueMode.move, call.arg_modes[0]);
+                found_call = true;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(found_call);
+}
+
+test "IR closure call preserves borrow mode without ARC ops" {
+    const source =
+        \\defmodule Test do
+        \\  opaque Handle = String
+        \\
+        \\  def apply(f :: (Handle -> Handle), x :: Handle) do
+        \\    f(x)
+        \\  end
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = types_mod.TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    const apply_clause = program.modules[0].items[1].function.clauses[0];
+    const clause_scope = collector.graph.node_scope_map.get(apply_clause.meta.span.start) orelse apply_clause.meta.scope_id;
+    const f_binding = collector.graph.resolveBinding(clause_scope, apply_clause.params[0].pattern.bind.name).?;
+    const f_type_id = collector.graph.bindings.items[f_binding].type_id.?.type_id;
+    const original_fn_type = checker.store.types.items[f_type_id].function;
+    const ownerships = try alloc.alloc(types_mod.Ownership, original_fn_type.params.len);
+    for (ownerships, 0..) |*ownership, idx| ownership.* = original_fn_type.param_ownerships.?[idx];
+    ownerships[0] = .borrowed;
+    checker.store.types.items[f_type_id] = .{ .function = .{
+        .params = original_fn_type.params,
+        .return_type = original_fn_type.return_type,
+        .param_ownerships = ownerships,
+        .return_ownership = original_fn_type.return_ownership,
+    } };
+
+    var hir_builder = hir_mod.HirBuilder.init(alloc, &parser.interner, &collector.graph, &checker.store);
+    defer hir_builder.deinit();
+    const hir_program = try hir_builder.buildProgram(&program);
+
+    var ir_builder = IrBuilder.init(alloc, &parser.interner);
+    ir_builder.type_store = &checker.store;
+    defer ir_builder.deinit();
+    const ir_program = try ir_builder.buildProgram(&hir_program);
+
+    const func = ir_program.functions[0];
+    var found_call = false;
+    var retain_count: usize = 0;
+    var release_count: usize = 0;
+    for (func.body[0].instructions) |instr| {
+        switch (instr) {
+            .call_closure => |call| {
+                try std.testing.expectEqual(@as(usize, 1), call.arg_modes.len);
+                try std.testing.expectEqual(ValueMode.borrow, call.arg_modes[0]);
+                found_call = true;
+            },
+            .retain => retain_count += 1,
+            .release => release_count += 1,
+            else => {},
+        }
+    }
+    try std.testing.expect(found_call);
+    try std.testing.expectEqual(@as(usize, 0), retain_count);
+    try std.testing.expectEqual(@as(usize, 0), release_count);
+}
+
+test "IR shared opaque call emits retain and release" {
+    const source =
+        \\defmodule Test do
+        \\  opaque Handle = String
+        \\
+        \\  def use(handle :: Handle) do
+        \\    handle
+        \\  end
+        \\
+        \\  def run(use_fn :: (Handle -> Handle), handle :: Handle) do
+        \\    use_fn(handle)
+        \\  end
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = types_mod.TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    const run_clause = program.modules[0].items[2].function.clauses[0];
+    const clause_scope = collector.graph.node_scope_map.get(run_clause.meta.span.start) orelse run_clause.meta.scope_id;
+    const fn_binding = collector.graph.resolveBinding(clause_scope, run_clause.params[0].pattern.bind.name).?;
+    const fn_type_id = collector.graph.bindings.items[fn_binding].type_id.?.type_id;
+    const original_fn_type = checker.store.types.items[fn_type_id].function;
+    const ownerships = try alloc.alloc(types_mod.Ownership, original_fn_type.params.len);
+    for (ownerships, 0..) |*ownership, idx| ownership.* = original_fn_type.param_ownerships.?[idx];
+    ownerships[0] = .shared;
+    checker.store.types.items[fn_type_id] = .{ .function = .{
+        .params = original_fn_type.params,
+        .return_type = original_fn_type.return_type,
+        .param_ownerships = ownerships,
+        .return_ownership = original_fn_type.return_ownership,
+    } };
+
+    var hir_builder = hir_mod.HirBuilder.init(alloc, &parser.interner, &collector.graph, &checker.store);
+    defer hir_builder.deinit();
+    const hir_program = try hir_builder.buildProgram(&program);
+
+    var ir_builder = IrBuilder.init(alloc, &parser.interner);
+    ir_builder.type_store = &checker.store;
+    defer ir_builder.deinit();
+    const ir_program = try ir_builder.buildProgram(&hir_program);
+
+    const run_func = ir_program.functions[1];
+    var retain_count: usize = 0;
+    var release_count: usize = 0;
+    for (run_func.body[0].instructions) |instr| {
+        switch (instr) {
+            .retain => retain_count += 1,
+            .release => release_count += 1,
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), retain_count);
+    try std.testing.expectEqual(@as(usize, 1), release_count);
 }

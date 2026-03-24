@@ -168,9 +168,18 @@ pub const Parser = struct {
                     // After newline, check if next token starts a new statement
                     self.skipNewlines();
                     switch (self.peek()) {
-                        .keyword_def, .keyword_defp, .keyword_defmodule, .keyword_defmacro,
-                        .keyword_defstruct, .keyword_defenum, .keyword_type, .keyword_opaque,
-                        .keyword_alias, .keyword_import, .keyword_end, .eof,
+                        .keyword_def,
+                        .keyword_defp,
+                        .keyword_defmodule,
+                        .keyword_defmacro,
+                        .keyword_defstruct,
+                        .keyword_defenum,
+                        .keyword_type,
+                        .keyword_opaque,
+                        .keyword_alias,
+                        .keyword_import,
+                        .keyword_end,
+                        .eof,
                         => return,
                         else => {},
                     }
@@ -867,7 +876,15 @@ pub const Parser = struct {
         const pattern = try self.parsePattern();
 
         var type_annotation: ?*const ast.TypeExpr = null;
+        var ownership: ast.Ownership = .shared;
         if (self.match(.double_colon)) {
+            if (self.match(.keyword_shared)) {
+                ownership = .shared;
+            } else if (self.match(.keyword_unique)) {
+                ownership = .unique;
+            } else if (self.match(.keyword_borrowed)) {
+                ownership = .borrowed;
+            }
             type_annotation = try self.parseTypeExpr();
         }
 
@@ -880,6 +897,7 @@ pub const Parser = struct {
             .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
             .pattern = pattern,
             .type_annotation = type_annotation,
+            .ownership = ownership,
             .default = default,
         };
     }
@@ -2866,10 +2884,10 @@ pub const Parser = struct {
         // If lowercase with no args, could be a type variable
         if (text[0] >= 'a' and text[0] <= 'z' and args.items.len == 0) {
             const known_types = [_][]const u8{
-                "i8",    "i16",   "i32",    "i64",
-                "u8",    "u16",   "u32",    "u64",
-                "f16",   "f32",   "f64",
-                "usize", "isize",
+                "i8",    "i16", "i32", "i64",
+                "u8",    "u16", "u32", "u64",
+                "f16",   "f32", "f64", "usize",
+                "isize",
             };
             for (known_types) |kt| {
                 if (std.mem.eql(u8, text, kt)) {
@@ -3066,6 +3084,39 @@ test "parse simple function" {
     const program = try parser.parseProgram();
     try std.testing.expectEqual(@as(usize, 1), program.top_items.len);
     try std.testing.expect(program.top_items[0] == .function);
+    try std.testing.expectEqual(ast.Ownership.shared, program.top_items[0].function.clauses[0].params[0].ownership);
+}
+
+test "parse unique param ownership annotation" {
+    const source =
+        \\def use(handle :: unique String) do
+        \\  handle
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    try std.testing.expectEqual(ast.Ownership.unique, program.top_items[0].function.clauses[0].params[0].ownership);
+}
+
+test "parse borrowed param ownership annotation" {
+    const source =
+        \\def use(handle :: borrowed String) do
+        \\  handle
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    try std.testing.expectEqual(ast.Ownership.borrowed, program.top_items[0].function.clauses[0].params[0].ownership);
 }
 
 test "parse module" {

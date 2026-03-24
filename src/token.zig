@@ -57,6 +57,9 @@ pub const Token = struct {
         keyword_only,
         keyword_except,
         keyword_as,
+        keyword_shared,
+        keyword_unique,
+        keyword_borrowed,
 
         // Operators
         plus, // +
@@ -149,6 +152,9 @@ pub const Token = struct {
         .{ "only", .keyword_only },
         .{ "except", .keyword_except },
         .{ "as", .keyword_as },
+        .{ "shared", .keyword_shared },
+        .{ "unique", .keyword_unique },
+        .{ "borrowed", .keyword_borrowed },
     });
 
     pub fn getKeyword(bytes: []const u8) ?Tag {
