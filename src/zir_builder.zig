@@ -541,8 +541,12 @@ pub const ZirDriver = struct {
     }
 
     fn emitFunction(self: *ZirDriver, func: ir.Function) !void {
+        // Detect main function: bare "main" or module-prefixed "__main"
+        const is_main = std.mem.eql(u8, func.name, "main") or
+            std.mem.endsWith(u8, func.name, "__main");
+
         // In library mode, skip the main function.
-        if (self.lib_mode and std.mem.eql(u8, func.name, "main")) return;
+        if (self.lib_mode and is_main) return;
 
         self.local_refs.clearRetainingCapacity();
         self.param_refs.clearRetainingCapacity();
@@ -550,9 +554,6 @@ pub const ZirDriver = struct {
         self.current_closure_env_ref = null;
         self.current_function_id = func.id;
         const closure_lowering = self.getClosureLowering(func.id, func.captures.len);
-
-        // Zig's main must return void or u8.
-        const is_main = std.mem.eql(u8, func.name, "main");
         const ret_type = if (is_main)
             mapMainReturnType(func.return_type)
         else
@@ -560,7 +561,9 @@ pub const ZirDriver = struct {
 
         self.current_ret_type = ret_type;
 
-        if (zir_builder_begin_func(self.handle, func.name.ptr, @intCast(func.name.len), ret_type) != 0) {
+        // Emit entry point as "main" so Zig's std.start can find it
+        const emit_name = if (is_main) "main" else func.name;
+        if (zir_builder_begin_func(self.handle, emit_name.ptr, @intCast(emit_name.len), ret_type) != 0) {
             return error.BeginFuncFailed;
         }
 
