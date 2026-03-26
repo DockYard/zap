@@ -10,7 +10,9 @@ defmodule Math do
   end
 end
 
-def main() do
-  Math.compute(5)
-  |> Kernel.inspect()
+defmodule DoubleMacro do
+  def main() do
+    Math.compute(5)
+    |> Kernel.inspect()
+  end
 end

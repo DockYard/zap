@@ -231,19 +231,15 @@ pub const Parser = struct {
                         self.synchronize();
                     }
                 },
-                .keyword_def => {
-                    if (self.parseFunctionDecl(.public)) |func| {
-                        try top_items.append(self.allocator, .{ .function = func });
-                    } else |_| {
-                        self.synchronize();
-                    }
-                },
-                .keyword_defp => {
-                    if (self.parseFunctionDecl(.private)) |func| {
-                        try top_items.append(self.allocator, .{ .priv_function = func });
-                    } else |_| {
-                        self.synchronize();
-                    }
+                .keyword_def, .keyword_defp => {
+                    try self.addRichError(
+                        "functions cannot be defined at the top level",
+                        self.currentSpan(),
+                        null,
+                        "move this function inside a `defmodule` block",
+                    );
+                    _ = self.advance(); // skip past def/defp to avoid infinite loop
+                    self.synchronize();
                 },
                 .keyword_type => {
                     if (self.parseTypeDecl()) |td| {
@@ -308,7 +304,7 @@ pub const Parser = struct {
                         }) catch "unexpected token at top level",
                         self.currentSpan(),
                         null,
-                        "the top level can contain `defmodule`, `def`, `defp`, `defstruct`, `defenum`, `type`, and `opaque` declarations",
+                        "the top level can contain `defmodule`, `defstruct`, `defenum`, `type`, and `opaque` declarations",
                     );
                     _ = self.advance();
                 },
@@ -877,13 +873,17 @@ pub const Parser = struct {
 
         var type_annotation: ?*const ast.TypeExpr = null;
         var ownership: ast.Ownership = .shared;
+        var ownership_explicit = false;
         if (self.match(.double_colon)) {
             if (self.match(.keyword_shared)) {
                 ownership = .shared;
+                ownership_explicit = true;
             } else if (self.match(.keyword_unique)) {
                 ownership = .unique;
+                ownership_explicit = true;
             } else if (self.match(.keyword_borrowed)) {
                 ownership = .borrowed;
+                ownership_explicit = true;
             }
             type_annotation = try self.parseTypeExpr();
         }
@@ -898,6 +898,7 @@ pub const Parser = struct {
             .pattern = pattern,
             .type_annotation = type_annotation,
             .ownership = ownership,
+            .ownership_explicit = ownership_explicit,
             .default = default,
         };
     }
@@ -2635,49 +2636,72 @@ pub const Parser = struct {
 
         if (self.check(.arrow)) {
             _ = self.advance();
+            const return_q = try self.parseOptionalOwnershipQualifier();
             const return_type = try self.parseTypeExpr();
             _ = try self.expect(.right_paren);
             return self.create(ast.TypeExpr, .{
                 .function = .{
                     .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
                     .params = &[_]*const ast.TypeExpr{},
+                    .param_ownerships = &[_]ast.Ownership{},
+                    .param_ownerships_explicit = &[_]bool{},
                     .return_type = return_type,
+                    .return_ownership = return_q.ownership,
+                    .return_ownership_explicit = return_q.explicit,
                 },
             });
         }
 
+        const first_q = try self.parseOptionalOwnershipQualifier();
         const first = try self.parseTypeExpr();
 
         if (self.check(.arrow)) {
             _ = self.advance();
+            const return_q = try self.parseOptionalOwnershipQualifier();
             const return_type = try self.parseTypeExpr();
             _ = try self.expect(.right_paren);
             return self.create(ast.TypeExpr, .{
                 .function = .{
                     .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
                     .params = try self.allocator.dupe(*const ast.TypeExpr, &[_]*const ast.TypeExpr{first}),
+                    .param_ownerships = try self.allocator.dupe(ast.Ownership, &[_]ast.Ownership{first_q.ownership}),
+                    .param_ownerships_explicit = try self.allocator.dupe(bool, &[_]bool{first_q.explicit}),
                     .return_type = return_type,
+                    .return_ownership = return_q.ownership,
+                    .return_ownership_explicit = return_q.explicit,
                 },
             });
         }
 
         if (self.check(.comma)) {
             var params: std.ArrayList(*const ast.TypeExpr) = .empty;
+            var param_ownerships: std.ArrayList(ast.Ownership) = .empty;
+            var param_ownerships_explicit: std.ArrayList(bool) = .empty;
             try params.append(self.allocator, first);
+            try param_ownerships.append(self.allocator, first_q.ownership);
+            try param_ownerships_explicit.append(self.allocator, first_q.explicit);
             while (self.match(.comma)) {
                 if (self.check(.arrow)) break;
+                const ownership = try self.parseOptionalOwnershipQualifier();
                 const param = try self.parseTypeExpr();
                 try params.append(self.allocator, param);
+                try param_ownerships.append(self.allocator, ownership.ownership);
+                try param_ownerships_explicit.append(self.allocator, ownership.explicit);
             }
             if (self.check(.arrow)) {
                 _ = self.advance();
+                const return_q = try self.parseOptionalOwnershipQualifier();
                 const return_type = try self.parseTypeExpr();
                 _ = try self.expect(.right_paren);
                 return self.create(ast.TypeExpr, .{
                     .function = .{
                         .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
                         .params = try params.toOwnedSlice(self.allocator),
+                        .param_ownerships = try param_ownerships.toOwnedSlice(self.allocator),
+                        .param_ownerships_explicit = try param_ownerships_explicit.toOwnedSlice(self.allocator),
                         .return_type = return_type,
+                        .return_ownership = return_q.ownership,
+                        .return_ownership_explicit = return_q.explicit,
                     },
                 });
             }
@@ -2690,6 +2714,13 @@ pub const Parser = struct {
                 .inner = first,
             },
         });
+    }
+
+    fn parseOptionalOwnershipQualifier(self: *Parser) !struct { ownership: ast.Ownership, explicit: bool } {
+        if (self.match(.keyword_shared)) return .{ .ownership = .shared, .explicit = true };
+        if (self.match(.keyword_unique)) return .{ .ownership = .unique, .explicit = true };
+        if (self.match(.keyword_borrowed)) return .{ .ownership = .borrowed, .explicit = true };
+        return .{ .ownership = .shared, .explicit = false };
     }
 
     fn parseTupleType(self: *Parser) !*const ast.TypeExpr {
@@ -3069,10 +3100,44 @@ fn tokenHumanName(tag: Token.Tag) []const u8 {
 // Tests
 // ============================================================
 
+test "top-level def is rejected" {
+    const source =
+        \\def foo() do
+        \\  42
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const result = parser.parseProgram();
+    try std.testing.expectError(error.ParseError, result);
+}
+
+test "top-level defp is rejected" {
+    const source =
+        \\defp foo() do
+        \\  42
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const result = parser.parseProgram();
+    try std.testing.expectError(error.ParseError, result);
+}
+
 test "parse simple function" {
     const source =
-        \\def add(x :: i64, y :: i64) :: i64 do
-        \\  x + y
+        \\defmodule Test do
+        \\  def add(x :: i64, y :: i64) :: i64 do
+        \\    x + y
+        \\  end
         \\end
     ;
 
@@ -3082,15 +3147,18 @@ test "parse simple function" {
     defer parser.deinit();
 
     const program = try parser.parseProgram();
-    try std.testing.expectEqual(@as(usize, 1), program.top_items.len);
-    try std.testing.expect(program.top_items[0] == .function);
-    try std.testing.expectEqual(ast.Ownership.shared, program.top_items[0].function.clauses[0].params[0].ownership);
+    try std.testing.expectEqual(@as(usize, 1), program.modules.len);
+    try std.testing.expectEqual(@as(usize, 1), program.modules[0].items.len);
+    try std.testing.expect(program.modules[0].items[0] == .function);
+    try std.testing.expectEqual(ast.Ownership.shared, program.modules[0].items[0].function.clauses[0].params[0].ownership);
 }
 
 test "parse unique param ownership annotation" {
     const source =
-        \\def use(handle :: unique String) do
-        \\  handle
+        \\defmodule Test do
+        \\  def use(handle :: unique String) do
+        \\    handle
+        \\  end
         \\end
     ;
 
@@ -3100,13 +3168,15 @@ test "parse unique param ownership annotation" {
     defer parser.deinit();
 
     const program = try parser.parseProgram();
-    try std.testing.expectEqual(ast.Ownership.unique, program.top_items[0].function.clauses[0].params[0].ownership);
+    try std.testing.expectEqual(ast.Ownership.unique, program.modules[0].items[0].function.clauses[0].params[0].ownership);
 }
 
 test "parse borrowed param ownership annotation" {
     const source =
-        \\def use(handle :: borrowed String) do
-        \\  handle
+        \\defmodule Test do
+        \\  def use(handle :: borrowed String) do
+        \\    handle
+        \\  end
         \\end
     ;
 
@@ -3116,7 +3186,27 @@ test "parse borrowed param ownership annotation" {
     defer parser.deinit();
 
     const program = try parser.parseProgram();
-    try std.testing.expectEqual(ast.Ownership.borrowed, program.top_items[0].function.clauses[0].params[0].ownership);
+    try std.testing.expectEqual(ast.Ownership.borrowed, program.modules[0].items[0].function.clauses[0].params[0].ownership);
+}
+
+test "parse function type ownership annotations" {
+    const source =
+        \\defmodule Test do
+        \\  def apply(f :: (borrowed String -> unique String)) do
+        \\    f
+        \\  end
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const fn_type = program.modules[0].items[0].function.clauses[0].params[0].type_annotation.?.function;
+    try std.testing.expectEqual(ast.Ownership.borrowed, fn_type.param_ownerships[0]);
+    try std.testing.expectEqual(ast.Ownership.unique, fn_type.return_ownership);
 }
 
 test "parse module" {
@@ -3153,11 +3243,13 @@ test "parse type declaration" {
 
 test "parse if expression" {
     const source =
-        \\def foo(x :: i64) :: i64 do
-        \\  if x > 0 do
-        \\    x
-        \\  else
-        \\    0
+        \\defmodule Test do
+        \\  def foo(x :: i64) :: i64 do
+        \\    if x > 0 do
+        \\      x
+        \\    else
+        \\      0
+        \\    end
         \\  end
         \\end
     ;
@@ -3168,17 +3260,19 @@ test "parse if expression" {
     defer parser.deinit();
 
     const program = try parser.parseProgram();
-    try std.testing.expectEqual(@as(usize, 1), program.top_items.len);
+    try std.testing.expectEqual(@as(usize, 1), program.modules.len);
 }
 
 test "parse case expression" {
     const source =
-        \\def foo(x) do
-        \\  case x do
-        \\    {:ok, v} ->
-        \\      v
-        \\    {:error, e} ->
-        \\      e
+        \\defmodule Test do
+        \\  def foo(x) do
+        \\    case x do
+        \\      {:ok, v} ->
+        \\        v
+        \\      {:error, e} ->
+        \\        e
+        \\    end
         \\  end
         \\end
     ;
@@ -3189,13 +3283,15 @@ test "parse case expression" {
     defer parser.deinit();
 
     const program = try parser.parseProgram();
-    try std.testing.expectEqual(@as(usize, 1), program.top_items.len);
+    try std.testing.expectEqual(@as(usize, 1), program.modules.len);
 }
 
 test "parse binary operators" {
     const source =
-        \\def calc(x :: i64, y :: i64) :: i64 do
-        \\  x + y * 2
+        \\defmodule Test do
+        \\  def calc(x :: i64, y :: i64) :: i64 do
+        \\    x + y * 2
+        \\  end
         \\end
     ;
 
@@ -3205,9 +3301,9 @@ test "parse binary operators" {
     defer parser.deinit();
 
     const program = try parser.parseProgram();
-    try std.testing.expectEqual(@as(usize, 1), program.top_items.len);
+    try std.testing.expectEqual(@as(usize, 1), program.modules.len);
 
-    const func = program.top_items[0].function;
+    const func = program.modules[0].items[0].function;
     const body = func.clauses[0].body;
     try std.testing.expectEqual(@as(usize, 1), body.len);
 
@@ -3218,8 +3314,10 @@ test "parse binary operators" {
 
 test "parse tuple and list" {
     const source =
-        \\def foo() do
-        \\  {1, 2, 3}
+        \\defmodule Test do
+        \\  def foo() do
+        \\    {1, 2, 3}
+        \\  end
         \\end
     ;
 
@@ -3229,13 +3327,15 @@ test "parse tuple and list" {
     defer parser.deinit();
 
     const program = try parser.parseProgram();
-    try std.testing.expectEqual(@as(usize, 1), program.top_items.len);
+    try std.testing.expectEqual(@as(usize, 1), program.modules.len);
 }
 
 test "parse refinement predicate" {
     const source =
-        \\def abs(x :: i64) :: i64 if x < 0 do
-        \\  -x
+        \\defmodule Test do
+        \\  def abs(x :: i64) :: i64 if x < 0 do
+        \\    -x
+        \\  end
         \\end
     ;
 
@@ -3245,15 +3345,17 @@ test "parse refinement predicate" {
     defer parser.deinit();
 
     const program = try parser.parseProgram();
-    const func = program.top_items[0].function;
+    const func = program.modules[0].items[0].function;
     try std.testing.expect(func.clauses[0].refinement != null);
 }
 
 test "parse assignment" {
     const source =
-        \\def foo() do
-        \\  x = 42
-        \\  x
+        \\defmodule Test do
+        \\  def foo() do
+        \\    x = 42
+        \\    x
+        \\  end
         \\end
     ;
 
@@ -3263,7 +3365,7 @@ test "parse assignment" {
     defer parser.deinit();
 
     const program = try parser.parseProgram();
-    const func = program.top_items[0].function;
+    const func = program.modules[0].items[0].function;
     const body = func.clauses[0].body;
     try std.testing.expectEqual(@as(usize, 2), body.len);
     try std.testing.expect(body[0] == .assignment);
@@ -3271,8 +3373,10 @@ test "parse assignment" {
 
 test "parse function call" {
     const source =
-        \\def foo() do
-        \\  bar(1, 2)
+        \\defmodule Test do
+        \\  def foo() do
+        \\    bar(1, 2)
+        \\  end
         \\end
     ;
 
@@ -3282,7 +3386,7 @@ test "parse function call" {
     defer parser.deinit();
 
     const program = try parser.parseProgram();
-    const func = program.top_items[0].function;
+    const func = program.modules[0].items[0].function;
     const body = func.clauses[0].body;
     try std.testing.expectEqual(@as(usize, 1), body.len);
     try std.testing.expect(body[0].expr.* == .call);
@@ -3290,8 +3394,10 @@ test "parse function call" {
 
 test "parse pipe operator" {
     const source =
-        \\def foo(x) do
-        \\  x |> bar(1)
+        \\defmodule Test do
+        \\  def foo(x) do
+        \\    x |> bar(1)
+        \\  end
         \\end
     ;
 
@@ -3301,7 +3407,7 @@ test "parse pipe operator" {
     defer parser.deinit();
 
     const program = try parser.parseProgram();
-    const func = program.top_items[0].function;
+    const func = program.modules[0].items[0].function;
     const body = func.clauses[0].body;
     try std.testing.expect(body[0].expr.* == .pipe);
 }
@@ -3336,8 +3442,10 @@ test "parse struct declaration" {
 
 test "parse panic expression" {
     const source =
-        \\def foo() do
-        \\  panic("oops")
+        \\defmodule Test do
+        \\  def foo() do
+        \\    panic("oops")
+        \\  end
         \\end
     ;
 
@@ -3347,15 +3455,17 @@ test "parse panic expression" {
     defer parser.deinit();
 
     const program = try parser.parseProgram();
-    const func = program.top_items[0].function;
+    const func = program.modules[0].items[0].function;
     const body = func.clauses[0].body;
     try std.testing.expect(body[0].expr.* == .panic_expr);
 }
 
 test "parse unwrap operator" {
     const source =
-        \\def foo(x) do
-        \\  bar(x)!
+        \\defmodule Test do
+        \\  def foo(x) do
+        \\    bar(x)!
+        \\  end
         \\end
     ;
 
@@ -3365,18 +3475,20 @@ test "parse unwrap operator" {
     defer parser.deinit();
 
     const program = try parser.parseProgram();
-    const func = program.top_items[0].function;
+    const func = program.modules[0].items[0].function;
     const body = func.clauses[0].body;
     try std.testing.expect(body[0].expr.* == .unwrap);
 }
 
 test "parse local function" {
     const source =
-        \\def outer(x :: i64) :: String do
-        \\  def inner(s :: String) :: String do
-        \\    s
+        \\defmodule Test do
+        \\  def outer(x :: i64) :: String do
+        \\    def inner(s :: String) :: String do
+        \\      s
+        \\    end
+        \\    inner("ok")
         \\  end
-        \\  inner("ok")
         \\end
     ;
 
@@ -3386,7 +3498,7 @@ test "parse local function" {
     defer parser.deinit();
 
     const program = try parser.parseProgram();
-    const func = program.top_items[0].function;
+    const func = program.modules[0].items[0].function;
     const body = func.clauses[0].body;
     try std.testing.expect(body.len >= 2);
     try std.testing.expect(body[0] == .function_decl);
@@ -3515,8 +3627,10 @@ test "parse struct init with type annotation" {
         \\  y :: f64
         \\end
         \\
-        \\def main() do
-        \\  %{x: 1.0, y: 2.0} :: Point
+        \\defmodule Test do
+        \\  def main() do
+        \\    %{x: 1.0, y: 2.0} :: Point
+        \\  end
         \\end
     ;
 
@@ -3526,9 +3640,9 @@ test "parse struct init with type annotation" {
     defer parser.deinit();
 
     const program = try parser.parseProgram();
-    // Should have defstruct + def
+    // Should have defstruct + defmodule
     try std.testing.expectEqual(@as(usize, 2), program.top_items.len);
-    const func = program.top_items[1].function;
+    const func = program.modules[0].items[0].function;
     const body = func.clauses[0].body;
     try std.testing.expect(body[0].expr.* == .struct_expr);
 }

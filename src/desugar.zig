@@ -408,8 +408,10 @@ const Parser = @import("parser.zig").Parser;
 
 test "desugar pipe operator" {
     const source =
-        \\def foo(x) do
-        \\  x |> bar(1)
+        \\defmodule Test do
+        \\  def foo(x) do
+        \\    x |> bar(1)
+        \\  end
         \\end
     ;
 
@@ -425,7 +427,7 @@ test "desugar pipe operator" {
     const desugared = try desugarer.desugarProgram(&program);
 
     // Function should now have a call instead of a pipe
-    const func = desugared.top_items[0].function;
+    const func = desugared.modules[0].items[0].function;
     const body = func.clauses[0].body;
     try std.testing.expectEqual(@as(usize, 1), body.len);
     // Should be a call expression (pipe was desugared)
@@ -436,8 +438,10 @@ test "desugar pipe operator" {
 
 test "desugar unwrap operator" {
     const source =
-        \\def foo(x) do
-        \\  bar(x)!
+        \\defmodule Test do
+        \\  def foo(x) do
+        \\    bar(x)!
+        \\  end
         \\end
     ;
 
@@ -453,7 +457,7 @@ test "desugar unwrap operator" {
     const desugared = try desugarer.desugarProgram(&program);
 
     // Function body should now have an unwrap expression (passed through)
-    const func = desugared.top_items[0].function;
+    const func = desugared.modules[0].items[0].function;
     const body = func.clauses[0].body;
     try std.testing.expectEqual(@as(usize, 1), body.len);
     try std.testing.expect(body[0].expr.* == .unwrap);
@@ -463,8 +467,10 @@ test "desugar unwrap operator" {
 
 test "desugar no-op on simple expressions" {
     const source =
-        \\def add(x :: i64, y :: i64) :: i64 do
-        \\  x + y
+        \\defmodule Test do
+        \\  def add(x :: i64, y :: i64) :: i64 do
+        \\    x + y
+        \\  end
         \\end
     ;
 
@@ -479,8 +485,8 @@ test "desugar no-op on simple expressions" {
     var desugarer = Desugarer.init(alloc, &parser.interner);
     const desugared = try desugarer.desugarProgram(&program);
 
-    try std.testing.expectEqual(@as(usize, 1), desugared.top_items.len);
-    const func = desugared.top_items[0].function;
+    try std.testing.expectEqual(@as(usize, 1), desugared.modules.len);
+    const func = desugared.modules[0].items[0].function;
     const body = func.clauses[0].body;
     try std.testing.expect(body[0].expr.* == .binary_op);
 }

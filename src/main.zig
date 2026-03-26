@@ -183,15 +183,15 @@ fn cmdInit(allocator: std.mem.Allocator) !void {
         \\          version: "0.1.0",
         \\          kind: :bin,
         \\          root: "{s}.main/1",
-        \\          paths: ["lib"]
+        \\          paths: ["lib/**/*.zap"]
         \\        }}
         \\      :test ->
         \\        %Zap.Manifest{{
         \\          name: "{s}_test",
         \\          version: "0.1.0",
         \\          kind: :bin,
-        \\          root: "{s}Test.main/0",
-        \\          paths: ["lib", "test"]
+        \\          root: "{s}Test.main/1",
+        \\          paths: ["lib/**/*.zap", "test/**/*.zap"]
         \\        }}
         \\      _ ->
         \\        panic("Unknown target: use '{s}' or 'test'")
@@ -207,11 +207,13 @@ fn cmdInit(allocator: std.mem.Allocator) !void {
     const lib_path = try std.fmt.allocPrint(allocator, "lib/{s}.zap", .{project_name});
     defer allocator.free(lib_path);
     const lib_source = try std.fmt.allocPrint(allocator,
-        \\def main(_args :: [String]) do
-        \\  IO.puts("Howdy!")
+        \\defmodule {s} do
+        \\  def main(_args :: [String]) do
+        \\    IO.puts("Howdy!")
+        \\  end
         \\end
         \\
-    , .{});
+    , .{module_name});
     defer allocator.free(lib_source);
     try writeFile(lib_path, lib_source);
 
@@ -219,11 +221,13 @@ fn cmdInit(allocator: std.mem.Allocator) !void {
     const test_path = try std.fmt.allocPrint(allocator, "test/{s}_test.zap", .{project_name});
     defer allocator.free(test_path);
     const test_source = try std.fmt.allocPrint(allocator,
-        \\def main(_args :: [String]) do
-        \\  IO.puts("Test Suite TBD")
+        \\defmodule {s}Test do
+        \\  def main(_args :: [String]) do
+        \\    IO.puts("Test Suite TBD")
+        \\  end
         \\end
         \\
-    , .{});
+    , .{module_name});
     defer allocator.free(test_source);
     try writeFile(test_path, test_source);
 
@@ -269,72 +273,73 @@ fn buildTarget(
     // When enabled, this compiles build.zap as a builder binary, spawns it with
     // target/os/arch args, and captures the manifest output from stdout.
     if (false) { // TODO: enable when Zig linker is fixed
-    const manifest_func_name = builder.findBuilderManifestName(alloc, build_source) catch |err| {
-        switch (err) {
-            error.ManifestNotFound => try stderr_w.print("Error: build.zap must define manifest/1\n", .{}),
-            error.ParseFailed => try stderr_w.print("Error: failed to parse build.zap\n", .{}),
-            else => try stderr_w.print("Error: {}\n", .{err}),
-        }
-        std.process.exit(1);
-    };
-
-    // Compile build.zap as a builder binary
-    const builder_path = try std.fs.path.join(alloc, &.{ ".zap-cache", "builder" });
-    const zig_lib_dir = zir_backend.detectZigLibDir(alloc) orelse blk: {
-        break :blk extractEmbeddedZigLib(alloc) catch {
-            try stderr_w.print("Error: could not find or extract Zig lib\n", .{});
+        const manifest_func_name = builder.findBuilderManifestName(alloc, build_source) catch |err| {
+            switch (err) {
+                error.ManifestNotFound => try stderr_w.print("Error: build.zap must define manifest/1\n", .{}),
+                error.ParseFailed => try stderr_w.print("Error: failed to parse build.zap\n", .{}),
+                else => try stderr_w.print("Error: {}\n", .{err}),
+            }
             std.process.exit(1);
         };
-    };
 
-    std.fs.cwd().makePath(".zap-cache") catch {};
+        // Compile build.zap as a builder binary
+        const builder_path = try std.fs.path.join(alloc, &.{ ".zap-cache", "builder" });
+        const zig_lib_dir = zir_backend.detectZigLibDir(alloc) orelse blk: {
+            break :blk extractEmbeddedZigLib(alloc) catch {
+                try stderr_w.print("Error: could not find or extract Zig lib\n", .{});
+                std.process.exit(1);
+            };
+        };
 
-    // Compile build.zap through the full pipeline with builder_entry set
-    const build_result = compiler.compileFrontend(alloc, build_source, build_file_path, .{
-        .show_progress = false,
-    }) catch {
-        std.process.exit(1);
-    };
+        std.fs.cwd().makePath(".zap-cache") catch {};
 
-    zir_backend.compile(alloc, build_result.ir_program, .{
-        .zig_lib_dir = zig_lib_dir,
-        .cache_dir = ".zap-cache",
-        .global_cache_dir = ".zap-cache",
-        .output_path = builder_path,
-        .name = "builder",
-        .runtime_source = compiler.getRuntimeSource(),
-        .builder_entry = manifest_func_name,
-    }) catch {
-        try stderr_w.print("Error: failed to compile build.zap\n", .{});
-        std.process.exit(1);
-    };
+        // Compile build.zap through the full pipeline with builder_entry set
+        const build_result = compiler.compileFrontend(alloc, build_source, build_file_path, .{
+            .show_progress = false,
+        }) catch {
+            std.process.exit(1);
+        };
 
-    // Spawn the builder binary: .zap-cache/builder <target> <os> <arch>
-    const os_name = @tagName(@import("builtin").os.tag);
-    const arch_name = @tagName(@import("builtin").cpu.arch);
+        zir_backend.compile(alloc, build_result.ir_program, .{
+            .zig_lib_dir = zig_lib_dir,
+            .cache_dir = ".zap-cache",
+            .global_cache_dir = ".zap-cache",
+            .output_path = builder_path,
+            .name = "builder",
+            .runtime_source = compiler.getRuntimeSource(),
+            .builder_entry = manifest_func_name,
+            .analysis_context = if (build_result.analysis_context) |*ctx| ctx else null,
+        }) catch {
+            try stderr_w.print("Error: failed to compile build.zap\n", .{});
+            std.process.exit(1);
+        };
 
-    const spawn_result = std.process.Child.run(.{
-        .allocator = alloc,
-        .argv = &.{ builder_path, target_name, os_name, arch_name },
-        .max_output_bytes = 1024 * 1024,
-    }) catch |err| {
-        try stderr_w.print("Error: failed to run builder: {}\n", .{err});
-        std.process.exit(1);
-    };
+        // Spawn the builder binary: .zap-cache/builder <target> <os> <arch>
+        const os_name = @tagName(@import("builtin").os.tag);
+        const arch_name = @tagName(@import("builtin").cpu.arch);
 
-    if (spawn_result.term != .Exited or spawn_result.term.Exited != 0) {
-        if (spawn_result.stderr.len > 0) {
-            try stderr_w.print("{s}", .{spawn_result.stderr});
+        const spawn_result = std.process.Child.run(.{
+            .allocator = alloc,
+            .argv = &.{ builder_path, target_name, os_name, arch_name },
+            .max_output_bytes = 1024 * 1024,
+        }) catch |err| {
+            try stderr_w.print("Error: failed to run builder: {}\n", .{err});
+            std.process.exit(1);
+        };
+
+        if (spawn_result.term != .Exited or spawn_result.term.Exited != 0) {
+            if (spawn_result.stderr.len > 0) {
+                try stderr_w.print("{s}", .{spawn_result.stderr});
+            }
+            try stderr_w.print("Error: builder failed\n", .{});
+            std.process.exit(1);
         }
-        try stderr_w.print("Error: builder failed\n", .{});
-        std.process.exit(1);
-    }
 
-    // Parse the builder's stdout output into BuildConfig
-    _ = builder.parseManifestOutput(alloc, spawn_result.stdout) catch {
-        try stderr_w.print("Error: failed to parse builder output\n", .{});
-        std.process.exit(1);
-    };
+        // Parse the builder's stdout output into BuildConfig
+        _ = builder.parseManifestOutput(alloc, spawn_result.stdout) catch {
+            try stderr_w.print("Error: failed to parse builder output\n", .{});
+            std.process.exit(1);
+        };
     } // end if (false) compiled builder block
 
     // Detect zig lib dir
@@ -345,23 +350,10 @@ fn buildTarget(
         };
     };
 
-    // Scan source files from manifest paths
+    // Scan source files from manifest path globs
     var source_files: std.ArrayListUnmanaged([]const u8) = .empty;
-    for (config.paths) |path| {
-        const full_dir = try std.fs.path.join(alloc, &.{ project_root, path });
-        if (std.fs.cwd().openDir(full_dir, .{ .iterate = true })) |*dir| {
-            var iter = dir.iterate();
-            while (iter.next() catch null) |entry| {
-                if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".zap")) {
-                    const full_path = try std.fs.path.join(alloc, &.{ full_dir, entry.name });
-                    try source_files.append(alloc, full_path);
-                }
-            }
-        } else |_| {
-            const stderr = std.fs.File.stderr().deprecatedWriter();
-            try stderr.print("Error: source path not found: {s}\n", .{path});
-            std.process.exit(1);
-        }
+    for (config.paths) |pattern| {
+        try globCollectFiles(alloc, project_root, pattern, &source_files);
     }
 
     if (source_files.items.len == 0) {
@@ -461,6 +453,7 @@ fn buildTarget(
         .runtime_source = compiler.getRuntimeSource(),
         .output_mode = output_mode_val,
         .optimize_mode = optimize_mode,
+        .analysis_context = if (result.analysis_context) |*ctx| ctx else null,
     }) catch {
         const stderr = std.fs.File.stderr().deprecatedWriter();
         try stderr.print("Error: compilation failed\n", .{});
@@ -567,6 +560,177 @@ fn discoverBuildFile(allocator: std.mem.Allocator, override: ?[]const u8) ![]con
     };
 
     return try allocator.dupe(u8, ".");
+}
+
+// ---------------------------------------------------------------------------
+// Glob-based source file collection
+// ---------------------------------------------------------------------------
+
+/// Match a file path against a simple glob pattern.
+/// Supports: `*` (any non-/ chars), `**` (any path depth), literal chars.
+fn globMatch(pattern: []const u8, path: []const u8) bool {
+    var pi: usize = 0; // pattern index
+    var si: usize = 0; // string (path) index
+    var star_pi: ?usize = null; // pattern index after last `*`
+    var star_si: usize = 0; // string index at last `*` match
+
+    while (si < path.len) {
+        if (pi < pattern.len and pattern[pi] == '*') {
+            // Check for `**`
+            if (pi + 1 < pattern.len and pattern[pi + 1] == '*') {
+                // `**` — skip the `**` and optional following `/`
+                pi += 2;
+                if (pi < pattern.len and pattern[pi] == '/') pi += 1;
+                // `**` can match everything remaining — try greedy with backtrack
+                star_pi = pi;
+                star_si = si;
+                continue;
+            }
+            // Single `*` — matches non-/ characters
+            star_pi = pi + 1;
+            star_si = si;
+            pi += 1;
+            continue;
+        }
+
+        if (pi < pattern.len and (pattern[pi] == path[si] or pattern[pi] == '?')) {
+            pi += 1;
+            si += 1;
+            continue;
+        }
+
+        // Mismatch — backtrack to last star
+        if (star_pi) |sp| {
+            pi = sp;
+            star_si += 1;
+            si = star_si;
+            // For single `*`, skip over '/' in path (don't match across dirs)
+            // Check if this was a `**` by looking back
+            if (sp >= 2 and pattern[sp - 2] == '*' and pattern[sp - 1] == '*') {
+                // `**` — can cross directory boundaries
+                continue;
+            }
+            // Single `*` — cannot cross `/`
+            if (si > 0 and path[si - 1] == '/') return false;
+            continue;
+        }
+
+        return false;
+    }
+
+    // Consume trailing stars/wildcards in pattern
+    while (pi < pattern.len and pattern[pi] == '*') : (pi += 1) {}
+
+    return pi == pattern.len;
+}
+
+/// Collect .zap files matching a glob pattern, relative to project_root.
+/// Always excludes build.zap.
+fn globCollectFiles(
+    alloc: std.mem.Allocator,
+    project_root: []const u8,
+    pattern: []const u8,
+    results: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    // Determine the base directory (everything before the first wildcard)
+    var base_end: usize = 0;
+    for (pattern, 0..) |c, i| {
+        if (c == '*' or c == '?') break;
+        if (c == '/') base_end = i + 1;
+    }
+
+    const base_rel = if (base_end > 0) pattern[0..base_end] else ".";
+    const sub_pattern = if (base_end > 0) pattern[base_end..] else pattern;
+    const has_double_star = std.mem.indexOf(u8, sub_pattern, "**") != null;
+
+    const base_dir = if (std.mem.eql(u8, base_rel, "."))
+        try alloc.dupe(u8, project_root)
+    else
+        try std.fs.path.join(alloc, &.{ project_root, base_rel });
+
+    try walkAndMatch(alloc, base_dir, base_dir, sub_pattern, project_root, has_double_star, results);
+}
+
+fn walkAndMatch(
+    alloc: std.mem.Allocator,
+    dir_path: []const u8,
+    base_dir: []const u8,
+    pattern: []const u8,
+    project_root: []const u8,
+    recurse: bool,
+    results: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
+    defer dir.close();
+    var iter = dir.iterate();
+
+    while (iter.next() catch null) |entry| {
+        const full_path = try std.fs.path.join(alloc, &.{ dir_path, entry.name });
+
+        if (entry.kind == .directory and recurse) {
+            try walkAndMatch(alloc, full_path, base_dir, pattern, project_root, recurse, results);
+        }
+
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".zap")) continue;
+
+        // Build path relative to base_dir for matching against sub_pattern
+        const match_path = if (std.mem.startsWith(u8, dir_path, base_dir) and dir_path.len > base_dir.len)
+            try std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir_path[base_dir.len + 1 ..], entry.name })
+        else
+            try alloc.dupe(u8, entry.name);
+
+        // Strip leading "./" from pattern for matching
+        const clean_pattern = if (std.mem.startsWith(u8, pattern, "./"))
+            pattern[2..]
+        else
+            pattern;
+
+        if (!globMatch(clean_pattern, match_path)) continue;
+
+        // Always exclude build.zap in the project root
+        if (std.mem.eql(u8, std.fs.path.basename(full_path), "build.zap")) {
+            const dir_of_file = std.fs.path.dirname(full_path) orelse ".";
+            if (std.mem.eql(u8, dir_of_file, project_root)) continue;
+        }
+
+        // Avoid duplicates
+        var dup = false;
+        for (results.items) |existing| {
+            if (std.mem.eql(u8, existing, full_path)) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) {
+            try results.append(alloc, full_path);
+        }
+    }
+}
+
+test "globMatch basics" {
+    // Exact match
+    try std.testing.expect(globMatch("foo.zap", "foo.zap"));
+    try std.testing.expect(!globMatch("foo.zap", "bar.zap"));
+
+    // Single * matches filename chars but not /
+    try std.testing.expect(globMatch("*.zap", "foo.zap"));
+    try std.testing.expect(globMatch("*.zap", "bar.zap"));
+    try std.testing.expect(!globMatch("*.zap", "lib/foo.zap"));
+
+    // ** matches across directories
+    try std.testing.expect(globMatch("**/*.zap", "foo.zap"));
+    try std.testing.expect(globMatch("**/*.zap", "lib/foo.zap"));
+    try std.testing.expect(globMatch("**/*.zap", "lib/sub/foo.zap"));
+
+    // Prefixed glob
+    try std.testing.expect(globMatch("lib/**/*.zap", "lib/foo.zap"));
+    try std.testing.expect(globMatch("lib/**/*.zap", "lib/sub/foo.zap"));
+    try std.testing.expect(!globMatch("lib/**/*.zap", "test/foo.zap"));
+
+    // Specific file
+    try std.testing.expect(globMatch("./hello.zap", "hello.zap"));
+    try std.testing.expect(!globMatch("./hello.zap", "other.zap"));
 }
 
 // ---------------------------------------------------------------------------

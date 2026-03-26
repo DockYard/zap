@@ -477,8 +477,10 @@ const Collector = @import("collector.zig").Collector;
 
 test "resolve simple function" {
     const source =
-        \\def add(x :: i64, y :: i64) :: i64 do
-        \\  x + y
+        \\defmodule Test do
+        \\  def add(x :: i64, y :: i64) :: i64 do
+        \\    x + y
+        \\  end
         \\end
     ;
 
@@ -532,12 +534,14 @@ test "resolve module with function" {
 
 test "resolve case expression with bindings" {
     const source =
-        \\def foo(x) do
-        \\  case x do
-        \\    {:ok, v} ->
-        \\      v
-        \\    {:error, e} ->
-        \\      e
+        \\defmodule Test do
+        \\  def foo(x) do
+        \\    case x do
+        \\      {:ok, v} ->
+        \\        v
+        \\      {:error, e} ->
+        \\        e
+        \\    end
         \\  end
         \\end
     ;
@@ -563,9 +567,11 @@ test "resolve case expression with bindings" {
 
 test "resolve assignment" {
     const source =
-        \\def foo() do
-        \\  x = 42
-        \\  x
+        \\defmodule Test do
+        \\  def foo() do
+        \\    x = 42
+        \\    x
+        \\  end
         \\end
     ;
 

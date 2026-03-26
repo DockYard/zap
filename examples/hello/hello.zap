@@ -4,8 +4,9 @@ defmodule Runner do
   end
 end
 
-def main() :: String do
-  Runner.hello("World!")
-  |> IO.puts()
+defmodule Hello do
+  def main() :: String do
+    Runner.hello("World!")
+    |> IO.puts()
+  end
 end
-

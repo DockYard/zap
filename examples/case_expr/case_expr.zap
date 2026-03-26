@@ -9,15 +9,15 @@ defmodule CaseExpr do
         "unknown"
     end
   end
-end
 
-def main() do
-  CaseExpr.check({:ok, "hello"})
-  |> IO.puts()
+  def main() do
+    CaseExpr.check({:ok, "hello"})
+    |> IO.puts()
 
-  CaseExpr.check({:error, "oops"})
-  |> IO.puts()
+    CaseExpr.check({:error, "oops"})
+    |> IO.puts()
 
-  CaseExpr.check(:something)
-  |> IO.puts()
+    CaseExpr.check(:something)
+    |> IO.puts()
+  end
 end

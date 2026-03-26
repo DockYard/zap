@@ -6,10 +6,10 @@ defmodule Pipes do
   def add_one(x :: i64) :: i64 do
     x + 1
   end
-end
 
-def main() do
-  5
-  |> Pipes.double()
-  |> Pipes.add_one()
+  def main() do
+    5
+    |> Pipes.double()
+    |> Pipes.add_one()
+  end
 end

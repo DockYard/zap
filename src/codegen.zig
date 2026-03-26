@@ -20,6 +20,17 @@ pub const CodeGen = struct {
     next_block_label: u32,
     current_case_label: ?[]const u8,
     lib_mode: bool,
+    function_names: std.AutoHashMap(ir.FunctionId, []const u8),
+    function_defs: std.AutoHashMap(ir.FunctionId, *const ir.Function),
+    analysis_context: ?*const @import("escape_lattice.zig").AnalysisContext,
+    current_function_id: ir.FunctionId,
+    current_block_label: ir.LabelId,
+    current_instr_index: u32,
+    current_block_instructions: []const ir.Instruction,
+    skip_next_ret_local: ?ir.LocalId,
+    reuse_backed_struct_locals: std.AutoHashMap(ir.LocalId, []const u8),
+    reuse_backed_union_locals: std.AutoHashMap(ir.LocalId, ir.UnionInit),
+    reuse_backed_tuple_locals: std.AutoHashMap(ir.LocalId, usize),
 
     pub fn init(allocator: std.mem.Allocator) CodeGen {
         return .{
@@ -32,16 +43,476 @@ pub const CodeGen = struct {
             .next_block_label = 0,
             .current_case_label = null,
             .lib_mode = false,
+            .function_names = std.AutoHashMap(ir.FunctionId, []const u8).init(allocator),
+            .function_defs = std.AutoHashMap(ir.FunctionId, *const ir.Function).init(allocator),
+            .analysis_context = null,
+            .current_function_id = 0,
+            .current_block_label = 0,
+            .current_instr_index = 0,
+            .current_block_instructions = &.{},
+            .skip_next_ret_local = null,
+            .reuse_backed_struct_locals = std.AutoHashMap(ir.LocalId, []const u8).init(allocator),
+            .reuse_backed_union_locals = std.AutoHashMap(ir.LocalId, ir.UnionInit).init(allocator),
+            .reuse_backed_tuple_locals = std.AutoHashMap(ir.LocalId, usize).init(allocator),
         };
     }
 
     pub fn deinit(self: *CodeGen) void {
         self.output.deinit(self.allocator);
         self.referenced_locals.deinit(self.allocator);
+        self.function_names.deinit();
+        self.function_defs.deinit();
+        self.reuse_backed_struct_locals.deinit();
+        self.reuse_backed_union_locals.deinit();
+        self.reuse_backed_tuple_locals.deinit();
     }
 
     pub fn getOutput(self: *const CodeGen) []const u8 {
         return self.output.items;
+    }
+
+    /// Check if ARC operations should be skipped for a value.
+    /// Only skips when the value was explicitly analyzed and found stack-eligible.
+    fn shouldSkipArc(self: *const CodeGen, local: ir.LocalId) bool {
+        if (self.analysis_context) |actx| {
+            const lattice = @import("escape_lattice.zig");
+            const vkey = lattice.ValueKey{
+                .function = self.current_function_id,
+                .local = local,
+            };
+            if (actx.escape_states.get(vkey)) |state| {
+                return state.isStackEligible();
+            }
+        }
+        return false;
+    }
+
+    fn findReusePairForDest(self: *const CodeGen, dest: ir.LocalId) ?@import("escape_lattice.zig").ReusePair {
+        if (self.analysis_context) |actx| {
+            for (actx.reuse_pairs.items) |pair| {
+                if (pair.reuse.dest != dest) continue;
+                const insertion_point = pair.reuse.insertion_point;
+                if (insertion_point.function != self.current_function_id) continue;
+                if (insertion_point.block != self.current_block_label) continue;
+                if (insertion_point.instr_index != self.current_instr_index) continue;
+                if (insertion_point.position != .before) continue;
+                return pair;
+            }
+        }
+        return null;
+    }
+
+    fn markReuseBackedStructLocal(self: *CodeGen, dest: ir.LocalId, type_name: []const u8) !void {
+        try self.reuse_backed_struct_locals.put(dest, type_name);
+    }
+
+    fn propagateReuseBackedStructLocal(self: *CodeGen, dest: ir.LocalId, source: ir.LocalId) !void {
+        if (self.reuse_backed_struct_locals.get(source)) |type_name| {
+            try self.reuse_backed_struct_locals.put(dest, type_name);
+        } else {
+            _ = self.reuse_backed_struct_locals.remove(dest);
+        }
+    }
+
+    fn isReuseBackedStructLocal(self: *const CodeGen, local: ir.LocalId) bool {
+        return self.reuse_backed_struct_locals.contains(local);
+    }
+
+    fn markReuseBackedUnionLocal(self: *CodeGen, union_init: ir.UnionInit) !void {
+        try self.reuse_backed_union_locals.put(union_init.dest, union_init);
+    }
+
+    fn propagateReuseBackedUnionLocal(self: *CodeGen, dest: ir.LocalId, source: ir.LocalId) !void {
+        if (self.reuse_backed_union_locals.get(source)) |union_init| {
+            var copied = union_init;
+            copied.dest = dest;
+            try self.reuse_backed_union_locals.put(dest, copied);
+        } else {
+            _ = self.reuse_backed_union_locals.remove(dest);
+        }
+    }
+
+    fn isReuseBackedUnionLocal(self: *const CodeGen, local: ir.LocalId) bool {
+        return self.reuse_backed_union_locals.contains(local);
+    }
+
+    fn markReuseBackedTupleLocal(self: *CodeGen, dest: ir.LocalId, arity: usize) !void {
+        try self.reuse_backed_tuple_locals.put(dest, arity);
+    }
+
+    fn propagateReuseBackedTupleLocal(self: *CodeGen, dest: ir.LocalId, source: ir.LocalId) !void {
+        if (self.reuse_backed_tuple_locals.get(source)) |arity| {
+            try self.reuse_backed_tuple_locals.put(dest, arity);
+        } else {
+            _ = self.reuse_backed_tuple_locals.remove(dest);
+        }
+    }
+
+    fn isReuseBackedTupleLocal(self: *const CodeGen, local: ir.LocalId) bool {
+        return self.reuse_backed_tuple_locals.contains(local);
+    }
+
+    const ClosureAllocation = enum { stack, heap };
+
+    fn getClosureTier(self: *const CodeGen, function_id: ir.FunctionId) @import("escape_lattice.zig").ClosureEnvTier {
+        if (self.analysis_context) |actx| return actx.getClosureTier(function_id);
+        return .escaping;
+    }
+
+    fn closureEnvPrefix(self: *const CodeGen, function_id: ir.FunctionId) []const u8 {
+        return switch (self.getClosureTier(function_id)) {
+            .block_local => "__block_env_",
+            .function_local => "__frame_env_",
+            else => "__env_",
+        };
+    }
+
+    const ClosureTarget = struct {
+        function_id: ir.FunctionId,
+        captures: []const ir.LocalId,
+    };
+
+    fn getClosureAllocation(self: *const CodeGen, function_id: ir.FunctionId) ClosureAllocation {
+        return switch (self.getClosureTier(function_id)) {
+            .lambda_lifted, .immediate_invocation, .block_local, .function_local => .stack,
+            .escaping => .heap,
+        };
+    }
+
+    fn getCallSiteSpecialization(self: *const CodeGen) ?@import("escape_lattice.zig").CallSiteSpecialization {
+        if (self.analysis_context) |actx| {
+            return actx.getCallSiteSpecialization(.{
+                .function = self.current_function_id,
+                .block = self.current_block_label,
+                .instr_index = self.current_instr_index,
+            });
+        }
+        return null;
+    }
+
+    fn findClosureTarget(self: *const CodeGen, local: ir.LocalId) ?ClosureTarget {
+        const func = self.function_defs.get(self.current_function_id) orelse return null;
+        return self.findClosureTargetInInstrs(func.body, local);
+    }
+
+    fn isParamDerivedClosure(self: *const CodeGen, local: ir.LocalId) bool {
+        const func = self.function_defs.get(self.current_function_id) orelse return false;
+        for (func.body) |block| {
+            for (block.instructions) |instr| {
+                switch (instr) {
+                    .param_get => |pg| if (pg.dest == local) return true,
+                    else => {},
+                }
+            }
+        }
+        return false;
+    }
+
+    fn findClosureTargetInInstrs(self: *const CodeGen, blocks: []const ir.Block, local: ir.LocalId) ?ClosureTarget {
+        _ = self;
+        for (blocks) |block| {
+            if (findClosureTargetInList(block.instructions, local)) |target| return target;
+        }
+        return null;
+    }
+
+    fn findClosureTargetInList(instrs: []const ir.Instruction, local: ir.LocalId) ?ClosureTarget {
+        return findClosureTargetInListDepth(instrs, local, 0);
+    }
+
+    fn findClosureTargetInListDepth(instrs: []const ir.Instruction, local: ir.LocalId, depth: u8) ?ClosureTarget {
+        if (depth > 32) return null;
+        for (instrs) |instr| {
+            switch (instr) {
+                .make_closure => |mc| {
+                    if (mc.dest == local) {
+                        return .{ .function_id = mc.function, .captures = mc.captures };
+                    }
+                },
+                .local_get => |lg| if (lg.dest == local) {
+                    if (findClosureTargetInListDepth(instrs, lg.source, depth + 1)) |target| return target;
+                },
+                .local_set => |ls| if (ls.dest == local) {
+                    if (findClosureTargetInListDepth(instrs, ls.value, depth + 1)) |target| return target;
+                },
+                .move_value => |mv| if (mv.dest == local) {
+                    if (findClosureTargetInListDepth(instrs, mv.source, depth + 1)) |target| return target;
+                },
+                .share_value => |sv| if (sv.dest == local) {
+                    if (findClosureTargetInListDepth(instrs, sv.source, depth + 1)) |target| return target;
+                },
+                .if_expr => |ie| {
+                    if (findClosureTargetInListDepth(ie.then_instrs, local, depth)) |target| return target;
+                    if (findClosureTargetInListDepth(ie.else_instrs, local, depth)) |target| return target;
+                },
+                .case_block => |cb| {
+                    if (findClosureTargetInListDepth(cb.pre_instrs, local, depth)) |target| return target;
+                    for (cb.arms) |arm| {
+                        if (findClosureTargetInListDepth(arm.cond_instrs, local, depth)) |target| return target;
+                        if (findClosureTargetInListDepth(arm.body_instrs, local, depth)) |target| return target;
+                    }
+                    if (findClosureTargetInListDepth(cb.default_instrs, local, depth)) |target| return target;
+                },
+                .guard_block => |gb| {
+                    if (findClosureTargetInListDepth(gb.body, local, depth)) |target| return target;
+                },
+                .switch_literal => |sl| {
+                    for (sl.cases) |case| {
+                        if (findClosureTargetInListDepth(case.body_instrs, local, depth)) |target| return target;
+                    }
+                    if (findClosureTargetInListDepth(sl.default_instrs, local, depth)) |target| return target;
+                },
+                .switch_return => |sr| {
+                    for (sr.cases) |case| {
+                        if (findClosureTargetInListDepth(case.body_instrs, local, depth)) |target| return target;
+                    }
+                    if (findClosureTargetInListDepth(sr.default_instrs, local, depth)) |target| return target;
+                },
+                .union_switch_return => |usr| {
+                    for (usr.cases) |case| {
+                        if (findClosureTargetInListDepth(case.body_instrs, local, depth)) |target| return target;
+                    }
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
+
+    fn closureInvokeName(self: *const CodeGen, function_id: ir.FunctionId) ?[]const u8 {
+        _ = self.function_defs.get(function_id) orelse return null;
+        const tier = if (self.analysis_context) |actx| actx.getClosureTier(function_id) else @import("escape_lattice.zig").ClosureEnvTier.escaping;
+        if (!self.functionNeedsClosureWrapper(function_id) and tier == .lambda_lifted) return null;
+        if (!self.functionNeedsClosureWrapper(function_id) and tier == .immediate_invocation) return null;
+        return std.fmt.allocPrint(self.allocator, "__closure_invoke_{d}", .{function_id}) catch null;
+    }
+
+    fn functionNeedsClosureWrapper(self: *const CodeGen, function_id: ir.FunctionId) bool {
+        if (self.function_defs.get(function_id)) |func| {
+            if (func.is_closure or func.captures.len > 0) return true;
+        }
+        var func_iter = self.function_defs.iterator();
+        while (func_iter.next()) |entry| {
+            for (entry.value_ptr.*.body) |block| {
+                if (self.blockCreatesClosureForFunction(block.instructions, function_id)) return true;
+            }
+        }
+        return false;
+    }
+
+    fn blockCreatesClosureForFunction(self: *const CodeGen, instrs: []const ir.Instruction, function_id: ir.FunctionId) bool {
+        for (instrs) |instr| {
+            switch (instr) {
+                .make_closure => |mc| if (mc.function == function_id) return true,
+                .if_expr => |ie| {
+                    if (self.blockCreatesClosureForFunction(ie.then_instrs, function_id)) return true;
+                    if (self.blockCreatesClosureForFunction(ie.else_instrs, function_id)) return true;
+                },
+                .case_block => |cb| {
+                    if (self.blockCreatesClosureForFunction(cb.pre_instrs, function_id)) return true;
+                    for (cb.arms) |arm| {
+                        if (self.blockCreatesClosureForFunction(arm.cond_instrs, function_id)) return true;
+                        if (self.blockCreatesClosureForFunction(arm.body_instrs, function_id)) return true;
+                    }
+                    if (self.blockCreatesClosureForFunction(cb.default_instrs, function_id)) return true;
+                },
+                .guard_block => |gb| if (self.blockCreatesClosureForFunction(gb.body, function_id)) return true,
+                .switch_literal => |sl| {
+                    for (sl.cases) |case| {
+                        if (self.blockCreatesClosureForFunction(case.body_instrs, function_id)) return true;
+                    }
+                    if (self.blockCreatesClosureForFunction(sl.default_instrs, function_id)) return true;
+                },
+                .switch_return => |sr| {
+                    for (sr.cases) |case| {
+                        if (self.blockCreatesClosureForFunction(case.body_instrs, function_id)) return true;
+                    }
+                    if (self.blockCreatesClosureForFunction(sr.default_instrs, function_id)) return true;
+                },
+                .union_switch_return => |usr| {
+                    for (usr.cases) |case| {
+                        if (self.blockCreatesClosureForFunction(case.body_instrs, function_id)) return true;
+                    }
+                },
+                else => {},
+            }
+        }
+        return false;
+    }
+
+    fn emitDirectClosureCall(self: *CodeGen, dest: ir.LocalId, target: ClosureTarget, args: []const ir.LocalId) !bool {
+        const target_name = self.function_names.get(target.function_id) orelse return false;
+        try self.writeIndent();
+        try self.writeDestLocal(dest);
+        try self.write(" = ");
+        try self.write(target_name);
+        try self.write("(");
+        for (target.captures, 0..) |capture, i| {
+            if (i > 0) try self.write(", ");
+            try self.writeValueLocal(capture);
+        }
+        for (args, 0..) |arg, i| {
+            if (target.captures.len > 0 or i > 0) try self.write(", ");
+            try self.writeValueLocal(arg);
+        }
+        try self.write(");\n");
+        return true;
+    }
+
+    fn emitInvokeWrapperCall(self: *CodeGen, dest: ir.LocalId, callee: ir.LocalId, function_id: ir.FunctionId, args: []const ir.LocalId) !bool {
+        const invoke_name = self.closureInvokeName(function_id) orelse return false;
+        defer self.allocator.free(invoke_name);
+        try self.writeIndent();
+        try self.writeDestLocal(dest);
+        try self.write(" = ");
+        try self.write(invoke_name);
+        try self.write("(");
+        try self.writeLocal(callee);
+        try self.write(".env, .{");
+        if (self.function_defs.get(function_id)) |func_def| {
+            for (func_def.params, 0..) |param, i| {
+                if (i > 0) try self.write(", ");
+                try self.write(".");
+                try self.write(param.name);
+                try self.write(" = ");
+                if (i < args.len) {
+                    try self.writeLocal(args[i]);
+                } else {
+                    try self.write("undefined");
+                }
+            }
+        }
+        try self.write(" });\n");
+        return true;
+    }
+
+    fn emitTailDirectClosureCall(self: *CodeGen, target: ClosureTarget, args: []const ir.LocalId) !bool {
+        const target_name = self.function_names.get(target.function_id) orelse return false;
+        try self.writeIndent();
+        try self.write("return @call(.always_tail, ");
+        try self.write(target_name);
+        try self.write(", .{");
+        for (target.captures, 0..) |capture, i| {
+            if (i > 0) try self.write(", ");
+            try self.writeValueLocal(capture);
+        }
+        for (args, 0..) |arg, i| {
+            if (target.captures.len > 0 or i > 0) try self.write(", ");
+            try self.writeValueLocal(arg);
+        }
+        try self.write("});\n");
+        return true;
+    }
+
+    fn emitTailInvokeWrapperCall(self: *CodeGen, callee: ir.LocalId, function_id: ir.FunctionId, args: []const ir.LocalId) !bool {
+        const invoke_name = self.closureInvokeName(function_id) orelse return false;
+        defer self.allocator.free(invoke_name);
+        try self.writeIndent();
+        try self.write("return @call(.always_tail, ");
+        try self.write(invoke_name);
+        try self.write(", .{");
+        try self.writeLocal(callee);
+        try self.write(".env, .{");
+        if (self.function_defs.get(function_id)) |func_def| {
+            for (func_def.params, 0..) |param, i| {
+                if (i > 0) try self.write(", ");
+                try self.write(".");
+                try self.write(param.name);
+                try self.write(" = ");
+                if (i < args.len) try self.writeValueLocal(args[i]) else try self.write("undefined");
+            }
+        }
+        try self.write(" }});\n");
+        return true;
+    }
+
+    fn isTailReturnOf(self: *const CodeGen, local: ir.LocalId) bool {
+        const next_idx = @as(usize, self.current_instr_index) + 1;
+        if (next_idx >= self.current_block_instructions.len) return false;
+        return switch (self.current_block_instructions[next_idx]) {
+            .ret => |r| r.value != null and r.value.? == local,
+            else => false,
+        };
+    }
+
+    fn emitAnalysisArcOps(self: *CodeGen, before: bool) !void {
+        if (self.analysis_context) |actx| {
+            for (actx.arc_ops.items) |op| {
+                if (op.insertion_point.function != self.current_function_id) continue;
+                if (op.insertion_point.block != self.current_block_label) continue;
+                if (op.insertion_point.instr_index != self.current_instr_index) continue;
+                if ((op.insertion_point.position == .before) != before) continue;
+                switch (op.kind) {
+                    .retain => {
+                        if (!self.shouldSkipArc(op.value)) {
+                            try self.writeIndent();
+                            try self.write("zap_runtime.ArcRuntime.retainAny(@TypeOf(");
+                            try self.writeLocal(op.value);
+                            try self.write("), ");
+                            try self.writeLocal(op.value);
+                            try self.write(");\n");
+                        }
+                    },
+                    .release => {
+                        if (op.reason == .perceus_drop) continue;
+                        if (!self.shouldSkipArc(op.value)) {
+                            try self.writeIndent();
+                            try self.write("zap_runtime.ArcRuntime.releaseAny(@TypeOf(");
+                            try self.writeLocal(op.value);
+                            try self.write("), std.heap.page_allocator, ");
+                            try self.writeLocal(op.value);
+                            try self.write(");\n");
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+    }
+
+    fn emitSwitchDispatch(self: *CodeGen, cc: ir.CallClosure, targets: []const ir.FunctionId) !bool {
+        var emitted_any = false;
+        for (targets, 0..) |target_id, i| {
+            const invoke_name = self.closureInvokeName(target_id) orelse continue;
+            defer self.allocator.free(invoke_name);
+            emitted_any = true;
+            try self.writeIndent();
+            if (i == 0) {
+                try self.write("if (");
+            } else {
+                try self.write("else if (");
+            }
+            try self.writeLocal(cc.callee);
+            try self.write(".call_fn == @ptrCast(&");
+            try self.write(invoke_name);
+            try self.write(")) {\n");
+            self.indent_level += 1;
+            _ = try self.emitInvokeWrapperCall(cc.dest, cc.callee, target_id, cc.args);
+            self.indent_level -= 1;
+            try self.writeIndent();
+            try self.write("} ");
+        }
+
+        if (!emitted_any) return false;
+
+        try self.write("else {\n");
+        self.indent_level += 1;
+        try self.writeIndent();
+        try self.writeDestLocal(cc.dest);
+        try self.write(" = zap_runtime.invokeDynClosure(");
+        try self.emitZigType(&cc.return_type);
+        try self.write(", ");
+        try self.writeLocal(cc.callee);
+        try self.write(", .{");
+        for (cc.args, 0..) |arg, i| {
+            if (i > 0) try self.write(", ");
+            try self.writeValueLocal(arg);
+        }
+        try self.write("});\n");
+        self.indent_level -= 1;
+        try self.writeIndent();
+        try self.write("}\n");
+        return true;
     }
 
     // ============================================================
@@ -49,6 +520,10 @@ pub const CodeGen = struct {
     // ============================================================
 
     pub fn emitProgram(self: *CodeGen, program: *const ir.Program) !void {
+        for (program.functions) |*func| {
+            try self.function_names.put(func.id, func.name);
+            try self.function_defs.put(func.id, func);
+        }
         // File header
         try self.write("// Generated by Zap compiler\n");
         try self.write("const std = @import(\"std\");\n");
@@ -120,8 +595,100 @@ pub const CodeGen = struct {
     // ============================================================
 
     fn emitFunction(self: *CodeGen, func: *const ir.Function) !void {
+        self.current_function_id = func.id;
+        self.reuse_backed_struct_locals.clearRetainingCapacity();
+        self.reuse_backed_union_locals.clearRetainingCapacity();
+        self.reuse_backed_tuple_locals.clearRetainingCapacity();
         const is_main = std.mem.eql(u8, func.name, "main") or
             std.mem.endsWith(u8, func.name, "__main");
+        const closure_alloc = self.getClosureAllocation(func.id);
+        // Call-local closures (immediate_invocation / lambda_lifted) don't need
+        // wrapper infrastructure — captures are forwarded as arguments.
+        const closure_tier = self.getClosureTier(func.id);
+        const needs_closure_wrappers = (func.is_closure or func.captures.len > 0) and
+            closure_tier != .lambda_lifted and closure_tier != .immediate_invocation;
+        const needs_release_wrapper = needs_closure_wrappers and closure_alloc == .heap;
+
+        if (!is_main and needs_closure_wrappers) {
+            try self.write("const __closure_env_");
+            try self.writeInt(@intCast(func.id));
+            try self.write(" = struct { ");
+            for (func.captures, 0..) |capture, i| {
+                if (i > 0) try self.write(", ");
+                try self.write(capture.name);
+                try self.write(": ");
+                try self.emitZigType(&capture.type_expr);
+            }
+            try self.write(" };\n");
+        }
+
+        if (!is_main and needs_closure_wrappers) {
+            try self.write("fn __closure_invoke_");
+            try self.writeInt(@intCast(func.id));
+            try self.write("(env_ptr: ?*anyopaque, args: struct {");
+            for (func.params, 0..) |param, i| {
+                if (i > 0) try self.write(", ");
+                try self.write(param.name);
+                try self.write(": ");
+                try self.emitZigType(&param.type_expr);
+            }
+            try self.write(" }) ");
+            try self.emitZigType(&func.return_type);
+            try self.write(" {\n");
+            self.indent_level += 1;
+            if (func.captures.len > 0) {
+                try self.writeIndent();
+                try self.write("const env: *__closure_env_");
+                try self.writeInt(@intCast(func.id));
+                try self.write(" = @ptrCast(@alignCast(env_ptr.?));\n");
+            }
+            try self.writeIndent();
+            if (func.return_type == .void) {
+                try self.write(func.name);
+            } else {
+                try self.write("return ");
+                try self.write(func.name);
+            }
+            try self.write("(");
+            for (func.captures, 0..) |capture, i| {
+                if (i > 0) try self.write(", ");
+                try self.write("env.");
+                try self.write(capture.name);
+            }
+            for (func.params, 0..) |param, i| {
+                if (func.captures.len > 0 or i > 0) try self.write(", ");
+                try self.write("args.");
+                try self.write(param.name);
+            }
+            try self.write(");\n");
+            self.indent_level -= 1;
+            try self.write("}\n");
+        }
+
+        if (!is_main and needs_release_wrapper) {
+            try self.write("fn __closure_release_");
+            try self.writeInt(@intCast(func.id));
+            try self.write("(env_ptr: *anyopaque) void {\n");
+            self.indent_level += 1;
+            try self.writeIndent();
+            try self.write("const env: *__closure_env_");
+            try self.writeInt(@intCast(func.id));
+            try self.write(" = @ptrCast(@alignCast(env_ptr));\n");
+            for (func.captures) |capture| {
+                if (capture.ownership == .shared and capture.type_expr == .struct_ref) {
+                    try self.writeIndent();
+                    try self.write("zap_runtime.ArcRuntime.releaseAny(@TypeOf(env.");
+                    try self.write(capture.name);
+                    try self.write("), std.heap.page_allocator, &env.");
+                    try self.write(capture.name);
+                    try self.write(");\n");
+                }
+            }
+            try self.writeIndent();
+            try self.write("std.heap.page_allocator.destroy(env);\n");
+            self.indent_level -= 1;
+            try self.write("}\n\n");
+        }
 
         // In library mode, skip main and make all other functions pub
         if (self.lib_mode and is_main) return;
@@ -154,8 +721,15 @@ pub const CodeGen = struct {
         }
         try self.write("(");
 
-        for (func.params, 0..) |param, i| {
+        for (func.captures, 0..) |capture, i| {
             if (i > 0) try self.write(", ");
+            try self.write(capture.name);
+            try self.write(": ");
+            try self.emitZigType(&capture.type_expr);
+        }
+
+        for (func.params, 0..) |param, i| {
+            if (func.captures.len > 0 or i > 0) try self.write(", ");
             try self.write(param.name);
             try self.write(": ");
             if (main_has_params) {
@@ -223,14 +797,42 @@ pub const CodeGen = struct {
     }
 
     fn emitBlock(self: *CodeGen, block: *const ir.Block) !void {
+        self.current_block_label = block.label;
+        self.current_block_instructions = block.instructions;
         // Collect which locals are referenced as sources
         self.referenced_locals = .empty;
         for (block.instructions) |instr| {
             self.collectReferencedLocals(&instr);
         }
 
-        for (block.instructions) |instr| {
+        for (block.instructions, 0..) |instr, instr_idx| {
+            self.current_instr_index = @intCast(instr_idx);
+            try self.emitAnalysisArcOps(true);
             try self.emitInstruction(&instr);
+            try self.emitAnalysisArcOps(false);
+        }
+    }
+
+    fn emitDropSpecializationsForCurrentInstr(self: *CodeGen, value_local: ir.LocalId, constructor_tag: ?u32) !void {
+        if (self.analysis_context) |actx| {
+            for (actx.drop_specializations.items) |spec| {
+                if (spec.function != self.current_function_id) continue;
+                if (spec.insertion_point.block != self.current_block_label) continue;
+                if (spec.insertion_point.instr_index != self.current_instr_index) continue;
+                if (spec.insertion_point.position != .after) continue;
+                if (constructor_tag) |tag| {
+                    if (spec.constructor_tag != tag) continue;
+                }
+                for (spec.field_drops) |field_drop| {
+                    const drop_local = field_drop.local orelse value_local;
+                    try self.writeIndent();
+                    try self.write("zap_runtime.ArcRuntime.releaseAny(@TypeOf(");
+                    try self.writeLocal(drop_local);
+                    try self.write("), std.heap.page_allocator, ");
+                    try self.writeLocal(drop_local);
+                    try self.write(");\n");
+                }
+            }
         }
     }
 
@@ -245,6 +847,8 @@ pub const CodeGen = struct {
         switch (instr.*) {
             .local_get => |lg| self.referenced_locals.append(self.allocator, lg.source) catch {},
             .local_set => |ls| self.referenced_locals.append(self.allocator, ls.value) catch {},
+            .move_value => |mv| self.referenced_locals.append(self.allocator, mv.source) catch {},
+            .share_value => |sv| self.referenced_locals.append(self.allocator, sv.source) catch {},
             .binary_op => |bo| {
                 self.referenced_locals.append(self.allocator, bo.lhs) catch {};
                 self.referenced_locals.append(self.allocator, bo.rhs) catch {};
@@ -261,6 +865,9 @@ pub const CodeGen = struct {
             .call_closure => |cc| {
                 self.referenced_locals.append(self.allocator, cc.callee) catch {};
                 for (cc.args) |arg| self.referenced_locals.append(self.allocator, arg) catch {};
+            },
+            .jump => |j| {
+                if (j.value) |value| self.referenced_locals.append(self.allocator, value) catch {};
             },
             .call_dispatch => |cd_disp| {
                 for (cd_disp.args) |arg| self.referenced_locals.append(self.allocator, arg) catch {};
@@ -511,6 +1118,9 @@ pub const CodeGen = struct {
                 try self.write(" = null;\n");
             },
             .local_get => |lg| {
+                try self.propagateReuseBackedStructLocal(lg.dest, lg.source);
+                try self.propagateReuseBackedUnionLocal(lg.dest, lg.source);
+                try self.propagateReuseBackedTupleLocal(lg.dest, lg.source);
                 try self.writeIndent();
                 try self.writeDestLocal(lg.dest);
                 try self.write(" = ");
@@ -518,11 +1128,42 @@ pub const CodeGen = struct {
                 try self.write(";\n");
             },
             .local_set => |ls| {
+                try self.propagateReuseBackedStructLocal(ls.dest, ls.value);
+                try self.propagateReuseBackedUnionLocal(ls.dest, ls.value);
+                try self.propagateReuseBackedTupleLocal(ls.dest, ls.value);
                 try self.writeIndent();
                 try self.writeDestLocal(ls.dest);
                 try self.write(" = ");
                 try self.writeLocal(ls.value);
                 try self.write(";\n");
+            },
+            .move_value => |mv| {
+                try self.propagateReuseBackedStructLocal(mv.dest, mv.source);
+                try self.propagateReuseBackedUnionLocal(mv.dest, mv.source);
+                try self.propagateReuseBackedTupleLocal(mv.dest, mv.source);
+                try self.writeIndent();
+                try self.writeDestLocal(mv.dest);
+                try self.write(" = ");
+                try self.writeLocal(mv.source);
+                try self.write(";\n");
+            },
+            .share_value => |sv| {
+                try self.propagateReuseBackedStructLocal(sv.dest, sv.source);
+                try self.propagateReuseBackedUnionLocal(sv.dest, sv.source);
+                try self.propagateReuseBackedTupleLocal(sv.dest, sv.source);
+                try self.writeIndent();
+                try self.writeDestLocal(sv.dest);
+                try self.write(" = ");
+                try self.writeLocal(sv.source);
+                try self.write(";\n");
+                if (!self.shouldSkipArc(sv.source)) {
+                    try self.writeIndent();
+                    try self.write("zap_runtime.ArcRuntime.retainAny(@TypeOf(");
+                    try self.writeLocal(sv.dest);
+                    try self.write("), ");
+                    try self.writeLocal(sv.dest);
+                    try self.write(");\n");
+                }
             },
             .param_get => |pg| {
                 // Skip emitting param_get if the dest local is unreferenced.
@@ -583,12 +1224,12 @@ pub const CodeGen = struct {
             .call_direct => |cd| {
                 try self.writeIndent();
                 try self.writeDestLocal(cd.dest);
-                try self.write(" = func_");
-                try self.writeInt(@intCast(cd.function));
+                try self.write(" = ");
+                try self.write(self.function_names.get(cd.function) orelse "func_unknown");
                 try self.write("(");
                 for (cd.args, 0..) |arg, i| {
                     if (i > 0) try self.write(", ");
-                    try self.writeLocal(arg);
+                    try self.writeValueLocal(arg);
                 }
                 try self.write(");\n");
             },
@@ -600,21 +1241,178 @@ pub const CodeGen = struct {
                 try self.write("(");
                 for (cn.args, 0..) |arg, i| {
                     if (i > 0) try self.write(", ");
-                    try self.writeLocal(arg);
+                    try self.writeValueLocal(arg);
                 }
                 try self.write(");\n");
             },
             .call_closure => |cc| {
-                try self.writeIndent();
-                try self.writeDestLocal(cc.dest);
-                try self.write(" = ");
-                try self.writeLocal(cc.callee);
-                try self.write("(");
-                for (cc.args, 0..) |arg, i| {
-                    if (i > 0) try self.write(", ");
-                    try self.writeLocal(arg);
+                const lattice_mod = @import("escape_lattice.zig");
+                const callee_is_param = self.isParamDerivedClosure(cc.callee);
+                var emitted_specialized = false;
+                if (self.getCallSiteSpecialization()) |spec| {
+                    switch (spec.decision) {
+                        .direct_call, .contified => {
+                            if (spec.decision == .contified and self.isTailReturnOf(cc.dest)) {
+                                if (!callee_is_param) {
+                                    if (self.findClosureTarget(cc.callee)) |target| {
+                                        if (try self.emitTailDirectClosureCall(target, cc.args)) {
+                                            emitted_specialized = true;
+                                            self.skip_next_ret_local = cc.dest;
+                                        }
+                                    }
+                                }
+                                if (!emitted_specialized and spec.lambda_set.isSingleton()) {
+                                    if (try self.emitTailInvokeWrapperCall(cc.callee, spec.lambda_set.members[0], cc.args)) {
+                                        emitted_specialized = true;
+                                        self.skip_next_ret_local = cc.dest;
+                                    }
+                                }
+                            }
+                            if (!emitted_specialized and !callee_is_param) {
+                                if (self.findClosureTarget(cc.callee)) |target| {
+                                    if (try self.emitDirectClosureCall(cc.dest, target, cc.args)) {
+                                        emitted_specialized = true;
+                                    }
+                                }
+                            }
+                            if (!emitted_specialized and spec.lambda_set.isSingleton()) {
+                                if (try self.emitInvokeWrapperCall(cc.dest, cc.callee, spec.lambda_set.members[0], cc.args)) {
+                                    emitted_specialized = true;
+                                }
+                            }
+                        },
+                        .switch_dispatch => {
+                            if (try self.emitSwitchDispatch(cc, spec.lambda_set.members)) {
+                                emitted_specialized = true;
+                            }
+                        },
+                        .unreachable_call => {
+                            try self.writeIndent();
+                            try self.writeDestLocal(cc.dest);
+                            try self.write(" = unreachable;\n");
+                            emitted_specialized = true;
+                        },
+                        .dyn_closure_dispatch => {},
+                    }
                 }
-                try self.write(");\n");
+
+                if (!emitted_specialized) {
+                    if (self.analysis_context) |actx| {
+                        const vkey = lattice_mod.ValueKey{
+                            .function = self.current_function_id,
+                            .local = cc.callee,
+                        };
+                        if (actx.getLambdaSet(vkey)) |ls| {
+                            if (!callee_is_param and ls.isSingleton()) {
+                                if (self.findClosureTarget(cc.callee)) |target| {
+                                    if (try self.emitDirectClosureCall(cc.dest, target, cc.args)) {
+                                        emitted_specialized = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (!emitted_specialized) {
+                    try self.writeIndent();
+                    try self.writeDestLocal(cc.dest);
+                    try self.write(" = zap_runtime.invokeDynClosure(");
+                    try self.emitZigType(&cc.return_type);
+                    try self.write(", ");
+                    try self.writeLocal(cc.callee);
+                    try self.write(", .{");
+                    for (cc.args, 0..) |arg, i| {
+                        if (i > 0) try self.write(", ");
+                        try self.writeValueLocal(arg);
+                    }
+                    try self.write("});\n");
+                }
+            },
+            .make_closure => |mc| {
+                const mc_alloc = self.getClosureAllocation(mc.function);
+                try self.writeIndent();
+                if (mc.captures.len == 0) {
+                    try self.writeDestLocal(mc.dest);
+                    try self.write(" = zap_runtime.DynClosure{ .call_fn = @ptrCast(&__closure_invoke_");
+                    try self.writeInt(@intCast(mc.function));
+                    try self.write("), .env = null, .env_release = null };\n");
+                } else {
+                    const local_env = mc_alloc == .stack;
+                    if (local_env) {
+                        try self.write("var ");
+                        try self.write(self.closureEnvPrefix(mc.function));
+                        try self.writeInt(@intCast(mc.dest));
+                        try self.write(" = __closure_env_");
+                        try self.writeInt(@intCast(mc.function));
+                        try self.write("{");
+                    } else {
+                        try self.write("const __env_");
+                        try self.writeInt(@intCast(mc.dest));
+                        try self.write(" = std.heap.page_allocator.create(__closure_env_");
+                        try self.writeInt(@intCast(mc.function));
+                        try self.write(") catch unreachable;\n");
+                        try self.writeIndent();
+                        try self.write("__env_");
+                        try self.writeInt(@intCast(mc.dest));
+                        try self.write(".* = .{");
+                    }
+                    for (mc.captures, 0..) |cap, i| {
+                        if (i > 0) try self.write(", ");
+                        try self.write(".__cap_");
+                        try self.writeInt(@intCast(i));
+                        try self.write(" = ");
+                        try self.writeLocal(cap);
+                    }
+                    try self.write("};\n");
+                    if (!local_env) {
+                        if (self.function_defs.get(mc.function)) |func_def| {
+                            for (func_def.captures, 0..) |capture, i| {
+                                if (capture.ownership == .shared and capture.type_expr == .struct_ref) {
+                                    try self.writeIndent();
+                                    try self.write("zap_runtime.ArcRuntime.retainAny(@TypeOf(__env_");
+                                    try self.writeInt(@intCast(mc.dest));
+                                    try self.write(".__cap_");
+                                    try self.writeInt(@intCast(i));
+                                    try self.write("), &__env_");
+                                    try self.writeInt(@intCast(mc.dest));
+                                    try self.write(".__cap_");
+                                    try self.writeInt(@intCast(i));
+                                    try self.write(");\n");
+                                }
+                            }
+                        }
+                    }
+                    try self.writeIndent();
+                    try self.writeDestLocal(mc.dest);
+                    try self.write(" = zap_runtime.DynClosure{ .call_fn = @ptrCast(&__closure_invoke_");
+                    try self.writeInt(@intCast(mc.function));
+                    try self.write("), .env = ");
+                    if (local_env) {
+                        try self.write("@ptrCast(&");
+                        try self.write(self.closureEnvPrefix(mc.function));
+                        try self.writeInt(@intCast(mc.dest));
+                        try self.write(")");
+                    } else {
+                        try self.write("__env_");
+                        try self.writeInt(@intCast(mc.dest));
+                    }
+                    try self.write(", .env_release = ");
+                    if (local_env) {
+                        try self.write("null");
+                    } else {
+                        try self.write("&__closure_release_");
+                        try self.writeInt(@intCast(mc.function));
+                    }
+                    try self.write(" };\n");
+                }
+            },
+            .capture_get => |cg| {
+                try self.writeIndent();
+                try self.writeDestLocal(cg.dest);
+                try self.write(" = __cap_");
+                try self.writeInt(@intCast(cg.index));
+                try self.write(";\n");
             },
             .call_dispatch => |cd_disp| {
                 try self.writeIndent();
@@ -624,7 +1422,7 @@ pub const CodeGen = struct {
                 try self.write("(");
                 for (cd_disp.args, 0..) |arg, i| {
                     if (i > 0) try self.write(", ");
-                    try self.writeLocal(arg);
+                    try self.writeValueLocal(arg);
                 }
                 try self.write(");\n");
             },
@@ -636,7 +1434,7 @@ pub const CodeGen = struct {
                 try self.write(", .{");
                 for (tc.args, 0..) |arg, i| {
                     if (i > 0) try self.write(", ");
-                    try self.writeLocal(arg);
+                    try self.writeValueLocal(arg);
                 }
                 try self.write("});\n");
             },
@@ -820,6 +1618,31 @@ pub const CodeGen = struct {
                 const saved_case_label = self.current_case_label;
                 self.current_case_label = label_str;
 
+                // Perceus: emit reset for the scrutinee if there's a reuse pair.
+                // The reset checks RC and produces a reuse token.
+                if (self.analysis_context) |actx| {
+                    for (actx.reuse_pairs.items) |pair| {
+                        // Check if the scrutinee of this case_block matches the reset source.
+                        // The pre_instrs usually contain the scrutinee setup.
+                        if (pair.reset.source == cb.dest or
+                            (cb.pre_instrs.len > 0 and self.instrDefinesLocal(cb.pre_instrs[0], pair.reset.source)))
+                        {
+                            try self.writeIndent();
+                            try self.write("// Perceus: reset for potential reuse\n");
+                            try self.writeIndent();
+                            const token_local = try std.fmt.allocPrint(self.allocator, "const __local_{d}", .{pair.reset.dest});
+                            try self.write(token_local);
+                            try self.write(" = if (zap_runtime.ArcRuntime.refCountAny(@TypeOf(");
+                            try self.writeLocal(pair.reset.source);
+                            try self.write("), ");
+                            try self.writeLocal(pair.reset.source);
+                            try self.write(") == 1) @as(?*anyopaque, @ptrCast(");
+                            try self.writeLocal(pair.reset.source);
+                            try self.write(")) else null;\n");
+                        }
+                    }
+                }
+
                 // const __local_N = blk_case_L: { ... };
                 try self.writeIndent();
                 try self.writeDestLocal(cb.dest);
@@ -834,7 +1657,7 @@ pub const CodeGen = struct {
                 }
 
                 // Emit each conditional arm
-                for (cb.arms) |arm| {
+                for (cb.arms, 0..) |arm, arm_idx| {
                     for (arm.cond_instrs) |sub_instr| {
                         try self.emitInstruction(&sub_instr);
                     }
@@ -845,6 +1668,9 @@ pub const CodeGen = struct {
                     self.indent_level += 1;
                     for (arm.body_instrs) |sub_instr| {
                         try self.emitInstruction(&sub_instr);
+                    }
+                    if (arm.result) |r| {
+                        try self.emitDropSpecializationsForCurrentInstr(r, @intCast(arm_idx));
                     }
                     if (arm.result) |r| {
                         try self.writeIndent();
@@ -1155,25 +1981,73 @@ pub const CodeGen = struct {
                 try self.write("\n");
             },
             .ret => |r| {
+                if (self.skip_next_ret_local) |local| {
+                    if (r.value != null and r.value.? == local) {
+                        self.skip_next_ret_local = null;
+                        return;
+                    }
+                }
                 try self.writeIndent();
                 try self.write("return");
                 if (!self.current_fn_is_void) {
                     if (r.value) |v| {
                         try self.write(" ");
-                        try self.writeLocal(v);
+                        try self.writeValueLocal(v);
                     }
                 }
                 try self.write(";\n");
             },
-            .tuple_init => |ti| {
-                try self.writeIndent();
-                try self.writeDestLocal(ti.dest);
-                try self.write(" = .{");
-                for (ti.elements, 0..) |elem, i| {
-                    if (i > 0) try self.write(", ");
-                    try self.writeLocal(elem);
+            .jump => |j| {
+                if (j.bind_dest) |dest| {
+                    if (j.value) |value| {
+                        try self.writeIndent();
+                        try self.writeDestLocal(dest);
+                        try self.write(" = ");
+                        try self.writeValueLocal(value);
+                        try self.write(";\n");
+                    }
                 }
-                try self.write("};\n");
+                try self.writeIndent();
+                try self.write("// continuation jump label_");
+                try self.writeInt(@intCast(j.target));
+                try self.write("\n");
+            },
+            .tuple_init => |ti| {
+                if (self.findReusePairForDest(ti.dest)) |pair| {
+                    const token = pair.reuse.token orelse return error.EmitFailed;
+                    try self.markReuseBackedTupleLocal(ti.dest, ti.elements.len);
+                    try self.writeIndent();
+                    try self.write("const __tuple_seed_");
+                    try self.writeInt(@intCast(ti.dest));
+                    try self.write(" = .{");
+                    for (ti.elements, 0..) |elem, i| {
+                        if (i > 0) try self.write(", ");
+                        try self.writeValueLocal(elem);
+                    }
+                    try self.write("};\n");
+                    try self.writeIndent();
+                    try self.writeDestLocal(ti.dest);
+                    try self.write(" = zap_runtime.ArcRuntime.reuseAllocByType(@TypeOf(__tuple_seed_");
+                    try self.writeInt(@intCast(ti.dest));
+                    try self.write("), std.heap.page_allocator, ");
+                    try self.writeLocal(token);
+                    try self.write(");\n");
+                    try self.writeIndent();
+                    try self.writeLocal(ti.dest);
+                    try self.write(".* = __tuple_seed_");
+                    try self.writeInt(@intCast(ti.dest));
+                    try self.write(";\n");
+                } else {
+                    _ = self.reuse_backed_tuple_locals.remove(ti.dest);
+                    try self.writeIndent();
+                    try self.writeDestLocal(ti.dest);
+                    try self.write(" = .{");
+                    for (ti.elements, 0..) |elem, i| {
+                        if (i > 0) try self.write(", ");
+                        try self.writeValueLocal(elem);
+                    }
+                    try self.write("};\n");
+                }
             },
             .list_init => |li| {
                 try self.writeIndent();
@@ -1181,11 +2055,11 @@ pub const CodeGen = struct {
                 if (li.elements.len > 0) {
                     // Emit &[N]@TypeOf(first){...} for a typed runtime array
                     try self.write(" = &[_]@TypeOf(");
-                    try self.writeLocal(li.elements[0]);
+                    try self.writeValueLocal(li.elements[0]);
                     try self.write("){");
                     for (li.elements, 0..) |elem, i| {
                         if (i > 0) try self.write(", ");
-                        try self.writeLocal(elem);
+                        try self.writeValueLocal(elem);
                     }
                     try self.write("};\n");
                 } else {
@@ -1199,18 +2073,6 @@ pub const CodeGen = struct {
                 try self.write(mf.message);
                 try self.write("\");\n");
             },
-            .make_closure => |mc| {
-                try self.writeIndent();
-                try self.writeDestLocal(mc.dest);
-                try self.write(" = makeClosure(func_");
-                try self.writeInt(@intCast(mc.function));
-                try self.write(", .{");
-                for (mc.captures, 0..) |cap, i| {
-                    if (i > 0) try self.write(", ");
-                    try self.writeLocal(cap);
-                }
-                try self.write("});\n");
-            },
             .call_builtin => |cb| {
                 try self.writeIndent();
                 try self.writeDestLocal(cb.dest);
@@ -1219,7 +2081,7 @@ pub const CodeGen = struct {
                 try self.write("(");
                 for (cb.args, 0..) |arg, i| {
                     if (i > 0) try self.write(", ");
-                    try self.writeLocal(arg);
+                    try self.writeValueLocal(arg);
                 }
                 try self.write(");\n");
             },
@@ -1227,35 +2089,85 @@ pub const CodeGen = struct {
                 try self.writeIndent();
                 try self.writeDestLocal(ou.dest);
                 try self.write(" = ");
-                try self.writeLocal(ou.source);
+                try self.writeValueLocal(ou.source);
                 try self.write(" orelse zap_runtime.panic(\"attempted to unwrap nil value\");\n");
             },
             .struct_init => |si| {
-                try self.writeIndent();
-                try self.writeDestLocal(si.dest);
-                try self.write(" = ");
-                try self.write(si.type_name);
-                try self.write("{ ");
-                for (si.fields, 0..) |field, i| {
-                    if (i > 0) try self.write(", ");
-                    try self.write(".");
-                    try self.write(field.name);
+                if (self.findReusePairForDest(si.dest)) |pair| {
+                    const token = pair.reuse.token orelse return error.EmitFailed;
+                    try self.markReuseBackedStructLocal(si.dest, si.type_name);
+                    try self.writeIndent();
+                    try self.writeDestLocal(si.dest);
+                    try self.write(" = zap_runtime.ArcRuntime.reuseAllocByType(");
+                    try self.write(si.type_name);
+                    try self.write(", std.heap.page_allocator, ");
+                    try self.writeLocal(token);
+                    try self.write(");\n");
+                    try self.writeIndent();
+                    try self.writeLocal(si.dest);
+                    try self.write(".* = ");
+                    try self.write(si.type_name);
+                    try self.write("{ ");
+                    for (si.fields, 0..) |field, i| {
+                        if (i > 0) try self.write(", ");
+                        try self.write(".");
+                        try self.write(field.name);
+                        try self.write(" = ");
+                        try self.writeValueLocal(field.value);
+                    }
+                    try self.write(" };\n");
+                } else {
+                    _ = self.reuse_backed_struct_locals.remove(si.dest);
+                    _ = self.reuse_backed_union_locals.remove(si.dest);
+                    try self.writeIndent();
+                    try self.writeDestLocal(si.dest);
                     try self.write(" = ");
-                    try self.writeLocal(field.value);
+                    try self.write(si.type_name);
+                    try self.write("{ ");
+                    for (si.fields, 0..) |field, i| {
+                        if (i > 0) try self.write(", ");
+                        try self.write(".");
+                        try self.write(field.name);
+                        try self.write(" = ");
+                        try self.writeValueLocal(field.value);
+                    }
+                    try self.write(" };\n");
                 }
-                try self.write(" };\n");
             },
             .union_init => |ui| {
-                // Emit: const __local_N = UnionType{ .Variant = value };
-                try self.writeIndent();
-                try self.writeDestLocal(ui.dest);
-                try self.write(": ");
-                try self.write(ui.union_type);
-                try self.write(" = .{ .");
-                try self.write(ui.variant_name);
-                try self.write(" = ");
-                try self.writeLocal(ui.value);
-                try self.write(" };\n");
+                if (self.findReusePairForDest(ui.dest)) |pair| {
+                    const token = pair.reuse.token orelse return error.EmitFailed;
+                    _ = self.reuse_backed_struct_locals.remove(ui.dest);
+                    try self.markReuseBackedUnionLocal(ui);
+                    try self.writeIndent();
+                    try self.writeDestLocal(ui.dest);
+                    try self.write(" = zap_runtime.ArcRuntime.reuseAllocByType(");
+                    try self.write(ui.union_type);
+                    try self.write(", std.heap.page_allocator, ");
+                    try self.writeLocal(token);
+                    try self.write(");\n");
+                    try self.writeIndent();
+                    try self.writeLocal(ui.dest);
+                    try self.write(".* = ");
+                    try self.write(ui.union_type);
+                    try self.write("{ .");
+                    try self.write(ui.variant_name);
+                    try self.write(" = ");
+                    try self.writeValueLocal(ui.value);
+                    try self.write(" };\n");
+                } else {
+                    _ = self.reuse_backed_union_locals.remove(ui.dest);
+                    _ = self.reuse_backed_struct_locals.remove(ui.dest);
+                    try self.writeIndent();
+                    try self.writeDestLocal(ui.dest);
+                    try self.write(": ");
+                    try self.write(ui.union_type);
+                    try self.write(" = .{ .");
+                    try self.write(ui.variant_name);
+                    try self.write(" = ");
+                    try self.writeValueLocal(ui.value);
+                    try self.write(" };\n");
+                }
             },
             .field_get => |fg| {
                 try self.writeIndent();
@@ -1406,26 +2318,95 @@ pub const CodeGen = struct {
                 try self.write("\");\n");
             },
             .retain => |ret| {
-                try self.writeIndent();
-                try self.write("zap_runtime.ArcRuntime.retainAny(@TypeOf(");
-                try self.writeLocal(ret.value);
-                try self.write("), ");
-                try self.writeLocal(ret.value);
-                try self.write(");\n");
+                if (!self.shouldSkipArc(ret.value)) {
+                    try self.writeIndent();
+                    try self.write("zap_runtime.ArcRuntime.retainAny(@TypeOf(");
+                    try self.writeLocal(ret.value);
+                    try self.write("), ");
+                    try self.writeLocal(ret.value);
+                    try self.write(");\n");
+                }
             },
             .release => |rel| {
+                if (!self.shouldSkipArc(rel.value)) {
+                    try self.writeIndent();
+                    try self.write("zap_runtime.ArcRuntime.releaseAny(@TypeOf(");
+                    try self.writeLocal(rel.value);
+                    try self.write("), std.heap.page_allocator, ");
+                    try self.writeLocal(rel.value);
+                    try self.write(");\n");
+                }
+            },
+            .reset => |r| {
+                // Perceus reset: if RC=1, reuse token = source ptr; else release and token = null.
                 try self.writeIndent();
-                try self.write("zap_runtime.ArcRuntime.releaseAny(@TypeOf(");
-                try self.writeLocal(rel.value);
+                try self.writeDestLocal(r.dest);
+                try self.write(" = if (zap_runtime.ArcRuntime.refCountAny(@TypeOf(");
+                try self.writeLocal(r.source);
+                try self.write("), ");
+                try self.writeLocal(r.source);
+                try self.write(") == 1) @as(?*anyopaque, @ptrCast(");
+                try self.writeLocal(r.source);
+                try self.write(")) else blk: { zap_runtime.ArcRuntime.releaseAny(@TypeOf(");
+                try self.writeLocal(r.source);
                 try self.write("), std.heap.page_allocator, ");
-                try self.writeLocal(rel.value);
-                try self.write(");\n");
+                try self.writeLocal(r.source);
+                try self.write("); break :blk null; };\n");
+            },
+            .reuse_alloc => |ra| {
+                // Perceus reuse_alloc: if token non-null, reuse; else fresh alloc.
+                try self.writeIndent();
+                try self.writeDestLocal(ra.dest);
+                if (ra.token) |token| {
+                    try self.write(" = if (");
+                    try self.writeLocal(token);
+                    try self.write(") |reuse_ptr| @ptrCast(reuse_ptr) else ");
+                    try self.write("std.heap.page_allocator.create(");
+                    try self.emitZigType(&ra.dest_type);
+                    try self.write(") catch unreachable;\n");
+                } else {
+                    try self.write(" = std.heap.page_allocator.create(");
+                    try self.emitZigType(&ra.dest_type);
+                    try self.write(") catch unreachable;\n");
+                }
             },
             else => {
                 try self.writeIndent();
                 try self.write("// unhandled instruction\n");
             },
         }
+    }
+
+    /// Check if an instruction defines (produces) a given local.
+    fn instrDefinesLocal(self: *const CodeGen, instr_val: ir.Instruction, local: ir.LocalId) bool {
+        _ = self;
+        return switch (instr_val) {
+            .const_int => |ci| ci.dest == local,
+            .const_float => |cf| cf.dest == local,
+            .const_string => |cs| cs.dest == local,
+            .const_bool => |cb| cb.dest == local,
+            .const_atom => |ca| ca.dest == local,
+            .const_nil => |dest| dest == local,
+            .local_get => |lg| lg.dest == local,
+            .local_set => |ls| ls.dest == local,
+            .move_value => |mv| mv.dest == local,
+            .share_value => |sv| sv.dest == local,
+            .param_get => |pg| pg.dest == local,
+            .struct_init => |si| si.dest == local,
+            .tuple_init => |ti| ti.dest == local,
+            .list_init => |li| li.dest == local,
+            .map_init => |mi| mi.dest == local,
+            .union_init => |ui| ui.dest == local,
+            .field_get => |fg| fg.dest == local,
+            .binary_op => |bo| bo.dest == local,
+            .unary_op => |uo| uo.dest == local,
+            .call_direct => |cd| cd.dest == local,
+            .call_named => |cn| cn.dest == local,
+            .call_closure => |cc| cc.dest == local,
+            .make_closure => |mc| mc.dest == local,
+            .capture_get => |cg| cg.dest == local,
+            else => false,
+        };
     }
 
     // ============================================================
@@ -1512,6 +2493,7 @@ pub const CodeGen = struct {
                 }
                 try self.write(" }");
             },
+            .function => try self.write("zap_runtime.DynClosure"),
             .any => try self.write("anytype"),
             .struct_ref => |name| try self.write(name),
             .tagged_union => |name| try self.write(name),
@@ -1537,6 +2519,16 @@ pub const CodeGen = struct {
     fn writeLocal(self: *CodeGen, id: ir.LocalId) !void {
         const str = try std.fmt.allocPrint(self.allocator, "__local_{d}", .{id});
         try self.write(str);
+    }
+
+    fn writeValueLocal(self: *CodeGen, id: ir.LocalId) !void {
+        if (self.isReuseBackedStructLocal(id) or self.isReuseBackedUnionLocal(id) or self.isReuseBackedTupleLocal(id)) {
+            try self.write("(");
+            try self.writeLocal(id);
+            try self.write(".*)");
+            return;
+        }
+        try self.writeLocal(id);
     }
 
     fn writeDestLocal(self: *CodeGen, id: ir.LocalId) !void {
@@ -1581,6 +2573,104 @@ pub const CodeGen = struct {
     }
 };
 
+test "CodeGen.findReusePairForDest matches exact insertion point" {
+    const testing = std.testing;
+    const lattice = @import("escape_lattice.zig");
+
+    var analysis_context = lattice.AnalysisContext.init(testing.allocator);
+    defer analysis_context.deinit();
+
+    try analysis_context.addReusePair(.{
+        .match_site = 1,
+        .alloc_site = 10,
+        .reset = .{ .dest = 10001, .source = 4, .source_type = 0 },
+        .reuse = .{
+            .dest = 9,
+            .token = 10001,
+            .insertion_point = .{ .function = 3, .block = 5, .instr_index = 7, .position = .before },
+            .constructor_tag = 10,
+            .dest_type = 0,
+        },
+        .kind = .dynamic_reuse,
+    });
+    try analysis_context.addReusePair(.{
+        .match_site = 2,
+        .alloc_site = 11,
+        .reset = .{ .dest = 10002, .source = 6, .source_type = 0 },
+        .reuse = .{
+            .dest = 9,
+            .token = 10002,
+            .insertion_point = .{ .function = 3, .block = 5, .instr_index = 8, .position = .before },
+            .constructor_tag = 11,
+            .dest_type = 0,
+        },
+        .kind = .dynamic_reuse,
+    });
+
+    var codegen = CodeGen.init(testing.allocator);
+    defer codegen.deinit();
+    codegen.analysis_context = &analysis_context;
+    codegen.current_function_id = 3;
+    codegen.current_block_label = 5;
+    codegen.current_instr_index = 7;
+
+    const pair = codegen.findReusePairForDest(9) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(ir.LocalId, 10001), pair.reset.dest);
+    try testing.expectEqual(@as(u32, 7), pair.reuse.insertion_point.instr_index);
+}
+
+test "CodeGen.findReusePairForDest requires exact destination and site" {
+    const testing = std.testing;
+    const lattice = @import("escape_lattice.zig");
+
+    var analysis_context = lattice.AnalysisContext.init(testing.allocator);
+    defer analysis_context.deinit();
+
+    try analysis_context.addReusePair(.{
+        .match_site = 1,
+        .alloc_site = 10,
+        .reset = .{ .dest = 10001, .source = 4, .source_type = 0 },
+        .reuse = .{
+            .dest = 9,
+            .token = 10001,
+            .insertion_point = .{ .function = 3, .block = 5, .instr_index = 7, .position = .before },
+            .constructor_tag = 10,
+            .dest_type = 0,
+        },
+        .kind = .dynamic_reuse,
+    });
+
+    var wrong_instr = CodeGen.init(testing.allocator);
+    defer wrong_instr.deinit();
+    wrong_instr.analysis_context = &analysis_context;
+    wrong_instr.current_function_id = 3;
+    wrong_instr.current_block_label = 5;
+    wrong_instr.current_instr_index = 6;
+    try testing.expect(wrong_instr.findReusePairForDest(9) == null);
+
+    var wrong_dest = CodeGen.init(testing.allocator);
+    defer wrong_dest.deinit();
+    wrong_dest.analysis_context = &analysis_context;
+    wrong_dest.current_function_id = 3;
+    wrong_dest.current_block_label = 5;
+    wrong_dest.current_instr_index = 7;
+    try testing.expect(wrong_dest.findReusePairForDest(10) == null);
+}
+
+test "CodeGen.findClosureTargetInList follows local aliases" {
+    const captures = [_]ir.LocalId{7};
+    const instrs = [_]ir.Instruction{
+        .{ .make_closure = .{ .dest = 4, .function = 9, .captures = &captures } },
+        .{ .local_set = .{ .dest = 5, .value = 4 } },
+        .{ .share_value = .{ .dest = 6, .source = 5 } },
+    };
+
+    const target = CodeGen.findClosureTargetInList(&instrs, 6) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(ir.FunctionId, 9), target.function_id);
+    try std.testing.expectEqual(@as(usize, 1), target.captures.len);
+    try std.testing.expectEqual(@as(ir.LocalId, 7), target.captures[0]);
+}
+
 // ============================================================
 // Tests
 // ============================================================
@@ -1588,11 +2678,14 @@ pub const CodeGen = struct {
 const Parser = @import("parser.zig").Parser;
 const Collector = @import("collector.zig").Collector;
 const hir_mod = @import("hir.zig");
+const lattice_test = @import("escape_lattice.zig");
 
 test "codegen simple function" {
     const source =
-        \\def add(x :: i64, y :: i64) :: i64 do
-        \\  x + y
+        \\defmodule Test do
+        \\  def add(x :: i64, y :: i64) :: i64 do
+        \\    x + y
+        \\  end
         \\end
     ;
 
@@ -1624,16 +2717,18 @@ test "codegen simple function" {
     try codegen.emitProgram(&ir_program);
 
     const output = codegen.getOutput();
-    // Should contain function definition
-    try std.testing.expect(std.mem.indexOf(u8, output, "fn add") != null);
+    // Should contain function definition (module-prefixed)
+    try std.testing.expect(std.mem.indexOf(u8, output, "fn Test__add") != null);
     // Should contain return statement
     try std.testing.expect(std.mem.indexOf(u8, output, "return") != null);
 }
 
 test "codegen produces valid structure" {
     const source =
-        \\def foo() do
-        \\  42
+        \\defmodule Test do
+        \\  def foo() do
+        \\    42
+        \\  end
         \\end
     ;
 
@@ -1669,4 +2764,465 @@ test "codegen produces valid structure" {
     try std.testing.expect(std.mem.indexOf(u8, output, "Generated by Zap compiler") != null);
     // Should contain the literal 42
     try std.testing.expect(std.mem.indexOf(u8, output, "42") != null);
+}
+
+test "codegen emits analysis-owned ARC operations at insertion points" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const instrs = [_]ir.Instruction{
+        .{ .local_get = .{ .dest = 0, .source = 0 } },
+        .{ .ret = .{ .value = 0 } },
+    };
+    const blocks = [_]ir.Block{.{ .label = 0, .instructions = &instrs }};
+    const params = [_]ir.Param{.{ .name = "value", .type_expr = .i64 }};
+    const functions = [_]ir.Function{.{
+        .id = 0,
+        .name = "with_arc_ops",
+        .scope_id = 0,
+        .arity = 1,
+        .params = &params,
+        .return_type = .i64,
+        .body = &blocks,
+        .is_closure = false,
+        .captures = &.{},
+    }};
+    const program = ir.Program{ .functions = &functions, .type_defs = &.{}, .entry = 0 };
+
+    var actx = lattice_test.AnalysisContext.init(alloc);
+    defer actx.deinit();
+    try actx.addArcOp(.{
+        .kind = .retain,
+        .value = 0,
+        .insertion_point = .{ .function = 0, .block = 0, .instr_index = 0, .position = .before },
+        .reason = .shared_binding,
+    });
+    try actx.addArcOp(.{
+        .kind = .release,
+        .value = 0,
+        .insertion_point = .{ .function = 0, .block = 0, .instr_index = 0, .position = .after },
+        .reason = .scope_exit,
+    });
+
+    var codegen = CodeGen.init(alloc);
+    defer codegen.deinit();
+    codegen.analysis_context = &actx;
+    try codegen.emitProgram(&program);
+
+    const output = codegen.getOutput();
+    try std.testing.expect(std.mem.indexOf(u8, output, "ArcRuntime.retainAny(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "ArcRuntime.releaseAny(") != null);
+}
+
+test "codegen lowers analysis-driven struct reuse via reuseAllocByType" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const struct_fields = [_]ir.StructFieldDef{
+        .{ .name = "first", .type_expr = "i64" },
+        .{ .name = "second", .type_expr = "i64" },
+    };
+    const type_defs = [_]ir.TypeDef{.{
+        .name = "Pair",
+        .kind = .{ .struct_def = .{ .fields = &struct_fields } },
+    }};
+    const struct_init_fields = [_]ir.StructFieldInit{
+        .{ .name = "first", .value = 11 },
+        .{ .name = "second", .value = 10 },
+    };
+    const instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .field_get = .{ .dest = 10, .object = 0, .field = "first" } },
+        .{ .field_get = .{ .dest = 11, .object = 0, .field = "second" } },
+        .{ .struct_init = .{ .dest = 20, .type_name = "Pair", .fields = &struct_init_fields } },
+        .{ .ret = .{ .value = 20 } },
+    };
+    const blocks = [_]ir.Block{.{ .label = 0, .instructions = &instrs }};
+    const params = [_]ir.Param{.{ .name = "pair", .type_expr = .{ .struct_ref = "Pair" } }};
+    const functions = [_]ir.Function{.{
+        .id = 0,
+        .name = "swap_pair",
+        .scope_id = 0,
+        .arity = 1,
+        .params = &params,
+        .return_type = .{ .struct_ref = "Pair" },
+        .body = &blocks,
+        .is_closure = false,
+        .captures = &.{},
+    }};
+    const program = ir.Program{ .functions = &functions, .type_defs = &type_defs, .entry = 0 };
+
+    var actx = lattice_test.AnalysisContext.init(alloc);
+    defer actx.deinit();
+    try actx.addReusePair(.{
+        .match_site = 1,
+        .alloc_site = 2,
+        .reset = .{
+            .dest = 10001,
+            .source = 0,
+            .source_type = 0,
+        },
+        .reuse = .{
+            .dest = 20,
+            .token = 10001,
+            .insertion_point = .{ .function = 0, .block = 0, .instr_index = 3, .position = .before },
+            .constructor_tag = 2,
+            .dest_type = 0,
+        },
+        .kind = .dynamic_reuse,
+    });
+
+    var codegen = CodeGen.init(alloc);
+    defer codegen.deinit();
+    codegen.analysis_context = &actx;
+    try codegen.emitProgram(&program);
+
+    const output = codegen.getOutput();
+    try std.testing.expect(std.mem.indexOf(u8, output, "ArcRuntime.reuseAllocByType(Pair, std.heap.page_allocator, __local_10001)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "__local_20.* = Pair{ .first = __local_11, .second = __local_10 }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "return (__local_20.*);") != null);
+}
+
+test "codegen lowers analysis-driven union reuse via reuseAllocByType" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const union_variants = [_]ir.UnionVariant{
+        .{ .name = "circle", .type_name = "f64" },
+        .{ .name = "rect", .type_name = "f64" },
+    };
+    const type_defs = [_]ir.TypeDef{.{
+        .name = "Shape",
+        .kind = .{ .union_def = .{ .variants = &union_variants } },
+    }};
+    const instrs = [_]ir.Instruction{
+        .{ .const_float = .{ .dest = 10, .value = 3.0 } },
+        .{ .union_init = .{ .dest = 20, .union_type = "Shape", .variant_name = "circle", .value = 10 } },
+        .{ .ret = .{ .value = 20 } },
+    };
+    const blocks = [_]ir.Block{.{ .label = 0, .instructions = &instrs }};
+    const functions = [_]ir.Function{.{
+        .id = 0,
+        .name = "mk_shape",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .{ .tagged_union = "Shape" },
+        .body = &blocks,
+        .is_closure = false,
+        .captures = &.{},
+    }};
+    const program = ir.Program{ .functions = &functions, .type_defs = &type_defs, .entry = 0 };
+
+    var actx = lattice_test.AnalysisContext.init(alloc);
+    defer actx.deinit();
+    try actx.addReusePair(.{
+        .match_site = 1,
+        .alloc_site = 2,
+        .reset = .{ .dest = 10001, .source = 0, .source_type = 0 },
+        .reuse = .{
+            .dest = 20,
+            .token = 10001,
+            .insertion_point = .{ .function = 0, .block = 0, .instr_index = 1, .position = .before },
+            .constructor_tag = 2,
+            .dest_type = 0,
+        },
+        .kind = .dynamic_reuse,
+    });
+
+    var codegen = CodeGen.init(alloc);
+    defer codegen.deinit();
+    codegen.analysis_context = &actx;
+    try codegen.emitProgram(&program);
+
+    const output = codegen.getOutput();
+    try std.testing.expect(std.mem.indexOf(u8, output, "ArcRuntime.reuseAllocByType(Shape, std.heap.page_allocator, __local_10001)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "__local_20.* = Shape{ .circle = __local_10 };") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "return (__local_20.*);") != null);
+}
+
+test "codegen lowers continuation jump payload into bound local" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const block0_instrs = [_]ir.Instruction{
+        .{ .const_int = .{ .dest = 5, .value = 42 } },
+        .{ .jump = .{ .target = 1, .value = 5, .bind_dest = 1 } },
+    };
+    const block1_instrs = [_]ir.Instruction{
+        .{ .const_int = .{ .dest = 2, .value = 1 } },
+        .{ .binary_op = .{ .dest = 3, .op = .add, .lhs = 1, .rhs = 2 } },
+        .{ .ret = .{ .value = 3 } },
+    };
+    const blocks = [_]ir.Block{
+        .{ .label = 0, .instructions = &block0_instrs },
+        .{ .label = 1, .instructions = &block1_instrs },
+    };
+    const functions = [_]ir.Function{.{
+        .id = 0,
+        .name = "main",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .i64,
+        .body = &blocks,
+        .is_closure = false,
+        .captures = &.{},
+    }};
+    const program = ir.Program{ .functions = &functions, .type_defs = &.{}, .entry = 0 };
+
+    var codegen = CodeGen.init(alloc);
+    defer codegen.deinit();
+    try codegen.emitProgram(&program);
+
+    const output = codegen.getOutput();
+    try std.testing.expect(std.mem.indexOf(u8, output, "// continuation jump label_1") != null);
+}
+
+test "codegen lowers analysis-driven tuple reuse via reuseAllocByType" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const instrs = [_]ir.Instruction{
+        .{ .const_int = .{ .dest = 10, .value = 1 } },
+        .{ .const_int = .{ .dest = 11, .value = 2 } },
+        .{ .tuple_init = .{ .dest = 20, .elements = &[_]ir.LocalId{ 10, 11 } } },
+        .{ .ret = .{ .value = 20 } },
+    };
+    const blocks = [_]ir.Block{.{ .label = 0, .instructions = &instrs }};
+    const functions = [_]ir.Function{.{
+        .id = 0,
+        .name = "main",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .{ .tuple = &[_]ir.ZigType{ .i64, .i64 } },
+        .body = &blocks,
+        .is_closure = false,
+        .captures = &.{},
+    }};
+    const program = ir.Program{ .functions = &functions, .type_defs = &.{}, .entry = 0 };
+
+    var actx = lattice_test.AnalysisContext.init(alloc);
+    defer actx.deinit();
+    try actx.addReusePair(.{
+        .match_site = 1,
+        .alloc_site = 2,
+        .reset = .{ .dest = 10001, .source = 0, .source_type = 0 },
+        .reuse = .{
+            .dest = 20,
+            .token = 10001,
+            .insertion_point = .{ .function = 0, .block = 0, .instr_index = 2, .position = .before },
+            .constructor_tag = 2,
+            .dest_type = 0,
+        },
+        .kind = .dynamic_reuse,
+    });
+
+    var codegen = CodeGen.init(alloc);
+    defer codegen.deinit();
+    codegen.analysis_context = &actx;
+    try codegen.emitProgram(&program);
+
+    const output = codegen.getOutput();
+    try std.testing.expect(std.mem.indexOf(u8, output, "ArcRuntime.reuseAllocByType(@TypeOf(__tuple_seed_20), std.heap.page_allocator, __local_10001)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "__local_20.* = __tuple_seed_20;") != null);
+}
+
+test "codegen keeps plain tuple construction when reuse pair does not match" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const instrs = [_]ir.Instruction{
+        .{ .const_int = .{ .dest = 10, .value = 1 } },
+        .{ .const_int = .{ .dest = 11, .value = 2 } },
+        .{ .tuple_init = .{ .dest = 20, .elements = &[_]ir.LocalId{ 10, 11 } } },
+        .{ .ret = .{ .value = 20 } },
+    };
+    const blocks = [_]ir.Block{.{ .label = 0, .instructions = &instrs }};
+    const functions = [_]ir.Function{.{
+        .id = 0,
+        .name = "main",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .{ .tuple = &[_]ir.ZigType{ .i64, .i64 } },
+        .body = &blocks,
+        .is_closure = false,
+        .captures = &.{},
+    }};
+    const program = ir.Program{ .functions = &functions, .type_defs = &.{}, .entry = 0 };
+
+    var actx = lattice_test.AnalysisContext.init(alloc);
+    defer actx.deinit();
+    try actx.addReusePair(.{
+        .match_site = 1,
+        .alloc_site = 2,
+        .reset = .{ .dest = 10001, .source = 0, .source_type = 0 },
+        .reuse = .{
+            .dest = 20,
+            .token = 10001,
+            .insertion_point = .{ .function = 0, .block = 0, .instr_index = 1, .position = .before },
+            .constructor_tag = 2,
+            .dest_type = 0,
+        },
+        .kind = .dynamic_reuse,
+    });
+
+    var codegen = CodeGen.init(alloc);
+    defer codegen.deinit();
+    codegen.analysis_context = &actx;
+    try codegen.emitProgram(&program);
+
+    const output = codegen.getOutput();
+    try std.testing.expect(std.mem.indexOf(u8, output, "ArcRuntime.reuseAllocByType(@TypeOf(__tuple_seed_20)") == null);
+}
+
+test "codegen emits arm-specific drop specializations without duplicate generic releases" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const arm0_body = [_]ir.Instruction{.{ .const_int = .{ .dest = 11, .value = 1 } }};
+    const arm1_body = [_]ir.Instruction{.{ .const_int = .{ .dest = 21, .value = 2 } }};
+    const arm0_cond = [_]ir.Instruction{.{ .const_bool = .{ .dest = 10, .value = true } }};
+    const arm1_cond = [_]ir.Instruction{.{ .const_bool = .{ .dest = 20, .value = false } }};
+    const arms = [_]ir.IrCaseArm{
+        .{ .cond_instrs = &arm0_cond, .condition = 10, .body_instrs = &arm0_body, .result = 11 },
+        .{ .cond_instrs = &arm1_cond, .condition = 20, .body_instrs = &arm1_body, .result = 21 },
+    };
+    const instrs = [_]ir.Instruction{
+        .{ .case_block = .{ .dest = 30, .pre_instrs = &.{}, .arms = &arms, .default_instrs = &.{}, .default_result = null } },
+        .{ .ret = .{ .value = 30 } },
+    };
+    const blocks = [_]ir.Block{.{ .label = 0, .instructions = &instrs }};
+    const functions = [_]ir.Function{.{
+        .id = 0,
+        .name = "main",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .i64,
+        .body = &blocks,
+        .is_closure = false,
+        .captures = &.{},
+    }};
+    const program = ir.Program{ .functions = &functions, .type_defs = &.{}, .entry = 0 };
+
+    const fd0 = try alloc.alloc(lattice_test.FieldDrop, 1);
+    fd0[0] = .{ .field_name = "left", .field_index = 0, .needs_recursive_drop = true, .local = 11 };
+    const fd1 = try alloc.alloc(lattice_test.FieldDrop, 1);
+    fd1[0] = .{ .field_name = "right", .field_index = 0, .needs_recursive_drop = true, .local = 21 };
+
+    var actx = lattice_test.AnalysisContext.init(alloc);
+    defer actx.deinit();
+    try actx.drop_specializations.append(alloc, .{
+        .match_site = 1,
+        .constructor_tag = 0,
+        .field_drops = fd0,
+        .function = 0,
+        .insertion_point = .{ .function = 0, .block = 0, .instr_index = 0, .position = .after },
+    });
+    try actx.drop_specializations.append(alloc, .{
+        .match_site = 1,
+        .constructor_tag = 1,
+        .field_drops = fd1,
+        .function = 0,
+        .insertion_point = .{ .function = 0, .block = 0, .instr_index = 0, .position = .after },
+    });
+    try actx.arc_ops.append(alloc, .{
+        .kind = .release,
+        .value = 30,
+        .insertion_point = .{ .function = 0, .block = 0, .instr_index = 0, .position = .after },
+        .reason = .perceus_drop,
+    });
+
+    var codegen = CodeGen.init(alloc);
+    defer codegen.deinit();
+    codegen.analysis_context = &actx;
+    try codegen.emitProgram(&program);
+
+    const output = codegen.getOutput();
+    try std.testing.expect(std.mem.indexOf(u8, output, "releaseAny(@TypeOf(__local_11), std.heap.page_allocator, __local_11);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "releaseAny(@TypeOf(__local_21), std.heap.page_allocator, __local_21);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "releaseAny(@TypeOf(__local_30)") == null);
+}
+
+test "codegen distinguishes block-local and function-local closure env names" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const closure_instrs = [_]ir.Instruction{
+        .{ .capture_get = .{ .dest = 0, .index = 0 } },
+        .{ .ret = .{ .value = 0 } },
+    };
+    const closure_blocks = [_]ir.Block{.{ .label = 0, .instructions = &closure_instrs }};
+    const closure_captures = [_]ir.Capture{.{ .name = "x", .type_expr = .i64, .ownership = .shared }};
+
+    const main_instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .make_closure = .{ .dest = 1, .function = 1, .captures = &[_]ir.LocalId{0} } },
+        .{ .make_closure = .{ .dest = 2, .function = 2, .captures = &[_]ir.LocalId{0} } },
+        .{ .ret = .{ .value = 0 } },
+    };
+    const main_blocks = [_]ir.Block{.{ .label = 0, .instructions = &main_instrs }};
+    const main_params = [_]ir.Param{.{ .name = "x", .type_expr = .i64 }};
+
+    const functions = [_]ir.Function{
+        .{
+            .id = 0,
+            .name = "main",
+            .scope_id = 0,
+            .arity = 1,
+            .params = &main_params,
+            .return_type = .i64,
+            .body = &main_blocks,
+            .is_closure = false,
+            .captures = &.{},
+        },
+        .{
+            .id = 1,
+            .name = "block_cap",
+            .scope_id = 0,
+            .arity = 0,
+            .params = &.{},
+            .return_type = .i64,
+            .body = &closure_blocks,
+            .is_closure = true,
+            .captures = &closure_captures,
+        },
+        .{
+            .id = 2,
+            .name = "frame_cap",
+            .scope_id = 0,
+            .arity = 0,
+            .params = &.{},
+            .return_type = .i64,
+            .body = &closure_blocks,
+            .is_closure = true,
+            .captures = &closure_captures,
+        },
+    };
+    const program = ir.Program{ .functions = &functions, .type_defs = &.{}, .entry = 0 };
+
+    var actx = lattice_test.AnalysisContext.init(alloc);
+    defer actx.deinit();
+    try actx.closure_tiers.put(1, .block_local);
+    try actx.closure_tiers.put(2, .function_local);
+
+    var codegen = CodeGen.init(alloc);
+    defer codegen.deinit();
+    codegen.analysis_context = &actx;
+    try codegen.emitProgram(&program);
+
+    const output = codegen.getOutput();
+    try std.testing.expect(std.mem.indexOf(u8, output, "var __block_env_1 = __closure_env_1{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "var __frame_env_2 = __closure_env_2{") != null);
 }

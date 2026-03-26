@@ -14,7 +14,9 @@ defmodule Counter do
   end
 end
 
-def main() do
-  Counter.countdown(100_000_000)
-  |> Kernel.inspect()
+defmodule TailCall do
+  def main() do
+    Counter.countdown(100_000_000)
+    |> Kernel.inspect()
+  end
 end

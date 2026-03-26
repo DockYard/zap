@@ -530,8 +530,10 @@ const Parser = @import("parser.zig").Parser;
 
 test "collect simple function" {
     const source =
-        \\def add(x :: i64, y :: i64) :: i64 do
-        \\  x + y
+        \\defmodule Test do
+        \\  def add(x :: i64, y :: i64) :: i64 do
+        \\    x + y
+        \\  end
         \\end
     ;
 
@@ -547,8 +549,8 @@ test "collect simple function" {
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    // Should have: prelude scope + function scope
-    try std.testing.expectEqual(@as(usize, 2), collector.graph.scopes.items.len);
+    // Should have: prelude scope + module scope + function scope
+    try std.testing.expectEqual(@as(usize, 3), collector.graph.scopes.items.len);
     // Should have 1 function family
     try std.testing.expectEqual(@as(usize, 1), collector.graph.families.items.len);
     // Family should have arity 2
@@ -616,12 +618,14 @@ test "collect type declaration" {
 
 test "collect function family grouping" {
     const source =
-        \\def factorial(0 :: i64) :: i64 do
-        \\  1
-        \\end
+        \\defmodule Test do
+        \\  def factorial(0 :: i64) :: i64 do
+        \\    1
+        \\  end
         \\
-        \\def factorial(n :: i64) :: i64 do
-        \\  n * factorial(n - 1)
+        \\  def factorial(n :: i64) :: i64 do
+        \\    n * factorial(n - 1)
+        \\  end
         \\end
     ;
 
@@ -645,12 +649,14 @@ test "collect function family grouping" {
 
 test "collect case expression creates scopes" {
     const source =
-        \\def foo(x) do
-        \\  case x do
-        \\    {:ok, v} ->
-        \\      v
-        \\    {:error, e} ->
-        \\      e
+        \\defmodule Test do
+        \\  def foo(x) do
+        \\    case x do
+        \\      {:ok, v} ->
+        \\        v
+        \\      {:error, e} ->
+        \\        e
+        \\    end
         \\  end
         \\end
     ;
@@ -667,19 +673,21 @@ test "collect case expression creates scopes" {
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    // prelude + function + 2 case clause scopes
-    try std.testing.expectEqual(@as(usize, 4), collector.graph.scopes.items.len);
+    // prelude + module + function + 2 case clause scopes
+    try std.testing.expectEqual(@as(usize, 5), collector.graph.scopes.items.len);
     // Parameter x + pattern binds v and e
     try std.testing.expectEqual(@as(usize, 3), collector.graph.bindings.items.len);
 }
 
 test "collect local def hoisting" {
     const source =
-        \\def outer(x :: i64) :: String do
-        \\  def inner(s :: String) :: String do
-        \\    s
+        \\defmodule Test do
+        \\  def outer(x :: i64) :: String do
+        \\    def inner(s :: String) :: String do
+        \\      s
+        \\    end
+        \\    inner("ok")
         \\  end
-        \\  inner("ok")
         \\end
     ;
 

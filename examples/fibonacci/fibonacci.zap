@@ -10,8 +10,8 @@ defmodule Fibonacci do
   def fib(n :: i64) :: i64 do
     fib(n - 1) + fib(n - 2)
   end
-end
 
-def main() do
-  Fibonacci.fib(20)
+  def main() do
+    Fibonacci.fib(20)
+  end
 end

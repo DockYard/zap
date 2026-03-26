@@ -1110,8 +1110,10 @@ const Collector = @import("collector.zig").Collector;
 
 test "macro engine no-op on program without macros" {
     const source =
-        \\def add(x :: i64, y :: i64) :: i64 do
-        \\  x + y
+        \\defmodule Test do
+        \\  def add(x :: i64, y :: i64) :: i64 do
+        \\    x + y
+        \\  end
         \\end
     ;
 
@@ -1132,8 +1134,8 @@ test "macro engine no-op on program without macros" {
     const expanded = try engine.expandProgram(&program);
 
     // No macros — program should be unchanged
-    try std.testing.expectEqual(@as(usize, 1), expanded.top_items.len);
-    try std.testing.expect(expanded.top_items[0] == .function);
+    try std.testing.expectEqual(@as(usize, 1), expanded.modules.len);
+    try std.testing.expect(expanded.modules[0].items[0] == .function);
 }
 
 test "macro engine expands simple macro" {
@@ -1209,8 +1211,10 @@ test "macro engine hygiene generates unique names" {
 
 test "macro engine reaches fixed point" {
     const source =
-        \\def foo() do
-        \\  42
+        \\defmodule Test do
+        \\  def foo() do
+        \\    42
+        \\  end
         \\end
     ;
 
@@ -1232,7 +1236,7 @@ test "macro engine reaches fixed point" {
 
     // Should reach fixed point immediately (no macros to expand)
     try std.testing.expectEqual(@as(usize, 0), engine.errors.items.len);
-    try std.testing.expectEqual(@as(usize, 1), expanded.top_items.len);
+    try std.testing.expectEqual(@as(usize, 1), expanded.modules.len);
 }
 
 test "typed macro: nil in String return position is an error" {

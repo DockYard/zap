@@ -1,6 +1,8 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 const scope_mod = @import("scope.zig");
+const escape_lattice = @import("escape_lattice.zig");
+const ir = @import("ir.zig");
 const similarity = @import("similarity.zig");
 
 // ============================================================
@@ -391,6 +393,8 @@ pub const TypeChecker = struct {
     // Ownership metadata for bindings. Phase 1 stores the foundation here,
     // but enforcement comes later.
     ownership_bindings: std.AutoHashMap(scope_mod.BindingId, BindingOwnershipInfo),
+    analysis_context: ?*const escape_lattice.AnalysisContext,
+    analysis_program: ?*const ir.Program,
 
     // Number of stdlib lines prepended (bindings in these lines are skipped for unused checks)
     stdlib_line_count: u32 = 0,
@@ -417,6 +421,8 @@ pub const TypeChecker = struct {
             .current_scope = null,
             .referenced_bindings = std.AutoHashMap(scope_mod.BindingId, void).init(allocator),
             .ownership_bindings = std.AutoHashMap(scope_mod.BindingId, BindingOwnershipInfo).init(allocator),
+            .analysis_context = null,
+            .analysis_program = null,
         };
     }
 
@@ -428,6 +434,11 @@ pub const TypeChecker = struct {
         self.ownership_bindings.deinit();
     }
 
+    pub fn setAnalysisContext(self: *TypeChecker, context: *const escape_lattice.AnalysisContext, program: *const ir.Program) void {
+        self.analysis_context = context;
+        self.analysis_program = program;
+    }
+
     fn defaultOwnershipForType(self: *const TypeChecker, type_id: TypeId) Ownership {
         const typ = self.store.getType(type_id);
         return switch (typ) {
@@ -437,8 +448,23 @@ pub const TypeChecker = struct {
     }
 
     fn resolveParamOwnership(self: *const TypeChecker, param: ast.Param, resolved_type: TypeId) Ownership {
+        if (param.ownership_explicit) {
+            return switch (param.ownership) {
+                .shared => .shared,
+                .unique => .unique,
+                .borrowed => .borrowed,
+            };
+        }
         return switch (param.ownership) {
             .shared => self.defaultOwnershipForType(resolved_type),
+            .unique => .unique,
+            .borrowed => .borrowed,
+        };
+    }
+
+    fn mapAstOwnership(ownership: ast.Ownership) Ownership {
+        return switch (ownership) {
+            .shared => .shared,
             .unique => .unique,
             .borrowed => .borrowed,
         };
@@ -453,6 +479,7 @@ pub const TypeChecker = struct {
     fn recordBindingType(self: *TypeChecker, binding_id: scope_mod.BindingId, type_id: TypeId, source_span: ast.SourceSpan) !void {
         self.graph.bindings.items[binding_id].type_id = .{
             .type_id = type_id,
+            .ownership = .shared,
             .source_span = source_span,
         };
         try self.recordBindingOwnership(binding_id, type_id, self.defaultOwnershipForType(type_id));
@@ -461,6 +488,11 @@ pub const TypeChecker = struct {
     fn recordBindingQualifiedType(self: *TypeChecker, binding_id: scope_mod.BindingId, qualified_type: QualifiedType, source_span: ast.SourceSpan) !void {
         self.graph.bindings.items[binding_id].type_id = .{
             .type_id = qualified_type.type_id,
+            .ownership = switch (qualified_type.ownership) {
+                .shared => .shared,
+                .unique => .unique,
+                .borrowed => .borrowed,
+            },
             .source_span = source_span,
         };
         try self.recordBindingOwnership(binding_id, qualified_type.type_id, qualified_type.ownership);
@@ -523,13 +555,36 @@ pub const TypeChecker = struct {
     }
 
     fn applyCallOwnership(self: *TypeChecker, args: []const *const ast.Expr, fn_type: Type.FunctionType) ![]const scope_mod.BindingId {
+        return self.applyCallOwnershipWithSafeParams(args, fn_type, null);
+    }
+
+    fn applyCallOwnershipWithSafeParams(self: *TypeChecker, args: []const *const ast.Expr, fn_type: Type.FunctionType, safe_closure_params: ?[]const bool) ![]const scope_mod.BindingId {
         const param_ownerships = fn_type.param_ownerships orelse return &[_]scope_mod.BindingId{};
         if (self.current_scope == null) return &[_]scope_mod.BindingId{};
 
         const scope_id = self.current_scope.?;
         const count = @min(args.len, param_ownerships.len);
         var borrowed: std.ArrayList(scope_mod.BindingId) = .empty;
-        for (args[0..count], param_ownerships[0..count]) |arg, ownership| {
+        for (args[0..count], param_ownerships[0..count], 0..) |arg, ownership, idx| {
+            if (arg.* == .var_ref) {
+                if (self.resolveFunctionValueDecl(self.current_scope.?, arg.var_ref.name)) |decl| {
+                    if (self.analysis_context != null and self.functionDeclCapturesBorrowed(decl)) {
+                        const callee_allows = if (safe_closure_params) |flags|
+                            idx < flags.len and flags[idx]
+                        else
+                            false;
+                        if (!callee_allows) {
+                            try self.addHardError(
+                                "closure with borrowed captures cannot be passed as an argument",
+                                arg.getMeta().span,
+                                "borrowed capture escapes scope",
+                                "call the closure locally instead of passing it beyond the borrow scope",
+                            );
+                            continue;
+                        }
+                    }
+                }
+            }
             if (arg.* != .var_ref) continue;
             const vr = arg.var_ref;
             const binding_id = self.graph.resolveBinding(scope_id, vr.name) orelse continue;
@@ -569,6 +624,19 @@ pub const TypeChecker = struct {
         for (borrowed_bindings) |binding_id| {
             try self.endBindingBorrow(binding_id);
         }
+    }
+
+    fn borrowedBindingFromExpr(self: *TypeChecker, expr: *const ast.Expr) ?scope_mod.BindingId {
+        if (self.current_scope == null) return null;
+        return switch (expr.*) {
+            .var_ref => |vr| blk: {
+                const binding_id = self.graph.resolveBinding(self.current_scope.?, vr.name) orelse break :blk null;
+                const info = self.ownership_bindings.get(binding_id) orelse break :blk null;
+                if (info.qualified_type.ownership == .borrowed) break :blk binding_id;
+                break :blk null;
+            },
+            else => null,
+        };
     }
 
     fn sharedOwnershipSlice(self: *TypeChecker, len: usize) ![]const Ownership {
@@ -612,6 +680,441 @@ pub const TypeChecker = struct {
             .return_type = return_type,
             .return_ownership = self.defaultOwnershipForType(return_type),
         };
+    }
+
+    fn resolveFunctionValueSignature(self: *TypeChecker, scope_id: scope_mod.ScopeId, name: ast.StringId) !?FunctionSignature {
+        var current: ?scope_mod.ScopeId = scope_id;
+        var found: ?FunctionSignature = null;
+        while (current) |sid| {
+            var it = self.graph.getScope(sid).function_families.iterator();
+            while (it.next()) |entry| {
+                const key = entry.key_ptr.*;
+                if (key.name != name) continue;
+                if (found != null) return null;
+                found = try self.resolveFamilySignature(sid, name, key.arity);
+            }
+            current = self.graph.getScope(sid).parent;
+        }
+        return found;
+    }
+
+    fn isScopeWithinFunctionRoot(self: *const TypeChecker, scope_id: scope_mod.ScopeId, root_scope: scope_mod.ScopeId) bool {
+        var current: ?scope_mod.ScopeId = scope_id;
+        while (current) |sid| {
+            if (sid == root_scope) return true;
+            current = self.graph.getScope(sid).parent;
+        }
+        return false;
+    }
+
+    fn functionDeclCapturesBorrowed(self: *TypeChecker, func: *const ast.FunctionDecl) bool {
+        if (self.analysisFunctionByDecl(func)) |ir_func| {
+            for (ir_func.captures) |capture| {
+                if (capture.ownership == .borrowed) return true;
+            }
+        }
+        const captured = self.capturedBindingsForFunctionDecl(func) catch return false;
+        for (captured) |binding_id| {
+            const binding = self.graph.bindings.items[binding_id];
+            if (binding.type_id) |prov| if (prov.ownership == .borrowed) return true;
+        }
+        return false;
+    }
+
+    fn analysisFunctionIdByName(self: *const TypeChecker, bare_name: []const u8) ?ir.FunctionId {
+        const program = self.analysis_program orelse return null;
+        if (self.current_scope) |scope_id| {
+            if (self.enclosingModuleQualifiedName(scope_id)) |qualified| {
+                defer self.allocator.free(qualified);
+                const full = std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ qualified, bare_name }) catch return null;
+                defer self.allocator.free(full);
+                for (program.functions) |func| {
+                    if (std.mem.eql(u8, func.name, full)) return func.id;
+                }
+            }
+        }
+        for (program.functions) |func| {
+            if (std.mem.eql(u8, func.name, bare_name)) return func.id;
+        }
+        var best_id: ?ir.FunctionId = null;
+        var best_score: usize = 0;
+        for (program.functions) |func| {
+            if (std.mem.endsWith(u8, func.name, bare_name) and func.name.len > bare_name.len and func.name[func.name.len - bare_name.len - 1] == '_' and func.name[func.name.len - bare_name.len - 2] == '_') {
+                var score: usize = 1;
+                if (self.current_scope) |scope_id| {
+                    if (self.enclosingModuleQualifiedName(scope_id)) |qualified| {
+                        defer self.allocator.free(qualified);
+                        if (std.mem.startsWith(u8, func.name, qualified)) score += qualified.len;
+                    }
+                }
+                if (score > best_score) {
+                    best_score = score;
+                    best_id = func.id;
+                }
+            }
+        }
+        return best_id;
+    }
+
+    fn analysisFunctionByDecl(self: *const TypeChecker, decl: *const ast.FunctionDecl) ?ir.Function {
+        const name = self.interner.get(decl.name);
+        const function_id = self.analysisFunctionIdByName(name) orelse return null;
+        const program = self.analysis_program orelse return null;
+        for (program.functions) |func| {
+            if (func.id == function_id) return func;
+        }
+        return null;
+    }
+
+    fn closureEscapeForDecl(self: *const TypeChecker, decl: *const ast.FunctionDecl) ?escape_lattice.EscapeState {
+        const function_id = self.analysisFunctionIdByName(self.interner.get(decl.name)) orelse return null;
+        const ctx = self.analysis_context orelse return null;
+        const program = self.analysis_program orelse return null;
+        return self.findClosureEscape(ctx, program, function_id);
+    }
+
+    fn findClosureEscape(self: *const TypeChecker, ctx: *const escape_lattice.AnalysisContext, program: *const ir.Program, closure_func_id: ir.FunctionId) ?escape_lattice.EscapeState {
+        _ = self;
+        for (program.functions) |func| {
+            for (func.body) |block| {
+                for (block.instructions) |instr| {
+                    switch (instr) {
+                        .make_closure => |mc| {
+                            if (mc.function == closure_func_id) {
+                                return ctx.getEscape(.{ .function = func.id, .local = mc.dest });
+                            }
+                        },
+                        .if_expr => |ie| {
+                            if (findClosureEscapeInInstrs(ctx, func.id, ie.then_instrs, closure_func_id)) |escape| return escape;
+                            if (findClosureEscapeInInstrs(ctx, func.id, ie.else_instrs, closure_func_id)) |escape| return escape;
+                        },
+                        .case_block => |cb| {
+                            if (findClosureEscapeInInstrs(ctx, func.id, cb.pre_instrs, closure_func_id)) |escape| return escape;
+                            for (cb.arms) |arm| {
+                                if (findClosureEscapeInInstrs(ctx, func.id, arm.cond_instrs, closure_func_id)) |escape| return escape;
+                                if (findClosureEscapeInInstrs(ctx, func.id, arm.body_instrs, closure_func_id)) |escape| return escape;
+                            }
+                            if (findClosureEscapeInInstrs(ctx, func.id, cb.default_instrs, closure_func_id)) |escape| return escape;
+                        },
+                        else => {},
+                    }
+                }
+            }
+        }
+        return .no_escape;
+    }
+
+    fn findClosureEscapeInInstrs(ctx: *const escape_lattice.AnalysisContext, func_id: ir.FunctionId, instrs: []const ir.Instruction, closure_func_id: ir.FunctionId) ?escape_lattice.EscapeState {
+        for (instrs) |instr| {
+            switch (instr) {
+                .make_closure => |mc| {
+                    if (mc.function == closure_func_id) {
+                        return ctx.getEscape(.{ .function = func_id, .local = mc.dest });
+                    }
+                },
+                .if_expr => |ie| {
+                    if (findClosureEscapeInInstrs(ctx, func_id, ie.then_instrs, closure_func_id)) |escape| return escape;
+                    if (findClosureEscapeInInstrs(ctx, func_id, ie.else_instrs, closure_func_id)) |escape| return escape;
+                },
+                .case_block => |cb| {
+                    if (findClosureEscapeInInstrs(ctx, func_id, cb.pre_instrs, closure_func_id)) |escape| return escape;
+                    for (cb.arms) |arm| {
+                        if (findClosureEscapeInInstrs(ctx, func_id, arm.cond_instrs, closure_func_id)) |escape| return escape;
+                        if (findClosureEscapeInInstrs(ctx, func_id, arm.body_instrs, closure_func_id)) |escape| return escape;
+                    }
+                    if (findClosureEscapeInInstrs(ctx, func_id, cb.default_instrs, closure_func_id)) |escape| return escape;
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
+
+    fn enclosingModuleQualifiedName(self: *const TypeChecker, scope_id: scope_mod.ScopeId) ?[]u8 {
+        var current: ?scope_mod.ScopeId = scope_id;
+        while (current) |sid| {
+            for (self.graph.modules.items) |module| {
+                if (module.scope_id != sid) continue;
+                return self.moduleNameToString(module.name);
+            }
+            current = self.graph.getScope(sid).parent;
+        }
+        return null;
+    }
+
+    fn moduleNameToString(self: *const TypeChecker, name: ast.ModuleName) []u8 {
+        if (name.parts.len == 0) return self.allocator.alloc(u8, 0) catch return &[_]u8{};
+        var total_len: usize = 0;
+        for (name.parts, 0..) |part, idx| {
+            total_len += self.interner.get(part).len;
+            if (idx > 0) total_len += 2;
+        }
+        const buffer = self.allocator.alloc(u8, total_len) catch return &[_]u8{};
+        var offset: usize = 0;
+        for (name.parts, 0..) |part, idx| {
+            if (idx > 0) {
+                buffer[offset] = '_';
+                buffer[offset + 1] = '_';
+                offset += 2;
+            }
+            const piece = self.interner.get(part);
+            @memcpy(buffer[offset .. offset + piece.len], piece);
+            offset += piece.len;
+        }
+        return buffer;
+    }
+
+    fn closureDeclFromExpr(self: *TypeChecker, expr: *const ast.Expr) ?*const ast.FunctionDecl {
+        if (expr.* != .var_ref or self.current_scope == null) return null;
+        return self.resolveFunctionValueDecl(self.current_scope.?, expr.var_ref.name);
+    }
+
+    fn safeClosureParamsForCurrentCallee(self: *const TypeChecker, callee_name: ast.StringId, arity: u32) ?[]const bool {
+        if (self.current_scope) |scope_id| {
+            if (self.graph.resolveFamily(scope_id, callee_name, arity)) |family_id| {
+                return self.safeClosureParamsForFamily(family_id);
+            }
+        }
+
+        const bare_name = self.interner.get(callee_name);
+        const function_id = self.analysisFunctionIdByName(bare_name) orelse return null;
+        const ctx = self.analysis_context orelse return null;
+        const summary = ctx.function_summaries.get(function_id) orelse return null;
+        const safe = self.allocator.alloc(bool, summary.param_summaries.len) catch return null;
+        for (summary.param_summaries, 0..) |param_summary, i| {
+            var returned = false;
+            for (summary.return_summary.param_sources) |src_idx| {
+                if (src_idx == i) {
+                    returned = true;
+                    break;
+                }
+            }
+            safe[i] = !param_summary.escapes() and !returned;
+        }
+        return safe;
+    }
+
+    fn safeClosureParamsForFamily(self: *const TypeChecker, family_id: scope_mod.FunctionFamilyId) ?[]const bool {
+        const family = self.graph.getFamily(family_id);
+        if (family.clauses.items.len == 0) return null;
+
+        const first_clause = family.clauses.items[0];
+        if (first_clause.clause_index >= first_clause.decl.clauses.len) return null;
+        const params = first_clause.decl.clauses[first_clause.clause_index].params;
+        const safe = self.allocator.alloc(bool, params.len) catch return null;
+        @memset(safe, true);
+
+        for (family.clauses.items) |clause_ref| {
+            if (clause_ref.clause_index >= clause_ref.decl.clauses.len) continue;
+            const clause = clause_ref.decl.clauses[clause_ref.clause_index];
+            for (clause.params, 0..) |param, idx| {
+                const param_name = switch (param.pattern.*) {
+                    .bind => |b| b.name,
+                    else => continue,
+                };
+                if (!self.isClosureParamUsedLocally(clause.body, param_name)) {
+                    safe[idx] = false;
+                }
+            }
+        }
+
+        return safe;
+    }
+
+    fn isClosureParamUsedLocally(self: *const TypeChecker, body: []const ast.Stmt, param_name: ast.StringId) bool {
+        for (body) |stmt| {
+            switch (stmt) {
+                .expr => |expr| {
+                    if (self.exprUsesClosureParamUnsafely(expr, param_name, false)) return false;
+                },
+                .assignment => |assign| {
+                    if (self.exprUsesClosureParamUnsafely(assign.value, param_name, false)) return false;
+                },
+                .function_decl, .macro_decl, .import_decl => {},
+            }
+        }
+        return true;
+    }
+
+    fn exprUsesClosureParamUnsafely(self: *const TypeChecker, expr: *const ast.Expr, param_name: ast.StringId, allow_direct_callee: bool) bool {
+        switch (expr.*) {
+            .var_ref => |vr| return vr.name == param_name and !allow_direct_callee,
+            .call => |call| {
+                if (self.exprUsesClosureParamUnsafely(call.callee, param_name, true)) return true;
+                for (call.args) |arg| {
+                    if (self.exprUsesClosureParamUnsafely(arg, param_name, false)) return true;
+                }
+                return false;
+            },
+            .tuple => |tuple_expr| {
+                for (tuple_expr.elements) |elem| {
+                    if (self.exprUsesClosureParamUnsafely(elem, param_name, false)) return true;
+                }
+                return false;
+            },
+            .list => |list_expr| {
+                for (list_expr.elements) |elem| {
+                    if (self.exprUsesClosureParamUnsafely(elem, param_name, false)) return true;
+                }
+                return false;
+            },
+            .map => |map_expr| {
+                for (map_expr.fields) |field| {
+                    if (self.exprUsesClosureParamUnsafely(field.key, param_name, false)) return true;
+                    if (self.exprUsesClosureParamUnsafely(field.value, param_name, false)) return true;
+                }
+                return false;
+            },
+            .struct_expr => |struct_expr| {
+                if (struct_expr.update_source) |source| {
+                    if (self.exprUsesClosureParamUnsafely(source, param_name, false)) return true;
+                }
+                for (struct_expr.fields) |field| {
+                    if (self.exprUsesClosureParamUnsafely(field.value, param_name, false)) return true;
+                }
+                return false;
+            },
+            .binary_op => |bo| return self.exprUsesClosureParamUnsafely(bo.lhs, param_name, false) or self.exprUsesClosureParamUnsafely(bo.rhs, param_name, false),
+            .unary_op => |uo| return self.exprUsesClosureParamUnsafely(uo.operand, param_name, false),
+            .field_access => |fa| return self.exprUsesClosureParamUnsafely(fa.object, param_name, false),
+            .pipe => |pipe| return self.exprUsesClosureParamUnsafely(pipe.lhs, param_name, false) or self.exprUsesClosureParamUnsafely(pipe.rhs, param_name, false),
+            .unwrap => |uw| return self.exprUsesClosureParamUnsafely(uw.expr, param_name, false),
+            .type_annotated => |ta| return self.exprUsesClosureParamUnsafely(ta.expr, param_name, false),
+            .if_expr => |ie| {
+                if (self.exprUsesClosureParamUnsafely(ie.condition, param_name, false)) return true;
+                if (!self.isClosureParamUsedLocally(ie.then_block, param_name)) return true;
+                if (ie.else_block) |else_block| if (!self.isClosureParamUsedLocally(else_block, param_name)) return true;
+                return false;
+            },
+            .block => |block| return !self.isClosureParamUsedLocally(block.stmts, param_name),
+            .with_expr => |with_expr| {
+                for (with_expr.items) |item| {
+                    switch (item) {
+                        .bind => |bind| {
+                            if (self.exprUsesClosureParamUnsafely(bind.source, param_name, false)) return true;
+                        },
+                        .expr => |subexpr| {
+                            if (self.exprUsesClosureParamUnsafely(subexpr, param_name, false)) return true;
+                        },
+                    }
+                }
+                if (!self.isClosureParamUsedLocally(with_expr.body, param_name)) return true;
+                if (with_expr.else_clauses) |clauses| {
+                    for (clauses) |clause| {
+                        if (clause.guard) |guard| if (self.exprUsesClosureParamUnsafely(guard, param_name, false)) return true;
+                        if (!self.isClosureParamUsedLocally(clause.body, param_name)) return true;
+                    }
+                }
+                return false;
+            },
+            .cond_expr => |cond_expr| {
+                for (cond_expr.clauses) |clause| {
+                    if (self.exprUsesClosureParamUnsafely(clause.condition, param_name, false)) return true;
+                    if (!self.isClosureParamUsedLocally(clause.body, param_name)) return true;
+                }
+                return false;
+            },
+            .case_expr, .panic_expr, .quote_expr, .unquote_expr, .intrinsic, .binary_literal, .function_ref => return true,
+            else => return false,
+        }
+    }
+
+    fn ensureClosureValueCanEscape(self: *TypeChecker, expr: *const ast.Expr, context: []const u8) !void {
+        const decl = self.closureDeclFromExpr(expr) orelse return;
+        if (!self.functionDeclCapturesBorrowed(decl)) return;
+        try self.addHardError(
+            try std.fmt.allocPrint(self.allocator, "closure with borrowed captures cannot escape via {s}", .{context}),
+            expr.getMeta().span,
+            "borrowed capture escapes scope",
+            "avoid storing or returning closures that capture borrowed values",
+        );
+    }
+
+    fn collectCapturedBindingsFromExpr(self: *TypeChecker, expr: *const ast.Expr, function_scope: scope_mod.ScopeId, captured: *std.AutoHashMap(scope_mod.BindingId, void)) anyerror!void {
+        switch (expr.*) {
+            .var_ref => |vr| {
+                const binding_id = self.graph.resolveBinding(function_scope, vr.name) orelse return;
+                const binding = self.graph.bindings.items[binding_id];
+                if (!self.isScopeWithinFunctionRoot(binding.scope_id, function_scope)) {
+                    try captured.put(binding_id, {});
+                }
+            },
+            .binary_op => |bo| {
+                try self.collectCapturedBindingsFromExpr(bo.lhs, function_scope, captured);
+                try self.collectCapturedBindingsFromExpr(bo.rhs, function_scope, captured);
+            },
+            .unary_op => |uo| try self.collectCapturedBindingsFromExpr(uo.operand, function_scope, captured),
+            .call => |call| {
+                try self.collectCapturedBindingsFromExpr(call.callee, function_scope, captured);
+                for (call.args) |arg| try self.collectCapturedBindingsFromExpr(arg, function_scope, captured);
+            },
+            .field_access => |fa| try self.collectCapturedBindingsFromExpr(fa.object, function_scope, captured),
+            .if_expr => |ie| {
+                try self.collectCapturedBindingsFromExpr(ie.condition, function_scope, captured);
+                for (ie.then_block) |stmt| try self.collectCapturedBindingsFromStmt(stmt, function_scope, captured);
+                if (ie.else_block) |eb| for (eb) |stmt| try self.collectCapturedBindingsFromStmt(stmt, function_scope, captured);
+            },
+            .case_expr => |ce| {
+                try self.collectCapturedBindingsFromExpr(ce.scrutinee, function_scope, captured);
+                for (ce.clauses) |clause| {
+                    if (clause.guard) |g| try self.collectCapturedBindingsFromExpr(g, function_scope, captured);
+                    for (clause.body) |stmt| try self.collectCapturedBindingsFromStmt(stmt, function_scope, captured);
+                }
+            },
+            .tuple => |items| for (items.elements) |item| try self.collectCapturedBindingsFromExpr(item, function_scope, captured),
+            .list => |items| for (items.elements) |item| try self.collectCapturedBindingsFromExpr(item, function_scope, captured),
+            .map => |items| for (items.fields) |item| {
+                try self.collectCapturedBindingsFromExpr(item.key, function_scope, captured);
+                try self.collectCapturedBindingsFromExpr(item.value, function_scope, captured);
+            },
+            .struct_expr => |sl| for (sl.fields) |field| try self.collectCapturedBindingsFromExpr(field.value, function_scope, captured),
+            else => {},
+        }
+    }
+
+    fn collectCapturedBindingsFromStmt(self: *TypeChecker, stmt: ast.Stmt, function_scope: scope_mod.ScopeId, captured: *std.AutoHashMap(scope_mod.BindingId, void)) anyerror!void {
+        switch (stmt) {
+            .expr => |e| try self.collectCapturedBindingsFromExpr(e, function_scope, captured),
+            .assignment => |a| try self.collectCapturedBindingsFromExpr(a.value, function_scope, captured),
+            .function_decl => {},
+            else => {},
+        }
+    }
+
+    fn capturedBindingsForFunctionDecl(self: *TypeChecker, func: *const ast.FunctionDecl) ![]scope_mod.BindingId {
+        var captured = std.AutoHashMap(scope_mod.BindingId, void).init(self.allocator);
+        defer captured.deinit();
+        for (func.clauses) |clause| {
+            const function_scope = self.graph.node_scope_map.get(clause.meta.span.start) orelse clause.meta.scope_id;
+            for (clause.body) |stmt| {
+                try self.collectCapturedBindingsFromStmt(stmt, function_scope, &captured);
+            }
+        }
+        var result = std.ArrayList(scope_mod.BindingId).empty;
+        var it = captured.iterator();
+        while (it.next()) |entry| {
+            try result.append(self.allocator, entry.key_ptr.*);
+        }
+        return try result.toOwnedSlice(self.allocator);
+    }
+
+    fn resolveFunctionValueDecl(self: *TypeChecker, scope_id: scope_mod.ScopeId, name: ast.StringId) ?*const ast.FunctionDecl {
+        var current: ?scope_mod.ScopeId = scope_id;
+        var found: ?*const ast.FunctionDecl = null;
+        while (current) |sid| {
+            var it = self.graph.getScope(sid).function_families.iterator();
+            while (it.next()) |entry| {
+                const key = entry.key_ptr.*;
+                if (key.name != name) continue;
+                const family = self.graph.getFamily(entry.value_ptr.*);
+                if (family.clauses.items.len == 0) continue;
+                const decl = family.clauses.items[0].decl;
+                if (found != null and found != decl) return null;
+                found = decl;
+            }
+            current = self.graph.getScope(sid).parent;
+        }
+        return found;
     }
 
     pub fn bindingOwnershipInfo(self: *const TypeChecker, binding_id: scope_mod.BindingId) ?BindingOwnershipInfo {
@@ -1034,8 +1537,44 @@ pub const TypeChecker = struct {
 
         // Check body
         var body_type: TypeId = TypeStore.NIL;
+        var last_expr: ?*const ast.Expr = null;
         for (clause.body) |stmt| {
+            if (stmt == .expr) last_expr = stmt.expr;
             body_type = try self.checkStmt(stmt);
+        }
+
+        if (last_expr) |expr| {
+            if (self.borrowedBindingFromExpr(expr)) |binding_id| {
+                const binding = self.graph.bindings.items[binding_id];
+                const name = self.interner.get(binding.name);
+                try self.addHardError(
+                    try std.fmt.allocPrint(self.allocator, "borrowed value `{s}` cannot escape through return", .{name}),
+                    expr.getMeta().span,
+                    "borrowed value escapes scope",
+                    "return a shared or unique value instead of a borrowed binding",
+                );
+            }
+            if (expr.* == .var_ref) {
+                if (try self.resolveFunctionValueSignature(self.current_scope orelse self.graph.prelude_scope, expr.var_ref.name)) |_| {
+                    if (self.resolveFunctionValueDecl(self.current_scope orelse self.graph.prelude_scope, expr.var_ref.name)) |decl| {
+                        if (self.analysis_context != null and self.functionDeclCapturesBorrowed(decl)) {
+                            const escape = self.closureEscapeForDecl(decl);
+                            const allowed = if (escape) |e|
+                                e == .no_escape
+                            else
+                                false;
+                            if (!allowed) {
+                                try self.addHardError(
+                                    "closure with borrowed captures cannot escape through return",
+                                    expr.getMeta().span,
+                                    "borrowed capture escapes scope",
+                                    "avoid returning closures that capture borrowed values",
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Verify return type matches (suppress if either side is ERROR/UNKNOWN/type_var from cascading)
@@ -1078,6 +1617,7 @@ pub const TypeChecker = struct {
         return switch (stmt) {
             .expr => |expr| self.inferExpr(expr),
             .assignment => |assign| {
+                try self.ensureClosureValueCanEscape(assign.value, "assignment");
                 const value_type = try self.inferExpr(assign.value);
                 // Store type on the target binding if it's a bind pattern
                 if (assign.pattern.* == .bind) {
@@ -1143,6 +1683,30 @@ pub const TypeChecker = struct {
                             try std.fmt.allocPrint(self.allocator, "did you mean `{s}`?", .{suggestion}),
                         );
                     }
+
+                    if (try self.resolveFunctionValueSignature(scope_id, vr.name)) |signature| {
+                        if (self.resolveFunctionValueDecl(scope_id, vr.name)) |decl| {
+                            const captured = try self.capturedBindingsForFunctionDecl(decl);
+                            for (captured) |binding_id| {
+                                const binding = self.graph.bindings.items[binding_id];
+                                if (binding.type_id) |prov| {
+                                    switch (prov.ownership) {
+                                        .unique => if (try self.ensureBindingMovable(binding_id, vr.meta.span)) {
+                                            try self.markBindingMoved(binding_id);
+                                        },
+                                        .borrowed => {},
+                                        .shared => {},
+                                    }
+                                }
+                            }
+                        }
+                        return try self.store.addFunctionType(
+                            signature.params,
+                            signature.return_type,
+                            signature.param_ownerships,
+                            signature.return_ownership,
+                        );
+                    }
                 }
                 return TypeStore.UNKNOWN;
             },
@@ -1154,6 +1718,7 @@ pub const TypeChecker = struct {
             .tuple => |t| {
                 var elem_types: std.ArrayList(TypeId) = .empty;
                 for (t.elements) |elem| {
+                    try self.ensureClosureValueCanEscape(elem, "tuple storage");
                     try elem_types.append(self.allocator, try self.inferExpr(elem));
                 }
                 return try self.store.addType(.{
@@ -1163,6 +1728,9 @@ pub const TypeChecker = struct {
 
             .list => |l| {
                 if (l.elements.len == 0) return TypeStore.UNKNOWN;
+                for (l.elements) |elem| {
+                    try self.ensureClosureValueCanEscape(elem, "list storage");
+                }
                 const elem_type = try self.inferExpr(l.elements[0]);
                 return try self.store.addType(.{
                     .list = .{ .element = elem_type },
@@ -1334,6 +1902,10 @@ pub const TypeChecker = struct {
             .map => |m| {
                 // Infer key/value types from first entry
                 if (m.fields.len > 0) {
+                    for (m.fields) |field| {
+                        try self.ensureClosureValueCanEscape(field.key, "map key storage");
+                        try self.ensureClosureValueCanEscape(field.value, "map value storage");
+                    }
                     _ = try self.inferExpr(m.fields[0].key);
                     _ = try self.inferExpr(m.fields[0].value);
                 }
@@ -1352,6 +1924,7 @@ pub const TypeChecker = struct {
                                 var found = false;
                                 for (se.fields) |provided| {
                                     if (provided.name == req_field.name) {
+                                        try self.ensureClosureValueCanEscape(provided.value, "struct field storage");
                                         found = true;
                                         // Check field value type
                                         const val_type = try self.inferExpr(provided.value);
@@ -1574,6 +2147,26 @@ pub const TypeChecker = struct {
 
                 // Check function families
                 if (try self.resolveFamilySignature(scope_id, vr.name, arity)) |signature| {
+                    const safe_params = self.safeClosureParamsForCurrentCallee(vr.name, arity);
+                    for (call.args, 0..) |arg, idx| {
+                        if (arg.* != .var_ref) continue;
+                        if (self.resolveFunctionValueDecl(scope_id, arg.var_ref.name)) |decl| {
+                            if (self.analysis_context != null and self.functionDeclCapturesBorrowed(decl)) {
+                                const callee_allows = if (safe_params) |flags|
+                                    idx < flags.len and flags[idx]
+                                else
+                                    false;
+                                if (!callee_allows) {
+                                    try self.addHardError(
+                                        "closure with borrowed captures cannot be passed as an argument",
+                                        arg.getMeta().span,
+                                        "borrowed capture escapes scope",
+                                        "call the closure locally instead of passing it beyond the borrow scope",
+                                    );
+                                }
+                            }
+                        }
+                    }
                     for (call.args, 0..) |arg, idx| {
                         const arg_type = try self.inferExpr(arg);
                         if (idx < signature.params.len) {
@@ -1588,7 +2181,7 @@ pub const TypeChecker = struct {
                             }
                         }
                     }
-                    const borrowed = try self.applyCallOwnership(call.args, signature.toFunctionType());
+                    const borrowed = try self.applyCallOwnershipWithSafeParams(call.args, signature.toFunctionType(), safe_params);
                     defer self.endBorrowedBindings(borrowed) catch {};
                     return signature.return_type;
                 }
@@ -1765,7 +2358,23 @@ pub const TypeChecker = struct {
                     try param_types.append(self.allocator, try self.resolveTypeExpr(param));
                 }
                 const return_type = try self.resolveTypeExpr(ft.return_type);
-                return try self.buildFunctionType(try param_types.toOwnedSlice(self.allocator), return_type);
+                const params = try param_types.toOwnedSlice(self.allocator);
+                const param_ownerships = try self.allocator.alloc(Ownership, ft.param_ownerships.len);
+                for (ft.param_ownerships, ft.param_ownerships_explicit, params, 0..) |ownership, explicit, param_type, idx| {
+                    param_ownerships[idx] = if (explicit)
+                        mapAstOwnership(ownership)
+                    else if (mapAstOwnership(ownership) == .shared)
+                        self.defaultOwnershipForType(param_type)
+                    else
+                        mapAstOwnership(ownership);
+                }
+                const ret_ownership = if (ft.return_ownership_explicit)
+                    mapAstOwnership(ft.return_ownership)
+                else if (mapAstOwnership(ft.return_ownership) == .shared)
+                    self.defaultOwnershipForType(return_type)
+                else
+                    mapAstOwnership(ft.return_ownership);
+                return try self.store.addFunctionType(params, return_type, param_ownerships, ret_ownership);
             },
             .never => TypeStore.NEVER,
             .literal => |lt| {
@@ -1810,6 +2419,30 @@ test "type store resolve builtin names" {
     try std.testing.expectEqual(TypeStore.BOOL, store.resolveTypeName("Bool").?);
     try std.testing.expectEqual(TypeStore.STRING, store.resolveTypeName("String").?);
     try std.testing.expect(store.resolveTypeName("Nonexistent") == null);
+}
+
+fn rerunWithEscapeAnalysis(
+    alloc: std.mem.Allocator,
+    interner: *ast.StringInterner,
+    graph: *scope_mod.ScopeGraph,
+    checker: *TypeChecker,
+    program: *const ast.Program,
+) !void {
+    var hir_builder = @import("hir.zig").HirBuilder.init(alloc, interner, graph, &checker.store);
+    defer hir_builder.deinit();
+    const hir_program = try hir_builder.buildProgram(program);
+
+    var ir_builder = @import("ir.zig").IrBuilder.init(alloc, interner);
+    ir_builder.type_store = &checker.store;
+    defer ir_builder.deinit();
+    const ir_program = try ir_builder.buildProgram(&hir_program);
+
+    var pipeline_result = try @import("analysis_pipeline.zig").runAnalysisPipeline(alloc, &ir_program);
+    defer pipeline_result.deinit();
+
+    checker.setAnalysisContext(&pipeline_result.context, &ir_program);
+    checker.errors.clearRetainingCapacity();
+    try checker.checkProgram(program);
 }
 
 test "qualified type defaults to shared ownership" {
@@ -1987,6 +2620,18 @@ test "type check simple function" {
 
     var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
     defer checker.deinit();
+    try checker.checkProgram(&program);
+    var hir_builder = @import("hir.zig").HirBuilder.init(alloc, &parser.interner, &collector.graph, &checker.store);
+    defer hir_builder.deinit();
+    const hir_program = try hir_builder.buildProgram(&program);
+    var ir_builder = @import("ir.zig").IrBuilder.init(alloc, &parser.interner);
+    ir_builder.type_store = &checker.store;
+    defer ir_builder.deinit();
+    const ir_program = try ir_builder.buildProgram(&hir_program);
+    var pipeline_result = try @import("analysis_pipeline.zig").runAnalysisPipeline(alloc, &ir_program);
+    defer pipeline_result.deinit();
+    checker.setAnalysisContext(&pipeline_result.context, &ir_program);
+    checker.errors.clearRetainingCapacity();
     try checker.checkProgram(&program);
 
     try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
@@ -2282,8 +2927,10 @@ test "typed parameter records shared ownership metadata" {
 
 test "function ref inference defaults param ownerships to shared" {
     const source =
-        \\def main(args) do
-        \\  Foo.main/1
+        \\defmodule Test do
+        \\  def main(args) do
+        \\    Foo.main/1
+        \\  end
         \\end
     ;
 
@@ -2305,7 +2952,7 @@ test "function ref inference defaults param ownerships to shared" {
 
     try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
 
-    const main_func = program.top_items[0].function;
+    const main_func = program.modules[0].items[0].function;
     const fn_ref_expr = main_func.clauses[0].body[0].expr;
     const inferred = try checker.inferExpr(fn_ref_expr);
     const typ = checker.store.getType(inferred);
@@ -2502,6 +3149,7 @@ test "named call with unique parameter moves opaque binding" {
     var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
+    try rerunWithEscapeAnalysis(alloc, &parser.interner, &collector.graph, &checker, &program);
 
     var found = false;
     for (checker.errors.items) |err| {
@@ -2519,12 +3167,338 @@ test "borrowed param annotation keeps binding usable after call" {
         \\  opaque Handle = String
         \\
         \\  def inspect(handle :: borrowed Handle) do
-        \\    handle
+        \\    nil
         \\  end
         \\
         \\  def run(handle :: Handle) do
         \\    inspect(handle)
         \\    handle
+        \\  end
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+}
+
+test "borrowed value cannot escape through return" {
+    const source =
+        \\defmodule Test do
+        \\  opaque Handle = String
+        \\
+        \\  def inspect(handle :: borrowed Handle) do
+        \\    handle
+        \\  end
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+    try rerunWithEscapeAnalysis(alloc, &parser.interner, &collector.graph, &checker, &program);
+
+    var found = false;
+    for (checker.errors.items) |err| {
+        if (std.mem.indexOf(u8, err.message, "cannot escape through return") != null) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "closure with borrowed capture cannot be returned" {
+    const source =
+        \\defmodule Test do
+        \\  opaque Handle = String
+        \\
+        \\  def make(handle :: borrowed Handle) do
+        \\    def use() do
+        \\      handle
+        \\    end
+        \\
+        \\    use
+        \\  end
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+    try rerunWithEscapeAnalysis(alloc, &parser.interner, &collector.graph, &checker, &program);
+
+    var found = false;
+    for (checker.errors.items) |err| {
+        if (std.mem.indexOf(u8, err.message, "borrowed captures") != null) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "unique capture moves outer binding" {
+    const source =
+        \\defmodule Test do
+        \\  opaque Handle = String
+        \\
+        \\  def make(handle :: unique Handle) do
+        \\    def use() do
+        \\      handle
+        \\    end
+        \\
+        \\    inspect(use)
+        \\    handle
+        \\  end
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+    try rerunWithEscapeAnalysis(alloc, &parser.interner, &collector.graph, &checker, &program);
+
+    var found = false;
+    for (checker.errors.items) |err| {
+        if (std.mem.indexOf(u8, err.message, "already moved") != null) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "closure with borrowed capture cannot be passed as argument" {
+    const source =
+        \\defmodule Test do
+        \\  opaque Handle = String
+        \\
+        \\  def apply(f :: (-> Handle)) do
+        \\    f
+        \\  end
+        \\
+        \\  def make(handle :: borrowed Handle) do
+        \\    def use() do
+        \\      handle
+        \\    end
+        \\
+        \\    apply(use)
+        \\  end
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+    try rerunWithEscapeAnalysis(alloc, &parser.interner, &collector.graph, &checker, &program);
+
+    var found = false;
+    for (checker.errors.items) |err| {
+        if (std.mem.indexOf(u8, err.message, "cannot be passed as an argument") != null) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "closure with borrowed capture cannot be assigned" {
+    const source =
+        \\defmodule Test do
+        \\  opaque Handle = String
+        \\
+        \\  def make(handle :: borrowed Handle) do
+        \\    def use() do
+        \\      handle
+        \\    end
+        \\
+        \\    f = use
+        \\    f
+        \\  end
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+    try rerunWithEscapeAnalysis(alloc, &parser.interner, &collector.graph, &checker, &program);
+
+    var found = false;
+    for (checker.errors.items) |err| {
+        if (std.mem.indexOf(u8, err.message, "assignment") != null) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "closure with borrowed capture cannot be stored in tuple" {
+    const source =
+        \\defmodule Test do
+        \\  opaque Handle = String
+        \\
+        \\  def make(handle :: borrowed Handle) do
+        \\    def use() do
+        \\      handle
+        \\    end
+        \\
+        \\    {use}
+        \\  end
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+    try rerunWithEscapeAnalysis(alloc, &parser.interner, &collector.graph, &checker, &program);
+
+    var found = false;
+    for (checker.errors.items) |err| {
+        if (std.mem.indexOf(u8, err.message, "tuple storage") != null) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "closure with borrowed capture may be locally invoked" {
+    const source =
+        \\defmodule Test do
+        \\  opaque Handle = String
+        \\
+        \\  def make(handle :: borrowed Handle) do
+        \\    def use() do
+        \\      handle == handle
+        \\    end
+        \\
+        \\    use()
+        \\  end
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+}
+
+test "closure with borrowed capture may be passed to known-safe callee" {
+    const source =
+        \\defmodule Test do
+        \\  opaque Handle = String
+        \\
+        \\  def apply(f :: (borrowed Handle -> Bool), handle :: borrowed Handle) do
+        \\    f(handle)
+        \\  end
+        \\
+        \\  def make(handle :: borrowed Handle) do
+        \\    def use(h :: borrowed Handle) do
+        \\      h == handle
+        \\    end
+        \\
+        \\    apply(use, handle)
         \\  end
         \\end
     ;

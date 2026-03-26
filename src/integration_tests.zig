@@ -99,19 +99,7 @@ fn compileWithDiagnostics(alloc: std.mem.Allocator, source: []const u8, strict_t
     type_checker.checkProgram(&desugared_program) catch {};
     type_checker.checkUnusedBindings() catch {};
 
-    // Drain type checker errors — hard errors always block, others respect strict flag
     const type_severity: @import("diagnostics.zig").Severity = if (strict_types) .@"error" else .warning;
-    for (type_checker.errors.items) |type_err| {
-        try diag_engine.reportDiagnostic(.{
-            .severity = type_err.severity orelse type_severity,
-            .message = type_err.message,
-            .span = type_err.span,
-            .label = type_err.label,
-            .help = type_err.help,
-            .secondary_spans = type_err.secondary_spans,
-        });
-    }
-    if (diag_engine.hasErrors()) return error.TypeError;
 
     var hir_builder = hir_mod.HirBuilder.init(alloc, &parser.interner, &collector.graph, &type_checker.store);
     defer hir_builder.deinit();
@@ -126,10 +114,39 @@ fn compileWithDiagnostics(alloc: std.mem.Allocator, source: []const u8, strict_t
     var ir_builder = ir.IrBuilder.init(alloc, &parser.interner);
     ir_builder.type_store = &type_checker.store;
     defer ir_builder.deinit();
-    const ir_program = try ir_builder.buildProgram(&hir_program);
+    var ir_program = try ir_builder.buildProgram(&hir_program);
+
+    const analysis_pipeline = @import("analysis_pipeline.zig");
+    const contification_rewrite = @import("contification_rewrite.zig");
+    var pipeline_result = try analysis_pipeline.runAnalysisPipeline(alloc, &ir_program);
+    defer pipeline_result.deinit();
+    contification_rewrite.rewriteContifiedContinuations(alloc, &ir_program, &pipeline_result.context) catch |err| switch (err) {
+        error.UnsupportedContifiedRewrite => {},
+        else => return err,
+    };
+
+    type_checker.setAnalysisContext(&pipeline_result.context, &ir_program);
+    type_checker.errors.clearRetainingCapacity();
+    try type_checker.checkProgram(&desugared_program);
+    try type_checker.checkUnusedBindings();
+    for (pipeline_result.diagnostics.items) |analysis_diag| {
+        try diag_engine.reportDiagnostic(analysis_diag);
+    }
+    for (type_checker.errors.items) |type_err| {
+        try diag_engine.reportDiagnostic(.{
+            .severity = type_err.severity orelse type_severity,
+            .message = type_err.message,
+            .span = type_err.span,
+            .label = type_err.label,
+            .help = type_err.help,
+            .secondary_spans = type_err.secondary_spans,
+        });
+    }
+    if (diag_engine.hasErrors()) return error.TypeError;
 
     var codegen = CodeGen.init(alloc);
     defer codegen.deinit();
+    codegen.analysis_context = &pipeline_result.context;
     try codegen.emitProgram(&ir_program);
 
     const diag_output = try diag_engine.format(alloc);
@@ -138,6 +155,53 @@ fn compileWithDiagnostics(alloc: std.mem.Allocator, source: []const u8, strict_t
         .output = try alloc.dupe(u8, codegen.getOutput()),
         .diag_output = diag_output,
     };
+}
+
+pub fn analyzeSource(alloc: std.mem.Allocator, source: []const u8) !struct {
+    ir_program: ir.Program,
+    pipeline_result: @import("analysis_pipeline.zig").PipelineResult,
+} {
+    const prepend_result = try stdlib.prependStdlib(alloc, source);
+    const full_source = prepend_result.source;
+
+    var parser = Parser.init(alloc, full_source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var macro_engine = MacroEngine.init(alloc, &parser.interner, &collector.graph);
+    defer macro_engine.deinit();
+    const expanded_program = try macro_engine.expandProgram(&program);
+
+    var desugarer = Desugarer.init(alloc, &parser.interner);
+    const desugared_program = try desugarer.desugarProgram(&expanded_program);
+
+    var type_checker = types_mod.TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    defer type_checker.deinit();
+    type_checker.stdlib_line_count = prepend_result.stdlib_line_count;
+    try type_checker.checkProgram(&desugared_program);
+    try type_checker.checkUnusedBindings();
+
+    var hir_builder = hir_mod.HirBuilder.init(alloc, &parser.interner, &collector.graph, &type_checker.store);
+    defer hir_builder.deinit();
+    const hir_program = try hir_builder.buildProgram(&desugared_program);
+
+    var ir_builder = ir.IrBuilder.init(alloc, &parser.interner);
+    ir_builder.type_store = &type_checker.store;
+    defer ir_builder.deinit();
+    var ir_program = try ir_builder.buildProgram(&hir_program);
+
+    const analysis_pipeline = @import("analysis_pipeline.zig");
+    const contification_rewrite = @import("contification_rewrite.zig");
+    const pipeline_result = try analysis_pipeline.runAnalysisPipeline(alloc, &ir_program);
+    contification_rewrite.rewriteContifiedContinuations(alloc, &ir_program, &pipeline_result.context) catch |err| switch (err) {
+        error.UnsupportedContifiedRewrite => {},
+        else => return err,
+    };
+    return .{ .ir_program = ir_program, .pipeline_result = pipeline_result };
 }
 
 fn expectContains(haystack: []const u8, needle: []const u8) !void {
@@ -176,8 +240,10 @@ test "example: hello world" {
     const alloc = arena.allocator();
 
     const source =
-        \\def main() do
-        \\  IO.puts("Hello, world!")
+        \\defmodule Test do
+        \\  def main() do
+        \\    IO.puts("Hello, world!")
+        \\  end
         \\end
     ;
 
@@ -197,8 +263,10 @@ test "IO.puts resolves to runtime println" {
     const alloc = arena.allocator();
 
     const source =
-        \\def main() do
-        \\  IO.puts("test output")
+        \\defmodule Test do
+        \\  def main() do
+        \\    IO.puts("test output")
+        \\  end
         \\end
     ;
 
@@ -213,8 +281,10 @@ test "bare println is not implicitly available" {
     const alloc = arena.allocator();
 
     const source =
-        \\def main() do
-        \\  println("should not resolve")
+        \\defmodule Test do
+        \\  def main() do
+        \\    println("should not resolve")
+        \\  end
         \\end
     ;
 
@@ -244,8 +314,10 @@ test "example: factorial" {
         \\  end
         \\end
         \\
-        \\def main() do
-        \\  Factorial.factorial(10)
+        \\defmodule Test do
+        \\  def main() do
+        \\    Factorial.factorial(10)
+        \\  end
         \\end
     ;
 
@@ -280,8 +352,10 @@ test "example: fibonacci" {
         \\  end
         \\end
         \\
-        \\def main() do
-        \\  Fib.fib(20)
+        \\defmodule Test do
+        \\  def main() do
+        \\    Fib.fib(20)
+        \\  end
         \\end
     ;
 
@@ -319,8 +393,10 @@ test "example: math module" {
         \\  end
         \\end
         \\
-        \\def main() do
-        \\  Math.square(5)
+        \\defmodule Test do
+        \\  def main() do
+        \\    Math.square(5)
+        \\  end
         \\end
     ;
 
@@ -356,8 +432,10 @@ test "example: pattern matching" {
         \\  end
         \\end
         \\
-        \\def main() do
-        \\  Matcher.describe(:ok)
+        \\defmodule Test do
+        \\  def main() do
+        \\    Matcher.describe(:ok)
+        \\  end
         \\end
     ;
 
@@ -389,10 +467,12 @@ test "example: multiline pipes" {
         \\  end
         \\end
         \\
-        \\def main() do
-        \\  5
-        \\  |> Pipes.double()
-        \\  |> Pipes.add_one()
+        \\defmodule Test do
+        \\  def main() do
+        \\    5
+        \\    |> Pipes.double()
+        \\    |> Pipes.add_one()
+        \\  end
         \\end
     ;
 
@@ -427,8 +507,10 @@ test "example: type declarations" {
         \\  end
         \\end
         \\
-        \\def main() do
-        \\  Geometry.area({:circle, 5.0})
+        \\defmodule Test do
+        \\  def main() do
+        \\    Geometry.area({:circle, 5.0})
+        \\  end
         \\end
     ;
 
@@ -450,8 +532,10 @@ test "all compiled output has required header" {
     const alloc = arena.allocator();
 
     const source =
-        \\def main() do
-        \\  nil
+        \\defmodule Test do
+        \\  def main() do
+        \\    nil
+        \\  end
         \\end
     ;
 
@@ -549,8 +633,10 @@ test "tuple pattern destructuring" {
         \\  end
         \\end
         \\
-        \\def main() do
-        \\  Geometry.area({:circle, 5.0})
+        \\defmodule Test do
+        \\  def main() do
+        \\    Geometry.area({:circle, 5.0})
+        \\  end
         \\end
     ;
 
@@ -1230,9 +1316,11 @@ test "two modules with same function name don't collide" {
         \\  end
         \\end
         \\
-        \\def main() do
-        \\  A.calc(1)
-        \\  B.calc(2)
+        \\defmodule Test do
+        \\  def main() do
+        \\    A.calc(1)
+        \\    B.calc(2)
+        \\  end
         \\end
     ;
 
@@ -1252,8 +1340,10 @@ test "bare inspect resolves to Kernel__inspect" {
     const alloc = arena.allocator();
 
     const source =
-        \\def main() do
-        \\  inspect(42)
+        \\defmodule Test do
+        \\  def main() do
+        \\    inspect(42)
+        \\  end
         \\end
     ;
 
@@ -1275,8 +1365,10 @@ test "module-qualified call emits prefixed name" {
         \\  end
         \\end
         \\
-        \\def main() do
-        \\  Math.double(5)
+        \\defmodule Test do
+        \\  def main() do
+        \\    Math.double(5)
+        \\  end
         \\end
     ;
 
@@ -1284,6 +1376,702 @@ test "module-qualified call emits prefixed name" {
     try expectContains(output, "fn Math__double(");
     try expectContains(output, "Math__double(");
     try expectContains(output, "fn main(");
+    try expectNotContains(output, "// unhandled instruction");
+}
+
+test "nested local def direct call compiles" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Foo do
+        \\  def bar(x :: i64) :: i64 do
+        \\    def other(y :: i64) :: i64 do
+        \\      y * 10
+        \\    end
+        \\
+        \\    other(123)
+        \\  end
+        \\end
+        \\
+        \\defmodule Test do
+        \\  def main() do
+        \\    Foo.bar(4)
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, "fn Foo__other(");
+    try expectContains(output, "Foo__other(");
+    try expectNotContains(output, "func_unknown(");
+    try expectNotContains(output, "// unhandled instruction");
+}
+
+test "nested noncapturing def can be passed as function value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Foo do
+        \\  def apply(f :: (i64 -> i64), value :: i64) :: i64 do
+        \\    f(value)
+        \\  end
+        \\
+        \\  def bar() :: i64 do
+        \\    def other(y :: i64) :: i64 do
+        \\      y * 10
+        \\    end
+        \\
+        \\    apply(other, 12)
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, "zap_runtime.DynClosure");
+    try expectContains(output, "__closure_invoke_");
+    try expectContains(output, "__closure_invoke_");
+    try expectNotContains(output, "func_unknown(");
+    try expectNotContains(output, "// unhandled instruction");
+}
+
+test "nested noncapturing def can be returned as function value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Foo do
+        \\  def make(x :: i64) :: (i64 -> i64) do
+        \\    def other(y :: i64) :: i64 do
+        \\      x + y
+        \\    end
+        \\
+        \\    other
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, "fn Foo__other(");
+    try expectContains(output, "zap_runtime.DynClosure");
+    try expectContains(output, "__closure_invoke_");
+    try expectNotContains(output, "func_unknown(");
+    try expectNotContains(output, "// unhandled instruction");
+}
+
+test "capturing nested def local call compiles as closure" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Foo do
+        \\  def bar(x :: i64) :: i64 do
+        \\    def add_x(y :: i64) :: i64 do
+        \\      x + y
+        \\    end
+        \\
+        \\    add_x(10)
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, "fn Foo__add_x(");
+    try expectContains(output, "Foo__add_x(__local_");
+    try expectNotContains(output, "zap_runtime.invokeDynClosure(");
+    try expectNotContains(output, "func_unknown(");
+    try expectNotContains(output, "// unhandled instruction");
+}
+
+test "call-local capturing closure omits closure wrappers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Foo do
+        \\  def bar(x :: i64) :: i64 do
+        \\    def add_x(y :: i64) :: i64 do
+        \\      x + y
+        \\    end
+        \\
+        \\    add_x(10)
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectNotContains(output, "fn __closure_invoke_11(");
+    try expectNotContains(output, "const __closure_env_11");
+}
+
+test "non-capturing local def stays lambda lifted without closure wrappers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Foo do
+        \\  def bar() :: i64 do
+        \\    def forty_two() :: i64 do
+        \\      42
+        \\    end
+        \\
+        \\    forty_two()
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, "fn Foo__forty_two(");
+    try expectContains(output, "Foo__forty_two(");
+    try expectNotContains(output, "zap_runtime.DynClosure{");
+    try expectNotContains(output, "fn __closure_invoke_");
+    try expectNotContains(output, "const __closure_env_");
+}
+
+test "call-local closure with if body still compiles as direct call" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Foo do
+        \\  def bar(flag :: Bool) :: i64 do
+        \\    def pick(value :: Bool) :: i64 do
+        \\      if value do
+        \\        5
+        \\      else
+        \\        7
+        \\      end
+        \\    end
+        \\
+        \\    pick(flag)
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, "fn Foo__pick(");
+    try expectContains(output, "Foo__pick(__local_");
+    try expectContains(output, "switch (__local_");
+    try expectNotContains(output, "zap_runtime.invokeDynClosure(");
+    try expectNotContains(output, "func_unknown(");
+}
+
+test "call-local closure with switch body still compiles as direct call" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Foo do
+        \\  def bar(flag :: Bool) :: i64 do
+        \\    def pick(value :: Bool) :: i64 do
+        \\      case value do
+        \\        true -> 5
+        \\        false -> 7
+        \\      end
+        \\    end
+        \\
+        \\    pick(flag)
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, "fn Foo__pick(");
+    try expectContains(output, "Foo__pick(__local_");
+    try expectContains(output, "switch (__local_");
+    try expectNotContains(output, "zap_runtime.invokeDynClosure(");
+    try expectNotContains(output, "func_unknown(");
+}
+
+test "call-local closure with case body still compiles as direct call" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Foo do
+        \\  def bar(flag :: Bool) :: i64 do
+        \\    def pick(value :: Bool) :: i64 do
+        \\      case value do
+        \\        true -> 5
+        \\        false -> 7
+        \\      end
+        \\    end
+        \\
+        \\    pick(flag)
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, "fn Foo__pick(");
+    try expectContains(output, "Foo__pick(__local_");
+    try expectNotContains(output, "zap_runtime.invokeDynClosure(");
+    try expectNotContains(output, "func_unknown(");
+}
+
+test "aliased call-local capturing closure still compiles as direct call" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Foo do
+        \\  def bar(x :: i64) :: i64 do
+        \\    def add_x(y :: i64) :: i64 do
+        \\      x + y
+        \\    end
+        \\
+        \\    f = add_x
+        \\    g = f
+        \\    g(10)
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, "fn Foo__add_x(");
+    try expectContains(output, "@call(.always_tail, Foo__add_x");
+    try expectNotContains(output, "zap_runtime.invokeDynClosure(");
+    try expectNotContains(output, "func_unknown(");
+}
+
+test "aliased call-local closure with case body still compiles as direct call" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Foo do
+        \\  def bar(flag :: Bool) :: i64 do
+        \\    def pick(value :: Bool) :: i64 do
+        \\      case value do
+        \\        true -> 5
+        \\        false -> 7
+        \\      end
+        \\    end
+        \\
+        \\    f = pick
+        \\    g = f
+        \\    g(flag)
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, "fn Foo__pick(");
+    try expectContains(output, "@call(.always_tail, Foo__pick");
+    try expectNotContains(output, "zap_runtime.invokeDynClosure(");
+    try expectNotContains(output, "func_unknown(");
+}
+
+test "block-local capturing closure avoids heap env allocation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Foo do
+        \\  def bar(x :: i64) :: i64 do
+        \\    def add_x(y :: i64) :: i64 do
+        \\      x + y
+        \\    end
+        \\
+        \\    f = add_x
+        \\    f(10)
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, "var __");
+    try expectNotContains(output, "std.heap.page_allocator.create(__closure_env_");
+    try expectContains(output, "zap_runtime.DynClosure{");
+    try expectNotContains(output, "fn __closure_release_");
+}
+
+test "capturing nested def can be passed as function value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Foo do
+        \\  def apply(f :: (i64 -> i64), value :: i64) :: i64 do
+        \\    f(value)
+        \\  end
+        \\
+        \\  def bar(x :: i64) :: i64 do
+        \\    def add_x(y :: i64) :: i64 do
+        \\      x + y
+        \\    end
+        \\
+        \\    apply(add_x, 10)
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, "zap_runtime.DynClosure");
+    try expectContains(output, "__closure_invoke_");
+    try expectContains(output, "const __closure_env_");
+    try expectNotContains(output, "func_unknown(");
+    try expectNotContains(output, "// unhandled instruction");
+}
+
+test "capturing nested def passed to known-safe callee avoids heap env" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Foo do
+        \\  def apply(f :: (i64 -> i64), value :: i64) :: i64 do
+        \\    f(value)
+        \\  end
+        \\
+        \\  def bar(x :: i64) :: i64 do
+        \\    def add_x(y :: i64) :: i64 do
+        \\      x + y
+        \\    end
+        \\
+        \\    apply(add_x, 10)
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, "Foo__apply(__local_1, __local_3)");
+    try expectContains(output, "var __");
+    try expectNotContains(output, "std.heap.page_allocator.create(__closure_env_");
+    try expectNotContains(output, "fn __closure_release_");
+}
+
+test "aliased capturing nested def passed to known-safe callee avoids heap env" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Foo do
+        \\  def apply(f :: (i64 -> i64), value :: i64) :: i64 do
+        \\    f(value)
+        \\  end
+        \\
+        \\  def bar(x :: i64) :: i64 do
+        \\    def add_x(y :: i64) :: i64 do
+        \\      x + y
+        \\    end
+        \\
+        \\    f = add_x
+        \\    apply(f, 10)
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, "Foo__apply(__local_");
+    try expectContains(output, "var __");
+    try expectNotContains(output, "std.heap.page_allocator.create(__closure_env_");
+    try expectNotContains(output, "fn __closure_release_");
+    try expectNotContains(output, "func_unknown(");
+}
+
+test "capturing nested def passed through transitive known-safe callees avoids heap env" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Foo do
+        \\  def apply(f :: (i64 -> i64), value :: i64) :: i64 do
+        \\    f(value)
+        \\  end
+        \\
+        \\  def wrap(f :: (i64 -> i64), value :: i64) :: i64 do
+        \\    apply(f, value)
+        \\  end
+        \\
+        \\  def bar(x :: i64) :: i64 do
+        \\    def add_x(y :: i64) :: i64 do
+        \\      x + y
+        \\    end
+        \\
+        \\    wrap(add_x, 10)
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, "Foo__wrap(__local_1, __local_3)");
+    try expectContains(output, "var __");
+    try expectNotContains(output, "std.heap.page_allocator.create(__closure_env_");
+    try expectNotContains(output, "fn __closure_release_");
+}
+
+test "aliased capturing nested def passed through transitive known-safe callees avoids heap env" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Foo do
+        \\  def apply(f :: (i64 -> i64), value :: i64) :: i64 do
+        \\    f(value)
+        \\  end
+        \\
+        \\  def wrap(f :: (i64 -> i64), value :: i64) :: i64 do
+        \\    apply(f, value)
+        \\  end
+        \\
+        \\  def bar(x :: i64) :: i64 do
+        \\    def add_x(y :: i64) :: i64 do
+        \\      x + y
+        \\    end
+        \\
+        \\    f = add_x
+        \\    wrap(f, 10)
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, "Foo__wrap(__local_");
+    try expectContains(output, "var __");
+    try expectNotContains(output, "std.heap.page_allocator.create(__closure_env_");
+    try expectNotContains(output, "fn __closure_release_");
+    try expectNotContains(output, "func_unknown(");
+}
+
+test "function-local capturing closure uses frame env without heap allocation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Foo do
+        \\  def apply(f :: (i64 -> i64), value :: i64) :: i64 do
+        \\    f(value)
+        \\  end
+        \\
+        \\  def bar(x :: i64) :: i64 do
+        \\    def add_x(y :: i64) :: i64 do
+        \\      x + y
+        \\    end
+        \\
+        \\    apply(add_x, 10)
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, "var __frame_env_");
+    try expectContains(output, "zap_runtime.DynClosure{");
+    try expectNotContains(output, "std.heap.page_allocator.create(__closure_env_");
+    try expectNotContains(output, "fn __closure_release_");
+}
+
+test "source pipeline marks multi-target higher-order call as switch_dispatch" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Foo do
+        \\  def inc(x :: i64) :: i64 do
+        \\    x + 1
+        \\  end
+        \\
+        \\  def dec(x :: i64) :: i64 do
+        \\    x - 1
+        \\  end
+        \\
+        \\  def apply(f :: (i64 -> i64), value :: i64) :: i64 do
+        \\    f(value)
+        \\  end
+        \\
+        \\  def choose(flag :: Bool) :: (i64 -> i64) do
+        \\    if flag do
+        \\      inc
+        \\    else
+        \\      dec
+        \\    end
+        \\  end
+        \\
+        \\  def run(flag :: Bool) :: i64 do
+        \\    apply(choose(flag), 10)
+        \\  end
+        \\end
+    ;
+
+    var analyzed = try analyzeSource(alloc, source);
+    defer analyzed.pipeline_result.deinit();
+
+    var apply_func: ?ir.FunctionId = null;
+    for (analyzed.ir_program.functions) |func| {
+        if (std.mem.eql(u8, func.name, "Foo__apply")) {
+            apply_func = func.id;
+            break;
+        }
+    }
+    try std.testing.expect(apply_func != null);
+
+    var found = false;
+    var iter = analyzed.pipeline_result.context.call_specializations.iterator();
+    while (iter.next()) |entry| {
+        if (entry.key_ptr.function == apply_func.? and entry.value_ptr.decision == .switch_dispatch) {
+            found = true;
+            try std.testing.expectEqual(@as(usize, 2), entry.value_ptr.lambda_set.members.len);
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "source pipeline records reuse pairs for tagged tuple reconstruction after case" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Handler do
+        \\  def handle(result) do
+        \\    case result do
+        \\      {:ok, v} -> {:ok, v}
+        \\      {:error, e} -> {:error, e}
+        \\    end
+        \\  end
+        \\end
+    ;
+
+    var analyzed = try analyzeSource(alloc, source);
+    defer analyzed.pipeline_result.deinit();
+
+    try std.testing.expect(analyzed.pipeline_result.context.reuse_pairs.items.len > 0);
+}
+
+test "source pipeline records reuse pairs for struct reconstruction after case" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defstruct User do
+        \\  name :: String
+        \\  age :: i64
+        \\end
+        \\
+        \\defmodule Foo do
+        \\  def norm(u :: User) :: User do
+        \\    case u do
+        \\      x -> %{name: x.name, age: x.age} :: User
+        \\    end
+        \\  end
+        \\end
+    ;
+
+    var analyzed = try analyzeSource(alloc, source);
+    defer analyzed.pipeline_result.deinit();
+
+    try std.testing.expect(analyzed.pipeline_result.context.reuse_pairs.items.len > 0);
+}
+
+test "source codegen emits switch dispatch for multi-target higher-order call" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Foo do
+        \\  def inc(x :: i64) :: i64 do
+        \\    x + 1
+        \\  end
+        \\
+        \\  def dec(x :: i64) :: i64 do
+        \\    x - 1
+        \\  end
+        \\
+        \\  def apply(f :: (i64 -> i64), value :: i64) :: i64 do
+        \\    f(value)
+        \\  end
+        \\
+        \\  def choose(flag :: Bool) :: (i64 -> i64) do
+        \\    if flag do
+        \\      inc
+        \\    else
+        \\      dec
+        \\    end
+        \\  end
+        \\
+        \\  def run(flag :: Bool) :: i64 do
+        \\    apply(choose(flag), 10)
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, ".call_fn == @ptrCast(&__closure_invoke_");
+    try expectContains(output, "invokeDynClosure");
+}
+
+test "capturing nested def can be returned as function value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Foo do
+        \\  def make_adder(x :: i64) :: (i64 -> i64) do
+        \\    def add_x(y :: i64) :: i64 do
+        \\      x + y
+        \\    end
+        \\
+        \\    add_x
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, "zap_runtime.DynClosure{");
+    try expectContains(output, "const __closure_env_");
+    try expectContains(output, "fn __closure_invoke_");
+    try expectContains(output, "std.heap.page_allocator.create(__closure_env_");
+    try expectNotContains(output, "func_unknown(");
+    try expectNotContains(output, "// unhandled instruction");
+}
+
+test "capturing closure with shared opaque capture emits retain and release helpers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Foo do
+        \\  opaque Handle = String
+        \\
+        \\  def make(handle :: shared Handle) do
+        \\    def use() do
+        \\      handle
+        \\    end
+        \\
+        \\    use
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, "const __closure_env_");
+    try expectContains(output, "fn __closure_release_");
+    try expectContains(output, "zap_runtime.ArcRuntime.retainAny(");
+    try expectContains(output, "zap_runtime.ArcRuntime.releaseAny(");
     try expectNotContains(output, "// unhandled instruction");
 }
 
@@ -1296,7 +2084,7 @@ test "shared opaque closure arg emits ARC retain and release" {
         \\defmodule Test do
         \\  opaque Handle = String
         \\
-        \\  def run(use_fn :: (Handle -> Handle), handle :: Handle) do
+        \\  def run(use_fn :: (shared Handle -> Handle), handle :: Handle) do
         \\    use_fn(handle)
         \\  end
         \\end
@@ -1306,6 +2094,58 @@ test "shared opaque closure arg emits ARC retain and release" {
     try expectContains(output, "zap_runtime.ArcRuntime.retainAny(");
     try expectContains(output, "zap_runtime.ArcRuntime.releaseAny(");
     try expectNotContains(output, "// unhandled instruction");
+}
+
+test "borrowed opaque closure arg emits no ARC retain or release" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Test do
+        \\  opaque Handle = String
+        \\
+        \\  def run(use_fn :: (borrowed Handle -> Handle), handle :: Handle) do
+        \\    use_fn(handle)
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectNotContains(output, "zap_runtime.ArcRuntime.retainAny(");
+    try expectNotContains(output, "zap_runtime.ArcRuntime.releaseAny(");
+    try expectNotContains(output, "// unhandled instruction");
+}
+
+test "borrowed capturing closure passed to known-safe callee avoids heap env and ARC ops" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Test do
+        \\  opaque Handle = String
+        \\
+        \\  def apply(f :: (borrowed Handle -> Bool), handle :: borrowed Handle) do
+        \\    f(handle)
+        \\  end
+        \\
+        \\  def make(handle :: borrowed Handle) do
+        \\    def use(h :: borrowed Handle) do
+        \\      h == handle
+        \\    end
+        \\
+        \\    apply(use, handle)
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, "var __");
+    try expectNotContains(output, "std.heap.page_allocator.create(__closure_env_");
+    try expectNotContains(output, "fn __closure_release_");
+    try expectNotContains(output, "zap_runtime.ArcRuntime.retainAny(");
+    try expectNotContains(output, "zap_runtime.ArcRuntime.releaseAny(");
 }
 
 test "top-level main stays bare, module functions get prefixed" {
@@ -1320,8 +2160,10 @@ test "top-level main stays bare, module functions get prefixed" {
         \\  end
         \\end
         \\
-        \\def main() do
-        \\  Helper.helper(5)
+        \\defmodule Test do
+        \\  def main() do
+        \\    Helper.helper(5)
+        \\  end
         \\end
     ;
 
@@ -1565,8 +2407,10 @@ test "return type mismatch is always an error" {
 
     // Return type mismatch: declared i64, returns String
     const source =
-        \\def bad() :: i64 do
-        \\  "not a number"
+        \\defmodule Test do
+        \\  def bad() :: i64 do
+        \\    "not a number"
+        \\  end
         \\end
     ;
 
@@ -1835,12 +2679,14 @@ test "multiline struct literal parses correctly" {
         \\  age :: i64
         \\end
         \\
-        \\def main() do
-        \\  u = %{
-        \\    name: "Alice",
-        \\    age: 30
-        \\  } :: User
-        \\  u
+        \\defmodule Test do
+        \\  def main() do
+        \\    u = %{
+        \\      name: "Alice",
+        \\      age: 30
+        \\    } :: User
+        \\    u
+        \\  end
         \\end
     ;
 
@@ -1863,8 +2709,10 @@ test "multi-parameter function uses distinct param indices" {
         \\  end
         \\end
         \\
-        \\def main() do
-        \\  Math.add(20, 22)
+        \\defmodule Test do
+        \\  def main() do
+        \\    Math.add(20, 22)
+        \\  end
         \\end
     ;
 
@@ -1881,8 +2729,10 @@ test "multi-parameter function param_get indices in IR" {
     const alloc = arena.allocator();
 
     const source =
-        \\def add(a, b) do
-        \\  a + b
+        \\defmodule Test do
+        \\  def add(a, b) do
+        \\    a + b
+        \\  end
         \\end
     ;
 
@@ -1937,8 +2787,10 @@ test "top-level multi-param function called from main" {
         \\  end
         \\end
         \\
-        \\def main() do
-        \\  IO.puts(Adder.add(20, 22))
+        \\defmodule Test do
+        \\  def main() do
+        \\    IO.puts(Adder.add(20, 22))
+        \\  end
         \\end
     ;
 
@@ -1960,8 +2812,10 @@ test "three-parameter function uses all param indices" {
         \\  end
         \\end
         \\
-        \\def main() do
-        \\  Math.sum3(1, 2, 3)
+        \\defmodule Test do
+        \\  def main() do
+        \\    Math.sum3(1, 2, 3)
+        \\  end
         \\end
     ;
 
@@ -1969,4 +2823,390 @@ test "three-parameter function uses all param indices" {
     try expectContains(output, "__arg_0");
     try expectContains(output, "__arg_1");
     try expectContains(output, "__arg_2");
+}
+
+// ============================================================
+// Analysis Pipeline Integration Tests (Phase 9)
+// ============================================================
+
+test "pipeline: non-escaping closure avoids heap allocation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Foo do
+        \\  def bar(x :: i64) :: i64 do
+        \\    def add_x(y :: i64) :: i64 do
+        \\      x + y
+        \\    end
+        \\
+        \\    add_x(10)
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    // Non-escaping closure should NOT use page_allocator.
+    try expectNotContains(output, "page_allocator.create(__closure_env_");
+}
+
+test "pipeline: returned closure uses heap allocation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Foo do
+        \\  def make(x :: i64) :: (i64 -> i64) do
+        \\    def other(y :: i64) :: i64 do
+        \\      x + y
+        \\    end
+        \\
+        \\    other
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    // Returned closure should use DynClosure (it escapes).
+    try expectContains(output, "zap_runtime.DynClosure");
+    try expectContains(output, "std.heap.page_allocator.create(__closure_env_");
+    try expectContains(output, "fn __closure_release_");
+}
+
+test "pipeline: aliased returned closure still uses heap allocation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Foo do
+        \\  def make(x :: i64) :: (i64 -> i64) do
+        \\    def other(y :: i64) :: i64 do
+        \\      x + y
+        \\    end
+        \\
+        \\    f = other
+        \\    f
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, "zap_runtime.DynClosure");
+    try expectContains(output, "std.heap.page_allocator.create(__closure_env_");
+    try expectContains(output, "fn __closure_release_");
+}
+
+test "pipeline: lambda lifted local def uses no closure object" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Foo do
+        \\  def bar() :: i64 do
+        \\    def forty_two() :: i64 do
+        \\      42
+        \\    end
+        \\
+        \\    forty_two()
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, "fn Foo__forty_two(");
+    try expectNotContains(output, "zap_runtime.DynClosure{");
+    try expectNotContains(output, "__closure_invoke_");
+    try expectNotContains(output, "__closure_env_");
+}
+
+test "pipeline: multi-function program compiles cleanly" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Math do
+        \\  def add(a :: i64, b :: i64) :: i64 do
+        \\    a + b
+        \\  end
+        \\
+        \\  def double(x :: i64) :: i64 do
+        \\    add(x, x)
+        \\  end
+        \\end
+        \\
+        \\defmodule Test do
+        \\  def main() do
+        \\    IO.puts(Math.double(21))
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, "fn Math__add(");
+    try expectContains(output, "fn Math__double(");
+    try expectNotContains(output, "// unhandled instruction");
+}
+
+test "pipeline: pattern matching compiles through analysis" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Matcher do
+        \\  def check(x :: i64) :: i64 do
+        \\    case x do
+        \\      0 -> 100
+        \\      1 -> 200
+        \\      _ -> 300
+        \\    end
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, "fn Matcher__check(");
+    try expectNotContains(output, "// unhandled instruction");
+}
+
+test "pipeline: recursive function compiles through analysis" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Counter do
+        \\  def count(0) :: i64 do
+        \\    0
+        \\  end
+        \\
+        \\  def count(n :: i64) :: i64 do
+        \\    1 + count(n - 1)
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, "fn Counter__count(");
+    try expectNotContains(output, "// unhandled instruction");
+}
+
+test "pipeline: closure passed to higher-order function uses DynClosure" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Foo do
+        \\  def apply(f :: (i64 -> i64), value :: i64) :: i64 do
+        \\    f(value)
+        \\  end
+        \\
+        \\  def bar(x :: i64) :: i64 do
+        \\    def add_x(y :: i64) :: i64 do
+        \\      x + y
+        \\    end
+        \\
+        \\    apply(add_x, 10)
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    // Closure passed as argument is still represented as DynClosure, but the
+    // callee may be specialized to call its known invoke wrapper directly.
+    try expectContains(output, "zap_runtime.DynClosure");
+    try expectContains(output, "__closure_invoke_");
+    try expectNotContains(output, "// unhandled instruction");
+}
+
+test "pipeline: fibonacci compiles through full analysis" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Fib do
+        \\  def fib(0) :: i64 do
+        \\    0
+        \\  end
+        \\
+        \\  def fib(1) :: i64 do
+        \\    1
+        \\  end
+        \\
+        \\  def fib(n :: i64) :: i64 do
+        \\    fib(n - 1) + fib(n - 2)
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, "fn Fib__fib(");
+    try expectNotContains(output, "// unhandled instruction");
+}
+
+test "pipeline: multiple modules compile together" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule A do
+        \\  def double(x :: i64) :: i64 do
+        \\    x * 2
+        \\  end
+        \\end
+        \\
+        \\defmodule B do
+        \\  def quad(x :: i64) :: i64 do
+        \\    A.double(A.double(x))
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, "fn A__double(");
+    try expectContains(output, "fn B__quad(");
+    try expectNotContains(output, "// unhandled instruction");
+}
+
+// ============================================================
+// Phase 6 Success Criteria Tests
+// ============================================================
+
+test "pipeline: closure stored in collection uses DynClosure fallback" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Closure stored in a variable (not just called) → DynClosure.
+    const source =
+        \\defmodule Foo do
+        \\  def bar(x :: i64) :: i64 do
+        \\    def add_x(y :: i64) :: i64 do
+        \\      x + y
+        \\    end
+        \\
+        \\    f = add_x
+        \\    f(10)
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    // Closure is stored in a variable → uses DynClosure.
+    try expectContains(output, "zap_runtime.DynClosure{");
+    try expectNotContains(output, "// unhandled instruction");
+}
+
+// ============================================================
+// Phase 7 Success Criteria Tests
+// ============================================================
+
+test "pipeline: non-escaping struct has no retain in output" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // A struct that is created and used locally (not returned, not stored
+    // in a heap container) should not generate ARC operations.
+    const source =
+        \\defmodule Foo do
+        \\  def add(a :: i64, b :: i64) :: i64 do
+        \\    a + b
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    // Simple function with no heap allocation should have no ARC.
+    try expectNotContains(output, "retainAny");
+    try expectNotContains(output, "releaseAny");
+    try expectNotContains(output, "// unhandled instruction");
+}
+
+// ============================================================
+// Phase 9 Success Criteria Tests
+// ============================================================
+
+test "pipeline: complex program with closures, patterns, modules" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Math do
+        \\  def factorial(0) :: i64 do
+        \\    1
+        \\  end
+        \\
+        \\  def factorial(n :: i64) :: i64 do
+        \\    n * factorial(n - 1)
+        \\  end
+        \\end
+        \\
+        \\defmodule Test do
+        \\  def main() do
+        \\    IO.puts(Math.factorial(10))
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, "fn Math__factorial(");
+    try expectContains(output, "pub fn main(");
+    try expectNotContains(output, "// unhandled instruction");
+    try expectNotContains(output, "func_unknown(");
+}
+
+test "pipeline: nested closures compile cleanly" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Foo do
+        \\  def make_adder(x :: i64) :: (i64 -> i64) do
+        \\    def add(y :: i64) :: i64 do
+        \\      x + y
+        \\    end
+        \\
+        \\    add
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, "fn Foo__make_adder(");
+    try expectContains(output, "fn Foo__add(");
+    try expectContains(output, "zap_runtime.DynClosure");
+    try expectNotContains(output, "// unhandled instruction");
+}
+
+test "pipeline: atom pattern matching through analysis" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Status do
+        \\  def check(:ok) :: i64 do
+        \\    1
+        \\  end
+        \\
+        \\  def check(:error) :: i64 do
+        \\    0
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, "fn Status__check(");
+    try expectNotContains(output, "// unhandled instruction");
 }

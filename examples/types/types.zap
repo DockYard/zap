@@ -3,8 +3,6 @@
 # Demonstrates all supported types: scalars, compound types,
 # structs, enums, and module inheritance.
 
-# --- Struct definitions ---
-
 defstruct Point do
   x :: f64
   y :: f64
@@ -24,8 +22,6 @@ defstruct Rectangle extends Shape do
   height :: f64
 end
 
-# --- Enum definitions ---
-
 defenum Color do
   Red
   Green
@@ -38,8 +34,6 @@ defenum Direction do
   East
   West
 end
-
-# --- Modules ---
 
 defmodule Scalars do
   def int() :: i64 do
@@ -154,11 +148,13 @@ defmodule Demo do
   end
 end
 
-def main() do
-  Demo.scalars()
-  Demo.tuples()
-  IO.puts("=== Structs ===")
-  Demo.structs()
-  Demo.enums()
-  Demo.inheritance()
+defmodule Types do
+  def main() do
+    Demo.scalars()
+    Demo.tuples()
+    IO.puts("=== Structs ===")
+    Demo.structs()
+    Demo.enums()
+    Demo.inheritance()
+  end
 end

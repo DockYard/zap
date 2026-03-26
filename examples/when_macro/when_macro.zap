@@ -14,7 +14,9 @@ defmodule Guards do
   end
 end
 
-def main() do
-  Guards.check(10)!
-  |> IO.puts()
+defmodule WhenMacro do
+  def main() do
+    Guards.check(10)!
+    |> IO.puts()
+  end
 end

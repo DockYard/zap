@@ -2,6 +2,7 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const types_mod = @import("types.zig");
 const hir_mod = @import("hir.zig");
+const scope_mod = @import("scope.zig");
 
 // ============================================================
 // Zig-shaped IR (spec §19)
@@ -63,6 +64,8 @@ pub const Program = struct {
 pub const Function = struct {
     id: FunctionId,
     name: []const u8,
+    scope_id: scope_mod.ScopeId,
+    arity: u32,
     params: []const Param,
     return_type: ZigType,
     body: []const Block,
@@ -78,6 +81,7 @@ pub const Param = struct {
 pub const Capture = struct {
     name: []const u8,
     type_expr: ZigType,
+    ownership: hir_mod.Ownership,
 };
 
 pub const Block = struct {
@@ -101,6 +105,8 @@ pub const Instruction = union(enum) {
     // Locals
     local_get: LocalGet,
     local_set: LocalSet,
+    move_value: MoveValue,
+    share_value: ShareValue,
     param_get: ParamGet,
 
     // Aggregates
@@ -165,9 +171,12 @@ pub const Instruction = union(enum) {
     bin_match_prefix: BinMatchPrefix,
 
     // Memory / ARC
-    alloc_owned: AllocOwned,
     retain: Retain,
     release: Release,
+
+    // Perceus reuse (Koka-inspired)
+    reset: Reset,
+    reuse_alloc: ReuseAlloc,
 
     // Phi
     phi: Phi,
@@ -208,6 +217,16 @@ pub const LocalGet = struct {
 pub const LocalSet = struct {
     dest: LocalId,
     value: LocalId,
+};
+
+pub const MoveValue = struct {
+    dest: LocalId,
+    source: LocalId,
+};
+
+pub const ShareValue = struct {
+    dest: LocalId,
+    source: LocalId,
 };
 
 pub const ParamGet = struct {
@@ -376,6 +395,7 @@ pub const CallClosure = struct {
     callee: LocalId,
     args: []const LocalId,
     arg_modes: []const ValueMode,
+    return_type: ZigType,
 };
 
 pub const CallDispatch = struct {
@@ -516,6 +536,8 @@ pub const CondReturn = struct {
 
 pub const Jump = struct {
     target: LabelId,
+    value: ?LocalId = null,
+    bind_dest: ?LocalId = null,
 };
 
 pub const MakeClosure = struct {
@@ -583,17 +605,28 @@ pub const BinOffset = union(enum) {
     dynamic: LocalId,
 };
 
-pub const AllocOwned = struct {
-    dest: LocalId,
-    type_name: []const u8,
-};
-
 pub const Retain = struct {
     value: LocalId,
 };
 
 pub const Release = struct {
     value: LocalId,
+};
+
+/// Perceus: if RC=1, make memory available for reuse and return a reuse token.
+/// If RC>1, decrement RC and return null token.
+pub const Reset = struct {
+    dest: LocalId, // reuse token
+    source: LocalId, // value being deconstructed
+};
+
+/// Perceus: if reuse token is non-null, reuse memory for new allocation.
+/// If token is null, allocate fresh.
+pub const ReuseAlloc = struct {
+    dest: LocalId, // newly allocated value
+    token: ?LocalId, // reuse token from Reset (null = fresh alloc)
+    constructor_tag: u32, // constructor tag for tagged unions
+    dest_type: ZigType = .any,
 };
 
 pub const Phi = struct {
@@ -791,8 +824,10 @@ pub const IrBuilder = struct {
     fn buildFunctionGroup(self: *IrBuilder, group: *const hir_mod.FunctionGroup) !void {
         if (group.clauses.len == 0) return;
 
-        const func_id = self.next_function_id;
-        self.next_function_id += 1;
+        const func_id: FunctionId = group.id;
+        if (self.next_function_id <= func_id) {
+            self.next_function_id = func_id + 1;
+        }
         self.next_local = 0;
         self.next_label = 0;
         self.current_instrs = .empty;
@@ -807,6 +842,15 @@ pub const IrBuilder = struct {
         // Otherwise fall back to anytype.
         var params: std.ArrayList(Param) = .empty;
         var union_param_idx: ?u32 = null;
+        var captures: std.ArrayList(Capture) = .empty;
+        for (group.captures, 0..) |capture, idx| {
+            const cap_name = try std.fmt.allocPrint(self.allocator, "__cap_{d}", .{idx});
+            try captures.append(self.allocator, .{
+                .name = cap_name,
+                .type_expr = typeIdToZigTypeWithStore(capture.type_id, self.type_store),
+                .ownership = capture.ownership,
+            });
+        }
         for (first_clause.params, 0..) |param, i| {
             const name = try std.fmt.allocPrint(self.allocator, "__arg_{d}", .{i});
             var resolved_type = typeIdToZigTypeWithStore(param.type_id, self.type_store);
@@ -1063,11 +1107,13 @@ pub const IrBuilder = struct {
         try self.functions.append(self.allocator, .{
             .id = func_id,
             .name = name_str,
+            .scope_id = group.scope_id,
+            .arity = group.arity,
             .params = final_params,
             .return_type = return_type,
             .body = try self.allocSlice(Block, &.{entry_block}),
-            .is_closure = false,
-            .captures = &.{},
+            .is_closure = group.captures.len > 0,
+            .captures = try captures.toOwnedSlice(self.allocator),
         });
 
         // Generate forwarding wrappers for default parameter values.
@@ -1170,6 +1216,8 @@ pub const IrBuilder = struct {
                     try self.functions.append(self.allocator, .{
                         .id = wrapper_id,
                         .name = wrapper_name,
+                        .scope_id = group.scope_id,
+                        .arity = @intCast(arity),
                         .params = try wrapper_params.toOwnedSlice(self.allocator),
                         .return_type = return_type,
                         .body = try self.allocSlice(Block, &.{wrapper_block}),
@@ -2512,7 +2560,7 @@ pub const IrBuilder = struct {
         };
     }
 
-    fn lowerBlock(self: *IrBuilder, block: *const hir_mod.Block) !?LocalId {
+    fn lowerBlock(self: *IrBuilder, block: *const hir_mod.Block) anyerror!?LocalId {
         var last_local: ?LocalId = null;
         for (block.stmts) |stmt| {
             switch (stmt) {
@@ -2527,7 +2575,20 @@ pub const IrBuilder = struct {
                     }
                     last_local = ls.index;
                 },
-                .function_group => {},
+                .function_group => |group| {
+                    const saved_instrs = self.current_instrs;
+                    const saved_next_local = self.next_local;
+                    const saved_known_local_types = self.known_local_types;
+                    self.current_instrs = .empty;
+                    self.known_local_types = std.AutoHashMap(LocalId, ZigType).init(self.allocator);
+                    defer {
+                        self.known_local_types.deinit();
+                        self.known_local_types = saved_known_local_types;
+                    }
+                    try self.buildFunctionGroup(group);
+                    self.current_instrs = saved_instrs;
+                    self.next_local = saved_next_local;
+                },
             }
         }
         return last_local;
@@ -2643,15 +2704,30 @@ pub const IrBuilder = struct {
             .call => |call| {
                 var args: std.ArrayList(LocalId) = .empty;
                 var arg_modes: std.ArrayList(ValueMode) = .empty;
-                var shared_arc_args: std.ArrayList(LocalId) = .empty;
+                var shared_release_locals: std.ArrayList(LocalId) = .empty;
                 for (call.args) |arg| {
                     const arg_local = try self.lowerExpr(arg.expr);
-                    try args.append(self.allocator, arg_local);
+                    const lowered_arg = switch (arg.mode) {
+                        .move => blk: {
+                            const moved_local = self.next_local;
+                            self.next_local += 1;
+                            try self.current_instrs.append(self.allocator, .{ .move_value = .{ .dest = moved_local, .source = arg_local } });
+                            break :blk moved_local;
+                        },
+                        .share => blk: {
+                            if (self.isArcManagedType(arg.expr.type_id)) {
+                                const shared_local = self.next_local;
+                                self.next_local += 1;
+                                try self.current_instrs.append(self.allocator, .{ .share_value = .{ .dest = shared_local, .source = arg_local } });
+                                try shared_release_locals.append(self.allocator, shared_local);
+                                break :blk shared_local;
+                            }
+                            break :blk arg_local;
+                        },
+                        .borrow => arg_local,
+                    };
+                    try args.append(self.allocator, lowered_arg);
                     try arg_modes.append(self.allocator, arg.mode);
-                    if (arg.mode == .share and self.isArcManagedType(arg.expr.type_id)) {
-                        try self.current_instrs.append(self.allocator, .{ .retain = .{ .value = arg_local } });
-                        try shared_arc_args.append(self.allocator, arg_local);
-                    }
                 }
                 switch (call.target) {
                     .direct => |dc| {
@@ -2732,7 +2808,7 @@ pub const IrBuilder = struct {
                         const lowered_args = try args.toOwnedSlice(self.allocator);
                         const lowered_modes = try arg_modes.toOwnedSlice(self.allocator);
                         try self.current_instrs.append(self.allocator, .{
-                            .call_closure = .{ .dest = dest, .callee = callee_local, .args = lowered_args, .arg_modes = lowered_modes },
+                            .call_closure = .{ .dest = dest, .callee = callee_local, .args = lowered_args, .arg_modes = lowered_modes, .return_type = typeIdToZigTypeWithStore(expr.type_id, self.type_store) },
                         });
                     },
                     .dispatch => |dc| {
@@ -2750,8 +2826,8 @@ pub const IrBuilder = struct {
                         });
                     },
                 }
-                for (shared_arc_args.items) |arg_local| {
-                    try self.current_instrs.append(self.allocator, .{ .release = .{ .value = arg_local } });
+                for (shared_release_locals.items) |shared_local| {
+                    try self.current_instrs.append(self.allocator, .{ .release = .{ .value = shared_local } });
                 }
             },
             .branch => {
@@ -2895,6 +2971,24 @@ pub const IrBuilder = struct {
                 }
                 try self.current_instrs.append(self.allocator, .{
                     .map_init = .{ .dest = dest, .entries = try ir_entries.toOwnedSlice(self.allocator) },
+                });
+            },
+            .capture_get => |index| {
+                try self.current_instrs.append(self.allocator, .{
+                    .capture_get = .{ .dest = dest, .index = index },
+                });
+            },
+            .closure_create => |cc| {
+                var capture_locals: std.ArrayList(LocalId) = .empty;
+                for (cc.captures) |capture| {
+                    try capture_locals.append(self.allocator, try self.lowerExpr(capture.expr));
+                }
+                try self.current_instrs.append(self.allocator, .{
+                    .make_closure = .{
+                        .dest = dest,
+                        .function = cc.function_group_id,
+                        .captures = try capture_locals.toOwnedSlice(self.allocator),
+                    },
                 });
             },
             else => {
@@ -3078,6 +3172,15 @@ fn typeIdToZigTypeWithStore(type_id: types_mod.TypeId, type_store: ?*const types
                             elem_zig.* = typeIdToZigTypeWithStore(lt.element, type_store);
                             return .{ .list = elem_zig };
                         },
+                        .function => |ft| {
+                            var zig_params = ts.allocator.alloc(ZigType, ft.params.len) catch return .any;
+                            for (ft.params, 0..) |param, i| {
+                                zig_params[i] = typeIdToZigTypeWithStore(param, type_store);
+                            }
+                            const ret_ptr = ts.allocator.create(ZigType) catch return .any;
+                            ret_ptr.* = typeIdToZigTypeWithStore(ft.return_type, type_store);
+                            return .{ .function = .{ .params = zig_params, .return_type = ret_ptr } };
+                        },
                         .union_type => |ut| {
                             // T | nil → ?T (Zig optional)
                             if (ut.members.len == 2) {
@@ -3143,6 +3246,9 @@ fn typeIdToZigTypeStrWithStore(type_id: types_mod.TypeId, type_store: ?*const ty
                         .opaque_type => |ot| {
                             return ts.interner.get(ot.name);
                         },
+                        .function => {
+                            return "zap_runtime.DynClosure";
+                        },
                         else => {},
                     }
                 }
@@ -3161,8 +3267,10 @@ const Collector = @import("collector.zig").Collector;
 
 test "IR build simple function" {
     const source =
-        \\def add(x :: i64, y :: i64) :: i64 do
-        \\  x + y
+        \\defmodule Test do
+        \\  def add(x :: i64, y :: i64) :: i64 do
+        \\    x + y
+        \\  end
         \\end
     ;
 
@@ -3197,8 +3305,10 @@ test "IR build simple function" {
 
 test "IR param_get indices are unique for multi-parameter functions" {
     const source =
-        \\def add(a, b) do
-        \\  a + b
+        \\defmodule Test do
+        \\  def add(a, b) do
+        \\    a + b
+        \\  end
         \\end
     ;
 
@@ -3303,8 +3413,10 @@ test "IR call preserves HIR arg modes" {
 
     const func = ir_program.functions[0];
     var found_call = false;
+    var found_move = false;
     for (func.body[0].instructions) |instr| {
         switch (instr) {
+            .move_value => found_move = true,
             .call_closure => |call| {
                 try std.testing.expectEqual(@as(usize, 1), call.arg_modes.len);
                 try std.testing.expectEqual(ValueMode.move, call.arg_modes[0]);
@@ -3314,6 +3426,7 @@ test "IR call preserves HIR arg modes" {
         }
     }
     try std.testing.expect(found_call);
+    try std.testing.expect(found_move);
 }
 
 test "IR named call preserves move mode" {
@@ -3358,8 +3471,15 @@ test "IR named call preserves move mode" {
 
     const run_func = ir_program.functions[1];
     var found_call = false;
+    var found_move = false;
     for (run_func.body[0].instructions) |instr| {
         switch (instr) {
+            .move_value => found_move = true,
+            .call_direct => |call| {
+                try std.testing.expectEqual(@as(usize, 1), call.arg_modes.len);
+                try std.testing.expectEqual(ValueMode.move, call.arg_modes[0]);
+                found_call = true;
+            },
             .call_named => |call| {
                 try std.testing.expectEqual(@as(usize, 1), call.arg_modes.len);
                 try std.testing.expectEqual(ValueMode.move, call.arg_modes[0]);
@@ -3369,6 +3489,7 @@ test "IR named call preserves move mode" {
         }
     }
     try std.testing.expect(found_call);
+    try std.testing.expect(found_move);
 }
 
 test "IR closure call preserves borrow mode without ARC ops" {
@@ -3499,15 +3620,15 @@ test "IR shared opaque call emits retain and release" {
     const ir_program = try ir_builder.buildProgram(&hir_program);
 
     const run_func = ir_program.functions[1];
-    var retain_count: usize = 0;
+    var share_count: usize = 0;
     var release_count: usize = 0;
     for (run_func.body[0].instructions) |instr| {
         switch (instr) {
-            .retain => retain_count += 1,
+            .share_value => share_count += 1,
             .release => release_count += 1,
             else => {},
         }
     }
-    try std.testing.expectEqual(@as(usize, 1), retain_count);
+    try std.testing.expectEqual(@as(usize, 1), share_count);
     try std.testing.expectEqual(@as(usize, 1), release_count);
 }

@@ -6,8 +6,8 @@ defmodule Factorial do
   def factorial(n :: i64) :: i64 do
     n * factorial(n - 1)
   end
-end
 
-def main() do
-  Factorial.factorial(10)
+  def main() do
+    Factorial.factorial(10)
+  end
 end

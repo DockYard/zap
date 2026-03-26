@@ -360,8 +360,10 @@ const Collector = @import("collector.zig").Collector;
 
 test "dispatch resolve simple function" {
     const source =
-        \\def add(x :: i64, y :: i64) :: i64 do
-        \\  x + y
+        \\defmodule Test do
+        \\  def add(x :: i64, y :: i64) :: i64 do
+        \\    x + y
+        \\  end
         \\end
     ;
 
@@ -383,10 +385,18 @@ test "dispatch resolve simple function" {
     var engine = DispatchEngine.init(alloc, &collector.graph, &type_store, &parser.interner);
     defer engine.deinit();
 
+    // Find the module scope
+    var module_scope: scope_mod.ScopeId = 0;
+    for (collector.graph.scopes.items, 0..) |s, idx| {
+        if (s.kind == .module) {
+            module_scope = @intCast(idx);
+        }
+    }
+
     const add_name = try parser.interner.intern("add");
     const arg_types = [_]types_mod.TypeId{ types_mod.TypeStore.I64, types_mod.TypeStore.I64 };
     const result = try engine.resolve(
-        0, // prelude scope
+        module_scope,
         add_name,
         2,
         &arg_types,
@@ -453,8 +463,10 @@ test "dispatch scope fallback" {
 
 test "dispatch no match" {
     const source =
-        \\def add(x :: i64, y :: i64) :: i64 do
-        \\  x + y
+        \\defmodule Test do
+        \\  def add(x :: i64, y :: i64) :: i64 do
+        \\    x + y
+        \\  end
         \\end
     ;
 
@@ -476,9 +488,17 @@ test "dispatch no match" {
     var engine = DispatchEngine.init(alloc, &collector.graph, &type_store, &parser.interner);
     defer engine.deinit();
 
+    // Find the module scope
+    var module_scope: scope_mod.ScopeId = 0;
+    for (collector.graph.scopes.items, 0..) |s, idx| {
+        if (s.kind == .module) {
+            module_scope = @intCast(idx);
+        }
+    }
+
     const nonexistent = try parser.interner.intern("nonexistent");
     const result = try engine.resolve(
-        0,
+        module_scope,
         nonexistent,
         1,
         &.{types_mod.TypeStore.I64},
@@ -491,12 +511,14 @@ test "dispatch no match" {
 
 test "dispatch specificity — literal pattern beats bind" {
     const source =
-        \\def factorial(0 :: i64) :: i64 do
-        \\  1
-        \\end
+        \\defmodule Test do
+        \\  def factorial(0 :: i64) :: i64 do
+        \\    1
+        \\  end
         \\
-        \\def factorial(n :: i64) :: i64 do
-        \\  n * factorial(n - 1)
+        \\  def factorial(n :: i64) :: i64 do
+        \\    n * factorial(n - 1)
+        \\  end
         \\end
     ;
 
@@ -518,9 +540,17 @@ test "dispatch specificity — literal pattern beats bind" {
     var engine = DispatchEngine.init(alloc, &collector.graph, &type_store, &parser.interner);
     defer engine.deinit();
 
+    // Find the module scope
+    var module_scope: scope_mod.ScopeId = 0;
+    for (collector.graph.scopes.items, 0..) |s, idx| {
+        if (s.kind == .module) {
+            module_scope = @intCast(idx);
+        }
+    }
+
     const factorial_name = try parser.interner.intern("factorial");
     const result = try engine.resolve(
-        0,
+        module_scope,
         factorial_name,
         1,
         &.{types_mod.TypeStore.I64},

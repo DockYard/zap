@@ -10,15 +10,15 @@ defmodule Guards do
   def classify(_ :: i64) :: String do
     "zero"
   end
-end
 
-def main() do
-  Guards.classify(-4)
-  |> IO.puts()
+  def main() do
+    Guards.classify(-4)
+    |> IO.puts()
 
-  Guards.classify(-7)
-  |> IO.puts()
+    Guards.classify(-7)
+    |> IO.puts()
 
-  Guards.classify(0)
-  |> IO.puts()
+    Guards.classify(0)
+    |> IO.puts()
+  end
 end

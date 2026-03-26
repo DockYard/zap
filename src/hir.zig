@@ -46,8 +46,17 @@ pub const FunctionGroup = struct {
     scope_id: scope_mod.ScopeId,
     name: ast.StringId,
     arity: u32,
+    is_local: bool = false,
+    captures: []const Capture = &.{},
     clauses: []const Clause,
     fallback_parent: ?u32, // ID of the outer scope's function group
+};
+
+pub const Capture = struct {
+    name: ast.StringId,
+    binding_id: scope_mod.BindingId,
+    type_id: TypeId,
+    ownership: Ownership,
 };
 
 pub const Clause = struct {
@@ -137,6 +146,7 @@ pub const ExprKind = union(enum) {
     // References
     local_get: u32, // local variable index
     param_get: u32, // parameter index
+    capture_get: u32,
 
     // Compound
     tuple_init: []const *const Expr,
@@ -248,6 +258,11 @@ pub const CaseBindKind = enum {
     tuple_element, // bind an element extracted from the scrutinee tuple
 };
 
+pub const AssignmentBinding = struct {
+    name: ast.StringId,
+    local_index: u32,
+};
+
 pub const MapEntry = struct {
     key: *const Expr,
     value: *const Expr,
@@ -265,7 +280,12 @@ pub const StructFieldInit = struct {
 
 pub const ClosureCreate = struct {
     function_group_id: u32,
-    captures: []const u32, // local variable indices
+    captures: []const CaptureValue,
+};
+
+pub const CaptureValue = struct {
+    expr: *const Expr,
+    ownership: Ownership,
 };
 
 // ============================================================
@@ -1241,9 +1261,15 @@ pub const HirBuilder = struct {
     current_list_bindings: std.ArrayList(ListBinding),
     current_binary_bindings: std.ArrayList(BinaryBinding),
     current_case_bindings: std.ArrayList(CaseBinding),
+    current_assignment_bindings: std.ArrayList(AssignmentBinding),
     current_module_scope: ?scope_mod.ScopeId,
     current_clause_scope: ?scope_mod.ScopeId,
+    current_function_root_scope: ?scope_mod.ScopeId,
     current_function_name: ?[]const u8,
+    family_to_group: std.AutoHashMap(scope_mod.FunctionFamilyId, u32),
+    group_captures: std.AutoHashMap(u32, []const Capture),
+    current_capture_map: std.AutoHashMap(ast.StringId, u32),
+    current_capture_list: std.ArrayList(Capture),
     errors: std.ArrayList(Error),
 
     pub const Error = struct {
@@ -1270,14 +1296,25 @@ pub const HirBuilder = struct {
             .current_list_bindings = .empty,
             .current_binary_bindings = .empty,
             .current_case_bindings = .empty,
+            .current_assignment_bindings = .empty,
             .current_module_scope = null,
             .current_clause_scope = null,
+            .current_function_root_scope = null,
             .current_function_name = null,
+            .family_to_group = std.AutoHashMap(scope_mod.FunctionFamilyId, u32).init(allocator),
+            .group_captures = std.AutoHashMap(u32, []const Capture).init(allocator),
+            .current_capture_map = std.AutoHashMap(ast.StringId, u32).init(allocator),
+            .current_capture_list = .empty,
             .errors = .empty,
         };
     }
 
     pub fn deinit(self: *HirBuilder) void {
+        self.family_to_group.deinit();
+        self.group_captures.deinit();
+        self.current_capture_map.deinit();
+        self.current_capture_list.deinit(self.allocator);
+        self.current_assignment_bindings.deinit(self.allocator);
         self.errors.deinit(self.allocator);
     }
 
@@ -1297,7 +1334,7 @@ pub const HirBuilder = struct {
     /// Look up a function's declared return type from the scope graph.
     /// Searches current module scope, then prelude.
     fn resolveFunctionReturnType(self: *const HirBuilder, name: ast.StringId, arity: u32) types_mod.TypeId {
-        const scope_id = self.current_module_scope orelse self.graph.prelude_scope;
+        const scope_id = self.current_clause_scope orelse self.current_module_scope orelse self.graph.prelude_scope;
         if (self.graph.resolveFamily(scope_id, name, arity)) |fam_id| {
             const family = self.graph.getFamily(fam_id);
             if (family.clauses.items.len > 0) {
@@ -1337,8 +1374,23 @@ pub const HirBuilder = struct {
     }
 
     fn resolveParamOwnership(self: *const HirBuilder, param: ast.Param, resolved_type: types_mod.TypeId) Ownership {
+        if (param.ownership_explicit) {
+            return switch (param.ownership) {
+                .shared => .shared,
+                .unique => .unique,
+                .borrowed => .borrowed,
+            };
+        }
         return switch (param.ownership) {
             .shared => self.defaultOwnershipForType(resolved_type),
+            .unique => .unique,
+            .borrowed => .borrowed,
+        };
+    }
+
+    fn mapAstOwnership(ownership: ast.Ownership) Ownership {
+        return switch (ownership) {
+            .shared => .shared,
             .unique => .unique,
             .borrowed => .borrowed,
         };
@@ -1371,6 +1423,113 @@ pub const HirBuilder = struct {
             };
         }
         return ownerships;
+    }
+
+    fn resolveFunctionValueGroup(self: *const HirBuilder, name: ast.StringId) ?u32 {
+        var current: ?scope_mod.ScopeId = self.current_clause_scope orelse self.current_module_scope orelse self.graph.prelude_scope;
+        var found: ?u32 = null;
+        while (current) |sid| {
+            var it = self.graph.getScope(sid).function_families.iterator();
+            while (it.next()) |entry| {
+                const key = entry.key_ptr.*;
+                if (key.name != name) continue;
+                const group_id = self.family_to_group.get(entry.value_ptr.*) orelse continue;
+                if (found != null) return null;
+                found = group_id;
+            }
+            current = self.graph.getScope(sid).parent;
+        }
+        return found;
+    }
+
+    fn isScopeWithinFunctionRoot(self: *const HirBuilder, scope_id: scope_mod.ScopeId) bool {
+        const root = self.current_function_root_scope orelse return false;
+        var current: ?scope_mod.ScopeId = scope_id;
+        while (current) |sid| {
+            if (sid == root) return true;
+            current = self.graph.getScope(sid).parent;
+        }
+        return false;
+    }
+
+    fn captureIndexForBinding(self: *HirBuilder, binding_id: scope_mod.BindingId) !?u32 {
+        const binding = self.graph.bindings.items[binding_id];
+        if (self.isScopeWithinFunctionRoot(binding.scope_id)) return null;
+
+        if (self.current_capture_map.get(binding.name)) |idx| return idx;
+
+        const idx: u32 = @intCast(self.current_capture_list.items.len);
+        const ownership = if (binding.type_id) |prov| switch (prov.ownership) {
+            .shared => Ownership.shared,
+            .unique => Ownership.unique,
+            .borrowed => Ownership.borrowed,
+        } else Ownership.shared;
+        try self.current_capture_list.append(self.allocator, .{
+            .name = binding.name,
+            .binding_id = binding_id,
+            .type_id = if (binding.type_id) |prov| prov.type_id else types_mod.TypeStore.UNKNOWN,
+            .ownership = ownership,
+        });
+        try self.current_capture_map.put(binding.name, idx);
+        return idx;
+    }
+
+    fn buildBindingReference(self: *HirBuilder, name: ast.StringId, type_id: TypeId, span: ast.SourceSpan) anyerror!?*const Expr {
+        for (self.current_param_names, 0..) |param_name, idx| {
+            if (param_name) |pn| {
+                if (pn == name) {
+                    return try self.create(Expr, .{
+                        .kind = .{ .param_get = @intCast(idx) },
+                        .type_id = type_id,
+                        .span = span,
+                    });
+                }
+            }
+        }
+        for (self.current_tuple_bindings.items) |binding| {
+            if (binding.name == name) {
+                return try self.create(Expr, .{ .kind = .{ .local_get = binding.local_index }, .type_id = type_id, .span = span });
+            }
+        }
+        for (self.current_struct_bindings.items) |binding| {
+            if (binding.name == name) {
+                return try self.create(Expr, .{ .kind = .{ .local_get = binding.local_index }, .type_id = type_id, .span = span });
+            }
+        }
+        for (self.current_list_bindings.items) |binding| {
+            if (binding.name == name) {
+                return try self.create(Expr, .{ .kind = .{ .local_get = binding.local_index }, .type_id = type_id, .span = span });
+            }
+        }
+        for (self.current_binary_bindings.items) |binding| {
+            if (binding.name == name) {
+                return try self.create(Expr, .{ .kind = .{ .local_get = binding.local_index }, .type_id = type_id, .span = span });
+            }
+        }
+        for (self.current_case_bindings.items) |binding| {
+            if (binding.name == name) {
+                return try self.create(Expr, .{ .kind = .{ .local_get = binding.local_index }, .type_id = type_id, .span = span });
+            }
+        }
+        for (self.current_assignment_bindings.items) |binding| {
+            if (binding.name == name) {
+                return try self.create(Expr, .{ .kind = .{ .local_get = binding.local_index }, .type_id = type_id, .span = span });
+            }
+        }
+
+        if (self.current_clause_scope) |scope_id| {
+            if (self.graph.resolveBinding(scope_id, name)) |binding_id| {
+                if (try self.captureIndexForBinding(binding_id)) |capture_idx| {
+                    return try self.create(Expr, .{
+                        .kind = .{ .capture_get = capture_idx },
+                        .type_id = type_id,
+                        .span = span,
+                    });
+                }
+            }
+        }
+
+        return null;
     }
 
     // ============================================================
@@ -1521,6 +1680,11 @@ pub const HirBuilder = struct {
         const group_id = self.next_group_id;
         self.next_group_id += 1;
 
+        const arity: u32 = if (decls[0].clauses.len > 0) @intCast(decls[0].clauses[0].params.len) else 0;
+        if (self.graph.resolveFamily(scope_id, decls[0].name, arity)) |family_id| {
+            try self.family_to_group.put(family_id, group_id);
+        }
+
         self.current_function_name = self.interner.get(decls[0].name);
 
         var clauses: std.ArrayList(Clause) = .empty;
@@ -1535,7 +1699,9 @@ pub const HirBuilder = struct {
             .id = group_id,
             .scope_id = scope_id,
             .name = first.name,
-            .arity = if (first.clauses.len > 0) @intCast(first.clauses[0].params.len) else 0,
+            .arity = arity,
+            .is_local = false,
+            .captures = &.{},
             .clauses = try clauses.toOwnedSlice(self.allocator),
             .fallback_parent = null,
         };
@@ -1546,22 +1712,43 @@ pub const HirBuilder = struct {
         func: *const ast.FunctionDecl,
         scope_id: scope_mod.ScopeId,
         fallback_parent: ?u32,
+        is_local: bool,
     ) !FunctionGroup {
         const group_id = self.next_group_id;
         self.next_group_id += 1;
 
+        const arity: u32 = if (func.clauses.len > 0) @intCast(func.clauses[0].params.len) else 0;
+        if (self.graph.resolveFamily(scope_id, func.name, arity)) |family_id| {
+            try self.family_to_group.put(family_id, group_id);
+        }
+
         self.current_function_name = self.interner.get(func.name);
+        const saved_root_scope = self.current_function_root_scope;
+        const saved_capture_map = self.current_capture_map;
+        const saved_capture_list = self.current_capture_list;
+        self.current_function_root_scope = if (func.clauses.len > 0) self.graph.node_scope_map.get(func.clauses[0].meta.span.start) orelse func.clauses[0].meta.scope_id else null;
+        self.current_capture_map = std.AutoHashMap(ast.StringId, u32).init(self.allocator);
+        self.current_capture_list = .empty;
 
         var clauses: std.ArrayList(Clause) = .empty;
         for (func.clauses) |clause| {
             try clauses.append(self.allocator, try self.buildClause(&clause));
         }
 
+        const captures = try self.current_capture_list.toOwnedSlice(self.allocator);
+        try self.group_captures.put(group_id, captures);
+        self.current_capture_map.deinit();
+        self.current_capture_list = saved_capture_list;
+        self.current_capture_map = saved_capture_map;
+        self.current_function_root_scope = saved_root_scope;
+
         return .{
             .id = group_id,
             .scope_id = scope_id,
             .name = func.name,
-            .arity = if (func.clauses.len > 0) @intCast(func.clauses[0].params.len) else 0,
+            .arity = arity,
+            .is_local = is_local,
+            .captures = captures,
             .clauses = try clauses.toOwnedSlice(self.allocator),
             .fallback_parent = fallback_parent,
         };
@@ -1863,6 +2050,24 @@ pub const HirBuilder = struct {
 
     fn buildBlock(self: *HirBuilder, stmts: []const ast.Stmt) anyerror!*const Block {
         var hir_stmts: std.ArrayList(Stmt) = .empty;
+        const saved_assignment_bindings = self.current_assignment_bindings;
+        self.current_assignment_bindings = .empty;
+        defer {
+            self.current_assignment_bindings.deinit(self.allocator);
+            self.current_assignment_bindings = saved_assignment_bindings;
+        }
+
+        for (stmts) |stmt| {
+            switch (stmt) {
+                .function_decl => |func| {
+                    const group_scope = self.current_clause_scope orelse self.current_module_scope orelse self.graph.prelude_scope;
+                    const group = try self.buildFunctionGroup(func, group_scope, null, true);
+                    const group_ptr = try self.create(FunctionGroup, group);
+                    try hir_stmts.append(self.allocator, .{ .function_group = group_ptr });
+                },
+                else => {},
+            }
+        }
 
         for (stmts) |stmt| {
             switch (stmt) {
@@ -1874,15 +2079,17 @@ pub const HirBuilder = struct {
                     const value = try self.buildExpr(assign.value);
                     const idx = self.next_local;
                     self.next_local += 1;
+                    if (assign.pattern.* == .bind) {
+                        try self.current_assignment_bindings.append(self.allocator, .{
+                            .name = assign.pattern.bind.name,
+                            .local_index = idx,
+                        });
+                    }
                     try hir_stmts.append(self.allocator, .{
                         .local_set = .{ .index = idx, .value = value },
                     });
                 },
-                .function_decl => |func| {
-                    const group = try self.buildFunctionGroup(func, self.graph.prelude_scope, null);
-                    const group_ptr = try self.create(FunctionGroup, group);
-                    try hir_stmts.append(self.allocator, .{ .function_group = group_ptr });
-                },
+                .function_decl => {},
                 else => {},
             }
         }
@@ -1933,67 +2140,28 @@ pub const HirBuilder = struct {
                 // Try to resolve type from scope graph binding
                 const resolved_type = self.resolveBindingType(v.name);
 
-                // Check if this var refers to a parameter
-                for (self.current_param_names, 0..) |param_name, idx| {
-                    if (param_name) |pn| {
-                        if (pn == v.name) {
-                            return try self.create(Expr, .{
-                                .kind = .{ .param_get = @intCast(idx) },
-                                .type_id = resolved_type,
-                                .span = v.meta.span,
-                            });
-                        }
+                if (self.current_clause_scope != null) {
+                    if (try self.buildBindingReference(v.name, resolved_type, v.meta.span)) |ref| {
+                        return ref;
                     }
                 }
-                // Check if this var refers to a tuple binding (destructured variable)
-                for (self.current_tuple_bindings.items) |binding| {
-                    if (binding.name == v.name) {
-                        return try self.create(Expr, .{
-                            .kind = .{ .local_get = binding.local_index },
-                            .type_id = resolved_type,
-                            .span = v.meta.span,
+                if (self.resolveFunctionValueGroup(v.name)) |group_id| {
+                    const group_captures = self.group_captures.get(group_id) orelse &.{};
+                    var capture_values: std.ArrayList(CaptureValue) = .empty;
+                    for (group_captures) |capture| {
+                        try capture_values.append(self.allocator, .{
+                            .expr = (try self.buildBindingReference(capture.name, capture.type_id, v.meta.span)) orelse return error.OutOfMemory,
+                            .ownership = capture.ownership,
                         });
                     }
-                }
-                // Check if this var refers to a struct field binding
-                for (self.current_struct_bindings.items) |binding| {
-                    if (binding.name == v.name) {
-                        return try self.create(Expr, .{
-                            .kind = .{ .local_get = binding.local_index },
-                            .type_id = resolved_type,
-                            .span = v.meta.span,
-                        });
-                    }
-                }
-                // Check if this var refers to a list element binding
-                for (self.current_list_bindings.items) |binding| {
-                    if (binding.name == v.name) {
-                        return try self.create(Expr, .{
-                            .kind = .{ .local_get = binding.local_index },
-                            .type_id = resolved_type,
-                            .span = v.meta.span,
-                        });
-                    }
-                }
-                // Check if this var refers to a binary segment binding
-                for (self.current_binary_bindings.items) |binding| {
-                    if (binding.name == v.name) {
-                        return try self.create(Expr, .{
-                            .kind = .{ .local_get = binding.local_index },
-                            .type_id = resolved_type,
-                            .span = v.meta.span,
-                        });
-                    }
-                }
-                // Check if this var refers to a case binding
-                for (self.current_case_bindings.items) |binding| {
-                    if (binding.name == v.name) {
-                        return try self.create(Expr, .{
-                            .kind = .{ .local_get = binding.local_index },
-                            .type_id = resolved_type,
-                            .span = v.meta.span,
-                        });
-                    }
+                    return try self.create(Expr, .{
+                        .kind = .{ .closure_create = .{
+                            .function_group_id = group_id,
+                            .captures = try capture_values.toOwnedSlice(self.allocator),
+                        } },
+                        .type_id = resolved_type,
+                        .span = v.meta.span,
+                    });
                 }
                 return try self.create(Expr, .{
                     .kind = .{ .local_get = 0 }, // TODO: resolve to local index
@@ -2084,6 +2252,18 @@ pub const HirBuilder = struct {
                         callee_expr = try self.buildExpr(call.callee);
                         break :blk .{ .closure = callee_expr.? };
                     }
+                    if (self.current_clause_scope != null) {
+                        if (try self.buildBindingReference(vr.name, self.resolveBindingType(vr.name), vr.meta.span)) |binding_ref| {
+                            callee_expr = binding_ref;
+                            break :blk .{ .closure = callee_expr.? };
+                        }
+                    }
+                    const scope_id = self.current_clause_scope orelse self.current_module_scope orelse self.graph.prelude_scope;
+                    if (self.graph.resolveFamily(scope_id, vr.name, @intCast(call.args.len))) |family_id| {
+                        if (self.family_to_group.get(family_id)) |group_id| {
+                            break :blk .{ .direct = .{ .function_group_id = group_id, .clause_index = 0 } };
+                        }
+                    }
                     // Check if this bare call resolves to an imported function
                     const import_module = self.resolveImport(vr.name, @intCast(call.args.len));
                     break :blk .{ .named = .{ .module = import_module, .name = self.interner.get(vr.name) } };
@@ -2096,8 +2276,35 @@ pub const HirBuilder = struct {
                     self.applyCallArgModes(args.items, callee.type_id);
                 }
 
+                if (target == .direct) {
+                    const group_id = target.direct.function_group_id;
+                    const group_captures = self.group_captures.get(group_id) orelse &.{};
+                    if (group_captures.len > 0) {
+                        var full_args: std.ArrayList(CallArg) = .empty;
+                        for (group_captures) |capture| {
+                            try full_args.append(self.allocator, .{
+                                .expr = (try self.buildBindingReference(capture.name, capture.type_id, call.meta.span)) orelse return error.OutOfMemory,
+                                .mode = switch (capture.ownership) {
+                                    .shared => .share,
+                                    .unique => .move,
+                                    .borrowed => .borrow,
+                                },
+                            });
+                        }
+                        for (args.items) |arg| try full_args.append(self.allocator, arg);
+                        args.deinit(self.allocator);
+                        args = full_args;
+                    }
+                }
+
                 // Resolve return type for named calls
                 const call_return_type: types_mod.TypeId = switch (target) {
+                    .direct => blk: {
+                        if (call.callee.* == .var_ref) {
+                            break :blk self.resolveFunctionReturnType(call.callee.var_ref.name, @intCast(call.args.len));
+                        }
+                        break :blk types_mod.TypeStore.UNKNOWN;
+                    },
                     .named => |n| blk: {
                         // For bare calls (no module prefix), look up in scope graph
                         if (n.module == null) {
@@ -2122,6 +2329,19 @@ pub const HirBuilder = struct {
                                     .borrowed => .borrow,
                                 };
                             }
+                        }
+                    }
+                }
+                if (target == .direct and call.callee.* == .var_ref) {
+                    if (self.resolveFunctionParamOwnerships(call.callee.var_ref.name, @intCast(call.args.len))) |ownerships| {
+                        const offset = args.items.len - call.args.len;
+                        const count = @min(call.args.len, ownerships.len);
+                        for (args.items[offset .. offset + count], ownerships[0..count]) |*arg, ownership| {
+                            arg.mode = switch (ownership) {
+                                .shared => .share,
+                                .unique => .move,
+                                .borrowed => .borrow,
+                            };
                         }
                     }
                 }
@@ -2448,6 +2668,31 @@ pub const HirBuilder = struct {
                 const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
                 return store_ptr.addType(.{ .tuple = .{ .elements = elements } }) catch types_mod.TypeStore.UNKNOWN;
             },
+            .function => |ft| {
+                var param_types: std.ArrayList(TypeId) = .empty;
+                for (ft.params) |param| {
+                    param_types.append(self.allocator, self.resolveTypeExpr(param)) catch return types_mod.TypeStore.UNKNOWN;
+                }
+                const params = param_types.toOwnedSlice(self.allocator) catch return types_mod.TypeStore.UNKNOWN;
+                const param_ownerships = self.allocator.alloc(Ownership, ft.param_ownerships.len) catch return types_mod.TypeStore.UNKNOWN;
+                for (ft.param_ownerships, ft.param_ownerships_explicit, params, 0..) |ownership, explicit, param_type, idx| {
+                    param_ownerships[idx] = if (explicit)
+                        mapAstOwnership(ownership)
+                    else if (mapAstOwnership(ownership) == .shared)
+                        self.defaultOwnershipForType(param_type)
+                    else
+                        mapAstOwnership(ownership);
+                }
+                const return_type = self.resolveTypeExpr(ft.return_type);
+                const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
+                const ret_ownership = if (ft.return_ownership_explicit)
+                    mapAstOwnership(ft.return_ownership)
+                else if (mapAstOwnership(ft.return_ownership) == .shared)
+                    self.defaultOwnershipForType(return_type)
+                else
+                    mapAstOwnership(ft.return_ownership);
+                return store_ptr.addFunctionType(params, return_type, param_ownerships, ret_ownership) catch types_mod.TypeStore.UNKNOWN;
+            },
             else => types_mod.TypeStore.UNKNOWN,
         };
     }
@@ -2588,8 +2833,10 @@ const Collector = @import("collector.zig").Collector;
 
 test "HIR build simple function" {
     const source =
-        \\def add(x :: i64, y :: i64) :: i64 do
-        \\  x + y
+        \\defmodule Test do
+        \\  def add(x :: i64, y :: i64) :: i64 do
+        \\    x + y
+        \\  end
         \\end
     ;
 
@@ -2612,8 +2859,8 @@ test "HIR build simple function" {
     defer builder.deinit();
     const hir_program = try builder.buildProgram(&program);
 
-    try std.testing.expectEqual(@as(usize, 1), hir_program.top_functions.len);
-    try std.testing.expectEqual(@as(u32, 2), hir_program.top_functions[0].arity);
+    try std.testing.expectEqual(@as(usize, 1), hir_program.modules.len);
+    try std.testing.expectEqual(@as(u32, 2), hir_program.modules[0].functions[0].arity);
 }
 
 test "HIR build module" {
@@ -2650,12 +2897,14 @@ test "HIR build module" {
 
 test "HIR pattern compilation" {
     const source =
-        \\def foo(x) do
-        \\  case x do
-        \\    {:ok, v} ->
-        \\      v
-        \\    {:error, e} ->
-        \\      e
+        \\defmodule Test do
+        \\  def foo(x) do
+        \\    case x do
+        \\      {:ok, v} ->
+        \\        v
+        \\      {:error, e} ->
+        \\        e
+        \\    end
         \\  end
         \\end
     ;
@@ -2680,14 +2929,16 @@ test "HIR pattern compilation" {
     const hir_program = try builder.buildProgram(&program);
 
     // Should have built the function with case expression
-    try std.testing.expectEqual(@as(usize, 1), hir_program.top_functions.len);
+    try std.testing.expectEqual(@as(usize, 1), hir_program.modules[0].functions.len);
     try std.testing.expectEqual(@as(usize, 0), builder.errors.items.len);
 }
 
 test "HIR typed params default to shared ownership" {
     const source =
-        \\def add(x :: i64, y :: i64) :: i64 do
-        \\  x + y
+        \\defmodule Test do
+        \\  def add(x :: i64, y :: i64) :: i64 do
+        \\    x + y
+        \\  end
         \\end
     ;
 
@@ -2710,7 +2961,7 @@ test "HIR typed params default to shared ownership" {
     defer builder.deinit();
     const hir_program = try builder.buildProgram(&program);
 
-    const params = hir_program.top_functions[0].clauses[0].params;
+    const params = hir_program.modules[0].functions[0].clauses[0].params;
     try std.testing.expectEqual(@as(usize, 2), params.len);
     try std.testing.expectEqual(Ownership.shared, params[0].ownership);
     try std.testing.expectEqual(Ownership.shared, params[1].ownership);
@@ -2790,12 +3041,14 @@ test "HIR respects borrowed param annotation" {
 
 test "HIR call args default to share mode" {
     const source =
-        \\def foo(x) do
-        \\  x
-        \\end
+        \\defmodule Test do
+        \\  def foo(x) do
+        \\    x
+        \\  end
         \\
-        \\def bar(y) do
-        \\  foo(y)
+        \\  def bar(y) do
+        \\    foo(y)
+        \\  end
         \\end
     ;
 
@@ -2818,7 +3071,7 @@ test "HIR call args default to share mode" {
     defer builder.deinit();
     const hir_program = try builder.buildProgram(&program);
 
-    const bar_clause = hir_program.top_functions[1].clauses[0];
+    const bar_clause = hir_program.modules[0].functions[1].clauses[0];
     const call_expr = bar_clause.body.stmts[0].expr;
     try std.testing.expect(call_expr.kind == .call);
     try std.testing.expectEqual(@as(usize, 1), call_expr.kind.call.args.len);

@@ -4,9 +4,9 @@ defmodule UnlessMacro do
   def check(x :: i64) :: String | nil do
     unless(x > 10, "small number")
   end
-end
 
-def main() do
-  UnlessMacro.check(5)!
-  |> IO.puts()
+  def main() do
+    UnlessMacro.check(5)!
+    |> IO.puts()
+  end
 end

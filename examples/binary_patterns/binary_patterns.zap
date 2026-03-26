@@ -7,10 +7,6 @@
 # Output: {"div", {"id", "top"}, {"h1", {"", ""}, "Hello, Zap!"}}
 
 defmodule MarkupParser do
-  # ── Tag name extraction ────────────────────────────────────
-  #
-  # Collects characters until space (attrs follow) or > (tag ends).
-
   def take_tag(<<">"::String, _rest::String>>) :: String do
     ""
   end
@@ -27,8 +23,6 @@ defmodule MarkupParser do
     ""
   end
 
-  # ── Skip to content after '>' ──────────────────────────────
-
   def after_gt(<<">"::String, rest::String>>) :: String do
     rest
   end
@@ -41,8 +35,6 @@ defmodule MarkupParser do
     ""
   end
 
-  # ── Text extraction (stops at '<') ─────────────────────────
-
   def take_text(<<"<"::String, _rest::String>>) :: String do
     ""
   end
@@ -54,11 +46,6 @@ defmodule MarkupParser do
   def take_text(_) :: String do
     ""
   end
-
-  # ── Attribute parsing ──────────────────────────────────────
-  #
-  # Scans past the tag name looking for ' key=value'.
-  # Returns {key, value} as a tuple of strings.
 
   def take_until_eq(<<"="::String, _rest::String>>) :: String do
     ""
@@ -112,14 +99,6 @@ defmodule MarkupParser do
     {"", ""}
   end
 
-  # ── Recursive descent parser ───────────────────────────────
-  #
-  # parse_leaf: parses <tag>text</tag> into {tag, attrs, text}
-  # parse_node: parses <tag><child>...</child></tag> into {tag, attrs, child}
-  #
-  # Binary prefix matching dispatches on '<' to enter tag parsing.
-  # Recursion occurs when parse_node calls parse_leaf for the child.
-
   def parse_leaf(<<"<"::String, rest::String>>) :: {String, {String, String}, String} do
     {take_tag(rest), parse_attr(rest), take_text(after_gt(rest))}
   end
@@ -137,7 +116,9 @@ defmodule MarkupParser do
   end
 end
 
-def main() do
-  [MarkupParser.parse_node("<div id=top><h1>Hello, Zap!</h1></div>")]
-  |> Kernel.inspect()
+defmodule BinaryPatterns do
+  def main() do
+    [MarkupParser.parse_node("<div id=top><h1>Hello, Zap!</h1></div>")]
+    |> Kernel.inspect()
+  end
 end
