@@ -15,6 +15,7 @@ const runtime_source = @embedFile("runtime.zig");
 
 pub const CompileResult = struct {
     ir_program: ir.Program,
+    analysis_context: ?zap.escape_lattice.AnalysisContext = null,
 };
 
 pub const CompileError = error{
@@ -52,7 +53,7 @@ pub fn compileFrontend(
     options: CompileOptions,
 ) CompileError!CompileResult {
     const progress = std.fs.File.stderr().deprecatedWriter();
-    const total_steps: u32 = 10;
+    const total_steps: u32 = 11;
     var step: u32 = 0;
 
     if (options.show_progress) {
@@ -173,20 +174,6 @@ pub fn compileFrontend(
     type_checker.checkUnusedBindings() catch {};
 
     const type_severity: zap.Severity = if (options.strict_types) .@"error" else .warning;
-    for (type_checker.errors.items) |type_err| {
-        diag_engine.reportDiagnostic(.{
-            .severity = type_err.severity orelse type_severity,
-            .message = type_err.message,
-            .span = type_err.span,
-            .label = type_err.label,
-            .help = type_err.help,
-            .secondary_spans = type_err.secondary_spans,
-        }) catch {};
-    }
-    if (diag_engine.hasErrors()) {
-        emitDiagnostics(&diag_engine, alloc);
-        return error.TypeCheckFailed;
-    }
 
     // Phase 6: HIR lowering
     step += 1;
@@ -217,18 +204,55 @@ pub fn compileFrontend(
     var ir_builder = zap.ir.IrBuilder.init(alloc, &parser.interner);
     ir_builder.type_store = &type_checker.store;
     defer ir_builder.deinit();
-    const ir_program = ir_builder.buildProgram(&hir_program) catch {
+    var ir_program = ir_builder.buildProgram(&hir_program) catch {
         diag_engine.err("Error during IR lowering", .{ .start = 0, .end = 0 }) catch {};
         emitDiagnostics(&diag_engine, alloc);
         return error.IrFailed;
     };
+
+    step += 1;
+    if (options.show_progress) progress.print("  [{d}/{d}] Escape analysis\n", .{ step, total_steps }) catch {};
+
+    var pipeline_result = zap.analysis_pipeline.runAnalysisPipeline(alloc, &ir_program) catch {
+        diag_engine.err("Error during escape analysis", .{ .start = 0, .end = 0 }) catch {};
+        emitDiagnostics(&diag_engine, alloc);
+        return error.IrFailed;
+    };
+    zap.contification_rewrite.rewriteContifiedContinuations(alloc, &ir_program, &pipeline_result.context) catch |err| switch (err) {
+        error.UnsupportedContifiedRewrite => {},
+        else => return error.IrFailed,
+    };
+
+    type_checker.setAnalysisContext(&pipeline_result.context, &ir_program);
+    type_checker.errors.clearRetainingCapacity();
+    type_checker.checkProgram(&desugared_program) catch {};
+    type_checker.checkUnusedBindings() catch {};
+
+    for (pipeline_result.diagnostics.items) |analysis_diag| {
+        diag_engine.reportDiagnostic(analysis_diag) catch {};
+    }
+
+    for (type_checker.errors.items) |type_err| {
+        diag_engine.reportDiagnostic(.{
+            .severity = type_err.severity orelse type_severity,
+            .message = type_err.message,
+            .span = type_err.span,
+            .label = type_err.label,
+            .help = type_err.help,
+            .secondary_spans = type_err.secondary_spans,
+        }) catch {};
+    }
+    if (diag_engine.hasErrors()) {
+        emitDiagnostics(&diag_engine, alloc);
+        return error.TypeCheckFailed;
+    }
 
     // Emit any accumulated warnings
     if (diag_engine.warningCount() > 0) {
         emitDiagnostics(&diag_engine, alloc);
     }
 
-    return .{ .ir_program = ir_program };
+    return .{ .ir_program = ir_program, .analysis_context = pipeline_result.context };
 }
 
 /// Compile a Zap source file through the frontend and ZIR backend to produce
@@ -242,14 +266,18 @@ pub fn compileToNative(
     frontend_opts: CompileOptions,
     backend_opts: zap.zir_backend.CompileOptions,
 ) !void {
-    const result = try compileFrontend(alloc, source, file_path, frontend_opts);
+    var result = try compileFrontend(alloc, source, file_path, frontend_opts);
 
     const progress = std.fs.File.stderr().deprecatedWriter();
     if (frontend_opts.show_progress) {
         progress.print("  [8/10] ZIR\n", .{}) catch {};
     }
 
-    try zap.zir_backend.compile(alloc, result.ir_program, backend_opts);
+    var opts = backend_opts;
+    if (result.analysis_context != null) {
+        opts.analysis_context = &result.analysis_context.?;
+    }
+    try zap.zir_backend.compile(alloc, result.ir_program, opts);
 
     if (frontend_opts.show_progress) {
         progress.print("  [9/10] Sema + Codegen\n", .{}) catch {};
@@ -262,7 +290,6 @@ fn emitDiagnostics(diag_engine: *zap.DiagnosticEngine, alloc: std.mem.Allocator)
     const stderr = std.fs.File.stderr().deprecatedWriter();
     stderr.print("{s}", .{rendered}) catch {};
 }
-
 
 /// Run a compiled binary by name from zap-out/bin/.
 pub fn runBinary(allocator: std.mem.Allocator, bin_path: []const u8, program_args: []const []const u8) !u8 {

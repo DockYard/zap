@@ -209,6 +209,7 @@ pub const Param = struct {
     pattern: *const Pattern,
     type_annotation: ?*const TypeExpr,
     ownership: Ownership = .shared,
+    ownership_explicit: bool = false,
     default: ?*const Expr = null,
 };
 
@@ -835,7 +836,11 @@ pub const TypeUnionExpr = struct {
 pub const TypeFunExpr = struct {
     meta: NodeMeta,
     params: []const *const TypeExpr,
+    param_ownerships: []const Ownership,
+    param_ownerships_explicit: []const bool,
     return_type: *const TypeExpr,
+    return_ownership: Ownership = .shared,
+    return_ownership_explicit: bool = false,
 };
 
 pub const TypeLiteralExpr = struct {

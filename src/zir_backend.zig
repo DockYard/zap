@@ -87,6 +87,8 @@ pub const CompileOptions = struct {
     /// Builder mode: compile as a builder binary with a custom entry point.
     /// The entry point function name (mangled, e.g., "FooBar__Builder__manifest").
     builder_entry: ?[]const u8 = null,
+    /// Analysis results from the escape/region/ARC pipeline.
+    analysis_context: ?*const @import("escape_lattice.zig").AnalysisContext = null,
 };
 
 /// Compile a Zap IR program to a native binary via ZIR.
@@ -128,7 +130,7 @@ pub fn compile(allocator: std.mem.Allocator, program: ir.Program, options: Compi
 
     // Phase 2b: Build ZIR via C-ABI calls and inject into compilation.
     const lib_mode = options.output_mode == 1;
-    try zir_builder.buildAndInject(allocator, program, ctx, null, lib_mode, options.builder_entry);
+    try zir_builder.buildAndInject(allocator, program, ctx, null, lib_mode, options.builder_entry, options.analysis_context);
 
     // Phase 3: Run Sema + codegen + link.
     if (zir_compilation_update(ctx) != 0) {

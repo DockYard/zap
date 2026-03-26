@@ -235,6 +235,21 @@ pub const ZirDriver = struct {
     tuple_init_count: u32 = 0,
     /// Nested tuple types in DFS post-order (inner-first), matching tuple_init emission order.
     tuple_type_stack: std.ArrayListUnmanaged(ir.ZigType) = .empty,
+    /// ID of the function currently being emitted (for analysis lookups).
+    current_function_id: ir.FunctionId = 0,
+    /// Label of the current block.
+    current_block_label: ir.LabelId = 0,
+    /// Instruction index within the current block.
+    current_instr_index: u32 = 0,
+    current_block_instructions: []const ir.Instruction = &.{},
+    skip_next_ret_local: ?ir.LocalId = null,
+    /// Analysis results from the escape/region/ARC pipeline.
+    analysis_context: ?*const @import("escape_lattice.zig").AnalysisContext = null,
+    reuse_backed_struct_locals: std.AutoHashMapUnmanaged(ir.LocalId, []const u8) = .empty,
+    reuse_backed_union_locals: std.AutoHashMapUnmanaged(ir.LocalId, ir.UnionInit) = .empty,
+    reuse_backed_tuple_locals: std.AutoHashMapUnmanaged(ir.LocalId, usize) = .empty,
+    capture_param_refs: std.ArrayListUnmanaged(u32) = .empty,
+    current_closure_env_ref: ?u32 = null,
 
     pub fn init(allocator: Allocator) !ZirDriver {
         const handle = zir_builder_create() orelse return error.ZirCreateFailed;
@@ -251,6 +266,26 @@ pub const ZirDriver = struct {
         zir_builder_destroy(self.handle);
         self.local_refs.deinit(self.allocator);
         self.param_refs.deinit(self.allocator);
+        self.reuse_backed_struct_locals.deinit(self.allocator);
+        self.reuse_backed_union_locals.deinit(self.allocator);
+        self.reuse_backed_tuple_locals.deinit(self.allocator);
+        self.capture_param_refs.deinit(self.allocator);
+    }
+
+    /// Check if ARC operations should be skipped for a value.
+    /// Only skips when the value was explicitly analyzed and found stack-eligible.
+    fn shouldSkipArc(self: *const ZirDriver, local: ir.LocalId) bool {
+        const lattice = @import("escape_lattice.zig");
+        if (self.analysis_context) |actx| {
+            const vkey = lattice.ValueKey{
+                .function = self.current_function_id,
+                .local = local,
+            };
+            if (actx.escape_states.get(vkey)) |state| {
+                return state.isStackEligible();
+            }
+        }
+        return false;
     }
 
     // -- Helpers --------------------------------------------------------------
@@ -299,8 +334,143 @@ pub const ZirDriver = struct {
         try self.local_refs.put(self.allocator, local, ref);
     }
 
+    fn emitAllocatorRef(self: *ZirDriver) BuildError!u32 {
+        const std_import = zir_builder_emit_import(self.handle, "std", 3);
+        if (std_import == error_ref) return error.EmitFailed;
+        const heap_mod = zir_builder_emit_field_val(self.handle, std_import, "heap", 4);
+        if (heap_mod == error_ref) return error.EmitFailed;
+        const alloc_ref = zir_builder_emit_field_val(self.handle, heap_mod, "page_allocator", 14);
+        if (alloc_ref == error_ref) return error.EmitFailed;
+        return alloc_ref;
+    }
+
+    fn emitTypeRef(self: *ZirDriver, zig_type: ir.ZigType) BuildError!u32 {
+        return switch (zig_type) {
+            .tuple => self.emitBodyLocalTupleType(zig_type),
+            else => blk: {
+                const ref = mapReturnType(zig_type);
+                if (ref == @intFromEnum(Zir.Inst.Ref.none)) return error.EmitFailed;
+                break :blk ref;
+            },
+        };
+    }
+
     fn refForLocal(self: *ZirDriver, local: ir.LocalId) BuildError!u32 {
         return self.local_refs.get(local) orelse return error.EmitFailed;
+    }
+
+    fn markReuseBackedStructLocal(self: *ZirDriver, dest: ir.LocalId, type_name: []const u8) !void {
+        try self.reuse_backed_struct_locals.put(self.allocator, dest, type_name);
+    }
+
+    fn propagateReuseBackedStructLocal(self: *ZirDriver, dest: ir.LocalId, source: ir.LocalId) !void {
+        if (self.reuse_backed_struct_locals.get(source)) |type_name| {
+            try self.reuse_backed_struct_locals.put(self.allocator, dest, type_name);
+        } else {
+            _ = self.reuse_backed_struct_locals.remove(dest);
+        }
+    }
+
+    fn markReuseBackedUnionLocal(self: *ZirDriver, union_init: ir.UnionInit) !void {
+        try self.reuse_backed_union_locals.put(self.allocator, union_init.dest, union_init);
+    }
+
+    fn markReuseBackedTupleLocal(self: *ZirDriver, dest: ir.LocalId, arity: usize) !void {
+        try self.reuse_backed_tuple_locals.put(self.allocator, dest, arity);
+    }
+
+    fn propagateReuseBackedUnionLocal(self: *ZirDriver, dest: ir.LocalId, source: ir.LocalId) !void {
+        if (self.reuse_backed_union_locals.get(source)) |union_init| {
+            var copied = union_init;
+            copied.dest = dest;
+            try self.reuse_backed_union_locals.put(self.allocator, dest, copied);
+        } else {
+            _ = self.reuse_backed_union_locals.remove(dest);
+        }
+    }
+
+    fn propagateReuseBackedTupleLocal(self: *ZirDriver, dest: ir.LocalId, source: ir.LocalId) !void {
+        if (self.reuse_backed_tuple_locals.get(source)) |arity| {
+            try self.reuse_backed_tuple_locals.put(self.allocator, dest, arity);
+        } else {
+            _ = self.reuse_backed_tuple_locals.remove(dest);
+        }
+    }
+
+    fn findStructDef(self: *const ZirDriver, type_name: []const u8) ?ir.StructDef {
+        const prog = self.program orelse return null;
+        for (prog.type_defs) |type_def| {
+            if (!std.mem.eql(u8, type_def.name, type_name)) continue;
+            return switch (type_def.kind) {
+                .struct_def => |def| def,
+                else => null,
+            };
+        }
+        return null;
+    }
+
+    fn refForValueLocal(self: *ZirDriver, local: ir.LocalId) BuildError!u32 {
+        if (self.reuse_backed_tuple_locals.get(local)) |arity| {
+            const ptr_ref = try self.refForLocal(local);
+            var names_ptrs = std.ArrayListUnmanaged([*]const u8).empty;
+            defer names_ptrs.deinit(self.allocator);
+            var names_lens = std.ArrayListUnmanaged(u32).empty;
+            defer names_lens.deinit(self.allocator);
+            var values = std.ArrayListUnmanaged(u32).empty;
+            defer values.deinit(self.allocator);
+            for (0..arity) |i| {
+                const name = indexFieldName(i);
+                const field_ref = zir_builder_emit_field_val(self.handle, ptr_ref, name.ptr, name.len);
+                if (field_ref == error_ref) return error.EmitFailed;
+                try names_ptrs.append(self.allocator, name.ptr);
+                try names_lens.append(self.allocator, name.len);
+                try values.append(self.allocator, field_ref);
+            }
+            const value_ref = zir_builder_emit_struct_init_anon(self.handle, names_ptrs.items.ptr, names_lens.items.ptr, values.items.ptr, @intCast(values.items.len));
+            if (value_ref == error_ref) return error.EmitFailed;
+            return value_ref;
+        }
+        if (self.reuse_backed_union_locals.get(local)) |union_init| {
+            const ptr_ref = try self.refForLocal(local);
+            const payload_ref = zir_builder_emit_field_val(self.handle, ptr_ref, union_init.variant_name.ptr, @intCast(union_init.variant_name.len));
+            if (payload_ref == error_ref) return error.EmitFailed;
+            const names = [_][*]const u8{union_init.variant_name.ptr};
+            const lens = [_]u32{@intCast(union_init.variant_name.len)};
+            const vals = [_]u32{payload_ref};
+            const value_ref = zir_builder_emit_struct_init_anon(self.handle, &names, &lens, &vals, 1);
+            if (value_ref == error_ref) return error.EmitFailed;
+            return value_ref;
+        }
+        if (self.reuse_backed_struct_locals.get(local)) |type_name| {
+            const ptr_ref = try self.refForLocal(local);
+            const struct_def = self.findStructDef(type_name) orelse return error.EmitFailed;
+
+            var names_ptrs = std.ArrayListUnmanaged([*]const u8).empty;
+            defer names_ptrs.deinit(self.allocator);
+            var names_lens = std.ArrayListUnmanaged(u32).empty;
+            defer names_lens.deinit(self.allocator);
+            var values = std.ArrayListUnmanaged(u32).empty;
+            defer values.deinit(self.allocator);
+
+            for (struct_def.fields) |field| {
+                const field_ref = zir_builder_emit_field_val(self.handle, ptr_ref, field.name.ptr, @intCast(field.name.len));
+                if (field_ref == error_ref) return error.EmitFailed;
+                try names_ptrs.append(self.allocator, field.name.ptr);
+                try names_lens.append(self.allocator, @intCast(field.name.len));
+                try values.append(self.allocator, field_ref);
+            }
+
+            const value_ref = zir_builder_emit_struct_init_anon(
+                self.handle,
+                names_ptrs.items.ptr,
+                names_lens.items.ptr,
+                values.items.ptr,
+                @intCast(values.items.len),
+            );
+            if (value_ref == error_ref) return error.EmitFailed;
+            return value_ref;
+        }
+        return self.refForLocal(local);
     }
 
     // -- Program emission -----------------------------------------------------
@@ -308,6 +478,9 @@ pub const ZirDriver = struct {
     pub fn buildProgram(self: *ZirDriver, program: ir.Program) !void {
         self.program = program;
         for (program.functions) |func| {
+            self.reuse_backed_struct_locals.clearRetainingCapacity();
+            self.reuse_backed_union_locals.clearRetainingCapacity();
+            self.reuse_backed_tuple_locals.clearRetainingCapacity();
             try self.emitFunction(func);
         }
 
@@ -373,6 +546,10 @@ pub const ZirDriver = struct {
 
         self.local_refs.clearRetainingCapacity();
         self.param_refs.clearRetainingCapacity();
+        self.capture_param_refs.clearRetainingCapacity();
+        self.current_closure_env_ref = null;
+        self.current_function_id = func.id;
+        const closure_lowering = self.getClosureLowering(func.id, func.captures.len);
 
         // Zig's main must return void or u8.
         const is_main = std.mem.eql(u8, func.name, "main");
@@ -416,7 +593,46 @@ pub const ZirDriver = struct {
         // so we don't emit a real parameter. Instead, we inject code at the
         // top of the body to get OS args via std.process.argsAlloc and store
         // the result as the first param's local ref.
-        if (is_main and func.params.len == 1) {
+        if (closure_lowering.direct_capture_params) {
+            for (func.captures) |capture| {
+                const capture_ref = zir_builder_emit_param(
+                    self.handle,
+                    capture.name.ptr,
+                    @intCast(capture.name.len),
+                    mapParamType(capture.type_expr),
+                );
+                if (capture_ref == error_ref) return error.EmitFailed;
+                try self.capture_param_refs.append(self.allocator, capture_ref);
+            }
+            for (func.params, 0..) |param, i| {
+                const effective_type: u32 = mapParamType(param.type_expr);
+                const param_ref = zir_builder_emit_param(
+                    self.handle,
+                    param.name.ptr,
+                    @intCast(param.name.len),
+                    effective_type,
+                );
+                if (param_ref == error_ref) return error.EmitFailed;
+                try self.param_refs.append(self.allocator, param_ref);
+                try self.setLocal(@intCast(i), param_ref);
+            }
+        } else if (closure_lowering.needs_env_param) {
+            const env_param_ref = zir_builder_emit_param(self.handle, "__closure_env".ptr, 13, @intFromEnum(Zir.Inst.Ref.none));
+            if (env_param_ref == error_ref) return error.EmitFailed;
+            self.current_closure_env_ref = env_param_ref;
+            for (func.params, 0..) |param, i| {
+                const effective_type: u32 = mapParamType(param.type_expr);
+                const param_ref = zir_builder_emit_param(
+                    self.handle,
+                    param.name.ptr,
+                    @intCast(param.name.len),
+                    effective_type,
+                );
+                if (param_ref == error_ref) return error.EmitFailed;
+                try self.param_refs.append(self.allocator, param_ref);
+                try self.setLocal(@intCast(i), param_ref);
+            }
+        } else if (is_main and func.params.len == 1) {
             // Inject: const args = std.os.argv (no allocation needed)
             const std_import = zir_builder_emit_import(self.handle, "std", 3);
             if (std_import == error_ref) return error.EmitFailed;
@@ -445,8 +661,13 @@ pub const ZirDriver = struct {
 
         // Emit body blocks.
         for (func.body) |block| {
-            for (block.instructions) |instr| {
+            self.current_block_label = block.label;
+            self.current_block_instructions = block.instructions;
+            for (block.instructions, 0..) |instr, instr_idx| {
+                self.current_instr_index = @intCast(instr_idx);
+                try self.emitAnalysisArcOps(true);
                 try self.emitInstruction(instr);
+                try self.emitAnalysisArcOps(false);
             }
         }
 
@@ -456,6 +677,453 @@ pub const ZirDriver = struct {
     }
 
     // -- Instruction dispatch -------------------------------------------------
+
+    fn getCallSiteSpecialization(self: *const ZirDriver) ?@import("escape_lattice.zig").CallSiteSpecialization {
+        if (self.analysis_context) |actx| {
+            return actx.getCallSiteSpecialization(.{
+                .function = self.current_function_id,
+                .block = self.current_block_label,
+                .instr_index = self.current_instr_index,
+            });
+        }
+        return null;
+    }
+
+    fn findReusePairForDest(self: *const ZirDriver, dest: ir.LocalId) ?@import("escape_lattice.zig").ReusePair {
+        if (self.analysis_context) |actx| {
+            for (actx.reuse_pairs.items) |pair| {
+                if (pair.reuse.dest != dest) continue;
+                const insertion_point = pair.reuse.insertion_point;
+                if (insertion_point.function != self.current_function_id) continue;
+                if (insertion_point.block != self.current_block_label) continue;
+                if (insertion_point.instr_index != self.current_instr_index) continue;
+                if (insertion_point.position != .before) continue;
+                return pair;
+            }
+        }
+        return null;
+    }
+
+    fn isParamDerivedClosure(self: *const ZirDriver, local: ir.LocalId) bool {
+        if (self.program) |prog| {
+            for (prog.functions) |func| {
+                if (func.id != self.current_function_id) continue;
+                for (func.body) |block| {
+                    for (block.instructions) |instr| {
+                        switch (instr) {
+                            .param_get => |pg| if (pg.dest == local) return true,
+                            else => {},
+                        }
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    fn findClosureTarget(self: *const ZirDriver, local: ir.LocalId) ?ir.FunctionId {
+        const target = self.findClosureCallTarget(local) orelse return null;
+        return target.function_id;
+    }
+
+    const ClosureCallTarget = struct {
+        function_id: ir.FunctionId,
+        captures: []const ir.LocalId,
+    };
+
+    const ClosureLowering = struct {
+        const StorageScope = enum {
+            none,
+            immediate,
+            stack_block,
+            stack_function,
+            heap,
+        };
+
+        tier: @import("escape_lattice.zig").ClosureEnvTier,
+        needs_env_param: bool,
+        direct_capture_params: bool,
+        needs_closure_object: bool,
+        stack_env: bool,
+        storage_scope: StorageScope,
+    };
+
+    fn closure_lowering_for_tier(tier: @import("escape_lattice.zig").ClosureEnvTier, capture_count: usize) ClosureLowering {
+        const has_captures = capture_count != 0;
+        return switch (tier) {
+            .lambda_lifted => .{
+                .tier = tier,
+                .needs_env_param = false,
+                .direct_capture_params = false,
+                .needs_closure_object = true,
+                .stack_env = false,
+                .storage_scope = .none,
+            },
+            .immediate_invocation => .{
+                .tier = tier,
+                .needs_env_param = false,
+                .direct_capture_params = has_captures,
+                .needs_closure_object = false,
+                .stack_env = false,
+                .storage_scope = .immediate,
+            },
+            .block_local => .{
+                .tier = tier,
+                .needs_env_param = has_captures,
+                .direct_capture_params = false,
+                .needs_closure_object = true,
+                .stack_env = true,
+                .storage_scope = .stack_block,
+            },
+            .function_local => .{
+                .tier = tier,
+                .needs_env_param = has_captures,
+                .direct_capture_params = false,
+                .needs_closure_object = true,
+                .stack_env = true,
+                .storage_scope = .stack_function,
+            },
+            .escaping => .{
+                .tier = tier,
+                .needs_env_param = has_captures,
+                .direct_capture_params = false,
+                .needs_closure_object = true,
+                .stack_env = false,
+                .storage_scope = .heap,
+            },
+        };
+    }
+
+    fn getClosureLowering(self: *const ZirDriver, function_id: ir.FunctionId, capture_count: usize) ClosureLowering {
+        const lattice = @import("escape_lattice.zig");
+        const tier = if (self.analysis_context) |actx|
+            actx.getClosureTier(function_id)
+        else if (capture_count == 0)
+            lattice.ClosureEnvTier.lambda_lifted
+        else
+            lattice.ClosureEnvTier.escaping;
+        return closure_lowering_for_tier(tier, capture_count);
+    }
+
+    fn currentClosureLowering(self: *const ZirDriver) ?ClosureLowering {
+        if (self.program) |prog| {
+            for (prog.functions) |func| {
+                if (func.id != self.current_function_id) continue;
+                if (!func.is_closure) return null;
+                return self.getClosureLowering(func.id, func.captures.len);
+            }
+        }
+        return null;
+    }
+
+    fn findClosureCallTarget(self: *const ZirDriver, local: ir.LocalId) ?ClosureCallTarget {
+        if (self.program) |prog| {
+            for (prog.functions) |func| {
+                if (func.id != self.current_function_id) continue;
+                for (func.body) |block| {
+                    if (findClosureTargetInInstrs(block.instructions, local)) |target| return target;
+                }
+            }
+        }
+        return null;
+    }
+
+    fn findClosureTargetInInstrs(instrs: []const ir.Instruction, local: ir.LocalId) ?ClosureCallTarget {
+        return findClosureTargetInInstrsDepth(instrs, local, 0);
+    }
+
+    fn findClosureTargetInInstrsDepth(instrs: []const ir.Instruction, local: ir.LocalId, depth: u8) ?ClosureCallTarget {
+        if (depth > 32) return null;
+        for (instrs) |instr| {
+            switch (instr) {
+                .make_closure => |mc| if (mc.dest == local) return .{ .function_id = mc.function, .captures = mc.captures },
+                .local_get => |lg| if (lg.dest == local) {
+                    if (findClosureTargetInInstrsDepth(instrs, lg.source, depth + 1)) |target| return target;
+                },
+                .local_set => |ls| if (ls.dest == local) {
+                    if (findClosureTargetInInstrsDepth(instrs, ls.value, depth + 1)) |target| return target;
+                },
+                .move_value => |mv| if (mv.dest == local) {
+                    if (findClosureTargetInInstrsDepth(instrs, mv.source, depth + 1)) |target| return target;
+                },
+                .share_value => |sv| if (sv.dest == local) {
+                    if (findClosureTargetInInstrsDepth(instrs, sv.source, depth + 1)) |target| return target;
+                },
+                .if_expr => |ie| {
+                    if (findClosureTargetInInstrsDepth(ie.then_instrs, local, depth)) |target| return target;
+                    if (findClosureTargetInInstrsDepth(ie.else_instrs, local, depth)) |target| return target;
+                },
+                .case_block => |cb| {
+                    if (findClosureTargetInInstrsDepth(cb.pre_instrs, local, depth)) |target| return target;
+                    for (cb.arms) |arm| {
+                        if (findClosureTargetInInstrsDepth(arm.cond_instrs, local, depth)) |target| return target;
+                        if (findClosureTargetInInstrsDepth(arm.body_instrs, local, depth)) |target| return target;
+                    }
+                    if (findClosureTargetInInstrsDepth(cb.default_instrs, local, depth)) |target| return target;
+                },
+                .guard_block => |gb| if (findClosureTargetInInstrsDepth(gb.body, local, depth)) |target| return target,
+                .switch_literal => |sl| {
+                    for (sl.cases) |case| {
+                        if (findClosureTargetInInstrsDepth(case.body_instrs, local, depth)) |target| return target;
+                    }
+                    if (findClosureTargetInInstrsDepth(sl.default_instrs, local, depth)) |target| return target;
+                },
+                .switch_return => |sr| {
+                    for (sr.cases) |case| {
+                        if (findClosureTargetInInstrsDepth(case.body_instrs, local, depth)) |target| return target;
+                    }
+                    if (findClosureTargetInInstrsDepth(sr.default_instrs, local, depth)) |target| return target;
+                },
+                .union_switch_return => |usr| {
+                    for (usr.cases) |case| {
+                        if (findClosureTargetInInstrsDepth(case.body_instrs, local, depth)) |target| return target;
+                    }
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
+
+    fn emitNamedCallToTarget(self: *ZirDriver, target_id: ir.FunctionId, captures: []const ir.LocalId, args_locals: []const ir.LocalId) !u32 {
+        const prog = self.program orelse return error.EmitFailed;
+        if (target_id >= prog.functions.len) return error.EmitFailed;
+        const target_name = prog.functions[target_id].name;
+        const lowering = self.getClosureLowering(target_id, captures.len);
+        var args = std.ArrayListUnmanaged(u32).empty;
+        defer args.deinit(self.allocator);
+        if (lowering.direct_capture_params) {
+            for (captures) |capture| {
+                const ref = self.refForValueLocal(capture) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                try args.append(self.allocator, ref);
+            }
+        }
+        for (args_locals) |arg| {
+            const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
+            try args.append(self.allocator, ref);
+        }
+        const ref = zir_builder_emit_call(self.handle, target_name.ptr, @intCast(target_name.len), args.items.ptr, @intCast(args.items.len));
+        if (ref == error_ref) return error.EmitFailed;
+        return ref;
+    }
+
+    fn emitTailNamedCallToTarget(self: *ZirDriver, target_id: ir.FunctionId, captures: []const ir.LocalId, args_locals: []const ir.LocalId) !void {
+        const ref = try self.emitNamedCallToTarget(target_id, captures, args_locals);
+        if (zir_builder_emit_ret(self.handle, ref) != 0) return error.EmitFailed;
+    }
+
+    fn emitTailInvokeWrapperCall(self: *ZirDriver, callee: ir.LocalId, function_id: ir.FunctionId, args_locals: []const ir.LocalId) !bool {
+        const prog = self.program orelse return false;
+        if (function_id >= prog.functions.len) return false;
+
+        const callee_ref = self.refForLocal(callee) catch return false;
+        const env_ref = zir_builder_emit_field_val(self.handle, callee_ref, "env", 3);
+        if (env_ref == error_ref) return false;
+
+        const invoke_name = try std.fmt.allocPrint(self.allocator, "__closure_invoke_{d}", .{function_id});
+        defer self.allocator.free(invoke_name);
+
+        const func_def = prog.functions[function_id];
+        var name_ptrs = try self.allocator.alloc([*]const u8, func_def.params.len);
+        defer self.allocator.free(name_ptrs);
+        var name_lens = try self.allocator.alloc(u32, func_def.params.len);
+        defer self.allocator.free(name_lens);
+        var values = try self.allocator.alloc(u32, func_def.params.len);
+        defer self.allocator.free(values);
+        for (func_def.params, 0..) |param, i| {
+            name_ptrs[i] = param.name.ptr;
+            name_lens[i] = @intCast(param.name.len);
+            values[i] = if (i < args_locals.len)
+                self.refForLocal(args_locals[i]) catch @intFromEnum(Zir.Inst.Ref.void_value)
+            else
+                @intFromEnum(Zir.Inst.Ref.void_value);
+        }
+        const arg_struct = zir_builder_emit_struct_init_anon(self.handle, name_ptrs.ptr, name_lens.ptr, values.ptr, @intCast(values.len));
+        if (arg_struct == error_ref) return false;
+
+        const call_args = [_]u32{ env_ref, arg_struct };
+        const ref = zir_builder_emit_call(self.handle, invoke_name.ptr, @intCast(invoke_name.len), &call_args, 2);
+        if (ref == error_ref) return false;
+        if (zir_builder_emit_ret(self.handle, ref) != 0) return error.EmitFailed;
+        return true;
+    }
+
+    fn isTailReturnOf(self: *const ZirDriver, local: ir.LocalId) bool {
+        const next_idx = @as(usize, self.current_instr_index) + 1;
+        if (next_idx >= self.current_block_instructions.len) return false;
+        return switch (self.current_block_instructions[next_idx]) {
+            .ret => |r| r.value != null and r.value.? == local,
+            else => false,
+        };
+    }
+
+    fn emitAnalysisArcOps(self: *ZirDriver, before: bool) !void {
+        if (self.analysis_context) |actx| {
+            for (actx.arc_ops.items) |op| {
+                if (op.insertion_point.function != self.current_function_id) continue;
+                if (op.insertion_point.block != self.current_block_label) continue;
+                if (op.insertion_point.instr_index != self.current_instr_index) continue;
+                if ((op.insertion_point.position == .before) != before) continue;
+                switch (op.kind) {
+                    .retain => {
+                        if (!self.shouldSkipArc(op.value)) {
+                            const val_ref = self.refForLocal(op.value) catch continue;
+                            const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                            if (rt_import == error_ref) return error.EmitFailed;
+                            const arc_runtime = zir_builder_emit_field_val(self.handle, rt_import, "ArcRuntime", 10);
+                            if (arc_runtime == error_ref) return error.EmitFailed;
+                            const retain_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "retainAny", 9);
+                            if (retain_fn == error_ref) return error.EmitFailed;
+                            const args = [_]u32{val_ref};
+                            _ = zir_builder_emit_call_ref(self.handle, retain_fn, &args, 1);
+                        }
+                    },
+                    .release => {
+                        if (op.reason == .perceus_drop) continue;
+                        if (!self.shouldSkipArc(op.value)) {
+                            const val_ref = self.refForLocal(op.value) catch continue;
+                            const alloc_ref = try self.emitAllocatorRef();
+                            const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                            if (rt_import == error_ref) return error.EmitFailed;
+                            const arc_runtime = zir_builder_emit_field_val(self.handle, rt_import, "ArcRuntime", 10);
+                            if (arc_runtime == error_ref) return error.EmitFailed;
+                            const release_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "releaseAny", 10);
+                            if (release_fn == error_ref) return error.EmitFailed;
+                            const args = [_]u32{ alloc_ref, val_ref };
+                            _ = zir_builder_emit_call_ref(self.handle, release_fn, &args, 2);
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+    }
+
+    fn emitDropSpecializationsForCurrentInstr(self: *ZirDriver, value_local: ir.LocalId, constructor_tag: ?u32) !void {
+        if (self.analysis_context) |actx| {
+            for (actx.drop_specializations.items) |spec| {
+                if (spec.function != self.current_function_id) continue;
+                if (spec.insertion_point.block != self.current_block_label) continue;
+                if (spec.insertion_point.instr_index != self.current_instr_index) continue;
+                if (spec.insertion_point.position != .after) continue;
+                if (constructor_tag) |tag| {
+                    if (spec.constructor_tag != tag) continue;
+                }
+                for (spec.field_drops) |field_drop| {
+                    const drop_local = field_drop.local orelse value_local;
+                    const val_ref = self.refForLocal(drop_local) catch continue;
+                    const alloc_ref = try self.emitAllocatorRef();
+                    const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                    if (rt_import == error_ref) return error.EmitFailed;
+                    const arc_runtime = zir_builder_emit_field_val(self.handle, rt_import, "ArcRuntime", 10);
+                    if (arc_runtime == error_ref) return error.EmitFailed;
+                    const release_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "releaseAny", 10);
+                    if (release_fn == error_ref) return error.EmitFailed;
+                    const args = [_]u32{ alloc_ref, val_ref };
+                    _ = zir_builder_emit_call_ref(self.handle, release_fn, &args, 2);
+                }
+            }
+        }
+    }
+
+    fn emitPerceusResetForCase(self: *ZirDriver, cb: ir.CaseBlock) !void {
+        if (self.analysis_context) |actx| {
+            for (actx.reuse_pairs.items) |pair| {
+                if (pair.reset.source == cb.dest) {
+                    const source_ref = self.refForLocal(pair.reset.source) catch continue;
+                    const alloc_ref = try self.emitAllocatorRef();
+                    const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                    if (rt_import == error_ref) return error.EmitFailed;
+                    const arc_runtime = zir_builder_emit_field_val(self.handle, rt_import, "ArcRuntime", 10);
+                    if (arc_runtime == error_ref) return error.EmitFailed;
+                    const reset_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "resetAny", 8);
+                    if (reset_fn == error_ref) return error.EmitFailed;
+                    const args = [_]u32{ alloc_ref, source_ref };
+                    const token_ref = zir_builder_emit_call_ref(self.handle, reset_fn, &args, 2);
+                    if (token_ref == error_ref) return error.EmitFailed;
+                    try self.setLocal(pair.reset.dest, token_ref);
+                }
+            }
+        }
+    }
+
+    fn emitClosureSwitchDispatch(self: *ZirDriver, cc: ir.CallClosure, targets: []const ir.FunctionId) !bool {
+        const prog = self.program orelse return false;
+        const callee_ref = self.refForLocal(cc.callee) catch return false;
+        const call_fn_ref = zir_builder_emit_field_val(self.handle, callee_ref, "call_fn", 7);
+        if (call_fn_ref == error_ref) return false;
+
+        var fallback_args = std.ArrayListUnmanaged(u32).empty;
+        defer fallback_args.deinit(self.allocator);
+        for (cc.args) |arg| {
+            const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
+            try fallback_args.append(self.allocator, ref);
+        }
+
+        zir_builder_begin_capture(self.handle);
+        const fallback_ref = zir_builder_emit_call_ref(self.handle, callee_ref, fallback_args.items.ptr, @intCast(fallback_args.items.len));
+        if (fallback_ref == error_ref) return false;
+        try self.setLocal(cc.dest, fallback_ref);
+        var else_len: u32 = 0;
+        const else_ptr = zir_builder_end_capture(self.handle, &else_len);
+        var current_else_insts = try self.allocator.alloc(u32, else_len);
+        @memcpy(current_else_insts, else_ptr[0..else_len]);
+        var current_else_result = fallback_ref;
+
+        var emitted = false;
+        var i: usize = targets.len;
+        while (i > 0) {
+            i -= 1;
+            const target_id = targets[i];
+            if (target_id >= prog.functions.len) continue;
+            if (prog.functions[target_id].captures.len != 0) continue;
+            emitted = true;
+
+            const target_name = prog.functions[target_id].name;
+            const name_ref = zir_builder_emit_str(self.handle, target_name.ptr, @intCast(target_name.len));
+            if (name_ref == error_ref) return error.EmitFailed;
+            const cond_ref = zir_builder_emit_binop(self.handle, @intFromEnum(Zir.Inst.Tag.cmp_eq), call_fn_ref, name_ref);
+            if (cond_ref == error_ref) return error.EmitFailed;
+
+            zir_builder_begin_capture(self.handle);
+            const direct_ref = try self.emitNamedCallToTarget(target_id, &.{}, cc.args);
+            try self.setLocal(cc.dest, direct_ref);
+            var then_len: u32 = 0;
+            const then_ptr = zir_builder_end_capture(self.handle, &then_len);
+            const then_insts = try self.allocator.alloc(u32, then_len);
+            @memcpy(then_insts, then_ptr[0..then_len]);
+
+            const ref = zir_builder_emit_if_else_bodies(
+                self.handle,
+                cond_ref,
+                then_insts.ptr,
+                @intCast(then_insts.len),
+                direct_ref,
+                current_else_insts.ptr,
+                @intCast(current_else_insts.len),
+                current_else_result,
+            );
+
+            self.allocator.free(then_insts);
+            self.allocator.free(current_else_insts);
+            if (ref == error_ref) return error.EmitFailed;
+
+            if (i > 0) {
+                const block_idx = zir_builder_pop_body_inst(self.handle);
+                current_else_insts = try self.allocator.alloc(u32, 1);
+                current_else_insts[0] = block_idx;
+                current_else_result = ref;
+            } else {
+                current_else_insts = try self.allocator.alloc(u32, 0);
+                current_else_result = ref;
+            }
+        }
+
+        defer self.allocator.free(current_else_insts);
+        if (!emitted) return false;
+        try self.setLocal(cc.dest, current_else_result);
+        return true;
+    }
 
     fn emitInstruction(self: *ZirDriver, instr: ir.Instruction) BuildError!void {
         switch (instr) {
@@ -505,13 +1173,47 @@ pub const ZirDriver = struct {
 
             // Locals
             .local_get => |lg| {
+                try self.propagateReuseBackedStructLocal(lg.dest, lg.source);
+                try self.propagateReuseBackedUnionLocal(lg.dest, lg.source);
+                try self.propagateReuseBackedTupleLocal(lg.dest, lg.source);
                 if (self.local_refs.get(lg.source)) |ref| {
                     try self.setLocal(lg.dest, ref);
                 }
             },
             .local_set => |ls| {
+                try self.propagateReuseBackedStructLocal(ls.dest, ls.value);
+                try self.propagateReuseBackedUnionLocal(ls.dest, ls.value);
+                try self.propagateReuseBackedTupleLocal(ls.dest, ls.value);
                 if (self.local_refs.get(ls.value)) |ref| {
                     try self.setLocal(ls.dest, ref);
+                }
+            },
+            .move_value => |mv| {
+                try self.propagateReuseBackedStructLocal(mv.dest, mv.source);
+                try self.propagateReuseBackedUnionLocal(mv.dest, mv.source);
+                try self.propagateReuseBackedTupleLocal(mv.dest, mv.source);
+                if (self.local_refs.get(mv.source)) |ref| {
+                    try self.setLocal(mv.dest, ref);
+                }
+            },
+            .share_value => |sv| {
+                try self.propagateReuseBackedStructLocal(sv.dest, sv.source);
+                try self.propagateReuseBackedUnionLocal(sv.dest, sv.source);
+                try self.propagateReuseBackedTupleLocal(sv.dest, sv.source);
+                if (self.local_refs.get(sv.source)) |ref| {
+                    try self.setLocal(sv.dest, ref);
+
+                    if (!self.shouldSkipArc(sv.source)) {
+                        const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                        if (rt_import == error_ref) return error.EmitFailed;
+                        const arc_runtime = zir_builder_emit_field_val(self.handle, rt_import, "ArcRuntime", 10);
+                        if (arc_runtime == error_ref) return error.EmitFailed;
+                        const retain_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "retainAny", 9);
+                        if (retain_fn == error_ref) return error.EmitFailed;
+
+                        const args = [_]u32{ref};
+                        _ = zir_builder_emit_call_ref(self.handle, retain_fn, &args, 1);
+                    }
                 }
             },
             .param_get => |pg| {
@@ -565,6 +1267,12 @@ pub const ZirDriver = struct {
 
             // Returns
             .ret => |ret| {
+                if (self.skip_next_ret_local) |local| {
+                    if (ret.value != null and ret.value.? == local) {
+                        self.skip_next_ret_local = null;
+                        return;
+                    }
+                }
                 if (self.current_ret_type == 0) {
                     // Void function — always return void, discarding any value.
                     // In Zap, the last expression is the implicit return but
@@ -573,7 +1281,7 @@ pub const ZirDriver = struct {
                         return error.EmitFailed;
                     }
                 } else if (ret.value) |val| {
-                    const ref = try self.refForLocal(val);
+                    const ref = try self.refForValueLocal(val);
                     if (zir_builder_emit_ret(self.handle, ref) != 0) {
                         return error.EmitFailed;
                     }
@@ -589,7 +1297,7 @@ pub const ZirDriver = struct {
                 var args = std.ArrayListUnmanaged(u32).empty;
                 defer args.deinit(self.allocator);
                 for (cn.args) |arg| {
-                    const ref = self.refForLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                    const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
                     try args.append(self.allocator, ref);
                 }
 
@@ -655,7 +1363,7 @@ pub const ZirDriver = struct {
                 var args = std.ArrayListUnmanaged(u32).empty;
                 defer args.deinit(self.allocator);
                 for (cb.args) |arg| {
-                    const ref = self.refForLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                    const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
                     try args.append(self.allocator, ref);
                 }
 
@@ -700,7 +1408,7 @@ pub const ZirDriver = struct {
                 var args = std.ArrayListUnmanaged(u32).empty;
                 defer args.deinit(self.allocator);
                 for (tc.args) |arg| {
-                    const ref = self.refForLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                    const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
                     try args.append(self.allocator, ref);
                 }
                 const call_ref = zir_builder_emit_call(
@@ -740,7 +1448,7 @@ pub const ZirDriver = struct {
                         var args = std.ArrayListUnmanaged(u32).empty;
                         defer args.deinit(self.allocator);
                         for (cd.args) |arg| {
-                            const ref = self.refForLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                            const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
                             try args.append(self.allocator, ref);
                         }
                         const ref = zir_builder_emit_call(
@@ -842,9 +1550,14 @@ pub const ZirDriver = struct {
                     }
                 }
             },
-            // Never generated by IrBuilder — verified in ir.zig.
-            // Goto-style jump; no IR lowering path creates this.
-            .jump => {},
+            .jump => |j| {
+                if (j.bind_dest) |dest| {
+                    if (j.value) |value| {
+                        const ref = try self.refForValueLocal(value);
+                        try self.setLocal(dest, ref);
+                    }
+                }
+            },
 
             // Aggregates
             .tuple_init => |ti| {
@@ -873,25 +1586,69 @@ pub const ZirDriver = struct {
                     self.tuple_init_count += 1;
                     break :blk @as(u32, 0);
                 };
-                const result = if (body_local_type != 0)
-                    zir_builder_emit_struct_init_typed(
-                        self.handle,
-                        body_local_type,
-                        names_ptrs.items.ptr,
-                        names_lens.items.ptr,
-                        values.items.ptr,
-                        @intCast(values.items.len),
-                    )
-                else
-                    zir_builder_emit_struct_init_anon(
-                        self.handle,
-                        names_ptrs.items.ptr,
-                        names_lens.items.ptr,
-                        values.items.ptr,
-                        @intCast(values.items.len),
-                    );
-                if (result == error_ref) return error.EmitFailed;
-                try self.setLocal(ti.dest, result);
+                if (self.findReusePairForDest(ti.dest)) |pair| {
+                    const seed_ref = if (body_local_type != 0)
+                        zir_builder_emit_struct_init_typed(
+                            self.handle,
+                            body_local_type,
+                            names_ptrs.items.ptr,
+                            names_lens.items.ptr,
+                            values.items.ptr,
+                            @intCast(values.items.len),
+                        )
+                    else
+                        zir_builder_emit_struct_init_anon(
+                            self.handle,
+                            names_ptrs.items.ptr,
+                            names_lens.items.ptr,
+                            values.items.ptr,
+                            @intCast(values.items.len),
+                        );
+                    if (seed_ref == error_ref) return error.EmitFailed;
+                    const type_ref = zir_builder_emit_typeof(self.handle, seed_ref);
+                    if (type_ref == error_ref) return error.EmitFailed;
+                    const token_local = pair.reuse.token orelse return error.EmitFailed;
+                    const token_ref = try self.refForLocal(token_local);
+                    const alloc_ref = try self.emitAllocatorRef();
+                    const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                    if (rt_import == error_ref) return error.EmitFailed;
+                    const arc_runtime = zir_builder_emit_field_val(self.handle, rt_import, "ArcRuntime", 10);
+                    if (arc_runtime == error_ref) return error.EmitFailed;
+                    const reuse_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "reuseAllocByType", 16);
+                    if (reuse_fn == error_ref) return error.EmitFailed;
+                    const args = [_]u32{ type_ref, alloc_ref, token_ref };
+                    const ptr_ref = zir_builder_emit_call_ref(self.handle, reuse_fn, &args, 3);
+                    if (ptr_ref == error_ref) return error.EmitFailed;
+                    for (0..ti.elements.len) |i| {
+                        const name = indexFieldName(i);
+                        const ptr = zir_builder_emit_field_ptr(self.handle, ptr_ref, name.ptr, name.len);
+                        if (ptr == error_ref) return error.EmitFailed;
+                        if (zir_builder_emit_store(self.handle, ptr, values.items[i]) != 0) return error.EmitFailed;
+                    }
+                    try self.markReuseBackedTupleLocal(ti.dest, ti.elements.len);
+                    try self.setLocal(ti.dest, ptr_ref);
+                } else {
+                    _ = self.reuse_backed_tuple_locals.remove(ti.dest);
+                    const result = if (body_local_type != 0)
+                        zir_builder_emit_struct_init_typed(
+                            self.handle,
+                            body_local_type,
+                            names_ptrs.items.ptr,
+                            names_lens.items.ptr,
+                            values.items.ptr,
+                            @intCast(values.items.len),
+                        )
+                    else
+                        zir_builder_emit_struct_init_anon(
+                            self.handle,
+                            names_ptrs.items.ptr,
+                            names_lens.items.ptr,
+                            values.items.ptr,
+                            @intCast(values.items.len),
+                        );
+                    if (result == error_ref) return error.EmitFailed;
+                    try self.setLocal(ti.dest, result);
+                }
             },
             .list_init => |li| {
                 // Lists use the same representation as tuples — anonymous struct with numeric fields
@@ -971,7 +1728,6 @@ pub const ZirDriver = struct {
                 }
             },
             .struct_init => |si| {
-                // Named struct fields — use struct_init_anon with field names from IR
                 var names_ptrs = std.ArrayListUnmanaged([*]const u8).empty;
                 defer names_ptrs.deinit(self.allocator);
                 var names_lens = std.ArrayListUnmanaged(u32).empty;
@@ -980,21 +1736,55 @@ pub const ZirDriver = struct {
                 defer values.deinit(self.allocator);
 
                 for (si.fields) |field| {
-                    const ref = self.refForLocal(field.value) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                    const ref = self.refForValueLocal(field.value) catch @intFromEnum(Zir.Inst.Ref.void_value);
                     try names_ptrs.append(self.allocator, field.name.ptr);
                     try names_lens.append(self.allocator, @intCast(field.name.len));
                     try values.append(self.allocator, ref);
                 }
 
-                const result = zir_builder_emit_struct_init_anon(
-                    self.handle,
-                    names_ptrs.items.ptr,
-                    names_lens.items.ptr,
-                    values.items.ptr,
-                    @intCast(values.items.len),
-                );
-                if (result == error_ref) return error.EmitFailed;
-                try self.setLocal(si.dest, result);
+                if (self.findReusePairForDest(si.dest)) |pair| {
+                    const seed_ref = zir_builder_emit_struct_init_anon(
+                        self.handle,
+                        names_ptrs.items.ptr,
+                        names_lens.items.ptr,
+                        values.items.ptr,
+                        @intCast(values.items.len),
+                    );
+                    if (seed_ref == error_ref) return error.EmitFailed;
+                    const type_ref = zir_builder_emit_typeof(self.handle, seed_ref);
+                    if (type_ref == error_ref) return error.EmitFailed;
+                    const token_local = pair.reuse.token orelse return error.EmitFailed;
+                    const token_ref = try self.refForLocal(token_local);
+                    const alloc_ref = try self.emitAllocatorRef();
+                    const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                    if (rt_import == error_ref) return error.EmitFailed;
+                    const arc_runtime = zir_builder_emit_field_val(self.handle, rt_import, "ArcRuntime", 10);
+                    if (arc_runtime == error_ref) return error.EmitFailed;
+                    const reuse_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "reuseAllocByType", 16);
+                    if (reuse_fn == error_ref) return error.EmitFailed;
+                    const args = [_]u32{ type_ref, alloc_ref, token_ref };
+                    const ptr_ref = zir_builder_emit_call_ref(self.handle, reuse_fn, &args, 3);
+                    if (ptr_ref == error_ref) return error.EmitFailed;
+                    for (si.fields) |field| {
+                        const value_ref = self.refForValueLocal(field.value) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                        const ptr = zir_builder_emit_field_ptr(self.handle, ptr_ref, field.name.ptr, @intCast(field.name.len));
+                        if (ptr == error_ref) return error.EmitFailed;
+                        if (zir_builder_emit_store(self.handle, ptr, value_ref) != 0) return error.EmitFailed;
+                    }
+                    try self.markReuseBackedStructLocal(si.dest, si.type_name);
+                    try self.setLocal(si.dest, ptr_ref);
+                } else {
+                    _ = self.reuse_backed_struct_locals.remove(si.dest);
+                    const result = zir_builder_emit_struct_init_anon(
+                        self.handle,
+                        names_ptrs.items.ptr,
+                        names_lens.items.ptr,
+                        values.items.ptr,
+                        @intCast(values.items.len),
+                    );
+                    if (result == error_ref) return error.EmitFailed;
+                    try self.setLocal(si.dest, result);
+                }
             },
             .field_get => |fg| {
                 const obj_ref = self.refForLocal(fg.object) catch return;
@@ -1037,13 +1827,38 @@ pub const ZirDriver = struct {
                 try self.setLocal(lg.dest, ref);
             },
             .union_init => |ui| {
-                const val_ref = self.refForLocal(ui.value) catch return;
+                const val_ref = self.refForValueLocal(ui.value) catch return;
                 const names = [_][*]const u8{ui.variant_name.ptr};
                 const lens = [_]u32{@intCast(ui.variant_name.len)};
                 const vals = [_]u32{val_ref};
-                const ref = zir_builder_emit_struct_init_anon(self.handle, &names, &lens, &vals, 1);
-                if (ref == error_ref) return error.EmitFailed;
-                try self.setLocal(ui.dest, ref);
+                if (self.findReusePairForDest(ui.dest)) |pair| {
+                    const seed_ref = zir_builder_emit_struct_init_anon(self.handle, &names, &lens, &vals, 1);
+                    if (seed_ref == error_ref) return error.EmitFailed;
+                    const type_ref = zir_builder_emit_typeof(self.handle, seed_ref);
+                    if (type_ref == error_ref) return error.EmitFailed;
+                    const token_local = pair.reuse.token orelse return error.EmitFailed;
+                    const token_ref = try self.refForLocal(token_local);
+                    const alloc_ref = try self.emitAllocatorRef();
+                    const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                    if (rt_import == error_ref) return error.EmitFailed;
+                    const arc_runtime = zir_builder_emit_field_val(self.handle, rt_import, "ArcRuntime", 10);
+                    if (arc_runtime == error_ref) return error.EmitFailed;
+                    const reuse_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "reuseAllocByType", 16);
+                    if (reuse_fn == error_ref) return error.EmitFailed;
+                    const args = [_]u32{ type_ref, alloc_ref, token_ref };
+                    const ptr_ref = zir_builder_emit_call_ref(self.handle, reuse_fn, &args, 3);
+                    if (ptr_ref == error_ref) return error.EmitFailed;
+                    const ptr = zir_builder_emit_field_ptr(self.handle, ptr_ref, ui.variant_name.ptr, @intCast(ui.variant_name.len));
+                    if (ptr == error_ref) return error.EmitFailed;
+                    if (zir_builder_emit_store(self.handle, ptr, val_ref) != 0) return error.EmitFailed;
+                    try self.markReuseBackedUnionLocal(ui);
+                    try self.setLocal(ui.dest, ptr_ref);
+                } else {
+                    _ = self.reuse_backed_union_locals.remove(ui.dest);
+                    const ref = zir_builder_emit_struct_init_anon(self.handle, &names, &lens, &vals, 1);
+                    if (ref == error_ref) return error.EmitFailed;
+                    try self.setLocal(ui.dest, ref);
+                }
             },
 
             // Pattern matching — compare atom IDs (u32)
@@ -1199,30 +2014,128 @@ pub const ZirDriver = struct {
                 var args = std.ArrayListUnmanaged(u32).empty;
                 defer args.deinit(self.allocator);
                 for (cd.args) |arg| {
-                    const ref = self.refForLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                    const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
                     try args.append(self.allocator, ref);
                 }
                 const ref = zir_builder_emit_call(self.handle, name_slice.ptr, @intCast(name_slice.len), args.items.ptr, @intCast(args.items.len));
                 if (ref != error_ref) try self.setLocal(cd.dest, ref);
             },
             .call_closure => |cc| {
-                const callee_ref = self.refForLocal(cc.callee) catch return;
-                var args = std.ArrayListUnmanaged(u32).empty;
-                defer args.deinit(self.allocator);
-                for (cc.args) |arg| {
-                    const ref = self.refForLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
-                    try args.append(self.allocator, ref);
+                const lattice = @import("escape_lattice.zig");
+                const callee_is_param = self.isParamDerivedClosure(cc.callee);
+                if (self.getCallSiteSpecialization()) |spec| {
+                    switch (spec.decision) {
+                        .unreachable_call => {
+                            return error.EmitFailed;
+                        },
+                        .direct_call, .contified => {
+                            if (spec.decision == .contified and self.isTailReturnOf(cc.dest) and spec.lambda_set.isSingleton()) {
+                                const target_id = spec.lambda_set.members[0];
+                                if (self.program) |prog| {
+                                    if (target_id < prog.functions.len) {
+                                        const lowering = self.getClosureLowering(target_id, prog.functions[target_id].captures.len);
+                                        if (lowering.direct_capture_params) {
+                                            if (!callee_is_param) {
+                                                if (self.findClosureCallTarget(cc.callee)) |target| {
+                                                    try self.emitTailNamedCallToTarget(target.function_id, target.captures, cc.args);
+                                                    self.skip_next_ret_local = cc.dest;
+                                                    return;
+                                                }
+                                            }
+                                        } else if (prog.functions[target_id].captures.len == 0) {
+                                            try self.emitTailNamedCallToTarget(target_id, &.{}, cc.args);
+                                            self.skip_next_ret_local = cc.dest;
+                                            return;
+                                        }
+                                    }
+                                }
+                                if (try self.emitTailInvokeWrapperCall(cc.callee, target_id, cc.args)) {
+                                    self.skip_next_ret_local = cc.dest;
+                                    return;
+                                }
+                            }
+                            if (spec.lambda_set.isSingleton()) {
+                                if (self.program) |prog| {
+                                    const target_id = spec.lambda_set.members[0];
+                                    if (target_id < prog.functions.len) {
+                                        const lowering = self.getClosureLowering(target_id, prog.functions[target_id].captures.len);
+                                        if (lowering.direct_capture_params) {
+                                            if (!callee_is_param) {
+                                                if (self.findClosureCallTarget(cc.callee)) |target| {
+                                                    const ref = try self.emitNamedCallToTarget(target.function_id, target.captures, cc.args);
+                                                    if (ref != error_ref) {
+                                                        try self.setLocal(cc.dest, ref);
+                                                        return;
+                                                    }
+                                                }
+                                            }
+                                        } else if (prog.functions[target_id].captures.len == 0) {
+                                            const ref = try self.emitNamedCallToTarget(target_id, &.{}, cc.args);
+                                            if (ref != error_ref) {
+                                                try self.setLocal(cc.dest, ref);
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        .switch_dispatch => {
+                            if (try self.emitClosureSwitchDispatch(cc, spec.lambda_set.members)) {
+                                return;
+                            }
+                        },
+                        .dyn_closure_dispatch => {},
+                    }
                 }
-                const ref = zir_builder_emit_call_ref(self.handle, callee_ref, args.items.ptr, @intCast(args.items.len));
-                if (ref == error_ref) return error.EmitFailed;
-                try self.setLocal(cc.dest, ref);
+
+                // Lambda set specialization: singleton non-capturing → direct call
+                const direct_target: ?ClosureCallTarget = blk: {
+                    if (!callee_is_param) {
+                        if (self.findClosureCallTarget(cc.callee)) |target| {
+                            const lowering = self.getClosureLowering(target.function_id, target.captures.len);
+                            if (lowering.direct_capture_params) break :blk target;
+                        }
+                        if (self.analysis_context) |actx| {
+                            const vkey = lattice.ValueKey{
+                                .function = self.current_function_id,
+                                .local = cc.callee,
+                            };
+                            if (actx.getLambdaSet(vkey)) |ls| {
+                                if (ls.isSingleton()) {
+                                    if (self.program) |prog| {
+                                        if (ls.members.len > 0 and ls.members[0] < prog.functions.len) {
+                                            const target_func = prog.functions[ls.members[0]];
+                                            if (target_func.captures.len == 0) {
+                                                break :blk .{ .function_id = ls.members[0], .captures = &.{} };
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    break :blk null;
+                };
+
+                if (direct_target) |target| {
+                    const ref = try self.emitNamedCallToTarget(target.function_id, target.captures, cc.args);
+                    if (ref != error_ref) try self.setLocal(cc.dest, ref);
+                } else {
+                    // Fallback: indirect call via closure ref
+                    const callee_ref = self.refForLocal(cc.callee) catch return;
+                    var args = std.ArrayListUnmanaged(u32).empty;
+                    defer args.deinit(self.allocator);
+                    for (cc.args) |arg| {
+                        const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                        try args.append(self.allocator, ref);
+                    }
+                    const ref = zir_builder_emit_call_ref(self.handle, callee_ref, args.items.ptr, @intCast(args.items.len));
+                    if (ref == error_ref) return error.EmitFailed;
+                    try self.setLocal(cc.dest, ref);
+                }
             },
             .make_closure => |mc| {
-                // Build closure as anonymous struct: .{ .call_fn = func_ref, .env = .{cap0, cap1, ...} }
-                //
-                // 1. Resolve the function reference by name from the program's function table.
-                //    We access it via @import("zap_runtime") or direct name, but since the
-                //    closure target is a Zap-compiled function, emit a named reference.
                 const func_name: []const u8 = if (self.program) |prog| blk: {
                     break :blk if (mc.function < prog.functions.len)
                         prog.functions[mc.function].name
@@ -1230,7 +2143,36 @@ pub const ZirDriver = struct {
                         "unknown_closure";
                 } else "unknown_closure";
 
-                // 2. Build the environment tuple: .{ capture0, capture1, ... }
+                const lowering = self.getClosureLowering(mc.function, mc.captures.len);
+
+                if (!lowering.needs_closure_object) {
+                    const fn_name_ref = zir_builder_emit_str(self.handle, func_name.ptr, @intCast(func_name.len));
+                    if (fn_name_ref == error_ref) return error.EmitFailed;
+                    try self.setLocal(mc.dest, fn_name_ref);
+                    return;
+                }
+
+                // Tier 0: lambda-lifted closures with no captures need no env object.
+                if (mc.captures.len == 0 and lowering.tier == .lambda_lifted) {
+                    const fn_name_ref = zir_builder_emit_str(self.handle, func_name.ptr, @intCast(func_name.len));
+                    if (fn_name_ref == error_ref) return error.EmitFailed;
+                    const null_ref = @intFromEnum(Zir.Inst.Ref.null_value);
+                    const closure_field_names = [_][*]const u8{ "call_fn", "env", "env_release" };
+                    const closure_field_lens = [_]u32{ 7, 3, 11 };
+                    const closure_field_vals = [_]u32{ fn_name_ref, null_ref, null_ref };
+                    const closure_ref = zir_builder_emit_struct_init_anon(
+                        self.handle,
+                        &closure_field_names,
+                        &closure_field_lens,
+                        &closure_field_vals,
+                        3,
+                    );
+                    if (closure_ref == error_ref) return error.EmitFailed;
+                    try self.setLocal(mc.dest, closure_ref);
+                    return;
+                }
+
+                // Build the environment tuple: .{ capture0, capture1, ... }
                 var env_names_ptrs = std.ArrayListUnmanaged([*]const u8).empty;
                 defer env_names_ptrs.deinit(self.allocator);
                 var env_names_lens = std.ArrayListUnmanaged(u32).empty;
@@ -1261,41 +2203,43 @@ pub const ZirDriver = struct {
                 //    a string so it can be resolved at call time.
                 const fn_name_ref = zir_builder_emit_str(self.handle, func_name.ptr, @intCast(func_name.len));
                 if (fn_name_ref == error_ref) return error.EmitFailed;
+                const null_ref = @intFromEnum(Zir.Inst.Ref.null_value);
 
-                const closure_field_names = [_][*]const u8{ "call_fn", "env" };
-                const closure_field_lens = [_]u32{ 7, 3 };
-                const closure_field_vals = [_]u32{ fn_name_ref, env_ref };
+                const closure_field_names = [_][*]const u8{ "call_fn", "env", "env_release" };
+                const closure_field_lens = [_]u32{ 7, 3, 11 };
+                const closure_field_vals = [_]u32{ fn_name_ref, env_ref, null_ref };
                 const closure_ref = zir_builder_emit_struct_init_anon(
                     self.handle,
                     &closure_field_names,
                     &closure_field_lens,
                     &closure_field_vals,
-                    2,
+                    3,
                 );
                 if (closure_ref == error_ref) return error.EmitFailed;
                 try self.setLocal(mc.dest, closure_ref);
             },
             .capture_get => |cg| {
-                // Access the closure environment by index.
-                // The closure environment is passed as an implicit parameter.
-                // In ZIR, we access it from the current function's capture context.
-                //
-                // For now, emit field access on the closure env using numeric index.
-                // The closure env local is conventionally the first local (local 0)
-                // in a closure function body — it's the `env` field of the closure struct.
-                //
-                // Access pattern: env_local.@"N" where N is the capture index
-                const env_local: ir.LocalId = 0; // closure env is always local 0
-                const env_ref = self.refForLocal(env_local) catch {
-                    // Fallback: emit void if env not available
-                    const ref = zir_builder_emit_void(self.handle);
-                    if (ref != error_ref) try self.setLocal(cg.dest, ref);
-                    return;
-                };
-                const name = indexFieldName(cg.index);
-                const ref = zir_builder_emit_field_val(self.handle, env_ref, name.ptr, name.len);
-                if (ref == error_ref) return error.EmitFailed;
-                try self.setLocal(cg.dest, ref);
+                if (self.currentClosureLowering()) |lowering| {
+                    if (lowering.direct_capture_params and cg.index < self.capture_param_refs.items.len) {
+                        try self.setLocal(cg.dest, self.capture_param_refs.items[cg.index]);
+                        return;
+                    }
+                    if (lowering.needs_env_param) {
+                        const env_ref = self.current_closure_env_ref orelse {
+                            const ref = zir_builder_emit_void(self.handle);
+                            if (ref != error_ref) try self.setLocal(cg.dest, ref);
+                            return;
+                        };
+                        const name = indexFieldName(cg.index);
+                        const ref = zir_builder_emit_field_val(self.handle, env_ref, name.ptr, name.len);
+                        if (ref == error_ref) return error.EmitFailed;
+                        try self.setLocal(cg.dest, ref);
+                        return;
+                    }
+                }
+
+                const ref = zir_builder_emit_void(self.handle);
+                if (ref != error_ref) try self.setLocal(cg.dest, ref);
             },
 
             .optional_unwrap => |ou| {
@@ -1550,68 +2494,76 @@ pub const ZirDriver = struct {
             },
 
             // Memory/ARC
-            .alloc_owned => |ao| {
-                // Emit: @import("zap_runtime").ArcRuntime.allocAny(allocator, value)
-                // The IR only carries type_name (no value ref), so we emit the
-                // type name as a string argument for runtime dispatch.
-
-                // Get allocator: std.heap.page_allocator
-                const std_import = zir_builder_emit_import(self.handle, "std", 3);
-                if (std_import == error_ref) return error.EmitFailed;
-                const heap_mod = zir_builder_emit_field_val(self.handle, std_import, "heap", 4);
-                if (heap_mod == error_ref) return error.EmitFailed;
-                const alloc_ref = zir_builder_emit_field_val(self.handle, heap_mod, "page_allocator", 14);
-                if (alloc_ref == error_ref) return error.EmitFailed;
-
-                // Get ArcRuntime.allocAny
-                const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
-                if (rt_import == error_ref) return error.EmitFailed;
-                const arc_runtime = zir_builder_emit_field_val(self.handle, rt_import, "ArcRuntime", 10);
-                if (arc_runtime == error_ref) return error.EmitFailed;
-                const alloc_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "allocAny", 8);
-                if (alloc_fn == error_ref) return error.EmitFailed;
-
-                // Call allocAny(allocator)
-                const args = [_]u32{alloc_ref};
-                const ref = zir_builder_emit_call_ref(self.handle, alloc_fn, &args, 1);
-                if (ref == error_ref) return error.EmitFailed;
-                try self.setLocal(ao.dest, ref);
-            },
             .retain => |ret| {
-                // Emit: @import("zap_runtime").ArcRuntime.retainAny(value)
-                const val_ref = self.refForLocal(ret.value) catch return;
+                if (!self.shouldSkipArc(ret.value)) {
+                    // Emit: @import("zap_runtime").ArcRuntime.retainAny(value)
+                    const val_ref = self.refForLocal(ret.value) catch return;
 
-                const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
-                if (rt_import == error_ref) return error.EmitFailed;
-                const arc_runtime = zir_builder_emit_field_val(self.handle, rt_import, "ArcRuntime", 10);
-                if (arc_runtime == error_ref) return error.EmitFailed;
-                const retain_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "retainAny", 9);
-                if (retain_fn == error_ref) return error.EmitFailed;
+                    const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                    if (rt_import == error_ref) return error.EmitFailed;
+                    const arc_runtime = zir_builder_emit_field_val(self.handle, rt_import, "ArcRuntime", 10);
+                    if (arc_runtime == error_ref) return error.EmitFailed;
+                    const retain_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "retainAny", 9);
+                    if (retain_fn == error_ref) return error.EmitFailed;
 
-                const args = [_]u32{val_ref};
-                _ = zir_builder_emit_call_ref(self.handle, retain_fn, &args, 1);
+                    const args = [_]u32{val_ref};
+                    _ = zir_builder_emit_call_ref(self.handle, retain_fn, &args, 1);
+                }
             },
             .release => |rel| {
-                // Emit: @import("zap_runtime").ArcRuntime.releaseAny(allocator, value)
-                const val_ref = self.refForLocal(rel.value) catch return;
+                if (!self.shouldSkipArc(rel.value)) {
+                    // Emit: @import("zap_runtime").ArcRuntime.releaseAny(allocator, value)
+                    const val_ref = self.refForLocal(rel.value) catch return;
 
-                // Get allocator: std.heap.page_allocator
-                const std_import = zir_builder_emit_import(self.handle, "std", 3);
-                if (std_import == error_ref) return error.EmitFailed;
-                const heap_mod = zir_builder_emit_field_val(self.handle, std_import, "heap", 4);
-                if (heap_mod == error_ref) return error.EmitFailed;
-                const alloc_ref = zir_builder_emit_field_val(self.handle, heap_mod, "page_allocator", 14);
-                if (alloc_ref == error_ref) return error.EmitFailed;
+                    const alloc_ref = try self.emitAllocatorRef();
+
+                    const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                    if (rt_import == error_ref) return error.EmitFailed;
+                    const arc_runtime = zir_builder_emit_field_val(self.handle, rt_import, "ArcRuntime", 10);
+                    if (arc_runtime == error_ref) return error.EmitFailed;
+                    const release_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "releaseAny", 10);
+                    if (release_fn == error_ref) return error.EmitFailed;
+
+                    const args = [_]u32{ alloc_ref, val_ref };
+                    _ = zir_builder_emit_call_ref(self.handle, release_fn, &args, 2);
+                }
+            },
+            .reset => |r| {
+                const val_ref = self.refForLocal(r.source) catch return;
+                const alloc_ref = try self.emitAllocatorRef();
 
                 const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                 if (rt_import == error_ref) return error.EmitFailed;
                 const arc_runtime = zir_builder_emit_field_val(self.handle, rt_import, "ArcRuntime", 10);
                 if (arc_runtime == error_ref) return error.EmitFailed;
-                const release_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "releaseAny", 10);
-                if (release_fn == error_ref) return error.EmitFailed;
+                const reset_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "resetAny", 8);
+                if (reset_fn == error_ref) return error.EmitFailed;
 
                 const args = [_]u32{ alloc_ref, val_ref };
-                _ = zir_builder_emit_call_ref(self.handle, release_fn, &args, 2);
+                const ref = zir_builder_emit_call_ref(self.handle, reset_fn, &args, 2);
+                if (ref == error_ref) return error.EmitFailed;
+                try self.setLocal(r.dest, ref);
+            },
+            .reuse_alloc => |ra| {
+                const type_ref = try self.emitTypeRef(ra.dest_type);
+                const alloc_ref = try self.emitAllocatorRef();
+                const token_ref = if (ra.token) |token|
+                    try self.refForLocal(token)
+                else
+                    zir_builder_emit_void(self.handle);
+                if (token_ref == error_ref) return error.EmitFailed;
+
+                const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                if (rt_import == error_ref) return error.EmitFailed;
+                const arc_runtime = zir_builder_emit_field_val(self.handle, rt_import, "ArcRuntime", 10);
+                if (arc_runtime == error_ref) return error.EmitFailed;
+                const reuse_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "reuseAllocByType", 16);
+                if (reuse_fn == error_ref) return error.EmitFailed;
+
+                const args = [_]u32{ type_ref, alloc_ref, token_ref };
+                const ref = zir_builder_emit_call_ref(self.handle, reuse_fn, &args, 3);
+                if (ref == error_ref) return error.EmitFailed;
+                try self.setLocal(ra.dest, ref);
             },
 
             // Never generated by IrBuilder — verified in ir.zig.
@@ -1840,6 +2792,8 @@ pub const ZirDriver = struct {
         self.current_case_dest = cb.dest;
         defer self.current_case_dest = saved_case_dest;
 
+        try self.emitPerceusResetForCase(cb);
+
         if (cb.arms.len == 0) {
             // The Zap frontend lowers atom/pattern case blocks to flat
             // pre_instrs containing match_atom + guard_block pairs, with
@@ -1881,6 +2835,9 @@ pub const ZirDriver = struct {
             // Capture the arm body
             zir_builder_begin_capture(self.handle);
             for (arm.body_instrs) |bi| try self.emitInstruction(bi);
+            if (arm.result) |r| {
+                try self.emitDropSpecializationsForCurrentInstr(r, @intCast(i));
+            }
             var arm_len: u32 = 0;
             const arm_ptr = zir_builder_end_capture(self.handle, &arm_len);
 
@@ -1924,6 +2881,7 @@ pub const ZirDriver = struct {
 
         // The last ref produced is the result of the entire case block
         try self.setLocal(cb.dest, current_else_result);
+        try self.emitDropSpecializationsForCurrentInstr(cb.dest, null);
     }
 
     /// Handle a case_block where the frontend put all logic in pre_instrs
@@ -1931,6 +2889,7 @@ pub const ZirDriver = struct {
     /// the guard_blocks as arms and restructure into nested if-else-bodies.
     fn emitFlatCaseBlock(self: *ZirDriver, cb: ir.CaseBlock) BuildError!void {
         const void_ref = @intFromEnum(Zir.Inst.Ref.void_value);
+        try self.emitPerceusResetForCase(cb);
 
         // Split pre_instrs into: setup before each guard, guard_blocks, and
         // trailing default instructions after the last guard_block.
@@ -1949,6 +2908,7 @@ pub const ZirDriver = struct {
                     try self.setLocal(cb.dest, ref);
                 }
             }
+            try self.emitDropSpecializationsForCurrentInstr(cb.dest, null);
             return;
         }
 
@@ -2008,6 +2968,7 @@ pub const ZirDriver = struct {
             // Capture the guard body
             zir_builder_begin_capture(self.handle);
             for (gb.body) |bi| try self.emitInstruction(bi);
+            try self.emitDropSpecializationsForCurrentInstr(cb.dest, @intCast(gi));
             var body_len: u32 = 0;
             const body_ptr = zir_builder_end_capture(self.handle, &body_len);
 
@@ -2050,6 +3011,7 @@ pub const ZirDriver = struct {
 
         // Set the case_block result
         try self.setLocal(cb.dest, current_else_result);
+        try self.emitDropSpecializationsForCurrentInstr(cb.dest, null);
     }
 
     /// Emit a switch_return as a chain of if-else-bodies.
@@ -2283,6 +3245,7 @@ pub fn buildAndInject(
     runtime_path: ?[:0]const u8,
     lib_mode: bool,
     builder_entry: ?[]const u8,
+    analysis_context: ?*const @import("escape_lattice.zig").AnalysisContext,
 ) BuildError!void {
     // Register the runtime module if a path was provided.
     if (runtime_path) |rpath| {
@@ -2294,6 +3257,7 @@ pub fn buildAndInject(
     var driver = try ZirDriver.init(allocator);
     driver.lib_mode = lib_mode;
     driver.builder_entry = builder_entry;
+    driver.analysis_context = analysis_context;
 
     driver.buildProgram(program) catch |err| {
         driver.deinit(); // destroy builder on error path
@@ -2310,4 +3274,148 @@ pub fn buildAndInject(
     if (result != 0) {
         return error.ZirInjectionFailed;
     }
+}
+
+test "ZirDriver.findReusePairForDest matches exact insertion point" {
+    const testing = std.testing;
+    const lattice = @import("escape_lattice.zig");
+
+    var analysis_context = lattice.AnalysisContext.init(testing.allocator);
+    defer analysis_context.deinit();
+
+    try analysis_context.addReusePair(.{
+        .match_site = 1,
+        .alloc_site = 10,
+        .reset = .{ .dest = 10001, .source = 4, .source_type = 0 },
+        .reuse = .{
+            .dest = 9,
+            .token = 10001,
+            .insertion_point = .{ .function = 3, .block = 5, .instr_index = 7, .position = .before },
+            .constructor_tag = 10,
+            .dest_type = 0,
+        },
+        .kind = .dynamic_reuse,
+    });
+    try analysis_context.addReusePair(.{
+        .match_site = 2,
+        .alloc_site = 11,
+        .reset = .{ .dest = 10002, .source = 6, .source_type = 0 },
+        .reuse = .{
+            .dest = 9,
+            .token = 10002,
+            .insertion_point = .{ .function = 3, .block = 5, .instr_index = 8, .position = .before },
+            .constructor_tag = 11,
+            .dest_type = 0,
+        },
+        .kind = .dynamic_reuse,
+    });
+
+    const driver = ZirDriver{
+        .handle = undefined,
+        .local_refs = .empty,
+        .param_refs = .empty,
+        .allocator = testing.allocator,
+        .program = null,
+        .current_function_id = 3,
+        .current_block_label = 5,
+        .current_instr_index = 7,
+        .analysis_context = &analysis_context,
+        .reuse_backed_struct_locals = .empty,
+    };
+
+    const pair = driver.findReusePairForDest(9) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(ir.LocalId, 10001), pair.reset.dest);
+    try testing.expectEqual(@as(u32, 7), pair.reuse.insertion_point.instr_index);
+}
+
+test "ZirDriver.findReusePairForDest requires exact destination and site" {
+    const testing = std.testing;
+    const lattice = @import("escape_lattice.zig");
+
+    var analysis_context = lattice.AnalysisContext.init(testing.allocator);
+    defer analysis_context.deinit();
+
+    try analysis_context.addReusePair(.{
+        .match_site = 1,
+        .alloc_site = 10,
+        .reset = .{ .dest = 10001, .source = 4, .source_type = 0 },
+        .reuse = .{
+            .dest = 9,
+            .token = 10001,
+            .insertion_point = .{ .function = 3, .block = 5, .instr_index = 7, .position = .before },
+            .constructor_tag = 10,
+            .dest_type = 0,
+        },
+        .kind = .dynamic_reuse,
+    });
+
+    const wrong_instr_driver = ZirDriver{
+        .handle = undefined,
+        .local_refs = .empty,
+        .param_refs = .empty,
+        .allocator = testing.allocator,
+        .program = null,
+        .current_function_id = 3,
+        .current_block_label = 5,
+        .current_instr_index = 6,
+        .analysis_context = &analysis_context,
+        .reuse_backed_struct_locals = .empty,
+    };
+    try testing.expect(wrong_instr_driver.findReusePairForDest(9) == null);
+
+    const wrong_dest_driver = ZirDriver{
+        .handle = undefined,
+        .local_refs = .empty,
+        .param_refs = .empty,
+        .allocator = testing.allocator,
+        .program = null,
+        .current_function_id = 3,
+        .current_block_label = 5,
+        .current_instr_index = 7,
+        .analysis_context = &analysis_context,
+        .reuse_backed_struct_locals = .empty,
+    };
+    try testing.expect(wrong_dest_driver.findReusePairForDest(10) == null);
+}
+
+test "closure lowering helper distinguishes immediate and stack tiers" {
+    const lattice = @import("escape_lattice.zig");
+
+    const immediate = ZirDriver.closure_lowering_for_tier(.immediate_invocation, 1);
+    try std.testing.expectEqual(lattice.ClosureEnvTier.immediate_invocation, immediate.tier);
+    try std.testing.expect(immediate.direct_capture_params);
+    try std.testing.expect(!immediate.needs_env_param);
+    try std.testing.expect(!immediate.needs_closure_object);
+
+    const block_local = ZirDriver.closure_lowering_for_tier(.block_local, 1);
+    try std.testing.expect(block_local.needs_env_param);
+    try std.testing.expect(block_local.needs_closure_object);
+    try std.testing.expect(block_local.stack_env);
+    try std.testing.expectEqual(ZirDriver.ClosureLowering.StorageScope.stack_block, block_local.storage_scope);
+
+    const function_local = ZirDriver.closure_lowering_for_tier(.function_local, 1);
+    try std.testing.expect(function_local.needs_env_param);
+    try std.testing.expect(function_local.needs_closure_object);
+    try std.testing.expect(function_local.stack_env);
+    try std.testing.expectEqual(ZirDriver.ClosureLowering.StorageScope.stack_function, function_local.storage_scope);
+
+    const escaping = ZirDriver.closure_lowering_for_tier(.escaping, 1);
+    try std.testing.expect(escaping.needs_env_param);
+    try std.testing.expect(escaping.needs_closure_object);
+    try std.testing.expect(!escaping.stack_env);
+    try std.testing.expectEqual(ZirDriver.ClosureLowering.StorageScope.heap, escaping.storage_scope);
+}
+
+test "findClosureTargetInInstrs follows local aliases" {
+    const captures = [_]ir.LocalId{7};
+    const instrs = [_]ir.Instruction{
+        .{ .make_closure = .{ .dest = 4, .function = 9, .captures = &captures } },
+        .{ .local_set = .{ .dest = 5, .value = 4 } },
+        .{ .share_value = .{ .dest = 6, .source = 5 } },
+    };
+
+    const target = ZirDriver.findClosureTargetInInstrs(&instrs, 6) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(ir.FunctionId, 9), target.function_id);
+    try std.testing.expectEqual(@as(usize, 1), target.captures.len);
+    try std.testing.expectEqual(@as(ir.LocalId, 7), target.captures[0]);
 }

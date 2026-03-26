@@ -174,6 +174,26 @@ pub const ArcRuntime = struct {
         const inner: *Inner = @fieldParentPtr("value", ptr);
         return inner.header.count();
     }
+
+    /// Reset a value for Perceus-style reuse. If the reference count is 1,
+    /// return an opaque reuse token for the existing allocation. Otherwise,
+    /// release the current value and return null.
+    pub fn resetAny(comptime T: type, allocator: std.mem.Allocator, ptr: *T) ?*anyopaque {
+        if (refCountAny(T, ptr) == 1) {
+            return @ptrCast(ptr);
+        }
+        releaseAny(T, allocator, ptr);
+        return null;
+    }
+
+    /// Convert a Perceus reuse token back into a typed allocation. If the token
+    /// is present, reuse that storage; otherwise allocate a fresh value.
+    pub fn reuseAllocByType(comptime T: type, allocator: std.mem.Allocator, token: ?*anyopaque) *T {
+        if (token) |ptr| {
+            return @ptrCast(@alignCast(ptr));
+        }
+        return allocator.create(T) catch @panic("ArcRuntime.reuseAllocByType: out of memory");
+    }
 };
 
 // ============================================================
@@ -378,6 +398,12 @@ pub const DynClosure = struct {
     }
 };
 
+pub fn invokeDynClosure(comptime Ret: type, closure: DynClosure, args: anytype) Ret {
+    const Fn = *const fn (?*anyopaque, @TypeOf(args)) Ret;
+    const fn_ptr: Fn = @ptrCast(@alignCast(closure.call_fn));
+    return fn_ptr(closure.env, args);
+}
+
 // ============================================================
 // Tagged Value — Runtime tagged union for dynamic values
 // ============================================================
@@ -505,6 +531,28 @@ pub fn List(comptime T: type) type {
             return list;
         }
     };
+}
+
+const testing = std.testing;
+
+test "ArcRuntime.resetAny returns token for unique value" {
+    const allocator = testing.allocator;
+    const ptr = ArcRuntime.allocAny(i64, allocator, 42);
+    const token = ArcRuntime.resetAny(i64, allocator, ptr);
+    try testing.expect(token != null);
+    const reused = ArcRuntime.reuseAllocByType(i64, allocator, token);
+    reused.* = 7;
+    try testing.expectEqual(@as(i64, 7), reused.*);
+    ArcRuntime.releaseAny(i64, allocator, reused);
+}
+
+test "ArcRuntime.resetAny releases shared value and yields null token" {
+    const allocator = testing.allocator;
+    const ptr = ArcRuntime.allocAny(i64, allocator, 10);
+    ArcRuntime.retainAny(i64, ptr);
+    const token = ArcRuntime.resetAny(i64, allocator, ptr);
+    try testing.expect(token == null);
+    ArcRuntime.releaseAny(i64, allocator, ptr);
 }
 
 // ============================================================

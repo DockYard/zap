@@ -41,7 +41,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
-
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
     // to the module defined above, it's sometimes preferable to split business
@@ -113,17 +112,15 @@ pub fn build(b: *std.Build) void {
 
         // Clang libraries
         const clang_libs = [_][]const u8{
-            "clangFrontendTool", "clangCodeGen",              "clangFrontend",
-            "clangDriver",       "clangSerialization",        "clangSema",
-            "clangStaticAnalyzerFrontend", "clangStaticAnalyzerCheckers",
-            "clangStaticAnalyzerCore",     "clangAnalysis",
-            "clangASTMatchers",  "clangAST",                  "clangParse",
-            "clangAPINotes",     "clangBasic",                "clangEdit",
-            "clangLex",          "clangARCMigrate",
-            "clangRewriteFrontend", "clangRewrite",
-            "clangCrossTU",      "clangIndex",
-            "clangToolingCore",  "clangExtractAPI",
-            "clangSupport",      "clangInstallAPI",
+            "clangFrontendTool",           "clangCodeGen",                "clangFrontend",
+            "clangDriver",                 "clangSerialization",          "clangSema",
+            "clangStaticAnalyzerFrontend", "clangStaticAnalyzerCheckers", "clangStaticAnalyzerCore",
+            "clangAnalysis",               "clangASTMatchers",            "clangAST",
+            "clangParse",                  "clangAPINotes",               "clangBasic",
+            "clangEdit",                   "clangLex",                    "clangARCMigrate",
+            "clangRewriteFrontend",        "clangRewrite",                "clangCrossTU",
+            "clangIndex",                  "clangToolingCore",            "clangExtractAPI",
+            "clangSupport",                "clangInstallAPI",
         };
         for (clang_libs) |lib_name| {
             exe.root_module.linkSystemLibrary(lib_name, .{});
@@ -139,56 +136,70 @@ pub fn build(b: *std.Build) void {
 
         // LLVM libraries (matching Zig 0.15.2 build.zig order)
         const llvm_libs = [_][]const u8{
-            "LLVMWindowsManifest",  "LLVMXRay",            "LLVMLibDriver",
-            "LLVMDlltoolDriver",    "LLVMTelemetry",       "LLVMTextAPIBinaryReader",
-            "LLVMCoverage",         "LLVMLineEditor",
-            "LLVMXCoreDisassembler", "LLVMXCoreCodeGen",   "LLVMXCoreDesc",         "LLVMXCoreInfo",
-            "LLVMX86TargetMCA",     "LLVMX86Disassembler", "LLVMX86AsmParser",      "LLVMX86CodeGen",     "LLVMX86Desc",     "LLVMX86Info",
-            "LLVMWebAssemblyDisassembler", "LLVMWebAssemblyAsmParser", "LLVMWebAssemblyCodeGen", "LLVMWebAssemblyUtils", "LLVMWebAssemblyDesc", "LLVMWebAssemblyInfo",
-            "LLVMVEDisassembler",   "LLVMVEAsmParser",     "LLVMVECodeGen",         "LLVMVEDesc",         "LLVMVEInfo",
-            "LLVMSystemZDisassembler", "LLVMSystemZAsmParser", "LLVMSystemZCodeGen", "LLVMSystemZDesc",    "LLVMSystemZInfo",
-            "LLVMSPIRVCodeGen",     "LLVMSPIRVDesc",       "LLVMSPIRVInfo",         "LLVMSPIRVAnalysis",
-            "LLVMSparcDisassembler", "LLVMSparcAsmParser",  "LLVMSparcCodeGen",      "LLVMSparcDesc",      "LLVMSparcInfo",
-            "LLVMRISCVTargetMCA",   "LLVMRISCVDisassembler", "LLVMRISCVAsmParser",  "LLVMRISCVCodeGen",   "LLVMRISCVDesc",   "LLVMRISCVInfo",
-            "LLVMPowerPCDisassembler", "LLVMPowerPCAsmParser", "LLVMPowerPCCodeGen", "LLVMPowerPCDesc",    "LLVMPowerPCInfo",
-            "LLVMNVPTXCodeGen",     "LLVMNVPTXDesc",       "LLVMNVPTXInfo",
-            "LLVMMSP430Disassembler", "LLVMMSP430AsmParser", "LLVMMSP430CodeGen",   "LLVMMSP430Desc",     "LLVMMSP430Info",
-            "LLVMMipsDisassembler", "LLVMMipsAsmParser",   "LLVMMipsCodeGen",       "LLVMMipsDesc",       "LLVMMipsInfo",
-            "LLVMLoongArchDisassembler", "LLVMLoongArchAsmParser", "LLVMLoongArchCodeGen", "LLVMLoongArchDesc", "LLVMLoongArchInfo",
-            "LLVMLanaiDisassembler", "LLVMLanaiCodeGen",   "LLVMLanaiAsmParser",    "LLVMLanaiDesc",      "LLVMLanaiInfo",
-            "LLVMHexagonDisassembler", "LLVMHexagonCodeGen", "LLVMHexagonAsmParser", "LLVMHexagonDesc",    "LLVMHexagonInfo",
-            "LLVMBPFDisassembler",  "LLVMBPFAsmParser",    "LLVMBPFCodeGen",        "LLVMBPFDesc",        "LLVMBPFInfo",
-            "LLVMAVRDisassembler",  "LLVMAVRAsmParser",    "LLVMAVRCodeGen",        "LLVMAVRDesc",        "LLVMAVRInfo",
-            "LLVMARMDisassembler",  "LLVMARMAsmParser",    "LLVMARMCodeGen",        "LLVMARMDesc",        "LLVMARMUtils",    "LLVMARMInfo",
-            "LLVMAMDGPUTargetMCA",  "LLVMAMDGPUDisassembler", "LLVMAMDGPUAsmParser", "LLVMAMDGPUCodeGen", "LLVMAMDGPUDesc",  "LLVMAMDGPUUtils", "LLVMAMDGPUInfo",
-            "LLVMAArch64Disassembler", "LLVMAArch64AsmParser", "LLVMAArch64CodeGen", "LLVMAArch64Desc",   "LLVMAArch64Utils", "LLVMAArch64Info",
-            "LLVMOrcDebugging",     "LLVMOrcJIT",          "LLVMWindowsDriver",     "LLVMMCJIT",          "LLVMJITLink",
-            "LLVMInterpreter",      "LLVMExecutionEngine", "LLVMRuntimeDyld",
-            "LLVMOrcTargetProcess", "LLVMOrcShared",       "LLVMDWP",
-            "LLVMDebugInfoLogicalView", "LLVMDebugInfoGSYM",
-            "LLVMOption",           "LLVMObjectYAML",      "LLVMObjCopy",
-            "LLVMMCA",              "LLVMMCDisassembler",  "LLVMLTO",
-            "LLVMPasses",           "LLVMHipStdPar",       "LLVMCFGuard",
-            "LLVMCoroutines",       "LLVMipo",             "LLVMVectorize",
-            "LLVMSandboxIR",        "LLVMLinker",          "LLVMInstrumentation",
-            "LLVMFrontendOpenMP",   "LLVMFrontendOffloading",
-            "LLVMFrontendOpenACC",  "LLVMFrontendHLSL",   "LLVMFrontendDriver",    "LLVMFrontendAtomic",
-            "LLVMExtensions",       "Polly",               "PollyISL",
-            "LLVMDWARFLinkerParallel", "LLVMDWARFLinkerClassic", "LLVMDWARFLinker",
-            "LLVMGlobalISel",       "LLVMMIRParser",       "LLVMAsmPrinter",
-            "LLVMSelectionDAG",     "LLVMCodeGen",         "LLVMTarget",
-            "LLVMObjCARCOpts",      "LLVMCodeGenTypes",    "LLVMCGData",
-            "LLVMIRPrinter",        "LLVMInterfaceStub",   "LLVMFileCheck",
-            "LLVMFuzzMutate",       "LLVMScalarOpts",      "LLVMInstCombine",
-            "LLVMAggressiveInstCombine", "LLVMTransformUtils",
-            "LLVMBitWriter",        "LLVMAnalysis",        "LLVMProfileData",
-            "LLVMSymbolize",        "LLVMDebugInfoBTF",    "LLVMDebugInfoPDB",
-            "LLVMDebugInfoMSF",     "LLVMDebugInfoCodeView", "LLVMDebugInfoDWARF",
-            "LLVMObject",           "LLVMTextAPI",         "LLVMMCParser",
-            "LLVMIRReader",         "LLVMAsmParser",       "LLVMMC",
-            "LLVMBitReader",        "LLVMFuzzerCLI",       "LLVMCore",
-            "LLVMRemarks",          "LLVMBitstreamReader", "LLVMBinaryFormat",
-            "LLVMTargetParser",     "LLVMSupport",         "LLVMDemangle",
+            "LLVMWindowsManifest",         "LLVMXRay",                  "LLVMLibDriver",
+            "LLVMDlltoolDriver",           "LLVMTelemetry",             "LLVMTextAPIBinaryReader",
+            "LLVMCoverage",                "LLVMLineEditor",            "LLVMXCoreDisassembler",
+            "LLVMXCoreCodeGen",            "LLVMXCoreDesc",             "LLVMXCoreInfo",
+            "LLVMX86TargetMCA",            "LLVMX86Disassembler",       "LLVMX86AsmParser",
+            "LLVMX86CodeGen",              "LLVMX86Desc",               "LLVMX86Info",
+            "LLVMWebAssemblyDisassembler", "LLVMWebAssemblyAsmParser",  "LLVMWebAssemblyCodeGen",
+            "LLVMWebAssemblyUtils",        "LLVMWebAssemblyDesc",       "LLVMWebAssemblyInfo",
+            "LLVMVEDisassembler",          "LLVMVEAsmParser",           "LLVMVECodeGen",
+            "LLVMVEDesc",                  "LLVMVEInfo",                "LLVMSystemZDisassembler",
+            "LLVMSystemZAsmParser",        "LLVMSystemZCodeGen",        "LLVMSystemZDesc",
+            "LLVMSystemZInfo",             "LLVMSPIRVCodeGen",          "LLVMSPIRVDesc",
+            "LLVMSPIRVInfo",               "LLVMSPIRVAnalysis",         "LLVMSparcDisassembler",
+            "LLVMSparcAsmParser",          "LLVMSparcCodeGen",          "LLVMSparcDesc",
+            "LLVMSparcInfo",               "LLVMRISCVTargetMCA",        "LLVMRISCVDisassembler",
+            "LLVMRISCVAsmParser",          "LLVMRISCVCodeGen",          "LLVMRISCVDesc",
+            "LLVMRISCVInfo",               "LLVMPowerPCDisassembler",   "LLVMPowerPCAsmParser",
+            "LLVMPowerPCCodeGen",          "LLVMPowerPCDesc",           "LLVMPowerPCInfo",
+            "LLVMNVPTXCodeGen",            "LLVMNVPTXDesc",             "LLVMNVPTXInfo",
+            "LLVMMSP430Disassembler",      "LLVMMSP430AsmParser",       "LLVMMSP430CodeGen",
+            "LLVMMSP430Desc",              "LLVMMSP430Info",            "LLVMMipsDisassembler",
+            "LLVMMipsAsmParser",           "LLVMMipsCodeGen",           "LLVMMipsDesc",
+            "LLVMMipsInfo",                "LLVMLoongArchDisassembler", "LLVMLoongArchAsmParser",
+            "LLVMLoongArchCodeGen",        "LLVMLoongArchDesc",         "LLVMLoongArchInfo",
+            "LLVMLanaiDisassembler",       "LLVMLanaiCodeGen",          "LLVMLanaiAsmParser",
+            "LLVMLanaiDesc",               "LLVMLanaiInfo",             "LLVMHexagonDisassembler",
+            "LLVMHexagonCodeGen",          "LLVMHexagonAsmParser",      "LLVMHexagonDesc",
+            "LLVMHexagonInfo",             "LLVMBPFDisassembler",       "LLVMBPFAsmParser",
+            "LLVMBPFCodeGen",              "LLVMBPFDesc",               "LLVMBPFInfo",
+            "LLVMAVRDisassembler",         "LLVMAVRAsmParser",          "LLVMAVRCodeGen",
+            "LLVMAVRDesc",                 "LLVMAVRInfo",               "LLVMARMDisassembler",
+            "LLVMARMAsmParser",            "LLVMARMCodeGen",            "LLVMARMDesc",
+            "LLVMARMUtils",                "LLVMARMInfo",               "LLVMAMDGPUTargetMCA",
+            "LLVMAMDGPUDisassembler",      "LLVMAMDGPUAsmParser",       "LLVMAMDGPUCodeGen",
+            "LLVMAMDGPUDesc",              "LLVMAMDGPUUtils",           "LLVMAMDGPUInfo",
+            "LLVMAArch64Disassembler",     "LLVMAArch64AsmParser",      "LLVMAArch64CodeGen",
+            "LLVMAArch64Desc",             "LLVMAArch64Utils",          "LLVMAArch64Info",
+            "LLVMOrcDebugging",            "LLVMOrcJIT",                "LLVMWindowsDriver",
+            "LLVMMCJIT",                   "LLVMJITLink",               "LLVMInterpreter",
+            "LLVMExecutionEngine",         "LLVMRuntimeDyld",           "LLVMOrcTargetProcess",
+            "LLVMOrcShared",               "LLVMDWP",                   "LLVMDebugInfoLogicalView",
+            "LLVMDebugInfoGSYM",           "LLVMOption",                "LLVMObjectYAML",
+            "LLVMObjCopy",                 "LLVMMCA",                   "LLVMMCDisassembler",
+            "LLVMLTO",                     "LLVMPasses",                "LLVMHipStdPar",
+            "LLVMCFGuard",                 "LLVMCoroutines",            "LLVMipo",
+            "LLVMVectorize",               "LLVMSandboxIR",             "LLVMLinker",
+            "LLVMInstrumentation",         "LLVMFrontendOpenMP",        "LLVMFrontendOffloading",
+            "LLVMFrontendOpenACC",         "LLVMFrontendHLSL",          "LLVMFrontendDriver",
+            "LLVMFrontendAtomic",          "LLVMExtensions",            "Polly",
+            "PollyISL",                    "LLVMDWARFLinkerParallel",   "LLVMDWARFLinkerClassic",
+            "LLVMDWARFLinker",             "LLVMGlobalISel",            "LLVMMIRParser",
+            "LLVMAsmPrinter",              "LLVMSelectionDAG",          "LLVMCodeGen",
+            "LLVMTarget",                  "LLVMObjCARCOpts",           "LLVMCodeGenTypes",
+            "LLVMCGData",                  "LLVMIRPrinter",             "LLVMInterfaceStub",
+            "LLVMFileCheck",               "LLVMFuzzMutate",            "LLVMScalarOpts",
+            "LLVMInstCombine",             "LLVMAggressiveInstCombine", "LLVMTransformUtils",
+            "LLVMBitWriter",               "LLVMAnalysis",              "LLVMProfileData",
+            "LLVMSymbolize",               "LLVMDebugInfoBTF",          "LLVMDebugInfoPDB",
+            "LLVMDebugInfoMSF",            "LLVMDebugInfoCodeView",     "LLVMDebugInfoDWARF",
+            "LLVMObject",                  "LLVMTextAPI",               "LLVMMCParser",
+            "LLVMIRReader",                "LLVMAsmParser",             "LLVMMC",
+            "LLVMBitReader",               "LLVMFuzzerCLI",             "LLVMCore",
+            "LLVMRemarks",                 "LLVMBitstreamReader",       "LLVMBinaryFormat",
+            "LLVMTargetParser",            "LLVMSupport",               "LLVMDemangle",
         };
         for (llvm_libs) |lib_name| {
             exe.root_module.linkSystemLibrary(lib_name, .{});
@@ -267,6 +278,28 @@ pub fn build(b: *std.Build) void {
     // Ensure the zap binary is built and installed before running ZIR tests
     zir_test_step.dependOn(b.getInstallStep());
 
+    const phase9_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/phase9_validation_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_phase9_tests = b.addRunArtifact(phase9_tests);
+    const phase9_test_step = b.step("phase9-test", "Run Phase 9 validation tests");
+    phase9_test_step.dependOn(&run_phase9_tests.step);
+
+    const phase9_bench = b.addExecutable(.{
+        .name = "phase9-benchmarks",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/phase9_benchmarks.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_phase9_bench = b.addRunArtifact(phase9_bench);
+    const bench_step = b.step("bench", "Run Phase 9 benchmarks");
+    bench_step.dependOn(&run_phase9_bench.step);
 }
 
 /// Auto-detect the Zig lib directory at build time.

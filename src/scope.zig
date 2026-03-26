@@ -149,6 +149,7 @@ pub const MacroFamily = struct {
 
 pub const TypeProvenance = struct {
     type_id: u32,
+    ownership: ast.Ownership = .shared,
     source_span: ast.SourceSpan,
 };
 

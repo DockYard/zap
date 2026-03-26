@@ -1,5 +1,33 @@
 # Plan: Ownership-Typed ARC Integration
 
+## Implementation Status
+
+This plan has now been implemented to the intended MVP/runtime-integration level.
+
+Completed:
+
+- [x] ownership metadata in `src/types.zig`
+- [x] ownership-aware function typing and signature comparison
+- [x] AST/parser ownership qualifiers for params and function-type params/results
+- [x] `TypeChecker` ownership state tracking and move diagnostics
+- [x] call-scoped borrow handling
+- [x] rejection of moving currently borrowed values
+- [x] rejection of shared values passed to unique parameters
+- [x] borrowed-return escape diagnostics
+- [x] HIR ownership/value-mode propagation
+- [x] IR ownership/value-mode propagation
+- [x] explicit IR `move`/`share` semantics
+- [x] removal of `alloc_owned` reliance from the lowering pipeline
+- [x] ZIR/codegen/runtime hooks for ARC retain/release
+- [x] tests for ownership typing, borrow behavior, HIR/IR lowering, and ARC-sensitive codegen
+
+Intentionally still deferred, as already documented in this plan:
+
+- [ ] full lifetime inference
+- [ ] deep field-level ownership on every container element
+- [ ] advanced closure/borrow interaction beyond the current compiler architecture
+- [ ] aggressive global ARC optimization passes
+
 ## Goal
 
 Keep Zap's existing ARC runtime as the execution substrate, but make ownership a
