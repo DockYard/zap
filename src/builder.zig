@@ -18,10 +18,12 @@ pub const BuildConfig = struct {
     kind: Kind,
     root: ?[]const u8 = null,
     asset_name: ?[]const u8 = null,
+    optimize: Optimize = .release_safe,
     paths: []const []const u8 = &.{},
     build_opts: std.StringHashMapUnmanaged([]const u8) = .empty,
 
     pub const Kind = enum { bin, lib, obj };
+    pub const Optimize = enum { debug, release_safe, release_fast, release_small };
 };
 
 /// Scan build.zap AST to find the module defining manifest/1.
@@ -394,6 +396,14 @@ fn extractFieldsFromStruct(
         } else if (std.mem.eql(u8, field_name, "asset_name")) {
             if (field.value.* == .string_literal) {
                 config.asset_name = interner.get(field.value.string_literal.value);
+            }
+        } else if (std.mem.eql(u8, field_name, "optimize")) {
+            if (field.value.* == .atom_literal) {
+                const opt_str = interner.get(field.value.atom_literal.value);
+                if (std.mem.eql(u8, opt_str, "debug")) config.optimize = .debug
+                else if (std.mem.eql(u8, opt_str, "release_safe")) config.optimize = .release_safe
+                else if (std.mem.eql(u8, opt_str, "release_fast")) config.optimize = .release_fast
+                else if (std.mem.eql(u8, opt_str, "release_small")) config.optimize = .release_small;
             }
         } else if (std.mem.eql(u8, field_name, "paths")) {
             if (field.value.* == .list) {

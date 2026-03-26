@@ -183,7 +183,9 @@ fn cmdInit(allocator: std.mem.Allocator) !void {
         \\          version: "0.1.0",
         \\          kind: :bin,
         \\          root: "{s}.main/1",
-        \\          paths: ["lib/**/*.zap"]
+        \\          paths: ["lib/**/*.zap"],
+        \\          # :debug | :release_safe | :release_fast | :release_small
+        \\          optimize: :release_safe
         \\        }}
         \\      :test ->
         \\        %Zap.Manifest{{
@@ -191,7 +193,8 @@ fn cmdInit(allocator: std.mem.Allocator) !void {
         \\          version: "0.1.0",
         \\          kind: :bin,
         \\          root: "{s}Test.main/1",
-        \\          paths: ["lib/**/*.zap", "test/**/*.zap"]
+        \\          paths: ["lib/**/*.zap", "test/**/*.zap"],
+        \\          optimize: :debug
         \\        }}
         \\      _ ->
         \\        panic("Unknown target: use '{s}' or 'test'")
@@ -427,15 +430,12 @@ fn buildTarget(
         std.process.exit(1);
     };
 
-    // Map build_opts to compilation settings
-    const optimize_mode: u8 = blk: {
-        if (config.build_opts.get("optimize")) |opt| {
-            if (std.mem.eql(u8, opt, "debug")) break :blk 0;
-            if (std.mem.eql(u8, opt, "release_safe")) break :blk 1;
-            if (std.mem.eql(u8, opt, "release_fast")) break :blk 2;
-            if (std.mem.eql(u8, opt, "release_small")) break :blk 3;
-        }
-        break :blk 1; // default: ReleaseSafe
+    // Map optimize mode from manifest
+    const optimize_mode: u8 = switch (config.optimize) {
+        .debug => 0,
+        .release_safe => 1,
+        .release_fast => 2,
+        .release_small => 3,
     };
 
     // Compile through ZIR backend (zig_lib_dir already resolved above)
