@@ -57,7 +57,7 @@ pub fn build(b: *std.Build) void {
     //
     // If neither case applies to you, feel free to delete the declaration you
     // don't need and to put everything under a single module.
-    const zig_compiler_lib_path = b.option([]const u8, "zig-compiler-lib", "Path to libzig_compiler.a") orelse "../zig/zig-out/lib/libzig_compiler.a";
+    const zig_compiler_lib_path = b.option([]const u8, "zap-compiler-lib", "Path to libzap_compiler.a") orelse "../zig/zig-out/lib/libzap_compiler.a";
 
     // Zig library directory — needed to create the embedded stdlib archive.
     // Auto-detected from ZIG_LIB_DIR, exe-relative, or well-known paths.
@@ -123,7 +123,7 @@ pub fn build(b: *std.Build) void {
             "clangSupport",                "clangInstallAPI",
         };
         for (clang_libs) |lib_name| {
-            exe.root_module.linkSystemLibrary(lib_name, .{});
+            exe.root_module.linkSystemLibrary(lib_name, .{ .preferred_link_mode = .static });
         }
 
         // LLD libraries
@@ -131,7 +131,7 @@ pub fn build(b: *std.Build) void {
             "lldMinGW", "lldELF", "lldCOFF", "lldWasm", "lldMachO", "lldCommon",
         };
         for (lld_libs) |lib_name| {
-            exe.root_module.linkSystemLibrary(lib_name, .{});
+            exe.root_module.linkSystemLibrary(lib_name, .{ .preferred_link_mode = .static });
         }
 
         // LLVM libraries (matching Zig 0.15.2 build.zig order)
@@ -202,7 +202,7 @@ pub fn build(b: *std.Build) void {
             "LLVMTargetParser",            "LLVMSupport",               "LLVMDemangle",
         };
         for (llvm_libs) |lib_name| {
-            exe.root_module.linkSystemLibrary(lib_name, .{});
+            exe.root_module.linkSystemLibrary(lib_name, .{ .preferred_link_mode = .static });
         }
 
         // System dependencies
