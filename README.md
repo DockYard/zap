@@ -32,35 +32,42 @@ Download the latest release tarball for your platform. Extract it — the archiv
 
 ### Build from source
 
-Zap links against a fork of the Zig compiler as a static library (`libzig_compiler.a`) with LLVM enabled. Building from source requires:
+Zap links against a fork of the Zig compiler (`libzap_compiler.a`) with LLVM enabled. Building from source requires:
 
 - **Zig 0.15.2** (install via [asdf](https://asdf-vm.com/), [zigup](https://github.com/marler8/zigup), or [ziglang.org](https://ziglang.org/download/))
-- **Pre-built `libzig_compiler.a`** for your platform (see [Releases](https://github.com/DockYard/zap/releases))
-- **LLVM 20 static libraries** for your platform (see [Releases](https://github.com/DockYard/zap/releases))
+- **Pre-built Zap compiler deps** for your platform (from the [Zig fork releases](https://github.com/DockYard/zig/releases))
 
-#### Quick build (with pre-built deps)
+#### 1. Download the deps
 
-Download `libzig_compiler.a` and the LLVM libs archive for your platform from the releases page, then:
+Download the `zap-deps` tarball for your platform from [DockYard/zig releases](https://github.com/DockYard/zig/releases/tag/v0.15.2-zap.1):
+
+| Platform | File |
+|---|---|
+| macOS Apple Silicon | `zap-deps-aarch64-macos-none.tar.xz` |
+| Linux arm64 | `zap-deps-aarch64-linux-gnu.tar.xz` |
+| Linux x86_64 | `zap-deps-x86_64-linux-gnu.tar.xz` |
+
+```sh
+# Example for macOS Apple Silicon
+curl -LO https://github.com/DockYard/zig/releases/download/v0.15.2-zap.1/zap-deps-aarch64-macos-none.tar.xz
+tar xJf zap-deps-aarch64-macos-none.tar.xz
+```
+
+#### 2. Clone and build Zap
 
 ```sh
 git clone https://github.com/DockYard/zap.git
 cd zap
 zig build \
-  -Dzig-compiler-lib=/path/to/libzig_compiler.a \
-  -Dllvm-lib-path=/path/to/llvm-libs/lib
-```
-
-If `libzig_compiler.a` is at the default path (`../zig/zig-out/lib/libzig_compiler.a`), you only need:
-
-```sh
-zig build -Dllvm-lib-path=/path/to/llvm-libs/lib
+  -Dzap-compiler-lib=../aarch64-macos-none/libzap_compiler.a \
+  -Dllvm-lib-path=../aarch64-macos-none/llvm-libs
 ```
 
 This produces the compiler binary at `zig-out/bin/zap`.
 
-#### Full build from source (building everything)
+#### Building the Zig fork from scratch
 
-If you want to build the Zig fork and LLVM from scratch, see [Building the Zig Fork](#building-the-zig-fork) below.
+If you want to build `libzap_compiler.a` and the LLVM libraries yourself instead of using the pre-built deps, see [Building the Zig Fork](#building-the-zig-fork) below.
 
 ### Create a project
 
