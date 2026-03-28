@@ -3,6 +3,8 @@
 zig-out/
 zap-out/
 .zap-cache/
+zap-deps/
+zap-deps-*.tar.xz
 .claude/
 .cog/
 .opencode/

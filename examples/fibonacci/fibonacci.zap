@@ -11,7 +11,7 @@ defmodule Fibonacci do
     fib(n - 1) + fib(n - 2)
   end
 
-  def main() do
+  def main() :: i64 do
     Fibonacci.fib(20)
   end
 end

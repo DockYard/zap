@@ -7,7 +7,7 @@ defmodule Pipes do
     x + 1
   end
 
-  def main() do
+  def main() :: i64 do
     5
     |> Pipes.double()
     |> Pipes.add_one()

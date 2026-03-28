@@ -2972,7 +2972,7 @@ test "HIR opaque typed params default to unique ownership" {
         \\defmodule Test do
         \\  opaque Handle = String
         \\
-        \\  def use(handle :: Handle) do
+        \\  def use(handle :: Handle) :: Handle do
         \\    handle
         \\  end
         \\end
@@ -3081,7 +3081,7 @@ test "HIR call args default to share mode" {
 test "HIR call args adopt function ownership modes" {
     const source =
         \\defmodule Test do
-        \\  def apply(f :: (String -> String), x :: String) do
+        \\  def apply(f :: (String -> String), x :: String) :: String do
         \\    f(x)
         \\  end
         \\end
@@ -3138,11 +3138,11 @@ test "HIR named calls use resolved parameter ownership" {
         \\defmodule Test do
         \\  opaque Handle = String
         \\
-        \\  def take(handle :: Handle) do
+        \\  def take(handle :: Handle) :: Handle do
         \\    handle
         \\  end
         \\
-        \\  def run(handle :: Handle) do
+        \\  def run(handle :: Handle) :: Handle do
         \\    take(handle)
         \\  end
         \\end

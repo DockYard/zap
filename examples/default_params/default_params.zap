@@ -16,7 +16,7 @@ defmodule Greeter do
 end
 
 defmodule DefaultParams do
-  def main() do
+  def main() :: String do
     # All defaults
     IO.puts(Http.request("https://example.com"))
 

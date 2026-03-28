@@ -2,7 +2,7 @@ pub const borrowed_closure_arg =
     \\defmodule Test do
     \\  opaque Handle = String
     \\
-    \\  def run(use_fn :: (borrowed Handle -> Handle), handle :: Handle) do
+    \\  def run(use_fn :: (borrowed Handle -> Handle), handle :: Handle) :: Handle do
     \\    use_fn(handle)
     \\  end
     \\end
@@ -12,7 +12,7 @@ pub const shared_closure_arg =
     \\defmodule Test do
     \\  opaque Handle = String
     \\
-    \\  def run(use_fn :: (shared Handle -> Handle), handle :: Handle) do
+    \\  def run(use_fn :: (shared Handle -> Handle), handle :: Handle) :: Handle do
     \\    use_fn(handle)
     \\  end
     \\end

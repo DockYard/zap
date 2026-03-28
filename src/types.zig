@@ -1516,11 +1516,18 @@ pub const TypeChecker = struct {
             }
         }
 
-        // Resolve return type
+        // Resolve return type — required for all functions
         const declared_return = if (clause.return_type) |rt|
             try self.resolveTypeExpr(rt)
-        else
-            TypeStore.UNKNOWN;
+        else blk: {
+            try self.addHardError(
+                "missing return type annotation",
+                clause.meta.span,
+                "this function has no return type",
+                "add a return type: `def name(params) :: ReturnType do`",
+            );
+            break :blk TypeStore.UNKNOWN;
+        };
 
         // Check refinement is Bool
         if (clause.refinement) |ref| {
@@ -2221,7 +2228,47 @@ pub const TypeChecker = struct {
             }
         }
 
-        // Non-var_ref callee (field access, lambda, etc.) — original path
+        // Module-qualified call: IO.puts(...) is a call with field_access callee
+        if (call.callee.* == .field_access) {
+            const fa = call.callee.field_access;
+            if (fa.object.* == .module_ref) {
+                // Look up the module's scope and resolve the function there
+                const mod_name = fa.object.module_ref.name;
+                for (self.graph.modules.items) |mod_entry| {
+                    if (mod_entry.name.parts.len == mod_name.parts.len) {
+                        var match = true;
+                        for (mod_entry.name.parts, mod_name.parts) |a, b| {
+                            if (a != b) {
+                                match = false;
+                                break;
+                            }
+                        }
+                        if (match) {
+                            if (try self.resolveFamilySignature(mod_entry.scope_id, fa.field, arity)) |signature| {
+                                for (call.args, 0..) |arg, idx| {
+                                    const arg_type = try self.inferExpr(arg);
+                                    if (idx < signature.params.len) {
+                                        const expected = signature.params[idx];
+                                        if (expected != TypeStore.UNKNOWN and arg_type != TypeStore.UNKNOWN and arg_type != TypeStore.ERROR and !self.store.typeEquals(arg_type, expected)) {
+                                            try self.addRichError(
+                                                try std.fmt.allocPrint(self.allocator, "argument {d} expects `{s}`, got `{s}`", .{ idx + 1, self.typeToString(expected), self.typeToString(arg_type) }),
+                                                arg.getMeta().span,
+                                                "argument type mismatch",
+                                                null,
+                                            );
+                                        }
+                                    }
+                                }
+                                return signature.return_type;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Non-var_ref callee (lambda, etc.) — original path
         const callee_type = try self.inferExpr(call.callee);
         if (callee_type != TypeStore.UNKNOWN and callee_type != TypeStore.ERROR) {
             const ct = self.store.getType(callee_type);
@@ -2640,7 +2687,7 @@ test "type check simple function" {
 test "type check literals" {
     const source =
         \\defmodule Test do
-        \\  def foo() do
+        \\  def foo() :: i64 do
         \\    42
         \\  end
         \\end
@@ -2668,7 +2715,7 @@ test "type check literals" {
 test "type check case expression" {
     const source =
         \\defmodule Test do
-        \\  def foo(x) do
+        \\  def foo(x) :: Nil do
         \\    case x do
         \\      {:ok, v} ->
         \\        v
@@ -2702,7 +2749,7 @@ test "type check arithmetic mismatch reported" {
     // String + i64 should produce a type error
     const source =
         \\defmodule Test do
-        \\  def bad() do
+        \\  def bad() :: i64 do
         \\    "hello" + 42
         \\  end
         \\end
@@ -2780,7 +2827,7 @@ test "type check if condition must be Bool" {
     // Using an integer as if condition should produce an error
     const source =
         \\defmodule Test do
-        \\  def bad() do
+        \\  def bad() :: i64 do
         \\    if 42 do
         \\      1
         \\    end
@@ -2928,7 +2975,7 @@ test "typed parameter records shared ownership metadata" {
 test "function ref inference defaults param ownerships to shared" {
     const source =
         \\defmodule Test do
-        \\  def main(args) do
+        \\  def main(args) :: (Nil -> Nil) do
         \\    Foo.main/1
         \\  end
         \\end
@@ -2950,6 +2997,9 @@ test "function ref inference defaults param ownerships to shared" {
     defer checker.deinit();
     try checker.checkProgram(&program);
 
+    for (checker.errors.items) |err| {
+        std.debug.print("ERR_MSG: [{s}]\n", .{err.message});
+    }
     try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
 
     const main_func = program.modules[0].items[0].function;
@@ -3166,11 +3216,11 @@ test "borrowed param annotation keeps binding usable after call" {
         \\defmodule Test do
         \\  opaque Handle = String
         \\
-        \\  def inspect(handle :: borrowed Handle) do
+        \\  def inspect(handle :: borrowed Handle) :: Nil do
         \\    nil
         \\  end
         \\
-        \\  def run(handle :: Handle) do
+        \\  def run(handle :: Handle) :: Handle do
         \\    inspect(handle)
         \\    handle
         \\  end
@@ -3455,8 +3505,8 @@ test "closure with borrowed capture may be locally invoked" {
         \\defmodule Test do
         \\  opaque Handle = String
         \\
-        \\  def make(handle :: borrowed Handle) do
-        \\    def use() do
+        \\  def make(handle :: borrowed Handle) :: Bool do
+        \\    def use() :: Bool do
         \\      handle == handle
         \\    end
         \\
@@ -3489,12 +3539,12 @@ test "closure with borrowed capture may be passed to known-safe callee" {
         \\defmodule Test do
         \\  opaque Handle = String
         \\
-        \\  def apply(f :: (borrowed Handle -> Bool), handle :: borrowed Handle) do
+        \\  def apply(f :: (borrowed Handle -> Bool), handle :: borrowed Handle) :: Bool do
         \\    f(handle)
         \\  end
         \\
-        \\  def make(handle :: borrowed Handle) do
-        \\    def use(h :: borrowed Handle) do
+        \\  def make(handle :: borrowed Handle) :: Bool do
+        \\    def use(h :: borrowed Handle) :: Bool do
         \\      h == handle
         \\    end
         \\

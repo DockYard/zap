@@ -541,9 +541,14 @@ pub const ZirDriver = struct {
     }
 
     fn emitFunction(self: *ZirDriver, func: ir.Function) !void {
-        // Detect main function: bare "main" or module-prefixed "__main"
-        const is_main = std.mem.eql(u8, func.name, "main") or
-            std.mem.endsWith(u8, func.name, "__main");
+        // Detect the entry point using the program's entry function ID.
+        // When multiple modules define main, only the one matching the
+        // manifest root is emitted as "main" in ZIR.
+        const is_main = if (self.program) |prog|
+            if (prog.entry) |entry_id| func.id == entry_id else false
+        else
+            std.mem.eql(u8, func.name, "main") or
+                std.mem.endsWith(u8, func.name, "__main");
 
         // In library mode, skip the main function.
         if (self.lib_mode and is_main) return;

@@ -15,11 +15,11 @@ pub const lib_io =
 
 pub const lib_kernel =
     \\defmodule Kernel do
-    \\  def inspect(value) do
+    \\  def inspect(value :: String) :: String do
     \\    :zig.inspect(value)
     \\  end
     \\
-    \\  defmacro if(condition, then_body) do
+    \\  defmacro if(condition, then_body) :: Nil do
     \\    quote do
     \\      case unquote(condition) do
     \\        true ->
@@ -30,7 +30,7 @@ pub const lib_kernel =
     \\    end
     \\  end
     \\
-    \\  defmacro if(condition, then_body, else_body) do
+    \\  defmacro if(condition, then_body, else_body) :: Nil do
     \\    quote do
     \\      case unquote(condition) do
     \\        true ->
@@ -41,7 +41,7 @@ pub const lib_kernel =
     \\    end
     \\  end
     \\
-    \\  defmacro unless(condition, body) do
+    \\  defmacro unless(condition, body) :: Nil do
     \\    quote do
     \\      if not unquote(condition) do
     \\        unquote(body)

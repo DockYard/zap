@@ -35,39 +35,25 @@ Download the latest release tarball for your platform. Extract it — the archiv
 Zap links against a fork of the Zig compiler (`libzap_compiler.a`) with LLVM enabled. Building from source requires:
 
 - **Zig 0.15.2** (install via [asdf](https://asdf-vm.com/), [zigup](https://github.com/marler8/zigup), or [ziglang.org](https://ziglang.org/download/))
-- **Pre-built Zap compiler deps** for your platform (from the [Zig fork releases](https://github.com/DockYard/zig/releases))
-
-#### 1. Download the deps
-
-Download the `zap-deps` tarball for your platform from [DockYard/zig releases](https://github.com/DockYard/zig/releases/tag/v0.15.2-zap.1):
-
-| Platform | File |
-|---|---|
-| macOS Apple Silicon | `zap-deps-aarch64-macos-none.tar.xz` |
-| Linux arm64 | `zap-deps-aarch64-linux-gnu.tar.xz` |
-| Linux x86_64 | `zap-deps-x86_64-linux-gnu.tar.xz` |
-
-```sh
-# Example for macOS Apple Silicon
-curl -LO https://github.com/DockYard/zig/releases/download/v0.15.2-zap.1/zap-deps-aarch64-macos-none.tar.xz
-tar xJf zap-deps-aarch64-macos-none.tar.xz
-```
-
-#### 2. Clone and build Zap
 
 ```sh
 git clone https://github.com/DockYard/zap.git
 cd zap
-zig build \
-  -Dzap-compiler-lib=../aarch64-macos-none/libzap_compiler.a \
-  -Dllvm-lib-path=../aarch64-macos-none/llvm-libs
+zig build setup    # Downloads pre-built deps for your platform
+zig build          # Builds the zap binary
 ```
 
 This produces the compiler binary at `zig-out/bin/zap`.
 
-#### Building the Zig fork from scratch
+`zig build setup` automatically downloads the correct `zap-deps` tarball for your platform (macOS Apple Silicon, Linux arm64, or Linux x86_64) from the [Zig fork releases](https://github.com/DockYard/zig/releases/tag/v0.15.2-zap.1). You can also pass custom paths if you have your own build of the Zig fork:
 
-If you want to build `libzap_compiler.a` and the LLVM libraries yourself instead of using the pre-built deps, see [Building the Zig Fork](#building-the-zig-fork) below.
+```sh
+zig build \
+  -Dzap-compiler-lib=path/to/libzap_compiler.a \
+  -Dllvm-lib-path=path/to/llvm-libs
+```
+
+To build `libzap_compiler.a` and the LLVM libraries yourself from scratch, see [Building the Zig Fork](#building-the-zig-fork) below.
 
 ### Create a project
 
@@ -88,11 +74,12 @@ my_app/
 ### Build and run
 
 ```sh
-zap build my_app    # Compile
-zap run my_app      # Compile and run
+zap build           # Compile (uses default target)
+zap run             # Compile and run
+zap run test        # Compile and run test target
 ```
 
-The binary is output to `zap-out/bin/my_app`.
+You can also specify a target explicitly: `zap build my_app`. The binary is output to `zap-out/bin/my_app`.
 
 ---
 
@@ -223,25 +210,38 @@ end
 
 ## Build Manifest
 
-Every Zap project has a `build.zap` that defines build targets:
+Every Zap project has a `build.zap` that defines build targets. Case branches delegate to private functions, and the `_default` catch-all selects the target used when no target name is passed to `zap build` or `zap run`:
 
 ```elixir
 defmodule MyApp.Builder do
   def manifest(env :: Zap.Env) :: Zap.Manifest do
     case env.target do
-      :my_app ->
-        %Zap.Manifest{
-          name: "my_app",
-          version: "0.1.0",
-          kind: :bin,
-          root: "MyApp.main/1",
-          paths: ["lib/**/*.zap"],
-          # :debug | :release_safe | :release_fast | :release_small
-          optimize: :release_safe
-        }
-      _ ->
-        panic("Unknown target")
+      :my_app -> my_app(env)
+      :test -> test(env)
+      _default -> my_app(env)
     end
+  end
+
+  defp my_app(env :: Zap.Env) :: Zap.Manifest do
+    %Zap.Manifest{
+      name: "my_app",
+      version: "0.1.0",
+      kind: :bin,
+      root: "MyApp.main/1",
+      paths: ["lib/**/*.zap"],
+      optimize: :release_safe
+    }
+  end
+
+  defp test(env :: Zap.Env) :: Zap.Manifest do
+    %Zap.Manifest{
+      name: "my_app_test",
+      version: "0.1.0",
+      kind: :bin,
+      root: "MyAppTest.main/1",
+      paths: ["lib/**/*.zap", "test/**/*.zap"],
+      optimize: :debug
+    }
   end
 end
 ```
@@ -344,9 +344,9 @@ Zap includes a fork of the Zig compiler as a static library. The compiler lowers
 ## CLI Reference
 
 ```
-zap init                    Create a new project in the current directory
-zap build <target>          Compile a target defined in build.zap
-zap run <target> [-- args]  Compile and run a target
+zap init                     Create a new project in the current directory
+zap build [target]           Compile a target defined in build.zap (defaults to :default)
+zap run [target] [-- args]   Compile and run a target (defaults to :default)
 ```
 
 ---
@@ -356,6 +356,12 @@ zap run <target> [-- args]  Compile and run a target
 ```sh
 # Run the full test suite
 zig build test
+
+# Download pre-built deps (first time only)
+zig build setup
+
+# Build the zap compiler
+zig build
 
 # Build and run an example
 cd examples/hello

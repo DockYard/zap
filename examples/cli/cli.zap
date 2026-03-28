@@ -9,15 +9,15 @@
 #   zap run cli
 
 defmodule Cli do
-  def main(["greet", name]) do
+  def main(["greet", name]) :: String do
     IO.puts("Hello, " <> name <> "!")
   end
 
-  def main(["version"]) do
+  def main(["version"]) :: String do
     IO.puts("zap-cli v0.1.0")
   end
 
-  def main(_) do
+  def main(_) :: String do
     IO.puts("Usage:")
     IO.puts("  cli greet <name>")
     IO.puts("  cli version")

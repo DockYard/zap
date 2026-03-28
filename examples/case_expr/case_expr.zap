@@ -10,7 +10,7 @@ defmodule CaseExpr do
     end
   end
 
-  def main() do
+  def main() :: String do
     CaseExpr.check({:ok, "hello"})
     |> IO.puts()
 

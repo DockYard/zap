@@ -230,7 +230,7 @@ pub fn extractManifestFromAST(
                 .function => |func| {
                     const name = parser.interner.get(func.name);
                     if (std.mem.eql(u8, name, "manifest") and func.clauses.len > 0 and func.clauses[0].params.len == 1) {
-                        return extractFromManifestBody(alloc, &parser.interner, func, target_name);
+                        return extractFromManifestBody(alloc, &parser.interner, func, target_name, mod.items);
                     }
                 },
                 else => {},
@@ -250,6 +250,7 @@ fn extractFromManifestBody(
     interner: *const zap.ast.StringInterner,
     func: *const zap.ast.FunctionDecl,
     target_name: []const u8,
+    mod_items: []const zap.ast.ModuleItem,
 ) !BuildConfig {
     // Walk all function clauses looking for:
     // 1. Case expressions on env.target with matching clause
@@ -258,7 +259,7 @@ fn extractFromManifestBody(
         for (clause.body) |stmt| {
             switch (stmt) {
                 .expr => |expr| {
-                    if (extractFromExpr(alloc, interner, expr, target_name)) |config| {
+                    if (extractFromExpr(alloc, interner, expr, target_name, mod_items)) |config| {
                         return config;
                     }
                     if (extractManifestFromStructExpr(alloc, interner, expr)) |config| {
@@ -281,22 +282,23 @@ fn extractFromExpr(
     interner: *const zap.ast.StringInterner,
     expr: *const zap.ast.Expr,
     target_name: []const u8,
+    mod_items: []const zap.ast.ModuleItem,
 ) ?BuildConfig {
     switch (expr.*) {
         .case_expr => |ce| {
-            // Walk case clauses looking for one whose pattern matches target_name
+            // First pass: look for exact atom match
             for (ce.clauses) |clause| {
-                if (clauseMatchesTarget(interner, clause, target_name)) {
-                    // Extract the manifest struct from this clause's body
-                    for (clause.body) |stmt| {
-                        switch (stmt) {
-                            .expr => |body_expr| {
-                                if (extractManifestFromStructExpr(alloc, interner, body_expr)) |config| {
-                                    return config;
-                                }
-                            },
-                            else => {},
-                        }
+                if (clauseMatchesAtom(interner, clause, target_name)) {
+                    if (extractFromClauseBody(alloc, interner, clause, mod_items)) |config| {
+                        return config;
+                    }
+                }
+            }
+            // Second pass: fall back to _default bind pattern
+            for (ce.clauses) |clause| {
+                if (clauseIsDefault(interner, clause)) {
+                    if (extractFromClauseBody(alloc, interner, clause, mod_items)) |config| {
+                        return config;
                     }
                 }
             }
@@ -305,7 +307,7 @@ fn extractFromExpr(
             for (blk.stmts) |stmt| {
                 switch (stmt) {
                     .expr => |e| {
-                        if (extractFromExpr(alloc, interner, e, target_name)) |config| {
+                        if (extractFromExpr(alloc, interner, e, target_name, mod_items)) |config| {
                             return config;
                         }
                     },
@@ -318,12 +320,33 @@ fn extractFromExpr(
     return null;
 }
 
-fn clauseMatchesTarget(
+fn extractFromClauseBody(
+    alloc: std.mem.Allocator,
+    interner: *const zap.ast.StringInterner,
+    clause: zap.ast.CaseClause,
+    mod_items: []const zap.ast.ModuleItem,
+) ?BuildConfig {
+    for (clause.body) |stmt| {
+        switch (stmt) {
+            .expr => |body_expr| {
+                if (extractManifestFromStructExpr(alloc, interner, body_expr)) |config| {
+                    return config;
+                }
+                if (extractManifestFromCallExpr(alloc, interner, body_expr, mod_items)) |config| {
+                    return config;
+                }
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn clauseMatchesAtom(
     interner: *const zap.ast.StringInterner,
     clause: zap.ast.CaseClause,
     target_name: []const u8,
 ) bool {
-    // Check if the clause's pattern is an atom literal matching target_name
     switch (clause.pattern.*) {
         .literal => |lit| {
             switch (lit) {
@@ -334,9 +357,65 @@ fn clauseMatchesTarget(
                 else => return false,
             }
         },
-        .wildcard => return false,
         else => return false,
     }
+}
+
+fn clauseIsDefault(
+    interner: *const zap.ast.StringInterner,
+    clause: zap.ast.CaseClause,
+) bool {
+    switch (clause.pattern.*) {
+        .bind => |bp| {
+            const bind_name = interner.get(bp.name);
+            return std.mem.eql(u8, bind_name, "_default");
+        },
+        else => return false,
+    }
+}
+
+fn extractManifestFromCallExpr(
+    alloc: std.mem.Allocator,
+    interner: *const zap.ast.StringInterner,
+    expr: *const zap.ast.Expr,
+    mod_items: []const zap.ast.ModuleItem,
+) ?BuildConfig {
+    switch (expr.*) {
+        .call => |ce| {
+            // Resolve the callee name from a var_ref (e.g., foo_bar(env))
+            switch (ce.callee.*) {
+                .var_ref => |vr| {
+                    const func_name = interner.get(vr.name);
+                    // Find the function in module items
+                    for (mod_items) |item| {
+                        const func = switch (item) {
+                            .function => |f| f,
+                            .priv_function => |f| f,
+                            else => continue,
+                        };
+                        if (std.mem.eql(u8, interner.get(func.name), func_name)) {
+                            // Extract manifest from this function's body
+                            for (func.clauses) |clause| {
+                                for (clause.body) |stmt| {
+                                    switch (stmt) {
+                                        .expr => |body_expr| {
+                                            if (extractManifestFromStructExpr(alloc, interner, body_expr)) |config| {
+                                                return config;
+                                            }
+                                        },
+                                        else => {},
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                else => {},
+            }
+        },
+        else => {},
+    }
+    return null;
 }
 
 fn extractManifestFromStructExpr(

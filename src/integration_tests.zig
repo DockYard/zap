@@ -241,7 +241,7 @@ test "example: hello world" {
 
     const source =
         \\defmodule Test do
-        \\  def main() do
+        \\  def main() :: String do
         \\    IO.puts("Hello, world!")
         \\  end
         \\end
@@ -264,7 +264,7 @@ test "IO.puts resolves to runtime println" {
 
     const source =
         \\defmodule Test do
-        \\  def main() do
+        \\  def main() :: String do
         \\    IO.puts("test output")
         \\  end
         \\end
@@ -282,7 +282,7 @@ test "bare println is not implicitly available" {
 
     const source =
         \\defmodule Test do
-        \\  def main() do
+        \\  def main() :: String do
         \\    println("should not resolve")
         \\  end
         \\end
@@ -315,7 +315,7 @@ test "example: factorial" {
         \\end
         \\
         \\defmodule Test do
-        \\  def main() do
+        \\  def main() :: i64 do
         \\    Factorial.factorial(10)
         \\  end
         \\end
@@ -353,7 +353,7 @@ test "example: fibonacci" {
         \\end
         \\
         \\defmodule Test do
-        \\  def main() do
+        \\  def main() :: i64 do
         \\    Fib.fib(20)
         \\  end
         \\end
@@ -394,7 +394,7 @@ test "example: math module" {
         \\end
         \\
         \\defmodule Test do
-        \\  def main() do
+        \\  def main() :: i64 do
         \\    Math.square(5)
         \\  end
         \\end
@@ -433,7 +433,7 @@ test "example: pattern matching" {
         \\end
         \\
         \\defmodule Test do
-        \\  def main() do
+        \\  def main() :: String do
         \\    Matcher.describe(:ok)
         \\  end
         \\end
@@ -468,7 +468,7 @@ test "example: multiline pipes" {
         \\end
         \\
         \\defmodule Test do
-        \\  def main() do
+        \\  def main() :: i64 do
         \\    5
         \\    |> Pipes.double()
         \\    |> Pipes.add_one()
@@ -508,7 +508,7 @@ test "example: type declarations" {
         \\end
         \\
         \\defmodule Test do
-        \\  def main() do
+        \\  def main() :: f64 do
         \\    Geometry.area({:circle, 5.0})
         \\  end
         \\end
@@ -533,7 +533,7 @@ test "all compiled output has required header" {
 
     const source =
         \\defmodule Test do
-        \\  def main() do
+        \\  def main() :: Nil do
         \\    nil
         \\  end
         \\end
@@ -634,7 +634,7 @@ test "tuple pattern destructuring" {
         \\end
         \\
         \\defmodule Test do
-        \\  def main() do
+        \\  def main() :: f64 do
         \\    Geometry.area({:circle, 5.0})
         \\  end
         \\end
@@ -730,7 +730,7 @@ test "case expression with tuple destructuring" {
 
     const source =
         \\defmodule Handler do
-        \\  def handle(result) do
+        \\  def handle(result) :: Nil do
         \\    case result do
         \\      {:ok, v} ->
         \\        v
@@ -757,7 +757,7 @@ test "case expression with bind pattern" {
 
     const source =
         \\defmodule Identity do
-        \\  def identity(x) do
+        \\  def identity(x) :: Nil do
         \\    case x do
         \\      v ->
         \\        v
@@ -894,7 +894,7 @@ test "nested tuple patterns decompose once" {
 
     const source =
         \\defmodule Processor do
-        \\  def process(x) do
+        \\  def process(x) :: Nil do
         \\    case x do
         \\      {:ok, {:data, v}} ->
         \\        v
@@ -928,7 +928,7 @@ test "case with tuple patterns checks struct type once" {
 
     const source =
         \\defmodule Handler do
-        \\  def handle(result) do
+        \\  def handle(result) :: Nil do
         \\    case result do
         \\      {:ok, v} ->
         \\        v
@@ -959,11 +959,11 @@ test "multi-clause function with tuple dispatch checks once" {
 
     const source =
         \\defmodule Handler do
-        \\  def handle({:ok, v}) do
+        \\  def handle({:ok, v}) :: Nil do
         \\    v
         \\  end
         \\
-        \\  def handle({:error, e}) do
+        \\  def handle({:error, e}) :: Nil do
         \\    e
         \\  end
         \\end
@@ -1132,7 +1132,7 @@ test "macro expansion: unless compiles through pipeline" {
 
     const source =
         \\defmodule Logic do
-        \\  defmacro unless(condition, body) do
+        \\  defmacro unless(condition, body) :: Nil do
         \\    quote do
         \\      if not unquote(condition) do
         \\        unquote(body)
@@ -1161,7 +1161,7 @@ test "macro expansion: expression substitution" {
 
     const source =
         \\defmodule Math do
-        \\  defmacro double(value) do
+        \\  defmacro double(value) :: Nil do
         \\    quote do
         \\      unquote(value) + unquote(value)
         \\    end
@@ -1244,7 +1244,7 @@ test "with expression desugars to nested case" {
 
     const source =
         \\defmodule Processor do
-        \\  def process(x) do
+        \\  def process(x) :: Nil do
         \\    with {:ok, a} <- x do
         \\      a
         \\    else
@@ -1317,7 +1317,7 @@ test "two modules with same function name don't collide" {
         \\end
         \\
         \\defmodule Test do
-        \\  def main() do
+        \\  def main() :: i64 do
         \\    A.calc(1)
         \\    B.calc(2)
         \\  end
@@ -1341,7 +1341,7 @@ test "bare inspect resolves to Kernel__inspect" {
 
     const source =
         \\defmodule Test do
-        \\  def main() do
+        \\  def main() :: String do
         \\    inspect(42)
         \\  end
         \\end
@@ -1366,7 +1366,7 @@ test "module-qualified call emits prefixed name" {
         \\end
         \\
         \\defmodule Test do
-        \\  def main() do
+        \\  def main() :: i64 do
         \\    Math.double(5)
         \\  end
         \\end
@@ -1396,7 +1396,7 @@ test "nested local def direct call compiles" {
         \\end
         \\
         \\defmodule Test do
-        \\  def main() do
+        \\  def main() :: i64 do
         \\    Foo.bar(4)
         \\  end
         \\end
@@ -1943,7 +1943,7 @@ test "source pipeline records reuse pairs for tagged tuple reconstruction after 
 
     const source =
         \\defmodule Handler do
-        \\  def handle(result) do
+        \\  def handle(result) :: Nil do
         \\    case result do
         \\      {:ok, v} -> {:ok, v}
         \\      {:error, e} -> {:error, e}
@@ -2057,8 +2057,8 @@ test "capturing closure with shared opaque capture emits retain and release help
         \\defmodule Foo do
         \\  opaque Handle = String
         \\
-        \\  def make(handle :: shared Handle) do
-        \\    def use() do
+        \\  def make(handle :: shared Handle) :: (-> Handle) do
+        \\    def use() :: Handle do
         \\      handle
         \\    end
         \\
@@ -2084,7 +2084,7 @@ test "shared opaque closure arg emits ARC retain and release" {
         \\defmodule Test do
         \\  opaque Handle = String
         \\
-        \\  def run(use_fn :: (shared Handle -> Handle), handle :: Handle) do
+        \\  def run(use_fn :: (shared Handle -> Handle), handle :: Handle) :: Handle do
         \\    use_fn(handle)
         \\  end
         \\end
@@ -2105,7 +2105,7 @@ test "borrowed opaque closure arg emits no ARC retain or release" {
         \\defmodule Test do
         \\  opaque Handle = String
         \\
-        \\  def run(use_fn :: (borrowed Handle -> Handle), handle :: Handle) do
+        \\  def run(use_fn :: (borrowed Handle -> Handle), handle :: Handle) :: Handle do
         \\    use_fn(handle)
         \\  end
         \\end
@@ -2126,12 +2126,12 @@ test "borrowed capturing closure passed to known-safe callee avoids heap env and
         \\defmodule Test do
         \\  opaque Handle = String
         \\
-        \\  def apply(f :: (borrowed Handle -> Bool), handle :: borrowed Handle) do
+        \\  def apply(f :: (borrowed Handle -> Bool), handle :: borrowed Handle) :: Bool do
         \\    f(handle)
         \\  end
         \\
-        \\  def make(handle :: borrowed Handle) do
-        \\    def use(h :: borrowed Handle) do
+        \\  def make(handle :: borrowed Handle) :: Bool do
+        \\    def use(h :: borrowed Handle) :: Bool do
         \\      h == handle
         \\    end
         \\
@@ -2161,7 +2161,7 @@ test "top-level main stays bare, module functions get prefixed" {
         \\end
         \\
         \\defmodule Test do
-        \\  def main() do
+        \\  def main() :: i64 do
         \\    Helper.helper(5)
         \\  end
         \\end
@@ -2442,7 +2442,7 @@ test "def main inside defmodule emits pub fn main" {
 
     const source =
         \\defmodule App do
-        \\  def main() do
+        \\  def main() :: i64 do
         \\    42
         \\  end
         \\end
@@ -2461,7 +2461,7 @@ test "binary pattern matching extracts bytes" {
 
     const source =
         \\defmodule Binary do
-        \\  def first_byte(<<a, _b, _c>>) do
+        \\  def first_byte(<<a, _b, _c>>) :: i64 do
         \\    a
         \\  end
         \\end
@@ -2479,7 +2479,7 @@ test "binary pattern with u16 type spec" {
 
     const source =
         \\defmodule Binary do
-        \\  def parse_port(<<port::u16>>) do
+        \\  def parse_port(<<port::u16>>) :: i64 do
         \\    port
         \\  end
         \\end
@@ -2496,7 +2496,7 @@ test "binary pattern with String rest" {
 
     const source =
         \\defmodule Binary do
-        \\  def parse_header(<<tag::u8, rest::String>>) do
+        \\  def parse_header(<<tag::u8, rest::String>>) :: {i64, String} do
         \\    {tag, rest}
         \\  end
         \\end
@@ -2514,7 +2514,7 @@ test "binary pattern with float extraction" {
 
     const source =
         \\defmodule Binary do
-        \\  def parse_coord(<<lat::f64, lon::f64>>) do
+        \\  def parse_coord(<<lat::f64, lon::f64>>) :: {f64, f64} do
         \\    {lat, lon}
         \\  end
         \\end
@@ -2532,7 +2532,7 @@ test "binary pattern with endianness" {
 
     const source =
         \\defmodule Binary do
-        \\  def parse_le(<<val::u32-little>>) do
+        \\  def parse_le(<<val::u32-little>>) :: i64 do
         \\    val
         \\  end
         \\end
@@ -2549,7 +2549,7 @@ test "binary pattern emits length check" {
 
     const source =
         \\defmodule Binary do
-        \\  def parse_port(<<port::u16>>) do
+        \\  def parse_port(<<port::u16>>) :: i64 do
         \\    port
         \\  end
         \\end
@@ -2567,7 +2567,7 @@ test "binary pattern with string prefix match" {
 
     const source =
         \\defmodule HTTP do
-        \\  def parse_method(<<"GET "::String, path::String>>) do
+        \\  def parse_method(<<"GET "::String, path::String>>) :: String do
         \\    path
         \\  end
         \\end
@@ -2586,7 +2586,7 @@ test "binary pattern sub-byte extraction" {
 
     const source =
         \\defmodule Flags do
-        \\  def parse_flags(<<syn::u1, ack::u1, fin::u1, _reserved::u5>>) do
+        \\  def parse_flags(<<syn::u1, ack::u1, fin::u1, _reserved::u5>>) :: {i64, i64, i64} do
         \\    {syn, ack, fin}
         \\  end
         \\end
@@ -2608,7 +2608,7 @@ test "binary pattern in case emits length check" {
     // Binary patterns in case expressions emit length checks via check_binary
     const source =
         \\defmodule Binary do
-        \\  def parse(data) do
+        \\  def parse(data) :: i64 do
         \\    case data do
         \\      <<_a, _b>> -> 1
         \\      _ -> 0
@@ -2680,7 +2680,7 @@ test "multiline struct literal parses correctly" {
         \\end
         \\
         \\defmodule Test do
-        \\  def main() do
+        \\  def main() :: User do
         \\    u = %{
         \\      name: "Alice",
         \\      age: 30
@@ -2710,7 +2710,7 @@ test "multi-parameter function uses distinct param indices" {
         \\end
         \\
         \\defmodule Test do
-        \\  def main() do
+        \\  def main() :: i64 do
         \\    Math.add(20, 22)
         \\  end
         \\end
@@ -2730,7 +2730,7 @@ test "multi-parameter function param_get indices in IR" {
 
     const source =
         \\defmodule Test do
-        \\  def add(a, b) do
+        \\  def add(a, b) :: i64 do
         \\    a + b
         \\  end
         \\end
@@ -2788,7 +2788,7 @@ test "top-level multi-param function called from main" {
         \\end
         \\
         \\defmodule Test do
-        \\  def main() do
+        \\  def main() :: String do
         \\    IO.puts(Adder.add(20, 22))
         \\  end
         \\end
@@ -2813,7 +2813,7 @@ test "three-parameter function uses all param indices" {
         \\end
         \\
         \\defmodule Test do
-        \\  def main() do
+        \\  def main() :: i64 do
         \\    Math.sum3(1, 2, 3)
         \\  end
         \\end
@@ -2940,7 +2940,7 @@ test "pipeline: multi-function program compiles cleanly" {
         \\end
         \\
         \\defmodule Test do
-        \\  def main() do
+        \\  def main() :: String do
         \\    IO.puts(Math.double(21))
         \\  end
         \\end
@@ -3152,7 +3152,7 @@ test "pipeline: complex program with closures, patterns, modules" {
         \\end
         \\
         \\defmodule Test do
-        \\  def main() do
+        \\  def main() :: String do
         \\    IO.puts(Math.factorial(10))
         \\  end
         \\end

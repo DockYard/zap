@@ -110,7 +110,7 @@ defmodule Dog extends Animal do
 end
 
 defmodule Demo do
-  def scalars() do
+  def scalars() :: String do
     IO.puts("=== Scalars ===")
     Scalars.int() |> Kernel.inspect()
     Scalars.negative() |> Kernel.inspect()
@@ -121,7 +121,7 @@ defmodule Demo do
     Scalars.hex() |> Kernel.inspect()
   end
 
-  def tuples() do
+  def tuples() :: String do
     IO.puts("=== Tuples ===")
     Tuples.pair() |> Kernel.inspect()
     Tuples.triple() |> Kernel.inspect()
@@ -129,19 +129,19 @@ defmodule Demo do
     Tuples.deep() |> Kernel.inspect()
   end
 
-  def structs() do
+  def structs() :: String do
     p = %{x: 3.0, y: 4.0} :: Point
     Kernel.inspect(p.x)
     Kernel.inspect(p.y)
   end
 
-  def enums() do
+  def enums() :: String do
     IO.puts("=== Enums ===")
     Kernel.inspect(Color.Red)
     Kernel.inspect(Direction.North)
   end
 
-  def inheritance() do
+  def inheritance() :: String do
     IO.puts("=== Inheritance ===")
     Dog.speak() |> IO.puts()
     Dog.breathe() |> IO.puts()
@@ -149,7 +149,7 @@ defmodule Demo do
 end
 
 defmodule Types do
-  def main() do
+  def main() :: String do
     Demo.scalars()
     Demo.tuples()
     IO.puts("=== Structs ===")

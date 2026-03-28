@@ -57,7 +57,7 @@ pub fn compileFrontend(
     var step: u32 = 0;
 
     if (options.show_progress) {
-        progress.print("Compiling {s}\n", .{file_path}) catch {};
+        progress.print("Compiling\n", .{}) catch {};
     }
 
     // Create shared DiagnosticEngine
@@ -67,7 +67,7 @@ pub fn compileFrontend(
 
     // Phase 1: Parse (with stdlib prepended)
     step += 1;
-    if (options.show_progress) progress.print("  [{d}/{d}] Parse\n", .{ step, total_steps }) catch {};
+    if (options.show_progress) progress.print("\r\x1b[K  [{d}/{d}] Parse", .{ step, total_steps }) catch {};
 
     const prepend_result = zap.stdlib.prependStdlib(alloc, source) catch
         return error.StdlibError;
@@ -89,6 +89,7 @@ pub fn compileFrontend(
                 .help = parse_err.help,
             }) catch {};
         }
+        if (options.show_progress) progress.print("\r\x1b[K", .{}) catch {};
         emitDiagnostics(&diag_engine, alloc);
         return error.ParseFailed;
     };
@@ -104,13 +105,14 @@ pub fn compileFrontend(
         }) catch {};
     }
     if (diag_engine.hasErrors()) {
+        if (options.show_progress) progress.print("\r\x1b[K", .{}) catch {};
         emitDiagnostics(&diag_engine, alloc);
         return error.ParseFailed;
     }
 
     // Phase 2: Collect declarations
     step += 1;
-    if (options.show_progress) progress.print("  [{d}/{d}] Collect\n", .{ step, total_steps }) catch {};
+    if (options.show_progress) progress.print("\r\x1b[K  [{d}/{d}] Collect", .{ step, total_steps }) catch {};
 
     var collector = zap.Collector.init(alloc, &parser.interner);
     defer collector.deinit();
@@ -118,6 +120,7 @@ pub fn compileFrontend(
         for (collector.errors.items) |collect_err| {
             diag_engine.err(collect_err.message, collect_err.span) catch {};
         }
+        if (options.show_progress) progress.print("\r\x1b[K", .{}) catch {};
         emitDiagnostics(&diag_engine, alloc);
         return error.CollectFailed;
     };
@@ -126,13 +129,14 @@ pub fn compileFrontend(
         diag_engine.err(collect_err.message, collect_err.span) catch {};
     }
     if (diag_engine.hasErrors()) {
+        if (options.show_progress) progress.print("\r\x1b[K", .{}) catch {};
         emitDiagnostics(&diag_engine, alloc);
         return error.CollectFailed;
     }
 
     // Phase 3: Macro expansion
     step += 1;
-    if (options.show_progress) progress.print("  [{d}/{d}] Expand macros\n", .{ step, total_steps }) catch {};
+    if (options.show_progress) progress.print("\r\x1b[K  [{d}/{d}] Expand macros", .{ step, total_steps }) catch {};
 
     var macro_engine = zap.MacroEngine.init(alloc, &parser.interner, &collector.graph);
     defer macro_engine.deinit();
@@ -140,6 +144,7 @@ pub fn compileFrontend(
         for (macro_engine.errors.items) |macro_err| {
             diag_engine.err(macro_err.message, macro_err.span) catch {};
         }
+        if (options.show_progress) progress.print("\r\x1b[K", .{}) catch {};
         emitDiagnostics(&diag_engine, alloc);
         return error.MacroExpansionFailed;
     };
@@ -148,24 +153,26 @@ pub fn compileFrontend(
         diag_engine.err(macro_err.message, macro_err.span) catch {};
     }
     if (diag_engine.hasErrors()) {
+        if (options.show_progress) progress.print("\r\x1b[K", .{}) catch {};
         emitDiagnostics(&diag_engine, alloc);
         return error.MacroExpansionFailed;
     }
 
     // Phase 4: Desugaring
     step += 1;
-    if (options.show_progress) progress.print("  [{d}/{d}] Desugar\n", .{ step, total_steps }) catch {};
+    if (options.show_progress) progress.print("\r\x1b[K  [{d}/{d}] Desugar", .{ step, total_steps }) catch {};
 
     var desugarer = zap.Desugarer.init(alloc, &parser.interner);
     const desugared_program = desugarer.desugarProgram(&expanded_program) catch {
         diag_engine.err("Error during desugaring", .{ .start = 0, .end = 0 }) catch {};
+        if (options.show_progress) progress.print("\r\x1b[K", .{}) catch {};
         emitDiagnostics(&diag_engine, alloc);
         return error.DesugarFailed;
     };
 
     // Phase 5: Type checking
     step += 1;
-    if (options.show_progress) progress.print("  [{d}/{d}] Type check\n", .{ step, total_steps }) catch {};
+    if (options.show_progress) progress.print("\r\x1b[K  [{d}/{d}] Type check", .{ step, total_steps }) catch {};
 
     var type_checker = zap.types.TypeChecker.init(alloc, &parser.interner, &collector.graph);
     defer type_checker.deinit();
@@ -177,7 +184,7 @@ pub fn compileFrontend(
 
     // Phase 6: HIR lowering
     step += 1;
-    if (options.show_progress) progress.print("  [{d}/{d}] HIR\n", .{ step, total_steps }) catch {};
+    if (options.show_progress) progress.print("\r\x1b[K  [{d}/{d}] HIR", .{ step, total_steps }) catch {};
 
     var hir_builder = zap.hir.HirBuilder.init(alloc, &parser.interner, &collector.graph, &type_checker.store);
     defer hir_builder.deinit();
@@ -185,6 +192,7 @@ pub fn compileFrontend(
         for (hir_builder.errors.items) |hir_err| {
             diag_engine.err(hir_err.message, hir_err.span) catch {};
         }
+        if (options.show_progress) progress.print("\r\x1b[K", .{}) catch {};
         emitDiagnostics(&diag_engine, alloc);
         return error.HirFailed;
     };
@@ -193,28 +201,31 @@ pub fn compileFrontend(
         diag_engine.err(hir_err.message, hir_err.span) catch {};
     }
     if (diag_engine.hasErrors()) {
+        if (options.show_progress) progress.print("\r\x1b[K", .{}) catch {};
         emitDiagnostics(&diag_engine, alloc);
         return error.HirFailed;
     }
 
     // Phase 7: IR lowering
     step += 1;
-    if (options.show_progress) progress.print("  [{d}/{d}] IR\n", .{ step, total_steps }) catch {};
+    if (options.show_progress) progress.print("\r\x1b[K  [{d}/{d}] IR", .{ step, total_steps }) catch {};
 
     var ir_builder = zap.ir.IrBuilder.init(alloc, &parser.interner);
     ir_builder.type_store = &type_checker.store;
     defer ir_builder.deinit();
     var ir_program = ir_builder.buildProgram(&hir_program) catch {
         diag_engine.err("Error during IR lowering", .{ .start = 0, .end = 0 }) catch {};
+        if (options.show_progress) progress.print("\r\x1b[K", .{}) catch {};
         emitDiagnostics(&diag_engine, alloc);
         return error.IrFailed;
     };
 
     step += 1;
-    if (options.show_progress) progress.print("  [{d}/{d}] Escape analysis\n", .{ step, total_steps }) catch {};
+    if (options.show_progress) progress.print("\r\x1b[K  [{d}/{d}] Escape analysis", .{ step, total_steps }) catch {};
 
     var pipeline_result = zap.analysis_pipeline.runAnalysisPipeline(alloc, &ir_program) catch {
         diag_engine.err("Error during escape analysis", .{ .start = 0, .end = 0 }) catch {};
+        if (options.show_progress) progress.print("\r\x1b[K", .{}) catch {};
         emitDiagnostics(&diag_engine, alloc);
         return error.IrFailed;
     };
@@ -243,15 +254,18 @@ pub fn compileFrontend(
         }) catch {};
     }
     if (diag_engine.hasErrors()) {
+        if (options.show_progress) progress.print("\r\x1b[K", .{}) catch {};
         emitDiagnostics(&diag_engine, alloc);
         return error.TypeCheckFailed;
     }
 
     // Emit any accumulated warnings
     if (diag_engine.warningCount() > 0) {
+        if (options.show_progress) progress.print("\r\x1b[K", .{}) catch {};
         emitDiagnostics(&diag_engine, alloc);
     }
 
+    if (options.show_progress) progress.print("\r\x1b[K", .{}) catch {};
     return .{ .ir_program = ir_program, .analysis_context = pipeline_result.context };
 }
 
@@ -270,7 +284,7 @@ pub fn compileToNative(
 
     const progress = std.fs.File.stderr().deprecatedWriter();
     if (frontend_opts.show_progress) {
-        progress.print("  [8/10] ZIR\n", .{}) catch {};
+        progress.print("\r\x1b[K  [8/10] ZIR", .{}) catch {};
     }
 
     var opts = backend_opts;
@@ -280,8 +294,8 @@ pub fn compileToNative(
     try zap.zir_backend.compile(alloc, result.ir_program, opts);
 
     if (frontend_opts.show_progress) {
-        progress.print("  [9/10] Sema + Codegen\n", .{}) catch {};
-        progress.print("  [10/10] Linked {s}\n", .{output_path}) catch {};
+        progress.print("\r\x1b[K  [9/10] Sema + Codegen", .{}) catch {};
+        progress.print("\r\x1b[K  [10/10] Linked {s}\n", .{output_path}) catch {};
     }
 }
 

@@ -11,7 +11,7 @@ defmodule Math do
 end
 
 defmodule DoubleMacro do
-  def main() do
+  def main() :: String do
     Math.compute(5)
     |> Kernel.inspect()
   end

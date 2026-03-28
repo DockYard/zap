@@ -25,7 +25,7 @@ defmodule PatternMatch do
 end
 
 defmodule PatternMatching do
-  def main() do
+  def main() :: String do
     PatternMatch.describe(:ok)
     |> IO.puts()
 

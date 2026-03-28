@@ -5,7 +5,7 @@ defmodule UnlessMacro do
     unless(x > 10, "small number")
   end
 
-  def main() do
+  def main() :: String do
     UnlessMacro.check(5)!
     |> IO.puts()
   end

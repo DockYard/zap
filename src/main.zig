@@ -42,8 +42,8 @@ fn printUsage() void {
         \\Usage: zap <command> [options]
         \\
         \\Commands:
-        \\  build <target>    Build the specified target
-        \\  run <target>      Build and run the specified bin target
+        \\  build [target]    Build the specified target (defaults to :default)
+        \\  run [target]      Build and run the specified bin target (defaults to :default)
         \\  init              Scaffold a new project in the current directory
         \\
         \\Options:
@@ -52,7 +52,8 @@ fn printUsage() void {
         \\  -- <args...>      Pass arguments to the program (run only)
         \\
         \\Examples:
-        \\  zap build my_app
+        \\  zap build
+        \\  zap run
         \\  zap build my_app -Doptimize=release_fast
         \\  zap run my_app -- arg1 arg2
         \\  zap init
@@ -68,15 +69,11 @@ fn cmdBuild(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var parsed = try parseTargetArgs(allocator, args);
     defer parsed.deinit(allocator);
 
-    if (parsed.target == null) {
-        const stderr = std.fs.File.stderr().deprecatedWriter();
-        try stderr.print("Error: zap build requires a target name\n\nUsage: zap build <target> [-Dkey=value...]\n", .{});
-        std.process.exit(1);
-    }
+    const target = parsed.target orelse "default";
 
     const project_root = try discoverBuildFile(allocator, parsed.build_file);
     defer allocator.free(project_root);
-    const output_path = try buildTarget(allocator, project_root, parsed.target.?, parsed.build_opts);
+    const output_path = try buildTarget(allocator, project_root, target, parsed.build_opts);
     allocator.free(output_path);
 }
 
@@ -88,15 +85,11 @@ fn cmdRun(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var parsed = try parseTargetArgs(allocator, args);
     defer parsed.deinit(allocator);
 
-    if (parsed.target == null) {
-        const stderr = std.fs.File.stderr().deprecatedWriter();
-        try stderr.print("Error: zap run requires a target name\n\nUsage: zap run <target> [-Dkey=value...] [-- program-args...]\n", .{});
-        std.process.exit(1);
-    }
+    const target = parsed.target orelse "default";
 
     const project_root = try discoverBuildFile(allocator, parsed.build_file);
     defer allocator.free(project_root);
-    const output_path = try buildTarget(allocator, project_root, parsed.target.?, parsed.build_opts);
+    const output_path = try buildTarget(allocator, project_root, target, parsed.build_opts);
     defer allocator.free(output_path);
 
     // Run the built binary
@@ -158,17 +151,17 @@ fn cmdInit(allocator: std.mem.Allocator) !void {
         \\
         \\## Build
         \\
-        \\    zap build {s}
+        \\    zap build
         \\
         \\## Run
         \\
-        \\    zap run {s}
+        \\    zap run
         \\
         \\## Test
         \\
         \\    zap run test
         \\
-    , .{ project_name, project_name, project_name });
+    , .{project_name});
     defer allocator.free(readme);
     try writeFile("README.md", readme);
 
@@ -177,32 +170,37 @@ fn cmdInit(allocator: std.mem.Allocator) !void {
         \\defmodule {s}.Builder do
         \\  def manifest(env :: Zap.Env) :: Zap.Manifest do
         \\    case env.target do
-        \\      :{s} ->
-        \\        %Zap.Manifest{{
-        \\          name: "{s}",
-        \\          version: "0.1.0",
-        \\          kind: :bin,
-        \\          root: "{s}.main/1",
-        \\          paths: ["lib/**/*.zap"],
-        \\          # :debug | :release_safe | :release_fast | :release_small
-        \\          optimize: :release_safe
-        \\        }}
-        \\      :test ->
-        \\        %Zap.Manifest{{
-        \\          name: "{s}_test",
-        \\          version: "0.1.0",
-        \\          kind: :bin,
-        \\          root: "{s}Test.main/1",
-        \\          paths: ["lib/**/*.zap", "test/**/*.zap"],
-        \\          optimize: :debug
-        \\        }}
-        \\      _ ->
-        \\        panic("Unknown target: use '{s}' or 'test'")
+        \\      :{s} -> {s}(env)
+        \\      :test -> test(env)
+        \\      _default -> {s}(env)
         \\    end
+        \\  end
+        \\
+        \\  defp {s}(env :: Zap.Env) :: Zap.Manifest do
+        \\    %Zap.Manifest{{
+        \\      name: "{s}",
+        \\      version: "0.1.0",
+        \\      kind: :bin,
+        \\      root: "{s}.main/1",
+        \\      paths: ["lib/**/*.zap"],
+        \\      # :debug | :release_safe | :release_fast | :release_small
+        \\      optimize: :release_safe
+        \\    }}
+        \\  end
+        \\
+        \\  defp test(env :: Zap.Env) :: Zap.Manifest do
+        \\    %Zap.Manifest{{
+        \\      name: "{s}_test",
+        \\      version: "0.1.0",
+        \\      kind: :bin,
+        \\      root: "{s}Test.main/1",
+        \\      paths: ["lib/**/*.zap", "test/**/*.zap"],
+        \\      optimize: :debug
+        \\    }}
         \\  end
         \\end
         \\
-    , .{ module_name, project_name, project_name, module_name, project_name, module_name, project_name });
+    , .{ module_name, project_name, project_name, project_name, project_name, project_name, module_name, project_name, module_name });
     defer allocator.free(build_zap);
     try writeFile("build.zap", build_zap);
 
@@ -235,7 +233,7 @@ fn cmdInit(allocator: std.mem.Allocator) !void {
     try writeFile(test_path, test_source);
 
     const stdout = std.fs.File.stdout().deprecatedWriter();
-    try stdout.print("Created project '{s}'\n\n  zap build {s}\n  zap run {s}\n  zap run test\n", .{ project_name, project_name, project_name });
+    try stdout.print("Created project '{s}'\n\n  zap build\n  zap run\n  zap run test\n", .{project_name});
 }
 
 // ---------------------------------------------------------------------------
@@ -424,11 +422,38 @@ fn buildTarget(
     const lib_mode = config.kind == .lib;
 
     // Compile through frontend
-    const result = compiler.compileFrontend(alloc, merged_source, source_files.items[0], .{
+    var result = compiler.compileFrontend(alloc, merged_source, source_files.items[0], .{
         .lib_mode = lib_mode,
     }) catch {
         std.process.exit(1);
     };
+
+    // Resolve the manifest root (e.g. "FooBar.main/1") to an IR function ID
+    // so the ZIR backend knows which function is the entry point.
+    if (config.root) |root| {
+        // Strip arity suffix: "FooBar.main/1" -> "FooBar.main"
+        const without_arity = if (std.mem.lastIndexOfScalar(u8, root, '/')) |slash|
+            root[0..slash]
+        else
+            root;
+        // Convert dots to double underscores: "FooBar.main" -> "FooBar__main"
+        var mangled: std.ArrayListUnmanaged(u8) = .empty;
+        var i: usize = 0;
+        while (i < without_arity.len) : (i += 1) {
+            if (without_arity[i] == '.') {
+                mangled.appendSlice(alloc, "__") catch break;
+            } else {
+                mangled.append(alloc, without_arity[i]) catch break;
+            }
+        }
+        const mangled_name = mangled.items;
+        for (result.ir_program.functions) |func| {
+            if (std.mem.eql(u8, func.name, mangled_name)) {
+                result.ir_program.entry = func.id;
+                break;
+            }
+        }
+    }
 
     // Map optimize mode from manifest
     const optimize_mode: u8 = switch (config.optimize) {
