@@ -4,4 +4,5 @@ defstruct Zap.Manifest do
   kind :: Atom
   root :: String = ""
   asset_name :: String = ""
+  deps :: List({Atom, {Atom, String}}) = []
 end

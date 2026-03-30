@@ -85,11 +85,20 @@ You can also specify a target explicitly: `zap build my_app`. The binary is outp
 
 ## The Language
 
-### Modules and Functions
+### Modules and Files
 
-All functions must be defined inside a module. Modules group related functions. Functions declare types at the boundary and infer everything inside.
+Every `.zap` file contains exactly one module. The module name maps to the file path:
+
+| Module name | File path |
+|---|---|
+| `App` | `lib/app.zap` |
+| `Config.Parser` | `lib/config/parser.zap` |
+| `JsonParser` | `lib/json_parser.zap` |
+
+The compiler enforces this — a mismatch is a compile error. The compiler discovers files by following module references from the entry point. No glob patterns or file manifests needed.
 
 ```elixir
+# lib/math.zap
 defmodule Math do
   def square(x :: i64) :: i64 do
     x * x
@@ -100,6 +109,13 @@ defmodule Math do
   end
 end
 ```
+
+### Visibility
+
+- `def` / `defmacro` — public function/macro
+- `defp` / `defmacrop` — private to the module (file)
+- `defmodule` — public module
+- `defmodulep` — private module (visible within the dep, invisible outside)
 
 ### Entry Point
 
@@ -210,41 +226,27 @@ end
 
 ## Build Manifest
 
-Every Zap project has a `build.zap` that defines build targets. Case branches delegate to private functions, and the `_default` catch-all selects the target used when no target name is passed to `zap build` or `zap run`:
+Every Zap project has a `build.zap` that defines build targets:
 
 ```elixir
 defmodule MyApp.Builder do
   def manifest(env :: Zap.Env) :: Zap.Manifest do
     case env.target do
-      :my_app -> my_app(env)
-      :test -> test(env)
-      _default -> my_app(env)
+      :my_app ->
+        %Zap.Manifest{
+          name: "my_app",
+          version: "0.1.0",
+          kind: :bin,
+          root: "MyApp.main/0"
+        }
+      _ ->
+        panic("Unknown target")
     end
-  end
-
-  defp my_app(env :: Zap.Env) :: Zap.Manifest do
-    %Zap.Manifest{
-      name: "my_app",
-      version: "0.1.0",
-      kind: :bin,
-      root: "MyApp.main/1",
-      paths: ["lib/**/*.zap"],
-      optimize: :release_safe
-    }
-  end
-
-  defp test(env :: Zap.Env) :: Zap.Manifest do
-    %Zap.Manifest{
-      name: "my_app_test",
-      version: "0.1.0",
-      kind: :bin,
-      root: "MyAppTest.main/1",
-      paths: ["lib/**/*.zap", "test/**/*.zap"],
-      optimize: :debug
-    }
   end
 end
 ```
+
+When `root` is specified and `paths` is omitted, the compiler uses import-driven discovery — it starts from the entry module and follows module references to find all source files automatically.
 
 | Field | Description |
 |---|---|
@@ -252,8 +254,39 @@ end
 | `version` | Project version |
 | `kind` | `:bin`, `:lib`, or `:obj` |
 | `root` | Entry point as `"Module.function/arity"` |
-| `paths` | Glob patterns for source files (relative to `build.zap`) |
+| `deps` | List of dependency tuples |
 | `optimize` | `:debug`, `:release_safe`, `:release_fast`, or `:release_small` |
+
+### Dependencies
+
+Dependencies are declared in the manifest as tuples:
+
+```elixir
+%Zap.Manifest{
+  name: "my_app",
+  version: "0.1.0",
+  kind: :bin,
+  root: "App.main/0",
+  deps: [
+    {:shared_utils, {:path, "../shared_utils"}},
+    {:json_parser, {:git, "https://github.com/someone/json_parser.zap", "v1.0.0"}}
+  ]
+}
+```
+
+| Source type | Format | Description |
+|---|---|---|
+| Path | `{:name, {:path, "dir"}}` | Local Zap library |
+| Git | `{:name, {:git, "url", "ref"}}` | Remote Zap library |
+
+Zap dependencies are first-class — their modules are available directly (`JsonParser.parse(data)`). The compiler discovers dep modules the same way it discovers project modules.
+
+A `zap.lock` lockfile is generated automatically on first build and records resolved versions for reproducible builds.
+
+```sh
+zap deps update         # Re-resolve all dependencies
+zap deps update <name>  # Re-resolve a single dependency
+```
 
 ---
 
@@ -300,43 +333,50 @@ end
 
 ## Architecture
 
-Zap includes a fork of the Zig compiler as a static library. The compiler lowers Zap IR to ZIR (Zig Intermediate Representation), then Zig's semantic analysis, LLVM code generation, and linker produce native binaries. No intermediate Zig source code is generated during normal compilation.
+Zap uses a per-file compilation architecture:
+
+1. **Discovery** — start from the entry point, follow module references to find files
+2. **Pass 1** — parse all files, collect declarations into a shared scope graph
+3. **Pass 2** — compile each file: macro expand, desugar, type check, HIR, IR
+4. **Pass 3** — merge IR, run analysis pipeline (escape analysis, interprocedural summaries, region solving, lambda sets, Perceus reuse), emit ZIR
+
+The compiler includes a fork of the Zig compiler as a static library. Zap IR lowers to ZIR (Zig Intermediate Representation), then Zig's semantic analysis, LLVM code generation, and linker produce native binaries.
 
 ```
-  .zap source
+  .zap source files
       |
       v
-   Lexer ----------- tokenize with indent/dedent tracking
+   Discovery -------- follow module references from entry point
       |
       v
-   Parser ---------- surface AST
+   Parse ------------ per-file ASTs
       |
       v
-   Collector ------- register modules and functions
+   Collect ---------- shared scope graph + type store
       |
       v
-   Macro Expansion - AST->AST transforms to fixed point
+   Macro Expansion -- AST->AST transforms
       |
       v
-   Desugar --------- simplify syntax before type checking
+   Desugar ---------- simplify syntax
       |
       v
-   Type Checker ---- overload resolution + inference
+   Type Check ------- overload resolution + inference
       |
       v
-   HIR Lowering ---- typed intermediate representation
+   HIR Lowering ----- typed intermediate representation
       |
       v
-   IR Lowering ----- lower-level IR closer to Zig semantics
+   IR Lowering ------ lower-level IR
       |
       v
-   ZIR Emit -------- emit Zig Intermediate Representation
+   Analysis --------- escape, regions, lambda sets, Perceus
       |
       v
-   Sema ------------ Zig semantic analysis (via LLVM)
+   ZIR Emit --------- Zig Intermediate Representation
       |
       v
-   Codegen --------- native binary
+   Codegen ---------- native binary (via LLVM)
 ```
 
 ---
@@ -347,6 +387,7 @@ Zap includes a fork of the Zig compiler as a static library. The compiler lowers
 zap init                     Create a new project in the current directory
 zap build [target]           Compile a target defined in build.zap (defaults to :default)
 zap run [target] [-- args]   Compile and run a target (defaults to :default)
+zap deps update [name]       Re-resolve dependencies and rewrite zap.lock
 ```
 
 ---

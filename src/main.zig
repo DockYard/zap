@@ -29,6 +29,8 @@ pub fn main() !void {
         try cmdRun(allocator, args[2..]);
     } else if (std.mem.eql(u8, command, "init")) {
         try cmdInit(allocator);
+    } else if (std.mem.eql(u8, command, "deps")) {
+        try cmdDeps(allocator, args[2..]);
     } else {
         const stderr = std.fs.File.stderr().deprecatedWriter();
         try stderr.print("Error: unknown command: {s}\n\nRun 'zap --help' for usage.\n", .{command});
@@ -45,6 +47,8 @@ fn printUsage() void {
         \\  build [target]    Build the specified target (defaults to :default)
         \\  run [target]      Build and run the specified bin target (defaults to :default)
         \\  init              Scaffold a new project in the current directory
+        \\  deps update       Re-resolve all dependencies and rewrite zap.lock
+        \\  deps update <name> Re-resolve a single dependency
         \\
         \\Options:
         \\  -Dkey=value       Pass build option to the builder
@@ -99,6 +103,101 @@ fn cmdRun(allocator: std.mem.Allocator, args: []const []const u8) !void {
         std.process.exit(1);
     };
     std.process.exit(exit_code);
+}
+
+// ---------------------------------------------------------------------------
+// Command: init
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Command: deps
+// ---------------------------------------------------------------------------
+
+fn cmdDeps(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    const stderr_w = std.fs.File.stderr().deprecatedWriter();
+
+    if (args.len == 0) {
+        try stderr_w.print("Usage: zap deps update [name]\n", .{});
+        std.process.exit(1);
+    }
+
+    if (!std.mem.eql(u8, args[0], "update")) {
+        try stderr_w.print("Error: unknown deps command: {s}\n\nUsage: zap deps update [name]\n", .{args[0]});
+        std.process.exit(1);
+    }
+
+    const specific_dep: ?[]const u8 = if (args.len >= 2) args[1] else null;
+
+    const project_root = try discoverBuildFile(allocator, null);
+    const build_file_path = try std.fs.path.join(allocator, &.{ project_root, "build.zap" });
+    const build_source = std.fs.cwd().readFileAlloc(allocator, build_file_path, 10 * 1024 * 1024) catch {
+        try stderr_w.print("Error: could not read build.zap\n", .{});
+        std.process.exit(1);
+    };
+
+    const config = zap.builder.extractManifestFromAST(allocator, build_source, "default") catch {
+        try stderr_w.print("Error: could not parse build.zap manifest\n", .{});
+        std.process.exit(1);
+    };
+
+    var lock_entries: std.ArrayListUnmanaged(zap.lockfile.LockEntry) = .empty;
+
+    for (config.deps) |dep| {
+        // If specific dep requested, skip others
+        if (specific_dep) |name| {
+            if (!std.mem.eql(u8, dep.name, name)) {
+                // Keep existing lock entry for skipped deps
+                if (zap.lockfile.readLockfile(allocator, project_root)) |existing| {
+                    if (zap.lockfile.findEntry(existing, dep.name)) |entry| {
+                        try lock_entries.append(allocator, entry);
+                    }
+                }
+                continue;
+            }
+        }
+
+        switch (dep.source) {
+            .path => |dep_path| {
+                try lock_entries.append(allocator, .{
+                    .name = dep.name,
+                    .source_type = "path",
+                    .url = dep_path,
+                    .resolved_ref = "-",
+                    .commit = "-",
+                    .integrity = "-",
+                });
+                try stderr_w.print("  {s}: path dep (not locked)\n", .{dep.name});
+            },
+            .git => |git| {
+                const ref = git.tag orelse git.branch orelse git.rev;
+                try stderr_w.print("  {s}: fetching from {s}...\n", .{ dep.name, git.url });
+
+                const result = zap.lockfile.fetchGitDep(
+                    allocator,
+                    dep.name,
+                    git.url,
+                    ref,
+                    null, // force re-fetch by not passing locked commit
+                ) catch {
+                    try stderr_w.print("Error: failed to fetch dep `{s}`\n", .{dep.name});
+                    std.process.exit(1);
+                };
+
+                try lock_entries.append(allocator, .{
+                    .name = dep.name,
+                    .source_type = "git",
+                    .url = git.url,
+                    .resolved_ref = ref orelse "-",
+                    .commit = result.commit,
+                    .integrity = result.integrity,
+                });
+                try stderr_w.print("  {s}: resolved to {s}\n", .{ dep.name, result.commit });
+            },
+        }
+    }
+
+    try zap.lockfile.writeLockfile(allocator, project_root, lock_entries.items);
+    try stderr_w.print("Updated zap.lock\n", .{});
 }
 
 // ---------------------------------------------------------------------------
@@ -351,15 +450,223 @@ fn buildTarget(
         };
     };
 
-    // Scan source files from manifest path globs
+    // Discover source files — either via import-driven discovery from the
+    // entry point (when paths is empty) or via glob patterns (legacy).
     var source_files: std.ArrayListUnmanaged([]const u8) = .empty;
-    for (config.paths) |pattern| {
-        try globCollectFiles(alloc, project_root, pattern, &source_files);
+    // Source roots for import-driven discovery (populated below, used by validation)
+    var source_roots: std.ArrayListUnmanaged(zap.discovery.SourceRoot) = .empty;
+
+    if (config.paths.len == 0 and config.root != null) {
+        // Import-driven discovery from the entry point
+        const root_spec = config.root.?;
+
+        // Extract module name from root spec: "App.main/0" → "App"
+        const slash_pos = std.mem.indexOfScalar(u8, root_spec, '/');
+        const name_part = if (slash_pos) |pos| root_spec[0..pos] else root_spec;
+        const last_dot = std.mem.lastIndexOfScalar(u8, name_part, '.');
+        const entry_module = if (last_dot) |pos| name_part[0..pos] else name_part;
+
+        // Build source roots: project lib/ dir, project root, + dep lib directories
+        // Try project_root/lib/ first (standard layout), then project_root/ (flat layout)
+        const lib_dir = try std.fs.path.join(alloc, &.{ project_root, "lib" });
+        if (std.fs.cwd().access(lib_dir, .{})) |_| {
+            try source_roots.append(alloc, .{ .name = "project", .path = lib_dir });
+        } else |_| {}
+        try source_roots.append(alloc, .{ .name = "project", .path = project_root });
+
+        // Read lockfile if it exists
+        const lock_entries = zap.lockfile.readLockfile(alloc, project_root);
+        var new_lock_entries: std.ArrayListUnmanaged(zap.lockfile.LockEntry) = .empty;
+        var lockfile_changed = false;
+
+        for (config.deps) |dep| {
+            const dep_name = try std.fmt.allocPrint(alloc, "dep:{s}", .{dep.name});
+
+            switch (dep.source) {
+                .path => |dep_path| {
+                    // Resolve dep path relative to the project root
+                    const dep_dir = try std.fs.path.join(alloc, &.{ project_root, dep_path });
+
+                    // Try dep_dir/lib/ first (standard layout), fall back to dep_dir/
+                    const dep_lib_dir = try std.fs.path.join(alloc, &.{ dep_dir, "lib" });
+                    if (std.fs.cwd().access(dep_lib_dir, .{})) |_| {
+                        try source_roots.append(alloc, .{ .name = dep_name, .path = dep_lib_dir });
+                    } else |_| {
+                        try source_roots.append(alloc, .{ .name = dep_name, .path = dep_dir });
+                    }
+
+                    // Path deps are recorded in lockfile but not locked
+                    try new_lock_entries.append(alloc, .{
+                        .name = dep.name,
+                        .source_type = "path",
+                        .url = dep_path,
+                        .resolved_ref = "-",
+                        .commit = "-",
+                        .integrity = "-",
+                    });
+                },
+                .git => |git| {
+                    // Check lockfile for cached commit
+                    const locked = if (lock_entries) |entries|
+                        zap.lockfile.findEntry(entries, dep.name)
+                    else
+                        null;
+
+                    const locked_commit: ?[]const u8 = if (locked) |l|
+                        (if (std.mem.eql(u8, l.commit, "-")) null else l.commit)
+                    else
+                        null;
+
+                    const ref = git.tag orelse git.branch orelse git.rev;
+
+                    // Fetch (or use cache)
+                    const result = zap.lockfile.fetchGitDep(
+                        alloc,
+                        dep.name,
+                        git.url,
+                        ref,
+                        locked_commit,
+                    ) catch {
+                        try stderr_w.print("Error: failed to fetch dep `{s}`\n", .{dep.name});
+                        std.process.exit(1);
+                    };
+
+                    // Add dep's lib dir as source root
+                    const dep_lib_dir = try std.fs.path.join(alloc, &.{ result.path, "lib" });
+                    if (std.fs.cwd().access(dep_lib_dir, .{})) |_| {
+                        try source_roots.append(alloc, .{ .name = dep_name, .path = dep_lib_dir });
+                    } else |_| {
+                        try source_roots.append(alloc, .{ .name = dep_name, .path = result.path });
+                    }
+
+                    // Record in lockfile
+                    try new_lock_entries.append(alloc, .{
+                        .name = dep.name,
+                        .source_type = "git",
+                        .url = git.url,
+                        .resolved_ref = ref orelse "-",
+                        .commit = result.commit,
+                        .integrity = result.integrity,
+                    });
+
+                    // Check if lockfile needs updating
+                    if (locked_commit == null or !std.mem.eql(u8, locked_commit.?, result.commit)) {
+                        lockfile_changed = true;
+                    }
+                },
+            }
+        }
+
+        // Write lockfile if it changed or doesn't exist
+        if (lock_entries == null or lockfile_changed) {
+            zap.lockfile.writeLockfile(alloc, project_root, new_lock_entries.items) catch |err| {
+                try stderr_w.print("Warning: could not write zap.lock: {}\n", .{err});
+            };
+        }
+
+        var discovery_err_info: zap.discovery.ErrorInfo = .{};
+        var file_graph = zap.discovery.discover(
+            alloc,
+            entry_module,
+            source_roots.items,
+            &zap.discovery.STDLIB_MODULES,
+            &discovery_err_info,
+        ) catch |err| switch (err) {
+            error.ModuleNotFound => {
+                if (discovery_err_info.unresolved_module) |mod| {
+                    const expected = zap.discovery.moduleNameToRelPath(alloc, mod) catch "?";
+                    try stderr_w.print("Error: Module `{s}` not found — expected {s} in one of the source roots\n", .{ mod, expected });
+                } else if (discovery_err_info.boundary_module) |mod| {
+                    try stderr_w.print("Error: Module `{s}` is private (defmodulep) to {s} — cannot be accessed from {s}\n", .{
+                        mod,
+                        discovery_err_info.boundary_dep orelse "?",
+                        discovery_err_info.boundary_from orelse "?",
+                    });
+                } else {
+                    try stderr_w.print("Error: Module not found during discovery\n", .{});
+                }
+                std.process.exit(1);
+            },
+            error.CircularDependency => {
+                try stderr_w.print("Error: Circular module dependency detected\n", .{});
+                std.process.exit(1);
+            },
+            error.ReadError => {
+                try stderr_w.print("Error: could not read source file\n", .{});
+                std.process.exit(1);
+            },
+            else => {
+                try stderr_w.print("Error: file discovery failed\n", .{});
+                std.process.exit(1);
+            },
+        };
+        defer file_graph.deinit();
+
+        // Collect discovered files in topological order
+        for (file_graph.topo_order.items) |file_path| {
+            try source_files.append(alloc, file_path);
+        }
+    } else {
+        // Legacy: glob-based file collection from paths
+        for (config.paths) |pattern| {
+            try globCollectFiles(alloc, project_root, pattern, &source_files);
+        }
     }
 
     if (source_files.items.len == 0) {
         const stderr = std.fs.File.stderr().deprecatedWriter();
-        try stderr.print("Error: no .zap source files found in paths\n", .{});
+        try stderr.print("Error: no .zap source files found\n", .{});
+        std.process.exit(1);
+    }
+
+    // Validate one-module-per-file and name=path for each source file
+    var validation_failed = false;
+    for (source_files.items) |sf| {
+        // Skip build.zap — it's build configuration, not project source
+        if (std.mem.eql(u8, std.fs.path.basename(sf), "build.zap")) continue;
+
+        const src = try std.fs.cwd().readFileAlloc(alloc, sf, 10 * 1024 * 1024);
+
+        // Compute the relative path from its source root for validation.
+        // Check each source root to find which one this file is under.
+        const lib_rel = blk: {
+            if (config.paths.len == 0) {
+                // Import-driven: check the source_roots we built
+                // Normalize paths by stripping leading "./" for consistent matching
+                const norm_sf = if (std.mem.startsWith(u8, sf, "./")) sf[2..] else sf;
+                for (source_roots.items) |root| {
+                    const norm_root = if (std.mem.startsWith(u8, root.path, "./"))
+                        root.path[2..]
+                    else
+                        root.path;
+                    const root_slash = try std.fmt.allocPrint(alloc, "{s}/", .{norm_root});
+                    if (std.mem.startsWith(u8, norm_sf, root_slash)) {
+                        break :blk norm_sf[root_slash.len..];
+                    }
+                }
+            }
+
+            // Fallback: strip project root and common prefixes
+            const rel_path = if (std.mem.startsWith(u8, sf, project_root))
+                std.mem.trimLeft(u8, sf[project_root.len..], "/")
+            else
+                sf;
+
+            if (std.mem.startsWith(u8, rel_path, "lib/")) {
+                break :blk rel_path[4..];
+            }
+            if (std.mem.startsWith(u8, rel_path, "./")) {
+                break :blk rel_path[2..];
+            }
+            break :blk rel_path;
+        };
+
+        if (compiler.validateOneModulePerFile(alloc, src, lib_rel)) |err_msg| {
+            try stderr_w.print("Error: {s}\n", .{err_msg});
+            validation_failed = true;
+        }
+    }
+    if (validation_failed) {
         std.process.exit(1);
     }
 
@@ -422,11 +729,19 @@ fn buildTarget(
     const lib_mode = config.kind == .lib;
 
     // Compile through frontend
-    var result = compiler.compileFrontend(alloc, merged_source, source_files.items[0], .{
-        .lib_mode = lib_mode,
-    }) catch {
-        std.process.exit(1);
-    };
+    // Use per-file pipeline for import-driven discovery, legacy pipeline for glob
+    var result = if (config.paths.len == 0 and config.root != null)
+        compiler.compilePerFile(alloc, merged_source, source_files.items[0], .{
+            .lib_mode = lib_mode,
+        }) catch {
+            std.process.exit(1);
+        }
+    else
+        compiler.compileFrontend(alloc, merged_source, source_files.items[0], .{
+            .lib_mode = lib_mode,
+        }) catch {
+            std.process.exit(1);
+        };
 
     // Resolve the manifest root (e.g. "FooBar.main/1") to an IR function ID
     // so the ZIR backend knows which function is the entry point.

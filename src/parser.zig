@@ -224,9 +224,17 @@ pub const Parser = struct {
         while (!self.check(.eof)) {
             switch (self.peek()) {
                 .keyword_defmodule => {
-                    if (self.parseModuleDecl()) |mod| {
+                    if (self.parseModuleDecl(false)) |mod| {
                         try modules.append(self.allocator, mod);
                         try top_items.append(self.allocator, .{ .module = try self.create(ast.ModuleDecl, mod) });
+                    } else |_| {
+                        self.synchronize();
+                    }
+                },
+                .keyword_defmodulep => {
+                    if (self.parseModuleDecl(true)) |mod| {
+                        try modules.append(self.allocator, mod);
+                        try top_items.append(self.allocator, .{ .priv_module = try self.create(ast.ModuleDecl, mod) });
                     } else |_| {
                         self.synchronize();
                     }
@@ -256,8 +264,15 @@ pub const Parser = struct {
                     }
                 },
                 .keyword_defmacro => {
-                    if (self.parseMacroDecl()) |mac| {
+                    if (self.parseMacroDecl(.public)) |mac| {
                         try top_items.append(self.allocator, .{ .macro = mac });
+                    } else |_| {
+                        self.synchronize();
+                    }
+                },
+                .keyword_defmacrop => {
+                    if (self.parseMacroDecl(.private)) |mac| {
+                        try top_items.append(self.allocator, .{ .priv_macro = mac });
                     } else |_| {
                         self.synchronize();
                     }
@@ -286,7 +301,7 @@ pub const Parser = struct {
                     // Check for misspelled keywords
                     if (self.current.tag == .identifier) {
                         const text = self.current.slice(self.source);
-                        const keywords = [_][]const u8{ "defmodule", "def", "defp", "defmacro", "defstruct", "defenum", "type", "opaque" };
+                        const keywords = [_][]const u8{ "defmodule", "defmodulep", "def", "defp", "defmacro", "defmacrop", "defstruct", "defenum", "type", "opaque" };
                         if (similarity.findBestMatch(text, &keywords, 0.75)) |suggestion| {
                             try self.addRichError(
                                 std.fmt.allocPrint(self.allocator, "I was not expecting `{s}` at the top level", .{text}) catch "unexpected identifier at top level",
@@ -304,7 +319,7 @@ pub const Parser = struct {
                         }) catch "unexpected token at top level",
                         self.currentSpan(),
                         null,
-                        "the top level can contain `defmodule`, `defstruct`, `defenum`, `type`, and `opaque` declarations",
+                        "the top level can contain `defmodule`, `defmodulep`, `defstruct`, `defenum`, `type`, and `opaque` declarations",
                     );
                     _ = self.advance();
                 },
@@ -326,13 +341,18 @@ pub const Parser = struct {
     // Module declarations
     // ============================================================
 
-    fn parseModuleDecl(self: *Parser) !ast.ModuleDecl {
+    fn parseModuleDecl(self: *Parser, is_private: bool) !ast.ModuleDecl {
         const start = self.currentSpan();
-        _ = try self.expect(.keyword_defmodule);
+        if (is_private) {
+            _ = try self.expect(.keyword_defmodulep);
+        } else {
+            _ = try self.expect(.keyword_defmodule);
+        }
 
+        const keyword_name = if (is_private) "defmodulep" else "defmodule";
         if (!self.check(.module_identifier)) {
             try self.addRichError(
-                "I was expecting a module name (like `MyModule`) after `defmodule`",
+                std.fmt.allocPrint(self.allocator, "I was expecting a module name (like `MyModule`) after `{s}`", .{keyword_name}) catch "expected module name",
                 start,
                 "module declaration starts here",
                 "module names must start with an uppercase letter",
@@ -384,8 +404,15 @@ pub const Parser = struct {
                     }
                 },
                 .keyword_defmacro => {
-                    if (self.parseMacroDecl()) |mac| {
+                    if (self.parseMacroDecl(.public)) |mac| {
                         try items.append(self.allocator, .{ .macro = mac });
+                    } else |_| {
+                        self.synchronize();
+                    }
+                },
+                .keyword_defmacrop => {
+                    if (self.parseMacroDecl(.private)) |mac| {
+                        try items.append(self.allocator, .{ .priv_macro = mac });
                     } else |_| {
                         self.synchronize();
                     }
@@ -445,7 +472,7 @@ pub const Parser = struct {
                         }) catch "unexpected token in module",
                         self.currentSpan(),
                         "not valid inside a module body",
-                        "modules can contain `def`, `defp`, `defstruct`, `defenum`, `type`, `alias`, and `import` declarations",
+                        "modules can contain `def`, `defp`, `defmacro`, `defmacrop`, `defstruct`, `defenum`, `type`, `alias`, and `import` declarations",
                     );
                     _ = self.advance();
                 },
@@ -470,6 +497,7 @@ pub const Parser = struct {
             .name = name,
             .parent = parent,
             .items = try items.toOwnedSlice(self.allocator),
+            .is_private = is_private,
         };
     }
 
@@ -758,9 +786,13 @@ pub const Parser = struct {
         });
     }
 
-    fn parseMacroDecl(self: *Parser) !*const ast.FunctionDecl {
+    fn parseMacroDecl(self: *Parser, visibility: ast.FunctionDecl.Visibility) !*const ast.FunctionDecl {
         const start = self.currentSpan();
-        _ = try self.expect(.keyword_defmacro);
+        if (visibility == .private) {
+            _ = try self.expect(.keyword_defmacrop);
+        } else {
+            _ = try self.expect(.keyword_defmacro);
+        }
 
         // Allow keywords as macro names (like Elixir's Kernel macros: if, cond, with)
         const name_tok = if (self.check(.identifier))
@@ -777,7 +809,7 @@ pub const Parser = struct {
             .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
             .name = name,
             .clauses = try self.allocator.dupe(ast.FunctionClause, &[_]ast.FunctionClause{clause}),
-            .visibility = .public,
+            .visibility = visibility,
         });
     }
 
@@ -1026,7 +1058,11 @@ pub const Parser = struct {
             return .{ .function_decl = func };
         }
         if (self.check(.keyword_defmacro)) {
-            const mac = try self.parseMacroDecl();
+            const mac = try self.parseMacroDecl(.public);
+            return .{ .macro_decl = mac };
+        }
+        if (self.check(.keyword_defmacrop)) {
+            const mac = try self.parseMacroDecl(.private);
             return .{ .macro_decl = mac };
         }
         if (self.check(.keyword_import)) {
@@ -3645,4 +3681,65 @@ test "parse struct init with type annotation" {
     const func = program.modules[0].items[0].function;
     const body = func.clauses[0].body;
     try std.testing.expect(body[0].expr.* == .struct_expr);
+}
+
+test "parse defmodulep as private module" {
+    const source =
+        \\defmodulep Internal do
+        \\  def helper() :: i64 do
+        \\    42
+        \\  end
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    try std.testing.expectEqual(@as(usize, 1), program.modules.len);
+    try std.testing.expect(program.modules[0].is_private);
+    try std.testing.expectEqual(@as(usize, 1), program.top_items.len);
+    try std.testing.expect(program.top_items[0] == .priv_module);
+}
+
+test "parse defmacrop inside module" {
+    const source =
+        \\defmodule Foo do
+        \\  defmacrop helper(x) do
+        \\    x
+        \\  end
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    try std.testing.expectEqual(@as(usize, 1), program.modules.len);
+    try std.testing.expectEqual(@as(usize, 1), program.modules[0].items.len);
+    try std.testing.expect(program.modules[0].items[0] == .priv_macro);
+    try std.testing.expectEqual(ast.FunctionDecl.Visibility.private, program.modules[0].items[0].priv_macro.visibility);
+}
+
+test "parse defmodule is_private false by default" {
+    const source =
+        \\defmodule Foo do
+        \\  def bar() :: i64 do
+        \\    1
+        \\  end
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    try std.testing.expectEqual(@as(usize, 1), program.modules.len);
+    try std.testing.expect(!program.modules[0].is_private);
 }

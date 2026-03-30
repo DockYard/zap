@@ -64,6 +64,7 @@ pub const Desugarer = struct {
             .function => |func| .{ .function = try self.desugarFunctionDecl(func) },
             .priv_function => |func| .{ .priv_function = try self.desugarFunctionDecl(func) },
             .macro => |mac| .{ .macro = try self.desugarFunctionDecl(mac) },
+            .priv_macro => |mac| .{ .priv_macro = try self.desugarFunctionDecl(mac) },
             else => item,
         };
     }
@@ -73,6 +74,7 @@ pub const Desugarer = struct {
             .function => |func| .{ .function = try self.desugarFunctionDecl(func) },
             .priv_function => |func| .{ .priv_function = try self.desugarFunctionDecl(func) },
             .macro => |mac| .{ .macro = try self.desugarFunctionDecl(mac) },
+            .priv_macro => |mac| .{ .priv_macro = try self.desugarFunctionDecl(mac) },
             else => item,
         };
     }

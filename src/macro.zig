@@ -125,6 +125,11 @@ pub const MacroEngine = struct {
                     if (expanded.changed) changed = true;
                     try new_items.append(self.allocator, .{ .macro = expanded.decl });
                 },
+                .priv_macro => |mac| {
+                    const expanded = try self.expandFunctionDecl(mac);
+                    if (expanded.changed) changed = true;
+                    try new_items.append(self.allocator, .{ .priv_macro = expanded.decl });
+                },
                 else => try new_items.append(self.allocator, item),
             }
         }
@@ -135,6 +140,7 @@ pub const MacroEngine = struct {
                 .name = mod.name,
                 .parent = mod.parent,
                 .items = try new_items.toOwnedSlice(self.allocator),
+                .is_private = mod.is_private,
             },
             .changed = changed,
         };
@@ -162,6 +168,10 @@ pub const MacroEngine = struct {
             .macro => |mac| {
                 const expanded = try self.expandFunctionDecl(mac);
                 return .{ .item = .{ .macro = expanded.decl }, .changed = expanded.changed };
+            },
+            .priv_macro => |mac| {
+                const expanded = try self.expandFunctionDecl(mac);
+                return .{ .item = .{ .priv_macro = expanded.decl }, .changed = expanded.changed };
             },
             else => return .{ .item = item, .changed = false },
         }

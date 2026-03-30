@@ -59,11 +59,13 @@ pub const Collector = struct {
                 .function => |func| try self.collectFunction(func, self.graph.prelude_scope),
                 .priv_function => |func| try self.collectFunction(func, self.graph.prelude_scope),
                 .macro => |mac| try self.collectMacro(mac, self.graph.prelude_scope),
+                .priv_macro => |mac| try self.collectMacro(mac, self.graph.prelude_scope),
                 .type_decl => |td| try self.collectType(td, self.graph.prelude_scope),
                 .opaque_decl => |od| try self.collectOpaque(od, self.graph.prelude_scope),
                 .struct_decl => |sd| try self.collectStruct(sd, self.graph.prelude_scope),
                 .enum_decl => |ed| try self.collectEnum(ed, self.graph.prelude_scope),
                 .module => {},
+                .priv_module => {},
             }
         }
 
@@ -88,6 +90,7 @@ pub const Collector = struct {
                 .function => |func| try self.collectFunction(func, mod_scope),
                 .priv_function => |func| try self.collectFunction(func, mod_scope),
                 .macro => |mac| try self.collectMacro(mac, mod_scope),
+                .priv_macro => |mac| try self.collectMacro(mac, mod_scope),
                 .type_decl => |td| try self.collectType(td, mod_scope),
                 .opaque_decl => |od| try self.collectOpaque(od, mod_scope),
                 .struct_decl => |sd| try self.collectStruct(sd, mod_scope),

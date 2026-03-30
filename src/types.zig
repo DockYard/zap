@@ -1234,6 +1234,15 @@ pub const TypeChecker = struct {
                         "all macros must be defined inside a `defmodule ... do ... end` block",
                     );
                 },
+                .priv_macro => |mac| {
+                    const name = self.interner.get(mac.name);
+                    try self.addHardError(
+                        try std.fmt.allocPrint(self.allocator, "top-level private macro `{s}` is not allowed — macros must be inside a module", .{name}),
+                        mac.meta.span,
+                        "move this macro into a `defmodule`",
+                        "all macros must be defined inside a `defmodule ... do ... end` block",
+                    );
+                },
                 else => {},
             }
             try self.checkTopItem(item);
@@ -1396,7 +1405,7 @@ pub const TypeChecker = struct {
             switch (item) {
                 .function => |func| try self.checkFunctionDecl(func),
                 .priv_function => |func| try self.checkFunctionDecl(func),
-                .macro => |mac| {
+                .macro, .priv_macro => |mac| {
                     // Mark macro params as referenced — they're used in quote/unquote,
                     // not via normal var_ref, so the unused-binding check can't see them.
                     for (mac.clauses) |clause| {
@@ -1479,7 +1488,9 @@ pub const TypeChecker = struct {
             .function => |func| try self.checkFunctionDecl(func),
             .priv_function => |func| try self.checkFunctionDecl(func),
             .macro => |mac| try self.checkFunctionDecl(mac),
+            .priv_macro => |mac| try self.checkFunctionDecl(mac),
             .module => {},
+            .priv_module => {},
             else => {},
         }
     }

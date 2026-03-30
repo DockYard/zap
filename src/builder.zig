@@ -20,10 +20,29 @@ pub const BuildConfig = struct {
     asset_name: ?[]const u8 = null,
     optimize: Optimize = .release_safe,
     paths: []const []const u8 = &.{},
+    deps: []const Dep = &.{},
     build_opts: std.StringHashMapUnmanaged([]const u8) = .empty,
 
     pub const Kind = enum { bin, lib, obj };
     pub const Optimize = enum { debug, release_safe, release_fast, release_small };
+
+    pub const Dep = struct {
+        name: []const u8,
+        source: DepSource,
+    };
+
+    pub const DepSource = union(enum) {
+        path: []const u8,
+        git: GitSource,
+        // Future: zig, system
+    };
+
+    pub const GitSource = struct {
+        url: []const u8,
+        tag: ?[]const u8 = null,
+        branch: ?[]const u8 = null,
+        rev: ?[]const u8 = null,
+    };
 };
 
 /// Scan build.zap AST to find the module defining manifest/1.
@@ -449,6 +468,7 @@ fn extractFieldsFromStruct(
         .kind = .bin,
     };
     var paths: std.ArrayListUnmanaged([]const u8) = .empty;
+    var deps: std.ArrayListUnmanaged(BuildConfig.Dep) = .empty;
 
     for (fields) |field| {
         const field_name = interner.get(field.name);
@@ -492,9 +512,85 @@ fn extractFieldsFromStruct(
                     }
                 }
             }
+        } else if (std.mem.eql(u8, field_name, "deps")) {
+            if (field.value.* == .list) {
+                for (field.value.list.elements) |elem| {
+                    if (parseDep(alloc, interner, elem)) |dep| {
+                        deps.append(alloc, dep) catch continue;
+                    }
+                }
+            }
         }
     }
 
     config.paths = paths.toOwnedSlice(alloc) catch return null;
+    config.deps = deps.toOwnedSlice(alloc) catch return null;
     return config;
+}
+
+/// Parse a single dep tuple from the AST: {:name, {:source_type, ...}}
+fn parseDep(
+    _: std.mem.Allocator,
+    interner: *const zap.ast.StringInterner,
+    expr: *const zap.ast.Expr,
+) ?BuildConfig.Dep {
+    // Expect a tuple: {atom, source_tuple}
+    if (expr.* != .tuple) return null;
+    const elements = expr.tuple.elements;
+    if (elements.len != 2) return null;
+
+    // First element: atom (dep name)
+    if (elements[0].* != .atom_literal) return null;
+    const dep_name = interner.get(elements[0].atom_literal.value);
+
+    // Second element: source tuple
+    if (elements[1].* != .tuple) return null;
+    const source_elements = elements[1].tuple.elements;
+    if (source_elements.len < 2) return null;
+
+    // Source type tag: atom
+    if (source_elements[0].* != .atom_literal) return null;
+    const source_type = interner.get(source_elements[0].atom_literal.value);
+
+    if (std.mem.eql(u8, source_type, "path")) {
+        // {:path, "relative/path"}
+        if (source_elements[1].* != .string_literal) return null;
+        const path = interner.get(source_elements[1].string_literal.value);
+        return .{
+            .name = dep_name,
+            .source = .{ .path = path },
+        };
+    }
+
+    if (std.mem.eql(u8, source_type, "git")) {
+        // {:git, "url"} or {:git, "url", "ref"}
+        if (source_elements[1].* != .string_literal) return null;
+        const url = interner.get(source_elements[1].string_literal.value);
+        var git_source = BuildConfig.GitSource{ .url = url };
+
+        if (source_elements.len >= 3 and source_elements[2].* == .string_literal) {
+            const ref = interner.get(source_elements[2].string_literal.value);
+            // Detect ref type: "v1.0.0" looks like a tag, hex looks like a commit
+            if (ref.len == 40 and isHexString(ref)) {
+                git_source.rev = ref;
+            } else {
+                git_source.tag = ref;
+            }
+        }
+
+        return .{
+            .name = dep_name,
+            .source = .{ .git = git_source },
+        };
+    }
+
+    // Future: handle :zig, :system
+    return null;
+}
+
+fn isHexString(s: []const u8) bool {
+    for (s) |c| {
+        if (!std.ascii.isHex(c)) return false;
+    }
+    return s.len > 0;
 }

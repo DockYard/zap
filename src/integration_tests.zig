@@ -3210,3 +3210,201 @@ test "pipeline: atom pattern matching through analysis" {
     try expectContains(output, "fn Status__check(");
     try expectNotContains(output, "// unhandled instruction");
 }
+
+// ============================================================
+// Dependency system integration tests
+// ============================================================
+
+const discovery = @import("discovery.zig");
+const compiler = @import("compiler.zig");
+
+test "deps: cross-module function call compiles" {
+    // Two modules — App calls MathLib.add
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const source =
+        \\defmodule MathLib do
+        \\  def add(a :: i64, b :: i64) :: i64 do
+        \\    a + b
+        \\  end
+        \\end
+        \\
+        \\defmodule App do
+        \\  def main() :: i64 do
+        \\    MathLib.add(1, 2)
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, "fn MathLib__add(");
+    try expectContains(output, "fn main(");
+}
+
+test "deps: discovery finds files and they compile together" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Create temp project with two files
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{
+        .sub_path = "app.zap",
+        .data = "defmodule App do\n  def main() :: i64 do\n    Helper.value()\n  end\nend\n",
+    });
+    try tmp_dir.dir.writeFile(.{
+        .sub_path = "helper.zap",
+        .data = "defmodule Helper do\n  def value() :: i64 do\n    42\n  end\nend\n",
+    });
+
+    const tmp_path = try tmp_dir.dir.realpathAlloc(alloc, ".");
+
+    // Discover files
+    var graph = try discovery.discover(
+        alloc,
+        "App",
+        &.{.{ .name = "project", .path = tmp_path }},
+        &discovery.STDLIB_MODULES,
+        null,
+    );
+    defer graph.deinit();
+
+    // Read discovered files and concatenate
+    var combined: std.ArrayListUnmanaged(u8) = .empty;
+    for (graph.topo_order.items) |file_path| {
+        const src = try std.fs.cwd().readFileAlloc(alloc, file_path, 10 * 1024 * 1024);
+        try combined.appendSlice(alloc, src);
+        try combined.append(alloc, '\n');
+    }
+
+    // Compile the concatenated source
+    const output = try compile(alloc, combined.items);
+    try expectContains(output, "fn Helper__value(");
+    try expectContains(output, "fn main(");
+}
+
+test "deps: discovery with dep root finds dep modules" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    // Project file
+    tmp_dir.dir.makePath("project") catch {};
+    tmp_dir.dir.makePath("dep_lib") catch {};
+
+    try tmp_dir.dir.writeFile(.{
+        .sub_path = "project/app.zap",
+        .data = "defmodule App do\n  def main() :: i64 do\n    DepMath.add(1, 2)\n  end\nend\n",
+    });
+    try tmp_dir.dir.writeFile(.{
+        .sub_path = "dep_lib/dep_math.zap",
+        .data = "defmodule DepMath do\n  def add(a :: i64, b :: i64) :: i64 do\n    a + b\n  end\nend\n",
+    });
+
+    const project_path = try tmp_dir.dir.realpathAlloc(alloc, "project");
+    const dep_path = try tmp_dir.dir.realpathAlloc(alloc, "dep_lib");
+
+    // Discover with dep root
+    var graph = try discovery.discover(
+        alloc,
+        "App",
+        &.{
+            .{ .name = "project", .path = project_path },
+            .{ .name = "dep:math", .path = dep_path },
+        },
+        &discovery.STDLIB_MODULES,
+        null,
+    );
+    defer graph.deinit();
+
+    // Read and compile
+    var combined: std.ArrayListUnmanaged(u8) = .empty;
+    for (graph.topo_order.items) |file_path| {
+        const src = try std.fs.cwd().readFileAlloc(alloc, file_path, 10 * 1024 * 1024);
+        try combined.appendSlice(alloc, src);
+        try combined.append(alloc, '\n');
+    }
+
+    const output = try compile(alloc, combined.items);
+    try expectContains(output, "fn DepMath__add(");
+    try expectContains(output, "fn main(");
+}
+
+test "deps: defmodulep enforcement blocks cross-dep access" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    tmp_dir.dir.makePath("project") catch {};
+    tmp_dir.dir.makePath("dep_lib") catch {};
+
+    // Project tries to access a private dep module
+    try tmp_dir.dir.writeFile(.{
+        .sub_path = "project/app.zap",
+        .data = "defmodule App do\n  def main() :: i64 do\n    PrivateMod.secret()\n  end\nend\n",
+    });
+    // Dep has a private module
+    try tmp_dir.dir.writeFile(.{
+        .sub_path = "dep_lib/private_mod.zap",
+        .data = "defmodulep PrivateMod do\n  def secret() :: i64 do\n    99\n  end\nend\n",
+    });
+
+    const project_path = try tmp_dir.dir.realpathAlloc(alloc, "project");
+    const dep_path = try tmp_dir.dir.realpathAlloc(alloc, "dep_lib");
+
+    const result = discovery.discover(
+        alloc,
+        "App",
+        &.{
+            .{ .name = "project", .path = project_path },
+            .{ .name = "dep:secret_lib", .path = dep_path },
+        },
+        &discovery.STDLIB_MODULES,
+        null,
+    );
+
+    // Should fail because PrivateMod is defmodulep in a different dep
+    try std.testing.expectError(error.ModuleNotFound, result);
+}
+
+test "deps: defmodulep allowed within same dep" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    // Both files in the same source root — defmodulep is visible
+    try tmp_dir.dir.writeFile(.{
+        .sub_path = "public_mod.zap",
+        .data = "defmodule PublicMod do\n  def go() :: i64 do\n    InternalMod.helper()\n  end\nend\n",
+    });
+    try tmp_dir.dir.writeFile(.{
+        .sub_path = "internal_mod.zap",
+        .data = "defmodulep InternalMod do\n  def helper() :: i64 do\n    42\n  end\nend\n",
+    });
+
+    const tmp_path = try tmp_dir.dir.realpathAlloc(alloc, ".");
+
+    // Both in same root — should succeed
+    var graph = try discovery.discover(
+        alloc,
+        "PublicMod",
+        &.{.{ .name = "dep:mylib", .path = tmp_path }},
+        &discovery.STDLIB_MODULES,
+        null,
+    );
+    defer graph.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), graph.topo_order.items.len);
+}

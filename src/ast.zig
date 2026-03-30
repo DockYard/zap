@@ -84,6 +84,7 @@ pub const Program = struct {
 
 pub const TopItem = union(enum) {
     module: *const ModuleDecl,
+    priv_module: *const ModuleDecl,
     type_decl: *const TypeDecl,
     opaque_decl: *const OpaqueDecl,
     struct_decl: *const StructDecl,
@@ -91,6 +92,7 @@ pub const TopItem = union(enum) {
     function: *const FunctionDecl,
     priv_function: *const FunctionDecl,
     macro: *const FunctionDecl,
+    priv_macro: *const FunctionDecl,
 };
 
 // ============================================================
@@ -102,6 +104,7 @@ pub const ModuleDecl = struct {
     name: ModuleName,
     parent: ?StringId = null,
     items: []const ModuleItem,
+    is_private: bool = false,
 };
 
 pub const ModuleName = struct {
@@ -117,6 +120,7 @@ pub const ModuleItem = union(enum) {
     function: *const FunctionDecl,
     priv_function: *const FunctionDecl,
     macro: *const FunctionDecl,
+    priv_macro: *const FunctionDecl,
     alias_decl: *const AliasDecl,
     import_decl: *const ImportDecl,
 };

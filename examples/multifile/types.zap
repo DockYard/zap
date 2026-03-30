@@ -1,4 +1,4 @@
-# Shared type definitions — no modules, just data shapes.
+# Shared type definitions for the multifile example.
 
 defstruct Shape do
   color :: String = "black"
@@ -17,4 +17,7 @@ defenum Color do
   Red
   Green
   Blue
+end
+
+defmodule Types do
 end

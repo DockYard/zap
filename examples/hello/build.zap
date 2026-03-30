@@ -6,8 +6,7 @@ defmodule Hello.Builder do
           name: "hello",
           version: "0.1.0",
           kind: :bin,
-          root: "Hello.main/0",
-          paths: ["./*.zap"]
+          root: "Hello.main/0"
         }
       _ ->
         panic("Unknown target: use 'hello'")

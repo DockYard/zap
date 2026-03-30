@@ -1,20 +1,3 @@
-# Default parameter values
-#
-# Trailing parameters can have defaults. The compiler generates
-# wrapper functions for each valid shorter arity.
-
-defmodule Http do
-  def request(url :: String, method :: String = "GET", _timeout :: i64 = 30) :: String do
-    method <> " " <> url
-  end
-end
-
-defmodule Greeter do
-  def greet(name :: String, greeting :: String = "Hello", punctuation :: String = "!") :: String do
-    greeting <> ", " <> name <> punctuation
-  end
-end
-
 defmodule DefaultParams do
   def main() :: String do
     # All defaults

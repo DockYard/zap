@@ -73,6 +73,7 @@ pub const Resolver = struct {
                 .function => |func| try self.resolveFunctionDecl(func),
                 .priv_function => |func| try self.resolveFunctionDecl(func),
                 .macro => |mac| try self.resolveFunctionDecl(mac),
+                .priv_macro => |mac| try self.resolveFunctionDecl(mac),
                 .type_decl => |td| try self.resolveTypeDecl(td),
                 .opaque_decl => |od| try self.resolveOpaqueDecl(od),
                 else => {},
@@ -85,11 +86,13 @@ pub const Resolver = struct {
             .function => |func| try self.resolveFunctionDecl(func),
             .priv_function => |func| try self.resolveFunctionDecl(func),
             .macro => |mac| try self.resolveFunctionDecl(mac),
+            .priv_macro => |mac| try self.resolveFunctionDecl(mac),
             .type_decl => |td| try self.resolveTypeDecl(td),
             .opaque_decl => |od| try self.resolveOpaqueDecl(od),
             .struct_decl => {},
             .enum_decl => {},
             .module => {},
+            .priv_module => {},
         }
     }
 
