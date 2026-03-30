@@ -95,6 +95,8 @@ pub const FunctionFamily = struct {
     arity: u32,
     clauses: std.ArrayList(FunctionClauseRef),
     visibility: ast.FunctionDecl.Visibility,
+    /// Attributes attached to this function (@doc, @deprecated, etc.)
+    attributes: std.ArrayListUnmanaged(Attribute) = .empty,
 
     pub fn init(id: FunctionFamilyId, scope_id: ScopeId, name: ast.StringId, arity: u32, visibility: ast.FunctionDecl.Visibility) FunctionFamily {
         return .{
@@ -104,6 +106,7 @@ pub const FunctionFamily = struct {
             .arity = arity,
             .clauses = .empty,
             .visibility = visibility,
+            .attributes = .empty,
         };
     }
 
@@ -127,6 +130,8 @@ pub const MacroFamily = struct {
     name: ast.StringId,
     arity: u32,
     clauses: std.ArrayList(FunctionClauseRef),
+    /// Attributes attached to this macro (@doc, @debug, etc.)
+    attributes: std.ArrayListUnmanaged(Attribute) = .empty,
 
     pub fn init(id: MacroFamilyId, scope_id: ScopeId, name: ast.StringId, arity: u32) MacroFamily {
         return .{
@@ -191,10 +196,19 @@ pub const TypeKind = union(enum) {
 // Module registration
 // ============================================================
 
+/// A compile-time attribute stored on a module or function.
+pub const Attribute = struct {
+    name: ast.StringId,
+    type_expr: ?*const ast.TypeExpr = null,
+    value: ?*const ast.Expr = null,
+};
+
 pub const ModuleEntry = struct {
     name: ast.ModuleName,
     scope_id: ScopeId,
     decl: *const ast.ModuleDecl,
+    /// Module-level attributes (@moduledoc, @author, etc.)
+    attributes: std.ArrayListUnmanaged(Attribute) = .empty,
 };
 
 // ============================================================

@@ -85,12 +85,49 @@ pub const Collector = struct {
         try self.graph.node_scope_map.put(mod.meta.span.start, mod_scope);
         try self.graph.registerModule(mod.name, mod_scope, mod);
 
+        // Track pending attributes to attach to the next function/macro
+        var pending_attrs: std.ArrayListUnmanaged(scope.Attribute) = .empty;
+
         for (mod.items) |item| {
             switch (item) {
-                .function => |func| try self.collectFunction(func, mod_scope),
-                .priv_function => |func| try self.collectFunction(func, mod_scope),
-                .macro => |mac| try self.collectMacro(mac, mod_scope),
-                .priv_macro => |mac| try self.collectMacro(mac, mod_scope),
+                .function => |func| {
+                    try self.collectFunctionWithAttrs(func, mod_scope, &pending_attrs);
+                    pending_attrs = .empty;
+                },
+                .priv_function => |func| {
+                    try self.collectFunctionWithAttrs(func, mod_scope, &pending_attrs);
+                    pending_attrs = .empty;
+                },
+                .macro => |mac| {
+                    try self.collectMacroWithAttrs(mac, mod_scope, &pending_attrs);
+                    pending_attrs = .empty;
+                },
+                .priv_macro => |mac| {
+                    try self.collectMacroWithAttrs(mac, mod_scope, &pending_attrs);
+                    pending_attrs = .empty;
+                },
+                .attribute => |attr| {
+                    const attr_name = self.interner.get(attr.name);
+                    if (std.mem.eql(u8, attr_name, "moduledoc")) {
+                        // @moduledoc is always module-level — attach immediately
+                        for (self.graph.modules.items) |*mod_entry| {
+                            if (mod_entry.scope_id == mod_scope) {
+                                try mod_entry.attributes.append(self.allocator, .{
+                                    .name = attr.name,
+                                    .type_expr = attr.type_expr,
+                                    .value = attr.value,
+                                });
+                                break;
+                            }
+                        }
+                    } else {
+                        try pending_attrs.append(self.allocator, .{
+                            .name = attr.name,
+                            .type_expr = attr.type_expr,
+                            .value = attr.value,
+                        });
+                    }
+                },
                 .type_decl => |td| try self.collectType(td, mod_scope),
                 .opaque_decl => |od| try self.collectOpaque(od, mod_scope),
                 .struct_decl => |sd| try self.collectStruct(sd, mod_scope),
@@ -99,11 +136,71 @@ pub const Collector = struct {
                 .import_decl => |id_decl| try self.collectImport(id_decl, mod_scope),
             }
         }
+
+        // Any remaining pending attributes are module-level (not attached to a function)
+        if (pending_attrs.items.len > 0) {
+            // Find the module entry and attach the attributes
+            for (self.graph.modules.items) |*mod_entry| {
+                if (mod_entry.scope_id == mod_scope) {
+                    for (pending_attrs.items) |attr| {
+                        try mod_entry.attributes.append(self.allocator, attr);
+                    }
+                    break;
+                }
+            }
+        }
     }
 
     // ============================================================
     // Function collection — family grouping
     // ============================================================
+
+    fn collectFunctionWithAttrs(
+        self: *Collector,
+        func: *const ast.FunctionDecl,
+        parent_scope: scope.ScopeId,
+        pending_attrs: *std.ArrayListUnmanaged(scope.Attribute),
+    ) !void {
+        try self.collectFunction(func, parent_scope);
+        // Attach pending attributes to the function family
+        if (pending_attrs.items.len > 0) {
+            for (func.clauses) |clause| {
+                const arity: u32 = @intCast(clause.params.len);
+                const key = scope.FamilyKey{ .name = func.name, .arity = arity };
+                const parent = self.graph.getScopeMut(parent_scope);
+                if (parent.function_families.get(key)) |fid| {
+                    const family = self.graph.getFamilyMut(fid);
+                    for (pending_attrs.items) |attr| {
+                        try family.attributes.append(self.allocator, attr);
+                    }
+                }
+                break; // Only attach to the first clause's family
+            }
+        }
+    }
+
+    fn collectMacroWithAttrs(
+        self: *Collector,
+        mac: *const ast.FunctionDecl,
+        parent_scope: scope.ScopeId,
+        pending_attrs: *std.ArrayListUnmanaged(scope.Attribute),
+    ) !void {
+        try self.collectMacro(mac, parent_scope);
+        // Attach pending attributes to the macro family
+        // Macro families are stored on the ScopeGraph, indexed via the Scope's macro_families map
+        if (pending_attrs.items.len > 0) {
+            if (mac.clauses.len > 0) {
+                const arity: u32 = @intCast(mac.clauses[0].params.len);
+                const key = scope.FamilyKey{ .name = mac.name, .arity = arity };
+                const parent = self.graph.getScopeMut(parent_scope);
+                if (parent.macros.get(key)) |mid| {
+                    for (pending_attrs.items) |attr| {
+                        try self.graph.macro_families.items[mid].attributes.append(self.allocator, attr);
+                    }
+                }
+            }
+        }
+    }
 
     fn collectFunction(self: *Collector, func: *const ast.FunctionDecl, parent_scope: scope.ScopeId) !void {
         for (func.clauses, 0..) |clause, clause_idx| {

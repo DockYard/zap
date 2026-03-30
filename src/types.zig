@@ -1014,7 +1014,7 @@ pub const TypeChecker = struct {
                 }
                 return false;
             },
-            .case_expr, .panic_expr, .quote_expr, .unquote_expr, .intrinsic, .binary_literal, .function_ref => return true,
+            .case_expr, .panic_expr, .quote_expr, .unquote_expr, .intrinsic, .attr_ref, .binary_literal, .function_ref => return true,
             else => return false,
         }
     }
@@ -1403,8 +1403,14 @@ pub const TypeChecker = struct {
 
         for (mod.items) |item| {
             switch (item) {
-                .function => |func| try self.checkFunctionDecl(func),
-                .priv_function => |func| try self.checkFunctionDecl(func),
+                .function => |func| {
+                    try self.checkFunctionDecl(func);
+                    if (self.current_scope) |cs| try self.checkDebugAttribute(func, cs);
+                },
+                .priv_function => |func| {
+                    try self.checkFunctionDecl(func);
+                    if (self.current_scope) |cs| try self.checkDebugAttribute(func, cs);
+                },
                 .macro, .priv_macro => |mac| {
                     // Mark macro params as referenced — they're used in quote/unquote,
                     // not via normal var_ref, so the unused-binding check can't see them.
@@ -1420,9 +1426,119 @@ pub const TypeChecker = struct {
                     }
                     try self.checkFunctionDecl(mac);
                 },
+                .attribute => |attr| {
+                    try self.checkAttributeDecl(attr);
+                },
                 else => {},
             }
         }
+    }
+
+    fn checkAttributeDecl(self: *TypeChecker, attr: *const ast.AttributeDecl) !void {
+        // For typed attributes (@name :: Type = value), validate the value against the type
+        if (attr.type_expr != null and attr.value != null) {
+            const declared_type = self.resolveTypeExpr(attr.type_expr.?) catch return;
+            const attr_name = self.interner.get(attr.name);
+
+            // Infer the type of the value from its literal form
+            const value_type = literalType(attr.value.?);
+
+            if (declared_type != TypeStore.UNKNOWN and value_type != TypeStore.UNKNOWN) {
+                if (declared_type != value_type) {
+                    try self.addHardError(
+                        try std.fmt.allocPrint(self.allocator,
+                            "@{s} declared as {s}, but value has type {s}",
+                            .{ attr_name, self.typeToString(declared_type), self.typeToString(value_type) },
+                        ),
+                        attr.meta.span,
+                        "type mismatch in attribute value",
+                        "the value must match the declared type",
+                    );
+                }
+            }
+        } else if (attr.type_expr == null and attr.value == null) {
+            // Marker attribute — valid
+            // For @debug, validate that it's on a function with T -> T semantics
+            // (This validation is done later when we see the function declaration)
+        } else {
+            // Type without value or value without type — should not happen
+            // (parser enforces the syntax), but handle defensively
+            const attr_name = self.interner.get(attr.name);
+            try self.addHardError(
+                try std.fmt.allocPrint(self.allocator,
+                    "@{s}: typed attributes must have both a type and a value",
+                    .{attr_name},
+                ),
+                attr.meta.span,
+                null,
+                "use @name :: Type = value",
+            );
+        }
+    }
+
+    /// Check if a function has @debug attribute and validate pass-through semantics.
+    fn checkDebugAttribute(self: *TypeChecker, func: *const ast.FunctionDecl, mod_scope: scope_mod.ScopeId) !void {
+        if (func.clauses.len == 0) return;
+        const arity: u32 = @intCast(func.clauses[0].params.len);
+        const key = scope_mod.FamilyKey{ .name = func.name, .arity = arity };
+        const parent = self.graph.scopes.items[mod_scope];
+        const fid = parent.function_families.get(key) orelse return;
+        const family = self.graph.families.items[fid];
+
+        // Check if this function has @debug
+        var has_debug = false;
+        for (family.attributes.items) |attr| {
+            if (std.mem.eql(u8, self.interner.get(attr.name), "debug")) {
+                has_debug = true;
+                break;
+            }
+        }
+
+        if (!has_debug) return;
+
+        // Validate: @debug functions must have exactly one parameter
+        if (arity != 1) {
+            try self.addHardError(
+                try std.fmt.allocPrint(self.allocator,
+                    "@debug function `{s}` must have exactly one parameter, found {d}",
+                    .{ self.interner.get(func.name), arity },
+                ),
+                func.meta.span,
+                "@debug requires pass-through semantics (T -> T)",
+                "the function must take one argument and return the same type",
+            );
+            return;
+        }
+
+        // Validate: return type must match parameter type
+        // (For now, we check that a return type is declared — the T -> T check
+        // requires generic type resolution which is a future enhancement)
+        for (func.clauses) |clause| {
+            if (clause.return_type == null) {
+                try self.addHardError(
+                    try std.fmt.allocPrint(self.allocator,
+                        "@debug function `{s}` must declare a return type",
+                        .{self.interner.get(func.name)},
+                    ),
+                    func.meta.span,
+                    "@debug requires explicit return type",
+                    "add :: T after the parameter list",
+                );
+            }
+        }
+    }
+
+    /// Infer the type of a literal expression for attribute type checking.
+    fn literalType(expr: *const ast.Expr) TypeId {
+        return switch (expr.*) {
+            .int_literal => TypeStore.I64,
+            .float_literal => TypeStore.F64,
+            .string_literal => TypeStore.STRING,
+            .atom_literal => TypeStore.ATOM,
+            .bool_literal => TypeStore.BOOL,
+            .nil_literal => TypeStore.NIL,
+            else => TypeStore.UNKNOWN,
+        };
     }
 
     fn checkModuleExtendsSignatures(self: *TypeChecker, mod: *const ast.ModuleDecl, parent_name: ast.StringId) !void {
@@ -2091,6 +2207,7 @@ pub const TypeChecker = struct {
             .with_expr => TypeStore.UNKNOWN, // desugared before type checking
             .cond_expr => TypeStore.UNKNOWN, // desugared before type checking
             .intrinsic => TypeStore.UNKNOWN,
+            .attr_ref => TypeStore.UNKNOWN,
             .binary_literal => TypeStore.STRING, // binary literals produce []const u8
             .type_annotated => |ta| {
                 // Infer the inner expression, but prefer the annotated type

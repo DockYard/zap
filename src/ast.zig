@@ -123,6 +123,7 @@ pub const ModuleItem = union(enum) {
     priv_macro: *const FunctionDecl,
     alias_decl: *const AliasDecl,
     import_decl: *const ImportDecl,
+    attribute: *const AttributeDecl,
 };
 
 // ============================================================
@@ -247,6 +248,19 @@ pub const ImportEntry = union(enum) {
 };
 
 // ============================================================
+// Module attributes
+// ============================================================
+
+pub const AttributeDecl = struct {
+    meta: NodeMeta,
+    name: StringId,
+    /// Type annotation — null for marker attributes (@name with no value)
+    type_expr: ?*const TypeExpr = null,
+    /// Value expression — null for marker attributes
+    value: ?*const Expr = null,
+};
+
+// ============================================================
 // Statements
 // ============================================================
 
@@ -315,6 +329,9 @@ pub const Expr = union(enum) {
     // Intrinsics
     intrinsic: IntrinsicExpr,
 
+    // Attribute reference: @name in expression position
+    attr_ref: AttrRefExpr,
+
     // Binary literal: <<1, 2, 3>>
     binary_literal: BinaryLiteral,
 
@@ -354,6 +371,7 @@ pub const Expr = union(enum) {
             .panic_expr => |v| v.meta,
             .block => |v| v.meta,
             .intrinsic => |v| v.meta,
+            .attr_ref => |v| v.meta,
             .binary_literal => |v| v.meta,
             .function_ref => |v| v.meta,
             .type_annotated => |v| v.meta,
@@ -588,6 +606,11 @@ pub const IntrinsicExpr = struct {
     meta: NodeMeta,
     name: StringId,
     args: []const *const Expr,
+};
+
+pub const AttrRefExpr = struct {
+    meta: NodeMeta,
+    name: StringId,
 };
 
 // ============================================================

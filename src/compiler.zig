@@ -134,13 +134,37 @@ pub fn compileFrontend(
         return error.CollectFailed;
     }
 
+    // Phase 2.5: Attribute substitution
+    // Replace @name references in function bodies with stored attribute values
+    var subst_errors: std.ArrayListUnmanaged(zap.attr_substitute.SubstitutionError) = .empty;
+    const substituted_program = zap.attr_substitute.substituteAttributes(
+        alloc,
+        &program,
+        &collector.graph,
+        &parser.interner,
+        &subst_errors,
+    ) catch {
+        diag_engine.err("Error during attribute substitution", .{ .start = 0, .end = 0 }) catch {};
+        if (options.show_progress) progress.print("\r\x1b[K", .{}) catch {};
+        emitDiagnostics(&diag_engine, alloc);
+        return error.DesugarFailed;
+    };
+    for (subst_errors.items) |subst_err| {
+        diag_engine.err(subst_err.message, subst_err.span) catch {};
+    }
+    if (diag_engine.hasErrors()) {
+        if (options.show_progress) progress.print("\r\x1b[K", .{}) catch {};
+        emitDiagnostics(&diag_engine, alloc);
+        return error.DesugarFailed;
+    }
+
     // Phase 3: Macro expansion
     step += 1;
     if (options.show_progress) progress.print("\r\x1b[K  [{d}/{d}] Expand macros", .{ step, total_steps }) catch {};
 
     var macro_engine = zap.MacroEngine.init(alloc, &parser.interner, &collector.graph);
     defer macro_engine.deinit();
-    const expanded_program = macro_engine.expandProgram(&program) catch {
+    const expanded_program = macro_engine.expandProgram(&substituted_program) catch {
         for (macro_engine.errors.items) |macro_err| {
             diag_engine.err(macro_err.message, macro_err.span) catch {};
         }

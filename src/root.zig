@@ -37,6 +37,7 @@ pub const project = @import("project.zig");
 pub const compiler = @import("compiler.zig");
 pub const builder = @import("builder.zig");
 pub const discovery = @import("discovery.zig");
+pub const attr_substitute = @import("attr_substitute.zig");
 pub const lockfile = @import("lockfile.zig");
 
 test {
@@ -74,5 +75,6 @@ test {
     _ = @import("builder.zig");
     _ = @import("discovery.zig");
     _ = @import("lockfile.zig");
+    _ = @import("attr_substitute.zig");
     _ = @import("integration_tests.zig");
 }

@@ -3408,3 +3408,178 @@ test "deps: defmodulep allowed within same dep" {
 
     try std.testing.expectEqual(@as(usize, 2), graph.topo_order.items.len);
 }
+
+// ============================================================
+// Module attribute integration tests
+// ============================================================
+
+test "attributes: typed attribute compiles and is stored on function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Foo do
+        \\  @doc :: String = "hello world"
+        \\  def bar() :: i64 do
+        \\    42
+        \\  end
+        \\end
+    ;
+
+    // Compile through the pipeline — should not error
+    const output = try compile(alloc, source);
+    try expectContains(output, "fn Foo__bar(");
+}
+
+test "attributes: marker attribute compiles" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Foo do
+        \\  @debug
+        \\  def inspect(value :: i64) :: i64 do
+        \\    value
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, "fn Foo__inspect(");
+}
+
+test "attributes: module-level attribute compiles" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Foo do
+        \\  @moduledoc :: String = "A module"
+        \\  def bar() :: i64 do
+        \\    42
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, "fn Foo__bar(");
+}
+
+test "attributes: multiple attributes on function compiles" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Foo do
+        \\  @doc :: String = "does something"
+        \\  @deprecated :: String = "use bar2"
+        \\  def bar() :: i64 do
+        \\    42
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, "fn Foo__bar(");
+}
+
+test "attributes: stored in scope graph" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    const source =
+        \\defmodule Foo do
+        \\  @moduledoc :: String = "A module doc"
+        \\  @doc :: String = "Function doc"
+        \\  def bar() :: i64 do
+        \\    42
+        \\  end
+        \\end
+    ;
+
+    const prepend_result = try stdlib.prependStdlib(alloc, source);
+    const full_source = prepend_result.source;
+
+    var parser = @import("parser.zig").Parser.init(alloc, full_source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = @import("collector.zig").Collector.init(alloc, &parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    // Find the Foo module entry
+    var foo_found = false;
+    for (collector.graph.modules.items) |mod_entry| {
+        if (mod_entry.name.parts.len == 1) {
+            const name = parser.interner.get(mod_entry.name.parts[0]);
+            if (std.mem.eql(u8, name, "Foo")) {
+                foo_found = true;
+                // Module should have the @moduledoc attribute
+                try std.testing.expectEqual(@as(usize, 1), mod_entry.attributes.items.len);
+                const attr = mod_entry.attributes.items[0];
+                try std.testing.expectEqualStrings("moduledoc", parser.interner.get(attr.name));
+                break;
+            }
+        }
+    }
+    try std.testing.expect(foo_found);
+
+    // Find the bar function family and check it has @doc
+    var bar_found = false;
+    for (collector.graph.families.items) |family| {
+        const fname = parser.interner.get(family.name);
+        if (std.mem.eql(u8, fname, "bar") and family.arity == 0) {
+            // Check if this is Foo's bar (not a stdlib function)
+            if (family.attributes.items.len > 0) {
+                bar_found = true;
+                try std.testing.expectEqual(@as(usize, 1), family.attributes.items.len);
+                const attr = family.attributes.items[0];
+                try std.testing.expectEqualStrings("doc", parser.interner.get(attr.name));
+            }
+        }
+    }
+    try std.testing.expect(bar_found);
+}
+
+test "attributes: @name substitution in function body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Foo do
+        \\  @timeout :: i64 = 5000
+        \\  def get_timeout() :: i64 do
+        \\    @timeout
+        \\  end
+        \\end
+    ;
+
+    // Should compile — @timeout is substituted with 5000
+    const output = try compile(alloc, source);
+    try expectContains(output, "fn Foo__get_timeout(");
+}
+
+test "attributes: @name substitution in expression" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\defmodule Foo do
+        \\  @base :: i64 = 100
+        \\  def doubled() :: i64 do
+        \\    @base * 2
+        \\  end
+        \\end
+    ;
+
+    const output = try compile(alloc, source);
+    try expectContains(output, "fn Foo__doubled(");
+}

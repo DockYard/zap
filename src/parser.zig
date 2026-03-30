@@ -459,6 +459,13 @@ pub const Parser = struct {
                         self.synchronize();
                     }
                 },
+                .at_sign => {
+                    if (self.parseAttributeDecl()) |attr| {
+                        try items.append(self.allocator, .{ .attribute = attr });
+                    } else |_| {
+                        self.synchronize();
+                    }
+                },
                 .dedent => {
                     _ = self.advance();
                 },
@@ -472,7 +479,7 @@ pub const Parser = struct {
                         }) catch "unexpected token in module",
                         self.currentSpan(),
                         "not valid inside a module body",
-                        "modules can contain `def`, `defp`, `defmacro`, `defmacrop`, `defstruct`, `defenum`, `type`, `alias`, and `import` declarations",
+                        "modules can contain `def`, `defp`, `defmacro`, `defmacrop`, `defstruct`, `defenum`, `type`, `alias`, `import`, and `@attribute` declarations",
                     );
                     _ = self.advance();
                 },
@@ -979,6 +986,58 @@ pub const Parser = struct {
         });
     }
 
+    // ============================================================
+    // Module attribute declarations
+    // ============================================================
+
+    fn parseAttributeDecl(self: *Parser) !*const ast.AttributeDecl {
+        const start = self.currentSpan();
+        _ = try self.expect(.at_sign);
+
+        if (!self.check(.identifier)) {
+            try self.addRichError(
+                "I was expecting an attribute name after `@`",
+                start,
+                "attribute starts here",
+                "attribute names must be lowercase identifiers, like `@doc` or `@deprecated`",
+            );
+            return error.ParseError;
+        }
+        const name_tok = self.advance();
+        const name = try self.internToken(name_tok);
+
+        // Check for typed attribute: @name :: Type = value
+        if (self.check(.double_colon)) {
+            _ = self.advance();
+            const type_expr = try self.parseTypeExpr();
+            if (!self.check(.equal)) {
+                try self.addRichError(
+                    "I was expecting `=` after the type in this attribute declaration",
+                    self.currentSpan(),
+                    null,
+                    "typed attributes look like: `@name :: Type = value`",
+                );
+                return error.ParseError;
+            }
+            _ = self.advance();
+            const value = try self.parseExpr();
+            return self.create(ast.AttributeDecl, .{
+                .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
+                .name = name,
+                .type_expr = type_expr,
+                .value = value,
+            });
+        }
+
+        // Marker attribute: @name (no type, no value)
+        return self.create(ast.AttributeDecl, .{
+            .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
+            .name = name,
+            .type_expr = null,
+            .value = null,
+        });
+    }
+
     fn parseImportFilter(self: *Parser) !ast.ImportFilter {
         if (self.match(.keyword_only)) {
             _ = try self.expect(.colon);
@@ -1418,7 +1477,7 @@ pub const Parser = struct {
             .keyword_quote => return self.parseQuoteExpr(),
             .keyword_unquote => return self.parseUnquoteExpr(),
             .keyword_panic => return self.parsePanicExpr(),
-            .at_sign => return self.parseIntrinsicExpr(),
+            .at_sign => return self.parseAtSignExpr(),
             .double_ampersand => {
                 try self.addRichError(
                     "Zap uses `and` for logical AND, not `&&`",
@@ -2083,6 +2142,51 @@ pub const Parser = struct {
                 .message = message,
             },
         });
+    }
+
+    /// Disambiguate @name(args) (intrinsic call) from @name (attribute reference).
+    /// If @ identifier is followed by (, it's an intrinsic. Otherwise it's an attr ref.
+    fn parseAtSignExpr(self: *Parser) !*const ast.Expr {
+        // Peek ahead: @ identifier ( → intrinsic, @ identifier → attr ref
+        const start = self.currentSpan();
+        if (self.peekNext() == .identifier) {
+            // Look two tokens ahead (past @, past identifier) for (
+            // We can't easily peek that far, so consume @ and identifier,
+            // then check for (
+            _ = self.advance(); // consume @
+            const name_tok = self.advance(); // consume identifier
+            const name = try self.internToken(name_tok);
+
+            if (self.check(.left_paren)) {
+                // Intrinsic call: @name(args...)
+                _ = self.advance(); // consume (
+                var args: std.ArrayList(*const ast.Expr) = .empty;
+                while (!self.check(.right_paren) and !self.check(.eof)) {
+                    const arg = try self.parseExpr();
+                    try args.append(self.allocator, arg);
+                    if (!self.match(.comma)) break;
+                }
+                _ = try self.expect(.right_paren);
+                return self.create(ast.Expr, .{
+                    .intrinsic = .{
+                        .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
+                        .name = name,
+                        .args = try args.toOwnedSlice(self.allocator),
+                    },
+                });
+            }
+
+            // Attribute reference: @name
+            return self.create(ast.Expr, .{
+                .attr_ref = .{
+                    .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
+                    .name = name,
+                },
+            });
+        }
+
+        // Fall back to intrinsic parsing for other patterns
+        return self.parseIntrinsicExpr();
     }
 
     fn parseIntrinsicExpr(self: *Parser) !*const ast.Expr {
@@ -3742,4 +3846,160 @@ test "parse defmodule is_private false by default" {
     const program = try parser.parseProgram();
     try std.testing.expectEqual(@as(usize, 1), program.modules.len);
     try std.testing.expect(!program.modules[0].is_private);
+}
+
+test "parse typed module attribute" {
+    const source =
+        \\defmodule Foo do
+        \\  @doc :: String = "hello world"
+        \\  def bar() :: i64 do
+        \\    1
+        \\  end
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    try std.testing.expectEqual(@as(usize, 1), program.modules.len);
+    try std.testing.expectEqual(@as(usize, 2), program.modules[0].items.len);
+    // First item is the attribute
+    try std.testing.expect(program.modules[0].items[0] == .attribute);
+    const attr = program.modules[0].items[0].attribute;
+    try std.testing.expectEqualStrings("doc", parser.interner.get(attr.name));
+    try std.testing.expect(attr.type_expr != null);
+    try std.testing.expect(attr.value != null);
+    // Second item is the function
+    try std.testing.expect(program.modules[0].items[1] == .function);
+}
+
+test "parse marker attribute" {
+    const source =
+        \\defmodule Foo do
+        \\  @debug
+        \\  def bar() :: i64 do
+        \\    1
+        \\  end
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    try std.testing.expectEqual(@as(usize, 1), program.modules.len);
+    try std.testing.expectEqual(@as(usize, 2), program.modules[0].items.len);
+    const attr = program.modules[0].items[0].attribute;
+    try std.testing.expectEqualStrings("debug", parser.interner.get(attr.name));
+    try std.testing.expect(attr.type_expr == null);
+    try std.testing.expect(attr.value == null);
+}
+
+test "parse multiple attributes on same function" {
+    const source =
+        \\defmodule Foo do
+        \\  @doc :: String = "does something"
+        \\  @deprecated :: String = "use bar2 instead"
+        \\  def bar() :: i64 do
+        \\    1
+        \\  end
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    try std.testing.expectEqual(@as(usize, 1), program.modules.len);
+    // 2 attributes + 1 function = 3 items
+    try std.testing.expectEqual(@as(usize, 3), program.modules[0].items.len);
+    try std.testing.expect(program.modules[0].items[0] == .attribute);
+    try std.testing.expect(program.modules[0].items[1] == .attribute);
+    try std.testing.expect(program.modules[0].items[2] == .function);
+
+    const doc = program.modules[0].items[0].attribute;
+    try std.testing.expectEqualStrings("doc", parser.interner.get(doc.name));
+
+    const dep = program.modules[0].items[1].attribute;
+    try std.testing.expectEqualStrings("deprecated", parser.interner.get(dep.name));
+}
+
+test "parse module-level attribute" {
+    const source =
+        \\defmodule Foo do
+        \\  @moduledoc :: String = "A module"
+        \\  @version :: String = "1.0.0"
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    try std.testing.expectEqual(@as(usize, 1), program.modules.len);
+    try std.testing.expectEqual(@as(usize, 2), program.modules[0].items.len);
+    try std.testing.expect(program.modules[0].items[0] == .attribute);
+    try std.testing.expect(program.modules[0].items[1] == .attribute);
+
+    const moduledoc = program.modules[0].items[0].attribute;
+    try std.testing.expectEqualStrings("moduledoc", parser.interner.get(moduledoc.name));
+
+    const version = program.modules[0].items[1].attribute;
+    try std.testing.expectEqualStrings("version", parser.interner.get(version.name));
+}
+
+test "parse attribute with integer value" {
+    const source =
+        \\defmodule Foo do
+        \\  @timeout :: i64 = 5000
+        \\  def connect() :: i64 do
+        \\    1
+        \\  end
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    try std.testing.expectEqual(@as(usize, 2), program.modules[0].items.len);
+    const attr = program.modules[0].items[0].attribute;
+    try std.testing.expectEqualStrings("timeout", parser.interner.get(attr.name));
+    try std.testing.expect(attr.type_expr != null);
+    try std.testing.expect(attr.value != null);
+    // Value should be an int literal
+    try std.testing.expect(attr.value.?.* == .int_literal);
+}
+
+test "parse attribute with list value" {
+    const source =
+        \\defmodule Foo do
+        \\  @flags :: List(Atom) = [:read, :write]
+        \\  def connect() :: i64 do
+        \\    1
+        \\  end
+        \\end
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    try std.testing.expectEqual(@as(usize, 2), program.modules[0].items.len);
+    const attr = program.modules[0].items[0].attribute;
+    try std.testing.expectEqualStrings("flags", parser.interner.get(attr.name));
+    try std.testing.expect(attr.value.?.* == .list);
 }
