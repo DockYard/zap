@@ -265,11 +265,11 @@ test "example: hello world" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Test do
-        \\  def main() :: String do
+        \\pub module Test {
+        \\  pub fn main() :: String {
         \\    IO.puts("Hello, world!")
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -288,11 +288,11 @@ test "IO.puts resolves to runtime println" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Test do
-        \\  def main() :: String do
+        \\pub module Test {
+        \\  pub fn main() :: String {
         \\    IO.puts("test output")
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -306,11 +306,11 @@ test "bare println is not implicitly available" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Test do
-        \\  def main() :: String do
+        \\pub module Test {
+        \\  pub fn main() :: String {
         \\    println("should not resolve")
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -329,21 +329,21 @@ test "example: factorial" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Factorial do
-        \\  def factorial(0 :: i64) :: i64 do
+        \\pub module Factorial {
+        \\  pub fn factorial(0 :: i64) :: i64 {
         \\    1
-        \\  end
+        \\  }
         \\
-        \\  def factorial(n :: i64) :: i64 do
+        \\  pub fn factorial(n :: i64) :: i64 {
         \\    n * factorial(n - 1)
-        \\  end
-        \\end
+        \\  }
+        \\}
         \\
-        \\defmodule Test do
-        \\  def main() :: i64 do
+        \\pub module Test {
+        \\  pub fn main() :: i64 {
         \\    Factorial.factorial(10)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -363,25 +363,25 @@ test "example: fibonacci" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Fib do
-        \\  def fib(0 :: i64) :: i64 do
+        \\pub module Fib {
+        \\  pub fn fib(0 :: i64) :: i64 {
         \\    0
-        \\  end
+        \\  }
         \\
-        \\  def fib(1 :: i64) :: i64 do
+        \\  pub fn fib(1 :: i64) :: i64 {
         \\    1
-        \\  end
+        \\  }
         \\
-        \\  def fib(n :: i64) :: i64 do
+        \\  pub fn fib(n :: i64) :: i64 {
         \\    fib(n - 1) + fib(n - 2)
-        \\  end
-        \\end
+        \\  }
+        \\}
         \\
-        \\defmodule Test do
-        \\  def main() :: i64 do
+        \\pub module Test {
+        \\  pub fn main() :: i64 {
         \\    Fib.fib(20)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -400,29 +400,29 @@ test "example: math module" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Math do
-        \\  def square(x :: i64) :: i64 do
+        \\pub module Math {
+        \\  pub fn square(x :: i64) :: i64 {
         \\    x * x
-        \\  end
+        \\  }
         \\
-        \\  def cube(x :: i64) :: i64 do
+        \\  pub fn cube(x :: i64) :: i64 {
         \\    x * x * x
-        \\  end
+        \\  }
         \\
-        \\  def abs(x :: i64) :: i64 do
-        \\    if x < 0 do
+        \\  pub fn abs(x :: i64) :: i64 {
+        \\    if x < 0 {
         \\      -x
-        \\    else
+        \\    } else {
         \\      x
-        \\    end
-        \\  end
-        \\end
+        \\    }
+        \\  }
+        \\}
         \\
-        \\defmodule Test do
-        \\  def main() :: i64 do
+        \\pub module Test {
+        \\  pub fn main() :: i64 {
         \\    Math.square(5)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -443,25 +443,25 @@ test "example: pattern matching" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Matcher do
-        \\  def describe(:ok :: Atom) :: String do
+        \\pub module Matcher {
+        \\  pub fn describe(:ok :: Atom) :: String {
         \\    "success"
-        \\  end
+        \\  }
         \\
-        \\  def describe(:error :: Atom) :: String do
+        \\  pub fn describe(:error :: Atom) :: String {
         \\    "failure"
-        \\  end
+        \\  }
         \\
-        \\  def describe(_ :: Atom) :: String do
+        \\  pub fn describe(_ :: Atom) :: String {
         \\    "unknown"
-        \\  end
-        \\end
+        \\  }
+        \\}
         \\
-        \\defmodule Test do
-        \\  def main() :: String do
+        \\pub module Test {
+        \\  pub fn main() :: String {
         \\    Matcher.describe(:ok)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -482,23 +482,23 @@ test "example: multiline pipes" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Pipes do
-        \\  def double(x :: i64) :: i64 do
+        \\pub module Pipes {
+        \\  pub fn double(x :: i64) :: i64 {
         \\    x * 2
-        \\  end
+        \\  }
         \\
-        \\  def add_one(x :: i64) :: i64 do
+        \\  pub fn add_one(x :: i64) :: i64 {
         \\    x + 1
-        \\  end
-        \\end
+        \\  }
+        \\}
         \\
-        \\defmodule Test do
-        \\  def main() :: i64 do
+        \\pub module Test {
+        \\  pub fn main() :: i64 {
         \\    5
         \\    |> Pipes.double()
         \\    |> Pipes.add_one()
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -520,23 +520,23 @@ test "example: type declarations" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Geometry do
+        \\pub module Geometry {
         \\  type Shape = {:circle, f64} | {:rectangle, f64, f64}
         \\
-        \\  def area({:circle, radius} :: Shape) :: f64 do
+        \\  pub fn area({:circle, radius} :: Shape) :: f64 {
         \\    3.14159 * radius * radius
-        \\  end
+        \\  }
         \\
-        \\  def area({:rectangle, w, h} :: Shape) :: f64 do
+        \\  pub fn area({:rectangle, w, h} :: Shape) :: f64 {
         \\    w * h
-        \\  end
-        \\end
+        \\  }
+        \\}
         \\
-        \\defmodule Test do
-        \\  def main() :: f64 do
+        \\pub module Test {
+        \\  pub fn main() :: f64 {
         \\    Geometry.area({:circle, 5.0})
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -557,11 +557,11 @@ test "all compiled output has required header" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Test do
-        \\  def main() :: Nil do
+        \\pub module Test {
+        \\  pub fn main() :: Nil {
         \\    nil
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -576,15 +576,15 @@ test "multiple function clauses produce separate functions" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Greeter do
-        \\  def greet(:morning :: Atom) :: String do
+        \\pub module Greeter {
+        \\  pub fn greet(:morning :: Atom) :: String {
         \\    "Good morning"
-        \\  end
+        \\  }
         \\
-        \\  def greet(:evening :: Atom) :: String do
+        \\  pub fn greet(:evening :: Atom) :: String {
         \\    "Good evening"
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -599,11 +599,11 @@ test "string concatenation in function body" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Greeter do
-        \\  def greet(name :: String) :: String do
+        \\pub module Greeter {
+        \\  pub fn greet(name :: String) :: String {
         \\    "Hello, " <> name
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -617,15 +617,15 @@ test "if-else generates conditional" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Sign do
-        \\  def sign(x :: i64) :: String do
-        \\    if x > 0 do
+        \\pub module Sign {
+        \\  pub fn sign(x :: i64) :: String {
+        \\    if x > 0 {
         \\      "positive"
-        \\    else
+        \\    } else {
         \\      "non-positive"
-        \\    end
-        \\  end
-        \\end
+        \\    }
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -648,21 +648,21 @@ test "tuple pattern destructuring" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Geometry do
-        \\  def area({:circle, radius} :: f64) :: f64 do
+        \\pub module Geometry {
+        \\  pub fn area({:circle, radius} :: f64) :: f64 {
         \\    3.14159 * radius * radius
-        \\  end
+        \\  }
         \\
-        \\  def area({:rectangle, w, h} :: f64) :: f64 do
+        \\  pub fn area({:rectangle, w, h} :: f64) :: f64 {
         \\    w * h
-        \\  end
-        \\end
+        \\  }
+        \\}
         \\
-        \\defmodule Test do
-        \\  def main() :: f64 do
+        \\pub module Test {
+        \\  pub fn main() :: f64 {
         \\    Geometry.area({:circle, 5.0})
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -690,19 +690,19 @@ test "refinement guard on function clause" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Classifier do
-        \\  def classify(n :: i64) :: String if n > 0 do
+        \\pub module Classifier {
+        \\  pub fn classify(n :: i64) :: String if n > 0 {
         \\    "positive"
-        \\  end
+        \\  }
         \\
-        \\  def classify(n :: i64) :: String if n < 0 do
+        \\  pub fn classify(n :: i64) :: String if n < 0 {
         \\    "negative"
-        \\  end
+        \\  }
         \\
-        \\  def classify(_ :: i64) :: String do
+        \\  pub fn classify(_ :: i64) :: String {
         \\    "zero"
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -724,18 +724,15 @@ test "case expression with literal patterns" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Checker do
-        \\  def check(x :: i64) :: String do
-        \\    case x do
-        \\      0 ->
-        \\        "zero"
-        \\      1 ->
-        \\        "one"
-        \\      _ ->
-        \\        "other"
-        \\    end
-        \\  end
-        \\end
+        \\pub module Checker {
+        \\  pub fn check(x :: i64) :: String {
+        \\    case x {
+        \\      0 -> "zero"
+        \\      1 -> "one"
+        \\      _ -> "other"
+        \\    }
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -754,16 +751,14 @@ test "case expression with tuple destructuring" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Handler do
-        \\  def handle(result :: Atom) :: Nil do
-        \\    case result do
-        \\      {:ok, v} ->
-        \\        v
-        \\      {:error, e} ->
-        \\        e
-        \\    end
-        \\  end
-        \\end
+        \\pub module Handler {
+        \\  pub fn handle(result :: Atom) :: Nil {
+        \\    case result {
+        \\      {:ok, v} -> v
+        \\      {:error, e} -> e
+        \\    }
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -781,14 +776,13 @@ test "case expression with bind pattern" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Identity do
-        \\  def identity(x :: Atom) :: Nil do
-        \\    case x do
-        \\      v ->
-        \\        v
-        \\    end
-        \\  end
-        \\end
+        \\pub module Identity {
+        \\  pub fn identity(x :: Atom) :: Nil {
+        \\    case x {
+        \\      v -> v
+        \\    }
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -807,18 +801,15 @@ test "case expression emits switch for integer literals" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Checker do
-        \\  def check(x :: i64) :: String do
-        \\    case x do
-        \\      0 ->
-        \\        "zero"
-        \\      1 ->
-        \\        "one"
-        \\      _ ->
-        \\        "other"
-        \\    end
-        \\  end
-        \\end
+        \\pub module Checker {
+        \\  pub fn check(x :: i64) :: String {
+        \\    case x {
+        \\      0 -> "zero"
+        \\      1 -> "one"
+        \\      _ -> "other"
+        \\    }
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -836,19 +827,19 @@ test "function dispatch emits switch for integer literals" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Fib do
-        \\  def fib(0 :: i64) :: i64 do
+        \\pub module Fib {
+        \\  pub fn fib(0 :: i64) :: i64 {
         \\    0
-        \\  end
+        \\  }
         \\
-        \\  def fib(1 :: i64) :: i64 do
+        \\  pub fn fib(1 :: i64) :: i64 {
         \\    1
-        \\  end
+        \\  }
         \\
-        \\  def fib(n :: i64) :: i64 do
+        \\  pub fn fib(n :: i64) :: i64 {
         \\    fib(n - 1) + fib(n - 2)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -862,18 +853,15 @@ test "case with guards falls back to if-else" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Checker do
-        \\  def check(x :: i64) :: String do
-        \\    case x do
-        \\      0 ->
-        \\        "zero"
-        \\      n if n > 0 ->
-        \\        "positive"
-        \\      _ ->
-        \\        "negative"
-        \\    end
-        \\  end
-        \\end
+        \\pub module Checker {
+        \\  pub fn check(x :: i64) :: String {
+        \\    case x {
+        \\      0 -> "zero"
+        \\      n if n > 0 -> "positive"
+        \\      _ -> "negative"
+        \\    }
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -888,18 +876,15 @@ test "case with atom literals falls back to if-else" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Checker do
-        \\  def check(x :: Atom) :: String do
-        \\    case x do
-        \\      :ok ->
-        \\        "yes"
-        \\      :error ->
-        \\        "no"
-        \\      _ ->
-        \\        "unknown"
-        \\    end
-        \\  end
-        \\end
+        \\pub module Checker {
+        \\  pub fn check(x :: Atom) :: String {
+        \\    case x {
+        \\      :ok -> "yes"
+        \\      :error -> "no"
+        \\      _ -> "unknown"
+        \\    }
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -918,18 +903,15 @@ test "nested tuple patterns decompose once" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Processor do
-        \\  def process(x :: Atom) :: Nil do
-        \\    case x do
-        \\      {:ok, {:data, v}} ->
-        \\        v
-        \\      {:ok, {:empty}} ->
-        \\        nil
-        \\      {:error, msg} ->
-        \\        msg
-        \\    end
-        \\  end
-        \\end
+        \\pub module Processor {
+        \\  pub fn process(x :: Atom) :: Nil {
+        \\    case x {
+        \\      {:ok, {:data, v}} -> v
+        \\      {:ok, {:empty}} -> nil
+        \\      {:error, msg} -> msg
+        \\    }
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -952,16 +934,14 @@ test "case with tuple patterns checks struct type once" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Handler do
-        \\  def handle(result :: Atom) :: Nil do
-        \\    case result do
-        \\      {:ok, v} ->
-        \\        v
-        \\      {:error, e} ->
-        \\        e
-        \\    end
-        \\  end
-        \\end
+        \\pub module Handler {
+        \\  pub fn handle(result :: Atom) :: Nil {
+        \\    case result {
+        \\      {:ok, v} -> v
+        \\      {:error, e} -> e
+        \\    }
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -983,15 +963,15 @@ test "multi-clause function with tuple dispatch checks once" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Handler do
-        \\  def handle({:ok, v} :: Atom) :: Nil do
+        \\pub module Handler {
+        \\  pub fn handle({:ok, v} :: Atom) :: Nil {
         \\    v
-        \\  end
+        \\  }
         \\
-        \\  def handle({:error, e} :: Atom) :: Nil do
+        \\  pub fn handle({:error, e} :: Atom) :: Nil {
         \\    e
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -1017,15 +997,15 @@ test "typed integer param skips type check in switch" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule TypedSwitch do
-        \\  def f(0 :: i64) :: i64 do
+        \\pub module TypedSwitch {
+        \\  pub fn f(0 :: i64) :: i64 {
         \\    1
-        \\  end
+        \\  }
         \\
-        \\  def f(n :: i64) :: i64 do
+        \\  pub fn f(n :: i64) :: i64 {
         \\    n
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -1042,15 +1022,15 @@ test "untyped param produces type error" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Describer do
-        \\  def describe(:ok) :: String do
+        \\pub module Describer {
+        \\  pub fn describe(:ok) :: String {
         \\    "yes"
-        \\  end
+        \\  }
         \\
-        \\  def describe(_) :: String do
+        \\  pub fn describe(_) :: String {
         \\    "no"
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     // Untyped params now require type annotations — should produce a type error
@@ -1064,16 +1044,14 @@ test "typed case scrutinee skips type check" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Checker do
-        \\  def check(x :: i64) :: String do
-        \\    case x do
-        \\      0 ->
-        \\        "zero"
-        \\      _ ->
-        \\        "other"
-        \\    end
-        \\  end
-        \\end
+        \\pub module Checker {
+        \\  pub fn check(x :: i64) :: String {
+        \\    case x {
+        \\      0 -> "zero"
+        \\      _ -> "other"
+        \\    }
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -1084,23 +1062,21 @@ test "typed case scrutinee skips type check" {
 }
 
 test "mixed variable and constructor in case" {
-    // case x do 1 -> "one"; y -> y end
+    // case x { 1 -> "one"; y -> y }
     // Should work with mixture of literal and variable patterns
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Checker do
-        \\  def check(x :: i64) :: i64 do
-        \\    case x do
-        \\      1 ->
-        \\        100
-        \\      y ->
-        \\        y
-        \\    end
-        \\  end
-        \\end
+        \\pub module Checker {
+        \\  pub fn check(x :: i64) :: i64 {
+        \\    case x {
+        \\      1 -> 100
+        \\      y -> y
+        \\    }
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -1115,18 +1091,15 @@ test "case with mixed literal types falls back" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Checker do
-        \\  def check(x :: Atom) :: String do
-        \\    case x do
-        \\      0 ->
-        \\        "zero"
-        \\      :ok ->
-        \\        "ok"
-        \\      _ ->
-        \\        "other"
-        \\    end
-        \\  end
-        \\end
+        \\pub module Checker {
+        \\  pub fn check(x :: Atom) :: String {
+        \\    case x {
+        \\      0 -> "zero"
+        \\      :ok -> "ok"
+        \\      _ -> "other"
+        \\    }
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -1140,7 +1113,7 @@ test "parse error produces error" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    const source = "def (broken syntax";
+    const source = "pub fn (broken syntax";
     const result = compile(alloc, source);
     try std.testing.expectError(error.ParseError, result);
 }
@@ -1155,19 +1128,19 @@ test "macro expansion: unless compiles through pipeline" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Logic do
-        \\  defmacro unless(condition :: Expr, body :: Expr) :: Nil do
-        \\    quote do
-        \\      if not unquote(condition) do
+        \\pub module Logic {
+        \\  pub macro unless(condition :: Expr, body :: Expr) :: Nil {
+        \\    quote {
+        \\      if not unquote(condition) {
         \\        unquote(body)
-        \\      end
-        \\    end
-        \\  end
+        \\      }
+        \\    }
+        \\  }
         \\
-        \\  def check(x :: i64) :: i64 do
+        \\  pub fn check(x :: i64) :: i64 {
         \\    unless(x > 0, 42)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -1184,17 +1157,17 @@ test "macro expansion: expression substitution" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Math do
-        \\  defmacro double(value :: Expr) :: Nil do
-        \\    quote do
+        \\pub module Math {
+        \\  pub macro double(value :: Expr) :: Nil {
+        \\    quote {
         \\      unquote(value) + unquote(value)
-        \\    end
-        \\  end
+        \\    }
+        \\  }
         \\
-        \\  def compute(x :: i64) :: i64 do
+        \\  pub fn compute(x :: i64) :: i64 {
         \\    double(x * 3)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -1209,15 +1182,15 @@ test "Kernel.unless macro works without module prefix" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Checker do
-        \\  def check(x :: i64) :: i64 do
+        \\pub module Checker {
+        \\  pub fn check(x :: i64) :: i64 {
         \\    unless(x > 10, 42)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
-    // unless should expand to: if not (x > 10) do 42 end, then if desugars to case(true/false)
+    // unless should expand to: if not (x > 10) { 42 }, then if desugars to case(true/false)
     try expectContains(output, "switch (");
     try expectContains(output, "!");
     try expectNotContains(output, "// unhandled instruction");
@@ -1233,18 +1206,15 @@ test "cond expression desugars to nested case" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Classifier do
-        \\  def classify(x :: i64) :: String do
-        \\    cond do
-        \\      x > 0 ->
-        \\        "positive"
-        \\      x < 0 ->
-        \\        "negative"
-        \\      true ->
-        \\        "zero"
-        \\    end
-        \\  end
-        \\end
+        \\pub module Classifier {
+        \\  pub fn classify(x :: i64) :: String {
+        \\    cond {
+        \\      x > 0 -> "positive"
+        \\      x < 0 -> "negative"
+        \\      true -> "zero"
+        \\    }
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -1267,16 +1237,15 @@ test "with expression desugars to nested case" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Processor do
-        \\  def process(x :: Atom) :: Nil do
-        \\    with {:ok, a} <- x do
+        \\pub module Processor {
+        \\  pub fn process(x :: Atom) :: Nil {
+        \\    with {:ok, a} <- x {
         \\      a
-        \\    else
-        \\      {:error, e} ->
-        \\        e
-        \\    end
-        \\  end
-        \\end
+        \\    } else {
+        \\      {:error, e} -> e
+        \\    }
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -1297,17 +1266,17 @@ test "tagged union with different tuple arities" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Geometry do
+        \\pub module Geometry {
         \\  type Shape = {:circle, f64} | {:rectangle, f64, f64}
         \\
-        \\  def area({:circle, radius} :: Shape) :: f64 do
+        \\  pub fn area({:circle, radius} :: Shape) :: f64 {
         \\    3.14159 * radius * radius
-        \\  end
+        \\  }
         \\
-        \\  def area({:rectangle, w, h} :: Shape) :: f64 do
+        \\  pub fn area({:rectangle, w, h} :: Shape) :: f64 {
         \\    w * h
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -1328,24 +1297,24 @@ test "two modules with same function name don't collide" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule A do
-        \\  def calc(x :: i64) :: i64 do
+        \\pub module A {
+        \\  pub fn calc(x :: i64) :: i64 {
         \\    x + 1
-        \\  end
-        \\end
+        \\  }
+        \\}
         \\
-        \\defmodule B do
-        \\  def calc(x :: i64) :: i64 do
+        \\pub module B {
+        \\  pub fn calc(x :: i64) :: i64 {
         \\    x * 2
-        \\  end
-        \\end
+        \\  }
+        \\}
         \\
-        \\defmodule Test do
-        \\  def main() :: i64 do
+        \\pub module Test {
+        \\  pub fn main() :: i64 {
         \\    A.calc(1)
         \\    B.calc(2)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -1364,11 +1333,11 @@ test "bare inspect resolves to Kernel__inspect" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Test do
-        \\  def main() :: String do
+        \\pub module Test {
+        \\  pub fn main() :: String {
         \\    inspect(42)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -1383,17 +1352,17 @@ test "module-qualified call emits prefixed name" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Math do
-        \\  def double(x :: i64) :: i64 do
+        \\pub module Math {
+        \\  pub fn double(x :: i64) :: i64 {
         \\    x * 2
-        \\  end
-        \\end
+        \\  }
+        \\}
         \\
-        \\defmodule Test do
-        \\  def main() :: i64 do
+        \\pub module Test {
+        \\  pub fn main() :: i64 {
         \\    Math.double(5)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -1409,21 +1378,21 @@ test "nested local def direct call compiles" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Foo do
-        \\  def bar(x :: i64) :: i64 do
-        \\    def other(y :: i64) :: i64 do
+        \\pub module Foo {
+        \\  pub fn bar(x :: i64) :: i64 {
+        \\    pub fn other(y :: i64) :: i64 {
         \\      y * 10
-        \\    end
+        \\    }
         \\
         \\    other(123)
-        \\  end
-        \\end
+        \\  }
+        \\}
         \\
-        \\defmodule Test do
-        \\  def main() :: i64 do
+        \\pub module Test {
+        \\  pub fn main() :: i64 {
         \\    Foo.bar(4)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -1439,19 +1408,19 @@ test "nested noncapturing def can be passed as function value" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Foo do
-        \\  def apply(f :: (i64 -> i64), value :: i64) :: i64 do
+        \\pub module Foo {
+        \\  pub fn apply(f :: (i64 -> i64), value :: i64) :: i64 {
         \\    f(value)
-        \\  end
+        \\  }
         \\
-        \\  def bar() :: i64 do
-        \\    def other(y :: i64) :: i64 do
+        \\  pub fn bar() :: i64 {
+        \\    pub fn other(y :: i64) :: i64 {
         \\      y * 10
-        \\    end
+        \\    }
         \\
         \\    apply(other, 12)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -1468,15 +1437,15 @@ test "nested noncapturing def can be returned as function value" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Foo do
-        \\  def make(x :: i64) :: (i64 -> i64) do
-        \\    def other(y :: i64) :: i64 do
+        \\pub module Foo {
+        \\  pub fn make(x :: i64) :: (i64 -> i64) {
+        \\    pub fn other(y :: i64) :: i64 {
         \\      x + y
-        \\    end
+        \\    }
         \\
         \\    other
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -1493,15 +1462,15 @@ test "capturing nested def local call compiles as closure" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Foo do
-        \\  def bar(x :: i64) :: i64 do
-        \\    def add_x(y :: i64) :: i64 do
+        \\pub module Foo {
+        \\  pub fn bar(x :: i64) :: i64 {
+        \\    pub fn add_x(y :: i64) :: i64 {
         \\      x + y
-        \\    end
+        \\    }
         \\
         \\    add_x(10)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -1518,15 +1487,15 @@ test "call-local capturing closure omits closure wrappers" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Foo do
-        \\  def bar(x :: i64) :: i64 do
-        \\    def add_x(y :: i64) :: i64 do
+        \\pub module Foo {
+        \\  pub fn bar(x :: i64) :: i64 {
+        \\    pub fn add_x(y :: i64) :: i64 {
         \\      x + y
-        \\    end
+        \\    }
         \\
         \\    add_x(10)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -1540,15 +1509,15 @@ test "non-capturing local def stays lambda lifted without closure wrappers" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Foo do
-        \\  def bar() :: i64 do
-        \\    def forty_two() :: i64 do
+        \\pub module Foo {
+        \\  pub fn bar() :: i64 {
+        \\    pub fn forty_two() :: i64 {
         \\      42
-        \\    end
+        \\    }
         \\
         \\    forty_two()
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -1565,19 +1534,19 @@ test "call-local closure with if body still compiles as direct call" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Foo do
-        \\  def bar(flag :: Bool) :: i64 do
-        \\    def pick(value :: Bool) :: i64 do
-        \\      if value do
+        \\pub module Foo {
+        \\  pub fn bar(flag :: Bool) :: i64 {
+        \\    pub fn pick(value :: Bool) :: i64 {
+        \\      if value {
         \\        5
-        \\      else
+        \\      } else {
         \\        7
-        \\      end
-        \\    end
+        \\      }
+        \\    }
         \\
         \\    pick(flag)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -1594,18 +1563,18 @@ test "call-local closure with switch body still compiles as direct call" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Foo do
-        \\  def bar(flag :: Bool) :: i64 do
-        \\    def pick(value :: Bool) :: i64 do
-        \\      case value do
+        \\pub module Foo {
+        \\  pub fn bar(flag :: Bool) :: i64 {
+        \\    pub fn pick(value :: Bool) :: i64 {
+        \\      case value {
         \\        true -> 5
         \\        false -> 7
-        \\      end
-        \\    end
+        \\      }
+        \\    }
         \\
         \\    pick(flag)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -1622,18 +1591,18 @@ test "call-local closure with case body still compiles as direct call" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Foo do
-        \\  def bar(flag :: Bool) :: i64 do
-        \\    def pick(value :: Bool) :: i64 do
-        \\      case value do
+        \\pub module Foo {
+        \\  pub fn bar(flag :: Bool) :: i64 {
+        \\    pub fn pick(value :: Bool) :: i64 {
+        \\      case value {
         \\        true -> 5
         \\        false -> 7
-        \\      end
-        \\    end
+        \\      }
+        \\    }
         \\
         \\    pick(flag)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -1649,17 +1618,17 @@ test "aliased call-local capturing closure still compiles as direct call" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Foo do
-        \\  def bar(x :: i64) :: i64 do
-        \\    def add_x(y :: i64) :: i64 do
+        \\pub module Foo {
+        \\  pub fn bar(x :: i64) :: i64 {
+        \\    pub fn add_x(y :: i64) :: i64 {
         \\      x + y
-        \\    end
+        \\    }
         \\
         \\    f = add_x
         \\    g = f
         \\    g(10)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -1675,20 +1644,20 @@ test "aliased call-local closure with case body still compiles as direct call" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Foo do
-        \\  def bar(flag :: Bool) :: i64 do
-        \\    def pick(value :: Bool) :: i64 do
-        \\      case value do
+        \\pub module Foo {
+        \\  pub fn bar(flag :: Bool) :: i64 {
+        \\    pub fn pick(value :: Bool) :: i64 {
+        \\      case value {
         \\        true -> 5
         \\        false -> 7
-        \\      end
-        \\    end
+        \\      }
+        \\    }
         \\
         \\    f = pick
         \\    g = f
         \\    g(flag)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -1704,16 +1673,16 @@ test "block-local capturing closure avoids heap env allocation" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Foo do
-        \\  def bar(x :: i64) :: i64 do
-        \\    def add_x(y :: i64) :: i64 do
+        \\pub module Foo {
+        \\  pub fn bar(x :: i64) :: i64 {
+        \\    pub fn add_x(y :: i64) :: i64 {
         \\      x + y
-        \\    end
+        \\    }
         \\
         \\    f = add_x
         \\    f(10)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -1729,19 +1698,19 @@ test "capturing nested def can be passed as function value" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Foo do
-        \\  def apply(f :: (i64 -> i64), value :: i64) :: i64 do
+        \\pub module Foo {
+        \\  pub fn apply(f :: (i64 -> i64), value :: i64) :: i64 {
         \\    f(value)
-        \\  end
+        \\  }
         \\
-        \\  def bar(x :: i64) :: i64 do
-        \\    def add_x(y :: i64) :: i64 do
+        \\  pub fn bar(x :: i64) :: i64 {
+        \\    pub fn add_x(y :: i64) :: i64 {
         \\      x + y
-        \\    end
+        \\    }
         \\
         \\    apply(add_x, 10)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -1758,19 +1727,19 @@ test "capturing nested def passed to known-safe callee avoids heap env" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Foo do
-        \\  def apply(f :: (i64 -> i64), value :: i64) :: i64 do
+        \\pub module Foo {
+        \\  pub fn apply(f :: (i64 -> i64), value :: i64) :: i64 {
         \\    f(value)
-        \\  end
+        \\  }
         \\
-        \\  def bar(x :: i64) :: i64 do
-        \\    def add_x(y :: i64) :: i64 do
+        \\  pub fn bar(x :: i64) :: i64 {
+        \\    pub fn add_x(y :: i64) :: i64 {
         \\      x + y
-        \\    end
+        \\    }
         \\
         \\    apply(add_x, 10)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -1786,20 +1755,20 @@ test "aliased capturing nested def passed to known-safe callee avoids heap env" 
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Foo do
-        \\  def apply(f :: (i64 -> i64), value :: i64) :: i64 do
+        \\pub module Foo {
+        \\  pub fn apply(f :: (i64 -> i64), value :: i64) :: i64 {
         \\    f(value)
-        \\  end
+        \\  }
         \\
-        \\  def bar(x :: i64) :: i64 do
-        \\    def add_x(y :: i64) :: i64 do
+        \\  pub fn bar(x :: i64) :: i64 {
+        \\    pub fn add_x(y :: i64) :: i64 {
         \\      x + y
-        \\    end
+        \\    }
         \\
         \\    f = add_x
         \\    apply(f, 10)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -1816,23 +1785,23 @@ test "capturing nested def passed through transitive known-safe callees avoids h
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Foo do
-        \\  def apply(f :: (i64 -> i64), value :: i64) :: i64 do
+        \\pub module Foo {
+        \\  pub fn apply(f :: (i64 -> i64), value :: i64) :: i64 {
         \\    f(value)
-        \\  end
+        \\  }
         \\
-        \\  def wrap(f :: (i64 -> i64), value :: i64) :: i64 do
+        \\  pub fn wrap(f :: (i64 -> i64), value :: i64) :: i64 {
         \\    apply(f, value)
-        \\  end
+        \\  }
         \\
-        \\  def bar(x :: i64) :: i64 do
-        \\    def add_x(y :: i64) :: i64 do
+        \\  pub fn bar(x :: i64) :: i64 {
+        \\    pub fn add_x(y :: i64) :: i64 {
         \\      x + y
-        \\    end
+        \\    }
         \\
         \\    wrap(add_x, 10)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -1848,24 +1817,24 @@ test "aliased capturing nested def passed through transitive known-safe callees 
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Foo do
-        \\  def apply(f :: (i64 -> i64), value :: i64) :: i64 do
+        \\pub module Foo {
+        \\  pub fn apply(f :: (i64 -> i64), value :: i64) :: i64 {
         \\    f(value)
-        \\  end
+        \\  }
         \\
-        \\  def wrap(f :: (i64 -> i64), value :: i64) :: i64 do
+        \\  pub fn wrap(f :: (i64 -> i64), value :: i64) :: i64 {
         \\    apply(f, value)
-        \\  end
+        \\  }
         \\
-        \\  def bar(x :: i64) :: i64 do
-        \\    def add_x(y :: i64) :: i64 do
+        \\  pub fn bar(x :: i64) :: i64 {
+        \\    pub fn add_x(y :: i64) :: i64 {
         \\      x + y
-        \\    end
+        \\    }
         \\
         \\    f = add_x
         \\    wrap(f, 10)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -1882,19 +1851,19 @@ test "function-local capturing closure uses frame env without heap allocation" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Foo do
-        \\  def apply(f :: (i64 -> i64), value :: i64) :: i64 do
+        \\pub module Foo {
+        \\  pub fn apply(f :: (i64 -> i64), value :: i64) :: i64 {
         \\    f(value)
-        \\  end
+        \\  }
         \\
-        \\  def bar(x :: i64) :: i64 do
-        \\    def add_x(y :: i64) :: i64 do
+        \\  pub fn bar(x :: i64) :: i64 {
+        \\    pub fn add_x(y :: i64) :: i64 {
         \\      x + y
-        \\    end
+        \\    }
         \\
         \\    apply(add_x, 10)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -1910,31 +1879,31 @@ test "source pipeline marks multi-target higher-order call as switch_dispatch" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Foo do
-        \\  def inc(x :: i64) :: i64 do
+        \\pub module Foo {
+        \\  pub fn inc(x :: i64) :: i64 {
         \\    x + 1
-        \\  end
+        \\  }
         \\
-        \\  def dec(x :: i64) :: i64 do
+        \\  pub fn dec(x :: i64) :: i64 {
         \\    x - 1
-        \\  end
+        \\  }
         \\
-        \\  def apply(f :: (i64 -> i64), value :: i64) :: i64 do
+        \\  pub fn apply(f :: (i64 -> i64), value :: i64) :: i64 {
         \\    f(value)
-        \\  end
+        \\  }
         \\
-        \\  def choose(flag :: Bool) :: (i64 -> i64) do
-        \\    if flag do
+        \\  pub fn choose(flag :: Bool) :: (i64 -> i64) {
+        \\    if flag {
         \\      inc
-        \\    else
+        \\    } else {
         \\      dec
-        \\    end
-        \\  end
+        \\    }
+        \\  }
         \\
-        \\  def run(flag :: Bool) :: i64 do
+        \\  pub fn run(flag :: Bool) :: i64 {
         \\    apply(choose(flag), 10)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var analyzed = try analyzeSource(alloc, source);
@@ -1966,14 +1935,14 @@ test "source pipeline records reuse pairs for tagged tuple reconstruction after 
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Handler do
-        \\  def handle(result :: Atom) :: Nil do
-        \\    case result do
+        \\pub module Handler {
+        \\  pub fn handle(result :: Atom) :: Nil {
+        \\    case result {
         \\      {:ok, v} -> {:ok, v}
         \\      {:error, e} -> {:error, e}
-        \\    end
-        \\  end
-        \\end
+        \\    }
+        \\  }
+        \\}
     ;
 
     var analyzed = try analyzeSource(alloc, source);
@@ -1988,18 +1957,18 @@ test "source pipeline records reuse pairs for struct reconstruction after case" 
     const alloc = arena.allocator();
 
     const source =
-        \\defstruct User do
+        \\pub struct User {
         \\  name :: String
         \\  age :: i64
-        \\end
+        \\}
         \\
-        \\defmodule Foo do
-        \\  def norm(u :: User) :: User do
-        \\    case u do
+        \\pub module Foo {
+        \\  pub fn norm(u :: User) :: User {
+        \\    case u {
         \\      x -> %{name: x.name, age: x.age} :: User
-        \\    end
-        \\  end
-        \\end
+        \\    }
+        \\  }
+        \\}
     ;
 
     var analyzed = try analyzeSource(alloc, source);
@@ -2014,31 +1983,31 @@ test "source codegen emits switch dispatch for multi-target higher-order call" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Foo do
-        \\  def inc(x :: i64) :: i64 do
+        \\pub module Foo {
+        \\  pub fn inc(x :: i64) :: i64 {
         \\    x + 1
-        \\  end
+        \\  }
         \\
-        \\  def dec(x :: i64) :: i64 do
+        \\  pub fn dec(x :: i64) :: i64 {
         \\    x - 1
-        \\  end
+        \\  }
         \\
-        \\  def apply(f :: (i64 -> i64), value :: i64) :: i64 do
+        \\  pub fn apply(f :: (i64 -> i64), value :: i64) :: i64 {
         \\    f(value)
-        \\  end
+        \\  }
         \\
-        \\  def choose(flag :: Bool) :: (i64 -> i64) do
-        \\    if flag do
+        \\  pub fn choose(flag :: Bool) :: (i64 -> i64) {
+        \\    if flag {
         \\      inc
-        \\    else
+        \\    } else {
         \\      dec
-        \\    end
-        \\  end
+        \\    }
+        \\  }
         \\
-        \\  def run(flag :: Bool) :: i64 do
+        \\  pub fn run(flag :: Bool) :: i64 {
         \\    apply(choose(flag), 10)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -2052,15 +2021,15 @@ test "capturing nested def can be returned as function value" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Foo do
-        \\  def make_adder(x :: i64) :: (i64 -> i64) do
-        \\    def add_x(y :: i64) :: i64 do
+        \\pub module Foo {
+        \\  pub fn make_adder(x :: i64) :: (i64 -> i64) {
+        \\    pub fn add_x(y :: i64) :: i64 {
         \\      x + y
-        \\    end
+        \\    }
         \\
         \\    add_x
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -2078,17 +2047,17 @@ test "capturing closure with shared opaque capture emits retain and release help
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Foo do
+        \\pub module Foo {
         \\  opaque Handle = String
         \\
-        \\  def make(handle :: shared Handle) :: (-> Handle) do
-        \\    def use() :: Handle do
+        \\  pub fn make(handle :: shared Handle) :: (-> Handle) {
+        \\    pub fn use() :: Handle {
         \\      handle
-        \\    end
+        \\    }
         \\
         \\    use
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -2105,13 +2074,13 @@ test "shared opaque closure arg emits ARC retain and release" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Test do
+        \\pub module Test {
         \\  opaque Handle = String
         \\
-        \\  def run(use_fn :: (shared Handle -> Handle), handle :: Handle) :: Handle do
+        \\  pub fn run(use_fn :: (shared Handle -> Handle), handle :: Handle) :: Handle {
         \\    use_fn(handle)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -2126,13 +2095,13 @@ test "borrowed opaque closure arg emits no ARC retain or release" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Test do
+        \\pub module Test {
         \\  opaque Handle = String
         \\
-        \\  def run(use_fn :: (borrowed Handle -> Handle), handle :: Handle) :: Handle do
+        \\  pub fn run(use_fn :: (borrowed Handle -> Handle), handle :: Handle) :: Handle {
         \\    use_fn(handle)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -2147,21 +2116,21 @@ test "borrowed capturing closure passed to known-safe callee avoids heap env and
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Test do
+        \\pub module Test {
         \\  opaque Handle = String
         \\
-        \\  def apply(f :: (borrowed Handle -> Bool), handle :: borrowed Handle) :: Bool do
+        \\  pub fn apply(f :: (borrowed Handle -> Bool), handle :: borrowed Handle) :: Bool {
         \\    f(handle)
-        \\  end
+        \\  }
         \\
-        \\  def make(handle :: borrowed Handle) :: Bool do
-        \\    def use(h :: borrowed Handle) :: Bool do
+        \\  pub fn make(handle :: borrowed Handle) :: Bool {
+        \\    pub fn use(h :: borrowed Handle) :: Bool {
         \\      h == handle
-        \\    end
+        \\    }
         \\
         \\    apply(use, handle)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -2178,17 +2147,17 @@ test "top-level main stays bare, module functions get prefixed" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Helper do
-        \\  def helper(x :: i64) :: i64 do
+        \\pub module Helper {
+        \\  pub fn helper(x :: i64) :: i64 {
         \\    x + 1
-        \\  end
-        \\end
+        \\  }
+        \\}
         \\
-        \\defmodule Test do
-        \\  def main() :: i64 do
+        \\pub module Test {
+        \\  pub fn main() :: i64 {
         \\    Helper.helper(5)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -2209,19 +2178,19 @@ test "import with only filter resolves bare call to source module" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Bar do
-        \\  def run(x :: i64) :: i64 do
+        \\pub module Bar {
+        \\  pub fn run(x :: i64) :: i64 {
         \\    x + 1
-        \\  end
-        \\end
+        \\  }
+        \\}
         \\
-        \\defmodule Foo do
+        \\pub module Foo {
         \\  import Bar, only: [run: 1]
         \\
-        \\  def call() :: i64 do
+        \\  pub fn call() :: i64 {
         \\    run(1)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -2238,19 +2207,19 @@ test "import all resolves bare call to source module" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Utils do
-        \\  def helper(x :: i64) :: i64 do
+        \\pub module Utils {
+        \\  pub fn helper(x :: i64) :: i64 {
         \\    x * 2
-        \\  end
-        \\end
+        \\  }
+        \\}
         \\
-        \\defmodule App do
+        \\pub module App {
         \\  import Utils
         \\
-        \\  def go() :: i64 do
+        \\  pub fn go() :: i64 {
         \\    helper(5)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -2267,19 +2236,19 @@ test "import does not affect unrelated functions" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Bar do
-        \\  def run(x :: i64) :: i64 do
+        \\pub module Bar {
+        \\  pub fn run(x :: i64) :: i64 {
         \\    x + 1
-        \\  end
-        \\end
+        \\  }
+        \\}
         \\
-        \\defmodule Foo do
+        \\pub module Foo {
         \\  import Bar, only: [run: 1]
         \\
-        \\  def call() :: nil do
+        \\  pub fn call() :: nil {
         \\    inspect(42)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -2294,23 +2263,23 @@ test "local function takes priority over import" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Bar do
-        \\  def run(x :: i64) :: i64 do
+        \\pub module Bar {
+        \\  pub fn run(x :: i64) :: i64 {
         \\    x + 1
-        \\  end
-        \\end
+        \\  }
+        \\}
         \\
-        \\defmodule Foo do
+        \\pub module Foo {
         \\  import Bar, only: [run: 1]
         \\
-        \\  def run(x :: i64) :: i64 do
+        \\  pub fn run(x :: i64) :: i64 {
         \\    x * 10
-        \\  end
+        \\  }
         \\
-        \\  def call() :: i64 do
+        \\  pub fn call() :: i64 {
         \\    run(1)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -2326,23 +2295,23 @@ test "import with except filter excludes specified functions" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Utils do
-        \\  def helper(x :: i64) :: i64 do
+        \\pub module Utils {
+        \\  pub fn helper(x :: i64) :: i64 {
         \\    x * 2
-        \\  end
+        \\  }
         \\
-        \\  def other(x :: i64) :: i64 do
+        \\  pub fn other(x :: i64) :: i64 {
         \\    x + 1
-        \\  end
-        \\end
+        \\  }
+        \\}
         \\
-        \\defmodule App do
+        \\pub module App {
         \\  import Utils, except: [helper: 1]
         \\
-        \\  def go() :: i64 do
+        \\  pub fn go() :: i64 {
         \\    other(5)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -2360,7 +2329,7 @@ test "parse error includes file and line in diagnostics" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    const source = "def (broken syntax";
+    const source = "pub fn (broken syntax";
     const result = compile(alloc, source);
     try std.testing.expectError(error.ParseError, result);
 }
@@ -2373,7 +2342,7 @@ test "diagnostic engine captures errors with line and col" {
     var engine = DiagnosticEngine.init(alloc);
     defer engine.deinit();
 
-    const source = "def foo() do\n  bar()\nend\n";
+    const source = "pub fn foo() {\n  bar()\n}\n";
     engine.setSource(source, "test.zap");
 
     // Simulate an error at line 2, col 3
@@ -2391,17 +2360,17 @@ test "column numbers are accurate for tokens at known positions" {
     const Token = @import("token.zig").Token;
     const ast = @import("ast.zig");
 
-    const source = "def add(x, y) do\n  x + y\nend";
+    const source = "pub fn add(x, y) {\n  x + y\n}";
     var lexer = Lexer.init(source);
 
-    // Line 1: def at col 1
-    const def_tok = lexer.next();
-    try std.testing.expectEqual(Token.Tag.keyword_def, def_tok.tag);
-    try std.testing.expectEqual(@as(u32, 1), def_tok.loc.col);
-    try std.testing.expectEqual(@as(u32, 1), def_tok.loc.line);
+    // Line 1: pub at col 1
+    const pub_tok = lexer.next();
+    try std.testing.expectEqual(Token.Tag.keyword_pub, pub_tok.tag);
+    try std.testing.expectEqual(@as(u32, 1), pub_tok.loc.col);
+    try std.testing.expectEqual(@as(u32, 1), pub_tok.loc.line);
 
     // SourceSpan.from preserves col
-    const span = ast.SourceSpan.from(def_tok.loc);
+    const span = ast.SourceSpan.from(pub_tok.loc);
     try std.testing.expectEqual(@as(u32, 1), span.col);
     try std.testing.expectEqual(@as(u32, 1), span.line);
 }
@@ -2413,11 +2382,11 @@ test "type checker warnings do not halt compilation by default" {
 
     // This valid program should compile even with type checking enabled
     const source =
-        \\defmodule Adder do
-        \\  def add(x :: i64, y :: i64) :: i64 do
+        \\pub module Adder {
+        \\  pub fn add(x :: i64, y :: i64) :: i64 {
         \\    x + y
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const result = try compileWithDiagnostics(alloc, source, false);
@@ -2431,11 +2400,11 @@ test "return type mismatch is always an error" {
 
     // Return type mismatch: declared i64, returns String
     const source =
-        \\defmodule Test do
-        \\  def bad() :: i64 do
+        \\pub module Test {
+        \\  pub fn bad() :: i64 {
         \\    "not a number"
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     // Return type mismatch is a hard error regardless of strict_types
@@ -2450,7 +2419,7 @@ test "error messages contain file:line:col format" {
 
     var engine = DiagnosticEngine.init(alloc);
     defer engine.deinit();
-    engine.setSource("def foo() :: i64 do\n  \"hello\"\nend", "example.zap");
+    engine.setSource("pub fn foo() :: i64 {\n  \"hello\"\n}", "example.zap");
     try engine.err("expected i64, got String", .{ .start = 22, .end = 29, .line = 2, .col = 3 });
 
     const output = try engine.format(alloc);
@@ -2459,17 +2428,17 @@ test "error messages contain file:line:col format" {
     try expectContains(output, "example.zap:2:3");
 }
 
-test "def main inside defmodule emits pub fn main" {
+test "pub fn main inside pub module emits pub fn main" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule App do
-        \\  def main() :: i64 do
+        \\pub module App {
+        \\  pub fn main() :: i64 {
         \\    42
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -2484,11 +2453,11 @@ test "binary pattern matching extracts bytes" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Binary do
-        \\  def first_byte(<<a, _b, _c>> :: String) :: i64 do
+        \\pub module Binary {
+        \\  pub fn first_byte(<<a, _b, _c>> :: String) :: i64 {
         \\    a
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -2502,11 +2471,11 @@ test "binary pattern with u16 type spec" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Binary do
-        \\  def parse_port(<<port::u16>> :: String) :: i64 do
+        \\pub module Binary {
+        \\  pub fn parse_port(<<port::u16>> :: String) :: i64 {
         \\    port
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -2519,11 +2488,11 @@ test "binary pattern with String rest" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Binary do
-        \\  def parse_header(<<tag::u8, rest::String>> :: String) :: {i64, String} do
+        \\pub module Binary {
+        \\  pub fn parse_header(<<tag::u8, rest::String>> :: String) :: {i64, String} {
         \\    {tag, rest}
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -2537,11 +2506,11 @@ test "binary pattern with float extraction" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Binary do
-        \\  def parse_coord(<<lat::f64, lon::f64>> :: String) :: {f64, f64} do
+        \\pub module Binary {
+        \\  pub fn parse_coord(<<lat::f64, lon::f64>> :: String) :: {f64, f64} {
         \\    {lat, lon}
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -2555,11 +2524,11 @@ test "binary pattern with endianness" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Binary do
-        \\  def parse_le(<<val::u32-little>> :: String) :: i64 do
+        \\pub module Binary {
+        \\  pub fn parse_le(<<val::u32-little>> :: String) :: i64 {
         \\    val
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -2572,11 +2541,11 @@ test "binary pattern emits length check" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Binary do
-        \\  def parse_port(<<port::u16>> :: String) :: i64 do
+        \\pub module Binary {
+        \\  pub fn parse_port(<<port::u16>> :: String) :: i64 {
         \\    port
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -2590,11 +2559,11 @@ test "binary pattern with string prefix match" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule HTTP do
-        \\  def parse_method(<<"GET "::String, path::String>> :: String) :: String do
+        \\pub module HTTP {
+        \\  pub fn parse_method(<<"GET "::String, path::String>> :: String) :: String {
         \\    path
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -2609,11 +2578,11 @@ test "binary pattern sub-byte extraction" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Flags do
-        \\  def parse_flags(<<syn::u1, ack::u1, fin::u1, _reserved::u5>> :: String) :: {i64, i64, i64} do
+        \\pub module Flags {
+        \\  pub fn parse_flags(<<syn::u1, ack::u1, fin::u1, _reserved::u5>> :: String) :: {i64, i64, i64} {
         \\    {syn, ack, fin}
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -2631,14 +2600,14 @@ test "binary pattern in case emits length check" {
 
     // Binary patterns in case expressions emit length checks via check_binary
     const source =
-        \\defmodule Binary do
-        \\  def parse(data :: String) :: i64 do
-        \\    case data do
+        \\pub module Binary {
+        \\  pub fn parse(data :: String) :: i64 {
+        \\    case data {
         \\      <<_a, _b>> -> 1
         \\      _ -> 0
-        \\    end
-        \\  end
-        \\end
+        \\    }
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -2698,20 +2667,20 @@ test "multiline struct literal parses correctly" {
     const alloc = arena.allocator();
 
     const source =
-        \\defstruct User do
+        \\pub struct User {
         \\  name :: String
         \\  age :: i64
-        \\end
+        \\}
         \\
-        \\defmodule Test do
-        \\  def main() :: User do
+        \\pub module Test {
+        \\  pub fn main() :: User {
         \\    u = %{
         \\      name: "Alice",
         \\      age: 30
         \\    } :: User
         \\    u
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -2727,17 +2696,17 @@ test "multi-parameter function uses distinct param indices" {
 
     // Typed version — goes through full pipeline including type checker
     const source =
-        \\defmodule Math do
-        \\  def add(a :: i64, b :: i64) :: i64 do
+        \\pub module Math {
+        \\  pub fn add(a :: i64, b :: i64) :: i64 {
         \\    a + b
-        \\  end
-        \\end
+        \\  }
+        \\}
         \\
-        \\defmodule Test do
-        \\  def main() :: i64 do
+        \\pub module Test {
+        \\  pub fn main() :: i64 {
         \\    Math.add(20, 22)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -2753,11 +2722,11 @@ test "multi-parameter function param_get indices in IR" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Test do
-        \\  def add(a :: i64, b :: i64) :: i64 do
+        \\pub module Test {
+        \\  pub fn add(a :: i64, b :: i64) :: i64 {
         \\    a + b
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var parser = @import("parser.zig").Parser.init(alloc, source);
@@ -2805,17 +2774,17 @@ test "top-level multi-param function called from main" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Adder do
-        \\  def add(a :: i64, b :: i64) :: i64 do
+        \\pub module Adder {
+        \\  pub fn add(a :: i64, b :: i64) :: i64 {
         \\    a + b
-        \\  end
-        \\end
+        \\  }
+        \\}
         \\
-        \\defmodule Test do
-        \\  def main() :: String do
+        \\pub module Test {
+        \\  pub fn main() :: String {
         \\    IO.puts(Adder.add(20, 22))
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -2830,17 +2799,17 @@ test "three-parameter function uses all param indices" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Math do
-        \\  def sum3(a :: i64, b :: i64, c :: i64) :: i64 do
+        \\pub module Math {
+        \\  pub fn sum3(a :: i64, b :: i64, c :: i64) :: i64 {
         \\    a + b + c
-        \\  end
-        \\end
+        \\  }
+        \\}
         \\
-        \\defmodule Test do
-        \\  def main() :: i64 do
+        \\pub module Test {
+        \\  pub fn main() :: i64 {
         \\    Math.sum3(1, 2, 3)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -2859,15 +2828,15 @@ test "pipeline: non-escaping closure avoids heap allocation" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Foo do
-        \\  def bar(x :: i64) :: i64 do
-        \\    def add_x(y :: i64) :: i64 do
+        \\pub module Foo {
+        \\  pub fn bar(x :: i64) :: i64 {
+        \\    pub fn add_x(y :: i64) :: i64 {
         \\      x + y
-        \\    end
+        \\    }
         \\
         \\    add_x(10)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -2881,15 +2850,15 @@ test "pipeline: returned closure uses heap allocation" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Foo do
-        \\  def make(x :: i64) :: (i64 -> i64) do
-        \\    def other(y :: i64) :: i64 do
+        \\pub module Foo {
+        \\  pub fn make(x :: i64) :: (i64 -> i64) {
+        \\    pub fn other(y :: i64) :: i64 {
         \\      x + y
-        \\    end
+        \\    }
         \\
         \\    other
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -2905,16 +2874,16 @@ test "pipeline: aliased returned closure still uses heap allocation" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Foo do
-        \\  def make(x :: i64) :: (i64 -> i64) do
-        \\    def other(y :: i64) :: i64 do
+        \\pub module Foo {
+        \\  pub fn make(x :: i64) :: (i64 -> i64) {
+        \\    pub fn other(y :: i64) :: i64 {
         \\      x + y
-        \\    end
+        \\    }
         \\
         \\    f = other
         \\    f
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -2929,15 +2898,15 @@ test "pipeline: lambda lifted local def uses no closure object" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Foo do
-        \\  def bar() :: i64 do
-        \\    def forty_two() :: i64 do
+        \\pub module Foo {
+        \\  pub fn bar() :: i64 {
+        \\    pub fn forty_two() :: i64 {
         \\      42
-        \\    end
+        \\    }
         \\
         \\    forty_two()
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -2953,21 +2922,21 @@ test "pipeline: multi-function program compiles cleanly" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Math do
-        \\  def add(a :: i64, b :: i64) :: i64 do
+        \\pub module Math {
+        \\  pub fn add(a :: i64, b :: i64) :: i64 {
         \\    a + b
-        \\  end
+        \\  }
         \\
-        \\  def double(x :: i64) :: i64 do
+        \\  pub fn double(x :: i64) :: i64 {
         \\    add(x, x)
-        \\  end
-        \\end
+        \\  }
+        \\}
         \\
-        \\defmodule Test do
-        \\  def main() :: String do
+        \\pub module Test {
+        \\  pub fn main() :: String {
         \\    IO.puts(Math.double(21))
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -2982,15 +2951,15 @@ test "pipeline: pattern matching compiles through analysis" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Matcher do
-        \\  def check(x :: i64) :: i64 do
-        \\    case x do
+        \\pub module Matcher {
+        \\  pub fn check(x :: i64) :: i64 {
+        \\    case x {
         \\      0 -> 100
         \\      1 -> 200
         \\      _ -> 300
-        \\    end
-        \\  end
-        \\end
+        \\    }
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -3004,15 +2973,15 @@ test "pipeline: recursive function compiles through analysis" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Counter do
-        \\  def count(0 :: i64) :: i64 do
+        \\pub module Counter {
+        \\  pub fn count(0 :: i64) :: i64 {
         \\    0
-        \\  end
+        \\  }
         \\
-        \\  def count(n :: i64) :: i64 do
+        \\  pub fn count(n :: i64) :: i64 {
         \\    1 + count(n - 1)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -3026,19 +2995,19 @@ test "pipeline: closure passed to higher-order function uses DynClosure" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Foo do
-        \\  def apply(f :: (i64 -> i64), value :: i64) :: i64 do
+        \\pub module Foo {
+        \\  pub fn apply(f :: (i64 -> i64), value :: i64) :: i64 {
         \\    f(value)
-        \\  end
+        \\  }
         \\
-        \\  def bar(x :: i64) :: i64 do
-        \\    def add_x(y :: i64) :: i64 do
+        \\  pub fn bar(x :: i64) :: i64 {
+        \\    pub fn add_x(y :: i64) :: i64 {
         \\      x + y
-        \\    end
+        \\    }
         \\
         \\    apply(add_x, 10)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -3055,19 +3024,19 @@ test "pipeline: fibonacci compiles through full analysis" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Fib do
-        \\  def fib(0 :: i64) :: i64 do
+        \\pub module Fib {
+        \\  pub fn fib(0 :: i64) :: i64 {
         \\    0
-        \\  end
+        \\  }
         \\
-        \\  def fib(1 :: i64) :: i64 do
+        \\  pub fn fib(1 :: i64) :: i64 {
         \\    1
-        \\  end
+        \\  }
         \\
-        \\  def fib(n :: i64) :: i64 do
+        \\  pub fn fib(n :: i64) :: i64 {
         \\    fib(n - 1) + fib(n - 2)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -3081,17 +3050,17 @@ test "pipeline: multiple modules compile together" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule A do
-        \\  def double(x :: i64) :: i64 do
+        \\pub module A {
+        \\  pub fn double(x :: i64) :: i64 {
         \\    x * 2
-        \\  end
-        \\end
+        \\  }
+        \\}
         \\
-        \\defmodule B do
-        \\  def quad(x :: i64) :: i64 do
+        \\pub module B {
+        \\  pub fn quad(x :: i64) :: i64 {
         \\    A.double(A.double(x))
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -3111,16 +3080,16 @@ test "pipeline: closure stored in collection uses DynClosure fallback" {
 
     // Closure stored in a variable (not just called) → DynClosure.
     const source =
-        \\defmodule Foo do
-        \\  def bar(x :: i64) :: i64 do
-        \\    def add_x(y :: i64) :: i64 do
+        \\pub module Foo {
+        \\  pub fn bar(x :: i64) :: i64 {
+        \\    pub fn add_x(y :: i64) :: i64 {
         \\      x + y
-        \\    end
+        \\    }
         \\
         \\    f = add_x
         \\    f(10)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -3141,11 +3110,11 @@ test "pipeline: non-escaping struct has no retain in output" {
     // A struct that is created and used locally (not returned, not stored
     // in a heap container) should not generate ARC operations.
     const source =
-        \\defmodule Foo do
-        \\  def add(a :: i64, b :: i64) :: i64 do
+        \\pub module Foo {
+        \\  pub fn add(a :: i64, b :: i64) :: i64 {
         \\    a + b
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -3165,21 +3134,21 @@ test "pipeline: complex program with closures, patterns, modules" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Math do
-        \\  def factorial(0 :: i64) :: i64 do
+        \\pub module Math {
+        \\  pub fn factorial(0 :: i64) :: i64 {
         \\    1
-        \\  end
+        \\  }
         \\
-        \\  def factorial(n :: i64) :: i64 do
+        \\  pub fn factorial(n :: i64) :: i64 {
         \\    n * factorial(n - 1)
-        \\  end
-        \\end
+        \\  }
+        \\}
         \\
-        \\defmodule Test do
-        \\  def main() :: String do
+        \\pub module Test {
+        \\  pub fn main() :: String {
         \\    IO.puts(Math.factorial(10))
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -3195,15 +3164,15 @@ test "pipeline: nested closures compile cleanly" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Foo do
-        \\  def make_adder(x :: i64) :: (i64 -> i64) do
-        \\    def add(y :: i64) :: i64 do
+        \\pub module Foo {
+        \\  pub fn make_adder(x :: i64) :: (i64 -> i64) {
+        \\    pub fn add(y :: i64) :: i64 {
         \\      x + y
-        \\    end
+        \\    }
         \\
         \\    add
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -3219,15 +3188,15 @@ test "pipeline: atom pattern matching through analysis" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Status do
-        \\  def check(:ok :: Atom) :: i64 do
+        \\pub module Status {
+        \\  pub fn check(:ok :: Atom) :: i64 {
         \\    1
-        \\  end
+        \\  }
         \\
-        \\  def check(:error :: Atom) :: i64 do
+        \\  pub fn check(:error :: Atom) :: i64 {
         \\    0
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -3248,17 +3217,17 @@ test "deps: cross-module function call compiles" {
     defer arena.deinit();
     const alloc = arena.allocator();
     const source =
-        \\defmodule MathLib do
-        \\  def add(a :: i64, b :: i64) :: i64 do
+        \\pub module MathLib {
+        \\  pub fn add(a :: i64, b :: i64) :: i64 {
         \\    a + b
-        \\  end
-        \\end
+        \\  }
+        \\}
         \\
-        \\defmodule App do
-        \\  def main() :: i64 do
+        \\pub module App {
+        \\  pub fn main() :: i64 {
         \\    MathLib.add(1, 2)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -3277,11 +3246,11 @@ test "deps: discovery finds files and they compile together" {
 
     try tmp_dir.dir.writeFile(.{
         .sub_path = "app.zap",
-        .data = "defmodule App do\n  def main() :: i64 do\n    Helper.value()\n  end\nend\n",
+        .data = "pub module App {\n  pub fn main() :: i64 {\n    Helper.value()\n  }\n}\n",
     });
     try tmp_dir.dir.writeFile(.{
         .sub_path = "helper.zap",
-        .data = "defmodule Helper do\n  def value() :: i64 do\n    42\n  end\nend\n",
+        .data = "pub module Helper {\n  pub fn value() :: i64 {\n    42\n  }\n}\n",
     });
 
     const tmp_path = try tmp_dir.dir.realpathAlloc(alloc, ".");
@@ -3324,11 +3293,11 @@ test "deps: discovery with dep root finds dep modules" {
 
     try tmp_dir.dir.writeFile(.{
         .sub_path = "project/app.zap",
-        .data = "defmodule App do\n  def main() :: i64 do\n    DepMath.add(1, 2)\n  end\nend\n",
+        .data = "pub module App {\n  pub fn main() :: i64 {\n    DepMath.add(1, 2)\n  }\n}\n",
     });
     try tmp_dir.dir.writeFile(.{
         .sub_path = "dep_lib/dep_math.zap",
-        .data = "defmodule DepMath do\n  def add(a :: i64, b :: i64) :: i64 do\n    a + b\n  end\nend\n",
+        .data = "pub module DepMath {\n  pub fn add(a :: i64, b :: i64) :: i64 {\n    a + b\n  }\n}\n",
     });
 
     const project_path = try tmp_dir.dir.realpathAlloc(alloc, "project");
@@ -3360,7 +3329,7 @@ test "deps: discovery with dep root finds dep modules" {
     try expectContains(output, "fn main(");
 }
 
-test "deps: defmodulep enforcement blocks cross-dep access" {
+test "deps: private module enforcement blocks cross-dep access" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -3374,12 +3343,12 @@ test "deps: defmodulep enforcement blocks cross-dep access" {
     // Project tries to access a private dep module
     try tmp_dir.dir.writeFile(.{
         .sub_path = "project/app.zap",
-        .data = "defmodule App do\n  def main() :: i64 do\n    PrivateMod.secret()\n  end\nend\n",
+        .data = "pub module App {\n  pub fn main() :: i64 {\n    PrivateMod.secret()\n  }\n}\n",
     });
     // Dep has a private module
     try tmp_dir.dir.writeFile(.{
         .sub_path = "dep_lib/private_mod.zap",
-        .data = "defmodulep PrivateMod do\n  def secret() :: i64 do\n    99\n  end\nend\n",
+        .data = "module PrivateMod {\n  pub fn secret() :: i64 {\n    99\n  }\n}\n",
     });
 
     const project_path = try tmp_dir.dir.realpathAlloc(alloc, "project");
@@ -3396,11 +3365,11 @@ test "deps: defmodulep enforcement blocks cross-dep access" {
         null,
     );
 
-    // Should fail because PrivateMod is defmodulep in a different dep
+    // Should fail because PrivateMod is module (private) in a different dep
     try std.testing.expectError(error.ModuleNotFound, result);
 }
 
-test "deps: defmodulep allowed within same dep" {
+test "deps: private module allowed within same dep" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -3408,14 +3377,14 @@ test "deps: defmodulep allowed within same dep" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    // Both files in the same source root — defmodulep is visible
+    // Both files in the same source root — module (private) is visible
     try tmp_dir.dir.writeFile(.{
         .sub_path = "public_mod.zap",
-        .data = "defmodule PublicMod do\n  def go() :: i64 do\n    InternalMod.helper()\n  end\nend\n",
+        .data = "pub module PublicMod {\n  pub fn go() :: i64 {\n    InternalMod.helper()\n  }\n}\n",
     });
     try tmp_dir.dir.writeFile(.{
         .sub_path = "internal_mod.zap",
-        .data = "defmodulep InternalMod do\n  def helper() :: i64 do\n    42\n  end\nend\n",
+        .data = "module InternalMod {\n  pub fn helper() :: i64 {\n    42\n  }\n}\n",
     });
 
     const tmp_path = try tmp_dir.dir.realpathAlloc(alloc, ".");
@@ -3443,12 +3412,12 @@ test "attributes: typed attribute compiles and is stored on function" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Foo do
+        \\pub module Foo {
         \\  @doc :: String = "hello world"
-        \\  def bar() :: i64 do
+        \\  pub fn bar() :: i64 {
         \\    42
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     // Compile through the pipeline — should not error
@@ -3462,12 +3431,12 @@ test "attributes: marker attribute compiles" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Foo do
+        \\pub module Foo {
         \\  @debug
-        \\  def inspect(value :: i64) :: i64 do
+        \\  pub fn inspect(value :: i64) :: i64 {
         \\    value
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -3480,12 +3449,12 @@ test "attributes: module-level attribute compiles" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Foo do
+        \\pub module Foo {
         \\  @moduledoc :: String = "A module"
-        \\  def bar() :: i64 do
+        \\  pub fn bar() :: i64 {
         \\    42
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -3498,13 +3467,13 @@ test "attributes: multiple attributes on function compiles" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Foo do
+        \\pub module Foo {
         \\  @doc :: String = "does something"
         \\  @deprecated :: String = "use bar2"
-        \\  def bar() :: i64 do
+        \\  pub fn bar() :: i64 {
         \\    42
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);
@@ -3517,13 +3486,13 @@ test "attributes: stored in scope graph" {
     const alloc = arena_state.allocator();
 
     const source =
-        \\defmodule Foo do
+        \\pub module Foo {
         \\  @moduledoc :: String = "A module doc"
         \\  @doc :: String = "Function doc"
-        \\  def bar() :: i64 do
+        \\  pub fn bar() :: i64 {
         \\    42
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const stdlib_source = try readStdlibSource(alloc);
@@ -3577,12 +3546,12 @@ test "attributes: @name substitution in function body" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Foo do
+        \\pub module Foo {
         \\  @timeout :: i64 = 5000
-        \\  def get_timeout() :: i64 do
+        \\  pub fn get_timeout() :: i64 {
         \\    @timeout
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     // Should compile — @timeout is substituted with 5000
@@ -3596,12 +3565,12 @@ test "attributes: @name substitution in expression" {
     const alloc = arena.allocator();
 
     const source =
-        \\defmodule Foo do
+        \\pub module Foo {
         \\  @base :: i64 = 100
-        \\  def doubled() :: i64 do
+        \\  pub fn doubled() :: i64 {
         \\    @base * 2
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     const output = try compile(alloc, source);

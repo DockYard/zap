@@ -1,4 +1,4 @@
-defstruct Zap.Manifest do
+pub struct Zap.Manifest {
   name :: String
   version :: String
   kind :: Atom
@@ -8,4 +8,4 @@ defstruct Zap.Manifest do
   paths :: [String] = []
   deps :: [Zap.Dep] = []
   build_opts :: [{String, String}] = []
-end
+}

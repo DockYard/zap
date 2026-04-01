@@ -46,9 +46,9 @@ fn compileOnly(source: []const u8) TestError!void {
     tmp_dir.dir.makePath("lib") catch return error.Unexpected;
 
     const build_source =
-        \\defmodule TestProg.Builder do
-        \\  def manifest(env :: Zap.Env) :: Zap.Manifest do
-        \\    case env.target do
+        \\pub module TestProg.Builder {
+        \\  pub fn manifest(env :: Zap.Env) :: Zap.Manifest {
+        \\    case env.target {
         \\      :test_prog ->
         \\        %Zap.Manifest{
         \\          name: "test_prog",
@@ -59,9 +59,9 @@ fn compileOnly(source: []const u8) TestError!void {
         \\        }
         \\      _ ->
         \\        panic("Unknown target")
-        \\    end
-        \\  end
-        \\end
+        \\    }
+        \\  }
+        \\}
     ;
 
     tmp_dir.dir.writeFile(.{ .sub_path = "build.zap", .data = build_source }) catch return error.Unexpected;
@@ -108,9 +108,9 @@ fn compileAndRun(source: []const u8) TestError!TestResult {
     tmp_dir.dir.makePath("lib") catch return error.Unexpected;
 
     const build_source =
-        \\defmodule TestProg.Builder do
-        \\  def manifest(env :: Zap.Env) :: Zap.Manifest do
-        \\    case env.target do
+        \\pub module TestProg.Builder {
+        \\  pub fn manifest(env :: Zap.Env) :: Zap.Manifest {
+        \\    case env.target {
         \\      :test_prog ->
         \\        %Zap.Manifest{
         \\          name: "test_prog",
@@ -121,9 +121,9 @@ fn compileAndRun(source: []const u8) TestError!TestResult {
         \\        }
         \\      _ ->
         \\        panic("Unknown target")
-        \\    end
-        \\  end
-        \\end
+        \\    }
+        \\  }
+        \\}
     ;
 
     tmp_dir.dir.writeFile(.{ .sub_path = "build.zap", .data = build_source }) catch
@@ -210,11 +210,11 @@ fn compileAndRun(source: []const u8) TestError!TestResult {
 
 test "ZIR: integer arithmetic" {
     var result = try compileAndRun(
-        \\defmodule Main do
-        \\  def main() do
+        \\pub module Main {
+        \\  pub fn main() {
         \\    Kernel.println(20 + 22)
-        \\  end
-        \\end
+        \\  }
+        \\}
     );
     defer result.deinit();
     try std.testing.expectEqualStrings("42\n", result.stdout);
@@ -223,11 +223,11 @@ test "ZIR: integer arithmetic" {
 
 test "ZIR: string literal" {
     var result = try compileAndRun(
-        \\defmodule Main do
-        \\  def main() do
+        \\pub module Main {
+        \\  pub fn main() {
         \\    Kernel.println("hello world")
-        \\  end
-        \\end
+        \\  }
+        \\}
     );
     defer result.deinit();
     try std.testing.expectEqualStrings("hello world\n", result.stdout);
@@ -236,11 +236,11 @@ test "ZIR: string literal" {
 
 test "ZIR: boolean" {
     var result = try compileAndRun(
-        \\defmodule Main do
-        \\  def main() do
+        \\pub module Main {
+        \\  pub fn main() {
         \\    Kernel.println(true)
-        \\  end
-        \\end
+        \\  }
+        \\}
     );
     defer result.deinit();
     try std.testing.expectEqualStrings("true\n", result.stdout);
@@ -253,17 +253,17 @@ test "ZIR: boolean" {
 
 test "ZIR: multi-function call" {
     var result = try compileAndRun(
-        \\defmodule Math do
-        \\  def add(a :: i64, b :: i64) :: i64 do
+        \\pub module Math {
+        \\  pub fn add(a :: i64, b :: i64) :: i64 {
         \\    a + b
-        \\  end
-        \\end
+        \\  }
+        \\}
         \\
-        \\defmodule Main do
-        \\  def main() do
+        \\pub module Main {
+        \\  pub fn main() {
         \\    Kernel.println(Math.add(20, 22))
-        \\  end
-        \\end
+        \\  }
+        \\}
     );
     defer result.deinit();
     try std.testing.expectEqualStrings("42\n", result.stdout);
@@ -272,10 +272,10 @@ test "ZIR: multi-function call" {
 
 test "ZIR: void function" {
     var result = try compileAndRun(
-        \\defmodule Main do
-        \\  def main() do
-        \\  end
-        \\end
+        \\pub module Main {
+        \\  pub fn main() {
+        \\  }
+        \\}
     );
     defer result.deinit();
     try std.testing.expectEqualStrings("", result.stdout);
@@ -288,15 +288,15 @@ test "ZIR: void function" {
 
 test "ZIR: if-else true branch" {
     var result = try compileAndRun(
-        \\defmodule Main do
-        \\  def main() do
-        \\    if true do
+        \\pub module Main {
+        \\  pub fn main() {
+        \\    if true {
         \\      Kernel.println("yes")
-        \\    else
+        \\    } else {
         \\      Kernel.println("no")
-        \\    end
-        \\  end
-        \\end
+        \\    }
+        \\  }
+        \\}
     );
     defer result.deinit();
     try std.testing.expectEqualStrings("yes\n", result.stdout);
@@ -305,15 +305,15 @@ test "ZIR: if-else true branch" {
 
 test "ZIR: if-else false branch" {
     var result = try compileAndRun(
-        \\defmodule Main do
-        \\  def main() do
-        \\    if false do
+        \\pub module Main {
+        \\  pub fn main() {
+        \\    if false {
         \\      Kernel.println("yes")
-        \\    else
+        \\    } else {
         \\      Kernel.println("no")
-        \\    end
-        \\  end
-        \\end
+        \\    }
+        \\  }
+        \\}
     );
     defer result.deinit();
     try std.testing.expectEqualStrings("no\n", result.stdout);
@@ -326,14 +326,14 @@ test "ZIR: if-else false branch" {
 
 test "ZIR: case with atoms" {
     var result = try compileAndRun(
-        \\defmodule Main do
-        \\  def main() do
-        \\    case :ok do
+        \\pub module Main {
+        \\  pub fn main() {
+        \\    case :ok {
         \\      :ok -> Kernel.println("matched")
         \\      _ -> Kernel.println("default")
-        \\    end
-        \\  end
-        \\end
+        \\    }
+        \\  }
+        \\}
     );
     defer result.deinit();
     try std.testing.expectEqualStrings("matched\n", result.stdout);
@@ -342,14 +342,14 @@ test "ZIR: case with atoms" {
 
 test "ZIR: case with ints" {
     var result = try compileAndRun(
-        \\defmodule Main do
-        \\  def main() do
-        \\    case 1 do
+        \\pub module Main {
+        \\  pub fn main() {
+        \\    case 1 {
         \\      1 -> Kernel.println("one")
         \\      _ -> Kernel.println("other")
-        \\    end
-        \\  end
-        \\end
+        \\    }
+        \\  }
+        \\}
     );
     defer result.deinit();
     try std.testing.expectEqualStrings("one\n", result.stdout);
@@ -362,21 +362,21 @@ test "ZIR: case with ints" {
 
 test "ZIR: recursive sum" {
     var result = try compileAndRun(
-        \\defmodule Math do
-        \\  def sum_to(n :: i64) :: i64 do
-        \\    case n do
+        \\pub module Math {
+        \\  pub fn sum_to(n :: i64) :: i64 {
+        \\    case n {
         \\      0 -> 1
         \\      1 -> 1
         \\      _ -> n + Math.sum_to(n - 1)
-        \\    end
-        \\  end
-        \\end
+        \\    }
+        \\  }
+        \\}
         \\
-        \\defmodule Main do
-        \\  def main() do
+        \\pub module Main {
+        \\  pub fn main() {
         \\    Kernel.println(Math.sum_to(5))
-        \\  end
-        \\end
+        \\  }
+        \\}
     );
     defer result.deinit();
     try std.testing.expectEqualStrings("15\n", result.stdout);
@@ -385,21 +385,21 @@ test "ZIR: recursive sum" {
 
 test "ZIR: multiple helper functions" {
     var result = try compileAndRun(
-        \\defmodule Helpers do
-        \\  def double(x :: i64) :: i64 do
+        \\pub module Helpers {
+        \\  pub fn double(x :: i64) :: i64 {
         \\    x + x
-        \\  end
+        \\  }
         \\
-        \\  def add_one(x :: i64) :: i64 do
+        \\  pub fn add_one(x :: i64) :: i64 {
         \\    x + 1
-        \\  end
-        \\end
+        \\  }
+        \\}
         \\
-        \\defmodule Main do
-        \\  def main() do
+        \\pub module Main {
+        \\  pub fn main() {
         \\    Kernel.println(Helpers.add_one(Helpers.double(10)))
-        \\  end
-        \\end
+        \\  }
+        \\}
     );
     defer result.deinit();
     try std.testing.expectEqualStrings("21\n", result.stdout);
@@ -408,70 +408,70 @@ test "ZIR: multiple helper functions" {
 
 test "ZIR compile: lambda lifted local def" {
     try compileOnly(
-        \\defmodule Foo do
-        \\  def bar() :: i64 do
-        \\    def forty_two() :: i64 do
+        \\pub module Foo {
+        \\  pub fn bar() :: i64 {
+        \\    pub fn forty_two() :: i64 {
         \\      42
-        \\    end
+        \\    }
         \\
         \\    forty_two()
-        \\  end
-        \\end
+        \\  }
+        \\}
         \\
-        \\defmodule Main do
-        \\  def main() do
+        \\pub module Main {
+        \\  pub fn main() {
         \\    Kernel.println(Foo.bar())
-        \\  end
-        \\end
+        \\  }
+        \\}
     );
 }
 
 test "ZIR compile: function-local captured closure" {
     try compileOnly(
-        \\defmodule Foo do
-        \\  def apply(f :: (i64 -> i64), value :: i64) :: i64 do
+        \\pub module Foo {
+        \\  pub fn apply(f :: (i64 -> i64), value :: i64) :: i64 {
         \\    f(value)
-        \\  end
+        \\  }
         \\
-        \\  def bar(x :: i64) :: i64 do
-        \\    def add_x(y :: i64) :: i64 do
+        \\  pub fn bar(x :: i64) :: i64 {
+        \\    pub fn add_x(y :: i64) :: i64 {
         \\      x + y
-        \\    end
+        \\    }
         \\
         \\    apply(add_x, 10)
-        \\  end
-        \\end
+        \\  }
+        \\}
         \\
-        \\defmodule Main do
-        \\  def main() do
+        \\pub module Main {
+        \\  pub fn main() {
         \\    Kernel.println(Foo.bar(32))
-        \\  end
-        \\end
+        \\  }
+        \\}
     );
 }
 
 test "ZIR compile: aliased function-local captured closure" {
     try compileOnly(
-        \\defmodule Foo do
-        \\  def apply(f :: (i64 -> i64), value :: i64) :: i64 do
+        \\pub module Foo {
+        \\  pub fn apply(f :: (i64 -> i64), value :: i64) :: i64 {
         \\    f(value)
-        \\  end
+        \\  }
         \\
-        \\  def bar(x :: i64) :: i64 do
-        \\    def add_x(y :: i64) :: i64 do
+        \\  pub fn bar(x :: i64) :: i64 {
+        \\    pub fn add_x(y :: i64) :: i64 {
         \\      x + y
-        \\    end
+        \\    }
         \\
         \\    f = add_x
         \\    apply(f, 10)
-        \\  end
-        \\end
+        \\  }
+        \\}
         \\
-        \\defmodule Main do
-        \\  def main() do
+        \\pub module Main {
+        \\  pub fn main() {
         \\    Kernel.println(Foo.bar(32))
-        \\  end
-        \\end
+        \\  }
+        \\}
     );
 }
 

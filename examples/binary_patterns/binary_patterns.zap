@@ -5,9 +5,9 @@
 # Run with:
 #   zap run binary_patterns
 
-defmodule BinaryPatterns do
-  def main(_args :: [String]) :: String do
+pub module BinaryPatterns {
+  pub fn main(_args :: [String]) :: String {
     MarkupParser.greet("Zap")
     |> IO.puts()
-  end
-end
+  }
+}

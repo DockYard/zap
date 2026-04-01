@@ -1,6 +1,6 @@
-defmodule TailCall.Builder do
-  def manifest(env :: Zap.Env) :: Zap.Manifest do
-    case env.target do
+pub module TailCall.Builder {
+  pub fn manifest(env :: Zap.Env) :: Zap.Manifest {
+    case env.target {
       :tail_call ->
         %Zap.Manifest{
           name: "tail_call",
@@ -11,6 +11,6 @@ defmodule TailCall.Builder do
         }
       _ ->
         panic("Unknown target: use 'tail_call'")
-    end
-  end
-end
+    }
+  }
+}

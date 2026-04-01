@@ -1,58 +1,58 @@
 pub const borrowed_closure_arg =
-    \\defmodule Test do
+    \\pub module Test {
     \\  opaque Handle = String
     \\
-    \\  def run(use_fn :: (borrowed Handle -> Handle), handle :: Handle) :: Handle do
+    \\  pub fn run(use_fn :: (borrowed Handle -> Handle), handle :: Handle) :: Handle {
     \\    use_fn(handle)
-    \\  end
-    \\end
+    \\  }
+    \\}
 ;
 
 pub const shared_closure_arg =
-    \\defmodule Test do
+    \\pub module Test {
     \\  opaque Handle = String
     \\
-    \\  def run(use_fn :: (shared Handle -> Handle), handle :: Handle) :: Handle do
+    \\  pub fn run(use_fn :: (shared Handle -> Handle), handle :: Handle) :: Handle {
     \\    use_fn(handle)
-    \\  end
-    \\end
+    \\  }
+    \\}
 ;
 
 pub const switch_dispatch =
-    \\defmodule Foo do
-    \\  def inc(x :: i64) :: i64 do
+    \\pub module Foo {
+    \\  pub fn inc(x :: i64) :: i64 {
     \\    x + 1
-    \\  end
+    \\  }
     \\
-    \\  def dec(x :: i64) :: i64 do
+    \\  pub fn dec(x :: i64) :: i64 {
     \\    x - 1
-    \\  end
+    \\  }
     \\
-    \\  def apply(f :: (i64 -> i64), value :: i64) :: i64 do
+    \\  pub fn apply(f :: (i64 -> i64), value :: i64) :: i64 {
     \\    f(value)
-    \\  end
+    \\  }
     \\
-    \\  def choose(flag :: Bool) :: (i64 -> i64) do
-    \\    if flag do
+    \\  pub fn choose(flag :: Bool) :: (i64 -> i64) {
+    \\    if flag {
     \\      inc
-    \\    else
+    \\    } else {
     \\      dec
-    \\    end
-    \\  end
+    \\    }
+    \\  }
     \\
-    \\  def run(flag :: Bool) :: i64 do
+    \\  pub fn run(flag :: Bool) :: i64 {
     \\    apply(choose(flag), 10)
-    \\  end
-    \\end
+    \\  }
+    \\}
 ;
 
 pub const non_escaping_closure =
-    \\defmodule Foo do
-    \\  def run(x :: i64) :: i64 do
-    \\    f = fn(y :: i64) :: i64 do
+    \\pub module Foo {
+    \\  pub fn run(x :: i64) :: i64 {
+    \\    f = fn(y :: i64) :: i64 {
     \\      x + y
-    \\    end
+    \\    }
     \\    f(2)
-    \\  end
-    \\end
+    \\  }
+    \\}
 ;

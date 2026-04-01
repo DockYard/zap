@@ -3,8 +3,8 @@
 # Demonstrates supported types: scalars, compound types,
 # structs, enums, and module inheritance.
 
-defmodule Types do
-  def main(_args :: [String]) :: String do
+pub module Types {
+  pub fn main(_args :: [String]) :: String {
     IO.puts("=== Scalars ===")
     IO.puts(Integer.to_string(Scalars.int()))
     IO.puts(Integer.to_string(Scalars.negative()))
@@ -14,5 +14,5 @@ defmodule Types do
     IO.puts("=== Inheritance ===")
     IO.puts(Dog.speak())
     IO.puts(Dog.breathe())
-  end
-end
+  }
+}

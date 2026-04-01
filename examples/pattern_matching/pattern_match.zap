@@ -1,25 +1,25 @@
-defmodule PatternMatch do
-  def describe(_ :: Atom) :: String do
+pub module PatternMatch {
+  pub fn describe(_ :: Atom) :: String {
     "HEY YO!"
-  end
+  }
 
-  def describe(0 :: i64) :: String do
+  pub fn describe(0 :: i64) :: String {
     "zero"
-  end
+  }
 
-  def describe(:ok :: Atom) :: String do
+  pub fn describe(:ok :: Atom) :: String {
     "success"
-  end
+  }
 
-  def describe(:error :: Atom) :: String do
+  pub fn describe(:error :: Atom) :: String {
     "failure"
-  end
+  }
 
-  def describe(n :: i64) :: String do
-    if n > 0 do
+  pub fn describe(n :: i64) :: String {
+    if n > 0 {
       "positive"
-    else
+    } else {
       "negative"
-    end
-  end
-end
+    }
+  }
+}

@@ -1,6 +1,6 @@
-defmodule WhenMacro.Builder do
-  def manifest(env :: Zap.Env) :: Zap.Manifest do
-    case env.target do
+pub module WhenMacro.Builder {
+  pub fn manifest(env :: Zap.Env) :: Zap.Manifest {
+    case env.target {
       :when_macro ->
         %Zap.Manifest{
           name: "when_macro",
@@ -11,6 +11,6 @@ defmodule WhenMacro.Builder do
         }
       _ ->
         panic("Unknown target: use 'when_macro'")
-    end
-  end
-end
+    }
+  }
+}

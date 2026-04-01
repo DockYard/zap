@@ -3,12 +3,12 @@
 # Run with:
 #   zap run when_macro
 
-defmodule WhenMacro do
-  def main(_args :: [String]) :: String do
+pub module WhenMacro {
+  pub fn main(_args :: [String]) :: String {
     Guards.check(10)
     |> IO.puts()
 
     Guards.check(-5)
     |> IO.puts()
-  end
-end
+  }
+}

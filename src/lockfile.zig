@@ -318,7 +318,7 @@ test "computeDirectoryHash: produces consistent hash" {
 
     try tmp_dir.dir.writeFile(.{
         .sub_path = "test.zap",
-        .data = "defmodule Test do\nend\n",
+        .data = "pub module Test {}\n",
     });
 
     const hash1 = try computeDirectoryHash(alloc, tmp_path);

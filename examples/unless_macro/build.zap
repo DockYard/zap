@@ -1,6 +1,6 @@
-defmodule UnlessMacro.Builder do
-  def manifest(env :: Zap.Env) :: Zap.Manifest do
-    case env.target do
+pub module UnlessMacro.Builder {
+  pub fn manifest(env :: Zap.Env) :: Zap.Manifest {
+    case env.target {
       :unless_macro ->
         %Zap.Manifest{
           name: "unless_macro",
@@ -11,6 +11,6 @@ defmodule UnlessMacro.Builder do
         }
       _ ->
         panic("Unknown target: use 'unless_macro'")
-    end
-  end
-end
+    }
+  }
+}

@@ -360,11 +360,11 @@ const Collector = @import("collector.zig").Collector;
 
 test "dispatch resolve simple function" {
     const source =
-        \\defmodule Test do
-        \\  def add(x :: i64, y :: i64) :: i64 do
+        \\pub module Test {
+        \\  pub fn add(x :: i64, y :: i64) :: i64 {
         \\    x + y
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -409,18 +409,18 @@ test "dispatch resolve simple function" {
 
 test "dispatch scope fallback" {
     const source =
-        \\defmodule Foo do
-        \\  def b(s :: String) :: String do
+        \\pub module Foo {
+        \\  pub fn b(s :: String) :: String {
         \\    s
-        \\  end
+        \\  }
         \\
-        \\  def a(x :: i64) :: String do
-        \\    def b(n :: i64) :: String do
+        \\  pub fn a(x :: i64) :: String {
+        \\    fn b(n :: i64) :: String {
         \\      "local"
-        \\    end
+        \\    }
         \\    b("hello")
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -463,11 +463,11 @@ test "dispatch scope fallback" {
 
 test "dispatch no match" {
     const source =
-        \\defmodule Test do
-        \\  def add(x :: i64, y :: i64) :: i64 do
+        \\pub module Test {
+        \\  pub fn add(x :: i64, y :: i64) :: i64 {
         \\    x + y
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -511,15 +511,15 @@ test "dispatch no match" {
 
 test "dispatch specificity — literal pattern beats bind" {
     const source =
-        \\defmodule Test do
-        \\  def factorial(0 :: i64) :: i64 do
+        \\pub module Test {
+        \\  pub fn factorial(0 :: i64) :: i64 {
         \\    1
-        \\  end
+        \\  }
         \\
-        \\  def factorial(n :: i64) :: i64 do
+        \\  pub fn factorial(n :: i64) :: i64 {
         \\    n * factorial(n - 1)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

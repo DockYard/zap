@@ -1,9 +1,9 @@
-defmodule Animal do
-  def speak() :: String do
+pub module Animal {
+  pub fn speak() :: String {
     "..."
-  end
+  }
 
-  def breathe() :: String do
+  pub fn breathe() :: String {
     "inhale, exhale"
-  end
-end
+  }
+}

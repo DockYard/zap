@@ -1,5 +1,5 @@
-defmodule PatternMatching do
-  def main(_args :: [String]) :: String do
+pub module PatternMatching {
+  pub fn main(_args :: [String]) :: String {
     PatternMatch.describe(:ok)
     |> IO.puts()
 
@@ -11,5 +11,5 @@ defmodule PatternMatching do
 
     PatternMatch.describe(-100)
     |> IO.puts()
-  end
-end
+  }
+}

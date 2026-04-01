@@ -2,19 +2,19 @@
 #
 # Demonstrates case/switch on atom values.
 
-defmodule CaseExpr do
-  def describe(x :: i64) :: String do
-    case x do
+pub module CaseExpr {
+  pub fn describe(x :: i64) :: String {
+    case x {
       0 ->
         "zero"
       1 ->
         "one"
       _ ->
         "other"
-    end
-  end
+    }
+  }
 
-  def main(_args :: [String]) :: String do
+  pub fn main(_args :: [String]) :: String {
     CaseExpr.describe(0)
     |> IO.puts()
 
@@ -23,5 +23,5 @@ defmodule CaseExpr do
 
     CaseExpr.describe(42)
     |> IO.puts()
-  end
-end
+  }
+}

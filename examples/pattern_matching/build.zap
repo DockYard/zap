@@ -1,6 +1,6 @@
-defmodule PatternMatching.Builder do
-  def manifest(env :: Zap.Env) :: Zap.Manifest do
-    case env.target do
+pub module PatternMatching.Builder {
+  pub fn manifest(env :: Zap.Env) :: Zap.Manifest {
+    case env.target {
       :pattern_matching ->
         %Zap.Manifest{
           name: "pattern_matching",
@@ -11,6 +11,6 @@ defmodule PatternMatching.Builder do
         }
       _ ->
         panic("Unknown target: use 'pattern_matching'")
-    end
-  end
-end
+    }
+  }
+}

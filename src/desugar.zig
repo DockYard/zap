@@ -410,11 +410,11 @@ const Parser = @import("parser.zig").Parser;
 
 test "desugar pipe operator" {
     const source =
-        \\defmodule Test do
-        \\  def foo(x) do
+        \\pub module Test {
+        \\  pub fn foo(x) {
         \\    x |> bar(1)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -440,11 +440,11 @@ test "desugar pipe operator" {
 
 test "desugar unwrap operator" {
     const source =
-        \\defmodule Test do
-        \\  def foo(x) do
+        \\pub module Test {
+        \\  pub fn foo(x) {
         \\    bar(x)!
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -469,11 +469,11 @@ test "desugar unwrap operator" {
 
 test "desugar no-op on simple expressions" {
     const source =
-        \\defmodule Test do
-        \\  def add(x :: i64, y :: i64) :: i64 do
+        \\pub module Test {
+        \\  pub fn add(x :: i64, y :: i64) :: i64 {
         \\    x + y
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

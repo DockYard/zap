@@ -1132,11 +1132,11 @@ const Collector = @import("collector.zig").Collector;
 
 test "macro engine no-op on program without macros" {
     const source =
-        \\defmodule Test do
-        \\  def add(x :: i64, y :: i64) :: i64 do
+        \\pub module Test {
+        \\  pub fn add(x :: i64, y :: i64) :: i64 {
         \\    x + y
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1163,19 +1163,19 @@ test "macro engine no-op on program without macros" {
 test "macro engine expands simple macro" {
     // Define a macro and use it
     const source =
-        \\defmodule Test do
-        \\  defmacro unless(expr, body) do
-        \\    quote do
-        \\      if not unquote(expr) do
+        \\pub module Test {
+        \\  pub macro unless(expr, body) {
+        \\    quote {
+        \\      if not unquote(expr) {
         \\        unquote(body)
-        \\      end
-        \\    end
-        \\  end
+        \\      }
+        \\    }
+        \\  }
         \\
-        \\  def foo(x :: i64) :: i64 do
+        \\  pub fn foo(x :: i64) :: i64 {
         \\    unless(x > 0, 42)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1233,11 +1233,11 @@ test "macro engine hygiene generates unique names" {
 
 test "macro engine reaches fixed point" {
     const source =
-        \\defmodule Test do
-        \\  def foo() do
+        \\pub module Test {
+        \\  pub fn foo() {
         \\    42
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1263,21 +1263,21 @@ test "macro engine reaches fixed point" {
 
 test "typed macro: nil in String return position is an error" {
     const source =
-        \\defmodule Test do
-        \\  defmacro when_positive(value :: i64, result :: String) :: String do
-        \\    quote do
-        \\      if unquote(value) > 0 do
+        \\pub module Test {
+        \\  pub macro when_positive(value :: i64, result :: String) :: String {
+        \\    quote {
+        \\      if unquote(value) > 0 {
         \\        unquote(result)
-        \\      else
+        \\      } else {
         \\        nil
-        \\      end
-        \\    end
-        \\  end
+        \\      }
+        \\    }
+        \\  }
         \\
-        \\  def check(n :: i64) :: String do
+        \\  pub fn check(n :: i64) :: String {
         \\    when_positive(n, "yes")
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1303,21 +1303,21 @@ test "typed macro: nil in String return position is an error" {
 
 test "typed macro: valid types produce no errors" {
     const source =
-        \\defmodule Test do
-        \\  defmacro when_positive(value :: i64, result :: String) :: String do
-        \\    quote do
-        \\      if unquote(value) > 0 do
+        \\pub module Test {
+        \\  pub macro when_positive(value :: i64, result :: String) :: String {
+        \\    quote {
+        \\      if unquote(value) > 0 {
         \\        unquote(result)
-        \\      else
+        \\      } else {
         \\        "default"
-        \\      end
-        \\    end
-        \\  end
+        \\      }
+        \\    }
+        \\  }
         \\
-        \\  def check(n :: i64) :: String do
+        \\  pub fn check(n :: i64) :: String {
         \\    when_positive(n, "yes")
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1342,19 +1342,19 @@ test "typed macro: valid types produce no errors" {
 
 test "typed macro: missing else branch is an error for non-nil return type" {
     const source =
-        \\defmodule Test do
-        \\  defmacro unless(expr :: Bool, body :: i64) :: i64 do
-        \\    quote do
-        \\      if not unquote(expr) do
+        \\pub module Test {
+        \\  pub macro unless(expr :: Bool, body :: i64) :: i64 {
+        \\    quote {
+        \\      if not unquote(expr) {
         \\        unquote(body)
-        \\      end
-        \\    end
-        \\  end
+        \\      }
+        \\    }
+        \\  }
         \\
-        \\  def foo(x :: i64) :: i64 do
+        \\  pub fn foo(x :: i64) :: i64 {
         \\    unless(x > 0, 42)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1380,17 +1380,17 @@ test "typed macro: missing else branch is an error for non-nil return type" {
 
 test "typed macro: param type mismatch with return type" {
     const source =
-        \\defmodule Test do
-        \\  defmacro wrap(value :: i64) :: String do
-        \\    quote do
+        \\pub module Test {
+        \\  pub macro wrap(value :: i64) :: String {
+        \\    quote {
         \\      unquote(value)
-        \\    end
-        \\  end
+        \\    }
+        \\  }
         \\
-        \\  def foo(x :: i64) :: String do
+        \\  pub fn foo(x :: i64) :: String {
         \\    wrap(x)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1416,22 +1416,20 @@ test "typed macro: param type mismatch with return type" {
 test "macro substitution into case_expr and block" {
     // A macro that produces a case expression with unquote inside
     const source =
-        \\defmodule Test do
-        \\  defmacro match_it(val, fallback) do
-        \\    quote do
-        \\      case unquote(val) do
-        \\        0 ->
-        \\          unquote(fallback)
-        \\        x ->
-        \\          x
-        \\      end
-        \\    end
-        \\  end
+        \\pub module Test {
+        \\  pub macro match_it(val :: Expr, fallback :: Expr) :: Nil {
+        \\    quote {
+        \\      case unquote(val) {
+        \\        0 -> unquote(fallback)
+        \\        x -> x
+        \\      }
+        \\    }
+        \\  }
         \\
-        \\  def check(x :: i64) :: i64 do
+        \\  pub fn check(x :: i64) :: i64 {
         \\    match_it(x, 42)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

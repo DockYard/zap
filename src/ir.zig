@@ -3270,11 +3270,11 @@ const Collector = @import("collector.zig").Collector;
 
 test "IR build simple function" {
     const source =
-        \\defmodule Test do
-        \\  def add(x :: i64, y :: i64) :: i64 do
+        \\pub module Test {
+        \\  pub fn add(x :: i64, y :: i64) :: i64 {
         \\    x + y
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3308,11 +3308,11 @@ test "IR build simple function" {
 
 test "IR param_get indices are unique for multi-parameter functions" {
     const source =
-        \\defmodule Test do
-        \\  def add(a, b) do
+        \\pub module Test {
+        \\  pub fn add(a, b) {
         \\    a + b
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3367,11 +3367,11 @@ test "IR param_get indices are unique for multi-parameter functions" {
 
 test "IR call preserves HIR arg modes" {
     const source =
-        \\defmodule Test do
-        \\  def apply(f :: (String -> String), x :: String) do
+        \\pub module Test {
+        \\  pub fn apply(f :: (String -> String), x :: String) {
         \\    f(x)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3434,17 +3434,17 @@ test "IR call preserves HIR arg modes" {
 
 test "IR named call preserves move mode" {
     const source =
-        \\defmodule Test do
+        \\pub module Test {
         \\  opaque Handle = String
         \\
-        \\  def take(handle :: Handle) do
+        \\  pub fn take(handle :: Handle) {
         \\    handle
-        \\  end
+        \\  }
         \\
-        \\  def run(handle :: Handle) do
+        \\  pub fn run(handle :: Handle) {
         \\    take(handle)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3497,13 +3497,13 @@ test "IR named call preserves move mode" {
 
 test "IR closure call preserves borrow mode without ARC ops" {
     const source =
-        \\defmodule Test do
+        \\pub module Test {
         \\  opaque Handle = String
         \\
-        \\  def apply(f :: (Handle -> Handle), x :: Handle) do
+        \\  pub fn apply(f :: (Handle -> Handle), x :: Handle) {
         \\    f(x)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3569,17 +3569,17 @@ test "IR closure call preserves borrow mode without ARC ops" {
 
 test "IR shared opaque call emits retain and release" {
     const source =
-        \\defmodule Test do
+        \\pub module Test {
         \\  opaque Handle = String
         \\
-        \\  def use(handle :: Handle) do
+        \\  pub fn use(handle :: Handle) {
         \\    handle
-        \\  end
+        \\  }
         \\
-        \\  def run(use_fn :: (Handle -> Handle), handle :: Handle) do
+        \\  pub fn run(use_fn :: (Handle -> Handle), handle :: Handle) {
         \\    use_fn(handle)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

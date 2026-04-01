@@ -2833,11 +2833,11 @@ const Collector = @import("collector.zig").Collector;
 
 test "HIR build simple function" {
     const source =
-        \\defmodule Test do
-        \\  def add(x :: i64, y :: i64) :: i64 do
+        \\pub module Test {
+        \\  pub fn add(x :: i64, y :: i64) :: i64 {
         \\    x + y
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -2865,11 +2865,11 @@ test "HIR build simple function" {
 
 test "HIR build module" {
     const source =
-        \\defmodule Math do
-        \\  def add(x :: i64, y :: i64) :: i64 do
+        \\pub module Math {
+        \\  pub fn add(x :: i64, y :: i64) :: i64 {
         \\    x + y
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -2897,16 +2897,14 @@ test "HIR build module" {
 
 test "HIR pattern compilation" {
     const source =
-        \\defmodule Test do
-        \\  def foo(x) do
-        \\    case x do
-        \\      {:ok, v} ->
-        \\        v
-        \\      {:error, e} ->
-        \\        e
-        \\    end
-        \\  end
-        \\end
+        \\pub module Test {
+        \\  pub fn foo(x :: Atom) :: Nil {
+        \\    case x {
+        \\      {:ok, v} -> v
+        \\      {:error, e} -> e
+        \\    }
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -2935,11 +2933,11 @@ test "HIR pattern compilation" {
 
 test "HIR typed params default to shared ownership" {
     const source =
-        \\defmodule Test do
-        \\  def add(x :: i64, y :: i64) :: i64 do
+        \\pub module Test {
+        \\  pub fn add(x :: i64, y :: i64) :: i64 {
         \\    x + y
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -2969,13 +2967,13 @@ test "HIR typed params default to shared ownership" {
 
 test "HIR opaque typed params default to unique ownership" {
     const source =
-        \\defmodule Test do
+        \\pub module Test {
         \\  opaque Handle = String
         \\
-        \\  def use(handle :: Handle) :: Handle do
+        \\  pub fn use(handle :: Handle) :: Handle {
         \\    handle
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3006,13 +3004,13 @@ test "HIR opaque typed params default to unique ownership" {
 
 test "HIR respects borrowed param annotation" {
     const source =
-        \\defmodule Test do
+        \\pub module Test {
         \\  opaque Handle = String
         \\
-        \\  def inspect(handle :: borrowed Handle) do
+        \\  pub fn inspect(handle :: borrowed Handle) {
         \\    handle
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3041,15 +3039,15 @@ test "HIR respects borrowed param annotation" {
 
 test "HIR call args default to share mode" {
     const source =
-        \\defmodule Test do
-        \\  def foo(x) do
+        \\pub module Test {
+        \\  pub fn foo(x) {
         \\    x
-        \\  end
+        \\  }
         \\
-        \\  def bar(y) do
+        \\  pub fn bar(y) {
         \\    foo(y)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3080,11 +3078,11 @@ test "HIR call args default to share mode" {
 
 test "HIR call args adopt function ownership modes" {
     const source =
-        \\defmodule Test do
-        \\  def apply(f :: (String -> String), x :: String) :: String do
+        \\pub module Test {
+        \\  pub fn apply(f :: (String -> String), x :: String) :: String {
         \\    f(x)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3135,17 +3133,17 @@ test "HIR call args adopt function ownership modes" {
 
 test "HIR named calls use resolved parameter ownership" {
     const source =
-        \\defmodule Test do
+        \\pub module Test {
         \\  opaque Handle = String
         \\
-        \\  def take(handle :: Handle) :: Handle do
+        \\  pub fn take(handle :: Handle) :: Handle {
         \\    handle
-        \\  end
+        \\  }
         \\
-        \\  def run(handle :: Handle) :: Handle do
+        \\  pub fn run(handle :: Handle) :: Handle {
         \\    take(handle)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3178,11 +3176,11 @@ test "HIR named calls use resolved parameter ownership" {
 
 test "HIR closure calls adopt borrowed ownership mode" {
     const source =
-        \\defmodule Test do
-        \\  def apply(f :: (String -> String), x :: String) do
+        \\pub module Test {
+        \\  pub fn apply(f :: (String -> String), x :: String) {
         \\    f(x)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

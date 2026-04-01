@@ -6,9 +6,9 @@
 # Run with:
 #   zap run computed_attributes
 
-defmodule ComputedAttributes do
-  def main(_args :: [String]) :: String do
+pub module ComputedAttributes {
+  pub fn main(_args :: [String]) :: String {
     IO.puts("Effective timeout: " <> Integer.to_string(Limits.effective_timeout()))
     IO.puts("Max payload: " <> Integer.to_string(Limits.max_payload()))
-  end
-end
+  }
+}

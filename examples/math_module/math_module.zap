@@ -1,6 +1,6 @@
-defmodule MathModule do
-  def main(_args :: [String]) :: String do
+pub module MathModule {
+  pub fn main(_args :: [String]) :: String {
     Math.square(5)
     |> IO.puts()
-  end
-end
+  }
+}

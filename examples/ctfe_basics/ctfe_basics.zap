@@ -1,7 +1,7 @@
 # Compile-Time Function Execution (CTFE) basics
 #
 # Zap's IR interpreter can evaluate functions at compile time.
-# The build manifest (build.zap) is itself executed via CTFE —
+# The build manifest (build.zap) is itself executed via CTFE ---
 # struct construction, case expressions, and string operations
 # all run inside the compiler's abstract machine.
 #
@@ -10,9 +10,9 @@
 # Run with:
 #   zap run ctfe_basics
 
-defmodule CtfeBasics do
-  def main(_args :: [String]) :: String do
+pub module CtfeBasics {
+  pub fn main(_args :: [String]) :: String {
     Greeter.greet("World")
     |> IO.puts()
-  end
-end
+  }
+}

@@ -1,9 +1,9 @@
-defmodule Counter do
-  def countdown(0 :: i64) :: i64 do
+pub module Counter {
+  pub fn countdown(0 :: i64) :: i64 {
     0
-  end
+  }
 
-  def countdown(n :: i64) :: i64 do
+  pub fn countdown(n :: i64) :: i64 {
     countdown(n - 1)
-  end
-end
+  }
+}

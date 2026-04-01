@@ -1,5 +1,5 @@
-defmodule IO do
-  def puts(message :: String) :: String do
+pub module IO {
+  pub fn puts(message :: String) :: String {
     :zig.println(message)
-  end
-end
+  }
+}

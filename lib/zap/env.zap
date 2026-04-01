@@ -1,5 +1,5 @@
-defstruct Zap.Env do
+pub struct Zap.Env {
   target :: Atom
   os :: Atom
   arch :: Atom
-end
+}

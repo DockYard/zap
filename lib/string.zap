@@ -1,9 +1,9 @@
-defmodule String do
-  def to_atom(name :: String) :: Atom do
+pub module String {
+  pub fn to_atom(name :: String) :: Atom {
     :zig.to_atom(name)
-  end
+  }
 
-  def to_existing_atom(name :: String) :: Atom do
+  pub fn to_existing_atom(name :: String) :: Atom {
     :zig.to_existing_atom(name)
-  end
-end
+  }
+}

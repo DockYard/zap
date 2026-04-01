@@ -1,6 +1,6 @@
-defmodule DefaultParams.Builder do
-  def manifest(env :: Zap.Env) :: Zap.Manifest do
-    case env.target do
+pub module DefaultParams.Builder {
+  pub fn manifest(env :: Zap.Env) :: Zap.Manifest {
+    case env.target {
       :default_params ->
         %Zap.Manifest{
           name: "default_params",
@@ -11,6 +11,6 @@ defmodule DefaultParams.Builder do
         }
       _ ->
         panic("Unknown target: use 'default_params'")
-    end
-  end
-end
+    }
+  }
+}

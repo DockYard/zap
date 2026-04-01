@@ -1,6 +1,6 @@
-defmodule Guards.Builder do
-  def manifest(env :: Zap.Env) :: Zap.Manifest do
-    case env.target do
+pub module Guards.Builder {
+  pub fn manifest(env :: Zap.Env) :: Zap.Manifest {
+    case env.target {
       :guards ->
         %Zap.Manifest{
           name: "guards",
@@ -11,6 +11,6 @@ defmodule Guards.Builder do
         }
       _ ->
         panic("Unknown target: use 'guards'")
-    end
-  end
-end
+    }
+  }
+}

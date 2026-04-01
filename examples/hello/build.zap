@@ -1,6 +1,6 @@
-defmodule Hello.Builder do
-  def manifest(env :: Zap.Env) :: Zap.Manifest do
-    case env.target do
+pub module Hello.Builder {
+  pub fn manifest(env :: Zap.Env) :: Zap.Manifest {
+    case env.target {
       :hello ->
         %Zap.Manifest{
           name: "hello",
@@ -11,6 +11,6 @@ defmodule Hello.Builder do
         }
       _ ->
         panic("Unknown target: use 'hello'")
-    end
-  end
-end
+    }
+  }
+}

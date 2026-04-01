@@ -1,6 +1,6 @@
-defmodule Attributes.Builder do
-  def manifest(env :: Zap.Env) :: Zap.Manifest do
-    case env.target do
+pub module Attributes.Builder {
+  pub fn manifest(env :: Zap.Env) :: Zap.Manifest {
+    case env.target {
       :attributes ->
         %Zap.Manifest{
           name: "attributes",
@@ -11,6 +11,6 @@ defmodule Attributes.Builder do
         }
       _ ->
         panic("Unknown target: use 'attributes'")
-    end
-  end
-end
+    }
+  }
+}

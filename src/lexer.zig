@@ -14,32 +14,18 @@ pub const Lexer = struct {
     line_start: u32,
     source_id: ?u32 = null,
 
-    // Indentation tracking — simple fixed-size stack
-    indent_levels: [256]u32,
-    indent_depth: u32,
-    pending_dedents: u32,
-    at_line_start: bool,
-    emit_newline: bool,
-
     // String interpolation tracking
     interp_depth: u32,
 
     pub fn init(source: []const u8) Lexer {
-        var self = Lexer{
+        return Lexer{
             .source = source,
             .pos = 0,
             .line = 1,
             .line_start = 0,
             .source_id = null,
-            .indent_levels = undefined,
-            .indent_depth = 1,
-            .pending_dedents = 0,
-            .at_line_start = true,
-            .emit_newline = false,
             .interp_depth = 0,
         };
-        self.indent_levels[0] = 0; // base indent level
-        return self;
     }
 
     pub fn initWithSourceId(source: []const u8, source_id: u32) Lexer {
@@ -48,90 +34,12 @@ pub const Lexer = struct {
         return self;
     }
 
-    fn currentIndent(self: *const Lexer) u32 {
-        return self.indent_levels[self.indent_depth - 1];
-    }
-
-    fn pushIndent(self: *Lexer, level: u32) void {
-        self.indent_levels[self.indent_depth] = level;
-        self.indent_depth += 1;
-    }
-
-    fn popIndent(self: *Lexer) void {
-        if (self.indent_depth > 1) {
-            self.indent_depth -= 1;
-        }
-    }
-
     pub fn next(self: *Lexer) Token {
-        // Emit pending dedents first
-        if (self.pending_dedents > 0) {
-            self.pending_dedents -= 1;
-            return self.makeToken(.dedent, self.pos, self.pos);
-        }
-
-        // Emit pending newline
-        if (self.emit_newline) {
-            self.emit_newline = false;
-            return self.makeToken(.newline, self.pos, self.pos);
-        }
-
-        // Handle start of line (indentation)
-        if (self.at_line_start) {
-            self.at_line_start = false;
-            const indent_result = self.measureIndent();
-
-            // Skip blank lines
-            if (indent_result.is_blank) {
-                if (self.pos < self.source.len and self.source[self.pos] == '\n') {
-                    self.pos += 1;
-                    self.line += 1;
-                    self.line_start = self.pos;
-                    self.at_line_start = true;
-                    return self.next();
-                }
-                return self.handleEofDedents();
-            }
-
-            // Check for comment lines (skip them)
-            if (self.pos < self.source.len and self.source[self.pos] == '#' and
-                (self.pos + 1 >= self.source.len or self.source[self.pos + 1] != '{'))
-            {
-                self.skipToEndOfLine();
-                if (self.pos < self.source.len and self.source[self.pos] == '\n') {
-                    self.pos += 1;
-                    self.line += 1;
-                    self.line_start = self.pos;
-                    self.at_line_start = true;
-                }
-                return self.next();
-            }
-
-            const current_indent = self.currentIndent();
-
-            if (indent_result.level > current_indent) {
-                self.pushIndent(indent_result.level);
-                return self.makeToken(.indent, self.pos, self.pos);
-            } else if (indent_result.level < current_indent) {
-                var dedents: u32 = 0;
-                while (self.indent_depth > 1 and
-                    self.indent_levels[self.indent_depth - 1] > indent_result.level)
-                {
-                    self.popIndent();
-                    dedents += 1;
-                }
-                if (dedents > 0) {
-                    self.pending_dedents = dedents - 1;
-                    return self.makeToken(.dedent, self.pos, self.pos);
-                }
-            }
-        }
-
         // Skip whitespace (not newlines)
         self.skipHorizontalWhitespace();
 
         if (self.pos >= self.source.len) {
-            return self.handleEofDedents();
+            return self.makeToken(.eof, self.pos, self.pos);
         }
 
         const c = self.source[self.pos];
@@ -142,7 +50,6 @@ pub const Lexer = struct {
             self.pos += 1;
             self.line += 1;
             self.line_start = self.pos;
-            self.at_line_start = true;
             return self.makeToken(.newline, start, self.pos);
         }
 
@@ -174,44 +81,6 @@ pub const Lexer = struct {
 
         // Operators and delimiters
         return self.lexOperator();
-    }
-
-    fn handleEofDedents(self: *Lexer) Token {
-        if (self.indent_depth > 1) {
-            self.popIndent();
-            var remaining: u32 = 0;
-            while (self.indent_depth > 1) {
-                self.popIndent();
-                remaining += 1;
-            }
-            self.pending_dedents = remaining;
-            return self.makeToken(.dedent, self.pos, self.pos);
-        }
-        return self.makeToken(.eof, self.pos, self.pos);
-    }
-
-    const IndentResult = struct {
-        level: u32,
-        is_blank: bool,
-    };
-
-    fn measureIndent(self: *Lexer) IndentResult {
-        var level: u32 = 0;
-        while (self.pos < self.source.len) {
-            switch (self.source[self.pos]) {
-                ' ' => {
-                    level += 1;
-                    self.pos += 1;
-                },
-                '\t' => {
-                    level += 1;
-                    self.pos += 1;
-                },
-                '\n' => return .{ .level = level, .is_blank = true },
-                else => return .{ .level = level, .is_blank = false },
-            }
-        }
-        return .{ .level = level, .is_blank = true };
     }
 
     fn skipHorizontalWhitespace(self: *Lexer) void {
@@ -274,11 +143,10 @@ pub const Lexer = struct {
 
     fn lexNumber(self: *Lexer) Token {
         const start = self.pos;
-        // Check for hex prefix 0x/0X
         if (self.pos + 1 < self.source.len and self.source[self.pos] == '0' and
             (self.source[self.pos + 1] == 'x' or self.source[self.pos + 1] == 'X'))
         {
-            self.pos += 2; // skip 0x
+            self.pos += 2;
             while (self.pos < self.source.len and (isHexDigit(self.source[self.pos]) or self.source[self.pos] == '_')) {
                 self.pos += 1;
             }
@@ -496,21 +364,21 @@ pub const Lexer = struct {
 // ============================================================
 
 test "lex simple tokens" {
-    const source = "def foo do end";
+    const source = "pub fn foo {";
     var lexer = Lexer.init(source);
 
     const t1 = lexer.next();
-    try std.testing.expectEqual(Token.Tag.keyword_def, t1.tag);
+    try std.testing.expectEqual(Token.Tag.keyword_pub, t1.tag);
 
     const t2 = lexer.next();
-    try std.testing.expectEqual(Token.Tag.identifier, t2.tag);
-    try std.testing.expectEqualStrings("foo", t2.slice(source));
+    try std.testing.expectEqual(Token.Tag.keyword_fn, t2.tag);
 
     const t3 = lexer.next();
-    try std.testing.expectEqual(Token.Tag.keyword_do, t3.tag);
+    try std.testing.expectEqual(Token.Tag.identifier, t3.tag);
+    try std.testing.expectEqualStrings("foo", t3.slice(source));
 
     const t4 = lexer.next();
-    try std.testing.expectEqual(Token.Tag.keyword_end, t4.tag);
+    try std.testing.expectEqual(Token.Tag.left_brace, t4.tag);
 }
 
 test "lex numbers" {
@@ -586,26 +454,20 @@ test "lex module identifier" {
     try std.testing.expectEqualStrings("MyModule", t3.slice(source));
 }
 
-test "lex indentation" {
-    const source =
-        \\defmodule Foo do
-        \\  def bar do
-        \\    42
-        \\  end
-        \\end
-    ;
+test "lex braces" {
+    const source = "pub module Foo {\n  pub fn bar() :: i64 {\n    42\n  }\n}";
     var lexer = Lexer.init(source);
 
-    var has_indent = false;
-    var has_dedent = false;
+    var has_left_brace = false;
+    var has_right_brace = false;
     while (true) {
         const tok = lexer.next();
-        if (tok.tag == .indent) has_indent = true;
-        if (tok.tag == .dedent) has_dedent = true;
+        if (tok.tag == .left_brace) has_left_brace = true;
+        if (tok.tag == .right_brace) has_right_brace = true;
         if (tok.tag == .eof) break;
     }
-    try std.testing.expect(has_indent);
-    try std.testing.expect(has_dedent);
+    try std.testing.expect(has_left_brace);
+    try std.testing.expect(has_right_brace);
 }
 
 test "lex type annotations" {
@@ -645,9 +507,13 @@ test "lex comments are skipped" {
     ;
     var lexer = Lexer.init(source);
 
-    const t1 = lexer.next();
-    try std.testing.expectEqual(Token.Tag.int_literal, t1.tag);
-    try std.testing.expectEqualStrings("42", t1.slice(source));
+    // Skip past any newline tokens from the comment line
+    var tok = lexer.next();
+    while (tok.tag == .newline) {
+        tok = lexer.next();
+    }
+    try std.testing.expectEqual(Token.Tag.int_literal, tok.tag);
+    try std.testing.expectEqualStrings("42", tok.slice(source));
 }
 
 test "lex map arrow =>" {
@@ -662,15 +528,15 @@ test "lex map arrow =>" {
 }
 
 test "lex function definition tokens" {
-    const source = "def add(x :: i64, y :: i64) :: i64 do\n  x + y\nend";
+    const source = "pub fn add(x :: i64, y :: i64) :: i64 {";
     var lexer = Lexer.init(source);
 
     const expected_tags = [_]Token.Tag{
-        .keyword_def, .identifier,   .left_paren,
-        .identifier,  .double_colon, .identifier,
-        .comma,       .identifier,   .double_colon,
-        .identifier,  .right_paren,  .double_colon,
-        .identifier,  .keyword_do,
+        .keyword_pub, .keyword_fn,    .identifier,
+        .left_paren,  .identifier,    .double_colon,
+        .identifier,  .comma,         .identifier,
+        .double_colon, .identifier,   .right_paren,
+        .double_colon, .identifier,   .left_brace,
     };
 
     for (expected_tags) |exp| {
@@ -690,39 +556,43 @@ test "lex pipe and percent" {
 }
 
 test "lex column tracking on single line" {
-    const source = "def foo do";
+    const source = "pub fn foo {";
     var lexer = Lexer.init(source);
 
-    const t1 = lexer.next(); // def at col 1
-    try std.testing.expectEqual(Token.Tag.keyword_def, t1.tag);
+    const t1 = lexer.next(); // pub at col 1
+    try std.testing.expectEqual(Token.Tag.keyword_pub, t1.tag);
     try std.testing.expectEqual(@as(u32, 1), t1.loc.col);
 
-    const t2 = lexer.next(); // foo at col 5
-    try std.testing.expectEqual(Token.Tag.identifier, t2.tag);
+    const t2 = lexer.next(); // fn at col 5
+    try std.testing.expectEqual(Token.Tag.keyword_fn, t2.tag);
     try std.testing.expectEqual(@as(u32, 5), t2.loc.col);
 
-    const t3 = lexer.next(); // do at col 9
-    try std.testing.expectEqual(Token.Tag.keyword_do, t3.tag);
-    try std.testing.expectEqual(@as(u32, 9), t3.loc.col);
+    const t3 = lexer.next(); // foo at col 8
+    try std.testing.expectEqual(Token.Tag.identifier, t3.tag);
+    try std.testing.expectEqual(@as(u32, 8), t3.loc.col);
+
+    const t4 = lexer.next(); // { at col 12
+    try std.testing.expectEqual(Token.Tag.left_brace, t4.tag);
+    try std.testing.expectEqual(@as(u32, 12), t4.loc.col);
 }
 
 test "lex column tracking across lines" {
     const source = "foo\nbar baz";
     var lexer = Lexer.init(source);
 
-    const t1 = lexer.next(); // foo at line 1, col 1
+    const t1 = lexer.next();
     try std.testing.expectEqual(Token.Tag.identifier, t1.tag);
     try std.testing.expectEqual(@as(u32, 1), t1.loc.line);
     try std.testing.expectEqual(@as(u32, 1), t1.loc.col);
 
     _ = lexer.next(); // newline
 
-    const t3 = lexer.next(); // bar at line 2, col 1
+    const t3 = lexer.next();
     try std.testing.expectEqual(Token.Tag.identifier, t3.tag);
     try std.testing.expectEqual(@as(u32, 2), t3.loc.line);
     try std.testing.expectEqual(@as(u32, 1), t3.loc.col);
 
-    const t4 = lexer.next(); // baz at line 2, col 5
+    const t4 = lexer.next();
     try std.testing.expectEqual(Token.Tag.identifier, t4.tag);
     try std.testing.expectEqual(@as(u32, 2), t4.loc.line);
     try std.testing.expectEqual(@as(u32, 5), t4.loc.col);
@@ -732,12 +602,12 @@ test "lex column tracking with operators" {
     const source = "x + y";
     var lexer = Lexer.init(source);
 
-    const t1 = lexer.next(); // x at col 1
+    const t1 = lexer.next();
     try std.testing.expectEqual(@as(u32, 1), t1.loc.col);
 
-    const t2 = lexer.next(); // + at col 3
+    const t2 = lexer.next();
     try std.testing.expectEqual(@as(u32, 3), t2.loc.col);
 
-    const t3 = lexer.next(); // y at col 5
+    const t3 = lexer.next();
     try std.testing.expectEqual(@as(u32, 5), t3.loc.col);
 }

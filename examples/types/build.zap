@@ -1,6 +1,6 @@
-defmodule Types.Builder do
-  def manifest(env :: Zap.Env) :: Zap.Manifest do
-    case env.target do
+pub module Types.Builder {
+  pub fn manifest(env :: Zap.Env) :: Zap.Manifest {
+    case env.target {
       :types ->
         %Zap.Manifest{
           name: "types",
@@ -11,6 +11,6 @@ defmodule Types.Builder do
         }
       _ ->
         panic("Unknown target: use 'types'")
-    end
-  end
-end
+    }
+  }
+}

@@ -1,5 +1,5 @@
-defmodule Runner do
-  def hello(word :: String) :: String do
+pub module Runner {
+  pub fn hello(word :: String) :: String {
     "Hello" <> " " <> word
-  end
-end
+  }
+}

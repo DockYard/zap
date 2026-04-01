@@ -1,23 +1,23 @@
 # Shared type definitions for the multifile example.
 
-defstruct Shape do
-  color :: String = "black"
-end
+pub struct Shape {
+  color :: String = "black",
+}
 
-defstruct Circle extends Shape do
-  radius :: f64
-end
+pub struct Circle extends Shape {
+  radius :: f64,
+}
 
-defstruct Rectangle extends Shape do
-  width :: f64
-  height :: f64
-end
+pub struct Rectangle extends Shape {
+  width :: f64,
+  height :: f64,
+}
 
-defenum Color do
+pub enum Color {
   Red
   Green
   Blue
-end
+}
 
-defmodule Types do
-end
+pub module Types {
+}

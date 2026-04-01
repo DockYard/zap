@@ -480,11 +480,11 @@ const Collector = @import("collector.zig").Collector;
 
 test "resolve simple function" {
     const source =
-        \\defmodule Test do
-        \\  def add(x :: i64, y :: i64) :: i64 do
+        \\pub module Test {
+        \\  pub fn add(x :: i64, y :: i64) :: i64 {
         \\    x + y
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -509,11 +509,11 @@ test "resolve simple function" {
 
 test "resolve module with function" {
     const source =
-        \\defmodule Math do
-        \\  def add(x :: i64, y :: i64) :: i64 do
+        \\pub module Math {
+        \\  pub fn add(x :: i64, y :: i64) :: i64 {
         \\    x + y
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -537,16 +537,14 @@ test "resolve module with function" {
 
 test "resolve case expression with bindings" {
     const source =
-        \\defmodule Test do
-        \\  def foo(x) do
-        \\    case x do
-        \\      {:ok, v} ->
-        \\        v
-        \\      {:error, e} ->
-        \\        e
-        \\    end
-        \\  end
-        \\end
+        \\pub module Test {
+        \\  pub fn foo(x :: Atom) :: Nil {
+        \\    case x {
+        \\      {:ok, v} -> v
+        \\      {:error, e} -> e
+        \\    }
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -570,12 +568,12 @@ test "resolve case expression with bindings" {
 
 test "resolve assignment" {
     const source =
-        \\defmodule Test do
-        \\  def foo() do
+        \\pub module Test {
+        \\  pub fn foo() {
         \\    x = 42
         \\    x
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

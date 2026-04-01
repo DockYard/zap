@@ -1,11 +1,11 @@
 # String concatenation and function calls
 
-defmodule Http do
-  def get(url :: String) :: String do
+pub module Http {
+  pub fn get(url :: String) :: String {
     "GET " <> url
-  end
+  }
 
-  def post(url :: String) :: String do
+  pub fn post(url :: String) :: String {
     "POST " <> url
-  end
-end
+  }
+}

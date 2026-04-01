@@ -1,5 +1,5 @@
-defmodule MarkupParser do
-  def greet(name :: String) :: String do
+pub module MarkupParser {
+  pub fn greet(name :: String) :: String {
     "Hello, " <> name <> "!"
-  end
-end
+  }
+}

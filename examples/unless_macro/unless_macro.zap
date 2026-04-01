@@ -3,20 +3,20 @@
 # Run with:
 #   zap run unless_macro
 
-defmodule UnlessMacro do
-  def check(x :: i64) :: String if x > 10 do
+pub module UnlessMacro {
+  pub fn check(x :: i64) :: String if x > 10 {
     "big number"
-  end
+  }
 
-  def check(_ :: i64) :: String do
+  pub fn check(_ :: i64) :: String {
     "small number"
-  end
+  }
 
-  def main(_args :: [String]) :: String do
+  pub fn main(_args :: [String]) :: String {
     UnlessMacro.check(5)
     |> IO.puts()
 
     UnlessMacro.check(20)
     |> IO.puts()
-  end
-end
+  }
+}

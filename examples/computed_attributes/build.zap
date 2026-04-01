@@ -1,6 +1,6 @@
-defmodule ComputedAttributes.Builder do
-  def manifest(env :: Zap.Env) :: Zap.Manifest do
-    case env.target do
+pub module ComputedAttributes.Builder {
+  pub fn manifest(env :: Zap.Env) :: Zap.Manifest {
+    case env.target {
       :computed_attributes ->
         %Zap.Manifest{
           name: "computed_attributes",
@@ -11,6 +11,6 @@ defmodule ComputedAttributes.Builder do
         }
       _ ->
         panic("Unknown target: use 'computed_attributes'")
-    end
-  end
-end
+    }
+  }
+}

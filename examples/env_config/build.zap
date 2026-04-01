@@ -1,6 +1,6 @@
-defmodule EnvConfig.Builder do
-  def manifest(env :: Zap.Env) :: Zap.Manifest do
-    case env.target do
+pub module EnvConfig.Builder {
+  pub fn manifest(env :: Zap.Env) :: Zap.Manifest {
+    case env.target {
       :env_config ->
         %Zap.Manifest{
           name: "env_config",
@@ -11,6 +11,6 @@ defmodule EnvConfig.Builder do
         }
       _ ->
         panic("Unknown target: use 'env_config'")
-    end
-  end
-end
+    }
+  }
+}

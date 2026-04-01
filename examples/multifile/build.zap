@@ -1,6 +1,6 @@
-defmodule Multifile.Builder do
-  def manifest(env :: Zap.Env) :: Zap.Manifest do
-    case env.target do
+pub module Multifile.Builder {
+  pub fn manifest(env :: Zap.Env) :: Zap.Manifest {
+    case env.target {
       :multifile ->
         %Zap.Manifest{
           name: "multifile",
@@ -11,6 +11,6 @@ defmodule Multifile.Builder do
         }
       _ ->
         panic("Unknown target: use 'multifile'")
-    end
-  end
-end
+    }
+  }
+}

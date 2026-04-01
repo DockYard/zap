@@ -27,17 +27,13 @@ pub const Token = struct {
         module_identifier, // capitalized identifier
 
         // Keywords
-        keyword_def,
-        keyword_defp,
-        keyword_defmodule,
-        keyword_defmodulep,
-        keyword_defmacro,
-        keyword_defmacrop,
-        keyword_defstruct,
-        keyword_defenum,
+        keyword_pub,
+        keyword_fn,
+        keyword_module,
+        keyword_struct,
+        keyword_enum,
+        keyword_macro,
         keyword_extends,
-        keyword_do,
-        keyword_end,
         keyword_if,
         keyword_else,
         keyword_case,
@@ -106,8 +102,6 @@ pub const Token = struct {
 
         // Layout tokens
         newline,
-        indent,
-        dedent,
 
         // Special
         eof,
@@ -124,17 +118,13 @@ pub const Token = struct {
     }
 
     pub const keywords = std.StaticStringMap(Tag).initComptime(.{
-        .{ "def", .keyword_def },
-        .{ "defp", .keyword_defp },
-        .{ "defmodule", .keyword_defmodule },
-        .{ "defmodulep", .keyword_defmodulep },
-        .{ "defmacro", .keyword_defmacro },
-        .{ "defmacrop", .keyword_defmacrop },
-        .{ "defstruct", .keyword_defstruct },
-        .{ "defenum", .keyword_defenum },
+        .{ "pub", .keyword_pub },
+        .{ "fn", .keyword_fn },
+        .{ "module", .keyword_module },
+        .{ "struct", .keyword_struct },
+        .{ "enum", .keyword_enum },
+        .{ "macro", .keyword_macro },
         .{ "extends", .keyword_extends },
-        .{ "do", .keyword_do },
-        .{ "end", .keyword_end },
         .{ "if", .keyword_if },
         .{ "else", .keyword_else },
         .{ "case", .keyword_case },
@@ -172,17 +162,17 @@ pub const Token = struct {
 };
 
 test "keyword lookup" {
-    try std.testing.expectEqual(Token.Tag.keyword_def, Token.getKeyword("def").?);
-    try std.testing.expectEqual(Token.Tag.keyword_defmodule, Token.getKeyword("defmodule").?);
-    try std.testing.expectEqual(Token.Tag.keyword_end, Token.getKeyword("end").?);
+    try std.testing.expectEqual(Token.Tag.keyword_fn, Token.getKeyword("fn").?);
+    try std.testing.expectEqual(Token.Tag.keyword_module, Token.getKeyword("module").?);
+    try std.testing.expectEqual(Token.Tag.keyword_pub, Token.getKeyword("pub").?);
     try std.testing.expect(Token.getKeyword("foobar") == null);
 }
 
 test "token slice" {
-    const source = "defmodule Foo do";
+    const source = "pub module Foo {";
     const tok = Token{
-        .tag = .keyword_defmodule,
-        .loc = .{ .start = 0, .end = 9 },
+        .tag = .keyword_pub,
+        .loc = .{ .start = 0, .end = 3 },
     };
-    try std.testing.expectEqualStrings("defmodule", tok.slice(source));
+    try std.testing.expectEqualStrings("pub", tok.slice(source));
 }

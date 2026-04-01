@@ -1,17 +1,17 @@
-defmodule Math do
-  def square(x :: i64) :: i64 do
+pub module Math {
+  pub fn square(x :: i64) :: i64 {
     x * x
-  end
+  }
 
-  def cube(x :: i64) :: i64 do
+  pub fn cube(x :: i64) :: i64 {
     x * x * x
-  end
+  }
 
-  def abs(x :: i64) :: i64 do
-    if x < 0 do
+  pub fn abs(x :: i64) :: i64 {
+    if x < 0 {
       -x
-    else
+    } else {
       x
-    end
-  end
-end
+    }
+  }
+}

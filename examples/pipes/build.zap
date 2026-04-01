@@ -1,6 +1,6 @@
-defmodule Pipes.Builder do
-  def manifest(env :: Zap.Env) :: Zap.Manifest do
-    case env.target do
+pub module Pipes.Builder {
+  pub fn manifest(env :: Zap.Env) :: Zap.Manifest {
+    case env.target {
       :pipes ->
         %Zap.Manifest{
           name: "pipes",
@@ -11,6 +11,6 @@ defmodule Pipes.Builder do
         }
       _ ->
         panic("Unknown target: use 'pipes'")
-    end
-  end
-end
+    }
+  }
+}

@@ -97,129 +97,129 @@ Every `.zap` file contains exactly one module. The module name maps to the file 
 
 The compiler enforces this — a mismatch is a compile error. The compiler discovers files by following module references from the entry point. No glob patterns or file manifests needed.
 
-```elixir
+```zap
 # lib/math.zap
-defmodule Math do
-  def square(x :: i64) :: i64 do
+pub module Math {
+  pub fn square(x :: i64) :: i64 {
     x * x
-  end
+  }
 
-  def double(x :: i64) :: i64 do
+  pub fn double(x :: i64) :: i64 {
     x * 2
-  end
-end
+  }
+}
 ```
 
 ### Visibility
 
-- `def` / `defmacro` — public function/macro
-- `defp` / `defmacrop` — private to the module (file)
-- `defmodule` — public module
-- `defmodulep` — private module (visible within the dep, invisible outside)
+- `pub fn` / `pub macro` — public function/macro
+- `fn` / `macro` — private to the module (file)
+- `pub module` — public module
+- `module` — private module (visible within the dep, invisible outside)
 
 ### Entry Point
 
 Every program needs a `main` function inside a module. The `build.zap` manifest specifies the entry point:
 
-```elixir
-defmodule MyApp do
-  def main(_args :: [String]) do
+```zap
+pub module MyApp {
+  pub fn main(_args :: [String]) {
     IO.puts("Hello!")
-  end
-end
+  }
+}
 ```
 
 ### Pipe Operator
 
 Chain function calls, passing the result of each step as the first argument to the next:
 
-```elixir
-defmodule Pipes do
-  def double(x :: i64) :: i64 do
+```zap
+pub module Pipes {
+  pub fn double(x :: i64) :: i64 {
     x * 2
-  end
+  }
 
-  def add_one(x :: i64) :: i64 do
+  pub fn add_one(x :: i64) :: i64 {
     x + 1
-  end
+  }
 
-  def main() do
+  pub fn main() {
     5
     |> Pipes.double()
     |> Pipes.add_one()
-  end
-end
+  }
+}
 ```
 
 ### Pattern Matching
 
 Multiple function clauses with the same name form an overload group. The compiler resolves which clause to call based on argument values and types.
 
-```elixir
-defmodule Factorial do
-  def factorial(0 :: i64) :: i64 do
+```zap
+pub module Factorial {
+  pub fn factorial(0 :: i64) :: i64 {
     1
-  end
+  }
 
-  def factorial(n :: i64) :: i64 do
+  pub fn factorial(n :: i64) :: i64 {
     n * factorial(n - 1)
-  end
-end
+  }
+}
 ```
 
 ### Guards
 
 Function clauses can carry guard conditions that participate in dispatch:
 
-```elixir
-defmodule Guards do
-  def classify(n :: i64) :: String if n > 0 do
+```zap
+pub module Guards {
+  pub fn classify(n :: i64) :: String if n > 0 {
     "positive"
-  end
+  }
 
-  def classify(n :: i64) :: String if n < 0 do
+  pub fn classify(n :: i64) :: String if n < 0 {
     "negative"
-  end
+  }
 
-  def classify(_ :: i64) :: String do
+  pub fn classify(_ :: i64) :: String {
     "zero"
-  end
-end
+  }
+}
 ```
 
 ### Case Expressions
 
 Pattern matching inside function bodies:
 
-```elixir
-defmodule CaseExpr do
-  def check(result) :: String do
-    case result do
+```zap
+pub module CaseExpr {
+  pub fn check(result) :: String {
+    case result {
       {:ok, v} ->
         v
       {:error, e} ->
         e
       _ ->
         "unknown"
-    end
-  end
-end
+    }
+  }
+}
 ```
 
 ### If / Else
 
 If/else is an expression — it produces a value:
 
-```elixir
-defmodule Math do
-  def abs(x :: i64) :: i64 do
-    if x < 0 do
+```zap
+pub module Math {
+  pub fn abs(x :: i64) :: i64 {
+    if x < 0 {
       -x
-    else
+    } else {
       x
-    end
-  end
-end
+    }
+  }
+}
 ```
 
 ---
@@ -228,10 +228,10 @@ end
 
 Every Zap project has a `build.zap` that defines build targets:
 
-```elixir
-defmodule MyApp.Builder do
-  def manifest(env :: Zap.Env) :: Zap.Manifest do
-    case env.target do
+```zap
+pub module MyApp.Builder {
+  pub fn manifest(env :: Zap.Env) :: Zap.Manifest {
+    case env.target {
       :my_app ->
         %Zap.Manifest{
           name: "my_app",
@@ -241,9 +241,9 @@ defmodule MyApp.Builder do
         }
       _ ->
         panic("Unknown target")
-    end
-  end
-end
+    }
+  }
+}
 ```
 
 When `root` is specified and `paths` is omitted, the compiler uses import-driven discovery — it starts from the entry module and follows module references to find all source files automatically.
@@ -261,7 +261,7 @@ When `root` is specified and `paths` is omitted, the compiler uses import-driven
 
 Dependencies are declared in the manifest as tuples:
 
-```elixir
+```zap
 %Zap.Manifest{
   name: "my_app",
   version: "0.1.0",
@@ -306,27 +306,27 @@ Types are declared at function boundaries. No implicit numeric coercion — all 
 
 ### Structs
 
-```elixir
-defstruct User do
-  name :: String
-  email :: String
-  age :: i64
-end
+```zap
+pub struct User {
+  name :: String,
+  email :: String,
+  age :: i64,
+}
 
-defstruct Circle extends Shape do
-  radius :: f64
-end
+pub struct Circle extends Shape {
+  radius :: f64,
+}
 ```
 
 ### Enums
 
-```elixir
-defenum Direction do
-  North
-  South
-  East
-  West
-end
+```zap
+pub enum Direction {
+  North,
+  South,
+  East,
+  West,
+}
 ```
 
 ---

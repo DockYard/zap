@@ -623,7 +623,7 @@ test "diagnostic engine basic error" {
     var engine = DiagnosticEngine.init(alloc);
     defer engine.deinit();
 
-    engine.setSource("def foo() do\n  bar()\nend\n", "test.zip");
+    engine.setSource("pub fn foo() {\n  bar()\n}\n", "test.zip");
 
     try engine.undefinedFunction("bar", 0, .{ .start = 2, .end = 7, .line = 2 });
 
@@ -693,7 +693,7 @@ test "rich format with caret underlines" {
 
     var engine = DiagnosticEngine.init(alloc);
     defer engine.deinit();
-    engine.setSource("def foo() do\n  bar()\nend\n", "test.zap");
+    engine.setSource("pub fn foo() {\n  bar()\n}\n", "test.zap");
 
     try engine.reportDiagnostic(.{
         .severity = .@"error",

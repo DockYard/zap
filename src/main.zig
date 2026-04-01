@@ -267,16 +267,16 @@ fn cmdInit(allocator: std.mem.Allocator) !void {
 
     // build.zap
     const build_zap = try std.fmt.allocPrint(allocator,
-        \\defmodule {s}.Builder do
-        \\  def manifest(env :: Zap.Env) :: Zap.Manifest do
-        \\    case env.target do
+        \\pub module {s}.Builder {{
+        \\  pub fn manifest(env :: Zap.Env) :: Zap.Manifest {{
+        \\    case env.target {{
         \\      :{s} -> {s}(env)
         \\      :test -> test(env)
         \\      _default -> {s}(env)
-        \\    end
-        \\  end
+        \\    }}
+        \\  }}
         \\
-        \\  defp {s}(env :: Zap.Env) :: Zap.Manifest do
+        \\  fn {s}(env :: Zap.Env) :: Zap.Manifest {{
         \\    %Zap.Manifest{{
         \\      name: "{s}",
         \\      version: "0.1.0",
@@ -286,9 +286,9 @@ fn cmdInit(allocator: std.mem.Allocator) !void {
         \\      # :debug | :release_safe | :release_fast | :release_small
         \\      optimize: :release_safe
         \\    }}
-        \\  end
+        \\  }}
         \\
-        \\  defp test(env :: Zap.Env) :: Zap.Manifest do
+        \\  fn test(env :: Zap.Env) :: Zap.Manifest {{
         \\    %Zap.Manifest{{
         \\      name: "{s}_test",
         \\      version: "0.1.0",
@@ -297,8 +297,8 @@ fn cmdInit(allocator: std.mem.Allocator) !void {
         \\      paths: ["lib/**/*.zap", "test/**/*.zap"],
         \\      optimize: :debug
         \\    }}
-        \\  end
-        \\end
+        \\  }}
+        \\}}
         \\
     , .{ module_name, project_name, project_name, project_name, project_name, project_name, module_name, project_name, module_name });
     defer allocator.free(build_zap);
@@ -308,11 +308,11 @@ fn cmdInit(allocator: std.mem.Allocator) !void {
     const lib_path = try std.fmt.allocPrint(allocator, "lib/{s}.zap", .{project_name});
     defer allocator.free(lib_path);
     const lib_source = try std.fmt.allocPrint(allocator,
-        \\defmodule {s} do
-        \\  def main(_args :: [String]) do
+        \\pub module {s} {{
+        \\  pub fn main(_args :: [String]) {{
         \\    IO.puts("Howdy!")
-        \\  end
-        \\end
+        \\  }}
+        \\}}
         \\
     , .{module_name});
     defer allocator.free(lib_source);
@@ -322,11 +322,11 @@ fn cmdInit(allocator: std.mem.Allocator) !void {
     const test_path = try std.fmt.allocPrint(allocator, "test/{s}_test.zap", .{project_name});
     defer allocator.free(test_path);
     const test_source = try std.fmt.allocPrint(allocator,
-        \\defmodule {s}Test do
-        \\  def main(_args :: [String]) do
+        \\pub module {s}Test {{
+        \\  pub fn main(_args :: [String]) {{
         \\    IO.puts("Test Suite TBD")
-        \\  end
-        \\end
+        \\  }}
+        \\}}
         \\
     , .{module_name});
     defer allocator.free(test_source);
@@ -572,7 +572,7 @@ fn buildTarget(
                     const expected = zap.discovery.moduleNameToRelPath(alloc, mod) catch "?";
                     try stderr_w.print("Error: Module `{s}` not found — expected {s} in one of the source roots\n", .{ mod, expected });
                 } else if (discovery_err_info.boundary_module) |mod| {
-                    try stderr_w.print("Error: Module `{s}` is private (defmodulep) to {s} — cannot be accessed from {s}\n", .{
+                    try stderr_w.print("Error: Module `{s}` is private (module without pub) in {s} — cannot be accessed from {s}\n", .{
                         mod,
                         discovery_err_info.boundary_dep orelse "?",
                         discovery_err_info.boundary_from orelse "?",
@@ -934,8 +934,8 @@ fn parseTargetArgs(allocator: std.mem.Allocator, args: []const []const u8) !Pars
 const testing = std.testing;
 
 test "computeBuildCacheKey includes manifest result hash" {
-    const build_source = "defmodule App.Builder do end";
-    const merged_source = "defmodule App do end";
+    const build_source = "pub module App.Builder {}";
+    const merged_source = "pub module App {}";
     const target_name = "default";
 
     const first = computeBuildCacheKey(build_source, merged_source, target_name, 111);

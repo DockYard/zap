@@ -223,7 +223,7 @@ pub fn collectAllFromUnits(
         };
     }
 
-    // Collect top-level items (defstruct, defenum, etc.) from the merged program.
+    // Collect top-level items (struct, enum, etc.) from the merged program.
     // Per-module programs only contain modules; top_items live on the merged program.
     if (program.top_items.len > 0) {
         const top_only = ast.Program{ .modules = &.{}, .top_items = program.top_items };
@@ -780,7 +780,7 @@ fn buildCompilationUnits(
     source_units: []const SourceUnit,
 ) ![]CompilationUnit {
     // Build a unit for each module by matching module names to source files.
-    // Source files that contain only top-level items (e.g., Zap.zap with defstruct)
+    // Source files that contain only top-level items (e.g., Zap.zap with pub struct)
     // won't have a matching module_program and are skipped.
     var units_list: std.ArrayListUnmanaged(CompilationUnit) = .empty;
     for (module_programs, 0..) |entry, mod_idx| {
@@ -1133,7 +1133,7 @@ pub fn runBinary(allocator: std.mem.Allocator, bin_path: []const u8, program_arg
     };
 }
 
-/// Validate that a source file contains exactly one defmodule and that the
+/// Validate that a source file contains exactly one module declaration and that the
 /// module name matches the file path. Returns an error message if validation
 /// fails, or null if the file is valid.
 ///
@@ -1150,7 +1150,7 @@ pub fn validateOneModulePerFile(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // Parse without stdlib — we only need to count defmodule declarations
+    // Parse without stdlib — we only need to count module declarations
     var parser = zap.Parser.init(arena, source);
 
     const program = parser.parseProgram() catch {
@@ -1183,11 +1183,11 @@ pub fn validateOneModulePerFile(
     }
 
     if (module_count == 0) {
-        return std.fmt.allocPrint(alloc, "File `{s}` must contain exactly one defmodule declaration, found none", .{file_path}) catch "file has no module";
+        return std.fmt.allocPrint(alloc, "File `{s}` must contain exactly one module declaration, found none", .{file_path}) catch "file has no module";
     }
 
     if (module_count > 1) {
-        return std.fmt.allocPrint(alloc, "File `{s}` must contain exactly one defmodule declaration, found {d}", .{ file_path, module_count }) catch "file has multiple modules";
+        return std.fmt.allocPrint(alloc, "File `{s}` must contain exactly one module declaration, found {d}", .{ file_path, module_count }) catch "file has multiple modules";
     }
 
     // Build the actual module name from the AST
@@ -1256,28 +1256,28 @@ pub fn getRuntimeSource() []const u8 {
 
 test "validateOneModulePerFile: valid single module" {
     const alloc = std.testing.allocator;
-    const source = "defmodule Config do\n  def load() :: String do\n    \"ok\"\n  end\nend\n";
+    const source = "pub module Config {\n  pub fn load() :: String {\n    \"ok\"\n  }\n}\n";
     const result = validateOneModulePerFile(alloc, source, "config.zap");
     try std.testing.expectEqual(null, result);
 }
 
 test "validateOneModulePerFile: valid nested module name" {
     const alloc = std.testing.allocator;
-    const source = "defmodule Config.Parser do\n  def parse() :: String do\n    \"ok\"\n  end\nend\n";
+    const source = "pub module Config.Parser {\n  pub fn parse() :: String {\n    \"ok\"\n  }\n}\n";
     const result = validateOneModulePerFile(alloc, source, "config/parser.zap");
     try std.testing.expectEqual(null, result);
 }
 
 test "validateOneModulePerFile: valid private module" {
     const alloc = std.testing.allocator;
-    const source = "defmodulep Config.Helpers do\n  def help() :: String do\n    \"ok\"\n  end\nend\n";
+    const source = "module Config.Helpers {\n  pub fn help() :: String {\n    \"ok\"\n  }\n}\n";
     const result = validateOneModulePerFile(alloc, source, "config/helpers.zap");
     try std.testing.expectEqual(null, result);
 }
 
 test "validateOneModulePerFile: zero modules is error" {
     const alloc = std.testing.allocator;
-    const source = "defstruct Point do\n  x :: i64\nend\n";
+    const source = "pub struct Point {\n  x :: i64\n}\n";
     const result = validateOneModulePerFile(alloc, source, "point.zap");
     try std.testing.expect(result != null);
     try std.testing.expect(std.mem.indexOf(u8, result.?, "found none") != null);
@@ -1286,7 +1286,7 @@ test "validateOneModulePerFile: zero modules is error" {
 
 test "validateOneModulePerFile: multiple modules is error" {
     const alloc = std.testing.allocator;
-    const source = "defmodule Foo do\n  def foo() :: i64 do\n    1\n  end\nend\ndefmodule Bar do\n  def bar() :: i64 do\n    2\n  end\nend\n";
+    const source = "pub module Foo {\n  pub fn foo() :: i64 {\n    1\n  }\n}\npub module Bar {\n  pub fn bar() :: i64 {\n    2\n  }\n}\n";
     const result = validateOneModulePerFile(alloc, source, "foo.zap");
     try std.testing.expect(result != null);
     try std.testing.expect(std.mem.indexOf(u8, result.?, "found 2") != null);
@@ -1295,7 +1295,7 @@ test "validateOneModulePerFile: multiple modules is error" {
 
 test "validateOneModulePerFile: name mismatch is error" {
     const alloc = std.testing.allocator;
-    const source = "defmodule WrongName do\n  def foo() :: i64 do\n    1\n  end\nend\n";
+    const source = "pub module WrongName {\n  pub fn foo() :: i64 {\n    1\n  }\n}\n";
     const result = validateOneModulePerFile(alloc, source, "config.zap");
     try std.testing.expect(result != null);
     try std.testing.expect(std.mem.indexOf(u8, result.?, "does not match") != null);
@@ -1304,7 +1304,7 @@ test "validateOneModulePerFile: name mismatch is error" {
 
 test "validateOneModulePerFile: snake_case path to PascalCase" {
     const alloc = std.testing.allocator;
-    const source = "defmodule JsonParser do\n  def parse() :: String do\n    \"ok\"\n  end\nend\n";
+    const source = "pub module JsonParser {\n  pub fn parse() :: String {\n    \"ok\"\n  }\n}\n";
     const result = validateOneModulePerFile(alloc, source, "json_parser.zap");
     try std.testing.expectEqual(null, result);
 }
@@ -1314,10 +1314,10 @@ test "buildModulePrograms stores per-module AST programs" {
     defer arena.deinit();
     const alloc = arena.allocator();
     const source =
-        "defmodule Foo do\n" ++
-        "end\n" ++
-        "defmodule Bar.Baz do\n" ++
-        "end\n" ++
+        "pub module Foo {\n" ++
+        "}\n" ++
+        "pub module Bar.Baz {\n" ++
+        "}\n" ++
         "";
 
     var parser = zap.Parser.init(alloc, source);
@@ -1337,18 +1337,18 @@ test "buildCompilationUnits derives units from module programs" {
     defer arena.deinit();
     const alloc = arena.allocator();
     const source =
-        "defmodule Foo do\n" ++
-        "end\n" ++
-        "defmodule Bar.Baz do\n" ++
-        "end\n";
+        "pub module Foo {\n" ++
+        "}\n" ++
+        "pub module Bar.Baz {\n" ++
+        "}\n";
 
     var parser = zap.Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
     const module_programs = try buildModulePrograms(alloc, &program, parser.interner);
     const source_units = [_]SourceUnit{
-        .{ .file_path = "fixture.zap", .source = "defmodule Foo do\nend\n" },
-        .{ .file_path = "fixture.zap", .source = "defmodule Bar.Baz do\nend\n" },
+        .{ .file_path = "fixture.zap", .source = "pub module Foo {\n}\n" },
+        .{ .file_path = "fixture.zap", .source = "pub module Bar.Baz {\n}\n" },
     };
     const units = try buildCompilationUnits(alloc, module_programs, &source_units);
 
@@ -1365,13 +1365,13 @@ test "mergeSourceUnits concatenates explicit source units" {
     defer arena.deinit();
     const alloc = arena.allocator();
     const units = [_]SourceUnit{
-        .{ .file_path = "foo.zap", .source = "defmodule Foo do\nend\n" },
-        .{ .file_path = "bar.zap", .source = "defmodule Bar do\nend\n" },
+        .{ .file_path = "foo.zap", .source = "pub module Foo {\n}\n" },
+        .{ .file_path = "bar.zap", .source = "pub module Bar {\n}\n" },
     };
 
     const merged = try mergeSourceUnits(alloc, &units);
     try std.testing.expectEqualStrings(
-        "defmodule Foo do\nend\n\ndefmodule Bar do\nend\n\n",
+        "pub module Foo {\n}\n\npub module Bar {\n}\n\n",
         merged,
     );
 }
@@ -1384,7 +1384,7 @@ test "per-unit parser assigns source_id and file-local spans" {
 
     var parser = zap.Parser.initWithSharedInterner(
         alloc,
-        "defmodule Bar do\n  bad(\nend\n",
+        "pub module Bar {\n  bad(\n}\n",
         &interner,
         7,
     );
@@ -1402,16 +1402,16 @@ test "collector can build graph from per-module programs" {
     defer arena.deinit();
     const alloc = arena.allocator();
     const source =
-        "defmodule Foo do\n" ++
-        "  def run() :: i64 do\n" ++
+        "pub module Foo {\n" ++
+        "  pub fn run() :: i64 {\n" ++
         "    1\n" ++
-        "  end\n" ++
-        "end\n" ++
-        "defmodule Bar do\n" ++
-        "  def call() :: i64 do\n" ++
+        "  }\n" ++
+        "}\n" ++
+        "pub module Bar {\n" ++
+        "  pub fn call() :: i64 {\n" ++
         "    Foo.run()\n" ++
-        "  end\n" ++
-        "end\n";
+        "  }\n" ++
+        "}\n";
 
     var parser = zap.Parser.init(alloc, source);
     defer parser.deinit();

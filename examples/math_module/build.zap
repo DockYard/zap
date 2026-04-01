@@ -1,6 +1,6 @@
-defmodule MathModule.Builder do
-  def manifest(env :: Zap.Env) :: Zap.Manifest do
-    case env.target do
+pub module MathModule.Builder {
+  pub fn manifest(env :: Zap.Env) :: Zap.Manifest {
+    case env.target {
       :math_module ->
         %Zap.Manifest{
           name: "math_module",
@@ -11,6 +11,6 @@ defmodule MathModule.Builder do
         }
       _ ->
         panic("Unknown target: use 'math_module'")
-    end
-  end
-end
+    }
+  }
+}

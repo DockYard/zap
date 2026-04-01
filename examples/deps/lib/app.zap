@@ -1,7 +1,7 @@
-defmodule App do
-  def main(_args :: [String]) :: String do
+pub module App {
+  pub fn main(_args :: [String]) :: String {
     MathLib.add(1, 2)
     |> Integer.to_string()
     |> IO.puts()
-  end
-end
+  }
+}

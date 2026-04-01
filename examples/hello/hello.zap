@@ -1,6 +1,6 @@
-defmodule Hello do
-  def main(_args :: [String]) :: String do
+pub module Hello {
+  pub fn main(_args :: [String]) :: String {
     Runner.hello("World!")
     |> IO.puts()
-  end
-end
+  }
+}

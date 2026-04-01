@@ -1,6 +1,6 @@
-defmodule Cli.Builder do
-  def manifest(env :: Zap.Env) :: Zap.Manifest do
-    case env.target do
+pub module Cli.Builder {
+  pub fn manifest(env :: Zap.Env) :: Zap.Manifest {
+    case env.target {
       :cli ->
         %Zap.Manifest{
           name: "cli",
@@ -11,6 +11,6 @@ defmodule Cli.Builder do
         }
       _ ->
         panic("Unknown target: use 'cli'")
-    end
-  end
-end
+    }
+  }
+}

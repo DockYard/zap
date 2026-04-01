@@ -81,6 +81,26 @@ pub const Parser = struct {
         return lookahead.next().tag;
     }
 
+    const LexerState = struct {
+        lexer: Lexer,
+        current: Token,
+        previous: Token,
+    };
+
+    fn saveLexerState(self: *const Parser) LexerState {
+        return .{
+            .lexer = self.lexer,
+            .current = self.current,
+            .previous = self.previous,
+        };
+    }
+
+    fn restoreLexerState(self: *Parser, state: LexerState) void {
+        self.lexer = state.lexer;
+        self.current = state.current;
+        self.previous = state.previous;
+    }
+
     fn check(self: *const Parser, tag: Token.Tag) bool {
         return self.current.tag == tag;
     }
@@ -151,7 +171,7 @@ pub const Parser = struct {
         const saved_previous = self.previous;
 
         // Consume newlines and indentation tokens
-        while (self.check(.newline) or self.check(.indent) or self.check(.dedent)) {
+        while (self.check(.newline)) {
             _ = self.advance();
         }
 
@@ -184,23 +204,23 @@ pub const Parser = struct {
     fn synchronize(self: *Parser) void {
         while (!self.check(.eof)) {
             switch (self.peek()) {
-                .keyword_def, .keyword_defp, .keyword_defmodule, .keyword_defmacro, .keyword_defstruct, .keyword_defenum, .keyword_end => return,
+                .keyword_pub, .keyword_fn, .keyword_module, .keyword_macro, .keyword_struct, .keyword_enum, .right_brace => return,
                 .newline => {
                     _ = self.advance();
                     // After newline, check if next token starts a new statement
                     self.skipNewlines();
                     switch (self.peek()) {
-                        .keyword_def,
-                        .keyword_defp,
-                        .keyword_defmodule,
-                        .keyword_defmacro,
-                        .keyword_defstruct,
-                        .keyword_defenum,
+                        .keyword_pub,
+                        .keyword_fn,
+                        .keyword_module,
+                        .keyword_macro,
+                        .keyword_struct,
+                        .keyword_enum,
                         .keyword_type,
                         .keyword_opaque,
                         .keyword_alias,
                         .keyword_import,
-                        .keyword_end,
+                        .right_brace,
                         .eof,
                         => return,
                         else => {},
@@ -245,15 +265,71 @@ pub const Parser = struct {
 
         while (!self.check(.eof)) {
             switch (self.peek()) {
-                .keyword_defmodule => {
-                    if (self.parseModuleDecl(false)) |mod| {
-                        try modules.append(self.allocator, mod);
-                        try top_items.append(self.allocator, .{ .module = try self.create(ast.ModuleDecl, mod) });
-                    } else |_| {
-                        self.synchronize();
+                .keyword_pub => {
+                    // pub module / pub fn / pub macro / pub struct / pub enum
+                    const saved = self.saveLexerState();
+                    _ = self.advance(); // consume pub
+                    switch (self.peek()) {
+                        .keyword_module => {
+                            self.restoreLexerState(saved); // restore so parseModuleDecl sees pub
+                            if (self.parseModuleDecl(false)) |mod| {
+                                try modules.append(self.allocator, mod);
+                                try top_items.append(self.allocator, .{ .module = try self.create(ast.ModuleDecl, mod) });
+                            } else |_| {
+                                self.synchronize();
+                            }
+                        },
+                        .keyword_fn => {
+                            self.restoreLexerState(saved);
+                            try self.addRichError(
+                                "functions cannot be defined at the top level",
+                                self.currentSpan(),
+                                null,
+                                "move this function inside a `pub module` block",
+                            );
+                            _ = self.advance(); // skip pub
+                            _ = self.advance(); // skip fn
+                            self.synchronize();
+                        },
+                        .keyword_macro => {
+                            self.restoreLexerState(saved);
+                            if (self.parseMacroDecl(.public)) |mac| {
+                                try top_items.append(self.allocator, .{ .macro = mac });
+                            } else |_| {
+                                self.synchronize();
+                            }
+                        },
+                        .keyword_struct => {
+                            self.restoreLexerState(saved);
+                            if (self.parseTopLevelStructDecl()) |sd| {
+                                try top_items.append(self.allocator, .{ .struct_decl = sd });
+                            } else |_| {
+                                self.synchronize();
+                            }
+                        },
+                        .keyword_enum => {
+                            self.restoreLexerState(saved);
+                            if (self.parseEnumDecl()) |ed| {
+                                try top_items.append(self.allocator, .{ .enum_decl = ed });
+                            } else |_| {
+                                self.synchronize();
+                            }
+                        },
+                        else => {
+                            self.restoreLexerState(saved);
+                            try self.addRichError(
+                                "I was expecting `module`, `fn`, `macro`, `struct`, or `enum` after `pub`",
+                                self.currentSpan(),
+                                null,
+                                null,
+                            );
+                            _ = self.advance();
+                            self.synchronize();
+                        },
                     }
                 },
-                .keyword_defmodulep => {
+                .keyword_module => {
+                    // bare module = private
                     if (self.parseModuleDecl(true)) |mod| {
                         try modules.append(self.allocator, mod);
                         try top_items.append(self.allocator, .{ .priv_module = try self.create(ast.ModuleDecl, mod) });
@@ -261,16 +337,17 @@ pub const Parser = struct {
                         self.synchronize();
                     }
                 },
-                .keyword_def, .keyword_defp => {
+                .keyword_fn => {
                     try self.addRichError(
                         "functions cannot be defined at the top level",
                         self.currentSpan(),
                         null,
-                        "move this function inside a `defmodule` block",
+                        "move this function inside a `pub module` block",
                     );
-                    _ = self.advance(); // skip past def/defp to avoid infinite loop
+                    _ = self.advance();
                     self.synchronize();
                 },
+                // (legacy keywords removed — use `pub module` / `module` / `pub fn` / `fn` syntax)
                 .keyword_type => {
                     if (self.parseTypeDecl()) |td| {
                         try top_items.append(self.allocator, .{ .type_decl = td });
@@ -285,28 +362,22 @@ pub const Parser = struct {
                         self.synchronize();
                     }
                 },
-                .keyword_defmacro => {
-                    if (self.parseMacroDecl(.public)) |mac| {
-                        try top_items.append(self.allocator, .{ .macro = mac });
-                    } else |_| {
-                        self.synchronize();
-                    }
-                },
-                .keyword_defmacrop => {
+                .keyword_macro => {
+                    // bare macro at top level = private
                     if (self.parseMacroDecl(.private)) |mac| {
                         try top_items.append(self.allocator, .{ .priv_macro = mac });
                     } else |_| {
                         self.synchronize();
                     }
                 },
-                .keyword_defstruct => {
+                .keyword_struct => {
                     if (self.parseTopLevelStructDecl()) |sd| {
                         try top_items.append(self.allocator, .{ .struct_decl = sd });
                     } else |_| {
                         self.synchronize();
                     }
                 },
-                .keyword_defenum => {
+                .keyword_enum => {
                     if (self.parseEnumDecl()) |ed| {
                         try top_items.append(self.allocator, .{ .enum_decl = ed });
                     } else |_| {
@@ -316,14 +387,11 @@ pub const Parser = struct {
                 .newline => {
                     _ = self.advance();
                 },
-                .dedent => {
-                    _ = self.advance();
-                },
                 else => {
                     // Check for misspelled keywords
                     if (self.current.tag == .identifier) {
                         const text = self.current.slice(self.source);
-                        const keywords = [_][]const u8{ "defmodule", "defmodulep", "def", "defp", "defmacro", "defmacrop", "defstruct", "defenum", "type", "opaque" };
+                        const keywords = [_][]const u8{ "pub", "module", "fn", "macro", "struct", "enum", "type", "opaque" };
                         if (similarity.findBestMatch(text, &keywords, 0.75)) |suggestion| {
                             try self.addRichError(
                                 std.fmt.allocPrint(self.allocator, "I was not expecting `{s}` at the top level", .{text}) catch "unexpected identifier at top level",
@@ -341,7 +409,7 @@ pub const Parser = struct {
                         }) catch "unexpected token at top level",
                         self.currentSpan(),
                         null,
-                        "the top level can contain `defmodule`, `defmodulep`, `defstruct`, `defenum`, `type`, and `opaque` declarations",
+                        "the top level can contain `pub module`, `module`, `pub struct`, `pub enum`, `type`, and `opaque` declarations",
                     );
                     _ = self.advance();
                 },
@@ -365,16 +433,22 @@ pub const Parser = struct {
 
     fn parseModuleDecl(self: *Parser, is_private: bool) !ast.ModuleDecl {
         const start = self.currentSpan();
-        if (is_private) {
-            _ = try self.expect(.keyword_defmodulep);
+        // Determine whether we're using new syntax (pub module / module) or legacy (defmodule / defmodulep)
+        var use_brace_syntax = false;
+        if (self.check(.keyword_pub)) {
+            _ = self.advance(); // consume pub
+            _ = try self.expect(.keyword_module);
+            use_brace_syntax = true;
+        } else if (self.check(.keyword_module)) {
+            _ = self.advance(); // consume module
+            use_brace_syntax = true;
         } else {
-            _ = try self.expect(.keyword_defmodule);
+            return error.ParseError;
         }
 
-        const keyword_name = if (is_private) "defmodulep" else "defmodule";
         if (!self.check(.module_identifier)) {
             try self.addRichError(
-                std.fmt.allocPrint(self.allocator, "I was expecting a module name (like `MyModule`) after `{s}`", .{keyword_name}) catch "expected module name",
+                "I was expecting a module name (like `MyModule`) after the module keyword",
                 start,
                 "module declaration starts here",
                 "module names must start with an uppercase letter",
@@ -390,69 +464,118 @@ pub const Parser = struct {
             parent = try self.internToken(parent_tok);
         }
 
-        if (!self.check(.keyword_do)) {
-            try self.addRichError(
-                "I was expecting `do` to start the module body",
-                start,
-                "this module declaration needs a `do` ... `end` block",
-                "add `do` after the module name",
-            );
-            return error.ParseError;
+        // Accept either { or do to open the module body
+        const close_brace = use_brace_syntax or self.check(.left_brace);
+        if (close_brace) {
+            if (!self.check(.left_brace)) {
+                try self.addRichError(
+                    "I was expecting `{` to start the module body",
+                    start,
+                    "this module declaration needs a `{ ... }` block",
+                    "add `{` after the module name",
+                );
+                return error.ParseError;
+            }
+            _ = self.advance();
+        } else {
+            if (!self.check(.left_brace)) {
+                try self.addRichError(
+                    "I was expecting `do` to start the module body",
+                    start,
+                    "this module declaration needs a `do` ... `end` block",
+                    "add `do` after the module name",
+                );
+                return error.ParseError;
+            }
+            _ = self.advance();
         }
-        _ = self.advance();
         self.skipNewlines();
-
-        _ = self.match(.indent);
 
         var items: std.ArrayList(ast.ModuleItem) = .empty;
 
-        while (!self.check(.keyword_end) and !self.check(.eof)) {
+        while (!self.check(.right_brace) and !self.check(.eof)) {
             self.skipNewlines();
-            if (self.check(.keyword_end) or self.check(.eof)) break;
+            if (self.check(.right_brace) or self.check(.eof)) break;
 
             switch (self.peek()) {
-                .keyword_def => {
-                    if (self.parseFunctionDecl(.public)) |func| {
-                        try items.append(self.allocator, .{ .function = func });
-                    } else |_| {
-                        self.synchronize();
+                .keyword_pub => {
+                    // pub fn / pub macro / pub struct / pub enum
+                    const saved = self.saveLexerState();
+                    _ = self.advance(); // consume pub
+                    switch (self.peek()) {
+                        .keyword_fn => {
+                            self.restoreLexerState(saved);
+                            if (self.parseFunctionDecl(.public)) |func| {
+                                try items.append(self.allocator, .{ .function = func });
+                            } else |_| {
+                                self.synchronize();
+                            }
+                        },
+                        .keyword_macro => {
+                            self.restoreLexerState(saved);
+                            if (self.parseMacroDecl(.public)) |mac| {
+                                try items.append(self.allocator, .{ .macro = mac });
+                            } else |_| {
+                                self.synchronize();
+                            }
+                        },
+                        .keyword_struct => {
+                            self.restoreLexerState(saved);
+                            if (self.parseStructDecl()) |sd| {
+                                try items.append(self.allocator, .{ .struct_decl = sd });
+                            } else |_| {
+                                self.synchronize();
+                            }
+                        },
+                        .keyword_enum => {
+                            self.restoreLexerState(saved);
+                            if (self.parseEnumDecl()) |ed| {
+                                try items.append(self.allocator, .{ .enum_decl = ed });
+                            } else |_| {
+                                self.synchronize();
+                            }
+                        },
+                        else => {
+                            self.restoreLexerState(saved);
+                            try self.addRichError(
+                                "I was expecting `fn`, `macro`, `struct`, or `enum` after `pub`",
+                                self.currentSpan(),
+                                null,
+                                null,
+                            );
+                            _ = self.advance();
+                        },
                     }
                 },
-                .keyword_defp => {
+                .keyword_fn => {
                     if (self.parseFunctionDecl(.private)) |func| {
                         try items.append(self.allocator, .{ .priv_function = func });
                     } else |_| {
                         self.synchronize();
                     }
                 },
-                .keyword_defmacro => {
-                    if (self.parseMacroDecl(.public)) |mac| {
-                        try items.append(self.allocator, .{ .macro = mac });
-                    } else |_| {
-                        self.synchronize();
-                    }
-                },
-                .keyword_defmacrop => {
+                .keyword_macro => {
                     if (self.parseMacroDecl(.private)) |mac| {
                         try items.append(self.allocator, .{ .priv_macro = mac });
                     } else |_| {
                         self.synchronize();
                     }
                 },
-                .keyword_defstruct => {
+                .keyword_struct => {
                     if (self.parseStructDecl()) |sd| {
                         try items.append(self.allocator, .{ .struct_decl = sd });
                     } else |_| {
                         self.synchronize();
                     }
                 },
-                .keyword_defenum => {
+                .keyword_enum => {
                     if (self.parseEnumDecl()) |ed| {
                         try items.append(self.allocator, .{ .enum_decl = ed });
                     } else |_| {
                         self.synchronize();
                     }
                 },
+                // (legacy keyword_def/defp/defmacro/defmacrop/defstruct/defenum removed)
                 .keyword_type => {
                     if (self.parseTypeDecl()) |td| {
                         try items.append(self.allocator, .{ .type_decl = td });
@@ -488,9 +611,6 @@ pub const Parser = struct {
                         self.synchronize();
                     }
                 },
-                .dedent => {
-                    _ = self.advance();
-                },
                 .newline => {
                     _ = self.advance();
                 },
@@ -501,22 +621,30 @@ pub const Parser = struct {
                         }) catch "unexpected token in module",
                         self.currentSpan(),
                         "not valid inside a module body",
-                        "modules can contain `def`, `defp`, `defmacro`, `defmacrop`, `defstruct`, `defenum`, `type`, `alias`, `import`, and `@attribute` declarations",
+                        "modules can contain `pub fn`, `fn`, `pub macro`, `macro`, `pub struct`, `pub enum`, `type`, `alias`, `import`, and `@attribute` declarations",
                     );
                     _ = self.advance();
                 },
             }
         }
 
-        _ = self.match(.dedent);
         self.skipNewlines();
-        if (!self.check(.keyword_end)) {
-            try self.addRichError(
-                "I was expecting `end` to close the module that starts here",
-                start,
-                "this module was opened here",
-                "add `end` to close the module body",
-            );
+        if (!self.check(.right_brace)) {
+            if (close_brace) {
+                try self.addRichError(
+                    "I was expecting `}` to close the module that starts here",
+                    start,
+                    "this module was opened here",
+                    "add `}` to close the module body",
+                );
+            } else {
+                try self.addRichError(
+                    "I was expecting `end` to close the module that starts here",
+                    start,
+                    "this module was opened here",
+                    "add `end` to close the module body",
+                );
+            }
             return error.ParseError;
         }
         _ = self.advance();
@@ -632,7 +760,8 @@ pub const Parser = struct {
 
     fn parseStructDecl(self: *Parser) !*const ast.StructDecl {
         const start = self.currentSpan();
-        _ = try self.expect(.keyword_defstruct);
+        if (self.check(.keyword_pub)) _ = self.advance();
+        _ = try self.expect(.keyword_struct);
 
         // Parse optional struct name (e.g., defstruct Env do ... end)
         var struct_name: ?ast.StringId = null;
@@ -641,15 +770,14 @@ pub const Parser = struct {
             struct_name = try self.internToken(name_tok);
         }
 
-        _ = try self.expect(.keyword_do);
+        _ = try self.expect(.left_brace);
         self.skipNewlines();
-        _ = self.match(.indent);
 
         var fields: std.ArrayList(ast.StructFieldDecl) = .empty;
 
-        while (!self.check(.keyword_end) and !self.check(.dedent) and !self.check(.eof)) {
+        while (!self.check(.right_brace) and !self.check(.eof)) {
             self.skipNewlines();
-            if (self.check(.keyword_end) or self.check(.dedent)) break;
+            if (self.check(.right_brace)) break;
 
             const field_tok = try self.expect(.identifier);
             const field_name = try self.internToken(field_tok);
@@ -671,9 +799,8 @@ pub const Parser = struct {
             self.skipNewlines();
         }
 
-        _ = self.match(.dedent);
         self.skipNewlines();
-        _ = try self.expect(.keyword_end);
+        _ = try self.expect(.right_brace);
 
         return self.create(ast.StructDecl, .{
             .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
@@ -684,7 +811,8 @@ pub const Parser = struct {
 
     fn parseTopLevelStructDecl(self: *Parser) !*const ast.StructDecl {
         const start = self.currentSpan();
-        _ = try self.expect(.keyword_defstruct);
+        if (self.check(.keyword_pub)) _ = self.advance();
+        _ = try self.expect(.keyword_struct);
 
         // Parse name (required for top-level structs), supports dotted names (Zap.Env)
         const first_tok = try self.expect(.module_identifier);
@@ -713,15 +841,14 @@ pub const Parser = struct {
             parent = try self.internToken(parent_tok);
         }
 
-        _ = try self.expectAt(.keyword_do, start);
+        _ = try self.expectAt(.left_brace, start);
         self.skipNewlines();
-        _ = self.match(.indent);
 
         var fields: std.ArrayList(ast.StructFieldDecl) = .empty;
 
-        while (!self.check(.keyword_end) and !self.check(.dedent) and !self.check(.eof)) {
+        while (!self.check(.right_brace) and !self.check(.eof)) {
             self.skipNewlines();
-            if (self.check(.keyword_end) or self.check(.dedent)) break;
+            if (self.check(.right_brace)) break;
 
             const field_tok = try self.expect(.identifier);
             const field_name = try self.internToken(field_tok);
@@ -743,9 +870,8 @@ pub const Parser = struct {
             self.skipNewlines();
         }
 
-        _ = self.match(.dedent);
         self.skipNewlines();
-        _ = try self.expectAt(.keyword_end, start);
+        _ = try self.expectAt(.right_brace, start);
 
         return self.create(ast.StructDecl, .{
             .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
@@ -757,20 +883,20 @@ pub const Parser = struct {
 
     fn parseEnumDecl(self: *Parser) !*const ast.EnumDecl {
         const start = self.currentSpan();
-        _ = try self.expect(.keyword_defenum);
+        if (self.check(.keyword_pub)) _ = self.advance();
+        _ = try self.expect(.keyword_enum);
 
         const name_tok = try self.expect(.module_identifier);
         const name = try self.internToken(name_tok);
 
-        _ = try self.expectAt(.keyword_do, start);
+        _ = try self.expectAt(.left_brace, start);
         self.skipNewlines();
-        _ = self.match(.indent);
 
         var variants: std.ArrayList(ast.EnumVariant) = .empty;
 
-        while (!self.check(.keyword_end) and !self.check(.dedent) and !self.check(.eof)) {
+        while (!self.check(.right_brace) and !self.check(.eof)) {
             self.skipNewlines();
-            if (self.check(.keyword_end) or self.check(.dedent)) break;
+            if (self.check(.right_brace)) break;
 
             const variant_tok = try self.expect(.module_identifier);
             const variant_name = try self.internToken(variant_tok);
@@ -783,9 +909,8 @@ pub const Parser = struct {
             self.skipNewlines();
         }
 
-        _ = self.match(.dedent);
         self.skipNewlines();
-        _ = try self.expectAt(.keyword_end, start);
+        _ = try self.expectAt(.right_brace, start);
 
         return self.create(ast.EnumDecl, .{
             .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
@@ -800,7 +925,13 @@ pub const Parser = struct {
 
     fn parseFunctionDecl(self: *Parser, visibility: ast.FunctionDecl.Visibility) !*const ast.FunctionDecl {
         const start = self.currentSpan();
-        _ = self.advance(); // consume def/defp
+        // consume `pub fn` or `fn`
+        if (self.check(.keyword_pub)) _ = self.advance();
+        if (self.check(.keyword_fn)) {
+            _ = self.advance();
+        } else {
+            return error.ParseError;
+        }
 
         const name_tok = try self.expect(.identifier);
         const name = try self.internToken(name_tok);
@@ -817,11 +948,9 @@ pub const Parser = struct {
 
     fn parseMacroDecl(self: *Parser, visibility: ast.FunctionDecl.Visibility) !*const ast.FunctionDecl {
         const start = self.currentSpan();
-        if (visibility == .private) {
-            _ = try self.expect(.keyword_defmacrop);
-        } else {
-            _ = try self.expect(.keyword_defmacro);
-        }
+        // consume `pub macro` or `macro`
+        if (self.check(.keyword_pub)) _ = self.advance();
+        _ = try self.expect(.keyword_macro);
 
         // Allow keywords as macro names (like Elixir's Kernel macros: if, cond, with)
         const name_tok = if (self.check(.identifier))
@@ -877,29 +1006,27 @@ pub const Parser = struct {
             refinement = try self.parseExpr();
         }
 
-        if (!self.check(.keyword_do)) {
+        if (!self.check(.left_brace)) {
             try self.addRichError(
-                "I was expecting the `do` keyword to start the function body",
+                "I was expecting `{` to start the function body",
                 def_span,
-                "this function definition needs a `do` ... `end` block",
-                "add `do` after the function signature",
+                "this function definition needs a `{ ... }` block",
+                "add `{` after the function signature",
             );
             return error.ParseError;
         }
         _ = self.advance();
         self.skipNewlines();
-        _ = self.match(.indent);
 
         const body = try self.parseBlock();
 
-        _ = self.match(.dedent);
         self.skipNewlines();
-        if (!self.check(.keyword_end)) {
+        if (!self.check(.right_brace)) {
             try self.addRichError(
-                "I was expecting `end` to close the function that starts here",
+                "I was expecting `}` to close the function that starts here",
                 def_span,
                 "this function was opened here",
-                "add `end` to close the function body",
+                "add `}` to close the function body",
             );
             return error.ParseError;
         }
@@ -1113,12 +1240,12 @@ pub const Parser = struct {
     fn parseBlock(self: *Parser) anyerror![]const ast.Stmt {
         var stmts: std.ArrayList(ast.Stmt) = .empty;
 
-        while (!self.check(.keyword_end) and !self.check(.keyword_else) and
-            !self.check(.dedent) and !self.check(.eof))
+        while (!self.check(.right_brace) and !self.check(.keyword_else) and
+            !self.check(.eof))
         {
             self.skipNewlines();
-            if (self.check(.keyword_end) or self.check(.keyword_else) or
-                self.check(.dedent) or self.check(.eof)) break;
+            if (self.check(.right_brace) or self.check(.keyword_else) or
+                self.check(.eof)) break;
 
             const stmt = try self.parseStmt();
             try stmts.append(self.allocator, stmt);
@@ -1130,19 +1257,25 @@ pub const Parser = struct {
     }
 
     fn parseStmt(self: *Parser) !ast.Stmt {
-        if (self.check(.keyword_def)) {
-            const func = try self.parseFunctionDecl(.public);
-            return .{ .function_decl = func };
+        if (self.check(.keyword_pub)) {
+            const saved = self.saveLexerState();
+            _ = self.advance(); // consume pub
+            if (self.check(.keyword_fn)) {
+                self.restoreLexerState(saved);
+                const func = try self.parseFunctionDecl(.public);
+                return .{ .function_decl = func };
+            } else if (self.check(.keyword_macro)) {
+                self.restoreLexerState(saved);
+                const mac = try self.parseMacroDecl(.public);
+                return .{ .macro_decl = mac };
+            }
+            self.restoreLexerState(saved);
         }
-        if (self.check(.keyword_defp)) {
+        if (self.check(.keyword_fn)) {
             const func = try self.parseFunctionDecl(.private);
             return .{ .function_decl = func };
         }
-        if (self.check(.keyword_defmacro)) {
-            const mac = try self.parseMacroDecl(.public);
-            return .{ .macro_decl = mac };
-        }
-        if (self.check(.keyword_defmacrop)) {
+        if (self.check(.keyword_macro)) {
             const mac = try self.parseMacroDecl(.private);
             return .{ .macro_decl = mac };
         }
@@ -1666,7 +1799,6 @@ pub const Parser = struct {
 
         // Support multiline: %{\n  field: val,\n  ...\n}
         self.skipNewlines();
-        const indented = self.match(.indent);
 
         // Parse key:value fields — could be map (key -> value) or struct (name: value)
         // Detect struct fields (identifier followed by colon) vs map fields (expr followed by arrow)
@@ -1676,9 +1808,6 @@ pub const Parser = struct {
         var is_map = false;
 
         while (!self.check(.right_brace) and !self.check(.eof)) {
-            self.skipNewlines();
-            if (self.check(.indent)) _ = self.advance();
-            if (self.check(.dedent)) _ = self.advance();
             self.skipNewlines();
             if (self.check(.right_brace)) break;
 
@@ -1727,8 +1856,7 @@ pub const Parser = struct {
             }
         }
 
-        _ = indented;
-        while (self.check(.dedent) or self.check(.newline)) {
+        while (self.check(.newline)) {
             _ = self.advance();
         }
         _ = try self.expect(.right_brace);
@@ -1784,14 +1912,10 @@ pub const Parser = struct {
 
         // Support multiline: %Name{\n  field: val,\n  ...\n}
         self.skipNewlines();
-        const indented = self.match(.indent);
 
         var fields: std.ArrayList(ast.StructField) = .empty;
 
         while (!self.check(.right_brace) and !self.check(.eof)) {
-            self.skipNewlines();
-            if (self.check(.indent)) _ = self.advance();
-            if (self.check(.dedent)) _ = self.advance();
             self.skipNewlines();
             if (self.check(.right_brace)) break;
 
@@ -1803,8 +1927,6 @@ pub const Parser = struct {
             if (!self.match(.comma)) break;
         }
 
-        self.skipNewlines();
-        if (indented) _ = self.match(.dedent);
         self.skipNewlines();
         _ = try self.expect(.right_brace);
 
@@ -1828,25 +1950,23 @@ pub const Parser = struct {
 
         const condition = try self.parseExpr();
 
-        _ = try self.expect(.keyword_do);
+        _ = try self.expect(.left_brace);
         self.skipNewlines();
-        _ = self.match(.indent);
 
         const then_block = try self.parseBlock();
 
-        _ = self.match(.dedent);
+        self.skipNewlines();
+        _ = try self.expect(.right_brace);
         self.skipNewlines();
 
         var else_block: ?[]const ast.Stmt = null;
         if (self.match(.keyword_else)) {
+            _ = try self.expect(.left_brace);
             self.skipNewlines();
-            _ = self.match(.indent);
             else_block = try self.parseBlock();
-            _ = self.match(.dedent);
             self.skipNewlines();
+            _ = try self.expect(.right_brace);
         }
-
-        _ = try self.expect(.keyword_end);
 
         return self.create(ast.Expr, .{
             .if_expr = .{
@@ -1864,24 +1984,22 @@ pub const Parser = struct {
 
         const scrutinee = try self.parseExpr();
 
-        _ = try self.expect(.keyword_do);
+        _ = try self.expect(.left_brace);
         self.skipNewlines();
-        _ = self.match(.indent);
 
         var clauses: std.ArrayList(ast.CaseClause) = .empty;
 
-        while (!self.check(.keyword_end) and !self.check(.dedent) and !self.check(.eof)) {
+        while (!self.check(.right_brace) and !self.check(.eof)) {
             self.skipNewlines();
-            if (self.check(.keyword_end) or self.check(.dedent)) break;
+            if (self.check(.right_brace)) break;
 
             const clause = try self.parseCaseClause();
             try clauses.append(self.allocator, clause);
             self.skipNewlines();
         }
 
-        _ = self.match(.dedent);
         self.skipNewlines();
-        _ = try self.expect(.keyword_end);
+        _ = try self.expect(.right_brace);
 
         return self.create(ast.Expr, .{
             .case_expr = .{
@@ -1911,30 +2029,33 @@ pub const Parser = struct {
 
         _ = try self.expect(.arrow);
 
-        // Support both single-line and multi-line case bodies:
-        // Single-line: Color.Red -> "value"
-        // Multi-line:  Color.Red ->\n    "value"
-        if (!self.check(.newline) and !self.check(.indent)) {
-            // Single-line: parse just one expression
+        // Case arm body: three forms
+        // 1. Same-line expression:  pattern -> expr
+        // 2. Multi-statement block: pattern ->\n  { stmts }
+        // 3. Same-line tuple/map:   pattern -> {:ok, v}  (expression starting with {)
+        var body: []const ast.Stmt = undefined;
+        if (self.check(.newline)) {
+            // After newline: check if next non-newline token is { for braced block
+            self.skipNewlines();
+            if (self.check(.left_brace)) {
+                _ = self.advance();
+                self.skipNewlines();
+                body = try self.parseBlock();
+                self.skipNewlines();
+                _ = try self.expect(.right_brace);
+            } else {
+                // Single expression on next line
+                const expr = try self.parseExpr();
+                const stmts = try self.allocator.alloc(ast.Stmt, 1);
+                stmts[0] = .{ .expr = expr };
+                body = stmts;
+            }
+        } else {
+            // Same line: always parse as single expression (handles tuples like {:ok, v})
             const expr = try self.parseExpr();
-            const body = try self.allocator.alloc(ast.Stmt, 1);
-            body[0] = .{ .expr = expr };
-            return .{
-                .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
-                .pattern = pattern,
-                .type_annotation = type_annotation,
-                .guard = guard,
-                .body = body,
-            };
-        }
-
-        self.skipNewlines();
-        const indented = self.match(.indent);
-
-        const body = try self.parseBlock();
-
-        if (indented) {
-            _ = self.match(.dedent);
+            const stmts = try self.allocator.alloc(ast.Stmt, 1);
+            stmts[0] = .{ .expr = expr };
+            body = stmts;
         }
 
         return .{
@@ -1958,24 +2079,24 @@ pub const Parser = struct {
             if (!self.match(.comma)) break;
         }
 
-        _ = try self.expect(.keyword_do);
+        _ = try self.expect(.left_brace);
         self.skipNewlines();
-        _ = self.match(.indent);
 
         const body = try self.parseBlock();
 
-        _ = self.match(.dedent);
         self.skipNewlines();
+        _ = try self.expect(.right_brace);
 
         var else_clauses: ?[]const ast.WithElseClause = null;
+        self.skipNewlines();
         if (self.match(.keyword_else)) {
+            _ = try self.expect(.left_brace);
             self.skipNewlines();
-            _ = self.match(.indent);
 
             var clauses: std.ArrayList(ast.WithElseClause) = .empty;
-            while (!self.check(.keyword_end) and !self.check(.dedent) and !self.check(.eof)) {
+            while (!self.check(.right_brace) and !self.check(.eof)) {
                 self.skipNewlines();
-                if (self.check(.keyword_end) or self.check(.dedent)) break;
+                if (self.check(.right_brace)) break;
 
                 const clause = try self.parseWithElseClause();
                 try clauses.append(self.allocator, clause);
@@ -1983,11 +2104,9 @@ pub const Parser = struct {
             }
             else_clauses = try clauses.toOwnedSlice(self.allocator);
 
-            _ = self.match(.dedent);
             self.skipNewlines();
+            _ = try self.expect(.right_brace);
         }
-
-        _ = try self.expect(.keyword_end);
 
         return self.create(ast.Expr, .{
             .with_expr = .{
@@ -2001,12 +2120,9 @@ pub const Parser = struct {
 
     fn parseWithItem(self: *Parser) !ast.WithItem {
         // Save state for backtracking
-        const saved_pos = self.lexer.pos;
+        const saved_lexer = self.lexer;
         const saved_current = self.current;
         const saved_previous = self.previous;
-        const saved_line = self.lexer.line;
-        const saved_at_line_start = self.lexer.at_line_start;
-        const saved_indent_depth = self.lexer.indent_depth;
 
         // Try parsing as pattern <- expr
         if (self.parsePattern()) |pattern| {
@@ -2022,19 +2138,13 @@ pub const Parser = struct {
                 };
             }
             // Not a bind — backtrack
-            self.lexer.pos = saved_pos;
+            self.lexer = saved_lexer;
             self.current = saved_current;
             self.previous = saved_previous;
-            self.lexer.line = saved_line;
-            self.lexer.at_line_start = saved_at_line_start;
-            self.lexer.indent_depth = saved_indent_depth;
         } else |_| {
-            self.lexer.pos = saved_pos;
+            self.lexer = saved_lexer;
             self.current = saved_current;
             self.previous = saved_previous;
-            self.lexer.line = saved_line;
-            self.lexer.at_line_start = saved_at_line_start;
-            self.lexer.indent_depth = saved_indent_depth;
         }
 
         const expr = try self.parseExpr();
@@ -2058,12 +2168,21 @@ pub const Parser = struct {
         }
 
         _ = try self.expect(.arrow);
-        self.skipNewlines();
-        _ = self.match(.indent);
 
-        const body = try self.parseBlock();
-
-        _ = self.match(.dedent);
+        // Single expression or braced block for clause body
+        var body: []const ast.Stmt = undefined;
+        if (self.check(.left_brace)) {
+            _ = self.advance();
+            self.skipNewlines();
+            body = try self.parseBlock();
+            self.skipNewlines();
+            _ = try self.expect(.right_brace);
+        } else {
+            const expr = try self.parseExpr();
+            const stmts = try self.allocator.alloc(ast.Stmt, 1);
+            stmts[0] = .{ .expr = expr };
+            body = stmts;
+        }
 
         return .{
             .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
@@ -2077,23 +2196,33 @@ pub const Parser = struct {
     fn parseCondExpr(self: *Parser) !*const ast.Expr {
         const start = self.currentSpan();
         _ = try self.expect(.keyword_cond);
-        _ = try self.expect(.keyword_do);
+        _ = try self.expect(.left_brace);
         self.skipNewlines();
-        _ = self.match(.indent);
 
         var clauses: std.ArrayList(ast.CondClause) = .empty;
 
-        while (!self.check(.keyword_end) and !self.check(.dedent) and !self.check(.eof)) {
+        while (!self.check(.right_brace) and !self.check(.eof)) {
             self.skipNewlines();
-            if (self.check(.keyword_end) or self.check(.dedent)) break;
+            if (self.check(.right_brace)) break;
 
             const clause_start = self.currentSpan();
             const condition = try self.parseExpr();
             _ = try self.expect(.arrow);
-            self.skipNewlines();
-            _ = self.match(.indent);
-            const body = try self.parseBlock();
-            _ = self.match(.dedent);
+
+            // Single expression or braced block for clause body
+            var body: []const ast.Stmt = undefined;
+            if (self.check(.left_brace)) {
+                _ = self.advance();
+                self.skipNewlines();
+                body = try self.parseBlock();
+                self.skipNewlines();
+                _ = try self.expect(.right_brace);
+            } else {
+                const expr = try self.parseExpr();
+                const stmts = try self.allocator.alloc(ast.Stmt, 1);
+                stmts[0] = .{ .expr = expr };
+                body = stmts;
+            }
 
             try clauses.append(self.allocator, .{
                 .meta = .{ .span = ast.SourceSpan.merge(clause_start, self.previousSpan()) },
@@ -2103,9 +2232,8 @@ pub const Parser = struct {
             self.skipNewlines();
         }
 
-        _ = self.match(.dedent);
         self.skipNewlines();
-        _ = try self.expect(.keyword_end);
+        _ = try self.expect(.right_brace);
 
         return self.create(ast.Expr, .{
             .cond_expr = .{
@@ -2118,15 +2246,13 @@ pub const Parser = struct {
     fn parseQuoteExpr(self: *Parser) !*const ast.Expr {
         const start = self.currentSpan();
         _ = try self.expect(.keyword_quote);
-        _ = try self.expect(.keyword_do);
+        _ = try self.expect(.left_brace);
         self.skipNewlines();
-        _ = self.match(.indent);
 
         const body = try self.parseBlock();
 
-        _ = self.match(.dedent);
         self.skipNewlines();
-        _ = try self.expect(.keyword_end);
+        _ = try self.expect(.right_brace);
 
         return self.create(ast.Expr, .{
             .quote_expr = .{
@@ -3180,13 +3306,12 @@ pub const Parser = struct {
 /// Human-readable names for token tags, used in error messages.
 fn tokenHumanName(tag: Token.Tag) []const u8 {
     return switch (tag) {
-        .keyword_def => "`def`",
-        .keyword_defp => "`defp`",
-        .keyword_defmodule => "`defmodule`",
-        .keyword_defmacro => "`defmacro`",
-        .keyword_defstruct => "`defstruct`",
-        .keyword_do => "`do`",
-        .keyword_end => "`end`",
+        .keyword_pub => "`pub`",
+        .keyword_fn => "`fn`",
+        .keyword_module => "`module`",
+        .keyword_macro => "`macro`",
+        .keyword_struct => "`struct`",
+        .keyword_enum => "`enum`",
         .keyword_if => "`if`",
         .keyword_else => "`else`",
         .keyword_case => "`case`",
@@ -3247,8 +3372,6 @@ fn tokenHumanName(tag: Token.Tag) []const u8 {
         .string_literal => "a string",
         .atom_literal => "an atom",
         .newline => "a newline",
-        .indent => "indentation",
-        .dedent => "dedentation",
         .eof => "end of file",
         .invalid => "an invalid token",
         .double_ampersand => "`&&`",
@@ -3262,11 +3385,11 @@ fn tokenHumanName(tag: Token.Tag) []const u8 {
 // Tests
 // ============================================================
 
-test "top-level def is rejected" {
+test "top-level fn is rejected" {
     const source =
-        \\def foo() do
+        \\fn foo() {
         \\  42
-        \\end
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3278,11 +3401,11 @@ test "top-level def is rejected" {
     try std.testing.expectError(error.ParseError, result);
 }
 
-test "top-level defp is rejected" {
+test "top-level pub fn is also rejected" {
     const source =
-        \\defp foo() do
+        \\pub fn foo() {
         \\  42
-        \\end
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3296,11 +3419,11 @@ test "top-level defp is rejected" {
 
 test "parse simple function" {
     const source =
-        \\defmodule Test do
-        \\  def add(x :: i64, y :: i64) :: i64 do
+        \\pub module Test {
+        \\  pub fn add(x :: i64, y :: i64) :: i64 {
         \\    x + y
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3317,11 +3440,11 @@ test "parse simple function" {
 
 test "parse unique param ownership annotation" {
     const source =
-        \\defmodule Test do
-        \\  def use(handle :: unique String) do
+        \\pub module Test {
+        \\  pub fn use(handle :: unique String) {
         \\    handle
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3335,11 +3458,11 @@ test "parse unique param ownership annotation" {
 
 test "parse borrowed param ownership annotation" {
     const source =
-        \\defmodule Test do
-        \\  def use(handle :: borrowed String) do
+        \\pub module Test {
+        \\  pub fn use(handle :: borrowed String) {
         \\    handle
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3353,11 +3476,11 @@ test "parse borrowed param ownership annotation" {
 
 test "parse function type ownership annotations" {
     const source =
-        \\defmodule Test do
-        \\  def apply(f :: (borrowed String -> unique String)) do
+        \\pub module Test {
+        \\  pub fn apply(f :: (borrowed String -> unique String)) {
         \\    f
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3373,11 +3496,11 @@ test "parse function type ownership annotations" {
 
 test "parse module" {
     const source =
-        \\defmodule Foo do
-        \\  def bar() :: i64 do
+        \\pub module Foo {
+        \\  pub fn bar() :: i64 {
         \\    42
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3405,15 +3528,15 @@ test "parse type declaration" {
 
 test "parse if expression" {
     const source =
-        \\defmodule Test do
-        \\  def foo(x :: i64) :: i64 do
-        \\    if x > 0 do
+        \\pub module Test {
+        \\  pub fn foo(x :: i64) :: i64 {
+        \\    if x > 0 {
         \\      x
-        \\    else
+        \\    } else {
         \\      0
-        \\    end
-        \\  end
-        \\end
+        \\    }
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3427,16 +3550,14 @@ test "parse if expression" {
 
 test "parse case expression" {
     const source =
-        \\defmodule Test do
-        \\  def foo(x) do
-        \\    case x do
-        \\      {:ok, v} ->
-        \\        v
-        \\      {:error, e} ->
-        \\        e
-        \\    end
-        \\  end
-        \\end
+        \\pub module Test {
+        \\  pub fn foo(x :: Atom) :: Nil {
+        \\    case x {
+        \\      {:ok, v} -> v
+        \\      {:error, e} -> e
+        \\    }
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3450,11 +3571,11 @@ test "parse case expression" {
 
 test "parse binary operators" {
     const source =
-        \\defmodule Test do
-        \\  def calc(x :: i64, y :: i64) :: i64 do
+        \\pub module Test {
+        \\  pub fn calc(x :: i64, y :: i64) :: i64 {
         \\    x + y * 2
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3476,11 +3597,11 @@ test "parse binary operators" {
 
 test "parse tuple and list" {
     const source =
-        \\defmodule Test do
-        \\  def foo() do
+        \\pub module Test {
+        \\  pub fn foo() {
         \\    {1, 2, 3}
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3494,11 +3615,11 @@ test "parse tuple and list" {
 
 test "parse refinement predicate" {
     const source =
-        \\defmodule Test do
-        \\  def abs(x :: i64) :: i64 if x < 0 do
+        \\pub module Test {
+        \\  pub fn abs(x :: i64) :: i64 if x < 0 {
         \\    -x
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3513,12 +3634,12 @@ test "parse refinement predicate" {
 
 test "parse assignment" {
     const source =
-        \\defmodule Test do
-        \\  def foo() do
+        \\pub module Test {
+        \\  pub fn foo() {
         \\    x = 42
         \\    x
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3535,11 +3656,11 @@ test "parse assignment" {
 
 test "parse function call" {
     const source =
-        \\defmodule Test do
-        \\  def foo() do
+        \\pub module Test {
+        \\  pub fn foo() {
         \\    bar(1, 2)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3556,11 +3677,11 @@ test "parse function call" {
 
 test "parse pipe operator" {
     const source =
-        \\defmodule Test do
-        \\  def foo(x) do
+        \\pub module Test {
+        \\  pub fn foo(x) {
         \\    x |> bar(1)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3576,12 +3697,12 @@ test "parse pipe operator" {
 
 test "parse struct declaration" {
     const source =
-        \\defmodule User do
-        \\  defstruct do
+        \\pub module User {
+        \\  struct {
         \\    name :: String
         \\    age :: i64
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3604,11 +3725,11 @@ test "parse struct declaration" {
 
 test "parse panic expression" {
     const source =
-        \\defmodule Test do
-        \\  def foo() do
+        \\pub module Test {
+        \\  pub fn foo() {
         \\    panic("oops")
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3624,11 +3745,11 @@ test "parse panic expression" {
 
 test "parse unwrap operator" {
     const source =
-        \\defmodule Test do
-        \\  def foo(x) do
+        \\pub module Test {
+        \\  pub fn foo(x) {
         \\    bar(x)!
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3644,14 +3765,14 @@ test "parse unwrap operator" {
 
 test "parse local function" {
     const source =
-        \\defmodule Test do
-        \\  def outer(x :: i64) :: String do
-        \\    def inner(s :: String) :: String do
+        \\pub module Test {
+        \\  pub fn outer(x :: i64) :: String {
+        \\    fn inner(s :: String) :: String {
         \\      s
-        \\    end
+        \\    }
         \\    inner("ok")
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3668,20 +3789,20 @@ test "parse local function" {
 
 test "parse module with types and functions" {
     const source =
-        \\defmodule Foo do
+        \\pub module Foo {
         \\  type Result(a, e) = {:ok, a} | {:error, e}
         \\
-        \\  def b(s :: String) :: String do
+        \\  pub fn b(s :: String) :: String {
         \\    s <> "foo"
-        \\  end
+        \\  }
         \\
-        \\  def a(x :: i64) :: String do
-        \\    def b(n :: i64) :: String do
+        \\  pub fn a(x :: i64) :: String {
+        \\    fn b(n :: i64) :: String {
         \\      int_to_string(n)
-        \\    end
+        \\    }
         \\    b("other")
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3696,10 +3817,10 @@ test "parse module with types and functions" {
 
 test "parse top-level defstruct" {
     const source =
-        \\defstruct User do
+        \\pub struct User {
         \\  name :: String
         \\  age :: i64
-        \\end
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3716,13 +3837,13 @@ test "parse top-level defstruct" {
 
 test "parse defstruct extends" {
     const source =
-        \\defstruct Shape do
+        \\pub struct Shape {
         \\  color :: String
-        \\end
+        \\}
         \\
-        \\defstruct Circle extends Shape do
+        \\pub struct Circle extends Shape {
         \\  radius :: f64
-        \\end
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3739,11 +3860,11 @@ test "parse defstruct extends" {
 
 test "parse defenum" {
     const source =
-        \\defenum Color do
+        \\pub enum Color {
         \\  Red
         \\  Green
         \\  Blue
-        \\end
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3759,17 +3880,17 @@ test "parse defenum" {
 
 test "parse defmodule extends" {
     const source =
-        \\defmodule Animal do
-        \\  def breathe() :: String do
+        \\pub module Animal {
+        \\  pub fn breathe() :: String {
         \\    "inhale"
-        \\  end
-        \\end
+        \\  }
+        \\}
         \\
-        \\defmodule Dog extends Animal do
-        \\  def speak() :: String do
+        \\pub module Dog extends Animal {
+        \\  pub fn speak() :: String {
         \\    "woof"
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3784,16 +3905,16 @@ test "parse defmodule extends" {
 
 test "parse struct init with type annotation" {
     const source =
-        \\defstruct Point do
+        \\pub struct Point {
         \\  x :: f64
         \\  y :: f64
-        \\end
+        \\}
         \\
-        \\defmodule Test do
-        \\  def main() do
+        \\pub module Test {
+        \\  pub fn main() {
         \\    %{x: 1.0, y: 2.0} :: Point
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3811,11 +3932,11 @@ test "parse struct init with type annotation" {
 
 test "parse defmodulep as private module" {
     const source =
-        \\defmodulep Internal do
-        \\  def helper() :: i64 do
+        \\module Internal {
+        \\  pub fn helper() :: i64 {
         \\    42
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3832,11 +3953,11 @@ test "parse defmodulep as private module" {
 
 test "parse defmacrop inside module" {
     const source =
-        \\defmodule Foo do
-        \\  defmacrop helper(x) do
+        \\pub module Foo {
+        \\  macro helper(x) {
         \\    x
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3853,11 +3974,11 @@ test "parse defmacrop inside module" {
 
 test "parse defmodule is_private false by default" {
     const source =
-        \\defmodule Foo do
-        \\  def bar() :: i64 do
+        \\pub module Foo {
+        \\  pub fn bar() :: i64 {
         \\    1
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3872,12 +3993,12 @@ test "parse defmodule is_private false by default" {
 
 test "parse typed module attribute" {
     const source =
-        \\defmodule Foo do
+        \\pub module Foo {
         \\  @doc :: String = "hello world"
-        \\  def bar() :: i64 do
+        \\  pub fn bar() :: i64 {
         \\    1
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3900,12 +4021,12 @@ test "parse typed module attribute" {
 
 test "parse marker attribute" {
     const source =
-        \\defmodule Foo do
+        \\pub module Foo {
         \\  @debug
-        \\  def bar() :: i64 do
+        \\  pub fn bar() :: i64 {
         \\    1
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3924,13 +4045,13 @@ test "parse marker attribute" {
 
 test "parse multiple attributes on same function" {
     const source =
-        \\defmodule Foo do
+        \\pub module Foo {
         \\  @doc :: String = "does something"
         \\  @deprecated :: String = "use bar2 instead"
-        \\  def bar() :: i64 do
+        \\  pub fn bar() :: i64 {
         \\    1
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3955,10 +4076,10 @@ test "parse multiple attributes on same function" {
 
 test "parse module-level attribute" {
     const source =
-        \\defmodule Foo do
+        \\pub module Foo {
         \\  @moduledoc :: String = "A module"
         \\  @version :: String = "1.0.0"
-        \\end
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3981,12 +4102,12 @@ test "parse module-level attribute" {
 
 test "parse attribute with integer value" {
     const source =
-        \\defmodule Foo do
+        \\pub module Foo {
         \\  @timeout :: i64 = 5000
-        \\  def connect() :: i64 do
+        \\  pub fn connect() :: i64 {
         \\    1
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -4006,12 +4127,12 @@ test "parse attribute with integer value" {
 
 test "parse attribute with list value" {
     const source =
-        \\defmodule Foo do
+        \\pub module Foo {
         \\  @flags :: List(Atom) = [:read, :write]
-        \\  def connect() :: i64 do
+        \\  pub fn connect() :: i64 {
         \\    1
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

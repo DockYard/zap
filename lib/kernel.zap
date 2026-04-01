@@ -1,47 +1,43 @@
-defmodule Kernel do
-  def inspect(value :: i64) :: i64 do
+pub module Kernel {
+  pub fn inspect(value :: i64) :: i64 {
     :zig.inspect(value)
-  end
+  }
 
-  def inspect(value :: f64) :: f64 do
+  pub fn inspect(value :: f64) :: f64 {
     :zig.inspect(value)
-  end
+  }
 
-  def inspect(value :: String) :: String do
+  pub fn inspect(value :: String) :: String {
     :zig.inspect(value)
-  end
+  }
 
-  def inspect(value :: Bool) :: Bool do
+  pub fn inspect(value :: Bool) :: Bool {
     :zig.inspect(value)
-  end
+  }
 
-  defmacro if(condition :: Expr, then_body :: Expr) :: Nil do
-    quote do
-      case unquote(condition) do
-        true ->
-          unquote(then_body)
-        false ->
-          nil
-      end
-    end
-  end
+  pub macro if(condition :: Expr, then_body :: Expr) :: Nil {
+    quote {
+      case unquote(condition) {
+        true -> unquote(then_body)
+        false -> nil
+      }
+    }
+  }
 
-  defmacro if(condition :: Expr, then_body :: Expr, else_body :: Expr) :: Nil do
-    quote do
-      case unquote(condition) do
-        true ->
-          unquote(then_body)
-        false ->
-          unquote(else_body)
-      end
-    end
-  end
+  pub macro if(condition :: Expr, then_body :: Expr, else_body :: Expr) :: Nil {
+    quote {
+      case unquote(condition) {
+        true -> unquote(then_body)
+        false -> unquote(else_body)
+      }
+    }
+  }
 
-  defmacro unless(condition :: Expr, body :: Expr) :: Nil do
-    quote do
-      if not unquote(condition) do
+  pub macro unless(condition :: Expr, body :: Expr) :: Nil {
+    quote {
+      if not unquote(condition) {
         unquote(body)
-      end
-    end
-  end
-end
+      }
+    }
+  }
+}

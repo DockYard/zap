@@ -1,6 +1,6 @@
-defmodule CaseExpr.Builder do
-  def manifest(env :: Zap.Env) :: Zap.Manifest do
-    case env.target do
+pub module CaseExpr.Builder {
+  pub fn manifest(env :: Zap.Env) :: Zap.Manifest {
+    case env.target {
       :case_expr ->
         %Zap.Manifest{
           name: "case_expr",
@@ -11,6 +11,6 @@ defmodule CaseExpr.Builder do
         }
       _ ->
         panic("Unknown target: use 'case_expr'")
-    end
-  end
-end
+    }
+  }
+}

@@ -1,5 +1,5 @@
-defmodule Atom do
-  def to_string(atom :: Atom) :: String do
+pub module Atom {
+  pub fn to_string(atom :: Atom) :: String {
     :zig.atom_name(atom)
-  end
-end
+  }
+}

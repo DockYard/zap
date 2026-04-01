@@ -2682,11 +2682,11 @@ const lattice_test = @import("escape_lattice.zig");
 
 test "codegen simple function" {
     const source =
-        \\defmodule Test do
-        \\  def add(x :: i64, y :: i64) :: i64 do
+        \\pub module Test {
+        \\  pub fn add(x :: i64, y :: i64) :: i64 {
         \\    x + y
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -2725,11 +2725,11 @@ test "codegen simple function" {
 
 test "codegen produces valid structure" {
     const source =
-        \\defmodule Test do
-        \\  def foo() do
+        \\pub module Test {
+        \\  pub fn foo() {
         \\    42
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

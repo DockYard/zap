@@ -1,5 +1,5 @@
-defmodule Dog extends Animal do
-  def speak() :: String do
+pub module Dog extends Animal {
+  pub fn speak() :: String {
     "woof"
-  end
-end
+  }
+}

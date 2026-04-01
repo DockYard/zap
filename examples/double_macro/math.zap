@@ -1,11 +1,11 @@
-defmodule Math do
-  defmacro double(value :: i64) :: i64 do
-    quote do
+pub module Math {
+  pub macro double(value :: i64) :: i64 {
+    quote {
       unquote(value) + unquote(value)
-    end
-  end
+    }
+  }
 
-  def compute(x :: i64) :: i64 do
+  pub fn compute(x :: i64) :: i64 {
     double(x * 3)
-  end
-end
+  }
+}

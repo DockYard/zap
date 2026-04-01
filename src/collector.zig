@@ -644,11 +644,11 @@ const Parser = @import("parser.zig").Parser;
 
 test "collect simple function" {
     const source =
-        \\defmodule Test do
-        \\  def add(x :: i64, y :: i64) :: i64 do
+        \\pub module Test {
+        \\  pub fn add(x :: i64, y :: i64) :: i64 {
         \\    x + y
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -675,15 +675,15 @@ test "collect simple function" {
 
 test "collect module with functions" {
     const source =
-        \\defmodule Math do
-        \\  def add(x :: i64, y :: i64) :: i64 do
+        \\pub module Math {
+        \\  pub fn add(x :: i64, y :: i64) :: i64 {
         \\    x + y
-        \\  end
+        \\  }
         \\
-        \\  def sub(x :: i64, y :: i64) :: i64 do
+        \\  pub fn sub(x :: i64, y :: i64) :: i64 {
         \\    x - y
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -708,9 +708,9 @@ test "collect module with functions" {
 
 test "collect type declaration" {
     const source =
-        \\defmodule Types do
+        \\pub module Types {
         \\  type Result(a, e) = {:ok, a} | {:error, e}
-        \\end
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -732,15 +732,15 @@ test "collect type declaration" {
 
 test "collect function family grouping" {
     const source =
-        \\defmodule Test do
-        \\  def factorial(0 :: i64) :: i64 do
+        \\pub module Test {
+        \\  pub fn factorial(0 :: i64) :: i64 {
         \\    1
-        \\  end
+        \\  }
         \\
-        \\  def factorial(n :: i64) :: i64 do
+        \\  pub fn factorial(n :: i64) :: i64 {
         \\    n * factorial(n - 1)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -763,16 +763,14 @@ test "collect function family grouping" {
 
 test "collect case expression creates scopes" {
     const source =
-        \\defmodule Test do
-        \\  def foo(x) do
-        \\    case x do
-        \\      {:ok, v} ->
-        \\        v
-        \\      {:error, e} ->
-        \\        e
-        \\    end
-        \\  end
-        \\end
+        \\pub module Test {
+        \\  pub fn foo(x :: Atom) :: Nil {
+        \\    case x {
+        \\      {:ok, v} -> v
+        \\      {:error, e} -> e
+        \\    }
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -795,14 +793,14 @@ test "collect case expression creates scopes" {
 
 test "collect local def hoisting" {
     const source =
-        \\defmodule Test do
-        \\  def outer(x :: i64) :: String do
-        \\    def inner(s :: String) :: String do
+        \\pub module Test {
+        \\  pub fn outer(x :: i64) :: String {
+        \\    pub fn inner(s :: String) :: String {
         \\      s
-        \\    end
+        \\    }
         \\    inner("ok")
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -823,12 +821,12 @@ test "collect local def hoisting" {
 
 test "collect struct declaration" {
     const source =
-        \\defmodule User do
-        \\  defstruct do
+        \\pub module User {
+        \\  struct {
         \\    name :: String
         \\    age :: i64
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

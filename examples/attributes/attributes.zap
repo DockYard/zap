@@ -7,13 +7,13 @@
 # Run with:
 #   zap run attributes
 
-defmodule Attributes do
+pub module Attributes {
   @moduledoc :: String = "Attribute examples"
 
   @doc :: String = "Entry point"
-  def main(_args :: [String]) :: String do
+  pub fn main(_args :: [String]) :: String {
     IO.puts("App: " <> Config.app_name())
     IO.puts("Timeout: " <> Integer.to_string(Config.timeout()))
     IO.puts("Max retries: " <> Integer.to_string(Config.max_retries()))
-  end
-end
+  }
+}

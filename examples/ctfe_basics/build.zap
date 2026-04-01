@@ -1,6 +1,6 @@
-defmodule CtfeBasics.Builder do
-  def manifest(env :: Zap.Env) :: Zap.Manifest do
-    case env.target do
+pub module CtfeBasics.Builder {
+  pub fn manifest(env :: Zap.Env) :: Zap.Manifest {
+    case env.target {
       :ctfe_basics ->
         %Zap.Manifest{
           name: "ctfe_basics",
@@ -11,6 +11,6 @@ defmodule CtfeBasics.Builder do
         }
       _ ->
         panic("Unknown target: use 'ctfe_basics'")
-    end
-  end
-end
+    }
+  }
+}

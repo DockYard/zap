@@ -1,6 +1,6 @@
-defmodule DoubleMacro.Builder do
-  def manifest(env :: Zap.Env) :: Zap.Manifest do
-    case env.target do
+pub module DoubleMacro.Builder {
+  pub fn manifest(env :: Zap.Env) :: Zap.Manifest {
+    case env.target {
       :double_macro ->
         %Zap.Manifest{
           name: "double_macro",
@@ -11,6 +11,6 @@ defmodule DoubleMacro.Builder do
         }
       _ ->
         panic("Unknown target: use 'double_macro'")
-    end
-  end
-end
+    }
+  }
+}

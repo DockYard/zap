@@ -1,6 +1,6 @@
-defmodule Factorial.Builder do
-  def manifest(env :: Zap.Env) :: Zap.Manifest do
-    case env.target do
+pub module Factorial.Builder {
+  pub fn manifest(env :: Zap.Env) :: Zap.Manifest {
+    case env.target {
       :factorial ->
         %Zap.Manifest{
           name: "factorial",
@@ -11,6 +11,6 @@ defmodule Factorial.Builder do
         }
       _ ->
         panic("Unknown target: use 'factorial'")
-    end
-  end
-end
+    }
+  }
+}

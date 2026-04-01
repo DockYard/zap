@@ -1,17 +1,17 @@
-defmodule Guards do
-  def classify(n :: i64) :: String if n > 0 do
+pub module Guards {
+  pub fn classify(n :: i64) :: String if n > 0 {
     "positive"
-  end
+  }
 
-  def classify(n :: i64) :: String if n < 0 do
+  pub fn classify(n :: i64) :: String if n < 0 {
     "negative"
-  end
+  }
 
-  def classify(_ :: i64) :: String do
+  pub fn classify(_ :: i64) :: String {
     "zero"
-  end
+  }
 
-  def main(_args :: [String]) :: String do
+  pub fn main(_args :: [String]) :: String {
     Guards.classify(-4)
     |> IO.puts()
 
@@ -20,5 +20,5 @@ defmodule Guards do
 
     Guards.classify(0)
     |> IO.puts()
-  end
-end
+  }
+}

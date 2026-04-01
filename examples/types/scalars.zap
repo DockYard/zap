@@ -1,29 +1,29 @@
-defmodule Scalars do
-  def int() :: i64 do
+pub module Scalars {
+  pub fn int() :: i64 {
     42
-  end
+  }
 
-  def negative() :: i64 do
+  pub fn negative() :: i64 {
     -7
-  end
+  }
 
-  def float() :: f64 do
+  pub fn float() :: f64 {
     3.14
-  end
+  }
 
-  def string() :: String do
+  pub fn string() :: String {
     "hello"
-  end
+  }
 
-  def boolean_true() :: Bool do
+  pub fn boolean_true() :: Bool {
     true
-  end
+  }
 
-  def boolean_false() :: Bool do
+  pub fn boolean_false() :: Bool {
     false
-  end
+  }
 
-  def hex() :: i64 do
+  pub fn hex() :: i64 {
     0xFF
-  end
-end
+  }
+}

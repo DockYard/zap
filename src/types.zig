@@ -1220,8 +1220,8 @@ pub const TypeChecker = struct {
                         try self.addHardError(
                             try std.fmt.allocPrint(self.allocator, "top-level function `{s}` is not allowed — only `def main()` can be defined outside a module", .{name}),
                             func.meta.span,
-                            "move this function into a `defmodule`",
-                            "all functions except `main` must be defined inside a `defmodule ... do ... end` block",
+                            "move this function into a `module` block",
+                            "all functions except `main` must be defined inside a `module { ... }` block",
                         );
                     }
                 },
@@ -1230,8 +1230,8 @@ pub const TypeChecker = struct {
                     try self.addHardError(
                         try std.fmt.allocPrint(self.allocator, "top-level private function `{s}` is not allowed — functions must be inside a module", .{name}),
                         func.meta.span,
-                        "move this function into a `defmodule`",
-                        "all functions must be defined inside a `defmodule ... do ... end` block",
+                        "move this function into a `module` block",
+                        "all functions must be defined inside a `module { ... }` block",
                     );
                 },
                 .macro => |mac| {
@@ -1239,8 +1239,8 @@ pub const TypeChecker = struct {
                     try self.addHardError(
                         try std.fmt.allocPrint(self.allocator, "top-level macro `{s}` is not allowed — macros must be inside a module", .{name}),
                         mac.meta.span,
-                        "move this macro into a `defmodule`",
-                        "all macros must be defined inside a `defmodule ... do ... end` block",
+                        "move this macro into a `module` block",
+                        "all macros must be defined inside a `module { ... }` block",
                     );
                 },
                 .priv_macro => |mac| {
@@ -1248,8 +1248,8 @@ pub const TypeChecker = struct {
                     try self.addHardError(
                         try std.fmt.allocPrint(self.allocator, "top-level private macro `{s}` is not allowed — macros must be inside a module", .{name}),
                         mac.meta.span,
-                        "move this macro into a `defmodule`",
-                        "all macros must be defined inside a `defmodule ... do ... end` block",
+                        "move this macro into a `module` block",
+                        "all macros must be defined inside a `module { ... }` block",
                     );
                 },
                 else => {},
@@ -2702,9 +2702,9 @@ test "type store addFunctionType preserves ownership metadata" {
 
 test "type checker registers opaque types" {
     const source =
-        \\defmodule Test do
+        \\pub module Test {
         \\  opaque Handle = String
-        \\end
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -2791,11 +2791,11 @@ const Collector = @import("collector.zig").Collector;
 
 test "type check simple function" {
     const source =
-        \\defmodule Test do
-        \\  def add(x :: i64, y :: i64) :: i64 do
+        \\pub module Test {
+        \\  pub fn add(x :: i64, y :: i64) :: i64 {
         \\    x + y
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -2831,11 +2831,11 @@ test "type check simple function" {
 
 test "type check literals" {
     const source =
-        \\defmodule Test do
-        \\  def foo() :: i64 do
+        \\pub module Test {
+        \\  pub fn foo() :: i64 {
         \\    42
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -2859,16 +2859,14 @@ test "type check literals" {
 
 test "type check case expression" {
     const source =
-        \\defmodule Test do
-        \\  def foo(x :: Atom) :: Nil do
-        \\    case x do
-        \\      {:ok, v} ->
-        \\        v
-        \\      {:error, e} ->
-        \\        e
-        \\    end
-        \\  end
-        \\end
+        \\pub module Test {
+        \\  pub fn foo(x :: Atom) :: Nil {
+        \\    case x {
+        \\      {:ok, v} -> v
+        \\      {:error, e} -> e
+        \\    }
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -2893,11 +2891,11 @@ test "type check case expression" {
 test "type check arithmetic mismatch reported" {
     // String + i64 should produce a type error
     const source =
-        \\defmodule Test do
-        \\  def bad() :: i64 do
+        \\pub module Test {
+        \\  pub fn bad() :: i64 {
         \\    "hello" + 42
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -2941,11 +2939,11 @@ test "typeToString returns human-readable names" {
 test "type check var_ref resolves to parameter type" {
     // x is declared as i64, so x + 1 should not error (both i64)
     const source =
-        \\defmodule Test do
-        \\  def double(x :: i64) :: i64 do
+        \\pub module Test {
+        \\  pub fn double(x :: i64) :: i64 {
         \\    x + x
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -2971,13 +2969,13 @@ test "type check var_ref resolves to parameter type" {
 test "type check if condition must be Bool" {
     // Using an integer as if condition should produce an error
     const source =
-        \\defmodule Test do
-        \\  def bad() :: i64 do
-        \\    if 42 do
+        \\pub module Test {
+        \\  pub fn bad() :: i64 {
+        \\    if 42 {
         \\      1
-        \\    end
-        \\  end
-        \\end
+        \\    }
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3005,11 +3003,11 @@ test "type check if condition must be Bool" {
 test "type check return type mismatch" {
     // Function declares i64 return but body returns a string
     const source =
-        \\defmodule Test do
-        \\  def bad() :: i64 do
+        \\pub module Test {
+        \\  pub fn bad() :: i64 {
         \\    "not a number"
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3039,11 +3037,11 @@ test "type check return type mismatch" {
 
 test "type provenance tracks source span on typed parameter" {
     const source =
-        \\defmodule Test do
-        \\  def add(x :: i64) do
+        \\pub module Test {
+        \\  pub fn add(x :: i64) {
         \\    x
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3079,11 +3077,11 @@ test "type provenance tracks source span on typed parameter" {
 
 test "typed parameter records shared ownership metadata" {
     const source =
-        \\defmodule Test do
-        \\  def add(x :: i64) do
+        \\pub module Test {
+        \\  pub fn add(x :: i64) {
         \\    x
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3119,11 +3117,11 @@ test "typed parameter records shared ownership metadata" {
 
 test "function ref inference defaults param ownerships to shared" {
     const source =
-        \\defmodule Test do
-        \\  def main(args :: Nil) :: (Nil -> Nil) do
+        \\pub module Test {
+        \\  pub fn main(args :: Nil) :: (Nil -> Nil) {
         \\    Foo.main/1
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3161,11 +3159,11 @@ test "function ref inference defaults param ownerships to shared" {
 
 test "moved binding use reports ownership error" {
     const source =
-        \\defmodule Test do
-        \\  def echo(x :: String) do
+        \\pub module Test {
+        \\  pub fn echo(x :: String) {
         \\    x
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3207,12 +3205,12 @@ test "moved binding use reports ownership error" {
 
 test "unique function parameter ownership moves var_ref argument" {
     const source =
-        \\defmodule Test do
-        \\  def caller(f, x) do
+        \\pub module Test {
+        \\  pub fn caller(f, x) {
         \\    f(x)
         \\    x
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3263,11 +3261,11 @@ test "unique function parameter ownership moves var_ref argument" {
 
 test "shared binding cannot satisfy unique parameter ownership" {
     const source =
-        \\defmodule Test do
-        \\  def caller(f, x) do
+        \\pub module Test {
+        \\  pub fn caller(f, x) {
         \\    f(x)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3315,18 +3313,18 @@ test "shared binding cannot satisfy unique parameter ownership" {
 
 test "named call with unique parameter moves opaque binding" {
     const source =
-        \\defmodule Test do
+        \\pub module Test {
         \\  opaque Handle = String
         \\
-        \\  def take(handle :: Handle) do
+        \\  pub fn take(handle :: Handle) {
         \\    handle
-        \\  end
+        \\  }
         \\
-        \\  def run(handle :: Handle) do
+        \\  pub fn run(handle :: Handle) {
         \\    take(handle)
         \\    handle
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3358,18 +3356,18 @@ test "named call with unique parameter moves opaque binding" {
 
 test "borrowed param annotation keeps binding usable after call" {
     const source =
-        \\defmodule Test do
+        \\pub module Test {
         \\  opaque Handle = String
         \\
-        \\  def inspect(handle :: borrowed Handle) :: Nil do
+        \\  pub fn inspect(handle :: borrowed Handle) :: Nil {
         \\    nil
-        \\  end
+        \\  }
         \\
-        \\  def run(handle :: Handle) :: Handle do
+        \\  pub fn run(handle :: Handle) :: Handle {
         \\    inspect(handle)
         \\    handle
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3393,13 +3391,13 @@ test "borrowed param annotation keeps binding usable after call" {
 
 test "borrowed value cannot escape through return" {
     const source =
-        \\defmodule Test do
+        \\pub module Test {
         \\  opaque Handle = String
         \\
-        \\  def inspect(handle :: borrowed Handle) do
+        \\  pub fn inspect(handle :: borrowed Handle) {
         \\    handle
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3431,17 +3429,17 @@ test "borrowed value cannot escape through return" {
 
 test "closure with borrowed capture cannot be returned" {
     const source =
-        \\defmodule Test do
+        \\pub module Test {
         \\  opaque Handle = String
         \\
-        \\  def make(handle :: borrowed Handle) do
-        \\    def use() do
+        \\  pub fn make(handle :: borrowed Handle) {
+        \\    fn use() {
         \\      handle
-        \\    end
+        \\    }
         \\
         \\    use
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3473,18 +3471,18 @@ test "closure with borrowed capture cannot be returned" {
 
 test "unique capture moves outer binding" {
     const source =
-        \\defmodule Test do
+        \\pub module Test {
         \\  opaque Handle = String
         \\
-        \\  def make(handle :: unique Handle) do
-        \\    def use() do
+        \\  pub fn make(handle :: unique Handle) {
+        \\    fn use() {
         \\      handle
-        \\    end
+        \\    }
         \\
         \\    inspect(use)
         \\    handle
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3516,21 +3514,21 @@ test "unique capture moves outer binding" {
 
 test "closure with borrowed capture cannot be passed as argument" {
     const source =
-        \\defmodule Test do
+        \\pub module Test {
         \\  opaque Handle = String
         \\
-        \\  def apply(f :: (-> Handle)) do
+        \\  pub fn apply(f :: (-> Handle)) {
         \\    f
-        \\  end
+        \\  }
         \\
-        \\  def make(handle :: borrowed Handle) do
-        \\    def use() do
+        \\  pub fn make(handle :: borrowed Handle) {
+        \\    fn use() {
         \\      handle
-        \\    end
+        \\    }
         \\
         \\    apply(use)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3562,18 +3560,18 @@ test "closure with borrowed capture cannot be passed as argument" {
 
 test "closure with borrowed capture cannot be assigned" {
     const source =
-        \\defmodule Test do
+        \\pub module Test {
         \\  opaque Handle = String
         \\
-        \\  def make(handle :: borrowed Handle) do
-        \\    def use() do
+        \\  pub fn make(handle :: borrowed Handle) {
+        \\    fn use() {
         \\      handle
-        \\    end
+        \\    }
         \\
         \\    f = use
         \\    f
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3605,17 +3603,17 @@ test "closure with borrowed capture cannot be assigned" {
 
 test "closure with borrowed capture cannot be stored in tuple" {
     const source =
-        \\defmodule Test do
+        \\pub module Test {
         \\  opaque Handle = String
         \\
-        \\  def make(handle :: borrowed Handle) do
-        \\    def use() do
+        \\  pub fn make(handle :: borrowed Handle) {
+        \\    fn use() {
         \\      handle
-        \\    end
+        \\    }
         \\
         \\    {use}
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3647,17 +3645,17 @@ test "closure with borrowed capture cannot be stored in tuple" {
 
 test "closure with borrowed capture may be locally invoked" {
     const source =
-        \\defmodule Test do
+        \\pub module Test {
         \\  opaque Handle = String
         \\
-        \\  def make(handle :: borrowed Handle) :: Bool do
-        \\    def use() :: Bool do
+        \\  pub fn make(handle :: borrowed Handle) :: Bool {
+        \\    fn use() :: Bool {
         \\      handle == handle
-        \\    end
+        \\    }
         \\
         \\    use()
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3681,21 +3679,21 @@ test "closure with borrowed capture may be locally invoked" {
 
 test "closure with borrowed capture may be passed to known-safe callee" {
     const source =
-        \\defmodule Test do
+        \\pub module Test {
         \\  opaque Handle = String
         \\
-        \\  def apply(f :: (borrowed Handle -> Bool), handle :: borrowed Handle) :: Bool do
+        \\  pub fn apply(f :: (borrowed Handle -> Bool), handle :: borrowed Handle) :: Bool {
         \\    f(handle)
-        \\  end
+        \\  }
         \\
-        \\  def make(handle :: borrowed Handle) :: Bool do
-        \\    def use(h :: borrowed Handle) :: Bool do
+        \\  pub fn make(handle :: borrowed Handle) :: Bool {
+        \\    fn use(h :: borrowed Handle) :: Bool {
         \\      h == handle
-        \\    end
+        \\    }
         \\
         \\    apply(use, handle)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3719,12 +3717,12 @@ test "closure with borrowed capture may be passed to known-safe callee" {
 
 test "borrowed parameter does not move binding" {
     const source =
-        \\defmodule Test do
-        \\  def caller(f, x) do
+        \\pub module Test {
+        \\  pub fn caller(f, x) {
         \\    f(x)
         \\    x
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3770,11 +3768,11 @@ test "borrowed parameter does not move binding" {
 
 test "return type mismatch has secondary span" {
     const source =
-        \\defmodule Test do
-        \\  def bad() :: i64 do
+        \\pub module Test {
+        \\  pub fn bad() :: i64 {
         \\    "not a number"
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3803,14 +3801,14 @@ test "return type mismatch has secondary span" {
 
 test "undefined function suggests similar name" {
     const source =
-        \\defmodule Test do
-        \\  def foo(a, b) do
+        \\pub module Test {
+        \\  pub fn foo(a, b) {
         \\    a + b
-        \\  end
-        \\  def bar() do
+        \\  }
+        \\  pub fn bar() {
         \\    fob(1, 2)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3845,14 +3843,14 @@ test "undefined function suggests similar name" {
 
 test "undefined function no suggestion for unrelated name" {
     const source =
-        \\defmodule Test do
-        \\  def foo(a) do
+        \\pub module Test {
+        \\  pub fn foo(a) {
         \\    a
-        \\  end
-        \\  def bar() do
+        \\  }
+        \\  pub fn bar() {
         \\    zzzzz(1)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3884,14 +3882,14 @@ test "undefined function no suggestion for unrelated name" {
 
 test "valid function call produces no error" {
     const source =
-        \\defmodule Test do
-        \\  def foo(a, b) do
+        \\pub module Test {
+        \\  pub fn foo(a, b) {
         \\    a + b
-        \\  end
-        \\  def bar() do
+        \\  }
+        \\  pub fn bar() {
         \\    foo(1, 2)
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3918,12 +3916,12 @@ test "valid function call produces no error" {
 
 test "unused variable produces warning" {
     const source =
-        \\defmodule Test do
-        \\  def foo() do
+        \\pub module Test {
+        \\  pub fn foo() {
         \\    x = 42
         \\    1
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3956,12 +3954,12 @@ test "unused variable produces warning" {
 
 test "underscore-prefixed variable no unused warning" {
     const source =
-        \\defmodule Test do
-        \\  def foo() do
+        \\pub module Test {
+        \\  pub fn foo() {
         \\    _x = 42
         \\    1
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3988,12 +3986,12 @@ test "underscore-prefixed variable no unused warning" {
 
 test "used variable no unused warning" {
     const source =
-        \\defmodule Test do
-        \\  def foo() do
+        \\pub module Test {
+        \\  pub fn foo() {
         \\    x = 42
         \\    x + 1
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -4020,11 +4018,11 @@ test "used variable no unused warning" {
 
 test "unknown type name produces error" {
     const source =
-        \\defmodule Test do
-        \\  def foo(x :: Other) do
+        \\pub module Test {
+        \\  pub fn foo(x :: Other) {
         \\    x
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -4054,11 +4052,11 @@ test "unknown type name produces error" {
 
 test "unused function parameter produces warning" {
     const source =
-        \\defmodule Test do
-        \\  def foo(x :: i64) do
+        \\pub module Test {
+        \\  pub fn foo(x :: i64) {
         \\    42
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

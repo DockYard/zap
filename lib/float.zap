@@ -1,5 +1,5 @@
-defmodule Float do
-  def to_string(value :: f64) :: String do
+pub module Float {
+  pub fn to_string(value :: f64) :: String {
     :zig.f64_to_string(value)
-  end
-end
+  }
+}

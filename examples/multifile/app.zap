@@ -1,7 +1,7 @@
-# Main application — imports types from types.zap and behavior from geometry.zap.
+# Main application --- imports types from types.zap and behavior from geometry.zap.
 
-defmodule App do
-  def main(_args :: [String]) :: String do
+pub module App {
+  pub fn main(_args :: [String]) :: String {
     IO.puts("multifile project works!")
-  end
-end
+  }
+}

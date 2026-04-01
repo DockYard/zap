@@ -1,11 +1,11 @@
-defmodule Greeter do
+pub module Greeter {
   @greeting :: String = "Hello"
-  def greet(name :: String) :: String do
+  pub fn greet(name :: String) :: String {
     @greeting <> ", " <> name <> "!"
-  end
+  }
 
   @default_name :: String = "World"
-  def greet_default() :: String do
+  pub fn greet_default() :: String {
     greet(@default_name)
-  end
-end
+  }
+}

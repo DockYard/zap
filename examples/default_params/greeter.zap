@@ -1,5 +1,5 @@
-defmodule Greeter do
-  def greet(name :: String) :: String do
+pub module Greeter {
+  pub fn greet(name :: String) :: String {
     "Hello, " <> name <> "!"
-  end
-end
+  }
+}

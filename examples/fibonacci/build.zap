@@ -1,6 +1,6 @@
-defmodule Fibonacci.Builder do
-  def manifest(env :: Zap.Env) :: Zap.Manifest do
-    case env.target do
+pub module Fibonacci.Builder {
+  pub fn manifest(env :: Zap.Env) :: Zap.Manifest {
+    case env.target {
       :fibonacci ->
         %Zap.Manifest{
           name: "fibonacci",
@@ -11,6 +11,6 @@ defmodule Fibonacci.Builder do
         }
       _ ->
         panic("Unknown target: use 'fibonacci'")
-    end
-  end
-end
+    }
+  }
+}

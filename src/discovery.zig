@@ -285,15 +285,16 @@ fn resolveModuleToFile(
     return null;
 }
 
-/// Check if a source file declares its module with `defmodulep` (private).
+/// Check if a source file declares its module without `pub` (private).
 /// Uses the lexer for a fast scan — no full parsing needed.
+/// A `module Name {` declaration is private; `pub module Name {` is public.
 fn isPrivateModule(source: []const u8) bool {
     var lexer = zap.Lexer.init(source);
     while (true) {
         const tok = lexer.next();
         if (tok.tag == .eof) break;
-        if (tok.tag == .keyword_defmodulep) return true;
-        if (tok.tag == .keyword_defmodule) return false;
+        if (tok.tag == .keyword_module) return true; // bare `module` = private
+        if (tok.tag == .keyword_pub) return false; // `pub module` = public
     }
     return false;
 }
@@ -482,12 +483,12 @@ test "extractModuleReferences: finds qualified calls" {
     defer arena.deinit();
     const alloc = arena.allocator();
     const source =
-        \\defmodule App do
-        \\  def main() :: String do
+        \\pub module App {
+        \\  pub fn main() :: String {
         \\    Config.load("/etc/app")
         \\    IO.puts("hello")
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
     const refs = try extractModuleReferences(alloc, source, "App");
 
@@ -507,11 +508,11 @@ test "extractModuleReferences: finds nested module references" {
     defer arena.deinit();
     const alloc = arena.allocator();
     const source =
-        \\defmodule App do
-        \\  def main() :: String do
+        \\pub module App {
+        \\  pub fn main() :: String {
         \\    Config.Parser.parse("data")
-        \\  end
-        \\end
+        \\  }
+        \\}
     ;
     const refs = try extractModuleReferences(alloc, source, "App");
 
@@ -522,10 +523,10 @@ test "extractModuleReferences: finds nested module references" {
     try std.testing.expect(found);
 }
 
-test "isPrivateModule: detects defmodulep" {
-    try std.testing.expect(isPrivateModule("defmodulep Foo do\nend\n"));
-    try std.testing.expect(!isPrivateModule("defmodule Foo do\nend\n"));
-    try std.testing.expect(!isPrivateModule("defstruct Foo do\nend\n"));
+test "isPrivateModule: detects bare module" {
+    try std.testing.expect(isPrivateModule("module Foo {\n}\n"));
+    try std.testing.expect(!isPrivateModule("pub module Foo {\n}\n"));
+    try std.testing.expect(!isPrivateModule("pub struct Foo {\n}\n"));
 }
 
 test "discover: single file with no references" {
@@ -539,7 +540,7 @@ test "discover: single file with no references" {
 
     try tmp_dir.dir.writeFile(.{
         .sub_path = "app.zap",
-        .data = "defmodule App do\n  def main() :: i64 do\n    42\n  end\nend\n",
+        .data = "pub module App {\n  pub fn main() :: i64 {\n    42\n  }\n}\n",
     });
 
     const tmp_path = try tmp_dir.dir.realpathAlloc(alloc, ".");
@@ -563,15 +564,15 @@ test "discover: transitive references" {
     // App → Helper → Util (3 files, transitive chain)
     try tmp_dir.dir.writeFile(.{
         .sub_path = "app.zap",
-        .data = "defmodule App do\n  def main() :: i64 do\n    Helper.run()\n  end\nend\n",
+        .data = "pub module App {\n  pub fn main() :: i64 {\n    Helper.run()\n  }\n}\n",
     });
     try tmp_dir.dir.writeFile(.{
         .sub_path = "helper.zap",
-        .data = "defmodule Helper do\n  def run() :: i64 do\n    Util.value()\n  end\nend\n",
+        .data = "pub module Helper {\n  pub fn run() :: i64 {\n    Util.value()\n  }\n}\n",
     });
     try tmp_dir.dir.writeFile(.{
         .sub_path = "util.zap",
-        .data = "defmodule Util do\n  def value() :: i64 do\n    1\n  end\nend\n",
+        .data = "pub module Util {\n  pub fn value() :: i64 {\n    1\n  }\n}\n",
     });
 
     const tmp_path = try tmp_dir.dir.realpathAlloc(alloc, ".");
@@ -603,11 +604,11 @@ test "discover: circular dependency detected" {
     // A → B → A (cycle)
     try tmp_dir.dir.writeFile(.{
         .sub_path = "cycle_a.zap",
-        .data = "defmodule CycleA do\n  def go() :: i64 do\n    CycleB.go()\n  end\nend\n",
+        .data = "pub module CycleA {\n  pub fn go() :: i64 {\n    CycleB.go()\n  }\n}\n",
     });
     try tmp_dir.dir.writeFile(.{
         .sub_path = "cycle_b.zap",
-        .data = "defmodule CycleB do\n  def go() :: i64 do\n    CycleA.go()\n  end\nend\n",
+        .data = "pub module CycleB {\n  pub fn go() :: i64 {\n    CycleA.go()\n  }\n}\n",
     });
 
     const tmp_path = try tmp_dir.dir.realpathAlloc(alloc, ".");
@@ -628,7 +629,7 @@ test "discover: module not found" {
     // App references NonExistent which doesn't exist
     try tmp_dir.dir.writeFile(.{
         .sub_path = "app.zap",
-        .data = "defmodule App do\n  def main() :: i64 do\n    NonExistent.foo()\n  end\nend\n",
+        .data = "pub module App {\n  pub fn main() :: i64 {\n    NonExistent.foo()\n  }\n}\n",
     });
 
     const tmp_path = try tmp_dir.dir.realpathAlloc(alloc, ".");
@@ -652,11 +653,11 @@ test "discover: module found in dep root" {
 
     try tmp_dir.dir.writeFile(.{
         .sub_path = "project/app.zap",
-        .data = "defmodule App do\n  def main() :: i64 do\n    DepMod.value()\n  end\nend\n",
+        .data = "pub module App {\n  pub fn main() :: i64 {\n    DepMod.value()\n  }\n}\n",
     });
     try tmp_dir.dir.writeFile(.{
         .sub_path = "dep_lib/dep_mod.zap",
-        .data = "defmodule DepMod do\n  def value() :: i64 do\n    99\n  end\nend\n",
+        .data = "pub module DepMod {\n  pub fn value() :: i64 {\n    99\n  }\n}\n",
     });
 
     const project_path = try tmp_dir.dir.realpathAlloc(alloc, "project");

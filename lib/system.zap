@@ -1,17 +1,17 @@
-defmodule System do
-  def arg_count() :: i64 do
+pub module System {
+  pub fn arg_count() :: i64 {
     :zig.arg_count()
-  end
+  }
 
-  def arg_at(index :: i64) :: String do
+  pub fn arg_at(index :: i64) :: String {
     :zig.arg_at(index)
-  end
+  }
 
-  def get_env(name :: String) :: String do
+  pub fn get_env(name :: String) :: String {
     :zig.get_env(name)
-  end
+  }
 
-  def get_build_opt(name :: String) :: String do
+  pub fn get_build_opt(name :: String) :: String {
     :zig.get_build_opt(name)
-  end
-end
+  }
+}

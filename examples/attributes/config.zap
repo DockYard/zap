@@ -1,16 +1,16 @@
-defmodule Config do
+pub module Config {
   @timeout :: i64 = 5000
-  def timeout() :: i64 do
+  pub fn timeout() :: i64 {
     @timeout
-  end
+  }
 
   @max_retries :: i64 = 3
-  def max_retries() :: i64 do
+  pub fn max_retries() :: i64 {
     @max_retries
-  end
+  }
 
   @app_name :: String = "my_app"
-  def app_name() :: String do
+  pub fn app_name() :: String {
     @app_name
-  end
-end
+  }
+}
