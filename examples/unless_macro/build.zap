@@ -6,8 +6,8 @@ defmodule UnlessMacro.Builder do
           name: "unless_macro",
           version: "0.1.0",
           kind: :bin,
-          root: "UnlessMacro.main/0",
-          paths: ["./*.zap"]
+          root: "UnlessMacro.main/1",
+          paths: ["./*.zap"], deps: [{:zap_stdlib, {:path, "../../lib"}}]
         }
       _ ->
         panic("Unknown target: use 'unless_macro'")

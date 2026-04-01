@@ -5,7 +5,7 @@
 *ALWAYS* TDD: write failing tests first, implement minimum code to pass, run `zig build test` locally, push only when green.
 
 **No fallbacks.** When refactoring, fully commit to the new approach. Remove old code entirely. If the new approach fails, that's a bug to surface, not hide.
-j
+
 ## Release Process
 
 When the user says "release" (or similar), follow this procedure:

@@ -1,5 +1,5 @@
 defmodule PatternMatching do
-  def main() :: String do
+  def main(_args :: [String]) :: String do
     PatternMatch.describe(:ok)
     |> IO.puts()
 

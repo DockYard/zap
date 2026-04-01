@@ -8,7 +8,6 @@ const hir_mod = @import("hir.zig");
 const ir = @import("ir.zig");
 const CodeGen = @import("codegen.zig").CodeGen;
 const DiagnosticEngine = @import("diagnostics.zig").DiagnosticEngine;
-pub const stdlib = @import("stdlib.zig");
 
 // ============================================================
 // Integration tests (spec §12)
@@ -28,16 +27,42 @@ fn compile(alloc: std.mem.Allocator, source: []const u8) ![]const u8 {
     return result.output;
 }
 
+/// Read all .zap files from a directory and concatenate their sources.
+fn readDirZapFiles(alloc: std.mem.Allocator, dir_path: []const u8) ![]const u8 {
+    var result: std.ArrayListUnmanaged(u8) = .empty;
+    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return try result.toOwnedSlice(alloc);
+    defer dir.close();
+    var iter = dir.iterate();
+    while (iter.next() catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".zap")) continue;
+        const file_path = try std.fs.path.join(alloc, &.{ dir_path, entry.name });
+        const content = std.fs.cwd().readFileAlloc(alloc, file_path, 10 * 1024 * 1024) catch continue;
+        try result.appendSlice(alloc, content);
+        try result.append(alloc, '\n');
+    }
+    return try result.toOwnedSlice(alloc);
+}
+
+/// Read stdlib source from lib/ and lib/zap/ directories.
+fn readStdlibSource(alloc: std.mem.Allocator) ![]const u8 {
+    var combined: std.ArrayListUnmanaged(u8) = .empty;
+    const lib_source = try readDirZapFiles(alloc, "lib");
+    try combined.appendSlice(alloc, lib_source);
+    const zap_source = try readDirZapFiles(alloc, "lib/zap");
+    try combined.appendSlice(alloc, zap_source);
+    return try combined.toOwnedSlice(alloc);
+}
+
 /// Run the full compiler pipeline with diagnostics support.
 fn compileWithDiagnostics(alloc: std.mem.Allocator, source: []const u8, strict_types: bool) !CompileResult {
-    const prepend_result = try stdlib.prependStdlib(alloc, source);
-    const full_source = prepend_result.source;
+    const stdlib_source = try readStdlibSource(alloc);
+    const full_source = try std.mem.concat(alloc, u8, &.{ stdlib_source, source });
 
     // Create shared DiagnosticEngine
     var diag_engine = DiagnosticEngine.init(alloc);
     defer diag_engine.deinit();
     diag_engine.setSource(full_source, "test.zap");
-    diag_engine.setLineOffset(prepend_result.stdlib_line_count);
 
     var parser = Parser.init(alloc, full_source);
     defer parser.deinit();
@@ -67,7 +92,7 @@ fn compileWithDiagnostics(alloc: std.mem.Allocator, source: []const u8, strict_t
         return error.ParseError;
     }
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -78,7 +103,7 @@ fn compileWithDiagnostics(alloc: std.mem.Allocator, source: []const u8, strict_t
     if (diag_engine.hasErrors()) return error.CollectError;
 
     // Macro expansion (between collection and HIR lowering)
-    var macro_engine = MacroEngine.init(alloc, &parser.interner, &collector.graph);
+    var macro_engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
     defer macro_engine.deinit();
     const expanded_program = try macro_engine.expandProgram(&program);
 
@@ -89,19 +114,19 @@ fn compileWithDiagnostics(alloc: std.mem.Allocator, source: []const u8, strict_t
     if (diag_engine.hasErrors()) return error.MacroError;
 
     // Desugaring (after macro expansion, before HIR)
-    var desugarer = Desugarer.init(alloc, &parser.interner);
+    var desugarer = Desugarer.init(alloc, parser.interner);
     const desugared_program = try desugarer.desugarProgram(&expanded_program);
 
     // Type checking (on desugared AST)
-    var type_checker = types_mod.TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    var type_checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer type_checker.deinit();
-    type_checker.stdlib_line_count = prepend_result.stdlib_line_count;
+
     type_checker.checkProgram(&desugared_program) catch {};
     type_checker.checkUnusedBindings() catch {};
 
     const type_severity: @import("diagnostics.zig").Severity = if (strict_types) .@"error" else .warning;
 
-    var hir_builder = hir_mod.HirBuilder.init(alloc, &parser.interner, &collector.graph, &type_checker.store);
+    var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, &type_checker.store);
     defer hir_builder.deinit();
     const hir_program = try hir_builder.buildProgram(&desugared_program);
 
@@ -111,7 +136,7 @@ fn compileWithDiagnostics(alloc: std.mem.Allocator, source: []const u8, strict_t
     }
     if (diag_engine.hasErrors()) return error.HirError;
 
-    var ir_builder = ir.IrBuilder.init(alloc, &parser.interner);
+    var ir_builder = ir.IrBuilder.init(alloc, parser.interner);
     ir_builder.type_store = &type_checker.store;
     defer ir_builder.deinit();
     var ir_program = try ir_builder.buildProgram(&hir_program);
@@ -161,35 +186,35 @@ pub fn analyzeSource(alloc: std.mem.Allocator, source: []const u8) !struct {
     ir_program: ir.Program,
     pipeline_result: @import("analysis_pipeline.zig").PipelineResult,
 } {
-    const prepend_result = try stdlib.prependStdlib(alloc, source);
-    const full_source = prepend_result.source;
+    const stdlib_source = try readStdlibSource(alloc);
+    const full_source = try std.mem.concat(alloc, u8, &.{ stdlib_source, source });
 
     var parser = Parser.init(alloc, full_source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var macro_engine = MacroEngine.init(alloc, &parser.interner, &collector.graph);
+    var macro_engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
     defer macro_engine.deinit();
     const expanded_program = try macro_engine.expandProgram(&program);
 
-    var desugarer = Desugarer.init(alloc, &parser.interner);
+    var desugarer = Desugarer.init(alloc, parser.interner);
     const desugared_program = try desugarer.desugarProgram(&expanded_program);
 
-    var type_checker = types_mod.TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    var type_checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer type_checker.deinit();
-    type_checker.stdlib_line_count = prepend_result.stdlib_line_count;
+
     try type_checker.checkProgram(&desugared_program);
     try type_checker.checkUnusedBindings();
 
-    var hir_builder = hir_mod.HirBuilder.init(alloc, &parser.interner, &collector.graph, &type_checker.store);
+    var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, &type_checker.store);
     defer hir_builder.deinit();
     const hir_program = try hir_builder.buildProgram(&desugared_program);
 
-    var ir_builder = ir.IrBuilder.init(alloc, &parser.interner);
+    var ir_builder = ir.IrBuilder.init(alloc, parser.interner);
     ir_builder.type_store = &type_checker.store;
     defer ir_builder.deinit();
     var ir_program = try ir_builder.buildProgram(&hir_program);
@@ -419,15 +444,15 @@ test "example: pattern matching" {
 
     const source =
         \\defmodule Matcher do
-        \\  def describe(:ok) :: String do
+        \\  def describe(:ok :: Atom) :: String do
         \\    "success"
         \\  end
         \\
-        \\  def describe(:error) :: String do
+        \\  def describe(:error :: Atom) :: String do
         \\    "failure"
         \\  end
         \\
-        \\  def describe(_) :: String do
+        \\  def describe(_ :: Atom) :: String do
         \\    "unknown"
         \\  end
         \\end
@@ -552,11 +577,11 @@ test "multiple function clauses produce separate functions" {
 
     const source =
         \\defmodule Greeter do
-        \\  def greet(:morning) :: String do
+        \\  def greet(:morning :: Atom) :: String do
         \\    "Good morning"
         \\  end
         \\
-        \\  def greet(:evening) :: String do
+        \\  def greet(:evening :: Atom) :: String do
         \\    "Good evening"
         \\  end
         \\end
@@ -674,7 +699,7 @@ test "refinement guard on function clause" {
         \\    "negative"
         \\  end
         \\
-        \\  def classify(_) :: String do
+        \\  def classify(_ :: i64) :: String do
         \\    "zero"
         \\  end
         \\end
@@ -730,7 +755,7 @@ test "case expression with tuple destructuring" {
 
     const source =
         \\defmodule Handler do
-        \\  def handle(result) :: Nil do
+        \\  def handle(result :: Atom) :: Nil do
         \\    case result do
         \\      {:ok, v} ->
         \\        v
@@ -757,7 +782,7 @@ test "case expression with bind pattern" {
 
     const source =
         \\defmodule Identity do
-        \\  def identity(x) :: Nil do
+        \\  def identity(x :: Atom) :: Nil do
         \\    case x do
         \\      v ->
         \\        v
@@ -864,7 +889,7 @@ test "case with atom literals falls back to if-else" {
 
     const source =
         \\defmodule Checker do
-        \\  def check(x) :: String do
+        \\  def check(x :: Atom) :: String do
         \\    case x do
         \\      :ok ->
         \\        "yes"
@@ -894,7 +919,7 @@ test "nested tuple patterns decompose once" {
 
     const source =
         \\defmodule Processor do
-        \\  def process(x) :: Nil do
+        \\  def process(x :: Atom) :: Nil do
         \\    case x do
         \\      {:ok, {:data, v}} ->
         \\        v
@@ -928,7 +953,7 @@ test "case with tuple patterns checks struct type once" {
 
     const source =
         \\defmodule Handler do
-        \\  def handle(result) :: Nil do
+        \\  def handle(result :: Atom) :: Nil do
         \\    case result do
         \\      {:ok, v} ->
         \\        v
@@ -959,11 +984,11 @@ test "multi-clause function with tuple dispatch checks once" {
 
     const source =
         \\defmodule Handler do
-        \\  def handle({:ok, v}) :: Nil do
+        \\  def handle({:ok, v} :: Atom) :: Nil do
         \\    v
         \\  end
         \\
-        \\  def handle({:error, e}) :: Nil do
+        \\  def handle({:error, e} :: Atom) :: Nil do
         \\    e
         \\  end
         \\end
@@ -1011,7 +1036,7 @@ test "typed integer param skips type check in switch" {
     try expectNotContains(output, "// unhandled instruction");
 }
 
-test "untyped param keeps type check" {
+test "untyped param produces type error" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -1028,10 +1053,9 @@ test "untyped param keeps type check" {
         \\end
     ;
 
-    const output = try compile(alloc, source);
-    // Untyped param needs runtime type check for atom matching
-    try expectContains(output, "@TypeOf");
-    try expectNotContains(output, "// unhandled instruction");
+    // Untyped params now require type annotations — should produce a type error
+    const result = compileWithDiagnostics(alloc, source, true);
+    try std.testing.expectError(error.TypeError, result);
 }
 
 test "typed case scrutinee skips type check" {
@@ -1092,7 +1116,7 @@ test "case with mixed literal types falls back" {
 
     const source =
         \\defmodule Checker do
-        \\  def check(x) :: String do
+        \\  def check(x :: Atom) :: String do
         \\    case x do
         \\      0 ->
         \\        "zero"
@@ -1132,7 +1156,7 @@ test "macro expansion: unless compiles through pipeline" {
 
     const source =
         \\defmodule Logic do
-        \\  defmacro unless(condition, body) :: Nil do
+        \\  defmacro unless(condition :: Expr, body :: Expr) :: Nil do
         \\    quote do
         \\      if not unquote(condition) do
         \\        unquote(body)
@@ -1161,7 +1185,7 @@ test "macro expansion: expression substitution" {
 
     const source =
         \\defmodule Math do
-        \\  defmacro double(value) :: Nil do
+        \\  defmacro double(value :: Expr) :: Nil do
         \\    quote do
         \\      unquote(value) + unquote(value)
         \\    end
@@ -1244,7 +1268,7 @@ test "with expression desugars to nested case" {
 
     const source =
         \\defmodule Processor do
-        \\  def process(x) :: Nil do
+        \\  def process(x :: Atom) :: Nil do
         \\    with {:ok, a} <- x do
         \\      a
         \\    else
@@ -1943,7 +1967,7 @@ test "source pipeline records reuse pairs for tagged tuple reconstruction after 
 
     const source =
         \\defmodule Handler do
-        \\  def handle(result) :: Nil do
+        \\  def handle(result :: Atom) :: Nil do
         \\    case result do
         \\      {:ok, v} -> {:ok, v}
         \\      {:error, e} -> {:error, e}
@@ -2461,7 +2485,7 @@ test "binary pattern matching extracts bytes" {
 
     const source =
         \\defmodule Binary do
-        \\  def first_byte(<<a, _b, _c>>) :: i64 do
+        \\  def first_byte(<<a, _b, _c>> :: String) :: i64 do
         \\    a
         \\  end
         \\end
@@ -2479,7 +2503,7 @@ test "binary pattern with u16 type spec" {
 
     const source =
         \\defmodule Binary do
-        \\  def parse_port(<<port::u16>>) :: i64 do
+        \\  def parse_port(<<port::u16>> :: String) :: i64 do
         \\    port
         \\  end
         \\end
@@ -2496,7 +2520,7 @@ test "binary pattern with String rest" {
 
     const source =
         \\defmodule Binary do
-        \\  def parse_header(<<tag::u8, rest::String>>) :: {i64, String} do
+        \\  def parse_header(<<tag::u8, rest::String>> :: String) :: {i64, String} do
         \\    {tag, rest}
         \\  end
         \\end
@@ -2514,7 +2538,7 @@ test "binary pattern with float extraction" {
 
     const source =
         \\defmodule Binary do
-        \\  def parse_coord(<<lat::f64, lon::f64>>) :: {f64, f64} do
+        \\  def parse_coord(<<lat::f64, lon::f64>> :: String) :: {f64, f64} do
         \\    {lat, lon}
         \\  end
         \\end
@@ -2532,7 +2556,7 @@ test "binary pattern with endianness" {
 
     const source =
         \\defmodule Binary do
-        \\  def parse_le(<<val::u32-little>>) :: i64 do
+        \\  def parse_le(<<val::u32-little>> :: String) :: i64 do
         \\    val
         \\  end
         \\end
@@ -2549,7 +2573,7 @@ test "binary pattern emits length check" {
 
     const source =
         \\defmodule Binary do
-        \\  def parse_port(<<port::u16>>) :: i64 do
+        \\  def parse_port(<<port::u16>> :: String) :: i64 do
         \\    port
         \\  end
         \\end
@@ -2567,7 +2591,7 @@ test "binary pattern with string prefix match" {
 
     const source =
         \\defmodule HTTP do
-        \\  def parse_method(<<"GET "::String, path::String>>) :: String do
+        \\  def parse_method(<<"GET "::String, path::String>> :: String) :: String do
         \\    path
         \\  end
         \\end
@@ -2586,7 +2610,7 @@ test "binary pattern sub-byte extraction" {
 
     const source =
         \\defmodule Flags do
-        \\  def parse_flags(<<syn::u1, ack::u1, fin::u1, _reserved::u5>>) :: {i64, i64, i64} do
+        \\  def parse_flags(<<syn::u1, ack::u1, fin::u1, _reserved::u5>> :: String) :: {i64, i64, i64} do
         \\    {syn, ack, fin}
         \\  end
         \\end
@@ -2608,7 +2632,7 @@ test "binary pattern in case emits length check" {
     // Binary patterns in case expressions emit length checks via check_binary
     const source =
         \\defmodule Binary do
-        \\  def parse(data) :: i64 do
+        \\  def parse(data :: String) :: i64 do
         \\    case data do
         \\      <<_a, _b>> -> 1
         \\      _ -> 0
@@ -2723,14 +2747,14 @@ test "multi-parameter function uses distinct param indices" {
 }
 
 test "multi-parameter function param_get indices in IR" {
-    // Test at the IR level with untyped params (bypasses type checker)
+    // Test at the IR level — params now require types
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
 
     const source =
         \\defmodule Test do
-        \\  def add(a, b) :: i64 do
+        \\  def add(a :: i64, b :: i64) :: i64 do
         \\    a + b
         \\  end
         \\end
@@ -2740,18 +2764,18 @@ test "multi-parameter function param_get indices in IR" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = @import("collector.zig").Collector.init(alloc, &parser.interner);
+    var collector = @import("collector.zig").Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var type_store = @import("types.zig").TypeStore.init(alloc, &parser.interner);
+    var type_store = @import("types.zig").TypeStore.init(alloc, parser.interner);
     defer type_store.deinit();
 
-    var hir_builder = @import("hir.zig").HirBuilder.init(alloc, &parser.interner, &collector.graph, &type_store);
+    var hir_builder = @import("hir.zig").HirBuilder.init(alloc, parser.interner, &collector.graph, &type_store);
     defer hir_builder.deinit();
     const hir_program = try hir_builder.buildProgram(&program);
 
-    var ir_builder = ir.IrBuilder.init(alloc, &parser.interner);
+    var ir_builder = ir.IrBuilder.init(alloc, parser.interner);
     ir_builder.type_store = &type_store;
     defer ir_builder.deinit();
     const ir_program = try ir_builder.buildProgram(&hir_program);
@@ -2981,7 +3005,7 @@ test "pipeline: recursive function compiles through analysis" {
 
     const source =
         \\defmodule Counter do
-        \\  def count(0) :: i64 do
+        \\  def count(0 :: i64) :: i64 do
         \\    0
         \\  end
         \\
@@ -3032,11 +3056,11 @@ test "pipeline: fibonacci compiles through full analysis" {
 
     const source =
         \\defmodule Fib do
-        \\  def fib(0) :: i64 do
+        \\  def fib(0 :: i64) :: i64 do
         \\    0
         \\  end
         \\
-        \\  def fib(1) :: i64 do
+        \\  def fib(1 :: i64) :: i64 do
         \\    1
         \\  end
         \\
@@ -3142,7 +3166,7 @@ test "pipeline: complex program with closures, patterns, modules" {
 
     const source =
         \\defmodule Math do
-        \\  def factorial(0) :: i64 do
+        \\  def factorial(0 :: i64) :: i64 do
         \\    1
         \\  end
         \\
@@ -3196,11 +3220,11 @@ test "pipeline: atom pattern matching through analysis" {
 
     const source =
         \\defmodule Status do
-        \\  def check(:ok) :: i64 do
+        \\  def check(:ok :: Atom) :: i64 do
         \\    1
         \\  end
         \\
-        \\  def check(:error) :: i64 do
+        \\  def check(:error :: Atom) :: i64 do
         \\    0
         \\  end
         \\end
@@ -3267,7 +3291,7 @@ test "deps: discovery finds files and they compile together" {
         alloc,
         "App",
         &.{.{ .name = "project", .path = tmp_path }},
-        &discovery.STDLIB_MODULES,
+        &discovery.BUILTIN_TYPE_NAMES,
         null,
     );
     defer graph.deinit();
@@ -3318,7 +3342,7 @@ test "deps: discovery with dep root finds dep modules" {
             .{ .name = "project", .path = project_path },
             .{ .name = "dep:math", .path = dep_path },
         },
-        &discovery.STDLIB_MODULES,
+        &discovery.BUILTIN_TYPE_NAMES,
         null,
     );
     defer graph.deinit();
@@ -3368,7 +3392,7 @@ test "deps: defmodulep enforcement blocks cross-dep access" {
             .{ .name = "project", .path = project_path },
             .{ .name = "dep:secret_lib", .path = dep_path },
         },
-        &discovery.STDLIB_MODULES,
+        &discovery.BUILTIN_TYPE_NAMES,
         null,
     );
 
@@ -3401,7 +3425,7 @@ test "deps: defmodulep allowed within same dep" {
         alloc,
         "PublicMod",
         &.{.{ .name = "dep:mylib", .path = tmp_path }},
-        &discovery.STDLIB_MODULES,
+        &discovery.BUILTIN_TYPE_NAMES,
         null,
     );
     defer graph.deinit();
@@ -3502,14 +3526,14 @@ test "attributes: stored in scope graph" {
         \\end
     ;
 
-    const prepend_result = try stdlib.prependStdlib(alloc, source);
-    const full_source = prepend_result.source;
+    const stdlib_source = try readStdlibSource(alloc);
+    const full_source = try std.mem.concat(alloc, u8, &.{ stdlib_source, source });
 
     var parser = @import("parser.zig").Parser.init(alloc, full_source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = @import("collector.zig").Collector.init(alloc, &parser.interner);
+    var collector = @import("collector.zig").Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 

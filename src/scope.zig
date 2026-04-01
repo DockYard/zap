@@ -1,5 +1,6 @@
 const std = @import("std");
 const ast = @import("ast.zig");
+const ctfe = @import("ctfe.zig");
 
 // ============================================================
 // IDs — typed wrappers for type safety
@@ -201,6 +202,7 @@ pub const Attribute = struct {
     name: ast.StringId,
     type_expr: ?*const ast.TypeExpr = null,
     value: ?*const ast.Expr = null,
+    computed_value: ?ctfe.ConstValue = null,
 };
 
 pub const ModuleEntry = struct {

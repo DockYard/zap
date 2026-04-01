@@ -6,8 +6,8 @@ defmodule MathModule.Builder do
           name: "math_module",
           version: "0.1.0",
           kind: :bin,
-          root: "MathModule.main/0",
-          paths: ["./*.zap"]
+          root: "MathModule.main/1",
+          paths: ["./*.zap"], deps: [{:zap_stdlib, {:path, "../../lib"}}]
         }
       _ ->
         panic("Unknown target: use 'math_module'")

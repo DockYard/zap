@@ -2697,18 +2697,18 @@ test "codegen simple function" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var type_store = types_mod.TypeStore.init(alloc, &parser.interner);
+    var type_store = types_mod.TypeStore.init(alloc, parser.interner);
     defer type_store.deinit();
 
-    var hir_builder = hir_mod.HirBuilder.init(alloc, &parser.interner, &collector.graph, &type_store);
+    var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, &type_store);
     defer hir_builder.deinit();
     const hir_program = try hir_builder.buildProgram(&program);
 
-    var ir_builder = ir.IrBuilder.init(alloc, &parser.interner);
+    var ir_builder = ir.IrBuilder.init(alloc, parser.interner);
     defer ir_builder.deinit();
     const ir_program = try ir_builder.buildProgram(&hir_program);
 
@@ -2740,18 +2740,18 @@ test "codegen produces valid structure" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var type_store = types_mod.TypeStore.init(alloc, &parser.interner);
+    var type_store = types_mod.TypeStore.init(alloc, parser.interner);
     defer type_store.deinit();
 
-    var hir_builder = hir_mod.HirBuilder.init(alloc, &parser.interner, &collector.graph, &type_store);
+    var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, &type_store);
     defer hir_builder.deinit();
     const hir_program = try hir_builder.buildProgram(&program);
 
-    var ir_builder = ir.IrBuilder.init(alloc, &parser.interner);
+    var ir_builder = ir.IrBuilder.init(alloc, parser.interner);
     defer ir_builder.deinit();
     const ir_program = try ir_builder.buildProgram(&hir_program);
 

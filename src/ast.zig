@@ -10,9 +10,10 @@ pub const SourceSpan = struct {
     end: u32,
     line: u32 = 0,
     col: u32 = 0,
+    source_id: ?u32 = null,
 
     pub fn from(loc: Token.Location) SourceSpan {
-        return .{ .start = loc.start, .end = loc.end, .line = loc.line, .col = loc.col };
+        return .{ .start = loc.start, .end = loc.end, .line = loc.line, .col = loc.col, .source_id = loc.source_id };
     }
 
     pub fn merge(a: SourceSpan, b: SourceSpan) SourceSpan {
@@ -21,6 +22,7 @@ pub const SourceSpan = struct {
             .end = @max(a.end, b.end),
             .line = a.line,
             .col = a.col,
+            .source_id = a.source_id,
         };
     }
 };

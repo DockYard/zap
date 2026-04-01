@@ -1,9 +1,21 @@
 defmodule Kernel do
-  def inspect(value) do
+  def inspect(value :: i64) :: i64 do
     :zig.inspect(value)
   end
 
-  defmacro if(condition, then_body) do
+  def inspect(value :: f64) :: f64 do
+    :zig.inspect(value)
+  end
+
+  def inspect(value :: String) :: String do
+    :zig.inspect(value)
+  end
+
+  def inspect(value :: Bool) :: Bool do
+    :zig.inspect(value)
+  end
+
+  defmacro if(condition :: Expr, then_body :: Expr) :: Nil do
     quote do
       case unquote(condition) do
         true ->
@@ -14,7 +26,7 @@ defmodule Kernel do
     end
   end
 
-  defmacro if(condition, then_body, else_body) do
+  defmacro if(condition :: Expr, then_body :: Expr, else_body :: Expr) :: Nil do
     quote do
       case unquote(condition) do
         true ->
@@ -25,7 +37,7 @@ defmodule Kernel do
     end
   end
 
-  defmacro unless(condition, body) do
+  defmacro unless(condition :: Expr, body :: Expr) :: Nil do
     quote do
       if not unquote(condition) do
         unquote(body)

@@ -7,7 +7,9 @@ defmodule Factorial do
     n * factorial(n - 1)
   end
 
-  def main() :: i64 do
+  def main(_args :: [String]) :: String do
     Factorial.factorial(10)
+    |> Integer.to_string()
+    |> IO.puts()
   end
 end

@@ -116,10 +116,16 @@ pub fn detectColor() bool {
 // ============================================================
 
 pub const DiagnosticEngine = struct {
+    pub const SourceFile = struct {
+        source: []const u8,
+        file_path: []const u8,
+    };
+
     allocator: std.mem.Allocator,
     diagnostics: std.ArrayList(Diagnostic),
     source: ?[]const u8,
     file_path: ?[]const u8,
+    sources: std.ArrayList(SourceFile),
     line_offset: u32,
     max_errors: u32,
     use_color: bool,
@@ -130,6 +136,7 @@ pub const DiagnosticEngine = struct {
             .diagnostics = .empty,
             .source = null,
             .file_path = null,
+            .sources = .empty,
             .line_offset = 0,
             .max_errors = 20,
             .use_color = false,
@@ -138,11 +145,26 @@ pub const DiagnosticEngine = struct {
 
     pub fn deinit(self: *DiagnosticEngine) void {
         self.diagnostics.deinit(self.allocator);
+        self.sources.deinit(self.allocator);
     }
 
     pub fn setSource(self: *DiagnosticEngine, source: []const u8, file_path: []const u8) void {
         self.source = source;
         self.file_path = file_path;
+        self.sources.clearRetainingCapacity();
+        self.sources.append(self.allocator, .{ .source = source, .file_path = file_path }) catch {};
+    }
+
+    pub fn setSources(self: *DiagnosticEngine, sources: []const SourceFile) void {
+        self.sources.clearRetainingCapacity();
+        self.sources.appendSlice(self.allocator, sources) catch {};
+        if (sources.len > 0) {
+            self.source = sources[0].source;
+            self.file_path = sources[0].file_path;
+        } else {
+            self.source = null;
+            self.file_path = null;
+        }
     }
 
     /// Set the number of lines prepended before user source (e.g. stdlib).
@@ -258,6 +280,22 @@ pub const DiagnosticEngine = struct {
         return line;
     }
 
+    fn displaySpanLine(self: *const DiagnosticEngine, span: ast.SourceSpan) u32 {
+        if (span.source_id != null) return span.line;
+        return self.displayLine(span.line);
+    }
+
+    fn sourceForSpan(self: *const DiagnosticEngine, span: ast.SourceSpan) ?SourceFile {
+        if (span.source_id) |source_id| {
+            if (source_id < self.sources.items.len) return self.sources.items[source_id];
+            return null;
+        }
+        if (self.source != null and self.file_path != null) {
+            return .{ .source = self.source.?, .file_path = self.file_path.? };
+        }
+        return null;
+    }
+
     // ============================================================
     // Formatting
     // ============================================================
@@ -297,21 +335,22 @@ pub const DiagnosticEngine = struct {
         diag: Diagnostic,
         color: Color,
     ) !void {
-        const display_line = self.displayLine(diag.span.line);
+        const display_line = self.displaySpanLine(diag.span);
+        const source_file = self.sourceForSpan(diag.span);
 
         // Compute gutter width from max line number in this diagnostic
         var max_line = display_line;
         for (diag.secondary_spans) |ss| {
-            max_line = @max(max_line, self.displayLine(ss.span.line));
+            max_line = @max(max_line, self.displaySpanLine(ss.span));
         }
         for (diag.notes) |note| {
             if (note.span) |s| {
-                max_line = @max(max_line, self.displayLine(s.line));
+                max_line = @max(max_line, self.displaySpanLine(s));
             }
         }
         const gutter = @max(digitCount(max_line), @as(u32, 1));
 
-        const has_source = self.source != null and diag.span.line > 0;
+        const has_source = source_file != null and diag.span.line > 0;
 
         // ── Header: severity[code]: message ──
         const sev = color.severityStyle(diag.severity);
@@ -329,7 +368,7 @@ pub const DiagnosticEngine = struct {
 
         // ── Source context ──
         if (has_source) {
-            if (getSourceLine(self.source.?, diag.span.line)) |line| {
+            if (getSourceLine(source_file.?.source, diag.span.line)) |line| {
                 // Empty gutter line
                 try writeGutterEmpty(writer, gutter, color);
 
@@ -338,7 +377,7 @@ pub const DiagnosticEngine = struct {
                     const prev_line_num = diag.span.line - 1;
                     const prev_display = self.displayLine(prev_line_num);
                     if (prev_display > 0) {
-                        if (getSourceLine(self.source.?, prev_line_num)) |prev_line| {
+                        if (getSourceLine(source_file.?.source, prev_line_num)) |prev_line| {
                             if (prev_line.len > 0) {
                                 try writeGutterLine(writer, gutter, prev_display, prev_line, color);
                             }
@@ -367,14 +406,14 @@ pub const DiagnosticEngine = struct {
 
                 // Secondary spans
                 for (diag.secondary_spans) |ss| {
-                    const ss_display = self.displayLine(ss.span.line);
+                    const ss_display = self.displaySpanLine(ss.span);
                     if (ss.span.line != diag.span.line) {
-                        if (getSourceLine(self.source.?, ss.span.line)) |ss_line| {
+                        if (getSourceLine(source_file.?.source, ss.span.line)) |ss_line| {
                             try writeGutterLine(writer, gutter, ss_display, ss_line, color);
                         }
                     }
                     if (ss.span.col > 0) {
-                        if (getSourceLine(self.source.?, ss.span.line)) |ss_line| {
+                        if (getSourceLine(source_file.?.source, ss.span.line)) |ss_line| {
                             const ss_col0 = ss.span.col - 1;
                             const ss_line_len: u32 = @intCast(ss_line.len);
                             const ss_raw_len: u32 = if (ss.span.end > ss.span.start)
@@ -450,7 +489,7 @@ pub const DiagnosticEngine = struct {
         }
 
         // ── Footer: └─ file:line:col ──
-        if (self.file_path != null or display_line > 0) {
+        if ((source_file != null and source_file.?.file_path.len > 0) or display_line > 0) {
             if (has_source) {
                 try writeGutterEmpty(writer, gutter, color);
             }
@@ -458,8 +497,8 @@ pub const DiagnosticEngine = struct {
             const loc = color.locationStyle();
             try writer.writeAll(loc.start);
             try writer.writeAll("\u{2514}\u{2500} ");
-            if (self.file_path) |fp| {
-                try writer.writeAll(fp);
+            if (source_file) |sf| {
+                try writer.writeAll(sf.file_path);
             }
             if (display_line > 0) {
                 try writer.print(":{d}:{d}", .{ display_line, diag.span.col });
@@ -789,4 +828,27 @@ test "secondary spans with tildes" {
     try std.testing.expect(std.mem.indexOf(u8, output, "^^^ not found in this scope") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "~~~~ did you mean `name`?") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "= help:") != null);
+}
+
+test "diagnostic engine selects source by span source_id" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var engine = DiagnosticEngine.init(alloc);
+    defer engine.deinit();
+    engine.setSources(&.{
+        .{ .source = "first\n", .file_path = "first.zap" },
+        .{ .source = "second\nthird\n", .file_path = "second.zap" },
+    });
+
+    try engine.reportDiagnostic(.{
+        .severity = .@"error",
+        .message = "boom",
+        .span = .{ .start = 0, .end = 5, .line = 2, .col = 1, .source_id = 1 },
+    });
+
+    const output = try engine.format(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, output, "second.zap:2:1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "third") != null);
 }

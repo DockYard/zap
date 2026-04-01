@@ -1,12 +1,22 @@
-# unless is now a Kernel macro — no need to define it yourself
+# Guard-based conditional dispatch
+#
+# Run with:
+#   zap run unless_macro
 
 defmodule UnlessMacro do
-  def check(x :: i64) :: String | nil do
-    unless(x > 10, "small number")
+  def check(x :: i64) :: String if x > 10 do
+    "big number"
   end
 
-  def main() :: String do
-    UnlessMacro.check(5)!
+  def check(_ :: i64) :: String do
+    "small number"
+  end
+
+  def main(_args :: [String]) :: String do
+    UnlessMacro.check(5)
+    |> IO.puts()
+
+    UnlessMacro.check(20)
     |> IO.puts()
   end
 end

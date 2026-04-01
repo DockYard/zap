@@ -6,8 +6,8 @@ defmodule Guards.Builder do
           name: "guards",
           version: "0.1.0",
           kind: :bin,
-          root: "Guards.main/0",
-          paths: ["./*.zap"]
+          root: "Guards.main/1",
+          paths: ["./*.zap"], deps: [{:zap_stdlib, {:path, "../../lib"}}]
         }
       _ ->
         panic("Unknown target: use 'guards'")

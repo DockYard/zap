@@ -14,6 +14,7 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 const scope = @import("scope.zig");
+const ctfe = @import("ctfe.zig");
 
 pub const SubstitutionError = struct {
     message: []const u8,
@@ -26,7 +27,7 @@ pub fn substituteAttributes(
     alloc: std.mem.Allocator,
     program: *const ast.Program,
     graph: *const scope.ScopeGraph,
-    interner: *const ast.StringInterner,
+    interner: *ast.StringInterner,
     errors: *std.ArrayListUnmanaged(SubstitutionError),
 ) !ast.Program {
     var new_modules: std.ArrayListUnmanaged(ast.ModuleDecl) = .empty;
@@ -102,9 +103,9 @@ fn substituteInFunction(
     func: *const ast.FunctionDecl,
     func_attrs: []const scope.Attribute,
     mod_attrs: []const scope.Attribute,
-    interner: *const ast.StringInterner,
+    interner: *ast.StringInterner,
     errors: *std.ArrayListUnmanaged(SubstitutionError),
-) !*const ast.FunctionDecl {
+) error{OutOfMemory}!*const ast.FunctionDecl {
     var new_clauses: std.ArrayListUnmanaged(ast.FunctionClause) = .empty;
     var changed = false;
 
@@ -147,9 +148,9 @@ fn substituteInExpr(
     expr: *const ast.Expr,
     func_attrs: []const scope.Attribute,
     mod_attrs: []const scope.Attribute,
-    interner: *const ast.StringInterner,
+    interner: *ast.StringInterner,
     errors: *std.ArrayListUnmanaged(SubstitutionError),
-) !*const ast.Expr {
+) error{OutOfMemory}!*const ast.Expr {
     switch (expr.*) {
         .attr_ref => |ref| {
             const attr_name = interner.get(ref.name);
@@ -159,12 +160,29 @@ fn substituteInExpr(
                 findAttribute(ref.name, mod_attrs);
 
             if (attr) |a| {
+                // Prefer CTFE-computed value over raw AST value
+                if (a.computed_value) |cv| {
+                    return ctfe.constValueToExpr(alloc, cv, interner) catch {
+                        // Fall back to AST value if reification fails
+                        if (a.value) |value| return value;
+                        try errors.append(alloc, .{
+                            .message = std.fmt.allocPrint(
+                                alloc,
+                                "@{s} computed value cannot be converted to an expression",
+                                .{attr_name},
+                            ) catch "computed value reification failed",
+                            .span = ref.meta.span,
+                        });
+                        return expr;
+                    };
+                }
                 if (a.value) |value| {
                     return value;
                 } else {
                     // Marker attribute — can't be used as an expression
                     try errors.append(alloc, .{
-                        .message = std.fmt.allocPrint(alloc,
+                        .message = std.fmt.allocPrint(
+                            alloc,
                             "@{s} is a marker attribute and has no value — it cannot be used in an expression",
                             .{attr_name},
                         ) catch "marker attribute used as expression",
@@ -174,7 +192,8 @@ fn substituteInExpr(
                 }
             } else {
                 try errors.append(alloc, .{
-                    .message = std.fmt.allocPrint(alloc,
+                    .message = std.fmt.allocPrint(
+                        alloc,
                         "undefined attribute @{s} — define it with @{s} :: Type = value in the module body",
                         .{ attr_name, attr_name },
                     ) catch "undefined attribute",
@@ -238,18 +257,229 @@ fn substituteInExpr(
             } };
             return new_pipe;
         },
+        .tuple => |t| {
+            var new_elems: std.ArrayListUnmanaged(*const ast.Expr) = .empty;
+            var changed = false;
+            for (t.elements) |elem| {
+                const new_elem = try substituteInExpr(alloc, elem, func_attrs, mod_attrs, interner, errors);
+                if (new_elem != elem) changed = true;
+                try new_elems.append(alloc, new_elem);
+            }
+            if (!changed) return expr;
+            const new_expr = try alloc.create(ast.Expr);
+            new_expr.* = .{ .tuple = .{ .meta = t.meta, .elements = try new_elems.toOwnedSlice(alloc) } };
+            return new_expr;
+        },
+        .list => |l| {
+            var new_elems: std.ArrayListUnmanaged(*const ast.Expr) = .empty;
+            var changed = false;
+            for (l.elements) |elem| {
+                const new_elem = try substituteInExpr(alloc, elem, func_attrs, mod_attrs, interner, errors);
+                if (new_elem != elem) changed = true;
+                try new_elems.append(alloc, new_elem);
+            }
+            if (!changed) return expr;
+            const new_expr = try alloc.create(ast.Expr);
+            new_expr.* = .{ .list = .{ .meta = l.meta, .elements = try new_elems.toOwnedSlice(alloc) } };
+            return new_expr;
+        },
+        .map => |m| {
+            var new_fields: std.ArrayListUnmanaged(ast.MapField) = .empty;
+            var changed = false;
+            for (m.fields) |field| {
+                const new_key = try substituteInExpr(alloc, field.key, func_attrs, mod_attrs, interner, errors);
+                const new_val = try substituteInExpr(alloc, field.value, func_attrs, mod_attrs, interner, errors);
+                if (new_key != field.key or new_val != field.value) changed = true;
+                try new_fields.append(alloc, .{ .key = new_key, .value = new_val });
+            }
+            if (!changed) return expr;
+            const new_expr = try alloc.create(ast.Expr);
+            new_expr.* = .{ .map = .{ .meta = m.meta, .fields = try new_fields.toOwnedSlice(alloc) } };
+            return new_expr;
+        },
+        .struct_expr => |s| {
+            var new_fields: std.ArrayListUnmanaged(ast.StructField) = .empty;
+            var changed = false;
+            for (s.fields) |field| {
+                const new_val = try substituteInExpr(alloc, field.value, func_attrs, mod_attrs, interner, errors);
+                if (new_val != field.value) changed = true;
+                try new_fields.append(alloc, .{ .name = field.name, .value = new_val });
+            }
+            const new_update = if (s.update_source) |us|
+                try substituteInExpr(alloc, us, func_attrs, mod_attrs, interner, errors)
+            else
+                null;
+            if (!changed and new_update == s.update_source) return expr;
+            const new_expr = try alloc.create(ast.Expr);
+            new_expr.* = .{ .struct_expr = .{ .meta = s.meta, .module_name = s.module_name, .update_source = new_update, .fields = try new_fields.toOwnedSlice(alloc) } };
+            return new_expr;
+        },
+        .field_access => |f| {
+            const new_obj = try substituteInExpr(alloc, f.object, func_attrs, mod_attrs, interner, errors);
+            if (new_obj == f.object) return expr;
+            const new_expr = try alloc.create(ast.Expr);
+            new_expr.* = .{ .field_access = .{ .meta = f.meta, .object = new_obj, .field = f.field } };
+            return new_expr;
+        },
+        .unwrap => |u| {
+            const new_inner = try substituteInExpr(alloc, u.expr, func_attrs, mod_attrs, interner, errors);
+            if (new_inner == u.expr) return expr;
+            const new_expr = try alloc.create(ast.Expr);
+            new_expr.* = .{ .unwrap = .{ .meta = u.meta, .expr = new_inner } };
+            return new_expr;
+        },
+        .type_annotated => |ta| {
+            const new_inner = try substituteInExpr(alloc, ta.expr, func_attrs, mod_attrs, interner, errors);
+            if (new_inner == ta.expr) return expr;
+            const new_expr = try alloc.create(ast.Expr);
+            new_expr.* = .{ .type_annotated = .{ .meta = ta.meta, .expr = new_inner, .type_expr = ta.type_expr } };
+            return new_expr;
+        },
+        .if_expr => |ie| {
+            const new_cond = try substituteInExpr(alloc, ie.condition, func_attrs, mod_attrs, interner, errors);
+            const new_then = try substituteInStmts(alloc, ie.then_block, func_attrs, mod_attrs, interner, errors);
+            const new_else = if (ie.else_block) |eb|
+                try substituteInStmts(alloc, eb, func_attrs, mod_attrs, interner, errors)
+            else
+                null;
+            if (new_cond == ie.condition and stmtsUnchanged(ie.then_block, new_then) and elseUnchanged(ie.else_block, new_else)) return expr;
+            const new_expr = try alloc.create(ast.Expr);
+            new_expr.* = .{ .if_expr = .{ .meta = ie.meta, .condition = new_cond, .then_block = new_then, .else_block = new_else } };
+            return new_expr;
+        },
+        .case_expr => |ce| {
+            const new_scrutinee = try substituteInExpr(alloc, ce.scrutinee, func_attrs, mod_attrs, interner, errors);
+            var new_clauses: std.ArrayListUnmanaged(ast.CaseClause) = .empty;
+            var changed = new_scrutinee != ce.scrutinee;
+            for (ce.clauses) |clause| {
+                const new_guard = if (clause.guard) |g|
+                    try substituteInExpr(alloc, g, func_attrs, mod_attrs, interner, errors)
+                else
+                    null;
+                const new_body = try substituteInStmts(alloc, clause.body, func_attrs, mod_attrs, interner, errors);
+                if (new_guard != clause.guard or !stmtsUnchanged(clause.body, new_body)) changed = true;
+                var new_clause = clause;
+                new_clause.guard = new_guard;
+                new_clause.body = new_body;
+                try new_clauses.append(alloc, new_clause);
+            }
+            if (!changed) return expr;
+            const new_expr = try alloc.create(ast.Expr);
+            new_expr.* = .{ .case_expr = .{ .meta = ce.meta, .scrutinee = new_scrutinee, .clauses = try new_clauses.toOwnedSlice(alloc) } };
+            return new_expr;
+        },
+        .cond_expr => |ce| {
+            var new_clauses: std.ArrayListUnmanaged(ast.CondClause) = .empty;
+            var changed = false;
+            for (ce.clauses) |clause| {
+                const new_cond = try substituteInExpr(alloc, clause.condition, func_attrs, mod_attrs, interner, errors);
+                const new_body = try substituteInStmts(alloc, clause.body, func_attrs, mod_attrs, interner, errors);
+                if (new_cond != clause.condition or !stmtsUnchanged(clause.body, new_body)) changed = true;
+                try new_clauses.append(alloc, .{ .meta = clause.meta, .condition = new_cond, .body = new_body });
+            }
+            if (!changed) return expr;
+            const new_expr = try alloc.create(ast.Expr);
+            new_expr.* = .{ .cond_expr = .{ .meta = ce.meta, .clauses = try new_clauses.toOwnedSlice(alloc) } };
+            return new_expr;
+        },
+        .block => |b| {
+            const new_stmts = try substituteInStmts(alloc, b.stmts, func_attrs, mod_attrs, interner, errors);
+            if (stmtsUnchanged(b.stmts, new_stmts)) return expr;
+            const new_expr = try alloc.create(ast.Expr);
+            new_expr.* = .{ .block = .{ .meta = b.meta, .stmts = new_stmts } };
+            return new_expr;
+        },
+        .with_expr => |w| {
+            var new_items: std.ArrayListUnmanaged(ast.WithItem) = .empty;
+            var changed = false;
+            for (w.items) |item| {
+                switch (item) {
+                    .expr => |e| {
+                        const new_e = try substituteInExpr(alloc, e, func_attrs, mod_attrs, interner, errors);
+                        if (new_e != e) changed = true;
+                        try new_items.append(alloc, .{ .expr = new_e });
+                    },
+                    .bind => |b| {
+                        const new_src = try substituteInExpr(alloc, b.source, func_attrs, mod_attrs, interner, errors);
+                        if (new_src != b.source) changed = true;
+                        try new_items.append(alloc, .{ .bind = .{ .meta = b.meta, .pattern = b.pattern, .source = new_src } });
+                    },
+                }
+            }
+            const new_body = try substituteInStmts(alloc, w.body, func_attrs, mod_attrs, interner, errors);
+            if (!stmtsUnchanged(w.body, new_body)) changed = true;
+            // else_clauses contain patterns + bodies
+            var new_else_clauses: ?[]const ast.WithElseClause = w.else_clauses;
+            if (w.else_clauses) |ecs| {
+                var new_ecs: std.ArrayListUnmanaged(ast.WithElseClause) = .empty;
+                for (ecs) |ec| {
+                    const new_ec_guard = if (ec.guard) |g|
+                        try substituteInExpr(alloc, g, func_attrs, mod_attrs, interner, errors)
+                    else
+                        null;
+                    const new_ec_body = try substituteInStmts(alloc, ec.body, func_attrs, mod_attrs, interner, errors);
+                    if (new_ec_guard != ec.guard or !stmtsUnchanged(ec.body, new_ec_body)) changed = true;
+                    try new_ecs.append(alloc, .{ .meta = ec.meta, .pattern = ec.pattern, .type_annotation = ec.type_annotation, .guard = new_ec_guard, .body = new_ec_body });
+                }
+                if (changed) new_else_clauses = try new_ecs.toOwnedSlice(alloc);
+            }
+            if (!changed) return expr;
+            const new_expr = try alloc.create(ast.Expr);
+            new_expr.* = .{ .with_expr = .{ .meta = w.meta, .items = try new_items.toOwnedSlice(alloc), .body = new_body, .else_clauses = new_else_clauses } };
+            return new_expr;
+        },
         // Leaf expressions — no substitution needed
-        .int_literal, .float_literal, .string_literal, .string_interpolation,
-        .atom_literal, .bool_literal, .nil_literal, .var_ref, .module_ref,
-        .intrinsic, .binary_literal, .function_ref, .type_annotated,
-        .quote_expr, .unquote_expr, .panic_expr,
+        .int_literal,
+        .float_literal,
+        .string_literal,
+        .string_interpolation,
+        .atom_literal,
+        .bool_literal,
+        .nil_literal,
+        .var_ref,
+        .module_ref,
+        .intrinsic,
+        .binary_literal,
+        .function_ref,
+        .quote_expr,
+        .unquote_expr,
+        .panic_expr,
         => return expr,
-        // Compound expressions we don't recurse into for now
-        // (if_expr, case_expr, with_expr, cond_expr, block, tuple, list, map,
-        //  struct_expr, field_access, unwrap — these can contain attr_ref too,
-        //  but covering call, binary_op, pipe, unary_op handles the common cases)
-        else => return expr,
     }
+}
+
+fn substituteInStmts(
+    alloc: std.mem.Allocator,
+    stmts: []const ast.Stmt,
+    func_attrs: []const scope.Attribute,
+    mod_attrs: []const scope.Attribute,
+    interner: *ast.StringInterner,
+    errors: *std.ArrayListUnmanaged(SubstitutionError),
+) error{OutOfMemory}![]const ast.Stmt {
+    var new_stmts: std.ArrayListUnmanaged(ast.Stmt) = .empty;
+    var changed = false;
+    for (stmts) |stmt| {
+        switch (stmt) {
+            .expr => |e| {
+                const new_e = try substituteInExpr(alloc, e, func_attrs, mod_attrs, interner, errors);
+                if (new_e != e) changed = true;
+                try new_stmts.append(alloc, .{ .expr = new_e });
+            },
+            else => try new_stmts.append(alloc, stmt),
+        }
+    }
+    if (!changed) return stmts;
+    return new_stmts.toOwnedSlice(alloc);
+}
+
+fn stmtsUnchanged(old: []const ast.Stmt, new: []const ast.Stmt) bool {
+    return old.ptr == new.ptr;
+}
+
+fn elseUnchanged(old: ?[]const ast.Stmt, new: ?[]const ast.Stmt) bool {
+    if (old == null and new == null) return true;
+    if (old == null or new == null) return false;
+    return old.?.ptr == new.?.ptr;
 }
 
 fn findAttribute(name: ast.StringId, attrs: []const scope.Attribute) ?scope.Attribute {

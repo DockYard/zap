@@ -7,9 +7,11 @@ defmodule Pipes do
     x + 1
   end
 
-  def main() :: i64 do
+  def main(_args :: [String]) :: String do
     5
     |> Pipes.double()
     |> Pipes.add_one()
+    |> Integer.to_string()
+    |> IO.puts()
   end
 end

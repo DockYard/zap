@@ -10,4 +10,8 @@ defmodule System do
   def get_env(name :: String) :: String do
     :zig.get_env(name)
   end
+
+  def get_build_opt(name :: String) :: String do
+    :zig.get_build_opt(name)
+  end
 end

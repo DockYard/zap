@@ -11,7 +11,7 @@ defmodule Guards do
     "zero"
   end
 
-  def main() :: String do
+  def main(_args :: [String]) :: String do
     Guards.classify(-4)
     |> IO.puts()
 

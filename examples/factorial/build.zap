@@ -6,8 +6,8 @@ defmodule Factorial.Builder do
           name: "factorial",
           version: "0.1.0",
           kind: :bin,
-          root: "Factorial.main/0",
-          paths: ["./*.zap"]
+          root: "Factorial.main/1",
+          paths: ["./*.zap"], deps: [{:zap_stdlib, {:path, "../../lib"}}]
         }
       _ ->
         panic("Unknown target: use 'factorial'")

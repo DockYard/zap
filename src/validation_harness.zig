@@ -9,7 +9,6 @@ const ir = @import("ir.zig");
 const CodeGen = @import("codegen.zig").CodeGen;
 const DiagnosticEngine = @import("diagnostics.zig").DiagnosticEngine;
 const analysis_pipeline = @import("analysis_pipeline.zig");
-pub const stdlib = @import("stdlib.zig");
 
 pub const CompileResult = struct {
     output: []const u8,
@@ -40,6 +39,33 @@ pub const AnalysisSnapshot = struct {
     }
 };
 
+/// Read all .zap files from a directory and concatenate their sources.
+fn readDirZapFiles(alloc: std.mem.Allocator, dir_path: []const u8) ![]const u8 {
+    var result: std.ArrayListUnmanaged(u8) = .empty;
+    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return try result.toOwnedSlice(alloc);
+    defer dir.close();
+    var iter = dir.iterate();
+    while (iter.next() catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".zap")) continue;
+        const file_path = try std.fs.path.join(alloc, &.{ dir_path, entry.name });
+        const content = std.fs.cwd().readFileAlloc(alloc, file_path, 10 * 1024 * 1024) catch continue;
+        try result.appendSlice(alloc, content);
+        try result.append(alloc, '\n');
+    }
+    return try result.toOwnedSlice(alloc);
+}
+
+/// Read stdlib source from lib/ and lib/zap/ directories.
+fn readStdlibSource(alloc: std.mem.Allocator) ![]const u8 {
+    var combined: std.ArrayListUnmanaged(u8) = .empty;
+    const lib_source = try readDirZapFiles(alloc, "lib");
+    try combined.appendSlice(alloc, lib_source);
+    const zap_source = try readDirZapFiles(alloc, "lib/zap");
+    try combined.appendSlice(alloc, zap_source);
+    return try combined.toOwnedSlice(alloc);
+}
+
 pub fn compile(alloc: std.mem.Allocator, source: []const u8) ![]const u8 {
     const result = try compileWithDiagnostics(alloc, source, false);
     defer alloc.free(result.diag_output);
@@ -47,13 +73,12 @@ pub fn compile(alloc: std.mem.Allocator, source: []const u8) ![]const u8 {
 }
 
 pub fn compileWithDiagnostics(alloc: std.mem.Allocator, source: []const u8, strict_types: bool) !CompileResult {
-    const prepend_result = try stdlib.prependStdlib(alloc, source);
-    const full_source = prepend_result.source;
+    const stdlib_source = try readStdlibSource(alloc);
+    const full_source = try std.mem.concat(alloc, u8, &.{ stdlib_source, source });
 
     var diag_engine = DiagnosticEngine.init(alloc);
     defer diag_engine.deinit();
     diag_engine.setSource(full_source, "validation.zap");
-    diag_engine.setLineOffset(prepend_result.stdlib_line_count);
 
     var parser = Parser.init(alloc, full_source);
     defer parser.deinit();
@@ -83,7 +108,7 @@ pub fn compileWithDiagnostics(alloc: std.mem.Allocator, source: []const u8, stri
         return error.ParseError;
     }
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
     for (collector.errors.items) |collect_err| {
@@ -91,7 +116,7 @@ pub fn compileWithDiagnostics(alloc: std.mem.Allocator, source: []const u8, stri
     }
     if (diag_engine.hasErrors()) return error.CollectError;
 
-    var macro_engine = MacroEngine.init(alloc, &parser.interner, &collector.graph);
+    var macro_engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
     defer macro_engine.deinit();
     const expanded_program = try macro_engine.expandProgram(&program);
     for (macro_engine.errors.items) |macro_err| {
@@ -99,18 +124,17 @@ pub fn compileWithDiagnostics(alloc: std.mem.Allocator, source: []const u8, stri
     }
     if (diag_engine.hasErrors()) return error.MacroError;
 
-    var desugarer = Desugarer.init(alloc, &parser.interner);
+    var desugarer = Desugarer.init(alloc, parser.interner);
     const desugared_program = try desugarer.desugarProgram(&expanded_program);
 
-    var type_checker = types_mod.TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    var type_checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer type_checker.deinit();
-    type_checker.stdlib_line_count = prepend_result.stdlib_line_count;
     type_checker.checkProgram(&desugared_program) catch {};
     type_checker.checkUnusedBindings() catch {};
 
     const type_severity: @import("diagnostics.zig").Severity = if (strict_types) .@"error" else .warning;
 
-    var hir_builder = hir_mod.HirBuilder.init(alloc, &parser.interner, &collector.graph, &type_checker.store);
+    var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, &type_checker.store);
     defer hir_builder.deinit();
     const hir_program = try hir_builder.buildProgram(&desugared_program);
     for (hir_builder.errors.items) |hir_err| {
@@ -118,7 +142,7 @@ pub fn compileWithDiagnostics(alloc: std.mem.Allocator, source: []const u8, stri
     }
     if (diag_engine.hasErrors()) return error.HirError;
 
-    var ir_builder = ir.IrBuilder.init(alloc, &parser.interner);
+    var ir_builder = ir.IrBuilder.init(alloc, parser.interner);
     ir_builder.type_store = &type_checker.store;
     defer ir_builder.deinit();
     const ir_program = try ir_builder.buildProgram(&hir_program);
@@ -157,35 +181,34 @@ pub fn compileWithDiagnostics(alloc: std.mem.Allocator, source: []const u8, stri
 }
 
 pub fn analyzeSource(alloc: std.mem.Allocator, source: []const u8) !AnalysisSummary {
-    const prepend_result = try stdlib.prependStdlib(alloc, source);
-    const full_source = prepend_result.source;
+    const stdlib_source = try readStdlibSource(alloc);
+    const full_source = try std.mem.concat(alloc, u8, &.{ stdlib_source, source });
 
     var parser = Parser.init(alloc, full_source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var macro_engine = MacroEngine.init(alloc, &parser.interner, &collector.graph);
+    var macro_engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
     defer macro_engine.deinit();
     const expanded_program = try macro_engine.expandProgram(&program);
 
-    var desugarer = Desugarer.init(alloc, &parser.interner);
+    var desugarer = Desugarer.init(alloc, parser.interner);
     const desugared_program = try desugarer.desugarProgram(&expanded_program);
 
-    var type_checker = types_mod.TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    var type_checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer type_checker.deinit();
-    type_checker.stdlib_line_count = prepend_result.stdlib_line_count;
     try type_checker.checkProgram(&desugared_program);
     try type_checker.checkUnusedBindings();
 
-    var hir_builder = hir_mod.HirBuilder.init(alloc, &parser.interner, &collector.graph, &type_checker.store);
+    var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, &type_checker.store);
     defer hir_builder.deinit();
     const hir_program = try hir_builder.buildProgram(&desugared_program);
 
-    var ir_builder = ir.IrBuilder.init(alloc, &parser.interner);
+    var ir_builder = ir.IrBuilder.init(alloc, parser.interner);
     ir_builder.type_store = &type_checker.store;
     defer ir_builder.deinit();
     const ir_program = try ir_builder.buildProgram(&hir_program);

@@ -254,6 +254,28 @@ pub fn build(b: *std.Build) void {
     }
 
     // -----------------------------------------------------------------------
+    // Examples step: build all examples/*/
+    // -----------------------------------------------------------------------
+    const examples_step = b.step("examples", "Build all examples");
+    examples_step.dependOn(b.getInstallStep());
+
+    if (std.fs.cwd().openDir("examples", .{ .iterate = true })) |dir_| {
+        var dir = dir_;
+        defer dir.close();
+        var it = dir.iterate();
+        while (it.next() catch null) |entry| {
+            if (entry.kind != .directory) continue;
+            // Each example dir has a build.zap with a target matching the dir name
+            const example_run = b.addRunArtifact(exe);
+            example_run.addArgs(&.{ "build", entry.name });
+            example_run.setCwd(.{ .cwd_relative = b.fmt("examples/{s}", .{entry.name}) });
+            examples_step.dependOn(&example_run.step);
+        }
+    } else |_| {
+        // examples/ directory not found — skip
+    }
+
+    // -----------------------------------------------------------------------
     // ZIR integration tests (need the built binary)
     // -----------------------------------------------------------------------
     const zir_tests = b.addTest(.{

@@ -1,575 +1,529 @@
 # IR Interpreter Plan
 
-> Execute compiled functions at compile time. Modules compile in dependency
-> order. Each module's functions are callable by later modules during their
-> compilation step.
-
-## Architecture
-
-### How it fits in the compilation pipeline
-
-```
-Pass 1: Discovery + Collection (all files)
-  Discover files from entry point
-  Parse each file
-  Collect all declarations into shared scope graph + type store
-
-Pass 2: Compile each module in dependency order
-  For each module (topological order):
-    a. Evaluate attribute expressions
-       - Literal values: store directly
-       - Computed values: call IR interpreter to execute the expression
-       - The interpreter can call functions from already-compiled modules
-    b. Substitute attribute values into function bodies
-    c. Macro expand → Desugar → Type check → HIR → IR
-    d. Register this module's compiled IR with the interpreter
-       (now available for later modules' compile-time calls)
-
-Pass 3: Merge + backend
-  Merge all per-module IR programs
-  Run analysis pipeline
-  ZIR backend → native binary
-```
-
-The key step is **2d**: after a module compiles, its IR is registered with
-the interpreter. When the next module's attribute expressions call functions
-from the just-compiled module, the interpreter executes them.
-
-### The interpreter
-
-The interpreter is a Zig module (`src/ir_interpreter.zig`) that:
-
-- Accepts an `ir.Program` (or individual `ir.Function`s) to register
-- Executes a function by name, given argument values
-- Returns a compile-time `Value` (integer, float, string, atom, bool, nil,
-  list, tuple, map, struct)
-- Walks IR instructions sequentially within basic blocks
-- Maintains a call stack of frames, each with a local value array
-- Has a configurable step counter to abort infinite loops
-
-### Value representation
-
-The interpreter operates on a tagged union of compile-time values:
-
-```zig
-pub const Value = union(enum) {
-    int: i64,
-    float: f64,
-    string: []const u8,
-    atom: []const u8,
-    bool_val: bool,
-    nil_val: void,
-    list: []const Value,
-    tuple: []const Value,
-    map: []const MapEntry,
-    struct_val: StructValue,
-};
-
-pub const MapEntry = struct {
-    key: Value,
-    value: Value,
-};
-
-pub const StructValue = struct {
-    name: []const u8,
-    fields: []const StructFieldValue,
-};
-
-pub const StructFieldValue = struct {
-    name: []const u8,
-    value: Value,
-};
-```
-
-All values are arena-allocated per compile-time evaluation. No garbage
-collection needed — the arena is freed after each module's compilation step.
-
-### Stack frames
-
-```zig
-pub const Frame = struct {
-    function: *const ir.Function,
-    locals: []Value,           // indexed by LocalId
-    prev_block: ?ir.LabelId,  // for phi resolution
-    return_dest: ?ir.LocalId, // where to store the return value in caller
-};
-```
-
-The interpreter maintains a stack of frames (`ArrayList(Frame)`). On
-`call_direct`, push a new frame. On `ret`, pop and write the return value
-to the caller's `return_dest` local.
-
----
-
-## Phases
-
-### Phase A: Interpreter skeleton + constants + arithmetic
-
-**Goal:** Evaluate simple constant expressions like `@timeout :: i64 = 5000 * 2`.
-
-**New file: `src/ir_interpreter.zig`**
-
-Create the interpreter with:
-- `Value` tagged union (all variants)
-- `Frame` struct
-- `Interpreter` struct with:
-  - `registered_functions: StringHashMap(*const ir.Function)` — functions
-    available for compile-time calls
-  - `call_stack: ArrayList(Frame)`
-  - `step_count: u64` and `step_limit: u64`
-  - `allocator: Allocator` (arena)
-
-**Instruction support:**
-- `const_int` → `Value{ .int = value }`
-- `const_float` → `Value{ .float = value }`
-- `const_string` → `Value{ .string = value }`
-- `const_bool` → `Value{ .bool_val = value }`
-- `const_atom` → `Value{ .atom = value }`
-- `const_nil` → `Value{ .nil_val = {} }`
-- `local_set` → write value to `locals[dest]`
-- `local_get` → read from `locals[src]`
-- `ret` → return value from current frame
-
-**Binary operations** (on int and float values):
-- `add`, `sub`, `mul`, `div` → arithmetic on `Value.int` or `Value.float`
-- `eq`, `neq`, `lt`, `gt`, `lte`, `gte` → comparison, return `Value.bool_val`
-- `concat` → string concatenation, return `Value.string`
-
-**Unary operations:**
-- `negate` → negate int or float
-- `not_op` → boolean not
-
-**Public API:**
-```zig
-pub fn init(alloc: Allocator) Interpreter
-pub fn registerFunction(self: *Interpreter, name: []const u8, func: *const ir.Function) !void
-pub fn call(self: *Interpreter, name: []const u8, args: []const Value) !Value
-pub fn evalExpr(self: *Interpreter, func: *const ir.Function) !Value  // for no-arg functions
-```
-
-**Tests:**
-- Evaluate `const_int 42` → returns `Value{ .int = 42 }`
-- Evaluate `5 + 3` (const_int 5, const_int 3, add) → returns `Value{ .int = 8 }`
-- Evaluate `"hello" <> " world"` → returns `Value{ .string = "hello world" }`
-- Evaluate `10 * 2 + 1` → returns `Value{ .int = 21 }`
-- Step limit exceeded → returns error
-
-**Estimated size:** ~500 lines
-
----
-
-### Phase B: Function calls
-
-**Goal:** Evaluate `@value :: i64 = MathLib.compute()` where `compute` is
-a function in an already-compiled module.
-
-**New instruction support:**
-- `call_direct` → look up function by name in `registered_functions`, push
-  new frame, map arguments to params, execute
-- `call_named` → same but with module-qualified name
-  (`Module__function` mangling)
-- `param_get` → read from `locals[param_index]` (params are the first N locals)
-
-**Frame management:**
-- On `call_direct(dest, callee_name, args)`:
-  1. Evaluate each argument expression to get `Value`s
-  2. Look up `callee_name` in `registered_functions`
-  3. Create new `Frame` with `locals` sized to the callee's local count
-  4. Copy argument values into `locals[0..args.len]`
-  5. Push frame onto call stack
-  6. Execute callee's body
-  7. Pop frame, write return value to caller's `locals[dest]`
-
-- On `ret(value)`:
-  1. Read the return value from `locals[value]`
-  2. Pop current frame
-  3. Write return value to caller frame's `locals[return_dest]`
-  4. Resume execution in caller
-
-**Recursion:** Supported naturally through the call stack. The step counter
-prevents infinite recursion.
-
-**Tests:**
-- Call a zero-arg function that returns a constant
-- Call a function with arguments: `add(3, 4)` → 7
-- Call a function that calls another function (transitive)
-- Recursive function: `factorial(5)` → 120
-- Step limit on infinite recursion → error
-
-**Estimated size:** ~400 lines
-
----
-
-### Phase C: Control flow
-
-**Goal:** Execute functions with if/else, case, and pattern matching.
-
-**New instruction support:**
-- `branch` → evaluate condition, jump to then or else block
-- `jump` → unconditional jump to a label
-- `phi` → select value based on previous block
-  (iterate PhiSources, find the one whose `from_block` matches `prev_block`)
-- `switch_return` / `union_switch_return` → multi-way branch on value
-
-**Block execution:**
-- The interpreter processes blocks sequentially by label
-- `branch(cond, then_label, else_label)`:
-  1. Read `cond` from locals
-  2. If true: set `current_block = then_label`, set `prev_block`
-  3. If false: set `current_block = else_label`, set `prev_block`
-- Blocks are found by scanning `function.body` for matching `label`
-
-**Tests:**
-- If/else: function returns different values based on condition
-- Pattern matching via switch_return
-- Phi nodes: value depends on which branch was taken
-- Nested control flow
-
-**Estimated size:** ~400 lines
-
----
-
-### Phase D: Data structures
-
-**Goal:** Create and manipulate lists, tuples, maps, and structs at
-compile time.
-
-**New instruction support:**
-- `tuple_init` → collect element values into `Value{ .tuple = ... }`
-- `list_init` → collect element values into `Value{ .list = ... }`
-- `map_init` → collect key-value pairs into `Value{ .map = ... }`
-- `struct_init` → collect field values into `Value{ .struct_val = ... }`
-- `field_get` → extract field from struct or tuple by name/index
-- `field_set` → create new struct/map with updated field
-- `enum_literal` → `Value{ .atom = variant_name }`
-
-**Value operations:**
-- List indexing: `List.at(list, index)` → extract element
-- Map lookup: `Map.get(map, key)` → extract value
-- String operations: length, slice, concatenation
-
-**Tests:**
-- Create a tuple `{1, "hello"}` and extract elements
-- Create a list `[1, 2, 3]` and index into it
-- Create a map `%{key: "value"}` and look up a key
-- Create a struct and read a field
-- Nested data structures
-
-**Estimated size:** ~500 lines
-
----
-
-### Phase E: I/O intrinsics
-
-**Goal:** Enable compile-time file reads and environment variable access.
-
-**Special-cased function calls:**
-When the interpreter encounters a call to certain known functions, it
-executes Zig code directly instead of interpreting IR:
-
-- `File.read(path)` → `std.fs.cwd().readFileAlloc(alloc, path, max_size)`
-  Returns `Value{ .string = contents }`
-- `File.exists(path)` → `std.fs.cwd().access(path, .{})`
-  Returns `Value{ .bool_val = true/false }`
-- `System.get_env(name)` → `std.posix.getenv(name)`
-  Returns `Value{ .string = value }` or `Value{ .nil_val = {} }`
-
-**Resource tracking:**
-The interpreter records which external resources were accessed during
-compile-time evaluation:
-- File paths read
-- Environment variables accessed
-
-This list is stored per-module and used for incremental recompilation: if
-a tracked resource changes, the module must be recompiled.
-
-```zig
-pub const AccessedResource = union(enum) {
-    file: []const u8,       // file path that was read
-    env_var: []const u8,    // environment variable that was accessed
-};
-
-// On the Interpreter:
-accessed_resources: ArrayList(AccessedResource),
-```
-
-**Tests:**
-- Read a file at compile time, verify contents
-- Read a nonexistent file → compile error
-- Access environment variable
-- Resource tracking records accessed files
-
-**Estimated size:** ~200 lines
-
----
-
-### Phase F: Wire into compilation pipeline
-
-**Goal:** Connect the interpreter to the actual compilation pipeline so
-modules compile in dependency order with compile-time execution.
-
-**Changes to `src/compiler.zig`:**
-
-Modify the per-file compilation pipeline (`compileFiles` / `compilePerFile`):
-
-1. After pass 1 (collection), create an `Interpreter` instance
-2. Determine compilation order (topological sort from FileGraph)
-3. For each module in order:
-   a. Evaluate attribute value expressions:
-      - Literal values: convert directly to compile-time `Value`
-      - Function calls: execute via the interpreter
-      - Validate result against declared type
-      - Store result for substitution
-   b. Run attribute substitution (replace `@name` with values)
-   c. Compile the module through macro expand → desugar → typecheck → HIR → IR
-   d. Register the module's compiled IR functions with the interpreter
-
-**Changes to `src/main.zig`:**
-
-Thread the interpreter through the build pipeline. The interpreter persists
-across module compilations within a single build.
-
-**Changes to attribute substitution (`src/attr_substitute.zig`):**
-
-Currently substitution only handles attributes with literal values (the
-value is already an AST Expr node). With the interpreter, computed attribute
-values are `Value`s that need to be converted to AST Expr nodes for
-substitution:
-
-```zig
-fn valueToExpr(alloc: Allocator, value: Value) !*const ast.Expr {
-    return switch (value) {
-        .int => |v| create int_literal with v,
-        .float => |v| create float_literal with v,
-        .string => |v| create string_literal with v,
-        .bool_val => |v| create bool_literal with v,
-        .atom => |v| create atom_literal with v,
-        .nil_val => create nil_literal,
-        .list => |items| create list with recursive valueToExpr on items,
-        .tuple => |items| create tuple with recursive valueToExpr on items,
-        .map => |entries| create map with recursive valueToExpr on entries,
-        .struct_val => |sv| create struct_expr with recursive valueToExpr on fields,
-    };
-}
-```
-
-**Tests:**
-- Module A defines `compute() :: i64`, Module B uses
-  `@value :: i64 = A.compute()` — verify B's attribute has the computed value
-- Module A defines `generate_list() :: List(i64)`, Module B uses
-  `@data :: List(i64) = A.generate_list()` — verify list substitution
-- Module with no computed attributes compiles normally (no interpreter overhead)
-- Compilation order respects dependencies
-
-**Estimated size:** ~400 lines of pipeline changes
-
----
-
-### Phase G: @debug erasure
-
-**Goal:** Skip `@debug` function calls in release builds.
-
-**Changes to `src/compiler.zig` / `src/hir.zig`:**
-
-1. Add `optimize: Optimize` to `CompileOptions` and thread through to the
-   HIR builder
-
-2. In the HIR builder's call expression handling (`buildExpr` for `.call`),
-   when resolving a module-qualified call:
-   a. Look up the function family in the scope graph
-   b. Check if it has a `@debug` attribute
-   c. If yes AND optimize != debug:
-      - Don't emit the call
-      - Emit just the first argument as the result
-      - The pass-through semantics (`T -> T`) guarantee correctness
-
-3. The type checker already validates `@debug` functions have arity 1 and
-   a return type. This phase adds the actual erasure.
-
-**Changes to interprocedural analysis (`src/interprocedural.zig`):**
-
-When propagating effects through the call graph, skip calls to functions
-that have the `@debug` attribute. This means `@debug` functions don't make
-their callers appear effectful.
-
-The interprocedural analyzer needs access to function attributes. Thread
-the scope graph through to the analyzer, or pre-compute a set of debug
-function names.
-
-**Tests:**
-- In debug mode: `@debug` function call is emitted normally
-- In release mode: `@debug` function call is skipped, argument passes through
-- Effect analysis: calling a `@debug` function doesn't add effects to the caller
-- Pipeline integration: `Kernel.inspect` with `@debug` works end-to-end
-
-**Estimated size:** ~200 lines
-
----
-
-### Phase H: Module intrinsics
-
-**Goal:** Implement `Module.functions`, `Module.get_attribute`, etc. as
-functions the IR interpreter handles specially.
-
-**Approach:** `Module` is a stdlib module at `lib/module.zap` with bodyless
-function declarations (signatures only). The IR interpreter recognizes calls
-to `Module.*` and provides implementations by reading the scope graph.
-
-**`lib/module.zap`:**
-```zap
-defmodule Module do
-  @moduledoc :: String = "Compile-time module introspection."
-
-  def name(module :: Atom) :: Atom
-  def functions(module :: Atom) :: List({Atom, i64})
-  def macros(module :: Atom) :: List({Atom, i64})
-  def types(module :: Atom) :: List(Atom)
-  def file(module :: Atom) :: String
-  def is_private(module :: Atom) :: Bool
-  def has_function(module :: Atom, name :: Atom, arity :: i64) :: Bool
-  def get_attribute(module :: Atom, attr :: Atom) :: any
-  def get_attribute(module :: Atom, attr :: Atom, function :: Atom, arity :: i64) :: any
-  def has_attribute(module :: Atom, attr :: Atom) :: Bool
-  def attributes(module :: Atom) :: List({Atom, any})
-  def function_attributes(module :: Atom, function :: Atom, arity :: i64) :: List({Atom, any})
-end
-```
-
-**Parser changes:** Support bodyless function declarations — `def name(params) :: Type`
-without a `do ... end` block. These are valid only in modules whose functions
-are interpreter-provided.
-
-**Interpreter changes:**
-
-In the `call` method, before looking up the function in `registered_functions`,
-check if the call is to `Module.*`. If so, dispatch to a Zig function that
-reads the scope graph:
-
-```zig
-if (std.mem.startsWith(u8, callee_name, "Module__")) {
-    return self.handleModuleIntrinsic(callee_name, args);
-}
-```
-
-`handleModuleIntrinsic` implementations:
-- `Module__name(atom)` → return the atom itself
-- `Module__functions(atom)` → find the module in scope graph, iterate
-  function families, build `List({Atom, i64})`
-- `Module__get_attribute(atom, attr_name)` → find module entry, look up
-  attribute by name, return its value
-- Etc.
-
-**`__MODULE__` support:**
-
-`__MODULE__` is a special form in the parser that expands to the current
-module's atom literal during parsing. No interpreter involvement needed.
-
-**Tests:**
-- `Module.name(:Config)` → `:Config`
-- `Module.functions(:Config)` → `[{:load, 1}, {:load_from_env, 0}]`
-- `Module.get_attribute(:Config, :moduledoc)` → `"Configuration module."`
-- `Module.has_function(:Config, :load, 1)` → `true`
-- `Module.is_private(:InternalMod)` → `true` (for defmodulep)
-- Calling `Module.*` outside compile-time context → error
-
-**Estimated size:** ~400 lines (interpreter intrinsics + scope graph queries)
-
----
-
-## Implementation order
-
-```
-Phase A: Interpreter skeleton + constants + arithmetic     ~500 lines
-Phase B: Function calls                                    ~400 lines
-Phase C: Control flow                                      ~400 lines
-Phase D: Data structures                                   ~500 lines
-Phase E: I/O intrinsics                                    ~200 lines
-Phase F: Wire into compilation pipeline                    ~400 lines
-Phase G: @debug erasure                                    ~200 lines
-Phase H: Module intrinsics                                 ~400 lines
-                                                    Total: ~3,000 lines
-```
-
-Each phase is independently compilable and testable. Phases A-E build the
-interpreter. Phase F connects it to the compiler. Phases G-H use the
-interpreter for specific features.
-
----
-
-## Tradeoffs
-
-### Compilation speed
-
-Modules compile in strict dependency order. Parallel compilation is limited
-to modules at the same DAG level. Most modules don't use compile-time
-evaluation — only modules with computed attributes force serialization.
-
-### Interpreter performance
-
-The interpreter is ~10-100x slower than native execution. For typical
-compile-time workloads (small computations, file reads, config parsing),
-this is imperceptible. For heavy computation (generating large lookup
-tables), it may add seconds to the build.
-
-### Step counter
-
-Default limit: 10 million operations. Configurable per-build. Prevents
-infinite loops from hanging the compiler. When exceeded:
-```
-error: compile-time evaluation exceeded step limit (10000000 operations)
-  possible infinite loop in MathLib.generate() called from @sbox
-```
+> Research-grade, production-quality compile-time execution for Zap.
+>
+> This plan replaces the earlier "small IR interpreter + pipeline wiring"
+> approach with a design that matches Zap's actual compiler architecture and
+> borrows the strongest ideas from Rust const-eval/Miri, Zig comptime,
+> Clang's constexpr interpreter, and modern incremental build systems.
+
+## Goals
+
+- Execute selected Zap code at compile time with deterministic, target-aware semantics
+- Support computed attributes and eventually `build.zap` execution
+- Integrate with Zap's current IR, ownership model, and structured control flow
+- Allow controlled compile-time file/env access with correct invalidation
+- Provide strong diagnostics, bounded execution, and a path to incremental caching
+
+## Non-goals for v1
+
+- Full runtime equivalence for every Zap feature
+- Native/JIT execution of compile-time code
+- Ambient host access (`cwd`, time, random, subprocesses, network)
+- Full per-module frontend compilation refactor before interpreter value is proven
+- Full Miri-grade pointer provenance and memory-model fidelity on day one
+
+## Current Reality
+
+Zap is not yet truly compiling modules one-by-one, but CTFE is operational.
+
+- File discovery is dependency-aware in `src/discovery.zig` with topological ordering
+- `main.zig` still concatenates discovered files into one `merged_source`
+- `compilePerFile` chains `collectAll` → `compileFiles` (still whole-program under the hood)
+- `compileModuleByModule` exists as experimental per-module pipeline but is not the default path
+- CTFE runs at Phase 7.5 in `compileFrontend`, after IR lowering, before escape analysis
+- `evaluateComputedAttributes` / `evaluateModuleAttributesInOrder` store results on scope graph
+- `build.zap` is evaluated via CTFE (`builder.ctfeManifest`) — the old AST extraction code has been removed
+- `constValueToExpr` bridges CTFE results back to AST for attribute substitution
+- Persistent cache stores results to disk with full dependency tracking and validation
+- `-Dkey=value` build options are available via `System.get_build_opt/1` at compile time
+
+The per-module CTFE→compile loop (compile A, CTFE A's exports, then compile B) is the
+remaining architectural gap. Currently CTFE runs after all modules are compiled to IR.
+
+## Design Principles
+
+### 1. Interpret Zap IR, not the AST
+
+The long-term execution engine should run over typed or nearly-typed Zap IR.
+AST interpretation is useful for bridges and extraction hacks, but not as the
+main production engine.
+
+### 2. Use an abstract machine, not host execution
+
+Compile-time execution must run inside a compiler-owned machine with explicit:
+
+- stack frames
+- locals
+- symbolic allocations
+- typed values
+- capability-gated effects
+- step and recursion budgets
+
+Do not treat host pointers, host layout, or host runtime behavior as semantic
+truth.
+
+### 3. Be hermetic by default
+
+Compile-time code is pure unless explicit capabilities are granted.
+
+- file reads must go through interpreter intrinsics
+- env reads must go through interpreter intrinsics
+- every effect must be tracked for invalidation
+- absent files and absent env vars must also become dependencies
+
+### 4. Split cheap constant folding from full CTFE
+
+Zap should keep a cheap local constant folder for trivial expressions. The IR
+ interpreter is for the harder cases: function calls, structured control flow,
+ data construction, and compiler-visible compile-time evaluation.
+
+### 5. Optimize for correctness, diagnostics, and cacheability first
+
+Interpreter performance matters, but correctness and determinism matter more.
+Specialization, bytecode compilation, or hot-path optimization can come later.
+
+## Target Execution Model
+
+### Values
+
+Use two related but distinct value layers.
+
+#### `CtValue`
+
+Interpreter-time values used while executing Zap IR.
+
+Expected variants:
+
+- integers and floats with target-aware semantics
+- strings
+- atoms
+- bool
+- nil
+- tuples
+- lists
+- maps
+- structs
+- unions/enums
+- optionals
+- closures
+- symbolic references/allocations where needed
+
+`CtValue` is not just a pretty tagged union for literals. It is the semantic
+execution value domain.
+
+#### `ConstValue`
+
+Stable compiler-facing results exported from CTFE.
+
+This is what downstream compiler phases and caches should consume. It should be
+detached from ephemeral interpreter state.
 
 ### Memory
 
-Compile-time values are arena-allocated per module compilation step. The
-arena is freed after each module completes. Memory usage is bounded by the
-largest single compile-time evaluation, not cumulative across modules.
+Use a small symbolic memory model.
 
-### I/O non-determinism
+For v1 this can be simpler than Miri, but it must still avoid raw host memory as
+the semantic model.
 
-Compile-time file reads and env var access make builds dependent on external
-state. The resource tracker records all accessed resources for incremental
-recompilation: if a file changes, modules that read it at compile time are
-recompiled.
+Recommended shape:
 
-### FFI restriction
+- `AllocId` for compile-time allocations
+- allocation records for aggregate storage
+- symbolic references as `AllocId + path/offset`
+- immutable values where possible
+- copy-on-write or fresh-allocation semantics for updates like `field_set`
 
-Only Zap functions can be called at compile time. `:zig.*` intrinsics that
-the interpreter knows about (println, inspect) are special-cased. C
-libraries and external Zig functions cannot be called at compile time.
+The first version does not need full provenance checking, but it must preserve a
+clear separation between interpreter memory and host memory.
 
-### Cross-compilation
+### Frames
 
-Compile-time code runs on the host machine. File paths, environment
-variables, and integer behavior reflect the host, not the target. In
-practice this is acceptable — Zig and Elixir both operate this way.
+Frames need more than the original plan assumed.
 
-### Bodyless functions
+Each frame should carry:
 
-`Module` uses bodyless function declarations (`def name(params) :: Type`
-without `do...end`). This is a new parser feature. Bodyless functions are
-only valid in modules whose functions are interpreter-provided. The compiler
-rejects bodyless functions in regular modules.
+- function identity
+- local storage
+- capture storage if closure calls are enabled
+- evaluation provenance (source span / caller trace)
+- step budget linkage
 
----
+The IR currently does not expose a `local_count`, so the interpreter plan must
+either:
 
-## Testing strategy
+- add local-count metadata to `ir.Function`, or
+- compute max-local usage by scanning instructions recursively
 
-Each phase has its own unit tests in the interpreter module. Integration
-tests verify the full pipeline.
+Adding metadata is preferred.
 
-**Unit tests (in `src/ir_interpreter.zig`):**
-- Phase A: constant evaluation, arithmetic, string concat, step limit
-- Phase B: function calls, recursion, argument passing
-- Phase C: if/else, case, phi nodes
-- Phase D: list/tuple/map/struct creation and access
-- Phase E: file read, env var access, resource tracking
+## IR Subset Strategy
 
-**Integration tests (in `src/integration_tests.zig`):**
-- Computed attribute value from another module
-- Module with only compile-time usage is dead-code-eliminated
-- @debug erasure in release mode
-- Module.functions returns correct data
-- Compile error on step limit exceeded
-- Compile error on calling not-yet-compiled module
+Do not start from a generic CFG/SSA interpreter. Start from the IR Zap actually
+emits today.
+
+### Phase 1 execution subset
+
+Support these first:
+
+- constants: `const_int`, `const_float`, `const_string`, `const_bool`, `const_atom`, `const_nil`
+- locals: `local_get`, `local_set`, `param_get`
+- arithmetic and logic: `binary_op`, `unary_op`
+- structured calls: `call_direct`, `call_named`, `call_builtin`
+- structured control: `if_expr`, `switch_literal`, `switch_return`, `union_switch_return`, `guard_block`
+- aggregates: `tuple_init`, `list_init`, `map_init`, `struct_init`, `union_init`, `enum_literal`
+- access: `field_get`, `index_get`, `list_get`, `list_len_check`, `optional_unwrap`
+- return: `ret`
+
+### Phase 2 execution subset
+
+Add:
+
+- `case_block`
+- `call_closure`
+- `make_closure`, `capture_get`
+- `call_dispatch`
+- binary pattern instructions
+
+### Phase 3 execution subset
+
+Add lower-priority or analysis-sensitive semantics:
+
+- `move_value`, `share_value`
+- `retain`, `release`
+- `reset`, `reuse_alloc`
+- CFG-ish leftovers like `jump`, `cond_branch`, `phi` if still needed by emitted IR
+
+The interpreter should implement the structured subset first because that is what
+Zap lowering currently favors.
+
+## Effects and Capabilities
+
+Compile-time effects must be mediated through explicit intrinsics.
+
+### Capability model
+
+Recommended capability tiers:
+
+- `pure`
+- `read_file`
+- `read_env`
+- `reflect_module`
+
+Later, if ever justified:
+
+- `read_dir`
+
+Not for v1:
+
+- write access
+- subprocess execution
+- network access
+- clock/random access
+
+### Dependency manifest
+
+Every compile-time evaluation should return both a value and a manifest.
+
+```zig
+pub const CtDependency = union(enum) {
+    file: struct {
+        path: []const u8,
+        content_hash: u64,
+    },
+    env_var: struct {
+        name: []const u8,
+        value_hash: u64,
+        present: bool,
+    },
+    reflected_module: struct {
+        module_name: []const u8,
+        interface_hash: u64,
+    },
+};
+
+pub const CtEvalResult = struct {
+    value: ConstValue,
+    dependencies: []const CtDependency,
+    result_hash: u64,
+};
+```
+
+This is stronger than a raw list of accessed resources and is suitable for
+incremental invalidation.
+
+## Caching Model
+
+Use query-style memoization.
+
+### Cache key inputs
+
+At minimum:
+
+- stable callee identity
+- normalized argument values
+- target triple / optimize mode / relevant compile options
+- capability set
+- compiler/interpreter schema version
+
+For persisted caching, include dependency validation using the manifest.
+
+### Scope of caching
+
+Two levels are useful:
+
+- in-process memoization for repeated compile-time calls in one build
+- persistent cache entries for repeated builds when manifests still validate
+
+## Compiler Integration Strategy
+
+## Phase 0: Substrate and constraints — COMPLETE
+
+Before building the interpreter itself:
+
+- add stable identities for compile-time call sites and callable functions
+- add `local_count` or equivalent IR metadata
+- define `CtValue`, `ConstValue`, dependency manifest, and capability types
+- define the exact v1 IR execution subset
+- add a dedicated compile-time diagnostics stack format
+
+This is prerequisite work.
+
+## Phase 1: Attribute bridge — COMPLETE
+
+Keep current AST substitution, but make it capable of consuming computed values.
+
+Implemented:
+
+- `scope.Attribute` has `computed_value: ?ctfe.ConstValue` to store CTFE results
+- `attr_substitute.zig` prefers `computed_value` over raw AST value when substituting
+- `constValueToExpr` bridges CTFE results back to AST for attribute substitution
+  (production bridge between CTFE and AST-level substitution, in active use)
+
+## Phase 2: Interpreter MVP — COMPLETE
+
+Create `src/ctfe.zig` or `src/ir_interpreter.zig` with:
+
+- abstract machine state
+- function registry
+- evaluator for the v1 structured IR subset
+- step and recursion budgets
+- stack-trace diagnostics
+- in-process memoization
+
+Public API should be result-oriented:
+
+```zig
+pub fn evalFunction(
+    self: *Interpreter,
+    callee: FunctionHandle,
+    args: []const ConstValue,
+    caps: CapabilitySet,
+) !CtEvalResult
+```
+
+Prefer stable function handles over string-only lookup.
+
+## Phase 3: Hook into computed attributes — COMPLETE
+
+After global parse/collect, but before current attribute substitution:
+
+- identify computed attributes
+- evaluate them through CTFE when legal
+- store `ConstValue` results
+- reify to AST only where legacy substitution still requires it
+
+This phase should work even while the rest of the compiler remains globally
+compiled.
+
+## Phase 4: Replace `build.zap` AST extraction — COMPLETE
+
+Current `build.zap` handling is an AST bridge. Replace it with CTFE execution of
+builder code once the interpreter supports the required subset.
+
+This should happen before true per-module frontend refactoring, because it gives
+high-value real-world pressure on the interpreter.
+
+## Phase 5: True module-by-module compilation — NOT STARTED
+
+Only after CTFE is already useful:
+
+- split macro expansion, desugaring, typechecking, HIR, and IR lowering into
+  real per-module units
+- use discovery topo order as the actual compilation order
+- register compiled module interfaces and CTFE-visible exports incrementally
+
+This is where the original plan's dependency-ordered execution becomes real.
+
+## Phase 6: Reflection and `Module.*` — PARTIAL
+
+Implement module reflection as interpreter intrinsics backed by compiler data,
+not as ordinary runtime library functions.
+
+Reflection reads must produce dependency edges on module interfaces.
+
+## Phase 7: Advanced semantics — PARTIAL
+
+Add:
+
+- closures
+- ownership-sensitive execution semantics
+- ARC-sensitive correctness checks
+- richer binary and pattern-matching support
+- persistent CTFE cache
+
+## `build.zap` as the first proving ground
+
+`build.zap` is the best first production consumer because:
+
+- it already wants compile-time evaluation
+- the current AST extraction path is explicitly transitional
+- it exercises attributes, structs, case analysis, and controlled host access
+- it is high value but bounded in scope
+
+The interpreter should reach `build.zap` viability before trying to support the
+entire language at compile time.
+
+## Diagnostics
+
+Research-grade quality depends heavily on diagnostics.
+
+Every CTFE error should report:
+
+- what was being evaluated
+- why it had to be compile-time
+- the CTFE call stack
+- the exact failing operation
+- the capability or dependency involved, if effect-related
+
+Examples:
+
+```text
+error: compile-time evaluation exceeded step limit
+  while evaluating `Config.generate/0`
+  called from attribute `@config` in `App`
+  help: possible infinite recursion or unexpectedly large compile-time loop
+```
+
+```text
+error: compile-time file access not permitted
+  attempted `File.read("secrets.txt")`
+  while evaluating `Builder.manifest/1`
+  help: declare `read_file` capability or remove compile-time file access
+```
+
+## Testing Strategy
+
+### Unit tests
+
+Interpreter-only tests for:
+
+- constants and arithmetic
+- structured control flow
+- function calls and memoization
+- data construction and access
+- step and recursion budgets
+- capability enforcement
+- dependency manifest generation
+
+### Differential tests
+
+Where possible:
+
+- compare literal-only CTFE with the cheap constant folder
+- compare legacy AST manifest extraction with interpreter-backed `build.zap`
+- compare interpreter results across repeated runs with cache hits/misses
+
+### Integration tests
+
+- computed attributes across modules
+- builder manifest execution
+- invalidation on file/env change
+- privacy and dependency-order enforcement via discovery graph
+
+## Recommended File-Level Changes
+
+Expected major touch points:
+
+- `src/compiler.zig`
+  - CTFE integration hooks
+  - future real per-module pipeline split
+- `src/ir.zig`
+  - local-count or metadata additions
+  - stable callable identity support if needed
+- `src/attr_substitute.zig`
+  - computed-value integration and broader coverage
+- `src/scope.zig`
+  - attribute storage expansion for computed constants
+- `src/main.zig`
+  - build cache integration for CTFE manifests
+- `src/builder.zig`
+  - replace AST manifest extraction with CTFE-backed execution
+- `src/discovery.zig`
+  - reused for dependency ordering and privacy boundaries
+- new file:
+  - `src/ctfe.zig` or `src/ir_interpreter.zig`
+
+## Implementation Order
+
+```text
+Phase 0  Substrate: values, identities, metadata, diagnostics scaffold
+Phase 1  Attribute bridge: computed values + AST reification path
+Phase 2  Interpreter MVP: structured IR subset, budgets, memoization
+Phase 3  Computed attributes: actual compiler integration
+Phase 4  Builder execution: replace AST manifest extraction
+Phase 5  True per-module frontend compilation
+Phase 6  Reflection intrinsics and module metadata queries
+Phase 7  Advanced semantics: closures, ownership, ARC-sensitive behavior, persistent cache
+```
+
+## Final Recommendation
+
+The best production-quality implementation for Zap is:
+
+- not an AST interpreter
+- not a tiny literal evaluator bolted onto the side
+- not backend/JIT execution of compile-time code
+
+It is a typed Zap-IR abstract machine with:
+
+- deterministic semantics
+- explicit effect capabilities
+- dependency-tracked results
+- query-style memoization
+- staged integration into the existing compiler
+
+That is the approach most aligned with both the research and Zap's current code.
+
+## Known Limitations
+
+### Per-module CTFE→compile loop
+
+CTFE runs at Phase 7.5 in `compileFrontend()` — after ALL modules are compiled to
+IR. This means computed attributes from module A cannot influence macro expansion or
+type checking of module B in the same compilation.
+
+`compileModuleByModule()` in `compiler.zig` has the per-module loop structure (extract
+single module AST, per-module macro/desugar/typecheck/HIR/IR), but does not integrate
+CTFE between modules. The path to true per-module CTFE:
+
+1. After each module's IR is generated in the loop, run `evaluateComputedAttributes()`
+   for that module and store results on the scope graph
+2. Subsequent modules see earlier modules' computed values during attribute substitution
+3. Wire `compileModuleByModule()` into `main.zig` when `module_order` is available
+4. Prerequisites: TypeChecker and HirBuilder must resolve cross-module types via shared
+   scope graph; `extractModuleProgram()` must include dependent module type declarations;
+   IR function ID merge must handle overlapping IDs (partially implemented with offsets)
+
+### Reflected module cache validation
+
+`validateDependencies()` conservatively invalidates any `reflected_module` dependency
+because full re-validation would require the scope graph at cache-load time. This means
+CTFE results that use `Module.functions/attributes/types` builtins are never cached
+across builds. This is correct but not optimal.
+
+### Ownership-sensitive execution
+
+ARC operations (`retain`, `release`) are no-ops during CTFE. `move_value` zeros the
+source local but does not enforce use-after-move at the interpreter level. Full
+ownership-sensitive execution semantics are deferred to Phase 7.

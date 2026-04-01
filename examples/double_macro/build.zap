@@ -6,8 +6,8 @@ defmodule DoubleMacro.Builder do
           name: "double_macro",
           version: "0.1.0",
           kind: :bin,
-          root: "DoubleMacro.main/0",
-          paths: ["./*.zap"]
+          root: "DoubleMacro.main/1",
+          paths: ["./*.zap"], deps: [{:zap_stdlib, {:path, "../../lib"}}]
         }
       _ ->
         panic("Unknown target: use 'double_macro'")

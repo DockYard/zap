@@ -375,14 +375,14 @@ test "dispatch resolve simple function" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var type_store = types_mod.TypeStore.init(alloc, &parser.interner);
+    var type_store = types_mod.TypeStore.init(alloc, parser.interner);
     defer type_store.deinit();
 
-    var engine = DispatchEngine.init(alloc, &collector.graph, &type_store, &parser.interner);
+    var engine = DispatchEngine.init(alloc, &collector.graph, &type_store, parser.interner);
     defer engine.deinit();
 
     // Find the module scope
@@ -431,14 +431,14 @@ test "dispatch scope fallback" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var type_store = types_mod.TypeStore.init(alloc, &parser.interner);
+    var type_store = types_mod.TypeStore.init(alloc, parser.interner);
     defer type_store.deinit();
 
-    var engine = DispatchEngine.init(alloc, &collector.graph, &type_store, &parser.interner);
+    var engine = DispatchEngine.init(alloc, &collector.graph, &type_store, parser.interner);
     defer engine.deinit();
 
     // Both module and local b exist — find b from the function scope of a
@@ -478,14 +478,14 @@ test "dispatch no match" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var type_store = types_mod.TypeStore.init(alloc, &parser.interner);
+    var type_store = types_mod.TypeStore.init(alloc, parser.interner);
     defer type_store.deinit();
 
-    var engine = DispatchEngine.init(alloc, &collector.graph, &type_store, &parser.interner);
+    var engine = DispatchEngine.init(alloc, &collector.graph, &type_store, parser.interner);
     defer engine.deinit();
 
     // Find the module scope
@@ -530,14 +530,14 @@ test "dispatch specificity — literal pattern beats bind" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var type_store = types_mod.TypeStore.init(alloc, &parser.interner);
+    var type_store = types_mod.TypeStore.init(alloc, parser.interner);
     defer type_store.deinit();
 
-    var engine = DispatchEngine.init(alloc, &collector.graph, &type_store, &parser.interner);
+    var engine = DispatchEngine.init(alloc, &collector.graph, &type_store, parser.interner);
     defer engine.deinit();
 
     // Find the module scope

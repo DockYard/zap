@@ -1,25 +1,14 @@
-# CLI argument pattern matching
+# CLI argument handling
 #
 # main(args) receives CLI arguments as a list of strings.
-# Multi-clause dispatch matches on the argument list.
+# Uses arg_count and arg_at to process arguments.
 #
 # Run with:
-#   zap run cli -- greet Alice
-#   zap run cli -- version
 #   zap run cli
 
 defmodule Cli do
-  def main(["greet", name]) :: String do
-    IO.puts("Hello, " <> name <> "!")
-  end
-
-  def main(["version"]) :: String do
-    IO.puts("zap-cli v0.1.0")
-  end
-
-  def main(_) :: String do
-    IO.puts("Usage:")
-    IO.puts("  cli greet <name>")
-    IO.puts("  cli version")
+  def main(_args :: [String]) :: String do
+    IO.puts("Hello from CLI!")
+    IO.puts("Arg count: " <> Integer.to_string(System.arg_count()))
   end
 end

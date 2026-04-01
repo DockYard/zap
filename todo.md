@@ -2,6 +2,146 @@
 
 This file is a handoff for a fresh OpenCode session.
 
+## CTFE / IR Interpreter Remaining Work
+
+This section tracks the remaining work to make the IR interpreter / CTFE implementation complete based on the current source state.
+
+### Blocking Correctness Work
+
+- [ ] Fix dangling lifetime bugs in CTFE results.
+  Files: `src/ctfe.zig`, `src/builder.zig`
+  Required work:
+  - deep-copy `CtEvalResult.dependencies` before returning from `evalAndExport`
+  - deep-copy `EvalAttrResult.errors` before returning from attribute evaluation helpers
+  - audit all CTFE result structs so no returned slice points into interpreter-owned memory after `deinit`
+  - add tests proving returned dependency/error data remains valid after interpreter teardown
+
+- [ ] Fix persistent CTFE cache key correctness.
+  Files: `src/ctfe.zig`, `src/builder.zig`, `src/main.zig`
+  Required work:
+  - include target triple in persistent cache keys
+  - include optimize mode in persistent cache keys
+  - include relevant build options / `-Dkey=value` inputs in persistent cache keys
+  - either remove unused `options_hash` or wire it all the way through lookup/store
+  - add tests proving `System.get_build_opt/1` results are invalidated by option changes
+
+- [ ] Make computed attribute evaluation fully IR-driven instead of literal-call-only.
+  Files: `src/ctfe.zig`, possibly `src/compiler.zig`, `src/attr_substitute.zig`
+  Required work:
+  - stop limiting attribute CTFE to literals and calls with literal AST args
+  - evaluate arbitrary legal computed attribute expressions through lowered IR
+  - keep the AST bridge only for substitution/reification, not as the computation mechanism
+  - add tests for non-trivial attribute expressions and nested compile-time calls
+
+- [ ] Finish true module-by-module frontend architecture.
+  Files: `src/main.zig`, `src/compiler.zig`, collector/type/HIR plumbing as needed
+  Required work:
+  - remove dependence on one merged whole-program source as the effective frontend substrate
+  - stop doing global parse/collect as the only real compilation entry point
+  - make module compilation units real instead of extracting per-module ASTs from a merged program
+  - preserve dependency-order compilation from discovery as the actual frontend execution model
+  - add end-to-end tests proving earlier-module CTFE affects later macro expansion/type checking under the real module pipeline
+
+### Interpreter Semantics Still Incomplete
+
+- [ ] Finish CTFE diagnostic provenance.
+  Files: `src/ctfe.zig`
+  Required work:
+  - populate `CtfeFrame.instruction_index` during execution
+  - attach attribute/module context when attribute evaluation fails
+  - improve effect-related diagnostics to include which intrinsic/resource failed
+  - ensure formatted CTFE diagnostics include concrete call stack provenance, not placeholder frames
+
+- [ ] Finish reflection-aware persistent cache validation.
+  Files: `src/ctfe.zig`
+  Required work:
+  - make `reflected_module` dependencies re-validatable instead of always invalidating
+  - provide the cache validator enough interface metadata to compare reflected module state across builds
+  - add tests covering cache hits/misses for `Module.functions/attributes/types`
+
+- [ ] Finish ownership-sensitive CTFE semantics.
+  Files: `src/ctfe.zig`
+  Required work:
+  - stop treating `retain` as a pure no-op
+  - model `release`, `reset`, and `reuse_alloc` with stronger correctness semantics
+  - enforce use-after-move / use-after-release failures explicitly
+  - add tests for ownership errors during CTFE
+
+- [ ] Finish the symbolic memory model.
+  Files: `src/ctfe.zig`
+  Required work:
+  - reduce dependence on host-backed slices/pointers as semantic truth
+  - represent aggregate identity/reference paths more explicitly
+  - tighten union/closure payload handling so interpreter memory stays abstract-machine-owned
+  - keep host allocation as an implementation detail, not the semantic model
+
+- [ ] Implement stronger target-aware CTFE semantics.
+  Files: `src/ctfe.zig`
+  Required work:
+  - stop hardcoding only `i64`/`f64`-centric evaluation assumptions where target information matters
+  - thread compile-target/optimize context into evaluation where required
+  - define and test any target-sensitive numeric/layout behavior that compile-time execution must respect
+
+- [ ] Finish CTFE support for remaining IR control-flow forms that can matter.
+  Files: `src/ctfe.zig`, `src/ir.zig`, lowering sites if needed
+  Required work:
+  - either implement or permanently eliminate CTFE-relevant emission of `phi`, `branch`, `cond_branch`, and `switch_tag`
+  - document which forms are impossible after lowering if they remain unsupported
+  - add tests proving unsupported instructions cannot be emitted into CTFE paths, or that they now execute correctly
+
+- [ ] Strengthen callable/cache identity for CTFE queries.
+  Files: `src/ctfe.zig`, `src/ir.zig`
+  Required work:
+  - move beyond weak function-name-only persistent identity
+  - use a more stable callable identity where overloads/refactors/cache reuse matter
+  - decide whether call-site identity is also needed for future memoization/caching guarantees
+
+### Integration Work Still Incomplete
+
+- [ ] Move `build.zap` CTFE onto the real module-aware frontend path.
+  Files: `src/builder.zig`, `src/compiler.zig`, `src/main.zig`
+  Required work:
+  - stop compiling `build.zap` only through the old global `compileFrontend` path if the module-aware path is the intended architecture
+  - ensure builder evaluation uses the same CTFE/caching/invalidation semantics as normal project compilation
+  - add coverage for multi-module builder behavior if supported
+
+- [ ] Expand compiler-backed reflection beyond the currently implemented surface if required by the design.
+  Files: `src/ctfe.zig`, compiler metadata providers
+  Current builtins: `Module.functions`, `Module.attributes`, `Module.types`
+  Required work:
+  - audit whether additional module reflection APIs are required
+  - add any missing reflection intrinsics through compiler-backed metadata, not runtime shims
+  - ensure every reflection read produces correct invalidation dependencies
+
+- [ ] Settle the public CTFE API surface.
+  Files: `src/ctfe.zig`, callers in `src/builder.zig` and compiler integration points
+  Required work:
+  - decide the canonical external API for CTFE evaluation
+  - keep interpreter-internal `CtValue` APIs internal where possible
+  - make result-oriented APIs the stable boundary used by compiler consumers
+
+### Validation Still Needed
+
+- [ ] Add missing correctness tests for returned dependency/error ownership.
+- [ ] Add persistent-cache invalidation tests for file/env/build-opt/reflection dependencies.
+- [ ] Add integration tests for cross-module computed attributes under the real module pipeline.
+- [ ] Add tests for ownership-sensitive CTFE failure modes.
+- [ ] Add tests for any newly supported IR instructions or proofs that they cannot reach CTFE.
+
+### Completion Bar
+
+Do not mark this area done until all of the following are true:
+
+- CTFE results do not return dangling memory
+- persistent cache keys are semantically complete for option-sensitive evaluation
+- computed attributes are evaluated through IR, not just literal-call shortcuts
+- module-by-module compilation is real, not a merged-program hybrid
+- diagnostics carry real provenance
+- reflection dependencies can be validated or are intentionally modeled otherwise
+- ownership/memory semantics are deliberate rather than placeholder behavior
+- unsupported IR forms are either implemented or proven unreachable
+- the test suite covers the above cases explicitly
+
 ## Current State
 
 Work completed in this session:

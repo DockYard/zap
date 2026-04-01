@@ -1,23 +1,27 @@
+# Case expression with atom matching
+#
+# Demonstrates case/switch on atom values.
+
 defmodule CaseExpr do
-  def check(result) :: String do
-    case result do
-      {:ok, v} ->
-        v
-      {:error, e} ->
-        e
+  def describe(x :: i64) :: String do
+    case x do
+      0 ->
+        "zero"
+      1 ->
+        "one"
       _ ->
-        "unknown"
+        "other"
     end
   end
 
-  def main() :: String do
-    CaseExpr.check({:ok, "hello"})
+  def main(_args :: [String]) :: String do
+    CaseExpr.describe(0)
     |> IO.puts()
 
-    CaseExpr.check({:error, "oops"})
+    CaseExpr.describe(1)
     |> IO.puts()
 
-    CaseExpr.check(:something)
+    CaseExpr.describe(42)
     |> IO.puts()
   end
 end

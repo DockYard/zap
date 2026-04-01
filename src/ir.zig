@@ -71,6 +71,7 @@ pub const Function = struct {
     body: []const Block,
     is_closure: bool,
     captures: []const Capture,
+    local_count: u32 = 0,
 };
 
 pub const Param = struct {
@@ -1114,6 +1115,7 @@ pub const IrBuilder = struct {
             .body = try self.allocSlice(Block, &.{entry_block}),
             .is_closure = group.captures.len > 0,
             .captures = try captures.toOwnedSlice(self.allocator),
+            .local_count = self.next_local,
         });
 
         // Generate forwarding wrappers for default parameter values.
@@ -1223,6 +1225,7 @@ pub const IrBuilder = struct {
                         .body = try self.allocSlice(Block, &.{wrapper_block}),
                         .is_closure = false,
                         .captures = &.{},
+                        .local_count = result_local + 1,
                     });
 
                     // Register for call-site resolution
@@ -3282,18 +3285,18 @@ test "IR build simple function" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var type_store = types_mod.TypeStore.init(alloc, &parser.interner);
+    var type_store = types_mod.TypeStore.init(alloc, parser.interner);
     defer type_store.deinit();
 
-    var hir_builder = hir_mod.HirBuilder.init(alloc, &parser.interner, &collector.graph, &type_store);
+    var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, &type_store);
     defer hir_builder.deinit();
     const hir_program = try hir_builder.buildProgram(&program);
 
-    var ir_builder = IrBuilder.init(alloc, &parser.interner);
+    var ir_builder = IrBuilder.init(alloc, parser.interner);
     ir_builder.type_store = &type_store;
     defer ir_builder.deinit();
     const ir_program = try ir_builder.buildProgram(&hir_program);
@@ -3320,18 +3323,18 @@ test "IR param_get indices are unique for multi-parameter functions" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var type_store = types_mod.TypeStore.init(alloc, &parser.interner);
+    var type_store = types_mod.TypeStore.init(alloc, parser.interner);
     defer type_store.deinit();
 
-    var hir_builder = hir_mod.HirBuilder.init(alloc, &parser.interner, &collector.graph, &type_store);
+    var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, &type_store);
     defer hir_builder.deinit();
     const hir_program = try hir_builder.buildProgram(&program);
 
-    var ir_builder = IrBuilder.init(alloc, &parser.interner);
+    var ir_builder = IrBuilder.init(alloc, parser.interner);
     ir_builder.type_store = &type_store;
     defer ir_builder.deinit();
     const ir_program = try ir_builder.buildProgram(&hir_program);
@@ -3379,11 +3382,11 @@ test "IR call preserves HIR arg modes" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = types_mod.TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -3402,11 +3405,11 @@ test "IR call preserves HIR arg modes" {
         .return_ownership = original_fn_type.return_ownership,
     } };
 
-    var hir_builder = hir_mod.HirBuilder.init(alloc, &parser.interner, &collector.graph, &checker.store);
+    var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, &checker.store);
     defer hir_builder.deinit();
     const hir_program = try hir_builder.buildProgram(&program);
 
-    var ir_builder = IrBuilder.init(alloc, &parser.interner);
+    var ir_builder = IrBuilder.init(alloc, parser.interner);
     ir_builder.type_store = &checker.store;
     defer ir_builder.deinit();
     const ir_program = try ir_builder.buildProgram(&hir_program);
@@ -3452,19 +3455,19 @@ test "IR named call preserves move mode" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = types_mod.TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
-    var hir_builder = hir_mod.HirBuilder.init(alloc, &parser.interner, &collector.graph, &checker.store);
+    var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, &checker.store);
     defer hir_builder.deinit();
     const hir_program = try hir_builder.buildProgram(&program);
 
-    var ir_builder = IrBuilder.init(alloc, &parser.interner);
+    var ir_builder = IrBuilder.init(alloc, parser.interner);
     ir_builder.type_store = &checker.store;
     defer ir_builder.deinit();
     const ir_program = try ir_builder.buildProgram(&hir_program);
@@ -3511,11 +3514,11 @@ test "IR closure call preserves borrow mode without ARC ops" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = types_mod.TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -3534,11 +3537,11 @@ test "IR closure call preserves borrow mode without ARC ops" {
         .return_ownership = original_fn_type.return_ownership,
     } };
 
-    var hir_builder = hir_mod.HirBuilder.init(alloc, &parser.interner, &collector.graph, &checker.store);
+    var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, &checker.store);
     defer hir_builder.deinit();
     const hir_program = try hir_builder.buildProgram(&program);
 
-    var ir_builder = IrBuilder.init(alloc, &parser.interner);
+    var ir_builder = IrBuilder.init(alloc, parser.interner);
     ir_builder.type_store = &checker.store;
     defer ir_builder.deinit();
     const ir_program = try ir_builder.buildProgram(&hir_program);
@@ -3587,11 +3590,11 @@ test "IR shared opaque call emits retain and release" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = types_mod.TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -3610,11 +3613,11 @@ test "IR shared opaque call emits retain and release" {
         .return_ownership = original_fn_type.return_ownership,
     } };
 
-    var hir_builder = hir_mod.HirBuilder.init(alloc, &parser.interner, &collector.graph, &checker.store);
+    var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, &checker.store);
     defer hir_builder.deinit();
     const hir_program = try hir_builder.buildProgram(&program);
 
-    var ir_builder = IrBuilder.init(alloc, &parser.interner);
+    var ir_builder = IrBuilder.init(alloc, parser.interner);
     ir_builder.type_store = &checker.store;
     defer ir_builder.deinit();
     const ir_program = try ir_builder.buildProgram(&hir_program);

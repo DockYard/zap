@@ -244,9 +244,13 @@ pub fn moduleNameToRelPath(alloc: std.mem.Allocator, module_name: []const u8) ![
         first = false;
 
         // PascalCase → snake_case
+        // Only insert '_' when transitioning from lowercase to uppercase,
+        // not between consecutive uppercase letters (IO → io, not i_o).
         for (segment, 0..) |c, i| {
             if (std.ascii.isUpper(c)) {
-                if (i > 0) try result.append(alloc, '_');
+                if (i > 0 and !std.ascii.isUpper(segment[i - 1])) {
+                    try result.append(alloc, '_');
+                }
                 try result.append(alloc, std.ascii.toLower(c));
             } else {
                 try result.append(alloc, c);
@@ -430,18 +434,15 @@ fn topologicalSort(alloc: std.mem.Allocator, graph: *FileGraph) DiscoveryError!v
     }
 }
 
-/// Well-known stdlib module names that should not be resolved as file paths.
-pub const STDLIB_MODULES = [_][]const u8{
-    "Kernel",
-    "IO",
-    "System",
+/// Built-in type names that the discovery system should skip (not modules).
+/// These are resolved by the type checker, not by file discovery.
+pub const BUILTIN_TYPE_NAMES = [_][]const u8{
+    "Bool",
     "String",
     "Atom",
-    "Integer",
-    "Float",
-    "Zap",
-    "Zap.Env",
-    "Zap.Manifest",
+    "Nil",
+    "Expr",
+    "Never",
 };
 
 // ============================================================
@@ -544,7 +545,7 @@ test "discover: single file with no references" {
     const tmp_path = try tmp_dir.dir.realpathAlloc(alloc, ".");
     const roots = &[_]SourceRoot{.{ .name = "project", .path = tmp_path }};
 
-    var graph = try discover(alloc, "App", roots, &STDLIB_MODULES, null);
+    var graph = try discover(alloc, "App", roots, &BUILTIN_TYPE_NAMES, null);
     defer graph.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), graph.topo_order.items.len);
@@ -576,7 +577,7 @@ test "discover: transitive references" {
     const tmp_path = try tmp_dir.dir.realpathAlloc(alloc, ".");
     const roots = &[_]SourceRoot{.{ .name = "project", .path = tmp_path }};
 
-    var graph = try discover(alloc, "App", roots, &STDLIB_MODULES, null);
+    var graph = try discover(alloc, "App", roots, &BUILTIN_TYPE_NAMES, null);
     defer graph.deinit();
 
     // Should discover all 3 files
@@ -612,7 +613,7 @@ test "discover: circular dependency detected" {
     const tmp_path = try tmp_dir.dir.realpathAlloc(alloc, ".");
     const roots = &[_]SourceRoot{.{ .name = "project", .path = tmp_path }};
 
-    const result = discover(alloc, "CycleA", roots, &STDLIB_MODULES, null);
+    const result = discover(alloc, "CycleA", roots, &BUILTIN_TYPE_NAMES, null);
     try std.testing.expectError(error.CircularDependency, result);
 }
 
@@ -633,7 +634,7 @@ test "discover: module not found" {
     const tmp_path = try tmp_dir.dir.realpathAlloc(alloc, ".");
     const roots = &[_]SourceRoot{.{ .name = "project", .path = tmp_path }};
 
-    const result = discover(alloc, "App", roots, &STDLIB_MODULES, null);
+    const result = discover(alloc, "App", roots, &BUILTIN_TYPE_NAMES, null);
     try std.testing.expectError(error.ModuleNotFound, result);
 }
 
@@ -665,7 +666,7 @@ test "discover: module found in dep root" {
         .{ .name = "dep:mylib", .path = dep_path },
     };
 
-    var graph = try discover(alloc, "App", roots, &STDLIB_MODULES, null);
+    var graph = try discover(alloc, "App", roots, &BUILTIN_TYPE_NAMES, null);
     defer graph.deinit();
 
     try std.testing.expectEqual(@as(usize, 2), graph.topo_order.items.len);

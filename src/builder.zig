@@ -1,15 +1,13 @@
 //! Builder Phase
 //!
-//! Handles compiling build.zap as a separate binary, executing it to obtain
-//! the manifest, and parsing the manifest output.
-//!
-//! The builder binary receives env data as command-line arguments and outputs
-//! the manifest as a simple key=value format on stdout.
+//! Handles build.zap manifest evaluation via CTFE (compile-time function
+//! execution). The build source is compiled through the full frontend pipeline
+//! to IR, then the manifest/1 function is evaluated at compile time to produce
+//! a BuildConfig.
 
 const std = @import("std");
 const zap = @import("root.zig");
 const compiler = zap.compiler;
-const zir_backend = zap.zir_backend;
 
 /// Parsed manifest from the builder output.
 pub const BuildConfig = struct {
@@ -45,289 +43,346 @@ pub const BuildConfig = struct {
     };
 };
 
-/// Scan build.zap AST to find the module defining manifest/1.
-/// Returns the module name (e.g., "FooBar.Builder").
-pub fn findBuilderModule(
+pub const ManifestEval = struct {
+    config: BuildConfig,
+    dependencies: []const zap.ctfe.CtDependency,
+    result_hash: u64,
+};
+
+/// Extract a BuildConfig by compiling build.zap and evaluating manifest/1
+/// through the CTFE interpreter. This is the production path — it compiles
+/// the builder module to IR and runs the manifest function at compile time.
+pub fn ctfeManifest(
     alloc: std.mem.Allocator,
     build_source: []const u8,
-) ![]const u8 {
-    // Parse build.zap
-    const prepend_result = zap.stdlib.prependStdlib(alloc, build_source) catch
-        return error.StdlibError;
-    const full_source = prepend_result.source;
-
-    var parser = zap.Parser.init(alloc, full_source);
-    defer parser.deinit();
-
-    const program = parser.parseProgram() catch return error.ParseFailed;
-
-    // Walk module declarations looking for manifest/1
-    for (program.modules) |mod| {
-        for (mod.items) |item| {
-            switch (item) {
-                .function => |func| {
-                    const name = parser.interner.get(func.name);
-                    if (std.mem.eql(u8, name, "manifest") and func.clauses.len > 0 and func.clauses[0].params.len == 1) {
-                        // Found it — reconstruct the module name
-                        var mod_name_buf: std.ArrayListUnmanaged(u8) = .empty;
-                        for (mod.name.parts, 0..) |part, i| {
-                            if (i > 0) try mod_name_buf.append(alloc, '.');
-                            const part_str = parser.interner.get(part);
-                            try mod_name_buf.appendSlice(alloc, part_str);
-                        }
-                        return try mod_name_buf.toOwnedSlice(alloc);
-                    }
-                },
-                else => {},
-            }
-        }
-    }
-
-    return error.ManifestNotFound;
+    target_name: []const u8,
+    build_opts: std.StringHashMapUnmanaged([]const u8),
+    zap_lib_dir: ?[]const u8,
+) !BuildConfig {
+    return (try ctfeManifestDetailed(alloc, build_source, target_name, build_opts, zap_lib_dir)).config;
 }
 
-/// Find the mangled IR function name for the manifest/1 entry point.
-/// Returns the name as it appears in the IR (e.g., "manifest" for top-level,
-/// or "FooBar__Builder__manifest" for module-scoped).
-/// The build.zap source is parsed WITHOUT stdlib prepend.
-pub fn findBuilderManifestName(
+pub fn ctfeManifestDetailed(
     alloc: std.mem.Allocator,
     build_source: []const u8,
-) ![]const u8 {
-    var parser = zap.Parser.init(alloc, build_source);
-    defer parser.deinit();
+    target_name: []const u8,
+    build_opts: std.StringHashMapUnmanaged([]const u8),
+    zap_lib_dir: ?[]const u8,
+) !ManifestEval {
+    const ctfe = zap.ctfe;
 
-    const program = parser.parseProgram() catch {
+    // Build source units: stdlib lib files + build.zap
+    var source_units: std.ArrayListUnmanaged(compiler.SourceUnit) = .empty;
+
+    // Read stdlib files from zap lib dir if available
+    if (zap_lib_dir) |lib_dir| {
+        try readLibSourceUnits(alloc, lib_dir, &source_units);
+        const zap_subdir = try std.fs.path.join(alloc, &.{ lib_dir, "zap" });
+        try readLibSourceUnits(alloc, zap_subdir, &source_units);
+    }
+
+    // Add build.zap as the final source unit
+    try source_units.append(alloc, .{ .file_path = "build.zap", .source = build_source });
+
+    // Compile through the full frontend pipeline to get IR
+    var ctx = compiler.collectAllFromUnits(alloc, source_units.items, .{
+        .show_progress = false,
+    }) catch return error.CompileFailed;
+    const result = compiler.compileFiles(alloc, &ctx, .{
+        .show_progress = false,
+    }) catch return error.CompileFailed;
+
+    // Create CTFE interpreter with build capabilities and persistent cache
+    var interp = ctfe.Interpreter.init(alloc, &result.ir_program);
+    defer interp.deinit();
+    interp.capabilities = ctfe.CapabilitySet.build;
+    interp.build_opts = build_opts;
+    interp.compile_options_hash = ctfe.hashCompileOptions(target_name, build_opts.get("optimize") orelse "release_safe");
+    std.fs.cwd().makePath(".zap-cache/ctfe") catch {};
+    interp.persistent_cache = ctfe.PersistentCache.init(".zap-cache/ctfe");
+
+    // Find the manifest function by scanning IR functions for one ending in "__manifest"
+    const manifest_id = findManifestFunction(&result.ir_program) orelse
+        return error.ManifestNotFound;
+
+    // Construct the env argument: %Zap.Env{target: :target_name, os: :os, arch: :arch}
+    const os_name = @tagName(@import("builtin").os.tag);
+    const arch_name = @tagName(@import("builtin").cpu.arch);
+
+    const env_const = ctfe.ConstValue{ .struct_val = .{
+        .type_name = "Zap_Env",
+        .fields = &.{
+            .{ .name = "target", .value = .{ .atom = target_name } },
+            .{ .name = "os", .value = .{ .atom = os_name } },
+            .{ .name = "arch", .value = .{ .atom = arch_name } },
+        },
+    } };
+
+    // Evaluate manifest/1
+    const manifest_result = interp.evalAndExport(manifest_id, &.{env_const}, ctfe.CapabilitySet.build) catch {
+        // Report CTFE errors
         const stderr = std.fs.File.stderr().deprecatedWriter();
-        for (parser.errors.items) |parse_err| {
-            stderr.print("  parse error: {s}\n", .{parse_err.message}) catch {};
+        for (interp.errors.items) |err| {
+            stderr.print("  ctfe error: {s}\n", .{err.message}) catch {};
         }
-        return error.ParseFailed;
+        return error.CtfeFailed;
     };
 
-    // Look for manifest/1 in modules
-    for (program.modules) |mod| {
-        for (mod.items) |item| {
-            switch (item) {
-                .function => |func| {
-                    const name = parser.interner.get(func.name);
-                    if (std.mem.eql(u8, name, "manifest") and func.clauses.len > 0 and func.clauses[0].params.len == 1) {
-                        // Build the mangled name: Module__Name__manifest
-                        var mangled: std.ArrayListUnmanaged(u8) = .empty;
-                        for (mod.name.parts, 0..) |part, i| {
-                            if (i > 0) try mangled.appendSlice(alloc, "__");
-                            try mangled.appendSlice(alloc, parser.interner.get(part));
-                        }
-                        try mangled.appendSlice(alloc, "__manifest");
-                        return try mangled.toOwnedSlice(alloc);
-                    }
-                },
-                else => {},
-            }
-        }
-    }
-
-    // Look for manifest/1 at top level
-    for (program.top_items) |item| {
-        switch (item) {
-            .function => |func| {
-                const name = parser.interner.get(func.name);
-                if (std.mem.eql(u8, name, "manifest") and func.clauses.len > 0 and func.clauses[0].params.len == 1) {
-                    return try alloc.dupe(u8, "manifest");
-                }
-            },
-            else => {},
-        }
-    }
-
-    return error.ManifestNotFound;
-}
-
-/// Generate the wrapper main source that calls the builder's manifest/1.
-/// The wrapper reads env from CLI args, calls manifest(env), and writes
-/// the result as key=value lines to stdout.
-pub fn generateWrapperMain(
-    alloc: std.mem.Allocator,
-    builder_module: []const u8,
-) ![]const u8 {
-    // Generate a wrapper that calls the builder module's manifest function.
-    // For now, generate a simple main that calls manifest with a hardcoded env
-    // and prints the result fields.
-    //
-    // The wrapper is Zap source text prepended to build.zap.
-    // Since we can't yet compile struct construction or case expressions through
-    // ZIR reliably, we use a bridge approach: the zap CLI directly parses
-    // build.zap's AST to extract manifest data statically.
-    _ = builder_module;
-    _ = alloc;
-
-    // TODO: When Zap can compile struct construction, case expressions, and
-    // field access through ZIR, generate a real wrapper main here.
-    // For now, return empty — the bridge in main.zig handles it.
-    return "";
-}
-
-/// Parse the builder's stdout output into a BuildConfig.
-/// Format: key=value lines, one per field.
-/// paths are repeated: paths=lib\npaths=test
-/// build_opts are prefixed: build_opts.key=value
-pub fn parseManifestOutput(
-    alloc: std.mem.Allocator,
-    output: []const u8,
-) !BuildConfig {
-    var config = BuildConfig{
-        .name = "",
-        .version = "",
-        .kind = .bin,
+    return .{
+        .config = try constValueToBuildConfig(alloc, manifest_result.value),
+        .dependencies = manifest_result.dependencies,
+        .result_hash = manifest_result.result_hash,
     };
-
-    var paths: std.ArrayListUnmanaged([]const u8) = .empty;
-
-    var lines = std.mem.splitScalar(u8, output, '\n');
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-        const eq_idx = std.mem.indexOfScalar(u8, line, '=') orelse continue;
-        const key = line[0..eq_idx];
-        const value = line[eq_idx + 1 ..];
-
-        if (std.mem.eql(u8, key, "name")) {
-            config.name = try alloc.dupe(u8, value);
-        } else if (std.mem.eql(u8, key, "version")) {
-            config.version = try alloc.dupe(u8, value);
-        } else if (std.mem.eql(u8, key, "kind")) {
-            if (std.mem.eql(u8, value, "bin")) {
-                config.kind = .bin;
-            } else if (std.mem.eql(u8, value, "lib")) {
-                config.kind = .lib;
-            } else if (std.mem.eql(u8, value, "obj")) {
-                config.kind = .obj;
-            }
-        } else if (std.mem.eql(u8, key, "root")) {
-            config.root = try alloc.dupe(u8, value);
-        } else if (std.mem.eql(u8, key, "asset_name")) {
-            config.asset_name = try alloc.dupe(u8, value);
-        } else if (std.mem.eql(u8, key, "paths")) {
-            try paths.append(alloc, try alloc.dupe(u8, value));
-        } else if (std.mem.startsWith(u8, key, "build_opts.")) {
-            const opt_key = key["build_opts.".len..];
-            try config.build_opts.put(alloc, try alloc.dupe(u8, opt_key), try alloc.dupe(u8, value));
-        }
-    }
-
-    config.paths = try paths.toOwnedSlice(alloc);
-    return config;
 }
 
-/// Extract a BuildConfig directly from the build.zap AST.
-/// This is the bridge for v1 — it statically extracts the manifest for the
-/// requested target by pattern-matching the AST, without compiling and
-/// executing the builder.
-pub fn extractManifestFromAST(
+/// Read all .zap files from a directory and add them as source units.
+fn readLibSourceUnits(
     alloc: std.mem.Allocator,
-    build_source: []const u8,
-    target_name: []const u8,
-) !BuildConfig {
-    // Parse build.zap WITHOUT stdlib prepend — we're extracting data from
-    // the AST, not compiling. Stdlib types like Zap.Env and Zap.Manifest
-    // are recognized structurally, not by import.
-    var parser = zap.Parser.init(alloc, build_source);
-    defer parser.deinit();
-
-    const program = parser.parseProgram() catch {
-        // Show parse errors
-        const stderr = std.fs.File.stderr().deprecatedWriter();
-        for (parser.errors.items) |parse_err| {
-            stderr.print("  parse error: {s}\n", .{parse_err.message}) catch {};
-        }
-        return error.ParseFailed;
-    };
-
-    // Find the manifest/1 function
-    for (program.modules) |mod| {
-        for (mod.items) |item| {
-            switch (item) {
-                .function => |func| {
-                    const name = parser.interner.get(func.name);
-                    if (std.mem.eql(u8, name, "manifest") and func.clauses.len > 0 and func.clauses[0].params.len == 1) {
-                        return extractFromManifestBody(alloc, &parser.interner, func, target_name, mod.items);
-                    }
-                },
-                else => {},
-            }
-        }
+    dir_path: []const u8,
+    source_units: *std.ArrayListUnmanaged(compiler.SourceUnit),
+) !void {
+    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
+    defer dir.close();
+    var iter = dir.iterate();
+    while (iter.next() catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".zap")) continue;
+        const file_path = try std.fs.path.join(alloc, &.{ dir_path, entry.name });
+        const source = std.fs.cwd().readFileAlloc(alloc, file_path, 10 * 1024 * 1024) catch continue;
+        try source_units.append(alloc, .{ .file_path = file_path, .source = source });
     }
-
-    return error.ManifestNotFound;
 }
 
-const StdlibError = error{StdlibError};
-const ParseError = error{ParseFailed};
-const ManifestError = error{ManifestNotFound};
-
-fn extractFromManifestBody(
-    alloc: std.mem.Allocator,
-    interner: *const zap.ast.StringInterner,
-    func: *const zap.ast.FunctionDecl,
-    target_name: []const u8,
-    mod_items: []const zap.ast.ModuleItem,
-) !BuildConfig {
-    // Walk all function clauses looking for:
-    // 1. Case expressions on env.target with matching clause
-    // 2. Direct struct returns (no case — always returns the same manifest)
-    for (func.clauses) |clause| {
-        for (clause.body) |stmt| {
-            switch (stmt) {
-                .expr => |expr| {
-                    if (extractFromExpr(alloc, interner, expr, target_name, mod_items)) |config| {
-                        return config;
-                    }
-                    if (extractManifestFromStructExpr(alloc, interner, expr)) |config| {
-                        return config;
-                    }
-                },
-                else => {},
-            }
+fn findManifestFunction(program: *const zap.ir.Program) ?zap.ir.FunctionId {
+    for (program.functions, 0..) |func, i| {
+        if (std.mem.endsWith(u8, func.name, "__manifest") and func.arity == 1) {
+            return @intCast(i);
+        }
+        if (std.mem.eql(u8, func.name, "manifest") and func.arity == 1) {
+            return @intCast(i);
         }
     }
-
-    // Target not found in any case clause
-    const stderr = std.fs.File.stderr().deprecatedWriter();
-    stderr.print("Error: target '{s}' not found in build.zap manifest/1\n", .{target_name}) catch {};
-    return error.ManifestNotFound;
+    return null;
 }
 
-fn extractFromExpr(
-    alloc: std.mem.Allocator,
-    interner: *const zap.ast.StringInterner,
-    expr: *const zap.ast.Expr,
-    target_name: []const u8,
-    mod_items: []const zap.ast.ModuleItem,
-) ?BuildConfig {
-    switch (expr.*) {
-        .case_expr => |ce| {
-            // First pass: look for exact atom match
-            for (ce.clauses) |clause| {
-                if (clauseMatchesAtom(interner, clause, target_name)) {
-                    if (extractFromClauseBody(alloc, interner, clause, mod_items)) |config| {
-                        return config;
+fn constValueToBuildConfig(alloc: std.mem.Allocator, val: zap.ctfe.ConstValue) !BuildConfig {
+    switch (val) {
+        .struct_val => |sv| {
+            var config = BuildConfig{
+                .name = "",
+                .version = "",
+                .kind = .bin,
+            };
+            var paths_list: std.ArrayListUnmanaged([]const u8) = .empty;
+            var deps_list: std.ArrayListUnmanaged(BuildConfig.Dep) = .empty;
+
+            for (sv.fields) |field| {
+                if (std.mem.eql(u8, field.name, "name")) {
+                    config.name = switch (field.value) {
+                        .string => |s| try alloc.dupe(u8, s),
+                        else => "",
+                    };
+                } else if (std.mem.eql(u8, field.name, "version")) {
+                    config.version = switch (field.value) {
+                        .string => |s| try alloc.dupe(u8, s),
+                        else => "",
+                    };
+                } else if (std.mem.eql(u8, field.name, "kind")) {
+                    config.kind = switch (field.value) {
+                        .atom => |a| if (std.mem.eql(u8, a, "lib")) .lib else if (std.mem.eql(u8, a, "obj")) .obj else .bin,
+                        else => .bin,
+                    };
+                } else if (std.mem.eql(u8, field.name, "root")) {
+                    config.root = switch (field.value) {
+                        .string => |s| if (s.len > 0) try alloc.dupe(u8, s) else null,
+                        else => null,
+                    };
+                } else if (std.mem.eql(u8, field.name, "asset_name")) {
+                    config.asset_name = switch (field.value) {
+                        .string => |s| if (s.len > 0) try alloc.dupe(u8, s) else null,
+                        else => null,
+                    };
+                } else if (std.mem.eql(u8, field.name, "optimize")) {
+                    config.optimize = switch (field.value) {
+                        .atom => |a| if (std.mem.eql(u8, a, "debug"))
+                            .debug
+                        else if (std.mem.eql(u8, a, "release_fast"))
+                            .release_fast
+                        else if (std.mem.eql(u8, a, "release_small"))
+                            .release_small
+                        else
+                            .release_safe,
+                        else => .release_safe,
+                    };
+                } else if (std.mem.eql(u8, field.name, "paths")) {
+                    switch (field.value) {
+                        .list => |items| {
+                            for (items) |item| {
+                                switch (item) {
+                                    .string => |s| try paths_list.append(alloc, try alloc.dupe(u8, s)),
+                                    else => {},
+                                }
+                            }
+                        },
+                        else => {},
                     }
+                } else if (std.mem.eql(u8, field.name, "deps")) {
+                    switch (field.value) {
+                        .list => |items| {
+                            for (items) |item| {
+                                try deps_list.append(alloc, try constValueToDep(alloc, item));
+                            }
+                        },
+                        else => {},
+                    }
+                } else if (std.mem.eql(u8, field.name, "build_opts")) {
+                    try loadBuildOpts(alloc, &config.build_opts, field.value);
                 }
             }
-            // Second pass: fall back to _default bind pattern
-            for (ce.clauses) |clause| {
-                if (clauseIsDefault(interner, clause)) {
-                    if (extractFromClauseBody(alloc, interner, clause, mod_items)) |config| {
-                        return config;
-                    }
+
+            config.paths = try paths_list.toOwnedSlice(alloc);
+            config.deps = try deps_list.toOwnedSlice(alloc);
+            return config;
+        },
+        else => return error.ManifestNotFound,
+    }
+}
+
+fn constValueToDep(alloc: std.mem.Allocator, val: zap.ctfe.ConstValue) !BuildConfig.Dep {
+    var name: ?[]const u8 = null;
+    var path: ?[]const u8 = null;
+    var git_url: ?[]const u8 = null;
+    var git_tag: ?[]const u8 = null;
+    var git_branch: ?[]const u8 = null;
+    var git_rev: ?[]const u8 = null;
+
+    switch (val) {
+        .struct_val => |sv| {
+            for (sv.fields) |field| {
+                if (std.mem.eql(u8, field.name, "name")) {
+                    name = try constStringField(alloc, field.value);
+                } else if (std.mem.eql(u8, field.name, "path")) {
+                    path = try constOptionalStringField(alloc, field.value);
+                } else if (std.mem.eql(u8, field.name, "git_url")) {
+                    git_url = try constOptionalStringField(alloc, field.value);
+                } else if (std.mem.eql(u8, field.name, "git_tag")) {
+                    git_tag = try constOptionalStringField(alloc, field.value);
+                } else if (std.mem.eql(u8, field.name, "git_branch")) {
+                    git_branch = try constOptionalStringField(alloc, field.value);
+                } else if (std.mem.eql(u8, field.name, "git_rev")) {
+                    git_rev = try constOptionalStringField(alloc, field.value);
                 }
             }
         },
-        .block => |blk| {
-            for (blk.stmts) |stmt| {
-                switch (stmt) {
-                    .expr => |e| {
-                        if (extractFromExpr(alloc, interner, e, target_name, mod_items)) |config| {
-                            return config;
+        .map => |entries| {
+            for (entries) |entry| {
+                const key = constKeyName(entry.key) orelse continue;
+                if (std.mem.eql(u8, key, "name")) {
+                    name = try constStringField(alloc, entry.value);
+                } else if (std.mem.eql(u8, key, "path")) {
+                    path = try constOptionalStringField(alloc, entry.value);
+                } else if (std.mem.eql(u8, key, "git_url")) {
+                    git_url = try constOptionalStringField(alloc, entry.value);
+                } else if (std.mem.eql(u8, key, "git_tag")) {
+                    git_tag = try constOptionalStringField(alloc, entry.value);
+                } else if (std.mem.eql(u8, key, "git_branch")) {
+                    git_branch = try constOptionalStringField(alloc, entry.value);
+                } else if (std.mem.eql(u8, key, "git_rev")) {
+                    git_rev = try constOptionalStringField(alloc, entry.value);
+                }
+            }
+        },
+        .tuple => |elems| {
+            // Tuple format: {:name, {:path, "path"}} or {:name, {:git, "url"}}
+            // Also supports extended git: {:name, {:git, "url", tag: "v1"}}
+            if (elems.len >= 2) {
+                // First element: dep name (atom)
+                switch (elems[0]) {
+                    .atom => |a| name = try alloc.dupe(u8, a),
+                    .string => |s| name = try alloc.dupe(u8, s),
+                    else => {},
+                }
+                // Second element: source spec tuple {:path, "..."} or {:git, "..."}
+                switch (elems[1]) {
+                    .tuple => |source_elems| {
+                        if (source_elems.len >= 2) {
+                            const source_type = switch (source_elems[0]) {
+                                .atom => |a| a,
+                                else => "",
+                            };
+                            const source_val = switch (source_elems[1]) {
+                                .string => |s| try alloc.dupe(u8, s),
+                                else => null,
+                            };
+                            if (source_val) |sv| {
+                                if (std.mem.eql(u8, source_type, "path")) {
+                                    path = sv;
+                                } else if (std.mem.eql(u8, source_type, "git")) {
+                                    git_url = sv;
+                                    // Optional extra fields: tag, branch, rev
+                                    if (source_elems.len >= 3) {
+                                        switch (source_elems[2]) {
+                                            .string => |s| git_tag = try alloc.dupe(u8, s),
+                                            else => {},
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    else => {},
+                }
+            }
+        },
+        else => return error.ManifestNotFound,
+    }
+
+    const dep_name = name orelse return error.ManifestNotFound;
+    if (path) |dep_path| {
+        return .{ .name = dep_name, .source = .{ .path = dep_path } };
+    }
+    if (git_url) |url| {
+        return .{ .name = dep_name, .source = .{ .git = .{
+            .url = url,
+            .tag = git_tag,
+            .branch = git_branch,
+            .rev = git_rev,
+        } } };
+    }
+    return error.ManifestNotFound;
+}
+
+fn loadBuildOpts(
+    alloc: std.mem.Allocator,
+    map: *std.StringHashMapUnmanaged([]const u8),
+    val: zap.ctfe.ConstValue,
+) !void {
+    switch (val) {
+        .map => |entries| {
+            for (entries) |entry| {
+                const key = constKeyName(entry.key) orelse continue;
+                const value = try constStringField(alloc, entry.value);
+                try map.put(alloc, try alloc.dupe(u8, key), value);
+            }
+        },
+        .list => |items| {
+            for (items) |item| {
+                switch (item) {
+                    .tuple => |elems| {
+                        if (elems.len != 2) continue;
+                        const key = constKeyName(elems[0]) orelse continue;
+                        const value = try constStringField(alloc, elems[1]);
+                        try map.put(alloc, try alloc.dupe(u8, key), value);
+                    },
+                    .struct_val => |sv| {
+                        var key: ?[]const u8 = null;
+                        var value: ?[]const u8 = null;
+                        for (sv.fields) |field| {
+                            if (std.mem.eql(u8, field.name, "key")) key = try constStringField(alloc, field.value);
+                            if (std.mem.eql(u8, field.name, "value")) value = try constStringField(alloc, field.value);
+                        }
+                        if (key != null and value != null) {
+                            try map.put(alloc, key.?, value.?);
                         }
                     },
                     else => {},
@@ -336,261 +391,75 @@ fn extractFromExpr(
         },
         else => {},
     }
-    return null;
 }
 
-fn extractFromClauseBody(
-    alloc: std.mem.Allocator,
-    interner: *const zap.ast.StringInterner,
-    clause: zap.ast.CaseClause,
-    mod_items: []const zap.ast.ModuleItem,
-) ?BuildConfig {
-    for (clause.body) |stmt| {
-        switch (stmt) {
-            .expr => |body_expr| {
-                if (extractManifestFromStructExpr(alloc, interner, body_expr)) |config| {
-                    return config;
-                }
-                if (extractManifestFromCallExpr(alloc, interner, body_expr, mod_items)) |config| {
-                    return config;
-                }
-            },
-            else => {},
-        }
-    }
-    return null;
-}
-
-fn clauseMatchesAtom(
-    interner: *const zap.ast.StringInterner,
-    clause: zap.ast.CaseClause,
-    target_name: []const u8,
-) bool {
-    switch (clause.pattern.*) {
-        .literal => |lit| {
-            switch (lit) {
-                .atom => |al| {
-                    const atom_name = interner.get(al.value);
-                    return std.mem.eql(u8, atom_name, target_name);
-                },
-                else => return false,
-            }
-        },
-        else => return false,
-    }
-}
-
-fn clauseIsDefault(
-    interner: *const zap.ast.StringInterner,
-    clause: zap.ast.CaseClause,
-) bool {
-    switch (clause.pattern.*) {
-        .bind => |bp| {
-            const bind_name = interner.get(bp.name);
-            return std.mem.eql(u8, bind_name, "_default");
-        },
-        else => return false,
-    }
-}
-
-fn extractManifestFromCallExpr(
-    alloc: std.mem.Allocator,
-    interner: *const zap.ast.StringInterner,
-    expr: *const zap.ast.Expr,
-    mod_items: []const zap.ast.ModuleItem,
-) ?BuildConfig {
-    switch (expr.*) {
-        .call => |ce| {
-            // Resolve the callee name from a var_ref (e.g., foo_bar(env))
-            switch (ce.callee.*) {
-                .var_ref => |vr| {
-                    const func_name = interner.get(vr.name);
-                    // Find the function in module items
-                    for (mod_items) |item| {
-                        const func = switch (item) {
-                            .function => |f| f,
-                            .priv_function => |f| f,
-                            else => continue,
-                        };
-                        if (std.mem.eql(u8, interner.get(func.name), func_name)) {
-                            // Extract manifest from this function's body
-                            for (func.clauses) |clause| {
-                                for (clause.body) |stmt| {
-                                    switch (stmt) {
-                                        .expr => |body_expr| {
-                                            if (extractManifestFromStructExpr(alloc, interner, body_expr)) |config| {
-                                                return config;
-                                            }
-                                        },
-                                        else => {},
-                                    }
-                                }
-                            }
-                        }
-                    }
-                },
-                else => {},
-            }
-        },
-        else => {},
-    }
-    return null;
-}
-
-fn extractManifestFromStructExpr(
-    alloc: std.mem.Allocator,
-    interner: *const zap.ast.StringInterner,
-    expr: *const zap.ast.Expr,
-) ?BuildConfig {
-    switch (expr.*) {
-        .struct_expr => |se| {
-            // Check if this is a %Zap.Manifest{...} or %Manifest{...}
-            if (se.module_name.parts.len >= 1) {
-                const last = interner.get(se.module_name.parts[se.module_name.parts.len - 1]);
-                if (std.mem.eql(u8, last, "Manifest")) {
-                    return extractFieldsFromStruct(alloc, interner, se.fields);
-                }
-            }
-        },
-        else => {},
-    }
-    return null;
-}
-
-fn extractFieldsFromStruct(
-    alloc: std.mem.Allocator,
-    interner: *const zap.ast.StringInterner,
-    fields: []const zap.ast.StructField,
-) ?BuildConfig {
-    var config = BuildConfig{
-        .name = "",
-        .version = "",
-        .kind = .bin,
+fn constStringField(alloc: std.mem.Allocator, val: zap.ctfe.ConstValue) ![]const u8 {
+    return switch (val) {
+        .string => |s| try alloc.dupe(u8, s),
+        .atom => |s| try alloc.dupe(u8, s),
+        else => error.ManifestNotFound,
     };
-    var paths: std.ArrayListUnmanaged([]const u8) = .empty;
-    var deps: std.ArrayListUnmanaged(BuildConfig.Dep) = .empty;
-
-    for (fields) |field| {
-        const field_name = interner.get(field.name);
-
-        if (std.mem.eql(u8, field_name, "name")) {
-            if (field.value.* == .string_literal) {
-                config.name = interner.get(field.value.string_literal.value);
-            }
-        } else if (std.mem.eql(u8, field_name, "version")) {
-            if (field.value.* == .string_literal) {
-                config.version = interner.get(field.value.string_literal.value);
-            }
-        } else if (std.mem.eql(u8, field_name, "kind")) {
-            if (field.value.* == .atom_literal) {
-                const kind_str = interner.get(field.value.atom_literal.value);
-                if (std.mem.eql(u8, kind_str, "bin")) config.kind = .bin
-                else if (std.mem.eql(u8, kind_str, "lib")) config.kind = .lib
-                else if (std.mem.eql(u8, kind_str, "obj")) config.kind = .obj;
-            }
-        } else if (std.mem.eql(u8, field_name, "root")) {
-            if (field.value.* == .string_literal) {
-                config.root = interner.get(field.value.string_literal.value);
-            }
-        } else if (std.mem.eql(u8, field_name, "asset_name")) {
-            if (field.value.* == .string_literal) {
-                config.asset_name = interner.get(field.value.string_literal.value);
-            }
-        } else if (std.mem.eql(u8, field_name, "optimize")) {
-            if (field.value.* == .atom_literal) {
-                const opt_str = interner.get(field.value.atom_literal.value);
-                if (std.mem.eql(u8, opt_str, "debug")) config.optimize = .debug
-                else if (std.mem.eql(u8, opt_str, "release_safe")) config.optimize = .release_safe
-                else if (std.mem.eql(u8, opt_str, "release_fast")) config.optimize = .release_fast
-                else if (std.mem.eql(u8, opt_str, "release_small")) config.optimize = .release_small;
-            }
-        } else if (std.mem.eql(u8, field_name, "paths")) {
-            if (field.value.* == .list) {
-                for (field.value.list.elements) |elem| {
-                    if (elem.* == .string_literal) {
-                        paths.append(alloc, interner.get(elem.string_literal.value)) catch continue;
-                    }
-                }
-            }
-        } else if (std.mem.eql(u8, field_name, "deps")) {
-            if (field.value.* == .list) {
-                for (field.value.list.elements) |elem| {
-                    if (parseDep(alloc, interner, elem)) |dep| {
-                        deps.append(alloc, dep) catch continue;
-                    }
-                }
-            }
-        }
-    }
-
-    config.paths = paths.toOwnedSlice(alloc) catch return null;
-    config.deps = deps.toOwnedSlice(alloc) catch return null;
-    return config;
 }
 
-/// Parse a single dep tuple from the AST: {:name, {:source_type, ...}}
-fn parseDep(
-    _: std.mem.Allocator,
-    interner: *const zap.ast.StringInterner,
-    expr: *const zap.ast.Expr,
-) ?BuildConfig.Dep {
-    // Expect a tuple: {atom, source_tuple}
-    if (expr.* != .tuple) return null;
-    const elements = expr.tuple.elements;
-    if (elements.len != 2) return null;
-
-    // First element: atom (dep name)
-    if (elements[0].* != .atom_literal) return null;
-    const dep_name = interner.get(elements[0].atom_literal.value);
-
-    // Second element: source tuple
-    if (elements[1].* != .tuple) return null;
-    const source_elements = elements[1].tuple.elements;
-    if (source_elements.len < 2) return null;
-
-    // Source type tag: atom
-    if (source_elements[0].* != .atom_literal) return null;
-    const source_type = interner.get(source_elements[0].atom_literal.value);
-
-    if (std.mem.eql(u8, source_type, "path")) {
-        // {:path, "relative/path"}
-        if (source_elements[1].* != .string_literal) return null;
-        const path = interner.get(source_elements[1].string_literal.value);
-        return .{
-            .name = dep_name,
-            .source = .{ .path = path },
-        };
-    }
-
-    if (std.mem.eql(u8, source_type, "git")) {
-        // {:git, "url"} or {:git, "url", "ref"}
-        if (source_elements[1].* != .string_literal) return null;
-        const url = interner.get(source_elements[1].string_literal.value);
-        var git_source = BuildConfig.GitSource{ .url = url };
-
-        if (source_elements.len >= 3 and source_elements[2].* == .string_literal) {
-            const ref = interner.get(source_elements[2].string_literal.value);
-            // Detect ref type: "v1.0.0" looks like a tag, hex looks like a commit
-            if (ref.len == 40 and isHexString(ref)) {
-                git_source.rev = ref;
-            } else {
-                git_source.tag = ref;
-            }
-        }
-
-        return .{
-            .name = dep_name,
-            .source = .{ .git = git_source },
-        };
-    }
-
-    // Future: handle :zig, :system
-    return null;
+fn constOptionalStringField(alloc: std.mem.Allocator, val: zap.ctfe.ConstValue) !?[]const u8 {
+    return switch (val) {
+        .nil => null,
+        .string, .atom => try constStringField(alloc, val),
+        else => null,
+    };
 }
 
-fn isHexString(s: []const u8) bool {
-    for (s) |c| {
-        if (!std.ascii.isHex(c)) return false;
-    }
-    return s.len > 0;
+fn constKeyName(val: zap.ctfe.ConstValue) ?[]const u8 {
+    return switch (val) {
+        .string => |s| s,
+        .atom => |s| s,
+        else => null,
+    };
+}
+
+const testing = std.testing;
+
+test "constValueToBuildConfig parses deps and build opts" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const val = zap.ctfe.ConstValue{ .struct_val = .{
+        .type_name = "Zap_Manifest",
+        .fields = &.{
+            .{ .name = "name", .value = .{ .string = "app" } },
+            .{ .name = "version", .value = .{ .string = "0.1.0" } },
+            .{ .name = "kind", .value = .{ .atom = "bin" } },
+            .{ .name = "deps", .value = .{ .list = &.{
+                .{ .struct_val = .{
+                    .type_name = "Zap_Dep",
+                    .fields = &.{
+                        .{ .name = "name", .value = .{ .string = "local_dep" } },
+                        .{ .name = "path", .value = .{ .string = "../local_dep" } },
+                    },
+                } },
+                .{ .struct_val = .{
+                    .type_name = "Zap_Dep",
+                    .fields = &.{
+                        .{ .name = "name", .value = .{ .string = "git_dep" } },
+                        .{ .name = "git_url", .value = .{ .string = "https://example.com/repo.git" } },
+                        .{ .name = "git_tag", .value = .{ .string = "v1.2.3" } },
+                    },
+                } },
+            } } },
+            .{ .name = "build_opts", .value = .{ .list = &.{
+                .{ .tuple = &.{ .{ .string = "optimize" }, .{ .string = "release_fast" } } },
+                .{ .tuple = &.{ .{ .atom = "feature_x" }, .{ .string = "true" } } },
+            } } },
+        },
+    } };
+
+    const config = try constValueToBuildConfig(alloc, val);
+    try testing.expectEqual(@as(usize, 2), config.deps.len);
+    try testing.expect(config.deps[0].source == .path);
+    try testing.expectEqualStrings("../local_dep", config.deps[0].source.path);
+    try testing.expect(config.deps[1].source == .git);
+    try testing.expectEqualStrings("https://example.com/repo.git", config.deps[1].source.git.url);
+    try testing.expectEqualStrings("v1.2.3", config.deps[1].source.git.tag.?);
+    try testing.expectEqualStrings("release_fast", config.build_opts.get("optimize").?);
+    try testing.expectEqualStrings("true", config.build_opts.get("feature_x").?);
 }

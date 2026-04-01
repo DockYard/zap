@@ -1,10 +1,11 @@
-# Default parameter values
-#
-# Trailing parameters can have defaults. The compiler generates
-# wrapper functions for each valid shorter arity.
+# String concatenation and function calls
 
 defmodule Http do
-  def request(url :: String, method :: String = "GET", _timeout :: i64 = 30) :: String do
-    method <> " " <> url
+  def get(url :: String) :: String do
+    "GET " <> url
+  end
+
+  def post(url :: String) :: String do
+    "POST " <> url
   end
 end

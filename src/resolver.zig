@@ -495,11 +495,11 @@ test "resolve simple function" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var resolver = Resolver.init(alloc, &collector.graph, &parser.interner);
+    var resolver = Resolver.init(alloc, &collector.graph, parser.interner);
     defer resolver.deinit();
     try resolver.resolveProgram(&program);
 
@@ -524,11 +524,11 @@ test "resolve module with function" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var resolver = Resolver.init(alloc, &collector.graph, &parser.interner);
+    var resolver = Resolver.init(alloc, &collector.graph, parser.interner);
     defer resolver.deinit();
     try resolver.resolveProgram(&program);
 
@@ -557,11 +557,11 @@ test "resolve case expression with bindings" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var resolver = Resolver.init(alloc, &collector.graph, &parser.interner);
+    var resolver = Resolver.init(alloc, &collector.graph, parser.interner);
     defer resolver.deinit();
     try resolver.resolveProgram(&program);
 
@@ -586,11 +586,11 @@ test "resolve assignment" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var resolver = Resolver.init(alloc, &collector.graph, &parser.interner);
+    var resolver = Resolver.init(alloc, &collector.graph, parser.interner);
     defer resolver.deinit();
     try resolver.resolveProgram(&program);
 

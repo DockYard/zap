@@ -1,5 +1,5 @@
 defmodule PatternMatch do
-  def describe(_) :: String do
+  def describe(_ :: Atom) :: String do
     "HEY YO!"
   end
 
@@ -7,11 +7,11 @@ defmodule PatternMatch do
     "zero"
   end
 
-  def describe(:ok) :: String do
+  def describe(:ok :: Atom) :: String do
     "success"
   end
 
-  def describe(:error) :: String do
+  def describe(:error :: Atom) :: String do
     "failure"
   end
 

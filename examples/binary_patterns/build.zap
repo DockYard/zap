@@ -6,8 +6,8 @@ defmodule BinaryPatterns.Builder do
           name: "binary_patterns",
           version: "0.1.0",
           kind: :bin,
-          root: "BinaryPatterns.main/0",
-          paths: ["./*.zap"]
+          root: "BinaryPatterns.main/1",
+          paths: ["./*.zap"], deps: [{:zap_stdlib, {:path, "../../lib"}}]
         }
       _ ->
         panic("Unknown target: use 'binary_patterns'")

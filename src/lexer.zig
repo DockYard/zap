@@ -2,10 +2,17 @@ const std = @import("std");
 const Token = @import("token.zig").Token;
 
 pub const Lexer = struct {
+    pub const SourceMapSegment = struct {
+        start: u32,
+        end: u32,
+        source_id: u32,
+    };
+
     source: []const u8,
     pos: u32,
     line: u32,
     line_start: u32,
+    source_id: ?u32 = null,
 
     // Indentation tracking — simple fixed-size stack
     indent_levels: [256]u32,
@@ -23,6 +30,7 @@ pub const Lexer = struct {
             .pos = 0,
             .line = 1,
             .line_start = 0,
+            .source_id = null,
             .indent_levels = undefined,
             .indent_depth = 1,
             .pending_dedents = 0,
@@ -31,6 +39,12 @@ pub const Lexer = struct {
             .interp_depth = 0,
         };
         self.indent_levels[0] = 0; // base indent level
+        return self;
+    }
+
+    pub fn initWithSourceId(source: []const u8, source_id: u32) Lexer {
+        var self = init(source);
+        self.source_id = source_id;
         return self;
     }
 
@@ -437,9 +451,26 @@ pub const Lexer = struct {
     }
 
     fn makeToken(self: *Lexer, tag: Token.Tag, start: u32, end: u32) Token {
+        const mapped = self.mapLocation(start, end);
         return .{
             .tag = tag,
-            .loc = .{ .start = start, .end = end, .line = self.line, .col = start -| self.line_start + 1 },
+            .loc = .{
+                .start = mapped.start,
+                .end = mapped.end,
+                .line = mapped.line,
+                .col = mapped.col,
+                .source_id = mapped.source_id,
+            },
+        };
+    }
+
+    fn mapLocation(self: *const Lexer, start: u32, end: u32) Token.Location {
+        return .{
+            .start = start,
+            .end = end,
+            .line = self.line,
+            .col = start -| self.line_start + 1,
+            .source_id = self.source_id,
         };
     }
 
@@ -500,9 +531,9 @@ test "lex operators" {
     var lexer = Lexer.init(source);
 
     const expected = [_]Token.Tag{
-        .plus, .minus, .star, .slash, .equal_equal, .not_equal,
-        .less_equal, .greater_equal, .pipe_operator, .arrow,
-        .back_arrow, .double_colon, .diamond, .bang,
+        .plus,       .minus,         .star,          .slash, .equal_equal, .not_equal,
+        .less_equal, .greater_equal, .pipe_operator, .arrow, .back_arrow,  .double_colon,
+        .diamond,    .bang,
     };
 
     for (expected) |exp| {
@@ -597,7 +628,7 @@ test "lex delimiters" {
     var lexer = Lexer.init(source);
 
     const expected = [_]Token.Tag{
-        .left_paren, .right_paren, .left_bracket, .right_bracket,
+        .left_paren, .right_paren, .left_bracket,  .right_bracket,
         .left_brace, .right_brace, .percent_brace, .right_brace,
     };
 
@@ -635,10 +666,11 @@ test "lex function definition tokens" {
     var lexer = Lexer.init(source);
 
     const expected_tags = [_]Token.Tag{
-        .keyword_def, .identifier, .left_paren,
-        .identifier, .double_colon, .identifier, .comma,
-        .identifier, .double_colon, .identifier,
-        .right_paren, .double_colon, .identifier, .keyword_do,
+        .keyword_def, .identifier,   .left_paren,
+        .identifier,  .double_colon, .identifier,
+        .comma,       .identifier,   .double_colon,
+        .identifier,  .right_paren,  .double_colon,
+        .identifier,  .keyword_do,
     };
 
     for (expected_tags) |exp| {

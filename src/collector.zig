@@ -47,6 +47,16 @@ pub const Collector = struct {
     // ============================================================
 
     pub fn collectProgram(self: *Collector, program: *const ast.Program) !void {
+        try self.collectProgramSurface(program);
+
+        // Second pass: resolve struct extends (copy parent fields into children)
+        try self.resolveStructExtends();
+
+        // Third pass: resolve module extends (copy parent function families into children)
+        try self.resolveModuleExtends(program);
+    }
+
+    pub fn collectProgramSurface(self: *Collector, program: *const ast.Program) !void {
         // Process top-level modules
         for (program.modules) |*mod| {
             try self.collectModule(mod, self.graph.prelude_scope);
@@ -68,12 +78,16 @@ pub const Collector = struct {
                 .priv_module => {},
             }
         }
+    }
 
+    pub fn finalizeCollectedPrograms(self: *Collector, programs: []const ast.Program) !void {
         // Second pass: resolve struct extends (copy parent fields into children)
         try self.resolveStructExtends();
 
         // Third pass: resolve module extends (copy parent function families into children)
-        try self.resolveModuleExtends(program);
+        for (programs) |program| {
+            try self.resolveModuleExtends(&program);
+        }
     }
 
     // ============================================================
@@ -645,7 +659,7 @@ test "collect simple function" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -680,7 +694,7 @@ test "collect module with functions" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -707,7 +721,7 @@ test "collect type declaration" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -737,7 +751,7 @@ test "collect function family grouping" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -769,7 +783,7 @@ test "collect case expression creates scopes" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -799,7 +813,7 @@ test "collect local def hoisting" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -825,7 +839,7 @@ test "collect struct declaration" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 

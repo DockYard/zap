@@ -32,12 +32,12 @@ pub const diagnostics = @import("diagnostics.zig");
 pub const DiagnosticEngine = diagnostics.DiagnosticEngine;
 pub const Severity = diagnostics.Severity;
 pub const similarity = @import("similarity.zig");
-pub const stdlib = @import("stdlib.zig");
 pub const project = @import("project.zig");
 pub const compiler = @import("compiler.zig");
 pub const builder = @import("builder.zig");
 pub const discovery = @import("discovery.zig");
 pub const attr_substitute = @import("attr_substitute.zig");
+pub const ctfe = @import("ctfe.zig");
 pub const lockfile = @import("lockfile.zig");
 
 test {
@@ -69,12 +69,12 @@ test {
     _ = @import("runtime.zig");
     _ = @import("diagnostics.zig");
     _ = @import("similarity.zig");
-    _ = @import("stdlib.zig");
     _ = @import("project.zig");
     _ = @import("compiler.zig");
     _ = @import("builder.zig");
     _ = @import("discovery.zig");
     _ = @import("lockfile.zig");
     _ = @import("attr_substitute.zig");
+    _ = @import("ctfe.zig");
     _ = @import("integration_tests.zig");
 }

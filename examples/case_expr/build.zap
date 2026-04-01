@@ -6,8 +6,8 @@ defmodule CaseExpr.Builder do
           name: "case_expr",
           version: "0.1.0",
           kind: :bin,
-          root: "CaseExpr.main/0",
-          paths: ["./*.zap"]
+          root: "CaseExpr.main/1",
+          paths: ["./*.zap"], deps: [{:zap_stdlib, {:path, "../../lib"}}]
         }
       _ ->
         panic("Unknown target: use 'case_expr'")

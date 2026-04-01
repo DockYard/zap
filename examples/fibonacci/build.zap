@@ -6,8 +6,8 @@ defmodule Fibonacci.Builder do
           name: "fibonacci",
           version: "0.1.0",
           kind: :bin,
-          root: "Fibonacci.main/0",
-          paths: ["./*.zap"]
+          root: "Fibonacci.main/1",
+          paths: ["./*.zap"], deps: [{:zap_stdlib, {:path, "../../lib"}}]
         }
       _ ->
         panic("Unknown target: use 'fibonacci'")

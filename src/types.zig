@@ -289,6 +289,7 @@ pub const TypeStore = struct {
         if (std.mem.eql(u8, name, "f16")) return F16;
         if (std.mem.eql(u8, name, "usize")) return USIZE;
         if (std.mem.eql(u8, name, "isize")) return ISIZE;
+        if (std.mem.eql(u8, name, "Expr")) return UNKNOWN; // Macro meta-type
         return null;
     }
 
@@ -663,8 +664,16 @@ pub const TypeChecker = struct {
         for (clause.params) |param| {
             const param_type = if (param.type_annotation) |ann|
                 try self.resolveTypeExpr(ann)
-            else
-                TypeStore.UNKNOWN;
+            else blk: {
+                // All function parameters require type annotations
+                try self.addHardError(
+                    try std.fmt.allocPrint(self.allocator, "parameter requires a type annotation (e.g., `param :: Type`)", .{}),
+                    param.pattern.getMeta().span,
+                    "missing type annotation",
+                    null,
+                );
+                break :blk TypeStore.UNKNOWN;
+            };
             try param_types.append(self.allocator, param_type);
             try param_ownerships.append(self.allocator, self.resolveParamOwnership(param, param_type));
         }
@@ -1640,6 +1649,14 @@ pub const TypeChecker = struct {
                         }
                     }
                 }
+            } else {
+                // All function parameters require type annotations
+                try self.addHardError(
+                    try std.fmt.allocPrint(self.allocator, "parameter requires a type annotation (e.g., `param :: Type`)", .{}),
+                    param.pattern.getMeta().span,
+                    "missing type annotation",
+                    null,
+                );
             }
         }
 
@@ -2698,11 +2715,11 @@ test "type checker registers opaque types" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -2789,17 +2806,17 @@ test "type check simple function" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
-    var hir_builder = @import("hir.zig").HirBuilder.init(alloc, &parser.interner, &collector.graph, &checker.store);
+    var hir_builder = @import("hir.zig").HirBuilder.init(alloc, parser.interner, &collector.graph, &checker.store);
     defer hir_builder.deinit();
     const hir_program = try hir_builder.buildProgram(&program);
-    var ir_builder = @import("ir.zig").IrBuilder.init(alloc, &parser.interner);
+    var ir_builder = @import("ir.zig").IrBuilder.init(alloc, parser.interner);
     ir_builder.type_store = &checker.store;
     defer ir_builder.deinit();
     const ir_program = try ir_builder.buildProgram(&hir_program);
@@ -2829,11 +2846,11 @@ test "type check literals" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -2843,7 +2860,7 @@ test "type check literals" {
 test "type check case expression" {
     const source =
         \\defmodule Test do
-        \\  def foo(x) :: Nil do
+        \\  def foo(x :: Atom) :: Nil do
         \\    case x do
         \\      {:ok, v} ->
         \\        v
@@ -2862,11 +2879,11 @@ test "type check case expression" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -2891,11 +2908,11 @@ test "type check arithmetic mismatch reported" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -2939,11 +2956,11 @@ test "type check var_ref resolves to parameter type" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -2971,11 +2988,11 @@ test "type check if condition must be Bool" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -3003,11 +3020,11 @@ test "type check return type mismatch" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -3037,11 +3054,11 @@ test "type provenance tracks source span on typed parameter" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -3077,11 +3094,11 @@ test "typed parameter records shared ownership metadata" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -3103,7 +3120,7 @@ test "typed parameter records shared ownership metadata" {
 test "function ref inference defaults param ownerships to shared" {
     const source =
         \\defmodule Test do
-        \\  def main(args) :: (Nil -> Nil) do
+        \\  def main(args :: Nil) :: (Nil -> Nil) do
         \\    Foo.main/1
         \\  end
         \\end
@@ -3117,11 +3134,11 @@ test "function ref inference defaults param ownerships to shared" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -3159,11 +3176,11 @@ test "moved binding use reports ownership error" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -3206,11 +3223,11 @@ test "unique function parameter ownership moves var_ref argument" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -3261,11 +3278,11 @@ test "shared binding cannot satisfy unique parameter ownership" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -3320,14 +3337,14 @@ test "named call with unique parameter moves opaque binding" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
-    try rerunWithEscapeAnalysis(alloc, &parser.interner, &collector.graph, &checker, &program);
+    try rerunWithEscapeAnalysis(alloc, parser.interner, &collector.graph, &checker, &program);
 
     var found = false;
     for (checker.errors.items) |err| {
@@ -3363,11 +3380,11 @@ test "borrowed param annotation keeps binding usable after call" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -3393,14 +3410,14 @@ test "borrowed value cannot escape through return" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
-    try rerunWithEscapeAnalysis(alloc, &parser.interner, &collector.graph, &checker, &program);
+    try rerunWithEscapeAnalysis(alloc, parser.interner, &collector.graph, &checker, &program);
 
     var found = false;
     for (checker.errors.items) |err| {
@@ -3435,14 +3452,14 @@ test "closure with borrowed capture cannot be returned" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
-    try rerunWithEscapeAnalysis(alloc, &parser.interner, &collector.graph, &checker, &program);
+    try rerunWithEscapeAnalysis(alloc, parser.interner, &collector.graph, &checker, &program);
 
     var found = false;
     for (checker.errors.items) |err| {
@@ -3478,14 +3495,14 @@ test "unique capture moves outer binding" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
-    try rerunWithEscapeAnalysis(alloc, &parser.interner, &collector.graph, &checker, &program);
+    try rerunWithEscapeAnalysis(alloc, parser.interner, &collector.graph, &checker, &program);
 
     var found = false;
     for (checker.errors.items) |err| {
@@ -3524,14 +3541,14 @@ test "closure with borrowed capture cannot be passed as argument" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
-    try rerunWithEscapeAnalysis(alloc, &parser.interner, &collector.graph, &checker, &program);
+    try rerunWithEscapeAnalysis(alloc, parser.interner, &collector.graph, &checker, &program);
 
     var found = false;
     for (checker.errors.items) |err| {
@@ -3567,14 +3584,14 @@ test "closure with borrowed capture cannot be assigned" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
-    try rerunWithEscapeAnalysis(alloc, &parser.interner, &collector.graph, &checker, &program);
+    try rerunWithEscapeAnalysis(alloc, parser.interner, &collector.graph, &checker, &program);
 
     var found = false;
     for (checker.errors.items) |err| {
@@ -3609,14 +3626,14 @@ test "closure with borrowed capture cannot be stored in tuple" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
-    try rerunWithEscapeAnalysis(alloc, &parser.interner, &collector.graph, &checker, &program);
+    try rerunWithEscapeAnalysis(alloc, parser.interner, &collector.graph, &checker, &program);
 
     var found = false;
     for (checker.errors.items) |err| {
@@ -3651,11 +3668,11 @@ test "closure with borrowed capture may be locally invoked" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -3689,11 +3706,11 @@ test "closure with borrowed capture may be passed to known-safe callee" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -3718,11 +3735,11 @@ test "borrowed parameter does not move binding" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -3768,11 +3785,11 @@ test "return type mismatch has secondary span" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -3804,11 +3821,11 @@ test "undefined function suggests similar name" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -3846,11 +3863,11 @@ test "undefined function no suggestion for unrelated name" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -3885,11 +3902,11 @@ test "valid function call produces no error" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -3917,11 +3934,11 @@ test "unused variable produces warning" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
     try checker.checkUnusedBindings();
@@ -3955,11 +3972,11 @@ test "underscore-prefixed variable no unused warning" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
     try checker.checkUnusedBindings();
@@ -3987,11 +4004,11 @@ test "used variable no unused warning" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
     try checker.checkUnusedBindings();
@@ -4018,11 +4035,11 @@ test "unknown type name produces error" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -4038,7 +4055,7 @@ test "unknown type name produces error" {
 test "unused function parameter produces warning" {
     const source =
         \\defmodule Test do
-        \\  def foo(x) do
+        \\  def foo(x :: i64) do
         \\    42
         \\  end
         \\end
@@ -4052,11 +4069,11 @@ test "unused function parameter produces warning" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, &parser.interner, &collector.graph);
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
     try checker.checkUnusedBindings();

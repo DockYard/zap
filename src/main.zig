@@ -135,8 +135,9 @@ fn cmdDeps(allocator: std.mem.Allocator, args: []const []const u8) !void {
         std.process.exit(1);
     };
 
-    const config = zap.builder.extractManifestFromAST(allocator, build_source, "default") catch {
-        try stderr_w.print("Error: could not parse build.zap manifest\n", .{});
+    const zap_lib_dir = detectZapLibDir(allocator);
+    const config = zap.builder.ctfeManifest(allocator, build_source, "default", .empty, zap_lib_dir) catch {
+        try stderr_w.print("Error: could not evaluate build.zap manifest via CTFE\n", .{});
         std.process.exit(1);
     };
 
@@ -336,6 +337,42 @@ fn cmdInit(allocator: std.mem.Allocator) !void {
 }
 
 // ---------------------------------------------------------------------------
+// Zap lib dir detection
+// ---------------------------------------------------------------------------
+
+/// Detect the zap stdlib lib directory by walking up from the executable path
+/// looking for a `lib/` directory containing `kernel.zap`.
+fn detectZapLibDir(allocator: std.mem.Allocator) ?[]const u8 {
+    const exe_path = std.fs.selfExePathAlloc(allocator) catch return null;
+    defer allocator.free(exe_path);
+
+    // Walk up directories from the executable
+    var dir_path = std.fs.path.dirname(exe_path);
+    while (dir_path) |dp| {
+        const lib_dir = std.fs.path.join(allocator, &.{ dp, "lib" }) catch return null;
+        const kernel_path = std.fs.path.join(allocator, &.{ lib_dir, "kernel.zap" }) catch {
+            allocator.free(lib_dir);
+            return null;
+        };
+        defer allocator.free(kernel_path);
+
+        if (std.fs.cwd().access(kernel_path, .{})) |_| {
+            return lib_dir;
+        } else |_| {
+            allocator.free(lib_dir);
+        }
+        dir_path = std.fs.path.dirname(dp);
+    }
+
+    // Fallback: check if ./lib/kernel.zap exists (for running from project root)
+    if (std.fs.cwd().access("lib/kernel.zap", .{})) |_| {
+        return allocator.dupe(u8, "lib") catch null;
+    } else |_| {}
+
+    return null;
+}
+
+// ---------------------------------------------------------------------------
 // Build pipeline
 // ---------------------------------------------------------------------------
 
@@ -360,87 +397,16 @@ fn buildTarget(
         std.process.exit(1);
     };
 
-    // Extract manifest from build.zap AST.
-    // The compiled builder path (compile build.zap as binary, execute, capture
-    // output) is implemented but blocked by the Zig self-hosted linker producing
-    // zero-filled binaries. AST extraction handles static manifests correctly.
-    _ = build_opts;
-    const config = builder.extractManifestFromAST(alloc, build_source, target_name) catch {
+    // Detect zap lib dir for stdlib
+    const zap_lib_dir = detectZapLibDir(alloc);
+
+    // Extract manifest from build.zap via CTFE.
+    // Compiles build.zap to IR and evaluates manifest/1 at compile time.
+    const manifest_eval = builder.ctfeManifestDetailed(alloc, build_source, target_name, build_opts, zap_lib_dir) catch |err| {
+        try stderr_w.print("Error: failed to evaluate build.zap manifest via CTFE: {}\n", .{err});
         std.process.exit(1);
     };
-
-    // Compiled builder path — disabled until Zig linker produces valid binaries.
-    // When enabled, this compiles build.zap as a builder binary, spawns it with
-    // target/os/arch args, and captures the manifest output from stdout.
-    if (false) { // TODO: enable when Zig linker is fixed
-        const manifest_func_name = builder.findBuilderManifestName(alloc, build_source) catch |err| {
-            switch (err) {
-                error.ManifestNotFound => try stderr_w.print("Error: build.zap must define manifest/1\n", .{}),
-                error.ParseFailed => try stderr_w.print("Error: failed to parse build.zap\n", .{}),
-                else => try stderr_w.print("Error: {}\n", .{err}),
-            }
-            std.process.exit(1);
-        };
-
-        // Compile build.zap as a builder binary
-        const builder_path = try std.fs.path.join(alloc, &.{ ".zap-cache", "builder" });
-        const zig_lib_dir = zir_backend.detectZigLibDir(alloc) orelse blk: {
-            break :blk extractEmbeddedZigLib(alloc) catch {
-                try stderr_w.print("Error: could not find or extract Zig lib\n", .{});
-                std.process.exit(1);
-            };
-        };
-
-        std.fs.cwd().makePath(".zap-cache") catch {};
-
-        // Compile build.zap through the full pipeline with builder_entry set
-        const build_result = compiler.compileFrontend(alloc, build_source, build_file_path, .{
-            .show_progress = false,
-        }) catch {
-            std.process.exit(1);
-        };
-
-        zir_backend.compile(alloc, build_result.ir_program, .{
-            .zig_lib_dir = zig_lib_dir,
-            .cache_dir = ".zap-cache",
-            .global_cache_dir = ".zap-cache",
-            .output_path = builder_path,
-            .name = "builder",
-            .runtime_source = compiler.getRuntimeSource(),
-            .builder_entry = manifest_func_name,
-            .analysis_context = if (build_result.analysis_context) |*ctx| ctx else null,
-        }) catch {
-            try stderr_w.print("Error: failed to compile build.zap\n", .{});
-            std.process.exit(1);
-        };
-
-        // Spawn the builder binary: .zap-cache/builder <target> <os> <arch>
-        const os_name = @tagName(@import("builtin").os.tag);
-        const arch_name = @tagName(@import("builtin").cpu.arch);
-
-        const spawn_result = std.process.Child.run(.{
-            .allocator = alloc,
-            .argv = &.{ builder_path, target_name, os_name, arch_name },
-            .max_output_bytes = 1024 * 1024,
-        }) catch |err| {
-            try stderr_w.print("Error: failed to run builder: {}\n", .{err});
-            std.process.exit(1);
-        };
-
-        if (spawn_result.term != .Exited or spawn_result.term.Exited != 0) {
-            if (spawn_result.stderr.len > 0) {
-                try stderr_w.print("{s}", .{spawn_result.stderr});
-            }
-            try stderr_w.print("Error: builder failed\n", .{});
-            std.process.exit(1);
-        }
-
-        // Parse the builder's stdout output into BuildConfig
-        _ = builder.parseManifestOutput(alloc, spawn_result.stdout) catch {
-            try stderr_w.print("Error: failed to parse builder output\n", .{});
-            std.process.exit(1);
-        };
-    } // end if (false) compiled builder block
+    const config = manifest_eval.config;
 
     // Detect zig lib dir
     const zig_lib_dir = zir_backend.detectZigLibDir(alloc) orelse blk: {
@@ -455,6 +421,8 @@ fn buildTarget(
     var source_files: std.ArrayListUnmanaged([]const u8) = .empty;
     // Source roots for import-driven discovery (populated below, used by validation)
     var source_roots: std.ArrayListUnmanaged(zap.discovery.SourceRoot) = .empty;
+    // Module names in topological order for CTFE evaluation
+    var module_order: std.ArrayListUnmanaged([]const u8) = .empty;
 
     if (config.paths.len == 0 and config.root != null) {
         // Import-driven discovery from the entry point
@@ -494,6 +462,24 @@ fn buildTarget(
                     } else |_| {
                         try source_roots.append(alloc, .{ .name = dep_name, .path = dep_dir });
                     }
+
+                    // Also add subdirectories that contain modules (e.g., lib/zap/ for Zap.Env)
+                    const dep_resolved = if (std.fs.cwd().access(dep_lib_dir, .{}))
+                        dep_lib_dir
+                    else |_|
+                        dep_dir;
+                    // Scan for subdirectories containing .zap files
+                    if (std.fs.cwd().openDir(dep_resolved, .{ .iterate = true })) |dir_handle| {
+                        var dir = dir_handle;
+                        defer dir.close();
+                        var it = dir.iterate();
+                        while (it.next() catch null) |entry| {
+                            if (entry.kind == .directory) {
+                                const subdir = try std.fs.path.join(alloc, &.{ dep_resolved, entry.name });
+                                try source_roots.append(alloc, .{ .name = dep_name, .path = subdir });
+                            }
+                        }
+                    } else |_| {}
 
                     // Path deps are recorded in lockfile but not locked
                     try new_lock_entries.append(alloc, .{
@@ -564,12 +550,21 @@ fn buildTarget(
             };
         }
 
+        // Add zap lib dir as a source root so stdlib modules are discovered
+        if (zap_lib_dir) |zap_lib| {
+            try source_roots.append(alloc, .{ .name = "zap_stdlib", .path = zap_lib });
+            const zap_subdir = try std.fs.path.join(alloc, &.{ zap_lib, "zap" });
+            if (std.fs.cwd().access(zap_subdir, .{})) |_| {
+                try source_roots.append(alloc, .{ .name = "zap_stdlib", .path = zap_subdir });
+            } else |_| {}
+        }
+
         var discovery_err_info: zap.discovery.ErrorInfo = .{};
         var file_graph = zap.discovery.discover(
             alloc,
             entry_module,
             source_roots.items,
-            &zap.discovery.STDLIB_MODULES,
+            &zap.discovery.BUILTIN_TYPE_NAMES,
             &discovery_err_info,
         ) catch |err| switch (err) {
             error.ModuleNotFound => {
@@ -606,10 +601,32 @@ fn buildTarget(
         for (file_graph.topo_order.items) |file_path| {
             try source_files.append(alloc, file_path);
         }
+
+        // Build module order for CTFE: reverse-map file paths to module names
+        var file_to_module = std.StringHashMap([]const u8).init(alloc);
+        {
+            var iter = file_graph.module_to_file.iterator();
+            while (iter.next()) |entry| {
+                try file_to_module.put(entry.value_ptr.*, entry.key_ptr.*);
+            }
+        }
+        for (file_graph.topo_order.items) |file_path| {
+            if (file_to_module.get(file_path)) |mod_name| {
+                try module_order.append(alloc, mod_name);
+            }
+        }
     } else {
-        // Legacy: glob-based file collection from paths
+        // Glob-based file collection from paths
         for (config.paths) |pattern| {
             try globCollectFiles(alloc, project_root, pattern, &source_files);
+        }
+        // Also include dep source files (e.g., stdlib from deps)
+        for (source_roots.items) |root| {
+            if (std.mem.startsWith(u8, root.name, "dep:") or
+                std.mem.eql(u8, root.name, "zap_stdlib"))
+            {
+                try globCollectFiles(alloc, root.path, "*.zap", &source_files);
+            }
         }
     }
 
@@ -619,6 +636,10 @@ fn buildTarget(
         std.process.exit(1);
     }
 
+    // Read sources once up front so validation, cache hashing, and frontend
+    // compilation all operate on the same explicit source units.
+    var source_units: std.ArrayListUnmanaged(compiler.SourceUnit) = .empty;
+
     // Validate one-module-per-file and name=path for each source file
     var validation_failed = false;
     for (source_files.items) |sf| {
@@ -626,6 +647,26 @@ fn buildTarget(
         if (std.mem.eql(u8, std.fs.path.basename(sf), "build.zap")) continue;
 
         const src = try std.fs.cwd().readFileAlloc(alloc, sf, 10 * 1024 * 1024);
+        try source_units.append(alloc, .{ .file_path = sf, .source = src });
+
+        // Skip validation for dep/stdlib source files — they're external code
+        const is_dep_file = blk: {
+            const norm_sf = if (std.mem.startsWith(u8, sf, "./")) sf[2..] else sf;
+            for (source_roots.items) |root| {
+                if (std.mem.startsWith(u8, root.name, "dep:") or
+                    std.mem.eql(u8, root.name, "zap_stdlib"))
+                {
+                    const norm_root = if (std.mem.startsWith(u8, root.path, "./"))
+                        root.path[2..]
+                    else
+                        root.path;
+                    const root_slash = try std.fmt.allocPrint(alloc, "{s}/", .{norm_root});
+                    if (std.mem.startsWith(u8, norm_sf, root_slash)) break :blk true;
+                }
+            }
+            break :blk false;
+        };
+        if (is_dep_file) continue;
 
         // Compute the relative path from its source root for validation.
         // Check each source root to find which one this file is under.
@@ -670,14 +711,7 @@ fn buildTarget(
         std.process.exit(1);
     }
 
-    // Read and concatenate all sources
-    var combined: std.ArrayListUnmanaged(u8) = .empty;
-    for (source_files.items) |sf| {
-        const src = try std.fs.cwd().readFileAlloc(alloc, sf, 10 * 1024 * 1024);
-        try combined.appendSlice(alloc, src);
-        try combined.append(alloc, '\n');
-    }
-    const merged_source = combined.items;
+    const merged_source = try compiler.mergeSourceUnits(alloc, source_units.items);
 
     // Determine output path from manifest (needed for cache check)
     const output_name = if (config.asset_name) |an|
@@ -701,13 +735,7 @@ fn buildTarget(
     const output_path = try std.fs.path.join(alloc, &.{ out_dir, output_filename });
 
     // Compilation caching: hash build.zap + all sources + target name
-    const cache_key = blk: {
-        var hasher = std.hash.Wyhash.init(0);
-        hasher.update(build_source);
-        hasher.update(merged_source);
-        hasher.update(target_name);
-        break :blk hasher.final();
-    };
+    const cache_key = computeBuildCacheKey(build_source, merged_source, target_name, manifest_eval.result_hash);
     const cache_key_hex = try std.fmt.allocPrint(alloc, "{x:0>16}", .{cache_key});
     const hash_file = try std.fmt.allocPrint(alloc, ".zap-cache/{s}.hash", .{target_name});
 
@@ -730,18 +758,21 @@ fn buildTarget(
 
     // Compile through frontend
     // Use per-file pipeline for import-driven discovery, legacy pipeline for glob
-    var result = if (config.paths.len == 0 and config.root != null)
-        compiler.compilePerFile(alloc, merged_source, source_files.items[0], .{
-            .lib_mode = lib_mode,
-        }) catch {
-            std.process.exit(1);
-        }
+    const mod_order_slice: ?[]const []const u8 = if (module_order.items.len > 0)
+        module_order.items
     else
-        compiler.compileFrontend(alloc, merged_source, source_files.items[0], .{
-            .lib_mode = lib_mode,
-        }) catch {
-            std.process.exit(1);
-        };
+        null;
+
+    var result = compileProjectFrontend(alloc, source_units.items, .{
+        .lib_mode = lib_mode,
+        .module_order = mod_order_slice,
+        .cache_dir = ".zap-cache/ctfe",
+        .ctfe_target = target_name,
+        .ctfe_optimize = @tagName(config.optimize),
+    }) catch {
+        std.process.exit(1);
+    };
+
 
     // Resolve the manifest root (e.g. "FooBar.main/1") to an IR function ID
     // so the ZIR backend knows which function is the entry point.
@@ -810,6 +841,34 @@ fn buildTarget(
     return try allocator.dupe(u8, output_path);
 }
 
+fn compileProjectFrontend(
+    alloc: std.mem.Allocator,
+    source_units: []const compiler.SourceUnit,
+    options: compiler.CompileOptions,
+) !compiler.CompileResult {
+    if (options.module_order) |module_order| {
+        var ctx = try compiler.collectAllFromUnits(alloc, source_units, options);
+        return try compiler.compileModuleByModule(alloc, &ctx, module_order, options);
+    }
+    const merged_source = try compiler.mergeSourceUnits(alloc, source_units);
+    const file_path = if (source_units.len > 0) source_units[0].file_path else "<memory>";
+    return try compiler.compileFrontend(alloc, merged_source, file_path, options);
+}
+
+fn computeBuildCacheKey(
+    build_source: []const u8,
+    merged_source: []const u8,
+    target_name: []const u8,
+    manifest_result_hash: u64,
+) u64 {
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(build_source);
+    hasher.update(merged_source);
+    hasher.update(target_name);
+    hasher.update(std.mem.asBytes(&manifest_result_hash));
+    return hasher.final();
+}
+
 // ---------------------------------------------------------------------------
 // Argument parsing
 // ---------------------------------------------------------------------------
@@ -870,6 +929,19 @@ fn parseTargetArgs(allocator: std.mem.Allocator, args: []const []const u8) !Pars
     }
 
     return result;
+}
+
+const testing = std.testing;
+
+test "computeBuildCacheKey includes manifest result hash" {
+    const build_source = "defmodule App.Builder do end";
+    const merged_source = "defmodule App do end";
+    const target_name = "default";
+
+    const first = computeBuildCacheKey(build_source, merged_source, target_name, 111);
+    const second = computeBuildCacheKey(build_source, merged_source, target_name, 222);
+
+    try testing.expect(first != second);
 }
 
 // ---------------------------------------------------------------------------

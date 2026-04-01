@@ -1,15 +1,9 @@
 defmodule Guards do
-  defmacro when_positive(value :: i64, result :: String) :: String | nil do
-    quote do
-      if unquote(value) > 0 do
-        unquote(result)
-      else
-        nil
-      end
-    end
+  def check(n :: i64) :: String if n > 0 do
+    "positive"
   end
 
-  def check(n :: i64) :: String | nil do
-    when_positive(n, "yes")
+  def check(_ :: i64) :: String do
+    "not positive"
   end
 end

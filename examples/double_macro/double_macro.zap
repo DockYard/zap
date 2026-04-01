@@ -1,6 +1,7 @@
 defmodule DoubleMacro do
-  def main() :: String do
+  def main(_args :: [String]) :: String do
     Math.compute(5)
-    |> Kernel.inspect()
+    |> Integer.to_string()
+    |> IO.puts()
   end
 end

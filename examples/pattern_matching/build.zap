@@ -6,8 +6,8 @@ defmodule PatternMatching.Builder do
           name: "pattern_matching",
           version: "0.1.0",
           kind: :bin,
-          root: "PatternMatching.main/0",
-          paths: ["./*.zap"]
+          root: "PatternMatching.main/1",
+          paths: ["./*.zap"], deps: [{:zap_stdlib, {:path, "../../lib"}}]
         }
       _ ->
         panic("Unknown target: use 'pattern_matching'")

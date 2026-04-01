@@ -181,7 +181,13 @@ fn mapReturnType(zig_type: ir.ZigType) u32 {
         .f32 => @intFromEnum(Zir.Inst.Ref.f32_type),
         .f64 => @intFromEnum(Zir.Inst.Ref.f64_type),
         .string => @intFromEnum(Zir.Inst.Ref.slice_const_u8_type),
-        else => @intFromEnum(Zir.Inst.Ref.none), // infer type
+        .optional => |inner| if (inner.* == .string)
+            @intFromEnum(Zir.Inst.Ref.slice_const_u8_type)
+        else
+            0,
+        .atom => @intFromEnum(Zir.Inst.Ref.u32_type), // atoms are interned u32 IDs
+        .nil => 0, // void
+        else => 0, // void fallback for unsupported types
     };
 }
 
@@ -1318,23 +1324,32 @@ pub const ZirDriver = struct {
                 const is_float = std.mem.startsWith(u8, cn.name, "Float__");
                 const is_system = std.mem.startsWith(u8, cn.name, "System__");
                 if (is_kernel or is_io or is_string or is_atom or is_integer or is_float or is_system) {
-                    // Map function names to their runtime module.function equivalents
-                    const func_name = if (is_kernel)
-                        cn.name["Kernel__".len..]
+                    // Map Zap function names to their runtime equivalents.
+                    // Most names match directly; these are the exceptions:
+                    const func_name = if (is_io and std.mem.eql(u8, cn.name["IO__".len..], "puts"))
+                        @as([]const u8, "println")
+                    else if (is_integer and std.mem.eql(u8, cn.name["Integer__".len..], "to_string"))
+                        @as([]const u8, "i64_to_string")
+                    else if (is_float and std.mem.eql(u8, cn.name["Float__".len..], "to_string"))
+                        @as([]const u8, "f64_to_string")
+                    else if (is_atom and std.mem.eql(u8, cn.name["Atom__".len..], "to_string"))
+                        @as([]const u8, "atom_name")
+                    else if (is_kernel)
+                        @as([]const u8, cn.name["Kernel__".len..])
+                    else if (is_io)
+                        @as([]const u8, cn.name["IO__".len..])
                     else if (is_string)
-                        cn.name["String__".len..]
+                        @as([]const u8, cn.name["String__".len..])
                     else if (is_atom)
-                        cn.name["Atom__".len..]
+                        @as([]const u8, cn.name["Atom__".len..])
                     else if (is_integer)
-                        cn.name["Integer__".len..]
+                        @as([]const u8, cn.name["Integer__".len..])
                     else if (is_float)
-                        cn.name["Float__".len..]
+                        @as([]const u8, cn.name["Float__".len..])
                     else if (is_system)
-                        cn.name["System__".len..]
-                    else if (std.mem.eql(u8, cn.name["IO__".len..], "puts"))
-                        "println"
+                        @as([]const u8, cn.name["System__".len..])
                     else
-                        cn.name["IO__".len..];
+                        @as([]const u8, cn.name);
 
                     // @import("zap_runtime")
                     const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
@@ -1349,9 +1364,24 @@ pub const ZirDriver = struct {
                     const fn_ref = zir_builder_emit_field_val(self.handle, mod_ref, func_name.ptr, @intCast(func_name.len));
                     if (fn_ref == error_ref) return error.EmitFailed;
 
+                    // Runtime functions that require an allocator as first arg
+                    const needs_allocator = std.mem.eql(u8, func_name, "i64_to_string") or
+                        std.mem.eql(u8, func_name, "f64_to_string");
+                    if (needs_allocator) {
+                        const alloc_ref = try self.emitAllocatorRef();
+                        try args.insert(self.allocator, 0, alloc_ref);
+                    }
+
                     // call(fn_ref, args)
-                    const ref = zir_builder_emit_call_ref(self.handle, fn_ref, args.items.ptr, @intCast(args.items.len));
+                    var ref = zir_builder_emit_call_ref(self.handle, fn_ref, args.items.ptr, @intCast(args.items.len));
                     if (ref == error_ref) return error.EmitFailed;
+
+                    // Wrap with try for functions that return error unions
+                    if (needs_allocator) {
+                        ref = zir_builder_emit_try(self.handle, ref);
+                        if (ref == error_ref) return error.EmitFailed;
+                    }
+
                     try self.setLocal(cn.dest, ref);
                 } else {
                     const ref = zir_builder_emit_call(
@@ -1915,12 +1945,23 @@ pub const ZirDriver = struct {
                 try self.setLocal(mf.dest, ref);
             },
             .match_string => |ms| {
-                // Compare scrutinee against expected string via cmp_eq
+                // Compare scrutinee against expected string via std.mem.eql
+                // (Zig's == on []const u8 compares pointer+length, not contents)
                 const scrutinee_ref = self.refForLocal(ms.scrutinee) catch return;
                 const expected_ref = zir_builder_emit_str(self.handle, ms.expected.ptr, @intCast(ms.expected.len));
                 if (expected_ref == error_ref) return error.EmitFailed;
-                const cmp_tag = @intFromEnum(Zir.Inst.Tag.cmp_eq);
-                const ref = zir_builder_emit_binop(self.handle, cmp_tag, scrutinee_ref, expected_ref);
+
+                // @import("std").mem.eql(u8, scrutinee, expected)
+                const std_import = zir_builder_emit_import(self.handle, "std", 3);
+                if (std_import == error_ref) return error.EmitFailed;
+                const mem_mod = zir_builder_emit_field_val(self.handle, std_import, "mem", 3);
+                if (mem_mod == error_ref) return error.EmitFailed;
+                const eql_fn = zir_builder_emit_field_val(self.handle, mem_mod, "eql", 3);
+                if (eql_fn == error_ref) return error.EmitFailed;
+
+                const u8_type_ref = @intFromEnum(Zir.Inst.Ref.u8_type);
+                const call_args = [_]u32{ u8_type_ref, scrutinee_ref, expected_ref };
+                const ref = zir_builder_emit_call_ref(self.handle, eql_fn, &call_args, 3);
                 if (ref == error_ref) return error.EmitFailed;
                 try self.setLocal(ms.dest, ref);
             },
@@ -2980,7 +3021,9 @@ pub const ZirDriver = struct {
             var body_len: u32 = 0;
             const body_ptr = zir_builder_end_capture(self.handle, &body_len);
 
-            const body_result: u32 = void_ref;
+            // The guard body contains case_break which sets cb.dest via
+            // current_case_dest. Use that ref as the body result.
+            const body_result: u32 = self.local_refs.get(cb.dest) orelse void_ref;
 
             const body_insts = try self.allocator.alloc(u32, body_len);
             @memcpy(body_insts, body_ptr[0..body_len]);

@@ -241,17 +241,15 @@ pub fn discoverZapFiles(allocator: std.mem.Allocator, path: []const u8) ![]const
 
     // Check if files actually reference each other (form a project).
     // Parse each file and collect what it defines vs references.
-    const stdlib_mod = @import("stdlib.zig");
     var all_defined: std.ArrayList([]const u8) = .empty;
     var all_referenced: std.ArrayList([]const u8) = .empty;
 
     for (candidate_paths.items) |cp| {
         const source = std.fs.cwd().readFileAlloc(allocator, cp, 10 * 1024 * 1024) catch continue;
-        const prepend_result = stdlib_mod.prependStdlib(allocator, source) catch continue;
-        var parser = @import("parser.zig").Parser.init(allocator, prepend_result.source);
+        var parser = @import("parser.zig").Parser.init(allocator, source);
         defer parser.deinit();
         const program = parser.parseProgram() catch continue;
-        const analysis = analyzeProgram(allocator, &program, &parser.interner) catch continue;
+        const analysis = analyzeProgram(allocator, &program, parser.interner) catch continue;
         for (analysis.defines_types) |dt| try all_defined.append(allocator, dt);
         for (analysis.defines_modules) |dm| try all_defined.append(allocator, dm);
         for (analysis.references_types) |rt| try all_referenced.append(allocator, rt);

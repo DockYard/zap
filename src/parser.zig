@@ -10,7 +10,8 @@ pub const Parser = struct {
     current: Token,
     previous: Token,
     source: []const u8,
-    interner: ast.StringInterner,
+    owned_interner: ?*ast.StringInterner,
+    interner: *ast.StringInterner,
     errors: std.ArrayList(Error),
 
     pub const Error = struct {
@@ -23,19 +24,40 @@ pub const Parser = struct {
     pub fn init(allocator: std.mem.Allocator, source: []const u8) Parser {
         var lexer = Lexer.init(source);
         const first = lexer.next();
+        const interner = allocator.create(ast.StringInterner) catch unreachable;
+        interner.* = ast.StringInterner.init(allocator);
         return .{
             .allocator = allocator,
             .lexer = lexer,
             .current = first,
             .previous = first,
             .source = source,
-            .interner = ast.StringInterner.init(allocator),
+            .owned_interner = interner,
+            .interner = interner,
+            .errors = .empty,
+        };
+    }
+
+    pub fn initWithSharedInterner(allocator: std.mem.Allocator, source: []const u8, interner: *ast.StringInterner, source_id: u32) Parser {
+        var lexer = Lexer.initWithSourceId(source, source_id);
+        const first = lexer.next();
+        return .{
+            .allocator = allocator,
+            .lexer = lexer,
+            .current = first,
+            .previous = first,
+            .source = source,
+            .owned_interner = null,
+            .interner = interner,
             .errors = .empty,
         };
     }
 
     pub fn deinit(self: *Parser) void {
-        self.interner.deinit();
+        if (self.owned_interner) |interner| {
+            interner.deinit();
+            self.allocator.destroy(interner);
+        }
         self.errors.deinit(self.allocator);
     }
 

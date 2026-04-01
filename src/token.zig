@@ -9,6 +9,7 @@ pub const Token = struct {
         end: u32,
         line: u32 = 0,
         col: u32 = 0,
+        source_id: ?u32 = null,
     };
 
     pub const Tag = enum {

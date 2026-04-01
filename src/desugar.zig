@@ -425,7 +425,7 @@ test "desugar pipe operator" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var desugarer = Desugarer.init(alloc, &parser.interner);
+    var desugarer = Desugarer.init(alloc, parser.interner);
     const desugared = try desugarer.desugarProgram(&program);
 
     // Function should now have a call instead of a pipe
@@ -455,7 +455,7 @@ test "desugar unwrap operator" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var desugarer = Desugarer.init(alloc, &parser.interner);
+    var desugarer = Desugarer.init(alloc, parser.interner);
     const desugared = try desugarer.desugarProgram(&program);
 
     // Function body should now have an unwrap expression (passed through)
@@ -484,7 +484,7 @@ test "desugar no-op on simple expressions" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var desugarer = Desugarer.init(alloc, &parser.interner);
+    var desugarer = Desugarer.init(alloc, parser.interner);
     const desugared = try desugarer.desugarProgram(&program);
 
     try std.testing.expectEqual(@as(usize, 1), desugared.modules.len);

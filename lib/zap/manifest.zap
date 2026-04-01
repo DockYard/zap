@@ -4,5 +4,8 @@ defstruct Zap.Manifest do
   kind :: Atom
   root :: String = ""
   asset_name :: String = ""
-  deps :: List({Atom, {Atom, String}}) = []
+  optimize :: Atom = :release_safe
+  paths :: [String] = []
+  deps :: [Zap.Dep] = []
+  build_opts :: [{String, String}] = []
 end

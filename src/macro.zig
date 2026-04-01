@@ -942,6 +942,9 @@ pub const MacroEngine = struct {
     /// Check if type `a` is compatible with type `b`.
     /// For union return types, `a` is compatible if it is a member of the union.
     fn typesMatch(self: *MacroEngine, a: *const ast.TypeExpr, b: *const ast.TypeExpr) bool {
+        // Expr is a macro meta-type — it's compatible with any type
+        if (self.isExprType(a) or self.isExprType(b)) return true;
+
         switch (b.*) {
             .union_type => |u| {
                 // a is compatible if it matches any member of the union
@@ -963,6 +966,14 @@ pub const MacroEngine = struct {
                 }
             },
             else => return true, // For complex types, assume compatible
+        }
+    }
+
+    /// Check if a type expression is the special macro meta-type `Expr`.
+    fn isExprType(self: *MacroEngine, type_expr: *const ast.TypeExpr) bool {
+        switch (type_expr.*) {
+            .name => |n| return std.mem.eql(u8, self.interner.get(n.name), "Expr"),
+            else => return false,
         }
     }
 
@@ -1136,11 +1147,11 @@ test "macro engine no-op on program without macros" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var engine = MacroEngine.init(alloc, &parser.interner, &collector.graph);
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
     defer engine.deinit();
     const expanded = try engine.expandProgram(&program);
 
@@ -1175,11 +1186,11 @@ test "macro engine expands simple macro" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var engine = MacroEngine.init(alloc, &parser.interner, &collector.graph);
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
     defer engine.deinit();
     const expanded = try engine.expandProgram(&program);
 
@@ -1237,11 +1248,11 @@ test "macro engine reaches fixed point" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var engine = MacroEngine.init(alloc, &parser.interner, &collector.graph);
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
     defer engine.deinit();
     const expanded = try engine.expandProgram(&program);
 
@@ -1277,11 +1288,11 @@ test "typed macro: nil in String return position is an error" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var engine = MacroEngine.init(alloc, &parser.interner, &collector.graph);
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
     defer engine.deinit();
     _ = try engine.expandProgram(&program);
 
@@ -1317,11 +1328,11 @@ test "typed macro: valid types produce no errors" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var engine = MacroEngine.init(alloc, &parser.interner, &collector.graph);
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
     defer engine.deinit();
     _ = try engine.expandProgram(&program);
 
@@ -1354,11 +1365,11 @@ test "typed macro: missing else branch is an error for non-nil return type" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var engine = MacroEngine.init(alloc, &parser.interner, &collector.graph);
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
     defer engine.deinit();
     _ = try engine.expandProgram(&program);
 
@@ -1390,11 +1401,11 @@ test "typed macro: param type mismatch with return type" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var engine = MacroEngine.init(alloc, &parser.interner, &collector.graph);
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
     defer engine.deinit();
     _ = try engine.expandProgram(&program);
 
@@ -1431,11 +1442,11 @@ test "macro substitution into case_expr and block" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, &parser.interner);
+    var collector = Collector.init(alloc, parser.interner);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var engine = MacroEngine.init(alloc, &parser.interner, &collector.graph);
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
     defer engine.deinit();
     const expanded = try engine.expandProgram(&program);
 
