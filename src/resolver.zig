@@ -356,8 +356,21 @@ pub const Resolver = struct {
             .int_literal, .float_literal, .string_literal,
             .string_interpolation, .atom_literal, .bool_literal,
             .nil_literal, .module_ref, .function_ref, .intrinsic, .attr_ref,
-            .error_pipe, .err_constructor,
             => {},
+            .error_pipe => |ep| {
+                try self.resolveExpr(ep.chain);
+                switch (ep.handler) {
+                    .block => |clauses| {
+                        for (clauses) |clause| {
+                            for (clause.body) |stmt| {
+                                try self.resolveStmt(stmt);
+                            }
+                        }
+                    },
+                    .function => |func| try self.resolveExpr(func),
+                }
+            },
+            .err_constructor => |ec| try self.resolveExpr(ec.value),
         }
     }
 

@@ -1598,6 +1598,21 @@ pub const Parser = struct {
                 }
 
                 const end_tok = try self.expect(.right_paren);
+
+                // Check for Err(value) constructor — single-arg call to "Err"
+                if (args.items.len == 1 and expr.* == .module_ref) {
+                    const name = self.interner.get(expr.module_ref.name.parts[0]);
+                    if (std.mem.eql(u8, name, "Err") and expr.module_ref.name.parts.len == 1) {
+                        expr = try self.create(ast.Expr, .{
+                            .err_constructor = .{
+                                .meta = .{ .span = ast.SourceSpan.merge(expr.getMeta().span, ast.SourceSpan.from(end_tok.loc)) },
+                                .value = args.items[0],
+                            },
+                        });
+                        continue;
+                    }
+                }
+
                 expr = try self.create(ast.Expr, .{
                     .call = .{
                         .meta = .{ .span = ast.SourceSpan.merge(expr.getMeta().span, ast.SourceSpan.from(end_tok.loc)) },
@@ -4194,4 +4209,65 @@ test "parse attribute with list value" {
     const attr = program.modules[0].items[0].attribute;
     try std.testing.expectEqualStrings("flags", parser.interner.get(attr.name));
     try std.testing.expect(attr.value.?.* == .list);
+}
+
+test "parse error pipe ~> with block handler" {
+    const source =
+        \\pub module Test {
+        \\  pub fn run() -> String {
+        \\    read_file("test.txt")
+        \\    |> parse()
+        \\    ~> {
+        \\      :not_found -> "default"
+        \\    }
+        \\  }
+        \\}
+    ;
+    var parser = Parser.init(std.testing.allocator, source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const func = program.modules[0].items[0].function;
+    const body = func.clauses[0].body;
+    try std.testing.expect(body.len > 0);
+    // The expression should be an error_pipe
+    try std.testing.expect(body[0].expr.* == .error_pipe);
+}
+
+test "parse error pipe ~> with function handler" {
+    const source =
+        \\pub module Test {
+        \\  pub fn run() -> String {
+        \\    read_file("test.txt")
+        \\    |> parse()
+        \\    ~> handle_error()
+        \\  }
+        \\}
+    ;
+    var parser = Parser.init(std.testing.allocator, source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const func = program.modules[0].items[0].function;
+    const body = func.clauses[0].body;
+    try std.testing.expect(body.len > 0);
+    try std.testing.expect(body[0].expr.* == .error_pipe);
+}
+
+test "parse Err() constructor" {
+    const source =
+        \\pub module Test {
+        \\  pub fn fail() -> String {
+        \\    Err(:not_found)
+        \\  }
+        \\}
+    ;
+    var parser = Parser.init(std.testing.allocator, source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const func = program.modules[0].items[0].function;
+    const body = func.clauses[0].body;
+    try std.testing.expect(body.len > 0);
+    try std.testing.expect(body[0].expr.* == .err_constructor);
 }

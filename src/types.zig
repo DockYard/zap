@@ -2231,8 +2231,15 @@ pub const TypeChecker = struct {
                 _ = try self.inferExpr(ta.expr);
                 return try self.resolveTypeExpr(ta.type_expr);
             },
-            .error_pipe => TypeStore.UNKNOWN, // TODO: implement error pipe type checking
-            .err_constructor => TypeStore.UNKNOWN, // TODO: implement Err() type checking
+            // error_pipe should be desugared to case expressions before type checking.
+            // If it reaches here, infer the chain type as fallback.
+            .error_pipe => |ep| try self.inferExpr(ep.chain),
+            // err_constructor desugars to {:error, value} tuple.
+            // If it reaches here, produce a tuple type.
+            .err_constructor => |ec| {
+                _ = try self.inferExpr(ec.value);
+                return TypeStore.ATOM; // {:error, T} is a tuple — simplified for now
+            },
         };
     }
 

@@ -221,6 +221,27 @@ pub const Desugarer = struct {
                 });
             },
 
+            // Error pipe: chain ~> handler → nested case checking for {:error, _}
+            .error_pipe => |ep| {
+                const chain = try self.desugarExpr(ep.chain);
+                return self.desugarErrorPipe(chain, ep.handler, ep.meta);
+            },
+
+            // Err(value) → {:error, value}
+            .err_constructor => |ec| {
+                const inner = try self.desugarExpr(ec.value);
+                const error_atom = try self.interner.intern("error");
+                return try self.create(ast.Expr, .{
+                    .tuple = .{
+                        .meta = ec.meta,
+                        .elements = try self.allocSlice(*const ast.Expr, &.{
+                            try self.create(ast.Expr, .{ .atom_literal = .{ .meta = ec.meta, .value = error_atom } }),
+                            inner,
+                        }),
+                    },
+                });
+            },
+
             // Leaf/passthrough nodes
             else => return expr,
         }
@@ -273,7 +294,211 @@ pub const Desugarer = struct {
     }
 
     // ============================================================
-    // Unwrap desugaring: expr! → case expr do {:ok, v} -> v; {:error, e} -> panic(e) end
+    // Error pipe desugaring: chain ~> handler
+    //
+    // Flattens the pipe chain and wraps each step in an error check.
+    // Each step is checked: if result is {:error, e}, jump to handler.
+    // Otherwise pass the value to the next step.
+    //
+    //   read_file(path) |> parse() |> validate() ~> { ErrType -> handle() }
+    //
+    // Desugars to:
+    //   case read_file(path) {
+    //     {:error, __err} -> case __err { ErrType -> handle() }
+    //     __val_0 -> case parse(__val_0) {
+    //       {:error, __err} -> case __err { ErrType -> handle() }
+    //       __val_1 -> case validate(__val_1) {
+    //         {:error, __err} -> case __err { ErrType -> handle() }
+    //         __val_2 -> __val_2
+    //       }
+    //     }
+    //   }
+    // ============================================================
+
+    fn desugarErrorPipe(self: *Desugarer, chain: *const ast.Expr, handler: ast.ErrorHandler, meta: ast.NodeMeta) !*const ast.Expr {
+        // Flatten the pipe chain into a list of steps
+        var steps: std.ArrayList(*const ast.Expr) = .empty;
+        try self.flattenPipeChain(chain, &steps);
+
+        // Build the error handler expression (shared by all error branches)
+        const handler_expr = try self.buildErrorHandler(handler, meta);
+
+        // Build nested case expressions from the last step back to the first
+        var result: *const ast.Expr = undefined;
+
+        // Start from the innermost step
+        var i: usize = steps.items.len;
+        while (i > 0) {
+            i -= 1;
+            const step = steps.items[i];
+
+            if (i == steps.items.len - 1) {
+                // Last step: wrap in error check, success value is the result
+                result = try self.wrapInErrorCheck(step, null, handler_expr, meta, i);
+            } else {
+                // Middle step: wrap in error check, success feeds into the next step
+                result = try self.wrapInErrorCheck(step, result, handler_expr, meta, i);
+            }
+        }
+
+        return result;
+    }
+
+    fn flattenPipeChain(self: *Desugarer, expr: *const ast.Expr, steps: *std.ArrayList(*const ast.Expr)) !void {
+        switch (expr.*) {
+            .pipe => |pe| {
+                try self.flattenPipeChain(pe.lhs, steps);
+                // The rhs of a pipe is a function call — desugar the pipe to get the actual call
+                const desugared_step = try self.desugarPipe(
+                    // Use a placeholder that will be replaced by the error check wrapper
+                    try self.create(ast.Expr, .{ .var_ref = .{ .meta = pe.meta, .name = try self.interner.intern("__pipe_placeholder") } }),
+                    pe.rhs,
+                    pe.meta,
+                );
+                try steps.append(self.allocator, desugared_step);
+            },
+            else => {
+                // Base case: first step in the chain
+                try steps.append(self.allocator, expr);
+            },
+        }
+    }
+
+    fn buildErrorHandler(self: *Desugarer, handler: ast.ErrorHandler, meta: ast.NodeMeta) !*const ast.Expr {
+        switch (handler) {
+            .block => |clauses| {
+                // Build case expression: case __err { pattern1 -> body1, ... }
+                const err_name = try self.interner.intern("__err");
+                const scrutinee = try self.create(ast.Expr, .{ .var_ref = .{ .meta = meta, .name = err_name } });
+                return try self.create(ast.Expr, .{
+                    .case_expr = .{
+                        .meta = meta,
+                        .scrutinee = scrutinee,
+                        .clauses = clauses,
+                    },
+                });
+            },
+            .function => |func| {
+                // Build function call: handler_func(__err)
+                const err_name = try self.interner.intern("__err");
+                const err_ref = try self.create(ast.Expr, .{ .var_ref = .{ .meta = meta, .name = err_name } });
+                return try self.create(ast.Expr, .{
+                    .call = .{
+                        .meta = meta,
+                        .callee = func,
+                        .args = try self.allocSlice(*const ast.Expr, &.{err_ref}),
+                    },
+                });
+            },
+        }
+    }
+
+    fn wrapInErrorCheck(
+        self: *Desugarer,
+        step: *const ast.Expr,
+        next_expr: ?*const ast.Expr,
+        handler_expr: *const ast.Expr,
+        meta: ast.NodeMeta,
+        step_index: usize,
+    ) !*const ast.Expr {
+        const err_name = try self.interner.intern("__err");
+        const error_atom = try self.interner.intern("error");
+
+        // Generate unique variable name for this step's success value
+        var buf: [32]u8 = undefined;
+        const val_name_str = try std.fmt.bufPrint(&buf, "__val_{d}", .{step_index});
+        const val_name = try self.interner.intern(val_name_str);
+
+        // For steps after the first, we need to replace the placeholder
+        // with the actual value from the previous step's success binding
+        var actual_step = step;
+        if (step_index > 0) {
+            // This step was desugared from a pipe: f(placeholder, args...)
+            // Replace the placeholder with the previous step's value
+            const prev_val_str = try std.fmt.bufPrint(&buf, "__val_{d}", .{step_index - 1});
+            const prev_val_name = try self.interner.intern(prev_val_str);
+            actual_step = try self.replacePlaceholder(step, prev_val_name, meta);
+        }
+
+        // Error pattern: {:error, __err}
+        const error_pattern = try self.create(ast.Pattern, .{
+            .tuple = .{
+                .meta = meta,
+                .elements = try self.allocSlice(*const ast.Pattern, &.{
+                    try self.create(ast.Pattern, .{ .literal = .{ .atom = .{ .meta = meta, .value = error_atom } } }),
+                    try self.create(ast.Pattern, .{ .bind = .{ .meta = meta, .name = err_name } }),
+                }),
+            },
+        });
+
+        // Error body: the handler expression
+        const error_body = try self.allocSlice(ast.Stmt, &.{
+            .{ .expr = handler_expr },
+        });
+
+        // Success pattern: __val_N (bind the result)
+        const success_pattern = try self.create(ast.Pattern, .{
+            .bind = .{ .meta = meta, .name = val_name },
+        });
+
+        // Success body: either the next case expression or just the value
+        const success_body = if (next_expr) |next|
+            try self.allocSlice(ast.Stmt, &.{.{ .expr = next }})
+        else
+            try self.allocSlice(ast.Stmt, &.{
+                .{ .expr = try self.create(ast.Expr, .{ .var_ref = .{ .meta = meta, .name = val_name } }) },
+            });
+
+        const clauses = try self.allocSlice(ast.CaseClause, &.{
+            .{ .meta = meta, .pattern = error_pattern, .type_annotation = null, .guard = null, .body = error_body },
+            .{ .meta = meta, .pattern = success_pattern, .type_annotation = null, .guard = null, .body = success_body },
+        });
+
+        return try self.create(ast.Expr, .{
+            .case_expr = .{
+                .meta = meta,
+                .scrutinee = actual_step,
+                .clauses = clauses,
+            },
+        });
+    }
+
+    fn replacePlaceholder(self: *Desugarer, expr: *const ast.Expr, replacement_name: ast.StringId, meta: ast.NodeMeta) !*const ast.Expr {
+        const placeholder_name = try self.interner.intern("__pipe_placeholder");
+        switch (expr.*) {
+            .call => |call| {
+                var new_args: std.ArrayList(*const ast.Expr) = .empty;
+                for (call.args) |arg| {
+                    if (arg.* == .var_ref and arg.var_ref.name == placeholder_name) {
+                        try new_args.append(self.allocator, try self.create(ast.Expr, .{
+                            .var_ref = .{ .meta = meta, .name = replacement_name },
+                        }));
+                    } else {
+                        try new_args.append(self.allocator, arg);
+                    }
+                }
+                return try self.create(ast.Expr, .{
+                    .call = .{
+                        .meta = call.meta,
+                        .callee = call.callee,
+                        .args = try new_args.toOwnedSlice(self.allocator),
+                    },
+                });
+            },
+            .var_ref => |vr| {
+                if (vr.name == placeholder_name) {
+                    return try self.create(ast.Expr, .{
+                        .var_ref = .{ .meta = meta, .name = replacement_name },
+                    });
+                }
+                return expr;
+            },
+            else => return expr,
+        }
+    }
+
+    // ============================================================
+    // Unwrap desugaring: expr! → case expr { {:ok, v} -> v, {:error, e} -> panic(e) }
     // ============================================================
 
     fn desugarUnwrap(self: *Desugarer, inner: *const ast.Expr, meta: ast.NodeMeta) !*const ast.Expr {
