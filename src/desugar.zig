@@ -235,17 +235,6 @@ pub const Desugarer = struct {
                 });
             },
 
-            // Err(value) — pass through to HIR builder which has type info
-            // to determine whether to emit union_init or tuple fallback
-            .err_constructor => |ec| {
-                const inner = try self.desugarExpr(ec.value);
-                return try self.create(ast.Expr, .{
-                    .err_constructor = .{
-                        .meta = ec.meta,
-                        .value = inner,
-                    },
-                });
-            },
 
             // Leaf/passthrough nodes
             else => return expr,

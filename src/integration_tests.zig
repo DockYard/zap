@@ -3578,27 +3578,8 @@ test "attributes: @name substitution in expression" {
 }
 
 // ============================================================
-// Err() constructor and error pipe (~>)
+// Error pipe (~>) with explicit union declarations
 // ============================================================
-
-test "Err() constructor desugars to error tuple" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    const source =
-        \\pub module Errors {
-        \\  pub fn fail() -> {Atom, Atom} {
-        \\    Err(:not_found)
-        \\  }
-        \\}
-    ;
-
-    const output = try compile(alloc, source);
-    try expectContains(output, "fn Errors__fail(");
-    try expectContains(output, ".@\"error\"");
-    try expectContains(output, ".@\"not_found\"");
-}
 
 test "error pipe ~> with block handler" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3607,8 +3588,13 @@ test "error pipe ~> with block handler" {
 
     const source =
         \\pub module Pipeline {
-        \\  pub fn maybe_fail(x :: i64) -> i64 | Err(i64) {
-        \\    Err(0)
+        \\  pub union Result {
+        \\    Ok :: i64
+        \\    Error :: i64
+        \\  }
+        \\
+        \\  pub fn maybe_fail(x :: i64) -> Result {
+        \\    Result.Error(0)
         \\  }
         \\
         \\  pub fn run(x :: i64) -> i64 {
@@ -3633,8 +3619,13 @@ test "error pipe ~> with function handler" {
 
     const source =
         \\pub module Pipeline {
-        \\  pub fn maybe_fail(x :: i64) -> i64 | Err(i64) {
-        \\    Err(0)
+        \\  pub union Result {
+        \\    Ok :: i64
+        \\    Error :: i64
+        \\  }
+        \\
+        \\  pub fn maybe_fail(x :: i64) -> Result {
+        \\    Result.Error(0)
         \\  }
         \\
         \\  pub fn handle_error(err :: i64) -> i64 {
@@ -3652,72 +3643,6 @@ test "error pipe ~> with function handler" {
     try expectContains(output, "fn Pipeline__maybe_fail(");
     try expectContains(output, "fn Pipeline__handle_error(");
     try expectContains(output, "fn Pipeline__run(");
-}
-
-
-// ============================================================
-// Batch 3: Err() and ~> with real tagged unions
-// ============================================================
-
-test "String | Err(Atom) return type synthesizes tagged union" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    // The return type String | Err(Atom) should synthesize a tagged union type def.
-    // Body returns String (matches Ok variant inner type) — no type error.
-    const source =
-        \\pub module Synth {
-        \\  pub fn identity(x :: String) -> String | Err(Atom) {
-        \\    x
-        \\  }
-        \\}
-    ;
-
-    const output = try compile(alloc, source);
-    // The synthesized tagged union should appear as a union(enum) type def
-    try expectContains(output, "union(enum)");
-    try expectContains(output, "Ok: []const u8");
-    try expectContains(output, "Error: []const u8");
-}
-
-test "Err() produces union_init when return type is synthesized tagged union" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    const source =
-        \\pub module Fallible {
-        \\  pub fn try_parse(s :: String) -> String | Err(Atom) {
-        \\    Err(:bad_input)
-        \\  }
-        \\}
-    ;
-
-    const output = try compile(alloc, source);
-    try expectContains(output, "fn Fallible__try_parse(");
-    // Err(:bad_input) should produce union_init with Error variant
-    try expectContains(output, ".{ .Error =");
-    try expectContains(output, "union(enum)");
-}
-
-test "success value auto-wrapped in Ok variant" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    const source =
-        \\pub module Wrapper {
-        \\  pub fn greet(name :: String) -> String | Err(Atom) {
-        \\    name
-        \\  }
-        \\}
-    ;
-
-    const output = try compile(alloc, source);
-    try expectContains(output, "fn Wrapper__greet(");
-    // The plain String return value should be auto-wrapped in Ok variant
-    try expectContains(output, ".{ .Ok =");
 }
 
 // ============================================================

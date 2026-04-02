@@ -501,7 +501,6 @@ pub const MacroEngine = struct {
             .attr_ref,
             .binary_literal,
             .error_pipe,
-            .err_constructor,
             => return .{ .expr = expr, .changed = false },
         }
     }

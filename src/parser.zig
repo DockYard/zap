@@ -1605,20 +1605,6 @@ pub const Parser = struct {
 
                 const end_tok = try self.expect(.right_paren);
 
-                // Check for Err(value) constructor — single-arg call to "Err"
-                if (args.items.len == 1 and expr.* == .module_ref) {
-                    const name = self.interner.get(expr.module_ref.name.parts[0]);
-                    if (std.mem.eql(u8, name, "Err") and expr.module_ref.name.parts.len == 1) {
-                        expr = try self.create(ast.Expr, .{
-                            .err_constructor = .{
-                                .meta = .{ .span = ast.SourceSpan.merge(expr.getMeta().span, ast.SourceSpan.from(end_tok.loc)) },
-                                .value = args.items[0],
-                            },
-                        });
-                        continue;
-                    }
-                }
-
                 expr = try self.create(ast.Expr, .{
                     .call = .{
                         .meta = .{ .span = ast.SourceSpan.merge(expr.getMeta().span, ast.SourceSpan.from(end_tok.loc)) },
@@ -4264,22 +4250,3 @@ test "parse error pipe ~> with function handler" {
     try std.testing.expect(body[0].expr.* == .error_pipe);
 }
 
-test "parse Err() constructor" {
-    const source =
-        \\pub module Test {
-        \\  pub fn fail() -> String {
-        \\    Err(:not_found)
-        \\  }
-        \\}
-    ;
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
-    defer parser.deinit();
-
-    const program = try parser.parseProgram();
-    const func = program.modules[0].items[0].function;
-    const body = func.clauses[0].body;
-    try std.testing.expect(body.len > 0);
-    try std.testing.expect(body[0].expr.* == .err_constructor);
-}

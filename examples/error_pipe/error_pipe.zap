@@ -1,11 +1,17 @@
 pub module ErrorPipe {
-  # A function that can fail — returns String or Err(Atom)
-  pub fn parse_number(input :: String) -> String | Err(Atom) {
+  # Result union for fallible string operations
+  pub union ParseResult {
+    Ok :: String
+    Error :: Atom
+  }
+
+  # A function that can fail — returns ParseResult
+  pub fn parse_number(input :: String) -> ParseResult {
     case input {
-      "one" -> "1"
-      "two" -> "2"
-      "three" -> "3"
-      _ -> Err(:unknown_number)
+      "one" -> ParseResult.Ok("1")
+      "two" -> ParseResult.Ok("2")
+      "three" -> ParseResult.Ok("3")
+      _ -> ParseResult.Error(:unknown_number)
     }
   }
 
@@ -37,7 +43,20 @@ pub module ErrorPipe {
     }
   }
 
+  # Result union for validation
+  pub union ValidateResult {
+    Ok :: String
+    Error :: Atom
+  }
+
   # Chaining multiple fallible steps
+  pub fn check_not_empty(input :: String) -> ValidateResult {
+    case input {
+      "" -> ValidateResult.Error(:empty_input)
+      _ -> ValidateResult.Ok(input)
+    }
+  }
+
   pub fn validate_and_process(input :: String) -> String {
     check_not_empty(input)
     |> parse_number()
@@ -45,13 +64,6 @@ pub module ErrorPipe {
     ~> {
       :empty_input -> "Error: input was empty"
       :unknown_number -> "Error: not a valid number"
-    }
-  }
-
-  pub fn check_not_empty(input :: String) -> String | Err(Atom) {
-    case input {
-      "" -> Err(:empty_input)
-      _ -> input
     }
   }
 

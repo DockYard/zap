@@ -54,8 +54,6 @@ extern "c" fn zir_builder_emit_type_info(handle: ?*ZirBuilderHandle, operand: u3
 extern "c" fn zir_builder_emit_if_else(handle: ?*ZirBuilderHandle, condition: u32, then_value: u32, else_value: u32) u32;
 extern "c" fn zir_builder_emit_struct_init_anon(handle: ?*ZirBuilderHandle, names_ptrs: [*]const [*]const u8, names_lens: [*]const u32, values_ptr: [*]const u32, fields_len: u32) u32;
 extern "c" fn zir_builder_emit_union_init(handle: ?*ZirBuilderHandle, union_type: u32, field_name_ptr: [*]const u8, field_name_len: u32, init_value: u32) u32;
-extern "c" fn zir_builder_emit_as(handle: ?*ZirBuilderHandle, dest_type: u32, operand: u32) u32;
-
 // Switch block for tagged unions (single-pass API)
 extern "c" fn zir_builder_add_switch_block(handle: ?*ZirBuilderHandle, operand: u32, prong_names_ptrs: [*]const [*]const u8, prong_names_lens: [*]const u32, prong_captures: [*]const u32, prong_body_lens: [*]const u32, prong_body_results: [*]const u32, prong_body_insts: [*]const u32, num_prongs: u32) u64;
 
@@ -82,9 +80,6 @@ extern "c" fn zir_builder_get_tuple_return_type_len(handle: ?*ZirBuilderHandle) 
 extern "c" fn zir_builder_emit_struct_init_typed(handle: ?*ZirBuilderHandle, struct_type: u32, names_ptrs: [*]const [*]const u8, names_lens: [*]const u32, values_ptr: [*]const u32, fields_len: u32) u32;
 extern "c" fn zir_builder_emit_tuple_decl(handle: ?*ZirBuilderHandle, types_ptr: [*]const u32, types_len: u32) u32;
 extern "c" fn zir_builder_emit_tuple_decl_body(handle: ?*ZirBuilderHandle, types_ptr: [*]const u32, types_len: u32) u32;
-
-// Union return type
-extern "c" fn zir_builder_set_union_return_type(handle: ?*ZirBuilderHandle, names_ptrs: [*]const [*]const u8, names_lens: [*]const u32, types_ptr: [*]const u32, fields_len: u32) i32;
 
 // Body management
 extern "c" fn zir_builder_pop_body_inst(handle: ?*ZirBuilderHandle) u32;
@@ -245,9 +240,6 @@ pub const ZirDriver = struct {
     /// 0 means void — used by the `.ret` handler to discard values from
     /// void functions instead of emitting a value return.
     current_ret_type: u32 = 0,
-    /// The union return type Ref (set by setUnionReturnType). Used by union_init
-    /// to produce properly typed union values. 0 means not a union return type.
-    current_union_ret_type_ref: u32 = 0,
     /// Tracks how many tuple_init instructions have been emitted in the current function.
     tuple_init_count: u32 = 0,
     /// Nested tuple types in DFS post-order (inner-first), matching tuple_init emission order.
@@ -424,34 +416,6 @@ pub const ZirDriver = struct {
             };
         }
         return null;
-    }
-
-    fn findUnionDef(self: *const ZirDriver, type_name: []const u8) ?ir.UnionDef {
-        const prog = self.program orelse return null;
-        for (prog.type_defs) |type_def| {
-            if (!std.mem.eql(u8, type_def.name, type_name)) continue;
-            return switch (type_def.kind) {
-                .union_def => |def| def,
-                else => null,
-            };
-        }
-        return null;
-    }
-
-    /// Map a Zig type name string to a ZIR type Ref.
-    fn mapTypeNameToRef(_: *const ZirDriver, type_name: []const u8) u32 {
-        if (std.mem.eql(u8, type_name, "[]const u8")) return @intFromEnum(Zir.Inst.Ref.slice_const_u8_type);
-        if (std.mem.eql(u8, type_name, "bool")) return @intFromEnum(Zir.Inst.Ref.bool_type);
-        if (std.mem.eql(u8, type_name, "i64")) return @intFromEnum(Zir.Inst.Ref.i64_type);
-        if (std.mem.eql(u8, type_name, "i32")) return @intFromEnum(Zir.Inst.Ref.i32_type);
-        if (std.mem.eql(u8, type_name, "u32")) return @intFromEnum(Zir.Inst.Ref.u32_type);
-        if (std.mem.eql(u8, type_name, "u64")) return @intFromEnum(Zir.Inst.Ref.u64_type);
-        if (std.mem.eql(u8, type_name, "f64")) return @intFromEnum(Zir.Inst.Ref.f64_type);
-        if (std.mem.eql(u8, type_name, "f32")) return @intFromEnum(Zir.Inst.Ref.f32_type);
-        if (std.mem.eql(u8, type_name, "usize")) return @intFromEnum(Zir.Inst.Ref.usize_type);
-        if (std.mem.eql(u8, type_name, "void")) return @intFromEnum(Zir.Inst.Ref.void_type);
-        if (std.mem.eql(u8, type_name, "zap_runtime.Atom")) return @intFromEnum(Zir.Inst.Ref.u32_type);
-        return 0; // void fallback
     }
 
     fn refForValueLocal(self: *ZirDriver, local: ir.LocalId) BuildError!u32 {
@@ -636,43 +600,6 @@ pub const ZirDriver = struct {
                 return error.EmitFailed;
             }
             self.current_ret_type = 1;
-        }
-
-        // For union return types (tagged_union/struct_ref), look up the union def
-        // and set up the return type via union_decl.
-        if (func.return_type == .struct_ref) {
-            if (self.findUnionDef(func.return_type.struct_ref)) |union_def| {
-                var name_ptrs = std.ArrayListUnmanaged([*]const u8).empty;
-                defer name_ptrs.deinit(self.allocator);
-                var name_lens = std.ArrayListUnmanaged(u32).empty;
-                defer name_lens.deinit(self.allocator);
-                var type_refs = std.ArrayListUnmanaged(u32).empty;
-                defer type_refs.deinit(self.allocator);
-
-                for (union_def.variants) |variant| {
-                    try name_ptrs.append(self.allocator, variant.name.ptr);
-                    try name_lens.append(self.allocator, @intCast(variant.name.len));
-                    // Map variant type name to ZIR type ref
-                    const type_ref = if (variant.type_name) |tn|
-                        self.mapTypeNameToRef(tn)
-                    else
-                        0; // void for unit variants
-                    try type_refs.append(self.allocator, type_ref);
-                }
-
-                const union_type_ref = zir_builder_set_union_return_type(
-                    self.handle,
-                    name_ptrs.items.ptr,
-                    name_lens.items.ptr,
-                    type_refs.items.ptr,
-                    @intCast(union_def.variants.len),
-                );
-                if (union_type_ref < 0) {
-                    return error.EmitFailed;
-                }
-                self.current_ret_type = 1;
-                self.current_union_ret_type_ref = @intCast(union_type_ref);
-            }
         }
 
         // Emit param instructions and register their Refs as locals.

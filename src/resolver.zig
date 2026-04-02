@@ -370,7 +370,6 @@ pub const Resolver = struct {
                     .function => |func| try self.resolveExpr(func),
                 }
             },
-            .err_constructor => |ec| try self.resolveExpr(ec.value),
         }
     }
 

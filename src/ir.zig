@@ -3533,7 +3533,7 @@ fn typeIdToZigTypeWithStore(type_id: types_mod.TypeId, type_store: ?*const types
                                     return .{ .optional = inner_ptr };
                                 }
                             }
-                            // General union types (e.g. String | Err(Atom)) → anytype
+                            // General union types → anytype
                             return .any;
                         },
                         else => {},

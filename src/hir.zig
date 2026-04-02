@@ -1295,7 +1295,6 @@ pub const HirBuilder = struct {
     current_clause_scope: ?scope_mod.ScopeId,
     current_function_root_scope: ?scope_mod.ScopeId,
     current_function_name: ?[]const u8,
-    current_fn_return_type: types_mod.TypeId = types_mod.TypeStore.UNKNOWN,
     family_to_group: std.AutoHashMap(scope_mod.FunctionFamilyId, u32),
     group_captures: std.AutoHashMap(u32, []const Capture),
     current_capture_map: std.AutoHashMap(ast.StringId, u32),
@@ -1842,8 +1841,6 @@ pub const HirBuilder = struct {
         else
             types_mod.TypeStore.NEVER;
 
-        self.current_fn_return_type = return_type;
-
         // Track param names for var_ref resolution
         var param_names: std.ArrayList(?ast.StringId) = .empty;
         for (params.items) |p| {
@@ -1950,49 +1947,7 @@ pub const HirBuilder = struct {
         const refinement_expr = if (clause.refinement) |ref| try self.buildExpr(ref) else null;
 
         // Build body block
-        var body = try self.buildBlock(clause.body);
-
-        // Auto-wrap: if return type is a synthesized tagged union and the body
-        // produces the Ok variant's inner type, wrap the last expression in Ok
-        if (return_type < self.type_store.types.items.len) {
-            const ret_type = self.type_store.types.items[return_type];
-            if (ret_type == .tagged_union and body.stmts.len > 0) {
-                const last_stmt = body.stmts[body.stmts.len - 1];
-                if (last_stmt == .expr) {
-                    const last_expr = last_stmt.expr;
-                    // Don't wrap if the expression already produces the union type
-                    if (last_expr.type_id != return_type) {
-                        // Check if it matches the Ok variant's inner type
-                        const interner_mut: *ast.StringInterner = @constCast(self.interner);
-                        const ok_name = interner_mut.intern("Ok") catch unreachable;
-                        for (ret_type.tagged_union.variants) |v| {
-                            if (v.name == ok_name) {
-                                if (v.type_id) |ok_tid| {
-                                    if (last_expr.type_id == ok_tid or last_expr.type_id == types_mod.TypeStore.UNKNOWN) {
-                                        const wrapped = try self.create(Expr, .{
-                                            .kind = .{ .union_init = .{
-                                                .union_type_id = return_type,
-                                                .variant_name = ok_name,
-                                                .value = last_expr,
-                                            } },
-                                            .type_id = return_type,
-                                            .span = last_expr.span,
-                                        });
-                                        const new_stmts = try self.allocator.alloc(Stmt, body.stmts.len);
-                                        @memcpy(new_stmts[0 .. body.stmts.len - 1], body.stmts[0 .. body.stmts.len - 1]);
-                                        new_stmts[body.stmts.len - 1] = .{ .expr = wrapped };
-                                        const new_block = try self.allocator.create(Block);
-                                        new_block.* = .{ .stmts = new_stmts, .result_type = return_type };
-                                        body = new_block;
-                                    }
-                                }
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        const body = try self.buildBlock(clause.body);
 
         return .{
             .params = try params.toOwnedSlice(self.allocator),
@@ -2518,48 +2473,6 @@ pub const HirBuilder = struct {
             .error_pipe => |ep| {
                 return try self.buildErrorPipe(ep);
             },
-            .err_constructor => |ec| {
-                const value_expr = try self.buildExpr(ec.value);
-                const ret_tid = self.current_fn_return_type;
-
-                // If the return type is a tagged union, emit union_init with Error variant
-                if (ret_tid < self.type_store.types.items.len) {
-                    const ret_type = self.type_store.types.items[ret_tid];
-                    if (ret_type == .tagged_union) {
-                        const interner_mut: *ast.StringInterner = @constCast(self.interner);
-                        const error_name = interner_mut.intern("Error") catch return error.OutOfMemory;
-                        for (ret_type.tagged_union.variants) |v| {
-                            if (v.name == error_name) {
-                                return try self.create(Expr, .{
-                                    .kind = .{ .union_init = .{
-                                        .union_type_id = ret_tid,
-                                        .variant_name = error_name,
-                                        .value = value_expr,
-                                    } },
-                                    .type_id = ret_tid,
-                                    .span = ec.meta.span,
-                                });
-                            }
-                        }
-                    }
-                }
-
-                // Fallback: Err(x) → {:error, x} tuple (for non-union return types)
-                const interner_mut: *ast.StringInterner = @constCast(self.interner);
-                const error_atom = interner_mut.intern("error") catch return error.OutOfMemory;
-                const elems = try self.allocator.alloc(*const Expr, 2);
-                elems[0] = try self.create(Expr, .{
-                    .kind = .{ .atom_lit = error_atom },
-                    .type_id = types_mod.TypeStore.ATOM,
-                    .span = ec.meta.span,
-                });
-                elems[1] = value_expr;
-                return try self.create(Expr, .{
-                    .kind = .{ .tuple_init = elems },
-                    .type_id = types_mod.TypeStore.UNKNOWN,
-                    .span = ec.meta.span,
-                });
-            },
             .panic_expr => |pe| try self.create(Expr, .{
                 .kind = .{ .panic = try self.buildExpr(pe.message) },
                 .type_id = types_mod.TypeStore.NEVER,
@@ -2888,34 +2801,6 @@ pub const HirBuilder = struct {
             .name => |n| {
                 const name_str = self.interner.get(n.name);
 
-                // Err(X) in type position → {Atom, X} (error tuple)
-                // Bare Err → {Atom, Atom} | {Atom, String}
-                if (std.mem.eql(u8, name_str, "Err")) {
-                    const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
-                    if (n.args.len == 1) {
-                        const inner_type = self.resolveTypeExpr(n.args[0]);
-                        const elements = self.allocator.alloc(TypeId, 2) catch return types_mod.TypeStore.UNKNOWN;
-                        elements[0] = types_mod.TypeStore.ATOM;
-                        elements[1] = inner_type;
-                        return store_ptr.addType(.{ .tuple = .{ .elements = elements } }) catch types_mod.TypeStore.UNKNOWN;
-                    } else if (n.args.len == 0) {
-                        const atom_err_elems = self.allocator.alloc(TypeId, 2) catch return types_mod.TypeStore.UNKNOWN;
-                        atom_err_elems[0] = types_mod.TypeStore.ATOM;
-                        atom_err_elems[1] = types_mod.TypeStore.ATOM;
-                        const atom_err = store_ptr.addType(.{ .tuple = .{ .elements = atom_err_elems } }) catch return types_mod.TypeStore.UNKNOWN;
-
-                        const string_err_elems = self.allocator.alloc(TypeId, 2) catch return types_mod.TypeStore.UNKNOWN;
-                        string_err_elems[0] = types_mod.TypeStore.ATOM;
-                        string_err_elems[1] = types_mod.TypeStore.STRING;
-                        const string_err = store_ptr.addType(.{ .tuple = .{ .elements = string_err_elems } }) catch return types_mod.TypeStore.UNKNOWN;
-
-                        const members = self.allocator.alloc(TypeId, 2) catch return types_mod.TypeStore.UNKNOWN;
-                        members[0] = atom_err;
-                        members[1] = string_err;
-                        return store_ptr.addType(.{ .union_type = .{ .members = members } }) catch types_mod.TypeStore.UNKNOWN;
-                    }
-                }
-
                 // First check builtins
                 if (self.type_store.resolveTypeName(name_str)) |id| return id;
                 // Then check user-defined types (struct/enum) from scope graph
@@ -2938,38 +2823,6 @@ pub const HirBuilder = struct {
                 };
             },
             .union_type => |ut| {
-                // Detect T | Err(E) pattern — find the synthesized tagged union
-                if (ut.members.len == 2) {
-                    var ok_expr: ?*const ast.TypeExpr = null;
-                    var err_expr: ?*const ast.TypeExpr = null;
-
-                    for (ut.members) |member| {
-                        if (member.* == .name) {
-                            const mn = member.name;
-                            const mname = self.interner.get(mn.name);
-                            if (std.mem.eql(u8, mname, "Err") and mn.args.len == 1) {
-                                err_expr = mn.args[0];
-                                continue;
-                            }
-                        }
-                        ok_expr = member;
-                    }
-
-                    if (ok_expr != null and err_expr != null) {
-                        // Resolve Ok and Err types, build the deterministic name
-                        const ok_type = self.resolveTypeExpr(ok_expr.?);
-                        const err_type = self.resolveTypeExpr(err_expr.?);
-                        const ok_str = typeIdToName(ok_type, self.type_store);
-                        const err_str = typeIdToName(err_type, self.type_store);
-                        const synth_name = std.fmt.allocPrint(self.allocator, "__Result__{s}__{s}", .{ ok_str, err_str }) catch return types_mod.TypeStore.UNKNOWN;
-                        const interner_mut: *ast.StringInterner = @constCast(self.interner);
-                        const name_id = interner_mut.intern(synth_name) catch return types_mod.TypeStore.UNKNOWN;
-                        if (self.type_store.name_to_type.get(name_id)) |tid| {
-                            return tid;
-                        }
-                    }
-                }
-
                 // General union type — resolve each member
                 var member_types: std.ArrayList(TypeId) = .empty;
                 for (ut.members) |member| {

@@ -326,7 +326,6 @@ pub const Expr = union(enum) {
     // Error handling
     panic_expr: PanicExpr,
     error_pipe: ErrorPipeExpr,
-    err_constructor: ErrConstructorExpr,
 
     // Block
     block: BlockExpr,
@@ -375,7 +374,6 @@ pub const Expr = union(enum) {
             .unquote_expr => |v| v.meta,
             .panic_expr => |v| v.meta,
             .error_pipe => |v| v.meta,
-            .err_constructor => |v| v.meta,
             .block => |v| v.meta,
             .intrinsic => |v| v.meta,
             .attr_ref => |v| v.meta,
@@ -534,11 +532,6 @@ pub const ErrorPipeExpr = struct {
 pub const ErrorHandler = union(enum) {
     block: []const CaseClause, // inline pattern -> body arms
     function: *const Expr, // function call handler
-};
-
-pub const ErrConstructorExpr = struct {
-    meta: NodeMeta,
-    value: *const Expr, // the error value
 };
 
 pub const TypeAnnotatedExpr = struct {
