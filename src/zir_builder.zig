@@ -54,7 +54,8 @@ extern "c" fn zir_builder_emit_type_info(handle: ?*ZirBuilderHandle, operand: u3
 extern "c" fn zir_builder_emit_if_else(handle: ?*ZirBuilderHandle, condition: u32, then_value: u32, else_value: u32) u32;
 extern "c" fn zir_builder_emit_struct_init_anon(handle: ?*ZirBuilderHandle, names_ptrs: [*]const [*]const u8, names_lens: [*]const u32, values_ptr: [*]const u32, fields_len: u32) u32;
 extern "c" fn zir_builder_emit_union_init(handle: ?*ZirBuilderHandle, union_type: u32, field_name_ptr: [*]const u8, field_name_len: u32, init_value: u32) u32;
-// Union return type declaration
+extern "c" fn zir_builder_get_union_ret_type_ref(handle: ?*ZirBuilderHandle) u32;
+// Union return type
 extern "c" fn zir_builder_set_union_return_type(handle: ?*ZirBuilderHandle, names_ptrs: [*]const [*]const u8, names_lens: [*]const u32, types_ptr: [*]const u32, fields_len: u32) i32;
 
 // Switch block for tagged unions (single-pass API)
@@ -1970,9 +1971,23 @@ pub const ZirDriver = struct {
                     try self.setLocal(ui.dest, ptr_ref);
                 } else {
                     _ = self.reuse_backed_union_locals.remove(ui.dest);
-                    const ref = zir_builder_emit_struct_init_anon(self.handle, &names, &lens, &vals, 1);
-                    if (ref == error_ref) return error.EmitFailed;
-                    try self.setLocal(ui.dest, ref);
+                    // Use proper @unionInit if a union return type is active
+                    const union_type_ref = zir_builder_get_union_ret_type_ref(self.handle);
+                    if (union_type_ref != 0) {
+                        const ref = zir_builder_emit_union_init(
+                            self.handle,
+                            union_type_ref,
+                            ui.variant_name.ptr,
+                            @intCast(ui.variant_name.len),
+                            val_ref,
+                        );
+                        if (ref == error_ref) return error.EmitFailed;
+                        try self.setLocal(ui.dest, ref);
+                    } else {
+                        const ref = zir_builder_emit_struct_init_anon(self.handle, &names, &lens, &vals, 1);
+                        if (ref == error_ref) return error.EmitFailed;
+                        try self.setLocal(ui.dest, ref);
+                    }
                 }
             },
 
