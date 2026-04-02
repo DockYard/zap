@@ -3167,22 +3167,101 @@ pub const IrBuilder = struct {
                 });
             },
             .error_pipe => |ep| {
-                // Lower error pipe to nested union_switch instructions.
-                // Each fallible step gets wrapped in a union_switch:
-                //   Ok => pipe to next step (possibly another union_switch)
-                //   Error => handler
+                // Lower error pipe as a FLAT sequence of union_switch instructions.
+                // Each switch has empty prong bodies — it just extracts the Ok payload
+                // or returns the handler result. Function calls happen BETWEEN switches,
+                // not inside prong bodies. This avoids ZIR body context issues.
+                //
+                // Pattern:
+                //   step0 = call(...)
+                //   switch0 = union_switch(step0) { Ok => payload, Error => handler }
+                //   step1 = call(switch0, ...)
+                //   switch1 = union_switch(step1) { Ok => payload, Error => handler }
+                //   ...
+                //   final_result = last non-fallible call or last switch result
                 if (ep.steps.len == 0) return dest;
 
-                // Lower the handler (shared by all Error branches)
                 const handler_local = try self.lowerExpr(ep.handler);
 
-                // Lower step 0 (the base call)
-                const step0_val = try self.lowerExpr(ep.steps[0].expr);
+                // Lower step 0
+                var pipe_val = try self.lowerExpr(ep.steps[0].expr);
 
-                // Build the chain from inside out using a recursive helper.
-                // lowerErrorPipeChain processes step[start_idx] and chains remaining steps.
-                const result = try self.lowerErrorPipeChain(ep, step0_val, handler_local, 0, dest);
-                return result;
+                // Process step 0: if fallible, wrap in union_switch (empty body)
+                if (ep.steps[0].is_fallible) {
+                    const ok_dest = self.next_local;
+                    self.next_local += 1;
+                    const switch_dest = self.next_local;
+                    self.next_local += 1;
+
+                    const cases = try self.allocator.alloc(UnionCase, 2);
+                    cases[0] = .{ .variant_name = "Ok", .field_bindings = &.{}, .body_instrs = &.{}, .return_value = ok_dest };
+                    cases[1] = .{ .variant_name = "Error", .field_bindings = &.{}, .body_instrs = &.{}, .return_value = handler_local };
+
+                    try self.current_instrs.append(self.allocator, .{
+                        .union_switch = .{ .dest = switch_dest, .scrutinee = pipe_val, .cases = cases },
+                    });
+                    pipe_val = switch_dest;
+                }
+
+                // Process remaining steps
+                for (ep.steps[1..]) |step| {
+                    // Build call with pipe_val as first arg
+                    if (step.expr.kind == .call) {
+                        const call = step.expr.kind.call;
+                        var arg_locals: std.ArrayList(LocalId) = .empty;
+                        try arg_locals.append(self.allocator, pipe_val);
+                        for (call.args) |arg| {
+                            try arg_locals.append(self.allocator, try self.lowerExpr(arg.expr));
+                        }
+                        const call_dest = self.next_local;
+                        self.next_local += 1;
+                        const final_args = try arg_locals.toOwnedSlice(self.allocator);
+                        const modes = try self.allocator.alloc(ValueMode, final_args.len);
+                        @memset(modes, .share);
+                        try self.current_instrs.append(self.allocator, .{
+                            .call_named = .{
+                                .dest = call_dest,
+                                .name = switch (call.target) {
+                                    .named => |n| try std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ n.module orelse "", n.name }),
+                                    else => "unknown",
+                                },
+                                .args = final_args,
+                                .arg_modes = modes,
+                            },
+                        });
+                        pipe_val = call_dest;
+                    }
+
+                    // If this step is fallible, wrap in union_switch
+                    var is_fallible = step.is_fallible;
+                    if (!is_fallible and step.expr.kind == .call) {
+                        const call_name = switch (step.expr.kind.call.target) {
+                            .named => |n| std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ n.module orelse "", n.name }) catch "",
+                            else => "",
+                        };
+                        if (call_name.len > 0) {
+                            is_fallible = self.isFunctionReturningTaggedUnion(call_name);
+                        }
+                    }
+
+                    if (is_fallible) {
+                        const ok_dest = self.next_local;
+                        self.next_local += 1;
+                        const switch_dest = self.next_local;
+                        self.next_local += 1;
+
+                        const cases = try self.allocator.alloc(UnionCase, 2);
+                        cases[0] = .{ .variant_name = "Ok", .field_bindings = &.{}, .body_instrs = &.{}, .return_value = ok_dest };
+                        cases[1] = .{ .variant_name = "Error", .field_bindings = &.{}, .body_instrs = &.{}, .return_value = handler_local };
+
+                        try self.current_instrs.append(self.allocator, .{
+                            .union_switch = .{ .dest = switch_dest, .scrutinee = pipe_val, .cases = cases },
+                        });
+                        pipe_val = switch_dest;
+                    }
+                }
+
+                return pipe_val;
             },
             .union_init => |ui| {
                 const value_local = try self.lowerExpr(ui.value);
