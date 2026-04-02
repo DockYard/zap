@@ -7,7 +7,7 @@
 #   zap run cli
 
 pub module Cli {
-  pub fn main(_args :: [String]) :: String {
+  pub fn main(_args :: [String]) -> String {
     IO.puts("Hello from CLI!")
     IO.puts("Arg count: " <> Integer.to_string(System.arg_count()))
   }

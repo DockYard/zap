@@ -1,5 +1,5 @@
 pub module Runner {
-  pub fn hello(word :: String) :: String {
+  pub fn hello(word :: String) -> String {
     "Hello" <> " " <> word
   }
 }

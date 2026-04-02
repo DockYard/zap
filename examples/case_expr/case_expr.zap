@@ -3,7 +3,7 @@
 # Demonstrates case/switch on atom values.
 
 pub module CaseExpr {
-  pub fn describe(x :: i64) :: String {
+  pub fn describe(x :: i64) -> String {
     case x {
       0 ->
         "zero"
@@ -14,7 +14,7 @@ pub module CaseExpr {
     }
   }
 
-  pub fn main(_args :: [String]) :: String {
+  pub fn main(_args :: [String]) -> String {
     CaseExpr.describe(0)
     |> IO.puts()
 

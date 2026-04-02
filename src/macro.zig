@@ -500,6 +500,8 @@ pub const MacroEngine = struct {
             .intrinsic,
             .attr_ref,
             .binary_literal,
+            .error_pipe,
+            .err_constructor,
             => return .{ .expr = expr, .changed = false },
         }
     }
@@ -1133,7 +1135,7 @@ const Collector = @import("collector.zig").Collector;
 test "macro engine no-op on program without macros" {
     const source =
         \\pub module Test {
-        \\  pub fn add(x :: i64, y :: i64) :: i64 {
+        \\  pub fn add(x :: i64, y :: i64) -> i64 {
         \\    x + y
         \\  }
         \\}
@@ -1172,7 +1174,7 @@ test "macro engine expands simple macro" {
         \\    }
         \\  }
         \\
-        \\  pub fn foo(x :: i64) :: i64 {
+        \\  pub fn foo(x :: i64) -> i64 {
         \\    unless(x > 0, 42)
         \\  }
         \\}
@@ -1264,7 +1266,7 @@ test "macro engine reaches fixed point" {
 test "typed macro: nil in String return position is an error" {
     const source =
         \\pub module Test {
-        \\  pub macro when_positive(value :: i64, result :: String) :: String {
+        \\  pub macro when_positive(value :: i64, result :: String) -> String {
         \\    quote {
         \\      if unquote(value) > 0 {
         \\        unquote(result)
@@ -1274,7 +1276,7 @@ test "typed macro: nil in String return position is an error" {
         \\    }
         \\  }
         \\
-        \\  pub fn check(n :: i64) :: String {
+        \\  pub fn check(n :: i64) -> String {
         \\    when_positive(n, "yes")
         \\  }
         \\}
@@ -1304,7 +1306,7 @@ test "typed macro: nil in String return position is an error" {
 test "typed macro: valid types produce no errors" {
     const source =
         \\pub module Test {
-        \\  pub macro when_positive(value :: i64, result :: String) :: String {
+        \\  pub macro when_positive(value :: i64, result :: String) -> String {
         \\    quote {
         \\      if unquote(value) > 0 {
         \\        unquote(result)
@@ -1314,7 +1316,7 @@ test "typed macro: valid types produce no errors" {
         \\    }
         \\  }
         \\
-        \\  pub fn check(n :: i64) :: String {
+        \\  pub fn check(n :: i64) -> String {
         \\    when_positive(n, "yes")
         \\  }
         \\}
@@ -1343,7 +1345,7 @@ test "typed macro: valid types produce no errors" {
 test "typed macro: missing else branch is an error for non-nil return type" {
     const source =
         \\pub module Test {
-        \\  pub macro unless(expr :: Bool, body :: i64) :: i64 {
+        \\  pub macro unless(expr :: Bool, body :: i64) -> i64 {
         \\    quote {
         \\      if not unquote(expr) {
         \\        unquote(body)
@@ -1351,7 +1353,7 @@ test "typed macro: missing else branch is an error for non-nil return type" {
         \\    }
         \\  }
         \\
-        \\  pub fn foo(x :: i64) :: i64 {
+        \\  pub fn foo(x :: i64) -> i64 {
         \\    unless(x > 0, 42)
         \\  }
         \\}
@@ -1381,13 +1383,13 @@ test "typed macro: missing else branch is an error for non-nil return type" {
 test "typed macro: param type mismatch with return type" {
     const source =
         \\pub module Test {
-        \\  pub macro wrap(value :: i64) :: String {
+        \\  pub macro wrap(value :: i64) -> String {
         \\    quote {
         \\      unquote(value)
         \\    }
         \\  }
         \\
-        \\  pub fn foo(x :: i64) :: String {
+        \\  pub fn foo(x :: i64) -> String {
         \\    wrap(x)
         \\  }
         \\}
@@ -1417,7 +1419,7 @@ test "macro substitution into case_expr and block" {
     // A macro that produces a case expression with unquote inside
     const source =
         \\pub module Test {
-        \\  pub macro match_it(val :: Expr, fallback :: Expr) :: Nil {
+        \\  pub macro match_it(val :: Expr, fallback :: Expr) -> Nil {
         \\    quote {
         \\      case unquote(val) {
         \\        0 -> unquote(fallback)
@@ -1426,7 +1428,7 @@ test "macro substitution into case_expr and block" {
         \\    }
         \\  }
         \\
-        \\  pub fn check(x :: i64) :: i64 {
+        \\  pub fn check(x :: i64) -> i64 {
         \\    match_it(x, 42)
         \\  }
         \\}

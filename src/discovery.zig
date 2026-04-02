@@ -484,7 +484,7 @@ test "extractModuleReferences: finds qualified calls" {
     const alloc = arena.allocator();
     const source =
         \\pub module App {
-        \\  pub fn main() :: String {
+        \\  pub fn main() -> String {
         \\    Config.load("/etc/app")
         \\    IO.puts("hello")
         \\  }
@@ -509,7 +509,7 @@ test "extractModuleReferences: finds nested module references" {
     const alloc = arena.allocator();
     const source =
         \\pub module App {
-        \\  pub fn main() :: String {
+        \\  pub fn main() -> String {
         \\    Config.Parser.parse("data")
         \\  }
         \\}
@@ -540,7 +540,7 @@ test "discover: single file with no references" {
 
     try tmp_dir.dir.writeFile(.{
         .sub_path = "app.zap",
-        .data = "pub module App {\n  pub fn main() :: i64 {\n    42\n  }\n}\n",
+        .data = "pub module App {\n  pub fn main() -> i64 {\n    42\n  }\n}\n",
     });
 
     const tmp_path = try tmp_dir.dir.realpathAlloc(alloc, ".");
@@ -564,15 +564,15 @@ test "discover: transitive references" {
     // App → Helper → Util (3 files, transitive chain)
     try tmp_dir.dir.writeFile(.{
         .sub_path = "app.zap",
-        .data = "pub module App {\n  pub fn main() :: i64 {\n    Helper.run()\n  }\n}\n",
+        .data = "pub module App {\n  pub fn main() -> i64 {\n    Helper.run()\n  }\n}\n",
     });
     try tmp_dir.dir.writeFile(.{
         .sub_path = "helper.zap",
-        .data = "pub module Helper {\n  pub fn run() :: i64 {\n    Util.value()\n  }\n}\n",
+        .data = "pub module Helper {\n  pub fn run() -> i64 {\n    Util.value()\n  }\n}\n",
     });
     try tmp_dir.dir.writeFile(.{
         .sub_path = "util.zap",
-        .data = "pub module Util {\n  pub fn value() :: i64 {\n    1\n  }\n}\n",
+        .data = "pub module Util {\n  pub fn value() -> i64 {\n    1\n  }\n}\n",
     });
 
     const tmp_path = try tmp_dir.dir.realpathAlloc(alloc, ".");
@@ -604,11 +604,11 @@ test "discover: circular dependency detected" {
     // A → B → A (cycle)
     try tmp_dir.dir.writeFile(.{
         .sub_path = "cycle_a.zap",
-        .data = "pub module CycleA {\n  pub fn go() :: i64 {\n    CycleB.go()\n  }\n}\n",
+        .data = "pub module CycleA {\n  pub fn go() -> i64 {\n    CycleB.go()\n  }\n}\n",
     });
     try tmp_dir.dir.writeFile(.{
         .sub_path = "cycle_b.zap",
-        .data = "pub module CycleB {\n  pub fn go() :: i64 {\n    CycleA.go()\n  }\n}\n",
+        .data = "pub module CycleB {\n  pub fn go() -> i64 {\n    CycleA.go()\n  }\n}\n",
     });
 
     const tmp_path = try tmp_dir.dir.realpathAlloc(alloc, ".");
@@ -629,7 +629,7 @@ test "discover: module not found" {
     // App references NonExistent which doesn't exist
     try tmp_dir.dir.writeFile(.{
         .sub_path = "app.zap",
-        .data = "pub module App {\n  pub fn main() :: i64 {\n    NonExistent.foo()\n  }\n}\n",
+        .data = "pub module App {\n  pub fn main() -> i64 {\n    NonExistent.foo()\n  }\n}\n",
     });
 
     const tmp_path = try tmp_dir.dir.realpathAlloc(alloc, ".");
@@ -653,11 +653,11 @@ test "discover: module found in dep root" {
 
     try tmp_dir.dir.writeFile(.{
         .sub_path = "project/app.zap",
-        .data = "pub module App {\n  pub fn main() :: i64 {\n    DepMod.value()\n  }\n}\n",
+        .data = "pub module App {\n  pub fn main() -> i64 {\n    DepMod.value()\n  }\n}\n",
     });
     try tmp_dir.dir.writeFile(.{
         .sub_path = "dep_lib/dep_mod.zap",
-        .data = "pub module DepMod {\n  pub fn value() :: i64 {\n    99\n  }\n}\n",
+        .data = "pub module DepMod {\n  pub fn value() -> i64 {\n    99\n  }\n}\n",
     });
 
     const project_path = try tmp_dir.dir.realpathAlloc(alloc, "project");

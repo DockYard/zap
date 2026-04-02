@@ -3271,7 +3271,7 @@ const Collector = @import("collector.zig").Collector;
 test "IR build simple function" {
     const source =
         \\pub module Test {
-        \\  pub fn add(x :: i64, y :: i64) :: i64 {
+        \\  pub fn add(x :: i64, y :: i64) -> i64 {
         \\    x + y
         \\  }
         \\}

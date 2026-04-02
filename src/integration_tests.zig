@@ -266,7 +266,7 @@ test "example: hello world" {
 
     const source =
         \\pub module Test {
-        \\  pub fn main() :: String {
+        \\  pub fn main() -> String {
         \\    IO.puts("Hello, world!")
         \\  }
         \\}
@@ -289,7 +289,7 @@ test "IO.puts resolves to runtime println" {
 
     const source =
         \\pub module Test {
-        \\  pub fn main() :: String {
+        \\  pub fn main() -> String {
         \\    IO.puts("test output")
         \\  }
         \\}
@@ -307,7 +307,7 @@ test "bare println is not implicitly available" {
 
     const source =
         \\pub module Test {
-        \\  pub fn main() :: String {
+        \\  pub fn main() -> String {
         \\    println("should not resolve")
         \\  }
         \\}
@@ -330,17 +330,17 @@ test "example: factorial" {
 
     const source =
         \\pub module Factorial {
-        \\  pub fn factorial(0 :: i64) :: i64 {
+        \\  pub fn factorial(0 :: i64) -> i64 {
         \\    1
         \\  }
         \\
-        \\  pub fn factorial(n :: i64) :: i64 {
+        \\  pub fn factorial(n :: i64) -> i64 {
         \\    n * factorial(n - 1)
         \\  }
         \\}
         \\
         \\pub module Test {
-        \\  pub fn main() :: i64 {
+        \\  pub fn main() -> i64 {
         \\    Factorial.factorial(10)
         \\  }
         \\}
@@ -364,21 +364,21 @@ test "example: fibonacci" {
 
     const source =
         \\pub module Fib {
-        \\  pub fn fib(0 :: i64) :: i64 {
+        \\  pub fn fib(0 :: i64) -> i64 {
         \\    0
         \\  }
         \\
-        \\  pub fn fib(1 :: i64) :: i64 {
+        \\  pub fn fib(1 :: i64) -> i64 {
         \\    1
         \\  }
         \\
-        \\  pub fn fib(n :: i64) :: i64 {
+        \\  pub fn fib(n :: i64) -> i64 {
         \\    fib(n - 1) + fib(n - 2)
         \\  }
         \\}
         \\
         \\pub module Test {
-        \\  pub fn main() :: i64 {
+        \\  pub fn main() -> i64 {
         \\    Fib.fib(20)
         \\  }
         \\}
@@ -401,15 +401,15 @@ test "example: math module" {
 
     const source =
         \\pub module Math {
-        \\  pub fn square(x :: i64) :: i64 {
+        \\  pub fn square(x :: i64) -> i64 {
         \\    x * x
         \\  }
         \\
-        \\  pub fn cube(x :: i64) :: i64 {
+        \\  pub fn cube(x :: i64) -> i64 {
         \\    x * x * x
         \\  }
         \\
-        \\  pub fn abs(x :: i64) :: i64 {
+        \\  pub fn abs(x :: i64) -> i64 {
         \\    if x < 0 {
         \\      -x
         \\    } else {
@@ -419,7 +419,7 @@ test "example: math module" {
         \\}
         \\
         \\pub module Test {
-        \\  pub fn main() :: i64 {
+        \\  pub fn main() -> i64 {
         \\    Math.square(5)
         \\  }
         \\}
@@ -444,21 +444,21 @@ test "example: pattern matching" {
 
     const source =
         \\pub module Matcher {
-        \\  pub fn describe(:ok :: Atom) :: String {
+        \\  pub fn describe(:ok :: Atom) -> String {
         \\    "success"
         \\  }
         \\
-        \\  pub fn describe(:error :: Atom) :: String {
+        \\  pub fn describe(:error :: Atom) -> String {
         \\    "failure"
         \\  }
         \\
-        \\  pub fn describe(_ :: Atom) :: String {
+        \\  pub fn describe(_ :: Atom) -> String {
         \\    "unknown"
         \\  }
         \\}
         \\
         \\pub module Test {
-        \\  pub fn main() :: String {
+        \\  pub fn main() -> String {
         \\    Matcher.describe(:ok)
         \\  }
         \\}
@@ -483,17 +483,17 @@ test "example: multiline pipes" {
 
     const source =
         \\pub module Pipes {
-        \\  pub fn double(x :: i64) :: i64 {
+        \\  pub fn double(x :: i64) -> i64 {
         \\    x * 2
         \\  }
         \\
-        \\  pub fn add_one(x :: i64) :: i64 {
+        \\  pub fn add_one(x :: i64) -> i64 {
         \\    x + 1
         \\  }
         \\}
         \\
         \\pub module Test {
-        \\  pub fn main() :: i64 {
+        \\  pub fn main() -> i64 {
         \\    5
         \\    |> Pipes.double()
         \\    |> Pipes.add_one()
@@ -523,17 +523,17 @@ test "example: type declarations" {
         \\pub module Geometry {
         \\  type Shape = {:circle, f64} | {:rectangle, f64, f64}
         \\
-        \\  pub fn area({:circle, radius} :: Shape) :: f64 {
+        \\  pub fn area({:circle, radius} :: Shape) -> f64 {
         \\    3.14159 * radius * radius
         \\  }
         \\
-        \\  pub fn area({:rectangle, w, h} :: Shape) :: f64 {
+        \\  pub fn area({:rectangle, w, h} :: Shape) -> f64 {
         \\    w * h
         \\  }
         \\}
         \\
         \\pub module Test {
-        \\  pub fn main() :: f64 {
+        \\  pub fn main() -> f64 {
         \\    Geometry.area({:circle, 5.0})
         \\  }
         \\}
@@ -558,7 +558,7 @@ test "all compiled output has required header" {
 
     const source =
         \\pub module Test {
-        \\  pub fn main() :: Nil {
+        \\  pub fn main() -> Nil {
         \\    nil
         \\  }
         \\}
@@ -577,11 +577,11 @@ test "multiple function clauses produce separate functions" {
 
     const source =
         \\pub module Greeter {
-        \\  pub fn greet(:morning :: Atom) :: String {
+        \\  pub fn greet(:morning :: Atom) -> String {
         \\    "Good morning"
         \\  }
         \\
-        \\  pub fn greet(:evening :: Atom) :: String {
+        \\  pub fn greet(:evening :: Atom) -> String {
         \\    "Good evening"
         \\  }
         \\}
@@ -600,7 +600,7 @@ test "string concatenation in function body" {
 
     const source =
         \\pub module Greeter {
-        \\  pub fn greet(name :: String) :: String {
+        \\  pub fn greet(name :: String) -> String {
         \\    "Hello, " <> name
         \\  }
         \\}
@@ -618,7 +618,7 @@ test "if-else generates conditional" {
 
     const source =
         \\pub module Sign {
-        \\  pub fn sign(x :: i64) :: String {
+        \\  pub fn sign(x :: i64) -> String {
         \\    if x > 0 {
         \\      "positive"
         \\    } else {
@@ -649,17 +649,17 @@ test "tuple pattern destructuring" {
 
     const source =
         \\pub module Geometry {
-        \\  pub fn area({:circle, radius} :: f64) :: f64 {
+        \\  pub fn area({:circle, radius} :: f64) -> f64 {
         \\    3.14159 * radius * radius
         \\  }
         \\
-        \\  pub fn area({:rectangle, w, h} :: f64) :: f64 {
+        \\  pub fn area({:rectangle, w, h} :: f64) -> f64 {
         \\    w * h
         \\  }
         \\}
         \\
         \\pub module Test {
-        \\  pub fn main() :: f64 {
+        \\  pub fn main() -> f64 {
         \\    Geometry.area({:circle, 5.0})
         \\  }
         \\}
@@ -691,15 +691,15 @@ test "refinement guard on function clause" {
 
     const source =
         \\pub module Classifier {
-        \\  pub fn classify(n :: i64) :: String if n > 0 {
+        \\  pub fn classify(n :: i64) -> String if n > 0 {
         \\    "positive"
         \\  }
         \\
-        \\  pub fn classify(n :: i64) :: String if n < 0 {
+        \\  pub fn classify(n :: i64) -> String if n < 0 {
         \\    "negative"
         \\  }
         \\
-        \\  pub fn classify(_ :: i64) :: String {
+        \\  pub fn classify(_ :: i64) -> String {
         \\    "zero"
         \\  }
         \\}
@@ -725,7 +725,7 @@ test "case expression with literal patterns" {
 
     const source =
         \\pub module Checker {
-        \\  pub fn check(x :: i64) :: String {
+        \\  pub fn check(x :: i64) -> String {
         \\    case x {
         \\      0 -> "zero"
         \\      1 -> "one"
@@ -752,7 +752,7 @@ test "case expression with tuple destructuring" {
 
     const source =
         \\pub module Handler {
-        \\  pub fn handle(result :: Atom) :: Nil {
+        \\  pub fn handle(result :: Atom) -> Nil {
         \\    case result {
         \\      {:ok, v} -> v
         \\      {:error, e} -> e
@@ -777,7 +777,7 @@ test "case expression with bind pattern" {
 
     const source =
         \\pub module Identity {
-        \\  pub fn identity(x :: Atom) :: Nil {
+        \\  pub fn identity(x :: Atom) -> Nil {
         \\    case x {
         \\      v -> v
         \\    }
@@ -802,7 +802,7 @@ test "case expression emits switch for integer literals" {
 
     const source =
         \\pub module Checker {
-        \\  pub fn check(x :: i64) :: String {
+        \\  pub fn check(x :: i64) -> String {
         \\    case x {
         \\      0 -> "zero"
         \\      1 -> "one"
@@ -828,15 +828,15 @@ test "function dispatch emits switch for integer literals" {
 
     const source =
         \\pub module Fib {
-        \\  pub fn fib(0 :: i64) :: i64 {
+        \\  pub fn fib(0 :: i64) -> i64 {
         \\    0
         \\  }
         \\
-        \\  pub fn fib(1 :: i64) :: i64 {
+        \\  pub fn fib(1 :: i64) -> i64 {
         \\    1
         \\  }
         \\
-        \\  pub fn fib(n :: i64) :: i64 {
+        \\  pub fn fib(n :: i64) -> i64 {
         \\    fib(n - 1) + fib(n - 2)
         \\  }
         \\}
@@ -854,7 +854,7 @@ test "case with guards falls back to if-else" {
 
     const source =
         \\pub module Checker {
-        \\  pub fn check(x :: i64) :: String {
+        \\  pub fn check(x :: i64) -> String {
         \\    case x {
         \\      0 -> "zero"
         \\      n if n > 0 -> "positive"
@@ -877,7 +877,7 @@ test "case with atom literals falls back to if-else" {
 
     const source =
         \\pub module Checker {
-        \\  pub fn check(x :: Atom) :: String {
+        \\  pub fn check(x :: Atom) -> String {
         \\    case x {
         \\      :ok -> "yes"
         \\      :error -> "no"
@@ -904,7 +904,7 @@ test "nested tuple patterns decompose once" {
 
     const source =
         \\pub module Processor {
-        \\  pub fn process(x :: Atom) :: Nil {
+        \\  pub fn process(x :: Atom) -> Nil {
         \\    case x {
         \\      {:ok, {:data, v}} -> v
         \\      {:ok, {:empty}} -> nil
@@ -935,7 +935,7 @@ test "case with tuple patterns checks struct type once" {
 
     const source =
         \\pub module Handler {
-        \\  pub fn handle(result :: Atom) :: Nil {
+        \\  pub fn handle(result :: Atom) -> Nil {
         \\    case result {
         \\      {:ok, v} -> v
         \\      {:error, e} -> e
@@ -964,11 +964,11 @@ test "multi-clause function with tuple dispatch checks once" {
 
     const source =
         \\pub module Handler {
-        \\  pub fn handle({:ok, v} :: Atom) :: Nil {
+        \\  pub fn handle({:ok, v} :: Atom) -> Nil {
         \\    v
         \\  }
         \\
-        \\  pub fn handle({:error, e} :: Atom) :: Nil {
+        \\  pub fn handle({:error, e} :: Atom) -> Nil {
         \\    e
         \\  }
         \\}
@@ -998,11 +998,11 @@ test "typed integer param skips type check in switch" {
 
     const source =
         \\pub module TypedSwitch {
-        \\  pub fn f(0 :: i64) :: i64 {
+        \\  pub fn f(0 :: i64) -> i64 {
         \\    1
         \\  }
         \\
-        \\  pub fn f(n :: i64) :: i64 {
+        \\  pub fn f(n :: i64) -> i64 {
         \\    n
         \\  }
         \\}
@@ -1023,11 +1023,11 @@ test "untyped param produces type error" {
 
     const source =
         \\pub module Describer {
-        \\  pub fn describe(:ok) :: String {
+        \\  pub fn describe(:ok) -> String {
         \\    "yes"
         \\  }
         \\
-        \\  pub fn describe(_) :: String {
+        \\  pub fn describe(_) -> String {
         \\    "no"
         \\  }
         \\}
@@ -1045,7 +1045,7 @@ test "typed case scrutinee skips type check" {
 
     const source =
         \\pub module Checker {
-        \\  pub fn check(x :: i64) :: String {
+        \\  pub fn check(x :: i64) -> String {
         \\    case x {
         \\      0 -> "zero"
         \\      _ -> "other"
@@ -1070,7 +1070,7 @@ test "mixed variable and constructor in case" {
 
     const source =
         \\pub module Checker {
-        \\  pub fn check(x :: i64) :: i64 {
+        \\  pub fn check(x :: i64) -> i64 {
         \\    case x {
         \\      1 -> 100
         \\      y -> y
@@ -1092,7 +1092,7 @@ test "case with mixed literal types falls back" {
 
     const source =
         \\pub module Checker {
-        \\  pub fn check(x :: Atom) :: String {
+        \\  pub fn check(x :: Atom) -> String {
         \\    case x {
         \\      0 -> "zero"
         \\      :ok -> "ok"
@@ -1129,7 +1129,7 @@ test "macro expansion: unless compiles through pipeline" {
 
     const source =
         \\pub module Logic {
-        \\  pub macro unless(condition :: Expr, body :: Expr) :: Nil {
+        \\  pub macro unless(condition :: Expr, body :: Expr) -> Nil {
         \\    quote {
         \\      if not unquote(condition) {
         \\        unquote(body)
@@ -1137,7 +1137,7 @@ test "macro expansion: unless compiles through pipeline" {
         \\    }
         \\  }
         \\
-        \\  pub fn check(x :: i64) :: i64 {
+        \\  pub fn check(x :: i64) -> i64 {
         \\    unless(x > 0, 42)
         \\  }
         \\}
@@ -1158,13 +1158,13 @@ test "macro expansion: expression substitution" {
 
     const source =
         \\pub module Math {
-        \\  pub macro double(value :: Expr) :: Nil {
+        \\  pub macro double(value :: Expr) -> Nil {
         \\    quote {
         \\      unquote(value) + unquote(value)
         \\    }
         \\  }
         \\
-        \\  pub fn compute(x :: i64) :: i64 {
+        \\  pub fn compute(x :: i64) -> i64 {
         \\    double(x * 3)
         \\  }
         \\}
@@ -1183,7 +1183,7 @@ test "Kernel.unless macro works without module prefix" {
 
     const source =
         \\pub module Checker {
-        \\  pub fn check(x :: i64) :: i64 {
+        \\  pub fn check(x :: i64) -> i64 {
         \\    unless(x > 10, 42)
         \\  }
         \\}
@@ -1207,7 +1207,7 @@ test "cond expression desugars to nested case" {
 
     const source =
         \\pub module Classifier {
-        \\  pub fn classify(x :: i64) :: String {
+        \\  pub fn classify(x :: i64) -> String {
         \\    cond {
         \\      x > 0 -> "positive"
         \\      x < 0 -> "negative"
@@ -1238,7 +1238,7 @@ test "with expression desugars to nested case" {
 
     const source =
         \\pub module Processor {
-        \\  pub fn process(x :: Atom) :: Nil {
+        \\  pub fn process(x :: Atom) -> Nil {
         \\    with {:ok, a} <- x {
         \\      a
         \\    } else {
@@ -1269,11 +1269,11 @@ test "tagged union with different tuple arities" {
         \\pub module Geometry {
         \\  type Shape = {:circle, f64} | {:rectangle, f64, f64}
         \\
-        \\  pub fn area({:circle, radius} :: Shape) :: f64 {
+        \\  pub fn area({:circle, radius} :: Shape) -> f64 {
         \\    3.14159 * radius * radius
         \\  }
         \\
-        \\  pub fn area({:rectangle, w, h} :: Shape) :: f64 {
+        \\  pub fn area({:rectangle, w, h} :: Shape) -> f64 {
         \\    w * h
         \\  }
         \\}
@@ -1298,19 +1298,19 @@ test "two modules with same function name don't collide" {
 
     const source =
         \\pub module A {
-        \\  pub fn calc(x :: i64) :: i64 {
+        \\  pub fn calc(x :: i64) -> i64 {
         \\    x + 1
         \\  }
         \\}
         \\
         \\pub module B {
-        \\  pub fn calc(x :: i64) :: i64 {
+        \\  pub fn calc(x :: i64) -> i64 {
         \\    x * 2
         \\  }
         \\}
         \\
         \\pub module Test {
-        \\  pub fn main() :: i64 {
+        \\  pub fn main() -> i64 {
         \\    A.calc(1)
         \\    B.calc(2)
         \\  }
@@ -1334,7 +1334,7 @@ test "bare inspect resolves to Kernel__inspect" {
 
     const source =
         \\pub module Test {
-        \\  pub fn main() :: String {
+        \\  pub fn main() -> String {
         \\    inspect(42)
         \\  }
         \\}
@@ -1353,13 +1353,13 @@ test "module-qualified call emits prefixed name" {
 
     const source =
         \\pub module Math {
-        \\  pub fn double(x :: i64) :: i64 {
+        \\  pub fn double(x :: i64) -> i64 {
         \\    x * 2
         \\  }
         \\}
         \\
         \\pub module Test {
-        \\  pub fn main() :: i64 {
+        \\  pub fn main() -> i64 {
         \\    Math.double(5)
         \\  }
         \\}
@@ -1379,8 +1379,8 @@ test "nested local def direct call compiles" {
 
     const source =
         \\pub module Foo {
-        \\  pub fn bar(x :: i64) :: i64 {
-        \\    pub fn other(y :: i64) :: i64 {
+        \\  pub fn bar(x :: i64) -> i64 {
+        \\    pub fn other(y :: i64) -> i64 {
         \\      y * 10
         \\    }
         \\
@@ -1389,7 +1389,7 @@ test "nested local def direct call compiles" {
         \\}
         \\
         \\pub module Test {
-        \\  pub fn main() :: i64 {
+        \\  pub fn main() -> i64 {
         \\    Foo.bar(4)
         \\  }
         \\}
@@ -1409,12 +1409,12 @@ test "nested noncapturing def can be passed as function value" {
 
     const source =
         \\pub module Foo {
-        \\  pub fn apply(f :: (i64 -> i64), value :: i64) :: i64 {
+        \\  pub fn apply(f :: (i64 -> i64), value :: i64) -> i64 {
         \\    f(value)
         \\  }
         \\
-        \\  pub fn bar() :: i64 {
-        \\    pub fn other(y :: i64) :: i64 {
+        \\  pub fn bar() -> i64 {
+        \\    pub fn other(y :: i64) -> i64 {
         \\      y * 10
         \\    }
         \\
@@ -1438,8 +1438,8 @@ test "nested noncapturing def can be returned as function value" {
 
     const source =
         \\pub module Foo {
-        \\  pub fn make(x :: i64) :: (i64 -> i64) {
-        \\    pub fn other(y :: i64) :: i64 {
+        \\  pub fn make(x :: i64) -> (i64 -> i64) {
+        \\    pub fn other(y :: i64) -> i64 {
         \\      x + y
         \\    }
         \\
@@ -1463,8 +1463,8 @@ test "capturing nested def local call compiles as closure" {
 
     const source =
         \\pub module Foo {
-        \\  pub fn bar(x :: i64) :: i64 {
-        \\    pub fn add_x(y :: i64) :: i64 {
+        \\  pub fn bar(x :: i64) -> i64 {
+        \\    pub fn add_x(y :: i64) -> i64 {
         \\      x + y
         \\    }
         \\
@@ -1488,8 +1488,8 @@ test "call-local capturing closure omits closure wrappers" {
 
     const source =
         \\pub module Foo {
-        \\  pub fn bar(x :: i64) :: i64 {
-        \\    pub fn add_x(y :: i64) :: i64 {
+        \\  pub fn bar(x :: i64) -> i64 {
+        \\    pub fn add_x(y :: i64) -> i64 {
         \\      x + y
         \\    }
         \\
@@ -1510,8 +1510,8 @@ test "non-capturing local def stays lambda lifted without closure wrappers" {
 
     const source =
         \\pub module Foo {
-        \\  pub fn bar() :: i64 {
-        \\    pub fn forty_two() :: i64 {
+        \\  pub fn bar() -> i64 {
+        \\    pub fn forty_two() -> i64 {
         \\      42
         \\    }
         \\
@@ -1535,8 +1535,8 @@ test "call-local closure with if body still compiles as direct call" {
 
     const source =
         \\pub module Foo {
-        \\  pub fn bar(flag :: Bool) :: i64 {
-        \\    pub fn pick(value :: Bool) :: i64 {
+        \\  pub fn bar(flag :: Bool) -> i64 {
+        \\    pub fn pick(value :: Bool) -> i64 {
         \\      if value {
         \\        5
         \\      } else {
@@ -1564,8 +1564,8 @@ test "call-local closure with switch body still compiles as direct call" {
 
     const source =
         \\pub module Foo {
-        \\  pub fn bar(flag :: Bool) :: i64 {
-        \\    pub fn pick(value :: Bool) :: i64 {
+        \\  pub fn bar(flag :: Bool) -> i64 {
+        \\    pub fn pick(value :: Bool) -> i64 {
         \\      case value {
         \\        true -> 5
         \\        false -> 7
@@ -1592,8 +1592,8 @@ test "call-local closure with case body still compiles as direct call" {
 
     const source =
         \\pub module Foo {
-        \\  pub fn bar(flag :: Bool) :: i64 {
-        \\    pub fn pick(value :: Bool) :: i64 {
+        \\  pub fn bar(flag :: Bool) -> i64 {
+        \\    pub fn pick(value :: Bool) -> i64 {
         \\      case value {
         \\        true -> 5
         \\        false -> 7
@@ -1619,8 +1619,8 @@ test "aliased call-local capturing closure still compiles as direct call" {
 
     const source =
         \\pub module Foo {
-        \\  pub fn bar(x :: i64) :: i64 {
-        \\    pub fn add_x(y :: i64) :: i64 {
+        \\  pub fn bar(x :: i64) -> i64 {
+        \\    pub fn add_x(y :: i64) -> i64 {
         \\      x + y
         \\    }
         \\
@@ -1645,8 +1645,8 @@ test "aliased call-local closure with case body still compiles as direct call" {
 
     const source =
         \\pub module Foo {
-        \\  pub fn bar(flag :: Bool) :: i64 {
-        \\    pub fn pick(value :: Bool) :: i64 {
+        \\  pub fn bar(flag :: Bool) -> i64 {
+        \\    pub fn pick(value :: Bool) -> i64 {
         \\      case value {
         \\        true -> 5
         \\        false -> 7
@@ -1674,8 +1674,8 @@ test "block-local capturing closure avoids heap env allocation" {
 
     const source =
         \\pub module Foo {
-        \\  pub fn bar(x :: i64) :: i64 {
-        \\    pub fn add_x(y :: i64) :: i64 {
+        \\  pub fn bar(x :: i64) -> i64 {
+        \\    pub fn add_x(y :: i64) -> i64 {
         \\      x + y
         \\    }
         \\
@@ -1699,12 +1699,12 @@ test "capturing nested def can be passed as function value" {
 
     const source =
         \\pub module Foo {
-        \\  pub fn apply(f :: (i64 -> i64), value :: i64) :: i64 {
+        \\  pub fn apply(f :: (i64 -> i64), value :: i64) -> i64 {
         \\    f(value)
         \\  }
         \\
-        \\  pub fn bar(x :: i64) :: i64 {
-        \\    pub fn add_x(y :: i64) :: i64 {
+        \\  pub fn bar(x :: i64) -> i64 {
+        \\    pub fn add_x(y :: i64) -> i64 {
         \\      x + y
         \\    }
         \\
@@ -1728,12 +1728,12 @@ test "capturing nested def passed to known-safe callee avoids heap env" {
 
     const source =
         \\pub module Foo {
-        \\  pub fn apply(f :: (i64 -> i64), value :: i64) :: i64 {
+        \\  pub fn apply(f :: (i64 -> i64), value :: i64) -> i64 {
         \\    f(value)
         \\  }
         \\
-        \\  pub fn bar(x :: i64) :: i64 {
-        \\    pub fn add_x(y :: i64) :: i64 {
+        \\  pub fn bar(x :: i64) -> i64 {
+        \\    pub fn add_x(y :: i64) -> i64 {
         \\      x + y
         \\    }
         \\
@@ -1756,12 +1756,12 @@ test "aliased capturing nested def passed to known-safe callee avoids heap env" 
 
     const source =
         \\pub module Foo {
-        \\  pub fn apply(f :: (i64 -> i64), value :: i64) :: i64 {
+        \\  pub fn apply(f :: (i64 -> i64), value :: i64) -> i64 {
         \\    f(value)
         \\  }
         \\
-        \\  pub fn bar(x :: i64) :: i64 {
-        \\    pub fn add_x(y :: i64) :: i64 {
+        \\  pub fn bar(x :: i64) -> i64 {
+        \\    pub fn add_x(y :: i64) -> i64 {
         \\      x + y
         \\    }
         \\
@@ -1786,16 +1786,16 @@ test "capturing nested def passed through transitive known-safe callees avoids h
 
     const source =
         \\pub module Foo {
-        \\  pub fn apply(f :: (i64 -> i64), value :: i64) :: i64 {
+        \\  pub fn apply(f :: (i64 -> i64), value :: i64) -> i64 {
         \\    f(value)
         \\  }
         \\
-        \\  pub fn wrap(f :: (i64 -> i64), value :: i64) :: i64 {
+        \\  pub fn wrap(f :: (i64 -> i64), value :: i64) -> i64 {
         \\    apply(f, value)
         \\  }
         \\
-        \\  pub fn bar(x :: i64) :: i64 {
-        \\    pub fn add_x(y :: i64) :: i64 {
+        \\  pub fn bar(x :: i64) -> i64 {
+        \\    pub fn add_x(y :: i64) -> i64 {
         \\      x + y
         \\    }
         \\
@@ -1818,16 +1818,16 @@ test "aliased capturing nested def passed through transitive known-safe callees 
 
     const source =
         \\pub module Foo {
-        \\  pub fn apply(f :: (i64 -> i64), value :: i64) :: i64 {
+        \\  pub fn apply(f :: (i64 -> i64), value :: i64) -> i64 {
         \\    f(value)
         \\  }
         \\
-        \\  pub fn wrap(f :: (i64 -> i64), value :: i64) :: i64 {
+        \\  pub fn wrap(f :: (i64 -> i64), value :: i64) -> i64 {
         \\    apply(f, value)
         \\  }
         \\
-        \\  pub fn bar(x :: i64) :: i64 {
-        \\    pub fn add_x(y :: i64) :: i64 {
+        \\  pub fn bar(x :: i64) -> i64 {
+        \\    pub fn add_x(y :: i64) -> i64 {
         \\      x + y
         \\    }
         \\
@@ -1852,12 +1852,12 @@ test "function-local capturing closure uses frame env without heap allocation" {
 
     const source =
         \\pub module Foo {
-        \\  pub fn apply(f :: (i64 -> i64), value :: i64) :: i64 {
+        \\  pub fn apply(f :: (i64 -> i64), value :: i64) -> i64 {
         \\    f(value)
         \\  }
         \\
-        \\  pub fn bar(x :: i64) :: i64 {
-        \\    pub fn add_x(y :: i64) :: i64 {
+        \\  pub fn bar(x :: i64) -> i64 {
+        \\    pub fn add_x(y :: i64) -> i64 {
         \\      x + y
         \\    }
         \\
@@ -1880,19 +1880,19 @@ test "source pipeline marks multi-target higher-order call as switch_dispatch" {
 
     const source =
         \\pub module Foo {
-        \\  pub fn inc(x :: i64) :: i64 {
+        \\  pub fn inc(x :: i64) -> i64 {
         \\    x + 1
         \\  }
         \\
-        \\  pub fn dec(x :: i64) :: i64 {
+        \\  pub fn dec(x :: i64) -> i64 {
         \\    x - 1
         \\  }
         \\
-        \\  pub fn apply(f :: (i64 -> i64), value :: i64) :: i64 {
+        \\  pub fn apply(f :: (i64 -> i64), value :: i64) -> i64 {
         \\    f(value)
         \\  }
         \\
-        \\  pub fn choose(flag :: Bool) :: (i64 -> i64) {
+        \\  pub fn choose(flag :: Bool) -> (i64 -> i64) {
         \\    if flag {
         \\      inc
         \\    } else {
@@ -1900,7 +1900,7 @@ test "source pipeline marks multi-target higher-order call as switch_dispatch" {
         \\    }
         \\  }
         \\
-        \\  pub fn run(flag :: Bool) :: i64 {
+        \\  pub fn run(flag :: Bool) -> i64 {
         \\    apply(choose(flag), 10)
         \\  }
         \\}
@@ -1936,7 +1936,7 @@ test "source pipeline records reuse pairs for tagged tuple reconstruction after 
 
     const source =
         \\pub module Handler {
-        \\  pub fn handle(result :: Atom) :: Nil {
+        \\  pub fn handle(result :: Atom) -> Nil {
         \\    case result {
         \\      {:ok, v} -> {:ok, v}
         \\      {:error, e} -> {:error, e}
@@ -1963,7 +1963,7 @@ test "source pipeline records reuse pairs for struct reconstruction after case" 
         \\}
         \\
         \\pub module Foo {
-        \\  pub fn norm(u :: User) :: User {
+        \\  pub fn norm(u :: User) -> User {
         \\    case u {
         \\      x -> %{name: x.name, age: x.age} :: User
         \\    }
@@ -1984,19 +1984,19 @@ test "source codegen emits switch dispatch for multi-target higher-order call" {
 
     const source =
         \\pub module Foo {
-        \\  pub fn inc(x :: i64) :: i64 {
+        \\  pub fn inc(x :: i64) -> i64 {
         \\    x + 1
         \\  }
         \\
-        \\  pub fn dec(x :: i64) :: i64 {
+        \\  pub fn dec(x :: i64) -> i64 {
         \\    x - 1
         \\  }
         \\
-        \\  pub fn apply(f :: (i64 -> i64), value :: i64) :: i64 {
+        \\  pub fn apply(f :: (i64 -> i64), value :: i64) -> i64 {
         \\    f(value)
         \\  }
         \\
-        \\  pub fn choose(flag :: Bool) :: (i64 -> i64) {
+        \\  pub fn choose(flag :: Bool) -> (i64 -> i64) {
         \\    if flag {
         \\      inc
         \\    } else {
@@ -2004,7 +2004,7 @@ test "source codegen emits switch dispatch for multi-target higher-order call" {
         \\    }
         \\  }
         \\
-        \\  pub fn run(flag :: Bool) :: i64 {
+        \\  pub fn run(flag :: Bool) -> i64 {
         \\    apply(choose(flag), 10)
         \\  }
         \\}
@@ -2022,8 +2022,8 @@ test "capturing nested def can be returned as function value" {
 
     const source =
         \\pub module Foo {
-        \\  pub fn make_adder(x :: i64) :: (i64 -> i64) {
-        \\    pub fn add_x(y :: i64) :: i64 {
+        \\  pub fn make_adder(x :: i64) -> (i64 -> i64) {
+        \\    pub fn add_x(y :: i64) -> i64 {
         \\      x + y
         \\    }
         \\
@@ -2050,8 +2050,8 @@ test "capturing closure with shared opaque capture emits retain and release help
         \\pub module Foo {
         \\  opaque Handle = String
         \\
-        \\  pub fn make(handle :: shared Handle) :: (-> Handle) {
-        \\    pub fn use() :: Handle {
+        \\  pub fn make(handle :: shared Handle) -> (-> Handle) {
+        \\    pub fn use() -> Handle {
         \\      handle
         \\    }
         \\
@@ -2077,7 +2077,7 @@ test "shared opaque closure arg emits ARC retain and release" {
         \\pub module Test {
         \\  opaque Handle = String
         \\
-        \\  pub fn run(use_fn :: (shared Handle -> Handle), handle :: Handle) :: Handle {
+        \\  pub fn run(use_fn :: (shared Handle -> Handle), handle :: Handle) -> Handle {
         \\    use_fn(handle)
         \\  }
         \\}
@@ -2098,7 +2098,7 @@ test "borrowed opaque closure arg emits no ARC retain or release" {
         \\pub module Test {
         \\  opaque Handle = String
         \\
-        \\  pub fn run(use_fn :: (borrowed Handle -> Handle), handle :: Handle) :: Handle {
+        \\  pub fn run(use_fn :: (borrowed Handle -> Handle), handle :: Handle) -> Handle {
         \\    use_fn(handle)
         \\  }
         \\}
@@ -2119,12 +2119,12 @@ test "borrowed capturing closure passed to known-safe callee avoids heap env and
         \\pub module Test {
         \\  opaque Handle = String
         \\
-        \\  pub fn apply(f :: (borrowed Handle -> Bool), handle :: borrowed Handle) :: Bool {
+        \\  pub fn apply(f :: (borrowed Handle -> Bool), handle :: borrowed Handle) -> Bool {
         \\    f(handle)
         \\  }
         \\
-        \\  pub fn make(handle :: borrowed Handle) :: Bool {
-        \\    pub fn use(h :: borrowed Handle) :: Bool {
+        \\  pub fn make(handle :: borrowed Handle) -> Bool {
+        \\    pub fn use(h :: borrowed Handle) -> Bool {
         \\      h == handle
         \\    }
         \\
@@ -2148,13 +2148,13 @@ test "top-level main stays bare, module functions get prefixed" {
 
     const source =
         \\pub module Helper {
-        \\  pub fn helper(x :: i64) :: i64 {
+        \\  pub fn helper(x :: i64) -> i64 {
         \\    x + 1
         \\  }
         \\}
         \\
         \\pub module Test {
-        \\  pub fn main() :: i64 {
+        \\  pub fn main() -> i64 {
         \\    Helper.helper(5)
         \\  }
         \\}
@@ -2179,7 +2179,7 @@ test "import with only filter resolves bare call to source module" {
 
     const source =
         \\pub module Bar {
-        \\  pub fn run(x :: i64) :: i64 {
+        \\  pub fn run(x :: i64) -> i64 {
         \\    x + 1
         \\  }
         \\}
@@ -2187,7 +2187,7 @@ test "import with only filter resolves bare call to source module" {
         \\pub module Foo {
         \\  import Bar, only: [run: 1]
         \\
-        \\  pub fn call() :: i64 {
+        \\  pub fn call() -> i64 {
         \\    run(1)
         \\  }
         \\}
@@ -2208,7 +2208,7 @@ test "import all resolves bare call to source module" {
 
     const source =
         \\pub module Utils {
-        \\  pub fn helper(x :: i64) :: i64 {
+        \\  pub fn helper(x :: i64) -> i64 {
         \\    x * 2
         \\  }
         \\}
@@ -2216,7 +2216,7 @@ test "import all resolves bare call to source module" {
         \\pub module App {
         \\  import Utils
         \\
-        \\  pub fn go() :: i64 {
+        \\  pub fn go() -> i64 {
         \\    helper(5)
         \\  }
         \\}
@@ -2237,7 +2237,7 @@ test "import does not affect unrelated functions" {
 
     const source =
         \\pub module Bar {
-        \\  pub fn run(x :: i64) :: i64 {
+        \\  pub fn run(x :: i64) -> i64 {
         \\    x + 1
         \\  }
         \\}
@@ -2245,7 +2245,7 @@ test "import does not affect unrelated functions" {
         \\pub module Foo {
         \\  import Bar, only: [run: 1]
         \\
-        \\  pub fn call() :: nil {
+        \\  pub fn call() -> nil {
         \\    inspect(42)
         \\  }
         \\}
@@ -2264,7 +2264,7 @@ test "local function takes priority over import" {
 
     const source =
         \\pub module Bar {
-        \\  pub fn run(x :: i64) :: i64 {
+        \\  pub fn run(x :: i64) -> i64 {
         \\    x + 1
         \\  }
         \\}
@@ -2272,11 +2272,11 @@ test "local function takes priority over import" {
         \\pub module Foo {
         \\  import Bar, only: [run: 1]
         \\
-        \\  pub fn run(x :: i64) :: i64 {
+        \\  pub fn run(x :: i64) -> i64 {
         \\    x * 10
         \\  }
         \\
-        \\  pub fn call() :: i64 {
+        \\  pub fn call() -> i64 {
         \\    run(1)
         \\  }
         \\}
@@ -2296,11 +2296,11 @@ test "import with except filter excludes specified functions" {
 
     const source =
         \\pub module Utils {
-        \\  pub fn helper(x :: i64) :: i64 {
+        \\  pub fn helper(x :: i64) -> i64 {
         \\    x * 2
         \\  }
         \\
-        \\  pub fn other(x :: i64) :: i64 {
+        \\  pub fn other(x :: i64) -> i64 {
         \\    x + 1
         \\  }
         \\}
@@ -2308,7 +2308,7 @@ test "import with except filter excludes specified functions" {
         \\pub module App {
         \\  import Utils, except: [helper: 1]
         \\
-        \\  pub fn go() :: i64 {
+        \\  pub fn go() -> i64 {
         \\    other(5)
         \\  }
         \\}
@@ -2383,7 +2383,7 @@ test "type checker warnings do not halt compilation by default" {
     // This valid program should compile even with type checking enabled
     const source =
         \\pub module Adder {
-        \\  pub fn add(x :: i64, y :: i64) :: i64 {
+        \\  pub fn add(x :: i64, y :: i64) -> i64 {
         \\    x + y
         \\  }
         \\}
@@ -2401,7 +2401,7 @@ test "return type mismatch is always an error" {
     // Return type mismatch: declared i64, returns String
     const source =
         \\pub module Test {
-        \\  pub fn bad() :: i64 {
+        \\  pub fn bad() -> i64 {
         \\    "not a number"
         \\  }
         \\}
@@ -2419,7 +2419,7 @@ test "error messages contain file:line:col format" {
 
     var engine = DiagnosticEngine.init(alloc);
     defer engine.deinit();
-    engine.setSource("pub fn foo() :: i64 {\n  \"hello\"\n}", "example.zap");
+    engine.setSource("pub fn foo() -> i64 {\n  \"hello\"\n}", "example.zap");
     try engine.err("expected i64, got String", .{ .start = 22, .end = 29, .line = 2, .col = 3 });
 
     const output = try engine.format(alloc);
@@ -2435,7 +2435,7 @@ test "pub fn main inside pub module emits pub fn main" {
 
     const source =
         \\pub module App {
-        \\  pub fn main() :: i64 {
+        \\  pub fn main() -> i64 {
         \\    42
         \\  }
         \\}
@@ -2454,7 +2454,7 @@ test "binary pattern matching extracts bytes" {
 
     const source =
         \\pub module Binary {
-        \\  pub fn first_byte(<<a, _b, _c>> :: String) :: i64 {
+        \\  pub fn first_byte(<<a, _b, _c>> :: String) -> i64 {
         \\    a
         \\  }
         \\}
@@ -2472,7 +2472,7 @@ test "binary pattern with u16 type spec" {
 
     const source =
         \\pub module Binary {
-        \\  pub fn parse_port(<<port::u16>> :: String) :: i64 {
+        \\  pub fn parse_port(<<port::u16>> :: String) -> i64 {
         \\    port
         \\  }
         \\}
@@ -2489,7 +2489,7 @@ test "binary pattern with String rest" {
 
     const source =
         \\pub module Binary {
-        \\  pub fn parse_header(<<tag::u8, rest::String>> :: String) :: {i64, String} {
+        \\  pub fn parse_header(<<tag::u8, rest::String>> :: String) -> {i64, String} {
         \\    {tag, rest}
         \\  }
         \\}
@@ -2507,7 +2507,7 @@ test "binary pattern with float extraction" {
 
     const source =
         \\pub module Binary {
-        \\  pub fn parse_coord(<<lat::f64, lon::f64>> :: String) :: {f64, f64} {
+        \\  pub fn parse_coord(<<lat::f64, lon::f64>> :: String) -> {f64, f64} {
         \\    {lat, lon}
         \\  }
         \\}
@@ -2525,7 +2525,7 @@ test "binary pattern with endianness" {
 
     const source =
         \\pub module Binary {
-        \\  pub fn parse_le(<<val::u32-little>> :: String) :: i64 {
+        \\  pub fn parse_le(<<val::u32-little>> :: String) -> i64 {
         \\    val
         \\  }
         \\}
@@ -2542,7 +2542,7 @@ test "binary pattern emits length check" {
 
     const source =
         \\pub module Binary {
-        \\  pub fn parse_port(<<port::u16>> :: String) :: i64 {
+        \\  pub fn parse_port(<<port::u16>> :: String) -> i64 {
         \\    port
         \\  }
         \\}
@@ -2560,7 +2560,7 @@ test "binary pattern with string prefix match" {
 
     const source =
         \\pub module HTTP {
-        \\  pub fn parse_method(<<"GET "::String, path::String>> :: String) :: String {
+        \\  pub fn parse_method(<<"GET "::String, path::String>> :: String) -> String {
         \\    path
         \\  }
         \\}
@@ -2579,7 +2579,7 @@ test "binary pattern sub-byte extraction" {
 
     const source =
         \\pub module Flags {
-        \\  pub fn parse_flags(<<syn::u1, ack::u1, fin::u1, _reserved::u5>> :: String) :: {i64, i64, i64} {
+        \\  pub fn parse_flags(<<syn::u1, ack::u1, fin::u1, _reserved::u5>> :: String) -> {i64, i64, i64} {
         \\    {syn, ack, fin}
         \\  }
         \\}
@@ -2601,7 +2601,7 @@ test "binary pattern in case emits length check" {
     // Binary patterns in case expressions emit length checks via check_binary
     const source =
         \\pub module Binary {
-        \\  pub fn parse(data :: String) :: i64 {
+        \\  pub fn parse(data :: String) -> i64 {
         \\    case data {
         \\      <<_a, _b>> -> 1
         \\      _ -> 0
@@ -2673,7 +2673,7 @@ test "multiline struct literal parses correctly" {
         \\}
         \\
         \\pub module Test {
-        \\  pub fn main() :: User {
+        \\  pub fn main() -> User {
         \\    u = %{
         \\      name: "Alice",
         \\      age: 30
@@ -2697,13 +2697,13 @@ test "multi-parameter function uses distinct param indices" {
     // Typed version — goes through full pipeline including type checker
     const source =
         \\pub module Math {
-        \\  pub fn add(a :: i64, b :: i64) :: i64 {
+        \\  pub fn add(a :: i64, b :: i64) -> i64 {
         \\    a + b
         \\  }
         \\}
         \\
         \\pub module Test {
-        \\  pub fn main() :: i64 {
+        \\  pub fn main() -> i64 {
         \\    Math.add(20, 22)
         \\  }
         \\}
@@ -2723,7 +2723,7 @@ test "multi-parameter function param_get indices in IR" {
 
     const source =
         \\pub module Test {
-        \\  pub fn add(a :: i64, b :: i64) :: i64 {
+        \\  pub fn add(a :: i64, b :: i64) -> i64 {
         \\    a + b
         \\  }
         \\}
@@ -2775,13 +2775,13 @@ test "top-level multi-param function called from main" {
 
     const source =
         \\pub module Adder {
-        \\  pub fn add(a :: i64, b :: i64) :: i64 {
+        \\  pub fn add(a :: i64, b :: i64) -> i64 {
         \\    a + b
         \\  }
         \\}
         \\
         \\pub module Test {
-        \\  pub fn main() :: String {
+        \\  pub fn main() -> String {
         \\    IO.puts(Adder.add(20, 22))
         \\  }
         \\}
@@ -2800,13 +2800,13 @@ test "three-parameter function uses all param indices" {
 
     const source =
         \\pub module Math {
-        \\  pub fn sum3(a :: i64, b :: i64, c :: i64) :: i64 {
+        \\  pub fn sum3(a :: i64, b :: i64, c :: i64) -> i64 {
         \\    a + b + c
         \\  }
         \\}
         \\
         \\pub module Test {
-        \\  pub fn main() :: i64 {
+        \\  pub fn main() -> i64 {
         \\    Math.sum3(1, 2, 3)
         \\  }
         \\}
@@ -2829,8 +2829,8 @@ test "pipeline: non-escaping closure avoids heap allocation" {
 
     const source =
         \\pub module Foo {
-        \\  pub fn bar(x :: i64) :: i64 {
-        \\    pub fn add_x(y :: i64) :: i64 {
+        \\  pub fn bar(x :: i64) -> i64 {
+        \\    pub fn add_x(y :: i64) -> i64 {
         \\      x + y
         \\    }
         \\
@@ -2851,8 +2851,8 @@ test "pipeline: returned closure uses heap allocation" {
 
     const source =
         \\pub module Foo {
-        \\  pub fn make(x :: i64) :: (i64 -> i64) {
-        \\    pub fn other(y :: i64) :: i64 {
+        \\  pub fn make(x :: i64) -> (i64 -> i64) {
+        \\    pub fn other(y :: i64) -> i64 {
         \\      x + y
         \\    }
         \\
@@ -2875,8 +2875,8 @@ test "pipeline: aliased returned closure still uses heap allocation" {
 
     const source =
         \\pub module Foo {
-        \\  pub fn make(x :: i64) :: (i64 -> i64) {
-        \\    pub fn other(y :: i64) :: i64 {
+        \\  pub fn make(x :: i64) -> (i64 -> i64) {
+        \\    pub fn other(y :: i64) -> i64 {
         \\      x + y
         \\    }
         \\
@@ -2899,8 +2899,8 @@ test "pipeline: lambda lifted local def uses no closure object" {
 
     const source =
         \\pub module Foo {
-        \\  pub fn bar() :: i64 {
-        \\    pub fn forty_two() :: i64 {
+        \\  pub fn bar() -> i64 {
+        \\    pub fn forty_two() -> i64 {
         \\      42
         \\    }
         \\
@@ -2923,17 +2923,17 @@ test "pipeline: multi-function program compiles cleanly" {
 
     const source =
         \\pub module Math {
-        \\  pub fn add(a :: i64, b :: i64) :: i64 {
+        \\  pub fn add(a :: i64, b :: i64) -> i64 {
         \\    a + b
         \\  }
         \\
-        \\  pub fn double(x :: i64) :: i64 {
+        \\  pub fn double(x :: i64) -> i64 {
         \\    add(x, x)
         \\  }
         \\}
         \\
         \\pub module Test {
-        \\  pub fn main() :: String {
+        \\  pub fn main() -> String {
         \\    IO.puts(Math.double(21))
         \\  }
         \\}
@@ -2952,7 +2952,7 @@ test "pipeline: pattern matching compiles through analysis" {
 
     const source =
         \\pub module Matcher {
-        \\  pub fn check(x :: i64) :: i64 {
+        \\  pub fn check(x :: i64) -> i64 {
         \\    case x {
         \\      0 -> 100
         \\      1 -> 200
@@ -2974,11 +2974,11 @@ test "pipeline: recursive function compiles through analysis" {
 
     const source =
         \\pub module Counter {
-        \\  pub fn count(0 :: i64) :: i64 {
+        \\  pub fn count(0 :: i64) -> i64 {
         \\    0
         \\  }
         \\
-        \\  pub fn count(n :: i64) :: i64 {
+        \\  pub fn count(n :: i64) -> i64 {
         \\    1 + count(n - 1)
         \\  }
         \\}
@@ -2996,12 +2996,12 @@ test "pipeline: closure passed to higher-order function uses DynClosure" {
 
     const source =
         \\pub module Foo {
-        \\  pub fn apply(f :: (i64 -> i64), value :: i64) :: i64 {
+        \\  pub fn apply(f :: (i64 -> i64), value :: i64) -> i64 {
         \\    f(value)
         \\  }
         \\
-        \\  pub fn bar(x :: i64) :: i64 {
-        \\    pub fn add_x(y :: i64) :: i64 {
+        \\  pub fn bar(x :: i64) -> i64 {
+        \\    pub fn add_x(y :: i64) -> i64 {
         \\      x + y
         \\    }
         \\
@@ -3025,15 +3025,15 @@ test "pipeline: fibonacci compiles through full analysis" {
 
     const source =
         \\pub module Fib {
-        \\  pub fn fib(0 :: i64) :: i64 {
+        \\  pub fn fib(0 :: i64) -> i64 {
         \\    0
         \\  }
         \\
-        \\  pub fn fib(1 :: i64) :: i64 {
+        \\  pub fn fib(1 :: i64) -> i64 {
         \\    1
         \\  }
         \\
-        \\  pub fn fib(n :: i64) :: i64 {
+        \\  pub fn fib(n :: i64) -> i64 {
         \\    fib(n - 1) + fib(n - 2)
         \\  }
         \\}
@@ -3051,13 +3051,13 @@ test "pipeline: multiple modules compile together" {
 
     const source =
         \\pub module A {
-        \\  pub fn double(x :: i64) :: i64 {
+        \\  pub fn double(x :: i64) -> i64 {
         \\    x * 2
         \\  }
         \\}
         \\
         \\pub module B {
-        \\  pub fn quad(x :: i64) :: i64 {
+        \\  pub fn quad(x :: i64) -> i64 {
         \\    A.double(A.double(x))
         \\  }
         \\}
@@ -3081,8 +3081,8 @@ test "pipeline: closure stored in collection uses DynClosure fallback" {
     // Closure stored in a variable (not just called) → DynClosure.
     const source =
         \\pub module Foo {
-        \\  pub fn bar(x :: i64) :: i64 {
-        \\    pub fn add_x(y :: i64) :: i64 {
+        \\  pub fn bar(x :: i64) -> i64 {
+        \\    pub fn add_x(y :: i64) -> i64 {
         \\      x + y
         \\    }
         \\
@@ -3111,7 +3111,7 @@ test "pipeline: non-escaping struct has no retain in output" {
     // in a heap container) should not generate ARC operations.
     const source =
         \\pub module Foo {
-        \\  pub fn add(a :: i64, b :: i64) :: i64 {
+        \\  pub fn add(a :: i64, b :: i64) -> i64 {
         \\    a + b
         \\  }
         \\}
@@ -3135,17 +3135,17 @@ test "pipeline: complex program with closures, patterns, modules" {
 
     const source =
         \\pub module Math {
-        \\  pub fn factorial(0 :: i64) :: i64 {
+        \\  pub fn factorial(0 :: i64) -> i64 {
         \\    1
         \\  }
         \\
-        \\  pub fn factorial(n :: i64) :: i64 {
+        \\  pub fn factorial(n :: i64) -> i64 {
         \\    n * factorial(n - 1)
         \\  }
         \\}
         \\
         \\pub module Test {
-        \\  pub fn main() :: String {
+        \\  pub fn main() -> String {
         \\    IO.puts(Math.factorial(10))
         \\  }
         \\}
@@ -3165,8 +3165,8 @@ test "pipeline: nested closures compile cleanly" {
 
     const source =
         \\pub module Foo {
-        \\  pub fn make_adder(x :: i64) :: (i64 -> i64) {
-        \\    pub fn add(y :: i64) :: i64 {
+        \\  pub fn make_adder(x :: i64) -> (i64 -> i64) {
+        \\    pub fn add(y :: i64) -> i64 {
         \\      x + y
         \\    }
         \\
@@ -3189,11 +3189,11 @@ test "pipeline: atom pattern matching through analysis" {
 
     const source =
         \\pub module Status {
-        \\  pub fn check(:ok :: Atom) :: i64 {
+        \\  pub fn check(:ok :: Atom) -> i64 {
         \\    1
         \\  }
         \\
-        \\  pub fn check(:error :: Atom) :: i64 {
+        \\  pub fn check(:error :: Atom) -> i64 {
         \\    0
         \\  }
         \\}
@@ -3218,13 +3218,13 @@ test "deps: cross-module function call compiles" {
     const alloc = arena.allocator();
     const source =
         \\pub module MathLib {
-        \\  pub fn add(a :: i64, b :: i64) :: i64 {
+        \\  pub fn add(a :: i64, b :: i64) -> i64 {
         \\    a + b
         \\  }
         \\}
         \\
         \\pub module App {
-        \\  pub fn main() :: i64 {
+        \\  pub fn main() -> i64 {
         \\    MathLib.add(1, 2)
         \\  }
         \\}
@@ -3246,11 +3246,11 @@ test "deps: discovery finds files and they compile together" {
 
     try tmp_dir.dir.writeFile(.{
         .sub_path = "app.zap",
-        .data = "pub module App {\n  pub fn main() :: i64 {\n    Helper.value()\n  }\n}\n",
+        .data = "pub module App {\n  pub fn main() -> i64 {\n    Helper.value()\n  }\n}\n",
     });
     try tmp_dir.dir.writeFile(.{
         .sub_path = "helper.zap",
-        .data = "pub module Helper {\n  pub fn value() :: i64 {\n    42\n  }\n}\n",
+        .data = "pub module Helper {\n  pub fn value() -> i64 {\n    42\n  }\n}\n",
     });
 
     const tmp_path = try tmp_dir.dir.realpathAlloc(alloc, ".");
@@ -3293,11 +3293,11 @@ test "deps: discovery with dep root finds dep modules" {
 
     try tmp_dir.dir.writeFile(.{
         .sub_path = "project/app.zap",
-        .data = "pub module App {\n  pub fn main() :: i64 {\n    DepMath.add(1, 2)\n  }\n}\n",
+        .data = "pub module App {\n  pub fn main() -> i64 {\n    DepMath.add(1, 2)\n  }\n}\n",
     });
     try tmp_dir.dir.writeFile(.{
         .sub_path = "dep_lib/dep_math.zap",
-        .data = "pub module DepMath {\n  pub fn add(a :: i64, b :: i64) :: i64 {\n    a + b\n  }\n}\n",
+        .data = "pub module DepMath {\n  pub fn add(a :: i64, b :: i64) -> i64 {\n    a + b\n  }\n}\n",
     });
 
     const project_path = try tmp_dir.dir.realpathAlloc(alloc, "project");
@@ -3343,12 +3343,12 @@ test "deps: private module enforcement blocks cross-dep access" {
     // Project tries to access a private dep module
     try tmp_dir.dir.writeFile(.{
         .sub_path = "project/app.zap",
-        .data = "pub module App {\n  pub fn main() :: i64 {\n    PrivateMod.secret()\n  }\n}\n",
+        .data = "pub module App {\n  pub fn main() -> i64 {\n    PrivateMod.secret()\n  }\n}\n",
     });
     // Dep has a private module
     try tmp_dir.dir.writeFile(.{
         .sub_path = "dep_lib/private_mod.zap",
-        .data = "module PrivateMod {\n  pub fn secret() :: i64 {\n    99\n  }\n}\n",
+        .data = "module PrivateMod {\n  pub fn secret() -> i64 {\n    99\n  }\n}\n",
     });
 
     const project_path = try tmp_dir.dir.realpathAlloc(alloc, "project");
@@ -3380,11 +3380,11 @@ test "deps: private module allowed within same dep" {
     // Both files in the same source root — module (private) is visible
     try tmp_dir.dir.writeFile(.{
         .sub_path = "public_mod.zap",
-        .data = "pub module PublicMod {\n  pub fn go() :: i64 {\n    InternalMod.helper()\n  }\n}\n",
+        .data = "pub module PublicMod {\n  pub fn go() -> i64 {\n    InternalMod.helper()\n  }\n}\n",
     });
     try tmp_dir.dir.writeFile(.{
         .sub_path = "internal_mod.zap",
-        .data = "module InternalMod {\n  pub fn helper() :: i64 {\n    42\n  }\n}\n",
+        .data = "module InternalMod {\n  pub fn helper() -> i64 {\n    42\n  }\n}\n",
     });
 
     const tmp_path = try tmp_dir.dir.realpathAlloc(alloc, ".");
@@ -3414,7 +3414,7 @@ test "attributes: typed attribute compiles and is stored on function" {
     const source =
         \\pub module Foo {
         \\  @doc :: String = "hello world"
-        \\  pub fn bar() :: i64 {
+        \\  pub fn bar() -> i64 {
         \\    42
         \\  }
         \\}
@@ -3433,7 +3433,7 @@ test "attributes: marker attribute compiles" {
     const source =
         \\pub module Foo {
         \\  @debug
-        \\  pub fn inspect(value :: i64) :: i64 {
+        \\  pub fn inspect(value :: i64) -> i64 {
         \\    value
         \\  }
         \\}
@@ -3451,7 +3451,7 @@ test "attributes: module-level attribute compiles" {
     const source =
         \\pub module Foo {
         \\  @moduledoc :: String = "A module"
-        \\  pub fn bar() :: i64 {
+        \\  pub fn bar() -> i64 {
         \\    42
         \\  }
         \\}
@@ -3470,7 +3470,7 @@ test "attributes: multiple attributes on function compiles" {
         \\pub module Foo {
         \\  @doc :: String = "does something"
         \\  @deprecated :: String = "use bar2"
-        \\  pub fn bar() :: i64 {
+        \\  pub fn bar() -> i64 {
         \\    42
         \\  }
         \\}
@@ -3489,7 +3489,7 @@ test "attributes: stored in scope graph" {
         \\pub module Foo {
         \\  @moduledoc :: String = "A module doc"
         \\  @doc :: String = "Function doc"
-        \\  pub fn bar() :: i64 {
+        \\  pub fn bar() -> i64 {
         \\    42
         \\  }
         \\}
@@ -3548,7 +3548,7 @@ test "attributes: @name substitution in function body" {
     const source =
         \\pub module Foo {
         \\  @timeout :: i64 = 5000
-        \\  pub fn get_timeout() :: i64 {
+        \\  pub fn get_timeout() -> i64 {
         \\    @timeout
         \\  }
         \\}
@@ -3567,7 +3567,7 @@ test "attributes: @name substitution in expression" {
     const source =
         \\pub module Foo {
         \\  @base :: i64 = 100
-        \\  pub fn doubled() :: i64 {
+        \\  pub fn doubled() -> i64 {
         \\    @base * 2
         \\  }
         \\}

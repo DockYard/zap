@@ -1,5 +1,5 @@
 pub module MathModule.Builder {
-  pub fn manifest(env :: Zap.Env) :: Zap.Manifest {
+  pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
     case env.target {
       :math_module ->
         %Zap.Manifest{

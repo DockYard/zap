@@ -356,6 +356,7 @@ pub const Resolver = struct {
             .int_literal, .float_literal, .string_literal,
             .string_interpolation, .atom_literal, .bool_literal,
             .nil_literal, .module_ref, .function_ref, .intrinsic, .attr_ref,
+            .error_pipe, .err_constructor,
             => {},
         }
     }
@@ -481,7 +482,7 @@ const Collector = @import("collector.zig").Collector;
 test "resolve simple function" {
     const source =
         \\pub module Test {
-        \\  pub fn add(x :: i64, y :: i64) :: i64 {
+        \\  pub fn add(x :: i64, y :: i64) -> i64 {
         \\    x + y
         \\  }
         \\}
@@ -510,7 +511,7 @@ test "resolve simple function" {
 test "resolve module with function" {
     const source =
         \\pub module Math {
-        \\  pub fn add(x :: i64, y :: i64) :: i64 {
+        \\  pub fn add(x :: i64, y :: i64) -> i64 {
         \\    x + y
         \\  }
         \\}
@@ -538,7 +539,7 @@ test "resolve module with function" {
 test "resolve case expression with bindings" {
     const source =
         \\pub module Test {
-        \\  pub fn foo(x :: Atom) :: Nil {
+        \\  pub fn foo(x :: Atom) -> Nil {
         \\    case x {
         \\      {:ok, v} -> v
         \\      {:error, e} -> e

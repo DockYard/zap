@@ -361,7 +361,7 @@ const Collector = @import("collector.zig").Collector;
 test "dispatch resolve simple function" {
     const source =
         \\pub module Test {
-        \\  pub fn add(x :: i64, y :: i64) :: i64 {
+        \\  pub fn add(x :: i64, y :: i64) -> i64 {
         \\    x + y
         \\  }
         \\}
@@ -410,12 +410,12 @@ test "dispatch resolve simple function" {
 test "dispatch scope fallback" {
     const source =
         \\pub module Foo {
-        \\  pub fn b(s :: String) :: String {
+        \\  pub fn b(s :: String) -> String {
         \\    s
         \\  }
         \\
-        \\  pub fn a(x :: i64) :: String {
-        \\    fn b(n :: i64) :: String {
+        \\  pub fn a(x :: i64) -> String {
+        \\    fn b(n :: i64) -> String {
         \\      "local"
         \\    }
         \\    b("hello")
@@ -464,7 +464,7 @@ test "dispatch scope fallback" {
 test "dispatch no match" {
     const source =
         \\pub module Test {
-        \\  pub fn add(x :: i64, y :: i64) :: i64 {
+        \\  pub fn add(x :: i64, y :: i64) -> i64 {
         \\    x + y
         \\  }
         \\}
@@ -512,11 +512,11 @@ test "dispatch no match" {
 test "dispatch specificity — literal pattern beats bind" {
     const source =
         \\pub module Test {
-        \\  pub fn factorial(0 :: i64) :: i64 {
+        \\  pub fn factorial(0 :: i64) -> i64 {
         \\    1
         \\  }
         \\
-        \\  pub fn factorial(n :: i64) :: i64 {
+        \\  pub fn factorial(n :: i64) -> i64 {
         \\    n * factorial(n - 1)
         \\  }
         \\}

@@ -444,6 +444,8 @@ fn substituteInExpr(
         .quote_expr,
         .unquote_expr,
         .panic_expr,
+        .error_pipe,
+        .err_constructor,
         => return expr,
     }
 }

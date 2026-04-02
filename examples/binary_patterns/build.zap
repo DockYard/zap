@@ -1,5 +1,5 @@
 pub module BinaryPatterns.Builder {
-  pub fn manifest(env :: Zap.Env) :: Zap.Manifest {
+  pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
     case env.target {
       :binary_patterns ->
         %Zap.Manifest{

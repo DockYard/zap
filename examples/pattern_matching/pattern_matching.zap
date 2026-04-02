@@ -1,5 +1,5 @@
 pub module PatternMatching {
-  pub fn main(_args :: [String]) :: String {
+  pub fn main(_args :: [String]) -> String {
     PatternMatch.describe(:ok)
     |> IO.puts()
 

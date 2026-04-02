@@ -268,7 +268,7 @@ fn cmdInit(allocator: std.mem.Allocator) !void {
     // build.zap
     const build_zap = try std.fmt.allocPrint(allocator,
         \\pub module {s}.Builder {{
-        \\  pub fn manifest(env :: Zap.Env) :: Zap.Manifest {{
+        \\  pub fn manifest(env :: Zap.Env) -> Zap.Manifest {{
         \\    case env.target {{
         \\      :{s} -> {s}(env)
         \\      :test -> test(env)
@@ -276,7 +276,7 @@ fn cmdInit(allocator: std.mem.Allocator) !void {
         \\    }}
         \\  }}
         \\
-        \\  fn {s}(env :: Zap.Env) :: Zap.Manifest {{
+        \\  fn {s}(env :: Zap.Env) -> Zap.Manifest {{
         \\    %Zap.Manifest{{
         \\      name: "{s}",
         \\      version: "0.1.0",
@@ -288,7 +288,7 @@ fn cmdInit(allocator: std.mem.Allocator) !void {
         \\    }}
         \\  }}
         \\
-        \\  fn test(env :: Zap.Env) :: Zap.Manifest {{
+        \\  fn test(env :: Zap.Env) -> Zap.Manifest {{
         \\    %Zap.Manifest{{
         \\      name: "{s}_test",
         \\      version: "0.1.0",

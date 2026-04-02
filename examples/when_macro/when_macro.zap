@@ -4,7 +4,7 @@
 #   zap run when_macro
 
 pub module WhenMacro {
-  pub fn main(_args :: [String]) :: String {
+  pub fn main(_args :: [String]) -> String {
     Guards.check(10)
     |> IO.puts()
 

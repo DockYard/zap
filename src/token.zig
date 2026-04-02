@@ -75,6 +75,7 @@ pub const Token = struct {
         pipe_operator, // |>
         arrow, // ->
         back_arrow, // <-
+        tilde_arrow, // ~>
         double_colon, // ::
         pipe, // |
         diamond, // <>

@@ -307,6 +307,13 @@ pub const Lexer = struct {
                 }
                 return self.makeToken(.hash, start, self.pos);
             },
+            '~' => {
+                if (self.pos < self.source.len and self.source[self.pos] == '>') {
+                    self.pos += 1;
+                    return self.makeToken(.tilde_arrow, start, self.pos);
+                }
+                return self.makeToken(.invalid, start, self.pos);
+            },
             '&' => {
                 if (self.pos < self.source.len and self.source[self.pos] == '&') {
                     self.pos += 1;
@@ -498,6 +505,15 @@ test "lex delimiters" {
         const tok = lexer.next();
         try std.testing.expectEqual(exp, tok.tag);
     }
+}
+
+test "lex tilde arrow ~>" {
+    const source = "foo ~> bar";
+    var lexer = Lexer.init(source);
+
+    try std.testing.expectEqual(Token.Tag.identifier, lexer.next().tag);
+    try std.testing.expectEqual(Token.Tag.tilde_arrow, lexer.next().tag);
+    try std.testing.expectEqual(Token.Tag.identifier, lexer.next().tag);
 }
 
 test "lex comments are skipped" {

@@ -1,5 +1,5 @@
 pub module ComputedAttributes.Builder {
-  pub fn manifest(env :: Zap.Env) :: Zap.Manifest {
+  pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
     case env.target {
       :computed_attributes ->
         %Zap.Manifest{

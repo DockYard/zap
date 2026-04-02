@@ -645,7 +645,7 @@ const Parser = @import("parser.zig").Parser;
 test "collect simple function" {
     const source =
         \\pub module Test {
-        \\  pub fn add(x :: i64, y :: i64) :: i64 {
+        \\  pub fn add(x :: i64, y :: i64) -> i64 {
         \\    x + y
         \\  }
         \\}
@@ -676,11 +676,11 @@ test "collect simple function" {
 test "collect module with functions" {
     const source =
         \\pub module Math {
-        \\  pub fn add(x :: i64, y :: i64) :: i64 {
+        \\  pub fn add(x :: i64, y :: i64) -> i64 {
         \\    x + y
         \\  }
         \\
-        \\  pub fn sub(x :: i64, y :: i64) :: i64 {
+        \\  pub fn sub(x :: i64, y :: i64) -> i64 {
         \\    x - y
         \\  }
         \\}
@@ -733,11 +733,11 @@ test "collect type declaration" {
 test "collect function family grouping" {
     const source =
         \\pub module Test {
-        \\  pub fn factorial(0 :: i64) :: i64 {
+        \\  pub fn factorial(0 :: i64) -> i64 {
         \\    1
         \\  }
         \\
-        \\  pub fn factorial(n :: i64) :: i64 {
+        \\  pub fn factorial(n :: i64) -> i64 {
         \\    n * factorial(n - 1)
         \\  }
         \\}
@@ -764,7 +764,7 @@ test "collect function family grouping" {
 test "collect case expression creates scopes" {
     const source =
         \\pub module Test {
-        \\  pub fn foo(x :: Atom) :: Nil {
+        \\  pub fn foo(x :: Atom) -> Nil {
         \\    case x {
         \\      {:ok, v} -> v
         \\      {:error, e} -> e
@@ -794,8 +794,8 @@ test "collect case expression creates scopes" {
 test "collect local def hoisting" {
     const source =
         \\pub module Test {
-        \\  pub fn outer(x :: i64) :: String {
-        \\    pub fn inner(s :: String) :: String {
+        \\  pub fn outer(x :: i64) -> String {
+        \\    pub fn inner(s :: String) -> String {
         \\      s
         \\    }
         \\    inner("ok")

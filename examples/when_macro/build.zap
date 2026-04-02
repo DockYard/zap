@@ -1,5 +1,5 @@
 pub module WhenMacro.Builder {
-  pub fn manifest(env :: Zap.Env) :: Zap.Manifest {
+  pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
     case env.target {
       :when_macro ->
         %Zap.Manifest{

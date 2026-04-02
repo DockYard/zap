@@ -100,11 +100,11 @@ The compiler enforces this — a mismatch is a compile error. The compiler disco
 ```zap
 # lib/math.zap
 pub module Math {
-  pub fn square(x :: i64) :: i64 {
+  pub fn square(x :: i64) -> i64 {
     x * x
   }
 
-  pub fn double(x :: i64) :: i64 {
+  pub fn double(x :: i64) -> i64 {
     x * 2
   }
 }
@@ -135,11 +135,11 @@ Chain function calls, passing the result of each step as the first argument to t
 
 ```zap
 pub module Pipes {
-  pub fn double(x :: i64) :: i64 {
+  pub fn double(x :: i64) -> i64 {
     x * 2
   }
 
-  pub fn add_one(x :: i64) :: i64 {
+  pub fn add_one(x :: i64) -> i64 {
     x + 1
   }
 
@@ -157,11 +157,11 @@ Multiple function clauses with the same name form an overload group. The compile
 
 ```zap
 pub module Factorial {
-  pub fn factorial(0 :: i64) :: i64 {
+  pub fn factorial(0 :: i64) -> i64 {
     1
   }
 
-  pub fn factorial(n :: i64) :: i64 {
+  pub fn factorial(n :: i64) -> i64 {
     n * factorial(n - 1)
   }
 }
@@ -173,15 +173,15 @@ Function clauses can carry guard conditions that participate in dispatch:
 
 ```zap
 pub module Guards {
-  pub fn classify(n :: i64) :: String if n > 0 {
+  pub fn classify(n :: i64) -> String if n > 0 {
     "positive"
   }
 
-  pub fn classify(n :: i64) :: String if n < 0 {
+  pub fn classify(n :: i64) -> String if n < 0 {
     "negative"
   }
 
-  pub fn classify(_ :: i64) :: String {
+  pub fn classify(_ :: i64) -> String {
     "zero"
   }
 }
@@ -193,7 +193,7 @@ Pattern matching inside function bodies:
 
 ```zap
 pub module CaseExpr {
-  pub fn check(result) :: String {
+  pub fn check(result) -> String {
     case result {
       {:ok, v} ->
         v
@@ -212,7 +212,7 @@ If/else is an expression — it produces a value:
 
 ```zap
 pub module Math {
-  pub fn abs(x :: i64) :: i64 {
+  pub fn abs(x :: i64) -> i64 {
     if x < 0 {
       -x
     } else {
@@ -230,7 +230,7 @@ Every Zap project has a `build.zap` that defines build targets:
 
 ```zap
 pub module MyApp.Builder {
-  pub fn manifest(env :: Zap.Env) :: Zap.Manifest {
+  pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
     case env.target {
       :my_app ->
         %Zap.Manifest{

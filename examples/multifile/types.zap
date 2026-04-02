@@ -1,16 +1,16 @@
 # Shared type definitions for the multifile example.
 
 pub struct Shape {
-  color :: String = "black",
+  color :: String = "black"
 }
 
 pub struct Circle extends Shape {
-  radius :: f64,
+  radius :: f64
 }
 
 pub struct Rectangle extends Shape {
-  width :: f64,
-  height :: f64,
+  width :: f64
+  height :: f64
 }
 
 pub enum Color {

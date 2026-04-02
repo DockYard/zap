@@ -1,5 +1,5 @@
 pub module DefaultParams.Builder {
-  pub fn manifest(env :: Zap.Env) :: Zap.Manifest {
+  pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
     case env.target {
       :default_params ->
         %Zap.Manifest{

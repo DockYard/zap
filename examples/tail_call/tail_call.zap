@@ -5,7 +5,7 @@
 # With TCO, it runs in constant stack space.
 
 pub module TailCall {
-  pub fn main(_args :: [String]) :: String {
+  pub fn main(_args :: [String]) -> String {
     Counter.countdown(100_000_000)
     |> Integer.to_string()
     |> IO.puts()

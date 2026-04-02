@@ -2,15 +2,15 @@
 # Demonstrates automatic union synthesis across file boundaries.
 
 pub module Geometry {
-  pub fn area(%{radius: r} :: Circle) :: f64 {
+  pub fn area(%{radius: r} :: Circle) -> f64 {
     3.14159 * r * r
   }
 
-  pub fn area(%{width: w, height: h} :: Rectangle) :: f64 {
+  pub fn area(%{width: w, height: h} :: Rectangle) -> f64 {
     w * h
   }
 
-  pub fn describe_color(color :: Color) :: String {
+  pub fn describe_color(color :: Color) -> String {
     case color {
       Color.Red -> "red"
       Color.Green -> "green"

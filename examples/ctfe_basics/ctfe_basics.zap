@@ -11,7 +11,7 @@
 #   zap run ctfe_basics
 
 pub module CtfeBasics {
-  pub fn main(_args :: [String]) :: String {
+  pub fn main(_args :: [String]) -> String {
     Greeter.greet("World")
     |> IO.puts()
   }

@@ -1256,21 +1256,21 @@ pub fn getRuntimeSource() []const u8 {
 
 test "validateOneModulePerFile: valid single module" {
     const alloc = std.testing.allocator;
-    const source = "pub module Config {\n  pub fn load() :: String {\n    \"ok\"\n  }\n}\n";
+    const source = "pub module Config {\n  pub fn load() -> String {\n    \"ok\"\n  }\n}\n";
     const result = validateOneModulePerFile(alloc, source, "config.zap");
     try std.testing.expectEqual(null, result);
 }
 
 test "validateOneModulePerFile: valid nested module name" {
     const alloc = std.testing.allocator;
-    const source = "pub module Config.Parser {\n  pub fn parse() :: String {\n    \"ok\"\n  }\n}\n";
+    const source = "pub module Config.Parser {\n  pub fn parse() -> String {\n    \"ok\"\n  }\n}\n";
     const result = validateOneModulePerFile(alloc, source, "config/parser.zap");
     try std.testing.expectEqual(null, result);
 }
 
 test "validateOneModulePerFile: valid private module" {
     const alloc = std.testing.allocator;
-    const source = "module Config.Helpers {\n  pub fn help() :: String {\n    \"ok\"\n  }\n}\n";
+    const source = "module Config.Helpers {\n  pub fn help() -> String {\n    \"ok\"\n  }\n}\n";
     const result = validateOneModulePerFile(alloc, source, "config/helpers.zap");
     try std.testing.expectEqual(null, result);
 }
@@ -1286,7 +1286,7 @@ test "validateOneModulePerFile: zero modules is error" {
 
 test "validateOneModulePerFile: multiple modules is error" {
     const alloc = std.testing.allocator;
-    const source = "pub module Foo {\n  pub fn foo() :: i64 {\n    1\n  }\n}\npub module Bar {\n  pub fn bar() :: i64 {\n    2\n  }\n}\n";
+    const source = "pub module Foo {\n  pub fn foo() -> i64 {\n    1\n  }\n}\npub module Bar {\n  pub fn bar() -> i64 {\n    2\n  }\n}\n";
     const result = validateOneModulePerFile(alloc, source, "foo.zap");
     try std.testing.expect(result != null);
     try std.testing.expect(std.mem.indexOf(u8, result.?, "found 2") != null);
@@ -1295,7 +1295,7 @@ test "validateOneModulePerFile: multiple modules is error" {
 
 test "validateOneModulePerFile: name mismatch is error" {
     const alloc = std.testing.allocator;
-    const source = "pub module WrongName {\n  pub fn foo() :: i64 {\n    1\n  }\n}\n";
+    const source = "pub module WrongName {\n  pub fn foo() -> i64 {\n    1\n  }\n}\n";
     const result = validateOneModulePerFile(alloc, source, "config.zap");
     try std.testing.expect(result != null);
     try std.testing.expect(std.mem.indexOf(u8, result.?, "does not match") != null);
@@ -1304,7 +1304,7 @@ test "validateOneModulePerFile: name mismatch is error" {
 
 test "validateOneModulePerFile: snake_case path to PascalCase" {
     const alloc = std.testing.allocator;
-    const source = "pub module JsonParser {\n  pub fn parse() :: String {\n    \"ok\"\n  }\n}\n";
+    const source = "pub module JsonParser {\n  pub fn parse() -> String {\n    \"ok\"\n  }\n}\n";
     const result = validateOneModulePerFile(alloc, source, "json_parser.zap");
     try std.testing.expectEqual(null, result);
 }
@@ -1403,12 +1403,12 @@ test "collector can build graph from per-module programs" {
     const alloc = arena.allocator();
     const source =
         "pub module Foo {\n" ++
-        "  pub fn run() :: i64 {\n" ++
+        "  pub fn run() -> i64 {\n" ++
         "    1\n" ++
         "  }\n" ++
         "}\n" ++
         "pub module Bar {\n" ++
-        "  pub fn call() :: i64 {\n" ++
+        "  pub fn call() -> i64 {\n" ++
         "    Foo.run()\n" ++
         "  }\n" ++
         "}\n";

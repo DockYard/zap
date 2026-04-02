@@ -1,9 +1,9 @@
 pub module Animal {
-  pub fn speak() :: String {
+  pub fn speak() -> String {
     "..."
   }
 
-  pub fn breathe() :: String {
+  pub fn breathe() -> String {
     "inhale, exhale"
   }
 }

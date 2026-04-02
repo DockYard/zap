@@ -1,5 +1,5 @@
 pub module Guards.Builder {
-  pub fn manifest(env :: Zap.Env) :: Zap.Manifest {
+  pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
     case env.target {
       :guards ->
         %Zap.Manifest{

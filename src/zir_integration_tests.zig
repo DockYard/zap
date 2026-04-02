@@ -47,7 +47,7 @@ fn compileOnly(source: []const u8) TestError!void {
 
     const build_source =
         \\pub module TestProg.Builder {
-        \\  pub fn manifest(env :: Zap.Env) :: Zap.Manifest {
+        \\  pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
         \\    case env.target {
         \\      :test_prog ->
         \\        %Zap.Manifest{
@@ -109,7 +109,7 @@ fn compileAndRun(source: []const u8) TestError!TestResult {
 
     const build_source =
         \\pub module TestProg.Builder {
-        \\  pub fn manifest(env :: Zap.Env) :: Zap.Manifest {
+        \\  pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
         \\    case env.target {
         \\      :test_prog ->
         \\        %Zap.Manifest{
@@ -254,7 +254,7 @@ test "ZIR: boolean" {
 test "ZIR: multi-function call" {
     var result = try compileAndRun(
         \\pub module Math {
-        \\  pub fn add(a :: i64, b :: i64) :: i64 {
+        \\  pub fn add(a :: i64, b :: i64) -> i64 {
         \\    a + b
         \\  }
         \\}
@@ -363,7 +363,7 @@ test "ZIR: case with ints" {
 test "ZIR: recursive sum" {
     var result = try compileAndRun(
         \\pub module Math {
-        \\  pub fn sum_to(n :: i64) :: i64 {
+        \\  pub fn sum_to(n :: i64) -> i64 {
         \\    case n {
         \\      0 -> 1
         \\      1 -> 1
@@ -386,11 +386,11 @@ test "ZIR: recursive sum" {
 test "ZIR: multiple helper functions" {
     var result = try compileAndRun(
         \\pub module Helpers {
-        \\  pub fn double(x :: i64) :: i64 {
+        \\  pub fn double(x :: i64) -> i64 {
         \\    x + x
         \\  }
         \\
-        \\  pub fn add_one(x :: i64) :: i64 {
+        \\  pub fn add_one(x :: i64) -> i64 {
         \\    x + 1
         \\  }
         \\}
@@ -409,8 +409,8 @@ test "ZIR: multiple helper functions" {
 test "ZIR compile: lambda lifted local def" {
     try compileOnly(
         \\pub module Foo {
-        \\  pub fn bar() :: i64 {
-        \\    pub fn forty_two() :: i64 {
+        \\  pub fn bar() -> i64 {
+        \\    pub fn forty_two() -> i64 {
         \\      42
         \\    }
         \\
@@ -429,12 +429,12 @@ test "ZIR compile: lambda lifted local def" {
 test "ZIR compile: function-local captured closure" {
     try compileOnly(
         \\pub module Foo {
-        \\  pub fn apply(f :: (i64 -> i64), value :: i64) :: i64 {
+        \\  pub fn apply(f :: (i64 -> i64), value :: i64) -> i64 {
         \\    f(value)
         \\  }
         \\
-        \\  pub fn bar(x :: i64) :: i64 {
-        \\    pub fn add_x(y :: i64) :: i64 {
+        \\  pub fn bar(x :: i64) -> i64 {
+        \\    pub fn add_x(y :: i64) -> i64 {
         \\      x + y
         \\    }
         \\
@@ -453,12 +453,12 @@ test "ZIR compile: function-local captured closure" {
 test "ZIR compile: aliased function-local captured closure" {
     try compileOnly(
         \\pub module Foo {
-        \\  pub fn apply(f :: (i64 -> i64), value :: i64) :: i64 {
+        \\  pub fn apply(f :: (i64 -> i64), value :: i64) -> i64 {
         \\    f(value)
         \\  }
         \\
-        \\  pub fn bar(x :: i64) :: i64 {
-        \\    pub fn add_x(y :: i64) :: i64 {
+        \\  pub fn bar(x :: i64) -> i64 {
+        \\    pub fn add_x(y :: i64) -> i64 {
         \\      x + y
         \\    }
         \\

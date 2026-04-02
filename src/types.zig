@@ -1668,7 +1668,7 @@ pub const TypeChecker = struct {
                 "missing return type annotation",
                 clause.meta.span,
                 "this function has no return type",
-                "add a return type: `def name(params) :: ReturnType do`",
+                "add a return type: `def name(params) -> ReturnType do`",
             );
             break :blk TypeStore.UNKNOWN;
         };
@@ -2231,6 +2231,8 @@ pub const TypeChecker = struct {
                 _ = try self.inferExpr(ta.expr);
                 return try self.resolveTypeExpr(ta.type_expr);
             },
+            .error_pipe => TypeStore.UNKNOWN, // TODO: implement error pipe type checking
+            .err_constructor => TypeStore.UNKNOWN, // TODO: implement Err() type checking
         };
     }
 
@@ -2792,7 +2794,7 @@ const Collector = @import("collector.zig").Collector;
 test "type check simple function" {
     const source =
         \\pub module Test {
-        \\  pub fn add(x :: i64, y :: i64) :: i64 {
+        \\  pub fn add(x :: i64, y :: i64) -> i64 {
         \\    x + y
         \\  }
         \\}
@@ -2832,7 +2834,7 @@ test "type check simple function" {
 test "type check literals" {
     const source =
         \\pub module Test {
-        \\  pub fn foo() :: i64 {
+        \\  pub fn foo() -> i64 {
         \\    42
         \\  }
         \\}
@@ -2860,7 +2862,7 @@ test "type check literals" {
 test "type check case expression" {
     const source =
         \\pub module Test {
-        \\  pub fn foo(x :: Atom) :: Nil {
+        \\  pub fn foo(x :: Atom) -> Nil {
         \\    case x {
         \\      {:ok, v} -> v
         \\      {:error, e} -> e
@@ -2892,7 +2894,7 @@ test "type check arithmetic mismatch reported" {
     // String + i64 should produce a type error
     const source =
         \\pub module Test {
-        \\  pub fn bad() :: i64 {
+        \\  pub fn bad() -> i64 {
         \\    "hello" + 42
         \\  }
         \\}
@@ -2940,7 +2942,7 @@ test "type check var_ref resolves to parameter type" {
     // x is declared as i64, so x + 1 should not error (both i64)
     const source =
         \\pub module Test {
-        \\  pub fn double(x :: i64) :: i64 {
+        \\  pub fn double(x :: i64) -> i64 {
         \\    x + x
         \\  }
         \\}
@@ -2970,7 +2972,7 @@ test "type check if condition must be Bool" {
     // Using an integer as if condition should produce an error
     const source =
         \\pub module Test {
-        \\  pub fn bad() :: i64 {
+        \\  pub fn bad() -> i64 {
         \\    if 42 {
         \\      1
         \\    }
@@ -3004,7 +3006,7 @@ test "type check return type mismatch" {
     // Function declares i64 return but body returns a string
     const source =
         \\pub module Test {
-        \\  pub fn bad() :: i64 {
+        \\  pub fn bad() -> i64 {
         \\    "not a number"
         \\  }
         \\}
@@ -3118,7 +3120,7 @@ test "typed parameter records shared ownership metadata" {
 test "function ref inference defaults param ownerships to shared" {
     const source =
         \\pub module Test {
-        \\  pub fn main(args :: Nil) :: (Nil -> Nil) {
+        \\  pub fn main(args :: Nil) -> (Nil -> Nil) {
         \\    Foo.main/1
         \\  }
         \\}
@@ -3359,11 +3361,11 @@ test "borrowed param annotation keeps binding usable after call" {
         \\pub module Test {
         \\  opaque Handle = String
         \\
-        \\  pub fn inspect(handle :: borrowed Handle) :: Nil {
+        \\  pub fn inspect(handle :: borrowed Handle) -> Nil {
         \\    nil
         \\  }
         \\
-        \\  pub fn run(handle :: Handle) :: Handle {
+        \\  pub fn run(handle :: Handle) -> Handle {
         \\    inspect(handle)
         \\    handle
         \\  }
@@ -3648,8 +3650,8 @@ test "closure with borrowed capture may be locally invoked" {
         \\pub module Test {
         \\  opaque Handle = String
         \\
-        \\  pub fn make(handle :: borrowed Handle) :: Bool {
-        \\    fn use() :: Bool {
+        \\  pub fn make(handle :: borrowed Handle) -> Bool {
+        \\    fn use() -> Bool {
         \\      handle == handle
         \\    }
         \\
@@ -3682,12 +3684,12 @@ test "closure with borrowed capture may be passed to known-safe callee" {
         \\pub module Test {
         \\  opaque Handle = String
         \\
-        \\  pub fn apply(f :: (borrowed Handle -> Bool), handle :: borrowed Handle) :: Bool {
+        \\  pub fn apply(f :: (borrowed Handle -> Bool), handle :: borrowed Handle) -> Bool {
         \\    f(handle)
         \\  }
         \\
-        \\  pub fn make(handle :: borrowed Handle) :: Bool {
-        \\    fn use(h :: borrowed Handle) :: Bool {
+        \\  pub fn make(handle :: borrowed Handle) -> Bool {
+        \\    fn use(h :: borrowed Handle) -> Bool {
         \\      h == handle
         \\    }
         \\
@@ -3769,7 +3771,7 @@ test "borrowed parameter does not move binding" {
 test "return type mismatch has secondary span" {
     const source =
         \\pub module Test {
-        \\  pub fn bad() :: i64 {
+        \\  pub fn bad() -> i64 {
         \\    "not a number"
         \\  }
         \\}

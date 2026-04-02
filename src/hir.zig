@@ -2834,7 +2834,7 @@ const Collector = @import("collector.zig").Collector;
 test "HIR build simple function" {
     const source =
         \\pub module Test {
-        \\  pub fn add(x :: i64, y :: i64) :: i64 {
+        \\  pub fn add(x :: i64, y :: i64) -> i64 {
         \\    x + y
         \\  }
         \\}
@@ -2866,7 +2866,7 @@ test "HIR build simple function" {
 test "HIR build module" {
     const source =
         \\pub module Math {
-        \\  pub fn add(x :: i64, y :: i64) :: i64 {
+        \\  pub fn add(x :: i64, y :: i64) -> i64 {
         \\    x + y
         \\  }
         \\}
@@ -2898,7 +2898,7 @@ test "HIR build module" {
 test "HIR pattern compilation" {
     const source =
         \\pub module Test {
-        \\  pub fn foo(x :: Atom) :: Nil {
+        \\  pub fn foo(x :: Atom) -> Nil {
         \\    case x {
         \\      {:ok, v} -> v
         \\      {:error, e} -> e
@@ -2934,7 +2934,7 @@ test "HIR pattern compilation" {
 test "HIR typed params default to shared ownership" {
     const source =
         \\pub module Test {
-        \\  pub fn add(x :: i64, y :: i64) :: i64 {
+        \\  pub fn add(x :: i64, y :: i64) -> i64 {
         \\    x + y
         \\  }
         \\}
@@ -2970,7 +2970,7 @@ test "HIR opaque typed params default to unique ownership" {
         \\pub module Test {
         \\  opaque Handle = String
         \\
-        \\  pub fn use(handle :: Handle) :: Handle {
+        \\  pub fn use(handle :: Handle) -> Handle {
         \\    handle
         \\  }
         \\}
@@ -3079,7 +3079,7 @@ test "HIR call args default to share mode" {
 test "HIR call args adopt function ownership modes" {
     const source =
         \\pub module Test {
-        \\  pub fn apply(f :: (String -> String), x :: String) :: String {
+        \\  pub fn apply(f :: (String -> String), x :: String) -> String {
         \\    f(x)
         \\  }
         \\}
@@ -3136,11 +3136,11 @@ test "HIR named calls use resolved parameter ownership" {
         \\pub module Test {
         \\  opaque Handle = String
         \\
-        \\  pub fn take(handle :: Handle) :: Handle {
+        \\  pub fn take(handle :: Handle) -> Handle {
         \\    handle
         \\  }
         \\
-        \\  pub fn run(handle :: Handle) :: Handle {
+        \\  pub fn run(handle :: Handle) -> Handle {
         \\    take(handle)
         \\  }
         \\}

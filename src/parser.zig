@@ -997,7 +997,7 @@ pub const Parser = struct {
         _ = self.advance();
 
         var return_type: ?*const ast.TypeExpr = null;
-        if (self.match(.double_colon)) {
+        if (self.match(.arrow)) {
             return_type = try self.parseTypeExpr();
         }
 
@@ -1418,7 +1418,55 @@ pub const Parser = struct {
             });
         }
 
+        // Check for ~> error pipe after the pipe chain
+        self.skipNewlinesForContinuation(.tilde_arrow);
+        if (self.check(.tilde_arrow)) {
+            _ = self.advance();
+            left = try self.parseErrorPipeHandler(left);
+        }
+
         return left;
+    }
+
+    fn parseErrorPipeHandler(self: *Parser, chain: *const ast.Expr) !*const ast.Expr {
+        const start = chain.getMeta().span;
+
+        // ~> { pattern -> body, ... } (inline block handler)
+        if (self.check(.left_brace)) {
+            _ = self.advance();
+            self.skipNewlines();
+
+            var clauses: std.ArrayList(ast.CaseClause) = .empty;
+            while (!self.check(.right_brace) and !self.check(.eof)) {
+                self.skipNewlines();
+                if (self.check(.right_brace)) break;
+
+                const clause = try self.parseCaseClause();
+                try clauses.append(self.allocator, clause);
+                self.skipNewlines();
+            }
+
+            self.skipNewlines();
+            _ = try self.expect(.right_brace);
+
+            return self.create(ast.Expr, .{
+                .error_pipe = .{
+                    .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
+                    .chain = chain,
+                    .handler = .{ .block = try clauses.toOwnedSlice(self.allocator) },
+                },
+            });
+        }
+
+        // ~> handler_function() (function call handler)
+        const func = try self.parseCallExpr();
+        return self.create(ast.Expr, .{
+            .error_pipe = .{
+                .meta = .{ .span = ast.SourceSpan.merge(start, func.getMeta().span) },
+                .chain = chain,
+                .handler = .{ .function = func },
+            },
+        });
     }
 
     fn parseAddExpr(self: *Parser) !*const ast.Expr {
@@ -3374,6 +3422,7 @@ fn tokenHumanName(tag: Token.Tag) []const u8 {
         .newline => "a newline",
         .eof => "end of file",
         .invalid => "an invalid token",
+        .tilde_arrow => "`~>`",
         .double_ampersand => "`&&`",
         .double_pipe => "`||`",
         .plus_plus => "`++`",
@@ -3420,7 +3469,7 @@ test "top-level pub fn is also rejected" {
 test "parse simple function" {
     const source =
         \\pub module Test {
-        \\  pub fn add(x :: i64, y :: i64) :: i64 {
+        \\  pub fn add(x :: i64, y :: i64) -> i64 {
         \\    x + y
         \\  }
         \\}
@@ -3497,7 +3546,7 @@ test "parse function type ownership annotations" {
 test "parse module" {
     const source =
         \\pub module Foo {
-        \\  pub fn bar() :: i64 {
+        \\  pub fn bar() -> i64 {
         \\    42
         \\  }
         \\}
@@ -3529,7 +3578,7 @@ test "parse type declaration" {
 test "parse if expression" {
     const source =
         \\pub module Test {
-        \\  pub fn foo(x :: i64) :: i64 {
+        \\  pub fn foo(x :: i64) -> i64 {
         \\    if x > 0 {
         \\      x
         \\    } else {
@@ -3551,7 +3600,7 @@ test "parse if expression" {
 test "parse case expression" {
     const source =
         \\pub module Test {
-        \\  pub fn foo(x :: Atom) :: Nil {
+        \\  pub fn foo(x :: Atom) -> Nil {
         \\    case x {
         \\      {:ok, v} -> v
         \\      {:error, e} -> e
@@ -3572,7 +3621,7 @@ test "parse case expression" {
 test "parse binary operators" {
     const source =
         \\pub module Test {
-        \\  pub fn calc(x :: i64, y :: i64) :: i64 {
+        \\  pub fn calc(x :: i64, y :: i64) -> i64 {
         \\    x + y * 2
         \\  }
         \\}
@@ -3616,7 +3665,7 @@ test "parse tuple and list" {
 test "parse refinement predicate" {
     const source =
         \\pub module Test {
-        \\  pub fn abs(x :: i64) :: i64 if x < 0 {
+        \\  pub fn abs(x :: i64) -> i64 if x < 0 {
         \\    -x
         \\  }
         \\}
@@ -3766,8 +3815,8 @@ test "parse unwrap operator" {
 test "parse local function" {
     const source =
         \\pub module Test {
-        \\  pub fn outer(x :: i64) :: String {
-        \\    fn inner(s :: String) :: String {
+        \\  pub fn outer(x :: i64) -> String {
+        \\    fn inner(s :: String) -> String {
         \\      s
         \\    }
         \\    inner("ok")
@@ -3792,12 +3841,12 @@ test "parse module with types and functions" {
         \\pub module Foo {
         \\  type Result(a, e) = {:ok, a} | {:error, e}
         \\
-        \\  pub fn b(s :: String) :: String {
+        \\  pub fn b(s :: String) -> String {
         \\    s <> "foo"
         \\  }
         \\
-        \\  pub fn a(x :: i64) :: String {
-        \\    fn b(n :: i64) :: String {
+        \\  pub fn a(x :: i64) -> String {
+        \\    fn b(n :: i64) -> String {
         \\      int_to_string(n)
         \\    }
         \\    b("other")
@@ -3881,13 +3930,13 @@ test "parse defenum" {
 test "parse defmodule extends" {
     const source =
         \\pub module Animal {
-        \\  pub fn breathe() :: String {
+        \\  pub fn breathe() -> String {
         \\    "inhale"
         \\  }
         \\}
         \\
         \\pub module Dog extends Animal {
-        \\  pub fn speak() :: String {
+        \\  pub fn speak() -> String {
         \\    "woof"
         \\  }
         \\}
@@ -3933,7 +3982,7 @@ test "parse struct init with type annotation" {
 test "parse defmodulep as private module" {
     const source =
         \\module Internal {
-        \\  pub fn helper() :: i64 {
+        \\  pub fn helper() -> i64 {
         \\    42
         \\  }
         \\}
@@ -3975,7 +4024,7 @@ test "parse defmacrop inside module" {
 test "parse defmodule is_private false by default" {
     const source =
         \\pub module Foo {
-        \\  pub fn bar() :: i64 {
+        \\  pub fn bar() -> i64 {
         \\    1
         \\  }
         \\}
@@ -3995,7 +4044,7 @@ test "parse typed module attribute" {
     const source =
         \\pub module Foo {
         \\  @doc :: String = "hello world"
-        \\  pub fn bar() :: i64 {
+        \\  pub fn bar() -> i64 {
         \\    1
         \\  }
         \\}
@@ -4023,7 +4072,7 @@ test "parse marker attribute" {
     const source =
         \\pub module Foo {
         \\  @debug
-        \\  pub fn bar() :: i64 {
+        \\  pub fn bar() -> i64 {
         \\    1
         \\  }
         \\}
@@ -4048,7 +4097,7 @@ test "parse multiple attributes on same function" {
         \\pub module Foo {
         \\  @doc :: String = "does something"
         \\  @deprecated :: String = "use bar2 instead"
-        \\  pub fn bar() :: i64 {
+        \\  pub fn bar() -> i64 {
         \\    1
         \\  }
         \\}
@@ -4104,7 +4153,7 @@ test "parse attribute with integer value" {
     const source =
         \\pub module Foo {
         \\  @timeout :: i64 = 5000
-        \\  pub fn connect() :: i64 {
+        \\  pub fn connect() -> i64 {
         \\    1
         \\  }
         \\}
@@ -4129,7 +4178,7 @@ test "parse attribute with list value" {
     const source =
         \\pub module Foo {
         \\  @flags :: List(Atom) = [:read, :write]
-        \\  pub fn connect() :: i64 {
+        \\  pub fn connect() -> i64 {
         \\    1
         \\  }
         \\}
