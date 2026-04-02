@@ -429,7 +429,7 @@ fn maxLabel(program: *const ir.Program) ir.LabelId {
 fn isStraightLineSuffix(instrs: []const ir.Instruction) bool {
     for (instrs) |instr| {
         switch (instr) {
-            .branch, .cond_branch, .jump, .switch_tag, .switch_literal, .switch_return, .union_switch_return => return false,
+            .branch, .cond_branch, .jump, .switch_tag, .switch_literal, .switch_return, .union_switch_return, .union_switch => return false,
             else => {},
         }
     }

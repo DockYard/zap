@@ -90,7 +90,7 @@ pub const TopItem = union(enum) {
     type_decl: *const TypeDecl,
     opaque_decl: *const OpaqueDecl,
     struct_decl: *const StructDecl,
-    enum_decl: *const EnumDecl,
+    union_decl: *const UnionDecl,
     function: *const FunctionDecl,
     priv_function: *const FunctionDecl,
     macro: *const FunctionDecl,
@@ -118,7 +118,7 @@ pub const ModuleItem = union(enum) {
     type_decl: *const TypeDecl,
     opaque_decl: *const OpaqueDecl,
     struct_decl: *const StructDecl,
-    enum_decl: *const EnumDecl,
+    union_decl: *const UnionDecl,
     function: *const FunctionDecl,
     priv_function: *const FunctionDecl,
     macro: *const FunctionDecl,
@@ -170,18 +170,19 @@ pub const StructFieldDecl = struct {
 };
 
 // ============================================================
-// Enum declarations
+// Union declarations
 // ============================================================
 
-pub const EnumDecl = struct {
+pub const UnionDecl = struct {
     meta: NodeMeta,
     name: StringId,
-    variants: []const EnumVariant,
+    variants: []const UnionVariant,
 };
 
-pub const EnumVariant = struct {
+pub const UnionVariant = struct {
     meta: NodeMeta,
     name: StringId,
+    type_expr: ?*const TypeExpr = null, // null = unit variant
 };
 
 // ============================================================

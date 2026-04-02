@@ -926,6 +926,19 @@ fn hashInstruction(hasher: *std.hash.Wyhash, instr: ir.Instruction) void {
                 if (case.return_value) |rv| hasher.update(std.mem.asBytes(&rv));
             }
         },
+        .union_switch => |v| {
+            hasher.update(std.mem.asBytes(&v.dest));
+            hasher.update(std.mem.asBytes(&v.scrutinee));
+            for (v.cases) |case| {
+                hasher.update(case.variant_name);
+                for (case.field_bindings) |binding| {
+                    hasher.update(binding.field_name);
+                    hasher.update(std.mem.asBytes(&binding.local_index));
+                }
+                for (case.body_instrs) |nested| hashInstruction(hasher, nested);
+                if (case.return_value) |rv| hasher.update(std.mem.asBytes(&rv));
+            }
+        },
         .match_atom => |v| {
             hasher.update(std.mem.asBytes(&v.dest));
             hasher.update(std.mem.asBytes(&v.scrutinee));
@@ -1505,6 +1518,7 @@ pub const Interpreter = struct {
             .switch_literal => |sl| return self.execSwitchLiteral(sl, frame),
             .switch_return => |sr| return self.execSwitchReturn(sr, frame),
             .union_switch_return => |usr| return self.execUnionSwitchReturn(usr, frame),
+            .union_switch => |us| return self.execUnionSwitch(us, frame),
             .branch => |b| return .{ .jumped = b.target },
             .cond_branch => |cb| {
                 const cond = try self.readLocal(frame, cb.condition);
@@ -2293,6 +2307,82 @@ pub const Interpreter = struct {
             },
             else => {
                 try self.emitError(.type_error, "union_switch_return on non-union value");
+                return error.CtfeFailure;
+            },
+        }
+    }
+
+    fn execUnionSwitch(self: *Interpreter, us: ir.UnionSwitch, frame: *Frame) CtfeInterpretError!ExecResult {
+        const scrutinee = try self.readLocal(frame, us.scrutinee);
+        switch (scrutinee) {
+            .union_val => |uv| {
+                for (us.cases) |case| {
+                    if (std.mem.eql(u8, case.variant_name, uv.variant)) {
+                        // Bind fields to locals
+                        for (case.field_bindings) |binding| {
+                            const payload_struct = uv.payload.*;
+                            switch (payload_struct) {
+                                .struct_val => |sv| {
+                                    for (sv.fields) |field| {
+                                        if (std.mem.eql(u8, field.name, binding.field_name)) {
+                                            frame.setLocal(binding.local_index, field.value);
+                                            break;
+                                        }
+                                    }
+                                },
+                                else => frame.setLocal(binding.local_index, payload_struct),
+                            }
+                        }
+                        // Execute body
+                        for (case.body_instrs, 0..) |instr, idx| {
+                            self.setCurrentInstructionIndex(idx);
+                            const r = try self.execOneInstruction(instr, frame);
+                            switch (r) {
+                                .returned => |v| return .{ .returned = v },
+                                .continued => {},
+                                .broke => {},
+                                .jumped => |target| return .{ .jumped = target },
+                            }
+                        }
+                        const result = if (case.return_value) |rv| try self.readLocal(frame, rv) else .void;
+                        frame.setLocal(us.dest, result);
+                        return .continued;
+                    }
+                }
+                try self.emitError(.match_failure, "no matching union variant");
+                return error.CtfeFailure;
+            },
+            .struct_val => |sv| {
+                for (us.cases) |case| {
+                    if (std.mem.eql(u8, case.variant_name, sv.type_name)) {
+                        for (case.field_bindings) |binding| {
+                            for (sv.fields) |field| {
+                                if (std.mem.eql(u8, field.name, binding.field_name)) {
+                                    frame.setLocal(binding.local_index, field.value);
+                                    break;
+                                }
+                            }
+                        }
+                        for (case.body_instrs, 0..) |instr, idx| {
+                            self.setCurrentInstructionIndex(idx);
+                            const r = try self.execOneInstruction(instr, frame);
+                            switch (r) {
+                                .returned => |v| return .{ .returned = v },
+                                .continued => {},
+                                .broke => {},
+                                .jumped => |target| return .{ .jumped = target },
+                            }
+                        }
+                        const result = if (case.return_value) |rv| try self.readLocal(frame, rv) else .void;
+                        frame.setLocal(us.dest, result);
+                        return .continued;
+                    }
+                }
+                try self.emitError(.match_failure, "no matching struct type");
+                return error.CtfeFailure;
+            },
+            else => {
+                try self.emitError(.type_error, "union_switch on non-union value");
                 return error.CtfeFailure;
             },
         }

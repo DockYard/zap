@@ -52,7 +52,7 @@ pub const UnionDef = struct {
 
 pub const UnionVariant = struct {
     name: []const u8,
-    type_name: []const u8,
+    type_name: ?[]const u8 = null, // null = unit variant (void)
 };
 
 pub const Program = struct {
@@ -145,6 +145,7 @@ pub const Instruction = union(enum) {
     switch_literal: SwitchLiteral,
     switch_return: SwitchReturn,
     union_switch_return: UnionSwitchReturn,
+    union_switch: UnionSwitch,
     match_atom: MatchAtom,
     match_int: MatchInt,
     match_float: MatchFloat,
@@ -463,6 +464,12 @@ pub const ReturnCase = struct {
 
 pub const UnionSwitchReturn = struct {
     scrutinee_param: u32,
+    cases: []const UnionCase,
+};
+
+pub const UnionSwitch = struct {
+    dest: LocalId,
+    scrutinee: LocalId,
     cases: []const UnionCase,
 };
 
@@ -793,17 +800,47 @@ pub const IrBuilder = struct {
                             } },
                         });
                     },
-                    .enum_type => |et| {
-                        var variants: std.ArrayList([]const u8) = .empty;
-                        for (et.variants) |v| {
-                            try variants.append(self.allocator, self.interner.get(v));
+                    .tagged_union => |tu| {
+                        // Check if any variant carries data
+                        var has_data = false;
+                        for (tu.variants) |v| {
+                            if (v.type_id != null) {
+                                has_data = true;
+                                break;
+                            }
                         }
-                        try type_defs.append(self.allocator, .{
-                            .name = self.interner.get(et.name),
-                            .kind = .{ .enum_def = .{
-                                .variants = try variants.toOwnedSlice(self.allocator),
-                            } },
-                        });
+                        if (has_data) {
+                            // Emit as union(enum) with typed variants
+                            var union_variants: std.ArrayList(UnionVariant) = .empty;
+                            for (tu.variants) |v| {
+                                const type_str = if (v.type_id) |tid|
+                                    typeIdToZigTypeStrWithStore(tid, self.type_store)
+                                else
+                                    "void";
+                                try union_variants.append(self.allocator, .{
+                                    .name = self.interner.get(v.name),
+                                    .type_name = type_str,
+                                });
+                            }
+                            try type_defs.append(self.allocator, .{
+                                .name = self.interner.get(tu.name),
+                                .kind = .{ .union_def = .{
+                                    .variants = try union_variants.toOwnedSlice(self.allocator),
+                                } },
+                            });
+                        } else {
+                            // All unit variants — emit as plain enum
+                            var variants: std.ArrayList([]const u8) = .empty;
+                            for (tu.variants) |v| {
+                                try variants.append(self.allocator, self.interner.get(v.name));
+                            }
+                            try type_defs.append(self.allocator, .{
+                                .name = self.interner.get(tu.name),
+                                .kind = .{ .enum_def = .{
+                                    .variants = try variants.toOwnedSlice(self.allocator),
+                                } },
+                            });
+                        }
                     },
                     else => {},
                 }
@@ -2602,6 +2639,194 @@ pub const IrBuilder = struct {
         return store.getType(type_id) == .opaque_type;
     }
 
+    /// Lower an error pipe chain starting at step `start_idx`.
+    /// `current_val` is the result of step[start_idx] (already lowered).
+    /// If step[start_idx] is fallible, wraps in union_switch with nested chain in Ok body.
+    /// If not fallible, pipes value to next step and recurses.
+    fn lowerErrorPipeChain(
+        self: *IrBuilder,
+        ep: hir_mod.ErrorPipeHir,
+        current_val: LocalId,
+        handler_local: LocalId,
+        start_idx: usize,
+        final_dest: LocalId,
+    ) anyerror!LocalId {
+        const step = ep.steps[start_idx];
+        const is_last = (start_idx == ep.steps.len - 1);
+
+        if (step.is_fallible) {
+            // This step returns a tagged union — wrap in union_switch
+            const ok_dest = self.next_local;
+            self.next_local += 1;
+
+            // Build Ok case body: pipe ok_dest through remaining steps
+            const saved = self.current_instrs;
+            self.current_instrs = .empty;
+
+            var ok_result: LocalId = ok_dest;
+            if (!is_last) {
+                // Pipe ok value through remaining steps
+                ok_result = try self.lowerErrorPipeRemainingSteps(ep, ok_dest, handler_local, start_idx + 1);
+            }
+
+            const ok_body_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
+            self.current_instrs = saved;
+
+            const cases = try self.allocator.alloc(UnionCase, 2);
+            cases[0] = .{
+                .variant_name = "Ok",
+                .field_bindings = &.{},
+                .body_instrs = ok_body_instrs,
+                .return_value = ok_result,
+            };
+            cases[1] = .{
+                .variant_name = "Error",
+                .field_bindings = &.{},
+                .body_instrs = &.{},
+                .return_value = handler_local,
+            };
+
+            try self.current_instrs.append(self.allocator, .{
+                .union_switch = .{
+                    .dest = final_dest,
+                    .scrutinee = current_val,
+                    .cases = cases,
+                },
+            });
+            return final_dest;
+        } else {
+            // Not fallible — this shouldn't happen for step 0 (it should be fallible)
+            // but handle gracefully by just returning the value
+            return current_val;
+        }
+    }
+
+    /// Lower remaining pipe steps after a fallible step's Ok branch.
+    /// Each step is a function call with the previous Ok value piped as first arg.
+    /// Emits all instructions (calls and switches) into self.current_instrs.
+    /// Returns the local holding the final result.
+    fn lowerErrorPipeRemainingSteps(
+        self: *IrBuilder,
+        ep: hir_mod.ErrorPipeHir,
+        input_val: LocalId,
+        handler_local: LocalId,
+        start_idx: usize,
+    ) anyerror!LocalId {
+        var pipe_val: LocalId = input_val;
+
+        var idx = start_idx;
+        while (idx < ep.steps.len) : (idx += 1) {
+            const step = ep.steps[idx];
+
+            // Build the call with pipe_val as first arg
+            if (step.expr.kind == .call) {
+                const call = step.expr.kind.call;
+                var arg_locals: std.ArrayList(LocalId) = .empty;
+                try arg_locals.append(self.allocator, pipe_val);
+                for (call.args) |arg| {
+                    try arg_locals.append(self.allocator, try self.lowerExpr(arg.expr));
+                }
+                const call_dest = self.next_local;
+                self.next_local += 1;
+                const final_args = try arg_locals.toOwnedSlice(self.allocator);
+                const modes = try self.allocator.alloc(ValueMode, final_args.len);
+                @memset(modes, .share);
+                try self.current_instrs.append(self.allocator, .{
+                    .call_named = .{
+                        .dest = call_dest,
+                        .name = switch (call.target) {
+                            .named => |n| try std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ n.module orelse "", n.name }),
+                            else => "unknown",
+                        },
+                        .args = final_args,
+                        .arg_modes = modes,
+                    },
+                });
+                pipe_val = call_dest;
+            }
+
+            // Detect if this step returns a tagged union
+            var is_step_fallible = step.is_fallible;
+            if (!is_step_fallible and step.expr.kind == .call) {
+                const call_name = switch (step.expr.kind.call.target) {
+                    .named => |n| std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ n.module orelse "", n.name }) catch "",
+                    else => "",
+                };
+                if (call_name.len > 0) {
+                    is_step_fallible = self.isFunctionReturningTaggedUnion(call_name);
+                }
+            }
+
+            if (is_step_fallible) {
+                // This step returned a tagged union — wrap in union_switch.
+                // All REMAINING steps go in the Ok body.
+                const ok_dest = self.next_local;
+                self.next_local += 1;
+
+                const saved = self.current_instrs;
+                self.current_instrs = .empty;
+
+                var ok_result: LocalId = ok_dest;
+                const is_last = (idx == ep.steps.len - 1);
+                if (!is_last) {
+                    ok_result = try self.lowerErrorPipeRemainingSteps(ep, ok_dest, handler_local, idx + 1);
+                }
+
+                const ok_body_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
+                self.current_instrs = saved;
+
+                const switch_dest = self.next_local;
+                self.next_local += 1;
+
+                const cases = try self.allocator.alloc(UnionCase, 2);
+                cases[0] = .{
+                    .variant_name = "Ok",
+                    .field_bindings = &.{},
+                    .body_instrs = ok_body_instrs,
+                    .return_value = ok_result,
+                };
+                cases[1] = .{
+                    .variant_name = "Error",
+                    .field_bindings = &.{},
+                    .body_instrs = &.{},
+                    .return_value = handler_local,
+                };
+
+                try self.current_instrs.append(self.allocator, .{
+                    .union_switch = .{
+                        .dest = switch_dest,
+                        .scrutinee = pipe_val,
+                        .cases = cases,
+                    },
+                });
+                return switch_dest;
+            }
+        }
+
+        return pipe_val;
+    }
+
+    /// Check if a function (by qualified name) returns a tagged union type.
+    fn isFunctionReturningTaggedUnion(self: *const IrBuilder, func_name: []const u8) bool {
+        for (self.functions.items) |func| {
+            if (std.mem.eql(u8, func.name, func_name)) {
+                if (func.return_type == .struct_ref) {
+                    if (self.type_store) |ts| {
+                        for (ts.types.items) |typ| {
+                            if (typ == .tagged_union) {
+                                if (std.mem.eql(u8, ts.interner.get(typ.tagged_union.name), func.return_type.struct_ref)) {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+                return false;
+            }
+        }
+        return false;
+    }
+
     fn lowerExpr(self: *IrBuilder, expr: *const hir_mod.Expr) anyerror!LocalId {
         // Case expressions need binding locals reserved before dest allocation
         // to avoid shadowing conflicts in the generated Zig.
@@ -2941,15 +3166,45 @@ pub const IrBuilder = struct {
                     },
                 });
             },
+            .error_pipe => |ep| {
+                // Lower error pipe to nested union_switch instructions.
+                // Each fallible step gets wrapped in a union_switch:
+                //   Ok => pipe to next step (possibly another union_switch)
+                //   Error => handler
+                if (ep.steps.len == 0) return dest;
+
+                // Lower the handler (shared by all Error branches)
+                const handler_local = try self.lowerExpr(ep.handler);
+
+                // Lower step 0 (the base call)
+                const step0_val = try self.lowerExpr(ep.steps[0].expr);
+
+                // Build the chain from inside out using a recursive helper.
+                // lowerErrorPipeChain processes step[start_idx] and chains remaining steps.
+                const result = try self.lowerErrorPipeChain(ep, step0_val, handler_local, 0, dest);
+                return result;
+            },
+            .union_init => |ui| {
+                const value_local = try self.lowerExpr(ui.value);
+                const type_name = self.resolveTypeName(ui.union_type_id);
+                try self.current_instrs.append(self.allocator, .{
+                    .union_init = .{
+                        .dest = dest,
+                        .union_type = type_name,
+                        .variant_name = self.interner.get(ui.variant_name),
+                        .value = value_local,
+                    },
+                });
+            },
             .field_get => |fg| {
                 // Check for enum variant access (object is nil_lit placeholder with enum type)
                 if (fg.object.kind == .nil_lit and self.type_store != null) {
                     const typ = self.type_store.?.getType(fg.object.type_id);
-                    if (typ == .enum_type) {
+                    if (typ == .tagged_union) {
                         try self.current_instrs.append(self.allocator, .{
                             .enum_literal = .{
                                 .dest = dest,
-                                .type_name = self.interner.get(typ.enum_type.name),
+                                .type_name = self.interner.get(typ.tagged_union.name),
                                 .variant = self.interner.get(fg.field),
                             },
                         });
@@ -3009,7 +3264,7 @@ pub const IrBuilder = struct {
             const typ = ts.getType(type_id);
             switch (typ) {
                 .struct_type => |st| return self.interner.get(st.name),
-                .enum_type => |et| return self.interner.get(et.name),
+                .tagged_union => |tu| return self.interner.get(tu.name),
                 else => {},
             }
         }
@@ -3157,8 +3412,8 @@ fn typeIdToZigTypeWithStore(type_id: types_mod.TypeId, type_store: ?*const types
                         .struct_type => |st| {
                             return .{ .struct_ref = ts.interner.get(st.name) };
                         },
-                        .enum_type => |et| {
-                            return .{ .struct_ref = ts.interner.get(et.name) };
+                        .tagged_union => |tu| {
+                            return .{ .struct_ref = ts.interner.get(tu.name) };
                         },
                         .opaque_type => |ot| {
                             return .{ .struct_ref = ts.interner.get(ot.name) };
@@ -3194,12 +3449,13 @@ fn typeIdToZigTypeWithStore(type_id: types_mod.TypeId, type_store: ?*const types
                                 }
                                 if (non_nil) |inner| {
                                     const inner_zig = typeIdToZigTypeWithStore(inner, type_store);
-                                    // Allocate the inner type on the heap for the optional pointer
                                     const inner_ptr = ts.allocator.create(ZigType) catch return .any;
                                     inner_ptr.* = inner_zig;
                                     return .{ .optional = inner_ptr };
                                 }
                             }
+                            // General union types (e.g. String | Err(Atom)) → anytype
+                            return .any;
                         },
                         else => {},
                     }
@@ -3243,8 +3499,8 @@ fn typeIdToZigTypeStrWithStore(type_id: types_mod.TypeId, type_store: ?*const ty
                         .struct_type => |st| {
                             return ts.interner.get(st.name);
                         },
-                        .enum_type => |et| {
-                            return ts.interner.get(et.name);
+                        .tagged_union => |tu| {
+                            return ts.interner.get(tu.name);
                         },
                         .opaque_type => |ot| {
                             return ts.interner.get(ot.name);

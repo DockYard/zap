@@ -164,6 +164,11 @@ pub const Cfg = struct {
                         try scanInstructionsForEdges(cfg, from_label, case.body_instrs);
                     }
                 },
+                .union_switch => |us| {
+                    for (us.cases) |case| {
+                        try scanInstructionsForEdges(cfg, from_label, case.body_instrs);
+                    }
+                },
                 else => {},
             }
         }
@@ -651,6 +656,14 @@ pub const UseDefInfo = struct {
                     if (case.return_value) |rv| try info.recordUse(rv, block);
                 }
             },
+            .union_switch => |us| {
+                try info.recordDef(us.dest, block);
+                try info.recordUse(us.scrutinee, block);
+                for (us.cases) |case| {
+                    try scanInstructionsForUseDef(info, block, case.body_instrs);
+                    if (case.return_value) |rv| try info.recordUse(rv, block);
+                }
+            },
 
             .ret => |ret_instr| {
                 if (ret_instr.value) |v| try info.recordUse(v, block);
@@ -1039,6 +1052,14 @@ fn instructionUsesLocal(local: ir.LocalId, instr: ir.Instruction) bool {
             }
             return false;
         },
+        .union_switch => |us| {
+            if (us.dest == local or us.scrutinee == local) return true;
+            for (us.cases) |case| {
+                if (case.return_value != null and case.return_value.? == local) return true;
+                if (containsLocalUse(local, case.body_instrs)) return true;
+            }
+            return false;
+        },
         .ret => |ret_instr| return ret_instr.value != null and ret_instr.value.? == local,
         .cond_return => |cr| return cr.condition == local or (cr.value != null and cr.value.? == local),
         .case_break => |cb| return cb.value != null and cb.value.? == local,
@@ -1304,6 +1325,14 @@ pub const ConstraintGenerator = struct {
                 for (usr.cases) |case| {
                     if (case.return_value) |rv| {
                         try self.addConstraint(self.regionOf(rv), .heap, .return_value);
+                    }
+                    try self.generateForInstructions(0, case.body_instrs);
+                }
+            },
+            .union_switch => |us| {
+                for (us.cases) |case| {
+                    if (case.return_value) |rv| {
+                        try self.addConstraint(self.regionOf(rv), self.regionOf(us.dest), .assignment);
                     }
                     try self.generateForInstructions(0, case.body_instrs);
                 }

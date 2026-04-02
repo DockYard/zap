@@ -73,7 +73,7 @@ pub const Collector = struct {
                 .type_decl => |td| try self.collectType(td, self.graph.prelude_scope),
                 .opaque_decl => |od| try self.collectOpaque(od, self.graph.prelude_scope),
                 .struct_decl => |sd| try self.collectStruct(sd, self.graph.prelude_scope),
-                .enum_decl => |ed| try self.collectEnum(ed, self.graph.prelude_scope),
+                .union_decl => |ed| try self.collectUnion(ed, self.graph.prelude_scope),
                 .module => {},
                 .priv_module => {},
             }
@@ -145,7 +145,7 @@ pub const Collector = struct {
                 .type_decl => |td| try self.collectType(td, mod_scope),
                 .opaque_decl => |od| try self.collectOpaque(od, mod_scope),
                 .struct_decl => |sd| try self.collectStruct(sd, mod_scope),
-                .enum_decl => |ed| try self.collectEnum(ed, mod_scope),
+                .union_decl => |ed| try self.collectUnion(ed, mod_scope),
                 .alias_decl => |ad| try self.collectAlias(ad, mod_scope),
                 .import_decl => |id_decl| try self.collectImport(id_decl, mod_scope),
             }
@@ -302,11 +302,11 @@ pub const Collector = struct {
         );
     }
 
-    fn collectEnum(self: *Collector, ed: *const ast.EnumDecl, parent_scope: scope.ScopeId) !void {
+    fn collectUnion(self: *Collector, ed: *const ast.UnionDecl, parent_scope: scope.ScopeId) !void {
         _ = try self.graph.registerType(
             ed.name,
             parent_scope,
-            .{ .enum_type = ed },
+            .{ .union_type = ed },
             &.{},
         );
     }

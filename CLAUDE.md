@@ -6,6 +6,10 @@
 
 **No fallbacks.** When refactoring, fully commit to the new approach. Remove old code entirely. If the new approach fails, that's a bug to surface, not hide.
 
+## Code Generation
+
+**Zap ALWAYS lowers to ZIR.** The only code generation path is `src/zir_builder.zig` → C-ABI calls to the Zig fork. *NEVER* generate Zig source text files. `src/codegen.zig` is legacy dead code — do not use it, do not write tests against it, do not treat it as a working backend. If a feature cannot be expressed through the ZIR builder, the correct fix is to add the necessary C-ABI function to the Zig fork (`~/projects/zig`), not to fall back to text codegen. Integration tests must validate through the ZIR path, not by checking generated Zig source strings.
+
 ## Release Process
 
 When the user says "release" (or similar), follow this procedure:

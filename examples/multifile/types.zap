@@ -13,7 +13,7 @@ pub struct Rectangle extends Shape {
   height :: f64
 }
 
-pub enum Color {
+pub union Color {
   Red
   Green
   Blue

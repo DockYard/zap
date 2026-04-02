@@ -500,6 +500,16 @@ pub const GeneralizedEscapeAnalyzer = struct {
                 }
             },
 
+            // Union switch (non-return).
+            .union_switch => |us| {
+                for (us.cases) |c| {
+                    try self.seedInstructions(func_id, c.body_instrs);
+                    if (c.return_value) |rv| {
+                        try self.raiseEscape(func_id, rv, .global_escape);
+                    }
+                }
+            },
+
             // Conditional return: value escapes globally.
             .cond_return => |cr| {
                 if (cr.value) |val| {

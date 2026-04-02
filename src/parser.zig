@@ -204,7 +204,7 @@ pub const Parser = struct {
     fn synchronize(self: *Parser) void {
         while (!self.check(.eof)) {
             switch (self.peek()) {
-                .keyword_pub, .keyword_fn, .keyword_module, .keyword_macro, .keyword_struct, .keyword_enum, .right_brace => return,
+                .keyword_pub, .keyword_fn, .keyword_module, .keyword_macro, .keyword_struct, .keyword_union, .right_brace => return,
                 .newline => {
                     _ = self.advance();
                     // After newline, check if next token starts a new statement
@@ -215,7 +215,7 @@ pub const Parser = struct {
                         .keyword_module,
                         .keyword_macro,
                         .keyword_struct,
-                        .keyword_enum,
+                        .keyword_union,
                         .keyword_type,
                         .keyword_opaque,
                         .keyword_alias,
@@ -307,10 +307,10 @@ pub const Parser = struct {
                                 self.synchronize();
                             }
                         },
-                        .keyword_enum => {
+                        .keyword_union => {
                             self.restoreLexerState(saved);
-                            if (self.parseEnumDecl()) |ed| {
-                                try top_items.append(self.allocator, .{ .enum_decl = ed });
+                            if (self.parseUnionDecl()) |ed| {
+                                try top_items.append(self.allocator, .{ .union_decl = ed });
                             } else |_| {
                                 self.synchronize();
                             }
@@ -318,7 +318,7 @@ pub const Parser = struct {
                         else => {
                             self.restoreLexerState(saved);
                             try self.addRichError(
-                                "I was expecting `module`, `fn`, `macro`, `struct`, or `enum` after `pub`",
+                                "I was expecting `module`, `fn`, `macro`, `struct`, or `union` after `pub`",
                                 self.currentSpan(),
                                 null,
                                 null,
@@ -377,9 +377,9 @@ pub const Parser = struct {
                         self.synchronize();
                     }
                 },
-                .keyword_enum => {
-                    if (self.parseEnumDecl()) |ed| {
-                        try top_items.append(self.allocator, .{ .enum_decl = ed });
+                .keyword_union => {
+                    if (self.parseUnionDecl()) |ed| {
+                        try top_items.append(self.allocator, .{ .union_decl = ed });
                     } else |_| {
                         self.synchronize();
                     }
@@ -527,10 +527,10 @@ pub const Parser = struct {
                                 self.synchronize();
                             }
                         },
-                        .keyword_enum => {
+                        .keyword_union => {
                             self.restoreLexerState(saved);
-                            if (self.parseEnumDecl()) |ed| {
-                                try items.append(self.allocator, .{ .enum_decl = ed });
+                            if (self.parseUnionDecl()) |ed| {
+                                try items.append(self.allocator, .{ .union_decl = ed });
                             } else |_| {
                                 self.synchronize();
                             }
@@ -538,7 +538,7 @@ pub const Parser = struct {
                         else => {
                             self.restoreLexerState(saved);
                             try self.addRichError(
-                                "I was expecting `fn`, `macro`, `struct`, or `enum` after `pub`",
+                                "I was expecting `fn`, `macro`, `struct`, or `union` after `pub`",
                                 self.currentSpan(),
                                 null,
                                 null,
@@ -568,9 +568,9 @@ pub const Parser = struct {
                         self.synchronize();
                     }
                 },
-                .keyword_enum => {
-                    if (self.parseEnumDecl()) |ed| {
-                        try items.append(self.allocator, .{ .enum_decl = ed });
+                .keyword_union => {
+                    if (self.parseUnionDecl()) |ed| {
+                        try items.append(self.allocator, .{ .union_decl = ed });
                     } else |_| {
                         self.synchronize();
                     }
@@ -881,10 +881,10 @@ pub const Parser = struct {
         });
     }
 
-    fn parseEnumDecl(self: *Parser) !*const ast.EnumDecl {
+    fn parseUnionDecl(self: *Parser) !*const ast.UnionDecl {
         const start = self.currentSpan();
         if (self.check(.keyword_pub)) _ = self.advance();
-        _ = try self.expect(.keyword_enum);
+        _ = try self.expect(.keyword_union);
 
         const name_tok = try self.expect(.module_identifier);
         const name = try self.internToken(name_tok);
@@ -892,7 +892,7 @@ pub const Parser = struct {
         _ = try self.expectAt(.left_brace, start);
         self.skipNewlines();
 
-        var variants: std.ArrayList(ast.EnumVariant) = .empty;
+        var variants: std.ArrayList(ast.UnionVariant) = .empty;
 
         while (!self.check(.right_brace) and !self.check(.eof)) {
             self.skipNewlines();
@@ -901,9 +901,15 @@ pub const Parser = struct {
             const variant_tok = try self.expect(.module_identifier);
             const variant_name = try self.internToken(variant_tok);
 
+            var type_expr: ?*const ast.TypeExpr = null;
+            if (self.match(.double_colon)) {
+                type_expr = try self.parseTypeExpr();
+            }
+
             try variants.append(self.allocator, .{
                 .meta = .{ .span = ast.SourceSpan.from(variant_tok.loc) },
                 .name = variant_name,
+                .type_expr = type_expr,
             });
 
             self.skipNewlines();
@@ -912,7 +918,7 @@ pub const Parser = struct {
         self.skipNewlines();
         _ = try self.expectAt(.right_brace, start);
 
-        return self.create(ast.EnumDecl, .{
+        return self.create(ast.UnionDecl, .{
             .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
             .name = name,
             .variants = try variants.toOwnedSlice(self.allocator),
@@ -3374,7 +3380,7 @@ fn tokenHumanName(tag: Token.Tag) []const u8 {
         .keyword_module => "`module`",
         .keyword_macro => "`macro`",
         .keyword_struct => "`struct`",
-        .keyword_enum => "`enum`",
+        .keyword_union => "`union`",
         .keyword_if => "`if`",
         .keyword_else => "`else`",
         .keyword_case => "`case`",
@@ -3922,9 +3928,9 @@ test "parse defstruct extends" {
     try std.testing.expectEqual(@as(usize, 1), circle.fields.len);
 }
 
-test "parse defenum" {
+test "parse union declaration" {
     const source =
-        \\pub enum Color {
+        \\pub union Color {
         \\  Red
         \\  Green
         \\  Blue
@@ -3938,7 +3944,7 @@ test "parse defenum" {
 
     const program = try parser.parseProgram();
     try std.testing.expectEqual(@as(usize, 1), program.top_items.len);
-    const ed = program.top_items[0].enum_decl;
+    const ed = program.top_items[0].union_decl;
     try std.testing.expectEqual(@as(usize, 3), ed.variants.len);
 }
 
@@ -4223,7 +4229,9 @@ test "parse error pipe ~> with block handler" {
         \\  }
         \\}
     ;
-    var parser = Parser.init(std.testing.allocator, source);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -4244,7 +4252,9 @@ test "parse error pipe ~> with function handler" {
         \\  }
         \\}
     ;
-    var parser = Parser.init(std.testing.allocator, source);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -4262,7 +4272,9 @@ test "parse Err() constructor" {
         \\  }
         \\}
     ;
-    var parser = Parser.init(std.testing.allocator, source);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();

@@ -221,23 +221,28 @@ pub const Desugarer = struct {
                 });
             },
 
-            // Error pipe: chain ~> handler → nested case checking for {:error, _}
+            // Error pipe: pass through to HIR builder which has type info
+            // to determine whether to use union tag switching or tuple matching.
+            // Do NOT desugar the inner pipe chain — the HIR builder needs to
+            // flatten it and insert error checks between steps.
             .error_pipe => |ep| {
-                const chain = try self.desugarExpr(ep.chain);
-                return self.desugarErrorPipe(chain, ep.handler, ep.meta);
+                return try self.create(ast.Expr, .{
+                    .error_pipe = .{
+                        .meta = ep.meta,
+                        .chain = ep.chain,
+                        .handler = ep.handler,
+                    },
+                });
             },
 
-            // Err(value) → {:error, value}
+            // Err(value) — pass through to HIR builder which has type info
+            // to determine whether to emit union_init or tuple fallback
             .err_constructor => |ec| {
                 const inner = try self.desugarExpr(ec.value);
-                const error_atom = try self.interner.intern("error");
                 return try self.create(ast.Expr, .{
-                    .tuple = .{
+                    .err_constructor = .{
                         .meta = ec.meta,
-                        .elements = try self.allocSlice(*const ast.Expr, &.{
-                            try self.create(ast.Expr, .{ .atom_literal = .{ .meta = ec.meta, .value = error_atom } }),
-                            inner,
-                        }),
+                        .value = inner,
                     },
                 });
             },
@@ -379,9 +384,26 @@ pub const Desugarer = struct {
                 });
             },
             .function => |func| {
-                // Build function call: handler_func(__err)
+                // Inject __err as first argument into the handler call
+                // ~> handle_error() desugars to handle_error(__err)
                 const err_name = try self.interner.intern("__err");
                 const err_ref = try self.create(ast.Expr, .{ .var_ref = .{ .meta = meta, .name = err_name } });
+                if (func.* == .call) {
+                    const call = func.call;
+                    var new_args: std.ArrayList(*const ast.Expr) = .empty;
+                    try new_args.append(self.allocator, err_ref);
+                    for (call.args) |arg| {
+                        try new_args.append(self.allocator, arg);
+                    }
+                    return try self.create(ast.Expr, .{
+                        .call = .{
+                            .meta = meta,
+                            .callee = call.callee,
+                            .args = try new_args.toOwnedSlice(self.allocator),
+                        },
+                    });
+                }
+                // Fallback: bare function ref, wrap in call
                 return try self.create(ast.Expr, .{
                     .call = .{
                         .meta = meta,

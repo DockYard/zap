@@ -190,7 +190,7 @@ pub const TypeKind = union(enum) {
     type_alias: *const ast.TypeExpr,
     opaque_type: *const ast.TypeExpr,
     struct_type: *const ast.StructDecl,
-    enum_type: *const ast.EnumDecl,
+    union_type: *const ast.UnionDecl,
 };
 
 // ============================================================

@@ -53,6 +53,11 @@ extern "c" fn zir_builder_emit_typeof(handle: ?*ZirBuilderHandle, operand: u32) 
 extern "c" fn zir_builder_emit_type_info(handle: ?*ZirBuilderHandle, operand: u32) u32;
 extern "c" fn zir_builder_emit_if_else(handle: ?*ZirBuilderHandle, condition: u32, then_value: u32, else_value: u32) u32;
 extern "c" fn zir_builder_emit_struct_init_anon(handle: ?*ZirBuilderHandle, names_ptrs: [*]const [*]const u8, names_lens: [*]const u32, values_ptr: [*]const u32, fields_len: u32) u32;
+extern "c" fn zir_builder_emit_union_init(handle: ?*ZirBuilderHandle, union_type: u32, field_name_ptr: [*]const u8, field_name_len: u32, init_value: u32) u32;
+
+// Switch block for tagged unions
+extern "c" fn zir_builder_begin_switch_block(handle: ?*ZirBuilderHandle, operand: u32) u64;
+extern "c" fn zir_builder_finalize_switch_block(handle: ?*ZirBuilderHandle, inst_idx: u32, operand: u32, prong_data_ptr: [*]const u32, prong_data_len: u32, num_prongs: u32) u32;
 
 // Body tracking control (for branch body emission)
 extern "c" fn zir_builder_set_body_tracking(handle: ?*ZirBuilderHandle, enabled: bool) void;
@@ -77,6 +82,9 @@ extern "c" fn zir_builder_get_tuple_return_type_len(handle: ?*ZirBuilderHandle) 
 extern "c" fn zir_builder_emit_struct_init_typed(handle: ?*ZirBuilderHandle, struct_type: u32, names_ptrs: [*]const [*]const u8, names_lens: [*]const u32, values_ptr: [*]const u32, fields_len: u32) u32;
 extern "c" fn zir_builder_emit_tuple_decl(handle: ?*ZirBuilderHandle, types_ptr: [*]const u32, types_len: u32) u32;
 extern "c" fn zir_builder_emit_tuple_decl_body(handle: ?*ZirBuilderHandle, types_ptr: [*]const u32, types_len: u32) u32;
+
+// Union return type
+extern "c" fn zir_builder_set_union_return_type(handle: ?*ZirBuilderHandle, names_ptrs: [*]const [*]const u8, names_lens: [*]const u32, types_ptr: [*]const u32, fields_len: u32) i32;
 
 // Body management
 extern "c" fn zir_builder_pop_body_inst(handle: ?*ZirBuilderHandle) u32;
@@ -415,6 +423,34 @@ pub const ZirDriver = struct {
         return null;
     }
 
+    fn findUnionDef(self: *const ZirDriver, type_name: []const u8) ?ir.UnionDef {
+        const prog = self.program orelse return null;
+        for (prog.type_defs) |type_def| {
+            if (!std.mem.eql(u8, type_def.name, type_name)) continue;
+            return switch (type_def.kind) {
+                .union_def => |def| def,
+                else => null,
+            };
+        }
+        return null;
+    }
+
+    /// Map a Zig type name string to a ZIR type Ref.
+    fn mapTypeNameToRef(_: *const ZirDriver, type_name: []const u8) u32 {
+        if (std.mem.eql(u8, type_name, "[]const u8")) return @intFromEnum(Zir.Inst.Ref.slice_const_u8_type);
+        if (std.mem.eql(u8, type_name, "bool")) return @intFromEnum(Zir.Inst.Ref.bool_type);
+        if (std.mem.eql(u8, type_name, "i64")) return @intFromEnum(Zir.Inst.Ref.i64_type);
+        if (std.mem.eql(u8, type_name, "i32")) return @intFromEnum(Zir.Inst.Ref.i32_type);
+        if (std.mem.eql(u8, type_name, "u32")) return @intFromEnum(Zir.Inst.Ref.u32_type);
+        if (std.mem.eql(u8, type_name, "u64")) return @intFromEnum(Zir.Inst.Ref.u64_type);
+        if (std.mem.eql(u8, type_name, "f64")) return @intFromEnum(Zir.Inst.Ref.f64_type);
+        if (std.mem.eql(u8, type_name, "f32")) return @intFromEnum(Zir.Inst.Ref.f32_type);
+        if (std.mem.eql(u8, type_name, "usize")) return @intFromEnum(Zir.Inst.Ref.usize_type);
+        if (std.mem.eql(u8, type_name, "void")) return @intFromEnum(Zir.Inst.Ref.void_type);
+        if (std.mem.eql(u8, type_name, "zap_runtime.Atom")) return @intFromEnum(Zir.Inst.Ref.u32_type);
+        return 0; // void fallback
+    }
+
     fn refForValueLocal(self: *ZirDriver, local: ir.LocalId) BuildError!u32 {
         if (self.reuse_backed_tuple_locals.get(local)) |arity| {
             const ptr_ref = try self.refForLocal(local);
@@ -597,6 +633,41 @@ pub const ZirDriver = struct {
                 return error.EmitFailed;
             }
             self.current_ret_type = 1;
+        }
+
+        // For union return types (tagged_union/struct_ref), look up the union def
+        // and set up the return type via union_decl.
+        if (func.return_type == .struct_ref) {
+            if (self.findUnionDef(func.return_type.struct_ref)) |union_def| {
+                var name_ptrs = std.ArrayListUnmanaged([*]const u8).empty;
+                defer name_ptrs.deinit(self.allocator);
+                var name_lens = std.ArrayListUnmanaged(u32).empty;
+                defer name_lens.deinit(self.allocator);
+                var type_refs = std.ArrayListUnmanaged(u32).empty;
+                defer type_refs.deinit(self.allocator);
+
+                for (union_def.variants) |variant| {
+                    try name_ptrs.append(self.allocator, variant.name.ptr);
+                    try name_lens.append(self.allocator, @intCast(variant.name.len));
+                    // Map variant type name to ZIR type ref
+                    const type_ref = if (variant.type_name) |tn|
+                        self.mapTypeNameToRef(tn)
+                    else
+                        0; // void for unit variants
+                    try type_refs.append(self.allocator, type_ref);
+                }
+
+                if (zir_builder_set_union_return_type(
+                    self.handle,
+                    name_ptrs.items.ptr,
+                    name_lens.items.ptr,
+                    type_refs.items.ptr,
+                    @intCast(union_def.variants.len),
+                ) != 0) {
+                    return error.EmitFailed;
+                }
+                self.current_ret_type = 1;
+            }
         }
 
         // Emit param instructions and register their Refs as locals.
@@ -890,6 +961,11 @@ pub const ZirDriver = struct {
                 },
                 .union_switch_return => |usr| {
                     for (usr.cases) |case| {
+                        if (findClosureTargetInInstrsDepth(case.body_instrs, local, depth)) |target| return target;
+                    }
+                },
+                .union_switch => |us| {
+                    for (us.cases) |case| {
                         if (findClosureTargetInInstrsDepth(case.body_instrs, local, depth)) |target| return target;
                     }
                 },
@@ -1546,6 +1622,11 @@ pub const ZirDriver = struct {
                 // Body-tracked emission: chain if-else-bodies for each case
                 // so Sema only analyzes the matching branch.
                 try self.emitUnionSwitchReturn(usr);
+            },
+            .union_switch => |us| {
+                // Non-return union switch: emit like union_switch_return
+                // but assign the result to dest instead of returning.
+                try self.emitUnionSwitch(us);
             },
             .cond_return => |cr| {
                 // Conditional return: if condition is true, return the value.
@@ -3272,6 +3353,99 @@ pub const ZirDriver = struct {
         }
 
         self.allocator.free(current_else_insts);
+    }
+
+    fn emitUnionSwitch(self: *ZirDriver, us: ir.UnionSwitch) BuildError!void {
+        const scrutinee_ref = try self.refForLocal(us.scrutinee);
+
+        if (us.cases.len == 0) return;
+
+        // Phase 1: Pre-emit ALL enum literals BEFORE the switch_block.
+        // ZIR requires prong item Refs to reference instructions emitted before the switch.
+        var item_refs = try self.allocator.alloc(u32, us.cases.len);
+        defer self.allocator.free(item_refs);
+        for (us.cases, 0..) |case, ci| {
+            item_refs[ci] = zir_builder_emit_enum_literal(self.handle, case.variant_name.ptr, @intCast(case.variant_name.len));
+            if (item_refs[ci] == error_ref) return error.EmitFailed;
+        }
+
+        // Phase 2: Begin switch_block — AFTER enum literals.
+        const begin_result = zir_builder_begin_switch_block(self.handle, scrutinee_ref);
+        if (begin_result == 0xFFFFFFFFFFFFFFFF) return error.EmitFailed;
+        const switch_inst_idx: u32 = @truncate(begin_result);
+        const payload_ref: u32 = @truncate(begin_result >> 32);
+
+        // Phase 3: Build each prong.
+        var prong_data = std.ArrayListUnmanaged(u32).empty;
+        defer prong_data.deinit(self.allocator);
+
+        for (us.cases, 0..) |case, ci| {
+            const item_ref = item_refs[ci];
+
+            const has_capture = true;
+            const is_ok = std.mem.eql(u8, case.variant_name, "Ok");
+
+            // Track body instructions manually (not via global capture)
+            // by disabling body tracking and collecting indices.
+            zir_builder_set_body_tracking(self.handle, false);
+            const body_start = zir_builder_get_inst_count(self.handle);
+
+            if (is_ok) {
+                if (case.return_value) |rv| {
+                    try self.setLocal(rv, payload_ref);
+                }
+            }
+
+            // Emit body instructions (these go into the instruction stream
+            // but NOT into the function body list)
+            for (case.body_instrs) |bi| {
+                try self.emitInstruction(bi);
+            }
+
+            var case_result: u32 = @intFromEnum(Zir.Inst.Ref.void_value);
+            if (is_ok) {
+                if (case.return_value) |rv| {
+                    case_result = self.refForLocal(rv) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                }
+            } else {
+                if (case.return_value) |rv| {
+                    case_result = self.refForValueLocal(rv) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                }
+            }
+
+            const body_end = zir_builder_get_inst_count(self.handle);
+            zir_builder_set_body_tracking(self.handle, true);
+
+            // Collect instruction indices emitted during the body
+            const case_len = body_end - body_start;
+            var body_insts = std.ArrayListUnmanaged(u32).empty;
+            defer body_insts.deinit(self.allocator);
+            for (body_start..body_end) |inst_i| {
+                try body_insts.append(self.allocator, @intCast(inst_i));
+            }
+
+            // Pack: [item, has_capture, body_insts_len, body_result, insts...]
+            try prong_data.append(self.allocator, item_ref);
+            try prong_data.append(self.allocator, if (has_capture) @as(u32, 1) else @as(u32, 0));
+            try prong_data.append(self.allocator, case_len);
+            try prong_data.append(self.allocator, case_result);
+            for (body_insts.items) |inst| {
+                try prong_data.append(self.allocator, inst);
+            }
+        }
+
+        // Phase 3: Finalize the switch_block
+        const result_ref = zir_builder_finalize_switch_block(
+            self.handle,
+            switch_inst_idx,
+            scrutinee_ref,
+            prong_data.items.ptr,
+            @intCast(prong_data.items.len),
+            @intCast(us.cases.len),
+        );
+        if (result_ref == error_ref) return error.EmitFailed;
+
+        try self.setLocal(us.dest, result_ref);
     }
 };
 

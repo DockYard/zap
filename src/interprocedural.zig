@@ -172,6 +172,11 @@ pub const CallGraph = struct {
                         try self.scanInstructions(caller, c.body_instrs);
                     }
                 },
+                .union_switch => |us| {
+                    for (us.cases) |c| {
+                        try self.scanInstructions(caller, c.body_instrs);
+                    }
+                },
                 else => {},
             }
         }
@@ -542,7 +547,7 @@ pub const InterproceduralAnalyzer = struct {
                     }
                     if (hasRetInstruction(cb.default_instrs)) return true;
                 },
-                .switch_return, .union_switch_return => return true,
+                .switch_return, .union_switch_return, .union_switch => return true,
                 else => {},
             }
         }
@@ -899,6 +904,15 @@ pub const InterproceduralAnalyzer = struct {
 
                 .union_switch_return => |usr| {
                     for (usr.cases) |c| {
+                        try self.analyzeInstructions(c.body_instrs, num_params, param_summaries, aliases, fresh_locals, return_sources);
+                        if (c.return_value) |rv| {
+                            try self.recordReturnValue(rv, param_summaries, aliases, fresh_locals, return_sources);
+                        }
+                    }
+                },
+
+                .union_switch => |us| {
+                    for (us.cases) |c| {
                         try self.analyzeInstructions(c.body_instrs, num_params, param_summaries, aliases, fresh_locals, return_sources);
                         if (c.return_value) |rv| {
                             try self.recordReturnValue(rv, param_summaries, aliases, fresh_locals, return_sources);

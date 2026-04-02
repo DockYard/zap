@@ -581,7 +581,7 @@ pub const CodeGen = struct {
                     try self.writeIndent();
                     try self.write(variant.name);
                     try self.write(": ");
-                    try self.write(variant.type_name);
+                    try self.write(variant.type_name orelse "void");
                     try self.write(",\n");
                 }
                 self.indent_level -= 1;
@@ -1860,6 +1860,58 @@ pub const CodeGen = struct {
                     self.indent_level += 1;
 
                     // Emit field bindings from payload
+                    for (case.field_bindings) |fb| {
+                        try self.writeIndent();
+                        try self.write("const ");
+                        try self.write(fb.local_name);
+                        try self.write(" = __payload.");
+                        try self.write(fb.field_name);
+                        try self.write(";\n");
+                    }
+
+                    for (case.body_instrs) |sub_instr| {
+                        try self.emitInstruction(&sub_instr);
+                    }
+                    if (case.return_value) |r| {
+                        try self.writeIndent();
+                        try self.write("break :");
+                        try self.write(case_label);
+                        try self.write(" ");
+                        try self.writeLocal(r);
+                        try self.write(";\n");
+                    }
+                    self.indent_level -= 1;
+                    try self.writeIndent();
+                    try self.write("},\n");
+                }
+
+                self.indent_level -= 1;
+                try self.writeIndent();
+                try self.write("};\n");
+            },
+            .union_switch => |us| {
+                // Emit: const __local_N = switch (__local_M) { .Variant => |payload| { ... }, ... };
+                try self.writeIndent();
+                try self.writeDestLocal(us.dest);
+                try self.write(" = switch (");
+                try self.writeLocal(us.scrutinee);
+                try self.write(") {\n");
+                self.indent_level += 1;
+
+                for (us.cases, 0..) |case, case_i| {
+                    try self.writeIndent();
+                    try self.write(".");
+                    try self.write(case.variant_name);
+                    if (case.field_bindings.len > 0 or case.body_instrs.len > 0) {
+                        try self.write(" => |__payload| ");
+                    } else {
+                        try self.write(" => ");
+                    }
+                    const case_label = try std.fmt.allocPrint(self.allocator, "blk_us_{d}", .{case_i});
+                    try self.write(case_label);
+                    try self.write(": {\n");
+                    self.indent_level += 1;
+
                     for (case.field_bindings) |fb| {
                         try self.writeIndent();
                         try self.write("const ");

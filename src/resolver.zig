@@ -90,7 +90,7 @@ pub const Resolver = struct {
             .type_decl => |td| try self.resolveTypeDecl(td),
             .opaque_decl => |od| try self.resolveOpaqueDecl(od),
             .struct_decl => {},
-            .enum_decl => {},
+            .union_decl => {},
             .module => {},
             .priv_module => {},
         }

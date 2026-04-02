@@ -309,7 +309,7 @@ pub fn analyzeProgram(
                     try ref_types.append(allocator, interner.get(parent));
                 }
             },
-            .enum_decl => |ed| {
+            .union_decl => |ed| {
                 try def_types.append(allocator, interner.get(ed.name));
             },
             .module => |mod| {

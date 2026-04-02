@@ -170,9 +170,38 @@ pub const ExprKind = union(enum) {
     panic: *const Expr,
     unwrap: *const Expr, // optional force-unwrap (expr!)
 
+    // Union
+    union_init: UnionInitExpr,
+    error_pipe: ErrorPipeHir,
+
     // Special
     closure_create: ClosureCreate,
     never,
+};
+
+pub const UnionInitExpr = struct {
+    union_type_id: types_mod.TypeId,
+    variant_name: ast.StringId,
+    value: *const Expr,
+};
+
+pub const ErrorPipeHir = struct {
+    /// The chain steps: first is the base call, rest are pipe steps.
+    /// Each step except the first takes the previous step's Ok value as first arg.
+    steps: []const ErrorPipeStep,
+    /// The error handler — called with the Error variant's payload.
+    handler: *const Expr,
+    /// The tagged union type returned by fallible steps.
+    union_type_id: types_mod.TypeId,
+};
+
+pub const ErrorPipeStep = struct {
+    /// The HIR expression for this step. For step 0, it's the base call.
+    /// For step N > 0, it's a call expression where the first arg should be
+    /// substituted with the Ok payload from step N-1.
+    expr: *const Expr,
+    /// Whether this step returns a tagged union (fallible) or a plain type.
+    is_fallible: bool,
 };
 
 pub const BinaryExpr = struct {
@@ -1266,6 +1295,7 @@ pub const HirBuilder = struct {
     current_clause_scope: ?scope_mod.ScopeId,
     current_function_root_scope: ?scope_mod.ScopeId,
     current_function_name: ?[]const u8,
+    current_fn_return_type: types_mod.TypeId = types_mod.TypeStore.UNKNOWN,
     family_to_group: std.AutoHashMap(scope_mod.FunctionFamilyId, u32),
     group_captures: std.AutoHashMap(u32, []const Capture),
     current_capture_map: std.AutoHashMap(ast.StringId, u32),
@@ -1619,7 +1649,7 @@ pub const HirBuilder = struct {
                         .kind = .struct_type,
                     });
                 },
-                .enum_decl => |ed| {
+                .union_decl => |ed| {
                     try type_defs.append(self.allocator, .{
                         .name = ed.name,
                         .type_id = types_mod.TypeStore.UNKNOWN,
@@ -1812,6 +1842,8 @@ pub const HirBuilder = struct {
         else
             types_mod.TypeStore.NEVER;
 
+        self.current_fn_return_type = return_type;
+
         // Track param names for var_ref resolution
         var param_names: std.ArrayList(?ast.StringId) = .empty;
         for (params.items) |p| {
@@ -1918,7 +1950,49 @@ pub const HirBuilder = struct {
         const refinement_expr = if (clause.refinement) |ref| try self.buildExpr(ref) else null;
 
         // Build body block
-        const body = try self.buildBlock(clause.body);
+        var body = try self.buildBlock(clause.body);
+
+        // Auto-wrap: if return type is a synthesized tagged union and the body
+        // produces the Ok variant's inner type, wrap the last expression in Ok
+        if (return_type < self.type_store.types.items.len) {
+            const ret_type = self.type_store.types.items[return_type];
+            if (ret_type == .tagged_union and body.stmts.len > 0) {
+                const last_stmt = body.stmts[body.stmts.len - 1];
+                if (last_stmt == .expr) {
+                    const last_expr = last_stmt.expr;
+                    // Don't wrap if the expression already produces the union type
+                    if (last_expr.type_id != return_type) {
+                        // Check if it matches the Ok variant's inner type
+                        const interner_mut: *ast.StringInterner = @constCast(self.interner);
+                        const ok_name = interner_mut.intern("Ok") catch unreachable;
+                        for (ret_type.tagged_union.variants) |v| {
+                            if (v.name == ok_name) {
+                                if (v.type_id) |ok_tid| {
+                                    if (last_expr.type_id == ok_tid or last_expr.type_id == types_mod.TypeStore.UNKNOWN) {
+                                        const wrapped = try self.create(Expr, .{
+                                            .kind = .{ .union_init = .{
+                                                .union_type_id = return_type,
+                                                .variant_name = ok_name,
+                                                .value = last_expr,
+                                            } },
+                                            .type_id = return_type,
+                                            .span = last_expr.span,
+                                        });
+                                        const new_stmts = try self.allocator.alloc(Stmt, body.stmts.len);
+                                        @memcpy(new_stmts[0 .. body.stmts.len - 1], body.stmts[0 .. body.stmts.len - 1]);
+                                        new_stmts[body.stmts.len - 1] = .{ .expr = wrapped };
+                                        const new_block = try self.allocator.create(Block);
+                                        new_block.* = .{ .stmts = new_stmts, .result_type = return_type };
+                                        body = new_block;
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         return .{
             .params = try params.toOwnedSlice(self.allocator),
@@ -2206,6 +2280,33 @@ pub const HirBuilder = struct {
                 .span = uo.meta.span,
             }),
             .call => |call| {
+                // Check for union variant constructor: Result.Ok("hello")
+                // Parsed as call(module_ref(["Result", "Ok"]), args)
+                if (call.callee.* == .module_ref and call.args.len >= 1) {
+                    const parts = call.callee.module_ref.name.parts;
+                    if (parts.len == 2) {
+                        if (self.type_store.name_to_type.get(parts[0])) |tid| {
+                            const typ = self.type_store.getType(tid);
+                            if (typ == .tagged_union) {
+                                for (typ.tagged_union.variants) |v| {
+                                    if (v.name == parts[1] and v.type_id != null) {
+                                        const arg_expr = try self.buildExpr(call.args[0]);
+                                        return try self.create(Expr, .{
+                                            .kind = .{ .union_init = .{
+                                                .union_type_id = tid,
+                                                .variant_name = parts[1],
+                                                .value = arg_expr,
+                                            } },
+                                            .type_id = tid,
+                                            .span = call.meta.span,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 var args: std.ArrayList(CallArg) = .empty;
                 for (call.args) |arg| {
                     try args.append(self.allocator, .{
@@ -2414,6 +2515,51 @@ pub const HirBuilder = struct {
                     .span = ce.meta.span,
                 });
             },
+            .error_pipe => |ep| {
+                return try self.buildErrorPipe(ep);
+            },
+            .err_constructor => |ec| {
+                const value_expr = try self.buildExpr(ec.value);
+                const ret_tid = self.current_fn_return_type;
+
+                // If the return type is a tagged union, emit union_init with Error variant
+                if (ret_tid < self.type_store.types.items.len) {
+                    const ret_type = self.type_store.types.items[ret_tid];
+                    if (ret_type == .tagged_union) {
+                        const interner_mut: *ast.StringInterner = @constCast(self.interner);
+                        const error_name = interner_mut.intern("Error") catch return error.OutOfMemory;
+                        for (ret_type.tagged_union.variants) |v| {
+                            if (v.name == error_name) {
+                                return try self.create(Expr, .{
+                                    .kind = .{ .union_init = .{
+                                        .union_type_id = ret_tid,
+                                        .variant_name = error_name,
+                                        .value = value_expr,
+                                    } },
+                                    .type_id = ret_tid,
+                                    .span = ec.meta.span,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // Fallback: Err(x) → {:error, x} tuple (for non-union return types)
+                const interner_mut: *ast.StringInterner = @constCast(self.interner);
+                const error_atom = interner_mut.intern("error") catch return error.OutOfMemory;
+                const elems = try self.allocator.alloc(*const Expr, 2);
+                elems[0] = try self.create(Expr, .{
+                    .kind = .{ .atom_lit = error_atom },
+                    .type_id = types_mod.TypeStore.ATOM,
+                    .span = ec.meta.span,
+                });
+                elems[1] = value_expr;
+                return try self.create(Expr, .{
+                    .kind = .{ .tuple_init = elems },
+                    .type_id = types_mod.TypeStore.UNKNOWN,
+                    .span = ec.meta.span,
+                });
+            },
             .panic_expr => |pe| try self.create(Expr, .{
                 .kind = .{ .panic = try self.buildExpr(pe.message) },
                 .type_id = types_mod.TypeStore.NEVER,
@@ -2499,7 +2645,7 @@ pub const HirBuilder = struct {
                     if (mod_parts.len == 1) {
                         if (self.type_store.name_to_type.get(mod_parts[0])) |tid| {
                             const typ = self.type_store.getType(tid);
-                            if (typ == .enum_type) {
+                            if (typ == .tagged_union) {
                                 return try self.create(Expr, .{
                                     .kind = .{
                                         .field_get = .{
@@ -2569,7 +2715,7 @@ pub const HirBuilder = struct {
                 if (mr.name.parts.len == 2) {
                     if (self.type_store.name_to_type.get(mr.name.parts[0])) |tid| {
                         const typ = self.type_store.getType(tid);
-                        if (typ == .enum_type) {
+                        if (typ == .tagged_union) {
                             return try self.create(Expr, .{
                                 .kind = .{
                                     .field_get = .{
@@ -2605,6 +2751,135 @@ pub const HirBuilder = struct {
     }
 
     // ============================================================
+    // Error pipe lowering
+    // ============================================================
+
+    /// Build an error pipe expression: chain ~> handler
+    /// Flattens the pipe chain, builds each step, detects which return tagged
+    /// unions, and produces an ErrorPipeHir that the IR builder lowers to
+    /// nested union_switch instructions.
+    fn buildErrorPipe(self: *HirBuilder, ep: ast.ErrorPipeExpr) anyerror!*const Expr {
+        // Flatten the AST pipe chain into individual steps
+        var ast_steps: std.ArrayList(*const ast.Expr) = .empty;
+        self.flattenAstPipeChain(ep.chain, &ast_steps);
+
+        if (ast_steps.items.len == 0) {
+            return try self.create(Expr, .{
+                .kind = .nil_lit,
+                .type_id = types_mod.TypeStore.UNKNOWN,
+                .span = ep.meta.span,
+            });
+        }
+
+        // Build each step as a HIR expression.
+        // Step 0 is the base call. Steps 1+ are pipe rhs (need lhs piped in as first arg).
+        var hir_steps: std.ArrayList(ErrorPipeStep) = .empty;
+        for (ast_steps.items) |step| {
+            const hir_expr = try self.buildExpr(step);
+            const is_fallible = blk: {
+                if (hir_expr.type_id < self.type_store.types.items.len) {
+                    if (self.type_store.types.items[hir_expr.type_id] == .tagged_union) {
+                        break :blk true;
+                    }
+                }
+                break :blk false;
+            };
+            try hir_steps.append(self.allocator, .{
+                .expr = hir_expr,
+                .is_fallible = is_fallible,
+            });
+        }
+
+        // Determine the union type from the first fallible step
+        var union_type_id: types_mod.TypeId = types_mod.TypeStore.UNKNOWN;
+        for (hir_steps.items) |step| {
+            if (step.is_fallible) {
+                union_type_id = step.expr.type_id;
+                break;
+            }
+        }
+
+        // Build the error handler expression
+        const handler_expr = try self.buildErrorHandlerExpr(ep.handler, ep.meta);
+
+        // Determine the result type (the Ok variant's inner type)
+        var result_type: types_mod.TypeId = types_mod.TypeStore.UNKNOWN;
+        if (union_type_id < self.type_store.types.items.len) {
+            const ut = self.type_store.types.items[union_type_id];
+            if (ut == .tagged_union) {
+                const interner_mut: *ast.StringInterner = @constCast(self.interner);
+                const ok_name = interner_mut.intern("Ok") catch unreachable;
+                for (ut.tagged_union.variants) |v| {
+                    if (v.name == ok_name) {
+                        result_type = v.type_id orelse types_mod.TypeStore.UNKNOWN;
+                        break;
+                    }
+                }
+            }
+        }
+
+        return try self.create(Expr, .{
+            .kind = .{ .error_pipe = .{
+                .steps = try hir_steps.toOwnedSlice(self.allocator),
+                .handler = handler_expr,
+                .union_type_id = union_type_id,
+            } },
+            .type_id = result_type,
+            .span = ep.meta.span,
+        });
+    }
+
+    /// Flatten a pipe chain AST expression into individual steps.
+    fn flattenAstPipeChain(self: *HirBuilder, expr: *const ast.Expr, steps: *std.ArrayList(*const ast.Expr)) void {
+        switch (expr.*) {
+            .pipe => |pe| {
+                self.flattenAstPipeChain(pe.lhs, steps);
+                steps.append(self.allocator, pe.rhs) catch {};
+            },
+            else => {
+                steps.append(self.allocator, expr) catch {};
+            },
+        }
+    }
+
+    /// Build an error handler HIR expression from an AST ErrorHandler.
+    fn buildErrorHandlerExpr(self: *HirBuilder, handler: ast.ErrorHandler, meta: ast.NodeMeta) !*const Expr {
+        switch (handler) {
+            .block => |clauses| {
+                // Build a case expression: case __err { pattern -> body, ... }
+                // The scrutinee will be substituted by the IR builder
+                const interner_mut: *ast.StringInterner = @constCast(self.interner);
+                const err_name = interner_mut.intern("__err") catch unreachable;
+                const scrutinee = try self.create(Expr, .{
+                    .kind = .{ .local_get = 0 }, // placeholder, will be substituted
+                    .type_id = types_mod.TypeStore.UNKNOWN,
+                    .span = meta.span,
+                });
+                _ = scrutinee;
+                _ = err_name;
+
+                // For now, build the handler bodies directly
+                // The block handler has case clauses; build the first body as fallback
+                if (clauses.len > 0) {
+                    const first_body = try self.buildBlock(clauses[0].body);
+                    if (first_body.stmts.len > 0) {
+                        const last = first_body.stmts[first_body.stmts.len - 1];
+                        if (last == .expr) return last.expr;
+                    }
+                }
+                return try self.create(Expr, .{
+                    .kind = .nil_lit,
+                    .type_id = types_mod.TypeStore.UNKNOWN,
+                    .span = meta.span,
+                });
+            },
+            .function => |func| {
+                return try self.buildExpr(func);
+            },
+        }
+    }
+
+    // ============================================================
     // Allocation helper
     // ============================================================
 
@@ -2612,6 +2887,35 @@ pub const HirBuilder = struct {
         return switch (type_expr.*) {
             .name => |n| {
                 const name_str = self.interner.get(n.name);
+
+                // Err(X) in type position → {Atom, X} (error tuple)
+                // Bare Err → {Atom, Atom} | {Atom, String}
+                if (std.mem.eql(u8, name_str, "Err")) {
+                    const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
+                    if (n.args.len == 1) {
+                        const inner_type = self.resolveTypeExpr(n.args[0]);
+                        const elements = self.allocator.alloc(TypeId, 2) catch return types_mod.TypeStore.UNKNOWN;
+                        elements[0] = types_mod.TypeStore.ATOM;
+                        elements[1] = inner_type;
+                        return store_ptr.addType(.{ .tuple = .{ .elements = elements } }) catch types_mod.TypeStore.UNKNOWN;
+                    } else if (n.args.len == 0) {
+                        const atom_err_elems = self.allocator.alloc(TypeId, 2) catch return types_mod.TypeStore.UNKNOWN;
+                        atom_err_elems[0] = types_mod.TypeStore.ATOM;
+                        atom_err_elems[1] = types_mod.TypeStore.ATOM;
+                        const atom_err = store_ptr.addType(.{ .tuple = .{ .elements = atom_err_elems } }) catch return types_mod.TypeStore.UNKNOWN;
+
+                        const string_err_elems = self.allocator.alloc(TypeId, 2) catch return types_mod.TypeStore.UNKNOWN;
+                        string_err_elems[0] = types_mod.TypeStore.ATOM;
+                        string_err_elems[1] = types_mod.TypeStore.STRING;
+                        const string_err = store_ptr.addType(.{ .tuple = .{ .elements = string_err_elems } }) catch return types_mod.TypeStore.UNKNOWN;
+
+                        const members = self.allocator.alloc(TypeId, 2) catch return types_mod.TypeStore.UNKNOWN;
+                        members[0] = atom_err;
+                        members[1] = string_err;
+                        return store_ptr.addType(.{ .union_type = .{ .members = members } }) catch types_mod.TypeStore.UNKNOWN;
+                    }
+                }
+
                 // First check builtins
                 if (self.type_store.resolveTypeName(name_str)) |id| return id;
                 // Then check user-defined types (struct/enum) from scope graph
@@ -2634,14 +2938,44 @@ pub const HirBuilder = struct {
                 };
             },
             .union_type => |ut| {
-                // Resolve each member type, then find matching union in the TypeStore
-                // (the TypeChecker already created this union type during its pass)
+                // Detect T | Err(E) pattern — find the synthesized tagged union
+                if (ut.members.len == 2) {
+                    var ok_expr: ?*const ast.TypeExpr = null;
+                    var err_expr: ?*const ast.TypeExpr = null;
+
+                    for (ut.members) |member| {
+                        if (member.* == .name) {
+                            const mn = member.name;
+                            const mname = self.interner.get(mn.name);
+                            if (std.mem.eql(u8, mname, "Err") and mn.args.len == 1) {
+                                err_expr = mn.args[0];
+                                continue;
+                            }
+                        }
+                        ok_expr = member;
+                    }
+
+                    if (ok_expr != null and err_expr != null) {
+                        // Resolve Ok and Err types, build the deterministic name
+                        const ok_type = self.resolveTypeExpr(ok_expr.?);
+                        const err_type = self.resolveTypeExpr(err_expr.?);
+                        const ok_str = typeIdToName(ok_type, self.type_store);
+                        const err_str = typeIdToName(err_type, self.type_store);
+                        const synth_name = std.fmt.allocPrint(self.allocator, "__Result__{s}__{s}", .{ ok_str, err_str }) catch return types_mod.TypeStore.UNKNOWN;
+                        const interner_mut: *ast.StringInterner = @constCast(self.interner);
+                        const name_id = interner_mut.intern(synth_name) catch return types_mod.TypeStore.UNKNOWN;
+                        if (self.type_store.name_to_type.get(name_id)) |tid| {
+                            return tid;
+                        }
+                    }
+                }
+
+                // General union type — resolve each member
                 var member_types: std.ArrayList(TypeId) = .empty;
                 for (ut.members) |member| {
                     member_types.append(self.allocator, self.resolveTypeExpr(member)) catch return types_mod.TypeStore.UNKNOWN;
                 }
                 const members = member_types.toOwnedSlice(self.allocator) catch return types_mod.TypeStore.UNKNOWN;
-                // Search the TypeStore for a matching union type
                 for (self.type_store.types.items, 0..) |typ, i| {
                     if (typ == .union_type) {
                         const existing = typ.union_type;
@@ -3221,4 +3555,42 @@ test "HIR closure calls adopt borrowed ownership mode" {
     const call_expr = hir_program.modules[0].functions[0].clauses[0].body.stmts[0].expr;
     try std.testing.expect(call_expr.kind == .call);
     try std.testing.expectEqual(ValueMode.borrow, call_expr.kind.call.args[0].mode);
+}
+
+/// Map a TypeId to a human-readable name string for synthesized type naming.
+/// Must produce the same strings as TypeChecker.typeToString for deterministic matching.
+fn typeIdToName(type_id: types_mod.TypeId, type_store: *const types_mod.TypeStore) []const u8 {
+    return switch (type_id) {
+        types_mod.TypeStore.BOOL => "Bool",
+        types_mod.TypeStore.STRING => "String",
+        types_mod.TypeStore.ATOM => "Atom",
+        types_mod.TypeStore.NIL => "Nil",
+        types_mod.TypeStore.NEVER => "Never",
+        types_mod.TypeStore.I64 => "i64",
+        types_mod.TypeStore.I32 => "i32",
+        types_mod.TypeStore.I16 => "i16",
+        types_mod.TypeStore.I8 => "i8",
+        types_mod.TypeStore.U64 => "u64",
+        types_mod.TypeStore.U32 => "u32",
+        types_mod.TypeStore.U16 => "u16",
+        types_mod.TypeStore.U8 => "u8",
+        types_mod.TypeStore.F64 => "f64",
+        types_mod.TypeStore.F32 => "f32",
+        types_mod.TypeStore.F16 => "f16",
+        types_mod.TypeStore.USIZE => "usize",
+        types_mod.TypeStore.ISIZE => "isize",
+        types_mod.TypeStore.UNKNOWN => "{unknown}",
+        types_mod.TypeStore.ERROR => "{error}",
+        else => {
+            if (type_id < type_store.types.items.len) {
+                const typ = type_store.types.items[type_id];
+                return switch (typ) {
+                    .tagged_union => |tu| type_store.interner.get(tu.name),
+                    .struct_type => |st| type_store.interner.get(st.name),
+                    else => "{type}",
+                };
+            }
+            return "{type}";
+        },
+    };
 }
