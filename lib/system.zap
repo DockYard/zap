@@ -3,15 +3,15 @@ pub module System {
     :zig.arg_count()
   }
 
-  pub fn arg_at(index :: i64) -> String {
-    :zig.arg_at(index)
+  pub fn arg_at(_index :: i64) -> String {
+    :zig.arg_at(_index)
   }
 
-  pub fn get_env(name :: String) -> String {
-    :zig.get_env(name)
+  pub fn get_env(_name :: String) -> String {
+    :zig.get_env(_name)
   }
 
-  pub fn get_build_opt(name :: String) -> String {
-    :zig.get_build_opt(name)
+  pub fn get_build_opt(_name :: String) -> String {
+    :zig.get_build_opt(_name)
   }
 }

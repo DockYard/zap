@@ -2223,7 +2223,13 @@ pub const TypeChecker = struct {
             .unquote_expr => TypeStore.UNKNOWN,
             .with_expr => TypeStore.UNKNOWN, // desugared before type checking
             .cond_expr => TypeStore.UNKNOWN, // desugared before type checking
-            .intrinsic => TypeStore.UNKNOWN,
+            .intrinsic => |intr| {
+                // Recurse into intrinsic args so var_refs mark bindings as used
+                for (intr.args) |arg| {
+                    _ = try self.inferExpr(arg);
+                }
+                return TypeStore.UNKNOWN;
+            },
             .attr_ref => TypeStore.UNKNOWN,
             .binary_literal => TypeStore.STRING, // binary literals produce []const u8
             .type_annotated => |ta| {
@@ -2385,6 +2391,21 @@ pub const TypeChecker = struct {
         // Module-qualified call: IO.puts(...) is a call with field_access callee
         if (call.callee.* == .field_access) {
             const fa = call.callee.field_access;
+            // :zig.func(args) — bridge call; infer args to mark bindings as used
+            if (fa.object.* == .atom_literal) {
+                for (call.args) |arg| {
+                    _ = try self.inferExpr(arg);
+                    // Mark any var_ref args as referenced directly
+                    if (arg.* == .var_ref) {
+                        if (self.current_scope) |scope_id| {
+                            if (self.graph.resolveBinding(scope_id, arg.var_ref.name)) |bid| {
+                                self.referenced_bindings.put(bid, {}) catch {};
+                            }
+                        }
+                    }
+                }
+                return TypeStore.UNKNOWN;
+            }
             if (fa.object.* == .module_ref) {
                 // Look up the module's scope and resolve the function there
                 const mod_name = fa.object.module_ref.name;
@@ -4022,6 +4043,40 @@ test "used variable no unused warning" {
 
     for (checker.errors.items) |err| {
         try std.testing.expect(std.mem.indexOf(u8, err.message, "variable `x` is unused") == null);
+    }
+}
+
+test "variable used in zig intrinsic call is not unused" {
+    const source =
+        \\pub module Test {
+        \\  pub fn greet(name :: String) -> String {
+        \\    :zig.to_atom(name)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var desugarer = @import("desugar.zig").Desugarer.init(alloc, parser.interner);
+    const desugared = try desugarer.desugarProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&desugared);
+    try checker.checkUnusedBindings();
+
+    for (checker.errors.items) |err| {
+        try std.testing.expect(std.mem.indexOf(u8, err.message, "variable `name` is unused") == null);
     }
 }
 

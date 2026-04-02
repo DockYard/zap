@@ -1,18 +1,18 @@
 pub module Kernel {
-  pub fn inspect(value :: i64) -> i64 {
-    :zig.inspect(value)
+  pub fn inspect(_value :: i64) -> i64 {
+    :zig.inspect(_value)
   }
 
-  pub fn inspect(value :: f64) -> f64 {
-    :zig.inspect(value)
+  pub fn inspect(_value :: f64) -> f64 {
+    :zig.inspect(_value)
   }
 
-  pub fn inspect(value :: String) -> String {
-    :zig.inspect(value)
+  pub fn inspect(_value :: String) -> String {
+    :zig.inspect(_value)
   }
 
-  pub fn inspect(value :: Bool) -> Bool {
-    :zig.inspect(value)
+  pub fn inspect(_value :: Bool) -> Bool {
+    :zig.inspect(_value)
   }
 
   pub macro if(condition :: Expr, then_body :: Expr) -> Nil {
