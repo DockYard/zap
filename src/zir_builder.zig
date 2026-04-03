@@ -3099,6 +3099,30 @@ pub const ZirDriver = struct {
             }
         }
 
+        // If the default body is empty AND there's a catch-all guard (_ pattern),
+        // use the last guard's body as the default instead of void.
+        // The last guard has condition=true (always matches), so the empty default
+        // is unreachable. Promoting the catch-all to the default avoids a void
+        // else branch that Sema can't merge with the other types.
+        if (current_else_result == @intFromEnum(Zir.Inst.Ref.void_value) and cb.default_instrs.len == 0 and guards.items.len > 0) {
+            const last_guard = guards.items[guards.items.len - 1];
+            const last_gb = cb.pre_instrs[last_guard.guard_idx].guard_block;
+
+            zir_builder_begin_capture(self.handle);
+            for (last_gb.body) |bi| try self.emitInstruction(bi);
+            var catchall_len: u32 = 0;
+            const catchall_ptr = zir_builder_end_capture(self.handle, &catchall_len);
+
+            const catchall_result: u32 = self.local_refs.get(cb.dest) orelse @intFromEnum(Zir.Inst.Ref.void_value);
+
+            self.allocator.free(current_else_insts);
+            current_else_insts = try self.allocator.alloc(u32, catchall_len);
+            @memcpy(current_else_insts, catchall_ptr[0..catchall_len]);
+            current_else_result = catchall_result;
+
+            _ = guards.pop();
+        }
+
         // Process guards in REVERSE order
         var gi = guards.items.len;
         while (gi > 0) {
