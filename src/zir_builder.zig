@@ -55,6 +55,7 @@ extern "c" fn zir_builder_emit_if_else(handle: ?*ZirBuilderHandle, condition: u3
 extern "c" fn zir_builder_emit_struct_init_anon(handle: ?*ZirBuilderHandle, names_ptrs: [*]const [*]const u8, names_lens: [*]const u32, values_ptr: [*]const u32, fields_len: u32) u32;
 extern "c" fn zir_builder_emit_union_init(handle: ?*ZirBuilderHandle, union_type: u32, field_name_ptr: [*]const u8, field_name_len: u32, init_value: u32) u32;
 extern "c" fn zir_builder_get_union_ret_type_ref(handle: ?*ZirBuilderHandle) u32;
+extern "c" fn zir_builder_emit_decl_ref(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32) u32;
 // Union return type
 extern "c" fn zir_builder_set_union_return_type(handle: ?*ZirBuilderHandle, names_ptrs: [*]const [*]const u8, names_lens: [*]const u32, types_ptr: [*]const u32, fields_len: u32) i32;
 
@@ -3599,13 +3600,9 @@ pub const ZirDriver = struct {
                 return fn_ref;
             }
         }
-        // User-defined function — resolve by name at module scope
-        // emit_call at the top level (body_tracking ON) creates a decl_ref
-        // that Sema can resolve. We emit a zero-arg call to get the fn ref,
-        // then the actual call with args happens inside the body via call_ref.
-        const ref = zir_builder_emit_call(self.handle, name.ptr, @intCast(name.len), &[_]u32{}, 0);
-        if (ref == error_ref) return error.EmitFailed;
-        return ref;
+        // User-defined function — can't pre-resolve without calling.
+        // The caller must handle this by using emit_call at the top level.
+        return error.EmitFailed;
     }
 };
 

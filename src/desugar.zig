@@ -221,10 +221,7 @@ pub const Desugarer = struct {
                 });
             },
 
-            // Error pipe: pass through to HIR builder which has type info
-            // to determine whether to use union tag switching or tuple matching.
-            // Do NOT desugar the inner pipe chain — the HIR builder needs to
-            // flatten it and insert error checks between steps.
+            // Error pipe: pass through to HIR builder.
             .error_pipe => |ep| {
                 return try self.create(ast.Expr, .{
                     .error_pipe = .{
