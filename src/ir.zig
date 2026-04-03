@@ -3197,10 +3197,42 @@ pub const IrBuilder = struct {
 
                 // Process remaining steps at the top level (not inside switch bodies)
                 for (ep.steps[1..]) |step| {
+                    // Build the call with pipe_val as first arg
+                    if (step.expr.kind == .call) {
+                        const call = step.expr.kind.call;
+                        var arg_locals: std.ArrayList(LocalId) = .empty;
+                        try arg_locals.append(self.allocator, pipe_val);
+                        for (call.args) |arg| {
+                            try arg_locals.append(self.allocator, try self.lowerExpr(arg.expr));
+                        }
+                        const call_dest = self.next_local;
+                        self.next_local += 1;
+                        const final_args = try arg_locals.toOwnedSlice(self.allocator);
+                        const modes = try self.allocator.alloc(ValueMode, final_args.len);
+                        @memset(modes, .share);
+                        const call_name_str = switch (call.target) {
+                            .named => |n| blk: {
+                                if (n.module) |mod| break :blk try std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ mod, n.name });
+                                if (self.current_module_prefix) |prefix| break :blk try std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ prefix, n.name });
+                                break :blk try self.allocator.dupe(u8, n.name);
+                            },
+                            else => "unknown",
+                        };
+                        try self.current_instrs.append(self.allocator, .{
+                            .call_named = .{ .dest = call_dest, .name = call_name_str, .args = final_args, .arg_modes = modes },
+                        });
+                        pipe_val = call_dest;
+                    }
+
+                    // Check if this step is fallible (returns a tagged union)
                     var is_fallible = step.is_fallible;
                     if (!is_fallible and step.expr.kind == .call) {
                         const call_name = switch (step.expr.kind.call.target) {
-                            .named => |n| std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ n.module orelse "", n.name }) catch "",
+                            .named => |n| blk: {
+                                if (n.module) |mod| break :blk std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ mod, n.name }) catch "";
+                                if (self.current_module_prefix) |prefix| break :blk std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ prefix, n.name }) catch "";
+                                break :blk std.fmt.allocPrint(self.allocator, "{s}", .{n.name}) catch "";
+                            },
                             else => "",
                         };
                         if (call_name.len > 0) {

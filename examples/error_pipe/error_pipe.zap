@@ -29,15 +29,11 @@ pub module ErrorPipe {
     }
   }
 
-  # Error pipe with function handler
+  # Error pipe with block handler (alternative style)
   pub fn process_with_handler(input :: String) -> String {
     parse_number(input)
     |> format_result()
-    ~> handle_error()
-  }
-
-  fn handle_error(err :: Atom) -> String {
-    case err {
+    ~> {
       :unknown_number -> "Handled: unknown number"
       _ -> "Handled: unexpected error"
     }

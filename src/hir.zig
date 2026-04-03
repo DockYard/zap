@@ -2690,9 +2690,32 @@ pub const HirBuilder = struct {
         for (ast_steps.items) |step| {
             const hir_expr = try self.buildExpr(step);
             const is_fallible = blk: {
+                // Check the HIR expression's resolved type
                 if (hir_expr.type_id < self.type_store.types.items.len) {
                     if (self.type_store.types.items[hir_expr.type_id] == .tagged_union) {
                         break :blk true;
+                    }
+                }
+                // For call expressions, look up the called function's return type.
+                // Pipe step args aren't included in the AST (they're injected by
+                // the IR), so arity = AST args + 1 (piped value).
+                if (step.* == .call) {
+                    const callee = step.call.callee;
+                    const arity: u32 = @intCast(step.call.args.len + 1);
+                    if (callee.* == .var_ref) {
+                        const ret_type = self.resolveFunctionReturnType(callee.var_ref.name, arity);
+                        if (ret_type < self.type_store.types.items.len) {
+                            if (self.type_store.types.items[ret_type] == .tagged_union) {
+                                break :blk true;
+                            }
+                        }
+                    } else if (callee.* == .field_access) {
+                        const ret_type = self.resolveFunctionReturnType(callee.field_access.field, arity);
+                        if (ret_type < self.type_store.types.items.len) {
+                            if (self.type_store.types.items[ret_type] == .tagged_union) {
+                                break :blk true;
+                            }
+                        }
                     }
                 }
                 break :blk false;
