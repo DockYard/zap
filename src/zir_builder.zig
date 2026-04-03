@@ -244,6 +244,9 @@ pub const ZirDriver = struct {
     /// 0 means void — used by the `.ret` handler to discard values from
     /// void functions instead of emitting a value return.
     current_ret_type: u32 = 0,
+    /// Cached ret_type Ref for @unionInit. Emitted once at function start,
+    /// reused for all union_init instructions. 0 means not a union return type.
+    cached_union_ret_type_ref: u32 = 0,
     /// Tracks how many tuple_init instructions have been emitted in the current function.
     tuple_init_count: u32 = 0,
     /// Nested tuple types in DFS post-order (inner-first), matching tuple_init emission order.
@@ -664,6 +667,11 @@ pub const ZirDriver = struct {
                     return error.EmitFailed;
                 }
                 self.current_ret_type = 1;
+                // Emit ret_type instruction ONCE in the function body (body_tracking ON).
+                // Cache for all @unionInit instructions. Must happen here, not inside
+                // branch bodies where body_tracking may be OFF.
+                self.cached_union_ret_type_ref = zir_builder_get_union_ret_type_ref(self.handle);
+
             }
         }
 
@@ -1971,9 +1979,9 @@ pub const ZirDriver = struct {
                     try self.setLocal(ui.dest, ptr_ref);
                 } else {
                     _ = self.reuse_backed_union_locals.remove(ui.dest);
-                    // Use proper @unionInit if a union return type is active
-                    const union_type_ref = zir_builder_get_union_ret_type_ref(self.handle);
-                    if (union_type_ref != 0) {
+                    // Use proper @unionInit if a union return type was set up at function start
+                    if (self.cached_union_ret_type_ref != 0) {
+                        const union_type_ref = self.cached_union_ret_type_ref;
                         const ref = zir_builder_emit_union_init(
                             self.handle,
                             union_type_ref,
