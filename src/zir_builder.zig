@@ -3425,9 +3425,10 @@ pub const ZirDriver = struct {
 
             try names_ptrs.append(self.allocator, case.variant_name.ptr);
             try names_lens.append(self.allocator, @intCast(case.variant_name.len));
-            // Both variants capture payload. Ok captures the success value,
-            // Error captures the error value (even if unused by the handler).
-            try captures.append(self.allocator, 1);
+            // Ok: capture payload + use capture as result (bit 0 = capture, bit 1 = use_capture_as_result)
+            // Error: capture payload only (handler result is pre-computed)
+            const capture_flags: u32 = if (is_ok) 3 else 1; // Ok=0b11, Error=0b01
+            try captures.append(self.allocator, capture_flags);
 
             // Emit body instructions with tracking off
             zir_builder_set_body_tracking(self.handle, false);
