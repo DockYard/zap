@@ -3675,7 +3675,7 @@ test "union declaration with data variants" {
     // Should emit a Zig union(enum) type definition
     try expectContains(output, "union(enum)");
     try expectContains(output, "Ok: []const u8");
-    try expectContains(output, "Error: []const u8");
+    try expectContains(output, "Error: u32");
     try expectContains(output, "fn Types__succeed(");
     try expectContains(output, "fn Types__fail(");
     // Union initialization

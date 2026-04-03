@@ -813,9 +813,11 @@ pub const IrBuilder = struct {
                             // Emit as union(enum) with typed variants
                             var union_variants: std.ArrayList(UnionVariant) = .empty;
                             for (tu.variants) |v| {
-                                const type_str = if (v.type_id) |tid|
-                                    typeIdToZigTypeStrWithStore(tid, self.type_store)
-                                else
+                                const type_str = if (v.type_id) |tid| blk: {
+                                    // Use ZIR-correct type names (atoms are u32 IDs in ZIR)
+                                    if (tid == types_mod.TypeStore.ATOM) break :blk @as([]const u8, "u32");
+                                    break :blk typeIdToZigTypeStrWithStore(tid, self.type_store);
+                                } else
                                     "void";
                                 try union_variants.append(self.allocator, .{
                                     .name = self.interner.get(v.name),
@@ -3218,13 +3220,23 @@ pub const IrBuilder = struct {
                         const final_args = try arg_locals.toOwnedSlice(self.allocator);
                         const modes = try self.allocator.alloc(ValueMode, final_args.len);
                         @memset(modes, .share);
+                        const call_name = switch (call.target) {
+                            .named => |n| blk: {
+                                if (n.module) |mod| {
+                                    break :blk try std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ mod, n.name });
+                                }
+                                // Same-module call: use current module prefix
+                                if (self.current_module_prefix) |prefix| {
+                                    break :blk try std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ prefix, n.name });
+                                }
+                                break :blk try self.allocator.dupe(u8, n.name);
+                            },
+                            else => "unknown",
+                        };
                         try self.current_instrs.append(self.allocator, .{
                             .call_named = .{
                                 .dest = call_dest,
-                                .name = switch (call.target) {
-                                    .named => |n| try std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ n.module orelse "", n.name }),
-                                    else => "unknown",
-                                },
+                                .name = call_name,
                                 .args = final_args,
                                 .arg_modes = modes,
                             },

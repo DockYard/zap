@@ -3425,7 +3425,9 @@ pub const ZirDriver = struct {
 
             try names_ptrs.append(self.allocator, case.variant_name.ptr);
             try names_lens.append(self.allocator, @intCast(case.variant_name.len));
-            try captures.append(self.allocator, 1); // always capture
+            // Both variants capture payload. Ok captures the success value,
+            // Error captures the error value (even if unused by the handler).
+            try captures.append(self.allocator, 1);
 
             // Emit body instructions with tracking off
             zir_builder_set_body_tracking(self.handle, false);
