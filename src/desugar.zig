@@ -221,13 +221,30 @@ pub const Desugarer = struct {
                 });
             },
 
-            // Error pipe: pass through to HIR builder.
+            // Error pipe: pass through to HIR builder. Transform function handlers
+            // into block handlers so the handler call is a top-level expression.
             .error_pipe => |ep| {
+                const handler: ast.ErrorHandler = switch (ep.handler) {
+                    .function => |func| blk: {
+                        // ~> handle_error() → ~> { _ -> handle_error() }
+                        // The function handler is called WITHOUT the error payload
+                        // (the flat IR uses early return, not error injection).
+                        const body = try self.allocSlice(ast.Stmt, &.{.{ .expr = func }});
+                        const pattern = try self.create(ast.Pattern, .{
+                            .wildcard = .{ .meta = ep.meta },
+                        });
+                        const clauses = try self.allocSlice(ast.CaseClause, &.{
+                            .{ .meta = ep.meta, .pattern = pattern, .type_annotation = null, .guard = null, .body = body },
+                        });
+                        break :blk .{ .block = clauses };
+                    },
+                    .block => ep.handler,
+                };
                 return try self.create(ast.Expr, .{
                     .error_pipe = .{
                         .meta = ep.meta,
                         .chain = ep.chain,
-                        .handler = ep.handler,
+                        .handler = handler,
                     },
                 });
             },

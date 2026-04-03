@@ -3178,16 +3178,21 @@ pub const IrBuilder = struct {
                 const handler_local = try self.lowerExpr(ep.handler);
                 var pipe_val = try self.lowerExpr(ep.steps[0].expr);
 
-                // Process step 0: if fallible, extract Ok payload via union_switch
+                // Process step 0: if fallible, extract Ok payload via union_switch.
+                // Error branch does early return (ret) to skip remaining pipe steps.
                 if (ep.steps[0].is_fallible) {
                     const ok_dest = self.next_local;
                     self.next_local += 1;
                     const switch_dest = self.next_local;
                     self.next_local += 1;
 
+                    // Error body: return handler result directly from the function
+                    const error_body = try self.allocator.alloc(Instruction, 1);
+                    error_body[0] = .{ .ret = .{ .value = handler_local } };
+
                     const cases = try self.allocator.alloc(UnionCase, 2);
                     cases[0] = .{ .variant_name = "Ok", .field_bindings = &.{}, .body_instrs = &.{}, .return_value = ok_dest };
-                    cases[1] = .{ .variant_name = "Error", .field_bindings = &.{}, .body_instrs = &.{}, .return_value = handler_local };
+                    cases[1] = .{ .variant_name = "Error", .field_bindings = &.{}, .body_instrs = error_body, .return_value = handler_local };
 
                     try self.current_instrs.append(self.allocator, .{
                         .union_switch = .{ .dest = switch_dest, .scrutinee = pipe_val, .cases = cases },
@@ -3246,9 +3251,13 @@ pub const IrBuilder = struct {
                         const switch_dest = self.next_local;
                         self.next_local += 1;
 
+                        // Error body: early return from function
+                        const err_body = try self.allocator.alloc(Instruction, 1);
+                        err_body[0] = .{ .ret = .{ .value = handler_local } };
+
                         const cases = try self.allocator.alloc(UnionCase, 2);
                         cases[0] = .{ .variant_name = "Ok", .field_bindings = &.{}, .body_instrs = &.{}, .return_value = ok_dest };
-                        cases[1] = .{ .variant_name = "Error", .field_bindings = &.{}, .body_instrs = &.{}, .return_value = handler_local };
+                        cases[1] = .{ .variant_name = "Error", .field_bindings = &.{}, .body_instrs = err_body, .return_value = handler_local };
 
                         try self.current_instrs.append(self.allocator, .{
                             .union_switch = .{ .dest = switch_dest, .scrutinee = pipe_val, .cases = cases },
