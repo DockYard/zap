@@ -3071,10 +3071,16 @@ pub const ZirDriver = struct {
         for (cb.default_instrs) |di| try self.emitInstruction(di);
         var default_len: u32 = 0;
         const default_ptr = zir_builder_end_capture(self.handle, &default_len);
-        const default_result: u32 = if (cb.default_result) |dr|
+        var default_result: u32 = if (cb.default_result) |dr|
             self.refForLocal(dr) catch void_ref
         else
             void_ref;
+
+        // If default_result is still void but default body was captured,
+        // check if case_break inside the body set cb.dest
+        if (default_result == void_ref and (default_len > 0 or default_pre_instrs.len > 0)) {
+            default_result = self.local_refs.get(cb.dest) orelse void_ref;
+        }
 
         var current_else_insts = try self.allocator.alloc(u32, default_len);
         @memcpy(current_else_insts, default_ptr[0..default_len]);
