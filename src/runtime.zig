@@ -872,26 +872,22 @@ pub const Prelude = struct {
         }
     }
 
-    pub fn i64_to_string(allocator: std.mem.Allocator, value: i64) ![]const u8 {
-        return std.fmt.allocPrint(allocator, "{d}", .{value}) catch {
-            var buf: [32]u8 = undefined;
-            const slice = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return "?";
-            const result = bumpAlloc(slice.len);
-            if (result.len == 0) return error.OutOfMemory;
-            @memcpy(result, slice);
-            return result;
-        };
+    pub fn i64_to_string(value: i64) []const u8 {
+        var buf: [32]u8 = undefined;
+        const slice = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return "?";
+        const result = bumpAlloc(slice.len);
+        if (result.len == 0) return "?";
+        @memcpy(result, slice);
+        return result;
     }
 
-    pub fn f64_to_string(allocator: std.mem.Allocator, value: f64) ![]const u8 {
-        return std.fmt.allocPrint(allocator, "{d}", .{value}) catch {
-            var buf: [64]u8 = undefined;
-            const slice = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return "?";
-            const result = bumpAlloc(slice.len);
-            if (result.len == 0) return error.OutOfMemory;
-            @memcpy(result, slice);
-            return result;
-        };
+    pub fn f64_to_string(value: f64) []const u8 {
+        var buf: [64]u8 = undefined;
+        const slice = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return "?";
+        const result = bumpAlloc(slice.len);
+        if (result.len == 0) return "?";
+        @memcpy(result, slice);
+        return result;
     }
 
     pub fn bool_to_string(value: bool) []const u8 {

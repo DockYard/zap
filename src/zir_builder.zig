@@ -1524,23 +1524,9 @@ pub const ZirDriver = struct {
                     const fn_ref = zir_builder_emit_field_val(self.handle, mod_ref, func_name.ptr, @intCast(func_name.len));
                     if (fn_ref == error_ref) return error.EmitFailed;
 
-                    // Runtime functions that require an allocator as first arg
-                    const needs_allocator = std.mem.eql(u8, func_name, "i64_to_string") or
-                        std.mem.eql(u8, func_name, "f64_to_string");
-                    if (needs_allocator) {
-                        const alloc_ref = try self.emitAllocatorRef();
-                        try args.insert(self.allocator, 0, alloc_ref);
-                    }
-
                     // call(fn_ref, args)
-                    var ref = zir_builder_emit_call_ref(self.handle, fn_ref, args.items.ptr, @intCast(args.items.len));
+                    const ref = zir_builder_emit_call_ref(self.handle, fn_ref, args.items.ptr, @intCast(args.items.len));
                     if (ref == error_ref) return error.EmitFailed;
-
-                    // Wrap with try for functions that return error unions
-                    if (needs_allocator) {
-                        ref = zir_builder_emit_try(self.handle, ref);
-                        if (ref == error_ref) return error.EmitFailed;
-                    }
 
                     try self.setLocal(cn.dest, ref);
                 } else {
