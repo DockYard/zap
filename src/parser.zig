@@ -1022,7 +1022,8 @@ pub const Parser = struct {
             self.check(.keyword_and) or
             self.check(.keyword_or) or self.check(.keyword_not) or
             self.check(.keyword_fn) or self.check(.keyword_module) or
-            self.check(.keyword_struct) or self.check(.keyword_macro))
+            self.check(.keyword_struct) or self.check(.keyword_union) or
+            self.check(.keyword_macro))
             self.advance()
         else if (self.check(.plus) or self.check(.minus) or self.check(.star) or
             self.check(.slash) or self.check(.equal_equal) or self.check(.not_equal) or
