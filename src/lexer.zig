@@ -16,6 +16,7 @@ pub const Lexer = struct {
 
     // String interpolation tracking
     interp_depth: u32,
+    interp_brace_depth: u32,
 
     pub fn init(source: []const u8) Lexer {
         return Lexer{
@@ -25,6 +26,7 @@ pub const Lexer = struct {
             .line_start = 0,
             .source_id = null,
             .interp_depth = 0,
+            .interp_brace_depth = 0,
         };
     }
 
@@ -43,6 +45,13 @@ pub const Lexer = struct {
         }
 
         const c = self.source[self.pos];
+
+        // End of string interpolation: closing } returns to string lexing
+        if (self.interp_depth > 0 and c == '}' and self.interp_brace_depth == 0) {
+            self.pos += 1; // skip closing }
+            self.interp_depth -= 1;
+            return self.lexStringContinuation();
+        }
 
         // Newlines
         if (c == '\n') {
@@ -106,17 +115,45 @@ pub const Lexer = struct {
                 return self.makeToken(.string_literal, start, self.pos);
             }
             if (ch == '#' and self.pos + 1 < self.source.len and self.source[self.pos + 1] == '{') {
-                self.pos += 2;
+                // Found interpolation — emit string_literal_start for prefix
+                const token = self.makeToken(.string_literal_start, start, self.pos);
+                self.pos += 2; // skip #{
                 self.interp_depth += 1;
-                var brace_depth: u32 = 1;
-                while (self.pos < self.source.len and brace_depth > 0) {
-                    if (self.source[self.pos] == '{') brace_depth += 1;
-                    if (self.source[self.pos] == '}') brace_depth -= 1;
-                    if (brace_depth > 0) self.pos += 1;
-                }
-                if (self.pos < self.source.len) self.pos += 1;
-                self.interp_depth -= 1;
+                self.interp_brace_depth = 0;
+                return token;
+            }
+            if (ch == '\\' and self.pos + 1 < self.source.len) {
+                self.pos += 2;
                 continue;
+            }
+            if (ch == '\n') {
+                self.line += 1;
+                self.line_start = self.pos + 1;
+            }
+            self.pos += 1;
+        }
+
+        return self.makeToken(.invalid, start, self.pos);
+    }
+
+    /// Continue lexing a string after the closing } of an interpolation.
+    /// Returns string_literal_part (if another #{) or string_literal_end (if ").
+    fn lexStringContinuation(self: *Lexer) Token {
+        const start = self.pos;
+
+        while (self.pos < self.source.len) {
+            const ch = self.source[self.pos];
+            if (ch == '"') {
+                self.pos += 1;
+                return self.makeToken(.string_literal_end, start, self.pos);
+            }
+            if (ch == '#' and self.pos + 1 < self.source.len and self.source[self.pos + 1] == '{') {
+                // Another interpolation
+                const token = self.makeToken(.string_literal_part, start, self.pos);
+                self.pos += 2; // skip #{
+                self.interp_depth += 1;
+                self.interp_brace_depth = 0;
+                return token;
             }
             if (ch == '\\' and self.pos + 1 < self.source.len) {
                 self.pos += 2;
@@ -210,8 +247,14 @@ pub const Lexer = struct {
             ')' => return self.makeToken(.right_paren, start, self.pos),
             '[' => return self.makeToken(.left_bracket, start, self.pos),
             ']' => return self.makeToken(.right_bracket, start, self.pos),
-            '{' => return self.makeToken(.left_brace, start, self.pos),
-            '}' => return self.makeToken(.right_brace, start, self.pos),
+            '{' => {
+                if (self.interp_depth > 0) self.interp_brace_depth += 1;
+                return self.makeToken(.left_brace, start, self.pos);
+            },
+            '}' => {
+                if (self.interp_depth > 0 and self.interp_brace_depth > 0) self.interp_brace_depth -= 1;
+                return self.makeToken(.right_brace, start, self.pos);
+            },
             '@' => return self.makeToken(.at_sign, start, self.pos),
             '-' => {
                 if (self.pos < self.source.len and self.source[self.pos] == '>') {
@@ -289,6 +332,7 @@ pub const Lexer = struct {
             '.' => {
                 if (self.pos < self.source.len and self.source[self.pos] == '{') {
                     self.pos += 1;
+                    if (self.interp_depth > 0) self.interp_brace_depth += 1;
                     return self.makeToken(.dot_brace, start, self.pos);
                 }
                 return self.makeToken(.dot, start, self.pos);
@@ -296,6 +340,7 @@ pub const Lexer = struct {
             '%' => {
                 if (self.pos < self.source.len and self.source[self.pos] == '{') {
                     self.pos += 1;
+                    if (self.interp_depth > 0) self.interp_brace_depth += 1;
                     return self.makeToken(.percent_brace, start, self.pos);
                 }
                 return self.makeToken(.percent, start, self.pos);
@@ -303,6 +348,7 @@ pub const Lexer = struct {
             '#' => {
                 if (self.pos < self.source.len and self.source[self.pos] == '{') {
                     self.pos += 1;
+                    if (self.interp_depth > 0) self.interp_brace_depth += 1;
                     return self.makeToken(.hash_brace, start, self.pos);
                 }
                 return self.makeToken(.hash, start, self.pos);
@@ -626,4 +672,56 @@ test "lex column tracking with operators" {
 
     const t3 = lexer.next();
     try std.testing.expectEqual(@as(u32, 5), t3.loc.col);
+}
+
+test "lex string interpolation" {
+    // "hello #{name}!"
+    const source = "\"hello #{name}!\"";
+    var lexer = Lexer.init(source);
+
+    const t1 = lexer.next();
+    try std.testing.expectEqual(Token.Tag.string_literal_start, t1.tag);
+    try std.testing.expectEqualStrings("\"hello ", t1.slice(source));
+
+    const t2 = lexer.next();
+    try std.testing.expectEqual(Token.Tag.identifier, t2.tag);
+    try std.testing.expectEqualStrings("name", t2.slice(source));
+
+    const t3 = lexer.next();
+    try std.testing.expectEqual(Token.Tag.string_literal_end, t3.tag);
+    try std.testing.expectEqualStrings("!\"", t3.slice(source));
+}
+
+test "lex string no interpolation" {
+    const source = "\"hello world\"";
+    var lexer = Lexer.init(source);
+
+    const t1 = lexer.next();
+    try std.testing.expectEqual(Token.Tag.string_literal, t1.tag);
+}
+
+test "lex string multiple interpolations" {
+    // "#{a} and #{b}"
+    const source = "\"#{a} and #{b}\"";
+    var lexer = Lexer.init(source);
+
+    const t1 = lexer.next();
+    try std.testing.expectEqual(Token.Tag.string_literal_start, t1.tag);
+    try std.testing.expectEqualStrings("\"", t1.slice(source));
+
+    const t2 = lexer.next();
+    try std.testing.expectEqual(Token.Tag.identifier, t2.tag);
+    try std.testing.expectEqualStrings("a", t2.slice(source));
+
+    const t3 = lexer.next();
+    try std.testing.expectEqual(Token.Tag.string_literal_part, t3.tag);
+    try std.testing.expectEqualStrings(" and ", t3.slice(source));
+
+    const t4 = lexer.next();
+    try std.testing.expectEqual(Token.Tag.identifier, t4.tag);
+    try std.testing.expectEqualStrings("b", t4.slice(source));
+
+    const t5 = lexer.next();
+    try std.testing.expectEqual(Token.Tag.string_literal_end, t5.tag);
+    try std.testing.expectEqualStrings("\"", t5.slice(source));
 }

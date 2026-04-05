@@ -553,21 +553,9 @@ pub const Desugarer = struct {
                 }),
                 .expr => |expr| blk: {
                     const desugared = try self.desugarExpr(expr);
-                    // Wrap in to_string() call
-                    if (self.to_string_id) |ts_id| {
-                        const callee = try self.create(ast.Expr, .{
-                            .var_ref = .{ .meta = si.meta, .name = ts_id },
-                        });
-                        break :blk try self.create(ast.Expr, .{
-                            .call = .{
-                                .meta = si.meta,
-                                .callee = callee,
-                                .args = try self.allocSlice(*const ast.Expr, &.{desugared}),
-                            },
-                        });
-                    } else {
-                        break :blk desugared;
-                    }
+                    // TODO: Wrap in to_string() when Kernel.to_string/1 exists.
+                    // For now, interpolation only supports string-typed expressions.
+                    break :blk desugared;
                 },
             };
 

@@ -1727,6 +1727,7 @@ pub const Parser = struct {
             .int_literal => return self.parseIntLiteral(),
             .float_literal => return self.parseFloatLiteral(),
             .string_literal => return self.parseStringLiteral(),
+            .string_literal_start => return self.parseStringInterpolation(),
             .atom_literal => return self.parseAtomLiteral(),
             .keyword_true, .keyword_false => return self.parseBoolLiteral(),
             .keyword_nil => return self.parseNilLiteral(),
@@ -1815,6 +1816,63 @@ pub const Parser = struct {
         const value = if (raw.len >= 2) raw[1 .. raw.len - 1] else raw;
         return self.create(ast.Expr, .{
             .string_literal = .{ .meta = .{ .span = ast.SourceSpan.from(tok.loc) }, .value = try self.interner.intern(value) },
+        });
+    }
+
+    fn parseStringInterpolation(self: *Parser) !*const ast.Expr {
+        const start_tok = self.advance(); // consume string_literal_start
+        var parts: std.ArrayList(ast.StringPart) = .empty;
+
+        // Add the literal prefix (strip opening quote)
+        const prefix_raw = start_tok.slice(self.source);
+        const prefix = if (prefix_raw.len > 0 and prefix_raw[0] == '"') prefix_raw[1..] else prefix_raw;
+        if (prefix.len > 0) {
+            try parts.append(self.allocator, .{ .literal = try self.interner.intern(prefix) });
+        }
+
+        // Parse first interpolation expression
+        const first_expr = try self.parseExpr();
+        try parts.append(self.allocator, .{ .expr = first_expr });
+
+        // Continue: string_literal_part (more interpolations) or string_literal_end
+        while (true) {
+            switch (self.peek()) {
+                .string_literal_part => {
+                    const part_tok = self.advance();
+                    const part_raw = part_tok.slice(self.source);
+                    if (part_raw.len > 0) {
+                        try parts.append(self.allocator, .{ .literal = try self.interner.intern(part_raw) });
+                    }
+                    const expr = try self.parseExpr();
+                    try parts.append(self.allocator, .{ .expr = expr });
+                },
+                .string_literal_end => {
+                    const end_tok = self.advance();
+                    const end_raw = end_tok.slice(self.source);
+                    // Strip closing quote
+                    const suffix = if (end_raw.len > 0 and end_raw[end_raw.len - 1] == '"') end_raw[0 .. end_raw.len - 1] else end_raw;
+                    if (suffix.len > 0) {
+                        try parts.append(self.allocator, .{ .literal = try self.interner.intern(suffix) });
+                    }
+                    break;
+                },
+                else => {
+                    try self.addRichError(
+                        "unterminated string interpolation",
+                        self.currentSpan(),
+                        "expected continuation or end of interpolated string",
+                        "close the interpolation with }",
+                    );
+                    return error.ParseError;
+                },
+            }
+        }
+
+        return self.create(ast.Expr, .{
+            .string_interpolation = .{
+                .meta = .{ .span = ast.SourceSpan.from(start_tok.loc) },
+                .parts = try parts.toOwnedSlice(self.allocator),
+            },
         });
     }
 
