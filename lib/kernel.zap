@@ -80,10 +80,10 @@ pub module Kernel {
   # Pipe operator: x |> f(y) → f(x, y)
   # Injects left as the first argument of the right-hand call.
   pub macro |>(left :: Expr, right :: Expr) -> Expr {
-    name = elem(right, 0)
-    meta = elem(right, 1)
-    args = elem(right, 2)
-    new_args = prepend(args, left)
-    tuple(name, meta, new_args)
+    _name = elem(right, 0)
+    _meta = elem(right, 1)
+    _args = elem(right, 2)
+    _new_args = prepend(_args, left)
+    tuple(_name, _meta, _new_args)
   }
 }

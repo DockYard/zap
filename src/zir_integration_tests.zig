@@ -1043,3 +1043,81 @@ test "ZIR: tuple wildcard pattern" {
     try std.testing.expectEqualStrings("42\n", result.stdout);
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
+
+// ============================================================
+// Variable assignment and reuse
+// ============================================================
+
+test "ZIR: variable assignment chain" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn main() -> String {
+        \\    a = 10
+        \\    b = a + 20
+        \\    c = b * 2
+        \\    Kernel.inspect(c)
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("60\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+// ============================================================
+// Nested case expressions
+// ============================================================
+
+test "ZIR: nested case expressions" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn classify(x :: i64, y :: i64) -> String {
+        \\    case x {
+        \\      0 -> case y {
+        \\        0 -> "origin"
+        \\        _ -> "y-axis"
+        \\      }
+        \\      _ -> case y {
+        \\        0 -> "x-axis"
+        \\        _ -> "plane"
+        \\      }
+        \\    }
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    IO.puts(classify(0, 0))
+        \\    IO.puts(classify(0, 5))
+        \\    IO.puts(classify(3, 0))
+        \\    IO.puts(classify(3, 5))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("origin\ny-axis\nx-axis\nplane\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+// ============================================================
+// Float arithmetic
+// ============================================================
+
+test "ZIR: float arithmetic" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn area(radius :: f64) -> f64 {
+        \\    3.14159 * radius * radius
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    Kernel.inspect(area(1.0))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    // 3.14159 * 1.0 * 1.0 = 3.14159
+    try std.testing.expect(std.mem.startsWith(u8, result.stdout, "3.14159"));
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
