@@ -889,3 +889,157 @@ test "ZIR: multi-clause string pattern matching" {
     try std.testing.expectEqualStrings("1\n2\n?\n", result.stdout);
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
+
+// ============================================================
+// Atoms
+// ============================================================
+
+test "ZIR: atom pattern matching in functions" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn status(:ok :: Atom) -> String {
+        \\    "success"
+        \\  }
+        \\
+        \\  pub fn status(:error :: Atom) -> String {
+        \\    "failure"
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    IO.puts(status(:ok))
+        \\    IO.puts(status(:error))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("success\nfailure\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+// ============================================================
+// Default parameters
+// ============================================================
+
+test "ZIR: default parameter values" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn add(a :: i64, b :: i64 = 10) -> i64 {
+        \\    a + b
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    Kernel.inspect(add(5))
+        \\    Kernel.inspect(add(5, 20))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("15\n25\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+// ============================================================
+// Multi-arity functions
+// ============================================================
+
+test "ZIR: three-argument function with string concat" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn join(a :: String, sep :: String, b :: String) -> String {
+        \\    a <> sep <> b
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    IO.puts(join("hello", " ", "world"))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("hello world\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+// ============================================================
+// Unions (tagged enums)
+// ============================================================
+
+test "ZIR: union variant pattern matching" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub union Color {
+        \\    Red
+        \\    Green
+        \\    Blue
+        \\  }
+        \\
+        \\  pub fn color_name(Color.Red :: Color) -> String {
+        \\    "red"
+        \\  }
+        \\
+        \\  pub fn color_name(Color.Green :: Color) -> String {
+        \\    "green"
+        \\  }
+        \\
+        \\  pub fn color_name(Color.Blue :: Color) -> String {
+        \\    "blue"
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    IO.puts(color_name(Color.Red))
+        \\    IO.puts(color_name(Color.Green))
+        \\    IO.puts(color_name(Color.Blue))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("red\ngreen\nblue\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+// ============================================================
+// Tuple destructuring
+// ============================================================
+
+test "ZIR: tuple pattern matching in case" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn sum_pair(t :: {i64, i64}) -> i64 {
+        \\    case t {
+        \\      {a, b} -> a + b
+        \\    }
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    Kernel.inspect(sum_pair({10, 32}))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("42\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: tuple wildcard pattern" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn second(t :: {i64, i64}) -> i64 {
+        \\    case t {
+        \\      {_, b} -> b
+        \\    }
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    Kernel.inspect(second({10, 42}))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("42\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
