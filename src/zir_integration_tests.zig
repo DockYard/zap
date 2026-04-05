@@ -787,3 +787,85 @@ test "ZIR: multi-clause function with pipes" {
     try std.testing.expectEqualStrings("3628800\n", result.stdout);
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
+
+// ============================================================
+// String concatenation
+// ============================================================
+
+test "ZIR: string concat operator" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn main() -> String {
+        \\    IO.puts("hello" <> " " <> "world")
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("hello world\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+// ============================================================
+// Guards (multi-clause with conditions)
+// ============================================================
+
+test "ZIR: function guards" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn classify(n :: i64) -> String if n > 0 {
+        \\    "positive"
+        \\  }
+        \\
+        \\  pub fn classify(n :: i64) -> String if n < 0 {
+        \\    "negative"
+        \\  }
+        \\
+        \\  pub fn classify(_ :: i64) -> String {
+        \\    "zero"
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    IO.puts(classify(5))
+        \\    IO.puts(classify(-3))
+        \\    IO.puts(classify(0))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("positive\nnegative\nzero\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+// ============================================================
+// Multi-clause string matching
+// ============================================================
+
+test "ZIR: multi-clause string pattern matching" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn parse("one" :: String) -> String {
+        \\    "1"
+        \\  }
+        \\
+        \\  pub fn parse("two" :: String) -> String {
+        \\    "2"
+        \\  }
+        \\
+        \\  pub fn parse(_ :: String) -> String {
+        \\    "?"
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    IO.puts(parse("one"))
+        \\    IO.puts(parse("two"))
+        \\    IO.puts(parse("three"))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("1\n2\n?\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
