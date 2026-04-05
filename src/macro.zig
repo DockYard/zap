@@ -349,8 +349,8 @@ pub const MacroEngine = struct {
 
             // Recurse into compound expressions
             .if_expr => |ie| {
-                // Expand if directly to case (Kernel.if macro behavior):
-                //   if cond { then } else { else } → case cond { true -> then, false -> else }
+                // Bootstrap fallback: expand if to case.
+                // Kernel.if macro provides the same behavior but allows user override.
                 const cond_exp = (try self.expandExpr(ie.condition)).expr;
                 const true_pat = try self.create(ast.Pattern, .{ .literal = .{ .bool_lit = .{ .meta = ie.meta, .value = true } } });
                 const false_pat = try self.create(ast.Pattern, .{ .literal = .{ .bool_lit = .{ .meta = ie.meta, .value = false } } });
@@ -419,6 +419,7 @@ pub const MacroEngine = struct {
                 }
 
                 // Bootstrap fallback: and/or get short-circuit case expansion
+                // (Kernel.and/or macros take precedence when available)
                 if (bo.op == .and_op) {
                     const lhs_exp = (try self.expandExpr(bo.lhs)).expr;
                     const rhs_exp = (try self.expandExpr(bo.rhs)).expr;
@@ -558,9 +559,8 @@ pub const MacroEngine = struct {
             },
 
             .cond_expr => |conde| {
-                // Expand cond directly to nested case:
-                //   cond { c1 -> b1, c2 -> b2, true -> b3 }
-                //     → case c1 { true -> b1, false -> case c2 { true -> b2, false -> b3 } }
+                // Bootstrap fallback: expand cond to nested case.
+                // Kernel.cond macro (if defined) provides the same behavior.
                 return .{
                     .expr = try self.condToNestedCase(conde.clauses, conde.meta),
                     .changed = true,
