@@ -154,6 +154,25 @@ pub const MacroEngine = struct {
                         try new_items.append(self.allocator, .{ .priv_macro = expanded.decl });
                     }
                 },
+                .struct_decl => {
+                    // Try Kernel.struct macro (Phase 5)
+                    if (self.tryExpandDeclarationMacro("struct", item)) |expanded_item| {
+                        try new_items.append(self.allocator, expanded_item);
+                        changed = true;
+                    } else {
+                        // Bootstrap fallback: pass through unchanged
+                        try new_items.append(self.allocator, item);
+                    }
+                },
+                .union_decl => {
+                    // Try Kernel.union macro (Phase 5)
+                    if (self.tryExpandDeclarationMacro("union", item)) |expanded_item| {
+                        try new_items.append(self.allocator, expanded_item);
+                        changed = true;
+                    } else {
+                        try new_items.append(self.allocator, item);
+                    }
+                },
                 .use_decl => |ud| {
                     // Expand `use Module` → `import Module`
                     const import_decl = try self.create(ast.ImportDecl, .{

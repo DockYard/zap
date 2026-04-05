@@ -77,6 +77,26 @@ pub module Kernel {
     }
   }
 
+  # ============================================================
+  # Declaration macros (Phase 5: AST-as-data)
+  #
+  # These receive the full declaration AST as a 3-tuple and return it.
+  # Identity transforms for now — the hook points enable future
+  # customization: validation, instrumentation, __using__ callbacks.
+  # ============================================================
+
+  pub macro fn(decl :: Expr) -> Expr {
+    quote { unquote(decl) }
+  }
+
+  pub macro struct(decl :: Expr) -> Expr {
+    quote { unquote(decl) }
+  }
+
+  pub macro union(decl :: Expr) -> Expr {
+    quote { unquote(decl) }
+  }
+
   # Pipe operator: x |> f(y) → f(x, y)
   # Injects left as the first argument of the right-hand call.
   pub macro |>(left :: Expr, right :: Expr) -> Expr {

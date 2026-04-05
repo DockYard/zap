@@ -2481,3 +2481,116 @@ test "round-trip: pipe" {
     try std.testing.expect(back.pipe.lhs.* == .int_literal);
     try std.testing.expectEqual(@as(i64, 5), back.pipe.lhs.int_literal.value);
 }
+
+// ============================================================
+// Declaration round-trip tests (Phase 5)
+// ============================================================
+
+test "round-trip: function declaration to CtValue" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    var store = AllocationStore{};
+    const meta = ast.NodeMeta{ .span = .{ .start = 0, .end = 0 } };
+
+    // Build: pub fn add(a :: i64, b :: i64) -> i64 { a + b }
+    const a_name = try interner.intern("a");
+    const b_name = try interner.intern("b");
+    const add_name = try interner.intern("add");
+
+    const a_pat = try alloc.create(ast.Pattern);
+    a_pat.* = .{ .bind = .{ .meta = meta, .name = a_name } };
+    const b_pat = try alloc.create(ast.Pattern);
+    b_pat.* = .{ .bind = .{ .meta = meta, .name = b_name } };
+
+    const i64_type = try alloc.create(ast.TypeExpr);
+    i64_type.* = .{ .name = .{ .meta = meta, .name = try interner.intern("i64"), .args = &.{} } };
+
+    const a_ref = try alloc.create(ast.Expr);
+    a_ref.* = .{ .var_ref = .{ .meta = meta, .name = a_name } };
+    const b_ref = try alloc.create(ast.Expr);
+    b_ref.* = .{ .var_ref = .{ .meta = meta, .name = b_name } };
+    const body_expr = try alloc.create(ast.Expr);
+    body_expr.* = .{ .binary_op = .{ .meta = meta, .op = .add, .lhs = a_ref, .rhs = b_ref } };
+
+    const params = try alloc.alloc(ast.Param, 2);
+    params[0] = .{ .meta = meta, .pattern = a_pat, .type_annotation = i64_type };
+    params[1] = .{ .meta = meta, .pattern = b_pat, .type_annotation = i64_type };
+
+    const body = try alloc.alloc(ast.Stmt, 1);
+    body[0] = .{ .expr = body_expr };
+
+    const clauses = try alloc.alloc(ast.FunctionClause, 1);
+    clauses[0] = .{
+        .meta = meta,
+        .params = params,
+        .return_type = i64_type,
+        .refinement = null,
+        .body = body,
+    };
+
+    const func_decl = try alloc.create(ast.FunctionDecl);
+    func_decl.* = .{
+        .meta = meta,
+        .name = add_name,
+        .visibility = .public,
+        .clauses = clauses,
+    };
+
+    // Convert to CtValue
+    const item: ast.ModuleItem = .{ .function = func_decl };
+    const ct = try moduleItemToCtValue(alloc, &interner, &store, item);
+
+    // Should be a 3-tuple with form :fn
+    try std.testing.expect(ct == .tuple);
+    try std.testing.expectEqual(@as(usize, 3), ct.tuple.elems.len);
+    try std.testing.expect(ct.tuple.elems[0] == .atom);
+    try std.testing.expect(std.mem.eql(u8, ct.tuple.elems[0].atom, "fn"));
+
+    // Round-trip back
+    const back = ctValueToModuleItem(alloc, &interner, ct) catch null;
+    try std.testing.expect(back != null);
+    try std.testing.expect(back.? == .function);
+}
+
+test "round-trip: struct declaration to CtValue" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    var store = AllocationStore{};
+    const meta = ast.NodeMeta{ .span = .{ .start = 0, .end = 0 } };
+
+    // Build: pub struct Point { x :: i64, y :: i64 }
+    const i64_type = try alloc.create(ast.TypeExpr);
+    i64_type.* = .{ .name = .{ .meta = meta, .name = try interner.intern("i64"), .args = &.{} } };
+
+    const fields = try alloc.alloc(ast.StructFieldDecl, 2);
+    fields[0] = .{ .meta = meta, .name = try interner.intern("x"), .type_expr = i64_type, .default = null };
+    fields[1] = .{ .meta = meta, .name = try interner.intern("y"), .type_expr = i64_type, .default = null };
+
+    const struct_decl = try alloc.create(ast.StructDecl);
+    struct_decl.* = .{
+        .meta = meta,
+        .name = try interner.intern("Point"),
+        .fields = fields,
+    };
+
+    // Convert to CtValue
+    const item: ast.ModuleItem = .{ .struct_decl = struct_decl };
+    const ct = try moduleItemToCtValue(alloc, &interner, &store, item);
+
+    // Should be a 3-tuple with form :struct
+    try std.testing.expect(ct == .tuple);
+    try std.testing.expectEqual(@as(usize, 3), ct.tuple.elems.len);
+    try std.testing.expect(ct.tuple.elems[0] == .atom);
+    try std.testing.expect(std.mem.eql(u8, ct.tuple.elems[0].atom, "struct"));
+
+    // Round-trip back
+    const back = ctValueToModuleItem(alloc, &interner, ct) catch null;
+    try std.testing.expect(back != null);
+    try std.testing.expect(back.? == .struct_decl);
+}
