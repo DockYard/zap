@@ -143,6 +143,56 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
             }
         }
 
+        // If expression: {:if, meta, [condition, [do: then, else: else]]}
+        if (std.mem.eql(u8, form_name, "if")) {
+            if (args == .list and args.list.elems.len == 2) {
+                const cond = try eval(env, args.list.elems[0]);
+                const kw = args.list.elems[1];
+                if (kw == .list) {
+                    var then_branch: ?CtValue = null;
+                    var else_branch: ?CtValue = null;
+                    for (kw.list.elems) |pair| {
+                        if (pair == .tuple and pair.tuple.elems.len == 2) {
+                            if (pair.tuple.elems[0] == .atom) {
+                                if (std.mem.eql(u8, pair.tuple.elems[0].atom, "do"))
+                                    then_branch = pair.tuple.elems[1];
+                                if (std.mem.eql(u8, pair.tuple.elems[0].atom, "else"))
+                                    else_branch = pair.tuple.elems[1];
+                            }
+                        }
+                    }
+                    if (cond == .bool_val) {
+                        if (cond.bool_val) {
+                            if (then_branch) |tb| return eval(env, tb);
+                        } else {
+                            if (else_branch) |eb| return eval(env, eb);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Cond: {:cond, meta, [clauses...]}
+        if (std.mem.eql(u8, form_name, "cond")) {
+            if (args == .list) {
+                for (args.list.elems) |clause| {
+                    if (clause == .tuple and clause.tuple.elems.len == 3) {
+                        if (clause.tuple.elems[0] == .atom and std.mem.eql(u8, clause.tuple.elems[0].atom, "->")) {
+                            const clause_args = clause.tuple.elems[2];
+                            if (clause_args == .list and clause_args.list.elems.len == 2) {
+                                const cond_expr = clause_args.list.elems[0];
+                                const body = clause_args.list.elems[1];
+                                const cond_val = try eval(env, cond_expr);
+                                if (cond_val == .bool_val and cond_val.bool_val) {
+                                    return eval(env, body);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Binary operators
         if (args == .list and args.list.elems.len == 2) {
             const lhs = try eval(env, args.list.elems[0]);
@@ -270,9 +320,17 @@ fn evalBinop(env: *Env, op: []const u8, lhs: CtValue, rhs: CtValue) MacroEvalErr
         if (std.mem.eql(u8, op, "/") and rhs.int != 0) return CtValue{ .int = @divTrunc(lhs.int, rhs.int) };
     }
 
-    // Comparison
+    // Comparison (works for all types)
     if (std.mem.eql(u8, op, "==")) return CtValue{ .bool_val = lhs.eql(rhs) };
     if (std.mem.eql(u8, op, "!=")) return CtValue{ .bool_val = !lhs.eql(rhs) };
+
+    // Integer comparison
+    if (lhs == .int and rhs == .int) {
+        if (std.mem.eql(u8, op, "<")) return CtValue{ .bool_val = lhs.int < rhs.int };
+        if (std.mem.eql(u8, op, ">")) return CtValue{ .bool_val = lhs.int > rhs.int };
+        if (std.mem.eql(u8, op, "<=")) return CtValue{ .bool_val = lhs.int <= rhs.int };
+        if (std.mem.eql(u8, op, ">=")) return CtValue{ .bool_val = lhs.int >= rhs.int };
+    }
 
     // Boolean
     if (lhs == .bool_val and rhs == .bool_val) {
@@ -315,10 +373,14 @@ fn evalCaseClauses(env: *Env, subject: CtValue, clauses: []const CtValue) MacroE
 }
 
 fn matchPattern(env: *Env, pattern: CtValue, subject: CtValue) bool {
-    // Wildcard: {:_, _, nil}
+    // 3-tuple pattern: {form, meta, args}
     if (pattern == .tuple and pattern.tuple.elems.len == 3) {
-        if (pattern.tuple.elems[0] == .atom and pattern.tuple.elems[2] == .nil) {
-            const name = pattern.tuple.elems[0].atom;
+        const form = pattern.tuple.elems[0];
+        const args = pattern.tuple.elems[2];
+
+        // Wildcard: {:_, _, nil}
+        if (form == .atom and args == .nil) {
+            const name = form.atom;
             if (std.mem.eql(u8, name, "_")) return true;
 
             // Variable binding — bind and match
@@ -328,8 +390,48 @@ fn matchPattern(env: *Env, pattern: CtValue, subject: CtValue) bool {
             }
 
             // Literal match: form matches subject's form
-            return pattern.tuple.elems[0].eql(extractForm(subject));
+            return form.eql(extractForm(subject));
         }
+
+        // Tuple destructuring: {:{}, [], [sub_patterns...]}
+        // Matches a tuple subject and binds sub-patterns to elements
+        if (form == .atom and std.mem.eql(u8, form.atom, "{}")) {
+            if (args == .list and subject == .tuple) {
+                if (args.list.elems.len != subject.tuple.elems.len) return false;
+                for (args.list.elems, subject.tuple.elems) |sub_pat, sub_val| {
+                    if (!matchPattern(env, sub_pat, sub_val)) return false;
+                }
+                return true;
+            }
+            return false;
+        }
+
+        // Structured AST pattern: {:form_name, _, [sub_patterns...]}
+        // Matches a 3-tuple subject with matching form and recurses on args
+        if (form == .atom and args == .list) {
+            if (subject == .tuple and subject.tuple.elems.len == 3) {
+                // Match the form
+                if (!form.eql(subject.tuple.elems[0])) return false;
+                // Match sub-patterns against subject args
+                const subj_args = subject.tuple.elems[2];
+                if (subj_args == .list and args.list.elems.len == subj_args.list.elems.len) {
+                    for (args.list.elems, subj_args.list.elems) |sub_pat, sub_val| {
+                        if (!matchPattern(env, sub_pat, sub_val)) return false;
+                    }
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+
+    // List pattern: match element by element
+    if (pattern == .list and subject == .list) {
+        if (pattern.list.elems.len != subject.list.elems.len) return false;
+        for (pattern.list.elems, subject.list.elems) |p, s| {
+            if (!matchPattern(env, p, s)) return false;
+        }
+        return true;
     }
 
     // Direct value match
