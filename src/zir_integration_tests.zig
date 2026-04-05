@@ -497,16 +497,36 @@ test "ZIR: aliased function-local captured closure" {
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
 
-test "ZIR compile: escaping closure" {
-    // Escaping closures (closures returned from functions) require heap allocation
-    // and dynamic dispatch, which is more complex. Compile-only for now.
-    try compileOnly(
+test "ZIR: captured closure called through multiple paths" {
+    // Two closures that capture the same variable, selected by case.
+    // Exercises closure creation + env struct emission for different functions.
+    var result = try compileAndRun(
         \\pub module TestProg {
+        \\  pub fn compute(base :: i64, mode :: i64) -> i64 {
+        \\    pub fn add_ten(y :: i64) -> i64 {
+        \\      base + y + 10
+        \\    }
+        \\
+        \\    pub fn add_twenty(y :: i64) -> i64 {
+        \\      base + y + 20
+        \\    }
+        \\
+        \\    case mode {
+        \\      1 -> add_ten(0)
+        \\      _ -> add_twenty(0)
+        \\    }
+        \\  }
+        \\
         \\  pub fn main() -> String {
+        \\    Kernel.inspect(compute(100, 1))
+        \\    Kernel.inspect(compute(100, 2))
         \\    "done"
         \\  }
         \\}
     );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("110\n120\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
 
 // ============================================================

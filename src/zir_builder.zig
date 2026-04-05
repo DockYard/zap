@@ -2336,15 +2336,39 @@ pub const ZirDriver = struct {
                     const ref = try self.emitNamedCallToTarget(target.function_id, target.captures, cc.args);
                     if (ref != error_ref) try self.setLocal(cc.dest, ref);
                 } else {
-                    // Fallback: indirect call via closure ref
+                    // Dynamic dispatch: extract call_fn and env from closure struct,
+                    // call function with env prepended to args.
                     const callee_ref = self.refForLocal(cc.callee) catch return;
-                    var args = std.ArrayListUnmanaged(u32).empty;
-                    defer args.deinit(self.allocator);
+
+                    // Extract function pointer and environment from closure struct
+                    const call_fn_ref = zir_builder_emit_field_val(self.handle, callee_ref, "call_fn", 7);
+                    if (call_fn_ref == error_ref) {
+                        // Fallback: callee might be a bare function ref, not a closure struct
+                        var args = std.ArrayListUnmanaged(u32).empty;
+                        defer args.deinit(self.allocator);
+                        for (cc.args) |arg| {
+                            const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                            try args.append(self.allocator, ref);
+                        }
+                        const ref = zir_builder_emit_call_ref(self.handle, callee_ref, args.items.ptr, @intCast(args.items.len));
+                        if (ref == error_ref) return error.EmitFailed;
+                        try self.setLocal(cc.dest, ref);
+                        return;
+                    }
+
+                    const env_ref = zir_builder_emit_field_val(self.handle, callee_ref, "env", 3);
+                    if (env_ref == error_ref) return error.EmitFailed;
+
+                    // Build args: env as first argument, then user args
+                    var full_args = std.ArrayListUnmanaged(u32).empty;
+                    defer full_args.deinit(self.allocator);
+                    try full_args.append(self.allocator, env_ref);
                     for (cc.args) |arg| {
                         const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
-                        try args.append(self.allocator, ref);
+                        try full_args.append(self.allocator, ref);
                     }
-                    const ref = zir_builder_emit_call_ref(self.handle, callee_ref, args.items.ptr, @intCast(args.items.len));
+
+                    const ref = zir_builder_emit_call_ref(self.handle, call_fn_ref, full_args.items.ptr, @intCast(full_args.items.len));
                     if (ref == error_ref) return error.EmitFailed;
                     try self.setLocal(cc.dest, ref);
                 }
@@ -2412,10 +2436,12 @@ pub const ZirDriver = struct {
                 if (env_ref == error_ref) return error.EmitFailed;
 
                 // 3. Build the closure struct: .{ .call_fn = func_ref, .env = env_ref }
-                //    For call_fn, emit a call to the named function with zero args to get
-                //    a reference. In ZIR comptime context, we store the function name as
-                //    a string so it can be resolved at call time.
-                const fn_name_ref = zir_builder_emit_str(self.handle, func_name.ptr, @intCast(func_name.len));
+                //    Use decl_ref to get a real function reference that supports dynamic dispatch.
+                const fn_ref = zir_builder_emit_decl_ref(self.handle, func_name.ptr, @intCast(func_name.len));
+                const fn_name_ref = if (fn_ref != error_ref) fn_ref else blk: {
+                    // Fallback to string name if decl_ref fails (function not yet emitted)
+                    break :blk zir_builder_emit_str(self.handle, func_name.ptr, @intCast(func_name.len));
+                };
                 if (fn_name_ref == error_ref) return error.EmitFailed;
                 const null_ref = @intFromEnum(Zir.Inst.Ref.null_value);
 
