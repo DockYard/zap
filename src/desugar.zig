@@ -553,9 +553,28 @@ pub const Desugarer = struct {
                 }),
                 .expr => |expr| blk: {
                     const desugared = try self.desugarExpr(expr);
-                    // TODO: Wrap in to_string() when Kernel.to_string/1 exists.
-                    // For now, interpolation only supports string-typed expressions.
-                    break :blk desugared;
+                    // Wrap in Kernel.to_string() for type-generic conversion
+                    const kernel_name = try self.interner.intern("Kernel");
+                    if (self.to_string_id) |ts_id| {
+                        const callee = try self.create(ast.Expr, .{
+                            .field_access = .{
+                                .meta = si.meta,
+                                .object = try self.create(ast.Expr, .{
+                                    .module_ref = .{ .meta = si.meta, .name = .{ .parts = try self.allocSlice(ast.StringId, &.{kernel_name}), .span = si.meta.span } },
+                                }),
+                                .field = ts_id,
+                            },
+                        });
+                        break :blk try self.create(ast.Expr, .{
+                            .call = .{
+                                .meta = si.meta,
+                                .callee = callee,
+                                .args = try self.allocSlice(*const ast.Expr, &.{desugared}),
+                            },
+                        });
+                    } else {
+                        break :blk desugared;
+                    }
                 },
             };
 

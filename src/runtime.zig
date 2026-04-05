@@ -898,6 +898,36 @@ pub const Prelude = struct {
         return if (value) "true" else "false";
     }
 
+    /// Generic to_string for string interpolation — handles all Zap types.
+    /// Strings pass through; other types are formatted via bump allocator.
+    pub fn to_string(value: anytype) []const u8 {
+        const T = @TypeOf(value);
+        const info = @typeInfo(T);
+        if (T == []const u8 or (info == .pointer and @typeInfo(std.meta.Child(T)) == .array)) {
+            return value;
+        } else if (T == bool) {
+            return if (value) "true" else "false";
+        } else if (info == .int or info == .comptime_int) {
+            var buf: [32]u8 = undefined;
+            const slice = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return "?";
+            const result = bumpAlloc(slice.len);
+            if (result.len == 0) return "?";
+            @memcpy(result, slice);
+            return result;
+        } else if (info == .float or info == .comptime_float) {
+            var buf: [64]u8 = undefined;
+            const slice = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return "?";
+            const result = bumpAlloc(slice.len);
+            if (result.len == 0) return "?";
+            @memcpy(result, slice);
+            return result;
+        } else if (info == .@"enum") {
+            return @tagName(value);
+        } else {
+            return "<value>";
+        }
+    }
+
     pub fn string_to_i64(s: []const u8) ?i64 {
         return std.fmt.parseInt(i64, s, 10) catch null;
     }

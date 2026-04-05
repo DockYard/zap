@@ -238,6 +238,20 @@ test "ZIR: string literal" {
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
 
+test "ZIR: string escape sequences" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn main() -> String {
+        \\    IO.print_str("line1\nline2\n")
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("line1\nline2\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
 test "ZIR: boolean" {
     var result = try compileAndRun(
         \\pub module TestProg {
@@ -626,6 +640,21 @@ test "ZIR: string interpolation with string variable" {
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
 
+test "ZIR: string interpolation with integer via to_string" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn main() -> String {
+        \\    n = 42
+        \\    IO.puts("The answer is #{n}")
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("The answer is 42\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
 test "ZIR: string interpolation multiple expressions" {
     var result = try compileAndRun(
         \\pub module TestProg {
@@ -665,4 +694,42 @@ test "ZIR: binary pattern byte extraction" {
     defer result.deinit();
     try std.testing.expectEqualStrings("65\n", result.stdout);
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: binary pattern string rest" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn skip_first(data :: String) -> String {
+        \\    case data {
+        \\      <<_, rest::String>> -> rest
+        \\      _ -> ""
+        \\    }
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    IO.puts(skip_first("Hello"))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("ello\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR compile: binary pattern string prefix" {
+    try compileOnly(
+        \\pub module TestProg {
+        \\  pub fn check_get(data :: String) -> String {
+        \\    case data {
+        \\      <<"GET "::String, path::String>> -> path
+        \\      _ -> "unknown"
+        \\    }
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    "done"
+        \\  }
+        \\}
+    );
 }

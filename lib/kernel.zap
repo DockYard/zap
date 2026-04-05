@@ -15,6 +15,22 @@ pub module Kernel {
     :zig.inspect(_value)
   }
 
+  pub fn to_string(value :: String) -> String {
+    value
+  }
+
+  pub fn to_string(value :: i64) -> String {
+    Integer.to_string(value)
+  }
+
+  pub fn to_string(value :: f64) -> String {
+    Float.to_string(value)
+  }
+
+  pub fn to_string(value :: Bool) -> String {
+    :zig.to_string(value)
+  }
+
   pub macro if(condition :: Expr, then_body :: Expr) -> Nil {
     quote {
       case unquote(condition) {

@@ -161,6 +161,35 @@ pub const Parser = struct {
         return buf.toOwnedSlice(self.allocator) catch text;
     }
 
+    /// Process escape sequences in a string: \n, \t, \r, \\, \", \0
+    fn unescapeString(self: *Parser, text: []const u8) []const u8 {
+        if (std.mem.indexOfScalar(u8, text, '\\') == null) return text;
+        var buf: std.ArrayList(u8) = .empty;
+        var i: usize = 0;
+        while (i < text.len) {
+            if (text[i] == '\\' and i + 1 < text.len) {
+                switch (text[i + 1]) {
+                    'n' => buf.append(self.allocator, '\n') catch return text,
+                    't' => buf.append(self.allocator, '\t') catch return text,
+                    'r' => buf.append(self.allocator, '\r') catch return text,
+                    '\\' => buf.append(self.allocator, '\\') catch return text,
+                    '"' => buf.append(self.allocator, '"') catch return text,
+                    '0' => buf.append(self.allocator, 0) catch return text,
+                    else => {
+                        // Unknown escape — keep as-is
+                        buf.append(self.allocator, '\\') catch return text;
+                        buf.append(self.allocator, text[i + 1]) catch return text;
+                    },
+                }
+                i += 2;
+            } else {
+                buf.append(self.allocator, text[i]) catch return text;
+                i += 1;
+            }
+        }
+        return buf.toOwnedSlice(self.allocator) catch text;
+    }
+
     fn skipNewlines(self: *Parser) void {
         while (self.check(.newline)) {
             _ = self.advance();
@@ -1813,7 +1842,8 @@ pub const Parser = struct {
     fn parseStringLiteral(self: *Parser) !*const ast.Expr {
         const tok = self.advance();
         const raw = tok.slice(self.source);
-        const value = if (raw.len >= 2) raw[1 .. raw.len - 1] else raw;
+        const stripped = if (raw.len >= 2) raw[1 .. raw.len - 1] else raw;
+        const value = self.unescapeString(stripped);
         return self.create(ast.Expr, .{
             .string_literal = .{ .meta = .{ .span = ast.SourceSpan.from(tok.loc) }, .value = try self.interner.intern(value) },
         });
@@ -1823,9 +1853,10 @@ pub const Parser = struct {
         const start_tok = self.advance(); // consume string_literal_start
         var parts: std.ArrayList(ast.StringPart) = .empty;
 
-        // Add the literal prefix (strip opening quote)
+        // Add the literal prefix (strip opening quote, unescape)
         const prefix_raw = start_tok.slice(self.source);
-        const prefix = if (prefix_raw.len > 0 and prefix_raw[0] == '"') prefix_raw[1..] else prefix_raw;
+        const prefix_stripped = if (prefix_raw.len > 0 and prefix_raw[0] == '"') prefix_raw[1..] else prefix_raw;
+        const prefix = self.unescapeString(prefix_stripped);
         if (prefix.len > 0) {
             try parts.append(self.allocator, .{ .literal = try self.interner.intern(prefix) });
         }
@@ -1839,7 +1870,7 @@ pub const Parser = struct {
             switch (self.peek()) {
                 .string_literal_part => {
                     const part_tok = self.advance();
-                    const part_raw = part_tok.slice(self.source);
+                    const part_raw = self.unescapeString(part_tok.slice(self.source));
                     if (part_raw.len > 0) {
                         try parts.append(self.allocator, .{ .literal = try self.interner.intern(part_raw) });
                     }
@@ -1849,8 +1880,9 @@ pub const Parser = struct {
                 .string_literal_end => {
                     const end_tok = self.advance();
                     const end_raw = end_tok.slice(self.source);
-                    // Strip closing quote
-                    const suffix = if (end_raw.len > 0 and end_raw[end_raw.len - 1] == '"') end_raw[0 .. end_raw.len - 1] else end_raw;
+                    // Strip closing quote, unescape
+                    const suffix_stripped = if (end_raw.len > 0 and end_raw[end_raw.len - 1] == '"') end_raw[0 .. end_raw.len - 1] else end_raw;
+                    const suffix = self.unescapeString(suffix_stripped);
                     if (suffix.len > 0) {
                         try parts.append(self.allocator, .{ .literal = try self.interner.intern(suffix) });
                     }
