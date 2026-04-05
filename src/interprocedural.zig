@@ -741,6 +741,36 @@ pub const InterproceduralAnalyzer = struct {
                     }
                 },
 
+                .try_call_named => |tcn| {
+                    const callee_id = self.call_graph.name_to_id.get(tcn.name);
+                    if (callee_id) |cid| {
+                        self.analyzeCallArgsDirect(
+                            tcn.args,
+                            cid,
+                            param_summaries,
+                            aliases,
+                        );
+                        if (self.summaries.get(cid)) |callee_summary| {
+                            if (callee_summary.return_summary.fresh_alloc) {
+                                try fresh_locals.put(tcn.dest, {});
+                            } else {
+                                for (callee_summary.return_summary.param_sources) |src_idx| {
+                                    if (src_idx < tcn.args.len) {
+                                        if (aliases.get(tcn.args[src_idx])) |param_set| {
+                                            try aliases.put(tcn.dest, param_set);
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            try fresh_locals.put(tcn.dest, {});
+                        }
+                    } else {
+                        markArgsPassedToUnknown(tcn.args, param_summaries, aliases);
+                        try fresh_locals.put(tcn.dest, {});
+                    }
+                },
+
                 .call_closure => |cc| {
                     markArgsPassedToUnknown(cc.args, param_summaries, aliases);
                     try fresh_locals.put(cc.dest, {});
@@ -811,6 +841,18 @@ pub const InterproceduralAnalyzer = struct {
                 .optional_unwrap => |ou| {
                     if (aliases.get(ou.source)) |param_set| {
                         try aliases.put(ou.dest, param_set);
+                    }
+                },
+
+                .error_catch => |ec| {
+                    // dest may come from source or catch_value; merge both alias sets.
+                    var merged = ParamSet.empty();
+                    if (aliases.get(ec.source)) |ps| merged = merged.merge(ps);
+                    if (aliases.get(ec.catch_value)) |ps| merged = merged.merge(ps);
+                    if (!merged.isEmpty()) {
+                        try aliases.put(ec.dest, merged);
+                    } else if (fresh_locals.get(ec.source) != null or fresh_locals.get(ec.catch_value) != null) {
+                        try fresh_locals.put(ec.dest, {});
                     }
                 },
 
@@ -965,7 +1007,7 @@ pub const InterproceduralAnalyzer = struct {
                 .bin_match_prefix => |bmp| try fresh_locals.put(bmp.dest, {}),
                 .list_len_check => |llc| try fresh_locals.put(llc.dest, {}),
                 .switch_tag => {},
-                .branch, .cond_branch, .jump, .case_break, .match_fail => {},
+                .branch, .cond_branch, .jump, .case_break, .match_fail, .match_error_return => {},
             }
         }
     }

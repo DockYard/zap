@@ -136,11 +136,13 @@ pub const Desugarer = struct {
 
     fn desugarExpr(self: *Desugarer, expr: *const ast.Expr) anyerror!*const ast.Expr {
         switch (expr.*) {
-            // Pipe: x |> f(y) → f(x, y)
+            // Pipe: desugared during macro expansion (Kernel.|> macro)
             .pipe => |pe| {
                 const lhs = try self.desugarExpr(pe.lhs);
                 const rhs = try self.desugarExpr(pe.rhs);
-                return self.desugarPipe(lhs, rhs, pe.meta);
+                return try self.create(ast.Expr, .{
+                    .pipe = .{ .meta = pe.meta, .lhs = lhs, .rhs = rhs },
+                });
             },
 
             // Unwrap: expr! → optional force-unwrap (panics if nil)
@@ -190,7 +192,7 @@ pub const Desugarer = struct {
                     },
                 });
             },
-            // if_expr, cond_expr, and with_expr are expanded to case by the
+            // if_expr and cond_expr are expanded to case by the
             // macro engine (Kernel macros / special forms) before desugaring.
             // They should not reach this point.
             .case_expr => |ce| {
@@ -255,51 +257,7 @@ pub const Desugarer = struct {
         }
     }
 
-    // ============================================================
-    // Pipe desugaring: x |> f(y) → f(x, y)
-    // ============================================================
-
-    fn desugarPipe(self: *Desugarer, lhs: *const ast.Expr, rhs: *const ast.Expr, meta: ast.NodeMeta) !*const ast.Expr {
-        switch (rhs.*) {
-            .call => |call| {
-                // Insert lhs as first argument
-                var new_args: std.ArrayList(*const ast.Expr) = .empty;
-                try new_args.append(self.allocator, lhs);
-                for (call.args) |arg| {
-                    try new_args.append(self.allocator, arg);
-                }
-                return try self.create(ast.Expr, .{
-                    .call = .{
-                        .meta = meta,
-                        .callee = call.callee,
-                        .args = try new_args.toOwnedSlice(self.allocator),
-                    },
-                });
-            },
-            .var_ref => {
-                // x |> f → f(x)
-                var args: std.ArrayList(*const ast.Expr) = .empty;
-                try args.append(self.allocator, lhs);
-                return try self.create(ast.Expr, .{
-                    .call = .{
-                        .meta = meta,
-                        .callee = rhs,
-                        .args = try args.toOwnedSlice(self.allocator),
-                    },
-                });
-            },
-            else => {
-                // Can't pipe into this expression, leave as-is
-                return try self.create(ast.Expr, .{
-                    .call = .{
-                        .meta = meta,
-                        .callee = rhs,
-                        .args = &.{lhs},
-                    },
-                });
-            },
-        }
-    }
+    // Pipe desugaring removed — now handled in macro engine (Phase 4).
 
     // ============================================================
     // Error pipe desugaring: chain ~> handler
@@ -658,7 +616,9 @@ pub const Desugarer = struct {
 
 const Parser = @import("parser.zig").Parser;
 
-test "desugar pipe operator" {
+test "pipe is desugared during macro expansion, not desugar" {
+    // Pipe desugaring now happens in the macro engine (Phase 4).
+    // The desugar pass just passes pipe nodes through.
     const source =
         \\pub module Test {
         \\  pub fn foo(x) {
@@ -678,14 +638,11 @@ test "desugar pipe operator" {
     var desugarer = Desugarer.init(alloc, parser.interner);
     const desugared = try desugarer.desugarProgram(&program);
 
-    // Function should now have a call instead of a pipe
+    // Pipe should still be a pipe (desugar doesn't transform it anymore)
     const func = desugared.modules[0].items[0].function;
     const body = func.clauses[0].body;
     try std.testing.expectEqual(@as(usize, 1), body.len);
-    // Should be a call expression (pipe was desugared)
-    try std.testing.expect(body[0].expr.* == .call);
-    // Call should have 2 args (x inserted as first arg)
-    try std.testing.expectEqual(@as(usize, 2), body[0].expr.call.args.len);
+    try std.testing.expect(body[0].expr.* == .pipe);
 }
 
 test "desugar unwrap operator" {

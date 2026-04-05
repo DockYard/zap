@@ -1000,26 +1000,6 @@ pub const TypeChecker = struct {
                 return false;
             },
             .block => |block| return !self.isClosureParamUsedLocally(block.stmts, param_name),
-            .with_expr => |with_expr| {
-                for (with_expr.items) |item| {
-                    switch (item) {
-                        .bind => |bind| {
-                            if (self.exprUsesClosureParamUnsafely(bind.source, param_name, false)) return true;
-                        },
-                        .expr => |subexpr| {
-                            if (self.exprUsesClosureParamUnsafely(subexpr, param_name, false)) return true;
-                        },
-                    }
-                }
-                if (!self.isClosureParamUsedLocally(with_expr.body, param_name)) return true;
-                if (with_expr.else_clauses) |clauses| {
-                    for (clauses) |clause| {
-                        if (clause.guard) |guard| if (self.exprUsesClosureParamUnsafely(guard, param_name, false)) return true;
-                        if (!self.isClosureParamUsedLocally(clause.body, param_name)) return true;
-                    }
-                }
-                return false;
-            },
             .cond_expr => |cond_expr| {
                 for (cond_expr.clauses) |clause| {
                     if (self.exprUsesClosureParamUnsafely(clause.condition, param_name, false)) return true;
@@ -1434,6 +1414,7 @@ pub const TypeChecker = struct {
                 .macro, .priv_macro => |mac| {
                     // Mark macro params as referenced — they're used in quote/unquote,
                     // not via normal var_ref, so the unused-binding check can't see them.
+                    // Macro bodies are compile-time code and are NOT type-checked.
                     for (mac.clauses) |clause| {
                         const macro_scope = self.graph.node_scope_map.get(clause.meta.span.start) orelse clause.meta.scope_id;
                         for (clause.params) |param| {
@@ -1444,7 +1425,6 @@ pub const TypeChecker = struct {
                             }
                         }
                     }
-                    try self.checkFunctionDecl(mac);
                 },
                 .attribute => |attr| {
                     try self.checkAttributeDecl(attr);
@@ -1623,8 +1603,7 @@ pub const TypeChecker = struct {
         switch (item) {
             .function => |func| try self.checkFunctionDecl(func),
             .priv_function => |func| try self.checkFunctionDecl(func),
-            .macro => |mac| try self.checkFunctionDecl(mac),
-            .priv_macro => |mac| try self.checkFunctionDecl(mac),
+            .macro, .priv_macro => {}, // Macro bodies are compile-time code — not type-checked
             .module => {},
             .priv_module => {},
             else => {},
@@ -1899,7 +1878,7 @@ pub const TypeChecker = struct {
                 });
             },
 
-            // if_expr, with_expr, cond_expr, pipe are desugared to case_expr
+            // if_expr, cond_expr, pipe are desugared to case_expr
             // before the TypeChecker runs. If we see them, return UNKNOWN.
             .if_expr => |ie| {
                 const cond_type = try self.inferExpr(ie.condition);
@@ -2197,7 +2176,14 @@ pub const TypeChecker = struct {
             },
             .panic_expr => TypeStore.NEVER,
             .unwrap => TypeStore.UNKNOWN,
-            .pipe => TypeStore.UNKNOWN, // desugared before type checking
+            .pipe => |pipe| {
+                // Pipes are desugared before type checking, but we still need
+                // to walk into children so var_refs get marked as referenced
+                // (e.g., for unused binding detection in error_pipe chains).
+                _ = try self.inferExpr(pipe.lhs);
+                _ = try self.inferExpr(pipe.rhs);
+                return TypeStore.UNKNOWN;
+            },
             .module_ref => |mr| {
                 // Check for enum variant access (e.g. Color.Red parsed as module_ref ["Color", "Red"])
                 if (mr.name.parts.len == 2) {
@@ -2231,8 +2217,7 @@ pub const TypeChecker = struct {
             },
             .string_interpolation => TypeStore.STRING,
             .quote_expr => TypeStore.UNKNOWN,
-            .unquote_expr => TypeStore.UNKNOWN,
-            .with_expr => TypeStore.UNKNOWN, // desugared before type checking
+            .unquote_expr, .unquote_splicing_expr => TypeStore.UNKNOWN,
             .cond_expr => TypeStore.UNKNOWN, // desugared before type checking
             .intrinsic => |intr| {
                 // Recurse into intrinsic args so var_refs mark bindings as used

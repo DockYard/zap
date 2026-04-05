@@ -40,4 +40,34 @@ pub module Kernel {
       }
     }
   }
+
+  # Short-circuit boolean: and expands to case
+  pub macro and(left :: Expr, right :: Expr) -> Expr {
+    quote {
+      case unquote(left) {
+        false -> false
+        _ -> unquote(right)
+      }
+    }
+  }
+
+  # Short-circuit boolean: or expands to case
+  pub macro or(left :: Expr, right :: Expr) -> Expr {
+    quote {
+      case unquote(left) {
+        false -> unquote(right)
+        _ -> unquote(left)
+      }
+    }
+  }
+
+  # Pipe operator: x |> f(y) → f(x, y)
+  # Injects left as the first argument of the right-hand call.
+  pub macro |>(left :: Expr, right :: Expr) -> Expr {
+    name = elem(right, 0)
+    meta = elem(right, 1)
+    args = elem(right, 2)
+    new_args = prepend(args, left)
+    tuple(name, meta, new_args)
+  }
 }

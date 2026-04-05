@@ -72,6 +72,17 @@ pub const Function = struct {
     is_closure: bool,
     captures: []const Capture,
     local_count: u32 = 0,
+    /// Default parameter values. defaults[i] is the default for params[full_arity - defaults.len + i].
+    /// Empty when no defaults exist.
+    defaults: []const DefaultValue = &.{},
+};
+
+pub const DefaultValue = union(enum) {
+    int: i64,
+    float: f64,
+    string: []const u8,
+    bool_val: bool,
+    nil,
 };
 
 pub const Param = struct {
@@ -134,6 +145,13 @@ pub const Instruction = union(enum) {
     call_dispatch: CallDispatch,
     call_builtin: CallBuiltin,
     tail_call: TailCall,
+    /// Call a __try function variant (returns error union).
+    /// Used in ~> catch basin pipe chains.
+    try_call_named: TryCallNamed,
+    /// Unwrap an error union result from try_call_named.
+    /// On success: dest = unwrapped value.
+    /// On error: dest = catch_value (handler result applied to the input that failed).
+    error_catch: ErrorCatch,
 
     // Control flow
     if_expr: IfExpr,
@@ -152,6 +170,7 @@ pub const Instruction = union(enum) {
     match_string: MatchString,
     match_type: MatchType,
     match_fail: MatchFail,
+    match_error_return: MatchErrorReturn,
     ret: Return,
     cond_return: CondReturn,
     case_break: CaseBreak,
@@ -352,6 +371,8 @@ pub const BinaryOp = struct {
         rem_op,
         eq,
         neq,
+        string_eq,
+        string_neq,
         lt,
         gt,
         lte,
@@ -412,6 +433,23 @@ pub const CallBuiltin = struct {
     name: []const u8,
     args: []const LocalId,
     arg_modes: []const ValueMode,
+};
+
+/// Call a __try function variant. The result is an error union:
+/// error{NoMatchingClause}!ReturnType.
+pub const TryCallNamed = struct {
+    dest: LocalId, // holds the error union result
+    name: []const u8, // the __try function name (already suffixed)
+    args: []const LocalId,
+    arg_modes: []const ValueMode,
+};
+
+/// Unwrap an error union from try_call_named.
+/// dest = if source is success: unwrapped value, else: catch_value.
+pub const ErrorCatch = struct {
+    dest: LocalId, // the final unwrapped result
+    source: LocalId, // the error union (from try_call_named)
+    catch_value: LocalId, // value to use on error (handler result for the failed input)
 };
 
 pub const Branch = struct {
@@ -531,6 +569,12 @@ pub const MatchType = struct {
 
 pub const MatchFail = struct {
     message: []const u8,
+};
+
+/// Like match_fail but returns error.NoMatchingClause instead of panicking.
+/// Used in __try function variants for the ~> catch basin operator.
+pub const MatchErrorReturn = struct {
+    scrutinee: LocalId, // the unmatched value
 };
 
 pub const Return = struct {
@@ -699,6 +743,8 @@ pub const IrBuilder = struct {
     allocator: std.mem.Allocator,
     functions: std.ArrayList(Function),
     next_function_id: FunctionId,
+    /// Separate ID counter for __try variants to avoid colliding with HIR group IDs.
+    next_try_id: FunctionId = 10000,
     next_local: LocalId,
     next_label: LabelId,
     current_blocks: std.ArrayList(Block),
@@ -713,6 +759,15 @@ pub const IrBuilder = struct {
     union_dispatch_map: std.StringHashMap(UnionDispatchInfo),
     /// Maps "func_name:arity" → wrapper name for default-arg resolution
     default_arg_wrappers: std.StringHashMap([]const u8),
+    /// When true, decision tree failure nodes emit match_error_return instead of match_fail.
+    /// Used when generating __try function variants for the ~> catch basin operator.
+    try_mode: bool = false,
+    /// The original function's arity (number of params excluding the handler).
+    /// The handler param is at index current_try_arity in the __try variant.
+    current_try_arity: u32 = 0,
+    /// Set of function names that need __try variants (populated by error pipe analysis).
+    /// Only functions in this set will get __try variants generated.
+    try_variant_names: std.StringHashMap(void),
 
     pub const UnionDispatchInfo = struct {
         param_idx: u32,
@@ -738,6 +793,7 @@ pub const IrBuilder = struct {
             .synthesized_type_defs = .empty,
             .union_dispatch_map = std.StringHashMap(UnionDispatchInfo).init(allocator),
             .default_arg_wrappers = std.StringHashMap([]const u8).init(allocator),
+            .try_variant_names = std.StringHashMap(void).init(allocator),
         };
     }
 
@@ -767,7 +823,26 @@ pub const IrBuilder = struct {
             try self.known_function_names.put(func_name, {});
         }
 
-        // Second pass: build function bodies
+        // Second pass: pre-scan for ~> error pipe chains to identify functions
+        // that need __try variants. This must happen before building function bodies
+        // so that __try variants are generated during buildFunctionGroup.
+        for (hir_program.modules) |mod| {
+            const module_prefix = self.moduleNameToPrefix(mod.name);
+            for (mod.functions) |func_group| {
+                for (func_group.clauses) |clause| {
+                    try self.scanForTryVariantNames(clause.body, module_prefix);
+                }
+            }
+        }
+        for (hir_program.top_functions) |func_group| {
+            for (func_group.clauses) |clause| {
+                try self.scanForTryVariantNames(clause.body, null);
+            }
+        }
+
+
+
+        // Fourth pass: build function bodies
         for (hir_program.modules) |mod| {
             const module_prefix = self.moduleNameToPrefix(mod.name);
             self.current_module_prefix = module_prefix;
@@ -945,6 +1020,8 @@ pub const IrBuilder = struct {
             self.next_local = max_binding_local;
         }
 
+        var uses_decision_tree = false;
+
         if (group.clauses.len == 1) {
             // Single clause — no dispatch needed
             // Emit tuple/binary bindings if present
@@ -1049,6 +1126,7 @@ pub const IrBuilder = struct {
                 },
             });
         } else {
+            uses_decision_tree = true;
             // General multi-clause dispatch via decision tree
             // Build PatternMatrix from clause params
             var pattern_rows: std.ArrayList(hir_mod.PatternRow) = .empty;
@@ -1144,6 +1222,27 @@ pub const IrBuilder = struct {
         };
 
         const final_params = try params.toOwnedSlice(self.allocator);
+        // Collect default parameter values for call-site inlining
+        var defaults_list: std.ArrayList(DefaultValue) = .empty;
+        if (group.clauses.len == 1) {
+            const clause = &group.clauses[0];
+            var di: usize = clause.params.len;
+            while (di > 0) {
+                di -= 1;
+                if (clause.params[di].default) |default_expr| {
+                    const dv: DefaultValue = switch (default_expr.kind) {
+                        .int_lit => |v| .{ .int = v },
+                        .float_lit => |v| .{ .float = v },
+                        .string_lit => |v| .{ .string = self.interner.get(v) },
+                        .bool_lit => |v| .{ .bool_val = v },
+                        .nil_lit => .nil,
+                        else => break, // Non-constant default, can't inline
+                    };
+                    try defaults_list.insert(self.allocator, 0, dv); // prepend to maintain order
+                } else break;
+            }
+        }
+
         try self.functions.append(self.allocator, .{
             .id = func_id,
             .name = name_str,
@@ -1155,13 +1254,12 @@ pub const IrBuilder = struct {
             .is_closure = group.captures.len > 0,
             .captures = try captures.toOwnedSlice(self.allocator),
             .local_count = self.next_local,
+            .defaults = try defaults_list.toOwnedSlice(self.allocator),
         });
 
-        // Generate forwarding wrappers for default parameter values.
-        // For def foo(a :: i64, b :: i64 = 10, c :: String = "hi"):
-        //   foo/1 calls foo/3 with b=10, c="hi"
-        //   foo/2 calls foo/3 with c="hi"
-        if (group.clauses.len == 1) {
+        // Default parameter wrappers disabled — defaults are inlined at call sites
+        // by the ZIR builder's call_named handler using default_arg_info.
+        if (false) { // @suppress: wrapper generation disabled
             const clause = &group.clauses[0];
             // Count trailing defaults
             var num_defaults: u32 = 0;
@@ -1178,8 +1276,10 @@ pub const IrBuilder = struct {
                 // Generate one wrapper for each shorter arity
                 var arity: usize = total_params - num_defaults;
                 while (arity < total_params) : (arity += 1) {
-                    const wrapper_id = self.next_function_id;
-                    self.next_function_id += 1;
+                    // Use high-offset IDs for wrappers to avoid colliding
+                    // with HIR group.id values used by normal functions.
+                    const wrapper_id = self.next_try_id;
+                    self.next_try_id += 1;
 
                     // Build param list for the wrapper (just the non-default params)
                     var wrapper_params: std.ArrayList(Param) = .empty;
@@ -1272,6 +1372,121 @@ pub const IrBuilder = struct {
                     try self.default_arg_wrappers.put(key, wrapper_name);
                 }
             }
+        }
+
+        // Generate __try variant for multi-clause functions that use decision tree dispatch.
+        if (uses_decision_tree and group.clauses.len > 1 and self.try_variant_names.contains(name_str)) {
+            // Use a high ID offset for __try variants to avoid colliding with
+            // normal function group IDs (which come from HIR and are sequential).
+            const try_func_id = self.next_try_id;
+            self.next_try_id += 1;
+            self.next_local = 0;
+            self.next_label = 0;
+            self.current_instrs = .empty;
+            self.known_local_types.clearRetainingCapacity();
+
+            // Reserve binding locals (same as normal function)
+            {
+                var max_binding_local: u32 = 0;
+                for (group.clauses) |clause| {
+                    for (clause.tuple_bindings) |binding| {
+                        max_binding_local = @max(max_binding_local, binding.local_index + 1);
+                    }
+                    for (clause.struct_bindings) |binding| {
+                        max_binding_local = @max(max_binding_local, binding.local_index + 1);
+                    }
+                    for (clause.list_bindings) |binding| {
+                        max_binding_local = @max(max_binding_local, binding.local_index + 1);
+                    }
+                    for (clause.binary_bindings) |binding| {
+                        max_binding_local = @max(max_binding_local, binding.local_index + 1);
+                    }
+                }
+                self.next_local = max_binding_local;
+            }
+
+            // Re-build the decision tree with try_mode enabled
+            self.try_mode = true;
+            self.current_try_arity = group.arity;
+            defer self.try_mode = false;
+
+            var try_pattern_rows: std.ArrayList(hir_mod.PatternRow) = .empty;
+            for (group.clauses, 0..) |clause, clause_idx| {
+                var pats: std.ArrayList(?*const hir_mod.MatchPattern) = .empty;
+                for (clause.params) |param| {
+                    try pats.append(self.allocator, param.pattern);
+                }
+                try try_pattern_rows.append(self.allocator, .{
+                    .patterns = try pats.toOwnedSlice(self.allocator),
+                    .body_index = @intCast(clause_idx),
+                    .guard = clause.refinement,
+                });
+            }
+
+            var try_scrutinee_ids: std.ArrayList(u32) = .empty;
+            for (0..group.arity) |i| {
+                try try_scrutinee_ids.append(self.allocator, @intCast(i));
+            }
+
+            var try_next_scrutinee_id: u32 = group.arity;
+            const try_decision = try hir_mod.compilePatternMatrix(
+                self.allocator,
+                .{
+                    .rows = try try_pattern_rows.toOwnedSlice(self.allocator),
+                    .column_count = group.arity,
+                },
+                try try_scrutinee_ids.toOwnedSlice(self.allocator),
+                &try_next_scrutinee_id,
+            );
+
+            var try_scrutinee_map = std.AutoHashMap(u32, LocalId).init(self.allocator);
+            defer try_scrutinee_map.deinit();
+            for (0..group.arity) |i| {
+                const param_local = self.next_local;
+                self.next_local += 1;
+                try self.current_instrs.append(self.allocator, .{
+                    .param_get = .{ .dest = param_local, .index = @intCast(i) },
+                });
+                try try_scrutinee_map.put(@intCast(i), param_local);
+            }
+
+            try self.lowerDecisionTreeForDispatch(try_decision, group.clauses, &try_scrutinee_map);
+
+            const try_entry_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
+            const try_entry_block = Block{
+                .label = 0,
+                .instructions = try_entry_instrs,
+            };
+
+            // Re-build captures for the __try variant
+            var try_captures: std.ArrayList(Capture) = .empty;
+            for (group.captures, 0..) |capture, idx| {
+                const cap_name = try std.fmt.allocPrint(self.allocator, "__cap_{d}", .{idx});
+                try try_captures.append(self.allocator, .{
+                    .name = cap_name,
+                    .type_expr = typeIdToZigTypeWithStore(capture.type_id, self.type_store),
+                    .ownership = capture.ownership,
+                });
+            }
+
+            // Add handler as last param
+            var try_params: std.ArrayList(Param) = .empty;
+            for (final_params) |p| try try_params.append(self.allocator, p);
+            try try_params.append(self.allocator, .{ .name = "__handler", .type_expr = return_type });
+
+            const try_name = try std.fmt.allocPrint(self.allocator, "{s}__try", .{name_str});
+            try self.functions.append(self.allocator, .{
+                .id = try_func_id,
+                .name = try_name,
+                .scope_id = group.scope_id,
+                .arity = group.arity + 1,
+                .params = try try_params.toOwnedSlice(self.allocator),
+                .return_type = return_type,
+                .body = try self.allocSlice(Block, &.{try_entry_block}),
+                .is_closure = group.captures.len > 0,
+                .captures = try try_captures.toOwnedSlice(self.allocator),
+                .local_count = self.next_local,
+            });
         }
     }
 
@@ -2167,7 +2382,14 @@ pub const IrBuilder = struct {
                     try self.current_instrs.append(self.allocator, .{
                         .index_get = .{ .dest = elem_local, .object = scrutinee_local, .index = i },
                     });
-                    try scrutinee_map.put(findParamGetIdInDecision(ct.success, i), elem_local);
+                    // Use stored element scrutinee IDs directly — avoids the
+                    // fragile heuristic of walking the decision tree which breaks
+                    // when wildcard patterns skip bind nodes.
+                    const elem_id = if (i < ct.element_scrutinee_ids.len)
+                        ct.element_scrutinee_ids[i]
+                    else
+                        findParamGetIdInDecision(ct.success, i);
+                    try scrutinee_map.put(elem_id, elem_local);
                 }
                 try self.lowerDecisionTreeForCase(ct.success, case_arms, scrutinee_map, 0);
                 const success_body = try self.current_instrs.toOwnedSlice(self.allocator);
@@ -2290,9 +2512,16 @@ pub const IrBuilder = struct {
                 try self.current_instrs.append(self.allocator, .{ .ret = .{ .value = result_local } });
             },
             .failure => {
-                try self.current_instrs.append(self.allocator, .{
-                    .match_fail = .{ .message = "no matching clause" },
-                });
+                if (self.try_mode) {
+                    // Return sentinel empty string — caller checks and substitutes handler
+                    try self.current_instrs.append(self.allocator, .{
+                        .match_error_return = .{ .scrutinee = 0 },
+                    });
+                } else {
+                    try self.current_instrs.append(self.allocator, .{
+                        .match_fail = .{ .message = "no matching clause" },
+                    });
+                }
             },
             .guard => |guard_node| {
                 const guard_local = try self.lowerExpr(guard_node.condition);
@@ -2358,7 +2587,11 @@ pub const IrBuilder = struct {
                     try self.current_instrs.append(self.allocator, .{
                         .index_get = .{ .dest = elem_local, .object = scrutinee_local, .index = i },
                     });
-                    try scrutinee_map.put(findParamGetIdInDecision(ct.success, i), elem_local);
+                    const elem_id = if (i < ct.element_scrutinee_ids.len)
+                        ct.element_scrutinee_ids[i]
+                    else
+                        findParamGetIdInDecision(ct.success, i);
+                    try scrutinee_map.put(elem_id, elem_local);
                 }
                 try self.lowerDecisionTreeForDispatch(ct.success, clauses, scrutinee_map);
                 const success_body = try self.current_instrs.toOwnedSlice(self.allocator);
@@ -2641,192 +2874,90 @@ pub const IrBuilder = struct {
         return store.getType(type_id) == .opaque_type;
     }
 
-    /// Lower an error pipe chain starting at step `start_idx`.
-    /// `current_val` is the result of step[start_idx] (already lowered).
-    /// If step[start_idx] is fallible, wraps in union_switch with nested chain in Ok body.
-    /// If not fallible, pipes value to next step and recurses.
-    fn lowerErrorPipeChain(
-        self: *IrBuilder,
-        ep: hir_mod.ErrorPipeHir,
-        current_val: LocalId,
-        handler_local: LocalId,
-        start_idx: usize,
-        final_dest: LocalId,
-    ) anyerror!LocalId {
-        const step = ep.steps[start_idx];
-        const is_last = (start_idx == ep.steps.len - 1);
-
-        if (step.is_fallible) {
-            // This step returns a tagged union — wrap in union_switch
-            const ok_dest = self.next_local;
-            self.next_local += 1;
-
-            // Build Ok case body: pipe ok_dest through remaining steps
-            const saved = self.current_instrs;
-            self.current_instrs = .empty;
-
-            var ok_result: LocalId = ok_dest;
-            if (!is_last) {
-                // Pipe ok value through remaining steps
-                ok_result = try self.lowerErrorPipeRemainingSteps(ep, ok_dest, handler_local, start_idx + 1);
-            }
-
-            const ok_body_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
-            self.current_instrs = saved;
-
-            const cases = try self.allocator.alloc(UnionCase, 2);
-            cases[0] = .{
-                .variant_name = "Ok",
-                .field_bindings = &.{},
-                .body_instrs = ok_body_instrs,
-                .return_value = ok_result,
-            };
-            cases[1] = .{
-                .variant_name = "Error",
-                .field_bindings = &.{},
-                .body_instrs = &.{},
-                .return_value = handler_local,
-            };
-
-            try self.current_instrs.append(self.allocator, .{
-                .union_switch = .{
-                    .dest = final_dest,
-                    .scrutinee = current_val,
-                    .cases = cases,
-                },
-            });
-            return final_dest;
-        } else {
-            // Not fallible — this shouldn't happen for step 0 (it should be fallible)
-            // but handle gracefully by just returning the value
-            return current_val;
-        }
-    }
-
-    /// Lower remaining pipe steps after a fallible step's Ok branch.
-    /// Each step is a function call with the previous Ok value piped as first arg.
-    /// Emits all instructions (calls and switches) into self.current_instrs.
-    /// Returns the local holding the final result.
-    fn lowerErrorPipeRemainingSteps(
-        self: *IrBuilder,
-        ep: hir_mod.ErrorPipeHir,
-        input_val: LocalId,
-        handler_local: LocalId,
-        start_idx: usize,
-    ) anyerror!LocalId {
-        var pipe_val: LocalId = input_val;
-
-        var idx = start_idx;
-        while (idx < ep.steps.len) : (idx += 1) {
-            const step = ep.steps[idx];
-
-            // Build the call with pipe_val as first arg
-            if (step.expr.kind == .call) {
-                const call = step.expr.kind.call;
-                var arg_locals: std.ArrayList(LocalId) = .empty;
-                try arg_locals.append(self.allocator, pipe_val);
-                for (call.args) |arg| {
-                    try arg_locals.append(self.allocator, try self.lowerExpr(arg.expr));
-                }
-                const call_dest = self.next_local;
-                self.next_local += 1;
-                const final_args = try arg_locals.toOwnedSlice(self.allocator);
-                const modes = try self.allocator.alloc(ValueMode, final_args.len);
-                @memset(modes, .share);
-                try self.current_instrs.append(self.allocator, .{
-                    .call_named = .{
-                        .dest = call_dest,
-                        .name = switch (call.target) {
-                            .named => |n| try std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ n.module orelse "", n.name }),
-                            else => "unknown",
-                        },
-                        .args = final_args,
-                        .arg_modes = modes,
-                    },
-                });
-                pipe_val = call_dest;
-            }
-
-            // Detect if this step returns a tagged union
-            var is_step_fallible = step.is_fallible;
-            if (!is_step_fallible and step.expr.kind == .call) {
-                const call_name = switch (step.expr.kind.call.target) {
-                    .named => |n| std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ n.module orelse "", n.name }) catch "",
-                    else => "",
-                };
-                if (call_name.len > 0) {
-                    is_step_fallible = self.isFunctionReturningTaggedUnion(call_name);
-                }
-            }
-
-            if (is_step_fallible) {
-                // This step returned a tagged union — wrap in union_switch.
-                // All REMAINING steps go in the Ok body.
-                const ok_dest = self.next_local;
-                self.next_local += 1;
-
-                const saved = self.current_instrs;
-                self.current_instrs = .empty;
-
-                var ok_result: LocalId = ok_dest;
-                const is_last = (idx == ep.steps.len - 1);
-                if (!is_last) {
-                    ok_result = try self.lowerErrorPipeRemainingSteps(ep, ok_dest, handler_local, idx + 1);
-                }
-
-                const ok_body_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
-                self.current_instrs = saved;
-
-                const switch_dest = self.next_local;
-                self.next_local += 1;
-
-                const cases = try self.allocator.alloc(UnionCase, 2);
-                cases[0] = .{
-                    .variant_name = "Ok",
-                    .field_bindings = &.{},
-                    .body_instrs = ok_body_instrs,
-                    .return_value = ok_result,
-                };
-                cases[1] = .{
-                    .variant_name = "Error",
-                    .field_bindings = &.{},
-                    .body_instrs = &.{},
-                    .return_value = handler_local,
-                };
-
-                try self.current_instrs.append(self.allocator, .{
-                    .union_switch = .{
-                        .dest = switch_dest,
-                        .scrutinee = pipe_val,
-                        .cases = cases,
-                    },
-                });
-                return switch_dest;
-            }
-        }
-
-        return pipe_val;
-    }
-
-    /// Check if a function (by qualified name) returns a tagged union type.
-    fn isFunctionReturningTaggedUnion(self: *const IrBuilder, func_name: []const u8) bool {
-        for (self.functions.items) |func| {
-            if (std.mem.eql(u8, func.name, func_name)) {
-                if (func.return_type == .struct_ref) {
-                    if (self.type_store) |ts| {
-                        for (ts.types.items) |typ| {
-                            if (typ == .tagged_union) {
-                                if (std.mem.eql(u8, ts.interner.get(typ.tagged_union.name), func.return_type.struct_ref)) {
-                                    return true;
-                                }
-                            }
-                        }
+    /// Pre-scan HIR block to find error_pipe expressions with
+    /// is_dispatched steps, registering their function names in try_variant_names.
+    /// This runs before function bodies are built so __try variants are generated.
+    fn scanForTryVariantNames(self: *IrBuilder, block: *const hir_mod.Block, module_prefix: ?[]const u8) error{OutOfMemory}!void {
+        for (block.stmts) |stmt| {
+            switch (stmt) {
+                .expr => |expr| try self.scanExprForTryVariants(expr, module_prefix),
+                .local_set => |ls| try self.scanExprForTryVariants(ls.value, module_prefix),
+                .function_group => |fg| {
+                    for (fg.clauses) |clause| {
+                        try self.scanForTryVariantNames(clause.body, module_prefix);
                     }
-                }
-                return false;
+                },
             }
         }
-        return false;
+    }
+
+    fn scanExprForTryVariants(self: *IrBuilder, expr: *const hir_mod.Expr, module_prefix: ?[]const u8) error{OutOfMemory}!void {
+        switch (expr.kind) {
+            .error_pipe => |ep| {
+                for (ep.steps) |step| {
+                    if (step.is_dispatched and step.expr.kind == .call) {
+                        const call = step.expr.kind.call;
+                        const call_name_str = switch (call.target) {
+                            .named => |n| blk: {
+                                if (n.module) |mod| break :blk try std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ mod, n.name });
+                                if (module_prefix) |prefix| break :blk try std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ prefix, n.name });
+                                break :blk try self.allocator.dupe(u8, n.name);
+                            },
+                            else => continue,
+                        };
+                        try self.try_variant_names.put(call_name_str, {});
+                    }
+                    // Recurse into step expressions
+                    try self.scanExprForTryVariants(step.expr, module_prefix);
+                }
+                // Recurse into handler
+                try self.scanExprForTryVariants(ep.handler, module_prefix);
+            },
+            .call => |c| {
+                for (c.args) |arg| {
+                    try self.scanExprForTryVariants(arg.expr, module_prefix);
+                }
+            },
+            .branch => |br| {
+                try self.scanExprForTryVariants(br.condition, module_prefix);
+                try self.scanBlockForTryVariants(br.then_block, module_prefix);
+                if (br.else_block) |eb| try self.scanBlockForTryVariants(eb, module_prefix);
+            },
+            .case => |ce| {
+                try self.scanExprForTryVariants(ce.scrutinee, module_prefix);
+                for (ce.arms) |arm| {
+                    try self.scanBlockForTryVariants(arm.body, module_prefix);
+                }
+            },
+            .binary => |b| {
+                try self.scanExprForTryVariants(b.lhs, module_prefix);
+                try self.scanExprForTryVariants(b.rhs, module_prefix);
+            },
+            .unary => |u| {
+                try self.scanExprForTryVariants(u.operand, module_prefix);
+            },
+            .union_init => |ui| {
+                try self.scanExprForTryVariants(ui.value, module_prefix);
+            },
+            .block => |blk| {
+                try self.scanBlockForTryVariants(&blk, module_prefix);
+            },
+            else => {},
+        }
+    }
+
+    fn scanBlockForTryVariants(self: *IrBuilder, block: *const hir_mod.Block, module_prefix: ?[]const u8) error{OutOfMemory}!void {
+        for (block.stmts) |stmt| {
+            switch (stmt) {
+                .expr => |expr| try self.scanExprForTryVariants(expr, module_prefix),
+                .local_set => |ls| try self.scanExprForTryVariants(ls.value, module_prefix),
+                .function_group => |fg| {
+                    for (fg.clauses) |clause| {
+                        try self.scanForTryVariantNames(clause.body, module_prefix);
+                    }
+                },
+            }
+        }
     }
 
     fn lowerExpr(self: *IrBuilder, expr: *const hir_mod.Expr) anyerror!LocalId {
@@ -2901,14 +3032,21 @@ pub const IrBuilder = struct {
             .binary => |bin| {
                 const lhs = try self.lowerExpr(bin.lhs);
                 const rhs = try self.lowerExpr(bin.rhs);
+                // Detect string comparison — Zig needs std.mem.eql, not ==
+                const lhs_is_string = if (self.known_local_types.get(lhs)) |t| t == .string else
+                    (bin.lhs.type_id == types_mod.TypeStore.STRING);
+                const rhs_is_string = if (self.known_local_types.get(rhs)) |t| t == .string else
+                    (bin.rhs.type_id == types_mod.TypeStore.STRING);
+                const is_string_cmp = lhs_is_string or rhs_is_string;
+
                 const ir_op: BinaryOp.Op = switch (bin.op) {
                     .add => .add,
                     .sub => .sub,
                     .mul => .mul,
                     .div => .div,
                     .rem_op => .rem_op,
-                    .equal => .eq,
-                    .not_equal => .neq,
+                    .equal => if (is_string_cmp) .string_eq else .eq,
+                    .not_equal => if (is_string_cmp) .string_neq else .neq,
                     .less => .lt,
                     .greater => .gt,
                     .less_equal => .lte,
@@ -2968,17 +3106,12 @@ pub const IrBuilder = struct {
                         });
                     },
                     .named => |nc| {
-                        var resolved_name = if (nc.module) |mod|
+                        const resolved_name = if (nc.module) |mod|
                             try std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ mod, nc.name })
                         else
                             try self.resolveBareCall(nc.name);
 
-                        // Check for default-arg wrapper: if calling with fewer args than
-                        // the full arity, redirect to the wrapper that fills in defaults
-                        const wrapper_key = try std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ resolved_name, args.items.len });
-                        if (self.default_arg_wrappers.get(wrapper_key)) |wrapper_name| {
-                            resolved_name = wrapper_name;
-                        }
+                        // Default params handled at ZIR call site (see zir_builder.zig call_named handler)
 
                         // Check if this function uses union dispatch — wrap args if needed
                         if (self.union_dispatch_map.get(resolved_name)) |info| {
@@ -3169,40 +3302,17 @@ pub const IrBuilder = struct {
                 });
             },
             .error_pipe => |ep| {
-                // Lower error pipe as FLAT sequence. Each fallible step gets
-                // a union_switch that extracts the Ok payload. Remaining pipe
-                // steps run on the merged result (both Ok and Error paths).
-                // This is correct when the handler produces the same type as Ok.
+                // Lower error pipe as FLAT sequence.
+                // Every function call in the pipe uses its __try variant if multi-clause.
+                // If the __try variant returns error.NoMatchingClause, the unmatched
+                // value flows to the ~> handler. Single-clause functions always match.
                 if (ep.steps.len == 0) return dest;
 
                 const handler_local = try self.lowerExpr(ep.handler);
                 var pipe_val = try self.lowerExpr(ep.steps[0].expr);
 
-                // Process step 0: if fallible, extract Ok payload via union_switch.
-                // Error branch does early return (ret) to skip remaining pipe steps.
-                if (ep.steps[0].is_fallible) {
-                    const ok_dest = self.next_local;
-                    self.next_local += 1;
-                    const switch_dest = self.next_local;
-                    self.next_local += 1;
-
-                    // Error body: return handler result directly from the function
-                    const error_body = try self.allocator.alloc(Instruction, 1);
-                    error_body[0] = .{ .ret = .{ .value = handler_local } };
-
-                    const cases = try self.allocator.alloc(UnionCase, 2);
-                    cases[0] = .{ .variant_name = "Ok", .field_bindings = &.{}, .body_instrs = &.{}, .return_value = ok_dest };
-                    cases[1] = .{ .variant_name = "Error", .field_bindings = &.{}, .body_instrs = error_body, .return_value = handler_local };
-
-                    try self.current_instrs.append(self.allocator, .{
-                        .union_switch = .{ .dest = switch_dest, .scrutinee = pipe_val, .cases = cases },
-                    });
-                    pipe_val = switch_dest;
-                }
-
-                // Process remaining steps at the top level (not inside switch bodies)
+                // Process remaining steps at the top level
                 for (ep.steps[1..]) |step| {
-                    // Build the call with pipe_val as first arg
                     if (step.expr.kind == .call) {
                         const call = step.expr.kind.call;
                         var arg_locals: std.ArrayList(LocalId) = .empty;
@@ -3223,46 +3333,37 @@ pub const IrBuilder = struct {
                             },
                             else => "unknown",
                         };
-                        try self.current_instrs.append(self.allocator, .{
-                            .call_named = .{ .dest = call_dest, .name = call_name_str, .args = final_args, .arg_modes = modes },
-                        });
-                        pipe_val = call_dest;
-                    }
 
-                    // Check if this step is fallible (returns a tagged union)
-                    var is_fallible = step.is_fallible;
-                    if (!is_fallible and step.expr.kind == .call) {
-                        const call_name = switch (step.expr.kind.call.target) {
-                            .named => |n| blk: {
-                                if (n.module) |mod| break :blk std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ mod, n.name }) catch "";
-                                if (self.current_module_prefix) |prefix| break :blk std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ prefix, n.name }) catch "";
-                                break :blk std.fmt.allocPrint(self.allocator, "{s}", .{n.name}) catch "";
-                            },
-                            else => "",
-                        };
-                        if (call_name.len > 0) {
-                            is_fallible = self.isFunctionReturningTaggedUnion(call_name);
+                        if (step.is_dispatched) {
+                            // Multi-clause: call __try variant with handler as last arg.
+                            // __try returns match result or handler directly.
+                            // Call __try variant with handler as last arg
+                            const try_name = try std.fmt.allocPrint(self.allocator, "{s}__try", .{call_name_str});
+                            try self.try_variant_names.put(call_name_str, {});
+
+                            var try_args: std.ArrayList(LocalId) = .empty;
+                            for (final_args) |arg| try try_args.append(self.allocator, arg);
+                            try try_args.append(self.allocator, handler_local);
+                            const try_final_args = try try_args.toOwnedSlice(self.allocator);
+                            const try_modes = try self.allocator.alloc(ValueMode, try_final_args.len);
+                            @memset(try_modes, .share);
+
+                            try self.current_instrs.append(self.allocator, .{
+                                .try_call_named = .{
+                                    .dest = call_dest,
+                                    .name = try_name,
+                                    .args = try_final_args,
+                                    .arg_modes = try_modes,
+                                },
+                            });
+                            pipe_val = call_dest;
+                        } else {
+                            // Single-clause function: always matches, regular call
+                            try self.current_instrs.append(self.allocator, .{
+                                .call_named = .{ .dest = call_dest, .name = call_name_str, .args = final_args, .arg_modes = modes },
+                            });
+                            pipe_val = call_dest;
                         }
-                    }
-
-                    if (is_fallible) {
-                        const ok_dest = self.next_local;
-                        self.next_local += 1;
-                        const switch_dest = self.next_local;
-                        self.next_local += 1;
-
-                        // Error body: early return from function
-                        const err_body = try self.allocator.alloc(Instruction, 1);
-                        err_body[0] = .{ .ret = .{ .value = handler_local } };
-
-                        const cases = try self.allocator.alloc(UnionCase, 2);
-                        cases[0] = .{ .variant_name = "Ok", .field_bindings = &.{}, .body_instrs = &.{}, .return_value = ok_dest };
-                        cases[1] = .{ .variant_name = "Error", .field_bindings = &.{}, .body_instrs = err_body, .return_value = handler_local };
-
-                        try self.current_instrs.append(self.allocator, .{
-                            .union_switch = .{ .dest = switch_dest, .scrutinee = pipe_val, .cases = cases },
-                        });
-                        pipe_val = switch_dest;
                     }
                 }
 

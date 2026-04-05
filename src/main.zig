@@ -774,23 +774,36 @@ fn buildTarget(
     };
 
 
-    // Resolve the manifest root (e.g. "FooBar.main/1") to an IR function ID
+    // Resolve the manifest root (e.g. "Test.TestHelper.main/1") to an IR function ID
     // so the ZIR backend knows which function is the entry point.
+    // IR naming: module parts joined by "_", then "__" before function name.
+    // e.g. "Test.TestHelper.main/1" -> "Test_TestHelper__main"
     if (config.root) |root| {
-        // Strip arity suffix: "FooBar.main/1" -> "FooBar.main"
+        // Strip arity suffix: "Test.TestHelper.main/1" -> "Test.TestHelper.main"
         const without_arity = if (std.mem.lastIndexOfScalar(u8, root, '/')) |slash|
             root[0..slash]
         else
             root;
-        // Convert dots to double underscores: "FooBar.main" -> "FooBar__main"
+        // Split on last dot: module prefix vs function name
+        // "Test.TestHelper.main" -> module="Test.TestHelper", func="main"
         var mangled: std.ArrayListUnmanaged(u8) = .empty;
-        var i: usize = 0;
-        while (i < without_arity.len) : (i += 1) {
-            if (without_arity[i] == '.') {
-                mangled.appendSlice(alloc, "__") catch break;
-            } else {
-                mangled.append(alloc, without_arity[i]) catch break;
+        if (std.mem.lastIndexOfScalar(u8, without_arity, '.')) |last_dot| {
+            const module_part = without_arity[0..last_dot];
+            const func_part = without_arity[last_dot + 1 ..];
+            // Module parts: dots become single underscores
+            for (module_part) |c| {
+                if (c == '.') {
+                    mangled.append(alloc, '_') catch break;
+                } else {
+                    mangled.append(alloc, c) catch break;
+                }
             }
+            // Double underscore separator between module and function
+            mangled.appendSlice(alloc, "__") catch {};
+            mangled.appendSlice(alloc, func_part) catch {};
+        } else {
+            // No dot — bare function name
+            mangled.appendSlice(alloc, without_arity) catch {};
         }
         const mangled_name = mangled.items;
         for (result.ir_program.functions) |func| {
@@ -800,6 +813,7 @@ fn buildTarget(
             }
         }
     }
+
 
     // Map optimize mode from manifest
     const optimize_mode: u8 = switch (config.optimize) {

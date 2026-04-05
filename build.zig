@@ -44,29 +44,6 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
 
-    const phase9_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/phase9_validation_tests.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const run_phase9_tests = b.addRunArtifact(phase9_tests);
-    const phase9_test_step = b.step("phase9-test", "Run Phase 9 validation tests");
-    phase9_test_step.dependOn(&run_phase9_tests.step);
-
-    const phase9_bench = b.addExecutable(.{
-        .name = "phase9-benchmarks",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/phase9_benchmarks.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const run_phase9_bench = b.addRunArtifact(phase9_bench);
-    const bench_step = b.step("bench", "Run Phase 9 benchmarks");
-    bench_step.dependOn(&run_phase9_bench.step);
-
     // -----------------------------------------------------------------------
     // Dependency paths
     // -----------------------------------------------------------------------

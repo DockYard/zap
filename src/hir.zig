@@ -189,19 +189,18 @@ pub const ErrorPipeHir = struct {
     /// The chain steps: first is the base call, rest are pipe steps.
     /// Each step except the first takes the previous step's Ok value as first arg.
     steps: []const ErrorPipeStep,
-    /// The error handler — called with the Error variant's payload.
+    /// The error handler — called when a pipe step can't match its input.
     handler: *const Expr,
-    /// The tagged union type returned by fallible steps.
-    union_type_id: types_mod.TypeId,
 };
 
 pub const ErrorPipeStep = struct {
     /// The HIR expression for this step. For step 0, it's the base call.
     /// For step N > 0, it's a call expression where the first arg should be
-    /// substituted with the Ok payload from step N-1.
+    /// substituted with the previous step's result piped as first arg.
     expr: *const Expr,
-    /// Whether this step returns a tagged union (fallible) or a plain type.
-    is_fallible: bool,
+    /// Whether this step calls a multi-clause function (has __try variant).
+    /// When true, the ~> catch basin can intercept unmatched values.
+    is_dispatched: bool = false,
 };
 
 pub const BinaryExpr = struct {
@@ -417,6 +416,11 @@ pub const LiteralValue = union(enum) {
 pub const CheckTupleNode = struct {
     scrutinee: *const Expr,
     expected_arity: u32,
+    /// Scrutinee IDs assigned to each tuple element by the pattern compiler.
+    /// element_scrutinee_ids[i] is the ID for element i, used to populate
+    /// the scrutinee_map in IR lowering. This avoids the fragile heuristic
+    /// of walking the decision tree to discover IDs (which breaks with wildcards).
+    element_scrutinee_ids: []const u32,
     success: *const Decision,
     failure: *const Decision,
 };
@@ -1001,10 +1005,14 @@ fn compileTupleCheck(
             });
         }
 
-        // Build new scrutinee IDs for this arity's elements
+        // Build new scrutinee IDs for this arity's elements.
+        // Save element IDs separately for the CheckTupleNode so IR lowering
+        // can map element positions to scrutinee locals directly.
+        var element_ids: std.ArrayList(u32) = .empty;
         var new_scrutinee_list: std.ArrayList(u32) = .empty;
         var j: u32 = 0;
         while (j < arity) : (j += 1) {
+            try element_ids.append(allocator, next_id.*);
             try new_scrutinee_list.append(allocator, next_id.*);
             next_id.* += 1;
         }
@@ -1024,6 +1032,7 @@ fn compileTupleCheck(
         d.* = .{ .check_tuple = .{
             .scrutinee = scrutinee_expr,
             .expected_arity = arity,
+            .element_scrutinee_ids = try element_ids.toOwnedSlice(allocator),
             .success = success_decision,
             .failure = current_failure,
         } };
@@ -1377,6 +1386,17 @@ pub const HirBuilder = struct {
             }
         }
         return types_mod.TypeStore.UNKNOWN;
+    }
+
+    /// Check if a function (by name and arity) has multiple clauses.
+    /// Multi-clause functions are the ones that get __try variants for ~> catch basins.
+    fn isFunctionMultiClause(self: *const HirBuilder, name: ast.StringId, arity: u32) bool {
+        const scope_id = self.current_clause_scope orelse self.current_module_scope orelse self.graph.prelude_scope;
+        if (self.graph.resolveFamily(scope_id, name, arity)) |fam_id| {
+            const family = self.graph.getFamily(fam_id);
+            return family.clauses.items.len > 1;
+        }
+        return false;
     }
 
     fn applyCallArgModes(self: *const HirBuilder, args: []CallArg, callee_type_id: types_mod.TypeId) void {
@@ -2689,76 +2709,39 @@ pub const HirBuilder = struct {
         var hir_steps: std.ArrayList(ErrorPipeStep) = .empty;
         for (ast_steps.items) |step| {
             const hir_expr = try self.buildExpr(step);
-            const is_fallible = blk: {
-                // Check the HIR expression's resolved type
-                if (hir_expr.type_id < self.type_store.types.items.len) {
-                    if (self.type_store.types.items[hir_expr.type_id] == .tagged_union) {
-                        break :blk true;
-                    }
-                }
-                // For call expressions, look up the called function's return type.
-                // Pipe step args aren't included in the AST (they're injected by
-                // the IR), so arity = AST args + 1 (piped value).
+            // Check if this step calls a multi-clause function (needs __try variant)
+            const is_dispatched = blk: {
                 if (step.* == .call) {
                     const callee = step.call.callee;
                     const arity: u32 = @intCast(step.call.args.len + 1);
                     if (callee.* == .var_ref) {
-                        const ret_type = self.resolveFunctionReturnType(callee.var_ref.name, arity);
-                        if (ret_type < self.type_store.types.items.len) {
-                            if (self.type_store.types.items[ret_type] == .tagged_union) {
-                                break :blk true;
-                            }
-                        }
+                        break :blk self.isFunctionMultiClause(callee.var_ref.name, arity);
                     } else if (callee.* == .field_access) {
-                        const ret_type = self.resolveFunctionReturnType(callee.field_access.field, arity);
-                        if (ret_type < self.type_store.types.items.len) {
-                            if (self.type_store.types.items[ret_type] == .tagged_union) {
-                                break :blk true;
-                            }
-                        }
+                        break :blk self.isFunctionMultiClause(callee.field_access.field, arity);
                     }
                 }
                 break :blk false;
             };
             try hir_steps.append(self.allocator, .{
                 .expr = hir_expr,
-                .is_fallible = is_fallible,
+                .is_dispatched = is_dispatched,
             });
-        }
-
-        // Determine the union type from the first fallible step
-        var union_type_id: types_mod.TypeId = types_mod.TypeStore.UNKNOWN;
-        for (hir_steps.items) |step| {
-            if (step.is_fallible) {
-                union_type_id = step.expr.type_id;
-                break;
-            }
         }
 
         // Build the error handler expression
         const handler_expr = try self.buildErrorHandlerExpr(ep.handler, ep.meta);
 
-        // Determine the result type (the Ok variant's inner type)
-        var result_type: types_mod.TypeId = types_mod.TypeStore.UNKNOWN;
-        if (union_type_id < self.type_store.types.items.len) {
-            const ut = self.type_store.types.items[union_type_id];
-            if (ut == .tagged_union) {
-                const interner_mut: *ast.StringInterner = @constCast(self.interner);
-                const ok_name = interner_mut.intern("Ok") catch unreachable;
-                for (ut.tagged_union.variants) |v| {
-                    if (v.name == ok_name) {
-                        result_type = v.type_id orelse types_mod.TypeStore.UNKNOWN;
-                        break;
-                    }
-                }
-            }
-        }
+        // Result type is the last step's type (the catch basin handler
+        // must return the same type for the expression to be well-typed).
+        const result_type = if (hir_steps.items.len > 0)
+            hir_steps.items[hir_steps.items.len - 1].expr.type_id
+        else
+            types_mod.TypeStore.UNKNOWN;
 
         return try self.create(Expr, .{
             .kind = .{ .error_pipe = .{
                 .steps = try hir_steps.toOwnedSlice(self.allocator),
                 .handler = handler_expr,
-                .union_type_id = union_type_id,
             } },
             .type_id = result_type,
             .span = ep.meta.span,

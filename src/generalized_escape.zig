@@ -386,6 +386,10 @@ pub const GeneralizedEscapeAnalyzer = struct {
                 try self.seedCallArgsNoSummary(func_id, cn.args, cn.arg_modes);
                 try self.setEscapeAndEnqueue(func_id, cn.dest, .function_local);
             },
+            .try_call_named => |tcn| {
+                try self.seedCallArgsNoSummary(func_id, tcn.args, tcn.arg_modes);
+                try self.setEscapeAndEnqueue(func_id, tcn.dest, .function_local);
+            },
             .call_closure => |cc| {
                 try self.seedCallArgsNoSummary(func_id, cc.args, cc.arg_modes);
                 // Calling a closure does NOT make it escape — being called is its
@@ -536,6 +540,13 @@ pub const GeneralizedEscapeAnalyzer = struct {
                 try self.propagateAllocSite(func_id, ou.source, ou.dest);
             },
 
+            // Error catch: dest gets the join of source and catch_value escape states.
+            .error_catch => |ec| {
+                const src_escape = self.ctx.getEscape(.{ .function = func_id, .local = ec.source });
+                const catch_escape = self.ctx.getEscape(.{ .function = func_id, .local = ec.catch_value });
+                try self.setEscapeAndEnqueue(func_id, ec.dest, EscapeState.join(src_escape, catch_escape));
+            },
+
             // Enum literal: no_escape (small value).
             .enum_literal => |el| try self.setEscapeAndEnqueue(func_id, el.dest, .no_escape),
 
@@ -572,7 +583,7 @@ pub const GeneralizedEscapeAnalyzer = struct {
             .cond_branch => {},
             .jump => {},
             .case_break => {},
-            .match_fail => {},
+            .match_fail, .match_error_return => {},
         }
     }
 

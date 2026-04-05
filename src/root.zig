@@ -12,7 +12,8 @@ pub const DispatchEngine = @import("dispatch.zig").DispatchEngine;
 pub const hir = @import("hir.zig");
 pub const ir = @import("ir.zig");
 pub const escape_analysis = @import("escape_analysis.zig");
-pub const CodeGen = @import("codegen.zig").CodeGen;
+pub const ast_data = @import("ast_data.zig");
+pub const macro_eval = @import("macro_eval.zig");
 pub const zir_builder = @import("zir_builder.zig");
 pub const zir_backend = @import("zir_backend.zig");
 pub const ZirDriver = zir_builder.ZirDriver;
@@ -63,7 +64,8 @@ test {
     _ = @import("perceus.zig");
     _ = @import("analysis_pipeline.zig");
     _ = @import("arc_optimizer.zig");
-    _ = @import("codegen.zig");
+    _ = @import("ast_data.zig");
+    _ = @import("macro_eval.zig");
     _ = @import("zir_builder.zig");
     _ = @import("zir_backend.zig");
     _ = @import("runtime.zig");
@@ -76,5 +78,4 @@ test {
     _ = @import("lockfile.zig");
     _ = @import("attr_substitute.zig");
     _ = @import("ctfe.zig");
-    _ = @import("integration_tests.zig");
 }

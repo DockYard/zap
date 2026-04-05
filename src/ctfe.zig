@@ -834,6 +834,12 @@ fn hashInstruction(hasher: *std.hash.Wyhash, instr: ir.Instruction) void {
             hashLocalIds(hasher, v.args);
             for (v.arg_modes) |mode| hasher.update(&[_]u8{@intFromEnum(mode)});
         },
+        .try_call_named => |v| {
+            hasher.update(std.mem.asBytes(&v.dest));
+            hasher.update(v.name);
+            hashLocalIds(hasher, v.args);
+            for (v.arg_modes) |mode| hasher.update(&[_]u8{@intFromEnum(mode)});
+        },
         .call_closure => |v| {
             hasher.update(std.mem.asBytes(&v.dest));
             hasher.update(std.mem.asBytes(&v.callee));
@@ -854,6 +860,11 @@ fn hashInstruction(hasher: *std.hash.Wyhash, instr: ir.Instruction) void {
         .tail_call => |v| {
             hasher.update(v.name);
             hashLocalIds(hasher, v.args);
+        },
+        .error_catch => |v| {
+            hasher.update(std.mem.asBytes(&v.dest));
+            hasher.update(std.mem.asBytes(&v.source));
+            hasher.update(std.mem.asBytes(&v.catch_value));
         },
         .if_expr => |v| {
             hasher.update(std.mem.asBytes(&v.dest));
@@ -964,7 +975,7 @@ fn hashInstruction(hasher: *std.hash.Wyhash, instr: ir.Instruction) void {
             hasher.update(std.mem.asBytes(&v.scrutinee));
             hashZigType(hasher, v.expected_type);
         },
-        .match_fail => {},
+        .match_fail, .match_error_return => {},
         .ret => |v| if (v.value) |value| hasher.update(std.mem.asBytes(&value)),
         .cond_return => |v| {
             hasher.update(std.mem.asBytes(&v.condition));
@@ -1567,6 +1578,25 @@ pub const Interpreter = struct {
                 frame.setLocal(cn.dest, result);
                 return .continued;
             },
+            .try_call_named => |tcn| {
+                // try_call_named behaves like call_named at CTFE level;
+                // the error union semantics are handled by error_catch.
+                const result = try self.execCallNamed(.{
+                    .dest = tcn.dest,
+                    .name = tcn.name,
+                    .args = tcn.args,
+                    .arg_modes = tcn.arg_modes,
+                }, frame);
+                frame.setLocal(tcn.dest, result);
+                return .continued;
+            },
+            .error_catch => |ec| {
+                // At CTFE, if source holds a value, pass it through;
+                // error handling is structural — catch_value is the fallback.
+                const source_val = try self.readLocal(frame, ec.source);
+                frame.setLocal(ec.dest, source_val);
+                return .continued;
+            },
             .call_builtin => |cb| {
                 const result = try self.execCallBuiltin(cb, frame);
                 frame.setLocal(cb.dest, result);
@@ -1636,6 +1666,10 @@ pub const Interpreter = struct {
             },
             .match_fail => {
                 try self.emitError(.match_failure, "no matching clause at compile time");
+                return error.CtfeFailure;
+            },
+            .match_error_return => {
+                try self.emitError(.match_failure, "no matching clause at compile time (try variant)");
                 return error.CtfeFailure;
             },
 
@@ -1961,8 +1995,8 @@ pub const Interpreter = struct {
                 }
                 return self.numericOp(lhs, rhs, .rem_op);
             },
-            .eq => return .{ .bool_val = lhs.eql(rhs) },
-            .neq => return .{ .bool_val = !lhs.eql(rhs) },
+            .eq, .string_eq => return .{ .bool_val = lhs.eql(rhs) },
+            .neq, .string_neq => return .{ .bool_val = !lhs.eql(rhs) },
             .lt => {
                 const ord = lhs.compare(rhs) orelse {
                     try self.emitError(.type_error, "incomparable types");

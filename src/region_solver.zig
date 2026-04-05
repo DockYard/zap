@@ -582,6 +582,12 @@ pub const UseDefInfo = struct {
                     try info.recordUse(arg, block);
                 }
             },
+            .try_call_named => |tcn| {
+                try info.recordDef(tcn.dest, block);
+                for (tcn.args) |arg| {
+                    try info.recordUse(arg, block);
+                }
+            },
             .call_closure => |cc| {
                 try info.recordDef(cc.dest, block);
                 try info.recordUse(cc.callee, block);
@@ -705,6 +711,13 @@ pub const UseDefInfo = struct {
                 try info.recordUse(ou.source, block);
             },
 
+            // Error catch: defines dest, uses source and catch_value.
+            .error_catch => |ec| {
+                try info.recordDef(ec.dest, block);
+                try info.recordUse(ec.source, block);
+                try info.recordUse(ec.catch_value, block);
+            },
+
             // Pattern matching.
             .match_atom => |ma| {
                 try info.recordDef(ma.dest, block);
@@ -781,7 +794,7 @@ pub const UseDefInfo = struct {
             },
 
             // Non-data instructions.
-            .branch, .jump, .match_fail => {},
+            .branch, .jump, .match_fail, .match_error_return => {},
         }
     }
 

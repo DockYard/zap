@@ -282,23 +282,6 @@ pub const Resolver = struct {
                     self.current_scope = saved;
                 }
             },
-            .with_expr => |we| {
-                const with_scope = try self.graph.createScope(self.current_scope, .block);
-                const saved = self.current_scope;
-                self.current_scope = with_scope;
-                for (we.items) |item| {
-                    switch (item) {
-                        .bind => |b| {
-                            try self.resolveExpr(b.source);
-                            try self.resolvePattern(b.pattern);
-                            try self.bindPattern(b.pattern);
-                        },
-                        .expr => |e| try self.resolveExpr(e),
-                    }
-                }
-                try self.resolveBlock(we.body);
-                self.current_scope = saved;
-            },
             .cond_expr => |cond| {
                 for (cond.clauses) |clause| {
                     try self.resolveExpr(clause.condition);
@@ -341,6 +324,7 @@ pub const Resolver = struct {
             .unwrap => |uw| try self.resolveExpr(uw.expr),
             .quote_expr => |qe| try self.resolveBlock(qe.body),
             .unquote_expr => |ue| try self.resolveExpr(ue.expr),
+            .unquote_splicing_expr => |ue| try self.resolveExpr(ue.expr),
             .type_annotated => |ta| {
                 try self.resolveExpr(ta.expr);
             },

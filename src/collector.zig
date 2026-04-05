@@ -148,6 +148,16 @@ pub const Collector = struct {
                 .union_decl => |ed| try self.collectUnion(ed, mod_scope),
                 .alias_decl => |ad| try self.collectAlias(ad, mod_scope),
                 .import_decl => |id_decl| try self.collectImport(id_decl, mod_scope),
+                .use_decl => |ud| {
+                    // `use Module` expands to `import Module` — collect the import directly
+                    const import_decl = try self.allocator.create(ast.ImportDecl);
+                    import_decl.* = .{
+                        .meta = ud.meta,
+                        .module_path = ud.module_path,
+                        .filter = null, // import all
+                    };
+                    try self.collectImport(import_decl, mod_scope);
+                },
             }
         }
 
@@ -599,25 +609,6 @@ pub const Collector = struct {
                     const clause_scope = try self.graph.createScope(parent_scope, .case_clause);
                     try self.collectPatternBindings(clause.pattern, clause_scope);
                     try self.collectBlock(clause.body, clause_scope);
-                }
-            },
-            .with_expr => |we| {
-                const with_scope = try self.graph.createScope(parent_scope, .block);
-                for (we.items) |item| {
-                    switch (item) {
-                        .bind => |b| {
-                            try self.collectPatternBindings(b.pattern, with_scope);
-                        },
-                        .expr => {},
-                    }
-                }
-                try self.collectBlock(we.body, with_scope);
-                if (we.else_clauses) |else_clauses| {
-                    for (else_clauses) |clause| {
-                        const clause_scope = try self.graph.createScope(parent_scope, .case_clause);
-                        try self.collectPatternBindings(clause.pattern, clause_scope);
-                        try self.collectBlock(clause.body, clause_scope);
-                    }
                 }
             },
             .cond_expr => |cond| {

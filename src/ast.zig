@@ -125,6 +125,7 @@ pub const ModuleItem = union(enum) {
     priv_macro: *const FunctionDecl,
     alias_decl: *const AliasDecl,
     import_decl: *const ImportDecl,
+    use_decl: *const UseDecl,
     attribute: *const AttributeDecl,
 };
 
@@ -237,6 +238,12 @@ pub const ImportDecl = struct {
     filter: ?ImportFilter,
 };
 
+pub const UseDecl = struct {
+    meta: NodeMeta,
+    module_path: ModuleName,
+    opts: ?*const Expr,
+};
+
 pub const ImportFilter = union(enum) {
     only: []const ImportEntry,
     except: []const ImportEntry,
@@ -316,12 +323,12 @@ pub const Expr = union(enum) {
     // Control flow
     if_expr: IfExpr,
     case_expr: CaseExpr,
-    with_expr: WithExpr,
     cond_expr: CondExpr,
 
     // Macros
     quote_expr: QuoteExpr,
     unquote_expr: UnquoteExpr,
+    unquote_splicing_expr: UnquoteSplicingExpr,
 
     // Error handling
     panic_expr: PanicExpr,
@@ -368,10 +375,10 @@ pub const Expr = union(enum) {
             .unwrap => |v| v.meta,
             .if_expr => |v| v.meta,
             .case_expr => |v| v.meta,
-            .with_expr => |v| v.meta,
             .cond_expr => |v| v.meta,
             .quote_expr => |v| v.meta,
             .unquote_expr => |v| v.meta,
+            .unquote_splicing_expr => |v| v.meta,
             .panic_expr => |v| v.meta,
             .error_pipe => |v| v.meta,
             .block => |v| v.meta,
@@ -561,32 +568,6 @@ pub const CaseClause = struct {
     body: []const Stmt,
 };
 
-pub const WithExpr = struct {
-    meta: NodeMeta,
-    items: []const WithItem,
-    body: []const Stmt,
-    else_clauses: ?[]const WithElseClause,
-};
-
-pub const WithItem = union(enum) {
-    bind: WithBind,
-    expr: *const Expr,
-};
-
-pub const WithBind = struct {
-    meta: NodeMeta,
-    pattern: *const Pattern,
-    source: *const Expr,
-};
-
-pub const WithElseClause = struct {
-    meta: NodeMeta,
-    pattern: *const Pattern,
-    type_annotation: ?*const TypeExpr,
-    guard: ?*const Expr,
-    body: []const Stmt,
-};
-
 pub const CondExpr = struct {
     meta: NodeMeta,
     clauses: []const CondClause,
@@ -604,6 +585,11 @@ pub const QuoteExpr = struct {
 };
 
 pub const UnquoteExpr = struct {
+    meta: NodeMeta,
+    expr: *const Expr,
+};
+
+pub const UnquoteSplicingExpr = struct {
     meta: NodeMeta,
     expr: *const Expr,
 };

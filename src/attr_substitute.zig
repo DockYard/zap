@@ -389,45 +389,6 @@ fn substituteInExpr(
             new_expr.* = .{ .block = .{ .meta = b.meta, .stmts = new_stmts } };
             return new_expr;
         },
-        .with_expr => |w| {
-            var new_items: std.ArrayListUnmanaged(ast.WithItem) = .empty;
-            var changed = false;
-            for (w.items) |item| {
-                switch (item) {
-                    .expr => |e| {
-                        const new_e = try substituteInExpr(alloc, e, func_attrs, mod_attrs, interner, errors);
-                        if (new_e != e) changed = true;
-                        try new_items.append(alloc, .{ .expr = new_e });
-                    },
-                    .bind => |b| {
-                        const new_src = try substituteInExpr(alloc, b.source, func_attrs, mod_attrs, interner, errors);
-                        if (new_src != b.source) changed = true;
-                        try new_items.append(alloc, .{ .bind = .{ .meta = b.meta, .pattern = b.pattern, .source = new_src } });
-                    },
-                }
-            }
-            const new_body = try substituteInStmts(alloc, w.body, func_attrs, mod_attrs, interner, errors);
-            if (!stmtsUnchanged(w.body, new_body)) changed = true;
-            // else_clauses contain patterns + bodies
-            var new_else_clauses: ?[]const ast.WithElseClause = w.else_clauses;
-            if (w.else_clauses) |ecs| {
-                var new_ecs: std.ArrayListUnmanaged(ast.WithElseClause) = .empty;
-                for (ecs) |ec| {
-                    const new_ec_guard = if (ec.guard) |g|
-                        try substituteInExpr(alloc, g, func_attrs, mod_attrs, interner, errors)
-                    else
-                        null;
-                    const new_ec_body = try substituteInStmts(alloc, ec.body, func_attrs, mod_attrs, interner, errors);
-                    if (new_ec_guard != ec.guard or !stmtsUnchanged(ec.body, new_ec_body)) changed = true;
-                    try new_ecs.append(alloc, .{ .meta = ec.meta, .pattern = ec.pattern, .type_annotation = ec.type_annotation, .guard = new_ec_guard, .body = new_ec_body });
-                }
-                if (changed) new_else_clauses = try new_ecs.toOwnedSlice(alloc);
-            }
-            if (!changed) return expr;
-            const new_expr = try alloc.create(ast.Expr);
-            new_expr.* = .{ .with_expr = .{ .meta = w.meta, .items = try new_items.toOwnedSlice(alloc), .body = new_body, .else_clauses = new_else_clauses } };
-            return new_expr;
-        },
         // Leaf expressions — no substitution needed
         .int_literal,
         .float_literal,
@@ -443,6 +404,7 @@ fn substituteInExpr(
         .function_ref,
         .quote_expr,
         .unquote_expr,
+        .unquote_splicing_expr,
         .panic_expr,
         .error_pipe,
         => return expr,

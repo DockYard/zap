@@ -105,6 +105,14 @@ pub const Parser = struct {
         return self.current.tag == tag;
     }
 
+    /// Check if current token is an identifier with a specific name.
+    /// Used for contextual keywords like `use`.
+    fn checkIdentifier(self: *const Parser, name: []const u8) bool {
+        if (self.current.tag != .identifier) return false;
+        const text = self.source[self.current.loc.start..self.current.loc.end];
+        return std.mem.eql(u8, text, name);
+    }
+
     fn match(self: *Parser, tag: Token.Tag) bool {
         if (self.check(tag)) {
             _ = self.advance();
@@ -604,6 +612,24 @@ pub const Parser = struct {
                         self.synchronize();
                     }
                 },
+                // "use" is contextual — recognized as identifier but treated as keyword here
+                .identifier => {
+                    if (self.checkIdentifier("use")) {
+                        if (self.parseUseDecl()) |ud| {
+                            try items.append(self.allocator, .{ .use_decl = ud });
+                        } else |_| {
+                            self.synchronize();
+                        }
+                    } else {
+                        try self.addRichError(
+                            "I was not expecting an identifier at the module level",
+                            self.currentSpan(),
+                            null,
+                            "the module level can contain `pub fn`, `fn`, `pub macro`, `macro`, `import`, `use`, `alias`, `type`, `struct`, `union`, `opaque`, and `@attribute` declarations",
+                        );
+                        self.synchronize();
+                    }
+                },
                 .at_sign => {
                     if (self.parseAttributeDecl()) |attr| {
                         try items.append(self.allocator, .{ .attribute = attr });
@@ -958,10 +984,22 @@ pub const Parser = struct {
         if (self.check(.keyword_pub)) _ = self.advance();
         _ = try self.expect(.keyword_macro);
 
-        // Allow keywords as macro names (like Elixir's Kernel macros: if, cond, with)
+        // Allow keywords and operators as macro names
+        // Keywords: if, cond, unless, etc.
+        // Operators: +, -, *, /, ==, !=, <, >, <=, >=, <>, |>, ~>, and, or
         const name_tok = if (self.check(.identifier))
             self.advance()
-        else if (self.check(.keyword_if) or self.check(.keyword_cond) or self.check(.keyword_with))
+        else if (self.check(.keyword_if) or self.check(.keyword_cond) or
+            self.check(.keyword_and) or
+            self.check(.keyword_or) or self.check(.keyword_not) or
+            self.check(.keyword_fn) or self.check(.keyword_module) or
+            self.check(.keyword_struct) or self.check(.keyword_macro))
+            self.advance()
+        else if (self.check(.plus) or self.check(.minus) or self.check(.star) or
+            self.check(.slash) or self.check(.equal_equal) or self.check(.not_equal) or
+            self.check(.less) or self.check(.greater) or self.check(.less_equal) or
+            self.check(.greater_equal) or self.check(.diamond) or
+            self.check(.pipe_operator) or self.check(.tilde_arrow))
             self.advance()
         else
             try self.expect(.identifier); // will error with expected message
@@ -1138,6 +1176,26 @@ pub const Parser = struct {
             .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
             .module_path = module_path,
             .filter = filter,
+        });
+    }
+
+    fn parseUseDecl(self: *Parser) !*const ast.UseDecl {
+        const start = self.currentSpan();
+        // "use" is a contextual keyword — consume it as an identifier
+        _ = self.advance();
+
+        const module_path = try self.parseModuleName();
+
+        // Optional opts after comma: use Module, key: value
+        var opts: ?*const ast.Expr = null;
+        if (self.match(.comma)) {
+            opts = try self.parseExpr();
+        }
+
+        return self.create(ast.UseDecl, .{
+            .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
+            .module_path = module_path,
+            .opts = opts,
         });
     }
 
@@ -1682,10 +1740,10 @@ pub const Parser = struct {
             .left_angle_angle => return self.parseBinaryExpr(),
             .keyword_if => return self.parseIfExpr(),
             .keyword_case => return self.parseCaseExpr(),
-            .keyword_with => return self.parseWithExpr(),
             .keyword_cond => return self.parseCondExpr(),
             .keyword_quote => return self.parseQuoteExpr(),
             .keyword_unquote => return self.parseUnquoteExpr(),
+            .keyword_unquote_splicing => return self.parseUnquoteSplicingExpr(),
             .keyword_panic => return self.parsePanicExpr(),
             .at_sign => return self.parseAtSignExpr(),
             .double_ampersand => {
@@ -1722,7 +1780,7 @@ pub const Parser = struct {
                     }) catch "unexpected token in expression",
                     self.currentSpan(),
                     "not a valid expression",
-                    "expressions start with a value (number, string, variable), an operator, or a keyword like `if`, `case`, or `with`",
+                    "expressions start with a value (number, string, variable), an operator, or a keyword like `if` or `case`",
                 );
                 return error.ParseError;
             },
@@ -2122,131 +2180,6 @@ pub const Parser = struct {
         };
     }
 
-    fn parseWithExpr(self: *Parser) !*const ast.Expr {
-        const start = self.currentSpan();
-        _ = try self.expect(.keyword_with);
-
-        var items: std.ArrayList(ast.WithItem) = .empty;
-
-        while (true) {
-            const item = try self.parseWithItem();
-            try items.append(self.allocator, item);
-            if (!self.match(.comma)) break;
-        }
-
-        _ = try self.expect(.left_brace);
-        self.skipNewlines();
-
-        const body = try self.parseBlock();
-
-        self.skipNewlines();
-        _ = try self.expect(.right_brace);
-
-        var else_clauses: ?[]const ast.WithElseClause = null;
-        self.skipNewlines();
-        if (self.match(.keyword_else)) {
-            _ = try self.expect(.left_brace);
-            self.skipNewlines();
-
-            var clauses: std.ArrayList(ast.WithElseClause) = .empty;
-            while (!self.check(.right_brace) and !self.check(.eof)) {
-                self.skipNewlines();
-                if (self.check(.right_brace)) break;
-
-                const clause = try self.parseWithElseClause();
-                try clauses.append(self.allocator, clause);
-                self.skipNewlines();
-            }
-            else_clauses = try clauses.toOwnedSlice(self.allocator);
-
-            self.skipNewlines();
-            _ = try self.expect(.right_brace);
-        }
-
-        return self.create(ast.Expr, .{
-            .with_expr = .{
-                .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
-                .items = try items.toOwnedSlice(self.allocator),
-                .body = body,
-                .else_clauses = else_clauses,
-            },
-        });
-    }
-
-    fn parseWithItem(self: *Parser) !ast.WithItem {
-        // Save state for backtracking
-        const saved_lexer = self.lexer;
-        const saved_current = self.current;
-        const saved_previous = self.previous;
-
-        // Try parsing as pattern <- expr
-        if (self.parsePattern()) |pattern| {
-            if (self.check(.back_arrow)) {
-                _ = self.advance();
-                const source = try self.parseExpr();
-                return .{
-                    .bind = .{
-                        .meta = .{ .span = ast.SourceSpan.merge(pattern.getMeta().span, source.getMeta().span) },
-                        .pattern = pattern,
-                        .source = source,
-                    },
-                };
-            }
-            // Not a bind — backtrack
-            self.lexer = saved_lexer;
-            self.current = saved_current;
-            self.previous = saved_previous;
-        } else |_| {
-            self.lexer = saved_lexer;
-            self.current = saved_current;
-            self.previous = saved_previous;
-        }
-
-        const expr = try self.parseExpr();
-        return .{ .expr = expr };
-    }
-
-    fn parseWithElseClause(self: *Parser) !ast.WithElseClause {
-        const start = self.currentSpan();
-        const pattern = try self.parsePattern();
-
-        var type_annotation: ?*const ast.TypeExpr = null;
-        if (self.check(.double_colon)) {
-            _ = self.advance();
-            type_annotation = try self.parseTypeExpr();
-        }
-
-        var guard: ?*const ast.Expr = null;
-        if (self.check(.keyword_if)) {
-            _ = self.advance();
-            guard = try self.parseExpr();
-        }
-
-        _ = try self.expect(.arrow);
-
-        // Single expression or braced block for clause body
-        var body: []const ast.Stmt = undefined;
-        if (self.check(.left_brace)) {
-            _ = self.advance();
-            self.skipNewlines();
-            body = try self.parseBlock();
-            self.skipNewlines();
-            _ = try self.expect(.right_brace);
-        } else {
-            const expr = try self.parseExpr();
-            const stmts = try self.allocator.alloc(ast.Stmt, 1);
-            stmts[0] = .{ .expr = expr };
-            body = stmts;
-        }
-
-        return .{
-            .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
-            .pattern = pattern,
-            .type_annotation = type_annotation,
-            .guard = guard,
-            .body = body,
-        };
-    }
 
     fn parseCondExpr(self: *Parser) !*const ast.Expr {
         const start = self.currentSpan();
@@ -2326,6 +2259,21 @@ pub const Parser = struct {
 
         return self.create(ast.Expr, .{
             .unquote_expr = .{
+                .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
+                .expr = expr,
+            },
+        });
+    }
+
+    fn parseUnquoteSplicingExpr(self: *Parser) !*const ast.Expr {
+        const start = self.currentSpan();
+        _ = try self.expect(.keyword_unquote_splicing);
+        _ = try self.expect(.left_paren);
+        const expr = try self.parseExpr();
+        _ = try self.expect(.right_paren);
+
+        return self.create(ast.Expr, .{
+            .unquote_splicing_expr = .{
                 .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
                 .expr = expr,
             },
@@ -3370,7 +3318,6 @@ fn tokenHumanName(tag: Token.Tag) []const u8 {
         .keyword_if => "`if`",
         .keyword_else => "`else`",
         .keyword_case => "`case`",
-        .keyword_with => "`with`",
         .keyword_cond => "`cond`",
         .keyword_type => "`type`",
         .keyword_opaque => "`opaque`",
@@ -3378,6 +3325,7 @@ fn tokenHumanName(tag: Token.Tag) []const u8 {
         .keyword_import => "`import`",
         .keyword_quote => "`quote`",
         .keyword_unquote => "`unquote`",
+        .keyword_unquote_splicing => "`unquote_splicing`",
         .keyword_true => "`true`",
         .keyword_false => "`false`",
         .keyword_nil => "`nil`",
