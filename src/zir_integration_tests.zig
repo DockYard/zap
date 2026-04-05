@@ -733,3 +733,57 @@ test "ZIR compile: binary pattern string prefix" {
         \\}
     );
 }
+
+// ============================================================
+// Pipe chains with type conversion
+// ============================================================
+
+test "ZIR: pipe chain with Integer.to_string" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn double(x :: i64) -> i64 {
+        \\    x * 2
+        \\  }
+        \\
+        \\  pub fn add_one(x :: i64) -> i64 {
+        \\    x + 1
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    5
+        \\    |> double()
+        \\    |> add_one()
+        \\    |> Integer.to_string()
+        \\    |> IO.puts()
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("11\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: multi-clause function with pipes" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn factorial(0 :: i64) -> i64 {
+        \\    1
+        \\  }
+        \\
+        \\  pub fn factorial(n :: i64) -> i64 {
+        \\    n * factorial(n - 1)
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    factorial(10)
+        \\    |> Integer.to_string()
+        \\    |> IO.puts()
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("3628800\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
