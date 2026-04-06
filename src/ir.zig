@@ -1562,9 +1562,28 @@ pub const IrBuilder = struct {
     ) !TailCallRewrite {
         if (body.len == 0 or return_value == null) return .{ .instrs = body, .rewritten = false };
 
-        // Check if the last instruction is a call_named to ourselves
+        // Check if the last instruction is a call_named or call_direct to ourselves
         // and the return_value matches the call's dest
         const last = body[body.len - 1];
+
+        // Handle call_direct: multi-clause recursive calls use call_direct.
+        // If the dest matches return_value, this is a tail-position self-call.
+        if (last == .call_direct) {
+            const cd = last.call_direct;
+            if (cd.dest == return_value.?) {
+                // call_direct in a multi-clause function calling itself
+                // Rewrite to tail_call using the function's own name.
+                var new_body: std.ArrayList(Instruction) = .empty;
+                for (body[0 .. body.len - 1]) |bi| {
+                    try new_body.append(self.allocator, bi);
+                }
+                try new_body.append(self.allocator, .{
+                    .tail_call = .{ .name = func_name, .args = cd.args },
+                });
+                return .{ .instrs = try new_body.toOwnedSlice(self.allocator), .rewritten = true };
+            }
+        }
+
         if (last == .call_named) {
             const cn = last.call_named;
             if (std.mem.eql(u8, cn.name, func_name) and cn.dest == return_value.?) {

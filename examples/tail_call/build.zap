@@ -7,6 +7,7 @@ pub module TailCall.Builder {
           version: "0.1.0",
           kind: :bin,
           root: "TailCall.main/1",
+          optimize: :release_safe,
           paths: ["./*.zap"], deps: [{:zap_stdlib, {:path, "../../lib"}}]
         }
       _ ->

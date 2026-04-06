@@ -16,7 +16,7 @@ pub const BuildConfig = struct {
     kind: Kind,
     root: ?[]const u8 = null,
     asset_name: ?[]const u8 = null,
-    optimize: Optimize = .release_safe,
+    optimize: Optimize = .debug,
     paths: []const []const u8 = &.{},
     deps: []const Dep = &.{},
     build_opts: std.StringHashMapUnmanaged([]const u8) = .empty,

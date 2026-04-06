@@ -1121,3 +1121,53 @@ test "ZIR: float arithmetic" {
     try std.testing.expect(std.mem.startsWith(u8, result.stdout, "3.14159"));
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
+
+// ============================================================
+// Tail calls
+// ============================================================
+
+test "ZIR: tail recursive countdown (small)" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn countdown(0 :: i64) -> i64 {
+        \\    0
+        \\  }
+        \\
+        \\  pub fn countdown(n :: i64) -> i64 {
+        \\    countdown(n - 1)
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    Kernel.inspect(countdown(10))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("0\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: tail recursive countdown (moderate depth)" {
+    // Note: true TCO (100M+ depth) requires LLVM backend.
+    // The self-hosted aarch64 backend doesn't optimize tail calls into loops.
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn countdown(0 :: i64) -> i64 {
+        \\    0
+        \\  }
+        \\
+        \\  pub fn countdown(n :: i64) -> i64 {
+        \\    countdown(n - 1)
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    Kernel.inspect(countdown(1000))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("0\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}

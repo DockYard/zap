@@ -79,7 +79,7 @@ pub const CompileOptions = struct {
     /// Output mode: 0=Exe, 1=Lib, 2=Obj.
     output_mode: u8 = 0,
     /// Optimize mode: 0=Debug, 1=ReleaseSafe, 2=ReleaseFast, 3=ReleaseSmall.
-    optimize_mode: u8 = 1,
+    optimize_mode: u8 = 0,
     /// For Lib output: true=dynamic (.so/.dylib), false=static (.a).
     is_dynamic: bool = false,
     /// Whether to link libc.
