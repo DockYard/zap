@@ -1,5 +1,5 @@
 pub module Zest.Case {
-  # Zest.Case provides the describe/test DSL for test modules.
+  # Zest.Case provides assertions and the describe/test DSL for test modules.
   #
   # Usage:
   #   pub module Test.MyTest {
@@ -15,24 +15,44 @@ pub module Zest.Case {
   #       assert(true)
   #     }
   #   }
-  #
-  # The __using__ macro injects assert/reject helpers
-  # and the describe/test macros into the calling module.
 
   pub macro __using__(_opts :: Expr) -> Expr {
     quote {
-      import Zest
+      import Zest.Case
+    }
+  }
+
+  # Assertions
+
+  pub fn assert(value :: Bool) -> String {
+    case value {
+      true -> "."
+      false -> panic("assertion failed")
+    }
+  }
+
+  pub fn assert(value :: Bool, message :: String) -> String {
+    case value {
+      true -> "."
+      false -> panic(message)
+    }
+  }
+
+  pub fn reject(value :: Bool) -> String {
+    case value {
+      false -> "."
+      true -> panic("rejection failed: expected false, got true")
+    }
+  }
+
+  pub fn reject(value :: Bool, message :: String) -> String {
+    case value {
+      false -> "."
+      true -> panic(message)
     }
   }
 
   # describe is a macro that takes a name and a block of tests.
-  # It generates functions prefixed with the describe name.
-  #
-  # describe "math" {
-  #   test "addition" { assert(1 + 1 == 2) }
-  # }
-  # →
-  # fn __test__math__addition() -> String { assert(1 + 1 == 2); "." }
   pub macro describe(name :: Expr, body :: Expr) -> Expr {
     quote {
       unquote(body)
@@ -40,11 +60,6 @@ pub module Zest.Case {
   }
 
   # test is a macro that takes a name and a body block.
-  # It generates a private function that runs the assertions.
-  #
-  # test "works" { assert(true) }
-  # →
-  # fn __test__works() -> String { assert(true); "." }
   pub macro test(name :: Expr, body :: Expr) -> Expr {
     quote {
       unquote(body)
