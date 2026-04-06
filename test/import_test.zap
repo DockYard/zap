@@ -1,11 +1,17 @@
 pub module Test.ImportTest {
-  use Zest
+  use Zest.Case
   import Test.MultiModuleHelper
 
   pub fn run() -> String {
-    # Imported functions can be called without module prefix
-    assert(double(3) == 6)
-    assert(greet("World") == "Hello, World!")
+    describe("imports") {
+      test("imported double function works") {
+        assert(double(3) == 6)
+      }
+
+      test("imported greet function works") {
+        assert(greet("World") == "Hello, World!")
+      }
+    }
 
     "ImportTest: passed"
   }

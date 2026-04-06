@@ -1,16 +1,32 @@
 pub module Test.IfElseTest {
-  use Zest
+  use Zest.Case
 
   pub fn run() -> String {
-    # If-else as expression
-    assert(check(true) == "yes")
-    assert(check(false) == "no")
+    describe("if else") {
+      test("if true returns yes") {
+        assert(check(true) == "yes")
+      }
 
-    # Nested if-else
-    assert(classify(true, true) == "both")
-    assert(classify(true, false) == "first only")
-    assert(classify(false, true) == "second only")
-    assert(classify(false, false) == "neither")
+      test("if false returns no") {
+        assert(check(false) == "no")
+      }
+
+      test("both true returns both") {
+        assert(classify(true, true) == "both")
+      }
+
+      test("first true only returns first only") {
+        assert(classify(true, false) == "first only")
+      }
+
+      test("second true only returns second only") {
+        assert(classify(false, true) == "second only")
+      }
+
+      test("both false returns neither") {
+        assert(classify(false, false) == "neither")
+      }
+    }
 
     "IfElseTest: passed"
   }

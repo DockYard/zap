@@ -1,14 +1,20 @@
 pub module Test.PipesTest {
-  use Zest
+  use Zest.Case
+
   pub fn run() -> String {
-    # Basic pipe
-    assert((5 |> add_one()) == 6)
+    describe("pipes") {
+      test("basic pipe adds one") {
+        assert((5 |> add_one()) == 6)
+      }
 
-    # Multi-step pipe
-    assert((5 |> add_one() |> add_one()) == 7)
+      test("multi-step pipe chains") {
+        assert((5 |> add_one() |> add_one()) == 7)
+      }
 
-    # Pipe with string functions
-    assert(("hello" |> shout()) == "hello!")
+      test("pipe with string function") {
+        assert(("hello" |> shout()) == "hello!")
+      }
+    }
 
     "PipesTest: passed"
   }

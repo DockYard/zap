@@ -1,11 +1,16 @@
 pub module Test.StringTest {
-  use Zest
-  pub fn run() -> String {
-    # String concatenation
-    assert(("Hello" <> ", " <> "world!") == "Hello, world!")
+  use Zest.Case
 
-    # String in function
-    assert(greet("World") == "Hello, World!")
+  pub fn run() -> String {
+    describe("strings") {
+      test("string concatenation") {
+        assert(("Hello" <> ", " <> "world!") == "Hello, world!")
+      }
+
+      test("string function greets correctly") {
+        assert(greet("World") == "Hello, World!")
+      }
+    }
 
     "StringTest: passed"
   }

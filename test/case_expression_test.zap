@@ -1,19 +1,40 @@
 pub module Test.CaseExpressionTest {
-  use Zest
+  use Zest.Case
+
   pub fn run() -> String {
-    # Case with integer literals
-    assert(label_number(1) == "one")
-    assert(label_number(2) == "two")
-    assert(label_number(99) == "other")
+    describe("case expressions") {
+      test("matches integer literal one") {
+        assert(label_number(1) == "one")
+      }
 
-    # Case with atom literals
-    assert(status_message(:ok) == "all good")
-    assert(status_message(:error) == "something went wrong")
-    assert(status_message(:pending) == "unknown status")
+      test("matches integer literal two") {
+        assert(label_number(2) == "two")
+      }
 
-    # Case with variable binding
-    assert(add_or_zero(5) == 10)
-    assert(add_or_zero(0) == 0)
+      test("falls through to default for other integers") {
+        assert(label_number(99) == "other")
+      }
+
+      test("matches atom ok") {
+        assert(status_message(:ok) == "all good")
+      }
+
+      test("matches atom error") {
+        assert(status_message(:error) == "something went wrong")
+      }
+
+      test("falls through to default for other atoms") {
+        assert(status_message(:pending) == "unknown status")
+      }
+
+      test("variable binding doubles non-zero value") {
+        assert(add_or_zero(5) == 10)
+      }
+
+      test("matches zero literal") {
+        assert(add_or_zero(0) == 0)
+      }
+    }
 
     "CaseExpressionTest: passed"
   }

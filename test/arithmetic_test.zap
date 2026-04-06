@@ -1,16 +1,32 @@
 pub module Test.ArithmeticTest {
-  use Zest
+  use Zest.Case
 
   pub fn run() -> String {
-    # Basic arithmetic
-    assert(2 + 3 == 5)
-    assert(10 - 4 == 6)
-    assert(3 * 7 == 21)
+    describe("arithmetic") {
+      test("addition") {
+        assert(2 + 3 == 5)
+      }
 
-    # Functions with arithmetic
-    assert(add(3, 4) == 7)
-    assert(square(5) == 25)
-    assert(cube(3) == 27)
+      test("subtraction") {
+        assert(10 - 4 == 6)
+      }
+
+      test("multiplication") {
+        assert(3 * 7 == 21)
+      }
+
+      test("add function") {
+        assert(add(3, 4) == 7)
+      }
+
+      test("square function") {
+        assert(square(5) == 25)
+      }
+
+      test("cube function") {
+        assert(cube(3) == 27)
+      }
+    }
 
     "ArithmeticTest: passed"
   }

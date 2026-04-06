@@ -1,13 +1,20 @@
 pub module Test.MultiArityTest {
-  use Zest
+  use Zest.Case
 
   pub fn run() -> String {
-    # Functions with different arities
-    assert(add(1, 2) == 3)
-    assert(add3(1, 2, 3) == 6)
+    describe("multi arity") {
+      test("two-argument add") {
+        assert(add(1, 2) == 3)
+      }
 
-    # Multi-parameter string functions
-    assert(join("hello", " ", "world") == "hello world")
+      test("three-argument add") {
+        assert(add3(1, 2, 3) == 6)
+      }
+
+      test("multi-parameter string join") {
+        assert(join("hello", " ", "world") == "hello world")
+      }
+    }
 
     "MultiArityTest: passed"
   }

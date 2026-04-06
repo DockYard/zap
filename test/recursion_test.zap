@@ -1,21 +1,44 @@
 pub module Test.RecursionTest {
-  use Zest
+  use Zest.Case
 
   pub fn run() -> String {
-    # Factorial via multi-clause recursion
-    assert(factorial(0) == 1)
-    assert(factorial(1) == 1)
-    assert(factorial(5) == 120)
-    assert(factorial(10) == 3628800)
+    describe("recursion") {
+      test("factorial of 0") {
+        assert(factorial(0) == 1)
+      }
 
-    # Fibonacci via multi-clause recursion
-    assert(fib(0) == 0)
-    assert(fib(1) == 1)
-    assert(fib(6) == 8)
+      test("factorial of 1") {
+        assert(factorial(1) == 1)
+      }
 
-    # Recursive sum
-    assert(sum(0) == 0)
-    assert(sum(5) == 15)
+      test("factorial of 5") {
+        assert(factorial(5) == 120)
+      }
+
+      test("factorial of 10") {
+        assert(factorial(10) == 3628800)
+      }
+
+      test("fibonacci of 0") {
+        assert(fib(0) == 0)
+      }
+
+      test("fibonacci of 1") {
+        assert(fib(1) == 1)
+      }
+
+      test("fibonacci of 6") {
+        assert(fib(6) == 8)
+      }
+
+      test("sum of 0") {
+        assert(sum(0) == 0)
+      }
+
+      test("sum of 5") {
+        assert(sum(5) == 15)
+      }
+    }
 
     "RecursionTest: passed"
   }

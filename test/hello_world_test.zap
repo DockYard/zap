@@ -1,7 +1,13 @@
 pub module Test.HelloWorldTest {
-  use Zest
+  use Zest.Case
+
   pub fn run() -> String {
-    assert(greeting() == "Hello, world!")
+    describe("greeting") {
+      test("returns hello world") {
+        assert(greeting() == "Hello, world!")
+      }
+    }
+
     "HelloWorldTest: passed"
   }
 

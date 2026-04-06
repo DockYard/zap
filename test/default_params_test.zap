@@ -1,14 +1,24 @@
 pub module Test.DefaultParamsTest {
-  use Zest
+  use Zest.Case
 
   pub fn run() -> String {
-    # Integer default
-    assert(add(5) == 15)
-    assert(add(5, 20) == 25)
+    describe("default params") {
+      test("integer default is used when arg omitted") {
+        assert(add(5) == 15)
+      }
 
-    # String default
-    assert(greet("World") == "Hello, World!")
-    assert(greet("World", "Hi") == "Hi, World!")
+      test("integer default is overridden when arg provided") {
+        assert(add(5, 20) == 25)
+      }
+
+      test("string default is used when arg omitted") {
+        assert(greet("World") == "Hello, World!")
+      }
+
+      test("string default is overridden when arg provided") {
+        assert(greet("World", "Hi") == "Hi, World!")
+      }
+    }
 
     "DefaultParamsTest: passed"
   }

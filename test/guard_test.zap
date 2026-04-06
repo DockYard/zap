@@ -1,16 +1,32 @@
 pub module Test.GuardTest {
-  use Zest
+  use Zest.Case
 
   pub fn run() -> String {
-    # Guards on function clauses
-    assert(classify(5) == "positive")
-    assert(classify(-3) == "negative")
-    assert(classify(0) == "zero")
+    describe("guards") {
+      test("positive number classified as positive") {
+        assert(classify(5) == "positive")
+      }
 
-    # Guards with multiple conditions
-    assert(range_check(5) == "small")
-    assert(range_check(50) == "medium")
-    assert(range_check(500) == "large")
+      test("negative number classified as negative") {
+        assert(classify(-3) == "negative")
+      }
+
+      test("zero classified as zero") {
+        assert(classify(0) == "zero")
+      }
+
+      test("small range check") {
+        assert(range_check(5) == "small")
+      }
+
+      test("medium range check") {
+        assert(range_check(50) == "medium")
+      }
+
+      test("large range check") {
+        assert(range_check(500) == "large")
+      }
+    }
 
     "GuardTest: passed"
   }

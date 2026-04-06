@@ -1,18 +1,32 @@
 pub module Test.TupleTest {
-  use Zest
+  use Zest.Case
 
   pub fn run() -> String {
-    # Tuple pattern matching — extract elements
-    assert(first({1, 2}) == 1)
-    assert(second({10, 20}) == 20)
-    assert(sum_tuple({3, 4}) == 7)
+    describe("tuples") {
+      test("extract first element") {
+        assert(first({1, 2}) == 1)
+      }
 
-    # Wildcard patterns
-    assert(second_wild({10, 20}) == 20)
-    assert(first_wild({10, 20}) == 10)
+      test("extract second element") {
+        assert(second({10, 20}) == 20)
+      }
 
-    # Arithmetic on tuple elements
-    assert(double_second({5, 7}) == 14)
+      test("sum tuple elements") {
+        assert(sum_tuple({3, 4}) == 7)
+      }
+
+      test("second with wildcard first") {
+        assert(second_wild({10, 20}) == 20)
+      }
+
+      test("first with wildcard second") {
+        assert(first_wild({10, 20}) == 10)
+      }
+
+      test("double second element") {
+        assert(double_second({5, 7}) == 14)
+      }
+    }
 
     "TupleTest: passed"
   }

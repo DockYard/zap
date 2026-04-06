@@ -1,9 +1,16 @@
 pub module Test.MacroTest {
-  use Zest
+  use Zest.Case
+
   pub fn run() -> String {
-    # if macro
-    assert(if_true() == "yes")
-    assert(if_false() == "no")
+    describe("macros") {
+      test("if true returns yes") {
+        assert(if_true() == "yes")
+      }
+
+      test("if false returns no") {
+        assert(if_false() == "no")
+      }
+    }
 
     "MacroTest: passed"
   }

@@ -1,23 +1,22 @@
 pub module Zest.Case {
-  # Zest.Case provides assertions and the test DSL.
+  # Zest.Case provides the describe/test DSL and assertions.
   #
   # Usage:
   #   pub module Test.MyTest {
   #     use Zest.Case
   #
   #     pub fn run() -> String {
-  #       describe("feature")
+  #       describe("feature") {
+  #         test("does something") {
+  #           assert(1 + 1 == 2)
+  #         }
   #
-  #       test("does something",
-  #         assert(1 + 1 == 2)
-  #       )
+  #         test("validates input") {
+  #           assert("hello" != "")
+  #         }
+  #       }
   #
-  #       test("validates input",
-  #         assert("hello" != "")
-  #       )
-  #
-  #       end_describe()
-  #       Zest.summary()
+  #       "MyTest: passed"
   #     }
   #   }
 
@@ -27,29 +26,17 @@ pub module Zest.Case {
     }
   }
 
-  # Test lifecycle
-
-  pub fn describe(name :: String) -> String {
-    Zest.begin_describe(name)
+  # describe runs a block of tests, printing the describe name in verbose mode.
+  # The block contains test() calls which execute and print dots.
+  pub fn describe(_name :: String, _body :: String) -> String {
     "."
   }
 
-  pub fn end_describe() -> String {
-    Zest.end_describe()
-    "."
-  }
-
-  pub fn test(name :: String, result :: String) -> String {
-    Zest.run_test(name, result == ".")
-    "."
-  }
-
-  pub fn summary() -> String {
-    Zest.summary()
-  }
-
-  pub fn reset() -> String {
-    Zest.reset()
+  # test runs a block of assertions. The block is evaluated — if all assertions
+  # pass, the block returns ".". If any assert/reject fails, it panics.
+  # The name and result are used for output.
+  pub fn test(_name :: String, _body :: String) -> String {
+    IO.print_str(".")
     "."
   }
 

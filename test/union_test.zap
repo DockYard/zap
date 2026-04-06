@@ -1,5 +1,5 @@
 pub module Test.UnionTest {
-  use Zest
+  use Zest.Case
 
   pub union Color {
     Red
@@ -8,10 +8,19 @@ pub module Test.UnionTest {
   }
 
   pub fn run() -> String {
-    # Unit variant enum
-    assert(color_name(Color.Red) == "red")
-    assert(color_name(Color.Green) == "green")
-    assert(color_name(Color.Blue) == "blue")
+    describe("unions") {
+      test("Red variant name") {
+        assert(color_name(Color.Red) == "red")
+      }
+
+      test("Green variant name") {
+        assert(color_name(Color.Green) == "green")
+      }
+
+      test("Blue variant name") {
+        assert(color_name(Color.Blue) == "blue")
+      }
+    }
 
     "UnionTest: passed"
   }

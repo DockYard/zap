@@ -1,14 +1,24 @@
 pub module Test.CatchBasinTest {
-  use Zest
+  use Zest.Case
 
   pub fn run() -> String {
-    # Matching value passes through
-    assert(try_parse("one") == "1")
-    assert(try_parse("two") == "2")
+    describe("catch basins") {
+      test("matching value passes through for one") {
+        assert(try_parse("one") == "1")
+      }
 
-    # Unmatched value goes to handler
-    assert(try_parse("nope") == "unmatched: nope")
-    assert(try_parse("xyz") == "unmatched: xyz")
+      test("matching value passes through for two") {
+        assert(try_parse("two") == "2")
+      }
+
+      test("unmatched value goes to handler") {
+        assert(try_parse("nope") == "unmatched: nope")
+      }
+
+      test("another unmatched value goes to handler") {
+        assert(try_parse("xyz") == "unmatched: xyz")
+      }
+    }
 
     # TODO: Additional catch basin patterns have multi-file compilation issues
 

@@ -1,26 +1,56 @@
 pub module Test.CondTest {
-  use Zest
+  use Zest.Case
 
   pub fn run() -> String {
-    # Cond with boolean
-    assert(check(true) == "yes")
-    assert(check(false) == "no")
+    describe("cond") {
+      test("boolean true returns yes") {
+        assert(check(true) == "yes")
+      }
 
-    # Cond with comparison
-    assert(describe(1) == "one")
-    assert(describe(2) == "two")
-    assert(describe(99) == "other")
+      test("boolean false returns no") {
+        assert(check(false) == "no")
+      }
 
-    # Cond with many arms
-    assert(grade(95) == "A")
-    assert(grade(85) == "B")
-    assert(grade(75) == "C")
-    assert(grade(50) == "F")
+      test("comparison matches one") {
+        assert(describe(1) == "one")
+      }
 
-    # Nested cond (cond returning values used in comparisons)
-    assert(abs_sign(-5) == "negative")
-    assert(abs_sign(0) == "zero")
-    assert(abs_sign(3) == "positive")
+      test("comparison matches two") {
+        assert(describe(2) == "two")
+      }
+
+      test("comparison falls through to other") {
+        assert(describe(99) == "other")
+      }
+
+      test("grade A for 95") {
+        assert(grade(95) == "A")
+      }
+
+      test("grade B for 85") {
+        assert(grade(85) == "B")
+      }
+
+      test("grade C for 75") {
+        assert(grade(75) == "C")
+      }
+
+      test("grade F for 50") {
+        assert(grade(50) == "F")
+      }
+
+      test("abs_sign negative") {
+        assert(abs_sign(-5) == "negative")
+      }
+
+      test("abs_sign zero") {
+        assert(abs_sign(0) == "zero")
+      }
+
+      test("abs_sign positive") {
+        assert(abs_sign(3) == "positive")
+      }
+    }
 
     "CondTest: passed"
   }

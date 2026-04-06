@@ -1,14 +1,28 @@
 pub module Test.AtomTest {
-  use Zest
-  pub fn run() -> String {
-    # Atom equality
-    assert(:ok == :ok)
-    assert(:error == :error)
-    reject(:ok == :error)
+  use Zest.Case
 
-    # Atom in functions
-    assert(status(:ok) == "success")
-    assert(status(:error) == "failure")
+  pub fn run() -> String {
+    describe("atoms") {
+      test("equal atoms match") {
+        assert(:ok == :ok)
+      }
+
+      test("error atoms match") {
+        assert(:error == :error)
+      }
+
+      test("different atoms do not match") {
+        reject(:ok == :error)
+      }
+
+      test("status function returns success for ok") {
+        assert(status(:ok) == "success")
+      }
+
+      test("status function returns failure for error") {
+        assert(status(:error) == "failure")
+      }
+    }
 
     "AtomTest: passed"
   }

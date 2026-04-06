@@ -1,13 +1,24 @@
 pub module Test.FunctionTest {
-  use Zest
-  pub fn run() -> String {
-    # Multi-clause dispatch
-    assert(classify(0) == "zero")
-    assert(classify(1) == "one")
-    assert(classify(42) == "other")
+  use Zest.Case
 
-    # String function
-    assert(greet("World") == "Hello, World!")
+  pub fn run() -> String {
+    describe("functions") {
+      test("multi-clause dispatch matches zero") {
+        assert(classify(0) == "zero")
+      }
+
+      test("multi-clause dispatch matches one") {
+        assert(classify(1) == "one")
+      }
+
+      test("multi-clause dispatch falls through to other") {
+        assert(classify(42) == "other")
+      }
+
+      test("string function greets correctly") {
+        assert(greet("World") == "Hello, World!")
+      }
+    }
 
     "FunctionTest: passed"
   }
