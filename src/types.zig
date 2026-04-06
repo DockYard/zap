@@ -669,13 +669,18 @@ pub const TypeChecker = struct {
             const param_type = if (param.type_annotation) |ann|
                 try self.resolveTypeExpr(ann)
             else blk: {
-                // All function parameters require type annotations
-                try self.addHardError(
-                    try std.fmt.allocPrint(self.allocator, "parameter requires a type annotation (e.g., `param :: Type`)", .{}),
-                    param.pattern.getMeta().span,
-                    "missing type annotation",
-                    null,
-                );
+                // Generated functions (e.g., __for_N from for comprehension) may
+                // lack type annotations — infer as UNKNOWN. User-written functions
+                // still require annotations.
+                const func_name = self.interner.get(name);
+                if (!std.mem.startsWith(u8, func_name, "__")) {
+                    try self.addHardError(
+                        try std.fmt.allocPrint(self.allocator, "parameter requires a type annotation (e.g., `param :: Type`)", .{}),
+                        param.pattern.getMeta().span,
+                        "missing type annotation",
+                        null,
+                    );
+                }
                 break :blk TypeStore.UNKNOWN;
             };
             try param_types.append(self.allocator, param_type);
@@ -1640,26 +1645,34 @@ pub const TypeChecker = struct {
                     }
                 }
             } else {
-                // All function parameters require type annotations
-                try self.addHardError(
-                    try std.fmt.allocPrint(self.allocator, "parameter requires a type annotation (e.g., `param :: Type`)", .{}),
-                    param.pattern.getMeta().span,
-                    "missing type annotation",
-                    null,
-                );
+                // Generated functions (span 0:0) may lack type annotations.
+                // Only error for user-written functions with real source locations.
+                const span = param.pattern.getMeta().span;
+                if (span.start != 0 or span.end != 0) {
+                    try self.addHardError(
+                        try std.fmt.allocPrint(self.allocator, "parameter requires a type annotation (e.g., `param :: Type`)", .{}),
+                        span,
+                        "missing type annotation",
+                        null,
+                    );
+                }
             }
         }
 
-        // Resolve return type — required for all functions
+        // Resolve return type — required for user-written functions.
+        // Generated functions (span 0:0) may lack return type annotations.
         const declared_return = if (clause.return_type) |rt|
             try self.resolveTypeExpr(rt)
         else blk: {
-            try self.addHardError(
-                "missing return type annotation",
-                clause.meta.span,
-                "this function has no return type",
-                "add a return type: `def name(params) -> ReturnType do`",
-            );
+            const span = clause.meta.span;
+            if (span.start != 0 or span.end != 0) {
+                try self.addHardError(
+                    "missing return type annotation",
+                    span,
+                    "this function has no return type",
+                    "add a return type: `def name(params) -> ReturnType do`",
+                );
+            }
             break :blk TypeStore.UNKNOWN;
         };
 

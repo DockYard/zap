@@ -692,7 +692,9 @@ pub const Desugarer = struct {
     // ============================================================
 
     fn desugarForExpr(self: *Desugarer, fe: *const ast.ForExpr) !*const ast.Expr {
-        const meta = fe.meta;
+        // Use zero span for generated function internals so the type checker
+        // skips annotation requirements for compiler-generated code.
+        const meta = ast.NodeMeta{ .span = .{ .start = 0, .end = 0 } };
 
         // Check if iterating over a string — use index-based iteration
         if (fe.iterable.* == .string_literal or fe.iterable.* == .string_interpolation) {
@@ -840,7 +842,7 @@ pub const Desugarer = struct {
     ///   }
     ///   __for_N(str, 0)
     fn desugarForString(self: *Desugarer, fe: *const ast.ForExpr) !*const ast.Expr {
-        const meta = fe.meta;
+        const meta = ast.NodeMeta{ .span = .{ .start = 0, .end = 0 } };
 
         var name_buf: [32]u8 = undefined;
         const name_str = try std.fmt.bufPrint(&name_buf, "__for_{d}", .{self.for_counter});
