@@ -4454,3 +4454,43 @@ test "parse non-keyword list unchanged" {
     try std.testing.expect(expr.list.elements[2].* == .int_literal);
 }
 
+test "parse for comprehension" {
+    const source = "for x <- items { x * 2 }";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const expr = try parser.parseExpr();
+    try std.testing.expect(expr.* == .for_expr);
+    try std.testing.expect(expr.for_expr.filter == null);
+    try std.testing.expect(expr.for_expr.iterable.* == .var_ref);
+    try std.testing.expect(expr.for_expr.body.* == .binary_op);
+}
+
+test "parse for comprehension with filter" {
+    const source = "for x <- items, x > 0 { x }";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const expr = try parser.parseExpr();
+    try std.testing.expect(expr.* == .for_expr);
+    try std.testing.expect(expr.for_expr.filter != null);
+    try std.testing.expect(expr.for_expr.filter.?.* == .binary_op);
+}
+
+test "parse list cons expression [h | t]" {
+    const source = "[1 | rest]";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const expr = try parser.parseExpr();
+    try std.testing.expect(expr.* == .list_cons_expr);
+    try std.testing.expect(expr.list_cons_expr.head.* == .int_literal);
+    try std.testing.expect(expr.list_cons_expr.tail.* == .var_ref);
+}
+
