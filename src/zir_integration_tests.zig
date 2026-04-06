@@ -825,6 +825,58 @@ test "ZIR: catch basin short-circuits multi-step pipe" {
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
 
+// ============================================================
+// Trailing block syntax
+// ============================================================
+
+test "ZIR: trailing block as last argument" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn with_block(name :: String, body :: String) -> String {
+        \\    name <> ": " <> body
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    result = with_block("test") {
+        \\      "hello"
+        \\    }
+        \\    IO.puts(result)
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("test: hello\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: nested trailing blocks" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn outer(name :: String, body :: String) -> String {
+        \\    "[" <> name <> " " <> body <> "]"
+        \\  }
+        \\
+        \\  pub fn inner(name :: String, body :: String) -> String {
+        \\    "(" <> name <> " " <> body <> ")"
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    result = outer("describe") {
+        \\      inner("test") {
+        \\        "pass"
+        \\      }
+        \\    }
+        \\    IO.puts(result)
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("[describe (test pass)]\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
 test "ZIR: catch basin ~> with function handler" {
     var result = try compileAndRun(
         \\pub module TestProg {

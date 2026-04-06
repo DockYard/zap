@@ -1694,6 +1694,12 @@ pub const Parser = struct {
 
                 const end_tok = try self.expect(.right_paren);
 
+                // Trailing block: func(args) { body } → body becomes last argument
+                if (self.check(.left_brace)) {
+                    const block_expr = try self.parseBlockExpr();
+                    try args.append(self.allocator, block_expr);
+                }
+
                 expr = try self.create(ast.Expr, .{
                     .call = .{
                         .meta = .{ .span = ast.SourceSpan.merge(expr.getMeta().span, ast.SourceSpan.from(end_tok.loc)) },
@@ -1978,6 +1984,32 @@ pub const Parser = struct {
         const name = try self.parseModuleName();
         return self.create(ast.Expr, .{
             .module_ref = .{ .meta = .{ .span = name.span }, .name = name },
+        });
+    }
+
+    /// Parse a block expression: { stmt; stmt; ... expr }
+    /// The block's value is the last expression.
+    fn parseBlockExpr(self: *Parser) !*const ast.Expr {
+        const start = self.currentSpan();
+        _ = try self.expect(.left_brace);
+        self.skipNewlines();
+
+        var stmts: std.ArrayList(ast.Stmt) = .empty;
+        while (!self.check(.right_brace) and !self.check(.eof)) {
+            self.skipNewlines();
+            if (self.check(.right_brace)) break;
+            const stmt = try self.parseStmt();
+            try stmts.append(self.allocator, stmt);
+            self.skipNewlines();
+        }
+
+        _ = try self.expect(.right_brace);
+
+        return self.create(ast.Expr, .{
+            .block = .{
+                .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
+                .stmts = try stmts.toOwnedSlice(self.allocator),
+            },
         });
     }
 
@@ -4511,5 +4543,36 @@ test "parse list cons expression [h | t]" {
     try std.testing.expect(expr.* == .list_cons_expr);
     try std.testing.expect(expr.list_cons_expr.head.* == .int_literal);
     try std.testing.expect(expr.list_cons_expr.tail.* == .var_ref);
+}
+
+test "parse trailing block as last argument" {
+    const source = "foo(\"name\") { 1 + 2 }";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const expr = try parser.parseExpr();
+    // Should be a call with 2 args: "name" and a block
+    try std.testing.expect(expr.* == .call);
+    try std.testing.expectEqual(@as(usize, 2), expr.call.args.len);
+    try std.testing.expect(expr.call.args[0].* == .string_literal);
+    try std.testing.expect(expr.call.args[1].* == .block);
+}
+
+test "parse nested trailing blocks" {
+    const source = "describe(\"math\") { test(\"add\") { 1 + 1 } }";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const expr = try parser.parseExpr();
+    // describe("math") { ... } → call with 2 args
+    try std.testing.expect(expr.* == .call);
+    try std.testing.expectEqual(@as(usize, 2), expr.call.args.len);
+    try std.testing.expect(expr.call.args[0].* == .string_literal);
+    // The block contains a test(...) { ... } call
+    try std.testing.expect(expr.call.args[1].* == .block);
 }
 
