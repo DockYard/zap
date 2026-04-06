@@ -460,10 +460,13 @@ pub const CallBuiltin = struct {
 /// Call a __try function variant. The result is an error union:
 /// error{NoMatchingClause}!ReturnType.
 pub const TryCallNamed = struct {
-    dest: LocalId, // holds the error union result
+    dest: LocalId, // holds the optional result (?ReturnType)
     name: []const u8, // the __try function name (already suffixed)
     args: []const LocalId,
     arg_modes: []const ValueMode,
+    input_local: LocalId, // the pipe input — passed to handler on null
+    handler_instrs: []const Instruction, // handler body instructions
+    handler_result: ?LocalId, // handler result local
 };
 
 /// Unwrap an error union from try_call_named.
@@ -1495,17 +1498,16 @@ pub const IrBuilder = struct {
                 });
             }
 
-            // Add handler as last param
+            // __try variant has the same params as the original (no handler param)
             var try_params: std.ArrayList(Param) = .empty;
             for (final_params) |p| try try_params.append(self.allocator, p);
-            try try_params.append(self.allocator, .{ .name = "__handler", .type_expr = return_type });
 
             const try_name = try std.fmt.allocPrint(self.allocator, "{s}__try", .{name_str});
             try self.functions.append(self.allocator, .{
                 .id = try_func_id,
                 .name = try_name,
                 .scope_id = group.scope_id,
-                .arity = group.arity + 1,
+                .arity = group.arity,
                 .params = try try_params.toOwnedSlice(self.allocator),
                 .return_type = return_type,
                 .body = try self.allocSlice(Block, &.{try_entry_block}),
@@ -3381,11 +3383,11 @@ pub const IrBuilder = struct {
             .error_pipe => |ep| {
                 // Lower error pipe as FLAT sequence.
                 // Every function call in the pipe uses its __try variant if multi-clause.
-                // If the __try variant returns error.NoMatchingClause, the unmatched
-                // value flows to the ~> handler. Single-clause functions always match.
+                // If __try returns null, the unmatched input flows to the handler.
                 if (ep.steps.len == 0) return dest;
 
-                const handler_local = try self.lowerExpr(ep.handler);
+                // Store the handler HIR expression for deferred evaluation at each step.
+                const handler_hir = ep.handler;
                 var pipe_val = try self.lowerExpr(ep.steps[0].expr);
 
                 // Process remaining steps at the top level
@@ -3412,25 +3414,34 @@ pub const IrBuilder = struct {
                         };
 
                         if (step.is_dispatched) {
-                            // Multi-clause: call __try variant with handler as last arg.
-                            // __try returns match result or handler directly.
-                            // Call __try variant with handler as last arg
+                            // Multi-clause: call __try variant (returns ?ReturnType).
+                            // On null: run handler with input value, short-circuit.
                             const try_name = try std.fmt.allocPrint(self.allocator, "{s}__try", .{call_name_str});
                             try self.try_variant_names.put(call_name_str, {});
 
-                            var try_args: std.ArrayList(LocalId) = .empty;
-                            for (final_args) |arg| try try_args.append(self.allocator, arg);
-                            try try_args.append(self.allocator, handler_local);
-                            const try_final_args = try try_args.toOwnedSlice(self.allocator);
-                            const try_modes = try self.allocator.alloc(ValueMode, try_final_args.len);
-                            @memset(try_modes, .share);
+                            // Lower handler with pipe_val as the scrutinee (__err)
+                            const saved = self.current_instrs;
+                            self.current_instrs = .empty;
+                            // Assign __err = pipe_val (the input that failed to match)
+                            const err_local = self.next_local;
+                            self.next_local += 1;
+                            try self.current_instrs.append(self.allocator, .{
+                                .local_set = .{ .dest = err_local, .value = pipe_val },
+                            });
+                            // Lower handler expression with __err available
+                            const handler_result = try self.lowerExpr(handler_hir);
+                            const handler_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
+                            self.current_instrs = saved;
 
                             try self.current_instrs.append(self.allocator, .{
                                 .try_call_named = .{
                                     .dest = call_dest,
                                     .name = try_name,
-                                    .args = try_final_args,
-                                    .arg_modes = try_modes,
+                                    .args = final_args,
+                                    .arg_modes = modes,
+                                    .input_local = pipe_val,
+                                    .handler_instrs = handler_instrs,
+                                    .handler_result = handler_result,
                                 },
                             });
                             pipe_val = call_dest;

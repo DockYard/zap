@@ -722,6 +722,109 @@ test "ZIR: catch basin ~> catches unmatched multi-clause function" {
     try std.testing.expectEqualStrings("matched\ncaught\n", result.stdout);
 }
 
+test "ZIR: catch basin receives unmatched value" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn parse("one" :: String) -> String {
+        \\    "1"
+        \\  }
+        \\
+        \\  pub fn parse("two" :: String) -> String {
+        \\    "2"
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    result = "three"
+        \\    |> parse()
+        \\    ~> {
+        \\      val -> "unmatched: " <> val
+        \\    }
+        \\    IO.puts(result)
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("unmatched: three\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: catch basin handler pattern matches on unmatched value" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn process("ok" :: String) -> String {
+        \\    "success"
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    r1 = "ok"
+        \\    |> process()
+        \\    ~> {
+        \\      "fail" -> "got fail"
+        \\      other -> "got: " <> other
+        \\    }
+        \\    IO.puts(r1)
+        \\
+        \\    r2 = "fail"
+        \\    |> process()
+        \\    ~> {
+        \\      "fail" -> "got fail"
+        \\      other -> "got: " <> other
+        \\    }
+        \\    IO.puts(r2)
+        \\
+        \\    r3 = "xyz"
+        \\    |> process()
+        \\    ~> {
+        \\      "fail" -> "got fail"
+        \\      other -> "got: " <> other
+        \\    }
+        \\    IO.puts(r3)
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("success\ngot fail\ngot: xyz\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: catch basin short-circuits multi-step pipe" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn validate("good" :: String) -> String {
+        \\    "valid"
+        \\  }
+        \\
+        \\  pub fn format(s :: String) -> String {
+        \\    "formatted: " <> s
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    good = "good"
+        \\    |> validate()
+        \\    |> format()
+        \\    ~> {
+        \\      val -> "rejected: " <> val
+        \\    }
+        \\    IO.puts(good)
+        \\
+        \\    bad = "bad"
+        \\    |> validate()
+        \\    |> format()
+        \\    ~> {
+        \\      val -> "rejected: " <> val
+        \\    }
+        \\    IO.puts(bad)
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("formatted: valid\nrejected: bad\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
 // ============================================================
 // Struct literals
 // ============================================================
