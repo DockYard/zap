@@ -1148,6 +1148,149 @@ test "ZIR: tail recursive countdown (small)" {
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
 
+// ============================================================
+// List operations
+// ============================================================
+
+test "ZIR: list literal and fixed-length pattern" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn sum_list(xs :: [i64]) -> i64 {
+        \\    case xs {
+        \\      [a, b, c] -> a + b + c
+        \\      _ -> 0
+        \\    }
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    Kernel.inspect(sum_list([10, 20, 12]))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("42\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: list cons pattern [h | t]" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn head(xs :: [i64]) -> i64 {
+        \\    case xs {
+        \\      [h | _] -> h
+        \\      _ -> 0
+        \\    }
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    Kernel.inspect(head([42, 10, 20]))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("42\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: recursive list sum with cons pattern" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn sum([] :: [i64]) -> i64 {
+        \\    0
+        \\  }
+        \\
+        \\  pub fn sum([h | t] :: [i64]) -> i64 {
+        \\    h + sum(t)
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    Kernel.inspect(sum([10, 20, 12]))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("42\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: list length via recursion" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn len([] :: [i64]) -> i64 {
+        \\    0
+        \\  }
+        \\
+        \\  pub fn len([_ | t] :: [i64]) -> i64 {
+        \\    1 + len(t)
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    Kernel.inspect(len([1, 2, 3, 4, 5]))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("5\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: list map via recursion" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn double_all([] :: [i64]) -> [i64] {
+        \\    []
+        \\  }
+        \\
+        \\  pub fn double_all([h | t] :: [i64]) -> [i64] {
+        \\    [h * 2 | double_all(t)]
+        \\  }
+        \\
+        \\  pub fn sum([] :: [i64]) -> i64 {
+        \\    0
+        \\  }
+        \\
+        \\  pub fn sum([h | t] :: [i64]) -> i64 {
+        \\    h + sum(t)
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    Kernel.inspect(sum(double_all([1, 2, 3])))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("12\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: list of strings with pattern matching" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn first([] :: [String]) -> String {
+        \\    "empty"
+        \\  }
+        \\
+        \\  pub fn first([h | _] :: [String]) -> String {
+        \\    h
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    IO.puts(first(["hello", "world"]))
+        \\    IO.puts(first([]))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("hello\nempty\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
 test "ZIR: tail recursive countdown (large, guaranteed TCO)" {
     var result = try compileAndRun(
         \\pub module TestProg {
