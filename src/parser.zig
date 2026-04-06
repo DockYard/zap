@@ -649,24 +649,12 @@ pub const Parser = struct {
                         } else |_| {
                             self.synchronize();
                         }
-                    } else if (self.checkIdentifier("describe")) {
-                        if (self.parseDescribeDecl()) |dd| {
-                            try items.append(self.allocator, .{ .describe = dd });
-                        } else |_| {
-                            self.synchronize();
-                        }
-                    } else if (self.checkIdentifier("test")) {
-                        if (self.parseTestDecl(null)) |td| {
-                            try items.append(self.allocator, .{ .test_decl = td });
-                        } else |_| {
-                            self.synchronize();
-                        }
                     } else {
                         try self.addRichError(
                             "I was not expecting an identifier at the module level",
                             self.currentSpan(),
                             null,
-                            "the module level can contain `pub fn`, `fn`, `pub macro`, `macro`, `import`, `use`, `describe`, `test`, `alias`, `type`, `struct`, `union`, `opaque`, and `@attribute` declarations",
+                            "the module level can contain `pub fn`, `fn`, `pub macro`, `macro`, `import`, `use`, `alias`, `type`, `struct`, `union`, `opaque`, and `@attribute` declarations",
                         );
                         self.synchronize();
                     }
@@ -1241,84 +1229,6 @@ pub const Parser = struct {
         });
     }
 
-    // ============================================================
-    // Test DSL: describe / test
-    // ============================================================
-
-    fn parseDescribeDecl(self: *Parser) !*const ast.DescribeDecl {
-        const start = self.currentSpan();
-        _ = self.advance(); // consume "describe"
-
-        // Parse description string
-        const name_tok = try self.expect(.string_literal);
-        const name_raw = name_tok.slice(self.source);
-        const name = if (name_raw.len >= 2) name_raw[1 .. name_raw.len - 1] else name_raw;
-
-        self.skipNewlines();
-        _ = try self.expect(.left_brace);
-        self.skipNewlines();
-
-        // Parse test declarations inside describe block
-        var tests: std.ArrayList(*const ast.TestDecl) = .empty;
-        while (!self.check(.right_brace) and !self.check(.eof)) {
-            self.skipNewlines();
-            if (self.check(.right_brace)) break;
-            if (self.checkIdentifier("test")) {
-                const td = try self.parseTestDecl(name);
-                try tests.append(self.allocator, td);
-            } else {
-                try self.addRichError(
-                    "describe blocks can only contain test declarations",
-                    self.currentSpan(),
-                    null,
-                    "use `test \"name\" { ... }` inside describe",
-                );
-                self.synchronize();
-            }
-            self.skipNewlines();
-        }
-
-        _ = try self.expect(.right_brace);
-
-        return self.create(ast.DescribeDecl, .{
-            .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
-            .name = name,
-            .tests = try tests.toOwnedSlice(self.allocator),
-        });
-    }
-
-    fn parseTestDecl(self: *Parser, describe_name: ?[]const u8) !*const ast.TestDecl {
-        const start = self.currentSpan();
-        _ = self.advance(); // consume "test"
-
-        // Parse test name string
-        const name_tok = try self.expect(.string_literal);
-        const name_raw = name_tok.slice(self.source);
-        const name = if (name_raw.len >= 2) name_raw[1 .. name_raw.len - 1] else name_raw;
-
-        self.skipNewlines();
-        _ = try self.expect(.left_brace);
-        self.skipNewlines();
-
-        // Parse body statements
-        var body: std.ArrayList(ast.Stmt) = .empty;
-        while (!self.check(.right_brace) and !self.check(.eof)) {
-            self.skipNewlines();
-            if (self.check(.right_brace)) break;
-            const stmt = try self.parseStmt();
-            try body.append(self.allocator, stmt);
-            self.skipNewlines();
-        }
-
-        _ = try self.expect(.right_brace);
-
-        return self.create(ast.TestDecl, .{
-            .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
-            .name = name,
-            .describe_name = describe_name,
-            .body = try body.toOwnedSlice(self.allocator),
-        });
-    }
 
     // ============================================================
     // Module attribute declarations

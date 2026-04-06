@@ -101,8 +101,6 @@ pub const Collector = struct {
 
         // Track pending attributes to attach to the next function/macro
         var pending_attrs: std.ArrayListUnmanaged(scope.Attribute) = .empty;
-        // Track test function names for auto-generating run/0
-        var test_func_names: std.ArrayList(ast.StringId) = .empty;
 
         for (mod.items) |item| {
             switch (item) {
@@ -160,28 +158,7 @@ pub const Collector = struct {
                     };
                     try self.collectImport(import_decl, mod_scope);
                 },
-                .describe => |dd| {
-                    for (dd.tests) |td| {
-                        const func = try self.testDeclToFunction(td);
-                        try self.collectFunctionWithAttrs(func, mod_scope, &pending_attrs);
-                        pending_attrs = .empty;
-                        try test_func_names.append(self.allocator, func.name);
-                    }
-                },
-                .test_decl => |td| {
-                    const func = try self.testDeclToFunction(td);
-                    try self.collectFunctionWithAttrs(func, mod_scope, &pending_attrs);
-                    pending_attrs = .empty;
-                    try test_func_names.append(self.allocator, func.name);
-                },
             }
-        }
-
-        // If we collected test functions, generate a run/0 that calls them all
-        if (test_func_names.items.len > 0) {
-            const run_func = try self.generateTestRunFunction(test_func_names.items, mod);
-            try self.collectFunctionWithAttrs(run_func, mod_scope, &pending_attrs);
-            pending_attrs = .empty;
         }
 
         // Any remaining pending attributes are module-level (not attached to a function)
@@ -198,99 +175,6 @@ pub const Collector = struct {
         }
     }
 
-    // ============================================================
-    // Test DSL → function declaration conversion
-    // ============================================================
-
-    fn testDeclToFunction(self: *Collector, td: *const ast.TestDecl) !*const ast.FunctionDecl {
-        // Generate a mangled function name from describe + test name
-        // "validation" + "rejects empty" → "__test__validation__rejects_empty"
-        const prefix = if (td.describe_name) |dn|
-            try std.fmt.allocPrint(self.allocator, "__test__{s}__{s}", .{ dn, td.name })
-        else
-            try std.fmt.allocPrint(self.allocator, "__test__{s}", .{td.name});
-
-        // Replace spaces with underscores for valid function name
-        for (prefix) |*c| {
-            if (c.* == ' ') c.* = '_';
-        }
-
-        const interner_mut: *ast.StringInterner = @constCast(self.interner);
-        const name = try interner_mut.intern(prefix);
-
-        const clause = try self.allocator.create(ast.FunctionClause);
-        clause.* = .{
-            .meta = td.meta,
-            .params = &.{},
-            .return_type = null,
-            .refinement = null,
-            .body = td.body,
-        };
-
-        const func = try self.allocator.create(ast.FunctionDecl);
-        func.* = .{
-            .meta = td.meta,
-            .name = name,
-            .clauses = try self.allocator.dupe(ast.FunctionClause, &.{clause.*}),
-            .visibility = .public,
-        };
-        return func;
-    }
-
-    /// Generate a `run/0` function that calls each test function and returns "passed"
-    fn generateTestRunFunction(
-        self: *Collector,
-        test_names: []const ast.StringId,
-        mod: *const ast.ModuleDecl,
-    ) !*const ast.FunctionDecl {
-        const interner_mut: *ast.StringInterner = @constCast(self.interner);
-        const meta = mod.meta;
-
-        // Build body: call each test function, then return module name + ": passed"
-        var stmts: std.ArrayList(ast.Stmt) = .empty;
-        for (test_names) |name| {
-            const callee = try self.allocator.create(ast.Expr);
-            callee.* = .{ .var_ref = .{ .meta = meta, .name = name } };
-            const call = try self.allocator.create(ast.Expr);
-            call.* = .{ .call = .{ .meta = meta, .callee = callee, .args = &.{} } };
-            try stmts.append(self.allocator, .{ .expr = call });
-        }
-
-        // Return "ModuleName: passed"
-        var mod_name_str: []const u8 = "";
-        for (mod.name.parts, 0..) |part, i| {
-            const part_str = self.interner.get(part);
-            if (i == 0) {
-                mod_name_str = part_str;
-            } else {
-                mod_name_str = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ mod_name_str, part_str });
-            }
-        }
-        const result_str = try std.fmt.allocPrint(self.allocator, "{s}: passed", .{mod_name_str});
-        const result_id = try interner_mut.intern(result_str);
-        const result_expr = try self.allocator.create(ast.Expr);
-        result_expr.* = .{ .string_literal = .{ .meta = meta, .value = result_id } };
-        try stmts.append(self.allocator, .{ .expr = result_expr });
-
-        const run_name = try interner_mut.intern("run");
-        const clause = try self.allocator.create(ast.FunctionClause);
-        clause.* = .{
-            .meta = meta,
-            .params = &.{},
-            .return_type = null,
-            .refinement = null,
-            .body = try stmts.toOwnedSlice(self.allocator),
-        };
-
-        const func = try self.allocator.create(ast.FunctionDecl);
-        func.* = .{
-            .meta = meta,
-            .name = run_name,
-            .clauses = try self.allocator.dupe(ast.FunctionClause, &.{clause.*}),
-            .visibility = .public,
-        };
-        return func;
-    }
 
     // ============================================================
     // Function collection — family grouping

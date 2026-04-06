@@ -127,21 +127,6 @@ pub const ModuleItem = union(enum) {
     import_decl: *const ImportDecl,
     use_decl: *const UseDecl,
     attribute: *const AttributeDecl,
-    describe: *const DescribeDecl,
-    test_decl: *const TestDecl,
-};
-
-pub const DescribeDecl = struct {
-    meta: NodeMeta,
-    name: []const u8,
-    tests: []const *const TestDecl,
-};
-
-pub const TestDecl = struct {
-    meta: NodeMeta,
-    name: []const u8,
-    describe_name: ?[]const u8 = null,
-    body: []const Stmt,
 };
 
 // ============================================================
