@@ -3,12 +3,16 @@ pub module Test.MultiModuleTest {
 
   pub fn run() -> String {
     describe("multi module") {
-      test("cross-module double function") {
+      test("cross-module call in comparison") {
         assert(Test.MultiModuleHelper.double(5) == 10)
       }
 
-      test("cross-module greet function") {
+      test("cross-module call in string comparison") {
         assert(Test.MultiModuleHelper.greet("Zap") == "Hello, Zap!")
+      }
+
+      test("stdlib qualified call in comparison") {
+        assert(String.length("hello") == 5)
       }
     }
 
