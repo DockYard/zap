@@ -349,6 +349,9 @@ pub fn compileFiles(
         return error.DesugarFailed;
     };
 
+    // Re-collect any new declarations added by desugaring (e.g., __for_N helpers)
+    ctx.collector.collectProgramSurface(&desugared_program) catch {};
+
     // Type checking (first pass)
     step += 1;
     if (options.show_progress) progress.print("\r\x1b[K  [{d}/{d}] Type check", .{ step, total_steps }) catch {};

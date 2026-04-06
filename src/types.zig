@@ -669,14 +669,15 @@ pub const TypeChecker = struct {
             const param_type = if (param.type_annotation) |ann|
                 try self.resolveTypeExpr(ann)
             else blk: {
-                // Generated functions (e.g., __for_N from for comprehension) may
-                // lack type annotations — infer as UNKNOWN. User-written functions
-                // still require annotations.
+                // Generated functions (e.g., __for_N) may lack type annotations.
+                // Skip error for generated code (name starts with __ or zero span).
                 const func_name = self.interner.get(name);
-                if (!std.mem.startsWith(u8, func_name, "__")) {
+                const span = param.pattern.getMeta().span;
+                const is_generated = std.mem.startsWith(u8, func_name, "__") or (span.start == 0 and span.end == 0);
+                if (!is_generated) {
                     try self.addHardError(
                         try std.fmt.allocPrint(self.allocator, "parameter requires a type annotation (e.g., `param :: Type`)", .{}),
-                        param.pattern.getMeta().span,
+                        span,
                         "missing type annotation",
                         null,
                     );
