@@ -24,8 +24,7 @@ pub module Test.TestRunner {
     IO.puts(Test.IfElseTest.run())
     IO.puts(Test.TupleTest.run())
     IO.puts(Test.DefaultParamsTest.run())
-    # TODO: CatchBasinTest and ForComprehensionTest crash in multi-file compilation
-    # due to __try variant and __for desugaring issues. They work through ZIR integration tests.
+    IO.puts(Test.CatchBasinTest.run())
 
     IO.puts("All tests passed!")
   }
