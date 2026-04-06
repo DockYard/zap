@@ -1268,6 +1268,66 @@ test "ZIR: list map via recursion" {
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
 
+test "ZIR: keyword list sugar" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn get_name(opts :: [{Atom, String}]) -> String {
+        \\    case opts {
+        \\      [name: n] -> n
+        \\      _ -> "unknown"
+        \\    }
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    IO.puts(get_name([name: "Brian"]))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("Brian\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: keyword list with multiple keys" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn get_age(opts :: [{Atom, i64}]) -> i64 {
+        \\    case opts {
+        \\      [name: _, age: a] -> a
+        \\      _ -> 0
+        \\    }
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    Kernel.inspect(get_age([name: "Brian", age: 42]))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("42\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: keyword list assignment pattern" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn main() -> String {
+        \\    opts = [greeting: "Hello", name: "World"]
+        \\    case opts {
+        \\      [greeting: g, name: n] -> IO.puts(g <> ", " <> n <> "!")
+        \\      _ -> IO.puts("no match")
+        \\    }
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("Hello, World!\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
 test "ZIR: list of strings with pattern matching" {
     var result = try compileAndRun(
         \\pub module TestProg {

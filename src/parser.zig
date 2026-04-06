@@ -1982,6 +1982,31 @@ pub const Parser = struct {
         var elements: std.ArrayList(*const ast.Expr) = .empty;
 
         while (!self.check(.right_bracket) and !self.check(.eof)) {
+            // Keyword list sugar: [key: value, ...] → [{:key, value}, ...]
+            if (self.check(.identifier)) {
+                const saved = self.saveLexerState();
+                const key_tok = self.advance();
+                if (self.check(.colon)) {
+                    _ = self.advance(); // consume colon
+                    const key_name = try self.internToken(key_tok);
+                    const value = try self.parseExpr();
+                    // Desugar to {:key, value} tuple
+                    const atom_key = try self.create(ast.Expr, .{
+                        .atom_literal = .{ .meta = .{ .span = ast.SourceSpan.from(key_tok.loc) }, .value = key_name },
+                    });
+                    const tuple = try self.create(ast.Expr, .{
+                        .tuple = .{
+                            .meta = .{ .span = ast.SourceSpan.merge(ast.SourceSpan.from(key_tok.loc), self.previousSpan()) },
+                            .elements = try self.allocator.dupe(*const ast.Expr, &.{ atom_key, value }),
+                        },
+                    });
+                    try elements.append(self.allocator, tuple);
+                    if (!self.match(.comma)) break;
+                    continue;
+                } else {
+                    self.restoreLexerState(saved);
+                }
+            }
             const elem = try self.parseExpr();
             try elements.append(self.allocator, elem);
             if (!self.match(.comma)) break;
@@ -2656,6 +2681,31 @@ pub const Parser = struct {
         var elements: std.ArrayList(*const ast.Pattern) = .empty;
 
         while (!self.check(.right_bracket) and !self.check(.pipe) and !self.check(.eof)) {
+            // Keyword list pattern sugar: [key: pat, ...] → [{:key, pat}, ...]
+            if (self.check(.identifier)) {
+                const saved = self.saveLexerState();
+                const key_tok = self.advance();
+                if (self.check(.colon)) {
+                    _ = self.advance(); // consume colon
+                    const key_name = try self.internToken(key_tok);
+                    const value_pat = try self.parsePattern();
+                    // Desugar to {:key, pattern} tuple pattern
+                    const atom_key = try self.create(ast.Pattern, .{
+                        .literal = .{ .atom = .{ .meta = .{ .span = ast.SourceSpan.from(key_tok.loc) }, .value = key_name } },
+                    });
+                    const tuple = try self.create(ast.Pattern, .{
+                        .tuple = .{
+                            .meta = .{ .span = ast.SourceSpan.merge(ast.SourceSpan.from(key_tok.loc), self.previousSpan()) },
+                            .elements = try self.allocator.dupe(*const ast.Pattern, &.{ atom_key, value_pat }),
+                        },
+                    });
+                    try elements.append(self.allocator, tuple);
+                    if (!self.match(.comma)) break;
+                    continue;
+                } else {
+                    self.restoreLexerState(saved);
+                }
+            }
             const elem = try self.parsePattern();
             try elements.append(self.allocator, elem);
             if (!self.match(.comma)) break;
