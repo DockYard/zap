@@ -2188,7 +2188,10 @@ pub const TypeChecker = struct {
                 }
                 return TypeStore.UNKNOWN;
             },
-            .panic_expr => TypeStore.NEVER,
+            .panic_expr => |pe| {
+                _ = try self.inferExpr(pe.message);
+                return TypeStore.NEVER;
+            },
             .unwrap => TypeStore.UNKNOWN,
             .pipe => |pipe| {
                 // Pipes are desugared before type checking, but we still need
