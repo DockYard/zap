@@ -1615,10 +1615,10 @@ pub const ZirDriver = struct {
 
             // Tail calls — call + ret
             .tail_call => |tc| {
-                // Emit tail call as call + ret. With LLVM backend or ReleaseSafe+,
-                // the backend converts this to a tail call/loop automatically.
-                // The self-hosted aarch64 backend doesn't support always_tail,
-                // so we use auto modifier and rely on optimization.
+                // Emit tail call as call + ret. With the LLVM backend (pre-built
+                // release), this is optimized into a tail call at ReleaseSafe+.
+                // For development builds without LLVM, deep recursion requires
+                // rebuilding the fork via zig-bootstrap.
                 var args = std.ArrayListUnmanaged(u32).empty;
                 defer args.deinit(self.allocator);
                 for (tc.args) |arg| {
