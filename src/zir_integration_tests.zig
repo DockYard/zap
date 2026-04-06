@@ -1148,9 +1148,7 @@ test "ZIR: tail recursive countdown (small)" {
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
 
-test "ZIR: tail recursive countdown (moderate depth)" {
-    // Note: true TCO (100M+ depth) requires LLVM backend.
-    // The self-hosted aarch64 backend doesn't optimize tail calls into loops.
+test "ZIR: tail recursive countdown (large, guaranteed TCO)" {
     var result = try compileAndRun(
         \\pub module TestProg {
         \\  pub fn countdown(0 :: i64) -> i64 {
@@ -1162,7 +1160,7 @@ test "ZIR: tail recursive countdown (moderate depth)" {
         \\  }
         \\
         \\  pub fn main() -> String {
-        \\    Kernel.inspect(countdown(1000))
+        \\    Kernel.inspect(countdown(100_000_000))
         \\    "done"
         \\  }
         \\}

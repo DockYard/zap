@@ -1615,10 +1615,9 @@ pub const ZirDriver = struct {
 
             // Tail calls — call + ret
             .tail_call => |tc| {
-                // Emit tail call as call + ret. With the LLVM backend (pre-built
-                // release), this is optimized into a tail call at ReleaseSafe+.
-                // For development builds without LLVM, deep recursion requires
-                // rebuilding the fork via zig-bootstrap.
+                // Guaranteed tail call: set always_tail modifier (4) so LLVM
+                // emits a tail call that reuses the current stack frame.
+                zir_builder_set_call_modifier(self.handle, 4); // always_tail
                 var args = std.ArrayListUnmanaged(u32).empty;
                 defer args.deinit(self.allocator);
                 for (tc.args) |arg| {
