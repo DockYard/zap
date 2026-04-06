@@ -1,9 +1,7 @@
 pub module Test.TestRunner {
   use Zest
-
   pub fn main(_args :: [String]) -> String {
     IO.puts("Running Zap tests...")
-
     IO.puts(Test.HelloWorldTest.run())
     IO.puts(Test.PatternMatchingTest.run())
     IO.puts(Test.PipesTest.run())
@@ -26,7 +24,6 @@ pub module Test.TestRunner {
     IO.puts(Test.DefaultParamsTest.run())
     IO.puts(Test.CatchBasinTest.run())
     IO.puts(Test.ForComprehensionTest.run())
-
     IO.puts("All tests passed!")
   }
 }

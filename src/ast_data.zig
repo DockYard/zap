@@ -707,7 +707,41 @@ pub fn ctValueToExpr(
 
     // Node with args: {form_atom, meta, args_list}
     if (form != .atom) {
-        // Non-atom form (e.g., dot call tuple) — fallback
+        // Non-atom form — check for dot-call: {:., meta, [object, :field]}
+        // This represents a qualified function call like Module.func(args)
+        if (form == .tuple and form.tuple.elems.len == 3) {
+            const dot_form = form.tuple.elems[0];
+            const dot_args = form.tuple.elems[2];
+            if (dot_form == .atom and std.mem.eql(u8, dot_form.atom, ".") and dot_args == .list and dot_args.list.elems.len == 2) {
+                // Reconstruct: object.field(args)
+                const object = try ctValueToExpr(alloc, interner, dot_args.list.elems[0]);
+                const field_atom = dot_args.list.elems[1];
+                const field_name = if (field_atom == .atom)
+                    try interner.intern(field_atom.atom)
+                else
+                    try interner.intern("unknown");
+
+                const callee = try alloc.create(ast.Expr);
+                callee.* = .{ .field_access = .{ .meta = node_meta, .object = object, .field = field_name } };
+
+                // Build the call with the dot-access callee
+                const arg_elems = if (args == .list) args.list.elems else &[_]CtValue{};
+                var call_args: std.ArrayListUnmanaged(*const ast.Expr) = .{};
+                for (arg_elems) |arg| {
+                    try call_args.append(alloc, try ctValueToExpr(alloc, interner, arg));
+                }
+
+                const expr = try alloc.create(ast.Expr);
+                expr.* = .{ .call = .{
+                    .meta = node_meta,
+                    .callee = callee,
+                    .args = try call_args.toOwnedSlice(alloc),
+                } };
+                return expr;
+            }
+        }
+
+        // Truly unrecognized non-atom form — fallback
         const expr = try alloc.create(ast.Expr);
         expr.* = .{ .nil_literal = .{ .meta = node_meta } };
         return expr;
