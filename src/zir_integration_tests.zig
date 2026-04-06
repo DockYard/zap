@@ -825,6 +825,61 @@ test "ZIR: catch basin short-circuits multi-step pipe" {
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
 
+test "ZIR: catch basin ~> with function handler" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn parse("one" :: String) -> String {
+        \\    "1"
+        \\  }
+        \\
+        \\  pub fn handle_error(val :: String) -> String {
+        \\    "error: " <> val
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    r1 = "one"
+        \\    |> parse()
+        \\    ~> handle_error()
+        \\    IO.puts(r1)
+        \\
+        \\    r2 = "bad"
+        \\    |> parse()
+        \\    ~> handle_error()
+        \\    IO.puts(r2)
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("1\nerror: bad\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: catch basin ~> function handler with extra args" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn parse("ok" :: String) -> String {
+        \\    "parsed"
+        \\  }
+        \\
+        \\  pub fn fallback(val :: String, prefix :: String) -> String {
+        \\    prefix <> val
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    r = "nope"
+        \\    |> parse()
+        \\    ~> fallback("unhandled: ")
+        \\    IO.puts(r)
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("unhandled: nope\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
 // ============================================================
 // Struct literals
 // ============================================================

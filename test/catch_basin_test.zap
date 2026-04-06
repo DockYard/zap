@@ -19,6 +19,14 @@ pub module Test.CatchBasinTest {
     assert(try_pipeline("good") == "formatted: valid")
     assert(try_pipeline("bad") == "rejected: bad")
 
+    # Function handler — unmatched value piped as first arg
+    assert(try_fn_handler("one") == "1")
+    assert(try_fn_handler("nope") == "error: nope")
+
+    # Function handler with extra args
+    assert(try_fn_handler_extra("one") == "1")
+    assert(try_fn_handler_extra("nope") == "fallback: nope")
+
     "CatchBasinTest: passed"
   }
 
@@ -66,5 +74,27 @@ pub module Test.CatchBasinTest {
     ~> {
       val -> "rejected: " <> val
     }
+  }
+
+  # Function handler — unmatched value injected as first arg
+  fn handle_error(val :: String) -> String {
+    "error: " <> val
+  }
+
+  fn try_fn_handler(input :: String) -> String {
+    input
+    |> parse()
+    ~> handle_error()
+  }
+
+  # Function handler with extra args
+  fn fallback(val :: String, prefix :: String) -> String {
+    prefix <> val
+  }
+
+  fn try_fn_handler_extra(input :: String) -> String {
+    input
+    |> parse()
+    ~> fallback("fallback: ")
   }
 }

@@ -229,12 +229,41 @@ pub const Desugarer = struct {
             .error_pipe => |ep| {
                 const handler: ast.ErrorHandler = switch (ep.handler) {
                     .function => |func| blk: {
-                        // ~> handle_error() → ~> { _ -> handle_error() }
-                        // The function handler is called WITHOUT the error payload
-                        // (the flat IR uses early return, not error injection).
-                        const body = try self.allocSlice(ast.Stmt, &.{.{ .expr = func }});
+                        // ~> handle_error() → ~> { __err -> handle_error(__err) }
+                        // The unmatched value is injected as the first argument.
+                        const err_name = try self.interner.intern("__err");
+                        const err_ref = try self.create(ast.Expr, .{
+                            .var_ref = .{ .meta = ep.meta, .name = err_name },
+                        });
+
+                        // Inject __err as first argument into the handler call
+                        const call_expr = if (func.* == .call) ce: {
+                            const call = func.call;
+                            var new_args: std.ArrayList(*const ast.Expr) = .empty;
+                            try new_args.append(self.allocator, err_ref);
+                            for (call.args) |arg| {
+                                try new_args.append(self.allocator, arg);
+                            }
+                            break :ce try self.create(ast.Expr, .{
+                                .call = .{
+                                    .meta = call.meta,
+                                    .callee = call.callee,
+                                    .args = try new_args.toOwnedSlice(self.allocator),
+                                },
+                            });
+                        } else
+                            // Bare function ref: wrap as call with __err
+                            try self.create(ast.Expr, .{
+                                .call = .{
+                                    .meta = ep.meta,
+                                    .callee = func,
+                                    .args = try self.allocSlice(*const ast.Expr, &.{err_ref}),
+                                },
+                            });
+
+                        const body = try self.allocSlice(ast.Stmt, &.{.{ .expr = call_expr }});
                         const pattern = try self.create(ast.Pattern, .{
-                            .wildcard = .{ .meta = ep.meta },
+                            .bind = .{ .meta = ep.meta, .name = err_name },
                         });
                         const clauses = try self.allocSlice(ast.CaseClause, &.{
                             .{ .meta = ep.meta, .pattern = pattern, .type_annotation = null, .guard = null, .body = body },
