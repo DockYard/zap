@@ -368,31 +368,98 @@ pub const ScopeGraph = struct {
     }
 
     /// Look up a function family by name and arity, walking up the scope chain.
+    /// Also checks imported module scopes for unqualified access.
     pub fn resolveFamily(self: *const ScopeGraph, scope_id: ScopeId, name: ast.StringId, arity: u32) ?FunctionFamilyId {
         const key = FamilyKey{ .name = name, .arity = arity };
         var current: ?ScopeId = scope_id;
         while (current) |sid| {
-            const scope = self.getScope(sid);
-            if (scope.function_families.get(key)) |fid| {
+            const s = self.getScope(sid);
+            if (s.function_families.get(key)) |fid| {
                 return fid;
             }
-            current = scope.parent;
+            // Check imported module scopes
+            for (s.imports.items) |imp| {
+                // Check pre-populated imported_families
+                if (imp.imported_families.get(key)) |fid| {
+                    return fid;
+                }
+                // Also search the source module's scope directly
+                if (self.findModuleScope(imp.source_module)) |mod_scope_id| {
+                    const mod_scope = self.getScope(mod_scope_id);
+                    if (mod_scope.function_families.get(key)) |fid| {
+                        // Check import filter
+                        if (self.passesImportFilter(imp.filter, key)) return fid;
+                    }
+                }
+            }
+            current = s.parent;
         }
         return null;
     }
 
     /// Look up a macro family by name and arity, walking up the scope chain.
+    /// Also checks imported module scopes.
     pub fn resolveMacro(self: *const ScopeGraph, scope_id: ScopeId, name: ast.StringId, arity: u32) ?MacroFamilyId {
         const key = FamilyKey{ .name = name, .arity = arity };
         var current: ?ScopeId = scope_id;
         while (current) |sid| {
-            const scope = self.getScope(sid);
-            if (scope.macros.get(key)) |mid| {
+            const s = self.getScope(sid);
+            if (s.macros.get(key)) |mid| {
                 return mid;
             }
-            current = scope.parent;
+            // Check imported module scopes for macros
+            for (s.imports.items) |imp| {
+                if (self.findModuleScope(imp.source_module)) |mod_scope_id| {
+                    const mod_scope = self.getScope(mod_scope_id);
+                    if (mod_scope.macros.get(key)) |mid| {
+                        if (self.passesImportFilter(imp.filter, key)) return mid;
+                    }
+                }
+            }
+            current = s.parent;
         }
         return null;
+    }
+
+    /// Find a module's scope by its name.
+    fn findModuleScope(self: *const ScopeGraph, module_name: ast.ModuleName) ?ScopeId {
+        for (self.modules.items) |mod_entry| {
+            if (mod_entry.decl.name.parts.len == module_name.parts.len) {
+                var match = true;
+                for (mod_entry.decl.name.parts, module_name.parts) |a, b| {
+                    if (a != b) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (match) return mod_entry.scope_id;
+            }
+        }
+        return null;
+    }
+
+    /// Check if a function key passes an import filter.
+    fn passesImportFilter(self: *const ScopeGraph, filter: ImportFilter, key: FamilyKey) bool {
+        _ = self;
+        switch (filter) {
+            .all => return true,
+            .only => |entries| {
+                for (entries) |entry| {
+                    if (entry.name == key.name) {
+                        if (entry.arity == null or entry.arity.? == key.arity) return true;
+                    }
+                }
+                return false;
+            },
+            .except => |entries| {
+                for (entries) |entry| {
+                    if (entry.name == key.name) {
+                        if (entry.arity == null or entry.arity.? == key.arity) return false;
+                    }
+                }
+                return true;
+            },
+        }
     }
 
     /// Collect all binding names visible from a scope, walking up the chain.
