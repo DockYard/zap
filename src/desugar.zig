@@ -253,6 +253,39 @@ pub const Desugarer = struct {
             },
 
 
+            // Map update: %{map | key: val, ...} → Map.put(Map.put(map, :key1, v1), :key2, v2)
+            .map => |me| {
+                if (me.update_source) |source| {
+                    var result = try self.desugarExpr(source);
+                    const map_name = try self.interner.intern("Map");
+                    const put_name = try self.interner.intern("put");
+                    for (me.fields) |field| {
+                        const callee = try self.create(ast.Expr, .{
+                            .field_access = .{
+                                .meta = me.meta,
+                                .object = try self.create(ast.Expr, .{
+                                    .module_ref = .{ .meta = me.meta, .name = .{ .parts = try self.allocSlice(ast.StringId, &.{map_name}), .span = me.meta.span } },
+                                }),
+                                .field = put_name,
+                            },
+                        });
+                        result = try self.create(ast.Expr, .{
+                            .call = .{
+                                .meta = me.meta,
+                                .callee = callee,
+                                .args = try self.allocSlice(*const ast.Expr, &.{
+                                    result,
+                                    try self.desugarExpr(field.key),
+                                    try self.desugarExpr(field.value),
+                                }),
+                            },
+                        });
+                    }
+                    return result;
+                }
+                return expr;
+            },
+
             // For comprehension → block with recursive helper function + call
             .for_expr => |fe| {
                 return self.desugarForExpr(&fe);

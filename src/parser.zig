@@ -2083,6 +2083,22 @@ pub const Parser = struct {
         // Support multiline: %{\n  field: val,\n  ...\n}
         self.skipNewlines();
 
+        // Check for map update: %{expr | key: value, ...}
+        var update_source: ?*const ast.Expr = null;
+        if (self.check(.identifier)) {
+            const saved = self.saveLexerState();
+            const id_tok = self.advance();
+            if (self.check(.pipe)) {
+                // This is %{var | ...} — map update syntax
+                _ = self.advance(); // consume |
+                update_source = try self.create(ast.Expr, .{
+                    .var_ref = .{ .meta = .{ .span = ast.SourceSpan.from(id_tok.loc) }, .name = try self.internToken(id_tok) },
+                });
+            } else {
+                self.restoreLexerState(saved);
+            }
+        }
+
         // Parse key:value fields — could be map (key -> value) or struct (name: value)
         // Detect struct fields (identifier followed by colon) vs map fields (expr followed by arrow)
         var struct_fields: std.ArrayList(ast.StructField) = .empty;
@@ -2173,6 +2189,7 @@ pub const Parser = struct {
             return self.create(ast.Expr, .{
                 .map = .{
                     .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
+                    .update_source = update_source,
                     .fields = try map_fields.toOwnedSlice(self.allocator),
                 },
             });
@@ -2181,6 +2198,7 @@ pub const Parser = struct {
         return self.create(ast.Expr, .{
             .map = .{
                 .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
+                .update_source = update_source,
                 .fields = try map_fields.toOwnedSlice(self.allocator),
             },
         });

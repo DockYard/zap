@@ -458,6 +458,7 @@ pub const ListExpr = struct {
 
 pub const MapExpr = struct {
     meta: NodeMeta,
+    update_source: ?*const Expr = null,
     fields: []const MapField,
 };
 

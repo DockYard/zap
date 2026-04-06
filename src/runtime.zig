@@ -1237,6 +1237,33 @@ pub const MapHelpers = struct {
         return @intCast(info.@"struct".fields.len);
     }
 
+    /// Create a new map with a key's value updated.
+    /// Returns the same map type with the matching entry's value replaced.
+    pub fn put(map: anytype, key: anytype, value: anytype) @TypeOf(map) {
+        var result = map;
+        const info = @typeInfo(@TypeOf(map));
+        if (info != .@"struct") return result;
+        inline for (info.@"struct".fields) |field| {
+            const entry = @field(map, field.name);
+            const E = @TypeOf(entry);
+            const e_info = @typeInfo(E);
+            if (e_info == .@"struct") {
+                const is_kv = comptime blk: {
+                    for (e_info.@"struct".fields) |f| {
+                        if (std.mem.eql(u8, f.name, "key")) break :blk true;
+                    }
+                    break :blk false;
+                };
+                if (is_kv) {
+                    if (keysEqual(entry.key, key)) {
+                        @field(result, field.name).value = value;
+                    }
+                }
+            }
+        }
+        return result;
+    }
+
     /// Compare two keys, handling atom IDs (u32), strings, and integers.
     fn keysEqual(a: anytype, b: anytype) bool {
         const A = @TypeOf(a);

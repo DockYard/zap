@@ -1404,6 +1404,23 @@ test "ZIR: map get with default" {
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
 
+test "ZIR: map update syntax" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn main() -> String {
+        \\    m = %{name: "Alice", age: 30}
+        \\    m2 = %{m | name: "Bob"}
+        \\    IO.puts(Map.get(m2, :name, "unknown"))
+        \\    Kernel.inspect(Map.get(m2, :age, 0))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("Bob\n30\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
 test "ZIR: map has_key check" {
     var result = try compileAndRun(
         \\pub module TestProg {
