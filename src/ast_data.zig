@@ -32,7 +32,12 @@ pub fn exprToCtValue(
         .int_literal => |v| makeTuple3(alloc, store, .{ .int = v.value }, try metaToList(alloc, store, v.meta, null), .nil),
         .float_literal => |v| makeTuple3(alloc, store, .{ .float = v.value }, try metaToList(alloc, store, v.meta, null), .nil),
         .string_literal => |v| makeTuple3(alloc, store, .{ .string = interner.get(v.value) }, try metaToList(alloc, store, v.meta, null), .nil),
-        .atom_literal => |v| makeTuple3(alloc, store, .{ .atom = interner.get(v.value) }, try metaToList(alloc, store, v.meta, null), .nil),
+        .atom_literal => |v| blk: {
+            // Prefix atom names with ":" to distinguish from variables in round-trip
+            const name = interner.get(v.value);
+            const prefixed = try std.fmt.allocPrint(alloc, ":{s}", .{name});
+            break :blk makeTuple3(alloc, store, .{ .atom = prefixed }, try metaToList(alloc, store, v.meta, null), .nil);
+        },
         .bool_literal => |v| makeTuple3(alloc, store, .{ .bool_val = v.value }, try metaToList(alloc, store, v.meta, null), .nil),
         .nil_literal => |v| makeTuple3(alloc, store, .nil, try metaToList(alloc, store, v.meta, null), .nil),
 
@@ -677,9 +682,12 @@ pub fn ctValueToExpr(
             },
             .atom => |name| blk: {
                 // Atom with nil args = variable or atom literal
-                // Convention: if it starts with lowercase or _, it's a variable
-                // Otherwise it's an atom
-                if (name.len > 0 and (name[0] == '_' or std.ascii.isLower(name[0]))) {
+                // Atoms are prefixed with ":" to distinguish from variables
+                if (name.len > 0 and name[0] == ':') {
+                    const expr = try alloc.create(ast.Expr);
+                    expr.* = .{ .atom_literal = .{ .meta = node_meta, .value = try interner.intern(name[1..]) } };
+                    break :blk expr;
+                } else if (name.len > 0 and (name[0] == '_' or std.ascii.isLower(name[0]))) {
                     const expr = try alloc.create(ast.Expr);
                     expr.* = .{ .var_ref = .{ .meta = node_meta, .name = try interner.intern(name) } };
                     break :blk expr;
@@ -2246,10 +2254,10 @@ test "atom literal to CtValue" {
 
     const result = try exprToCtValue(alloc, &interner, &store, expr);
 
-    // Should be {:ok, [], nil}
+    // Should be {":ok", [], nil} — atoms are prefixed with ":" in CtValue
     try std.testing.expect(result == .tuple);
     try std.testing.expect(result.tuple.elems[0] == .atom);
-    try std.testing.expect(std.mem.eql(u8, result.tuple.elems[0].atom, "ok"));
+    try std.testing.expect(std.mem.eql(u8, result.tuple.elems[0].atom, ":ok"));
     try std.testing.expect(result.tuple.elems[2] == .nil);
 }
 
