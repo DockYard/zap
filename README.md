@@ -222,6 +222,131 @@ pub module Math {
 }
 ```
 
+### Strings
+
+String interpolation with `#{}`, escape sequences, and concatenation with `<>`:
+
+```zap
+name = "World"
+IO.puts("Hello, #{name}!")           # Hello, World!
+IO.puts("count: #{42}")              # count: 42 (auto to_string)
+IO.puts("line1\nline2")              # escape sequences: \n \t \\ \"
+IO.puts("hello" <> " " <> "world")  # concatenation
+```
+
+### Maps
+
+Create maps with `%{}`, access with `Map.get`, update with `%{map | key: value}`:
+
+```zap
+m = %{name: "Alice", age: 30}
+
+Map.get(m, :name, "unknown")   # "Alice"
+Map.get(m, :email, "none")     # "none" (default)
+Map.has_key(m, :name)           # true
+Map.size(m)                     # 3
+
+m2 = %{m | name: "Bob"}        # update — creates modified copy
+```
+
+Map pattern matching in functions:
+
+```zap
+pub fn greet(%{name: n, greeting: g} :: %{Atom -> String}) -> String {
+  g <> ", " <> n <> "!"
+}
+```
+
+### Keyword Lists
+
+Shorthand for lists of `{atom, value}` tuples:
+
+```zap
+opts = [name: "Brian", age: 42]
+# equivalent to: [{:name, "Brian"}, {:age, 42}]
+
+case opts {
+  [name: n, age: a] -> IO.puts("#{n} is #{a}")
+}
+```
+
+### Lists
+
+Lists support pattern matching with cons (`[h | t]`), recursive processing, and for comprehensions:
+
+```zap
+pub fn sum([] :: [i64]) -> i64 { 0 }
+pub fn sum([h | t] :: [i64]) -> i64 { h + sum(t) }
+
+sum([1, 2, 3])  # 6
+```
+
+### For Comprehensions
+
+Transform and filter lists:
+
+```zap
+doubled = for x <- [1, 2, 3] {
+  x * 2
+}
+# [2, 4, 6]
+
+evens = for x <- [1, 2, 3, 4, 5, 6], x rem 2 == 0 {
+  x
+}
+# [2, 4, 6]
+```
+
+### Catch Basin (`~>`)
+
+Catch unmatched values in pipe chains. When a multi-clause function doesn't match, the handler runs and remaining pipe steps are skipped:
+
+```zap
+pub fn process(input :: String) -> String {
+  input
+  |> parse_number()
+  |> format_result()
+  ~> {
+    _ -> "Error: unrecognized"
+  }
+}
+```
+
+### Use
+
+`use Module` imports a module and calls its `__using__/1` callback if defined. This enables library DSLs:
+
+```zap
+pub module Greeter {
+  pub macro __using__(_opts :: Expr) -> Expr {
+    quote {
+      pub fn hello() -> String {
+        "Hello from Greeter!"
+      }
+    }
+  }
+}
+
+pub module MyApp {
+  use Greeter     # imports + injects hello/0 via __using__
+
+  pub fn main() {
+    IO.puts(hello())
+  }
+}
+```
+
+### Tail Call Optimization
+
+Recursive functions in tail position are guaranteed to use constant stack space via LLVM's `musttail`:
+
+```zap
+pub fn countdown(0 :: i64) -> i64 { 0 }
+pub fn countdown(n :: i64) -> i64 { countdown(n - 1) }
+
+countdown(100_000_000)  # runs in constant stack space
+```
+
 ---
 
 ## Build Manifest
@@ -302,7 +427,7 @@ Types are declared at function boundaries. No implicit numeric coercion — all 
 | Platform-sized | `usize` `isize` |
 | Primitives | `Bool` `String` `Atom` `Nil` |
 | Bottom | `Never` |
-| Compound | tuples, structs, enums |
+| Compound | tuples, lists, maps, structs, enums |
 
 ### Structs
 
