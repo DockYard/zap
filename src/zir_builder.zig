@@ -636,9 +636,13 @@ pub const ZirDriver = struct {
             return error.BeginFuncFailed;
         }
 
-        // __try variants take handler as last param, return it on mismatch.
+        // __try variants return error unions: anyerror!ReturnType.
+        // On no-match, they return error.NoMatchingClause.
         const is_try_variant = std.mem.endsWith(u8, func.name, "__try");
-        _ = is_try_variant;
+        if (is_try_variant) {
+            if (zir_builder_set_error_union_return_type(self.handle, "NoMatchingClause", 17) != 0)
+                return error.EmitFailed;
+        }
 
         // Build the nested tuple type stack in DFS post-order (inner-first).
         self.tuple_init_count = 0;
@@ -1553,19 +1557,54 @@ pub const ZirDriver = struct {
                     try args.append(self.allocator, ref);
                 }
                 zir_builder_set_call_modifier(self.handle, 3); // no_optimizations
-                const ref = zir_builder_emit_call(
+                const call_ref = zir_builder_emit_call(
                     self.handle,
                     tcn.name.ptr,
                     @intCast(tcn.name.len),
                     args.items.ptr,
                     @intCast(args.items.len),
                 );
-                if (ref == error_ref) return error.EmitFailed;
-                try self.setLocal(tcn.dest, ref);
+                if (call_ref == error_ref) return error.EmitFailed;
+
+                // __try returns error union. Check for error and short-circuit.
+                // If error: return the handler value (skip remaining pipe steps).
+                // If success: unwrap the payload and continue pipe.
+                const is_non_err = zir_builder_emit_is_non_err(self.handle, call_ref);
+                if (is_non_err == error_ref) return error.EmitFailed;
+
+                // Then branch (success): unwrap payload
+                zir_builder_begin_capture(self.handle);
+                const payload = zir_builder_emit_err_union_payload_unsafe(self.handle, call_ref);
+                if (payload == error_ref) return error.EmitFailed;
+                var then_len: u32 = 0;
+                const then_ptr = zir_builder_end_capture(self.handle, &then_len);
+                const then_insts = try self.allocator.alloc(u32, then_len);
+                @memcpy(then_insts, then_ptr[0..then_len]);
+
+                // Else branch (error): return handler value
+                zir_builder_begin_capture(self.handle);
+                const handler_ref = args.items[args.items.len - 1];
+                if (zir_builder_emit_ret(self.handle, handler_ref) != 0)
+                    return error.EmitFailed;
+                var else_len: u32 = 0;
+                const else_ptr = zir_builder_end_capture(self.handle, &else_len);
+
+                // Emit if-else: if (is_non_err) { unwrap } else { return handler }
+                const result = zir_builder_emit_if_else_bodies(
+                    self.handle,
+                    is_non_err,
+                    then_insts.ptr,
+                    @intCast(then_insts.len),
+                    payload,
+                    else_ptr,
+                    else_len,
+                    handler_ref,
+                );
+                self.allocator.free(then_insts);
+                if (result == error_ref) return error.EmitFailed;
+                try self.setLocal(tcn.dest, result);
             },
-            // Error catch — check if __try returned sentinel "" (len==0).
-            // Uses condReturn for the matched case + fallthrough for the handler.
-            // Error catch — passthrough. __try variant returns handler directly on mismatch.
+            // Error catch — no longer needed (try_call_named handles unwrapping).
             .error_catch => |ec| {
                 const source_ref = self.refForValueLocal(ec.source) catch @intFromEnum(Zir.Inst.Ref.void_value);
                 try self.setLocal(ec.dest, source_ref);
@@ -2235,13 +2274,10 @@ pub const ZirDriver = struct {
                 _ = zir_builder_emit_call_ref(self.handle, panic_fn, &args, 1);
             },
             .match_error_return => {
-                // Return the handler value (last parameter of __try variant).
-                // The handler index is stored in match_error_return's scrutinee field.
-                if (self.param_refs.items.len > 0) {
-                    const handler_ref = self.param_refs.items[self.param_refs.items.len - 1];
-                    if (zir_builder_emit_ret(self.handle, handler_ref) != 0)
-                        return error.EmitFailed;
-                }
+                // No-match in __try variant: return error.NoMatchingClause
+                // This lets the caller detect the failure and short-circuit the pipe.
+                if (zir_builder_emit_ret_error(self.handle, "NoMatchingClause", 17) != 0)
+                    return error.EmitFailed;
             },
 
             .call_dispatch => |cd| {
