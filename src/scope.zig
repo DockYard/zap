@@ -422,7 +422,7 @@ pub const ScopeGraph = struct {
     }
 
     /// Find a module's scope by its name.
-    fn findModuleScope(self: *const ScopeGraph, module_name: ast.ModuleName) ?ScopeId {
+    pub fn findModuleScope(self: *const ScopeGraph, module_name: ast.ModuleName) ?ScopeId {
         for (self.modules.items) |mod_entry| {
             if (mod_entry.decl.name.parts.len == module_name.parts.len) {
                 var match = true;

@@ -709,9 +709,8 @@ pub const Desugarer = struct {
             return self.desugarForString(fe);
         }
 
-        // Generate unique helper name
-        var name_buf: [32]u8 = undefined;
-        const name_str = try std.fmt.bufPrint(&name_buf, "__for_{d}", .{self.for_counter});
+        // Generate unique helper name (heap-allocated since interner stores slices)
+        const name_str = try std.fmt.allocPrint(self.allocator, "__for_{d}", .{self.for_counter});
         self.for_counter += 1;
         const helper_name = try self.interner.intern(name_str);
         const rest_name = try self.interner.intern("__rest");
@@ -844,8 +843,7 @@ pub const Desugarer = struct {
     fn desugarForString(self: *Desugarer, fe: *const ast.ForExpr) !*const ast.Expr {
         const meta = ast.NodeMeta{ .span = .{ .start = 0, .end = 0 } };
 
-        var name_buf: [32]u8 = undefined;
-        const name_str = try std.fmt.bufPrint(&name_buf, "__for_{d}", .{self.for_counter});
+        const name_str = try std.fmt.allocPrint(self.allocator, "__for_{d}", .{self.for_counter});
         self.for_counter += 1;
         const helper_name = try self.interner.intern(name_str);
         const s_name = try self.interner.intern("__s");

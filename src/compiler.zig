@@ -349,8 +349,28 @@ pub fn compileFiles(
         return error.DesugarFailed;
     };
 
-    // Re-collect any new declarations added by desugaring (e.g., __for_N helpers)
-    ctx.collector.collectProgramSurface(&desugared_program) catch {};
+    // Register new functions added by desugaring (e.g., __for_N helpers from for comprehensions).
+    // Walk the desugared program and collect any priv_function items that aren't already in scope.
+    for (desugared_program.modules) |*mod| {
+        // Find the existing module scope
+        const mod_scope = ctx.collector.graph.findModuleScope(mod.name) orelse continue;
+        for (mod.items) |item| {
+            switch (item) {
+                .priv_function => |func| {
+                    const key = zap.scope.FamilyKey{
+                        .name = func.name,
+                        .arity = @intCast(func.clauses[0].params.len),
+                    };
+                    const scope_data = ctx.collector.graph.getScope(mod_scope);
+                    if (scope_data.function_families.get(key) == null) {
+                        // New function — register it
+                        ctx.collector.collectFunction(func, mod_scope) catch {};
+                    }
+                },
+                else => {},
+            }
+        }
+    }
 
     // Type checking (first pass)
     step += 1;

@@ -25,8 +25,7 @@ pub module Test.TestRunner {
     IO.puts(Test.TupleTest.run())
     IO.puts(Test.DefaultParamsTest.run())
     IO.puts(Test.CatchBasinTest.run())
-    # TODO: ForComprehensionTest needs list cons representation fix
-    # for multi-file compilation (works in ZIR integration tests)
+    IO.puts(Test.ForComprehensionTest.run())
 
     IO.puts("All tests passed!")
   }

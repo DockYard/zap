@@ -1171,10 +1171,25 @@ pub const BinaryHelpers = struct {
 // ============================================================
 
 pub const ListHelpers = struct {
-    /// Prepend a head element to a tail list.
-    /// Returns a struct { head: H, tail: T } — a cons cell.
-    pub fn cons(head: anytype, tail: anytype) struct { head: @TypeOf(head), tail: @TypeOf(tail) } {
-        return .{ .head = head, .tail = tail };
+    /// Check if a list is empty (void = empty, anything else = non-empty).
+    pub fn isEmpty(list: anytype) bool {
+        return @sizeOf(@TypeOf(list)) == 0;
+    }
+
+    /// Get the length of a cons-cell list.
+    pub fn length(list: anytype) i64 {
+        const T = @TypeOf(list);
+        if (@sizeOf(T) == 0) return 0;
+        const info = @typeInfo(T);
+        if (info != .@"struct") return 0;
+        const has_tail = comptime blk: {
+            for (info.@"struct".fields) |f| {
+                if (std.mem.eql(u8, f.name, "tail")) break :blk true;
+            }
+            break :blk false;
+        };
+        if (!has_tail) return 0;
+        return 1 + length(list.tail);
     }
 };
 

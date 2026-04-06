@@ -343,7 +343,7 @@ pub const Collector = struct {
         }
     }
 
-    fn collectFunction(self: *Collector, func: *const ast.FunctionDecl, parent_scope: scope.ScopeId) !void {
+    pub fn collectFunction(self: *Collector, func: *const ast.FunctionDecl, parent_scope: scope.ScopeId) !void {
         for (func.clauses, 0..) |clause, clause_idx| {
             const arity: u32 = @intCast(clause.params.len);
             const key = scope.FamilyKey{ .name = func.name, .arity = arity };
