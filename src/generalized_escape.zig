@@ -376,6 +376,19 @@ pub const GeneralizedEscapeAnalyzer = struct {
                 const container_escape = self.ctx.getEscape(.{ .function = func_id, .local = lg2.list });
                 try self.setEscapeAndEnqueue(func_id, lg2.dest, container_escape);
             },
+            .map_has_key => |mhk| {
+                // Result is a boolean derived from the map and key; track both sources.
+                const map_escape = self.ctx.getEscape(.{ .function = func_id, .local = mhk.map });
+                const key_escape = self.ctx.getEscape(.{ .function = func_id, .local = mhk.key });
+                try self.setEscapeAndEnqueue(func_id, mhk.dest, EscapeState.join(map_escape, key_escape));
+            },
+            .map_get => |mg| {
+                // Result is a value from the map; track map, key, and default sources.
+                const map_escape = self.ctx.getEscape(.{ .function = func_id, .local = mg.map });
+                const key_escape = self.ctx.getEscape(.{ .function = func_id, .local = mg.key });
+                const default_escape = self.ctx.getEscape(.{ .function = func_id, .local = mg.default });
+                try self.setEscapeAndEnqueue(func_id, mg.dest, EscapeState.join(EscapeState.join(map_escape, key_escape), default_escape));
+            },
 
             // Calls: without interprocedural info, arguments conservatively escape.
             .call_direct => |cd| {

@@ -133,6 +133,8 @@ pub const Instruction = union(enum) {
     index_get: IndexGet,
     list_len_check: ListLenCheck,
     list_get: ListGet,
+    map_has_key: MapHasKey,
+    map_get: MapGet,
 
     // Arithmetic / logic
     binary_op: BinaryOp,
@@ -322,6 +324,19 @@ pub const ListGet = struct {
     dest: LocalId,
     list: LocalId,
     index: u32,
+};
+
+pub const MapHasKey = struct {
+    dest: LocalId,
+    map: LocalId,
+    key: LocalId,
+};
+
+pub const MapGet = struct {
+    dest: LocalId,
+    map: LocalId,
+    key: LocalId,
+    default: LocalId,
 };
 
 pub const GuardBlock = struct {
@@ -1016,6 +1031,9 @@ pub const IrBuilder = struct {
                 for (clause.binary_bindings) |binding| {
                     max_binding_local = @max(max_binding_local, binding.local_index + 1);
                 }
+                for (clause.map_bindings) |binding| {
+                    max_binding_local = @max(max_binding_local, binding.local_index + 1);
+                }
             }
             self.next_local = max_binding_local;
         }
@@ -1024,9 +1042,10 @@ pub const IrBuilder = struct {
 
         if (group.clauses.len == 1) {
             // Single clause — no dispatch needed
-            // Emit tuple/binary bindings if present
+            // Emit tuple/binary/map bindings if present
             try self.emitTupleBindings(first_clause);
             try self.emitBinaryBindings(first_clause);
+            try self.emitMapBindings(first_clause);
             const result_local = try self.lowerBlock(first_clause.body);
             try self.current_instrs.append(self.allocator, .{ .ret = .{ .value = result_local } });
         } else if (self.canSwitchDispatch(group)) |switch_param| {
@@ -2030,6 +2049,32 @@ pub const IrBuilder = struct {
                     .dest = binding.local_index,
                     .object = tuple_local,
                     .index = binding.element_index,
+                },
+            });
+        }
+    }
+
+    fn emitMapBindings(self: *IrBuilder, clause: *const hir_mod.Clause) !void {
+        for (clause.map_bindings) |binding| {
+            // Get the param (the map)
+            const map_local = self.next_local;
+            self.next_local += 1;
+            try self.current_instrs.append(self.allocator, .{
+                .param_get = .{ .dest = map_local, .index = binding.param_index },
+            });
+            // Lower the key expression to get the key local
+            const key_local = try self.lowerExpr(binding.key_expr);
+            // Create a default value (nil/0)
+            const default_local = self.next_local;
+            self.next_local += 1;
+            try self.current_instrs.append(self.allocator, .{ .const_nil = default_local });
+            // Extract the value via map_get
+            try self.current_instrs.append(self.allocator, .{
+                .map_get = .{
+                    .dest = binding.local_index,
+                    .map = map_local,
+                    .key = key_local,
+                    .default = default_local,
                 },
             });
         }

@@ -1157,6 +1157,93 @@ pub const BinaryHelpers = struct {
 };
 
 // ============================================================
+// MapHelpers — Operations on map values (anonymous structs of {key, value} entries)
+//
+// Maps in ZIR are represented as anonymous structs with numeric field names:
+//   .{ .@"0" = .{ .key = k0, .value = v0 }, .@"1" = .{ .key = k1, .value = v1 }, ... }
+//
+// These helpers use @typeInfo + inline for to iterate entries at compile time,
+// producing efficient code with no runtime overhead for small maps.
+// ============================================================
+
+pub const MapHelpers = struct {
+    /// Get a value from a map by key. Returns the value if found, or a default.
+    /// Usage: MapHelpers.get(map, key, default)
+    pub fn get(map: anytype, key: anytype, default: anytype) @TypeOf(default) {
+        const T = @TypeOf(map);
+        const info = @typeInfo(T);
+        if (info != .@"struct") return default;
+        inline for (info.@"struct".fields) |field| {
+            const entry = @field(map, field.name);
+            const E = @TypeOf(entry);
+            const e_info = @typeInfo(E);
+            if (e_info == .@"struct") {
+                // Check if this entry has key and value fields
+                const is_kv_entry = comptime blk: {
+                    for (e_info.@"struct".fields) |f| {
+                        if (std.mem.eql(u8, f.name, "key")) break :blk true;
+                    }
+                    break :blk false;
+                };
+                if (is_kv_entry) {
+                    if (keysEqual(entry.key, key)) return entry.value;
+                }
+            }
+        }
+        return default;
+    }
+
+    /// Check if a map contains a key.
+    pub fn has_key(map: anytype, key: anytype) bool {
+        const T = @TypeOf(map);
+        const info = @typeInfo(T);
+        if (info != .@"struct") return false;
+        inline for (info.@"struct".fields) |field| {
+            const entry = @field(map, field.name);
+            const E = @TypeOf(entry);
+            const e_info = @typeInfo(E);
+            if (e_info == .@"struct") {
+                const is_entry = comptime blk: {
+                    for (e_info.@"struct".fields) |f| {
+                        if (std.mem.eql(u8, f.name, "key")) break :blk true;
+                    }
+                    break :blk false;
+                };
+                if (is_entry) {
+                    if (keysEqual(entry.key, key)) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /// Get the number of entries in a map.
+    pub fn size(map: anytype) i64 {
+        const T = @TypeOf(map);
+        const info = @typeInfo(T);
+        if (info != .@"struct") return 0;
+        return @intCast(info.@"struct".fields.len);
+    }
+
+    /// Compare two keys, handling atom IDs (u32), strings, and integers.
+    fn keysEqual(a: anytype, b: anytype) bool {
+        const A = @TypeOf(a);
+        const B = @TypeOf(b);
+        if (A == B) {
+            if (A == []const u8) return std.mem.eql(u8, a, b);
+            return a == b;
+        }
+        // Cross-type comparison for atom IDs
+        if ((@typeInfo(A) == .int or @typeInfo(A) == .comptime_int) and
+            (@typeInfo(B) == .int or @typeInfo(B) == .comptime_int))
+        {
+            return a == b;
+        }
+        return false;
+    }
+};
+
+// ============================================================
 // Tests
 // ============================================================
 

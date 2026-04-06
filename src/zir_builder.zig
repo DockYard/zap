@@ -1483,7 +1483,8 @@ pub const ZirDriver = struct {
                 const is_integer = std.mem.startsWith(u8, cn.name, "Integer__");
                 const is_float = std.mem.startsWith(u8, cn.name, "Float__");
                 const is_system = std.mem.startsWith(u8, cn.name, "System__");
-                if (is_kernel or is_io or is_string or is_atom or is_integer or is_float or is_system) {
+                const is_map = std.mem.startsWith(u8, cn.name, "Map__");
+                if (is_kernel or is_io or is_string or is_atom or is_integer or is_float or is_system or is_map) {
                     // Map Zap function names to their runtime equivalents.
                     // Most names match directly; these are the exceptions:
                     const func_name = if (is_io and std.mem.eql(u8, cn.name["IO__".len..], "puts"))
@@ -1508,6 +1509,8 @@ pub const ZirDriver = struct {
                         @as([]const u8, cn.name["Float__".len..])
                     else if (is_system)
                         @as([]const u8, cn.name["System__".len..])
+                    else if (is_map)
+                        @as([]const u8, cn.name["Map__".len..])
                     else
                         @as([]const u8, cn.name);
 
@@ -1516,7 +1519,7 @@ pub const ZirDriver = struct {
                     if (rt_import == error_ref) return error.EmitFailed;
 
                     // Route to the correct runtime module
-                    const mod_name: []const u8 = if (is_string) "ZapString" else "Prelude";
+                    const mod_name: []const u8 = if (is_string) "ZapString" else if (is_map) "MapHelpers" else "Prelude";
                     const mod_ref = zir_builder_emit_field_val(self.handle, rt_import, mod_name.ptr, @intCast(mod_name.len));
                     if (mod_ref == error_ref) return error.EmitFailed;
 
@@ -2029,6 +2032,37 @@ pub const ZirDriver = struct {
                 const ref = zir_builder_emit_field_val(self.handle, list_ref, name.ptr, name.len);
                 if (ref == error_ref) return error.EmitFailed;
                 try self.setLocal(lg.dest, ref);
+            },
+            .map_has_key => |mhk| {
+                // Map key check: MapHelpers.has_key(map, key)
+                const map_ref = self.refForLocal(mhk.map) catch return;
+                const key_ref = self.refForLocal(mhk.key) catch return;
+                const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                if (rt_import == error_ref) return error.EmitFailed;
+                const helpers = zir_builder_emit_field_val(self.handle, rt_import, "MapHelpers", 10);
+                if (helpers == error_ref) return error.EmitFailed;
+                const fn_ref = zir_builder_emit_field_val(self.handle, helpers, "has_key", 7);
+                if (fn_ref == error_ref) return error.EmitFailed;
+                const call_args = [_]u32{ map_ref, key_ref };
+                const ref = zir_builder_emit_call_ref(self.handle, fn_ref, &call_args, 2);
+                if (ref == error_ref) return error.EmitFailed;
+                try self.setLocal(mhk.dest, ref);
+            },
+            .map_get => |mg| {
+                // Map value access: MapHelpers.get(map, key, default)
+                const map_ref = self.refForLocal(mg.map) catch return;
+                const key_ref = self.refForLocal(mg.key) catch return;
+                const default_ref = self.refForLocal(mg.default) catch return;
+                const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                if (rt_import == error_ref) return error.EmitFailed;
+                const helpers = zir_builder_emit_field_val(self.handle, rt_import, "MapHelpers", 10);
+                if (helpers == error_ref) return error.EmitFailed;
+                const fn_ref = zir_builder_emit_field_val(self.handle, helpers, "get", 3);
+                if (fn_ref == error_ref) return error.EmitFailed;
+                const call_args = [_]u32{ map_ref, key_ref, default_ref };
+                const ref = zir_builder_emit_call_ref(self.handle, fn_ref, &call_args, 3);
+                if (ref == error_ref) return error.EmitFailed;
+                try self.setLocal(mg.dest, ref);
             },
             .union_init => |ui| {
                 const val_ref = self.refForValueLocal(ui.value) catch return;

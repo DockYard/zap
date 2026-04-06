@@ -868,6 +868,20 @@ pub const InterproceduralAnalyzer = struct {
                     }
                 },
 
+                .map_has_key => |mhk| {
+                    // Result is a boolean; propagate alias from map source.
+                    if (aliases.get(mhk.map)) |param_set| {
+                        try aliases.put(mhk.dest, param_set);
+                    }
+                },
+
+                .map_get => |mg| {
+                    // Result comes from map lookup; propagate alias from map source.
+                    if (aliases.get(mg.map)) |param_set| {
+                        try aliases.put(mg.dest, param_set);
+                    }
+                },
+
                 // Nested control flow
                 .if_expr => |ie| {
                     try self.analyzeInstructions(ie.then_instrs, num_params, param_summaries, aliases, fresh_locals, return_sources);

@@ -557,6 +557,17 @@ pub const UseDefInfo = struct {
                 try info.recordDef(lg.dest, block);
                 try info.recordUse(lg.list, block);
             },
+            .map_has_key => |mhk| {
+                try info.recordDef(mhk.dest, block);
+                try info.recordUse(mhk.map, block);
+                try info.recordUse(mhk.key, block);
+            },
+            .map_get => |mg| {
+                try info.recordDef(mg.dest, block);
+                try info.recordUse(mg.map, block);
+                try info.recordUse(mg.key, block);
+                try info.recordUse(mg.default, block);
+            },
 
             // Arithmetic / logic.
             .binary_op => |bo| {
@@ -995,6 +1006,8 @@ fn instructionUsesLocal(local: ir.LocalId, instr: ir.Instruction) bool {
         .index_get => |ig| return ig.object == local,
         .list_len_check => |llc| return llc.scrutinee == local,
         .list_get => |lg| return lg.list == local,
+        .map_has_key => |mhk| return mhk.map == local or mhk.key == local,
+        .map_get => |mg| return mg.map == local or mg.key == local or mg.default == local,
         .binary_op => |bo| return bo.lhs == local or bo.rhs == local,
         .unary_op => |uo| return uo.operand == local,
         .call_direct => |cd| {
@@ -1709,6 +1722,8 @@ pub const RegionSolver = struct {
             .index_get => |ig| ig.dest,
             .list_len_check => |llc| llc.dest,
             .list_get => |lg| lg.dest,
+            .map_has_key => |mhk| mhk.dest,
+            .map_get => |mg| mg.dest,
             .binary_op => |bo| bo.dest,
             .unary_op => |uo| uo.dest,
             .call_direct => |cd| cd.dest,

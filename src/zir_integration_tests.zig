@@ -1152,6 +1152,102 @@ test "ZIR: tail recursive countdown (small)" {
 // List operations
 // ============================================================
 
+// ============================================================
+// Map operations
+// ============================================================
+
+test "ZIR: map literal creation" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn main() -> String {
+        \\    m = %{name: "Alice", age: 30}
+        \\    IO.puts(Map.get(m, :name, "unknown"))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("Alice\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: map get with default" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn main() -> String {
+        \\    m = %{x: 10, y: 20}
+        \\    Kernel.inspect(Map.get(m, :x, 0))
+        \\    Kernel.inspect(Map.get(m, :z, 99))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("10\n99\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: map has_key check" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn main() -> String {
+        \\    m = %{name: "Alice", age: 30}
+        \\    if Map.has_key(m, :name) {
+        \\      IO.puts("has name")
+        \\    } else {
+        \\      IO.puts("no name")
+        \\    }
+        \\    if Map.has_key(m, :email) {
+        \\      IO.puts("has email")
+        \\    } else {
+        \\      IO.puts("no email")
+        \\    }
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("has name\nno email\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: map pattern matching in function" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn greet(%{name: n, greeting: g} :: %{Atom -> String}) -> String {
+        \\    g <> ", " <> n <> "!"
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    IO.puts(greet(%{name: "World", greeting: "Hello"}))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("Hello, World!\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: map size" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn main() -> String {
+        \\    m = %{a: 1, b: 2, c: 3}
+        \\    Kernel.inspect(Map.size(m))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("3\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+// ============================================================
+// List operations
+// ============================================================
+
 test "ZIR: list literal and fixed-length pattern" {
     var result = try compileAndRun(
         \\pub module TestProg {

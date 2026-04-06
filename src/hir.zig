@@ -69,6 +69,7 @@ pub const Clause = struct {
     struct_bindings: []const StructBinding = &.{},
     list_bindings: []const ListBinding = &.{},
     binary_bindings: []const BinaryBinding = &.{},
+    map_bindings: []const MapBinding = &.{},
 };
 
 pub const TupleBinding = struct {
@@ -82,6 +83,13 @@ pub const StructBinding = struct {
     name: ast.StringId,
     param_index: u32,
     field_name: ast.StringId,
+    local_index: u32,
+};
+
+pub const MapBinding = struct {
+    name: ast.StringId,
+    param_index: u32,
+    key_expr: *const Expr,
     local_index: u32,
 };
 
@@ -460,6 +468,7 @@ pub const MatchPattern = union(enum) {
     list_cons: ListConsMatch,
     pin: ast.StringId,
     struct_match: StructMatch,
+    map_match: MapMatch,
     binary_match: BinaryMatchData,
 };
 
@@ -487,6 +496,15 @@ pub const StructMatch = struct {
 
 pub const StructFieldBind = struct {
     field_name: ast.StringId,
+    pattern: *const MatchPattern,
+};
+
+pub const MapMatch = struct {
+    field_bindings: []const MapFieldBind,
+};
+
+pub const MapFieldBind = struct {
+    key: *const ast.Expr,
     pattern: *const MatchPattern,
 };
 
@@ -1298,6 +1316,7 @@ pub const HirBuilder = struct {
     current_struct_bindings: std.ArrayList(StructBinding),
     current_list_bindings: std.ArrayList(ListBinding),
     current_binary_bindings: std.ArrayList(BinaryBinding),
+    current_map_bindings: std.ArrayList(MapBinding),
     current_case_bindings: std.ArrayList(CaseBinding),
     current_assignment_bindings: std.ArrayList(AssignmentBinding),
     current_module_scope: ?scope_mod.ScopeId,
@@ -1333,6 +1352,7 @@ pub const HirBuilder = struct {
             .current_struct_bindings = .empty,
             .current_list_bindings = .empty,
             .current_binary_bindings = .empty,
+            .current_map_bindings = .empty,
             .current_case_bindings = .empty,
             .current_assignment_bindings = .empty,
             .current_module_scope = null,
@@ -1958,6 +1978,28 @@ pub const HirBuilder = struct {
             }
         }
 
+        // Process map patterns to create bindings for destructured map fields
+        self.current_map_bindings = .empty;
+        for (params.items, 0..) |param, param_idx| {
+            if (param.pattern) |pat| {
+                if (pat.* == .map_match) {
+                    for (pat.map_match.field_bindings) |fb| {
+                        if (fb.pattern.* == .bind) {
+                            const local_idx = self.next_local;
+                            self.next_local += 1;
+                            const key_hir = try self.buildExpr(fb.key);
+                            try self.current_map_bindings.append(self.allocator, .{
+                                .name = fb.pattern.bind,
+                                .param_index = @intCast(param_idx),
+                                .key_expr = key_hir,
+                                .local_index = local_idx,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
         // Build decision tree for this clause
         const decision = try self.create(Decision, .{
             .success = .{ .bindings = &.{}, .body_index = 0 },
@@ -1979,6 +2021,7 @@ pub const HirBuilder = struct {
             .struct_bindings = try self.current_struct_bindings.toOwnedSlice(self.allocator),
             .list_bindings = try self.current_list_bindings.toOwnedSlice(self.allocator),
             .binary_bindings = try self.current_binary_bindings.toOwnedSlice(self.allocator),
+            .map_bindings = try self.current_map_bindings.toOwnedSlice(self.allocator),
         };
     }
 
@@ -2059,7 +2102,21 @@ pub const HirBuilder = struct {
                     },
                 });
             },
-            .map => null, // TODO
+            .map => |mp| {
+                var bindings: std.ArrayList(MapFieldBind) = .empty;
+                for (mp.fields) |field| {
+                    const value_pat = try self.compilePattern(field.value) orelse continue;
+                    try bindings.append(self.allocator, .{
+                        .key = field.key,
+                        .pattern = value_pat,
+                    });
+                }
+                return try self.create(MatchPattern, .{
+                    .map_match = .{
+                        .field_bindings = try bindings.toOwnedSlice(self.allocator),
+                    },
+                });
+            },
             .binary => |bin| {
                 return try self.create(MatchPattern, .{
                     .binary_match = .{

@@ -812,6 +812,17 @@ fn hashInstruction(hasher: *std.hash.Wyhash, instr: ir.Instruction) void {
             hasher.update(std.mem.asBytes(&v.list));
             hasher.update(std.mem.asBytes(&v.index));
         },
+        .map_has_key => |v| {
+            hasher.update(std.mem.asBytes(&v.dest));
+            hasher.update(std.mem.asBytes(&v.map));
+            hasher.update(std.mem.asBytes(&v.key));
+        },
+        .map_get => |v| {
+            hasher.update(std.mem.asBytes(&v.dest));
+            hasher.update(std.mem.asBytes(&v.map));
+            hasher.update(std.mem.asBytes(&v.key));
+            hasher.update(std.mem.asBytes(&v.default));
+        },
         .binary_op => |v| {
             hasher.update(std.mem.asBytes(&v.dest));
             hasher.update(&[_]u8{@intFromEnum(v.op)});
@@ -1491,6 +1502,52 @@ pub const Interpreter = struct {
             .list_get => |lg| {
                 const result = try self.evalListGet(lg, frame);
                 frame.setLocal(lg.dest, result);
+                return .continued;
+            },
+            .map_has_key => |mhk| {
+                const map_val = try self.readLocal(frame, mhk.map);
+                const key_val = try self.readLocal(frame, mhk.key);
+                switch (map_val) {
+                    .map => |mv| {
+                        var found = false;
+                        for (mv.entries) |entry| {
+                            if (entry.key.eql(key_val)) {
+                                found = true;
+                                break;
+                            }
+                        }
+                        frame.setLocal(mhk.dest, .{ .bool_val = found });
+                    },
+                    else => {
+                        try self.emitError(.type_error, "map_has_key on non-map value");
+                        return error.CtfeFailure;
+                    },
+                }
+                return .continued;
+            },
+            .map_get => |mg| {
+                const map_val = try self.readLocal(frame, mg.map);
+                const key_val = try self.readLocal(frame, mg.key);
+                switch (map_val) {
+                    .map => |mv| {
+                        var result: ?CtValue = null;
+                        for (mv.entries) |entry| {
+                            if (entry.key.eql(key_val)) {
+                                result = entry.value;
+                                break;
+                            }
+                        }
+                        if (result) |val| {
+                            frame.setLocal(mg.dest, val);
+                        } else {
+                            frame.setLocal(mg.dest, try self.readLocal(frame, mg.default));
+                        }
+                    },
+                    else => {
+                        try self.emitError(.type_error, "map_get on non-map value");
+                        return error.CtfeFailure;
+                    },
+                }
                 return .continued;
             },
             .list_len_check => |lc| {
