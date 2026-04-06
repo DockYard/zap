@@ -1,4 +1,4 @@
-pub module Test.ZestHelper {
+pub module Test.TestRunner {
   use Zest
 
   pub fn main(_args :: [String]) -> String {

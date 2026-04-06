@@ -771,15 +771,23 @@ pub const Desugarer = struct {
             },
         });
 
-        // With filter: if filter { [body | rec] } else { rec }
+        // With filter: case filter { true -> [body | rec]; false -> rec }
         const final_body_expr: *const ast.Expr = if (fe.filter) |filter| blk: {
             const desugared_filter = try self.desugarExpr(filter);
+            const true_pat = try self.create(ast.Pattern, .{
+                .literal = .{ .bool_lit = .{ .meta = meta, .value = true } },
+            });
+            const false_pat = try self.create(ast.Pattern, .{
+                .literal = .{ .bool_lit = .{ .meta = meta, .value = false } },
+            });
             break :blk try self.create(ast.Expr, .{
-                .if_expr = .{
+                .case_expr = .{
                     .meta = meta,
-                    .condition = desugared_filter,
-                    .then_block = try self.allocSlice(ast.Stmt, &.{.{ .expr = cons_body_expr }}),
-                    .else_block = try self.allocSlice(ast.Stmt, &.{.{ .expr = recursive_call }}),
+                    .scrutinee = desugared_filter,
+                    .clauses = try self.allocSlice(ast.CaseClause, &.{
+                        .{ .meta = meta, .pattern = true_pat, .type_annotation = null, .guard = null, .body = try self.allocSlice(ast.Stmt, &.{.{ .expr = cons_body_expr }}) },
+                        .{ .meta = meta, .pattern = false_pat, .type_annotation = null, .guard = null, .body = try self.allocSlice(ast.Stmt, &.{.{ .expr = recursive_call }}) },
+                    }),
                 },
             });
         } else cons_body_expr;
@@ -899,27 +907,43 @@ pub const Desugarer = struct {
             .list_cons_expr = .{ .meta = meta, .head = body_desugared, .tail = recursive_call },
         });
 
-        // With filter
+        // With filter: case filter { true -> [body | rec]; false -> rec }
         const final_body: *const ast.Expr = if (fe.filter) |filter| blk: {
             const f = try self.desugarExpr(filter);
+            const true_pat = try self.create(ast.Pattern, .{
+                .literal = .{ .bool_lit = .{ .meta = meta, .value = true } },
+            });
+            const false_pat = try self.create(ast.Pattern, .{
+                .literal = .{ .bool_lit = .{ .meta = meta, .value = false } },
+            });
             break :blk try self.create(ast.Expr, .{
-                .if_expr = .{
+                .case_expr = .{
                     .meta = meta,
-                    .condition = f,
-                    .then_block = try self.allocSlice(ast.Stmt, &.{.{ .expr = cons_expr }}),
-                    .else_block = try self.allocSlice(ast.Stmt, &.{.{ .expr = recursive_call }}),
+                    .scrutinee = f,
+                    .clauses = try self.allocSlice(ast.CaseClause, &.{
+                        .{ .meta = meta, .pattern = true_pat, .type_annotation = null, .guard = null, .body = try self.allocSlice(ast.Stmt, &.{.{ .expr = cons_expr }}) },
+                        .{ .meta = meta, .pattern = false_pat, .type_annotation = null, .guard = null, .body = try self.allocSlice(ast.Stmt, &.{.{ .expr = recursive_call }}) },
+                    }),
                 },
             });
         } else cons_expr;
 
-        // Build the if expression: if i >= len { [] } else { char = ...; [body | rec] }
+        // case (i >= len) { true -> []; false -> { char = ...; [body | rec] } }
         const empty_list = try self.create(ast.Expr, .{ .list = .{ .meta = meta, .elements = &.{} } });
+        const true_pat2 = try self.create(ast.Pattern, .{
+            .literal = .{ .bool_lit = .{ .meta = meta, .value = true } },
+        });
+        const false_pat2 = try self.create(ast.Pattern, .{
+            .literal = .{ .bool_lit = .{ .meta = meta, .value = false } },
+        });
         const if_expr = try self.create(ast.Expr, .{
-            .if_expr = .{
+            .case_expr = .{
                 .meta = meta,
-                .condition = cond,
-                .then_block = try self.allocSlice(ast.Stmt, &.{.{ .expr = empty_list }}),
-                .else_block = try self.allocSlice(ast.Stmt, &.{ char_assign, .{ .expr = final_body } }),
+                .scrutinee = cond,
+                .clauses = try self.allocSlice(ast.CaseClause, &.{
+                    .{ .meta = meta, .pattern = true_pat2, .type_annotation = null, .guard = null, .body = try self.allocSlice(ast.Stmt, &.{.{ .expr = empty_list }}) },
+                    .{ .meta = meta, .pattern = false_pat2, .type_annotation = null, .guard = null, .body = try self.allocSlice(ast.Stmt, &.{ char_assign, .{ .expr = final_body } }) },
+                }),
             },
         });
 

@@ -1800,6 +1800,20 @@ pub fn moduleItemToCtValue(
             const args = try makeListFromSlice(alloc, store, arg_vals.items);
             return makeTuple3(alloc, store, .{ .atom = "@" }, try emptyList(alloc, store), args);
         },
+        .describe => |dd| {
+            // {:describe, [], [name, [tests...]]}
+            var test_vals = std.ArrayListUnmanaged(CtValue){};
+            for (dd.tests) |td| {
+                try test_vals.append(alloc, CtValue{ .string = td.name });
+            }
+            const args = try makeList(alloc, store, &.{ CtValue{ .string = dd.name }, try makeListFromSlice(alloc, store, test_vals.items) });
+            return makeTuple3(alloc, store, .{ .atom = "describe" }, try emptyList(alloc, store), args);
+        },
+        .test_decl => |td| {
+            // {:test, [], [name]}
+            const args = try makeList(alloc, store, &.{CtValue{ .string = td.name }});
+            return makeTuple3(alloc, store, .{ .atom = "test" }, try emptyList(alloc, store), args);
+        },
     };
 }
 
