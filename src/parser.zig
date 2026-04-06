@@ -4339,3 +4339,64 @@ test "parse error pipe ~> with function handler" {
     try std.testing.expect(body[0].expr.* == .error_pipe);
 }
 
+test "parse keyword list expression desugars to tuples" {
+    const source = "[name: \"Brian\", age: 42]";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const expr = try parser.parseExpr();
+    // Should be a list of 2 tuple elements
+    try std.testing.expect(expr.* == .list);
+    try std.testing.expectEqual(@as(usize, 2), expr.list.elements.len);
+
+    // First: {:name, "Brian"}
+    const first = expr.list.elements[0];
+    try std.testing.expect(first.* == .tuple);
+    try std.testing.expectEqual(@as(usize, 2), first.tuple.elements.len);
+    try std.testing.expect(first.tuple.elements[0].* == .atom_literal);
+    try std.testing.expect(first.tuple.elements[1].* == .string_literal);
+
+    // Second: {:age, 42}
+    const second = expr.list.elements[1];
+    try std.testing.expect(second.* == .tuple);
+    try std.testing.expect(second.tuple.elements[0].* == .atom_literal);
+    try std.testing.expect(second.tuple.elements[1].* == .int_literal);
+    try std.testing.expectEqual(@as(i64, 42), second.tuple.elements[1].int_literal.value);
+}
+
+test "parse keyword list pattern desugars to tuple patterns" {
+    const source = "[name: n, age: a]";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const pat = try parser.parsePattern();
+    try std.testing.expect(pat.* == .list);
+    try std.testing.expectEqual(@as(usize, 2), pat.list.elements.len);
+
+    // First: {:name, n} tuple pattern
+    const first = pat.list.elements[0];
+    try std.testing.expect(first.* == .tuple);
+    try std.testing.expectEqual(@as(usize, 2), first.tuple.elements.len);
+    try std.testing.expect(first.tuple.elements[0].* == .literal);
+    try std.testing.expect(first.tuple.elements[1].* == .bind);
+}
+
+test "parse non-keyword list unchanged" {
+    const source = "[1, 2, 3]";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const expr = try parser.parseExpr();
+    try std.testing.expect(expr.* == .list);
+    try std.testing.expectEqual(@as(usize, 3), expr.list.elements.len);
+    try std.testing.expect(expr.list.elements[0].* == .int_literal);
+    try std.testing.expect(expr.list.elements[1].* == .int_literal);
+    try std.testing.expect(expr.list.elements[2].* == .int_literal);
+}
+
