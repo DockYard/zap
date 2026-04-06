@@ -829,6 +829,58 @@ test "ZIR: catch basin short-circuits multi-step pipe" {
 // Trailing block syntax
 // ============================================================
 
+test "ZIR: macro generates function from trailing block" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub macro make_fn(name :: Expr, body :: Expr) -> Expr {
+        \\    quote {
+        \\      pub fn generated() -> String {
+        \\        unquote(body)
+        \\        "generated ran"
+        \\      }
+        \\    }
+        \\  }
+        \\
+        \\  make_fn("my func") {
+        \\    IO.puts("inside generated")
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    IO.puts(generated())
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("inside generated\ngenerated ran\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: macro receives trailing block as AST" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub macro my_test(name :: Expr, body :: Expr) -> Expr {
+        \\    quote {
+        \\      IO.puts(unquote(name))
+        \\      unquote(body)
+        \\      IO.puts("passed")
+        \\    }
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    my_test("check math") {
+        \\      Kernel.inspect(1 + 1)
+        \\    }
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("check math\n2\npassed\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+
 test "ZIR: trailing block as last argument" {
     var result = try compileAndRun(
         \\pub module TestProg {
