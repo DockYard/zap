@@ -665,6 +665,11 @@ pub const Desugarer = struct {
     fn desugarForExpr(self: *Desugarer, fe: *const ast.ForExpr) !*const ast.Expr {
         const meta = fe.meta;
 
+        // Check if iterating over a string — use index-based iteration
+        if (fe.iterable.* == .string_literal or fe.iterable.* == .string_interpolation) {
+            return self.desugarForString(fe);
+        }
+
         // Generate unique helper name
         var name_buf: [32]u8 = undefined;
         const name_str = try std.fmt.bufPrint(&name_buf, "__for_{d}", .{self.for_counter});
@@ -779,6 +784,154 @@ pub const Desugarer = struct {
         });
 
         // Wrap in block: { fn __for_N(...); __for_N(list) }
+        return try self.create(ast.Expr, .{
+            .block = .{
+                .meta = meta,
+                .stmts = try self.allocSlice(ast.Stmt, &.{
+                    .{ .function_decl = func_decl },
+                    .{ .expr = call_expr },
+                }),
+            },
+        });
+    }
+
+    /// Desugar for over string: for char <- "hello" { body }
+    /// Generates index-based iteration using String.length and String.byte_at:
+    ///   fn __for_N(s :: String, i :: i64) -> [Result] {
+    ///     if i >= String.length(s) { [] }
+    ///     else { char = String.byte_at(s, i); [body | __for_N(s, i + 1)] }
+    ///   }
+    ///   __for_N(str, 0)
+    fn desugarForString(self: *Desugarer, fe: *const ast.ForExpr) !*const ast.Expr {
+        const meta = fe.meta;
+
+        var name_buf: [32]u8 = undefined;
+        const name_str = try std.fmt.bufPrint(&name_buf, "__for_{d}", .{self.for_counter});
+        self.for_counter += 1;
+        const helper_name = try self.interner.intern(name_str);
+        const s_name = try self.interner.intern("__s");
+        const i_name = try self.interner.intern("__i");
+        const string_name = try self.interner.intern("String");
+
+        // Build: String.length(__s)
+        const s_ref = try self.create(ast.Expr, .{ .var_ref = .{ .meta = meta, .name = s_name } });
+        const i_ref = try self.create(ast.Expr, .{ .var_ref = .{ .meta = meta, .name = i_name } });
+        const string_mod = try self.create(ast.Expr, .{
+            .module_ref = .{ .meta = meta, .name = .{ .parts = try self.allocSlice(ast.StringId, &.{string_name}), .span = meta.span } },
+        });
+
+        const len_callee = try self.create(ast.Expr, .{
+            .field_access = .{ .meta = meta, .object = string_mod, .field = try self.interner.intern("length") },
+        });
+        const len_call = try self.create(ast.Expr, .{
+            .call = .{ .meta = meta, .callee = len_callee, .args = try self.allocSlice(*const ast.Expr, &.{s_ref}) },
+        });
+
+        // Build: __i >= String.length(__s)
+        const cond = try self.create(ast.Expr, .{
+            .binary_op = .{ .meta = meta, .op = .greater_equal, .lhs = i_ref, .rhs = len_call },
+        });
+
+        // Build: String.byte_at(__s, __i)
+        const byte_at_callee = try self.create(ast.Expr, .{
+            .field_access = .{ .meta = meta, .object = string_mod, .field = try self.interner.intern("byte_at") },
+        });
+        const byte_at_call = try self.create(ast.Expr, .{
+            .call = .{ .meta = meta, .callee = byte_at_callee, .args = try self.allocSlice(*const ast.Expr, &.{ s_ref, i_ref }) },
+        });
+
+        // Build: __i + 1
+        const one = try self.create(ast.Expr, .{ .int_literal = .{ .meta = meta, .value = 1 } });
+        const i_plus_one = try self.create(ast.Expr, .{
+            .binary_op = .{ .meta = meta, .op = .add, .lhs = i_ref, .rhs = one },
+        });
+
+        // Build recursive call: __for_N(__s, __i + 1)
+        const recursive_call = try self.create(ast.Expr, .{
+            .call = .{
+                .meta = meta,
+                .callee = try self.create(ast.Expr, .{ .var_ref = .{ .meta = meta, .name = helper_name } }),
+                .args = try self.allocSlice(*const ast.Expr, &.{ s_ref, i_plus_one }),
+            },
+        });
+
+        // Build: char = String.byte_at(__s, __i)
+        const char_assign = ast.Stmt{
+            .assignment = try self.create(ast.Assignment, .{
+                .meta = meta,
+                .pattern = try self.create(ast.Pattern, .{ .bind = .{ .meta = meta, .name = fe.var_name } }),
+                .value = byte_at_call,
+            }),
+        };
+
+        // Build body: [body | __for_N(__s, __i + 1)]
+        const body_desugared = try self.desugarExpr(fe.body);
+        const cons_expr = try self.create(ast.Expr, .{
+            .list_cons_expr = .{ .meta = meta, .head = body_desugared, .tail = recursive_call },
+        });
+
+        // With filter
+        const final_body: *const ast.Expr = if (fe.filter) |filter| blk: {
+            const f = try self.desugarExpr(filter);
+            break :blk try self.create(ast.Expr, .{
+                .if_expr = .{
+                    .meta = meta,
+                    .condition = f,
+                    .then_block = try self.allocSlice(ast.Stmt, &.{.{ .expr = cons_expr }}),
+                    .else_block = try self.allocSlice(ast.Stmt, &.{.{ .expr = recursive_call }}),
+                },
+            });
+        } else cons_expr;
+
+        // Build the if expression: if i >= len { [] } else { char = ...; [body | rec] }
+        const empty_list = try self.create(ast.Expr, .{ .list = .{ .meta = meta, .elements = &.{} } });
+        const if_expr = try self.create(ast.Expr, .{
+            .if_expr = .{
+                .meta = meta,
+                .condition = cond,
+                .then_block = try self.allocSlice(ast.Stmt, &.{.{ .expr = empty_list }}),
+                .else_block = try self.allocSlice(ast.Stmt, &.{ char_assign, .{ .expr = final_body } }),
+            },
+        });
+
+        // Params: (__s :: String, __i :: i64)
+        const s_param = ast.Param{
+            .meta = meta,
+            .pattern = try self.create(ast.Pattern, .{ .bind = .{ .meta = meta, .name = s_name } }),
+            .type_annotation = null,
+        };
+        const i_param = ast.Param{
+            .meta = meta,
+            .pattern = try self.create(ast.Pattern, .{ .bind = .{ .meta = meta, .name = i_name } }),
+            .type_annotation = null,
+        };
+
+        const clause = ast.FunctionClause{
+            .meta = meta,
+            .params = try self.allocSlice(ast.Param, &.{ s_param, i_param }),
+            .return_type = null,
+            .refinement = null,
+            .body = try self.allocSlice(ast.Stmt, &.{.{ .expr = if_expr }}),
+        };
+
+        const func_decl = try self.create(ast.FunctionDecl, .{
+            .meta = meta,
+            .name = helper_name,
+            .clauses = try self.allocSlice(ast.FunctionClause, &.{clause}),
+            .visibility = .private,
+        });
+
+        // Call: __for_N(str, 0)
+        const zero = try self.create(ast.Expr, .{ .int_literal = .{ .meta = meta, .value = 0 } });
+        const iterable = try self.desugarExpr(fe.iterable);
+        const call_expr = try self.create(ast.Expr, .{
+            .call = .{
+                .meta = meta,
+                .callee = try self.create(ast.Expr, .{ .var_ref = .{ .meta = meta, .name = helper_name } }),
+                .args = try self.allocSlice(*const ast.Expr, &.{ iterable, zero }),
+            },
+        });
+
         return try self.create(ast.Expr, .{
             .block = .{
                 .meta = meta,

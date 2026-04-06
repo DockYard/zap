@@ -712,6 +712,16 @@ pub const ZapString = struct {
     pub fn trim(s: []const u8) []const u8 {
         return std.mem.trim(u8, s, " \t\n\r");
     }
+
+    /// Get byte at index as a single-character string.
+    pub fn byte_at(s: []const u8, index: i64) []const u8 {
+        const i: usize = if (index >= 0) @intCast(index) else return "";
+        if (i >= s.len) return "";
+        const result = bumpAlloc(1);
+        if (result.len == 0) return "";
+        result[0] = s[i];
+        return result;
+    }
 };
 
 // ============================================================

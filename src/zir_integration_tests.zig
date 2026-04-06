@@ -1260,6 +1260,31 @@ test "ZIR: for comprehension doubles list" {
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
 
+test "ZIR: for comprehension over string" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn join([] :: [String]) -> String {
+        \\    ""
+        \\  }
+        \\
+        \\  pub fn join([h | t] :: [String]) -> String {
+        \\    h <> join(t)
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    chars = for c <- "abc" {
+        \\      c <> "!"
+        \\    }
+        \\    IO.puts(join(chars))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("a!b!c!\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
 test "ZIR: for comprehension with filter" {
     var result = try compileAndRun(
         \\pub module TestProg {
