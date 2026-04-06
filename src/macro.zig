@@ -174,7 +174,7 @@ pub const MacroEngine = struct {
                     }
                 },
                 .use_decl => |ud| {
-                    // Expand `use Module` → `import Module`
+                    // Step 1: Always emit `import Module` for function access
                     const import_decl = try self.create(ast.ImportDecl, .{
                         .meta = ud.meta,
                         .module_path = ud.module_path,
@@ -182,6 +182,13 @@ pub const MacroEngine = struct {
                     });
                     try new_items.append(self.allocator, .{ .import_decl = import_decl });
                     changed = true;
+
+                    // Step 2: Look up Module.__using__/1 and inject returned items
+                    if (self.tryExpandUsing(ud)) |using_items| {
+                        for (using_items) |using_item| {
+                            try new_items.append(self.allocator, using_item);
+                        }
+                    }
                 },
                 else => try new_items.append(self.allocator, item),
             }
@@ -1105,6 +1112,102 @@ pub const MacroEngine = struct {
         if (result != .nil) {
             const interner_mut: *ast.StringInterner = @constCast(self.interner);
             return ast_data.ctValueToModuleItem(self.allocator, interner_mut, result) catch return null;
+        }
+        return null;
+    }
+
+    /// Try to expand `use Module` by calling Module.__using__/1.
+    /// Returns injected module items if __using__ exists, null otherwise.
+    fn tryExpandUsing(self: *MacroEngine, ud: *const ast.UseDecl) ?[]const ast.ModuleItem {
+        // Build the __using__ name
+        const using_name = self.interner.intern("__using__") catch return null;
+
+        // Look up __using__ macro with arity 1
+        const macro_id = self.findMacro(using_name, 1) orelse return null;
+
+        const family = &self.graph.macro_families.items[macro_id];
+        if (family.clauses.items.len == 0) return null;
+
+        const clause_ref = family.clauses.items[0];
+        const clause = &clause_ref.decl.clauses[clause_ref.clause_index];
+
+        // Build the opts argument: use the opts from UseDecl, or nil if none
+        var store = ctfe.AllocationStore{};
+        const opts_ct: ctfe.CtValue = if (ud.opts) |opts|
+            ast_data.exprToCtValue(self.allocator, self.interner, &store, opts) catch return null
+        else
+            .nil;
+
+        // Evaluate the __using__ macro body
+        if (clause.body.len == 1 and clause.body[0] == .expr) {
+            const body_expr = clause.body[0].expr;
+            if (body_expr.* == .quote_expr) {
+                // Template macro: substitute opts into quote body
+                var param_map = std.StringHashMap(ctfe.CtValue).init(self.allocator);
+                defer param_map.deinit();
+                for (clause.params) |param| {
+                    if (param.pattern.* == .bind) {
+                        const pname = self.interner.get(param.pattern.bind.name);
+                        param_map.put(pname, opts_ct) catch return null;
+                    }
+                }
+
+                var body_vals = std.ArrayListUnmanaged(ctfe.CtValue){};
+                for (body_expr.quote_expr.body) |stmt| {
+                    const stmt_ct = ast_data.stmtToCtValue(self.allocator, self.interner, &store, stmt) catch return null;
+                    body_vals.append(self.allocator, self.substituteCtValue(stmt_ct, &param_map, &store) catch return null) catch return null;
+                }
+
+                // Convert each result value to a module item
+                var items: std.ArrayList(ast.ModuleItem) = .empty;
+                const interner_mut: *ast.StringInterner = @constCast(self.interner);
+                for (body_vals.items) |val| {
+                    if (ast_data.ctValueToModuleItem(self.allocator, interner_mut, val) catch null) |mi| {
+                        items.append(self.allocator, mi) catch return null;
+                    }
+                }
+                return items.toOwnedSlice(self.allocator) catch return null;
+            }
+        }
+
+        // Non-template macro body — use the evaluator
+        const macro_eval = @import("macro_eval.zig");
+        var env = macro_eval.Env.init(self.allocator, &store);
+        defer env.deinit();
+
+        for (clause.params) |param| {
+            if (param.pattern.* == .bind) {
+                const pname = self.interner.get(param.pattern.bind.name);
+                env.bind(pname, opts_ct) catch return null;
+            }
+        }
+
+        var result: ctfe.CtValue = .nil;
+        for (clause.body) |stmt| {
+            const stmt_ct = ast_data.stmtToCtValue(self.allocator, self.interner, &store, stmt) catch return null;
+            result = macro_eval.eval(&env, stmt_ct) catch return null;
+        }
+
+        if (result != .nil) {
+            const interner_mut: *ast.StringInterner = @constCast(self.interner);
+            // Result could be a single item or a block of items
+            if (result == .tuple and result.tuple.elems.len == 3) {
+                if (ast_data.ctValueToModuleItem(self.allocator, interner_mut, result) catch null) |mi| {
+                    const items = self.allocator.alloc(ast.ModuleItem, 1) catch return null;
+                    items[0] = mi;
+                    return items;
+                }
+            }
+            // Try as a list of items
+            if (result == .list) {
+                var items: std.ArrayList(ast.ModuleItem) = .empty;
+                for (result.list.elems) |elem| {
+                    if (ast_data.ctValueToModuleItem(self.allocator, interner_mut, elem) catch null) |mi| {
+                        items.append(self.allocator, mi) catch return null;
+                    }
+                }
+                return items.toOwnedSlice(self.allocator) catch return null;
+            }
         }
         return null;
     }

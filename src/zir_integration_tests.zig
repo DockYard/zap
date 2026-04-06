@@ -206,6 +206,117 @@ fn compileAndRun(source: []const u8) TestError!TestResult {
     };
 }
 
+const ExtraFile = struct {
+    path: []const u8,
+    data: []const u8,
+};
+
+/// Compile and run with additional source files alongside test_prog.zap.
+fn compileAndRunWithFiles(source: []const u8, extra_files: []const ExtraFile) TestError!TestResult {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    tmp_dir.dir.makePath("lib") catch return error.Unexpected;
+
+    const build_source =
+        \\pub module TestProg.Builder {
+        \\  pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
+        \\    case env.target {
+        \\      :test_prog ->
+        \\        %Zap.Manifest{
+        \\          name: "test_prog",
+        \\          version: "0.1.0",
+        \\          kind: :bin,
+        \\          root: "TestProg.main/0",
+        \\          paths: ["lib/**/*.zap"]
+        \\        }
+        \\      _ ->
+        \\        panic("Unknown target")
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    tmp_dir.dir.writeFile(.{ .sub_path = "build.zap", .data = build_source }) catch
+        return error.Unexpected;
+    tmp_dir.dir.writeFile(.{ .sub_path = "lib/test_prog.zap", .data = source }) catch
+        return error.Unexpected;
+
+    for (extra_files) |ef| {
+        // Ensure parent directory exists
+        if (std.fs.path.dirname(ef.path)) |dir| {
+            tmp_dir.dir.makePath(dir) catch {};
+        }
+        tmp_dir.dir.writeFile(.{ .sub_path = ef.path, .data = ef.data }) catch
+            return error.Unexpected;
+    }
+
+    const tmp_dir_path = tmp_dir.dir.realpathAlloc(allocator, ".") catch
+        return error.Unexpected;
+    defer allocator.free(tmp_dir_path);
+
+    const zap_binary_raw = std.process.getEnvVarOwned(allocator, "ZAP_BINARY") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => allocator.dupe(u8, "zig-out/bin/zap") catch return error.OutOfMemory,
+        else => return error.Unexpected,
+    };
+    defer allocator.free(zap_binary_raw);
+
+    const zap_binary = if (std.fs.path.isAbsolute(zap_binary_raw))
+        allocator.dupe(u8, zap_binary_raw) catch return error.OutOfMemory
+    else
+        std.fs.cwd().realpathAlloc(allocator, zap_binary_raw) catch return error.Unexpected;
+    defer allocator.free(zap_binary);
+
+    const compile_argv: []const []const u8 = &.{ zap_binary, "build", "test_prog" };
+    var compile_child = std.process.Child.init(compile_argv, allocator);
+    compile_child.cwd = tmp_dir_path;
+    compile_child.stderr_behavior = .Ignore;
+    compile_child.stdout_behavior = .Ignore;
+    const compile_term = compile_child.spawnAndWait() catch return error.CompilationFailed;
+
+    const compile_exit = switch (compile_term) {
+        .Exited => |code| code,
+        else => return error.CompilationFailed,
+    };
+
+    if (compile_exit != 0) {
+        std.debug.print("\n=== COMPILATION FAILED (exit {d}) ===\n", .{compile_exit});
+        return error.CompilationFailed;
+    }
+
+    const compiled_binary = tmp_dir.dir.realpathAlloc(allocator, "zap-out/bin/test_prog") catch {
+        return error.CompilationFailed;
+    };
+    defer allocator.free(compiled_binary);
+
+    const run_result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{compiled_binary},
+        .max_output_bytes = 256 * 1024,
+    }) catch return error.RunFailed;
+
+    const run_exit = switch (run_result.term) {
+        .Exited => |code| code,
+        else => {
+            allocator.free(run_result.stdout);
+            allocator.free(run_result.stderr);
+            return error.RunFailed;
+        },
+    };
+
+    const output_dir = tmp_dir.dir.realpathAlloc(allocator, "zap-out") catch null;
+
+    return .{
+        .stdout = run_result.stdout,
+        .stderr = run_result.stderr,
+        .exit_code = run_exit,
+        .allocator = allocator,
+        .output_dir = output_dir,
+    };
+}
+
 // ============================================================
 // Constants and arithmetic
 // ============================================================
@@ -1151,6 +1262,62 @@ test "ZIR: tail recursive countdown (small)" {
 // ============================================================
 // List operations
 // ============================================================
+
+// ============================================================
+// use Module with __using__ callback
+// ============================================================
+
+test "ZIR: use Module imports functions" {
+    var result = try compileAndRunWithFiles(
+        \\pub module TestProg {
+        \\  use Helper
+        \\
+        \\  pub fn main() -> String {
+        \\    IO.puts(Helper.greet("World"))
+        \\    "done"
+        \\  }
+        \\}
+    , &.{
+        .{ .path = "lib/helper.zap", .data =
+            \\pub module Helper {
+            \\  pub fn greet(name :: String) -> String {
+            \\    "Hello, " <> name <> "!"
+            \\  }
+            \\}
+        },
+    });
+    defer result.deinit();
+    try std.testing.expectEqualStrings("Hello, World!\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: use Module with __using__ callback injects function" {
+    var result = try compileAndRunWithFiles(
+        \\pub module TestProg {
+        \\  use Greeter
+        \\
+        \\  pub fn main() -> String {
+        \\    IO.puts(hello())
+        \\    "done"
+        \\  }
+        \\}
+    , &.{
+        .{ .path = "lib/greeter.zap", .data =
+            \\pub module Greeter {
+            \\  pub macro __using__(_opts :: Expr) -> Expr {
+            \\    quote {
+            \\      pub fn hello() -> String {
+            \\        "Hello from __using__!"
+            \\      }
+            \\    }
+            \\  }
+            \\}
+        },
+    });
+    defer result.deinit();
+    try std.testing.expectEqualStrings("Hello from __using__!\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
 
 // ============================================================
 // Map operations
