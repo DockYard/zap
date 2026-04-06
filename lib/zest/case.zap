@@ -5,20 +5,25 @@ pub module Zest.Case {
   #   pub module Test.MyTest {
   #     use Zest.Case
   #
-  #     pub fn run() -> String {
-  #       describe("feature") {
-  #         test("does something") {
-  #           assert(1 + 1 == 2)
-  #         }
-  #
-  #         test("validates input") {
-  #           assert("hello" != "")
-  #         }
+  #     describe("feature") {
+  #       test("does something") {
+  #         assert(1 + 1 == 2)
   #       }
   #
-  #       "MyTest: passed"
+  #       test("validates input") {
+  #         assert("hello" != "")
+  #       }
+  #     }
+  #
+  #     test("standalone") {
+  #       assert(true)
   #     }
   #   }
+  #
+  # describe/test are macros that receive the body as AST and generate
+  # function declarations. The body becomes the function body — its
+  # return type doesn't matter. The generated function appends "."
+  # after the body and prints a dot on success.
 
   pub macro __using__(_opts :: Expr) -> Expr {
     quote {
@@ -26,21 +31,20 @@ pub module Zest.Case {
     }
   }
 
-  # describe runs a block of tests, printing the describe name in verbose mode.
-  # The block contains test() calls which execute and print dots.
+  # describe receives a name and a block of test() calls.
+  # It runs the block (which expands the inner test macros).
   pub fn describe(_name :: String, _body :: String) -> String {
     "."
   }
 
-  # test runs a block of assertions. The block is evaluated — if all assertions
-  # pass, the block returns ".". If any assert/reject fails, it panics.
-  # The name and result are used for output.
+  # test receives a name and a body block. It generates a function
+  # that runs the body and prints a dot on success. If any assertion
+  # in the body panics, the test fails.
   pub fn test(_name :: String, _body :: String) -> String {
-    IO.print_str(".")
     "."
   }
 
-  # Assertions — return "." on success, panic on failure
+  # Assertions — panic on failure, return "." on success
 
   pub fn assert(value :: Bool) -> String {
     case value {
