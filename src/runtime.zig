@@ -1308,6 +1308,107 @@ pub const MapHelpers = struct {
 };
 
 // ============================================================
+// ZestRuntime — Test framework runtime state
+//
+// Tracks test pass/fail counts, current describe context,
+// and provides formatted output (dot or verbose).
+// ============================================================
+
+pub const ZestRuntime = struct {
+    var total: u32 = 0;
+    var passed: u32 = 0;
+    var failed: u32 = 0;
+    var verbose: bool = false;
+    var current_describe: []const u8 = "";
+    var failure_messages: [256][]const u8 = [_][]const u8{""} ** 256;
+    var failure_count: u32 = 0;
+
+    const stderr = std.fs.File.stderr().deprecatedWriter();
+    const stdout = std.fs.File.stdout().deprecatedWriter();
+
+    pub fn reset() void {
+        total = 0;
+        passed = 0;
+        failed = 0;
+        failure_count = 0;
+        current_describe = "";
+    }
+
+    pub fn set_verbose(v: bool) void {
+        verbose = v;
+    }
+
+    pub fn begin_describe(name: []const u8) void {
+        current_describe = name;
+        if (verbose) {
+            stdout.print("  {s}\n", .{name}) catch {};
+        }
+    }
+
+    pub fn end_describe() void {
+        current_describe = "";
+    }
+
+    pub fn run_test(name: []const u8, test_passed: bool) void {
+        total += 1;
+        if (test_passed) {
+            passed += 1;
+            if (verbose) {
+                stdout.print("    \x1b[1;32m✓\x1b[0m {s}\n", .{name}) catch {};
+            } else {
+                stdout.print("\x1b[1;32m.\x1b[0m", .{}) catch {};
+            }
+        } else {
+            failed += 1;
+            if (verbose) {
+                stdout.print("    \x1b[1;31m✗\x1b[0m {s}\n", .{name}) catch {};
+            } else {
+                stdout.print("\x1b[1;31mF\x1b[0m", .{}) catch {};
+            }
+        }
+    }
+
+    pub fn record_failure(name: []const u8, message: []const u8, file: []const u8, line: i64) void {
+        if (failure_count < 256) {
+            // Build failure message using bump allocator
+            const msg = std.fmt.allocPrint(
+                std.heap.page_allocator,
+                "\n  \x1b[1;31m{d})\x1b[0m {s}\n     \x1b[31m{s}\x1b[0m\n     {s}:{d}",
+                .{ failure_count + 1, name, message, file, line },
+            ) catch "     (failed to format)";
+            failure_messages[failure_count] = msg;
+            failure_count += 1;
+        }
+    }
+
+    pub fn summary() []const u8 {
+        if (!verbose) {
+            stdout.print("\n", .{}) catch {};
+        }
+
+        // Print failure details
+        if (failure_count > 0) {
+            stdout.print("\nFailures:\n", .{}) catch {};
+            var i: u32 = 0;
+            while (i < failure_count) : (i += 1) {
+                stdout.print("{s}\n", .{failure_messages[i]}) catch {};
+            }
+        }
+
+        stdout.print("\n{d} tests, \x1b[1;32m{d} passed\x1b[0m", .{ total, passed }) catch {};
+        if (failed > 0) {
+            stdout.print(", \x1b[1;31m{d} failed\x1b[0m", .{failed}) catch {};
+        }
+        stdout.print("\n", .{}) catch {};
+
+        if (failed > 0) {
+            std.process.exit(1);
+        }
+        return "done";
+    }
+};
+
+// ============================================================
 // Tests
 // ============================================================
 

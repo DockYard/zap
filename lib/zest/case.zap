@@ -1,18 +1,23 @@
 pub module Zest.Case {
-  # Zest.Case provides assertions and the describe/test DSL for test modules.
+  # Zest.Case provides assertions and the test DSL.
   #
   # Usage:
   #   pub module Test.MyTest {
   #     use Zest.Case
   #
-  #     describe "feature" {
-  #       test "does something" {
-  #         assert(1 + 1 == 2)
-  #       }
-  #     }
+  #     pub fn run() -> String {
+  #       describe("feature")
   #
-  #     test "standalone test" {
-  #       assert(true)
+  #       test("does something",
+  #         assert(1 + 1 == 2)
+  #       )
+  #
+  #       test("validates input",
+  #         assert("hello" != "")
+  #       )
+  #
+  #       end_describe()
+  #       Zest.summary()
   #     }
   #   }
 
@@ -22,7 +27,33 @@ pub module Zest.Case {
     }
   }
 
-  # Assertions
+  # Test lifecycle
+
+  pub fn describe(name :: String) -> String {
+    Zest.begin_describe(name)
+    "."
+  }
+
+  pub fn end_describe() -> String {
+    Zest.end_describe()
+    "."
+  }
+
+  pub fn test(name :: String, result :: String) -> String {
+    Zest.run_test(name, result == ".")
+    "."
+  }
+
+  pub fn summary() -> String {
+    Zest.summary()
+  }
+
+  pub fn reset() -> String {
+    Zest.reset()
+    "."
+  }
+
+  # Assertions — return "." on success, panic on failure
 
   pub fn assert(value :: Bool) -> String {
     case value {
@@ -49,20 +80,6 @@ pub module Zest.Case {
     case value {
       false -> "."
       true -> panic(message)
-    }
-  }
-
-  # describe is a macro that takes a name and a block of tests.
-  pub macro describe(name :: Expr, body :: Expr) -> Expr {
-    quote {
-      unquote(body)
-    }
-  }
-
-  # test is a macro that takes a name and a body block.
-  pub macro test(name :: Expr, body :: Expr) -> Expr {
-    quote {
-      unquote(body)
     }
   }
 }
