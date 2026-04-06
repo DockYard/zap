@@ -761,6 +761,11 @@ fn hashInstruction(hasher: *std.hash.Wyhash, instr: ir.Instruction) void {
             hasher.update(std.mem.asBytes(&v.dest));
             hashLocalIds(hasher, v.elements);
         },
+        .list_cons => |v| {
+            hasher.update(std.mem.asBytes(&v.dest));
+            hasher.update(std.mem.asBytes(&v.head));
+            hasher.update(std.mem.asBytes(&v.tail));
+        },
         .map_init => |v| {
             hasher.update(std.mem.asBytes(&v.dest));
             for (v.entries) |entry| {
@@ -1438,6 +1443,16 @@ pub const Interpreter = struct {
                 const elems = try self.collectLocals(li.elements, frame);
                 const alloc_id = self.allocIdForDest(frame, li.dest, .list);
                 frame.setLocal(li.dest, .{ .list = .{ .alloc_id = alloc_id, .elems = elems } });
+                return .continued;
+            },
+            .list_cons => |lc| {
+                const head_val = try self.readLocal(frame, lc.head);
+                const tail_val = try self.readLocal(frame, lc.tail);
+                const elems = try self.allocator.alloc(CtValue, 2);
+                elems[0] = head_val;
+                elems[1] = tail_val;
+                const alloc_id = self.allocIdForDest(frame, lc.dest, .tuple);
+                frame.setLocal(lc.dest, .{ .tuple = .{ .alloc_id = alloc_id, .elems = elems } });
                 return .continued;
             },
             .map_init => |mi| {

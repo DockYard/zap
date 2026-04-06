@@ -1157,6 +1157,18 @@ pub const BinaryHelpers = struct {
 };
 
 // ============================================================
+// ListHelpers — List cons (prepend) for for-comprehension results
+// ============================================================
+
+pub const ListHelpers = struct {
+    /// Prepend a head element to a tail list.
+    /// Returns a struct { head: H, tail: T } — a cons cell.
+    pub fn cons(head: anytype, tail: anytype) struct { head: @TypeOf(head), tail: @TypeOf(tail) } {
+        return .{ .head = head, .tail = tail };
+    }
+};
+
+// ============================================================
 // MapHelpers — Operations on map values (anonymous structs of {key, value} entries)
 //
 // Maps in ZIR are represented as anonymous structs with numeric field names:

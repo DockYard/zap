@@ -1924,6 +1924,21 @@ pub const ZirDriver = struct {
                 if (result == error_ref) return error.EmitFailed;
                 try self.setLocal(li.dest, result);
             },
+            .list_cons => |lc| {
+                // List cons: prepend head to tail via runtime ListHelpers.cons
+                const head_ref = self.refForLocal(lc.head) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                const tail_ref = self.refForLocal(lc.tail) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                if (rt_import == error_ref) return error.EmitFailed;
+                const helpers = zir_builder_emit_field_val(self.handle, rt_import, "ListHelpers", 11);
+                if (helpers == error_ref) return error.EmitFailed;
+                const fn_ref = zir_builder_emit_field_val(self.handle, helpers, "cons", 4);
+                if (fn_ref == error_ref) return error.EmitFailed;
+                const call_args = [_]u32{ head_ref, tail_ref };
+                const ref = zir_builder_emit_call_ref(self.handle, fn_ref, &call_args, 2);
+                if (ref == error_ref) return error.EmitFailed;
+                try self.setLocal(lc.dest, ref);
+            },
             .map_init => |mi| {
                 // Build a map as an anonymous struct of {key, value} entry structs.
                 // Each entry becomes a field named "0", "1", ... whose value is

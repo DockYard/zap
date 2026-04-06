@@ -608,6 +608,53 @@ pub const MacroEngine = struct {
                 };
             },
 
+            // For comprehension — recurse into iterable, filter, body
+            .for_expr => |fe| {
+                var changed = false;
+                const iterable = try self.expandExpr(fe.iterable);
+                if (iterable.changed) changed = true;
+                const filter = if (fe.filter) |f| blk: {
+                    const exp = try self.expandExpr(f);
+                    if (exp.changed) changed = true;
+                    break :blk exp.expr;
+                } else null;
+                const body = try self.expandExpr(fe.body);
+                if (body.changed) changed = true;
+                if (!changed) return .{ .expr = expr, .changed = false };
+                return .{
+                    .expr = try self.create(ast.Expr, .{
+                        .for_expr = .{
+                            .meta = fe.meta,
+                            .var_name = fe.var_name,
+                            .iterable = iterable.expr,
+                            .filter = filter,
+                            .body = body.expr,
+                        },
+                    }),
+                    .changed = true,
+                };
+            },
+
+            // List cons expression — recurse into head and tail
+            .list_cons_expr => |lc| {
+                var changed = false;
+                const head = try self.expandExpr(lc.head);
+                if (head.changed) changed = true;
+                const tail = try self.expandExpr(lc.tail);
+                if (tail.changed) changed = true;
+                if (!changed) return .{ .expr = expr, .changed = false };
+                return .{
+                    .expr = try self.create(ast.Expr, .{
+                        .list_cons_expr = .{
+                            .meta = lc.meta,
+                            .head = head.expr,
+                            .tail = tail.expr,
+                        },
+                    }),
+                    .changed = true,
+                };
+            },
+
             // Leaf nodes — no expansion needed
             .int_literal,
             .float_literal,

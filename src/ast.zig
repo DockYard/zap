@@ -324,6 +324,10 @@ pub const Expr = union(enum) {
     if_expr: IfExpr,
     case_expr: CaseExpr,
     cond_expr: CondExpr,
+    for_expr: ForExpr,
+
+    // List construction
+    list_cons_expr: ListConsExpr,
 
     // Macros
     quote_expr: QuoteExpr,
@@ -376,6 +380,8 @@ pub const Expr = union(enum) {
             .if_expr => |v| v.meta,
             .case_expr => |v| v.meta,
             .cond_expr => |v| v.meta,
+            .for_expr => |v| v.meta,
+            .list_cons_expr => |v| v.meta,
             .quote_expr => |v| v.meta,
             .unquote_expr => |v| v.meta,
             .unquote_splicing_expr => |v| v.meta,
@@ -577,6 +583,20 @@ pub const CondClause = struct {
     meta: NodeMeta,
     condition: *const Expr,
     body: []const Stmt,
+};
+
+pub const ForExpr = struct {
+    meta: NodeMeta,
+    var_name: StringId,
+    iterable: *const Expr,
+    filter: ?*const Expr,
+    body: *const Expr,
+};
+
+pub const ListConsExpr = struct {
+    meta: NodeMeta,
+    head: *const Expr,
+    tail: *const Expr,
 };
 
 pub const QuoteExpr = struct {

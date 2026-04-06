@@ -16,6 +16,7 @@ pub const Desugarer = struct {
     allocator: std.mem.Allocator,
     interner: *ast.StringInterner,
     to_string_id: ?ast.StringId,
+    for_counter: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, interner: *ast.StringInterner) Desugarer {
         return .{
@@ -251,6 +252,22 @@ pub const Desugarer = struct {
                 });
             },
 
+
+            // For comprehension → block with recursive helper function + call
+            .for_expr => |fe| {
+                return self.desugarForExpr(&fe);
+            },
+
+            // List cons expression → recurse into head and tail
+            .list_cons_expr => |lce| {
+                return try self.create(ast.Expr, .{
+                    .list_cons_expr = .{
+                        .meta = lce.meta,
+                        .head = try self.desugarExpr(lce.head),
+                        .tail = try self.desugarExpr(lce.tail),
+                    },
+                });
+            },
 
             // Leaf/passthrough nodes
             else => return expr,
@@ -596,6 +613,146 @@ pub const Desugarer = struct {
             .string_literal = .{
                 .meta = si.meta,
                 .value = try self.interner.intern(""),
+            },
+        });
+    }
+
+    // ============================================================
+    // For comprehension desugaring
+    //
+    // for x <- list { body }
+    // →
+    // {
+    //   fn __for_N([] :: [T]) -> [T] { [] }
+    //   fn __for_N([x | __rest] :: [T]) -> [T] { [body | __for_N(__rest)] }
+    //   __for_N(list)
+    // }
+    // ============================================================
+
+    fn desugarForExpr(self: *Desugarer, fe: *const ast.ForExpr) !*const ast.Expr {
+        const meta = fe.meta;
+
+        // Generate unique helper name
+        var name_buf: [32]u8 = undefined;
+        const name_str = try std.fmt.bufPrint(&name_buf, "__for_{d}", .{self.for_counter});
+        self.for_counter += 1;
+        const helper_name = try self.interner.intern(name_str);
+        const rest_name = try self.interner.intern("__rest");
+
+        // Clause 1: base case — fn __for_N([]) { [] }
+        const empty_pat = try self.create(ast.Pattern, .{
+            .list = .{ .meta = meta, .elements = &.{} },
+        });
+        const empty_param = ast.Param{
+            .meta = meta,
+            .pattern = empty_pat,
+            .type_annotation = null,
+        };
+        const empty_list = try self.create(ast.Expr, .{
+            .list = .{ .meta = meta, .elements = &.{} },
+        });
+        const base_clause = ast.FunctionClause{
+            .meta = meta,
+            .params = try self.allocSlice(ast.Param, &.{empty_param}),
+            .return_type = null,
+            .refinement = null,
+            .body = try self.allocSlice(ast.Stmt, &.{.{ .expr = empty_list }}),
+        };
+
+        // Clause 2: recursive case — fn __for_N([x | __rest]) { [body | __for_N(__rest)] }
+        const var_pat = try self.create(ast.Pattern, .{
+            .bind = .{ .meta = meta, .name = fe.var_name },
+        });
+        const rest_pat = try self.create(ast.Pattern, .{
+            .bind = .{ .meta = meta, .name = rest_name },
+        });
+        const cons_pat = try self.create(ast.Pattern, .{
+            .list_cons = .{
+                .meta = meta,
+                .heads = try self.allocSlice(*const ast.Pattern, &.{var_pat}),
+                .tail = rest_pat,
+            },
+        });
+        const cons_param = ast.Param{
+            .meta = meta,
+            .pattern = cons_pat,
+            .type_annotation = null,
+        };
+
+        // Recursive call: __for_N(__rest)
+        const rest_ref = try self.create(ast.Expr, .{
+            .var_ref = .{ .meta = meta, .name = rest_name },
+        });
+        const callee = try self.create(ast.Expr, .{
+            .var_ref = .{ .meta = meta, .name = helper_name },
+        });
+        const recursive_call = try self.create(ast.Expr, .{
+            .call = .{
+                .meta = meta,
+                .callee = callee,
+                .args = try self.allocSlice(*const ast.Expr, &.{rest_ref}),
+            },
+        });
+
+        // Body expression: [body | __for_N(__rest)]
+        const body_desugared = try self.desugarExpr(fe.body);
+        const cons_body_expr = try self.create(ast.Expr, .{
+            .list_cons_expr = .{
+                .meta = meta,
+                .head = body_desugared,
+                .tail = recursive_call,
+            },
+        });
+
+        // With filter: if filter { [body | rec] } else { rec }
+        const final_body_expr: *const ast.Expr = if (fe.filter) |filter| blk: {
+            const desugared_filter = try self.desugarExpr(filter);
+            break :blk try self.create(ast.Expr, .{
+                .if_expr = .{
+                    .meta = meta,
+                    .condition = desugared_filter,
+                    .then_block = try self.allocSlice(ast.Stmt, &.{.{ .expr = cons_body_expr }}),
+                    .else_block = try self.allocSlice(ast.Stmt, &.{.{ .expr = recursive_call }}),
+                },
+            });
+        } else cons_body_expr;
+
+        const recursive_clause = ast.FunctionClause{
+            .meta = meta,
+            .params = try self.allocSlice(ast.Param, &.{cons_param}),
+            .return_type = null,
+            .refinement = null,
+            .body = try self.allocSlice(ast.Stmt, &.{.{ .expr = final_body_expr }}),
+        };
+
+        // Build function declaration with both clauses
+        const func_decl = try self.create(ast.FunctionDecl, .{
+            .meta = meta,
+            .name = helper_name,
+            .clauses = try self.allocSlice(ast.FunctionClause, &.{ base_clause, recursive_clause }),
+            .visibility = .private,
+        });
+
+        // Build the call: __for_N(list)
+        const iterable = try self.desugarExpr(fe.iterable);
+        const call_expr = try self.create(ast.Expr, .{
+            .call = .{
+                .meta = meta,
+                .callee = try self.create(ast.Expr, .{
+                    .var_ref = .{ .meta = meta, .name = helper_name },
+                }),
+                .args = try self.allocSlice(*const ast.Expr, &.{iterable}),
+            },
+        });
+
+        // Wrap in block: { fn __for_N(...); __for_N(list) }
+        return try self.create(ast.Expr, .{
+            .block = .{
+                .meta = meta,
+                .stmts = try self.allocSlice(ast.Stmt, &.{
+                    .{ .function_decl = func_decl },
+                    .{ .expr = call_expr },
+                }),
             },
         });
     }

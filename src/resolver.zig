@@ -354,6 +354,15 @@ pub const Resolver = struct {
                     .function => |func| try self.resolveExpr(func),
                 }
             },
+            .for_expr => |fe| {
+                try self.resolveExpr(fe.iterable);
+                if (fe.filter) |f| try self.resolveExpr(f);
+                try self.resolveExpr(fe.body);
+            },
+            .list_cons_expr => |lc| {
+                try self.resolveExpr(lc.head);
+                try self.resolveExpr(lc.tail);
+            },
         }
     }
 

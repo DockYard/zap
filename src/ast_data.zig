@@ -302,6 +302,24 @@ pub fn exprToCtValue(
             const args = try makeList(alloc, store, &.{ name, arity });
             return makeTuple3(alloc, store, .{ .atom = "&" }, try metaToList(alloc, store, v.meta, null), args);
         },
+
+        // For comprehension: {:for, meta, [var_atom, iterable, filter_or_nil, body]}
+        .for_expr => |v| {
+            const var_atom: CtValue = .{ .atom = interner.get(v.var_name) };
+            const iterable = try exprToCtValue(alloc, interner, store, v.iterable);
+            const filter_val = if (v.filter) |f| try exprToCtValue(alloc, interner, store, f) else CtValue.nil;
+            const body = try exprToCtValue(alloc, interner, store, v.body);
+            const args = try makeList(alloc, store, &.{ var_atom, iterable, filter_val, body });
+            return makeTuple3(alloc, store, .{ .atom = "for" }, try metaToList(alloc, store, v.meta, null), args);
+        },
+
+        // List cons expression: {:cons, meta, [head, tail]}
+        .list_cons_expr => |v| {
+            const head = try exprToCtValue(alloc, interner, store, v.head);
+            const tail = try exprToCtValue(alloc, interner, store, v.tail);
+            const args = try makeList(alloc, store, &.{ head, tail });
+            return makeTuple3(alloc, store, .{ .atom = "cons" }, try metaToList(alloc, store, v.meta, null), args);
+        },
     };
 }
 

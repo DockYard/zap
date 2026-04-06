@@ -210,6 +210,17 @@ pub const GeneralizedEscapeAnalyzer = struct {
                     try self.ctx.field_escapes.put(vkey, femap);
                 }
             },
+            .list_cons => |lc| {
+                _ = try self.registerAllocSite(func_id, lc.dest);
+                try self.setEscapeAndEnqueue(func_id, lc.dest, .no_escape);
+                const vkey = ValueKey{ .function = func_id, .local = lc.dest };
+                var femap = try FieldEscapeMap.init(self.allocator, 2);
+                const head_escape = self.ctx.getEscape(.{ .function = func_id, .local = lc.head });
+                const tail_escape = self.ctx.getEscape(.{ .function = func_id, .local = lc.tail });
+                femap.updateField(0, EscapeState.join(.no_escape, head_escape));
+                femap.updateField(1, EscapeState.join(.no_escape, tail_escape));
+                try self.ctx.field_escapes.put(vkey, femap);
+            },
             .map_init => |mi| {
                 _ = try self.registerAllocSite(func_id, mi.dest);
                 try self.setEscapeAndEnqueue(func_id, mi.dest, .no_escape);

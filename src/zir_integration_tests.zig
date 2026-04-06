@@ -1234,6 +1234,56 @@ test "ZIR: float arithmetic" {
 }
 
 // ============================================================
+// For comprehensions
+// ============================================================
+
+test "ZIR: for comprehension doubles list" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn sum([] :: [i64]) -> i64 {
+        \\    0
+        \\  }
+        \\
+        \\  pub fn sum([h | t] :: [i64]) -> i64 {
+        \\    h + sum(t)
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    doubled = for x <- [1, 2, 3] { x * 2 }
+        \\    Kernel.inspect(sum(doubled))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("12\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: for comprehension with filter" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn sum([] :: [i64]) -> i64 {
+        \\    0
+        \\  }
+        \\
+        \\  pub fn sum([h | t] :: [i64]) -> i64 {
+        \\    h + sum(t)
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    evens = for x <- [1, 2, 3, 4, 5, 6], x rem 2 == 0 { x }
+        \\    Kernel.inspect(sum(evens))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("12\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+// ============================================================
 // Tail calls
 // ============================================================
 

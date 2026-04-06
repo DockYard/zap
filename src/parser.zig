@@ -1772,6 +1772,7 @@ pub const Parser = struct {
             .keyword_if => return self.parseIfExpr(),
             .keyword_case => return self.parseCaseExpr(),
             .keyword_cond => return self.parseCondExpr(),
+            .keyword_for => return self.parseForExpr(),
             .keyword_quote => return self.parseQuoteExpr(),
             .keyword_unquote => return self.parseUnquoteExpr(),
             .keyword_unquote_splicing => return self.parseUnquoteSplicingExpr(),
@@ -1939,6 +1940,39 @@ pub const Parser = struct {
         });
     }
 
+    fn parseForExpr(self: *Parser) !*const ast.Expr {
+        const start = self.currentSpan();
+        _ = try self.expect(.keyword_for);
+
+        const var_tok = try self.expect(.identifier);
+        const var_name = try self.internToken(var_tok);
+        _ = try self.expect(.back_arrow); // <-
+        const iterable = try self.parseExpr();
+
+        // Optional filter: for x <- list, x > 0 { ... }
+        var filter: ?*const ast.Expr = null;
+        if (self.match(.comma)) {
+            filter = try self.parseExpr();
+        }
+
+        self.skipNewlines();
+        _ = try self.expect(.left_brace);
+        self.skipNewlines();
+        const body = try self.parseExpr();
+        self.skipNewlines();
+        _ = try self.expect(.right_brace);
+
+        return self.create(ast.Expr, .{
+            .for_expr = .{
+                .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
+                .var_name = var_name,
+                .iterable = iterable,
+                .filter = filter,
+                .body = body,
+            },
+        });
+    }
+
     fn parseModuleRefExpr(self: *Parser) !*const ast.Expr {
         const name = try self.parseModuleName();
         return self.create(ast.Expr, .{
@@ -2009,6 +2043,26 @@ pub const Parser = struct {
             }
             const elem = try self.parseExpr();
             try elements.append(self.allocator, elem);
+            // List cons expression: [head | tail]
+            if (self.check(.pipe)) {
+                _ = self.advance(); // consume |
+                const tail = try self.parseExpr();
+                _ = try self.expect(.right_bracket);
+                // Build nested cons: for [a, b | tail], create cons(a, cons(b, tail))
+                var result: *const ast.Expr = tail;
+                var i = elements.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    result = try self.create(ast.Expr, .{
+                        .list_cons_expr = .{
+                            .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
+                            .head = elements.items[i],
+                            .tail = result,
+                        },
+                    });
+                }
+                return result;
+            }
             if (!self.match(.comma)) break;
         }
 

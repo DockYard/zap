@@ -517,6 +517,11 @@ pub const UseDefInfo = struct {
                     try info.recordUse(elem, block);
                 }
             },
+            .list_cons => |lc| {
+                try info.recordDef(lc.dest, block);
+                try info.recordUse(lc.head, block);
+                try info.recordUse(lc.tail, block);
+            },
             .map_init => |mi| {
                 try info.recordDef(mi.dest, block);
                 for (mi.entries) |entry| {
@@ -1099,6 +1104,7 @@ fn instructionUsesLocal(local: ir.LocalId, instr: ir.Instruction) bool {
             for (ai.elements) |elem| if (elem == local) return true;
             return false;
         },
+        .list_cons => |lc| return lc.head == local or lc.tail == local,
         .map_init => |mi| {
             for (mi.entries) |entry| if (entry.key == local or entry.value == local) return true;
             return false;
@@ -1376,6 +1382,11 @@ pub const ConstraintGenerator = struct {
                 for (ai.elements) |elem| {
                     try self.addConstraint(self.regionOf(elem), dest_region, .store_into_container);
                 }
+            },
+            .list_cons => |lc| {
+                const dest_region = self.regionOf(lc.dest);
+                try self.addConstraint(self.regionOf(lc.head), dest_region, .store_into_container);
+                try self.addConstraint(self.regionOf(lc.tail), dest_region, .store_into_container);
             },
             .map_init => |mi| {
                 const dest_region = self.regionOf(mi.dest);
@@ -1714,6 +1725,7 @@ pub const RegionSolver = struct {
             .local_set => |ls| ls.dest,
             .param_get => |pg| pg.dest,
             .tuple_init, .list_init => |ai| ai.dest,
+            .list_cons => |lc| lc.dest,
             .map_init => |mi| mi.dest,
             .struct_init => |si| si.dest,
             .union_init => |ui| ui.dest,

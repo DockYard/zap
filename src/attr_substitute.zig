@@ -389,6 +389,26 @@ fn substituteInExpr(
             new_expr.* = .{ .block = .{ .meta = b.meta, .stmts = new_stmts } };
             return new_expr;
         },
+        .for_expr => |fe| {
+            const new_iterable = try substituteInExpr(alloc, fe.iterable, func_attrs, mod_attrs, interner, errors);
+            const new_filter = if (fe.filter) |f|
+                try substituteInExpr(alloc, f, func_attrs, mod_attrs, interner, errors)
+            else
+                null;
+            const new_body = try substituteInExpr(alloc, fe.body, func_attrs, mod_attrs, interner, errors);
+            if (new_iterable == fe.iterable and new_filter == fe.filter and new_body == fe.body) return expr;
+            const new_expr = try alloc.create(ast.Expr);
+            new_expr.* = .{ .for_expr = .{ .meta = fe.meta, .var_name = fe.var_name, .iterable = new_iterable, .filter = new_filter, .body = new_body } };
+            return new_expr;
+        },
+        .list_cons_expr => |lc| {
+            const new_head = try substituteInExpr(alloc, lc.head, func_attrs, mod_attrs, interner, errors);
+            const new_tail = try substituteInExpr(alloc, lc.tail, func_attrs, mod_attrs, interner, errors);
+            if (new_head == lc.head and new_tail == lc.tail) return expr;
+            const new_expr = try alloc.create(ast.Expr);
+            new_expr.* = .{ .list_cons_expr = .{ .meta = lc.meta, .head = new_head, .tail = new_tail } };
+            return new_expr;
+        },
         // Leaf expressions — no substitution needed
         .int_literal,
         .float_literal,

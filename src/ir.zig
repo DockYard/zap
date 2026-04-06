@@ -124,6 +124,7 @@ pub const Instruction = union(enum) {
     // Aggregates
     tuple_init: AggregateInit,
     list_init: AggregateInit,
+    list_cons: ListCons,
     map_init: MapInit,
     struct_init: StructInit,
     union_init: UnionInit,
@@ -312,6 +313,12 @@ pub const IndexGet = struct {
     dest: LocalId,
     object: LocalId,
     index: u32,
+};
+
+pub const ListCons = struct {
+    dest: LocalId,
+    head: LocalId,
+    tail: LocalId,
 };
 
 pub const ListLenCheck = struct {
@@ -3286,8 +3293,14 @@ pub const IrBuilder = struct {
                 try self.current_instrs.append(self.allocator, .{
                     .list_init = .{ .dest = dest, .elements = elements },
                 });
-                // Lists produce *const [N]T which can't be expressed as a ZigType.
-                // Mark as .any so the function becomes inline fn (Zig infers return type).
+                try self.known_local_types.put(dest, .any);
+            },
+            .list_cons => |lc| {
+                const head = try self.lowerExpr(lc.head);
+                const tail = try self.lowerExpr(lc.tail);
+                try self.current_instrs.append(self.allocator, .{
+                    .list_cons = .{ .dest = dest, .head = head, .tail = tail },
+                });
                 try self.known_local_types.put(dest, .any);
             },
             .panic => |msg| {

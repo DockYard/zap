@@ -159,6 +159,7 @@ pub const ExprKind = union(enum) {
     // Compound
     tuple_init: []const *const Expr,
     list_init: []const *const Expr,
+    list_cons: ListConsHir,
     map_init: []const MapEntry,
     struct_init: StructInit,
 
@@ -297,6 +298,11 @@ pub const CaseBindKind = enum {
 pub const AssignmentBinding = struct {
     name: ast.StringId,
     local_index: u32,
+};
+
+pub const ListConsHir = struct {
+    head: *const Expr,
+    tail: *const Expr,
 };
 
 pub const MapEntry = struct {
@@ -2575,6 +2581,16 @@ pub const HirBuilder = struct {
                     .kind = .{ .list_init = try elems.toOwnedSlice(self.allocator) },
                     .type_id = types_mod.TypeStore.UNKNOWN,
                     .span = l.meta.span,
+                });
+            },
+            .list_cons_expr => |lce| {
+                return try self.create(Expr, .{
+                    .kind = .{ .list_cons = .{
+                        .head = try self.buildExpr(lce.head),
+                        .tail = try self.buildExpr(lce.tail),
+                    } },
+                    .type_id = types_mod.TypeStore.UNKNOWN,
+                    .span = lce.meta.span,
                 });
             },
             .map => |m| {

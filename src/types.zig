@@ -2252,6 +2252,18 @@ pub const TypeChecker = struct {
                 return chain_type;
             },
             // error_pipe: infer the chain type as fallback.
+
+            // for_expr is desugared before type checking; return UNKNOWN if we see it
+            .for_expr => TypeStore.UNKNOWN,
+
+            // list_cons_expr: infer from head type → list type
+            .list_cons_expr => |lc| {
+                const head_type = try self.inferExpr(lc.head);
+                _ = try self.inferExpr(lc.tail);
+                return try self.store.addType(.{
+                    .list = .{ .element = head_type },
+                });
+            },
         };
     }
 

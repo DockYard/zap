@@ -649,6 +649,12 @@ pub const InterproceduralAnalyzer = struct {
                     }
                 },
 
+                .list_cons => |lc| {
+                    try fresh_locals.put(lc.dest, {});
+                    markEscapeToHeap(aliases, lc.head, param_summaries);
+                    markEscapeToHeap(aliases, lc.tail, param_summaries);
+                },
+
                 .map_init => |mi| {
                     try fresh_locals.put(mi.dest, {});
                     for (mi.entries) |entry| {
