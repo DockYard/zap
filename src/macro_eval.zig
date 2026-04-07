@@ -267,6 +267,39 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
                 }
             }
 
+            // split_words(string) — split a string on whitespace, return list of strings
+            if (std.mem.eql(u8, form_name, "split_words")) {
+                if (arg_elems.len == 1) {
+                    const val = try eval(env, arg_elems[0]);
+                    // Extract the string content from a wrapped literal {string, meta, nil}
+                    const content = if (val == .string)
+                        val.string
+                    else if (val == .tuple and val.tuple.elems.len == 3 and val.tuple.elems[0] == .string)
+                        val.tuple.elems[0].string
+                    else
+                        return .nil;
+
+                    var words = std.ArrayListUnmanaged(CtValue){};
+                    var i: usize = 0;
+                    while (i < content.len) {
+                        while (i < content.len and (content[i] == ' ' or content[i] == '\t' or content[i] == '\n' or content[i] == '\r')) : (i += 1) {}
+                        if (i >= content.len) break;
+                        const word_start = i;
+                        while (i < content.len and content[i] != ' ' and content[i] != '\t' and content[i] != '\n' and content[i] != '\r') : (i += 1) {}
+                        const word = content[word_start..i];
+                        // Wrap each word as a 3-tuple string literal: {word, [], nil}
+                        const word_elems = try env.alloc.alloc(CtValue, 3);
+                        word_elems[0] = .{ .string = word };
+                        word_elems[1] = .{ .list = .{ .alloc_id = 0, .elems = &.{} } };
+                        word_elems[2] = .nil;
+                        const word_id = env.store.alloc(env.alloc, .tuple, null);
+                        try words.append(env.alloc, CtValue{ .tuple = .{ .alloc_id = word_id, .elems = word_elems } });
+                    }
+                    const list_id = env.store.alloc(env.alloc, .list, null);
+                    return CtValue{ .list = .{ .alloc_id = list_id, .elems = try words.toOwnedSlice(env.alloc) } };
+                }
+            }
+
             // length(list_or_tuple) — get length
             if (std.mem.eql(u8, form_name, "length")) {
                 if (arg_elems.len == 1) {

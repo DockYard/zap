@@ -2609,13 +2609,14 @@ pub const Parser = struct {
 
     /// Parse a sigil expression: ~x"content" or ~abc"""heredoc"""
     /// Desugars to sigil_x("content", []) — a regular function call.
+    /// All sigils desugar to sigil_NAME(content, []) — a regular function call.
+    /// Sigil implementations are defined in Zap code (Kernel for built-ins).
     fn parseSigilExpr(self: *Parser) !*const ast.Expr {
         const start = self.currentSpan();
-        const sigil_tok = self.advance(); // consume sigil_prefix token
+        const sigil_tok = self.advance();
         const sigil_text = sigil_tok.slice(self.source);
-        const sigil_name = sigil_text[1..]; // strip ~
+        const sigil_name = sigil_text[1..];
 
-        // Parse the string argument
         const string_expr = if (self.check(.string_literal))
             try self.parseStringLiteral()
         else if (self.check(.string_literal_start))
@@ -2630,30 +2631,6 @@ pub const Parser = struct {
             return error.ParseError;
         };
 
-        // Built-in single-char sigils: handle at parse time
-        if (sigil_name.len == 1) {
-            switch (sigil_name[0]) {
-                // ~s"..." — string with interpolation (same as regular string)
-                's' => return string_expr,
-
-                // ~S"..." — raw string, no interpolation or escape processing
-                // For now, same as regular string (escape handling is in lexer)
-                'S' => return string_expr,
-
-                // ~w"foo bar baz" — word list: split on whitespace → ["foo", "bar", "baz"]
-                'w', 'W' => {
-                    if (string_expr.* == .string_literal) {
-                        const content = self.interner.get(string_expr.string_literal.value);
-                        return self.splitWordsToList(content, start);
-                    }
-                    // Interpolated word list — can't split at compile time, fall through to function call
-                },
-
-                else => {}, // unknown single-char sigil — fall through to function call
-            }
-        }
-
-        // Multi-char or unknown sigils: desugar to sigil_NAME(content, [])
         const func_name = try std.fmt.allocPrint(self.allocator, "sigil_{s}", .{sigil_name});
         const func_id = try self.interner.intern(func_name);
 
@@ -2669,28 +2646,6 @@ pub const Parser = struct {
                 .callee = callee,
                 .args = try self.allocator.dupe(*const ast.Expr, &.{ string_expr, empty_list }),
             },
-        });
-    }
-
-    /// Split a string on whitespace and produce a list literal AST node.
-    fn splitWordsToList(self: *Parser, content: []const u8, meta_span: ast.SourceSpan) !*const ast.Expr {
-        var words: std.ArrayList(*const ast.Expr) = .empty;
-        var i: usize = 0;
-        while (i < content.len) {
-            // Skip whitespace
-            while (i < content.len and (content[i] == ' ' or content[i] == '\t' or content[i] == '\n' or content[i] == '\r')) : (i += 1) {}
-            if (i >= content.len) break;
-            // Collect word
-            const word_start = i;
-            while (i < content.len and content[i] != ' ' and content[i] != '\t' and content[i] != '\n' and content[i] != '\r') : (i += 1) {}
-            const word = content[word_start..i];
-            const word_id = try self.interner.intern(word);
-            try words.append(self.allocator, try self.create(ast.Expr, .{
-                .string_literal = .{ .meta = .{ .span = meta_span }, .value = word_id },
-            }));
-        }
-        return self.create(ast.Expr, .{
-            .list = .{ .meta = .{ .span = meta_span }, .elements = try words.toOwnedSlice(self.allocator) },
         });
     }
 
@@ -4805,7 +4760,7 @@ test "parse multi-char sigil" {
     try std.testing.expectEqualStrings("sigil_sql", parser.interner.get(expr.call.callee.var_ref.name));
 }
 
-test "parse ~s sigil produces string" {
+test "parse ~s sigil desugars to sigil_s call" {
     const source =
         \\pub module Test {
         \\  pub fn run() -> String {
@@ -4824,34 +4779,14 @@ test "parse ~s sigil produces string" {
     const body = func.clauses[0].body.?;
     const expr = body[0].expr;
 
-    // ~s"hello world" produces a plain string literal
-    try std.testing.expect(expr.* == .string_literal);
-    try std.testing.expectEqualStrings("hello world", parser.interner.get(expr.string_literal.value));
+    try std.testing.expect(expr.* == .call);
+    try std.testing.expectEqualStrings("sigil_s", parser.interner.get(expr.call.callee.var_ref.name));
+    try std.testing.expectEqual(@as(usize, 2), expr.call.args.len);
+    try std.testing.expect(expr.call.args[0].* == .string_literal);
+    try std.testing.expect(expr.call.args[1].* == .list);
 }
 
-test "parse ~S sigil produces raw string" {
-    const source =
-        \\pub module Test {
-        \\  pub fn run() -> String {
-        \\    ~S"no \n escapes"
-        \\  }
-        \\}
-    ;
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
-    defer parser.deinit();
-
-    const program = try parser.parseProgram();
-    const func = program.modules[0].items[0].function;
-    const body = func.clauses[0].body.?;
-    const expr = body[0].expr;
-
-    try std.testing.expect(expr.* == .string_literal);
-}
-
-test "parse ~w sigil produces word list" {
+test "parse ~w sigil desugars to sigil_w call" {
     const source =
         \\pub module Test {
         \\  pub fn run() -> String {
@@ -4870,37 +4805,7 @@ test "parse ~w sigil produces word list" {
     const body = func.clauses[0].body.?;
     const expr = body[0].expr;
 
-    // ~w"foo bar baz" produces ["foo", "bar", "baz"]
-    try std.testing.expect(expr.* == .list);
-    try std.testing.expectEqual(@as(usize, 3), expr.list.elements.len);
-    try std.testing.expect(expr.list.elements[0].* == .string_literal);
-    try std.testing.expectEqualStrings("foo", parser.interner.get(expr.list.elements[0].string_literal.value));
-    try std.testing.expectEqualStrings("bar", parser.interner.get(expr.list.elements[1].string_literal.value));
-    try std.testing.expectEqualStrings("baz", parser.interner.get(expr.list.elements[2].string_literal.value));
-}
-
-test "parse ~W sigil produces word list (no interpolation)" {
-    const source =
-        \\pub module Test {
-        \\  pub fn run() -> String {
-        \\    ~W"alpha beta"
-        \\  }
-        \\}
-    ;
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
-    defer parser.deinit();
-
-    const program = try parser.parseProgram();
-    const func = program.modules[0].items[0].function;
-    const body = func.clauses[0].body.?;
-    const expr = body[0].expr;
-
-    try std.testing.expect(expr.* == .list);
-    try std.testing.expectEqual(@as(usize, 2), expr.list.elements.len);
-    try std.testing.expectEqualStrings("alpha", parser.interner.get(expr.list.elements[0].string_literal.value));
-    try std.testing.expectEqualStrings("beta", parser.interner.get(expr.list.elements[1].string_literal.value));
+    try std.testing.expect(expr.* == .call);
+    try std.testing.expectEqualStrings("sigil_w", parser.interner.get(expr.call.callee.var_ref.name));
 }
 

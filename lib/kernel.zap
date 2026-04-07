@@ -55,6 +55,26 @@ pub module Kernel {
     quote { unquote(decl) }
   }
 
+  # Sigils — ~s, ~S, ~w, ~W
+
+  pub macro sigil_s(content :: Expr, _opts :: Expr) -> Expr {
+    content
+  }
+
+  pub macro sigil_S(content :: Expr, _opts :: Expr) -> Expr {
+    content
+  }
+
+  pub macro sigil_w(content :: Expr, _opts :: Expr) -> Expr {
+    _words = split_words(content)
+    _words
+  }
+
+  pub macro sigil_W(content :: Expr, _opts :: Expr) -> Expr {
+    _words = split_words(content)
+    _words
+  }
+
   pub macro |>(left :: Expr, right :: Expr) -> Expr {
     _name = elem(right, 0)
     _meta = elem(right, 1)
