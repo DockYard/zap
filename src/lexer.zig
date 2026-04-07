@@ -17,6 +17,7 @@ pub const Lexer = struct {
     // String interpolation tracking
     interp_depth: u32,
     interp_brace_depth: u32,
+    in_heredoc: bool,
 
     pub fn init(source: []const u8) Lexer {
         return Lexer{
@@ -27,6 +28,7 @@ pub const Lexer = struct {
             .source_id = null,
             .interp_depth = 0,
             .interp_brace_depth = 0,
+            .in_heredoc = false,
         };
     }
 
@@ -104,8 +106,92 @@ pub const Lexer = struct {
         }
     }
 
+    fn lexHeredoc(self: *Lexer) Token {
+        const start = self.pos;
+        self.pos += 3; // skip opening """
+
+        // Skip rest of opening line (must be whitespace/newline only)
+        while (self.pos < self.source.len and self.source[self.pos] != '\n') {
+            self.pos += 1;
+        }
+        if (self.pos < self.source.len) {
+            self.pos += 1; // skip the newline
+            self.line += 1;
+            self.line_start = self.pos;
+        }
+
+        // Consume until closing """
+        while (self.pos + 2 < self.source.len) {
+            const ch = self.source[self.pos];
+            if (ch == '"' and self.source[self.pos + 1] == '"' and self.source[self.pos + 2] == '"') {
+                self.pos += 3; // skip closing """
+                return self.makeToken(.string_literal, start, self.pos);
+            }
+            if (ch == '#' and self.pos + 1 < self.source.len and self.source[self.pos + 1] == '{') {
+                const token = self.makeToken(.string_literal_start, start, self.pos);
+                self.pos += 2;
+                self.interp_depth += 1;
+                self.interp_brace_depth = 0;
+                self.in_heredoc = true;
+                return token;
+            }
+            if (ch == '\\' and self.pos + 1 < self.source.len) {
+                self.pos += 2;
+                continue;
+            }
+            if (ch == '\n') {
+                self.line += 1;
+                self.line_start = self.pos + 1;
+            }
+            self.pos += 1;
+        }
+
+        return self.makeToken(.invalid, start, self.pos);
+    }
+
+    /// Continue lexing a heredoc after the closing } of an interpolation.
+    fn lexHeredocContinuation(self: *Lexer) Token {
+        const start = self.pos;
+
+        while (self.pos + 2 < self.source.len) {
+            const ch = self.source[self.pos];
+            if (ch == '"' and self.source[self.pos + 1] == '"' and self.source[self.pos + 2] == '"') {
+                self.pos += 3;
+                self.in_heredoc = false;
+                return self.makeToken(.string_literal_end, start, self.pos);
+            }
+            if (ch == '#' and self.pos + 1 < self.source.len and self.source[self.pos + 1] == '{') {
+                const token = self.makeToken(.string_literal_part, start, self.pos);
+                self.pos += 2;
+                self.interp_depth += 1;
+                self.interp_brace_depth = 0;
+                return token;
+            }
+            if (ch == '\\' and self.pos + 1 < self.source.len) {
+                self.pos += 2;
+                continue;
+            }
+            if (ch == '\n') {
+                self.line += 1;
+                self.line_start = self.pos + 1;
+            }
+            self.pos += 1;
+        }
+
+        self.in_heredoc = false;
+        return self.makeToken(.invalid, start, self.pos);
+    }
+
     fn lexString(self: *Lexer) Token {
         const start = self.pos;
+
+        // Check for heredoc: """
+        if (self.pos + 2 < self.source.len and
+            self.source[self.pos + 1] == '"' and self.source[self.pos + 2] == '"')
+        {
+            return self.lexHeredoc();
+        }
+
         self.pos += 1; // skip opening quote
 
         while (self.pos < self.source.len) {
@@ -139,6 +225,7 @@ pub const Lexer = struct {
     /// Continue lexing a string after the closing } of an interpolation.
     /// Returns string_literal_part (if another #{) or string_literal_end (if ").
     fn lexStringContinuation(self: *Lexer) Token {
+        if (self.in_heredoc) return self.lexHeredocContinuation();
         const start = self.pos;
 
         while (self.pos < self.source.len) {

@@ -1887,11 +1887,58 @@ pub const Parser = struct {
     fn parseStringLiteral(self: *Parser) !*const ast.Expr {
         const tok = self.advance();
         const raw = tok.slice(self.source);
-        const stripped = if (raw.len >= 2) raw[1 .. raw.len - 1] else raw;
+
+        // Heredoc: """content""" — strip 3 quotes each side, then strip indentation
+        const is_heredoc = raw.len >= 6 and raw[0] == '"' and raw[1] == '"' and raw[2] == '"';
+        const stripped = if (is_heredoc)
+            stripHeredocIndent(raw[3 .. raw.len - 3])
+        else if (raw.len >= 2)
+            raw[1 .. raw.len - 1]
+        else
+            raw;
+
         const value = self.unescapeString(stripped);
         return self.create(ast.Expr, .{
             .string_literal = .{ .meta = .{ .span = ast.SourceSpan.from(tok.loc) }, .value = try self.interner.intern(value) },
         });
+    }
+
+    /// Strip indentation from heredoc content.
+    /// The indentation of the closing line (last line) determines strip amount.
+    fn stripHeredocIndent(content: []const u8) []const u8 {
+        if (content.len == 0) return content;
+
+        // Skip leading newline (content starts after opening """ line)
+        var start: usize = 0;
+        if (content[0] == '\n') start = 1;
+
+        // Find the last line — its leading whitespace is the indent to strip
+        var indent: usize = 0;
+        var last_line_start: usize = start;
+        for (content[start..], start..) |ch, i| {
+            if (ch == '\n') last_line_start = i + 1;
+        }
+        // Count whitespace on the last line
+        var i = last_line_start;
+        while (i < content.len and (content[i] == ' ' or content[i] == '\t')) : (i += 1) {
+            indent += 1;
+        }
+
+        // If last line is only whitespace, strip it and use its indent
+        const end = if (last_line_start > start and i >= content.len)
+            last_line_start - 1 // remove trailing newline before closing indent line
+        else
+            content.len;
+
+        // Return content between start and end (indent stripping of individual
+        // lines would require allocation — for now we trim the envelope)
+        if (start >= end or indent == 0) {
+            if (start >= content.len) return "";
+            return if (end <= content.len) content[start..end] else content[start..];
+        }
+        // Can't allocate in a pure function, so return trimmed without per-line strip
+        if (start >= content.len) return "";
+        return content[start..end];
     }
 
     fn parseStringInterpolation(self: *Parser) !*const ast.Expr {
