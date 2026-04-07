@@ -1,3 +1,34 @@
+## Zap is a Language — Implement Features in Zap Code
+
+**THIS IS THE MOST IMPORTANT RULE. VIOLATIONS ARE UNACCEPTABLE.**
+
+Zap is a general-purpose programming language. Features, behaviors, library functions, and language constructs MUST be implemented in Zap source code (`lib/*.zap`), NOT hardcoded in the Zig compiler (`src/*.zig`).
+
+**NEVER hardcode Zap module names, function names, or library behavior in the compiler.** The compiler is a general-purpose tool. It does not know about IO, String, Kernel, Map, Zest, or any other Zap module. If you find yourself writing a Zap module name as a string literal in Zig source, you are doing it wrong. Stop. Think. Find the Zap-level solution.
+
+**ALWAYS attempt the Zap solution first.** Before touching any Zig compiler code, ask: "Can this be done in Zap?" If the answer is "yes" or "maybe," do it in Zap. If you think it can't be done in Zap, think harder. Research how Elixir solves it. Research how other languages solve it. Only touch the compiler as a last resort for genuine language primitives (parsing, type system, ZIR emission).
+
+**The only things that belong in Zig:**
+- Lexer/parser syntax (tokens, AST nodes)
+- Type system primitives (Bool, String, Atom, i64, etc.)
+- ZIR emission mechanics
+- Zig runtime primitives that physically cannot be expressed in Zap (stdout, OS argv, memory allocation)
+
+**Everything else is Zap code:**
+- Standard library functions (IO, String, Integer, etc.) — defined in `lib/*.zap`, call `:zig.` for primitives
+- Macros (if, unless, and, or, |>, sigils) — defined in `lib/kernel.zap`
+- Test framework — defined in `lib/zest/*.zap`
+- Sigil implementations — defined as macros in Kernel
+- Validation, error checking, behavior — Zap macros and functions
+
+**Do not take shortcuts.** Do not bypass Zap because the Zig solution is "easier" or "faster." Do not hardcode behavior in the compiler because you can't figure out how to do it in Zap. Spend the time. Research deeply. Find the correct solution. Cost and time are not concerns — correctness is.
+
+**Do not create unnecessary abstractions in Zig.** No `@native`, no route tables, no runtime state tracking in Zig for things that are Zap-level concerns. If something was implemented in Zig and it could be Zap, rip it out and rewrite it in Zap.
+
+## Documentation
+
+**All public Zap functions MUST have `@doc` attributes.** Every `pub fn` and `pub macro` in `lib/*.zap` files must have a `@doc` string describing what it does. Use heredoc `"""` for multi-line docs. No exceptions.
+
 ## Development Workflow
 
 *NEVER* change old migrations that are already in git history.
