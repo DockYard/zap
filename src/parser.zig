@@ -2613,14 +2613,9 @@ pub const Parser = struct {
         const start = self.currentSpan();
         const sigil_tok = self.advance(); // consume sigil_prefix token
         const sigil_text = sigil_tok.slice(self.source);
-        // Strip the ~ prefix to get the sigil name
-        const sigil_name = sigil_text[1..];
+        const sigil_name = sigil_text[1..]; // strip ~
 
-        // Build the function name: sigil_NAME
-        const func_name = try std.fmt.allocPrint(self.allocator, "sigil_{s}", .{sigil_name});
-        const func_id = try self.interner.intern(func_name);
-
-        // Parse the string argument (must immediately follow the sigil prefix)
+        // Parse the string argument
         const string_expr = if (self.check(.string_literal))
             try self.parseStringLiteral()
         else if (self.check(.string_literal_start))
@@ -2635,22 +2630,67 @@ pub const Parser = struct {
             return error.ParseError;
         };
 
-        // Build empty list for options argument
+        // Built-in single-char sigils: handle at parse time
+        if (sigil_name.len == 1) {
+            switch (sigil_name[0]) {
+                // ~s"..." — string with interpolation (same as regular string)
+                's' => return string_expr,
+
+                // ~S"..." — raw string, no interpolation or escape processing
+                // For now, same as regular string (escape handling is in lexer)
+                'S' => return string_expr,
+
+                // ~w"foo bar baz" — word list: split on whitespace → ["foo", "bar", "baz"]
+                'w', 'W' => {
+                    if (string_expr.* == .string_literal) {
+                        const content = self.interner.get(string_expr.string_literal.value);
+                        return self.splitWordsToList(content, start);
+                    }
+                    // Interpolated word list — can't split at compile time, fall through to function call
+                },
+
+                else => {}, // unknown single-char sigil — fall through to function call
+            }
+        }
+
+        // Multi-char or unknown sigils: desugar to sigil_NAME(content, [])
+        const func_name = try std.fmt.allocPrint(self.allocator, "sigil_{s}", .{sigil_name});
+        const func_id = try self.interner.intern(func_name);
+
         const empty_list = try self.create(ast.Expr, .{
             .list = .{ .meta = .{ .span = start }, .elements = &.{} },
         });
-
-        // Desugar to: sigil_NAME(content, [])
         const callee = try self.create(ast.Expr, .{
             .var_ref = .{ .meta = .{ .span = start }, .name = func_id },
         });
-
         return self.create(ast.Expr, .{
             .call = .{
                 .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
                 .callee = callee,
                 .args = try self.allocator.dupe(*const ast.Expr, &.{ string_expr, empty_list }),
             },
+        });
+    }
+
+    /// Split a string on whitespace and produce a list literal AST node.
+    fn splitWordsToList(self: *Parser, content: []const u8, meta_span: ast.SourceSpan) !*const ast.Expr {
+        var words: std.ArrayList(*const ast.Expr) = .empty;
+        var i: usize = 0;
+        while (i < content.len) {
+            // Skip whitespace
+            while (i < content.len and (content[i] == ' ' or content[i] == '\t' or content[i] == '\n' or content[i] == '\r')) : (i += 1) {}
+            if (i >= content.len) break;
+            // Collect word
+            const word_start = i;
+            while (i < content.len and content[i] != ' ' and content[i] != '\t' and content[i] != '\n' and content[i] != '\r') : (i += 1) {}
+            const word = content[word_start..i];
+            const word_id = try self.interner.intern(word);
+            try words.append(self.allocator, try self.create(ast.Expr, .{
+                .string_literal = .{ .meta = .{ .span = meta_span }, .value = word_id },
+            }));
+        }
+        return self.create(ast.Expr, .{
+            .list = .{ .meta = .{ .span = meta_span }, .elements = try words.toOwnedSlice(self.allocator) },
         });
     }
 
@@ -4763,5 +4803,104 @@ test "parse multi-char sigil" {
 
     try std.testing.expect(expr.* == .call);
     try std.testing.expectEqualStrings("sigil_sql", parser.interner.get(expr.call.callee.var_ref.name));
+}
+
+test "parse ~s sigil produces string" {
+    const source =
+        \\pub module Test {
+        \\  pub fn run() -> String {
+        \\    ~s"hello world"
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const func = program.modules[0].items[0].function;
+    const body = func.clauses[0].body.?;
+    const expr = body[0].expr;
+
+    // ~s"hello world" produces a plain string literal
+    try std.testing.expect(expr.* == .string_literal);
+    try std.testing.expectEqualStrings("hello world", parser.interner.get(expr.string_literal.value));
+}
+
+test "parse ~S sigil produces raw string" {
+    const source =
+        \\pub module Test {
+        \\  pub fn run() -> String {
+        \\    ~S"no \n escapes"
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const func = program.modules[0].items[0].function;
+    const body = func.clauses[0].body.?;
+    const expr = body[0].expr;
+
+    try std.testing.expect(expr.* == .string_literal);
+}
+
+test "parse ~w sigil produces word list" {
+    const source =
+        \\pub module Test {
+        \\  pub fn run() -> String {
+        \\    ~w"foo bar baz"
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const func = program.modules[0].items[0].function;
+    const body = func.clauses[0].body.?;
+    const expr = body[0].expr;
+
+    // ~w"foo bar baz" produces ["foo", "bar", "baz"]
+    try std.testing.expect(expr.* == .list);
+    try std.testing.expectEqual(@as(usize, 3), expr.list.elements.len);
+    try std.testing.expect(expr.list.elements[0].* == .string_literal);
+    try std.testing.expectEqualStrings("foo", parser.interner.get(expr.list.elements[0].string_literal.value));
+    try std.testing.expectEqualStrings("bar", parser.interner.get(expr.list.elements[1].string_literal.value));
+    try std.testing.expectEqualStrings("baz", parser.interner.get(expr.list.elements[2].string_literal.value));
+}
+
+test "parse ~W sigil produces word list (no interpolation)" {
+    const source =
+        \\pub module Test {
+        \\  pub fn run() -> String {
+        \\    ~W"alpha beta"
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const func = program.modules[0].items[0].function;
+    const body = func.clauses[0].body.?;
+    const expr = body[0].expr;
+
+    try std.testing.expect(expr.* == .list);
+    try std.testing.expectEqual(@as(usize, 2), expr.list.elements.len);
+    try std.testing.expectEqualStrings("alpha", parser.interner.get(expr.list.elements[0].string_literal.value));
+    try std.testing.expectEqualStrings("beta", parser.interner.get(expr.list.elements[1].string_literal.value));
 }
 
