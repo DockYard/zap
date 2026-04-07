@@ -29,6 +29,14 @@ Zap is a general-purpose programming language. Features, behaviors, library func
 
 **All public Zap functions MUST have `@doc` attributes.** Every `pub fn` and `pub macro` in `lib/*.zap` files must have a `@doc` string describing what it does. Use heredoc `"""` for multi-line docs. No exceptions.
 
+## Zap Code Quality
+
+- **Blank line after every heredoc closing `"""`**. The `"""` must be followed by an empty line before the next declaration or attribute. No exceptions.
+- **`@moduledoc` goes inside the module body**, immediately after `pub module Name {`.
+- **`@doc` goes immediately before the function/macro it documents**, with a blank line between the closing `"""` and the `pub fn`/`pub macro`.
+- **All `@doc` and `@moduledoc` use heredoc `"""`** for multi-line content.
+- **Escape `#{` in doc examples** as `\#{` to prevent interpolation inside heredocs.
+
 ## Development Workflow
 
 *NEVER* change old migrations that are already in git history.

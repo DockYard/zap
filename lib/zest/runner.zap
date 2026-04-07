@@ -16,6 +16,7 @@ pub module Zest.Runner {
           }
         }
     """
+
   pub macro __using__(_opts :: Expr) -> Expr {
     quote {
       import Zest.Runner
@@ -34,6 +35,7 @@ pub module Zest.Runner {
           Zest.Runner.run()
         }
     """
+
   pub fn run() -> String {
     IO.puts("")
     "done"

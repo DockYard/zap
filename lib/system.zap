@@ -16,6 +16,7 @@ pub module System {
         # Running: zap run my_app -- foo bar
         System.arg_count()  # => 2
     """
+
   pub fn arg_count() -> i64 {
     :zig.Prelude.arg_count()
   }
@@ -33,6 +34,7 @@ pub module System {
         System.arg_at(0)  # => "hello"
         System.arg_at(1)  # => "world"
     """
+
   pub fn arg_at(index :: i64) -> String {
     :zig.Prelude.arg_at(index)
   }
@@ -48,6 +50,7 @@ pub module System {
         System.get_env("HOME")      # => "/Users/alice"
         System.get_env("UNDEFINED") # => ""
     """
+
   pub fn get_env(name :: String) -> String {
     :zig.Prelude.get_env(name)
   }
@@ -63,6 +66,7 @@ pub module System {
         # Building: zap build my_app -Doptimize=release_fast
         System.get_build_opt("optimize")  # => "release_fast"
     """
+
   pub fn get_build_opt(name :: String) -> String {
     :zig.Prelude.get_build_opt(name)
   }

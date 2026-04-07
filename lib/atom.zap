@@ -18,6 +18,7 @@ pub module Atom {
         Atom.to_string(:ok)     # => "ok"
         Atom.to_string(:error)  # => "error"
     """
+
   pub fn to_string(atom :: Atom) -> String {
     :zig.Prelude.atom_name(atom)
   }

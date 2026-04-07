@@ -10,6 +10,7 @@ pub module Kernel {
     You don't need to `import Kernel` — its macros are available
     everywhere automatically.
     """
+
   @doc = """
     Conditional expression with a single branch.
 
@@ -22,6 +23,7 @@ pub module Kernel {
           "positive"
         }
     """
+
   pub macro if(condition :: Expr, then_body :: Expr) -> Nil {
     quote {
       case unquote(condition) {
@@ -45,6 +47,7 @@ pub module Kernel {
           "non-positive"
         }
     """
+
   pub macro if(condition :: Expr, then_body :: Expr, else_body :: Expr) -> Nil {
     quote {
       case unquote(condition) {
@@ -63,6 +66,7 @@ pub module Kernel {
           IO.puts("still working...")
         }
     """
+
   pub macro unless(condition :: Expr, body :: Expr) -> Nil {
     quote {
       if not unquote(condition) {
@@ -83,6 +87,7 @@ pub module Kernel {
         true and false   # => false
         false and expr   # => false (expr not evaluated)
     """
+
   pub macro and(left :: Expr, right :: Expr) -> Expr {
     quote {
       case unquote(left) {
@@ -104,6 +109,7 @@ pub module Kernel {
         false or false  # => false
         true or expr    # => true (expr not evaluated)
     """
+
   pub macro or(left :: Expr, right :: Expr) -> Expr {
     quote {
       case unquote(left) {
@@ -121,6 +127,7 @@ pub module Kernel {
     customization such as validation, instrumentation, or
     compile-time checks.
     """
+
   pub macro fn(decl :: Expr) -> Expr {
     quote { unquote(decl) }
   }
@@ -131,6 +138,7 @@ pub module Kernel {
     Receives the full struct declaration AST and returns it.
     Identity transform — hook point for future customization.
     """
+
   pub macro struct(decl :: Expr) -> Expr {
     quote { unquote(decl) }
   }
@@ -141,6 +149,7 @@ pub module Kernel {
     Receives the full union declaration AST and returns it.
     Identity transform — hook point for future customization.
     """
+
   pub macro union(decl :: Expr) -> Expr {
     quote { unquote(decl) }
   }
@@ -158,6 +167,7 @@ pub module Kernel {
         ~s"hello"         # => "hello"
         ~s"count: \#{42}" # => "count: 42"
     """
+
   pub macro sigil_s(content :: Expr, _opts :: Expr) -> Expr {
     content
   }
@@ -173,6 +183,7 @@ pub module Kernel {
         ~S"hello"          # => "hello"
         ~S"no \#{interp}"   # => "no \#{interp}" (literal)
     """
+
   pub macro sigil_S(content :: Expr, _opts :: Expr) -> Expr {
     content
   }
@@ -188,6 +199,7 @@ pub module Kernel {
         ~w"foo bar baz"  # => ["foo", "bar", "baz"]
         ~w"hello world"  # => ["hello", "world"]
     """
+
   pub macro sigil_w(content :: Expr, _opts :: Expr) -> Expr {
     split_words(content)
   }
@@ -202,6 +214,7 @@ pub module Kernel {
 
         ~W"foo bar baz"  # => ["foo", "bar", "baz"]
     """
+
   pub macro sigil_W(content :: Expr, _opts :: Expr) -> Expr {
     split_words(content)
   }
@@ -218,6 +231,7 @@ pub module Kernel {
         "hello" |> String.length()  # => String.length("hello")
         x |> f() |> g()            # => g(f(x))
     """
+
   pub macro |>(left :: Expr, right :: Expr) -> Expr {
     _name = elem(right, 0)
     _meta = elem(right, 1)

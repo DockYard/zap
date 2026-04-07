@@ -24,6 +24,7 @@ pub module String {
         String.length("hello")  # => 5
         String.length("")       # => 0
     """
+
   pub fn length(s :: String) -> i64 {
     :zig.ZapString.length(s)
   }
@@ -40,6 +41,7 @@ pub module String {
         String.byte_at("hello", 4)  # => "o"
         String.byte_at("hello", 99) # => ""
     """
+
   pub fn byte_at(s :: String, index :: i64) -> String {
     :zig.ZapString.byte_at(s, index)
   }
@@ -53,6 +55,7 @@ pub module String {
         String.contains("hello world", "xyz")    # => false
         String.contains("hello", "")             # => true
     """
+
   pub fn contains(haystack :: String, needle :: String) -> Bool {
     :zig.ZapString.contains(haystack, needle)
   }
@@ -65,6 +68,7 @@ pub module String {
         String.starts_with("hello", "hel")  # => true
         String.starts_with("hello", "world") # => false
     """
+
   pub fn starts_with(s :: String, prefix :: String) -> Bool {
     :zig.ZapString.startsWith(s, prefix)
   }
@@ -77,6 +81,7 @@ pub module String {
         String.ends_with("hello", "llo")    # => true
         String.ends_with("hello", "world")  # => false
     """
+
   pub fn ends_with(s :: String, suffix :: String) -> Bool {
     :zig.ZapString.endsWith(s, suffix)
   }
@@ -90,6 +95,7 @@ pub module String {
 
         String.trim("  hello  ")   # => "hello"
     """
+
   pub fn trim(s :: String) -> String {
     :zig.ZapString.trim(s)
   }
@@ -105,6 +111,7 @@ pub module String {
         String.slice("hello world", 0, 5)   # => "hello"
         String.slice("hello world", 6, 11)  # => "world"
     """
+
   pub fn slice(s :: String, start :: i64, end :: i64) -> String {
     :zig.ZapString.slice(s, start, end)
   }
@@ -119,6 +126,7 @@ pub module String {
         String.to_atom("ok")    # => :ok
         String.to_atom("error") # => :error
     """
+
   pub fn to_atom(name :: String) -> Atom {
     :zig.ZapString.to_atom(name)
   }
@@ -133,6 +141,7 @@ pub module String {
 
         String.to_existing_atom("ok")  # => :ok (if :ok exists)
     """
+
   pub fn to_existing_atom(name :: String) -> Atom {
     :zig.ZapString.to_existing_atom(name)
   }

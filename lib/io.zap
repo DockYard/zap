@@ -27,6 +27,7 @@ pub module IO {
         "result" |> IO.puts()
         # => prints "result\n", returns "result"
     """
+
   pub fn puts(message :: String) -> String {
     :zig.Prelude.println(message)
     message
@@ -43,6 +44,7 @@ pub module IO {
         IO.print_str("loading...")
         # => prints "loading..." without newline
     """
+
   pub fn print_str(message :: String) -> String {
     :zig.Prelude.print_str(message)
     message

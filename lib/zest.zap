@@ -12,6 +12,7 @@ pub module Zest {
   @doc = """
     Asserts that a boolean value is `true`. Panics on failure.
     """
+
   pub fn assert(value :: Bool) -> String {
     case value {
       true -> "."
@@ -22,6 +23,7 @@ pub module Zest {
   @doc = """
     Asserts that a boolean value is `true` with a custom failure message.
     """
+
   pub fn assert(value :: Bool, message :: String) -> String {
     case value {
       true -> "."
@@ -32,6 +34,7 @@ pub module Zest {
   @doc = """
     Asserts that a boolean value is `false`. Panics on failure.
     """
+
   pub fn reject(value :: Bool) -> String {
     case value {
       false -> "."
@@ -42,6 +45,7 @@ pub module Zest {
   @doc = """
     Asserts that a boolean value is `false` with a custom failure message.
     """
+
   pub fn reject(value :: Bool, message :: String) -> String {
     case value {
       false -> "."

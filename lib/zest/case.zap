@@ -21,6 +21,7 @@ pub module Zest.Case {
           }
         }
     """
+
   pub macro __using__(_opts :: Expr) -> Expr {
     quote {
       import Zest.Case
@@ -41,6 +42,7 @@ pub module Zest.Case {
           }
         }
     """
+
   pub macro describe(name :: Expr, body :: Expr) -> Expr {
     quote {
       unquote(body)
@@ -60,6 +62,7 @@ pub module Zest.Case {
           assert(true == true)
         }
     """
+
   pub macro test(name :: Expr, body :: Expr) -> Expr {
     quote {
       unquote(body)
@@ -78,6 +81,7 @@ pub module Zest.Case {
         assert(true)           # passes
         assert(false)          # panics
     """
+
   pub fn assert(value :: Bool) -> String {
     case value {
       true -> "."
@@ -96,6 +100,7 @@ pub module Zest.Case {
         reject(false)     # passes
         reject(true)      # panics
     """
+
   pub fn reject(value :: Bool) -> String {
     case value {
       false -> "."
