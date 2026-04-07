@@ -424,33 +424,26 @@ fn buildTarget(
     // Module names in topological order for CTFE evaluation
     var module_order: std.ArrayListUnmanaged([]const u8) = .empty;
 
-    if (config.paths.len == 0 and config.root != null) {
-        // Import-driven discovery from the entry point
-        const root_spec = config.root.?;
-
-        // Extract module name from root spec: "App.main/0" → "App"
-        const slash_pos = std.mem.indexOfScalar(u8, root_spec, '/');
-        const name_part = if (slash_pos) |pos| root_spec[0..pos] else root_spec;
-        const last_dot = std.mem.lastIndexOfScalar(u8, name_part, '.');
-        const entry_module = if (last_dot) |pos| name_part[0..pos] else name_part;
-
-        // Build source roots: project lib/ dir, project root, + dep lib directories
-        // Try project_root/lib/ first (standard layout), then project_root/ (flat layout)
+    // Build source roots from deps — always done regardless of discovery mode.
+    // This ensures dep files (stdlib, etc.) are available in both import-driven
+    // and glob-based compilation paths.
+    {
         const lib_dir = try std.fs.path.join(alloc, &.{ project_root, "lib" });
         if (std.fs.cwd().access(lib_dir, .{})) |_| {
             try source_roots.append(alloc, .{ .name = "project", .path = lib_dir });
         } else |_| {}
         try source_roots.append(alloc, .{ .name = "project", .path = project_root });
+    }
 
-        // Read lockfile if it exists
-        const lock_entries = zap.lockfile.readLockfile(alloc, project_root);
-        var new_lock_entries: std.ArrayListUnmanaged(zap.lockfile.LockEntry) = .empty;
-        var lockfile_changed = false;
+    // Read lockfile if it exists
+    const lock_entries = zap.lockfile.readLockfile(alloc, project_root);
+    var new_lock_entries: std.ArrayListUnmanaged(zap.lockfile.LockEntry) = .empty;
+    var lockfile_changed = false;
 
-        for (config.deps) |dep| {
-            const dep_name = try std.fmt.allocPrint(alloc, "dep:{s}", .{dep.name});
+    for (config.deps) |dep| {
+        const dep_name = try std.fmt.allocPrint(alloc, "dep:{s}", .{dep.name});
 
-            switch (dep.source) {
+        switch (dep.source) {
                 .path => |dep_path| {
                     // Resolve dep path relative to the project root
                     const dep_dir = try std.fs.path.join(alloc, &.{ project_root, dep_path });
@@ -543,21 +536,31 @@ fn buildTarget(
             }
         }
 
-        // Write lockfile if it changed or doesn't exist
-        if (lock_entries == null or lockfile_changed) {
-            zap.lockfile.writeLockfile(alloc, project_root, new_lock_entries.items) catch |err| {
-                try stderr_w.print("Warning: could not write zap.lock: {}\n", .{err});
-            };
-        }
+    // Write lockfile if it changed or doesn't exist
+    if (lock_entries == null or lockfile_changed) {
+        zap.lockfile.writeLockfile(alloc, project_root, new_lock_entries.items) catch |err| {
+            try stderr_w.print("Warning: could not write zap.lock: {}\n", .{err});
+        };
+    }
 
-        // Add zap lib dir as a source root so stdlib modules are discovered
-        if (zap_lib_dir) |zap_lib| {
-            try source_roots.append(alloc, .{ .name = "zap_stdlib", .path = zap_lib });
-            const zap_subdir = try std.fs.path.join(alloc, &.{ zap_lib, "zap" });
-            if (std.fs.cwd().access(zap_subdir, .{})) |_| {
-                try source_roots.append(alloc, .{ .name = "zap_stdlib", .path = zap_subdir });
-            } else |_| {}
-        }
+    // Add zap lib dir as a source root so stdlib modules are discovered
+    if (zap_lib_dir) |zap_lib| {
+        try source_roots.append(alloc, .{ .name = "zap_stdlib", .path = zap_lib });
+        const zap_subdir = try std.fs.path.join(alloc, &.{ zap_lib, "zap" });
+        if (std.fs.cwd().access(zap_subdir, .{})) |_| {
+            try source_roots.append(alloc, .{ .name = "zap_stdlib", .path = zap_subdir });
+        } else |_| {}
+    }
+
+    if (config.paths.len == 0 and config.root != null) {
+        // Import-driven discovery from the entry point
+        const root_spec = config.root.?;
+
+        // Extract module name from root spec: "App.main/0" → "App"
+        const slash_pos = std.mem.indexOfScalar(u8, root_spec, '/');
+        const name_part = if (slash_pos) |pos| root_spec[0..pos] else root_spec;
+        const last_dot = std.mem.lastIndexOfScalar(u8, name_part, '.');
+        const entry_module = if (last_dot) |pos| name_part[0..pos] else name_part;
 
         var discovery_err_info: zap.discovery.ErrorInfo = .{};
         var file_graph = zap.discovery.discover(
@@ -628,6 +631,21 @@ fn buildTarget(
                 try globCollectFiles(alloc, root.path, "*.zap", &source_files);
             }
         }
+    }
+
+    // Deduplicate source files (explicit paths and dep paths may overlap)
+    {
+        var seen = std.StringHashMap(void).init(alloc);
+        var deduped: std.ArrayListUnmanaged([]const u8) = .empty;
+        for (source_files.items) |sf| {
+            // Normalize: resolve to real path for comparison
+            const key = std.fs.cwd().realpathAlloc(alloc, sf) catch sf;
+            if (!seen.contains(key)) {
+                seen.put(key, {}) catch {};
+                deduped.append(alloc, sf) catch {};
+            }
+        }
+        source_files = deduped;
     }
 
     if (source_files.items.len == 0) {
@@ -776,10 +794,14 @@ fn buildTarget(
 
     // Resolve the manifest root (e.g. "Test.TestHelper.main/1") to an IR function ID
     // so the ZIR backend knows which function is the entry point.
-    // IR naming: module parts joined by "_", then "__" before function name.
-    // e.g. "Test.TestHelper.main/1" -> "Test_TestHelper__main"
+    // IR naming: module parts joined by "_", then "__" before function name, then "__" arity.
+    // e.g. "Test.TestHelper.main/1" -> "Test_TestHelper__main__1"
     if (config.root) |root| {
-        // Strip arity suffix: "Test.TestHelper.main/1" -> "Test.TestHelper.main"
+        // Extract arity suffix: "Test.TestHelper.main/1" -> arity="1"
+        const arity_str = if (std.mem.lastIndexOfScalar(u8, root, '/')) |slash|
+            root[slash + 1 ..]
+        else
+            "0";
         const without_arity = if (std.mem.lastIndexOfScalar(u8, root, '/')) |slash|
             root[0..slash]
         else
@@ -801,9 +823,14 @@ fn buildTarget(
             // Double underscore separator between module and function
             mangled.appendSlice(alloc, "__") catch {};
             mangled.appendSlice(alloc, func_part) catch {};
+            // Arity suffix
+            mangled.appendSlice(alloc, "__") catch {};
+            mangled.appendSlice(alloc, arity_str) catch {};
         } else {
-            // No dot — bare function name
+            // No dot — bare function name with arity
             mangled.appendSlice(alloc, without_arity) catch {};
+            mangled.appendSlice(alloc, "__") catch {};
+            mangled.appendSlice(alloc, arity_str) catch {};
         }
         const mangled_name = mangled.items;
         for (result.ir_program.functions) |func| {

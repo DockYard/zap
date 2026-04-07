@@ -1,7 +1,9 @@
 pub module Test.TestRunner {
-  use Zest
+  use Zest.Runner
 
   pub fn main(_args :: [String]) -> String {
+    Zest.Runtime.reset()
+
     Test.HelloWorldTest.run()
     Test.PatternMatchingTest.run()
     Test.PipesTest.run()
@@ -25,6 +27,6 @@ pub module Test.TestRunner {
     Test.CatchBasinTest.run()
     Test.ForComprehensionTest.run()
 
-    IO.puts("\n\nAll tests passed!")
+    Zest.Runner.run()
   }
 }

@@ -110,23 +110,28 @@ fn substituteInFunction(
     var changed = false;
 
     for (func.clauses) |clause| {
-        var new_body: std.ArrayListUnmanaged(ast.Stmt) = .empty;
-        for (clause.body) |stmt| {
-            switch (stmt) {
-                .expr => |expr| {
-                    const new_expr = try substituteInExpr(alloc, expr, func_attrs, mod_attrs, interner, errors);
-                    if (new_expr != expr) changed = true;
-                    try new_body.append(alloc, .{ .expr = new_expr });
-                },
-                else => try new_body.append(alloc, stmt),
+        if (clause.body) |body| {
+            var new_body: std.ArrayListUnmanaged(ast.Stmt) = .empty;
+            for (body) |stmt| {
+                switch (stmt) {
+                    .expr => |expr| {
+                        const new_expr = try substituteInExpr(alloc, expr, func_attrs, mod_attrs, interner, errors);
+                        if (new_expr != expr) changed = true;
+                        try new_body.append(alloc, .{ .expr = new_expr });
+                    },
+                    else => try new_body.append(alloc, stmt),
+                }
             }
-        }
 
-        if (changed) {
-            var new_clause = clause;
-            new_clause.body = try new_body.toOwnedSlice(alloc);
-            try new_clauses.append(alloc, new_clause);
+            if (changed) {
+                var new_clause = clause;
+                new_clause.body = try new_body.toOwnedSlice(alloc);
+                try new_clauses.append(alloc, new_clause);
+            } else {
+                try new_clauses.append(alloc, clause);
+            }
         } else {
+            // @native bodyless declaration — pass through unchanged
             try new_clauses.append(alloc, clause);
         }
     }

@@ -155,10 +155,14 @@ fn readLibSourceUnits(
 
 fn findManifestFunction(program: *const zap.ir.Program) ?zap.ir.FunctionId {
     for (program.functions, 0..) |func, i| {
-        if (std.mem.endsWith(u8, func.name, "__manifest") and func.arity == 1) {
+        if ((std.mem.endsWith(u8, func.name, "__manifest__1") or
+            std.mem.endsWith(u8, func.name, "__manifest")) and func.arity == 1)
+        {
             return @intCast(i);
         }
-        if (std.mem.eql(u8, func.name, "manifest") and func.arity == 1) {
+        if ((std.mem.eql(u8, func.name, "manifest__1") or
+            std.mem.eql(u8, func.name, "manifest")) and func.arity == 1)
+        {
             return @intCast(i);
         }
     }

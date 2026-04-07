@@ -1322,34 +1322,100 @@ pub const ZestRuntime = struct {
     var current_describe: []const u8 = "";
     var failure_messages: [256][]const u8 = [_][]const u8{""} ** 256;
     var failure_count: u32 = 0;
+    var current_test_failed: bool = false;
+    var current_test_failure_msg: []const u8 = "";
 
-    const stderr = std.fs.File.stderr().deprecatedWriter();
     const stdout = std.fs.File.stdout().deprecatedWriter();
 
-    pub fn reset() void {
+    pub fn reset() []const u8 {
         total = 0;
         passed = 0;
         failed = 0;
         failure_count = 0;
         current_describe = "";
+        current_test_failed = false;
+        current_test_failure_msg = "";
+        return ".";
     }
 
-    pub fn set_verbose(v: bool) void {
+    pub fn set_verbose(v: bool) []const u8 {
         verbose = v;
+        return ".";
     }
 
-    pub fn begin_describe(name: []const u8) void {
+    pub fn begin_describe(name: []const u8) []const u8 {
         current_describe = name;
         if (verbose) {
             stdout.print("  {s}\n", .{name}) catch {};
         }
+        return ".";
     }
 
-    pub fn end_describe() void {
+    pub fn end_describe() []const u8 {
         current_describe = "";
+        return ".";
     }
 
-    pub fn run_test(name: []const u8, test_passed: bool) void {
+    /// Called at the start of each test to reset per-test failure state.
+    pub fn begin_test() []const u8 {
+        current_test_failed = false;
+        current_test_failure_msg = "";
+        return ".";
+    }
+
+    /// Called by assert/reject on failure. Records the failure message
+    /// and marks the current test as failed, but does NOT kill the process.
+    pub fn fail(message: []const u8) []const u8 {
+        current_test_failed = true;
+        current_test_failure_msg = message;
+        return ".";
+    }
+
+    /// Called at the end of each test. Checks if any assertions failed
+    /// during the test body and records pass/fail accordingly.
+    pub fn end_test(name: []const u8) []const u8 {
+        total += 1;
+        if (current_test_failed) {
+            failed += 1;
+            if (verbose) {
+                stdout.print("    \x1b[1;31m✗\x1b[0m {s}\n", .{name}) catch {};
+            } else {
+                stdout.print("\x1b[1;31mF\x1b[0m", .{}) catch {};
+            }
+            // Record failure details for the summary
+            if (failure_count < 256) {
+                if (current_describe.len > 0) {
+                    const msg = std.fmt.allocPrint(
+                        std.heap.page_allocator,
+                        "\n  \x1b[1;31m{d})\x1b[0m {s} > {s}\n     \x1b[31m{s}\x1b[0m",
+                        .{ failure_count + 1, current_describe, name, current_test_failure_msg },
+                    ) catch "     (failed to format)";
+                    failure_messages[failure_count] = msg;
+                } else {
+                    const msg = std.fmt.allocPrint(
+                        std.heap.page_allocator,
+                        "\n  \x1b[1;31m{d})\x1b[0m {s}\n     \x1b[31m{s}\x1b[0m",
+                        .{ failure_count + 1, name, current_test_failure_msg },
+                    ) catch "     (failed to format)";
+                    failure_messages[failure_count] = msg;
+                }
+                failure_count += 1;
+            }
+        } else {
+            passed += 1;
+            if (verbose) {
+                stdout.print("    \x1b[1;32m✓\x1b[0m {s}\n", .{name}) catch {};
+            } else {
+                stdout.print("\x1b[1;32m.\x1b[0m", .{}) catch {};
+            }
+        }
+        current_test_failed = false;
+        current_test_failure_msg = "";
+        return ".";
+    }
+
+    /// Legacy run_test — kept for backward compatibility.
+    pub fn run_test(name: []const u8, test_passed: bool) []const u8 {
         total += 1;
         if (test_passed) {
             passed += 1;
@@ -1366,19 +1432,7 @@ pub const ZestRuntime = struct {
                 stdout.print("\x1b[1;31mF\x1b[0m", .{}) catch {};
             }
         }
-    }
-
-    pub fn record_failure(name: []const u8, message: []const u8, file: []const u8, line: i64) void {
-        if (failure_count < 256) {
-            // Build failure message using bump allocator
-            const msg = std.fmt.allocPrint(
-                std.heap.page_allocator,
-                "\n  \x1b[1;31m{d})\x1b[0m {s}\n     \x1b[31m{s}\x1b[0m\n     {s}:{d}",
-                .{ failure_count + 1, name, message, file, line },
-            ) catch "     (failed to format)";
-            failure_messages[failure_count] = msg;
-            failure_count += 1;
-        }
+        return ".";
     }
 
     pub fn summary() []const u8 {
@@ -1395,7 +1449,12 @@ pub const ZestRuntime = struct {
             }
         }
 
-        stdout.print("\n{d} tests, \x1b[1;32m{d} passed\x1b[0m", .{ total, passed }) catch {};
+        stdout.print("\n{d} tests, ", .{total}) catch {};
+        if (passed > 0) {
+            stdout.print("\x1b[1;32m{d} passed\x1b[0m", .{passed}) catch {};
+        } else {
+            stdout.print("0 passed", .{}) catch {};
+        }
         if (failed > 0) {
             stdout.print(", \x1b[1;31m{d} failed\x1b[0m", .{failed}) catch {};
         }

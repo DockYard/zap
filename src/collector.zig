@@ -256,7 +256,10 @@ pub const Collector = struct {
             }
 
             // Collect body statements (hoisting local defs)
-            try self.collectBlock(clause.body, fn_scope);
+            // Bodyless declarations (@native) have no body to collect.
+            if (clause.body) |body| {
+                try self.collectBlock(body, fn_scope);
+            }
         }
     }
 
@@ -287,7 +290,9 @@ pub const Collector = struct {
                 try self.collectPatternBindings(param.pattern, fn_scope);
             }
 
-            try self.collectBlock(clause.body, fn_scope);
+            if (clause.body) |body| {
+                try self.collectBlock(body, fn_scope);
+            }
         }
     }
 

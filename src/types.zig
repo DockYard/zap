@@ -931,7 +931,7 @@ pub const TypeChecker = struct {
                     .bind => |b| b.name,
                     else => continue,
                 };
-                if (!self.isClosureParamUsedLocally(clause.body, param_name)) {
+                if (!self.isClosureParamUsedLocally(clause.body orelse &.{}, param_name)) {
                     safe[idx] = false;
                 }
             }
@@ -1085,8 +1085,10 @@ pub const TypeChecker = struct {
         defer captured.deinit();
         for (func.clauses) |clause| {
             const function_scope = self.graph.node_scope_map.get(clause.meta.span.start) orelse clause.meta.scope_id;
-            for (clause.body) |stmt| {
-                try self.collectCapturedBindingsFromStmt(stmt, function_scope, &captured);
+            if (clause.body) |body| {
+                for (body) |stmt| {
+                    try self.collectCapturedBindingsFromStmt(stmt, function_scope, &captured);
+                }
             }
         }
         var result = std.ArrayList(scope_mod.BindingId).empty;
@@ -1466,9 +1468,10 @@ pub const TypeChecker = struct {
             // Marker attribute — valid
             // For @debug, validate that it's on a function with T -> T semantics
             // (This validation is done later when we see the function declaration)
+        } else if (attr.type_expr == null and attr.value != null) {
+            // Value attribute without type (e.g., @native = "ZestRuntime.reset") — valid
         } else {
-            // Type without value or value without type — should not happen
-            // (parser enforces the syntax), but handle defensively
+            // Type without value — should not happen
             const attr_name = self.interner.get(attr.name);
             try self.addHardError(
                 try std.fmt.allocPrint(self.allocator,
@@ -1690,12 +1693,14 @@ pub const TypeChecker = struct {
             }
         }
 
-        // Check body
+        // Check body (skip for @native bodyless declarations)
         var body_type: TypeId = TypeStore.NIL;
         var last_expr: ?*const ast.Expr = null;
-        for (clause.body) |stmt| {
-            if (stmt == .expr) last_expr = stmt.expr;
-            body_type = try self.checkStmt(stmt);
+        if (clause.body) |body| {
+            for (body) |stmt| {
+                if (stmt == .expr) last_expr = stmt.expr;
+                body_type = try self.checkStmt(stmt);
+            }
         }
 
         if (last_expr) |expr| {
@@ -1731,6 +1736,9 @@ pub const TypeChecker = struct {
                 }
             }
         }
+
+        // Skip return type check for @native bodyless declarations
+        if (clause.body == null) return;
 
         // Verify return type matches (suppress if either side is ERROR/UNKNOWN/type_var from cascading)
         const declared_is_checkable = declared_return != TypeStore.UNKNOWN and
@@ -3212,7 +3220,7 @@ test "function ref inference defaults param ownerships to shared" {
     try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
 
     const main_func = program.modules[0].items[0].function;
-    const fn_ref_expr = main_func.clauses[0].body[0].expr;
+    const fn_ref_expr = main_func.clauses[0].body.?[0].expr;
     const inferred = try checker.inferExpr(fn_ref_expr);
     const typ = checker.store.getType(inferred);
 
@@ -3249,7 +3257,7 @@ test "moved binding use reports ownership error" {
     try checker.checkProgram(&program);
 
     const clause = program.modules[0].items[0].function.clauses[0];
-    const expr = clause.body[0].expr;
+    const expr = clause.body.?[0].expr;
     const scope_id = checker.graph.node_scope_map.get(clause.meta.span.start) orelse clause.meta.scope_id;
     checker.current_scope = scope_id;
 
@@ -3312,8 +3320,8 @@ test "unique function parameter ownership moves var_ref argument" {
 
     checker.errors.clearRetainingCapacity();
 
-    _ = try checker.inferExpr(clause.body[0].expr);
-    _ = try checker.inferExpr(clause.body[1].expr);
+    _ = try checker.inferExpr(clause.body.?[0].expr);
+    _ = try checker.inferExpr(clause.body.?[1].expr);
 
     var found = false;
     for (checker.errors.items) |err| {
@@ -3365,7 +3373,7 @@ test "shared binding cannot satisfy unique parameter ownership" {
     try checker.recordBindingType(x_binding, TypeStore.STRING, clause.params[1].meta.span);
     try checker.recordBindingOwnership(x_binding, TypeStore.STRING, .shared);
 
-    _ = try checker.inferExpr(clause.body[0].expr);
+    _ = try checker.inferExpr(clause.body.?[0].expr);
 
     var found = false;
     for (checker.errors.items) |err| {
@@ -3823,9 +3831,9 @@ test "borrowed parameter does not move binding" {
     try checker.recordBindingOwnership(x_binding, TypeStore.STRING, .unique);
 
     checker.errors.clearRetainingCapacity();
-    _ = try checker.inferExpr(clause.body[0].expr);
+    _ = try checker.inferExpr(clause.body.?[0].expr);
     checker.errors.clearRetainingCapacity();
-    _ = try checker.inferExpr(clause.body[1].expr);
+    _ = try checker.inferExpr(clause.body.?[1].expr);
 
     try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
     const ownership = checker.bindingOwnershipInfo(x_binding).?;

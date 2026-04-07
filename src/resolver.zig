@@ -192,8 +192,10 @@ pub const Resolver = struct {
                 try self.resolveExpr(ref);
             }
 
-            // Resolve body
-            try self.resolveBlock(clause.body);
+            // Resolve body (skip for @native bodyless declarations)
+            if (clause.body) |body| {
+                try self.resolveBlock(body);
+            }
 
             self.current_scope = saved;
         }

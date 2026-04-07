@@ -204,7 +204,7 @@ pub const FunctionClause = struct {
     params: []const Param,
     return_type: ?*const TypeExpr,
     refinement: ?*const Expr,
-    body: []const Stmt,
+    body: ?[]const Stmt = null,
 };
 
 pub const Ownership = enum {

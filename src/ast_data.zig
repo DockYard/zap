@@ -1625,16 +1625,18 @@ pub fn functionDeclToCtValue(
             try kw_elems.append(alloc, try makeKeywordPair(alloc, store, "return", try typeExprToCtValue(alloc, interner, store, rt)));
         }
 
-        // Body
-        var body_vals = std.ArrayListUnmanaged(CtValue){};
-        for (clause.body) |stmt| {
-            try body_vals.append(alloc, try stmtToCtValue(alloc, interner, store, stmt));
+        // Body (optional — @native functions have no body)
+        if (clause.body) |body_stmts| {
+            var body_vals = std.ArrayListUnmanaged(CtValue){};
+            for (body_stmts) |stmt| {
+                try body_vals.append(alloc, try stmtToCtValue(alloc, interner, store, stmt));
+            }
+            const body_ct = if (body_vals.items.len == 1)
+                body_vals.items[0]
+            else
+                try makeTuple3(alloc, store, .{ .atom = "__block__" }, try emptyList(alloc, store), try makeListFromSlice(alloc, store, body_vals.items));
+            try kw_elems.append(alloc, try makeKeywordPair(alloc, store, "do", body_ct));
         }
-        const body_ct = if (body_vals.items.len == 1)
-            body_vals.items[0]
-        else
-            try makeTuple3(alloc, store, .{ .atom = "__block__" }, try emptyList(alloc, store), try makeListFromSlice(alloc, store, body_vals.items));
-        try kw_elems.append(alloc, try makeKeywordPair(alloc, store, "do", body_ct));
 
         // Guard
         if (clause.refinement) |guard| {

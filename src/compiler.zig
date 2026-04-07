@@ -414,6 +414,7 @@ pub fn compileFiles(
 
     var ir_builder = zap.ir.IrBuilder.init(alloc, &ctx.interner);
     ir_builder.type_store = &type_checker.store;
+    ir_builder.scope_graph = &ctx.collector.graph;
     defer ir_builder.deinit();
     var ir_program = ir_builder.buildProgram(&hir_program) catch {
         ctx.diag_engine.err("Error during IR lowering", .{ .start = 0, .end = 0 }) catch {};
@@ -652,6 +653,7 @@ fn compileSingleModuleIr(
 
     var ir_builder = zap.ir.IrBuilder.init(alloc, &ctx.interner);
     ir_builder.type_store = &type_checker.store;
+    ir_builder.scope_graph = &ctx.collector.graph;
     defer ir_builder.deinit();
     const mod_ir = ir_builder.buildProgram(&hir_program) catch {
         ctx.diag_engine.err("Error during IR lowering", .{ .start = 0, .end = 0 }) catch {};
@@ -1451,4 +1453,214 @@ test "collector can build graph from per-module programs" {
     try collector.finalizeCollectedPrograms(program_slices);
 
     try std.testing.expectEqual(@as(usize, 2), collector.graph.modules.items.len);
+}
+
+test "@native attribute survives parse -> collect pipeline" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Source with @native attribute followed by a bodyless function declaration
+    const source =
+        "pub module TestNative {\n" ++
+        "  @native = \"Prelude.println\"\n" ++
+        "  pub fn puts(_message :: String) -> String\n" ++
+        "\n" ++
+        "  @native = \"Prelude.print_str\"\n" ++
+        "  pub fn print_str(_message :: String) -> String\n" ++
+        "}\n";
+
+    // Step 1: Parse
+    var parser = zap.Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    // Verify parse produced one module with 4 items (2 attributes + 2 functions)
+    try std.testing.expectEqual(@as(usize, 1), program.modules.len);
+    const mod = program.modules[0];
+    try std.testing.expectEqual(@as(usize, 4), mod.items.len);
+
+    // Verify item ordering: attribute, function, attribute, function
+    try std.testing.expect(mod.items[0] == .attribute);
+    try std.testing.expect(mod.items[1] == .function);
+    try std.testing.expect(mod.items[2] == .attribute);
+    try std.testing.expect(mod.items[3] == .function);
+
+    // Verify the first attribute is @native = "Prelude.println"
+    const attr0 = mod.items[0].attribute;
+    try std.testing.expectEqualStrings("native", parser.interner.get(attr0.name));
+    try std.testing.expect(attr0.value != null);
+    try std.testing.expect(attr0.value.?.* == .string_literal);
+    try std.testing.expectEqualStrings("Prelude.println", parser.interner.get(attr0.value.?.string_literal.value));
+
+    // Verify the first function is bodyless (no body = @native declaration)
+    const func0 = mod.items[1].function;
+    try std.testing.expectEqualStrings("puts", parser.interner.get(func0.name));
+    try std.testing.expect(func0.clauses.len == 1);
+    try std.testing.expect(func0.clauses[0].body == null); // bodyless = @native
+
+    // Step 2: Collect — verify @native attaches to the function family
+    const module_programs = try buildModulePrograms(alloc, &program, parser.interner);
+    const program_slices = try alloc.alloc(ast.Program, module_programs.len);
+    for (module_programs, 0..) |entry, i| program_slices[i] = entry.program;
+
+    var collector = zap.Collector.init(alloc, parser.interner);
+    defer collector.deinit();
+    for (module_programs) |entry| {
+        try collector.collectProgramSurface(&entry.program);
+    }
+    try collector.finalizeCollectedPrograms(program_slices);
+
+    // Find the module scope
+    try std.testing.expectEqual(@as(usize, 1), collector.graph.modules.items.len);
+    const mod_scope_id = collector.graph.modules.items[0].scope_id;
+    const mod_scope = collector.graph.getScope(mod_scope_id);
+
+    // Resolve function families and check their @native attributes
+    const puts_name = parser.interner.map.get("puts").?;
+    const puts_key = zap.scope.FamilyKey{ .name = puts_name, .arity = 1 };
+    const puts_fid = mod_scope.function_families.get(puts_key).?;
+    const puts_family = collector.graph.getFamily(puts_fid);
+
+    // The @native attribute must be attached to the puts family
+    try std.testing.expect(puts_family.attributes.items.len >= 1);
+    var found_native_puts = false;
+    for (puts_family.attributes.items) |attr| {
+        if (std.mem.eql(u8, parser.interner.get(attr.name), "native")) {
+            if (attr.value) |val| {
+                if (val.* == .string_literal) {
+                    try std.testing.expectEqualStrings("Prelude.println", parser.interner.get(val.string_literal.value));
+                    found_native_puts = true;
+                }
+            }
+        }
+    }
+    try std.testing.expect(found_native_puts);
+
+    // Check second function: print_str
+    const print_str_name = parser.interner.map.get("print_str").?;
+    const print_str_key = zap.scope.FamilyKey{ .name = print_str_name, .arity = 1 };
+    const print_str_fid = mod_scope.function_families.get(print_str_key).?;
+    const print_str_family = collector.graph.getFamily(print_str_fid);
+
+    try std.testing.expect(print_str_family.attributes.items.len >= 1);
+    var found_native_print_str = false;
+    for (print_str_family.attributes.items) |attr| {
+        if (std.mem.eql(u8, parser.interner.get(attr.name), "native")) {
+            if (attr.value) |val| {
+                if (val.* == .string_literal) {
+                    try std.testing.expectEqualStrings("Prelude.print_str", parser.interner.get(val.string_literal.value));
+                    found_native_print_str = true;
+                }
+            }
+        }
+    }
+    try std.testing.expect(found_native_print_str);
+}
+
+test "@native survives multi-file merge (boundary between files)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Simulate lib/io.zap content (with @native)
+    const io_source =
+        "pub module IO {\n" ++
+        "  @native = \"Prelude.println\"\n" ++
+        "  pub fn puts(_message :: String) -> String\n" ++
+        "}\n";
+
+    // Simulate lib/string.zap content (normal module)
+    const string_source =
+        "pub module MyString {\n" ++
+        "  pub fn length(s :: String) -> i64 {\n" ++
+        "    0\n" ++
+        "  }\n" ++
+        "}\n";
+
+    // Step 1: Verify mergeSourceUnits adds newlines between files
+    const units = [_]SourceUnit{
+        .{ .file_path = "lib/io.zap", .source = io_source },
+        .{ .file_path = "lib/string.zap", .source = string_source },
+    };
+    const merged = try mergeSourceUnits(alloc, &units);
+
+    // The merged source should have a newline between files
+    // io_source already ends with \n, mergeSourceUnits adds another \n
+    try std.testing.expect(std.mem.indexOf(u8, merged, "}\n\npub module MyString") != null);
+
+    // Step 2: Parse each unit independently (as the real pipeline does)
+    var interner = ast.StringInterner.init(alloc);
+    const parsed_programs = try alloc.alloc(ast.Program, units.len);
+    for (units, 0..) |unit, i| {
+        var parser = zap.Parser.initWithSharedInterner(alloc, unit.source, &interner, @intCast(i));
+        defer parser.deinit();
+        parsed_programs[i] = try parser.parseProgram();
+    }
+
+    // Step 3: Merge parsed programs
+    const program = try mergePrograms(alloc, parsed_programs);
+    try std.testing.expectEqual(@as(usize, 2), program.modules.len);
+
+    // Step 4: Verify IO module has the attribute items
+    const io_mod = program.modules[0];
+    var io_attr_count: usize = 0;
+    var io_func_count: usize = 0;
+    for (io_mod.items) |item| {
+        switch (item) {
+            .attribute => io_attr_count += 1,
+            .function => io_func_count += 1,
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), io_attr_count);
+    try std.testing.expectEqual(@as(usize, 1), io_func_count);
+
+    // Step 5: Collect and verify @native attaches to puts
+    const module_programs = try buildModulePrograms(alloc, &program, &interner);
+    const program_slices = try alloc.alloc(ast.Program, module_programs.len);
+    for (module_programs, 0..) |entry, i| program_slices[i] = entry.program;
+
+    var collector = zap.Collector.init(alloc, &interner);
+    defer collector.deinit();
+    for (module_programs) |entry| {
+        try collector.collectProgramSurface(&entry.program);
+    }
+    try collector.finalizeCollectedPrograms(program_slices);
+
+    try std.testing.expectEqual(@as(usize, 2), collector.graph.modules.items.len);
+
+    // Find IO module scope
+    var io_scope_id: ?zap.scope.ScopeId = null;
+    for (collector.graph.modules.items) |mod_entry| {
+        if (mod_entry.decl.name.parts.len == 1) {
+            const name = interner.get(mod_entry.decl.name.parts[0]);
+            if (std.mem.eql(u8, name, "IO")) {
+                io_scope_id = mod_entry.scope_id;
+                break;
+            }
+        }
+    }
+    try std.testing.expect(io_scope_id != null);
+
+    const io_scope = collector.graph.getScope(io_scope_id.?);
+    const puts_name = interner.map.get("puts").?;
+    const puts_key = zap.scope.FamilyKey{ .name = puts_name, .arity = 1 };
+    const puts_fid = io_scope.function_families.get(puts_key).?;
+    const puts_family = collector.graph.getFamily(puts_fid);
+
+    // @native attribute MUST be on the function family
+    try std.testing.expect(puts_family.attributes.items.len >= 1);
+    var found_native = false;
+    for (puts_family.attributes.items) |attr| {
+        if (std.mem.eql(u8, interner.get(attr.name), "native")) {
+            if (attr.value) |val| {
+                if (val.* == .string_literal) {
+                    try std.testing.expectEqualStrings("Prelude.println", interner.get(val.string_literal.value));
+                    found_native = true;
+                }
+            }
+        }
+    }
+    try std.testing.expect(found_native);
 }

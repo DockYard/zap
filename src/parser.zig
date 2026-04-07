@@ -175,6 +175,29 @@ pub const Parser = struct {
                     '\\' => buf.append(self.allocator, '\\') catch return text,
                     '"' => buf.append(self.allocator, '"') catch return text,
                     '0' => buf.append(self.allocator, 0) catch return text,
+                    'x' => {
+                        // Hex escape: \xNN
+                        if (i + 3 < text.len) {
+                            const hi = std.fmt.charToDigit(text[i + 2], 16) catch {
+                                buf.append(self.allocator, '\\') catch return text;
+                                buf.append(self.allocator, 'x') catch return text;
+                                i += 2;
+                                continue;
+                            };
+                            const lo = std.fmt.charToDigit(text[i + 3], 16) catch {
+                                buf.append(self.allocator, '\\') catch return text;
+                                buf.append(self.allocator, 'x') catch return text;
+                                i += 2;
+                                continue;
+                            };
+                            buf.append(self.allocator, hi * 16 + lo) catch return text;
+                            i += 4;
+                            continue;
+                        } else {
+                            buf.append(self.allocator, '\\') catch return text;
+                            buf.append(self.allocator, 'x') catch return text;
+                        }
+                    },
                     else => {
                         // Unknown escape — keep as-is
                         buf.append(self.allocator, '\\') catch return text;
@@ -1080,14 +1103,15 @@ pub const Parser = struct {
             refinement = try self.parseExpr();
         }
 
+        // Bodyless declaration: @native functions have no body
         if (!self.check(.left_brace)) {
-            try self.addRichError(
-                "I was expecting `{` to start the function body",
-                def_span,
-                "this function definition needs a `{ ... }` block",
-                "add `{` after the function signature",
-            );
-            return error.ParseError;
+            return .{
+                .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
+                .params = params,
+                .return_type = return_type,
+                .refinement = refinement,
+                .body = null,
+            };
         }
         _ = self.advance();
         self.skipNewlines();
@@ -1269,6 +1293,18 @@ pub const Parser = struct {
                 .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
                 .name = name,
                 .type_expr = type_expr,
+                .value = value,
+            });
+        }
+
+        // Value attribute without type: @name = value
+        if (self.check(.equal)) {
+            _ = self.advance();
+            const value = try self.parseExpr();
+            return self.create(ast.AttributeDecl, .{
+                .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
+                .name = name,
+                .type_expr = null,
                 .value = value,
             });
         }
@@ -3837,7 +3873,7 @@ test "parse binary operators" {
     try std.testing.expectEqual(@as(usize, 1), program.modules.len);
 
     const func = program.modules[0].items[0].function;
-    const body = func.clauses[0].body;
+    const body = func.clauses[0].body.?;
     try std.testing.expectEqual(@as(usize, 1), body.len);
 
     const expr = body[0].expr;
@@ -3899,7 +3935,7 @@ test "parse assignment" {
 
     const program = try parser.parseProgram();
     const func = program.modules[0].items[0].function;
-    const body = func.clauses[0].body;
+    const body = func.clauses[0].body.?;
     try std.testing.expectEqual(@as(usize, 2), body.len);
     try std.testing.expect(body[0] == .assignment);
 }
@@ -3920,7 +3956,7 @@ test "parse function call" {
 
     const program = try parser.parseProgram();
     const func = program.modules[0].items[0].function;
-    const body = func.clauses[0].body;
+    const body = func.clauses[0].body.?;
     try std.testing.expectEqual(@as(usize, 1), body.len);
     try std.testing.expect(body[0].expr.* == .call);
 }
@@ -3941,7 +3977,7 @@ test "parse pipe operator" {
 
     const program = try parser.parseProgram();
     const func = program.modules[0].items[0].function;
-    const body = func.clauses[0].body;
+    const body = func.clauses[0].body.?;
     try std.testing.expect(body[0].expr.* == .pipe);
 }
 
@@ -3989,7 +4025,7 @@ test "parse panic expression" {
 
     const program = try parser.parseProgram();
     const func = program.modules[0].items[0].function;
-    const body = func.clauses[0].body;
+    const body = func.clauses[0].body.?;
     try std.testing.expect(body[0].expr.* == .panic_expr);
 }
 
@@ -4009,7 +4045,7 @@ test "parse unwrap operator" {
 
     const program = try parser.parseProgram();
     const func = program.modules[0].items[0].function;
-    const body = func.clauses[0].body;
+    const body = func.clauses[0].body.?;
     try std.testing.expect(body[0].expr.* == .unwrap);
 }
 
@@ -4032,7 +4068,7 @@ test "parse local function" {
 
     const program = try parser.parseProgram();
     const func = program.modules[0].items[0].function;
-    const body = func.clauses[0].body;
+    const body = func.clauses[0].body.?;
     try std.testing.expect(body.len >= 2);
     try std.testing.expect(body[0] == .function_decl);
 }
@@ -4176,7 +4212,7 @@ test "parse struct init with type annotation" {
     // Should have defstruct + defmodule
     try std.testing.expectEqual(@as(usize, 2), program.top_items.len);
     const func = program.modules[0].items[0].function;
-    const body = func.clauses[0].body;
+    const body = func.clauses[0].body.?;
     try std.testing.expect(body[0].expr.* == .struct_expr);
 }
 
@@ -4416,7 +4452,7 @@ test "parse error pipe ~> with block handler" {
 
     const program = try parser.parseProgram();
     const func = program.modules[0].items[0].function;
-    const body = func.clauses[0].body;
+    const body = func.clauses[0].body.?;
     try std.testing.expect(body.len > 0);
     // The expression should be an error_pipe
     try std.testing.expect(body[0].expr.* == .error_pipe);
@@ -4439,7 +4475,7 @@ test "parse error pipe ~> with function handler" {
 
     const program = try parser.parseProgram();
     const func = program.modules[0].items[0].function;
-    const body = func.clauses[0].body;
+    const body = func.clauses[0].body.?;
     try std.testing.expect(body.len > 0);
     try std.testing.expect(body[0].expr.* == .error_pipe);
 }

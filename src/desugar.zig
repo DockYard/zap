@@ -100,7 +100,7 @@ pub const Desugarer = struct {
                 .params = clause.params,
                 .return_type = clause.return_type,
                 .refinement = if (clause.refinement) |r| try self.desugarExpr(r) else null,
-                .body = try self.desugarBlock(clause.body),
+                .body = if (clause.body) |body| try self.desugarBlock(body) else null,
             });
         }
         return try self.create(ast.FunctionDecl, .{
@@ -1036,7 +1036,7 @@ test "pipe is desugared during macro expansion, not desugar" {
 
     // Pipe should still be a pipe (desugar doesn't transform it anymore)
     const func = desugared.modules[0].items[0].function;
-    const body = func.clauses[0].body;
+    const body = func.clauses[0].body.?;
     try std.testing.expectEqual(@as(usize, 1), body.len);
     try std.testing.expect(body[0].expr.* == .pipe);
 }
@@ -1063,7 +1063,7 @@ test "desugar unwrap operator" {
 
     // Function body should now have an unwrap expression (passed through)
     const func = desugared.modules[0].items[0].function;
-    const body = func.clauses[0].body;
+    const body = func.clauses[0].body.?;
     try std.testing.expectEqual(@as(usize, 1), body.len);
     try std.testing.expect(body[0].expr.* == .unwrap);
     // Inner expression should be the call
@@ -1092,6 +1092,6 @@ test "desugar no-op on simple expressions" {
 
     try std.testing.expectEqual(@as(usize, 1), desugared.modules.len);
     const func = desugared.modules[0].items[0].function;
-    const body = func.clauses[0].body;
+    const body = func.clauses[0].body.?;
     try std.testing.expect(body[0].expr.* == .binary_op);
 }

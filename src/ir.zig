@@ -59,11 +59,19 @@ pub const Program = struct {
     functions: []const Function,
     type_defs: []const TypeDef,
     entry: ?FunctionId,
+    /// @native bindings as parallel arrays (keys and values).
+    /// Populated during IR building, consumed by ZIR builder.
+    native_binding_keys: []const []const u8 = &.{},
+    native_binding_values: []const []const u8 = &.{},
 };
 
 pub const Function = struct {
     id: FunctionId,
     name: []const u8,
+    /// Module this function belongs to (e.g., "IO", "Zest_Runtime"). Null for top-level.
+    module_name: ?[]const u8 = null,
+    /// Function name within its module, with arity suffix (e.g., "puts__1"). Used for per-module ZIR emission.
+    local_name: []const u8 = "",
     scope_id: scope_mod.ScopeId,
     arity: u32,
     params: []const Param,
@@ -793,6 +801,10 @@ pub const IrBuilder = struct {
     /// Set of function names that need __try variants (populated by error pipe analysis).
     /// Only functions in this set will get __try variants generated.
     try_variant_names: std.StringHashMap(void),
+    /// Maps mangled function names → @native binding strings (e.g., "String__length" → "ZapString.length").
+    /// Populated from @native attributes in the scope graph before building function bodies.
+    native_bindings: std.StringHashMap([]const u8),
+    scope_graph: ?*const scope_mod.ScopeGraph = null,
 
     pub const UnionDispatchInfo = struct {
         param_idx: u32,
@@ -819,6 +831,7 @@ pub const IrBuilder = struct {
             .union_dispatch_map = std.StringHashMap(UnionDispatchInfo).init(allocator),
             .default_arg_wrappers = std.StringHashMap([]const u8).init(allocator),
             .try_variant_names = std.StringHashMap(void).init(allocator),
+            .native_bindings = std.StringHashMap([]const u8).init(allocator),
         };
     }
 
@@ -831,6 +844,7 @@ pub const IrBuilder = struct {
         self.union_dispatch_map.deinit();
         self.default_arg_wrappers.deinit();
         self.known_function_names.deinit();
+        self.native_bindings.deinit();
     }
 
     pub fn buildProgram(self: *IrBuilder, hir_program: *const hir_mod.Program) !Program {
@@ -839,13 +853,45 @@ pub const IrBuilder = struct {
             const module_prefix = self.moduleNameToPrefix(mod.name);
             for (mod.functions) |func_group| {
                 const func_name = self.interner.get(func_group.name);
-                const qualified = try std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ module_prefix, func_name });
+                const qualified = try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ module_prefix, func_name, func_group.arity });
                 try self.known_function_names.put(qualified, {});
             }
         }
         for (hir_program.top_functions) |func_group| {
             const func_name = self.interner.get(func_group.name);
-            try self.known_function_names.put(func_name, {});
+            const qualified = try std.fmt.allocPrint(self.allocator, "{s}__{d}", .{ func_name, func_group.arity });
+            try self.known_function_names.put(qualified, {});
+        }
+
+        // Collect @native bindings from the scope graph.
+        // Scans ALL families globally for @native attribute, then finds
+        // the module prefix by walking scopes.
+        if (self.scope_graph) |graph| {
+            // Build a reverse map: scope_id → module prefix
+            var scope_to_prefix = std.AutoHashMap(scope_mod.ScopeId, []const u8).init(self.allocator);
+            defer scope_to_prefix.deinit();
+            for (graph.modules.items) |mod_entry| {
+                const prefix = self.moduleNameToPrefix(mod_entry.decl.name);
+                scope_to_prefix.put(mod_entry.scope_id, prefix) catch {};
+            }
+
+            for (graph.families.items) |family| {
+                for (family.attributes.items) |attr| {
+                    const attr_name = self.interner.get(attr.name);
+                    if (std.mem.eql(u8, attr_name, "native")) {
+                        if (attr.value) |val| {
+                            if (val.* == .string_literal) {
+                                const native_target = self.interner.get(val.string_literal.value);
+                                // Find module prefix from family's parent scope
+                                const prefix = scope_to_prefix.get(family.scope_id) orelse continue;
+                                const func_name = self.interner.get(family.name);
+                                const mangled = try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ prefix, func_name, family.arity });
+                                try self.native_bindings.put(mangled, native_target);
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Second pass: pre-scan for ~> error pipe chains to identify functions
@@ -954,15 +1000,30 @@ pub const IrBuilder = struct {
             try type_defs.append(self.allocator, synth_td);
         }
 
+        // Serialize native_bindings map to owned arrays for the Program struct
+        var nb_keys: std.ArrayListUnmanaged([]const u8) = .empty;
+        var nb_values: std.ArrayListUnmanaged([]const u8) = .empty;
+        var nb_it = self.native_bindings.iterator();
+        while (nb_it.next()) |entry| {
+            try nb_keys.append(self.allocator, entry.key_ptr.*);
+            try nb_values.append(self.allocator, entry.value_ptr.*);
+        }
+
         return .{
             .functions = try self.functions.toOwnedSlice(self.allocator),
             .type_defs = try type_defs.toOwnedSlice(self.allocator),
             .entry = null,
+            .native_binding_keys = try nb_keys.toOwnedSlice(self.allocator),
+            .native_binding_values = try nb_values.toOwnedSlice(self.allocator),
         };
     }
 
     fn buildFunctionGroup(self: *IrBuilder, group: *const hir_mod.FunctionGroup) !void {
         if (group.clauses.len == 0) return;
+
+        // @native bodyless functions: emit a minimal stub (no body instructions).
+        // The actual call routing happens via call_builtin at call sites.
+        // We still need to emit the function to preserve function ID ordering.
 
         const func_id: FunctionId = group.id;
         if (self.next_function_id <= func_id) {
@@ -1214,10 +1275,11 @@ pub const IrBuilder = struct {
             self.interner.get(group.name)
         else
             "anonymous";
+        const local_name = try std.fmt.allocPrint(self.allocator, "{s}__{d}", .{ raw_name, group.arity });
         const name_str = if (self.current_module_prefix) |prefix|
-            try std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ prefix, raw_name })
+            try std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ prefix, local_name })
         else
-            raw_name;
+            local_name;
 
         const return_type = typeIdToZigTypeWithStore(first_clause.return_type, self.type_store);
 
@@ -1275,6 +1337,8 @@ pub const IrBuilder = struct {
         try self.functions.append(self.allocator, .{
             .id = func_id,
             .name = name_str,
+            .module_name = self.current_module_prefix,
+            .local_name = local_name,
             .scope_id = group.scope_id,
             .arity = group.arity,
             .params = final_params,
@@ -1503,9 +1567,12 @@ pub const IrBuilder = struct {
             for (final_params) |p| try try_params.append(self.allocator, p);
 
             const try_name = try std.fmt.allocPrint(self.allocator, "{s}__try", .{name_str});
+            const try_local_name = try std.fmt.allocPrint(self.allocator, "{s}__try", .{local_name});
             try self.functions.append(self.allocator, .{
                 .id = try_func_id,
                 .name = try_name,
+                .module_name = self.current_module_prefix,
+                .local_name = try_local_name,
                 .scope_id = group.scope_id,
                 .arity = group.arity,
                 .params = try try_params.toOwnedSlice(self.allocator),
@@ -2970,11 +3037,13 @@ pub const IrBuilder = struct {
                 for (ep.steps) |step| {
                     if (step.is_dispatched and step.expr.kind == .call) {
                         const call = step.expr.kind.call;
+                        // +1 for the piped value which becomes the first argument
+                        const call_arity = call.args.len + 1;
                         const call_name_str = switch (call.target) {
                             .named => |n| blk: {
-                                if (n.module) |mod| break :blk try std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ mod, n.name });
-                                if (module_prefix) |prefix| break :blk try std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ prefix, n.name });
-                                break :blk try self.allocator.dupe(u8, n.name);
+                                if (n.module) |mod| break :blk try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ mod, n.name, call_arity });
+                                if (module_prefix) |prefix| break :blk try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ prefix, n.name, call_arity });
+                                break :blk try std.fmt.allocPrint(self.allocator, "{s}__{d}", .{ n.name, call_arity });
                             },
                             else => continue,
                         };
@@ -3179,10 +3248,26 @@ pub const IrBuilder = struct {
                         });
                     },
                     .named => |nc| {
-                        const resolved_name = if (nc.module) |mod|
-                            try std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ mod, nc.name })
-                        else
-                            try self.resolveBareCall(nc.name);
+                        const call_arity = call.args.len;
+                        // For module-qualified calls, try exact arity first, then higher
+                        // arities for functions with default parameters.
+                        const resolved_name = if (nc.module) |mod| blk: {
+                            var try_a: usize = call_arity;
+                            while (try_a <= call_arity + 4) : (try_a += 1) {
+                                const candidate = try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ mod, nc.name, try_a });
+                                if (self.known_function_names.contains(candidate)) break :blk candidate;
+                            }
+                            break :blk try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ mod, nc.name, call_arity });
+                        } else try self.resolveBareCall(nc.name, @intCast(call_arity));
+
+                        // Check if this function has a @native binding — emit call_builtin instead
+                        if (self.native_bindings.get(resolved_name)) |native_target| {
+                            const lowered_args = try args.toOwnedSlice(self.allocator);
+                            const lowered_modes = try arg_modes.toOwnedSlice(self.allocator);
+                            try self.current_instrs.append(self.allocator, .{
+                                .call_builtin = .{ .dest = dest, .name = native_target, .args = lowered_args, .arg_modes = lowered_modes },
+                            });
+                        } else {
 
                         // Default params handled at ZIR call site (see zir_builder.zig call_named handler)
 
@@ -3238,6 +3323,7 @@ pub const IrBuilder = struct {
                                 .call_named = .{ .dest = dest, .name = resolved_name, .args = lowered_args, .arg_modes = lowered_modes },
                             });
                         }
+                        } // close @native else block
                     },
                     .closure => |callee| {
                         const callee_local = try self.lowerExpr(callee);
@@ -3404,11 +3490,12 @@ pub const IrBuilder = struct {
                         const final_args = try arg_locals.toOwnedSlice(self.allocator);
                         const modes = try self.allocator.alloc(ValueMode, final_args.len);
                         @memset(modes, .share);
+                        const ep_call_arity = final_args.len;
                         const call_name_str = switch (call.target) {
                             .named => |n| blk: {
-                                if (n.module) |mod| break :blk try std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ mod, n.name });
-                                if (self.current_module_prefix) |prefix| break :blk try std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ prefix, n.name });
-                                break :blk try self.allocator.dupe(u8, n.name);
+                                if (n.module) |mod| break :blk try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ mod, n.name, ep_call_arity });
+                                if (self.current_module_prefix) |prefix| break :blk try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ prefix, n.name, ep_call_arity });
+                                break :blk try std.fmt.allocPrint(self.allocator, "{s}__{d}", .{ n.name, ep_call_arity });
                             },
                             else => "unknown",
                         };
@@ -3544,21 +3631,29 @@ pub const IrBuilder = struct {
         return "UnknownType";
     }
 
-    /// Resolve a bare function call to a qualified name.
+    /// Resolve a bare function call to a qualified name with arity.
     /// Resolution order: current module → Kernel → top-level → bare name.
-    fn resolveBareCall(self: *IrBuilder, name: []const u8) ![]const u8 {
-        // 1. Current module function
-        if (self.current_module_prefix) |prefix| {
-            const qualified = try std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ prefix, name });
-            if (self.known_function_names.contains(qualified)) return qualified;
+    /// Also checks higher arities for functions with default parameters.
+    fn resolveBareCall(self: *IrBuilder, name: []const u8, arity: u32) ![]const u8 {
+        // Try exact arity first, then higher arities (for default params)
+        var try_arity: u32 = arity;
+        while (try_arity <= arity + 4) : (try_arity += 1) {
+            // 1. Current module function
+            if (self.current_module_prefix) |prefix| {
+                const qualified = try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ prefix, name, try_arity });
+                if (self.known_function_names.contains(qualified)) return qualified;
+            }
+            // 2. Kernel auto-import
+            {
+                const kernel_name = try std.fmt.allocPrint(self.allocator, "Kernel__{s}__{d}", .{ name, try_arity });
+                if (self.known_function_names.contains(kernel_name)) return kernel_name;
+            }
+            // 3. Top-level function (bare name with arity)
+            {
+                const top_name = try std.fmt.allocPrint(self.allocator, "{s}__{d}", .{ name, try_arity });
+                if (self.known_function_names.contains(top_name)) return top_name;
+            }
         }
-        // 2. Kernel auto-import
-        {
-            const kernel_name = try std.fmt.allocPrint(self.allocator, "Kernel__{s}", .{name});
-            if (self.known_function_names.contains(kernel_name)) return kernel_name;
-        }
-        // 3. Top-level function (bare name)
-        if (self.known_function_names.contains(name)) return name;
         // 4. Keep bare name — Zig compiler will error
         return name;
     }

@@ -193,25 +193,9 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
             }
         }
 
-        // Binary operators
-        if (args == .list and args.list.elems.len == 2) {
-            const lhs = try eval(env, args.list.elems[0]);
-            const rhs = try eval(env, args.list.elems[1]);
-            return evalBinop(env, form_name, lhs, rhs);
-        }
-
-        // Unary operators
-        if (args == .list and args.list.elems.len == 1) {
-            const operand = try eval(env, args.list.elems[0]);
-            if (std.mem.eql(u8, form_name, "-") and operand == .int) {
-                return CtValue{ .int = -operand.int };
-            }
-            if (std.mem.eql(u8, form_name, "not") and operand == .bool_val) {
-                return CtValue{ .bool_val = !operand.bool_val };
-            }
-        }
-
         // Built-in compile-time functions for AST manipulation
+        // Must be checked BEFORE binary/unary operator fallbacks since
+        // built-in functions like elem(x, 0) also have 2 args.
         if (args == .list) {
             const arg_elems = args.list.elems;
 
@@ -293,6 +277,25 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
             }
         }
 
+        // Binary operators (checked AFTER built-in functions)
+        if (args == .list and args.list.elems.len == 2) {
+            const lhs = try eval(env, args.list.elems[0]);
+            const rhs = try eval(env, args.list.elems[1]);
+            const binop_result = try evalBinop(env, form_name, lhs, rhs);
+            if (binop_result != .nil) return binop_result;
+        }
+
+        // Unary operators
+        if (args == .list and args.list.elems.len == 1) {
+            const operand = try eval(env, args.list.elems[0]);
+            if (std.mem.eql(u8, form_name, "-") and operand == .int) {
+                return CtValue{ .int = -operand.int };
+            }
+            if (std.mem.eql(u8, form_name, "not") and operand == .bool_val) {
+                return CtValue{ .bool_val = !operand.bool_val };
+            }
+        }
+
         // Unknown function call — return as-is (it's probably AST data)
         return value;
     }
@@ -307,7 +310,12 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
         return CtValue{ .list = .{ .alloc_id = id, .elems = elems } };
     }
 
-    // Leaf values
+    // Leaf values — check for variable binding
+    if (value == .atom) {
+        if (env.lookup(value.atom)) |bound_val| {
+            return bound_val;
+        }
+    }
     return value;
 }
 

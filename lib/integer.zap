@@ -1,5 +1,4 @@
 pub module Integer {
-  pub fn to_string(_value :: i64) -> String {
-    :zig.i64_to_string(_value)
-  }
+  @native = "Prelude.i64_to_string"
+  pub fn to_string(_value :: i64) -> String
 }
