@@ -336,6 +336,39 @@ pub module MyApp {
 }
 ```
 
+### Testing with Zest
+
+Zest is Zap's built-in test framework. Use `Zest.Case` for assertions and describe/test DSL:
+
+```zap
+pub module Test.MathTest {
+  use Zest.Case
+
+  pub fn run() -> String {
+    describe("math") {
+      test("addition") {
+        assert(1 + 1 == 2)
+      }
+
+      test("negative check") {
+        reject(5 < 0)
+      }
+    }
+    "MathTest: passed"
+  }
+}
+```
+
+Test output shows green dots for passing tests and red F with failure details for failures:
+
+```
+..............
+
+14 tests, 14 passed
+```
+
+Failed assertions don't kill the process — the test records the failure and continues to the next test.
+
 ### Tail Call Optimization
 
 Recursive functions in tail position are guaranteed to use constant stack space via LLVM's `musttail`:
@@ -456,16 +489,40 @@ pub enum Direction {
 
 ---
 
+## Native Function Bindings (`@native`)
+
+Zap library functions that need Zig runtime implementations (I/O, string operations, atom tables, etc.) use `@native` attributes instead of hardcoded compiler knowledge:
+
+```zap
+pub module IO {
+  @native = "Prelude.println"
+  pub fn puts(_message :: String) -> String
+}
+
+pub module Zest.Runtime {
+  @native = "ZestRuntime.reset"
+  pub fn reset() -> String
+
+  @native = "ZestRuntime.fail"
+  pub fn fail(_message :: String) -> String
+}
+```
+
+The `@native = "Module.function"` annotation tells the compiler to route calls to `@import("zap_runtime").Module.function(args)` in the generated ZIR. No function body is needed — the annotation IS the implementation binding. The compiler has zero knowledge of specific library modules; all bindings are declared in `.zap` source files.
+
+---
+
 ## Architecture
 
-Zap uses a per-file compilation architecture:
+Zap uses a per-module compilation architecture with per-module ZIR emission:
 
 1. **Discovery** — start from the entry point, follow module references to find files
 2. **Pass 1** — parse all files, collect declarations into a shared scope graph
 3. **Pass 2** — compile each file: macro expand, desugar, type check, HIR, IR
-4. **Pass 3** — merge IR, run analysis pipeline (escape analysis, interprocedural summaries, region solving, lambda sets, Perceus reuse), emit ZIR
+4. **Pass 3** — merge IR, run analysis pipeline (escape analysis, interprocedural summaries, region solving, lambda sets, Perceus reuse)
+5. **Pass 4** — emit per-module ZIR, inject into Zig compilation, codegen
 
-The compiler includes a fork of the Zig compiler as a static library. Zap IR lowers to ZIR (Zig Intermediate Representation), then Zig's semantic analysis, LLVM code generation, and linker produce native binaries.
+Each Zap module becomes its own Zig ZIR module. Cross-module calls use `@import("Module").function(args)` chains. Namespace re-export modules are generated for hierarchical module names (e.g., `Zest` re-exports `Runtime`, `Case`, `Runner`). `@native` functions skip ZIR emission — their calls route directly to `@import("zap_runtime")`.
 
 ```
   .zap source files
@@ -480,7 +537,7 @@ The compiler includes a fork of the Zig compiler as a static library. Zap IR low
    Collect ---------- shared scope graph + type store
       |
       v
-   Macro Expansion -- AST->AST transforms
+   Macro Expansion -- AST->AST transforms (Kernel macros: if, and, or, |>)
       |
       v
    Desugar ---------- simplify syntax
@@ -492,14 +549,15 @@ The compiler includes a fork of the Zig compiler as a static library. Zap IR low
    HIR Lowering ----- typed intermediate representation
       |
       v
-   IR Lowering ------ lower-level IR
+   IR Lowering ------ lower-level IR (arity-suffixed function names)
       |
       v
    Analysis --------- escape, regions, lambda sets, Perceus
       |
       v
-   ZIR Emit --------- Zig Intermediate Representation
-      |
+   Per-Module ZIR --- each Zap module -> its own Zig ZIR module
+      |                cross-module calls -> @import chains
+      |                @native functions -> @import("zap_runtime")
       v
    Codegen ---------- native binary (via LLVM)
 ```
@@ -520,14 +578,17 @@ zap deps update [name]       Re-resolve dependencies and rewrite zap.lock
 ## Development
 
 ```sh
-# Run the full test suite
-zig build test
-
 # Download pre-built deps (first time only)
 zig build setup
 
 # Build the zap compiler
 zig build
+
+# Run Zig-level unit tests
+zig build test
+
+# Run Zap test suite (108 tests across 22 modules)
+zap run test
 
 # Build and run an example
 cd examples/hello
