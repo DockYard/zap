@@ -2638,7 +2638,6 @@ pub const Interpreter = struct {
 
         // Env read intrinsic
         if (std.mem.eql(u8, cb.name, "System.get_env") or
-            std.mem.endsWith(u8, cb.name, "__System__get_env") or
             std.mem.eql(u8, cb.name, ":zig.get_env"))
         {
             return self.builtinGetEnv(args);
@@ -2646,45 +2645,33 @@ pub const Interpreter = struct {
 
         // Build opt read intrinsic
         if (std.mem.eql(u8, cb.name, "System.get_build_opt") or
-            std.mem.endsWith(u8, cb.name, "__System__get_build_opt") or
             std.mem.eql(u8, cb.name, ":zig.get_build_opt"))
         {
             return self.builtinGetBuildOpt(args);
         }
 
         // Pure type conversion builtins
-        if (std.mem.eql(u8, cb.name, ":zig.atom_name") or
-            std.mem.endsWith(u8, cb.name, "__Atom__to_string"))
-        {
+        if (std.mem.eql(u8, cb.name, ":zig.atom_name")) {
             return self.builtinAtomName(args);
         }
-        if (std.mem.eql(u8, cb.name, ":zig.i64_to_string") or
-            std.mem.endsWith(u8, cb.name, "__Integer__to_string"))
-        {
+        if (std.mem.eql(u8, cb.name, ":zig.i64_to_string")) {
             return self.builtinI64ToString(args);
         }
-        if (std.mem.eql(u8, cb.name, ":zig.f64_to_string") or
-            std.mem.endsWith(u8, cb.name, "__Float__to_string"))
-        {
+        if (std.mem.eql(u8, cb.name, ":zig.f64_to_string")) {
             return self.builtinF64ToString(args);
         }
         if (std.mem.eql(u8, cb.name, ":zig.to_atom") or
-            std.mem.eql(u8, cb.name, ":zig.to_existing_atom") or
-            std.mem.endsWith(u8, cb.name, "__String__to_atom") or
-            std.mem.endsWith(u8, cb.name, "__String__to_existing_atom"))
+            std.mem.eql(u8, cb.name, ":zig.to_existing_atom"))
         {
             return self.builtinToAtom(args);
         }
-        if (std.mem.eql(u8, cb.name, ":zig.inspect") or
-            std.mem.endsWith(u8, cb.name, "__Kernel__inspect"))
-        {
+        if (std.mem.eql(u8, cb.name, ":zig.inspect")) {
             return self.builtinInspect(args);
         }
 
         // Side-effect builtins: no-op at compile time, return the argument
         if (std.mem.eql(u8, cb.name, ":zig.println") or
-            std.mem.endsWith(u8, cb.name, "__IO__puts") or
-            std.mem.endsWith(u8, cb.name, "__IO__println"))
+            std.mem.eql(u8, cb.name, ":zig.print_str"))
         {
             return if (args.len > 0) args[0] else .nil;
         }

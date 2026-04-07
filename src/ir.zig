@@ -3643,12 +3643,7 @@ pub const IrBuilder = struct {
                 const qualified = try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ prefix, name, try_arity });
                 if (self.known_function_names.contains(qualified)) return qualified;
             }
-            // 2. Kernel auto-import
-            {
-                const kernel_name = try std.fmt.allocPrint(self.allocator, "Kernel__{s}__{d}", .{ name, try_arity });
-                if (self.known_function_names.contains(kernel_name)) return kernel_name;
-            }
-            // 3. Top-level function (bare name with arity)
+            // 2. Top-level function (bare name with arity)
             {
                 const top_name = try std.fmt.allocPrint(self.allocator, "{s}__{d}", .{ name, try_arity });
                 if (self.known_function_names.contains(top_name)) return top_name;

@@ -315,10 +315,7 @@ pub fn analyzeProgram(
             .module => |mod| {
                 if (mod.name.parts.len > 0) {
                     const mod_name = interner.get(mod.name.parts[0]);
-                    // Skip stdlib modules — they're prepended to every file
-                    if (!isStdlibModule(mod_name)) {
-                        try def_modules.append(allocator, mod_name);
-                    }
+                    try def_modules.append(allocator, mod_name);
                 }
                 // Check for extends (references parent module)
                 if (mod.parent) |parent| {
@@ -495,14 +492,6 @@ fn collectTypeRefsFromTypeExpr(
         .never => {},
         else => {},
     }
-}
-
-fn isStdlibModule(name: []const u8) bool {
-    const stdlib_modules = [_][]const u8{ "Kernel", "IO", "System" };
-    for (stdlib_modules) |m| {
-        if (std.mem.eql(u8, name, m)) return true;
-    }
-    return false;
 }
 
 fn isBuiltinTypeName(name: []const u8) bool {

@@ -290,18 +290,18 @@ pub const Desugarer = struct {
             },
 
 
-            // Map update: %{map | key: val, ...} → Map.put(Map.put(map, :key1, v1), :key2, v2)
+            // Map update: %{map | key: val, ...} → :zig.MapHelpers.put chains
             .map => |me| {
                 if (me.update_source) |source| {
                     var result = try self.desugarExpr(source);
-                    const map_name = try self.interner.intern("Map");
+                    const zig_atom = try self.interner.intern("zig");
                     const put_name = try self.interner.intern("put");
                     for (me.fields) |field| {
                         const callee = try self.create(ast.Expr, .{
                             .field_access = .{
                                 .meta = me.meta,
                                 .object = try self.create(ast.Expr, .{
-                                    .module_ref = .{ .meta = me.meta, .name = .{ .parts = try self.allocSlice(ast.StringId, &.{map_name}), .span = me.meta.span } },
+                                    .atom_literal = .{ .meta = me.meta, .value = zig_atom },
                                 }),
                                 .field = put_name,
                             },
@@ -640,28 +640,25 @@ pub const Desugarer = struct {
                 }),
                 .expr => |expr| blk: {
                     const desugared = try self.desugarExpr(expr);
-                    // Wrap in Kernel.to_string() for type-generic conversion
-                    const kernel_name = try self.interner.intern("Kernel");
-                    if (self.to_string_id) |ts_id| {
-                        const callee = try self.create(ast.Expr, .{
-                            .field_access = .{
-                                .meta = si.meta,
-                                .object = try self.create(ast.Expr, .{
-                                    .module_ref = .{ .meta = si.meta, .name = .{ .parts = try self.allocSlice(ast.StringId, &.{kernel_name}), .span = si.meta.span } },
-                                }),
-                                .field = ts_id,
-                            },
-                        });
-                        break :blk try self.create(ast.Expr, .{
-                            .call = .{
-                                .meta = si.meta,
-                                .callee = callee,
-                                .args = try self.allocSlice(*const ast.Expr, &.{desugared}),
-                            },
-                        });
-                    } else {
-                        break :blk desugared;
-                    }
+                    // Wrap in :zig.to_string() for type-generic conversion
+                    const zig_atom = try self.interner.intern("zig");
+                    const to_string_field = try self.interner.intern("to_string");
+                    const callee = try self.create(ast.Expr, .{
+                        .field_access = .{
+                            .meta = si.meta,
+                            .object = try self.create(ast.Expr, .{
+                                .atom_literal = .{ .meta = si.meta, .value = zig_atom },
+                            }),
+                            .field = to_string_field,
+                        },
+                    });
+                    break :blk try self.create(ast.Expr, .{
+                        .call = .{
+                            .meta = si.meta,
+                            .callee = callee,
+                            .args = try self.allocSlice(*const ast.Expr, &.{desugared}),
+                        },
+                    });
                 },
             };
 
@@ -848,30 +845,30 @@ pub const Desugarer = struct {
         const helper_name = try self.interner.intern(name_str);
         const s_name = try self.interner.intern("__s");
         const i_name = try self.interner.intern("__i");
-        const string_name = try self.interner.intern("String");
+        const zig_atom = try self.interner.intern("zig");
 
-        // Build: String.length(__s)
+        // Build: :zig.length(__s)
         const s_ref = try self.create(ast.Expr, .{ .var_ref = .{ .meta = meta, .name = s_name } });
         const i_ref = try self.create(ast.Expr, .{ .var_ref = .{ .meta = meta, .name = i_name } });
-        const string_mod = try self.create(ast.Expr, .{
-            .module_ref = .{ .meta = meta, .name = .{ .parts = try self.allocSlice(ast.StringId, &.{string_name}), .span = meta.span } },
+        const zig_ref = try self.create(ast.Expr, .{
+            .atom_literal = .{ .meta = meta, .value = zig_atom },
         });
 
         const len_callee = try self.create(ast.Expr, .{
-            .field_access = .{ .meta = meta, .object = string_mod, .field = try self.interner.intern("length") },
+            .field_access = .{ .meta = meta, .object = zig_ref, .field = try self.interner.intern("length") },
         });
         const len_call = try self.create(ast.Expr, .{
             .call = .{ .meta = meta, .callee = len_callee, .args = try self.allocSlice(*const ast.Expr, &.{s_ref}) },
         });
 
-        // Build: __i >= String.length(__s)
+        // Build: __i >= :zig.length(__s)
         const cond = try self.create(ast.Expr, .{
             .binary_op = .{ .meta = meta, .op = .greater_equal, .lhs = i_ref, .rhs = len_call },
         });
 
-        // Build: String.byte_at(__s, __i)
+        // Build: :zig.byte_at(__s, __i)
         const byte_at_callee = try self.create(ast.Expr, .{
-            .field_access = .{ .meta = meta, .object = string_mod, .field = try self.interner.intern("byte_at") },
+            .field_access = .{ .meta = meta, .object = zig_ref, .field = try self.interner.intern("byte_at") },
         });
         const byte_at_call = try self.create(ast.Expr, .{
             .call = .{ .meta = meta, .callee = byte_at_callee, .args = try self.allocSlice(*const ast.Expr, &.{ s_ref, i_ref }) },
