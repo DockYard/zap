@@ -4714,3 +4714,54 @@ test "parse nested trailing blocks" {
     try std.testing.expect(expr.call.args[1].* == .block);
 }
 
+test "parse sigil desugars to function call" {
+    const source =
+        \\pub module Test {
+        \\  pub fn run() -> String {
+        \\    ~z"hello zig"
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const func = program.modules[0].items[0].function;
+    const body = func.clauses[0].body.?;
+    const expr = body[0].expr;
+
+    // ~z"hello zig" desugars to sigil_z("hello zig", [])
+    try std.testing.expect(expr.* == .call);
+    try std.testing.expectEqualStrings("sigil_z", parser.interner.get(expr.call.callee.var_ref.name));
+    try std.testing.expectEqual(@as(usize, 2), expr.call.args.len);
+    try std.testing.expect(expr.call.args[0].* == .string_literal);
+    try std.testing.expect(expr.call.args[1].* == .list);
+    try std.testing.expectEqual(@as(usize, 0), expr.call.args[1].list.elements.len);
+}
+
+test "parse multi-char sigil" {
+    const source =
+        \\pub module Test {
+        \\  pub fn run() -> String {
+        \\    ~sql"SELECT * FROM users"
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const func = program.modules[0].items[0].function;
+    const body = func.clauses[0].body.?;
+    const expr = body[0].expr;
+
+    try std.testing.expect(expr.* == .call);
+    try std.testing.expectEqualStrings("sigil_sql", parser.interner.get(expr.call.callee.var_ref.name));
+}
+

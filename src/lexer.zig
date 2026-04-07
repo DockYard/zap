@@ -819,3 +819,37 @@ test "lex string multiple interpolations" {
     try std.testing.expectEqual(Token.Tag.string_literal_end, t5.tag);
     try std.testing.expectEqualStrings("\"", t5.slice(source));
 }
+
+test "lex single-char sigil" {
+    const source = "~z\"hello\"";
+    var lexer = Lexer.init(source);
+
+    const t1 = lexer.next();
+    try std.testing.expectEqual(Token.Tag.sigil_prefix, t1.tag);
+    try std.testing.expectEqualStrings("~z", t1.slice(source));
+
+    const t2 = lexer.next();
+    try std.testing.expectEqual(Token.Tag.string_literal, t2.tag);
+}
+
+test "lex multi-char sigil" {
+    const source = "~MY_SIGIL\"content\"";
+    var lexer = Lexer.init(source);
+
+    const t1 = lexer.next();
+    try std.testing.expectEqual(Token.Tag.sigil_prefix, t1.tag);
+    try std.testing.expectEqualStrings("~MY_SIGIL", t1.slice(source));
+
+    const t2 = lexer.next();
+    try std.testing.expectEqual(Token.Tag.string_literal, t2.tag);
+}
+
+test "lex tilde arrow still works" {
+    const source = "x ~> y";
+    var lexer = Lexer.init(source);
+
+    _ = lexer.next(); // x
+    const t2 = lexer.next();
+    try std.testing.expectEqual(Token.Tag.tilde_arrow, t2.tag);
+    try std.testing.expectEqualStrings("~>", t2.slice(source));
+}
