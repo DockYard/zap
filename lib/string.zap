@@ -1,4 +1,18 @@
 pub module String {
+  @moduledoc = """
+    Functions for working with UTF-8 encoded strings.
+
+    Strings in Zap are immutable byte sequences (`[]const u8` in the
+    underlying Zig representation). All operations return new strings
+    rather than modifying in place.
+
+    ## Examples
+
+        String.length("hello")              # => 5
+        String.contains("hello world", "o") # => true
+        String.slice("hello", 0, 3)         # => "hel"
+    """
+
   @doc = """
     Returns the byte length of a string.
 
@@ -75,7 +89,6 @@ pub module String {
     ## Examples
 
         String.trim("  hello  ")   # => "hello"
-        String.trim("\\thello\\n") # => "hello"
     """
   pub fn trim(s :: String) -> String {
     :zig.ZapString.trim(s)

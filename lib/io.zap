@@ -1,4 +1,17 @@
 pub module IO {
+  @moduledoc = """
+    Functions for standard input/output operations.
+
+    `IO` provides the basic building blocks for printing to stdout.
+    All functions return their input, making them composable in
+    pipe chains.
+
+    ## Examples
+
+        IO.puts("Hello, world!")
+        "result" |> IO.puts()
+    """
+
   @doc = """
     Prints a value to standard output followed by a newline.
 

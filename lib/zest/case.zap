@@ -1,4 +1,26 @@
 pub module Zest.Case {
+  @moduledoc = """
+    Test case DSL for the Zest test framework.
+
+    Provides `describe`, `test`, `assert`, and `reject` for writing
+    structured test cases. Use `use Zest.Case` at the top of your
+    test module to import these.
+
+    ## Examples
+
+        pub module Test.MyTest {
+          use Zest.Case
+
+          pub fn run() -> String {
+            describe("my feature") {
+              test("it works") {
+                assert(1 + 1 == 2)
+              }
+            }
+            "done"
+          }
+        }
+    """
   pub macro __using__(_opts :: Expr) -> Expr {
     quote {
       import Zest.Case

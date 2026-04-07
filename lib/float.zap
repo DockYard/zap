@@ -1,4 +1,8 @@
 pub module Float {
+  @moduledoc = """
+    Functions for working with floating-point numbers.
+    """
+
   @doc = """
     Converts a floating-point number to its string representation.
 

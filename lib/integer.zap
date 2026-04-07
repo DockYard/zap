@@ -1,4 +1,8 @@
 pub module Integer {
+  @moduledoc = """
+    Functions for working with integers.
+    """
+
   @doc = """
     Converts an integer to its string representation.
 
