@@ -1745,7 +1745,14 @@ pub const Parser = struct {
                 });
             } else if (self.check(.dot)) {
                 _ = self.advance();
-                const field_tok = try self.expect(.identifier);
+                // Accept both lowercase identifiers and capitalized module names
+                // (e.g., :zig.Prelude.println or map.field)
+                const field_tok = if (self.check(.identifier))
+                    self.advance()
+                else if (self.check(.module_identifier))
+                    self.advance()
+                else
+                    try self.expect(.identifier); // error if neither
                 const field_name = try self.internToken(field_tok);
 
                 // Check for function reference: Module.func/arity

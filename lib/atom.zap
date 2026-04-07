@@ -1,4 +1,5 @@
 pub module Atom {
-  @native = "Prelude.atom_name"
-  pub fn to_string(_atom :: Atom) -> String
+  pub fn to_string(atom :: Atom) -> String {
+    :zig.Prelude.atom_name(atom)
+  }
 }

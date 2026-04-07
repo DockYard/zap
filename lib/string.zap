@@ -1,28 +1,37 @@
 pub module String {
-  @native = "ZapString.length"
-  pub fn length(_s :: String) -> i64
+  pub fn length(s :: String) -> i64 {
+    :zig.ZapString.length(s)
+  }
 
-  @native = "ZapString.byte_at"
-  pub fn byte_at(_s :: String, _index :: i64) -> String
+  pub fn byte_at(s :: String, index :: i64) -> String {
+    :zig.ZapString.byte_at(s, index)
+  }
 
-  @native = "ZapString.contains"
-  pub fn contains(_haystack :: String, _needle :: String) -> Bool
+  pub fn contains(haystack :: String, needle :: String) -> Bool {
+    :zig.ZapString.contains(haystack, needle)
+  }
 
-  @native = "ZapString.startsWith"
-  pub fn starts_with(_s :: String, _prefix :: String) -> Bool
+  pub fn starts_with(s :: String, prefix :: String) -> Bool {
+    :zig.ZapString.startsWith(s, prefix)
+  }
 
-  @native = "ZapString.endsWith"
-  pub fn ends_with(_s :: String, _suffix :: String) -> Bool
+  pub fn ends_with(s :: String, suffix :: String) -> Bool {
+    :zig.ZapString.endsWith(s, suffix)
+  }
 
-  @native = "ZapString.trim"
-  pub fn trim(_s :: String) -> String
+  pub fn trim(s :: String) -> String {
+    :zig.ZapString.trim(s)
+  }
 
-  @native = "ZapString.slice"
-  pub fn slice(_s :: String, _start :: i64, _end :: i64) -> String
+  pub fn slice(s :: String, start :: i64, end :: i64) -> String {
+    :zig.ZapString.slice(s, start, end)
+  }
 
-  @native = "ZapString.to_atom"
-  pub fn to_atom(_name :: String) -> Atom
+  pub fn to_atom(name :: String) -> Atom {
+    :zig.ZapString.to_atom(name)
+  }
 
-  @native = "ZapString.to_existing_atom"
-  pub fn to_existing_atom(_name :: String) -> Atom
+  pub fn to_existing_atom(name :: String) -> Atom {
+    :zig.ZapString.to_existing_atom(name)
+  }
 }

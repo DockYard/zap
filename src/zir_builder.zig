@@ -289,20 +289,11 @@ pub const ZirDriver = struct {
     reuse_backed_tuple_locals: std.AutoHashMapUnmanaged(ir.LocalId, usize) = .empty,
     capture_param_refs: std.ArrayListUnmanaged(u32) = .empty,
     current_closure_env_ref: ?u32 = null,
-    /// @native binding arrays from the IR Program.
-    native_binding_keys: []const []const u8 = &.{},
-    native_binding_values: []const []const u8 = &.{},
     /// Compilation context for per-module ZIR injection.
     compilation_ctx: ?*ZirContext = null,
     /// Module currently being emitted (e.g., "IO", "Zest_Case"). Null when emitting root.
     current_emit_module: ?[]const u8 = null,
 
-    fn lookupNativeBinding(self: *const ZirDriver, name: []const u8) ?[]const u8 {
-        for (self.native_binding_keys, 0..) |key, i| {
-            if (std.mem.eql(u8, key, name)) return self.native_binding_values[i];
-        }
-        return null;
-    }
 
     pub fn init(allocator: Allocator) !ZirDriver {
         const handle = zir_builder_create() orelse return error.ZirCreateFailed;
@@ -593,8 +584,6 @@ pub const ZirDriver = struct {
 
     pub fn buildProgram(self: *ZirDriver, program: ir.Program) !void {
         self.program = program;
-        self.native_binding_keys = program.native_binding_keys;
-        self.native_binding_values = program.native_binding_values;
 
         const ctx = self.compilation_ctx;
 
@@ -610,7 +599,6 @@ pub const ZirDriver = struct {
                 try all_module_names.put(mod, {});
             }
 
-            if (self.lookupNativeBinding(func.name) != null) continue;
 
             const is_entry = if (program.entry) |eid| func.id == eid else false;
             if (is_entry or func.module_name == null) {
@@ -1701,25 +1689,7 @@ pub const ZirDriver = struct {
                     }
                 }
 
-                // Check if target is a @native function — route to runtime import
-                const cn_native_routed = cn_routed: {
-                    const native_target = self.lookupNativeBinding(resolved_call_name) orelse break :cn_routed false;
-                    const dot_idx = std.mem.indexOfScalar(u8, native_target, '.') orelse break :cn_routed false;
-                    const mod_name = native_target[0..dot_idx];
-                    const fn_name = native_target[dot_idx + 1 ..];
-                    const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
-                    if (rt_import == error_ref) break :cn_routed false;
-                    const mod_ref = zir_builder_emit_field_val(self.handle, rt_import, mod_name.ptr, @intCast(mod_name.len));
-                    if (mod_ref == error_ref) break :cn_routed false;
-                    const fn_ref = zir_builder_emit_field_val(self.handle, mod_ref, fn_name.ptr, @intCast(fn_name.len));
-                    if (fn_ref == error_ref) break :cn_routed false;
-                    const ref = zir_builder_emit_call_ref(self.handle, fn_ref, args.items.ptr, @intCast(args.items.len));
-                    if (ref == error_ref) break :cn_routed false;
-                    try self.setLocal(cn.dest, ref);
-                    break :cn_routed true;
-                };
-
-                if (!cn_native_routed) {
+                {
                     const target_func = self.findFunctionByName(resolved_call_name);
                     const target_module = if (target_func) |tf| tf.module_name else null;
                     const is_cross_module = blk: {
@@ -1856,14 +1826,14 @@ pub const ZirDriver = struct {
                     if (ref == error_ref) return error.EmitFailed;
                     try self.setLocal(cb.dest, ref);
                 } else {
-                    // Simple name — call directly
-                    const ref = zir_builder_emit_call(
-                        self.handle,
-                        cb.name.ptr,
-                        @intCast(cb.name.len),
-                        args.items.ptr,
-                        @intCast(args.items.len),
-                    );
+                    // Bare name (no module qualifier) — route through zap_runtime.Prelude
+                    const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                    if (rt_import == error_ref) return error.EmitFailed;
+                    const prelude = zir_builder_emit_field_val(self.handle, rt_import, "Prelude", 7);
+                    if (prelude == error_ref) return error.EmitFailed;
+                    const fn_ref = zir_builder_emit_field_val(self.handle, prelude, cb.name.ptr, @intCast(cb.name.len));
+                    if (fn_ref == error_ref) return error.EmitFailed;
+                    const ref = zir_builder_emit_call_ref(self.handle, fn_ref, args.items.ptr, @intCast(args.items.len));
                     if (ref == error_ref) return error.EmitFailed;
                     try self.setLocal(cb.dest, ref);
                 }
@@ -1933,25 +1903,7 @@ pub const ZirDriver = struct {
                             try args.append(self.allocator, ref);
                         }
 
-                        // Check if target is a @native stub — route to runtime import
-                        const native_routed = routed: {
-                            const native_target = self.lookupNativeBinding(fname) orelse break :routed false;
-                            const dot_idx = std.mem.indexOfScalar(u8, native_target, '.') orelse break :routed false;
-                            const mod_name = native_target[0..dot_idx];
-                            const fn_name = native_target[dot_idx + 1 ..];
-                            const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
-                            if (rt_import == error_ref) break :routed false;
-                            const mod_ref = zir_builder_emit_field_val(self.handle, rt_import, mod_name.ptr, @intCast(mod_name.len));
-                            if (mod_ref == error_ref) break :routed false;
-                            const fn_ref = zir_builder_emit_field_val(self.handle, mod_ref, fn_name.ptr, @intCast(fn_name.len));
-                            if (fn_ref == error_ref) break :routed false;
-                            const ref = zir_builder_emit_call_ref(self.handle, fn_ref, args.items.ptr, @intCast(args.items.len));
-                            if (ref == error_ref) break :routed false;
-                            try self.setLocal(cd.dest, ref);
-                            break :routed true;
-                        };
-
-                        if (!native_routed) {
+                        {
                             const target_func = self.findFunctionById(cd.function);
                             const target_module = if (target_func) |tf| tf.module_name else null;
                             const is_cross = xmod: {
@@ -4039,21 +3991,6 @@ pub const ZirDriver = struct {
     /// Must be called with body_tracking ON (before entering prong bodies).
     /// Returns the function Ref, or error if not resolvable.
     fn resolveCallNamedToRef(self: *ZirDriver, name: []const u8) BuildError!u32 {
-        // Check if this is a @native function — resolve via @import("zap_runtime")
-        if (self.lookupNativeBinding(name)) |native_target| {
-            if (std.mem.indexOfScalar(u8, native_target, '.')) |dot_idx| {
-                const mod_name = native_target[0..dot_idx];
-                const fn_name = native_target[dot_idx + 1 ..];
-                const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
-                if (rt_import == error_ref) return error.EmitFailed;
-                const mod_ref = zir_builder_emit_field_val(self.handle, rt_import, mod_name.ptr, @intCast(mod_name.len));
-                if (mod_ref == error_ref) return error.EmitFailed;
-                const fn_ref = zir_builder_emit_field_val(self.handle, mod_ref, fn_name.ptr, @intCast(fn_name.len));
-                if (fn_ref == error_ref) return error.EmitFailed;
-                return fn_ref;
-            }
-        }
-
         // Check if this is a cross-module call — resolve via @import
         const target_func = self.findFunctionByName(name);
         const target_module = if (target_func) |tf| tf.module_name else null;

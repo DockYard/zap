@@ -59,10 +59,6 @@ pub const Program = struct {
     functions: []const Function,
     type_defs: []const TypeDef,
     entry: ?FunctionId,
-    /// @native bindings as parallel arrays (keys and values).
-    /// Populated during IR building, consumed by ZIR builder.
-    native_binding_keys: []const []const u8 = &.{},
-    native_binding_values: []const []const u8 = &.{},
 };
 
 pub const Function = struct {
@@ -803,8 +799,6 @@ pub const IrBuilder = struct {
     try_variant_names: std.StringHashMap(void),
     /// Maps mangled function names → @native binding strings (e.g., "String__length" → "ZapString.length").
     /// Populated from @native attributes in the scope graph before building function bodies.
-    native_bindings: std.StringHashMap([]const u8),
-    scope_graph: ?*const scope_mod.ScopeGraph = null,
 
     pub const UnionDispatchInfo = struct {
         param_idx: u32,
@@ -831,7 +825,6 @@ pub const IrBuilder = struct {
             .union_dispatch_map = std.StringHashMap(UnionDispatchInfo).init(allocator),
             .default_arg_wrappers = std.StringHashMap([]const u8).init(allocator),
             .try_variant_names = std.StringHashMap(void).init(allocator),
-            .native_bindings = std.StringHashMap([]const u8).init(allocator),
         };
     }
 
@@ -844,7 +837,6 @@ pub const IrBuilder = struct {
         self.union_dispatch_map.deinit();
         self.default_arg_wrappers.deinit();
         self.known_function_names.deinit();
-        self.native_bindings.deinit();
     }
 
     pub fn buildProgram(self: *IrBuilder, hir_program: *const hir_mod.Program) !Program {
@@ -861,37 +853,6 @@ pub const IrBuilder = struct {
             const func_name = self.interner.get(func_group.name);
             const qualified = try std.fmt.allocPrint(self.allocator, "{s}__{d}", .{ func_name, func_group.arity });
             try self.known_function_names.put(qualified, {});
-        }
-
-        // Collect @native bindings from the scope graph.
-        // Scans ALL families globally for @native attribute, then finds
-        // the module prefix by walking scopes.
-        if (self.scope_graph) |graph| {
-            // Build a reverse map: scope_id → module prefix
-            var scope_to_prefix = std.AutoHashMap(scope_mod.ScopeId, []const u8).init(self.allocator);
-            defer scope_to_prefix.deinit();
-            for (graph.modules.items) |mod_entry| {
-                const prefix = self.moduleNameToPrefix(mod_entry.decl.name);
-                scope_to_prefix.put(mod_entry.scope_id, prefix) catch {};
-            }
-
-            for (graph.families.items) |family| {
-                for (family.attributes.items) |attr| {
-                    const attr_name = self.interner.get(attr.name);
-                    if (std.mem.eql(u8, attr_name, "native")) {
-                        if (attr.value) |val| {
-                            if (val.* == .string_literal) {
-                                const native_target = self.interner.get(val.string_literal.value);
-                                // Find module prefix from family's parent scope
-                                const prefix = scope_to_prefix.get(family.scope_id) orelse continue;
-                                const func_name = self.interner.get(family.name);
-                                const mangled = try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ prefix, func_name, family.arity });
-                                try self.native_bindings.put(mangled, native_target);
-                            }
-                        }
-                    }
-                }
-            }
         }
 
         // Second pass: pre-scan for ~> error pipe chains to identify functions
@@ -1000,21 +961,10 @@ pub const IrBuilder = struct {
             try type_defs.append(self.allocator, synth_td);
         }
 
-        // Serialize native_bindings map to owned arrays for the Program struct
-        var nb_keys: std.ArrayListUnmanaged([]const u8) = .empty;
-        var nb_values: std.ArrayListUnmanaged([]const u8) = .empty;
-        var nb_it = self.native_bindings.iterator();
-        while (nb_it.next()) |entry| {
-            try nb_keys.append(self.allocator, entry.key_ptr.*);
-            try nb_values.append(self.allocator, entry.value_ptr.*);
-        }
-
         return .{
             .functions = try self.functions.toOwnedSlice(self.allocator),
             .type_defs = try type_defs.toOwnedSlice(self.allocator),
             .entry = null,
-            .native_binding_keys = try nb_keys.toOwnedSlice(self.allocator),
-            .native_binding_values = try nb_values.toOwnedSlice(self.allocator),
         };
     }
 
@@ -3260,15 +3210,6 @@ pub const IrBuilder = struct {
                             break :blk try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ mod, nc.name, call_arity });
                         } else try self.resolveBareCall(nc.name, @intCast(call_arity));
 
-                        // Check if this function has a @native binding — emit call_builtin instead
-                        if (self.native_bindings.get(resolved_name)) |native_target| {
-                            const lowered_args = try args.toOwnedSlice(self.allocator);
-                            const lowered_modes = try arg_modes.toOwnedSlice(self.allocator);
-                            try self.current_instrs.append(self.allocator, .{
-                                .call_builtin = .{ .dest = dest, .name = native_target, .args = lowered_args, .arg_modes = lowered_modes },
-                            });
-                        } else {
-
                         // Default params handled at ZIR call site (see zir_builder.zig call_named handler)
 
                         // Check if this function uses union dispatch — wrap args if needed
@@ -3323,7 +3264,6 @@ pub const IrBuilder = struct {
                                 .call_named = .{ .dest = dest, .name = resolved_name, .args = lowered_args, .arg_modes = lowered_modes },
                             });
                         }
-                        } // close @native else block
                     },
                     .closure => |callee| {
                         const callee_local = try self.lowerExpr(callee);

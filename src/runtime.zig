@@ -687,8 +687,8 @@ pub const ZapString = struct {
         return result;
     }
 
-    pub fn length(s: []const u8) usize {
-        return s.len;
+    pub fn length(s: []const u8) i64 {
+        return @intCast(s.len);
     }
 
     pub fn slice(s: []const u8, start: usize, end: usize) []const u8 {

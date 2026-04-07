@@ -2368,12 +2368,26 @@ pub const HirBuilder = struct {
                         // Module-qualified call — @native resolution happens at IR level
                         break :blk .{ .named = .{ .module = mod_name, .name = func_name } };
                     }
-                    // :zig.function() — bridge to Zig runtime
+                    // :zig.function() or :zig.Module.function() — bridge to Zig runtime
                     if (fa.object.* == .atom_literal) {
                         const atom_name = self.interner.get(fa.object.atom_literal.value);
                         if (std.mem.eql(u8, atom_name, "zig")) {
                             const func_name = self.interner.get(fa.field);
                             break :blk .{ .builtin = func_name };
+                        }
+                    }
+                    // :zig.Module.function() — chained field access
+                    if (fa.object.* == .field_access) {
+                        const inner = fa.object.field_access;
+                        if (inner.object.* == .atom_literal) {
+                            const atom_name = self.interner.get(inner.object.atom_literal.value);
+                            if (std.mem.eql(u8, atom_name, "zig")) {
+                                // Build "Module.function" qualified name
+                                const mod_part = self.interner.get(inner.field);
+                                const func_part = self.interner.get(fa.field);
+                                const qualified = std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ mod_part, func_part }) catch break :blk .{ .builtin = func_part };
+                                break :blk .{ .builtin = qualified };
+                            }
                         }
                     }
                     callee_expr = try self.buildExpr(call.callee);
@@ -2402,10 +2416,6 @@ pub const HirBuilder = struct {
                     }
                     const scope_id = self.current_clause_scope orelse self.current_module_scope orelse self.graph.prelude_scope;
                     if (self.graph.resolveFamily(scope_id, vr.name, @intCast(call.args.len))) |family_id| {
-                        // Check for @native binding before direct dispatch
-                        if (self.resolveNativeBinding(family_id)) |native_target| {
-                            break :blk .{ .builtin = native_target };
-                        }
                         if (self.family_to_group.get(family_id)) |group_id| {
                             break :blk .{ .direct = .{ .function_group_id = group_id, .clause_index = 0 } };
                         }
@@ -2993,52 +3003,6 @@ pub const HirBuilder = struct {
 
     /// Check if a function (resolved by family ID) has a @native attribute.
     /// Returns the native binding string (e.g., "ZestRuntime.fail") if found, null otherwise.
-    fn resolveNativeBinding(self: *const HirBuilder, family_id: scope_mod.FunctionFamilyId) ?[]const u8 {
-        const family = self.graph.getFamily(family_id);
-        for (family.attributes.items) |attr| {
-            const attr_name = self.interner.get(attr.name);
-            if (std.mem.eql(u8, attr_name, "native")) {
-                // Extract the string value from the attribute
-                if (attr.value) |val| {
-                    if (val.* == .string_literal) {
-                        return self.interner.get(val.string_literal.value);
-                    }
-                }
-            }
-        }
-        return null;
-    }
-
-    /// Resolve @native binding for a module-qualified call (e.g., Zest.Runtime.fail).
-    /// Looks up the function family in the target module's scope.
-    fn resolveNativeForModuleCall(self: *const HirBuilder, mod_name: ast.ModuleName, func_name: ast.StringId, arity: u32) ?[]const u8 {
-        // Try to find the module in the scope graph
-        if (self.graph.findModuleScope(mod_name)) |mod_scope_id| {
-            const mod_scope = self.graph.getScope(mod_scope_id);
-            const key = scope_mod.FamilyKey{ .name = func_name, .arity = arity };
-            if (mod_scope.function_families.get(key)) |fid| {
-                return self.resolveNativeBinding(fid);
-            }
-        }
-        // Also try searching all module entries by decl name
-        for (self.graph.modules.items) |mod_entry| {
-            if (mod_entry.decl.name.parts.len == mod_name.parts.len) {
-                var match = true;
-                for (mod_entry.decl.name.parts, mod_name.parts) |a, b| {
-                    if (a != b) { match = false; break; }
-                }
-                if (match) {
-                    const mod_scope = self.graph.getScope(mod_entry.scope_id);
-                    const key = scope_mod.FamilyKey{ .name = func_name, .arity = arity };
-                    if (mod_scope.function_families.get(key)) |fid| {
-                        return self.resolveNativeBinding(fid);
-                    }
-                }
-            }
-        }
-        return null;
-    }
-
     /// Check if an import declaration makes a specific function name/arity available.
     fn importMatchesFunction(self: *const HirBuilder, imp: scope_mod.ImportedScope, name: ast.StringId, arity: u32) bool {
         switch (imp.filter) {
