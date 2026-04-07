@@ -2,8 +2,6 @@ pub module Test.TestRunner {
   use Zest.Runner
 
   pub fn main(_args :: [String]) -> String {
-    Zest.Runtime.reset()
-
     Test.HelloWorldTest.run()
     Test.PatternMatchingTest.run()
     Test.PipesTest.run()
