@@ -2617,11 +2617,23 @@ pub const Parser = struct {
         const sigil_text = sigil_tok.slice(self.source);
         const sigil_name = sigil_text[1..];
 
+        // Uppercase sigils suppress interpolation
+        const is_uppercase = sigil_name.len > 0 and std.ascii.isUpper(sigil_name[0]);
+
         const string_expr = if (self.check(.string_literal))
             try self.parseStringLiteral()
-        else if (self.check(.string_literal_start))
-            try self.parseStringInterpolation()
-        else {
+        else if (self.check(.string_literal_start)) blk: {
+            if (is_uppercase) {
+                try self.addRichError(
+                    "uppercase sigils do not support interpolation",
+                    start,
+                    "use the lowercase version for interpolation",
+                    "uppercase sigils like ~S and ~W treat content as raw text",
+                );
+                return error.ParseError;
+            }
+            break :blk try self.parseStringInterpolation();
+        } else {
             try self.addRichError(
                 "sigil must be followed by a string",
                 start,

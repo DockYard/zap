@@ -57,22 +57,24 @@ pub module Kernel {
 
   # Sigils — ~s, ~S, ~w, ~W
 
+  # ~s"..." — string with interpolation (lowercase = interpolation)
   pub macro sigil_s(content :: Expr, _opts :: Expr) -> Expr {
     content
   }
 
+  # ~S"..." — raw string, no interpolation (uppercase = no interpolation)
   pub macro sigil_S(content :: Expr, _opts :: Expr) -> Expr {
     content
   }
 
+  # ~w"foo bar" — word list with interpolation
   pub macro sigil_w(content :: Expr, _opts :: Expr) -> Expr {
-    _words = split_words(content)
-    _words
+    split_words(content)
   }
 
+  # ~W"foo bar" — word list without interpolation
   pub macro sigil_W(content :: Expr, _opts :: Expr) -> Expr {
-    _words = split_words(content)
-    _words
+    split_words(content)
   }
 
   pub macro |>(left :: Expr, right :: Expr) -> Expr {
