@@ -1,4 +1,16 @@
 pub module Kernel {
+  @doc = """
+    Conditional expression with a single branch.
+
+    Evaluates `condition` and executes `then_body` if truthy.
+    Returns `nil` if the condition is false.
+
+    ## Examples
+
+        if x > 0 {
+          "positive"
+        }
+    """
   pub macro if(condition :: Expr, then_body :: Expr) -> Nil {
     quote {
       case unquote(condition) {
@@ -8,6 +20,20 @@ pub module Kernel {
     }
   }
 
+  @doc = """
+    Conditional expression with both branches.
+
+    Evaluates `condition` and executes `then_body` if truthy,
+    `else_body` if falsy.
+
+    ## Examples
+
+        if x > 0 {
+          "positive"
+        } else {
+          "non-positive"
+        }
+    """
   pub macro if(condition :: Expr, then_body :: Expr, else_body :: Expr) -> Nil {
     quote {
       case unquote(condition) {
@@ -17,6 +43,15 @@ pub module Kernel {
     }
   }
 
+  @doc = """
+    Negated conditional. Executes the body when the condition is false.
+
+    ## Examples
+
+        unless done {
+          IO.puts("still working...")
+        }
+    """
   pub macro unless(condition :: Expr, body :: Expr) -> Nil {
     quote {
       if not unquote(condition) {
@@ -25,6 +60,18 @@ pub module Kernel {
     }
   }
 
+  @doc = """
+    Short-circuit logical AND.
+
+    Returns `false` immediately if the left operand is false.
+    Otherwise evaluates and returns the right operand.
+
+    ## Examples
+
+        true and true    # => true
+        true and false   # => false
+        false and expr   # => false (expr not evaluated)
+    """
   pub macro and(left :: Expr, right :: Expr) -> Expr {
     quote {
       case unquote(left) {
@@ -34,6 +81,18 @@ pub module Kernel {
     }
   }
 
+  @doc = """
+    Short-circuit logical OR.
+
+    Returns the left operand immediately if it is truthy.
+    Otherwise evaluates and returns the right operand.
+
+    ## Examples
+
+        false or true   # => true
+        false or false  # => false
+        true or expr    # => true (expr not evaluated)
+    """
   pub macro or(left :: Expr, right :: Expr) -> Expr {
     quote {
       case unquote(left) {
@@ -43,40 +102,111 @@ pub module Kernel {
     }
   }
 
+  @doc = """
+    Declaration macro for function definitions.
+
+    Receives the full function declaration AST and returns it.
+    Identity transform — provides a hook point for future
+    customization such as validation, instrumentation, or
+    compile-time checks.
+    """
   pub macro fn(decl :: Expr) -> Expr {
     quote { unquote(decl) }
   }
 
+  @doc = """
+    Declaration macro for struct definitions.
+
+    Receives the full struct declaration AST and returns it.
+    Identity transform — hook point for future customization.
+    """
   pub macro struct(decl :: Expr) -> Expr {
     quote { unquote(decl) }
   }
 
+  @doc = """
+    Declaration macro for union/enum definitions.
+
+    Receives the full union declaration AST and returns it.
+    Identity transform — hook point for future customization.
+    """
   pub macro union(decl :: Expr) -> Expr {
     quote { unquote(decl) }
   }
 
-  # Sigils — ~s, ~S, ~w, ~W
+  # Sigils
 
-  # ~s"..." — string with interpolation (lowercase = interpolation)
+  @doc = """
+    String sigil with interpolation support.
+
+    `~s"hello \#{name}"` is equivalent to `"hello \#{name}"`.
+    Lowercase sigils allow `\#{}` interpolation.
+
+    ## Examples
+
+        ~s"hello"         # => "hello"
+        ~s"count: \#{42}" # => "count: 42"
+    """
   pub macro sigil_s(content :: Expr, _opts :: Expr) -> Expr {
     content
   }
 
-  # ~S"..." — raw string, no interpolation (uppercase = no interpolation)
+  @doc = """
+    Raw string sigil without interpolation.
+
+    `~S"hello \#{name}"` keeps `\#{name}` as literal characters.
+    Uppercase sigils suppress interpolation.
+
+    ## Examples
+
+        ~S"hello"          # => "hello"
+        ~S"no \#{interp}"   # => "no \#{interp}" (literal)
+    """
   pub macro sigil_S(content :: Expr, _opts :: Expr) -> Expr {
     content
   }
 
-  # ~w"foo bar" — word list with interpolation
+  @doc = """
+    Word list sigil with interpolation support.
+
+    Splits the string on whitespace and returns a list of strings.
+    Lowercase allows `\#{}` interpolation before splitting.
+
+    ## Examples
+
+        ~w"foo bar baz"  # => ["foo", "bar", "baz"]
+        ~w"hello world"  # => ["hello", "world"]
+    """
   pub macro sigil_w(content :: Expr, _opts :: Expr) -> Expr {
     split_words(content)
   }
 
-  # ~W"foo bar" — word list without interpolation
+  @doc = """
+    Word list sigil without interpolation.
+
+    Splits the string on whitespace and returns a list of strings.
+    Uppercase suppresses `\#{}` interpolation.
+
+    ## Examples
+
+        ~W"foo bar baz"  # => ["foo", "bar", "baz"]
+    """
   pub macro sigil_W(content :: Expr, _opts :: Expr) -> Expr {
     split_words(content)
   }
 
+  @doc = """
+    Pipe operator. Passes the left value as the first argument
+    to the function call on the right.
+
+    `x |> f(y)` becomes `f(x, y)`.
+
+    ## Examples
+
+        5 |> add_one()              # => add_one(5)
+        "hello" |> String.length()  # => String.length("hello")
+        x |> f() |> g()            # => g(f(x))
+    """
   pub macro |>(left :: Expr, right :: Expr) -> Expr {
     _name = elem(right, 0)
     _meta = elem(right, 1)
