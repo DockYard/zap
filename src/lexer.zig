@@ -445,6 +445,13 @@ pub const Lexer = struct {
                     self.pos += 1;
                     return self.makeToken(.tilde_arrow, start, self.pos);
                 }
+                // Sigil: ~x or ~abc_def (alpha/underscore chars after ~)
+                if (self.pos < self.source.len and (std.ascii.isAlphabetic(self.source[self.pos]) or self.source[self.pos] == '_')) {
+                    while (self.pos < self.source.len and (std.ascii.isAlphanumeric(self.source[self.pos]) or self.source[self.pos] == '_')) {
+                        self.pos += 1;
+                    }
+                    return self.makeToken(.sigil_prefix, start, self.pos);
+                }
                 return self.makeToken(.invalid, start, self.pos);
             },
             '&' => {

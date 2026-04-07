@@ -1828,6 +1828,7 @@ pub const Parser = struct {
             .keyword_unquote_splicing => return self.parseUnquoteSplicingExpr(),
             .keyword_panic => return self.parsePanicExpr(),
             .at_sign => return self.parseAtSignExpr(),
+            .sigil_prefix => return self.parseSigilExpr(),
             .double_ampersand => {
                 try self.addRichError(
                     "Zap uses `and` for logical AND, not `&&`",
@@ -2602,6 +2603,53 @@ pub const Parser = struct {
             .panic_expr = .{
                 .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
                 .message = message,
+            },
+        });
+    }
+
+    /// Parse a sigil expression: ~x"content" or ~abc"""heredoc"""
+    /// Desugars to sigil_x("content", []) — a regular function call.
+    fn parseSigilExpr(self: *Parser) !*const ast.Expr {
+        const start = self.currentSpan();
+        const sigil_tok = self.advance(); // consume sigil_prefix token
+        const sigil_text = sigil_tok.slice(self.source);
+        // Strip the ~ prefix to get the sigil name
+        const sigil_name = sigil_text[1..];
+
+        // Build the function name: sigil_NAME
+        const func_name = try std.fmt.allocPrint(self.allocator, "sigil_{s}", .{sigil_name});
+        const func_id = try self.interner.intern(func_name);
+
+        // Parse the string argument (must immediately follow the sigil prefix)
+        const string_expr = if (self.check(.string_literal))
+            try self.parseStringLiteral()
+        else if (self.check(.string_literal_start))
+            try self.parseStringInterpolation()
+        else {
+            try self.addRichError(
+                "sigil must be followed by a string",
+                start,
+                "expected a string after the sigil",
+                "sigils must be followed by a string literal: ~x\"content\"",
+            );
+            return error.ParseError;
+        };
+
+        // Build empty list for options argument
+        const empty_list = try self.create(ast.Expr, .{
+            .list = .{ .meta = .{ .span = start }, .elements = &.{} },
+        });
+
+        // Desugar to: sigil_NAME(content, [])
+        const callee = try self.create(ast.Expr, .{
+            .var_ref = .{ .meta = .{ .span = start }, .name = func_id },
+        });
+
+        return self.create(ast.Expr, .{
+            .call = .{
+                .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
+                .callee = callee,
+                .args = try self.allocator.dupe(*const ast.Expr, &.{ string_expr, empty_list }),
             },
         });
     }

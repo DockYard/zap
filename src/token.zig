@@ -78,6 +78,7 @@ pub const Token = struct {
         arrow, // ->
         back_arrow, // <-
         tilde_arrow, // ~>
+        sigil_prefix, // ~z, ~r, ~MY_SIGIL (sigil name including ~)
         double_colon, // ::
         pipe, // |
         diamond, // <>
