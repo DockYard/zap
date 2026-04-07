@@ -14,6 +14,7 @@ pub module Zest.Case {
   pub macro test(_name :: Expr, body :: Expr) -> Expr {
     quote {
       unquote(body)
+      IO.print_str(".")
     }
   }
 
