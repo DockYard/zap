@@ -1480,61 +1480,21 @@ pub const ZirDriver = struct {
                 }
 
                 // Route stdlib module calls through @import("zap_runtime")
-                const is_kernel = std.mem.startsWith(u8, cn.name, "Kernel__");
-                const is_io = std.mem.startsWith(u8, cn.name, "IO__");
-                const is_string = std.mem.startsWith(u8, cn.name, "String__");
-                const is_atom = std.mem.startsWith(u8, cn.name, "Atom__");
-                const is_integer = std.mem.startsWith(u8, cn.name, "Integer__");
-                const is_float = std.mem.startsWith(u8, cn.name, "Float__");
-                const is_system = std.mem.startsWith(u8, cn.name, "System__");
-                const is_map = std.mem.startsWith(u8, cn.name, "Map__");
-                if (is_kernel or is_io or is_string or is_atom or is_integer or is_float or is_system or is_map) {
-                    // Map Zap function names to their runtime equivalents.
-                    // Most names match directly; these are the exceptions:
-                    const func_name = if (is_io and std.mem.eql(u8, cn.name["IO__".len..], "puts"))
-                        @as([]const u8, "println")
-                    else if (is_integer and std.mem.eql(u8, cn.name["Integer__".len..], "to_string"))
-                        @as([]const u8, "i64_to_string")
-                    else if (is_float and std.mem.eql(u8, cn.name["Float__".len..], "to_string"))
-                        @as([]const u8, "f64_to_string")
-                    else if (is_atom and std.mem.eql(u8, cn.name["Atom__".len..], "to_string"))
-                        @as([]const u8, "atom_name")
-                    else if (is_kernel)
-                        @as([]const u8, cn.name["Kernel__".len..])
-                    else if (is_io)
-                        @as([]const u8, cn.name["IO__".len..])
-                    else if (is_string)
-                        @as([]const u8, cn.name["String__".len..])
-                    else if (is_atom)
-                        @as([]const u8, cn.name["Atom__".len..])
-                    else if (is_integer)
-                        @as([]const u8, cn.name["Integer__".len..])
-                    else if (is_float)
-                        @as([]const u8, cn.name["Float__".len..])
-                    else if (is_system)
-                        @as([]const u8, cn.name["System__".len..])
-                    else if (is_map)
-                        @as([]const u8, cn.name["Map__".len..])
-                    else
-                        @as([]const u8, cn.name);
+                // Check if this is a Zig-implemented runtime function.
+                // Only functions that CANNOT be written in Zap (use anytype, @typeInfo,
+                // Zig stdout, atom tables, etc.) are routed to zap_runtime.
+                // Everything else compiles as a normal Zap function via decl_val + call.
+                const route: ?RuntimeRoute = resolveRuntimeRoute(cn.name);
 
-                    // @import("zap_runtime")
+                if (route) |rt| {
                     const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                     if (rt_import == error_ref) return error.EmitFailed;
-
-                    // Route to the correct runtime module
-                    const mod_name: []const u8 = if (is_string) "ZapString" else if (is_map) "MapHelpers" else "Prelude";
-                    const mod_ref = zir_builder_emit_field_val(self.handle, rt_import, mod_name.ptr, @intCast(mod_name.len));
+                    const mod_ref = zir_builder_emit_field_val(self.handle, rt_import, rt.zig_mod.ptr, @intCast(rt.zig_mod.len));
                     if (mod_ref == error_ref) return error.EmitFailed;
-
-                    // .function_name
-                    const fn_ref = zir_builder_emit_field_val(self.handle, mod_ref, func_name.ptr, @intCast(func_name.len));
+                    const fn_ref = zir_builder_emit_field_val(self.handle, mod_ref, rt.zig_fn.ptr, @intCast(rt.zig_fn.len));
                     if (fn_ref == error_ref) return error.EmitFailed;
-
-                    // call(fn_ref, args)
                     const ref = zir_builder_emit_call_ref(self.handle, fn_ref, args.items.ptr, @intCast(args.items.len));
                     if (ref == error_ref) return error.EmitFailed;
-
                     try self.setLocal(cn.dest, ref);
                 } else {
                     const ref = zir_builder_emit_call(
@@ -3786,40 +3746,14 @@ pub const ZirDriver = struct {
     /// Resolve a function name to a ZIR Ref via the appropriate import path.
     /// Must be called with body_tracking ON (before entering prong bodies).
     fn resolveCallNamedToRef(self: *ZirDriver, name: []const u8) BuildError!u32 {
-        const prefixes = [_]struct { prefix: []const u8, mod: []const u8 }{
-            .{ .prefix = "IO__", .mod = "Prelude" },
-            .{ .prefix = "Kernel__", .mod = "Prelude" },
-            .{ .prefix = "String__", .mod = "ZapString" },
-            .{ .prefix = "Atom__", .mod = "Prelude" },
-            .{ .prefix = "Integer__", .mod = "Prelude" },
-            .{ .prefix = "Float__", .mod = "Prelude" },
-            .{ .prefix = "System__", .mod = "Prelude" },
-        };
-        for (&prefixes) |p| {
-            if (std.mem.startsWith(u8, name, p.prefix)) {
-                const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
-                if (rt_import == error_ref) return error.EmitFailed;
-                const mod_ref = zir_builder_emit_field_val(self.handle, rt_import, p.mod.ptr, @intCast(p.mod.len));
-                if (mod_ref == error_ref) return error.EmitFailed;
-                const func_name = name[p.prefix.len..];
-                const mapped: []const u8 = if (std.mem.eql(u8, p.prefix, "IO__") and std.mem.eql(u8, func_name, "puts"))
-                    "println"
-                else if (std.mem.eql(u8, p.prefix, "Integer__") and std.mem.eql(u8, func_name, "to_string"))
-                    "i64_to_string"
-                else if (std.mem.eql(u8, p.prefix, "Float__") and std.mem.eql(u8, func_name, "to_string"))
-                    "f64_to_string"
-                else if (std.mem.eql(u8, p.prefix, "Atom__") and std.mem.eql(u8, func_name, "to_string"))
-                    "atom_name"
-                else
-                    func_name;
-                const fn_ref = zir_builder_emit_field_val(self.handle, mod_ref, mapped.ptr, @intCast(mapped.len));
-                if (fn_ref == error_ref) return error.EmitFailed;
-                return fn_ref;
-            }
-        }
-        // User-defined function — can't pre-resolve without calling.
-        // The caller must handle this by using emit_call at the top level.
-        return error.EmitFailed;
+        const route = resolveRuntimeRoute(name) orelse return error.EmitFailed;
+        const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+        if (rt_import == error_ref) return error.EmitFailed;
+        const mod_ref = zir_builder_emit_field_val(self.handle, rt_import, route.zig_mod.ptr, @intCast(route.zig_mod.len));
+        if (mod_ref == error_ref) return error.EmitFailed;
+        const fn_ref = zir_builder_emit_field_val(self.handle, mod_ref, route.zig_fn.ptr, @intCast(route.zig_fn.len));
+        if (fn_ref == error_ref) return error.EmitFailed;
+        return fn_ref;
     }
 };
 
@@ -4017,4 +3951,65 @@ test "findClosureTargetInInstrs follows local aliases" {
     try std.testing.expectEqual(@as(ir.FunctionId, 9), target.function_id);
     try std.testing.expectEqual(@as(usize, 1), target.captures.len);
     try std.testing.expectEqual(@as(ir.LocalId, 7), target.captures[0]);
+}
+
+// ============================================================
+// Runtime function routing table
+//
+// Maps Zap mangled function names to Zig runtime module + function.
+// Only functions implemented in Zig (not Zap) are listed here.
+// Everything else compiles as a normal Zap function via decl_val.
+// ============================================================
+
+const RuntimeRoute = struct { zig_mod: []const u8, zig_fn: []const u8 };
+
+fn resolveRuntimeRoute(name: []const u8) ?RuntimeRoute {
+    // Explicit lookup table — no prefix matching
+    const routes = [_]struct { zap_name: []const u8, route: RuntimeRoute }{
+        // IO module — Zig stdout operations
+        .{ .zap_name = "IO__puts", .route = .{ .zig_mod = "Prelude", .zig_fn = "println" } },
+        .{ .zap_name = "IO__print_str", .route = .{ .zig_mod = "Prelude", .zig_fn = "print_str" } },
+
+        // Kernel module — formatting and intrinsics
+        .{ .zap_name = "Kernel__inspect", .route = .{ .zig_mod = "Prelude", .zig_fn = "inspect" } },
+        .{ .zap_name = "Kernel__to_string", .route = .{ .zig_mod = "Prelude", .zig_fn = "to_string" } },
+
+        // Integer module — number formatting
+        .{ .zap_name = "Integer__to_string", .route = .{ .zig_mod = "Prelude", .zig_fn = "i64_to_string" } },
+
+        // Float module — number formatting
+        .{ .zap_name = "Float__to_string", .route = .{ .zig_mod = "Prelude", .zig_fn = "f64_to_string" } },
+
+        // Atom module — atom table operations
+        .{ .zap_name = "Atom__to_string", .route = .{ .zig_mod = "Prelude", .zig_fn = "atom_name" } },
+
+        // String module — Zig slice operations
+        .{ .zap_name = "String__length", .route = .{ .zig_mod = "ZapString", .zig_fn = "length" } },
+        .{ .zap_name = "String__byte_at", .route = .{ .zig_mod = "ZapString", .zig_fn = "byte_at" } },
+        .{ .zap_name = "String__contains", .route = .{ .zig_mod = "ZapString", .zig_fn = "contains" } },
+        .{ .zap_name = "String__starts_with", .route = .{ .zig_mod = "ZapString", .zig_fn = "startsWith" } },
+        .{ .zap_name = "String__ends_with", .route = .{ .zig_mod = "ZapString", .zig_fn = "endsWith" } },
+        .{ .zap_name = "String__trim", .route = .{ .zig_mod = "ZapString", .zig_fn = "trim" } },
+        .{ .zap_name = "String__slice", .route = .{ .zig_mod = "ZapString", .zig_fn = "slice" } },
+        .{ .zap_name = "String__to_atom", .route = .{ .zig_mod = "ZapString", .zig_fn = "to_atom" } },
+        .{ .zap_name = "String__to_existing_atom", .route = .{ .zig_mod = "ZapString", .zig_fn = "to_existing_atom" } },
+
+        // Map module — @typeInfo-based operations
+        .{ .zap_name = "Map__get", .route = .{ .zig_mod = "MapHelpers", .zig_fn = "get" } },
+        .{ .zap_name = "Map__has_key", .route = .{ .zig_mod = "MapHelpers", .zig_fn = "has_key" } },
+        .{ .zap_name = "Map__size", .route = .{ .zig_mod = "MapHelpers", .zig_fn = "size" } },
+        .{ .zap_name = "Map__put", .route = .{ .zig_mod = "MapHelpers", .zig_fn = "put" } },
+
+        // System module — OS operations
+        .{ .zap_name = "System__arg_count", .route = .{ .zig_mod = "Prelude", .zig_fn = "arg_count" } },
+        .{ .zap_name = "System__arg_at", .route = .{ .zig_mod = "Prelude", .zig_fn = "arg_at" } },
+        .{ .zap_name = "System__get_env", .route = .{ .zig_mod = "Prelude", .zig_fn = "get_env" } },
+        .{ .zap_name = "System__get_build_opt", .route = .{ .zig_mod = "Prelude", .zig_fn = "get_build_opt" } },
+        .{ .zap_name = "System__panic", .route = .{ .zig_mod = "Prelude", .zig_fn = "panic" } },
+    };
+
+    for (&routes) |entry| {
+        if (std.mem.eql(u8, name, entry.zap_name)) return entry.route;
+    }
+    return null;
 }
