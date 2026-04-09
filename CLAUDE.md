@@ -36,6 +36,7 @@ Zap is a general-purpose programming language. Features, behaviors, library func
 - **`@doc` goes immediately before the function/macro it documents**, with a blank line between the closing `"""` and the `pub fn`/`pub macro`.
 - **All `@doc` and `@moduledoc` use heredoc `"""`** for multi-line content.
 - **Escape `#{` in doc examples** as `\#{` to prevent interpolation inside heredocs.
+- **Always use descriptive names.** Never use short or cryptic variable names, parameter names, or helper names when writing new code. Prefer explicit names that make the code readable without extra context.
 
 ## Development Workflow
 

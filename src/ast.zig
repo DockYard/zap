@@ -353,6 +353,9 @@ pub const Expr = union(enum) {
     // Function reference: Module.func/arity
     function_ref: FunctionRefExpr,
 
+    // Anonymous function expression
+    anonymous_function: AnonymousFunctionExpr,
+
     // Type annotation on expression: expr :: Type
     type_annotated: TypeAnnotatedExpr,
 
@@ -392,6 +395,7 @@ pub const Expr = union(enum) {
             .attr_ref => |v| v.meta,
             .binary_literal => |v| v.meta,
             .function_ref => |v| v.meta,
+            .anonymous_function => |v| v.meta,
             .type_annotated => |v| v.meta,
         };
     }
@@ -800,6 +804,11 @@ pub const FunctionRefExpr = struct {
     module: ?ModuleName, // null for local function references
     function: StringId,
     arity: u32,
+};
+
+pub const AnonymousFunctionExpr = struct {
+    meta: NodeMeta,
+    decl: *const FunctionDecl,
 };
 
 // ============================================================

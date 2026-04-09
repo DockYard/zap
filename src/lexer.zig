@@ -459,7 +459,7 @@ pub const Lexer = struct {
                     self.pos += 1;
                     return self.makeToken(.double_ampersand, start, self.pos);
                 }
-                return self.makeToken(.invalid, start, self.pos);
+                return self.makeToken(.ampersand, start, self.pos);
             },
             else => return self.makeToken(.invalid, start, self.pos),
         }
@@ -688,11 +688,11 @@ test "lex function definition tokens" {
     var lexer = Lexer.init(source);
 
     const expected_tags = [_]Token.Tag{
-        .keyword_pub, .keyword_fn,    .identifier,
-        .left_paren,  .identifier,    .double_colon,
-        .identifier,  .comma,         .identifier,
-        .double_colon, .identifier,   .right_paren,
-        .double_colon, .identifier,   .left_brace,
+        .keyword_pub,  .keyword_fn, .identifier,
+        .left_paren,   .identifier, .double_colon,
+        .identifier,   .comma,      .identifier,
+        .double_colon, .identifier, .right_paren,
+        .double_colon, .identifier, .left_brace,
     };
 
     for (expected_tags) |exp| {

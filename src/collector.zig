@@ -175,7 +175,6 @@ pub const Collector = struct {
         }
     }
 
-
     // ============================================================
     // Function collection — family grouping
     // ============================================================
@@ -534,6 +533,7 @@ pub const Collector = struct {
             switch (stmt) {
                 .assignment => |assign| {
                     try self.collectPatternBindings(assign.pattern, parent_scope);
+                    try self.collectExprScopes(assign.value, parent_scope);
                 },
                 .expr => |expr| {
                     try self.collectExprScopes(expr, parent_scope);
@@ -626,6 +626,9 @@ pub const Collector = struct {
             .block => |blk| {
                 const blk_scope = try self.graph.createScope(parent_scope, .block);
                 try self.collectBlock(blk.stmts, blk_scope);
+            },
+            .anonymous_function => |anon| {
+                try self.collectFunction(anon.decl, parent_scope);
             },
             // For other expressions, we don't create new scopes
             else => {},

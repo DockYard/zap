@@ -1314,7 +1314,7 @@ pub const HirBuilder = struct {
     allocator: std.mem.Allocator,
     interner: *const ast.StringInterner,
     graph: *const scope_mod.ScopeGraph,
-    type_store: *const types_mod.TypeStore,
+    type_store: *types_mod.TypeStore,
     next_group_id: u32,
     next_local: u32,
     current_param_names: []const ?ast.StringId,
@@ -1344,7 +1344,7 @@ pub const HirBuilder = struct {
         allocator: std.mem.Allocator,
         interner: *const ast.StringInterner,
         graph: *const scope_mod.ScopeGraph,
-        type_store: *const types_mod.TypeStore,
+        type_store: *types_mod.TypeStore,
     ) HirBuilder {
         return .{
             .allocator = allocator,
@@ -1515,6 +1515,97 @@ pub const HirBuilder = struct {
             current = self.graph.getScope(sid).parent;
         }
         return found;
+    }
+
+    fn buildResolvedFunctionType(self: *HirBuilder, clause: ast.FunctionClause) anyerror!types_mod.TypeId {
+        const params = try self.allocator.alloc(types_mod.TypeId, clause.params.len);
+        const ownerships = try self.allocator.alloc(Ownership, clause.params.len);
+        for (clause.params, 0..) |param, idx| {
+            const param_type = if (param.type_annotation) |ann|
+                self.resolveTypeExpr(ann)
+            else
+                types_mod.TypeStore.UNKNOWN;
+            params[idx] = param_type;
+            ownerships[idx] = self.resolveParamOwnership(param, param_type);
+        }
+
+        const return_type = if (clause.return_type) |rt|
+            self.resolveTypeExpr(rt)
+        else
+            types_mod.TypeStore.UNKNOWN;
+
+        return try self.type_store.addFunctionType(params, return_type, ownerships, self.defaultOwnershipForType(return_type));
+    }
+
+    fn resolveFunctionValueType(self: *HirBuilder, name: ast.StringId) anyerror!types_mod.TypeId {
+        const scope_id = self.current_clause_scope orelse self.current_module_scope orelse self.graph.prelude_scope;
+        var current: ?scope_mod.ScopeId = scope_id;
+        var found_clause: ?ast.FunctionClause = null;
+        while (current) |sid| {
+            var it = self.graph.getScope(sid).function_families.iterator();
+            while (it.next()) |entry| {
+                const key = entry.key_ptr.*;
+                if (key.name != name) continue;
+                const family = self.graph.getFamily(entry.value_ptr.*);
+                if (family.clauses.items.len == 0) continue;
+                const clause_ref = family.clauses.items[0];
+                const clause = clause_ref.decl.clauses[clause_ref.clause_index];
+                if (found_clause != null) return types_mod.TypeStore.UNKNOWN;
+                found_clause = clause;
+            }
+            current = self.graph.getScope(sid).parent;
+        }
+
+        if (found_clause) |clause| {
+            return try self.buildResolvedFunctionType(clause);
+        }
+
+        return types_mod.TypeStore.UNKNOWN;
+    }
+
+    fn resolveFunctionRefType(self: *HirBuilder, fr: ast.FunctionRefExpr) anyerror!types_mod.TypeId {
+        const scope_id = if (fr.module) |module_name|
+            self.graph.findModuleScope(module_name)
+        else
+            self.current_clause_scope orelse self.current_module_scope orelse self.graph.prelude_scope;
+
+        const resolved_scope = scope_id orelse return types_mod.TypeStore.UNKNOWN;
+        const family_id = self.graph.resolveFamily(resolved_scope, fr.function, fr.arity) orelse return types_mod.TypeStore.UNKNOWN;
+        const family = self.graph.getFamily(family_id);
+        if (family.clauses.items.len == 0) return types_mod.TypeStore.UNKNOWN;
+        const clause_ref = family.clauses.items[0];
+        const clause = clause_ref.decl.clauses[clause_ref.clause_index];
+        return try self.buildResolvedFunctionType(clause);
+    }
+
+    fn resolveFunctionRefGroup(self: *const HirBuilder, fr: ast.FunctionRefExpr) ?u32 {
+        const scope_id = if (fr.module) |module_name|
+            self.graph.findModuleScope(module_name)
+        else
+            self.current_clause_scope orelse self.current_module_scope orelse self.graph.prelude_scope;
+
+        const resolved_scope = scope_id orelse return null;
+        const family_id = self.graph.resolveFamily(resolved_scope, fr.function, fr.arity) orelse return null;
+        return self.family_to_group.get(family_id);
+    }
+
+    fn buildFunctionValueExpr(self: *HirBuilder, group_id: u32, type_id: types_mod.TypeId, span: ast.SourceSpan) anyerror!*const Expr {
+        const group_captures = self.group_captures.get(group_id) orelse &.{};
+        var capture_values: std.ArrayList(CaptureValue) = .empty;
+        for (group_captures) |capture| {
+            try capture_values.append(self.allocator, .{
+                .expr = (try self.buildBindingReference(capture.name, capture.type_id, span)) orelse return error.OutOfMemory,
+                .ownership = capture.ownership,
+            });
+        }
+        return try self.create(Expr, .{
+            .kind = .{ .closure_create = .{
+                .function_group_id = group_id,
+                .captures = try capture_values.toOwnedSlice(self.allocator),
+            } },
+            .type_id = type_id,
+            .span = span,
+        });
     }
 
     fn isScopeWithinFunctionRoot(self: *const HirBuilder, scope_id: scope_mod.ScopeId) bool {
@@ -2253,7 +2344,10 @@ pub const HirBuilder = struct {
             }),
             .var_ref => |v| {
                 // Try to resolve type from scope graph binding
-                const resolved_type = self.resolveBindingType(v.name);
+                var resolved_type = self.resolveBindingType(v.name);
+                if (resolved_type == types_mod.TypeStore.UNKNOWN) {
+                    resolved_type = try self.resolveFunctionValueType(v.name);
+                }
 
                 if (self.current_clause_scope != null) {
                     if (try self.buildBindingReference(v.name, resolved_type, v.meta.span)) |ref| {
@@ -2261,22 +2355,7 @@ pub const HirBuilder = struct {
                     }
                 }
                 if (self.resolveFunctionValueGroup(v.name)) |group_id| {
-                    const group_captures = self.group_captures.get(group_id) orelse &.{};
-                    var capture_values: std.ArrayList(CaptureValue) = .empty;
-                    for (group_captures) |capture| {
-                        try capture_values.append(self.allocator, .{
-                            .expr = (try self.buildBindingReference(capture.name, capture.type_id, v.meta.span)) orelse return error.OutOfMemory,
-                            .ownership = capture.ownership,
-                        });
-                    }
-                    return try self.create(Expr, .{
-                        .kind = .{ .closure_create = .{
-                            .function_group_id = group_id,
-                            .captures = try capture_values.toOwnedSlice(self.allocator),
-                        } },
-                        .type_id = resolved_type,
-                        .span = v.meta.span,
-                    });
+                    return try self.buildFunctionValueExpr(group_id, resolved_type, v.meta.span);
                 }
                 return try self.create(Expr, .{
                     .kind = .{ .local_get = 0 }, // TODO: resolve to local index
@@ -2731,6 +2810,36 @@ pub const HirBuilder = struct {
                     .kind = inner.kind,
                     .type_id = annotated_type,
                     .span = ta.meta.span,
+                });
+            },
+            .function_ref => |fr| {
+                const function_type = try self.resolveFunctionRefType(fr);
+                if (self.resolveFunctionRefGroup(fr)) |group_id| {
+                    return try self.buildFunctionValueExpr(group_id, function_type, fr.meta.span);
+                }
+                return try self.create(Expr, .{
+                    .kind = .nil_lit,
+                    .type_id = function_type,
+                    .span = fr.meta.span,
+                });
+            },
+            .anonymous_function => |anon| {
+                const function_type = try self.resolveFunctionValueType(anon.decl.name);
+                const group_scope = self.current_clause_scope orelse self.current_module_scope orelse self.graph.prelude_scope;
+                const group = try self.buildFunctionGroup(anon.decl, group_scope, null, true);
+                const group_ptr = try self.create(FunctionGroup, group);
+                const closure_expr = try self.buildFunctionValueExpr(group.id, function_type, anon.meta.span);
+                const block = try self.create(Block, .{
+                    .stmts = try self.allocator.dupe(Stmt, &.{
+                        .{ .function_group = group_ptr },
+                        .{ .expr = closure_expr },
+                    }),
+                    .result_type = function_type,
+                });
+                return try self.create(Expr, .{
+                    .kind = .{ .block = block.* },
+                    .type_id = function_type,
+                    .span = anon.meta.span,
                 });
             },
             .module_ref => |mr| {
@@ -3506,6 +3615,51 @@ test "HIR closure calls adopt borrowed ownership mode" {
     const call_expr = hir_program.modules[0].functions[0].clauses[0].body.stmts[0].expr;
     try std.testing.expect(call_expr.kind == .call);
     try std.testing.expectEqual(ValueMode.borrow, call_expr.kind.call.args[0].mode);
+}
+
+test "HIR function_ref keeps concrete function type" {
+    const source =
+        \\pub module Test {
+        \\  pub fn double(x :: i64) -> i64 {
+        \\    x * 2
+        \\  }
+        \\
+        \\  pub fn run() -> (i64 -> i64) {
+        \\    &double/1
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+
+    var builder = HirBuilder.init(alloc, parser.interner, &collector.graph, &checker.store);
+    defer builder.deinit();
+    const hir_program = try builder.buildProgram(&program);
+
+    const expr = hir_program.modules[0].functions[1].clauses[0].body.stmts[0].expr;
+    try std.testing.expect(expr.kind == .closure_create);
+    try std.testing.expect(expr.type_id != types_mod.TypeStore.UNKNOWN);
+
+    const typ = checker.store.getType(expr.type_id);
+    try std.testing.expect(typ == .function);
+    try std.testing.expectEqual(@as(usize, 1), typ.function.params.len);
+    try std.testing.expectEqual(types_mod.TypeStore.I64, typ.function.params[0]);
+    try std.testing.expectEqual(types_mod.TypeStore.I64, typ.function.return_type);
 }
 
 /// Map a TypeId to a human-readable name string for synthesized type naming.

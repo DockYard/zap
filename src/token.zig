@@ -83,6 +83,7 @@ pub const Token = struct {
         pipe, // |
         diamond, // <>
         bang, // !
+        ampersand, // &
         caret, // ^
         hash_brace, // #{
         percent_brace, // %{

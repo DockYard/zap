@@ -72,6 +72,17 @@ pub fn exprToCtValue(
             return makeTuple3(alloc, store, form, try metaToList(alloc, store, v.meta, null), args);
         },
 
+        .anonymous_function => |v| blk: {
+            const name = interner.get(v.decl.name);
+            const params = try paramsToCtList(alloc, interner, store, v.decl.clauses[0].params);
+            const body = if (v.decl.clauses[0].body) |body_stmts|
+                try blockToCtValue(alloc, interner, store, body_stmts)
+            else
+                .nil;
+            const args = try makeList(alloc, store, &.{ .{ .atom = name }, params, body });
+            break :blk makeTuple3(alloc, store, .{ .atom = "fn" }, try metaToList(alloc, store, v.meta, null), args);
+        },
+
         // Pipe: {:|>, meta, [left, right]}
         .pipe => |v| {
             const left = try exprToCtValue(alloc, interner, store, v.lhs);
@@ -559,6 +570,25 @@ fn blockToCtValue(
     }
     const args = try makeListFromSlice(alloc, store, vals.items);
     return makeTuple3(alloc, store, .{ .atom = "__block__" }, try emptyList(alloc, store), args);
+}
+
+fn paramsToCtList(
+    alloc: Allocator,
+    interner: *const ast.StringInterner,
+    store: *AllocationStore,
+    params: []const ast.Param,
+) error{OutOfMemory}!CtValue {
+    var vals = std.ArrayListUnmanaged(CtValue){};
+    for (params) |param| {
+        const pat = try patternToCtValue(alloc, interner, store, param.pattern);
+        if (param.type_annotation) |type_expr| {
+            const type_val = try typeExprToCtValue(alloc, interner, store, type_expr);
+            try vals.append(alloc, try makeTuple3(alloc, store, .{ .atom = "::" }, try emptyList(alloc, store), try makeList(alloc, store, &.{ pat, type_val })));
+        } else {
+            try vals.append(alloc, pat);
+        }
+    }
+    return makeListFromSlice(alloc, store, vals.items);
 }
 
 /// Convert a call's callee to the form atom/node.

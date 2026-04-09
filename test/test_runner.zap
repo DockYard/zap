@@ -11,6 +11,7 @@ pub module Test.TestRunner {
     Test.BooleanTest.run()
     Test.AtomTest.run()
     Test.FunctionTest.run()
+    Test.FunctionModuleTest.run()
     Test.MacroTest.run()
     Test.RecursionTest.run()
     Test.GuardTest.run()

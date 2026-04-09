@@ -308,6 +308,9 @@ pub const TypeStore = struct {
         if (ta == .never or tb == .never) return true;
         // Unknown matches anything (for inference)
         if (ta == .unknown or tb == .unknown) return true;
+        // Generic signatures compare structurally even when fresh type-variable
+        // IDs differ across separate resolution passes.
+        if (ta == .type_var and tb == .type_var) return true;
 
         // Structural tuple comparison
         if (ta == .tuple and tb == .tuple) {
@@ -701,6 +704,19 @@ pub const TypeChecker = struct {
         };
     }
 
+    fn resolveFunctionRefSignature(self: *TypeChecker, fr: ast.FunctionRefExpr) !?FunctionSignature {
+        if (fr.module) |module_name| {
+            const module_scope = self.graph.findModuleScope(module_name) orelse return null;
+            return try self.resolveFamilySignature(module_scope, fr.function, fr.arity);
+        }
+
+        if (self.current_scope) |scope_id| {
+            return try self.resolveFamilySignature(scope_id, fr.function, fr.arity);
+        }
+
+        return null;
+    }
+
     fn resolveFunctionValueSignature(self: *TypeChecker, scope_id: scope_mod.ScopeId, name: ast.StringId) !?FunctionSignature {
         var current: ?scope_mod.ScopeId = scope_id;
         var found: ?FunctionSignature = null;
@@ -884,8 +900,14 @@ pub const TypeChecker = struct {
     }
 
     fn closureDeclFromExpr(self: *TypeChecker, expr: *const ast.Expr) ?*const ast.FunctionDecl {
-        if (expr.* != .var_ref or self.current_scope == null) return null;
-        return self.resolveFunctionValueDecl(self.current_scope.?, expr.var_ref.name);
+        switch (expr.*) {
+            .anonymous_function => |anon| return anon.decl,
+            .var_ref => |vr| {
+                if (self.current_scope == null) return null;
+                return self.resolveFunctionValueDecl(self.current_scope.?, vr.name);
+            },
+            else => return null,
+        }
     }
 
     fn safeClosureParamsForCurrentCallee(self: *const TypeChecker, callee_name: ast.StringId, arity: u32) ?[]const bool {
@@ -1013,6 +1035,7 @@ pub const TypeChecker = struct {
                 }
                 return false;
             },
+            .anonymous_function => return false,
             .case_expr, .panic_expr, .quote_expr, .unquote_expr, .intrinsic, .attr_ref, .binary_literal, .function_ref => return true,
             else => return false,
         }
@@ -1060,6 +1083,7 @@ pub const TypeChecker = struct {
                     for (clause.body) |stmt| try self.collectCapturedBindingsFromStmt(stmt, function_scope, captured);
                 }
             },
+            .anonymous_function => {},
             .tuple => |items| for (items.elements) |item| try self.collectCapturedBindingsFromExpr(item, function_scope, captured),
             .list => |items| for (items.elements) |item| try self.collectCapturedBindingsFromExpr(item, function_scope, captured),
             .map => |items| for (items.fields) |item| {
@@ -1454,7 +1478,8 @@ pub const TypeChecker = struct {
             if (declared_type != TypeStore.UNKNOWN and value_type != TypeStore.UNKNOWN) {
                 if (declared_type != value_type) {
                     try self.addHardError(
-                        try std.fmt.allocPrint(self.allocator,
+                        try std.fmt.allocPrint(
+                            self.allocator,
                             "@{s} declared as {s}, but value has type {s}",
                             .{ attr_name, self.typeToString(declared_type), self.typeToString(value_type) },
                         ),
@@ -1474,7 +1499,8 @@ pub const TypeChecker = struct {
             // Type without value — should not happen
             const attr_name = self.interner.get(attr.name);
             try self.addHardError(
-                try std.fmt.allocPrint(self.allocator,
+                try std.fmt.allocPrint(
+                    self.allocator,
                     "@{s}: typed attributes must have both a type and a value",
                     .{attr_name},
                 ),
@@ -1508,7 +1534,8 @@ pub const TypeChecker = struct {
         // Validate: @debug functions must have exactly one parameter
         if (arity != 1) {
             try self.addHardError(
-                try std.fmt.allocPrint(self.allocator,
+                try std.fmt.allocPrint(
+                    self.allocator,
                     "@debug function `{s}` must have exactly one parameter, found {d}",
                     .{ self.interner.get(func.name), arity },
                 ),
@@ -1525,7 +1552,8 @@ pub const TypeChecker = struct {
         for (func.clauses) |clause| {
             if (clause.return_type == null) {
                 try self.addHardError(
-                    try std.fmt.allocPrint(self.allocator,
+                    try std.fmt.allocPrint(
+                        self.allocator,
                         "@debug function `{s}` must declare a return type",
                         .{self.interner.get(func.name)},
                     ),
@@ -1625,14 +1653,19 @@ pub const TypeChecker = struct {
 
     fn checkFunctionDecl(self: *TypeChecker, func: *const ast.FunctionDecl) !void {
         for (func.clauses) |clause| {
-            try self.checkFunctionClause(&clause);
+            try self.checkFunctionClause(func, &clause);
         }
     }
 
-    fn checkFunctionClause(self: *TypeChecker, clause: *const ast.FunctionClause) !void {
+    fn isAnonymousFunctionDecl(self: *const TypeChecker, func: *const ast.FunctionDecl) bool {
+        return std.mem.startsWith(u8, self.interner.get(func.name), "__anon_fn_");
+    }
+
+    fn checkFunctionClause(self: *TypeChecker, func: *const ast.FunctionDecl, clause: *const ast.FunctionClause) !void {
         const prev_scope = self.current_scope;
         self.current_scope = self.graph.node_scope_map.get(clause.meta.span.start) orelse clause.meta.scope_id;
         defer self.current_scope = prev_scope;
+        const is_anon = self.isAnonymousFunctionDecl(func);
 
         // Resolve parameter types and populate bindings
         for (clause.params) |param| {
@@ -1654,10 +1687,16 @@ pub const TypeChecker = struct {
                 const span = param.pattern.getMeta().span;
                 if (span.start != 0 or span.end != 0) {
                     try self.addHardError(
-                        try std.fmt.allocPrint(self.allocator, "parameter requires a type annotation (e.g., `param :: Type`)", .{}),
+                        if (is_anon)
+                            try std.fmt.allocPrint(self.allocator, "anonymous function parameter requires a type annotation", .{})
+                        else
+                            try std.fmt.allocPrint(self.allocator, "parameter requires a type annotation (e.g., `param :: Type`)", .{}),
                         span,
                         "missing type annotation",
-                        null,
+                        if (is_anon)
+                            "write the parameter like `fn(x :: Type) -> ReturnType { ... }`"
+                        else
+                            null,
                     );
                 }
             }
@@ -1671,10 +1710,19 @@ pub const TypeChecker = struct {
             const span = clause.meta.span;
             if (span.start != 0 or span.end != 0) {
                 try self.addHardError(
-                    "missing return type annotation",
+                    if (is_anon)
+                        "anonymous function is missing a return type annotation"
+                    else
+                        "missing return type annotation",
                     span,
-                    "this function has no return type",
-                    "add a return type: `def name(params) -> ReturnType do`",
+                    if (is_anon)
+                        "this anonymous function has no return type"
+                    else
+                        "this function has no return type",
+                    if (is_anon)
+                        "add a return type: `fn(params) -> ReturnType { ... }`"
+                    else
+                        "add a return type: `def name(params) -> ReturnType do`",
                 );
             }
             break :blk TypeStore.UNKNOWN;
@@ -1714,25 +1762,14 @@ pub const TypeChecker = struct {
                     "return a shared or unique value instead of a borrowed binding",
                 );
             }
-            if (expr.* == .var_ref) {
-                if (try self.resolveFunctionValueSignature(self.current_scope orelse self.graph.prelude_scope, expr.var_ref.name)) |_| {
-                    if (self.resolveFunctionValueDecl(self.current_scope orelse self.graph.prelude_scope, expr.var_ref.name)) |decl| {
-                        if (self.analysis_context != null and self.functionDeclCapturesBorrowed(decl)) {
-                            const escape = self.closureEscapeForDecl(decl);
-                            const allowed = if (escape) |e|
-                                e == .no_escape
-                            else
-                                false;
-                            if (!allowed) {
-                                try self.addHardError(
-                                    "closure with borrowed captures cannot escape through return",
-                                    expr.getMeta().span,
-                                    "borrowed capture escapes scope",
-                                    "avoid returning closures that capture borrowed values",
-                                );
-                            }
-                        }
-                    }
+            if (self.closureDeclFromExpr(expr)) |decl| {
+                if (self.functionDeclCapturesBorrowed(decl)) {
+                    try self.addHardError(
+                        "closure with borrowed captures cannot escape through return",
+                        expr.getMeta().span,
+                        "borrowed capture escapes scope",
+                        "avoid returning closures that capture borrowed values",
+                    );
                 }
             }
         }
@@ -2011,8 +2048,45 @@ pub const TypeChecker = struct {
                 return result_type;
             },
 
+            .anonymous_function => |anon| {
+                try self.checkFunctionDecl(anon.decl);
+                if (self.current_scope) |scope_id| {
+                    if (try self.resolveFunctionValueSignature(scope_id, anon.decl.name)) |signature| {
+                        return try self.store.addFunctionType(
+                            signature.params,
+                            signature.return_type,
+                            signature.param_ownerships,
+                            signature.return_ownership,
+                        );
+                    }
+                }
+                const clause = anon.decl.clauses[0];
+                const params = try self.allocator.alloc(TypeId, clause.params.len);
+                for (clause.params, 0..) |param, idx| {
+                    params[idx] = if (param.type_annotation) |ann|
+                        try self.resolveTypeExpr(ann)
+                    else
+                        TypeStore.UNKNOWN;
+                }
+                const return_type = if (clause.return_type) |rt|
+                    try self.resolveTypeExpr(rt)
+                else
+                    TypeStore.UNKNOWN;
+                return try self.buildFunctionType(params, return_type);
+            },
+
             .function_ref => |fr| {
-                // Create a function type with known arity, unknown param/return types
+                if (try self.resolveFunctionRefSignature(fr)) |signature| {
+                    return try self.store.addFunctionType(
+                        signature.params,
+                        signature.return_type,
+                        signature.param_ownerships,
+                        signature.return_ownership,
+                    );
+                }
+
+                // Fall back to an arity-shaped unknown function type so later
+                // stages can continue and produce richer diagnostics.
                 const params = try self.allocator.alloc(TypeId, fr.arity);
                 for (params) |*p| p.* = TypeStore.UNKNOWN;
                 return try self.buildFunctionType(params, TypeStore.UNKNOWN);
@@ -2332,6 +2406,40 @@ pub const TypeChecker = struct {
         };
     }
 
+    fn reportArgumentTypeMismatch(self: *TypeChecker, arg: *const ast.Expr, arg_index: usize, expected: TypeId, got: TypeId) !void {
+        const expected_type = self.store.getType(expected);
+        const got_type = self.store.getType(got);
+
+        if (expected_type == .function) {
+            const message = if (got_type == .function)
+                try std.fmt.allocPrint(self.allocator, "argument {d} expects callable `{s}`, got callable `{s}`", .{ arg_index + 1, self.typeToString(expected), self.typeToString(got) })
+            else
+                try std.fmt.allocPrint(self.allocator, "argument {d} expects callable `{s}`, got `{s}`", .{ arg_index + 1, self.typeToString(expected), self.typeToString(got) });
+
+            const help = if (arg.* == .anonymous_function)
+                "change the anonymous function signature to match the expected callable type"
+            else if (arg.* == .function_ref)
+                "pass a function reference whose signature matches the expected callable type"
+            else
+                "pass a callable value whose signature matches the expected function type";
+
+            try self.addRichError(
+                message,
+                arg.getMeta().span,
+                "callable signature mismatch",
+                help,
+            );
+            return;
+        }
+
+        try self.addRichError(
+            try std.fmt.allocPrint(self.allocator, "argument {d} expects `{s}`, got `{s}`", .{ arg_index + 1, self.typeToString(expected), self.typeToString(got) }),
+            arg.getMeta().span,
+            "argument type mismatch",
+            null,
+        );
+    }
+
     fn inferCall(self: *TypeChecker, call: *const ast.CallExpr) !TypeId {
         const arity: u32 = @intCast(call.args.len);
 
@@ -2382,12 +2490,7 @@ pub const TypeChecker = struct {
                         if (idx < signature.params.len) {
                             const expected = signature.params[idx];
                             if (expected != TypeStore.UNKNOWN and arg_type != TypeStore.UNKNOWN and arg_type != TypeStore.ERROR and !self.store.typeEquals(arg_type, expected)) {
-                                try self.addRichError(
-                                    try std.fmt.allocPrint(self.allocator, "argument {d} expects `{s}`, got `{s}`", .{ idx + 1, self.typeToString(expected), self.typeToString(arg_type) }),
-                                    arg.getMeta().span,
-                                    "argument type mismatch",
-                                    null,
-                                );
+                                try self.reportArgumentTypeMismatch(arg, idx, expected, arg_type);
                             }
                         }
                     }
@@ -2468,12 +2571,7 @@ pub const TypeChecker = struct {
                                     if (idx < signature.params.len) {
                                         const expected = signature.params[idx];
                                         if (expected != TypeStore.UNKNOWN and arg_type != TypeStore.UNKNOWN and arg_type != TypeStore.ERROR and !self.store.typeEquals(arg_type, expected)) {
-                                            try self.addRichError(
-                                                try std.fmt.allocPrint(self.allocator, "argument {d} expects `{s}`, got `{s}`", .{ idx + 1, self.typeToString(expected), self.typeToString(arg_type) }),
-                                                arg.getMeta().span,
-                                                "argument type mismatch",
-                                                null,
-                                            );
+                                            try self.reportArgumentTypeMismatch(arg, idx, expected, arg_type);
                                         }
                                     }
                                 }
@@ -3229,6 +3327,249 @@ test "function ref inference defaults param ownerships to shared" {
     try std.testing.expectEqual(@as(usize, 1), typ.function.param_ownerships.?.len);
     try std.testing.expectEqual(Ownership.shared, typ.function.param_ownerships.?[0]);
     try std.testing.expectEqual(Ownership.shared, typ.function.return_ownership);
+}
+
+test "anonymous closure with borrowed capture cannot escape via assignment" {
+    const source =
+        \\pub module Test {
+        \\  pub fn run(x :: borrowed String) -> Nil {
+        \\    f = fn() -> String {
+        \\      x
+        \\    }
+        \\    nil
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    const decl = program.modules[0].items[0].function.clauses[0].body.?[0].assignment.value.anonymous_function.decl;
+    try std.testing.expect(checker.functionDeclCapturesBorrowed(decl));
+
+    var found = false;
+    for (checker.errors.items) |err| {
+        if (std.mem.indexOf(u8, err.message, "closure with borrowed captures cannot escape via assignment") != null) {
+            found = true;
+            try std.testing.expect(err.help != null);
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "anonymous closure with borrowed capture cannot escape through return" {
+    const source =
+        \\pub module Test {
+        \\  pub fn run(x :: borrowed String) -> (String -> String) {
+        \\    fn(y :: String) -> String {
+        \\      x <> y
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    const expr = program.modules[0].items[0].function.clauses[0].body.?[0].expr;
+    try std.testing.expect(checker.functionDeclCapturesBorrowed(expr.anonymous_function.decl));
+
+    var found = false;
+    for (checker.errors.items) |err| {
+        if (std.mem.indexOf(u8, err.message, "closure with borrowed captures cannot escape through return") != null) {
+            found = true;
+            try std.testing.expect(err.help != null);
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "anonymous closure missing parameter annotation has closure-specific diagnostic" {
+    const source =
+        \\pub module Test {
+        \\  pub fn run() -> (i64 -> i64) {
+        \\    fn(x) -> i64 {
+        \\      x + 1
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var found = false;
+    for (checker.errors.items) |err| {
+        if (std.mem.indexOf(u8, err.message, "anonymous function parameter requires a type annotation") != null) {
+            found = true;
+            try std.testing.expect(err.help != null);
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "anonymous closure missing return annotation has closure-specific diagnostic" {
+    const source =
+        \\pub module Test {
+        \\  pub fn run() -> (i64 -> i64) {
+        \\    fn(x :: i64) {
+        \\      x + 1
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var found = false;
+    for (checker.errors.items) |err| {
+        if (std.mem.indexOf(u8, err.message, "anonymous function is missing a return type annotation") != null) {
+            found = true;
+            try std.testing.expect(err.help != null);
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "higher-order call reports callable signature mismatch for anonymous closure" {
+    const source =
+        \\pub module Test {
+        \\  pub fn apply(f :: (i64 -> i64)) -> i64 {
+        \\    f(41)
+        \\  }
+        \\
+        \\  pub fn run() -> i64 {
+        \\    apply(fn(x :: String) -> String {
+        \\      x
+        \\    })
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var found = false;
+    for (checker.errors.items) |err| {
+        if (std.mem.indexOf(u8, err.message, "expects callable") != null and err.label != null and std.mem.indexOf(u8, err.label.?, "callable signature mismatch") != null) {
+            found = true;
+            try std.testing.expect(err.help != null);
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "higher-order call reports callable signature mismatch for function ref" {
+    const source =
+        \\pub module Test {
+        \\  pub fn double(x :: i64) -> i64 {
+        \\    x * 2
+        \\  }
+        \\
+        \\  pub fn pair_sum(x :: i64, y :: i64) -> i64 {
+        \\    x + y
+        \\  }
+        \\
+        \\  pub fn apply(f :: (i64 -> i64)) -> i64 {
+        \\    f(41)
+        \\  }
+        \\
+        \\  pub fn run() -> i64 {
+        \\    apply(&pair_sum/2)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var found = false;
+    for (checker.errors.items) |err| {
+        if (std.mem.indexOf(u8, err.message, "expects callable") != null and err.label != null and std.mem.indexOf(u8, err.label.?, "callable signature mismatch") != null) {
+            found = true;
+            try std.testing.expect(err.help != null);
+        }
+    }
+    try std.testing.expect(found);
 }
 
 test "moved binding use reports ownership error" {

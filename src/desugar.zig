@@ -201,6 +201,14 @@ pub const Desugarer = struct {
                     },
                 });
             },
+            .anonymous_function => |anon| {
+                return try self.create(ast.Expr, .{
+                    .anonymous_function = .{
+                        .meta = anon.meta,
+                        .decl = try self.desugarFunctionDecl(anon.decl),
+                    },
+                });
+            },
             // if_expr and cond_expr are expanded to case by the
             // macro engine (Kernel macros / special forms) before desugaring.
             // They should not reach this point.
@@ -288,7 +296,6 @@ pub const Desugarer = struct {
                     },
                 });
             },
-
 
             // Map update: %{map | key: val, ...} → :zig.MapHelpers.put chains
             .map => |me| {

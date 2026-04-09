@@ -249,6 +249,9 @@ pub const Resolver = struct {
                     try self.resolveExpr(arg);
                 }
             },
+            .anonymous_function => |anon| {
+                try self.resolveFunctionDecl(anon.decl);
+            },
             .binary_op => |bo| {
                 try self.resolveExpr(bo.lhs);
                 try self.resolveExpr(bo.rhs);
@@ -339,9 +342,17 @@ pub const Resolver = struct {
                 }
             },
             // Literals and module refs — no resolution needed
-            .int_literal, .float_literal, .string_literal,
-            .string_interpolation, .atom_literal, .bool_literal,
-            .nil_literal, .module_ref, .function_ref, .intrinsic, .attr_ref,
+            .int_literal,
+            .float_literal,
+            .string_literal,
+            .string_interpolation,
+            .atom_literal,
+            .bool_literal,
+            .nil_literal,
+            .module_ref,
+            .function_ref,
+            .intrinsic,
+            .attr_ref,
             => {},
             .error_pipe => |ep| {
                 try self.resolveExpr(ep.chain);
@@ -454,12 +465,11 @@ pub const Resolver = struct {
 
     fn isBuiltinType(name: []const u8) bool {
         const builtins = [_][]const u8{
-            "i8", "i16", "i32", "i64",
-            "u8", "u16", "u32", "u64",
-            "f16", "f32", "f64",
-            "usize", "isize",
-            "Bool", "String", "Atom", "Nil",
-            "Never", "AST",
+            "i8",    "i16",   "i32",    "i64",
+            "u8",    "u16",   "u32",    "u64",
+            "f16",   "f32",   "f64",    "usize",
+            "isize", "Bool",  "String", "Atom",
+            "Nil",   "Never", "AST",
         };
         for (builtins) |b| {
             if (std.mem.eql(u8, name, b)) return true;
@@ -469,7 +479,7 @@ pub const Resolver = struct {
 
     fn isBuiltinFunction(name: []const u8) bool {
         const builtins = [_][]const u8{
-            "to_string", "int_to_string", "not",
+            "to_string",  "int_to_string", "not",
             "i32_to_i64", "i64_to_i32",
         };
         for (builtins) |b| {

@@ -13,6 +13,7 @@ pub const Parser = struct {
     owned_interner: ?*ast.StringInterner,
     interner: *ast.StringInterner,
     errors: std.ArrayList(Error),
+    anon_function_counter: u32,
 
     pub const Error = struct {
         message: []const u8,
@@ -35,6 +36,7 @@ pub const Parser = struct {
             .owned_interner = interner,
             .interner = interner,
             .errors = .empty,
+            .anon_function_counter = 0,
         };
     }
 
@@ -50,6 +52,7 @@ pub const Parser = struct {
             .owned_interner = null,
             .interner = interner,
             .errors = .empty,
+            .anon_function_counter = 0,
         };
     }
 
@@ -1253,7 +1256,6 @@ pub const Parser = struct {
         });
     }
 
-
     // ============================================================
     // Module attribute declarations
     // ============================================================
@@ -1403,8 +1405,10 @@ pub const Parser = struct {
             self.restoreLexerState(saved);
         }
         if (self.check(.keyword_fn)) {
-            const func = try self.parseFunctionDecl(.private);
-            return .{ .function_decl = func };
+            if (self.peekNext() == .identifier) {
+                const func = try self.parseFunctionDecl(.private);
+                return .{ .function_decl = func };
+            }
         }
         if (self.check(.keyword_macro)) {
             const mac = try self.parseMacroDecl(.private);
@@ -1827,7 +1831,9 @@ pub const Parser = struct {
             .keyword_unquote => return self.parseUnquoteExpr(),
             .keyword_unquote_splicing => return self.parseUnquoteSplicingExpr(),
             .keyword_panic => return self.parsePanicExpr(),
+            .keyword_fn => return self.parseAnonymousFunctionExpr(),
             .at_sign => return self.parseAtSignExpr(),
+            .ampersand => return self.parseFunctionRefExpr(),
             .sigil_prefix => return self.parseSigilExpr(),
             .double_ampersand => {
                 try self.addRichError(
@@ -1868,6 +1874,62 @@ pub const Parser = struct {
                 return error.ParseError;
             },
         }
+    }
+
+    fn parseFunctionRefExpr(self: *Parser) !*const ast.Expr {
+        const start = self.currentSpan();
+        _ = try self.expect(.ampersand);
+
+        var module_name: ?ast.ModuleName = null;
+        var function_name: ast.StringId = undefined;
+
+        if (self.check(.module_identifier)) {
+            module_name = try self.parseModuleName();
+            _ = try self.expect(.dot);
+            const function_tok = try self.expect(.identifier);
+            function_name = try self.internToken(function_tok);
+        } else {
+            const function_tok = try self.expect(.identifier);
+            function_name = try self.internToken(function_tok);
+        }
+
+        _ = try self.expect(.slash);
+        const arity_tok = try self.expect(.int_literal);
+        const arity_text = arity_tok.slice(self.source);
+        const arity = std.fmt.parseInt(u32, arity_text, 10) catch 0;
+
+        return self.create(ast.Expr, .{
+            .function_ref = .{
+                .meta = .{ .span = ast.SourceSpan.merge(start, ast.SourceSpan.from(arity_tok.loc)) },
+                .module = module_name,
+                .function = function_name,
+                .arity = arity,
+            },
+        });
+    }
+
+    fn parseAnonymousFunctionExpr(self: *Parser) !*const ast.Expr {
+        const start = self.currentSpan();
+        _ = try self.expect(.keyword_fn);
+
+        const synthesized_name = try std.fmt.allocPrint(self.allocator, "__anon_fn_{d}", .{self.anon_function_counter});
+        self.anon_function_counter += 1;
+        const name = try self.interner.intern(synthesized_name);
+
+        const clause = try self.parseFunctionClause(start);
+        const decl = try self.create(ast.FunctionDecl, .{
+            .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
+            .name = name,
+            .clauses = try self.allocator.dupe(ast.FunctionClause, &[_]ast.FunctionClause{clause}),
+            .visibility = .private,
+        });
+
+        return try self.create(ast.Expr, .{
+            .anonymous_function = .{
+                .meta = .{ .span = decl.meta.span },
+                .decl = decl,
+            },
+        });
     }
 
     // ============================================================
@@ -2491,7 +2553,6 @@ pub const Parser = struct {
             .body = body,
         };
     }
-
 
     fn parseCondExpr(self: *Parser) !*const ast.Expr {
         const start = self.currentSpan();
@@ -4809,3 +4870,79 @@ test "parse ~w sigil desugars to sigil_w call" {
     try std.testing.expectEqualStrings("sigil_w", parser.interner.get(expr.call.callee.var_ref.name));
 }
 
+test "parse &Module.function/arity as function_ref" {
+    const source =
+        \\pub module Test {
+        \\  pub fn run() {
+        \\    &Math.double/1
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const func = program.modules[0].items[0].function;
+    const body = func.clauses[0].body.?;
+    const expr = body[0].expr;
+
+    try std.testing.expect(expr.* == .function_ref);
+    try std.testing.expect(expr.function_ref.module != null);
+    try std.testing.expectEqualStrings("Math", parser.interner.get(expr.function_ref.module.?.parts[0]));
+    try std.testing.expectEqualStrings("double", parser.interner.get(expr.function_ref.function));
+    try std.testing.expectEqual(@as(u32, 1), expr.function_ref.arity);
+}
+
+test "parse &function/arity as local function_ref" {
+    const source =
+        \\pub module Test {
+        \\  pub fn run() {
+        \\    &double/1
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const func = program.modules[0].items[0].function;
+    const body = func.clauses[0].body.?;
+    const expr = body[0].expr;
+
+    try std.testing.expect(expr.* == .function_ref);
+    try std.testing.expect(expr.function_ref.module == null);
+    try std.testing.expectEqualStrings("double", parser.interner.get(expr.function_ref.function));
+    try std.testing.expectEqual(@as(u32, 1), expr.function_ref.arity);
+}
+
+test "parse anonymous function expression" {
+    const source =
+        \\pub module Test {
+        \\  pub fn run() {
+        \\    fn(x :: i64) -> i64 {
+        \\      x + 1
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const func = program.modules[0].items[0].function;
+    const body = func.clauses[0].body.?;
+    const expr = body[0].expr;
+
+    try std.testing.expect(expr.* == .anonymous_function);
+    try std.testing.expectEqual(@as(usize, 1), expr.anonymous_function.decl.clauses.len);
+    try std.testing.expectEqual(@as(usize, 1), expr.anonymous_function.decl.clauses[0].params.len);
+}

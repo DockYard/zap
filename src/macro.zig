@@ -378,6 +378,19 @@ pub const MacroEngine = struct {
                 return try self.expandCallExpr(expr);
             },
 
+            .anonymous_function => |anon| {
+                const expanded = try self.expandFunctionDecl(anon.decl);
+                return .{
+                    .expr = try self.create(ast.Expr, .{
+                        .anonymous_function = .{
+                            .meta = anon.meta,
+                            .decl = expanded.decl,
+                        },
+                    }),
+                    .changed = expanded.changed,
+                };
+            },
+
             // Recurse into compound expressions
             .if_expr => |ie| {
                 // Bootstrap fallback: expand if to case.

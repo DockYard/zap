@@ -640,6 +640,119 @@ test "ZIR: captured closure called through multiple paths" {
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
 
+test "ZIR: module function ref is first-class callable" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn double(x :: i64) -> i64 {
+        \\    x * 2
+        \\  }
+        \\
+        \\  pub fn apply(x :: i64, f :: (i64 -> i64)) -> i64 {
+        \\    f(x)
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    Kernel.inspect(apply(21, &TestProg.double/1))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("42\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: local function ref is first-class callable" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn double(x :: i64) -> i64 {
+        \\    x * 2
+        \\  }
+        \\
+        \\  pub fn apply(x :: i64, f :: (i64 -> i64)) -> i64 {
+        \\    f(x)
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    Kernel.inspect(apply(21, &double/1))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("42\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: nested local function ref captures environment" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn make_and_apply(base :: i64) -> i64 {
+        \\    pub fn add_base(x :: i64) -> i64 {
+        \\      base + x
+        \\    }
+        \\
+        \\    apply(10, &add_base/1)
+        \\  }
+        \\
+        \\  pub fn apply(x :: i64, f :: (i64 -> i64)) -> i64 {
+        \\    f(x)
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    Kernel.inspect(make_and_apply(32))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("42\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: anonymous closure is first-class callable" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn apply(x :: i64, f :: (i64 -> i64)) -> i64 {
+        \\    f(x)
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    add_one = fn(x :: i64) -> i64 {
+        \\      x + 1
+        \\    }
+        \\    Kernel.inspect(apply(41, add_one))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("42\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: anonymous closure captures environment" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn apply(x :: i64, f :: (i64 -> i64)) -> i64 {
+        \\    f(x)
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    offset = 10
+        \\    add_offset = fn(x :: i64) -> i64 {
+        \\      x + offset
+        \\    }
+        \\    Kernel.inspect(apply(32, add_offset))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("42\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
 // ============================================================
 // Cond (nested captured bodies)
 // ============================================================
@@ -879,7 +992,6 @@ test "ZIR: macro receives trailing block as AST" {
     try std.testing.expectEqualStrings("check math\n2\npassed\n", result.stdout);
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
-
 
 test "ZIR: trailing block as last argument" {
     var result = try compileAndRun(
@@ -1615,12 +1727,12 @@ test "ZIR: use Module imports functions" {
         \\  }
         \\}
     , &.{
-        .{ .path = "lib/helper.zap", .data =
-            \\pub module Helper {
-            \\  pub fn greet(name :: String) -> String {
-            \\    "Hello, " <> name <> "!"
-            \\  }
-            \\}
+        .{ .path = "lib/helper.zap", .data = 
+        \\pub module Helper {
+        \\  pub fn greet(name :: String) -> String {
+        \\    "Hello, " <> name <> "!"
+        \\  }
+        \\}
         },
     });
     defer result.deinit();
@@ -1639,16 +1751,16 @@ test "ZIR: use Module with __using__ callback injects function" {
         \\  }
         \\}
     , &.{
-        .{ .path = "lib/greeter.zap", .data =
-            \\pub module Greeter {
-            \\  pub macro __using__(_opts :: Expr) -> Expr {
-            \\    quote {
-            \\      pub fn hello() -> String {
-            \\        "Hello from __using__!"
-            \\      }
-            \\    }
-            \\  }
-            \\}
+        .{ .path = "lib/greeter.zap", .data = 
+        \\pub module Greeter {
+        \\  pub macro __using__(_opts :: Expr) -> Expr {
+        \\    quote {
+        \\      pub fn hello() -> String {
+        \\        "Hello from __using__!"
+        \\      }
+        \\    }
+        \\  }
+        \\}
         },
     });
     defer result.deinit();

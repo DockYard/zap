@@ -394,6 +394,13 @@ fn substituteInExpr(
             new_expr.* = .{ .block = .{ .meta = b.meta, .stmts = new_stmts } };
             return new_expr;
         },
+        .anonymous_function => |anon| {
+            const new_decl = try substituteInFunction(alloc, anon.decl, func_attrs, mod_attrs, interner, errors);
+            if (new_decl == anon.decl) return expr;
+            const new_expr = try alloc.create(ast.Expr);
+            new_expr.* = .{ .anonymous_function = .{ .meta = anon.meta, .decl = new_decl } };
+            return new_expr;
+        },
         .for_expr => |fe| {
             const new_iterable = try substituteInExpr(alloc, fe.iterable, func_attrs, mod_attrs, interner, errors);
             const new_filter = if (fe.filter) |f|
