@@ -289,6 +289,14 @@ pub const ZirDriver = struct {
     reuse_backed_tuple_locals: std.AutoHashMapUnmanaged(ir.LocalId, usize) = .empty,
     capture_param_refs: std.ArrayListUnmanaged(u32) = .empty,
     current_closure_env_ref: ?u32 = null,
+    /// Forward-propagating map from locals to closure function IDs.
+    /// Populated by make_closure, propagated by local_set/local_get/move/share.
+    /// Used by call_closure to resolve 0-capture closures to direct named calls.
+    closure_function_map: std.AutoHashMapUnmanaged(ir.LocalId, ir.FunctionId) = .empty,
+    /// Maps (closure_function_id, capture_index) → captured closure function ID.
+    /// When a closure captures another closure value, this allows the inner function's
+    /// capture_get to propagate the closure_function_map across function boundaries.
+    capture_closure_function_map: std.AutoHashMapUnmanaged(u64, ir.FunctionId) = .empty,
     /// Compilation context for per-module ZIR injection.
     compilation_ctx: ?*ZirContext = null,
     /// Module currently being emitted (e.g., "IO", "Zest_Case"). Null when emitting root.
@@ -310,6 +318,8 @@ pub const ZirDriver = struct {
         zir_builder_destroy(self.handle);
         self.local_refs.deinit(self.allocator);
         self.param_refs.deinit(self.allocator);
+        self.closure_function_map.deinit(self.allocator);
+        self.capture_closure_function_map.deinit(self.allocator);
         self.reuse_backed_struct_locals.deinit(self.allocator);
         self.reuse_backed_union_locals.deinit(self.allocator);
         self.reuse_backed_tuple_locals.deinit(self.allocator);
@@ -564,6 +574,15 @@ pub const ZirDriver = struct {
         return null;
     }
 
+    /// Emit a cross-module function reference: @import("TargetModule").local_name
+    fn emitCrossModuleRef(self: *ZirDriver, target_module: []const u8, local_name: []const u8) BuildError!u32 {
+        const import_ref = zir_builder_emit_import(self.handle, target_module.ptr, @intCast(target_module.len));
+        if (import_ref == error_ref) return error.EmitFailed;
+        const fn_ref = zir_builder_emit_field_val(self.handle, import_ref, local_name.ptr, @intCast(local_name.len));
+        if (fn_ref == error_ref) return error.EmitFailed;
+        return fn_ref;
+    }
+
     /// Emit a cross-module function call: @import("TargetModule").local_name(args)
     fn emitCrossModuleCall(self: *ZirDriver, target_module: []const u8, local_name: []const u8, arg_refs: []const u32) BuildError!u32 {
         const import_ref = zir_builder_emit_import(self.handle, target_module.ptr, @intCast(target_module.len));
@@ -586,6 +605,7 @@ pub const ZirDriver = struct {
         self.program = program;
 
         const ctx = self.compilation_ctx;
+
 
         // ── Step 1: Group functions by module ────────────────────────
         var module_funcs = std.StringHashMap(std.ArrayListUnmanaged(ir.Function)).init(self.allocator);
@@ -801,6 +821,7 @@ pub const ZirDriver = struct {
 
         self.local_refs.clearRetainingCapacity();
         self.param_refs.clearRetainingCapacity();
+        self.closure_function_map.clearRetainingCapacity();
         self.capture_param_refs.clearRetainingCapacity();
         self.current_closure_env_ref = null;
         self.skip_next_ret_local = null;
@@ -1102,10 +1123,12 @@ pub const ZirDriver = struct {
 
     fn getClosureLowering(self: *const ZirDriver, function_id: ir.FunctionId, capture_count: usize) ClosureLowering {
         const lattice = @import("escape_lattice.zig");
+        // A function with no captures is always lambda-lifted regardless of
+        // what the escape analysis says — there's no environment to allocate.
+        if (capture_count == 0)
+            return closure_lowering_for_tier(.lambda_lifted, 0);
         const tier = if (self.analysis_context) |actx|
             actx.getClosureTier(function_id)
-        else if (capture_count == 0)
-            lattice.ClosureEnvTier.lambda_lifted
         else
             lattice.ClosureEnvTier.escaping;
         return closure_lowering_for_tier(tier, capture_count);
@@ -1122,12 +1145,50 @@ pub const ZirDriver = struct {
         return null;
     }
 
+    /// Check if a local holds a bare function reference (0-capture make_closure).
+    /// Bare function refs are stored as decl_ref values, not closure structs,
+    /// so they must be called via call_ref rather than struct field access.
+    fn isBareFunctionRef(self: *const ZirDriver, local: ir.LocalId) bool {
+        if (self.findClosureCallTarget(local)) |target| {
+            return target.captures.len == 0;
+        }
+        return false;
+    }
+
     fn findClosureCallTarget(self: *const ZirDriver, local: ir.LocalId) ?ClosureCallTarget {
         if (self.program) |prog| {
             for (prog.functions) |func| {
                 if (func.id != self.current_function_id) continue;
+                // Search across ALL blocks in the function body so that
+                // local chains spanning block boundaries can be resolved.
                 for (func.body) |block| {
                     if (findClosureTargetInInstrs(block.instructions, local)) |target| return target;
+                }
+                // Second pass: if a local_set in one block references a value
+                // defined in another block, resolve the chain across blocks.
+                for (func.body) |block| {
+                    if (findClosureTargetCrossBlock(func.body, block.instructions, local)) |target| return target;
+                }
+            }
+        }
+        return null;
+    }
+
+    /// Search for a closure target across block boundaries. When a local_set/local_get
+    /// in one block references a value from another block, search all blocks for the source.
+    fn findClosureTargetCrossBlock(all_blocks: []const ir.Block, instrs: []const ir.Instruction, local: ir.LocalId) ?ClosureCallTarget {
+        for (instrs) |instr| {
+            const source_local: ?ir.LocalId = switch (instr) {
+                .local_set => |ls| if (ls.dest == local) ls.value else null,
+                .local_get => |lg| if (lg.dest == local) lg.source else null,
+                .move_value => |mv| if (mv.dest == local) mv.source else null,
+                .share_value => |sv| if (sv.dest == local) sv.source else null,
+                else => null,
+            };
+            if (source_local) |src| {
+                // Search all blocks for the source local
+                for (all_blocks) |block| {
+                    if (findClosureTargetInInstrs(block.instructions, src)) |target| return target;
                 }
             }
         }
@@ -1197,9 +1258,7 @@ pub const ZirDriver = struct {
     }
 
     fn emitNamedCallToTarget(self: *ZirDriver, target_id: ir.FunctionId, captures: []const ir.LocalId, args_locals: []const ir.LocalId) !u32 {
-        const prog = self.program orelse return error.EmitFailed;
-        if (target_id >= prog.functions.len) return error.EmitFailed;
-        const target_func = prog.functions[target_id];
+        const target_func = self.findFunctionById(target_id) orelse return error.EmitFailed;
         const lowering = self.getClosureLowering(target_id, captures.len);
         var args = std.ArrayListUnmanaged(u32).empty;
         defer args.deinit(self.allocator);
@@ -1503,6 +1562,8 @@ pub const ZirDriver = struct {
                 try self.propagateReuseBackedStructLocal(lg.dest, lg.source);
                 try self.propagateReuseBackedUnionLocal(lg.dest, lg.source);
                 try self.propagateReuseBackedTupleLocal(lg.dest, lg.source);
+                if (self.closure_function_map.get(lg.source)) |func_id|
+                    try self.closure_function_map.put(self.allocator, lg.dest, func_id);
                 if (self.local_refs.get(lg.source)) |ref| {
                     try self.setLocal(lg.dest, ref);
                 }
@@ -1511,6 +1572,8 @@ pub const ZirDriver = struct {
                 try self.propagateReuseBackedStructLocal(ls.dest, ls.value);
                 try self.propagateReuseBackedUnionLocal(ls.dest, ls.value);
                 try self.propagateReuseBackedTupleLocal(ls.dest, ls.value);
+                if (self.closure_function_map.get(ls.value)) |func_id|
+                    try self.closure_function_map.put(self.allocator, ls.dest, func_id);
                 if (self.local_refs.get(ls.value)) |ref| {
                     try self.setLocal(ls.dest, ref);
                 }
@@ -1519,6 +1582,8 @@ pub const ZirDriver = struct {
                 try self.propagateReuseBackedStructLocal(mv.dest, mv.source);
                 try self.propagateReuseBackedUnionLocal(mv.dest, mv.source);
                 try self.propagateReuseBackedTupleLocal(mv.dest, mv.source);
+                if (self.closure_function_map.get(mv.source)) |func_id|
+                    try self.closure_function_map.put(self.allocator, mv.dest, func_id);
                 if (self.local_refs.get(mv.source)) |ref| {
                     try self.setLocal(mv.dest, ref);
                 }
@@ -1527,6 +1592,8 @@ pub const ZirDriver = struct {
                 try self.propagateReuseBackedStructLocal(sv.dest, sv.source);
                 try self.propagateReuseBackedUnionLocal(sv.dest, sv.source);
                 try self.propagateReuseBackedTupleLocal(sv.dest, sv.source);
+                if (self.closure_function_map.get(sv.source)) |func_id|
+                    try self.closure_function_map.put(self.allocator, sv.dest, func_id);
                 if (self.local_refs.get(sv.source)) |ref| {
                     try self.setLocal(sv.dest, ref);
 
@@ -2551,10 +2618,33 @@ pub const ZirDriver = struct {
             .call_closure => |cc| {
                 const lattice = @import("escape_lattice.zig");
                 const callee_is_param = self.isParamDerivedClosure(cc.callee);
+
+                // Fast path: use the closure function map to resolve the callee
+                // directly to a named function call. This handles 0-capture closures
+                // (anonymous functions and function refs) by tracking the function ID
+                // through local assignments without needing backward instruction scanning.
+                if (!callee_is_param) {
+                    if (self.closure_function_map.get(cc.callee)) |func_id| {
+                        if (self.findFunctionById(func_id)) |target_func| {
+                            if (target_func.captures.len == 0) {
+                                const ref = try self.emitNamedCallToTarget(func_id, &.{}, cc.args);
+                                if (ref != error_ref) {
+                                    try self.setLocal(cc.dest, ref);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 if (self.getCallSiteSpecialization()) |spec| {
                     switch (spec.decision) {
                         .unreachable_call => {
-                            return error.EmitFailed;
+                            // Fall through to dynamic dispatch. The unreachable
+                            // classification may be wrong when function IDs shift
+                            // (e.g., anonymous closures inserted in the IR), or
+                            // when cross-module callers pass closures the local
+                            // escape analysis didn't see.
                         },
                         .direct_call, .contified => {
                             if (spec.decision == .contified and self.isTailReturnOf(cc.dest) and spec.lambda_set.isSingleton()) {
@@ -2652,7 +2742,23 @@ pub const ZirDriver = struct {
                 } else {
                     // Dynamic dispatch: extract call_fn and env from closure struct,
                     // call function with env prepended to args.
-                    const callee_ref = self.refForLocal(cc.callee) catch return;
+                    const callee_ref = self.refForLocal(cc.callee) catch return error.EmitFailed;
+
+                    // When the callee is a function parameter or a bare function ref
+                    // (from a 0-capture make_closure), emit a direct call_ref without
+                    // trying to destructure a closure struct.
+                    if (callee_is_param or self.isBareFunctionRef(cc.callee)) {
+                        var args = std.ArrayListUnmanaged(u32).empty;
+                        defer args.deinit(self.allocator);
+                        for (cc.args) |arg| {
+                            const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                            try args.append(self.allocator, ref);
+                        }
+                        const ref = zir_builder_emit_call_ref(self.handle, callee_ref, args.items.ptr, @intCast(args.items.len));
+                        if (ref == error_ref) return error.EmitFailed;
+                        try self.setLocal(cc.dest, ref);
+                        return;
+                    }
 
                     // Extract function pointer and environment from closure struct
                     const call_fn_ref = zir_builder_emit_field_val(self.handle, callee_ref, "call_fn", 7);
@@ -2688,25 +2794,49 @@ pub const ZirDriver = struct {
                 }
             },
             .make_closure => |mc| {
-                const func_name: []const u8 = if (self.program) |prog| blk: {
-                    break :blk if (mc.function < prog.functions.len)
-                        prog.functions[mc.function].name
-                    else
-                        "unknown_closure";
-                } else "unknown_closure";
+                const target_func = self.findFunctionById(mc.function) orelse return error.EmitFailed;
+
+                // Track which function this closure local points to.
+                try self.closure_function_map.put(self.allocator, mc.dest, mc.function);
+
+                // When this closure captures locals that are themselves closure values,
+                // record the mapping so the inner function's capture_get can resolve them.
+                for (mc.captures, 0..) |cap_local, cap_idx| {
+                    if (self.closure_function_map.get(cap_local)) |captured_func_id| {
+                        const key = @as(u64, mc.function) << 32 | @as(u64, @intCast(cap_idx));
+                        try self.capture_closure_function_map.put(self.allocator, key, captured_func_id);
+                    }
+                }
+
+                // Resolve the correct name for the current module context.
+                // In per-module emission, functions are emitted with local_name,
+                // so references must also use local_name (or @import for cross-module).
+                const emit_name = if (self.current_emit_module != null and target_func.local_name.len > 0)
+                    target_func.local_name
+                else
+                    target_func.name;
+
+                // Determine if this is a cross-module reference
+                const target_module = target_func.module_name;
+                const is_cross_module = blk: {
+                    if (target_module == null and self.current_emit_module == null) break :blk false;
+                    if (target_module == null or self.current_emit_module == null) break :blk true;
+                    break :blk !std.mem.eql(u8, target_module.?, self.current_emit_module.?);
+                };
 
                 const lowering = self.getClosureLowering(mc.function, mc.captures.len);
 
                 if (!lowering.needs_closure_object) {
-                    const fn_name_ref = zir_builder_emit_str(self.handle, func_name.ptr, @intCast(func_name.len));
+                    const fn_name_ref = zir_builder_emit_str(self.handle, emit_name.ptr, @intCast(emit_name.len));
                     if (fn_name_ref == error_ref) return error.EmitFailed;
                     try self.setLocal(mc.dest, fn_name_ref);
                     return;
                 }
 
                 // Tier 0: lambda-lifted closures with no captures need no env object.
+                // Create a closure struct with string name for dispatch resolution.
                 if (mc.captures.len == 0 and lowering.tier == .lambda_lifted) {
-                    const fn_name_ref = zir_builder_emit_str(self.handle, func_name.ptr, @intCast(func_name.len));
+                    const fn_name_ref = zir_builder_emit_str(self.handle, emit_name.ptr, @intCast(emit_name.len));
                     if (fn_name_ref == error_ref) return error.EmitFailed;
                     const null_ref = @intFromEnum(Zir.Inst.Ref.null_value);
                     const closure_field_names = [_][*]const u8{ "call_fn", "env", "env_release" };
@@ -2749,12 +2879,13 @@ pub const ZirDriver = struct {
                 );
                 if (env_ref == error_ref) return error.EmitFailed;
 
-                // 3. Build the closure struct: .{ .call_fn = func_ref, .env = env_ref }
-                //    Use decl_ref to get a real function reference that supports dynamic dispatch.
-                const fn_ref = zir_builder_emit_decl_ref(self.handle, func_name.ptr, @intCast(func_name.len));
-                const fn_name_ref = if (fn_ref != error_ref) fn_ref else blk: {
-                    // Fallback to string name if decl_ref fails (function not yet emitted)
-                    break :blk zir_builder_emit_str(self.handle, func_name.ptr, @intCast(func_name.len));
+                // Build the closure struct: .{ .call_fn = func_ref, .env = env_ref }
+                // Use module-aware resolution: decl_ref for same-module, @import for cross-module.
+                const fn_name_ref = if (is_cross_module and target_module != null)
+                    self.emitCrossModuleRef(target_module.?, target_func.local_name) catch @intFromEnum(Zir.Inst.Ref.void_value)
+                else blk: {
+                    const ref = zir_builder_emit_decl_ref(self.handle, emit_name.ptr, @intCast(emit_name.len));
+                    break :blk if (ref != error_ref) ref else zir_builder_emit_str(self.handle, emit_name.ptr, @intCast(emit_name.len));
                 };
                 if (fn_name_ref == error_ref) return error.EmitFailed;
                 const null_ref = @intFromEnum(Zir.Inst.Ref.null_value);
@@ -2773,6 +2904,13 @@ pub const ZirDriver = struct {
                 try self.setLocal(mc.dest, closure_ref);
             },
             .capture_get => |cg| {
+                // Propagate closure function mapping through captures.
+                {
+                    const key = @as(u64, self.current_function_id) << 32 | @as(u64, cg.index);
+                    if (self.capture_closure_function_map.get(key)) |func_id| {
+                        try self.closure_function_map.put(self.allocator, cg.dest, func_id);
+                    }
+                }
                 if (self.currentClosureLowering()) |lowering| {
                     if (lowering.direct_capture_params and cg.index < self.capture_param_refs.items.len) {
                         try self.setLocal(cg.dest, self.capture_param_refs.items[cg.index]);
@@ -3240,7 +3378,9 @@ pub const ZirDriver = struct {
 
         // Capture the default body
         zir_builder_begin_capture(self.handle);
-        for (sl.default_instrs) |di| try self.emitInstruction(di);
+        for (sl.default_instrs) |di| {
+            try self.emitInstruction(di);
+        }
         var default_len: u32 = 0;
         const default_ptr = zir_builder_end_capture(self.handle, &default_len);
         const default_result: u32 = if (sl.default_result) |dr|
@@ -3287,7 +3427,9 @@ pub const ZirDriver = struct {
 
             // Capture the case body
             zir_builder_begin_capture(self.handle);
-            for (case.body_instrs) |bi| try self.emitInstruction(bi);
+            for (case.body_instrs) |bi| {
+                try self.emitInstruction(bi);
+            }
             var case_len: u32 = 0;
             const case_ptr = zir_builder_end_capture(self.handle, &case_len);
 

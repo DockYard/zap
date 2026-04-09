@@ -1796,6 +1796,22 @@ pub const HirBuilder = struct {
             }
         }
 
+        // Pre-register all declared function families in family_to_group
+        // so that function references like &name/arity can resolve any
+        // sibling function regardless of declaration order.
+        for (fn_order.items) |name| {
+            if (fn_groups.getPtr(name)) |decls| {
+                const arity: u32 = if (decls.items[0].clauses.len > 0) @intCast(decls.items[0].clauses[0].params.len) else 0;
+                if (self.graph.resolveFamily(mod_scope, decls.items[0].name, arity)) |family_id| {
+                    if (!self.family_to_group.contains(family_id)) {
+                        const pre_id = self.next_group_id;
+                        self.next_group_id += 1;
+                        try self.family_to_group.put(family_id, pre_id);
+                    }
+                }
+            }
+        }
+
         var functions: std.ArrayList(FunctionGroup) = .empty;
         for (fn_order.items) |name| {
             if (fn_groups.getPtr(name)) |decls| {
@@ -1803,20 +1819,37 @@ pub const HirBuilder = struct {
             }
         }
 
-        // Build inherited functions from scope graph (module extends)
-        // These are families in the module scope that weren't in the AST items
+        // Build inherited functions from scope graph (module extends).
+        // Only include families whose clauses come from this module's own AST
+        // or from parent scopes (via __using__ injection). Skip families from
+        // sibling modules that leak into the scope during merged compilation.
         const mod_scope_data = self.graph.getScope(mod_scope);
         var inherited_iter = mod_scope_data.function_families.iterator();
         while (inherited_iter.next()) |entry| {
             const family_key = entry.key_ptr.*;
-            // Skip if already built from AST items
             if (fn_groups.contains(family_key.name)) continue;
 
             const family_id = entry.value_ptr.*;
             const family = self.graph.getFamily(family_id);
             if (family.clauses.items.len == 0) continue;
 
-            // Build from the family's clause references (these point to parent's AST decls)
+            // Check if any clause's decl belongs to this module's AST items
+            var belongs_to_module = false;
+            for (family.clauses.items) |clause_ref| {
+                for (mod.items) |item| {
+                    const mod_func = switch (item) {
+                        .function, .priv_function => |f| f,
+                        else => continue,
+                    };
+                    if (mod_func == clause_ref.decl) {
+                        belongs_to_module = true;
+                        break;
+                    }
+                }
+                if (belongs_to_module) break;
+            }
+            if (belongs_to_module) continue; // Already handled via fn_groups
+
             var decl_list: std.ArrayList(*const ast.FunctionDecl) = .empty;
             for (family.clauses.items) |clause_ref| {
                 try decl_list.append(self.allocator, clause_ref.decl);
@@ -1838,7 +1871,10 @@ pub const HirBuilder = struct {
     // Function group building
     // ============================================================
 
-    fn buildMergedFunctionGroup(
+    /// Register a function group: assign an ID and populate family_to_group,
+    /// but do NOT build clause bodies yet. Returns a skeleton FunctionGroup
+    /// with empty clauses that will be filled in by buildGroupClauses.
+    fn registerFunctionGroup(
         self: *HirBuilder,
         decls: []const *const ast.FunctionDecl,
         scope_id: scope_mod.ScopeId,
@@ -1850,6 +1886,57 @@ pub const HirBuilder = struct {
         if (self.graph.resolveFamily(scope_id, decls[0].name, arity)) |family_id| {
             try self.family_to_group.put(family_id, group_id);
         }
+
+        return .{
+            .id = group_id,
+            .scope_id = scope_id,
+            .name = decls[0].name,
+            .arity = arity,
+            .is_local = false,
+            .captures = &.{},
+            .clauses = &.{},
+            .fallback_parent = null,
+        };
+    }
+
+    /// Build clause bodies for a function group.
+    fn buildGroupClauses(
+        self: *HirBuilder,
+        decls: []const *const ast.FunctionDecl,
+    ) ![]const Clause {
+        self.current_function_name = self.interner.get(decls[0].name);
+
+        var clauses: std.ArrayList(Clause) = .empty;
+        for (decls) |func| {
+            for (func.clauses) |clause| {
+                try clauses.append(self.allocator, try self.buildClause(&clause));
+            }
+        }
+        return try clauses.toOwnedSlice(self.allocator);
+    }
+
+    fn buildMergedFunctionGroup(
+        self: *HirBuilder,
+        decls: []const *const ast.FunctionDecl,
+        scope_id: scope_mod.ScopeId,
+    ) !FunctionGroup {
+        // Reuse a pre-assigned group ID if one exists (from pre-registration),
+        // otherwise allocate a new one.
+        const arity: u32 = if (decls[0].clauses.len > 0) @intCast(decls[0].clauses[0].params.len) else 0;
+        const group_id = blk: {
+            if (self.graph.resolveFamily(scope_id, decls[0].name, arity)) |family_id| {
+                if (self.family_to_group.get(family_id)) |existing_id| {
+                    break :blk existing_id;
+                }
+                const new_id = self.next_group_id;
+                self.next_group_id += 1;
+                try self.family_to_group.put(family_id, new_id);
+                break :blk new_id;
+            }
+            const new_id = self.next_group_id;
+            self.next_group_id += 1;
+            break :blk new_id;
+        };
 
         self.current_function_name = self.interner.get(decls[0].name);
 
@@ -1888,7 +1975,9 @@ pub const HirBuilder = struct {
             try self.family_to_group.put(family_id, group_id);
         }
 
+        const saved_function_name = self.current_function_name;
         self.current_function_name = self.interner.get(func.name);
+        const saved_next_local = self.next_local;
         const saved_root_scope = self.current_function_root_scope;
         const saved_capture_map = self.current_capture_map;
         const saved_capture_list = self.current_capture_list;
@@ -1907,6 +1996,8 @@ pub const HirBuilder = struct {
         self.current_capture_list = saved_capture_list;
         self.current_capture_map = saved_capture_map;
         self.current_function_root_scope = saved_root_scope;
+        self.next_local = saved_next_local;
+        self.current_function_name = saved_function_name;
 
         return .{
             .id = group_id,
@@ -2256,12 +2347,12 @@ pub const HirBuilder = struct {
 
     fn buildBlock(self: *HirBuilder, stmts: []const ast.Stmt) anyerror!*const Block {
         var hir_stmts: std.ArrayList(Stmt) = .empty;
-        const saved_assignment_bindings = self.current_assignment_bindings;
-        self.current_assignment_bindings = .empty;
-        defer {
-            self.current_assignment_bindings.deinit(self.allocator);
-            self.current_assignment_bindings = saved_assignment_bindings;
-        }
+        // Inherit outer bindings so variables from enclosing scopes are
+        // visible inside block expressions (e.g., macro-expanded quote blocks).
+        // Track the entry length so bindings added inside this block are
+        // removed on exit — they don't leak to the outer scope.
+        const bindings_base_len = self.current_assignment_bindings.items.len;
+        defer self.current_assignment_bindings.shrinkRetainingCapacity(bindings_base_len);
 
         for (stmts) |stmt| {
             switch (stmt) {
@@ -2282,7 +2373,19 @@ pub const HirBuilder = struct {
                     try hir_stmts.append(self.allocator, .{ .expr = hir_expr });
                 },
                 .assignment => |assign| {
-                    const value = try self.buildExpr(assign.value);
+                    // For anonymous function assignments, extract the function
+                    // group as a separate statement (same as named function_decl)
+                    // so the IR can build it properly. The assignment value becomes
+                    // just the closure_create expression.
+                    const value = if (assign.value.* == .anonymous_function) blk: {
+                        const anon = assign.value.anonymous_function;
+                        const function_type = try self.resolveFunctionValueType(anon.decl.name);
+                        const group_scope = self.current_clause_scope orelse self.current_module_scope orelse self.graph.prelude_scope;
+                        const group = try self.buildFunctionGroup(anon.decl, group_scope, null, true);
+                        const group_ptr = try self.create(FunctionGroup, group);
+                        try hir_stmts.append(self.allocator, .{ .function_group = group_ptr });
+                        break :blk try self.buildFunctionValueExpr(group.id, function_type, anon.meta.span);
+                    } else try self.buildExpr(assign.value);
                     const idx = self.next_local;
                     self.next_local += 1;
                     if (assign.pattern.* == .bind) {

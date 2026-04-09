@@ -3374,7 +3374,22 @@ pub const IrBuilder = struct {
                                 .local_set = .{ .dest = ls.index, .value = val },
                             });
                         },
-                        else => {},
+                        .function_group => |group| {
+                            // Anonymous functions and nested functions defined
+                            // inside block expressions must be built as IR functions.
+                            const saved_instrs = self.current_instrs;
+                            const saved_next_local = self.next_local;
+                            const saved_known_local_types = self.known_local_types;
+                            self.current_instrs = .empty;
+                            self.known_local_types = std.AutoHashMap(LocalId, ZigType).init(self.allocator);
+                            defer {
+                                self.known_local_types.deinit();
+                                self.known_local_types = saved_known_local_types;
+                            }
+                            try self.buildFunctionGroup(group);
+                            self.current_instrs = saved_instrs;
+                            self.next_local = saved_next_local;
+                        },
                     }
                 }
                 if (last_local) |ll| {

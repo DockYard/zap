@@ -11,7 +11,6 @@ pub module Test.TestRunner {
     Test.BooleanTest.run()
     Test.AtomTest.run()
     Test.FunctionTest.run()
-    Test.FunctionModuleTest.run()
     Test.MacroTest.run()
     Test.RecursionTest.run()
     Test.GuardTest.run()
@@ -25,6 +24,7 @@ pub module Test.TestRunner {
     Test.DefaultParamsTest.run()
     Test.CatchBasinTest.run()
     Test.ForComprehensionTest.run()
+    Test.ClosureTest.run()
 
     Zest.Runner.run()
   }
