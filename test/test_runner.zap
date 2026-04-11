@@ -25,6 +25,7 @@ pub module Test.TestRunner {
     Test.CatchBasinTest.run()
     Test.ForComprehensionTest.run()
     Test.ClosureTest.run()
+    Test.ZestFeaturesTest.run()
 
     Zest.Runner.run()
   }
