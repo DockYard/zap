@@ -3,25 +3,42 @@ pub module Zest.Case {
     Test case DSL for the Zest test framework.
 
     Provides `describe`, `test`, `assert`, `reject`, `setup`, and
-    `teardown` for writing structured test cases with ExUnit-style
-    test tracking. Use `use Zest.Case` at the top of your test module
-    to import these.
+    `teardown` for writing structured test cases with test tracking.
+    Use `use Zest.Case` at the top of your test module to import these.
 
     Each test calls `begin_test` before running and `end_test` after.
     Assertions track pass and fail counts via `:zig.TestTracker`.
     On success a dot is returned; on failure an F is returned and the
     test is marked as failed, but execution continues (non-fatal).
 
+    ## Setup and Context
+
+    The `setup` macro runs before tests and its return value becomes
+    the test context. Tests can receive the context as a second
+    parameter:
+
+        describe("with context") {
+          setup() {
+            42
+          }
+
+          test("uses context", ctx) {
+            assert(ctx == 42)
+          }
+
+          test("no context needed") {
+            assert(true)
+          }
+        }
+
     ## Examples
 
         pub module Test.MyTest {
           use Zest.Case
 
-          pub fn run() -> String {
-            describe("my feature") {
-              test("it works") {
-                assert(1 + 1 == 2)
-              }
+          describe("my feature") {
+            test("it works") {
+              assert(1 + 1 == 2)
             }
           }
         }
@@ -61,12 +78,11 @@ pub module Zest.Case {
   }
 
   @doc = """
-    Defines a single test case with tracking.
+    Defines a single test case without context.
 
     Calls `begin_test` before running the body and `end_test`
     after. If any assertion in the body fails, the test is
-    marked as failed but execution continues to the next test
-    (non-fatal). Returns "." when complete.
+    marked as failed but execution continues (non-fatal).
 
     ## Examples
 
@@ -83,6 +99,8 @@ pub module Zest.Case {
       "."
     }
   }
+
+
 
   @doc = """
     Asserts that a boolean value is `true`.
@@ -133,34 +151,39 @@ pub module Zest.Case {
   }
 
   @doc = """
-    Runs setup code before tests in the current scope.
+    Runs setup code and provides context to tests.
 
-    The body is inlined directly and executes where the
-    `setup` call appears. Use inside a `describe` block
-    to run initialization before test code.
+    The return value of the body becomes the test context,
+    accessible via the second argument of `test/3`. The
+    context is stored in a scoped variable that tests can
+    bind to.
 
     ## Examples
 
         describe("with setup") {
-          setup {
-            IO.puts("initializing")
+          setup() {
+            conn = connect_db()
+            conn
           }
-          test("it works") {
-            assert(true)
+
+          test("uses connection", ctx) {
+            assert(query(ctx) == :ok)
           }
         }
     """
 
   pub macro setup(body :: Expr) -> Expr {
-    quote { unquote(body) }
+    quote {
+      __test_context__ = unquote(body)
+    }
   }
 
   @doc = """
     Runs teardown code after tests in the current scope.
 
     The body is inlined directly and executes where the
-    `teardown` call appears. Use inside a `describe` block
-    to run cleanup after test code.
+    `teardown` call appears. Since assertions are non-fatal,
+    teardown code always runs even when tests fail.
 
     ## Examples
 
@@ -168,8 +191,9 @@ pub module Zest.Case {
           test("it works") {
             assert(true)
           }
-          teardown {
-            IO.puts("cleaning up")
+
+          teardown() {
+            disconnect_db()
           }
         }
     """

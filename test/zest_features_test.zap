@@ -30,10 +30,10 @@ pub module Test.ZestFeaturesTest {
 
   describe("setup and teardown") {
     setup() {
-      _setup_ran = true
+      _initialized = true
     }
 
-    test("setup runs before test") {
+    test("runs after setup") {
       assert(true)
     }
 
@@ -42,7 +42,7 @@ pub module Test.ZestFeaturesTest {
     }
 
     teardown() {
-      _teardown_ran = true
+      _cleaned = true
     }
   }
 
