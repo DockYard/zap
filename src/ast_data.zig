@@ -521,7 +521,7 @@ pub fn makeList(alloc: Allocator, store: *AllocationStore, items: []const CtValu
 }
 
 /// Build a CtValue list from a slice.
-fn makeListFromSlice(alloc: Allocator, store: *AllocationStore, items: []const CtValue) !CtValue {
+pub fn makeListFromSlice(alloc: Allocator, store: *AllocationStore, items: []const CtValue) !CtValue {
     const elems = try alloc.alloc(CtValue, items.len);
     @memcpy(elems, items);
     const id = store.alloc(alloc, .list, null);
@@ -1873,6 +1873,9 @@ pub fn moduleItemToCtValue(
             }
             const args = try makeListFromSlice(alloc, store, arg_vals.items);
             return makeTuple3(alloc, store, .{ .atom = "@" }, try emptyList(alloc, store), args);
+        },
+        .module_level_expr => |expr| {
+            return exprToCtValue(alloc, interner, store, expr);
         },
     };
 }

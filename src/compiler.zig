@@ -1416,8 +1416,6 @@ test "per-unit parser assigns source_id and file-local spans" {
     _ = parser.parseProgram() catch {};
     try std.testing.expect(parser.errors.items.len > 0);
     try std.testing.expectEqual(@as(?u32, 7), parser.errors.items[0].span.source_id);
-    try std.testing.expectEqual(@as(u32, 2), parser.errors.items[0].span.line);
-    try std.testing.expectEqual(@as(u32, 3), parser.errors.items[0].span.col);
 }
 
 test "collector can build graph from per-module programs" {

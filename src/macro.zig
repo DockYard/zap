@@ -190,6 +190,16 @@ pub const MacroEngine = struct {
                         }
                     }
                 },
+                .module_level_expr => |expr| {
+                    const expanded_items = self.expandModuleLevelExpr(expr) catch {
+                        try new_items.append(self.allocator, item);
+                        continue;
+                    };
+                    if (expanded_items.changed) changed = true;
+                    for (expanded_items.items) |expanded_item| {
+                        try new_items.append(self.allocator, expanded_item);
+                    }
+                },
                 else => try new_items.append(self.allocator, item),
             }
         }
@@ -1094,6 +1104,177 @@ pub const MacroEngine = struct {
             }
         }
 
+        return null;
+    }
+
+    // ============================================================
+    // Module-level expression expansion
+    // ============================================================
+
+    const ExpandedModuleItems = struct {
+        items: []const ast.ModuleItem,
+        changed: bool,
+    };
+
+    /// Expand a module-level expression. If the expression is a macro call
+    /// that produces a function declaration (or other module item), convert
+    /// it to the appropriate ModuleItem variant. Otherwise keep it as a
+    /// module_level_expr for collection into a generated run/0 function.
+    fn expandModuleLevelExpr(self: *MacroEngine, expr: *const ast.Expr) !ExpandedModuleItems {
+        // Check if this is a macro call (identifier + args)
+        if (expr.* == .call and expr.call.callee.* == .var_ref) {
+            const name = expr.call.callee.var_ref.name;
+            const arity: u32 = @intCast(expr.call.args.len);
+
+            if (self.findMacro(name, arity)) |macro_family_id| {
+                const family = &self.graph.macro_families.items[macro_family_id];
+                if (family.clauses.items.len > 0) {
+                    const clause_ref = family.clauses.items[0];
+                    const clause = &clause_ref.decl.clauses[clause_ref.clause_index];
+
+                    // Evaluate the macro and get the CtValue result
+                    const result_ct = self.evaluateMacroBodyToCtValue(
+                        clause,
+                        expr.call.args,
+                    ) orelse {
+                        // Macro evaluation failed — keep as expression
+                        const expanded = try self.expandExpr(expr);
+                        const items = try self.allocator.alloc(ast.ModuleItem, 1);
+                        items[0] = .{ .module_level_expr = expanded.expr };
+                        return .{ .items = items, .changed = expanded.changed };
+                    };
+
+                    // Try converting the result to module items
+                    const interner_mut: *ast.StringInterner = @constCast(self.interner);
+
+                    // Single module item (e.g., function declaration)
+                    if (ast_data.ctValueToModuleItem(self.allocator, interner_mut, result_ct) catch null) |mi| {
+                        const items = try self.allocator.alloc(ast.ModuleItem, 1);
+                        items[0] = mi;
+                        return .{ .items = items, .changed = true };
+                    }
+
+                    // Block of module items (e.g., describe expanding to multiple functions)
+                    if (result_ct == .tuple and result_ct.tuple.elems.len == 3) {
+                        if (result_ct.tuple.elems[0] == .atom) {
+                            if (std.mem.eql(u8, result_ct.tuple.elems[0].atom, "__block__")) {
+                                if (result_ct.tuple.elems[2] == .list) {
+                                    var items: std.ArrayList(ast.ModuleItem) = .empty;
+                                    for (result_ct.tuple.elems[2].list.elems) |elem| {
+                                        if (ast_data.ctValueToModuleItem(self.allocator, interner_mut, elem) catch null) |mi| {
+                                            try items.append(self.allocator, mi);
+                                        } else {
+                                            // Not a module item — keep as expression
+                                            const elem_expr = ast_data.ctValueToExpr(self.allocator, self.interner, elem) catch continue;
+                                            try items.append(self.allocator, .{ .module_level_expr = elem_expr });
+                                        }
+                                    }
+                                    if (items.items.len > 0) {
+                                        return .{ .items = try items.toOwnedSlice(self.allocator), .changed = true };
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // List of module items
+                    if (result_ct == .list) {
+                        var items: std.ArrayList(ast.ModuleItem) = .empty;
+                        for (result_ct.list.elems) |elem| {
+                            if (ast_data.ctValueToModuleItem(self.allocator, interner_mut, elem) catch null) |mi| {
+                                try items.append(self.allocator, mi);
+                            }
+                        }
+                        if (items.items.len > 0) {
+                            return .{ .items = try items.toOwnedSlice(self.allocator), .changed = true };
+                        }
+                    }
+
+                    // Not a module item — convert to expression and keep as module_level_expr
+                    const result_expr = ast_data.ctValueToExpr(self.allocator, self.interner, result_ct) catch {
+                        const items = try self.allocator.alloc(ast.ModuleItem, 1);
+                        items[0] = .{ .module_level_expr = expr };
+                        return .{ .items = items, .changed = false };
+                    };
+                    const items = try self.allocator.alloc(ast.ModuleItem, 1);
+                    items[0] = .{ .module_level_expr = result_expr };
+                    return .{ .items = items, .changed = true };
+                }
+            }
+        }
+
+        // Not a macro call — expand as a regular expression
+        const expanded = try self.expandExpr(expr);
+        const items = try self.allocator.alloc(ast.ModuleItem, 1);
+        items[0] = .{ .module_level_expr = expanded.expr };
+        return .{ .items = items, .changed = expanded.changed };
+    }
+
+    /// Evaluate a macro's body given its clause and arguments, returning the
+    /// raw CtValue result. Returns null if evaluation fails.
+    fn evaluateMacroBodyToCtValue(
+        self: *MacroEngine,
+        clause: *const ast.FunctionClause,
+        args: []const *const ast.Expr,
+    ) ?ctfe.CtValue {
+        var store = ctfe.AllocationStore{};
+
+        // Fast path: bare quote body → template expansion returning CtValue
+        const clause_body = clause.body orelse return null;
+        if (clause_body.len == 1 and clause_body[0] == .expr) {
+            const body_expr = clause_body[0].expr;
+            if (body_expr.* == .quote_expr) {
+                var param_map = std.StringHashMap(ctfe.CtValue).init(self.allocator);
+                defer param_map.deinit();
+                for (clause.params, 0..) |param, i| {
+                    if (i < args.len) {
+                        if (param.pattern.* == .bind) {
+                            const pname = self.interner.get(param.pattern.bind.name);
+                            const arg_ct = ast_data.exprToCtValue(self.allocator, self.interner, &store, args[i]) catch return null;
+                            param_map.put(pname, arg_ct) catch return null;
+                        }
+                    }
+                }
+
+                var body_vals = std.ArrayListUnmanaged(ctfe.CtValue){};
+                for (body_expr.quote_expr.body) |stmt| {
+                    const stmt_ct = ast_data.stmtToCtValue(self.allocator, self.interner, &store, stmt) catch return null;
+                    body_vals.append(self.allocator, self.substituteCtValue(stmt_ct, &param_map, &store) catch return null) catch return null;
+                }
+
+                if (body_vals.items.len == 1) return body_vals.items[0];
+                // Multiple values: wrap in __block__
+                if (body_vals.items.len > 1) {
+                    const block_args = ast_data.makeListFromSlice(self.allocator, &store, body_vals.items) catch return null;
+                    const empty = ast_data.emptyList(self.allocator, &store) catch return null;
+                    return ast_data.makeTuple3(self.allocator, &store, .{ .atom = "__block__" }, empty, block_args) catch return null;
+                }
+                return null;
+            }
+        }
+
+        // Phase 3: evaluator path
+        const macro_eval = @import("macro_eval.zig");
+        var env = macro_eval.Env.init(self.allocator, &store);
+        defer env.deinit();
+
+        for (clause.params, 0..) |param, i| {
+            if (i < args.len) {
+                if (param.pattern.* == .bind) {
+                    const param_name = self.interner.get(param.pattern.bind.name);
+                    const arg_ct = ast_data.exprToCtValue(self.allocator, self.interner, &store, args[i]) catch return null;
+                    env.bind(param_name, arg_ct) catch return null;
+                }
+            }
+        }
+
+        var result: ctfe.CtValue = .nil;
+        for (clause_body) |stmt| {
+            const stmt_ct = ast_data.stmtToCtValue(self.allocator, self.interner, &store, stmt) catch return null;
+            result = macro_eval.eval(&env, stmt_ct) catch return null;
+        }
+
+        if (result != .nil) return result;
         return null;
     }
 

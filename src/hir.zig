@@ -1796,6 +1796,81 @@ pub const HirBuilder = struct {
             }
         }
 
+        // If the module has module-level expressions (e.g., describe/test macro
+        // calls), synthesize a pub fn run() -> String { <exprs>; "done" } and
+        // add it to fn_groups — unless the module already declares run/0.
+        {
+            var module_exprs: std.ArrayList(*const ast.Expr) = .empty;
+            for (mod.items) |item| {
+                if (item == .module_level_expr) {
+                    try module_exprs.append(self.allocator, item.module_level_expr);
+                }
+            }
+            if (module_exprs.items.len > 0) {
+                // Find the StringId for "run" by scanning existing interned strings
+                const run_name: ?ast.StringId = blk: {
+                    var sid: ast.StringId = 0;
+                    while (sid < self.interner.strings.items.len) : (sid += 1) {
+                        if (std.mem.eql(u8, self.interner.get(sid), "run")) break :blk sid;
+                    }
+                    break :blk null;
+                };
+
+                // Only generate run/0 if the string "run" exists in the interner
+                // (it will exist because test modules import Zest.Runner which has run)
+                if (run_name) |rn| {
+                    var has_run = false;
+                    if (fn_groups.get(rn)) |_| has_run = true;
+                    if (!has_run) {
+                        // Build AST statements from the module-level expressions
+                        var stmts = try self.allocator.alloc(ast.Stmt, module_exprs.items.len);
+                        for (module_exprs.items, 0..) |expr, idx| {
+                            stmts[idx] = .{ .expr = expr };
+                        }
+
+                        // Find StringId for "String" type
+                        const string_tid: ast.StringId = st_blk: {
+                            var sid: ast.StringId = 0;
+                            while (sid < self.interner.strings.items.len) : (sid += 1) {
+                                if (std.mem.eql(u8, self.interner.get(sid), "String")) break :st_blk sid;
+                            }
+                            break :st_blk 0;
+                        };
+
+                        // Synthesize: pub fn run() -> String { <stmts> }
+                        const string_type = try self.allocator.create(ast.TypeExpr);
+                        string_type.* = .{ .name = .{
+                            .meta = mod.meta,
+                            .name = string_tid,
+                            .args = &.{},
+                        } };
+                        const clause = try self.allocator.create(ast.FunctionClause);
+                        clause.* = .{
+                            .meta = mod.meta,
+                            .params = &.{},
+                            .return_type = string_type,
+                            .refinement = null,
+                            .body = stmts,
+                        };
+                        const run_decl = try self.allocator.create(ast.FunctionDecl);
+                        run_decl.* = .{
+                            .meta = mod.meta,
+                            .name = rn,
+                            .clauses = try self.allocator.dupe(ast.FunctionClause, &.{clause.*}),
+                            .visibility = .public,
+                        };
+
+                        const entry = try fn_groups.getOrPut(rn);
+                        if (!entry.found_existing) {
+                            entry.value_ptr.* = .empty;
+                            try fn_order.append(self.allocator, rn);
+                        }
+                        try entry.value_ptr.append(self.allocator, run_decl);
+                    }
+                }
+            }
+        }
+
         // Pre-register all declared function families in family_to_group
         // so that function references like &name/arity can resolve any
         // sibling function regardless of declaration order.

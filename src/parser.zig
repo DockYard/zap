@@ -676,13 +676,10 @@ pub const Parser = struct {
                             self.synchronize();
                         }
                     } else {
-                        try self.addRichError(
-                            "I was not expecting an identifier at the module level",
-                            self.currentSpan(),
-                            null,
-                            "the module level can contain `pub fn`, `fn`, `pub macro`, `macro`, `import`, `use`, `alias`, `type`, `struct`, `union`, `opaque`, and `@attribute` declarations",
-                        );
-                        self.synchronize();
+                        // Try parsing as a module-level expression (macro call like describe/test).
+                        // These are collected into an auto-generated run/0 function.
+                        const expr = try self.parseExpr();
+                        try items.append(self.allocator, .{ .module_level_expr = expr });
                     }
                 },
                 .at_sign => {

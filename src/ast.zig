@@ -127,6 +127,9 @@ pub const ModuleItem = union(enum) {
     import_decl: *const ImportDecl,
     use_decl: *const UseDecl,
     attribute: *const AttributeDecl,
+    /// Expression at module level (e.g., macro calls like describe/test).
+    /// Collected into an auto-generated run/0 function by the HIR builder.
+    module_level_expr: *const Expr,
 };
 
 // ============================================================

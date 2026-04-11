@@ -158,6 +158,9 @@ pub const Collector = struct {
                     };
                     try self.collectImport(import_decl, mod_scope);
                 },
+                .module_level_expr => |expr| {
+                    try self.collectExprScopes(expr, mod_scope);
+                },
             }
         }
 
