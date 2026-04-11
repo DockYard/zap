@@ -627,6 +627,16 @@ pub const Collector = struct {
                 }
             },
             .block => |blk| {
+                // Hoist function declarations from block expressions to the parent
+                // scope so they're visible to the enclosing function. This enables
+                // macros that produce {function_decl, call} blocks at expression level.
+                for (blk.stmts) |stmt| {
+                    switch (stmt) {
+                        .function_decl => |func| try self.collectFunction(func, parent_scope),
+                        .macro_decl => |mac| try self.collectMacro(mac, parent_scope),
+                        else => {},
+                    }
+                }
                 const blk_scope = try self.graph.createScope(parent_scope, .block);
                 try self.collectBlock(blk.stmts, blk_scope);
             },

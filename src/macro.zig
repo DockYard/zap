@@ -20,7 +20,9 @@ const ctfe = @import("ctfe.zig");
 pub const MacroEngine = struct {
     allocator: std.mem.Allocator,
     interner: *ast.StringInterner,
-    graph: *const scope.ScopeGraph,
+    graph: *scope.ScopeGraph,
+    /// The module scope currently being expanded, for registering generated declarations.
+    current_module_scope: ?scope.ScopeId = null,
     generation: u32,
     max_expansions: u32,
     errors: std.ArrayList(Error),
@@ -30,7 +32,7 @@ pub const MacroEngine = struct {
         span: ast.SourceSpan,
     };
 
-    pub fn init(allocator: std.mem.Allocator, interner: *ast.StringInterner, graph: *const scope.ScopeGraph) MacroEngine {
+    pub fn init(allocator: std.mem.Allocator, interner: *ast.StringInterner, graph: *scope.ScopeGraph) MacroEngine {
         return .{
             .allocator = allocator,
             .interner = interner,
@@ -109,6 +111,17 @@ pub const MacroEngine = struct {
     fn expandModule(self: *MacroEngine, mod: *const ast.ModuleDecl) !ExpandedModule {
         var changed = false;
         var new_items: std.ArrayList(ast.ModuleItem) = .empty;
+
+        // Find the module's scope for registering generated declarations.
+        // Also set current_module_scope so expression-level macros can register too.
+        const mod_scope: ?scope.ScopeId = blk: {
+            for (self.graph.modules.items) |entry| {
+                if (entry.decl == mod) break :blk entry.scope_id;
+            }
+            break :blk null;
+        };
+        self.current_module_scope = mod_scope;
+        defer self.current_module_scope = null;
 
         for (mod.items) |item| {
             switch (item) {
@@ -197,6 +210,14 @@ pub const MacroEngine = struct {
                     };
                     if (expanded_items.changed) changed = true;
                     for (expanded_items.items) |expanded_item| {
+                        // Register generated function declarations in the scope graph
+                        // so they're visible for call resolution in later pipeline passes.
+                        switch (expanded_item) {
+                            .function, .priv_function => |func| {
+                                self.registerGeneratedFunction(func, mod_scope);
+                            },
+                            else => {},
+                        }
                         try new_items.append(self.allocator, expanded_item);
                     }
                 },
@@ -806,6 +827,8 @@ pub const MacroEngine = struct {
 
             // Convert the result back to ast.Expr
             if (result != .nil) {
+                // If the result is a function declaration form, register it in
+                // the scope graph so calls to the generated function can resolve.
                 return ast_data.ctValueToExpr(self.allocator, self.interner, result) catch expr;
             }
         }
@@ -1105,6 +1128,29 @@ pub const MacroEngine = struct {
         }
 
         return null;
+    }
+
+    // ============================================================
+    // Generated declaration registration
+    // ============================================================
+
+    /// Register a macro-generated function declaration in the scope graph
+    /// so it's visible for call resolution in later pipeline passes.
+    fn registerGeneratedFunction(self: *MacroEngine, func: *const ast.FunctionDecl, mod_scope: ?scope.ScopeId) void {
+        const parent = mod_scope orelse return;
+        for (func.clauses, 0..) |clause, clause_idx| {
+            const arity: u32 = @intCast(clause.params.len);
+            const key = scope.FamilyKey{ .name = func.name, .arity = arity };
+            const parent_data = self.graph.getScopeMut(parent);
+            if (!parent_data.function_families.contains(key)) {
+                const family_id = self.graph.createFamily(parent, func.name, arity, func.visibility) catch return;
+                const family = &self.graph.families.items[family_id];
+                family.clauses.append(self.allocator, .{
+                    .decl = func,
+                    .clause_index = @intCast(clause_idx),
+                }) catch return;
+            }
+        }
     }
 
     // ============================================================
