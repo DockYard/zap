@@ -19,8 +19,6 @@ pub module Test.DefaultParamsTest {
         assert(greet("World", "Hi") == "Hi, World!")
       }
     }
-
-    "DefaultParamsTest: passed"
   }
 
   fn add(a :: i64, b :: i64 = 10) -> i64 {

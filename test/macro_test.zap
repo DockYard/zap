@@ -11,8 +11,6 @@ pub module Test.MacroTest {
         assert(if_false() == "no")
       }
     }
-
-    "MacroTest: passed"
   }
 
   fn if_true() -> String {

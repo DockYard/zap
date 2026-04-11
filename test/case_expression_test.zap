@@ -35,8 +35,6 @@ pub module Test.CaseExpressionTest {
         assert(add_or_zero(0) == 0)
       }
     }
-
-    "CaseExpressionTest: passed"
   }
 
   fn label_number(x :: i64) -> String {

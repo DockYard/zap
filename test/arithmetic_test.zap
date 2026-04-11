@@ -27,8 +27,6 @@ pub module Test.ArithmeticTest {
         assert(cube(3) == 27)
       }
     }
-
-    "ArithmeticTest: passed"
   }
 
   fn add(a :: i64, b :: i64) -> i64 {

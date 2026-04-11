@@ -51,8 +51,6 @@ pub module Test.CondTest {
         assert(abs_sign(3) == "positive")
       }
     }
-
-    "CondTest: passed"
   }
 
   fn check(x :: Bool) -> String {

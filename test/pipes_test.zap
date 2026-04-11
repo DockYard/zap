@@ -15,8 +15,6 @@ pub module Test.PipesTest {
         assert(("hello" |> shout()) == "hello!")
       }
     }
-
-    "PipesTest: passed"
   }
 
   fn add_one(x :: i64) -> i64 {

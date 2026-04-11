@@ -21,8 +21,6 @@ pub module Test.UnionTest {
         assert(color_name(Color.Blue) == "blue")
       }
     }
-
-    "UnionTest: passed"
   }
 
   fn color_name(Color.Red :: Color) -> String {

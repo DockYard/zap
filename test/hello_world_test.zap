@@ -7,8 +7,6 @@ pub module Test.HelloWorldTest {
         assert(greeting() == "Hello, world!")
       }
     }
-
-    "HelloWorldTest: passed"
   }
 
   fn greeting() -> String {

@@ -63,8 +63,6 @@ pub module Test.BooleanTest {
         assert(check_positive(-3) == "not positive")
       }
     }
-
-    "BooleanTest: passed"
   }
 
   fn check_positive(x :: i64) -> String {

@@ -25,8 +25,6 @@ pub module Test.CatchBasinTest {
     # TODO: Function handler with extra args has a multi-file issue
     # assert(try_fn_handler_extra("one") == "1")
     # assert(try_fn_handler_extra("nope") == "fallback: nope")
-
-    "CatchBasinTest: passed"
   }
 
   # Multi-clause function — only matches specific strings

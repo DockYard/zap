@@ -11,8 +11,6 @@ pub module Test.StringTest {
         assert(greet("World") == "Hello, World!")
       }
     }
-
-    "StringTest: passed"
   }
 
   fn greet(name :: String) -> String {

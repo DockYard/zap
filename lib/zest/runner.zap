@@ -1,9 +1,11 @@
 pub module Zest.Runner {
   @moduledoc = """
-    Test runner for the Zest test framework.
+    Finalizes test execution and prints the summary report.
 
-    Provides the `run/0` function that finalizes test output.
-    Use `use Zest.Runner` in your test runner module.
+    Delegates to `:zig.TestTracker.summary()` which prints an
+    ExUnit-style summary with test count, assertion count, and
+    failure count, then exits with a non-zero code if any tests
+    failed.
 
     ## Examples
 
@@ -17,6 +19,12 @@ pub module Zest.Runner {
         }
     """
 
+  @doc = """
+    Imports `Zest.Runner` into the calling module.
+
+    Called automatically when you write `use Zest.Runner`.
+    """
+
   pub macro __using__(_opts :: Expr) -> Expr {
     quote {
       import Zest.Runner
@@ -24,9 +32,12 @@ pub module Zest.Runner {
   }
 
   @doc = """
-    Finalizes the test run by printing a newline after the dot output.
+    Prints the test summary with counts and exits with a
+    failure code if any tests failed.
 
-    Call this as the last line of the test runner's `main` function.
+    Call this as the last line of the test runner's `main`
+    function. It invokes `:zig.TestTracker.summary()` which
+    outputs the final report to stdout.
 
     ## Examples
 
@@ -37,7 +48,7 @@ pub module Zest.Runner {
     """
 
   pub fn run() -> String {
-    IO.puts("")
+    :zig.TestTracker.summary()
     "done"
   }
 }

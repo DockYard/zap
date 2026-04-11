@@ -15,8 +15,6 @@ pub module Test.PatternMatchingTest {
         assert(describe(:other) == "unknown")
       }
     }
-
-    "PatternMatchingTest: passed"
   }
 
   fn describe(:ok :: Atom) -> String {

@@ -12,7 +12,5 @@ pub module Test.ImportTest {
         assert(greet("World") == "Hello, World!")
       }
     }
-
-    "ImportTest: passed"
   }
 }

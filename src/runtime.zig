@@ -1012,6 +1012,55 @@ pub const Prelude = struct {
 };
 
 // ============================================================
+// TestTracker — mutable counters for test/assertion reporting
+// ============================================================
+
+pub const TestTracker = struct {
+    var test_count: i64 = 0;
+    var test_failures: i64 = 0;
+    var assertion_count: i64 = 0;
+    var assertion_failures: i64 = 0;
+
+    pub fn increment_tests() void {
+        test_count += 1;
+    }
+
+    pub fn increment_test_failures() void {
+        test_failures += 1;
+    }
+
+    pub fn pass_assertion() void {
+        assertion_count += 1;
+    }
+
+    pub fn fail_assertion() void {
+        assertion_count += 1;
+        assertion_failures += 1;
+    }
+
+    pub fn print_dot() void {
+        const stdout = std.fs.File.stdout().deprecatedWriter();
+        stdout.print("\x1b[1;32m.\x1b[0m", .{}) catch {};
+    }
+
+    pub fn print_fail() void {
+        const stdout = std.fs.File.stdout().deprecatedWriter();
+        stdout.print("\x1b[1;31mF\x1b[0m", .{}) catch {};
+    }
+
+    pub fn summary() i64 {
+        const stdout = std.fs.File.stdout().deprecatedWriter();
+        stdout.print("\n\n{d} tests, {d} failures\n{d} assertions, {d} failures\n", .{
+            test_count,
+            test_failures,
+            assertion_count,
+            assertion_failures,
+        }) catch {};
+        return test_failures;
+    }
+};
+
+// ============================================================
 // BinaryHelpers — concrete binary pattern matching operations
 // for ZIR builder (no generics, no comptime type params)
 // ============================================================

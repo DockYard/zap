@@ -27,8 +27,6 @@ pub module Test.GuardTest {
         assert(range_check(500) == "large")
       }
     }
-
-    "GuardTest: passed"
   }
 
   fn classify(n :: i64) -> String if n > 0 {

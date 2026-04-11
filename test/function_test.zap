@@ -19,8 +19,6 @@ pub module Test.FunctionTest {
         assert(greet("World") == "Hello, World!")
       }
     }
-
-    "FunctionTest: passed"
   }
 
   fn classify(0 :: i64) -> String {

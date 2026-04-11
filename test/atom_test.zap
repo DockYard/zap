@@ -23,8 +23,6 @@ pub module Test.AtomTest {
         assert(status(:error) == "failure")
       }
     }
-
-    "AtomTest: passed"
   }
 
   fn status(:ok :: Atom) -> String {

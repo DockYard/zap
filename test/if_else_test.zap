@@ -27,8 +27,6 @@ pub module Test.IfElseTest {
         assert(classify(false, false) == "neither")
       }
     }
-
-    "IfElseTest: passed"
   }
 
   fn check(x :: Bool) -> String {

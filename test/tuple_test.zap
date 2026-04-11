@@ -27,8 +27,6 @@ pub module Test.TupleTest {
         assert(double_second({5, 7}) == 14)
       }
     }
-
-    "TupleTest: passed"
   }
 
   fn first(t :: {i64, i64}) -> i64 {

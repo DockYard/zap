@@ -39,8 +39,6 @@ pub module Test.RecursionTest {
         assert(sum(5) == 15)
       }
     }
-
-    "RecursionTest: passed"
   }
 
   fn factorial(0 :: i64) -> i64 {

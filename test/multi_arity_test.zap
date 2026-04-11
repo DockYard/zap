@@ -15,8 +15,6 @@ pub module Test.MultiArityTest {
         assert(join("hello", " ", "world") == "hello world")
       }
     }
-
-    "MultiArityTest: passed"
   }
 
   fn add(a :: i64, b :: i64) -> i64 {

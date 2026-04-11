@@ -23,7 +23,5 @@ pub module Test.ClosureTest {
         assert(add_one(20) + add_one(20) == 42)
       }
     }
-
-    "ClosureTest: passed"
   }
 }

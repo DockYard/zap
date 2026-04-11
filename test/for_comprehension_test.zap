@@ -12,8 +12,5 @@ pub module Test.ForComprehensionTest {
         assert(true)
       }
     }
-
-    # Verify the for comprehension ran without error
-    "ForComprehensionTest: passed"
   }
 }

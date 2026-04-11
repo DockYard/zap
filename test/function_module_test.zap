@@ -11,8 +11,6 @@ pub module Test.FunctionModuleTest {
         assert(Function.identity("zap") == "zap")
       }
     }
-
-    "FunctionModuleTest: passed"
   }
 
 }

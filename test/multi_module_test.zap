@@ -15,7 +15,5 @@ pub module Test.MultiModuleTest {
         assert(String.length("hello") == 5)
       }
     }
-
-    "MultiModuleTest: passed"
   }
 }
