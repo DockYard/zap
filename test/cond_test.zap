@@ -11,15 +11,15 @@ pub module Test.CondTest {
     }
 
     test("comparison matches one") {
-      assert(describe(1) == "one")
+      assert(classify(1) == "one")
     }
 
     test("comparison matches two") {
-      assert(describe(2) == "two")
+      assert(classify(2) == "two")
     }
 
     test("comparison falls through to other") {
-      assert(describe(99) == "other")
+      assert(classify(99) == "other")
     }
 
     test("grade A for 95") {
@@ -58,7 +58,7 @@ pub module Test.CondTest {
     }
   }
 
-  fn describe(x :: i64) -> String {
+  fn classify(x :: i64) -> String {
     cond {
       x == 1 -> "one"
       x == 2 -> "two"
