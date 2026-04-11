@@ -1,7 +1,7 @@
 pub module Test.ZestFeaturesTest {
   use Zest.Case
 
-  describe("setup with context") {
+  describe("setup context passing") {
     ctx = setup() {
       42
     }

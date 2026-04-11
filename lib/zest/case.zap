@@ -100,6 +100,24 @@ pub module Zest.Case {
     }
   }
 
+  @doc = """
+    Defines a test case that receives the setup context.
+
+    The setup return value is bound to `ctx` inside the test body.
+    Use the second argument to name the context variable in your test.
+
+    ## Examples
+
+        setup() {
+          42
+        }
+
+        test("uses context", ctx) {
+          assert(ctx == 42)
+        }
+    """
+
+
 
 
 

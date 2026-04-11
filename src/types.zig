@@ -2041,6 +2041,12 @@ pub const TypeChecker = struct {
             },
 
             .block => |blk| {
+                const prev_scope = self.current_scope;
+                if (self.graph.node_scope_map.get(blk.meta.span.start)) |block_scope| {
+                    self.current_scope = block_scope;
+                }
+                defer self.current_scope = prev_scope;
+
                 var result_type: TypeId = TypeStore.NIL;
                 for (blk.stmts) |stmt| {
                     result_type = try self.checkStmt(stmt);
