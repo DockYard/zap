@@ -504,7 +504,7 @@ pub fn makeTuple3(alloc: Allocator, store: *AllocationStore, form: CtValue, meta
 }
 
 /// Build a 2-tuple CtValue (for keyword pairs, map entries).
-fn makeTuple2(alloc: Allocator, store: *AllocationStore, first: CtValue, second: CtValue) !CtValue {
+pub fn makeTuple2(alloc: Allocator, store: *AllocationStore, first: CtValue, second: CtValue) !CtValue {
     const elems = try alloc.alloc(CtValue, 2);
     elems[0] = first;
     elems[1] = second;
@@ -1101,6 +1101,43 @@ pub fn ctValueToExpr(
             const expr = try alloc.create(ast.Expr);
             expr.* = .{ .attr_ref = .{ .meta = node_meta, .name = try interner.intern(arg_elems[0].atom) } };
             return expr;
+        }
+    }
+
+    // Function declaration form {:fn, meta, clauses} at expression level:
+    // Convert to a block containing the function declaration + a call to it.
+    // This allows macros that produce function declarations to work in
+    // expression contexts (e.g., test() inside run/0).
+    if (std.mem.eql(u8, form_name, "fn") and arg_elems.len > 0) {
+        if (arg_elems[0] == .tuple and arg_elems[0].tuple.elems.len == 3) {
+            // This looks like a clause: {:->, meta, [head, opts]}
+            const clause_ct = arg_elems[0];
+            if (clause_ct.tuple.elems[0] == .atom and std.mem.eql(u8, clause_ct.tuple.elems[0].atom, "->")) {
+                // Use the original value tuple directly for conversion
+                const interner_mut: *ast.StringInterner = @constCast(interner);
+                if (ctValueToModuleItem(alloc, interner_mut, value) catch null) |mi| {
+                    switch (mi) {
+                        .function, .priv_function => |decl| {
+                            // Wrap in a block: { function_decl; call_to_function }
+                            const fn_name = interner.get(decl.name);
+                            const call_callee = try alloc.create(ast.Expr);
+                            call_callee.* = .{ .var_ref = .{ .meta = node_meta, .name = decl.name } };
+                            const call_expr = try alloc.create(ast.Expr);
+                            call_expr.* = .{ .call = .{ .meta = node_meta, .callee = call_callee, .args = &.{} } };
+                            _ = fn_name;
+
+                            // Create block with function_decl statement + call expression
+                            const stmts = try alloc.alloc(ast.Stmt, 2);
+                            stmts[0] = .{ .function_decl = decl };
+                            stmts[1] = .{ .expr = call_expr };
+                            const block_expr = try alloc.create(ast.Expr);
+                            block_expr.* = .{ .block = .{ .meta = node_meta, .stmts = stmts } };
+                            return block_expr;
+                        },
+                        else => {},
+                    }
+                }
+            }
         }
     }
 

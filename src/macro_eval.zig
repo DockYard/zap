@@ -300,6 +300,52 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
                 }
             }
 
+            // slugify(string) — convert "hello world" to "hello_world"
+            if (std.mem.eql(u8, form_name, "slugify")) {
+                if (arg_elems.len == 1) {
+                    const val = try eval(env, arg_elems[0]);
+                    const content = extractString(val) orelse return .nil;
+                    const result = try env.alloc.alloc(u8, content.len);
+                    for (content, 0..) |c, i| {
+                        if (c == ' ' or c == '-' or c == '\t' or c == '\n') {
+                            result[i] = '_';
+                        } else if (std.ascii.isUpper(c)) {
+                            result[i] = std.ascii.toLower(c);
+                        } else if (std.ascii.isAlphanumeric(c) or c == '_') {
+                            result[i] = c;
+                        } else {
+                            result[i] = '_';
+                        }
+                    }
+                    return CtValue{ .string = result };
+                }
+            }
+
+            // string_concat(a, b) — concatenate two strings at compile time
+            if (std.mem.eql(u8, form_name, "string_concat")) {
+                if (arg_elems.len == 2) {
+                    const a = try eval(env, arg_elems[0]);
+                    const b = try eval(env, arg_elems[1]);
+                    const sa = extractString(a) orelse return .nil;
+                    const sb = extractString(b) orelse return .nil;
+                    const result = std.fmt.allocPrint(env.alloc, "{s}{s}", .{ sa, sb }) catch return .nil;
+                    return CtValue{ .string = result };
+                }
+            }
+
+            // make_fn_decl(name, body) — construct a {:fn, meta, clauses} CtValue
+            // for a zero-param pub function returning String.
+            // name: string (function name)
+            // body: CtValue (the function body expression/block)
+            if (std.mem.eql(u8, form_name, "make_fn_decl")) {
+                if (arg_elems.len == 2) {
+                    const name_val = try eval(env, arg_elems[0]);
+                    const body_val = try eval(env, arg_elems[1]);
+                    const name_str = extractString(name_val) orelse return .nil;
+                    return buildFnDeclCtValue(env.alloc, env.store, name_str, body_val) catch return .nil;
+                }
+            }
+
             // length(list_or_tuple) — get length
             if (std.mem.eql(u8, form_name, "length")) {
                 if (arg_elems.len == 1) {
@@ -557,4 +603,53 @@ test "eval: quote returns data" {
     try std.testing.expect(result.list.elems[0] == .tuple);
     try std.testing.expect(result.list.elems[0].tuple.elems[0] == .atom);
     try std.testing.expect(std.mem.eql(u8, result.list.elems[0].tuple.elems[0].atom, "+"));
+}
+
+// ============================================================
+// Helper functions
+// ============================================================
+
+/// Extract string content from a CtValue, handling both bare strings
+/// and wrapped string literals ({string_content, meta, nil}).
+fn extractString(val: CtValue) ?[]const u8 {
+    if (val == .string) return val.string;
+    if (val == .tuple and val.tuple.elems.len == 3 and val.tuple.elems[0] == .string)
+        return val.tuple.elems[0].string;
+    if (val == .atom) return val.atom;
+    return null;
+}
+
+/// Build a CtValue representing a zero-param pub function declaration
+/// with String return type:
+///   {:fn, [{:visibility, "pub"}], [{:->, [], [{:name, [], []}, [{:return, :String}, {:do, body}]]}]}
+fn buildFnDeclCtValue(alloc: Allocator, store: *AllocationStore, name: []const u8, body: CtValue) !CtValue {
+    const empty = try ast_data.emptyList(alloc, store);
+
+    // Head: {:name, [], []} — function name with no params
+    const head = try ast_data.makeTuple3(alloc, store, .{ .atom = name }, empty, empty);
+
+    // Return type: :String
+    const return_pair = try ast_data.makeTuple2(alloc, store, .{ .atom = "return" }, .{ .atom = "String" });
+
+    // Body: {:do, body_expr}
+    const do_pair = try ast_data.makeTuple2(alloc, store, .{ .atom = "do" }, body);
+
+    // Opts: [{:return, :String}, {:do, body}]
+    const opts = try ast_data.makeList(alloc, store, &.{ return_pair, do_pair });
+
+    // Clause args: [head, opts]
+    const clause_args = try ast_data.makeList(alloc, store, &.{ head, opts });
+
+    // Clause: {:->, [], [head, opts]}
+    const clause = try ast_data.makeTuple3(alloc, store, .{ .atom = "->" }, empty, clause_args);
+
+    // Clauses list
+    const clauses = try ast_data.makeList(alloc, store, &.{clause});
+
+    // Meta: [{:visibility, "pub"}]
+    const vis_pair = try ast_data.makeTuple2(alloc, store, .{ .atom = "visibility" }, .{ .string = "pub" });
+    const meta = try ast_data.makeList(alloc, store, &.{vis_pair});
+
+    // Function: {:fn, meta, clauses}
+    return ast_data.makeTuple3(alloc, store, .{ .atom = "fn" }, meta, clauses);
 }
