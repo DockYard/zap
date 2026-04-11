@@ -7,19 +7,17 @@ pub module Test.UnionTest {
     Blue
   }
 
-  pub fn run() -> String {
-    describe("unions") {
-      test("Red variant name") {
-        assert(color_name(Color.Red) == "red")
-      }
+  describe("unions") {
+    test("Red variant name") {
+      assert(color_name(Color.Red) == "red")
+    }
 
-      test("Green variant name") {
-        assert(color_name(Color.Green) == "green")
-      }
+    test("Green variant name") {
+      assert(color_name(Color.Green) == "green")
+    }
 
-      test("Blue variant name") {
-        assert(color_name(Color.Blue) == "blue")
-      }
+    test("Blue variant name") {
+      assert(color_name(Color.Blue) == "blue")
     }
   }
 

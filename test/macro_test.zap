@@ -1,15 +1,13 @@
 pub module Test.MacroTest {
   use Zest.Case
 
-  pub fn run() -> String {
-    describe("macros") {
-      test("if true returns yes") {
-        assert(if_true() == "yes")
-      }
+  describe("macros") {
+    test("if true returns yes") {
+      assert(if_true() == "yes")
+    }
 
-      test("if false returns no") {
-        assert(if_false() == "no")
-      }
+    test("if false returns no") {
+      assert(if_false() == "no")
     }
   }
 

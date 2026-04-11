@@ -1,31 +1,29 @@
 pub module Test.GuardTest {
   use Zest.Case
 
-  pub fn run() -> String {
-    describe("guards") {
-      test("positive number classified as positive") {
-        assert(classify(5) == "positive")
-      }
+  describe("guards") {
+    test("positive number classified as positive") {
+      assert(classify(5) == "positive")
+    }
 
-      test("negative number classified as negative") {
-        assert(classify(-3) == "negative")
-      }
+    test("negative number classified as negative") {
+      assert(classify(-3) == "negative")
+    }
 
-      test("zero classified as zero") {
-        assert(classify(0) == "zero")
-      }
+    test("zero classified as zero") {
+      assert(classify(0) == "zero")
+    }
 
-      test("small range check") {
-        assert(range_check(5) == "small")
-      }
+    test("small range check") {
+      assert(range_check(5) == "small")
+    }
 
-      test("medium range check") {
-        assert(range_check(50) == "medium")
-      }
+    test("medium range check") {
+      assert(range_check(50) == "medium")
+    }
 
-      test("large range check") {
-        assert(range_check(500) == "large")
-      }
+    test("large range check") {
+      assert(range_check(500) == "large")
     }
   }
 

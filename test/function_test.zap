@@ -1,23 +1,21 @@
 pub module Test.FunctionTest {
   use Zest.Case
 
-  pub fn run() -> String {
-    describe("functions") {
-      test("multi-clause dispatch matches zero") {
-        assert(classify(0) == "zero")
-      }
+  describe("functions") {
+    test("multi-clause dispatch matches zero") {
+      assert(classify(0) == "zero")
+    }
 
-      test("multi-clause dispatch matches one") {
-        assert(classify(1) == "one")
-      }
+    test("multi-clause dispatch matches one") {
+      assert(classify(1) == "one")
+    }
 
-      test("multi-clause dispatch falls through to other") {
-        assert(classify(42) == "other")
-      }
+    test("multi-clause dispatch falls through to other") {
+      assert(classify(42) == "other")
+    }
 
-      test("string function greets correctly") {
-        assert(greet("World") == "Hello, World!")
-      }
+    test("string function greets correctly") {
+      assert(greet("World") == "Hello, World!")
     }
   }
 

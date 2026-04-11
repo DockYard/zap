@@ -1,31 +1,29 @@
 pub module Test.TupleTest {
   use Zest.Case
 
-  pub fn run() -> String {
-    describe("tuples") {
-      test("extract first element") {
-        assert(first({1, 2}) == 1)
-      }
+  describe("tuples") {
+    test("extract first element") {
+      assert(first({1, 2}) == 1)
+    }
 
-      test("extract second element") {
-        assert(second({10, 20}) == 20)
-      }
+    test("extract second element") {
+      assert(second({10, 20}) == 20)
+    }
 
-      test("sum tuple elements") {
-        assert(sum_tuple({3, 4}) == 7)
-      }
+    test("sum tuple elements") {
+      assert(sum_tuple({3, 4}) == 7)
+    }
 
-      test("second with wildcard first") {
-        assert(second_wild({10, 20}) == 20)
-      }
+    test("second with wildcard first") {
+      assert(second_wild({10, 20}) == 20)
+    }
 
-      test("first with wildcard second") {
-        assert(first_wild({10, 20}) == 10)
-      }
+    test("first with wildcard second") {
+      assert(first_wild({10, 20}) == 10)
+    }
 
-      test("double second element") {
-        assert(double_second({5, 7}) == 14)
-      }
+    test("double second element") {
+      assert(double_second({5, 7}) == 14)
     }
   }
 

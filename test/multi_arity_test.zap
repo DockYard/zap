@@ -1,19 +1,17 @@
 pub module Test.MultiArityTest {
   use Zest.Case
 
-  pub fn run() -> String {
-    describe("multi arity") {
-      test("two-argument add") {
-        assert(add(1, 2) == 3)
-      }
+  describe("multi arity") {
+    test("two-argument add") {
+      assert(add(1, 2) == 3)
+    }
 
-      test("three-argument add") {
-        assert(add3(1, 2, 3) == 6)
-      }
+    test("three-argument add") {
+      assert(add3(1, 2, 3) == 6)
+    }
 
-      test("multi-parameter string join") {
-        assert(join("hello", " ", "world") == "hello world")
-      }
+    test("multi-parameter string join") {
+      assert(join("hello", " ", "world") == "hello world")
     }
   }
 

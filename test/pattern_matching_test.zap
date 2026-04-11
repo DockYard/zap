@@ -1,19 +1,17 @@
 pub module Test.PatternMatchingTest {
   use Zest.Case
 
-  pub fn run() -> String {
-    describe("pattern matching") {
-      test("matches ok atom to success") {
-        assert(describe(:ok) == "success")
-      }
+  describe("pattern matching") {
+    test("matches ok atom to success") {
+      assert(describe(:ok) == "success")
+    }
 
-      test("matches error atom to failure") {
-        assert(describe(:error) == "failure")
-      }
+    test("matches error atom to failure") {
+      assert(describe(:error) == "failure")
+    }
 
-      test("matches wildcard atom to unknown") {
-        assert(describe(:other) == "unknown")
-      }
+    test("matches wildcard atom to unknown") {
+      assert(describe(:other) == "unknown")
     }
   }
 

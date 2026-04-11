@@ -1,31 +1,29 @@
 pub module Test.CatchBasinTest {
   use Zest.Case
 
-  pub fn run() -> String {
-    describe("catch basins") {
-      test("matching value passes through for one") {
-        assert(try_parse("one") == "1")
-      }
-
-      test("matching value passes through for two") {
-        assert(try_parse("two") == "2")
-      }
-
-      test("unmatched value goes to handler") {
-        assert(try_parse("nope") == "unmatched: nope")
-      }
-
-      test("another unmatched value goes to handler") {
-        assert(try_parse("xyz") == "unmatched: xyz")
-      }
+  describe("catch basins") {
+    test("matching value passes through for one") {
+      assert(try_parse("one") == "1")
     }
 
-    # TODO: Additional catch basin patterns have multi-file compilation issues
+    test("matching value passes through for two") {
+      assert(try_parse("two") == "2")
+    }
 
-    # TODO: Function handler with extra args has a multi-file issue
-    # assert(try_fn_handler_extra("one") == "1")
-    # assert(try_fn_handler_extra("nope") == "fallback: nope")
+    test("unmatched value goes to handler") {
+      assert(try_parse("nope") == "unmatched: nope")
+    }
+
+    test("another unmatched value goes to handler") {
+      assert(try_parse("xyz") == "unmatched: xyz")
+    }
   }
+
+  # TODO: Additional catch basin patterns have multi-file compilation issues
+
+  # TODO: Function handler with extra args has a multi-file issue
+  # assert(try_fn_handler_extra("one") == "1")
+  # assert(try_fn_handler_extra("nope") == "fallback: nope")
 
   # Multi-clause function — only matches specific strings
   fn parse("one" :: String) -> String {
