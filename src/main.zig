@@ -27,6 +27,8 @@ pub fn main() !void {
         try cmdBuild(allocator, args[2..]);
     } else if (std.mem.eql(u8, command, "run")) {
         try cmdRun(allocator, args[2..]);
+    } else if (std.mem.eql(u8, command, "test")) {
+        try cmdRun(allocator, &.{"test"});
     } else if (std.mem.eql(u8, command, "init")) {
         try cmdInit(allocator);
     } else if (std.mem.eql(u8, command, "deps")) {
@@ -46,6 +48,7 @@ fn printUsage() void {
         \\Commands:
         \\  build [target]    Build the specified target (defaults to :default)
         \\  run [target]      Build and run the specified bin target (defaults to :default)
+        \\  test              Run the test suite (alias for `run test`)
         \\  init              Scaffold a new project in the current directory
         \\  deps update       Re-resolve all dependencies and rewrite zap.lock
         \\  deps update <name> Re-resolve a single dependency
