@@ -2,14 +2,15 @@ pub module Zest.Case {
   @moduledoc = """
     Test case DSL for the Zest test framework.
 
-    Provides `describe`, `test`, `assert`, and `reject` for writing
-    structured test cases with ExUnit-style test tracking. Use
-    `use Zest.Case` at the top of your test module to import these.
+    Provides `describe`, `test`, `assert`, `reject`, `setup`, and
+    `teardown` for writing structured test cases with ExUnit-style
+    test tracking. Use `use Zest.Case` at the top of your test module
+    to import these.
 
-    Each test increments a global test counter before running.
+    Each test calls `begin_test` before running and `end_test` after.
     Assertions track pass and fail counts via `:zig.TestTracker`.
-    On success a green dot is printed; on failure a red F is printed
-    and the process panics.
+    On success a dot is returned; on failure an F is returned and the
+    test is marked as failed, but execution continues (non-fatal).
 
     ## Examples
 
@@ -62,10 +63,10 @@ pub module Zest.Case {
   @doc = """
     Defines a single test case with tracking.
 
-    Increments the global test counter before running the body.
-    If all assertions in the body pass, prints a green dot to
-    stdout. If any assertion fails, the assertion itself prints
-    a red F and panics before the dot is reached.
+    Calls `begin_test` before running the body and `end_test`
+    after. If any assertion in the body fails, the test is
+    marked as failed but execution continues to the next test
+    (non-fatal). Returns "." when complete.
 
     ## Examples
 
@@ -76,9 +77,9 @@ pub module Zest.Case {
 
   pub macro test(_name :: Expr, body :: Expr) -> Expr {
     quote {
-      :zig.TestTracker.increment_tests()
+      :zig.TestTracker.begin_test()
       unquote(body)
-      :zig.TestTracker.print_dot()
+      :zig.TestTracker.end_test()
       "."
     }
   }
@@ -86,10 +87,10 @@ pub module Zest.Case {
   @doc = """
     Asserts that a boolean value is `true`.
 
-    On success, increments the assertion pass counter.
-    On failure, increments the assertion fail counter
-    and the test failure counter, prints a red F,
-    then panics with "assertion failed".
+    On success, increments the assertion pass counter and
+    returns ".". On failure, increments the assertion fail
+    counter, marks the current test as failed, and returns
+    "F". Execution continues (non-fatal).
 
     ## Examples
 
@@ -103,19 +104,17 @@ pub module Zest.Case {
       "."
     } else {
       :zig.TestTracker.fail_assertion()
-      :zig.TestTracker.increment_test_failures()
-      :zig.TestTracker.print_fail()
-      panic("assertion failed")
+      "F"
     }
   }
 
   @doc = """
     Asserts that a boolean value is `false`.
 
-    On success, increments the assertion pass counter.
-    On failure, increments the assertion fail counter
-    and the test failure counter, prints a red F,
-    then panics with "rejection failed".
+    On success, increments the assertion pass counter and
+    returns ".". On failure, increments the assertion fail
+    counter, marks the current test as failed, and returns
+    "F". Execution continues (non-fatal).
 
     ## Examples
 
@@ -129,9 +128,53 @@ pub module Zest.Case {
       "."
     } else {
       :zig.TestTracker.fail_assertion()
-      :zig.TestTracker.increment_test_failures()
-      :zig.TestTracker.print_fail()
-      panic("rejection failed")
+      "F"
     }
+  }
+
+  @doc = """
+    Runs setup code before tests in the current scope.
+
+    The body is inlined directly and executes where the
+    `setup` call appears. Use inside a `describe` block
+    to run initialization before test code.
+
+    ## Examples
+
+        describe("with setup") {
+          setup {
+            IO.puts("initializing")
+          }
+          test("it works") {
+            assert(true)
+          }
+        }
+    """
+
+  pub macro setup(body :: Expr) -> Expr {
+    quote { unquote(body) }
+  }
+
+  @doc = """
+    Runs teardown code after tests in the current scope.
+
+    The body is inlined directly and executes where the
+    `teardown` call appears. Use inside a `describe` block
+    to run cleanup after test code.
+
+    ## Examples
+
+        describe("with teardown") {
+          test("it works") {
+            assert(true)
+          }
+          teardown {
+            IO.puts("cleaning up")
+          }
+        }
+    """
+
+  pub macro teardown(body :: Expr) -> Expr {
+    quote { unquote(body) }
   }
 }

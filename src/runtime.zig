@@ -1020,13 +1020,20 @@ pub const TestTracker = struct {
     var test_failures: i64 = 0;
     var assertion_count: i64 = 0;
     var assertion_failures: i64 = 0;
+    var current_test_failed: bool = false;
 
-    pub fn increment_tests() void {
+    pub fn begin_test() void {
+        current_test_failed = false;
         test_count += 1;
     }
 
-    pub fn increment_test_failures() void {
-        test_failures += 1;
+    pub fn end_test() void {
+        if (current_test_failed) {
+            test_failures += 1;
+            print_fail();
+        } else {
+            print_dot();
+        }
     }
 
     pub fn pass_assertion() void {
@@ -1036,6 +1043,7 @@ pub const TestTracker = struct {
     pub fn fail_assertion() void {
         assertion_count += 1;
         assertion_failures += 1;
+        current_test_failed = true;
     }
 
     pub fn print_dot() void {

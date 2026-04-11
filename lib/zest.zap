@@ -6,15 +6,17 @@ pub module Zest {
     For test runner: `use Zest.Runner` (provides summary).
 
     This module provides standalone assert and reject functions
-    with test tracking via `:zig.TestTracker`.
+    with non-fatal test tracking via `:zig.TestTracker`. Failed
+    assertions mark the current test as failed and return "F"
+    but do not stop execution.
     """
 
   @doc = """
     Asserts that a boolean value is `true`.
 
-    On success, increments the assertion pass counter.
-    On failure, increments the assertion fail and test failure
-    counters, prints a red F, then panics.
+    On success, increments the assertion pass counter and
+    returns ".". On failure, increments the assertion fail
+    counter and returns "F". Execution continues (non-fatal).
     """
 
   pub fn assert(value :: Bool) -> String {
@@ -23,6 +25,10 @@ pub module Zest {
 
   @doc = """
     Asserts that a boolean value is `true` with a custom message.
+
+    On success, increments the assertion pass counter and
+    returns ".". On failure, increments the assertion fail
+    counter and returns "F". Execution continues (non-fatal).
     """
 
   pub fn assert(value :: Bool, message :: String) -> String {
@@ -31,6 +37,10 @@ pub module Zest {
 
   @doc = """
     Asserts that a boolean value is `false`.
+
+    On success, increments the assertion pass counter and
+    returns ".". On failure, increments the assertion fail
+    counter and returns "F". Execution continues (non-fatal).
     """
 
   pub fn reject(value :: Bool) -> String {
@@ -39,33 +49,33 @@ pub module Zest {
 
   @doc = """
     Asserts that a boolean value is `false` with a custom message.
+
+    On success, increments the assertion pass counter and
+    returns ".". On failure, increments the assertion fail
+    counter and returns "F". Execution continues (non-fatal).
     """
 
   pub fn reject(value :: Bool, message :: String) -> String {
     reject_check(value, message)
   }
 
-  fn assert_check(value :: Bool, message :: String) -> String {
+  fn assert_check(value :: Bool, _message :: String) -> String {
     if value {
       :zig.TestTracker.pass_assertion()
       "."
     } else {
       :zig.TestTracker.fail_assertion()
-      :zig.TestTracker.increment_test_failures()
-      :zig.TestTracker.print_fail()
-      panic(message)
+      "F"
     }
   }
 
-  fn reject_check(value :: Bool, message :: String) -> String {
+  fn reject_check(value :: Bool, _message :: String) -> String {
     if not value {
       :zig.TestTracker.pass_assertion()
       "."
     } else {
       :zig.TestTracker.fail_assertion()
-      :zig.TestTracker.increment_test_failures()
-      :zig.TestTracker.print_fail()
-      panic(message)
+      "F"
     }
   }
 }
