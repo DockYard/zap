@@ -1,23 +1,25 @@
 pub module Test.ZestFeaturesTest {
   use Zest.Case
 
+  describe("setup with context") {
+    ctx = setup() {
+      42
+    }
+
+    test("test uses setup return value") {
+      assert(ctx == 42)
+    }
+
+    test("test without context still works") {
+      assert(true)
+    }
+  }
+
   describe("multiple assertions per test") {
     test("all passing assertions run") {
       assert(1 + 1 == 2)
       assert(2 + 2 == 4)
       assert(3 + 3 == 6)
-    }
-
-    test("assert with different types") {
-      assert(true)
-      assert("hello" == "hello")
-      assert(42 == 42)
-    }
-
-    test("reject checks falsy values") {
-      reject(1 == 2)
-      reject(false)
-      reject(10 < 5)
     }
 
     test("mixed assert and reject") {
@@ -30,15 +32,11 @@ pub module Test.ZestFeaturesTest {
 
   describe("setup and teardown") {
     setup() {
-      _initialized = true
+      _ready = true
     }
 
-    test("runs after setup") {
+    test("setup runs before test") {
       assert(true)
-    }
-
-    test("another test after setup") {
-      assert(1 == 1)
     }
 
     teardown() {

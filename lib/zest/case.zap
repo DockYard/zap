@@ -102,6 +102,7 @@ pub module Zest.Case {
 
 
 
+
   @doc = """
     Asserts that a boolean value is `true`.
 
@@ -174,7 +175,7 @@ pub module Zest.Case {
 
   pub macro setup(body :: Expr) -> Expr {
     quote {
-      __test_context__ = unquote(body)
+      unquote(body)
     }
   }
 
