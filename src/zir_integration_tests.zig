@@ -2101,3 +2101,31 @@ test "ZIR: tail recursive countdown (large, guaranteed TCO)" {
     try std.testing.expectEqualStrings("0\n", result.stdout);
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
+
+test "ZIR: String.length cross-module call" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn main() -> String {
+        \\    Kernel.inspect(String.length("hello"))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("5\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: String.slice cross-module call" {
+    var result = try compileAndRun(
+        \\pub module TestProg {
+        \\  pub fn main() -> String {
+        \\    IO.puts(String.slice("hello", 0, 3))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("hel\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}

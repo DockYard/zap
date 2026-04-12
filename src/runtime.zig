@@ -691,9 +691,11 @@ pub const ZapString = struct {
         return @intCast(s.len);
     }
 
-    pub fn slice(s: []const u8, start: usize, end: usize) []const u8 {
-        const s_end = @min(end, s.len);
-        const s_start = @min(start, s_end);
+    pub fn slice(s: []const u8, start: i64, end: i64) []const u8 {
+        const safe_start: usize = if (start >= 0) @intCast(start) else 0;
+        const safe_end: usize = if (end >= 0) @intCast(end) else 0;
+        const s_end = @min(safe_end, s.len);
+        const s_start = @min(safe_start, s_end);
         return s[s_start..s_end];
     }
 
