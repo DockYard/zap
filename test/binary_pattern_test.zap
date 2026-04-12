@@ -26,8 +26,11 @@ pub module Test.BinaryPatternTest {
   }
 
   describe("binary pattern string prefix") {
-    test("match string prefix") {
+    test("match GET prefix") {
       assert(after_prefix("GET /index") == "/index")
+    }
+
+    test("no match for POST") {
       assert(after_prefix("POST /data") == "no match")
     }
   }
