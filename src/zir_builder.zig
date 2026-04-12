@@ -2986,7 +2986,7 @@ pub const ZirDriver = struct {
             },
 
             .bin_len_check => |blc| {
-                const data_ref = self.refForLocal(blc.scrutinee) catch return;
+                const data_ref = try self.refForLocal(blc.scrutinee);
                 const len_ref = zir_builder_emit_field_val(self.handle, data_ref, "len", 3);
                 if (len_ref == error_ref) return error.EmitFailed;
                 const min_ref = zir_builder_emit_int(self.handle, @intCast(blc.min_len));
@@ -3047,10 +3047,10 @@ pub const ZirDriver = struct {
                 const fn_ref = zir_builder_emit_field_val(self.handle, helpers, func_name.ptr, @intCast(func_name.len));
                 if (fn_ref == error_ref) return error.EmitFailed;
 
-                const source_ref = self.refForLocal(bri.source) catch return;
+                const source_ref = try self.refForLocal(bri.source);
                 const offset_ref = switch (bri.offset) {
                     .static => |s| zir_builder_emit_int(self.handle, @intCast(s)),
-                    .dynamic => |d| self.refForLocal(d) catch return,
+                    .dynamic => |d| self.refForLocal(d) catch return error.EmitFailed,
                 };
                 if (offset_ref == error_ref) return error.EmitFailed;
 
@@ -3095,10 +3095,10 @@ pub const ZirDriver = struct {
                 const fn_ref = zir_builder_emit_field_val(self.handle, helpers, func_name.ptr, @intCast(func_name.len));
                 if (fn_ref == error_ref) return error.EmitFailed;
 
-                const source_ref = self.refForLocal(brf.source) catch return;
+                const source_ref = try self.refForLocal(brf.source);
                 const offset_ref = switch (brf.offset) {
                     .static => |s| zir_builder_emit_int(self.handle, @intCast(s)),
-                    .dynamic => |d| self.refForLocal(d) catch return,
+                    .dynamic => |d| self.refForLocal(d) catch return error.EmitFailed,
                 };
                 if (offset_ref == error_ref) return error.EmitFailed;
 
@@ -3117,17 +3117,17 @@ pub const ZirDriver = struct {
                 const fn_ref = zir_builder_emit_field_val(self.handle, helpers, "slice", 5);
                 if (fn_ref == error_ref) return error.EmitFailed;
 
-                const source_ref = self.refForLocal(bs.source) catch return;
+                const source_ref = try self.refForLocal(bs.source);
                 const offset_ref = switch (bs.offset) {
                     .static => |s| zir_builder_emit_int(self.handle, @intCast(s)),
-                    .dynamic => |d| self.refForLocal(d) catch return,
+                    .dynamic => |d| self.refForLocal(d) catch return error.EmitFailed,
                 };
                 if (offset_ref == error_ref) return error.EmitFailed;
 
                 // null length means "rest of data" -- pass 0 as sentinel
                 const length_ref = if (bs.length) |len| switch (len) {
                     .static => |s| zir_builder_emit_int(self.handle, @intCast(s)),
-                    .dynamic => |d| self.refForLocal(d) catch return,
+                    .dynamic => |d| self.refForLocal(d) catch return error.EmitFailed,
                 } else zir_builder_emit_int(self.handle, 0);
                 if (length_ref == error_ref) return error.EmitFailed;
 
@@ -3143,10 +3143,10 @@ pub const ZirDriver = struct {
                 const helpers = zir_builder_emit_field_val(self.handle, rt_import, "BinaryHelpers", 13);
                 if (helpers == error_ref) return error.EmitFailed;
 
-                const source_ref = self.refForLocal(bru.source) catch return;
+                const source_ref = try self.refForLocal(bru.source);
                 const offset_ref = switch (bru.offset) {
                     .static => |s| zir_builder_emit_int(self.handle, @intCast(s)),
-                    .dynamic => |d| self.refForLocal(d) catch return,
+                    .dynamic => |d| self.refForLocal(d) catch return error.EmitFailed,
                 };
                 if (offset_ref == error_ref) return error.EmitFailed;
 
@@ -3175,7 +3175,7 @@ pub const ZirDriver = struct {
                 const fn_ref = zir_builder_emit_field_val(self.handle, helpers, "matchPrefix", 11);
                 if (fn_ref == error_ref) return error.EmitFailed;
 
-                const source_ref = self.refForLocal(bmp.source) catch return;
+                const source_ref = try self.refForLocal(bmp.source);
                 const expected_ref = zir_builder_emit_str(self.handle, bmp.expected.ptr, @intCast(bmp.expected.len));
                 if (expected_ref == error_ref) return error.EmitFailed;
 

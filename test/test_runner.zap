@@ -26,6 +26,7 @@ pub module Test.TestRunner {
     Test.ForComprehensionTest.run()
     Test.ClosureTest.run()
     Test.ZestFeaturesTest.run()
+    Test.BinaryPatternTest.run()
 
     Zest.Runner.run()
   }
