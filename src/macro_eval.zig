@@ -346,6 +346,35 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
                 }
             }
 
+            // find_setup(body) — find the setup() call in a block and return its body
+            if (std.mem.eql(u8, form_name, "find_setup")) {
+                if (arg_elems.len == 1) {
+                    const body = try eval(env, arg_elems[0]);
+                    return findNamedCallBody(body, "setup");
+                }
+            }
+
+            // find_teardown(body) — find the teardown() call in a block and return its body
+            if (std.mem.eql(u8, form_name, "find_teardown")) {
+                if (arg_elems.len == 1) {
+                    const body = try eval(env, arg_elems[0]);
+                    return findNamedCallBody(body, "teardown");
+                }
+            }
+
+            // inject_setup(body, setup_body, teardown_body) — walk a describe block body,
+            // find test/3 calls (test with context param), and inject setup_body before
+            // and teardown_body after the test body. test/2 calls get no injection.
+            // Returns the modified body.
+            if (std.mem.eql(u8, form_name, "inject_setup")) {
+                if (arg_elems.len == 3) {
+                    const body = try eval(env, arg_elems[0]);
+                    const setup_body = try eval(env, arg_elems[1]);
+                    const teardown_body = try eval(env, arg_elems[2]);
+                    return injectSetupIntoTests(env.alloc, env.store, body, setup_body, teardown_body) catch return .nil;
+                }
+            }
+
             // length(list_or_tuple) — get length
             if (std.mem.eql(u8, form_name, "length")) {
                 if (arg_elems.len == 1) {
@@ -608,6 +637,113 @@ test "eval: quote returns data" {
 // ============================================================
 // Helper functions
 // ============================================================
+
+/// Walk a describe block body (a __block__ or list of statements),
+/// find test/3 calls (tests with a context parameter), and for each one:
+/// - Replace the test body with: { ctx = <setup_body>; <original_body>; <teardown_body> }
+/// test/2 calls (no context) are left unchanged but get teardown injected.
+/// setup() and teardown() calls in the body are removed (consumed).
+fn injectSetupIntoTests(
+    alloc: Allocator,
+    store: *AllocationStore,
+    body: CtValue,
+    setup_body: CtValue,
+    teardown_body: CtValue,
+) !CtValue {
+    // Body should be a __block__: {:__block__, meta, [stmts...]}
+    // Or a single expression (just one statement)
+    if (body != .tuple or body.tuple.elems.len != 3) return body;
+
+    const form = body.tuple.elems[0];
+    const meta = body.tuple.elems[1];
+    const args = body.tuple.elems[2];
+
+    // Check if it's a __block__
+    if (form == .atom and std.mem.eql(u8, form.atom, "__block__") and args == .list) {
+        var new_stmts = std.ArrayListUnmanaged(CtValue){};
+
+        for (args.list.elems) |stmt| {
+            // Skip setup() and teardown() calls — they've been consumed
+            if (isCallNamed(stmt, "setup") or isCallNamed(stmt, "teardown")) continue;
+
+            // Check if this is a test/3 call: {:test, meta, [name, ctx_var, body]}
+            if (isCallNamed(stmt, "test")) {
+                const test_args = stmt.tuple.elems[2];
+                if (test_args == .list and test_args.list.elems.len == 3 and setup_body != .nil) {
+                    // test/3: inject setup body as ctx assignment + teardown after
+                    const test_name = test_args.list.elems[0];
+                    // ctx_var (index 1) is ignored — we always use "ctx"
+                    const test_body = test_args.list.elems[2];
+
+                    // Build new body: {:__block__, [], [ctx = setup_body, original_body, teardown_body]}
+                    const empty = try ast_data.emptyList(alloc, store);
+                    // Build ctx as a var_ref form {:ctx, [], nil} not a bare atom
+                    const ctx_var = try ast_data.makeTuple3(alloc, store, .{ .atom = "ctx" }, empty, .nil);
+                    const ctx_assign = try ast_data.makeTuple3(alloc, store, .{ .atom = "=" }, empty, try ast_data.makeList(alloc, store, &.{ ctx_var, setup_body }));
+
+                    var body_stmts = std.ArrayListUnmanaged(CtValue){};
+                    try body_stmts.append(alloc, ctx_assign);
+                    try body_stmts.append(alloc, test_body);
+                    if (teardown_body != .nil) try body_stmts.append(alloc, teardown_body);
+                    const new_test_body = try ast_data.makeTuple3(alloc, store, .{ .atom = "__block__" }, empty, try ast_data.makeListFromSlice(alloc, store, body_stmts.items));
+
+                    // Build new test/2 call with modified body (context handled internally)
+                    const new_test = try ast_data.makeTuple3(alloc, store, .{ .atom = "test" }, meta, try ast_data.makeList(alloc, store, &.{ test_name, new_test_body }));
+                    try new_stmts.append(alloc, new_test);
+                    continue;
+                } else if (test_args == .list and test_args.list.elems.len == 2 and teardown_body != .nil) {
+                    // test/2: inject teardown after body
+                    const test_name = test_args.list.elems[0];
+                    const test_body = test_args.list.elems[1];
+
+                    const empty = try ast_data.emptyList(alloc, store);
+                    var body_stmts = std.ArrayListUnmanaged(CtValue){};
+                    try body_stmts.append(alloc, test_body);
+                    try body_stmts.append(alloc, teardown_body);
+                    const new_test_body = try ast_data.makeTuple3(alloc, store, .{ .atom = "__block__" }, empty, try ast_data.makeListFromSlice(alloc, store, body_stmts.items));
+
+                    const new_test = try ast_data.makeTuple3(alloc, store, .{ .atom = "test" }, meta, try ast_data.makeList(alloc, store, &.{ test_name, new_test_body }));
+                    try new_stmts.append(alloc, new_test);
+                    continue;
+                }
+            }
+
+            // Other statements pass through unchanged
+            try new_stmts.append(alloc, stmt);
+        }
+
+        return ast_data.makeTuple3(alloc, store, form, meta, try ast_data.makeListFromSlice(alloc, store, new_stmts.items));
+    }
+
+    return body;
+}
+
+/// Find a named call (like setup or teardown) in a __block__ body
+/// and return its first argument (the body expression).
+fn findNamedCallBody(body: CtValue, name: []const u8) CtValue {
+    if (body != .tuple or body.tuple.elems.len != 3) return .nil;
+    const form = body.tuple.elems[0];
+    const args = body.tuple.elems[2];
+
+    if (form == .atom and std.mem.eql(u8, form.atom, "__block__") and args == .list) {
+        for (args.list.elems) |stmt| {
+            if (isCallNamed(stmt, name)) {
+                const call_args = stmt.tuple.elems[2];
+                if (call_args == .list and call_args.list.elems.len >= 1) {
+                    return call_args.list.elems[call_args.list.elems.len - 1]; // Last arg is the trailing block body
+                }
+            }
+        }
+    }
+    return .nil;
+}
+
+/// Check if a CtValue is a call to a specific named function/macro.
+fn isCallNamed(val: CtValue, name: []const u8) bool {
+    if (val != .tuple or val.tuple.elems.len != 3) return false;
+    if (val.tuple.elems[0] != .atom) return false;
+    return std.mem.eql(u8, val.tuple.elems[0].atom, name);
+}
 
 /// Extract string content from a CtValue, handling both bare strings
 /// and wrapped string literals ({string_content, meta, nil}).

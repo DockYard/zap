@@ -16,41 +16,55 @@ pub module Test.ZestFeaturesTest {
     }
   }
 
-  describe("setup context passing") {
-    ctx = setup() {
+  describe("setup runs fresh per test") {
+    setup() {
       42
     }
 
-    test("test uses setup return value") {
+    test("first test gets fresh context", ctx) {
       assert(ctx == 42)
     }
 
-    test("test without context still works") {
+    test("second test gets fresh context", ctx) {
+      assert(ctx == 42)
+    }
+
+    test("test without context works") {
       assert(true)
     }
   }
 
   describe("setup with string context") {
-    msg = setup() {
+    setup() {
       "ready"
     }
 
-    test("receives string context") {
-      assert(msg == "ready")
+    test("receives string", ctx) {
+      assert(ctx == "ready")
     }
   }
 
   describe("setup and teardown") {
     setup() {
-      _ready = true
+      42
     }
 
-    test("setup runs before test") {
-      assert(true)
+    test("setup and teardown both run", ctx) {
+      assert(ctx == 42)
     }
 
     teardown() {
       _cleaned = true
+    }
+  }
+
+  describe("describe without setup") {
+    test("plain test works") {
+      assert(true)
+    }
+
+    test("another plain test") {
+      reject(false)
     }
   }
 
