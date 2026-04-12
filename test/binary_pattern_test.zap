@@ -25,8 +25,12 @@ pub module Test.BinaryPatternTest {
     }
   }
 
-  # TODO: String prefix matching (<<"GET "::String, rest::String>>)
-  # needs bin_match_prefix support in case arm IR emission
+  describe("binary pattern string prefix") {
+    test("match string prefix") {
+      assert(after_prefix("GET /index") == "/index")
+      assert(after_prefix("POST /data") == "no match")
+    }
+  }
 
   fn first_byte(data :: String) -> i64 {
     case data {
@@ -39,6 +43,13 @@ pub module Test.BinaryPatternTest {
     case data {
       <<_, rest::String>> -> rest
       _ -> ""
+    }
+  }
+
+  fn after_prefix(data :: String) -> String {
+    case data {
+      <<"GET "::String, path::String>> -> path
+      _ -> "no match"
     }
   }
 }

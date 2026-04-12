@@ -2706,6 +2706,26 @@ pub const IrBuilder = struct {
                 try self.current_instrs.append(self.allocator, .{
                     .bin_len_check = .{ .dest = len_check_local, .scrutinee = scrutinee_local, .min_len = cb.min_byte_size },
                 });
+
+                // Emit bin_match_prefix for each string literal prefix segment
+                // and AND the result with the length check condition.
+                var condition_local = len_check_local;
+                for (cb.segments) |seg| {
+                    if (seg.string_literal) |sl| {
+                        const prefix_str = self.interner.get(sl);
+                        const prefix_check_local = self.next_local;
+                        self.next_local += 1;
+                        try self.current_instrs.append(self.allocator, .{
+                            .bin_match_prefix = .{
+                                .dest = prefix_check_local,
+                                .source = scrutinee_local,
+                                .expected = prefix_str,
+                            },
+                        });
+                        condition_local = try self.emitAnd(condition_local, prefix_check_local);
+                    }
+                }
+
                 const saved = self.current_instrs;
                 self.current_instrs = .empty;
 
@@ -2718,7 +2738,7 @@ pub const IrBuilder = struct {
                 const success_body = try self.current_instrs.toOwnedSlice(self.allocator);
                 self.current_instrs = saved;
                 try self.current_instrs.append(self.allocator, .{
-                    .guard_block = .{ .condition = len_check_local, .body = success_body },
+                    .guard_block = .{ .condition = condition_local, .body = success_body },
                 });
                 try self.lowerDecisionTreeForCase(cb.failure, case_arms, scrutinee_map, 0);
             },
