@@ -1080,39 +1080,39 @@ pub const BinaryHelpers = struct {
     // The ZIR builder calls these because ZIR cannot express generic
     // std.mem.readInt calls with comptime type parameters.
 
-    pub fn readIntU8(data: []const u8, offset: usize) u64 {
+    pub fn readIntU8(data: []const u8, offset: usize) i64 {
         if (offset >= data.len) return 0;
         return @intCast(data[offset]);
     }
 
-    pub fn readIntU16Big(data: []const u8, offset: usize) u64 {
+    pub fn readIntU16Big(data: []const u8, offset: usize) i64 {
         if (offset + 2 > data.len) return 0;
         return @intCast(std.mem.readInt(u16, data[offset..][0..2], .big));
     }
 
-    pub fn readIntU16Little(data: []const u8, offset: usize) u64 {
+    pub fn readIntU16Little(data: []const u8, offset: usize) i64 {
         if (offset + 2 > data.len) return 0;
         return @intCast(std.mem.readInt(u16, data[offset..][0..2], .little));
     }
 
-    pub fn readIntU32Big(data: []const u8, offset: usize) u64 {
+    pub fn readIntU32Big(data: []const u8, offset: usize) i64 {
         if (offset + 4 > data.len) return 0;
         return @intCast(std.mem.readInt(u32, data[offset..][0..4], .big));
     }
 
-    pub fn readIntU32Little(data: []const u8, offset: usize) u64 {
+    pub fn readIntU32Little(data: []const u8, offset: usize) i64 {
         if (offset + 4 > data.len) return 0;
         return @intCast(std.mem.readInt(u32, data[offset..][0..4], .little));
     }
 
-    pub fn readIntU64Big(data: []const u8, offset: usize) u64 {
+    pub fn readIntU64Big(data: []const u8, offset: usize) i64 {
         if (offset + 8 > data.len) return 0;
-        return std.mem.readInt(u64, data[offset..][0..8], .big);
+        return @bitCast(std.mem.readInt(u64, data[offset..][0..8], .big));
     }
 
-    pub fn readIntU64Little(data: []const u8, offset: usize) u64 {
+    pub fn readIntU64Little(data: []const u8, offset: usize) i64 {
         if (offset + 8 > data.len) return 0;
-        return std.mem.readInt(u64, data[offset..][0..8], .little);
+        return @bitCast(std.mem.readInt(u64, data[offset..][0..8], .little));
     }
 
     pub fn readIntI8(data: []const u8, offset: usize) i64 {
@@ -1151,7 +1151,7 @@ pub const BinaryHelpers = struct {
     }
 
     // Sub-byte read: extract `bits` bits from data[offset] >> bit_offset
-    pub fn readBitsU(data: []const u8, offset: usize, bit_offset: u3, bits: u8) u64 {
+    pub fn readBitsU(data: []const u8, offset: usize, bit_offset: u3, bits: u8) i64 {
         if (offset >= data.len) return 0;
         const shifted: u8 = data[offset] >> bit_offset;
         if (bits == 0 or bits >= 8) return @intCast(shifted);

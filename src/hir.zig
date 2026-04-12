@@ -293,6 +293,7 @@ pub const CaseBinding = struct {
 pub const CaseBindKind = enum {
     scrutinee, // bind the whole scrutinee value
     tuple_element, // bind an element extracted from the scrutinee tuple
+    binary_element, // bind a segment extracted from binary data
 };
 
 pub const AssignmentBinding = struct {
@@ -2798,6 +2799,25 @@ pub const HirBuilder = struct {
                             },
                             .tuple => |sub_pats| {
                                 try self.collectTuplePatternBindings(sub_pats);
+                            },
+                            .binary_match => |bm| {
+                                for (bm.segments, 0..) |seg, seg_idx| {
+                                    if (seg.pattern) |sub_pat| {
+                                        if (sub_pat.* == .bind) {
+                                            // Skip _-prefixed bindings (intentionally unused)
+                                            const name_str = self.interner.get(sub_pat.bind);
+                                            if (name_str.len > 0 and name_str[0] == '_') continue;
+                                            const local_idx = self.next_local;
+                                            self.next_local += 1;
+                                            try self.current_case_bindings.append(self.allocator, .{
+                                                .name = sub_pat.bind,
+                                                .local_index = local_idx,
+                                                .kind = .binary_element,
+                                                .element_index = @intCast(seg_idx),
+                                            });
+                                        }
+                                    }
+                                }
                             },
                             else => {},
                         }

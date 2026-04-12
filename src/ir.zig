@@ -2060,6 +2060,190 @@ pub const IrBuilder = struct {
         return 0;
     }
 
+    /// Emit binary segment extraction instructions for case expression bindings.
+    /// Iterates over the binary match segments, computes byte/bit offsets, and
+    /// emits bin_read_int/bin_read_float/bin_slice instructions targeting the
+    /// binding locals from the case arm's CaseBinding entries.
+    fn emitBinarySegmentExtractions(
+        self: *IrBuilder,
+        segments: []const hir_mod.BinaryMatchSegment,
+        data_local: LocalId,
+        case_arms: []const hir_mod.CaseArm,
+    ) !void {
+        var byte_offset: u32 = 0;
+        var bit_offset: u8 = 0;
+        var offset_is_dynamic = false;
+        var dynamic_offset_local: LocalId = 0;
+
+        for (segments, 0..) |seg, seg_idx_usize| {
+            const seg_idx: u32 = @intCast(seg_idx_usize);
+
+            // Find the binding local for this segment (if any) from case arm bindings
+            var binding_local: ?LocalId = null;
+            for (case_arms) |arm| {
+                for (arm.bindings) |binding| {
+                    if (binding.kind == .binary_element and binding.element_index == seg_idx) {
+                        binding_local = binding.local_index;
+                        break;
+                    }
+                }
+                if (binding_local != null) break;
+            }
+
+            // Handle string literal prefix segments
+            if (seg.string_literal) |sl| {
+                const prefix_str = self.interner.get(sl);
+                byte_offset += @intCast(prefix_str.len);
+                continue;
+            }
+
+            const current_offset: BinOffset = if (offset_is_dynamic)
+                .{ .dynamic = dynamic_offset_local }
+            else
+                .{ .static = byte_offset };
+
+            switch (seg.type_spec) {
+                .default => {
+                    if (bit_offset > 0) {
+                        byte_offset += 1;
+                        bit_offset = 0;
+                    }
+                    if (binding_local) |dest| {
+                        try self.current_instrs.append(self.allocator, .{
+                            .bin_read_int = .{
+                                .dest = dest,
+                                .source = data_local,
+                                .offset = current_offset,
+                                .bits = 8,
+                                .signed = false,
+                                .endianness = .big,
+                            },
+                        });
+                    }
+                    if (!offset_is_dynamic) byte_offset += 1;
+                },
+                .integer => |int_spec| {
+                    if (int_spec.bits < 8) {
+                        const shift: u8 = 8 - bit_offset - @as(u8, @intCast(int_spec.bits));
+                        if (binding_local) |dest| {
+                            try self.current_instrs.append(self.allocator, .{
+                                .bin_read_int = .{
+                                    .dest = dest,
+                                    .source = data_local,
+                                    .offset = current_offset,
+                                    .bits = int_spec.bits,
+                                    .signed = int_spec.signed,
+                                    .endianness = seg.endianness,
+                                    .bit_offset = shift,
+                                },
+                            });
+                        }
+                        bit_offset += @intCast(int_spec.bits);
+                        if (bit_offset >= 8) {
+                            byte_offset += bit_offset / 8;
+                            bit_offset = bit_offset % 8;
+                        }
+                    } else {
+                        if (bit_offset > 0) {
+                            byte_offset += 1;
+                            bit_offset = 0;
+                        }
+                        if (binding_local) |dest| {
+                            try self.current_instrs.append(self.allocator, .{
+                                .bin_read_int = .{
+                                    .dest = dest,
+                                    .source = data_local,
+                                    .offset = current_offset,
+                                    .bits = int_spec.bits,
+                                    .signed = int_spec.signed,
+                                    .endianness = seg.endianness,
+                                },
+                            });
+                        }
+                        if (!offset_is_dynamic) byte_offset += (int_spec.bits + 7) / 8;
+                    }
+                },
+                .float => |float_spec| {
+                    if (binding_local) |dest| {
+                        try self.current_instrs.append(self.allocator, .{
+                            .bin_read_float = .{
+                                .dest = dest,
+                                .source = data_local,
+                                .offset = current_offset,
+                                .bits = float_spec.bits,
+                                .endianness = seg.endianness,
+                            },
+                        });
+                    }
+                    if (!offset_is_dynamic) byte_offset += float_spec.bits / 8;
+                },
+                .string => {
+                    if (seg.size) |size| {
+                        switch (size) {
+                            .literal => |n| {
+                                if (binding_local) |dest| {
+                                    try self.current_instrs.append(self.allocator, .{
+                                        .bin_slice = .{
+                                            .dest = dest,
+                                            .source = data_local,
+                                            .offset = current_offset,
+                                            .length = .{ .static = n },
+                                        },
+                                    });
+                                }
+                                if (!offset_is_dynamic) byte_offset += n;
+                            },
+                            .variable => {
+                                // Dynamic-size string segments in case patterns
+                                // are not yet supported for extraction.
+                            },
+                        }
+                    } else {
+                        // Rest of data (no explicit size)
+                        if (binding_local) |dest| {
+                            try self.current_instrs.append(self.allocator, .{
+                                .bin_slice = .{
+                                    .dest = dest,
+                                    .source = data_local,
+                                    .offset = current_offset,
+                                    .length = null,
+                                },
+                            });
+                        }
+                    }
+                },
+                .utf8 => {
+                    if (binding_local) |dest| {
+                        const len_local = self.next_local;
+                        self.next_local += 1;
+                        try self.current_instrs.append(self.allocator, .{
+                            .bin_read_utf8 = .{
+                                .dest_codepoint = dest,
+                                .dest_len = len_local,
+                                .source = data_local,
+                                .offset = current_offset,
+                            },
+                        });
+                        if (!offset_is_dynamic) {
+                            const static_base = self.next_local;
+                            self.next_local += 1;
+                            try self.current_instrs.append(self.allocator, .{
+                                .const_int = .{ .dest = static_base, .value = @intCast(byte_offset) },
+                            });
+                            dynamic_offset_local = self.next_local;
+                            self.next_local += 1;
+                            try self.current_instrs.append(self.allocator, .{
+                                .binary_op = .{ .dest = dynamic_offset_local, .op = .add, .lhs = static_base, .rhs = len_local },
+                            });
+                            offset_is_dynamic = true;
+                        }
+                    }
+                },
+                .utf16, .utf32 => {},
+            }
+        }
+    }
+
     /// Emit index_get instructions to populate tuple binding locals.
     fn emitTupleBindings(self: *IrBuilder, clause: *const hir_mod.Clause) !void {
         for (clause.tuple_bindings) |binding| {
@@ -2524,6 +2708,12 @@ pub const IrBuilder = struct {
                 });
                 const saved = self.current_instrs;
                 self.current_instrs = .empty;
+
+                // Emit binary segment extraction instructions for case arm bindings.
+                // Each segment with a bind pattern needs a bin_read_int/bin_read_float/bin_slice
+                // instruction to extract the value into the binding's local.
+                try self.emitBinarySegmentExtractions(cb.segments, scrutinee_local, case_arms);
+
                 try self.lowerDecisionTreeForCase(cb.success, case_arms, scrutinee_map, 0);
                 const success_body = try self.current_instrs.toOwnedSlice(self.allocator);
                 self.current_instrs = saved;
