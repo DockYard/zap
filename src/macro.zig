@@ -1205,19 +1205,32 @@ pub const MacroEngine = struct {
                         if (result_ct.tuple.elems[0] == .atom) {
                             if (std.mem.eql(u8, result_ct.tuple.elems[0].atom, "__block__")) {
                                 if (result_ct.tuple.elems[2] == .list) {
-                                    var items: std.ArrayList(ast.ModuleItem) = .empty;
+                                    // Check if ALL elements are module items. If any element
+                                    // is not a module item (e.g., an assignment like ctx = 42),
+                                    // keep the entire block as a single module_level_expr to
+                                    // preserve variable bindings and control flow.
+                                    var all_module_items = true;
                                     for (result_ct.tuple.elems[2].list.elems) |elem| {
-                                        if (ast_data.ctValueToModuleItem(self.allocator, interner_mut, elem) catch null) |mi| {
-                                            try items.append(self.allocator, mi);
+                                        if (ast_data.ctValueToModuleItem(self.allocator, interner_mut, elem) catch null) |_| {
+                                            // is a module item
                                         } else {
-                                            // Not a module item — keep as expression
-                                            const elem_expr = ast_data.ctValueToExpr(self.allocator, self.interner, elem) catch continue;
-                                            try items.append(self.allocator, .{ .module_level_expr = elem_expr });
+                                            all_module_items = false;
+                                            break;
                                         }
                                     }
-                                    if (items.items.len > 0) {
-                                        return .{ .items = try items.toOwnedSlice(self.allocator), .changed = true };
+
+                                    if (all_module_items) {
+                                        var items: std.ArrayList(ast.ModuleItem) = .empty;
+                                        for (result_ct.tuple.elems[2].list.elems) |elem| {
+                                            if (ast_data.ctValueToModuleItem(self.allocator, interner_mut, elem) catch null) |mi| {
+                                                try items.append(self.allocator, mi);
+                                            }
+                                        }
+                                        if (items.items.len > 0) {
+                                            return .{ .items = try items.toOwnedSlice(self.allocator), .changed = true };
+                                        }
                                     }
+                                    // Mixed content: keep as single block expression
                                 }
                             }
                         }

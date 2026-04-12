@@ -805,7 +805,7 @@ pub fn ctValueToExpr(
     if (std.mem.eql(u8, form_name, "__block__")) {
         var stmts = std.ArrayListUnmanaged(ast.Stmt){};
         for (arg_elems) |elem| {
-            try stmts.append(alloc, .{ .expr = try ctValueToExpr(alloc, interner, elem) });
+            try stmts.append(alloc, try ctValueToStmt(alloc, interner, elem));
         }
         const expr = try alloc.create(ast.Expr);
         expr.* = .{ .block = .{ .meta = node_meta, .stmts = try stmts.toOwnedSlice(alloc) } };
@@ -1161,6 +1161,36 @@ pub fn ctValueToExpr(
     }
 }
 
+/// Convert a single CtValue element to an ast.Stmt, recognizing assignment
+/// forms {:=, meta, [target, value]} and reconstructing them as proper
+/// `.assignment` statements. All other forms become `.expr` statements.
+fn ctValueToStmt(
+    alloc: Allocator,
+    interner: *ast.StringInterner,
+    value: CtValue,
+) error{OutOfMemory}!ast.Stmt {
+    if (value == .tuple and value.tuple.elems.len == 3) {
+        const form = value.tuple.elems[0];
+        const args_val = value.tuple.elems[2];
+        if (form == .atom and std.mem.eql(u8, form.atom, "=")) {
+            if (args_val == .list and args_val.list.elems.len == 2) {
+                const pattern = try ctValueToPattern(alloc, interner, args_val.list.elems[0]);
+                const value_expr = try ctValueToExpr(alloc, interner, args_val.list.elems[1]);
+                const assignment = try alloc.create(ast.Assignment);
+                const node_meta = try keywordListToMeta(value.tuple.elems[1]);
+                assignment.* = .{
+                    .meta = node_meta,
+                    .pattern = pattern,
+                    .value = value_expr,
+                };
+                return .{ .assignment = assignment };
+            }
+        }
+    }
+    // Default: treat as expression statement
+    return .{ .expr = try ctValueToExpr(alloc, interner, value) };
+}
+
 /// Convert a CtValue to a statement list (for do/else blocks).
 fn ctValueToStmts(
     alloc: Allocator,
@@ -1173,16 +1203,15 @@ fn ctValueToStmts(
             if (value.tuple.elems[2] == .list) {
                 var stmts = std.ArrayListUnmanaged(ast.Stmt){};
                 for (value.tuple.elems[2].list.elems) |elem| {
-                    try stmts.append(alloc, .{ .expr = try ctValueToExpr(alloc, interner, elem) });
+                    try stmts.append(alloc, try ctValueToStmt(alloc, interner, elem));
                 }
                 return stmts.toOwnedSlice(alloc);
             }
         }
     }
-    // Single expression
-    const expr = try ctValueToExpr(alloc, interner, value);
+    // Single expression — may still be an assignment form
     const stmts = try alloc.alloc(ast.Stmt, 1);
-    stmts[0] = .{ .expr = expr };
+    stmts[0] = try ctValueToStmt(alloc, interner, value);
     return stmts;
 }
 

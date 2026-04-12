@@ -1,6 +1,21 @@
 pub module Test.ZestFeaturesTest {
   use Zest.Case
 
+  describe("multiple assertions per test") {
+    test("all passing assertions run") {
+      assert(1 + 1 == 2)
+      assert(2 + 2 == 4)
+      assert(3 + 3 == 6)
+    }
+
+    test("mixed assert and reject") {
+      assert(true)
+      reject(false)
+      assert(1 + 1 == 2)
+      reject(1 + 1 == 3)
+    }
+  }
+
   describe("setup context passing") {
     ctx = setup() {
       42
@@ -15,18 +30,13 @@ pub module Test.ZestFeaturesTest {
     }
   }
 
-  describe("multiple assertions per test") {
-    test("all passing assertions run") {
-      assert(1 + 1 == 2)
-      assert(2 + 2 == 4)
-      assert(3 + 3 == 6)
+  describe("setup with string context") {
+    msg = setup() {
+      "ready"
     }
 
-    test("mixed assert and reject") {
-      assert(true)
-      reject(false)
-      assert(1 + 1 == 2)
-      reject(1 + 1 == 3)
+    test("receives string context") {
+      assert(msg == "ready")
     }
   }
 
