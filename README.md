@@ -359,12 +359,13 @@ pub module Test.MathTest {
 }
 ```
 
-Test output shows green dots for passing tests and red F with failure details for failures:
+Test output shows green dots for passing tests and red F for failures, with a summary:
 
 ```
-..............
+.....................................
 
-14 tests, 14 passed
+37 tests, 0 failures
+43 assertions, 0 failures
 ```
 
 Failed assertions don't kill the process — the test records the failure and continues to the next test.
@@ -450,7 +451,7 @@ zap deps update <name>  # Re-resolve a single dependency
 
 ## Type System
 
-Types are declared at function boundaries. No implicit numeric coercion — all conversions are explicit.
+Types are declared at function boundaries. Narrower numeric types are implicitly widened at call sites (e.g., `i8` to `i64`), but no lossy conversions are implicit.
 
 | Category | Types |
 |---|---|
@@ -486,6 +487,58 @@ pub enum Direction {
   West,
 }
 ```
+
+---
+
+## Standard Library
+
+Zap includes a standard library of modules for working with primitive types and collections:
+
+| Module | Functions |
+|---|---|
+| `Integer` | `to_string`, `abs`, `max`, `min`, `parse`, `remainder`, `pow`, `clamp`, `digits`, `to_float` |
+| `Float` | `to_string`, `abs`, `max`, `min`, `parse`, `round`, `floor`, `ceil`, `truncate`, `to_integer`, `clamp` |
+| `Bool` | `to_string`, `negate` |
+| `String` | `length`, `slice`, `contains`, `starts_with`, `ends_with`, `trim`, `upcase`, `downcase`, `reverse`, `replace`, `index_of`, `pad_leading`, `pad_trailing`, `repeat`, `to_integer`, `to_float` |
+| `Atom` | `to_string` |
+| `List` | `empty?`, `length`, `head`, `tail`, `at`, `last`, `contains?`, `reverse`, `prepend`, `append`, `concat`, `take`, `drop`, `uniq` |
+| `Enum` | `map`, `filter`, `reject`, `reduce`, `each`, `find`, `any?`, `all?`, `count`, `sum`, `product`, `max`, `min`, `sort`, `flat_map` |
+
+### Higher-Order Functions
+
+Functions are first-class values. Pass named functions or anonymous functions as arguments:
+
+```zap
+# Named function as callback
+Enum.map([1, 2, 3], double)
+
+# Anonymous function with type annotations
+Enum.map([1, 2, 3], fn(x :: i64) -> i64 { x * 2 })
+
+# Filter with predicate
+Enum.filter([1, 2, 3, 4, 5], fn(x :: i64) -> Bool { x > 3 })
+
+# Reduce with accumulator
+Enum.reduce([1, 2, 3, 4], 0, fn(acc :: i64, x :: i64) -> i64 { acc + x })
+
+# Sort with comparator
+Enum.sort([3, 1, 2], fn(a :: i64, b :: i64) -> Bool { a < b })
+```
+
+Function type annotations use the arrow syntax: `callback :: (i64 -> i64)`, `predicate :: (i64 -> Bool)`.
+
+### Implicit Numeric Widening
+
+Narrower numeric types are automatically widened to wider types at function call sites:
+
+```zap
+fn process(value :: i64) -> i64 { value * 2 }
+
+small :: i8 = 42
+process(small)  # i8 automatically widened to i64
+```
+
+Widening rules: `i8` -> `i16` -> `i32` -> `i64`, `u8` -> `u16` -> `u32` -> `u64`, `f16` -> `f32` -> `f64`. No lossy conversions (signed-to-unsigned, wider-to-narrower, integer-to-float) are implicit.
 
 ---
 
@@ -570,6 +623,7 @@ Each Zap module becomes its own Zig ZIR module. Cross-module calls use `@import(
 zap init                     Create a new project in the current directory
 zap build [target]           Compile a target defined in build.zap (defaults to :default)
 zap run [target] [-- args]   Compile and run a target (defaults to :default)
+zap test                     Run the test suite (alias for `zap run test`)
 zap deps update [name]       Re-resolve dependencies and rewrite zap.lock
 ```
 
@@ -587,8 +641,8 @@ zig build
 # Run Zig-level unit tests
 zig build test
 
-# Run Zap test suite (108 tests across 22 modules)
-zap run test
+# Run Zap test suite (323 tests across 28 modules)
+zap test
 
 # Build and run an example
 cd examples/hello
