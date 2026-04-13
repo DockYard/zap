@@ -412,6 +412,467 @@ pub const TypeStore = struct {
 
         return false;
     }
+
+    // ============================================================
+    // Type unification
+    // ============================================================
+
+    /// Check whether `var_id` occurs anywhere inside the type referenced by `type_id`.
+    /// Used as an occurs check to prevent constructing infinite types during unification.
+    pub fn occursIn(self: *const TypeStore, var_id: TypeVarId, type_id: TypeId, subs: *const SubstitutionMap) bool {
+        const typ = self.getType(type_id);
+        return switch (typ) {
+            .type_var => |other_var_id| {
+                if (other_var_id == var_id) return true;
+                // If this var is already bound, check what it's bound to
+                if (subs.resolve(other_var_id)) |resolved| {
+                    return self.occursIn(var_id, resolved, subs);
+                }
+                return false;
+            },
+            .list => |list_type| self.occursIn(var_id, list_type.element, subs),
+            .tuple => |tuple_type| {
+                for (tuple_type.elements) |element| {
+                    if (self.occursIn(var_id, element, subs)) return true;
+                }
+                return false;
+            },
+            .function => |function_type| {
+                for (function_type.params) |param| {
+                    if (self.occursIn(var_id, param, subs)) return true;
+                }
+                return self.occursIn(var_id, function_type.return_type, subs);
+            },
+            .map => |map_type| {
+                return self.occursIn(var_id, map_type.key, subs) or
+                    self.occursIn(var_id, map_type.value, subs);
+            },
+            .applied => |applied_type| {
+                if (self.occursIn(var_id, applied_type.base, subs)) return true;
+                for (applied_type.args) |arg| {
+                    if (self.occursIn(var_id, arg, subs)) return true;
+                }
+                return false;
+            },
+            // Primitives and non-compound types cannot contain type variables
+            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type => false,
+            .struct_type, .union_type, .tagged_union, .opaque_type => false,
+        };
+    }
+
+    /// Resolve a type_id through existing substitutions to its current representative.
+    /// If the type is a type variable that is bound, follow the chain.
+    fn resolveTypeVar(self: *const TypeStore, type_id: TypeId, subs: *const SubstitutionMap) TypeId {
+        const typ = self.getType(type_id);
+        if (typ == .type_var) {
+            if (subs.resolve(typ.type_var)) |resolved| {
+                return self.resolveTypeVar(resolved, subs);
+            }
+        }
+        return type_id;
+    }
+
+    /// Unify two types, populating `subs` with type variable bindings.
+    /// Returns true if the types can be unified, false if they are incompatible.
+    ///
+    /// Rules:
+    /// - If both type IDs are identical, they unify trivially.
+    /// - UNKNOWN unifies with anything (wildcard for inference).
+    /// - A type variable binds to the other type (with occurs check).
+    /// - Compound types (list, tuple, function, map) unify structurally.
+    /// - Primitives must match exactly.
+    pub fn unify(self: *const TypeStore, a: TypeId, b: TypeId, subs: *SubstitutionMap) !bool {
+        // Resolve both sides through any existing substitutions
+        const resolved_a = self.resolveTypeVar(a, subs);
+        const resolved_b = self.resolveTypeVar(b, subs);
+
+        // Identical type IDs always unify
+        if (resolved_a == resolved_b) return true;
+
+        const type_a = self.getType(resolved_a);
+        const type_b = self.getType(resolved_b);
+
+        // UNKNOWN unifies with anything
+        if (type_a == .unknown or type_b == .unknown) return true;
+
+        // If a is a type variable, bind it to b (with occurs check)
+        if (type_a == .type_var) {
+            if (self.occursIn(type_a.type_var, resolved_b, subs)) return false;
+            subs.bind(type_a.type_var, resolved_b);
+            return true;
+        }
+
+        // If b is a type variable, bind it to a (with occurs check)
+        if (type_b == .type_var) {
+            if (self.occursIn(type_b.type_var, resolved_a, subs)) return false;
+            subs.bind(type_b.type_var, resolved_a);
+            return true;
+        }
+
+        // Both are list types: unify element types
+        if (type_a == .list and type_b == .list) {
+            return self.unify(type_a.list.element, type_b.list.element, subs);
+        }
+
+        // Both are tuple types: must have same length, unify pairwise
+        if (type_a == .tuple and type_b == .tuple) {
+            if (type_a.tuple.elements.len != type_b.tuple.elements.len) return false;
+            for (type_a.tuple.elements, type_b.tuple.elements) |elem_a, elem_b| {
+                if (!try self.unify(elem_a, elem_b, subs)) return false;
+            }
+            return true;
+        }
+
+        // Both are function types: must have same param count, unify params and return
+        if (type_a == .function and type_b == .function) {
+            if (type_a.function.params.len != type_b.function.params.len) return false;
+            for (type_a.function.params, type_b.function.params) |param_a, param_b| {
+                if (!try self.unify(param_a, param_b, subs)) return false;
+            }
+            return self.unify(type_a.function.return_type, type_b.function.return_type, subs);
+        }
+
+        // Both are map types: unify key and value types
+        if (type_a == .map and type_b == .map) {
+            if (!try self.unify(type_a.map.key, type_b.map.key, subs)) return false;
+            return self.unify(type_a.map.value, type_b.map.value, subs);
+        }
+
+        // Both are the same primitive kind: check they're structurally identical
+        // (int with matching signedness/bits, float with matching bits, etc.)
+        if (type_a == .int and type_b == .int) {
+            return type_a.int.signedness == type_b.int.signedness and
+                type_a.int.bits == type_b.int.bits;
+        }
+        if (type_a == .float and type_b == .float) {
+            return type_a.float.bits == type_b.float.bits;
+        }
+        if (type_a == .bool_type and type_b == .bool_type) return true;
+        if (type_a == .string_type and type_b == .string_type) return true;
+        if (type_a == .atom_type and type_b == .atom_type) return true;
+        if (type_a == .nil_type and type_b == .nil_type) return true;
+        if (type_a == .never and type_b == .never) return true;
+
+        // Incompatible types
+        return false;
+    }
+};
+
+// ============================================================
+// Substitution map for type variable bindings
+// ============================================================
+
+pub const SubstitutionMap = struct {
+    bindings: std.AutoHashMap(TypeVarId, TypeId),
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) SubstitutionMap {
+        return .{
+            .bindings = std.AutoHashMap(TypeVarId, TypeId).init(allocator),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *SubstitutionMap) void {
+        self.bindings.deinit();
+    }
+
+    /// Bind a type variable to a concrete type.
+    pub fn bind(self: *SubstitutionMap, var_id: TypeVarId, type_id: TypeId) void {
+        self.bindings.put(var_id, type_id) catch {};
+    }
+
+    /// Look up the binding for a type variable.
+    /// Returns null if the variable is unbound.
+    pub fn resolve(self: *const SubstitutionMap, var_id: TypeVarId) ?TypeId {
+        return self.bindings.get(var_id);
+    }
+
+    /// Apply all substitutions to a type, recursively replacing type variables
+    /// with their bound types. Returns a new TypeId for compound types where
+    /// substitutions occurred; returns the original TypeId for primitives or
+    /// unbound variables.
+    pub fn applyToType(self: *const SubstitutionMap, store: *TypeStore, type_id: TypeId) TypeId {
+        const typ = store.getType(type_id);
+        return switch (typ) {
+            .type_var => |var_id| {
+                if (self.resolve(var_id)) |bound_type| {
+                    // Recursively apply in case the bound type also contains vars
+                    return self.applyToType(store, bound_type);
+                }
+                return type_id;
+            },
+            .list => |list_type| {
+                const new_element = self.applyToType(store, list_type.element);
+                if (new_element == list_type.element) return type_id;
+                return store.addType(.{ .list = .{ .element = new_element } }) catch type_id;
+            },
+            .tuple => |tuple_type| {
+                var changed = false;
+                const new_elements = store.allocator.alloc(TypeId, tuple_type.elements.len) catch return type_id;
+                for (tuple_type.elements, 0..) |element, index| {
+                    const new_element = self.applyToType(store, element);
+                    new_elements[index] = new_element;
+                    if (new_element != element) changed = true;
+                }
+                if (!changed) {
+                    store.allocator.free(new_elements);
+                    return type_id;
+                }
+                return store.addType(.{ .tuple = .{ .elements = new_elements } }) catch type_id;
+            },
+            .function => |function_type| {
+                var changed = false;
+                const new_params = store.allocator.alloc(TypeId, function_type.params.len) catch return type_id;
+                for (function_type.params, 0..) |param, index| {
+                    const new_param = self.applyToType(store, param);
+                    new_params[index] = new_param;
+                    if (new_param != param) changed = true;
+                }
+                const new_return = self.applyToType(store, function_type.return_type);
+                if (new_return != function_type.return_type) changed = true;
+                if (!changed) {
+                    store.allocator.free(new_params);
+                    return type_id;
+                }
+                return store.addType(.{ .function = .{
+                    .params = new_params,
+                    .return_type = new_return,
+                    .param_ownerships = function_type.param_ownerships,
+                    .return_ownership = function_type.return_ownership,
+                } }) catch type_id;
+            },
+            .map => |map_type| {
+                const new_key = self.applyToType(store, map_type.key);
+                const new_value = self.applyToType(store, map_type.value);
+                if (new_key == map_type.key and new_value == map_type.value) return type_id;
+                return store.addType(.{ .map = .{
+                    .key = new_key,
+                    .value = new_value,
+                } }) catch type_id;
+            },
+            // Primitives and other types pass through unchanged
+            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type => type_id,
+            .struct_type, .union_type, .tagged_union, .opaque_type, .applied => type_id,
+        };
+    }
+};
+
+// ============================================================
+// Monomorphization registry
+// ============================================================
+
+pub const InstantiationKey = struct {
+    family_id: u32, // FunctionFamilyId from scope graph
+    type_args: []const TypeId, // Concrete types substituted for type vars
+};
+
+pub const MonomorphRegistry = struct {
+    allocator: std.mem.Allocator,
+    /// All recorded instantiations, in order of discovery.
+    instantiations: std.ArrayList(Instantiation),
+    /// Deduplication set: maps hash of (family_id, type_args) to index in instantiations.
+    seen: std.AutoHashMap(u64, u32),
+
+    pub const Instantiation = struct {
+        family_id: u32,
+        type_args: []const TypeId,
+        /// Substitution map for this instantiation (type var → concrete type).
+        substitutions: []const TypeVarBinding,
+        /// Mangled name suffix for the specialized function (e.g., "_i64_String").
+        name_suffix: []const u8,
+    };
+
+    pub const TypeVarBinding = struct {
+        var_id: TypeVarId,
+        concrete_type: TypeId,
+    };
+
+    pub fn init(allocator: std.mem.Allocator) MonomorphRegistry {
+        return .{
+            .allocator = allocator,
+            .instantiations = .empty,
+            .seen = std.AutoHashMap(u64, u32).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *MonomorphRegistry) void {
+        // Free owned slices within each instantiation
+        for (self.instantiations.items) |inst| {
+            self.allocator.free(inst.type_args);
+            self.allocator.free(inst.substitutions);
+            self.allocator.free(inst.name_suffix);
+        }
+        self.instantiations.deinit(self.allocator);
+        self.seen.deinit();
+    }
+
+    /// Compute a combined hash from a family_id and a slice of type argument IDs.
+    /// Uses Wyhash for consistency with the rest of the codebase.
+    fn hashInstantiationKey(family_id: u32, type_args: []const TypeId) u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(std.mem.asBytes(&family_id));
+        for (type_args) |type_arg| {
+            hasher.update(std.mem.asBytes(&type_arg));
+        }
+        return hasher.final();
+    }
+
+    /// Record a generic function instantiation. Returns the index of the
+    /// instantiation — either newly created or the existing one if these
+    /// exact type arguments were already recorded for this family.
+    pub fn recordInstantiation(
+        self: *MonomorphRegistry,
+        family_id: u32,
+        type_args: []const TypeId,
+        substitutions: []const TypeVarBinding,
+        type_store: *const TypeStore,
+    ) !u32 {
+        const key_hash = hashInstantiationKey(family_id, type_args);
+
+        // Check for existing instantiation with the same hash
+        if (self.seen.get(key_hash)) |existing_index| {
+            // Verify it is a true match (not just a hash collision)
+            const existing = self.instantiations.items[existing_index];
+            if (existing.family_id == family_id and std.mem.eql(TypeId, existing.type_args, type_args)) {
+                return existing_index;
+            }
+            // Hash collision with different key — fall through and add a new entry.
+            // In practice collisions are extremely rare with Wyhash over small keys.
+        }
+
+        // Make owned copies of the input slices so the registry owns the data
+        const owned_type_args = try self.allocator.dupe(TypeId, type_args);
+        errdefer self.allocator.free(owned_type_args);
+
+        const owned_substitutions = try self.allocator.dupe(TypeVarBinding, substitutions);
+        errdefer self.allocator.free(owned_substitutions);
+
+        const name_suffix = try self.generateNameSuffix(type_args, type_store);
+        errdefer self.allocator.free(name_suffix);
+
+        const index: u32 = @intCast(self.instantiations.items.len);
+        try self.instantiations.append(self.allocator, .{
+            .family_id = family_id,
+            .type_args = owned_type_args,
+            .substitutions = owned_substitutions,
+            .name_suffix = name_suffix,
+        });
+
+        try self.seen.put(key_hash, index);
+        return index;
+    }
+
+    /// Produce a readable mangled suffix from a slice of concrete type IDs.
+    /// For example, [I64, STRING] produces "_i64_String".
+    pub fn generateNameSuffix(
+        self: *MonomorphRegistry,
+        type_args: []const TypeId,
+        type_store: *const TypeStore,
+    ) ![]const u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(self.allocator);
+
+        for (type_args) |type_arg| {
+            try buf.append(self.allocator, '_');
+            const name = typeIdToMangledName(type_arg, type_store, self.allocator);
+            try buf.appendSlice(self.allocator, name);
+        }
+
+        return try buf.toOwnedSlice(self.allocator);
+    }
+
+    /// Convert a single TypeId to a short, readable name for mangling purposes.
+    fn typeIdToMangledName(type_id: TypeId, type_store: *const TypeStore, allocator: std.mem.Allocator) []const u8 {
+        // Well-known primitive types
+        if (type_id == TypeStore.BOOL) return "Bool";
+        if (type_id == TypeStore.STRING) return "String";
+        if (type_id == TypeStore.ATOM) return "Atom";
+        if (type_id == TypeStore.NIL) return "Nil";
+        if (type_id == TypeStore.NEVER) return "Never";
+        if (type_id == TypeStore.I64) return "i64";
+        if (type_id == TypeStore.I32) return "i32";
+        if (type_id == TypeStore.I16) return "i16";
+        if (type_id == TypeStore.I8) return "i8";
+        if (type_id == TypeStore.U64) return "u64";
+        if (type_id == TypeStore.U32) return "u32";
+        if (type_id == TypeStore.U16) return "u16";
+        if (type_id == TypeStore.U8) return "u8";
+        if (type_id == TypeStore.F64) return "f64";
+        if (type_id == TypeStore.F32) return "f32";
+        if (type_id == TypeStore.F16) return "f16";
+        if (type_id == TypeStore.USIZE) return "usize";
+        if (type_id == TypeStore.ISIZE) return "isize";
+        if (type_id == TypeStore.UNKNOWN) return "any";
+        if (type_id == TypeStore.ERROR) return "error";
+
+        // Compound / user-defined types
+        if (type_id < type_store.types.items.len) {
+            const typ = type_store.types.items[type_id];
+            switch (typ) {
+                .list => |list_type| {
+                    const element_name = typeIdToMangledName(list_type.element, type_store, allocator);
+                    return std.fmt.allocPrint(allocator, "list_{s}", .{element_name}) catch "list";
+                },
+                .tuple => |tuple_type| {
+                    var buf: std.ArrayList(u8) = .empty;
+                    buf.appendSlice(allocator, "tuple") catch return "tuple";
+                    for (tuple_type.elements) |element| {
+                        buf.append(allocator, '_') catch return "tuple";
+                        const element_name = typeIdToMangledName(element, type_store, allocator);
+                        buf.appendSlice(allocator, element_name) catch return "tuple";
+                    }
+                    return buf.toOwnedSlice(allocator) catch "tuple";
+                },
+                .function => |function_type| {
+                    var buf: std.ArrayList(u8) = .empty;
+                    buf.appendSlice(allocator, "fn") catch return "fn";
+                    for (function_type.params) |param| {
+                        buf.append(allocator, '_') catch return "fn";
+                        const param_name = typeIdToMangledName(param, type_store, allocator);
+                        buf.appendSlice(allocator, param_name) catch return "fn";
+                    }
+                    buf.append(allocator, '_') catch return "fn";
+                    const return_name = typeIdToMangledName(function_type.return_type, type_store, allocator);
+                    buf.appendSlice(allocator, return_name) catch return "fn";
+                    return buf.toOwnedSlice(allocator) catch "fn";
+                },
+                .map => |map_type| {
+                    const key_name = typeIdToMangledName(map_type.key, type_store, allocator);
+                    const value_name = typeIdToMangledName(map_type.value, type_store, allocator);
+                    return std.fmt.allocPrint(allocator, "map_{s}_{s}", .{ key_name, value_name }) catch "map";
+                },
+                .struct_type => |st| return type_store.interner.get(st.name),
+                .tagged_union => |tu| return type_store.interner.get(tu.name),
+                else => return "any",
+            }
+        }
+
+        return "any";
+    }
+
+    /// Get all instantiations for a given family_id.
+    /// Returns a (possibly empty) slice by scanning the instantiation list.
+    pub fn getInstantiationsForFamily(self: *const MonomorphRegistry, family_id: u32) []const Instantiation {
+        // Find the contiguous range. Because instantiations are appended in
+        // discovery order (not grouped by family), we must collect matching
+        // entries. We use the backing allocator to build a temporary slice.
+        var count: u32 = 0;
+        for (self.instantiations.items) |inst| {
+            if (inst.family_id == family_id) count += 1;
+        }
+        if (count == 0) return &.{};
+
+        const result = self.allocator.alloc(Instantiation, count) catch return &.{};
+        var write_index: u32 = 0;
+        for (self.instantiations.items) |inst| {
+            if (inst.family_id == family_id) {
+                result[write_index] = inst;
+                write_index += 1;
+            }
+        }
+        return result;
+    }
 };
 
 // ============================================================
@@ -440,6 +901,9 @@ pub const TypeChecker = struct {
     analysis_context: ?*const escape_lattice.AnalysisContext,
     analysis_program: ?*const ir.Program,
 
+    // Monomorphization registry: collects generic function instantiations during type checking
+    morph_registry: MonomorphRegistry,
+
     // Number of stdlib lines prepended (bindings in these lines are skipped for unused checks)
     stdlib_line_count: u32 = 0,
 
@@ -467,6 +931,7 @@ pub const TypeChecker = struct {
             .ownership_bindings = std.AutoHashMap(scope_mod.BindingId, BindingOwnershipInfo).init(allocator),
             .analysis_context = null,
             .analysis_program = null,
+            .morph_registry = MonomorphRegistry.init(allocator),
         };
     }
 
@@ -476,6 +941,7 @@ pub const TypeChecker = struct {
         self.expr_types.deinit();
         self.referenced_bindings.deinit();
         self.ownership_bindings.deinit();
+        self.morph_registry.deinit();
     }
 
     pub fn setAnalysisContext(self: *TypeChecker, context: *const escape_lattice.AnalysisContext, program: *const ir.Program) void {
@@ -4574,4 +5040,476 @@ test "unused function parameter produces warning" {
         }
     }
     try std.testing.expect(found_unused);
+}
+
+// ============================================================
+// Type unification tests
+// ============================================================
+
+test "unify identical primitives succeeds with empty subs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var store = TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    var subs = SubstitutionMap.init(alloc);
+    defer subs.deinit();
+
+    // i64 unifies with i64
+    const result = try store.unify(TypeStore.I64, TypeStore.I64, &subs);
+    try std.testing.expect(result);
+    try std.testing.expectEqual(@as(u32, 0), subs.bindings.count());
+}
+
+test "unify type_var with i64 succeeds and binds var" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var store = TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    var subs = SubstitutionMap.init(alloc);
+    defer subs.deinit();
+
+    // Create type_var(0)
+    const var_type = try store.freshVar();
+    _ = var_type;
+
+    const result = try store.unify(try store.addType(.{ .type_var = 0 }), TypeStore.I64, &subs);
+    try std.testing.expect(result);
+    // Var 0 should be bound to i64
+    try std.testing.expectEqual(TypeStore.I64, subs.resolve(0).?);
+}
+
+test "unify list of type_var with list of i64 binds var" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var store = TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    var subs = SubstitutionMap.init(alloc);
+    defer subs.deinit();
+
+    // Create [type_var(0)]
+    const var_type = try store.freshVar();
+    const list_of_var = try store.addType(.{ .list = .{ .element = var_type } });
+
+    // Create [i64]
+    const list_of_i64 = try store.addType(.{ .list = .{ .element = TypeStore.I64 } });
+
+    const result = try store.unify(list_of_var, list_of_i64, &subs);
+    try std.testing.expect(result);
+    // Var 0 should be bound to i64
+    try std.testing.expectEqual(TypeStore.I64, subs.resolve(0).?);
+}
+
+test "unify function type_vars with concrete types binds both" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var store = TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    var subs = SubstitutionMap.init(alloc);
+    defer subs.deinit();
+
+    // Create (type_var(0) -> type_var(1))
+    const var0 = try store.freshVar();
+    const var1 = try store.freshVar();
+    const param_types = try alloc.alloc(TypeId, 1);
+    param_types[0] = var0;
+    const generic_fn = try store.addType(.{ .function = .{
+        .params = param_types,
+        .return_type = var1,
+    } });
+
+    // Create (i64 -> String)
+    const concrete_params = try alloc.alloc(TypeId, 1);
+    concrete_params[0] = TypeStore.I64;
+    const concrete_fn = try store.addType(.{ .function = .{
+        .params = concrete_params,
+        .return_type = TypeStore.STRING,
+    } });
+
+    const result = try store.unify(generic_fn, concrete_fn, &subs);
+    try std.testing.expect(result);
+    // Var 0 should be bound to i64
+    try std.testing.expectEqual(TypeStore.I64, subs.resolve(0).?);
+    // Var 1 should be bound to String
+    try std.testing.expectEqual(TypeStore.STRING, subs.resolve(1).?);
+}
+
+test "unify incompatible primitives fails" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var store = TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    var subs = SubstitutionMap.init(alloc);
+    defer subs.deinit();
+
+    // i64 does not unify with String
+    const result = try store.unify(TypeStore.I64, TypeStore.STRING, &subs);
+    try std.testing.expect(!result);
+}
+
+test "unify list of i64 with list of String fails" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var store = TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    var subs = SubstitutionMap.init(alloc);
+    defer subs.deinit();
+
+    const list_of_i64 = try store.addType(.{ .list = .{ .element = TypeStore.I64 } });
+    const list_of_string = try store.addType(.{ .list = .{ .element = TypeStore.STRING } });
+
+    const result = try store.unify(list_of_i64, list_of_string, &subs);
+    try std.testing.expect(!result);
+}
+
+test "applyToType substitutes type_var in list" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var store = TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    var subs = SubstitutionMap.init(alloc);
+    defer subs.deinit();
+
+    // Create [type_var(0)]
+    const var_type = try store.freshVar();
+    const list_of_var = try store.addType(.{ .list = .{ .element = var_type } });
+
+    // Bind var 0 -> i64
+    subs.bind(0, TypeStore.I64);
+
+    // Apply substitution: [type_var(0)] should become [i64]
+    const result_type_id = subs.applyToType(&store, list_of_var);
+    const result_type = store.getType(result_type_id);
+    try std.testing.expect(result_type == .list);
+    try std.testing.expectEqual(TypeStore.I64, result_type.list.element);
+}
+
+test "applyToType substitutes type_vars in tuple" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var store = TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    var subs = SubstitutionMap.init(alloc);
+    defer subs.deinit();
+
+    // Create {type_var(0), type_var(1)}
+    const var0 = try store.freshVar();
+    const var1 = try store.freshVar();
+    const elements = try alloc.alloc(TypeId, 2);
+    elements[0] = var0;
+    elements[1] = var1;
+    const tuple_type = try store.addType(.{ .tuple = .{ .elements = elements } });
+
+    // Bind var 0 -> i64, var 1 -> String
+    subs.bind(0, TypeStore.I64);
+    subs.bind(1, TypeStore.STRING);
+
+    // Apply substitution
+    const result_type_id = subs.applyToType(&store, tuple_type);
+    const result_type = store.getType(result_type_id);
+    try std.testing.expect(result_type == .tuple);
+    try std.testing.expectEqual(@as(usize, 2), result_type.tuple.elements.len);
+    try std.testing.expectEqual(TypeStore.I64, result_type.tuple.elements[0]);
+    try std.testing.expectEqual(TypeStore.STRING, result_type.tuple.elements[1]);
+}
+
+test "applyToType substitutes type_vars in function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var store = TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    var subs = SubstitutionMap.init(alloc);
+    defer subs.deinit();
+
+    // Create (type_var(0) -> type_var(1))
+    const var0 = try store.freshVar();
+    const var1 = try store.freshVar();
+    const param_types = try alloc.alloc(TypeId, 1);
+    param_types[0] = var0;
+    const fn_type = try store.addType(.{ .function = .{
+        .params = param_types,
+        .return_type = var1,
+    } });
+
+    // Bind var 0 -> i64, var 1 -> Bool
+    subs.bind(0, TypeStore.I64);
+    subs.bind(1, TypeStore.BOOL);
+
+    // Apply substitution
+    const result_type_id = subs.applyToType(&store, fn_type);
+    const result_type = store.getType(result_type_id);
+    try std.testing.expect(result_type == .function);
+    try std.testing.expectEqual(@as(usize, 1), result_type.function.params.len);
+    try std.testing.expectEqual(TypeStore.I64, result_type.function.params[0]);
+    try std.testing.expectEqual(TypeStore.BOOL, result_type.function.return_type);
+}
+
+test "applyToType substitutes type_vars in map" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var store = TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    var subs = SubstitutionMap.init(alloc);
+    defer subs.deinit();
+
+    // Create Map(type_var(0), type_var(1))
+    const var0 = try store.freshVar();
+    const var1 = try store.freshVar();
+    const map_type = try store.addType(.{ .map = .{ .key = var0, .value = var1 } });
+
+    // Bind var 0 -> String, var 1 -> i64
+    subs.bind(0, TypeStore.STRING);
+    subs.bind(1, TypeStore.I64);
+
+    // Apply substitution
+    const result_type_id = subs.applyToType(&store, map_type);
+    const result_type = store.getType(result_type_id);
+    try std.testing.expect(result_type == .map);
+    try std.testing.expectEqual(TypeStore.STRING, result_type.map.key);
+    try std.testing.expectEqual(TypeStore.I64, result_type.map.value);
+}
+
+test "occurs check prevents infinite types" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var store = TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    var subs = SubstitutionMap.init(alloc);
+    defer subs.deinit();
+
+    // Create type_var(0) and [type_var(0)]
+    const var_type = try store.freshVar();
+    const list_of_var = try store.addType(.{ .list = .{ .element = var_type } });
+
+    // Trying to unify type_var(0) with [type_var(0)] should fail (occurs check)
+    const result = try store.unify(var_type, list_of_var, &subs);
+    try std.testing.expect(!result);
+}
+
+test "unify with UNKNOWN always succeeds" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var store = TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    var subs = SubstitutionMap.init(alloc);
+    defer subs.deinit();
+
+    // UNKNOWN unifies with i64
+    try std.testing.expect(try store.unify(TypeStore.UNKNOWN, TypeStore.I64, &subs));
+    // i64 unifies with UNKNOWN
+    try std.testing.expect(try store.unify(TypeStore.I64, TypeStore.UNKNOWN, &subs));
+}
+
+test "unify tuples of different lengths fails" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var store = TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    var subs = SubstitutionMap.init(alloc);
+    defer subs.deinit();
+
+    const elems2 = try alloc.alloc(TypeId, 2);
+    elems2[0] = TypeStore.I64;
+    elems2[1] = TypeStore.STRING;
+    const tuple2 = try store.addType(.{ .tuple = .{ .elements = elems2 } });
+
+    const elems3 = try alloc.alloc(TypeId, 3);
+    elems3[0] = TypeStore.I64;
+    elems3[1] = TypeStore.STRING;
+    elems3[2] = TypeStore.BOOL;
+    const tuple3 = try store.addType(.{ .tuple = .{ .elements = elems3 } });
+
+    const result = try store.unify(tuple2, tuple3, &subs);
+    try std.testing.expect(!result);
+}
+
+test "unify functions of different arity fails" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var store = TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    var subs = SubstitutionMap.init(alloc);
+    defer subs.deinit();
+
+    const params1 = try alloc.alloc(TypeId, 1);
+    params1[0] = TypeStore.I64;
+    const fn1 = try store.addType(.{ .function = .{
+        .params = params1,
+        .return_type = TypeStore.BOOL,
+    } });
+
+    const params2 = try alloc.alloc(TypeId, 2);
+    params2[0] = TypeStore.I64;
+    params2[1] = TypeStore.STRING;
+    const fn2 = try store.addType(.{ .function = .{
+        .params = params2,
+        .return_type = TypeStore.BOOL,
+    } });
+
+    const result = try store.unify(fn1, fn2, &subs);
+    try std.testing.expect(!result);
+}
+
+test "unify map type_vars with concrete types" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var store = TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    var subs = SubstitutionMap.init(alloc);
+    defer subs.deinit();
+
+    // Create Map(type_var(0), type_var(1))
+    const var0 = try store.freshVar();
+    const var1 = try store.freshVar();
+    const generic_map = try store.addType(.{ .map = .{ .key = var0, .value = var1 } });
+
+    // Create Map(String, i64)
+    const concrete_map = try store.addType(.{ .map = .{ .key = TypeStore.STRING, .value = TypeStore.I64 } });
+
+    const result = try store.unify(generic_map, concrete_map, &subs);
+    try std.testing.expect(result);
+    try std.testing.expectEqual(TypeStore.STRING, subs.resolve(0).?);
+    try std.testing.expectEqual(TypeStore.I64, subs.resolve(1).?);
+}
+
+test "transitive type variable resolution through substitutions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var store = TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    var subs = SubstitutionMap.init(alloc);
+    defer subs.deinit();
+
+    // Create type_var(0) and type_var(1)
+    const var0 = try store.freshVar();
+    const var1 = try store.freshVar();
+
+    // Unify var0 with var1 (binds var0 -> var1)
+    try std.testing.expect(try store.unify(var0, var1, &subs));
+    // Then unify var1 with i64 (binds var1 -> i64)
+    try std.testing.expect(try store.unify(var1, TypeStore.I64, &subs));
+
+    // applyToType on var0 should resolve through var1 to i64
+    const result = subs.applyToType(&store, var0);
+    try std.testing.expectEqual(TypeStore.I64, result);
+}
+
+test "applyToType leaves unbound type_var unchanged" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var store = TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    var subs = SubstitutionMap.init(alloc);
+    defer subs.deinit();
+
+    // Create type_var(0) with no binding
+    const var_type = try store.freshVar();
+
+    // applyToType should return the original type_var
+    const result = subs.applyToType(&store, var_type);
+    try std.testing.expectEqual(var_type, result);
+}
+
+test "applyToType leaves primitives unchanged" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var store = TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    var subs = SubstitutionMap.init(alloc);
+    defer subs.deinit();
+
+    // Applying to a primitive should return the same TypeId
+    try std.testing.expectEqual(TypeStore.I64, subs.applyToType(&store, TypeStore.I64));
+    try std.testing.expectEqual(TypeStore.STRING, subs.applyToType(&store, TypeStore.STRING));
+    try std.testing.expectEqual(TypeStore.BOOL, subs.applyToType(&store, TypeStore.BOOL));
+    try std.testing.expectEqual(TypeStore.NIL, subs.applyToType(&store, TypeStore.NIL));
 }
