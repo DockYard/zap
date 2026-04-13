@@ -14,7 +14,7 @@ pub module Test.ClosureTest {
       assert(add_one(20) + add_one(20) == 42)
     }
 
-    test("pass named function as callback") {
+    test("pass function as callback") {
       assert(apply(21, doubler) == 42)
     }
   }
