@@ -461,7 +461,7 @@ Types are declared at function boundaries. Narrower numeric types are implicitly
 | Platform-sized | `usize` `isize` |
 | Primitives | `Bool` `String` `Atom` `Nil` |
 | Bottom | `Never` |
-| Compound | tuples, lists, maps, structs, enums |
+| Compound | tuples, lists, maps, structs, unions |
 
 ### Structs
 
@@ -477,10 +477,12 @@ pub struct Circle extends Shape {
 }
 ```
 
-### Enums
+### Unions
+
+Tagged unions represent values that can be one of several variants:
 
 ```zap
-pub enum Direction {
+pub union Direction {
   North,
   South,
   East,
