@@ -92,54 +92,6 @@ pub module List {
   }
 
   @doc = """
-    Returns the sum of all elements.
-
-    ## Examples
-
-        List.sum([1, 2, 3, 4])  # => 10
-    """
-
-  pub fn sum(list :: [i64]) -> i64 {
-    :zig.ListCell.sum(list)
-  }
-
-  @doc = """
-    Returns the product of all elements. Returns 1 for empty.
-
-    ## Examples
-
-        List.product([2, 3, 4])  # => 24
-    """
-
-  pub fn product(list :: [i64]) -> i64 {
-    :zig.ListCell.product(list)
-  }
-
-  @doc = """
-    Returns the maximum element. Returns 0 for empty.
-
-    ## Examples
-
-        List.max([3, 1, 4, 1, 5])  # => 5
-    """
-
-  pub fn max(list :: [i64]) -> i64 {
-    :zig.ListCell.maxVal(list)
-  }
-
-  @doc = """
-    Returns the minimum element. Returns 0 for empty.
-
-    ## Examples
-
-        List.min([3, 1, 4, 1, 5])  # => 1
-    """
-
-  pub fn min(list :: [i64]) -> i64 {
-    :zig.ListCell.minVal(list)
-  }
-
-  @doc = """
     Returns `true` if the list contains the given value.
 
     ## Examples

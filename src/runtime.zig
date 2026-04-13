@@ -1660,6 +1660,147 @@ pub const ListCell = struct {
     }
 
     /// Remove duplicates, preserving first occurrence order.
+    // ---- Higher-order functions (for Enum module) ----
+
+    pub fn mapFn(list: ?*const ListCell, callback: anytype) ?*const ListCell {
+        var current = list;
+        var result: ?*const ListCell = null;
+        while (current) |cell| {
+            result = cons(callback(cell.head), result);
+            current = cell.tail;
+        }
+        return reverse(result);
+    }
+
+    pub fn filterFn(list: ?*const ListCell, predicate: anytype) ?*const ListCell {
+        var current = list;
+        var result: ?*const ListCell = null;
+        while (current) |cell| {
+            if (predicate(cell.head)) {
+                result = cons(cell.head, result);
+            }
+            current = cell.tail;
+        }
+        return reverse(result);
+    }
+
+    pub fn rejectFn(list: ?*const ListCell, predicate: anytype) ?*const ListCell {
+        var current = list;
+        var result: ?*const ListCell = null;
+        while (current) |cell| {
+            if (!predicate(cell.head)) {
+                result = cons(cell.head, result);
+            }
+            current = cell.tail;
+        }
+        return reverse(result);
+    }
+
+    pub fn reduceFn(list: ?*const ListCell, initial: i64, callback: anytype) i64 {
+        var current = list;
+        var acc = initial;
+        while (current) |cell| {
+            acc = callback(acc, cell.head);
+            current = cell.tail;
+        }
+        return acc;
+    }
+
+    pub fn eachFn(list: ?*const ListCell, callback: anytype) ?*const ListCell {
+        var current = list;
+        while (current) |cell| {
+            _ = callback(cell.head);
+            current = cell.tail;
+        }
+        return list;
+    }
+
+    pub fn findFn(list: ?*const ListCell, default: i64, predicate: anytype) i64 {
+        var current = list;
+        while (current) |cell| {
+            if (predicate(cell.head)) return cell.head;
+            current = cell.tail;
+        }
+        return default;
+    }
+
+    pub fn anyFn(list: ?*const ListCell, predicate: anytype) bool {
+        var current = list;
+        while (current) |cell| {
+            if (predicate(cell.head)) return true;
+            current = cell.tail;
+        }
+        return false;
+    }
+
+    pub fn allFn(list: ?*const ListCell, predicate: anytype) bool {
+        var current = list;
+        while (current) |cell| {
+            if (!predicate(cell.head)) return false;
+            current = cell.tail;
+        }
+        return true;
+    }
+
+    pub fn countFn(list: ?*const ListCell, predicate: anytype) i64 {
+        var current = list;
+        var count: i64 = 0;
+        while (current) |cell| {
+            if (predicate(cell.head)) count += 1;
+            current = cell.tail;
+        }
+        return count;
+    }
+
+    pub fn sortFn(list: ?*const ListCell, comparator: anytype) ?*const ListCell {
+        // Convert to array, sort, convert back
+        const len_val = length(list);
+        if (len_val <= 1) return list;
+        const len: usize = @intCast(len_val);
+        const arr = bumpAllocSlice(i64, len);
+        if (arr.len == 0) return list;
+        var current = list;
+        var i: usize = 0;
+        while (current) |cell| {
+            if (i < len) arr[i] = cell.head;
+            current = cell.tail;
+            i += 1;
+        }
+        // Insertion sort (stable, simple)
+        var j: usize = 1;
+        while (j < len) : (j += 1) {
+            const key = arr[j];
+            var k: usize = j;
+            while (k > 0 and comparator(key, arr[k - 1])) {
+                arr[k] = arr[k - 1];
+                k -= 1;
+            }
+            arr[k] = key;
+        }
+        // Build list from sorted array
+        var result: ?*const ListCell = null;
+        var ri: usize = len;
+        while (ri > 0) {
+            ri -= 1;
+            result = cons(arr[ri], result);
+        }
+        return result;
+    }
+
+    pub fn flatMapFn(list: ?*const ListCell, callback: anytype) ?*const ListCell {
+        var current = list;
+        var result: ?*const ListCell = null;
+        while (current) |cell| {
+            var inner = callback(cell.head);
+            while (inner) |inner_cell| {
+                result = cons(inner_cell.head, result);
+                inner = inner_cell.tail;
+            }
+            current = cell.tail;
+        }
+        return reverse(result);
+    }
+
     pub fn uniq(list: ?*const ListCell) ?*const ListCell {
         var current = list;
         var result: ?*const ListCell = null;

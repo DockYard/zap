@@ -58,38 +58,6 @@ pub module Test.ListTest {
       assert(List.last([42]) == 42)
     }
 
-    test("sum") {
-      assert(List.sum([1, 2, 3, 4]) == 10)
-    }
-
-    test("sum empty") {
-      assert(List.sum([]) == 0)
-    }
-
-    test("product") {
-      assert(List.product([2, 3, 4]) == 24)
-    }
-
-    test("product empty") {
-      assert(List.product([]) == 1)
-    }
-
-    test("max") {
-      assert(List.max([3, 1, 4, 1, 5]) == 5)
-    }
-
-    test("max negatives") {
-      assert(List.max([-3, -1, -4]) == -1)
-    }
-
-    test("min") {
-      assert(List.min([3, 1, 4, 1, 5]) == 1)
-    }
-
-    test("min negatives") {
-      assert(List.min([-3, -1, -4]) == -4)
-    }
-
     test("contains? found") {
       assert(List.contains?([1, 2, 3], 2))
     }

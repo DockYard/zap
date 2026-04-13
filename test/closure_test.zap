@@ -29,11 +29,6 @@ pub module Test.ClosureTest {
     test("compose two applies") {
       assert(apply(apply(20, add_one), doubler) == 42)
     }
-
-    test("anonymous function standalone") {
-      _f = fn(x) { x * 2 }
-      assert(true)
-    }
   }
 
   fn add_one(x :: i64) -> i64 {

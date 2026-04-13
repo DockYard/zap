@@ -31,6 +31,7 @@ pub module Test.TestRunner {
     Test.FloatTest.run()
     Test.BoolTest.run()
     Test.ListTest.run()
+    Test.EnumTest.run()
 
     Zest.Runner.run()
   }
