@@ -32,6 +32,7 @@ pub module Test.TestRunner {
     Test.BoolTest.run()
     Test.ListTest.run()
     Test.EnumTest.run()
+    Test.MapTest.run()
 
     Zest.Runner.run()
   }

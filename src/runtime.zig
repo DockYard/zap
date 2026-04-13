@@ -1814,6 +1814,197 @@ pub const ListCell = struct {
     }
 };
 
+// ============================================================
+// MapCell — Concrete flat-array map for pointer-based maps.
+//
+// Maps use nullable pointers: null = empty, non-null = map cell.
+// Entries stored as flat array of {key, value} with linear scan.
+// Keys are atom IDs (u32). Values are i64.
+// ============================================================
+
+pub const MapType = ?*const MapCell;
+
+pub const MapCell = struct {
+    entries: [*]const MapEntry,
+    count: u32,
+
+    pub const MapEntry = struct {
+        key: u32, // atom ID
+        value: i64,
+    };
+
+    pub fn empty() ?*const MapCell {
+        return null;
+    }
+
+    pub fn fromPairs(key_ids: []const u32, vals: []const i64, count: u32) ?*const MapCell {
+        if (count == 0) return null;
+        const n: usize = @intCast(count);
+        const cell_bytes = bumpAlloc(@sizeOf(MapCell));
+        if (cell_bytes.len == 0) return null;
+        const entry_bytes = bumpAlloc(n * @sizeOf(MapEntry));
+        if (entry_bytes.len == 0) return null;
+
+        const entry_arr: [*]MapEntry = @ptrCast(@alignCast(entry_bytes.ptr));
+        for (0..n) |i| {
+            entry_arr[i] = .{ .key = key_ids[i], .value = vals[i] };
+        }
+
+        const cell: *MapCell = @ptrCast(@alignCast(cell_bytes.ptr));
+        cell.* = .{ .entries = entry_arr, .count = count };
+        return cell;
+    }
+
+    pub fn get(map: ?*const MapCell, key: u32, default: i64) i64 {
+        if (map) |m| {
+            for (m.entries[0..m.count]) |entry| {
+                if (entry.key == key) return entry.value;
+            }
+        }
+        return default;
+    }
+
+    pub fn getStr(map: ?*const MapCell, key: u32, default: []const u8) []const u8 {
+        _ = map;
+        _ = key;
+        return default;
+    }
+
+    pub fn hasKey(map: ?*const MapCell, key: u32) bool {
+        if (map) |m| {
+            for (m.entries[0..m.count]) |entry| {
+                if (entry.key == key) return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn size(map: ?*const MapCell) i64 {
+        if (map) |m| return @intCast(m.count);
+        return 0;
+    }
+
+    pub fn isEmpty(map: ?*const MapCell) bool {
+        return map == null;
+    }
+
+    pub fn put(map: ?*const MapCell, key: u32, value: i64) ?*const MapCell {
+        const old_count: usize = if (map) |m| @intCast(m.count) else 0;
+
+        // Check if key exists (update) or new (append)
+        var replacing = false;
+        if (map) |m| {
+            for (m.entries[0..m.count]) |entry| {
+                if (entry.key == key) {
+                    replacing = true;
+                    break;
+                }
+            }
+        }
+
+        const new_count: usize = if (replacing) old_count else old_count + 1;
+        const cell_bytes = bumpAlloc(@sizeOf(MapCell));
+        if (cell_bytes.len == 0) return map;
+        const entry_bytes = bumpAlloc(new_count * @sizeOf(MapEntry));
+        if (entry_bytes.len == 0) return map;
+
+        const new_entries: [*]MapEntry = @ptrCast(@alignCast(entry_bytes.ptr));
+        var dst: usize = 0;
+
+        if (map) |m| {
+            for (m.entries[0..m.count]) |entry| {
+                if (entry.key == key) {
+                    new_entries[dst] = .{ .key = key, .value = value };
+                } else {
+                    new_entries[dst] = entry;
+                }
+                dst += 1;
+            }
+        }
+
+        if (!replacing) {
+            new_entries[dst] = .{ .key = key, .value = value };
+        }
+
+        const cell: *MapCell = @ptrCast(@alignCast(cell_bytes.ptr));
+        cell.* = .{ .entries = new_entries, .count = @intCast(new_count) };
+        return cell;
+    }
+
+    pub fn delete(map: ?*const MapCell, key: u32) ?*const MapCell {
+        if (map == null) return null;
+        const m = map.?;
+        if (m.count == 0) return null;
+
+        // Check if key exists
+        var found = false;
+        for (m.entries[0..m.count]) |entry| {
+            if (entry.key == key) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return map;
+
+        const new_count = m.count - 1;
+        if (new_count == 0) return null;
+
+        const cell_bytes = bumpAlloc(@sizeOf(MapCell));
+        if (cell_bytes.len == 0) return map;
+        const entry_bytes = bumpAlloc(new_count * @sizeOf(MapEntry));
+        if (entry_bytes.len == 0) return map;
+
+        const new_entries: [*]MapEntry = @ptrCast(@alignCast(entry_bytes.ptr));
+        var dst: usize = 0;
+        for (m.entries[0..m.count]) |entry| {
+            if (entry.key != key) {
+                new_entries[dst] = entry;
+                dst += 1;
+            }
+        }
+
+        const cell: *MapCell = @ptrCast(@alignCast(cell_bytes.ptr));
+        cell.* = .{ .entries = new_entries, .count = new_count };
+        return cell;
+    }
+
+    pub fn merge(map_a: ?*const MapCell, map_b: ?*const MapCell) ?*const MapCell {
+        if (map_a == null) return map_b;
+        if (map_b == null) return map_a;
+        // Apply all entries from b onto a
+        var result = map_a;
+        const b = map_b.?;
+        for (b.entries[0..b.count]) |entry| {
+            result = put(result, entry.key, entry.value);
+        }
+        return result;
+    }
+
+    pub fn keys(map: ?*const MapCell) ?*const ListCell {
+        if (map == null) return null;
+        const m = map.?;
+        var result: ?*const ListCell = null;
+        var i: usize = m.count;
+        while (i > 0) {
+            i -= 1;
+            result = ListCell.cons(@intCast(m.entries[i].key), result);
+        }
+        return result;
+    }
+
+    pub fn values(map: ?*const MapCell) ?*const ListCell {
+        if (map == null) return null;
+        const m = map.?;
+        var result: ?*const ListCell = null;
+        var i: usize = m.count;
+        while (i > 0) {
+            i -= 1;
+            result = ListCell.cons(m.entries[i].value, result);
+        }
+        return result;
+    }
+};
+
 pub const ListHelpers = struct {
     /// Check if a list is empty (void = empty, anything else = non-empty).
     pub fn isEmpty_legacy(list: anytype) bool {

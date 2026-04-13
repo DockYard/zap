@@ -831,6 +831,19 @@ pub const ZirDriver = struct {
     /// Emit a function parameter, handling list types specially.
     /// List params use zir_builder_emit_param_imported_type for correct ZIR encoding.
     fn emitTypedParam(self: *ZirDriver, param: ir.Param) !u32 {
+        if (std.meta.activeTag(param.type_expr) == .map) {
+            const ref = zir_builder_emit_param_imported_type(
+                self.handle,
+                param.name.ptr,
+                @intCast(param.name.len),
+                "zap_runtime",
+                11,
+                "MapType",
+                7,
+            );
+            if (ref == error_ref) return error.EmitFailed;
+            return ref;
+        }
         if (std.meta.activeTag(param.type_expr) == .list) {
             const ref = zir_builder_emit_param_imported_type(
                 self.handle,
@@ -886,7 +899,7 @@ pub const ZirDriver = struct {
         // For list-returning functions, ret_type is 0 (void) from mapReturnType
         // but the actual return type is set via set_imported_return_type. Mark as
         // non-void so the ret handler emits value returns, not void returns.
-        self.current_ret_type = if (std.meta.activeTag(func.return_type) == .list) 1 else ret_type;
+        self.current_ret_type = if (std.meta.activeTag(func.return_type) == .list or std.meta.activeTag(func.return_type) == .map) 1 else ret_type;
 
         const emit_name = if (is_main)
             @as([]const u8, "main")
@@ -903,6 +916,12 @@ pub const ZirDriver = struct {
         const is_try_variant = std.mem.endsWith(u8, func.name, "__try");
         if (is_try_variant) {
             if (zir_builder_set_optional_return_type(self.handle) != 0)
+                return error.EmitFailed;
+        }
+
+        // Map-returning functions: set return type to @import("zap_runtime").MapType.
+        if (std.meta.activeTag(func.return_type) == .map) {
+            if (zir_builder_set_imported_return_type(self.handle, "zap_runtime", 11, "MapType", 7) != 0)
                 return error.EmitFailed;
         }
 
@@ -2265,53 +2284,38 @@ pub const ZirDriver = struct {
                 try self.setLocal(lc.dest, ref);
             },
             .map_init => |mi| {
-                // Build a map as an anonymous struct of {key, value} entry structs.
-                // Each entry becomes a field named "0", "1", ... whose value is
-                // an anonymous struct .{ .key = k, .value = v }.
-                var entry_refs = std.ArrayListUnmanaged(u32).empty;
-                defer entry_refs.deinit(self.allocator);
-                var entry_names_ptrs = std.ArrayListUnmanaged([*]const u8).empty;
-                defer entry_names_ptrs.deinit(self.allocator);
-                var entry_names_lens = std.ArrayListUnmanaged(u32).empty;
-                defer entry_names_lens.deinit(self.allocator);
+                // Maps use MapCell — pointer-based flat array of {key, value} entries.
+                // Build key and value arrays, then call MapCell.fromPairs().
+                const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                if (rt_import == error_ref) return error.EmitFailed;
+                const map_cell = zir_builder_emit_field_val(self.handle, rt_import, "MapCell", 7);
+                if (map_cell == error_ref) return error.EmitFailed;
 
-                for (mi.entries, 0..) |entry, i| {
-                    const key_ref = self.refForLocal(entry.key) catch @intFromEnum(Zir.Inst.Ref.void_value);
-                    const val_ref = self.refForLocal(entry.value) catch @intFromEnum(Zir.Inst.Ref.void_value);
-
-                    // Build a 2-field anonymous struct: .{ .key = key_ref, .value = val_ref }
-                    const kv_names = [_][*]const u8{ "key", "value" };
-                    const kv_lens = [_]u32{ 3, 5 };
-                    const kv_vals = [_]u32{ key_ref, val_ref };
-                    const kv_struct = zir_builder_emit_struct_init_anon(
-                        self.handle,
-                        &kv_names,
-                        &kv_lens,
-                        &kv_vals,
-                        2,
-                    );
-                    if (kv_struct == error_ref) return error.EmitFailed;
-
-                    const name = indexFieldName(i);
-                    try entry_refs.append(self.allocator, kv_struct);
-                    try entry_names_ptrs.append(self.allocator, name.ptr);
-                    try entry_names_lens.append(self.allocator, name.len);
-                }
-
-                if (entry_refs.items.len > 0) {
-                    const result = zir_builder_emit_struct_init_anon(
-                        self.handle,
-                        entry_names_ptrs.items.ptr,
-                        entry_names_lens.items.ptr,
-                        entry_refs.items.ptr,
-                        @intCast(entry_refs.items.len),
-                    );
-                    if (result == error_ref) return error.EmitFailed;
-                    try self.setLocal(mi.dest, result);
-                } else {
-                    // Empty map — emit empty struct via the well-known empty_tuple ref
-                    const ref = @intFromEnum(Zir.Inst.Ref.empty_tuple);
+                if (mi.entries.len == 0) {
+                    // Empty map: MapCell.empty()
+                    const empty_fn = zir_builder_emit_field_val(self.handle, map_cell, "empty", 5);
+                    if (empty_fn == error_ref) return error.EmitFailed;
+                    const ref = zir_builder_emit_call_ref(self.handle, empty_fn, &.{}, 0);
+                    if (ref == error_ref) return error.EmitFailed;
                     try self.setLocal(mi.dest, ref);
+                } else {
+                    // Build map entry by entry using put()
+                    const empty_fn = zir_builder_emit_field_val(self.handle, map_cell, "empty", 5);
+                    if (empty_fn == error_ref) return error.EmitFailed;
+                    var current: u32 = zir_builder_emit_call_ref(self.handle, empty_fn, &.{}, 0);
+                    if (current == error_ref) return error.EmitFailed;
+
+                    const put_fn = zir_builder_emit_field_val(self.handle, map_cell, "put", 3);
+                    if (put_fn == error_ref) return error.EmitFailed;
+
+                    for (mi.entries) |entry| {
+                        const key_ref = self.refForLocal(entry.key) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                        const val_ref = self.refForLocal(entry.value) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                        const call_args = [_]u32{ current, key_ref, val_ref };
+                        current = zir_builder_emit_call_ref(self.handle, put_fn, &call_args, 3);
+                        if (current == error_ref) return error.EmitFailed;
+                    }
+                    try self.setLocal(mi.dest, current);
                 }
             },
             .struct_init => |si| {
@@ -2466,14 +2470,14 @@ pub const ZirDriver = struct {
                 try self.setLocal(lt.dest, ref);
             },
             .map_has_key => |mhk| {
-                // Map key check: MapHelpers.has_key(map, key)
+                // MapCell-based key check: MapCell.hasKey(map, key)
                 const map_ref = self.refForLocal(mhk.map) catch return;
                 const key_ref = self.refForLocal(mhk.key) catch return;
                 const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                 if (rt_import == error_ref) return error.EmitFailed;
-                const helpers = zir_builder_emit_field_val(self.handle, rt_import, "MapHelpers", 10);
-                if (helpers == error_ref) return error.EmitFailed;
-                const fn_ref = zir_builder_emit_field_val(self.handle, helpers, "has_key", 7);
+                const map_cell = zir_builder_emit_field_val(self.handle, rt_import, "MapCell", 7);
+                if (map_cell == error_ref) return error.EmitFailed;
+                const fn_ref = zir_builder_emit_field_val(self.handle, map_cell, "hasKey", 6);
                 if (fn_ref == error_ref) return error.EmitFailed;
                 const call_args = [_]u32{ map_ref, key_ref };
                 const ref = zir_builder_emit_call_ref(self.handle, fn_ref, &call_args, 2);
@@ -2481,15 +2485,15 @@ pub const ZirDriver = struct {
                 try self.setLocal(mhk.dest, ref);
             },
             .map_get => |mg| {
-                // Map value access: MapHelpers.get(map, key, default)
+                // MapCell-based value access: MapCell.get(map, key, default)
                 const map_ref = self.refForLocal(mg.map) catch return;
                 const key_ref = self.refForLocal(mg.key) catch return;
                 const default_ref = self.refForLocal(mg.default) catch return;
                 const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                 if (rt_import == error_ref) return error.EmitFailed;
-                const helpers = zir_builder_emit_field_val(self.handle, rt_import, "MapHelpers", 10);
-                if (helpers == error_ref) return error.EmitFailed;
-                const fn_ref = zir_builder_emit_field_val(self.handle, helpers, "get", 3);
+                const map_cell = zir_builder_emit_field_val(self.handle, rt_import, "MapCell", 7);
+                if (map_cell == error_ref) return error.EmitFailed;
+                const fn_ref = zir_builder_emit_field_val(self.handle, map_cell, "get", 3);
                 if (fn_ref == error_ref) return error.EmitFailed;
                 const call_args = [_]u32{ map_ref, key_ref, default_ref };
                 const ref = zir_builder_emit_call_ref(self.handle, fn_ref, &call_args, 3);

@@ -4110,6 +4110,13 @@ fn typeIdToZigTypeWithStore(type_id: types_mod.TypeId, type_store: ?*const types
                             elem_zig.* = typeIdToZigTypeWithStore(lt.element, type_store);
                             return .{ .list = elem_zig };
                         },
+                        .map => |mt| {
+                            const key_zig = ts.allocator.create(ZigType) catch return .any;
+                            key_zig.* = typeIdToZigTypeWithStore(mt.key, type_store);
+                            const val_zig = ts.allocator.create(ZigType) catch return .any;
+                            val_zig.* = typeIdToZigTypeWithStore(mt.value, type_store);
+                            return .{ .map = .{ .key = key_zig, .value = val_zig } };
+                        },
                         .function => |ft| {
                             var zig_params = ts.allocator.alloc(ZigType, ft.params.len) catch return .any;
                             for (ft.params, 0..) |param, i| {
