@@ -236,16 +236,10 @@ IO.puts("hello" <> " " <> "world")  # concatenation
 
 ### Maps
 
-Create maps with `%{}`, access with `Map.get`, update with `%{map | key: value}`:
+Create maps with `%{}` and update with `%{map | key: value}`:
 
 ```zap
 m = %{name: "Alice", age: 30}
-
-Map.get(m, :name, "unknown")   # "Alice"
-Map.get(m, :email, "none")     # "none" (default)
-Map.has_key(m, :name)           # true
-Map.size(m)                     # 3
-
 m2 = %{m | name: "Bob"}        # update — creates modified copy
 ```
 
@@ -279,6 +273,26 @@ pub fn sum([] :: [i64]) -> i64 { 0 }
 pub fn sum([h | t] :: [i64]) -> i64 { h + sum(t) }
 
 sum([1, 2, 3])  # 6
+```
+
+### Binary Pattern Matching
+
+Match and extract data from binary/string data using `<<>>` patterns:
+
+```zap
+fn first_byte(data :: String) -> i64 {
+  case data {
+    <<a, _>> -> a
+    _ -> 0
+  }
+}
+
+fn after_prefix(data :: String) -> String {
+  case data {
+    <<"GET "::String, path::String>> -> path
+    _ -> "no match"
+  }
+}
 ```
 
 ### For Comprehensions
@@ -344,17 +358,14 @@ Zest is Zap's built-in test framework. Use `Zest.Case` for assertions and descri
 pub module Test.MathTest {
   use Zest.Case
 
-  pub fn run() -> String {
-    describe("math") {
-      test("addition") {
-        assert(1 + 1 == 2)
-      }
-
-      test("negative check") {
-        reject(5 < 0)
-      }
+  describe("math") {
+    test("addition") {
+      assert(1 + 1 == 2)
     }
-    "MathTest: passed"
+
+    test("negative check") {
+      reject(5 < 0)
+    }
   }
 }
 ```
@@ -573,9 +584,10 @@ Zap uses a per-module compilation architecture with per-module ZIR emission:
 
 1. **Discovery** — start from the entry point, follow module references to find files
 2. **Pass 1** — parse all files, collect declarations into a shared scope graph
-3. **Pass 2** — compile each file: macro expand, desugar, type check, HIR, IR
-4. **Pass 3** — merge IR, run analysis pipeline (escape analysis, interprocedural summaries, region solving, lambda sets, Perceus reuse)
-5. **Pass 4** — emit per-module ZIR, inject into Zig compilation, codegen
+3. **Pass 2** — compile each file: macro expand, desugar, type check, HIR
+4. **Pass 3** — monomorphize generic functions, lower to IR
+5. **Pass 4** — run analysis pipeline (escape analysis, interprocedural summaries, region solving, lambda sets, Perceus reuse)
+6. **Pass 5** — emit per-module ZIR, inject into Zig compilation, codegen
 
 Each Zap module becomes its own Zig ZIR module. Cross-module calls use `@import("Module").function(args)` chains. Namespace re-export modules are generated for hierarchical module names (e.g., `Zest` re-exports `Runtime`, `Case`, `Runner`). `@native` functions skip ZIR emission — their calls route directly to `@import("zap_runtime")`.
 
@@ -602,6 +614,9 @@ Each Zap module becomes its own Zig ZIR module. Cross-module calls use `@import(
       |
       v
    HIR Lowering ----- typed intermediate representation
+      |
+      v
+   Monomorphize ---- specialize generic functions for concrete types
       |
       v
    IR Lowering ------ lower-level IR (arity-suffixed function names)
