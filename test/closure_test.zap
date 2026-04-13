@@ -14,8 +14,25 @@ pub module Test.ClosureTest {
       assert(add_one(20) + add_one(20) == 42)
     }
 
-    test("pass function as callback") {
+    test("pass doubler as callback") {
       assert(apply(21, doubler) == 42)
+    }
+
+    test("pass add_one as callback") {
+      assert(apply(41, add_one) == 42)
+    }
+
+    test("apply_twice with callback") {
+      assert(apply_twice(10, add_one) == 12)
+    }
+
+    test("compose two applies") {
+      assert(apply(apply(20, add_one), doubler) == 42)
+    }
+
+    test("anonymous function standalone") {
+      _f = fn(x) { x * 2 }
+      assert(true)
     }
   }
 
@@ -33,5 +50,9 @@ pub module Test.ClosureTest {
 
   fn apply(value :: i64, callback :: (i64 -> i64)) -> i64 {
     callback(value)
+  }
+
+  fn apply_twice(value :: i64, callback :: (i64 -> i64)) -> i64 {
+    callback(callback(value))
   }
 }

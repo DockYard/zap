@@ -1141,6 +1141,61 @@ pub fn ctValueToExpr(
         }
     }
 
+    // Anonymous function: {:fn, meta, [name, params, body]}
+    // Reconstructed from exprToCtValue's anonymous_function handler.
+    if (std.mem.eql(u8, form_name, "fn") and arg_elems.len == 3 and arg_elems[0] == .atom) {
+        {
+            const interner_mut: *ast.StringInterner = @constCast(interner);
+            const fn_name = try interner_mut.intern(arg_elems[0].atom);
+
+            // Reconstruct params from the CtValue list
+            var params: std.ArrayListUnmanaged(ast.Param) = .empty;
+            if (arg_elems[1] == .list) {
+                for (arg_elems[1].list.elems) |param_ct| {
+                    if (param_ct == .atom) {
+                        const pat = try alloc.create(ast.Pattern);
+                        pat.* = .{ .bind = .{ .meta = node_meta, .name = try interner_mut.intern(param_ct.atom) } };
+                        try params.append(alloc, .{
+                            .meta = node_meta,
+                            .pattern = pat,
+                            .type_annotation = null,
+                        });
+                    }
+                }
+            }
+
+            // Reconstruct body
+            var body_stmts: std.ArrayListUnmanaged(ast.Stmt) = .empty;
+            if (arg_elems[2] != .nil) {
+                const body_expr = try ctValueToExpr(alloc, interner, arg_elems[2]);
+                try body_stmts.append(alloc, .{ .expr = body_expr });
+            }
+
+            const clause = try alloc.create(ast.FunctionClause);
+            clause.* = .{
+                .meta = node_meta,
+                .params = try params.toOwnedSlice(alloc),
+                .return_type = null,
+                .refinement = null,
+                .body = try body_stmts.toOwnedSlice(alloc),
+            };
+            const clauses = try alloc.alloc(ast.FunctionClause, 1);
+            clauses[0] = clause.*;
+
+            const decl = try alloc.create(ast.FunctionDecl);
+            decl.* = .{
+                .meta = node_meta,
+                .name = fn_name,
+                .clauses = clauses,
+                .visibility = .private,
+            };
+
+            const anon_expr = try alloc.create(ast.Expr);
+            anon_expr.* = .{ .anonymous_function = .{ .meta = node_meta, .decl = decl } };
+            return anon_expr;
+        }
+    }
+
     // Default: treat as a function call — {:name, meta, [args...]}
     {
         const callee = try alloc.create(ast.Expr);

@@ -2690,11 +2690,29 @@ pub const ZirDriver = struct {
                 const lattice = @import("escape_lattice.zig");
                 const callee_is_param = self.isParamDerivedClosure(cc.callee);
 
+                // Parameter-derived closures: the callee is a function parameter.
+                // Its concrete type is *const fn(args...) ret — a bare function pointer.
+                // Call it directly via call_ref. This MUST be checked first, before any
+                // specialization logic that might try to destructure a closure struct.
+                if (callee_is_param) {
+                    const callee_ref = self.refForLocal(cc.callee) catch return error.EmitFailed;
+                    var args = std.ArrayListUnmanaged(u32).empty;
+                    defer args.deinit(self.allocator);
+                    for (cc.args) |arg| {
+                        const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                        try args.append(self.allocator, ref);
+                    }
+                    const ref = zir_builder_emit_call_ref(self.handle, callee_ref, args.items.ptr, @intCast(args.items.len));
+                    if (ref == error_ref) return error.EmitFailed;
+                    try self.setLocal(cc.dest, ref);
+                    return;
+                }
+
                 // Fast path: use the closure function map to resolve the callee
                 // directly to a named function call. This handles 0-capture closures
                 // (anonymous functions and function refs) by tracking the function ID
                 // through local assignments without needing backward instruction scanning.
-                if (!callee_is_param) {
+                if (true) {
                     if (self.closure_function_map.get(cc.callee)) |func_id| {
                         if (self.findFunctionById(func_id)) |target_func| {
                             if (target_func.captures.len == 0) {
@@ -2895,33 +2913,16 @@ pub const ZirDriver = struct {
                     break :blk !std.mem.eql(u8, target_module.?, self.current_emit_module.?);
                 };
 
-                const lowering = self.getClosureLowering(mc.function, mc.captures.len);
-
-                if (!lowering.needs_closure_object) {
-                    const fn_name_ref = zir_builder_emit_str(self.handle, emit_name.ptr, @intCast(emit_name.len));
-                    if (fn_name_ref == error_ref) return error.EmitFailed;
-                    try self.setLocal(mc.dest, fn_name_ref);
-                    return;
-                }
-
-                // Tier 0: lambda-lifted closures with no captures need no env object.
-                // Create a closure struct with string name for dispatch resolution.
-                if (mc.captures.len == 0 and lowering.tier == .lambda_lifted) {
-                    const fn_name_ref = zir_builder_emit_str(self.handle, emit_name.ptr, @intCast(emit_name.len));
-                    if (fn_name_ref == error_ref) return error.EmitFailed;
-                    const null_ref = @intFromEnum(Zir.Inst.Ref.null_value);
-                    const closure_field_names = [_][*]const u8{ "call_fn", "env", "env_release" };
-                    const closure_field_lens = [_]u32{ 7, 3, 11 };
-                    const closure_field_vals = [_]u32{ fn_name_ref, null_ref, null_ref };
-                    const closure_ref = zir_builder_emit_struct_init_anon(
-                        self.handle,
-                        &closure_field_names,
-                        &closure_field_lens,
-                        &closure_field_vals,
-                        3,
-                    );
-                    if (closure_ref == error_ref) return error.EmitFailed;
-                    try self.setLocal(mc.dest, closure_ref);
+                // 0-capture closures: emit a bare function pointer via decl_ref.
+                // This produces *const fn(args...) ret which is the uniform type
+                // for all function references passed as callback parameters.
+                if (mc.captures.len == 0) {
+                    const fn_ref = if (is_cross_module and target_module != null)
+                        try self.emitCrossModuleRef(target_module.?, emit_name)
+                    else
+                        zir_builder_emit_decl_ref(self.handle, emit_name.ptr, @intCast(emit_name.len));
+                    if (fn_ref == error_ref) return error.EmitFailed;
+                    try self.setLocal(mc.dest, fn_ref);
                     return;
                 }
 
