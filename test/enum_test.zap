@@ -108,6 +108,27 @@ pub module Test.EnumTest {
       assert(List.head(result) == 5)
       assert(List.last(result) == 1)
     }
+
+    test("map with anonymous function") {
+      result = Enum.map([1, 2, 3], fn(x :: i64) -> i64 { x * 2 })
+      assert(List.head(result) == 2)
+      assert(List.last(result) == 6)
+    }
+
+    test("filter with anonymous function") {
+      result = Enum.filter([1, 2, 3, 4, 5], fn(x :: i64) -> Bool { x > 3 })
+      assert(List.length(result) == 2)
+    }
+
+    test("reduce with anonymous function") {
+      assert(Enum.reduce([1, 2, 3, 4], 0, fn(acc :: i64, x :: i64) -> i64 { acc + x }) == 10)
+    }
+
+    test("sort with anonymous comparator") {
+      result = Enum.sort([3, 1, 2], fn(a :: i64, b :: i64) -> Bool { a < b })
+      assert(List.head(result) == 1)
+      assert(List.last(result) == 3)
+    }
   }
 
   fn double(x :: i64) -> i64 {

@@ -79,7 +79,11 @@ pub fn exprToCtValue(
                 try blockToCtValue(alloc, interner, store, body_stmts)
             else
                 .nil;
-            const args = try makeList(alloc, store, &.{ .{ .atom = name }, params, body });
+            const ret_type = if (v.decl.clauses[0].return_type) |rt|
+                try typeExprToCtValue(alloc, interner, store, rt)
+            else
+                CtValue.nil;
+            const args = try makeList(alloc, store, &.{ .{ .atom = name }, params, body, ret_type });
             break :blk makeTuple3(alloc, store, .{ .atom = "fn" }, try metaToList(alloc, store, v.meta, null), args);
         },
 
@@ -778,7 +782,21 @@ pub fn ctValueToExpr(
     }
 
     const form_name = form.atom;
+    const args_is_nil = args == .nil;
     const arg_elems = if (args == .list) args.list.elems else &[_]CtValue{};
+
+    // Variable reference: {:name, meta, nil}. Nil args means var_ref.
+    // Distinct from zero-arg call {:name, meta, []} which has empty list.
+    if (args_is_nil) {
+        const interner_mut: *ast.StringInterner = @constCast(interner);
+        const expr = try alloc.create(ast.Expr);
+        if (form_name.len > 0 and form_name[0] == ':') {
+            expr.* = .{ .atom_literal = .{ .meta = node_meta, .value = try interner_mut.intern(form_name[1..]) } };
+        } else {
+            expr.* = .{ .var_ref = .{ .meta = node_meta, .name = try interner_mut.intern(form_name) } };
+        }
+        return expr;
+    }
 
     // Binary operators
     if (stringToBinop(form_name)) |op| {
@@ -1143,7 +1161,7 @@ pub fn ctValueToExpr(
 
     // Anonymous function: {:fn, meta, [name, params, body]}
     // Reconstructed from exprToCtValue's anonymous_function handler.
-    if (std.mem.eql(u8, form_name, "fn") and arg_elems.len == 3 and arg_elems[0] == .atom) {
+    if (std.mem.eql(u8, form_name, "fn") and (arg_elems.len == 3 or arg_elems.len == 4) and arg_elems[0] == .atom) {
         {
             const interner_mut: *ast.StringInterner = @constCast(interner);
             const fn_name = try interner_mut.intern(arg_elems[0].atom);
@@ -1152,15 +1170,47 @@ pub fn ctValueToExpr(
             var params: std.ArrayListUnmanaged(ast.Param) = .empty;
             if (arg_elems[1] == .list) {
                 for (arg_elems[1].list.elems) |param_ct| {
-                    if (param_ct == .atom) {
-                        const pat = try alloc.create(ast.Pattern);
-                        pat.* = .{ .bind = .{ .meta = node_meta, .name = try interner_mut.intern(param_ct.atom) } };
-                        try params.append(alloc, .{
-                            .meta = node_meta,
-                            .pattern = pat,
-                            .type_annotation = null,
-                        });
+                    // Handle typed params {:::, meta, [pattern, type]}
+                    if (param_ct == .tuple and param_ct.tuple.elems.len == 3 and
+                        param_ct.tuple.elems[0] == .atom and
+                        std.mem.eql(u8, param_ct.tuple.elems[0].atom, "::"))
+                    {
+                        const param_args = param_ct.tuple.elems[2];
+                        if (param_args == .list and param_args.list.elems.len == 2) {
+                            const pat_ct = param_args.list.elems[0];
+                            const type_ct = param_args.list.elems[1];
+                            const name_str = if (pat_ct == .atom)
+                                pat_ct.atom
+                            else if (pat_ct == .tuple and pat_ct.tuple.elems.len >= 1 and pat_ct.tuple.elems[0] == .atom)
+                                pat_ct.tuple.elems[0].atom
+                            else
+                                continue;
+                            const pat = try alloc.create(ast.Pattern);
+                            pat.* = .{ .bind = .{ .meta = node_meta, .name = try interner_mut.intern(name_str) } };
+                            // Reconstruct type annotation from CtValue
+                            const type_ann = try ctValueToTypeExpr(alloc, interner_mut, type_ct);
+                            try params.append(alloc, .{
+                                .meta = node_meta,
+                                .pattern = pat,
+                                .type_annotation = type_ann,
+                            });
+                            continue;
+                        }
                     }
+                    // Handle untyped params: atoms or tuples
+                    const param_name = if (param_ct == .atom)
+                        param_ct.atom
+                    else if (param_ct == .tuple and param_ct.tuple.elems.len >= 1 and param_ct.tuple.elems[0] == .atom)
+                        param_ct.tuple.elems[0].atom
+                    else
+                        continue;
+                    const pat = try alloc.create(ast.Pattern);
+                    pat.* = .{ .bind = .{ .meta = node_meta, .name = try interner_mut.intern(param_name) } };
+                    try params.append(alloc, .{
+                        .meta = node_meta,
+                        .pattern = pat,
+                        .type_annotation = null,
+                    });
                 }
             }
 
@@ -1171,11 +1221,17 @@ pub fn ctValueToExpr(
                 try body_stmts.append(alloc, .{ .expr = body_expr });
             }
 
+            // Reconstruct return type if present (4th arg)
+            const return_type: ?*const ast.TypeExpr = if (arg_elems.len >= 4 and arg_elems[3] != .nil)
+                try ctValueToTypeExpr(alloc, interner_mut, arg_elems[3])
+            else
+                null;
+
             const clause = try alloc.create(ast.FunctionClause);
             clause.* = .{
                 .meta = node_meta,
                 .params = try params.toOwnedSlice(alloc),
-                .return_type = null,
+                .return_type = return_type,
                 .refinement = null,
                 .body = try body_stmts.toOwnedSlice(alloc),
             };

@@ -29,6 +29,14 @@ pub module Test.ClosureTest {
     test("compose two applies") {
       assert(apply(apply(20, add_one), doubler) == 42)
     }
+
+    test("anonymous function as callback") {
+      assert(apply(21, fn(x :: i64) -> i64 { x * 2 }) == 42)
+    }
+
+    test("anonymous function addition") {
+      assert(apply(40, fn(x :: i64) -> i64 { x + 2 }) == 42)
+    }
   }
 
   fn add_one(x :: i64) -> i64 {
@@ -49,5 +57,9 @@ pub module Test.ClosureTest {
 
   fn apply_twice(value :: i64, callback :: (i64 -> i64)) -> i64 {
     callback(callback(value))
+  }
+
+  fn test_anon_fn() -> i64 {
+    apply(21, fn(x :: i64) -> i64 { x * 2 })
   }
 }
