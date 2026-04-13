@@ -408,6 +408,16 @@ pub fn compileFiles(
         return error.HirFailed;
     }
 
+    // Monomorphization pass
+    var mono_next_group_id = hir_builder.next_group_id;
+    const mono_result = zap.monomorphize.monomorphize(alloc, &hir_program, @constCast(&type_checker.store), &mono_next_group_id) catch {
+        ctx.diag_engine.err("Error during monomorphization", .{ .start = 0, .end = 0 }) catch {};
+        if (options.show_progress) progress.print("\r\x1b[K", .{}) catch {};
+        emitContextDiagnostics(ctx, alloc);
+        return error.HirFailed;
+    };
+    const mono_program = mono_result.program;
+
     // IR lowering
     step += 1;
     if (options.show_progress) progress.print("\r\x1b[K  [{d}/{d}] IR", .{ step, total_steps }) catch {};
@@ -415,7 +425,7 @@ pub fn compileFiles(
     var ir_builder = zap.ir.IrBuilder.init(alloc, &ctx.interner);
     ir_builder.type_store = &type_checker.store;
     defer ir_builder.deinit();
-    var ir_program = ir_builder.buildProgram(&hir_program) catch {
+    var ir_program = ir_builder.buildProgram(&mono_program) catch {
         ctx.diag_engine.err("Error during IR lowering", .{ .start = 0, .end = 0 }) catch {};
         if (options.show_progress) progress.print("\r\x1b[K", .{}) catch {};
         emitContextDiagnostics(ctx, alloc);
@@ -650,10 +660,19 @@ fn compileSingleModuleIr(
         return error.HirFailed;
     }
 
+    // Monomorphization pass
+    var mono_next_group_id2 = hir_builder.next_group_id;
+    const mono_result2 = zap.monomorphize.monomorphize(alloc, &hir_program, @constCast(&type_checker.store), &mono_next_group_id2) catch {
+        ctx.diag_engine.err("Error during monomorphization", .{ .start = 0, .end = 0 }) catch {};
+        emitContextDiagnostics(ctx, alloc);
+        return error.HirFailed;
+    };
+    const mono_program2 = mono_result2.program;
+
     var ir_builder = zap.ir.IrBuilder.init(alloc, &ctx.interner);
     ir_builder.type_store = &type_checker.store;
     defer ir_builder.deinit();
-    const mod_ir = ir_builder.buildProgram(&hir_program) catch {
+    const mod_ir = ir_builder.buildProgram(&mono_program2) catch {
         ctx.diag_engine.err("Error during IR lowering", .{ .start = 0, .end = 0 }) catch {};
         emitContextDiagnostics(ctx, alloc);
         return error.IrFailed;
