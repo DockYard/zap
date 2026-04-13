@@ -1,29 +1,173 @@
 pub module Test.StringTest {
   use Zest.Case
 
-  describe("strings") {
+  describe("String module") {
     test("string concatenation") {
       assert(("Hello" <> ", " <> "world!") == "Hello, world!")
     }
 
-    test("string function greets correctly") {
-      assert(greet("World") == "Hello, World!")
-    }
-
-    test("String.slice returns substring") {
-      assert(String.slice("hello", 0, 3) == "hel")
-    }
-
-    test("String.length returns byte count") {
+    test("length returns byte count") {
       assert(String.length("hello") == 5)
     }
 
-    test("String.contains checks substring") {
-      assert(String.contains("hello world", "world") == true)
+    test("length of empty string") {
+      assert(String.length("") == 0)
     }
-  }
 
-  fn greet(name :: String) -> String {
-    "Hello, " <> name <> "!"
+    test("byte_at returns character") {
+      assert(String.byte_at("hello", 0) == "h")
+    }
+
+    test("byte_at last character") {
+      assert(String.byte_at("hello", 4) == "o")
+    }
+
+    test("byte_at out of bounds") {
+      assert(String.byte_at("hello", 99) == "")
+    }
+
+    test("contains finds substring") {
+      assert(String.contains("hello world", "world"))
+    }
+
+    test("contains misses substring") {
+      reject(String.contains("hello world", "xyz"))
+    }
+
+    test("contains empty needle") {
+      assert(String.contains("hello", ""))
+    }
+
+    test("starts_with match") {
+      assert(String.starts_with("hello", "hel"))
+    }
+
+    test("starts_with mismatch") {
+      reject(String.starts_with("hello", "world"))
+    }
+
+    test("ends_with match") {
+      assert(String.ends_with("hello", "llo"))
+    }
+
+    test("ends_with mismatch") {
+      reject(String.ends_with("hello", "world"))
+    }
+
+    test("trim whitespace") {
+      assert(String.trim("  hello  ") == "hello")
+    }
+
+    test("slice substring") {
+      assert(String.slice("hello world", 0, 5) == "hello")
+    }
+
+    test("slice second word") {
+      assert(String.slice("hello world", 6, 11) == "world")
+    }
+
+    test("upcase converts lowercase") {
+      assert(String.upcase("hello") == "HELLO")
+    }
+
+    test("upcase preserves non-alpha") {
+      assert(String.upcase("hello 123") == "HELLO 123")
+    }
+
+    test("upcase mixed case") {
+      assert(String.upcase("Hello World") == "HELLO WORLD")
+    }
+
+    test("downcase converts uppercase") {
+      assert(String.downcase("HELLO") == "hello")
+    }
+
+    test("downcase preserves non-alpha") {
+      assert(String.downcase("HELLO 123") == "hello 123")
+    }
+
+    test("downcase mixed case") {
+      assert(String.downcase("Hello World") == "hello world")
+    }
+
+    test("reverse string") {
+      assert(String.reverse("hello") == "olleh")
+    }
+
+    test("reverse short string") {
+      assert(String.reverse("ab") == "ba")
+    }
+
+    test("reverse empty string") {
+      assert(String.reverse("") == "")
+    }
+
+    test("replace single occurrence") {
+      assert(String.replace("hello world", "world", "zap") == "hello zap")
+    }
+
+    test("replace multiple occurrences") {
+      assert(String.replace("aaa", "a", "bb") == "bbbbbb")
+    }
+
+    test("replace no match") {
+      assert(String.replace("hello", "xyz", "abc") == "hello")
+    }
+
+    test("index_of finds substring") {
+      assert(String.index_of("hello world", "world") == 6)
+    }
+
+    test("index_of not found") {
+      assert(String.index_of("hello", "xyz") == -1)
+    }
+
+    test("index_of empty needle") {
+      assert(String.index_of("hello", "") == 0)
+    }
+
+    test("pad_leading adds padding") {
+      assert(String.pad_leading("42", 5, "0") == "00042")
+    }
+
+    test("pad_leading no padding needed") {
+      assert(String.pad_leading("hello", 3, " ") == "hello")
+    }
+
+    test("pad_trailing adds padding") {
+      assert(String.pad_trailing("hi", 5, ".") == "hi...")
+    }
+
+    test("pad_trailing no padding needed") {
+      assert(String.pad_trailing("hello", 3, " ") == "hello")
+    }
+
+    test("repeat string") {
+      assert(String.repeat("ab", 3) == "ababab")
+    }
+
+    test("repeat single char") {
+      assert(String.repeat("x", 5) == "xxxxx")
+    }
+
+    test("repeat zero times") {
+      assert(String.repeat("hi", 0) == "")
+    }
+
+    test("to_integer valid") {
+      assert(String.to_integer("42") == 42)
+    }
+
+    test("to_integer invalid") {
+      assert(String.to_integer("hello") == 0)
+    }
+
+    test("to_float valid") {
+      assert(String.to_float("3.14") == 3.14)
+    }
+
+    test("to_float invalid") {
+      assert(String.to_float("hello") == 0.0)
+    }
   }
 }

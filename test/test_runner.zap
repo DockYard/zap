@@ -27,6 +27,10 @@ pub module Test.TestRunner {
     Test.ClosureTest.run()
     Test.ZestFeaturesTest.run()
     Test.BinaryPatternTest.run()
+    Test.IntegerTest.run()
+    Test.FloatTest.run()
+    Test.BoolTest.run()
+    Test.ListTest.run()
 
     Zest.Runner.run()
   }

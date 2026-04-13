@@ -79,6 +79,19 @@ extern "c" fn zir_builder_emit_orelse(handle: ?*ZirBuilderHandle, operand: u32, 
 extern "c" fn zir_builder_set_call_modifier(handle: ?*ZirBuilderHandle, modifier: u32) void;
 extern "c" fn zir_builder_emit_if_else_inline(handle: ?*ZirBuilderHandle, condition: u32, then_value: u32, else_value: u32) u32;
 
+// Numeric widening (@as coercion)
+extern "c" fn zir_builder_emit_as(handle: ?*ZirBuilderHandle, dest_type: u32, operand: u32) u32;
+
+// Type construction
+extern "c" fn zir_builder_emit_optional_type(handle: ?*ZirBuilderHandle, child_type: u32) u32;
+
+// Return type overrides
+extern "c" fn zir_builder_set_imported_return_type(handle: ?*ZirBuilderHandle, mod_ptr: [*]const u8, mod_len: u32, field_ptr: [*]const u8, field_len: u32) i32;
+
+// Imported type parameters
+extern "c" fn zir_builder_emit_param_imported_type(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32, mod_ptr: [*]const u8, mod_len: u32, field_ptr: [*]const u8, field_len: u32) u32;
+
+
 // Tuple/array construction and element access
 extern "c" fn zir_builder_emit_array_init_anon(handle: ?*ZirBuilderHandle, values_ptr: [*]const u32, values_len: u32) u32;
 extern "c" fn zir_builder_emit_elem_val_imm(handle: ?*ZirBuilderHandle, operand: u32, index: u32) u32;
@@ -245,6 +258,10 @@ fn mapParamType(zig_type: ir.ZigType) u32 {
     };
 }
 
+/// Resolve the ZIR type ref for a list parameter at function begin time.
+/// Emits @import("zap_runtime").ListCell and wraps in optional const pointer.
+/// Returns the type ref, or 0 (void) on failure.
+
 // ---------------------------------------------------------------------------
 // ZirDriver
 // ---------------------------------------------------------------------------
@@ -287,6 +304,8 @@ pub const ZirDriver = struct {
     reuse_backed_struct_locals: std.AutoHashMapUnmanaged(ir.LocalId, []const u8) = .empty,
     reuse_backed_union_locals: std.AutoHashMapUnmanaged(ir.LocalId, ir.UnionInit) = .empty,
     reuse_backed_tuple_locals: std.AutoHashMapUnmanaged(ir.LocalId, usize) = .empty,
+    type_store: ?*const @import("types.zig").TypeStore = null,
+    cached_list_type_ref: u32 = 0,
     capture_param_refs: std.ArrayListUnmanaged(u32) = .empty,
     current_closure_env_ref: ?u32 = null,
     /// Forward-propagating map from locals to closure function IDs.
@@ -805,6 +824,37 @@ pub const ZirDriver = struct {
         }
     }
 
+    /// Resolve a parameter type ref, handling list types specially.
+    /// List types (`[T]`) are emitted as `?*const zap_runtime.ListCell`.
+    const LIST_PARAM_SENTINEL: u32 = 0xFFFFFFFE;
+
+    /// Emit a function parameter, handling list types specially.
+    /// List params use zir_builder_emit_param_imported_type for correct ZIR encoding.
+    fn emitTypedParam(self: *ZirDriver, param: ir.Param) !u32 {
+        if (std.meta.activeTag(param.type_expr) == .list) {
+            const ref = zir_builder_emit_param_imported_type(
+                self.handle,
+                param.name.ptr,
+                @intCast(param.name.len),
+                "zap_runtime",
+                11,
+                "ListType",
+                8,
+            );
+            if (ref == error_ref) return error.EmitFailed;
+            return ref;
+        }
+        const effective_type = mapParamType(param.type_expr);
+        const ref = zir_builder_emit_param(
+            self.handle,
+            param.name.ptr,
+            @intCast(param.name.len),
+            effective_type,
+        );
+        if (ref == error_ref) return error.EmitFailed;
+        return ref;
+    }
+
     fn emitFunction(self: *ZirDriver, func: ir.Function) !void {
         // Detect the entry point using the program's entry function ID.
         // When multiple modules define main, only the one matching the
@@ -824,6 +874,7 @@ pub const ZirDriver = struct {
         self.closure_function_map.clearRetainingCapacity();
         self.capture_param_refs.clearRetainingCapacity();
         self.current_closure_env_ref = null;
+        self.cached_list_type_ref = 0;
         self.skip_next_ret_local = null;
         self.current_function_id = func.id;
         const closure_lowering = self.getClosureLowering(func.id, func.captures.len);
@@ -832,7 +883,10 @@ pub const ZirDriver = struct {
         else
             mapReturnType(func.return_type);
 
-        self.current_ret_type = ret_type;
+        // For list-returning functions, ret_type is 0 (void) from mapReturnType
+        // but the actual return type is set via set_imported_return_type. Mark as
+        // non-void so the ret handler emits value returns, not void returns.
+        self.current_ret_type = if (std.meta.activeTag(func.return_type) == .list) 1 else ret_type;
 
         const emit_name = if (is_main)
             @as([]const u8, "main")
@@ -849,6 +903,12 @@ pub const ZirDriver = struct {
         const is_try_variant = std.mem.endsWith(u8, func.name, "__try");
         if (is_try_variant) {
             if (zir_builder_set_optional_return_type(self.handle) != 0)
+                return error.EmitFailed;
+        }
+
+        // List-returning functions: set return type to @import("zap_runtime").ListType.
+        if (std.meta.activeTag(func.return_type) == .list) {
+            if (zir_builder_set_imported_return_type(self.handle, "zap_runtime", 11, "ListType", 8) != 0)
                 return error.EmitFailed;
         }
 
@@ -932,14 +992,7 @@ pub const ZirDriver = struct {
                 try self.capture_param_refs.append(self.allocator, capture_ref);
             }
             for (func.params, 0..) |param, i| {
-                const effective_type: u32 = mapParamType(param.type_expr);
-                const param_ref = zir_builder_emit_param(
-                    self.handle,
-                    param.name.ptr,
-                    @intCast(param.name.len),
-                    effective_type,
-                );
-                if (param_ref == error_ref) return error.EmitFailed;
+                const param_ref = try self.emitTypedParam(param);
                 try self.param_refs.append(self.allocator, param_ref);
                 try self.setLocal(@intCast(i), param_ref);
             }
@@ -948,14 +1001,7 @@ pub const ZirDriver = struct {
             if (env_param_ref == error_ref) return error.EmitFailed;
             self.current_closure_env_ref = env_param_ref;
             for (func.params, 0..) |param, i| {
-                const effective_type: u32 = mapParamType(param.type_expr);
-                const param_ref = zir_builder_emit_param(
-                    self.handle,
-                    param.name.ptr,
-                    @intCast(param.name.len),
-                    effective_type,
-                );
-                if (param_ref == error_ref) return error.EmitFailed;
+                const param_ref = try self.emitTypedParam(param);
                 try self.param_refs.append(self.allocator, param_ref);
                 try self.setLocal(@intCast(i), param_ref);
             }
@@ -973,14 +1019,7 @@ pub const ZirDriver = struct {
             try self.setLocal(0, args_ref);
         } else {
             for (func.params, 0..) |param, i| {
-                const effective_type: u32 = mapParamType(param.type_expr);
-                const param_ref = zir_builder_emit_param(
-                    self.handle,
-                    param.name.ptr,
-                    @intCast(param.name.len),
-                    effective_type,
-                );
-                if (param_ref == error_ref) return error.EmitFailed;
+                const param_ref = try self.emitTypedParam(param);
                 try self.param_refs.append(self.allocator, param_ref);
                 try self.setLocal(@intCast(i), param_ref);
             }
@@ -2175,60 +2214,53 @@ pub const ZirDriver = struct {
                 }
             },
             .list_init => |li| {
-                // Lists are cons cells: { .head = elem, .tail = { .head = ..., .tail = void } }
-                // Build right-to-left: start with empty (void), prepend each element.
-                const head_name = [_][*]const u8{"head"};
-                const head_len = [_]u32{4};
-                const tail_name = [_][*]const u8{"tail"};
-                const tail_len = [_]u32{4};
-                const cons_names = [_][*]const u8{ "head", "tail" };
-                const cons_lens = [_]u32{ 4, 4 };
+                // Lists are pointer-based cons cells via ListCell.
+                // Empty list = null, non-empty = ?*const ListCell.
+                // Build right-to-left: start with null, prepend each element.
+                const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                if (rt_import == error_ref) return error.EmitFailed;
+                const list_cell = zir_builder_emit_field_val(self.handle, rt_import, "ListCell", 8);
+                if (list_cell == error_ref) return error.EmitFailed;
+                const cons_fn = zir_builder_emit_field_val(self.handle, list_cell, "cons", 4);
+                if (cons_fn == error_ref) return error.EmitFailed;
 
                 if (li.elements.len == 0) {
-                    // Empty list: void
-                    const ref = zir_builder_emit_void(self.handle);
+                    // Empty list: ListCell.empty() — typed null
+                    const empty_fn = zir_builder_emit_field_val(self.handle, list_cell, "empty", 5);
+                    if (empty_fn == error_ref) return error.EmitFailed;
+                    const ref = zir_builder_emit_call_ref(self.handle, empty_fn, &.{}, 0);
                     if (ref == error_ref) return error.EmitFailed;
                     try self.setLocal(li.dest, ref);
                 } else {
-                    // Build from right to left
-                    var current: u32 = zir_builder_emit_void(self.handle);
+                    // Build from right to left, starting with typed null tail
+                    const empty_fn = zir_builder_emit_field_val(self.handle, list_cell, "empty", 5);
+                    if (empty_fn == error_ref) return error.EmitFailed;
+                    var current: u32 = zir_builder_emit_call_ref(self.handle, empty_fn, &.{}, 0);
                     if (current == error_ref) return error.EmitFailed;
 
                     var i: usize = li.elements.len;
                     while (i > 0) {
                         i -= 1;
                         const elem_ref = self.refForLocal(li.elements[i]) catch @intFromEnum(Zir.Inst.Ref.void_value);
-                        const cons_vals = [_]u32{ elem_ref, current };
-                        current = zir_builder_emit_struct_init_anon(
-                            self.handle,
-                            &cons_names,
-                            &cons_lens,
-                            &cons_vals,
-                            2,
-                        );
+                        const call_args = [_]u32{ elem_ref, current };
+                        current = zir_builder_emit_call_ref(self.handle, cons_fn, &call_args, 2);
                         if (current == error_ref) return error.EmitFailed;
                     }
                     try self.setLocal(li.dest, current);
                 }
-                _ = head_name;
-                _ = head_len;
-                _ = tail_name;
-                _ = tail_len;
             },
             .list_cons => |lc| {
-                // List cons: { .head = head, .tail = tail } — pure structural, no runtime call
+                // List cons: ListCell.cons(head, tail)
                 const head_ref = self.refForLocal(lc.head) catch @intFromEnum(Zir.Inst.Ref.void_value);
                 const tail_ref = self.refForLocal(lc.tail) catch @intFromEnum(Zir.Inst.Ref.void_value);
-                const cons_names = [_][*]const u8{ "head", "tail" };
-                const cons_lens = [_]u32{ 4, 4 };
-                const cons_vals = [_]u32{ head_ref, tail_ref };
-                const ref = zir_builder_emit_struct_init_anon(
-                    self.handle,
-                    &cons_names,
-                    &cons_lens,
-                    &cons_vals,
-                    2,
-                );
+                const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                if (rt_import == error_ref) return error.EmitFailed;
+                const list_cell = zir_builder_emit_field_val(self.handle, rt_import, "ListCell", 8);
+                if (list_cell == error_ref) return error.EmitFailed;
+                const cons_fn = zir_builder_emit_field_val(self.handle, list_cell, "cons", 4);
+                if (cons_fn == error_ref) return error.EmitFailed;
+                const call_args = [_]u32{ head_ref, tail_ref };
+                const ref = zir_builder_emit_call_ref(self.handle, cons_fn, &call_args, 2);
                 if (ref == error_ref) return error.EmitFailed;
                 try self.setLocal(lc.dest, ref);
             },
@@ -2364,12 +2396,13 @@ pub const ZirDriver = struct {
             .list_len_check => |llc| {
                 // Cons cell length check via runtime helper.
                 // ListHelpers.length(list) == expected_len
+                // ListCell-based length check: ListCell.length(list) == expected_len
                 const list_ref = self.refForLocal(llc.scrutinee) catch return;
                 const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                 if (rt_import == error_ref) return error.EmitFailed;
-                const helpers = zir_builder_emit_field_val(self.handle, rt_import, "ListHelpers", 11);
-                if (helpers == error_ref) return error.EmitFailed;
-                const len_fn = zir_builder_emit_field_val(self.handle, helpers, "length", 6);
+                const list_cell = zir_builder_emit_field_val(self.handle, rt_import, "ListCell", 8);
+                if (list_cell == error_ref) return error.EmitFailed;
+                const len_fn = zir_builder_emit_field_val(self.handle, list_cell, "length", 6);
                 if (len_fn == error_ref) return error.EmitFailed;
                 const call_args = [_]u32{list_ref};
                 const len_ref = zir_builder_emit_call_ref(self.handle, len_fn, &call_args, 1);
@@ -2382,17 +2415,55 @@ pub const ZirDriver = struct {
                 try self.setLocal(llc.dest, ref);
             },
             .list_get => |lg| {
-                // Cons cell element access: walk lg.index .tail links, then read .head
+                // ListCell-based element access: ListCell.get(list, index)
                 const list_ref = self.refForLocal(lg.list) catch return;
-                var current = list_ref;
-                var i: u32 = 0;
-                while (i < lg.index) : (i += 1) {
-                    current = zir_builder_emit_field_val(self.handle, current, "tail", 4);
-                    if (current == error_ref) return error.EmitFailed;
-                }
-                const ref = zir_builder_emit_field_val(self.handle, current, "head", 4);
+                const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                if (rt_import == error_ref) return error.EmitFailed;
+                const list_cell = zir_builder_emit_field_val(self.handle, rt_import, "ListCell", 8);
+                if (list_cell == error_ref) return error.EmitFailed;
+                const get_fn = zir_builder_emit_field_val(self.handle, list_cell, "get", 3);
+                if (get_fn == error_ref) return error.EmitFailed;
+                const index_ref = zir_builder_emit_int(self.handle, @intCast(lg.index));
+                if (index_ref == error_ref) return error.EmitFailed;
+                const call_args = [_]u32{ list_ref, index_ref };
+                const ref = zir_builder_emit_call_ref(self.handle, get_fn, &call_args, 2);
                 if (ref == error_ref) return error.EmitFailed;
                 try self.setLocal(lg.dest, ref);
+            },
+            .list_is_not_empty => |lne| {
+                // ListCell non-empty check: list != null  (using is_non_null)
+                const list_ref = self.refForValueLocal(lne.list) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                const ref = zir_builder_emit_is_non_null(self.handle, list_ref);
+                if (ref == error_ref) return error.EmitFailed;
+                try self.setLocal(lne.dest, ref);
+            },
+            .list_head => |lh| {
+                // ListCell head extraction: ListCell.getHead(list)
+                const list_ref = self.refForValueLocal(lh.list) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                if (rt_import == error_ref) return error.EmitFailed;
+                const list_cell = zir_builder_emit_field_val(self.handle, rt_import, "ListCell", 8);
+                if (list_cell == error_ref) return error.EmitFailed;
+                const fn_ref = zir_builder_emit_field_val(self.handle, list_cell, "getHead", 7);
+                if (fn_ref == error_ref) return error.EmitFailed;
+                const call_args = [_]u32{list_ref};
+                const ref = zir_builder_emit_call_ref(self.handle, fn_ref, &call_args, 1);
+                if (ref == error_ref) return error.EmitFailed;
+                try self.setLocal(lh.dest, ref);
+            },
+            .list_tail => |lt| {
+                // ListCell tail extraction: ListCell.getTail(list)
+                const list_ref = self.refForValueLocal(lt.list) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                if (rt_import == error_ref) return error.EmitFailed;
+                const list_cell = zir_builder_emit_field_val(self.handle, rt_import, "ListCell", 8);
+                if (list_cell == error_ref) return error.EmitFailed;
+                const fn_ref = zir_builder_emit_field_val(self.handle, list_cell, "getTail", 7);
+                if (fn_ref == error_ref) return error.EmitFailed;
+                const call_args = [_]u32{list_ref};
+                const ref = zir_builder_emit_call_ref(self.handle, fn_ref, &call_args, 1);
+                if (ref == error_ref) return error.EmitFailed;
+                try self.setLocal(lt.dest, ref);
             },
             .map_has_key => |mhk| {
                 // Map key check: MapHelpers.has_key(map, key)
@@ -3262,6 +3333,15 @@ pub const ZirDriver = struct {
             // SSA phi nodes would merge values from different control flow paths;
             // the IR builder uses structured control flow (if_expr, case_block)
             // instead of SSA phi.
+            // Numeric widening — emit @as(DestType, source)
+            .int_widen, .float_widen => |nw| {
+                const source_ref = self.refForValueLocal(nw.source) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                const dest_type_ref = mapReturnType(nw.dest_type);
+                const ref = zir_builder_emit_as(self.handle, dest_type_ref, source_ref);
+                if (ref == error_ref) return error.EmitFailed;
+                try self.setLocal(nw.dest, ref);
+            },
+
             .phi => {},
         }
     }

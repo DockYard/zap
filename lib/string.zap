@@ -65,7 +65,7 @@ pub module String {
 
     ## Examples
 
-        String.starts_with("hello", "hel")  # => true
+        String.starts_with("hello", "hel")   # => true
         String.starts_with("hello", "world") # => false
     """
 
@@ -144,5 +144,154 @@ pub module String {
 
   pub fn to_existing_atom(name :: String) -> Atom {
     :zig.ZapString.to_existing_atom(name)
+  }
+
+  @doc = """
+    Converts all characters to uppercase.
+
+    Only affects ASCII letters (a-z).
+
+    ## Examples
+
+        String.upcase("hello")      # => "HELLO"
+        String.upcase("Hello World") # => "HELLO WORLD"
+        String.upcase("123")        # => "123"
+    """
+
+  pub fn upcase(s :: String) -> String {
+    :zig.Prelude.upcase(s)
+  }
+
+  @doc = """
+    Converts all characters to lowercase.
+
+    Only affects ASCII letters (A-Z).
+
+    ## Examples
+
+        String.downcase("HELLO")      # => "hello"
+        String.downcase("Hello World") # => "hello world"
+        String.downcase("123")        # => "123"
+    """
+
+  pub fn downcase(s :: String) -> String {
+    :zig.Prelude.downcase(s)
+  }
+
+  @doc = """
+    Reverses the bytes of a string.
+
+    ## Examples
+
+        String.reverse("hello")  # => "olleh"
+        String.reverse("abc")    # => "cba"
+        String.reverse("")       # => ""
+    """
+
+  pub fn reverse(s :: String) -> String {
+    :zig.Prelude.reverse_string(s)
+  }
+
+  @doc = """
+    Replaces all occurrences of `pattern` with `replacement`.
+
+    ## Examples
+
+        String.replace("hello world", "world", "zap")  # => "hello zap"
+        String.replace("aaa", "a", "bb")                # => "bbbbbb"
+        String.replace("hello", "xyz", "abc")           # => "hello"
+    """
+
+  pub fn replace(s :: String, pattern :: String, replacement :: String) -> String {
+    :zig.Prelude.replace_string(s, pattern, replacement)
+  }
+
+  @doc = """
+    Returns the index of the first occurrence of `needle` in the
+    string, or -1 if not found.
+
+    ## Examples
+
+        String.index_of("hello world", "world")  # => 6
+        String.index_of("hello", "xyz")           # => -1
+        String.index_of("hello", "")              # => 0
+    """
+
+  pub fn index_of(haystack :: String, needle :: String) -> i64 {
+    :zig.Prelude.index_of(haystack, needle)
+  }
+
+  @doc = """
+    Pads the string on the left to reach the target length using
+    the given padding character.
+
+    ## Examples
+
+        String.pad_leading("42", 5, "0")   # => "00042"
+        String.pad_leading("hello", 3, " ") # => "hello"
+    """
+
+  pub fn pad_leading(s :: String, total_length :: i64, pad_char :: String) -> String {
+    :zig.Prelude.pad_leading(s, total_length, pad_char)
+  }
+
+  @doc = """
+    Pads the string on the right to reach the target length using
+    the given padding character.
+
+    ## Examples
+
+        String.pad_trailing("hi", 5, ".")   # => "hi..."
+        String.pad_trailing("hello", 3, " ") # => "hello"
+    """
+
+  pub fn pad_trailing(s :: String, total_length :: i64, pad_char :: String) -> String {
+    :zig.Prelude.pad_trailing(s, total_length, pad_char)
+  }
+
+  @doc = """
+    Repeats a string the given number of times.
+
+    ## Examples
+
+        String.repeat("ab", 3)  # => "ababab"
+        String.repeat("x", 5)   # => "xxxxx"
+        String.repeat("hi", 0)  # => ""
+    """
+
+  pub fn repeat(s :: String, count :: i64) -> String {
+    :zig.Prelude.repeat_string(s, count)
+  }
+
+  @doc = """
+    Parses a string into an integer. Returns 0 if the string
+    is not a valid integer.
+
+    Delegates to `Integer.parse/1`.
+
+    ## Examples
+
+        String.to_integer("42")    # => 42
+        String.to_integer("hello") # => 0
+    """
+
+  pub fn to_integer(s :: String) -> i64 {
+    Integer.parse(s)
+  }
+
+  @doc = """
+    Parses a string into a float. Returns 0.0 if the string
+    is not a valid float.
+
+    Delegates to `Float.parse/1`.
+
+    ## Examples
+
+        String.to_float("3.14")    # => 3.14
+        String.to_float("hello")   # => 0.0
+    """
+
+  pub fn to_float(s :: String) -> f64 {
+    Float.parse(s)
   }
 }

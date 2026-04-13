@@ -72,6 +72,8 @@ pub const Function = struct {
     arity: u32,
     params: []const Param,
     return_type: ZigType,
+    /// Original TypeStore TypeId for the return type, preserved for list type detection.
+    return_type_id: ?types_mod.TypeId = null,
     body: []const Block,
     is_closure: bool,
     captures: []const Capture,
@@ -92,6 +94,8 @@ pub const DefaultValue = union(enum) {
 pub const Param = struct {
     name: []const u8,
     type_expr: ZigType,
+    /// Original TypeStore TypeId, preserved for list type detection.
+    type_id: ?types_mod.TypeId = null,
 };
 
 pub const Capture = struct {
@@ -138,6 +142,9 @@ pub const Instruction = union(enum) {
     index_get: IndexGet,
     list_len_check: ListLenCheck,
     list_get: ListGet,
+    list_is_not_empty: ListIsNotEmpty,
+    list_head: ListHeadTail,
+    list_tail: ListHeadTail,
     map_has_key: MapHasKey,
     map_get: MapGet,
 
@@ -205,6 +212,10 @@ pub const Instruction = union(enum) {
     // Perceus reuse (Koka-inspired)
     reset: Reset,
     reuse_alloc: ReuseAlloc,
+
+    // Numeric widening
+    int_widen: NumericWiden,
+    float_widen: NumericWiden,
 
     // Phi
     phi: Phi,
@@ -335,6 +346,16 @@ pub const ListGet = struct {
     dest: LocalId,
     list: LocalId,
     index: u32,
+};
+
+pub const ListIsNotEmpty = struct {
+    dest: LocalId,
+    list: LocalId,
+};
+
+pub const ListHeadTail = struct {
+    dest: LocalId,
+    list: LocalId,
 };
 
 pub const MapHasKey = struct {
@@ -551,6 +572,12 @@ pub const FieldBinding = struct {
     field_name: []const u8,
     local_name: []const u8,
     local_index: LocalId,
+};
+
+pub const NumericWiden = struct {
+    dest: LocalId,
+    source: LocalId,
+    dest_type: ZigType,
 };
 
 pub const LiteralValue = union(enum) {
@@ -1031,6 +1058,7 @@ pub const IrBuilder = struct {
             try params.append(self.allocator, .{
                 .name = name,
                 .type_expr = resolved_type,
+                .type_id = param.type_id,
             });
         }
 
@@ -1293,6 +1321,7 @@ pub const IrBuilder = struct {
             .arity = group.arity,
             .params = final_params,
             .return_type = return_type,
+            .return_type_id = first_clause.return_type,
             .body = try self.allocSlice(Block, &.{entry_block}),
             .is_closure = group.captures.len > 0,
             .captures = try captures.toOwnedSlice(self.allocator),
@@ -2699,6 +2728,47 @@ pub const IrBuilder = struct {
                 });
                 try self.lowerDecisionTreeForCase(cl.failure, case_arms, scrutinee_map, 0);
             },
+            .check_list_cons => |clc| {
+                const scrutinee_local = self.resolveScrutinee(clc.scrutinee, scrutinee_map);
+                const not_empty_local = self.next_local;
+                self.next_local += 1;
+                try self.current_instrs.append(self.allocator, .{
+                    .list_is_not_empty = .{ .dest = not_empty_local, .list = scrutinee_local },
+                });
+                const saved = self.current_instrs;
+                self.current_instrs = .empty;
+                var i: u32 = 0;
+                var current_list = scrutinee_local;
+                while (i < clc.head_count) : (i += 1) {
+                    const head_local = self.next_local;
+                    self.next_local += 1;
+                    try self.current_instrs.append(self.allocator, .{
+                        .list_head = .{ .dest = head_local, .list = current_list },
+                    });
+                    try scrutinee_map.put(clc.head_scrutinee_ids[i], head_local);
+                    if (i + 1 < clc.head_count) {
+                        const next_list = self.next_local;
+                        self.next_local += 1;
+                        try self.current_instrs.append(self.allocator, .{
+                            .list_tail = .{ .dest = next_list, .list = current_list },
+                        });
+                        current_list = next_list;
+                    }
+                }
+                const tail_local = self.next_local;
+                self.next_local += 1;
+                try self.current_instrs.append(self.allocator, .{
+                    .list_tail = .{ .dest = tail_local, .list = current_list },
+                });
+                try scrutinee_map.put(clc.tail_scrutinee_id, tail_local);
+                try self.lowerDecisionTreeForCase(clc.success, case_arms, scrutinee_map, 0);
+                const success_body = try self.current_instrs.toOwnedSlice(self.allocator);
+                self.current_instrs = saved;
+                try self.current_instrs.append(self.allocator, .{
+                    .guard_block = .{ .condition = not_empty_local, .body = success_body },
+                });
+                try self.lowerDecisionTreeForCase(clc.failure, case_arms, scrutinee_map, 0);
+            },
             .check_binary => |cb| {
                 const scrutinee_local = self.resolveScrutinee(cb.scrutinee, scrutinee_map);
                 const len_check_local = self.next_local;
@@ -2928,6 +2998,51 @@ pub const IrBuilder = struct {
                     .guard_block = .{ .condition = len_check_local, .body = success_body },
                 });
                 try self.lowerDecisionTreeForDispatch(cl.failure, clauses, scrutinee_map);
+            },
+            .check_list_cons => |clc| {
+                const scrutinee_local = self.resolveScrutinee(clc.scrutinee, scrutinee_map);
+                // Emit non-empty check: ListCell.isEmpty(list) == false
+                const not_empty_local = self.next_local;
+                self.next_local += 1;
+                try self.current_instrs.append(self.allocator, .{
+                    .list_is_not_empty = .{ .dest = not_empty_local, .list = scrutinee_local },
+                });
+                const saved = self.current_instrs;
+                self.current_instrs = .empty;
+                // Extract head elements
+                var i: u32 = 0;
+                var current_list = scrutinee_local;
+                while (i < clc.head_count) : (i += 1) {
+                    const head_local = self.next_local;
+                    self.next_local += 1;
+                    try self.current_instrs.append(self.allocator, .{
+                        .list_head = .{ .dest = head_local, .list = current_list },
+                    });
+                    try scrutinee_map.put(clc.head_scrutinee_ids[i], head_local);
+                    if (i + 1 < clc.head_count) {
+                        const next_list = self.next_local;
+                        self.next_local += 1;
+                        try self.current_instrs.append(self.allocator, .{
+                            .list_tail = .{ .dest = next_list, .list = current_list },
+                        });
+                        current_list = next_list;
+                    }
+                }
+                // Extract tail
+                const tail_local = self.next_local;
+                self.next_local += 1;
+                try self.current_instrs.append(self.allocator, .{
+                    .list_tail = .{ .dest = tail_local, .list = current_list },
+                });
+                try scrutinee_map.put(clc.tail_scrutinee_id, tail_local);
+
+                try self.lowerDecisionTreeForDispatch(clc.success, clauses, scrutinee_map);
+                const success_body = try self.current_instrs.toOwnedSlice(self.allocator);
+                self.current_instrs = saved;
+                try self.current_instrs.append(self.allocator, .{
+                    .guard_block = .{ .condition = not_empty_local, .body = success_body },
+                });
+                try self.lowerDecisionTreeForDispatch(clc.failure, clauses, scrutinee_map);
             },
             .check_binary => |cb| {
                 const scrutinee_local = self.resolveScrutinee(cb.scrutinee, scrutinee_map);
@@ -3399,6 +3514,37 @@ pub const IrBuilder = struct {
                     try args.append(self.allocator, lowered_arg);
                     try arg_modes.append(self.allocator, arg.mode);
                 }
+
+                // Implicit numeric widening: insert int_widen/float_widen
+                // when an arg's type is narrower than the expected param type.
+                if (self.type_store) |ts| {
+                    for (call.args, 0..) |arg, i| {
+                        if (i >= args.items.len) break;
+                        const expected = arg.expected_type;
+                        if (expected == types_mod.TypeStore.UNKNOWN) continue;
+                        const actual = arg.expr.type_id;
+                        if (actual == types_mod.TypeStore.UNKNOWN) continue;
+                        if (ts.canWidenTo(actual, expected)) {
+                            const widened_local = self.next_local;
+                            self.next_local += 1;
+                            const dest_zig_type = typeIdToZigTypeWithStore(expected, self.type_store);
+                            const actual_type = ts.getType(actual);
+                            if (actual_type == .int) {
+                                try self.current_instrs.append(self.allocator, .{
+                                    .int_widen = .{ .dest = widened_local, .source = args.items[i], .dest_type = dest_zig_type },
+                                });
+                            } else if (actual_type == .float) {
+                                try self.current_instrs.append(self.allocator, .{
+                                    .float_widen = .{ .dest = widened_local, .source = args.items[i], .dest_type = dest_zig_type },
+                                });
+                            } else {
+                                continue;
+                            }
+                            args.items[i] = widened_local;
+                        }
+                    }
+                }
+
                 switch (call.target) {
                     .direct => |dc| {
                         const lowered_args = try args.toOwnedSlice(self.allocator);
@@ -3880,6 +4026,12 @@ fn findParamGetIdInDecision(decision: *const hir_mod.Decision, target_element: u
                 return cl.scrutinee.kind.param_get;
             }
             return findParamGetIdInDecision(cl.success, target_element);
+        },
+        .check_list_cons => |clc| {
+            if (clc.scrutinee.kind == .param_get) {
+                return clc.scrutinee.kind.param_get;
+            }
+            return findParamGetIdInDecision(clc.success, target_element);
         },
         .check_binary => |cb| {
             if (cb.scrutinee.kind == .param_get) {

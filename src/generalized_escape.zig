@@ -387,6 +387,13 @@ pub const GeneralizedEscapeAnalyzer = struct {
                 const container_escape = self.ctx.getEscape(.{ .function = func_id, .local = lg2.list });
                 try self.setEscapeAndEnqueue(func_id, lg2.dest, container_escape);
             },
+            .list_is_not_empty => |lne| {
+                try self.setEscapeAndEnqueue(func_id, lne.dest, .no_escape);
+            },
+            .list_head, .list_tail => |lht| {
+                const container_escape = self.ctx.getEscape(.{ .function = func_id, .local = lht.list });
+                try self.setEscapeAndEnqueue(func_id, lht.dest, container_escape);
+            },
             .map_has_key => |mhk| {
                 // Result is a boolean derived from the map and key; track both sources.
                 const map_escape = self.ctx.getEscape(.{ .function = func_id, .local = mhk.map });
@@ -584,6 +591,12 @@ pub const GeneralizedEscapeAnalyzer = struct {
                 try self.setEscapeAndEnqueue(func_id, bru.dest_len, .no_escape);
             },
             .bin_match_prefix => |bmp| try self.setEscapeAndEnqueue(func_id, bmp.dest, .no_escape),
+
+            // Numeric widening: dest inherits source escape state.
+            .int_widen, .float_widen => |nw| {
+                const source_escape = self.ctx.getEscape(.{ .function = func_id, .local = nw.source });
+                try self.setEscapeAndEnqueue(func_id, nw.dest, source_escape);
+            },
 
             // Switch tag: no dest, just control flow.
             .switch_tag => {},

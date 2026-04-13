@@ -874,6 +874,18 @@ pub const InterproceduralAnalyzer = struct {
                     }
                 },
 
+                .list_is_not_empty => |lne| {
+                    try fresh_locals.put(lne.dest, {});
+                },
+
+                .list_head, .list_tail => |lht| {
+                    if (aliases.get(lht.list)) |param_set| {
+                        try aliases.put(lht.dest, param_set);
+                    } else {
+                        try fresh_locals.put(lht.dest, {});
+                    }
+                },
+
                 .map_has_key => |mhk| {
                     // Result is a boolean; propagate alias from map source.
                     if (aliases.get(mhk.map)) |param_set| {
@@ -1026,6 +1038,13 @@ pub const InterproceduralAnalyzer = struct {
                 },
                 .bin_match_prefix => |bmp| try fresh_locals.put(bmp.dest, {}),
                 .list_len_check => |llc| try fresh_locals.put(llc.dest, {}),
+                // Numeric widening: dest inherits alias from source.
+                .int_widen, .float_widen => |nw| {
+                    if (aliases.get(nw.source)) |param_set| {
+                        try aliases.put(nw.dest, param_set);
+                    }
+                    try fresh_locals.put(nw.dest, {});
+                },
                 .switch_tag => {},
                 .branch, .cond_branch, .jump, .case_break, .match_fail, .match_error_return => {},
             }

@@ -1,7 +1,7 @@
 pub module Test.AtomTest {
   use Zest.Case
 
-  describe("atoms") {
+  describe("Atom module") {
     test("equal atoms match") {
       assert(:ok == :ok)
     }
@@ -20,6 +20,22 @@ pub module Test.AtomTest {
 
     test("status function returns failure for error") {
       assert(status(:error) == "failure")
+    }
+
+    test("to_string converts atom") {
+      assert(Atom.to_string(:hello) == "hello")
+    }
+
+    test("to_string converts ok") {
+      assert(Atom.to_string(:ok) == "ok")
+    }
+
+    test("from_string creates atom") {
+      assert(Atom.from_string("ok") == :ok)
+    }
+
+    test("from_string roundtrip") {
+      assert(Atom.to_string(Atom.from_string("test")) == "test")
     }
   }
 

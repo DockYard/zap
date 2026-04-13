@@ -944,6 +944,26 @@ pub const Prelude = struct {
         return std.fmt.parseFloat(f64, s) catch null;
     }
 
+    /// Parse string to i64, returning 0 on failure (non-optional).
+    pub fn parse_i64(s: []const u8) i64 {
+        return std.fmt.parseInt(i64, s, 10) catch 0;
+    }
+
+    /// Parse string to f64, returning 0.0 on failure (non-optional).
+    pub fn parse_f64(s: []const u8) f64 {
+        return std.fmt.parseFloat(f64, s) catch 0.0;
+    }
+
+    pub fn div_i64(a: i64, b: i64) i64 {
+        if (b == 0) return 0;
+        return @divTrunc(a, b);
+    }
+
+    pub fn rem_i64(a: i64, b: i64) i64 {
+        if (b == 0) return 0;
+        return @rem(a, b);
+    }
+
     pub fn abs_i64(x: i64) i64 {
         return if (x < 0) -x else x;
     }
@@ -966,6 +986,206 @@ pub const Prelude = struct {
 
     pub fn min_f64(a: f64, b: f64) f64 {
         return @min(a, b);
+    }
+
+    // --- Float math ---
+    pub fn round_f64(x: f64) f64 {
+        return @round(x);
+    }
+
+    pub fn floor_f64(x: f64) f64 {
+        return @floor(x);
+    }
+
+    pub fn ceil_f64(x: f64) f64 {
+        return @ceil(x);
+    }
+
+    pub fn trunc_f64(x: f64) f64 {
+        return @trunc(x);
+    }
+
+    pub fn f64_to_i64(x: f64) i64 {
+        return @intFromFloat(x);
+    }
+
+    pub fn i64_to_f64(x: i64) f64 {
+        return @floatFromInt(x);
+    }
+
+    // --- String operations ---
+    pub fn upcase(s: []const u8) []const u8 {
+        const result = bumpAlloc(s.len);
+        if (result.len == 0) return s;
+        for (s, 0..) |c, i| {
+            result[i] = if (c >= 'a' and c <= 'z') c - 32 else c;
+        }
+        return result;
+    }
+
+    pub fn downcase(s: []const u8) []const u8 {
+        const result = bumpAlloc(s.len);
+        if (result.len == 0) return s;
+        for (s, 0..) |c, i| {
+            result[i] = if (c >= 'A' and c <= 'Z') c + 32 else c;
+        }
+        return result;
+    }
+
+    pub fn reverse_string(s: []const u8) []const u8 {
+        if (s.len == 0) return s;
+        const result = bumpAlloc(s.len);
+        if (result.len == 0) return s;
+        for (s, 0..) |c, i| {
+            result[s.len - 1 - i] = c;
+        }
+        return result;
+    }
+
+    pub fn replace_string(s: []const u8, pattern: []const u8, replacement: []const u8) []const u8 {
+        if (pattern.len == 0) return s;
+        // Count occurrences first
+        var count: usize = 0;
+        var pos: usize = 0;
+        while (pos + pattern.len <= s.len) {
+            if (std.mem.eql(u8, s[pos .. pos + pattern.len], pattern)) {
+                count += 1;
+                pos += pattern.len;
+            } else {
+                pos += 1;
+            }
+        }
+        if (count == 0) return s;
+        const new_len = s.len - (count * pattern.len) + (count * replacement.len);
+        const result = bumpAlloc(new_len);
+        if (result.len == 0) return s;
+        var src: usize = 0;
+        var dst: usize = 0;
+        while (src < s.len) {
+            if (src + pattern.len <= s.len and std.mem.eql(u8, s[src .. src + pattern.len], pattern)) {
+                @memcpy(result[dst .. dst + replacement.len], replacement);
+                dst += replacement.len;
+                src += pattern.len;
+            } else {
+                result[dst] = s[src];
+                dst += 1;
+                src += 1;
+            }
+        }
+        return result;
+    }
+
+    pub fn index_of(haystack: []const u8, needle: []const u8) i64 {
+        if (needle.len == 0) return 0;
+        if (needle.len > haystack.len) return -1;
+        if (std.mem.indexOf(u8, haystack, needle)) |idx| {
+            return @intCast(idx);
+        }
+        return -1;
+    }
+
+    pub fn pad_leading(s: []const u8, total_len: i64, pad_char: []const u8) []const u8 {
+        const target: usize = if (total_len > 0) @intCast(total_len) else return s;
+        if (s.len >= target) return s;
+        const pad_count = target - s.len;
+        const result = bumpAlloc(target);
+        if (result.len == 0) return s;
+        const fill: u8 = if (pad_char.len > 0) pad_char[0] else ' ';
+        @memset(result[0..pad_count], fill);
+        @memcpy(result[pad_count..target], s);
+        return result;
+    }
+
+    pub fn pad_trailing(s: []const u8, total_len: i64, pad_char: []const u8) []const u8 {
+        const target: usize = if (total_len > 0) @intCast(total_len) else return s;
+        if (s.len >= target) return s;
+        const result = bumpAlloc(target);
+        if (result.len == 0) return s;
+        @memcpy(result[0..s.len], s);
+        const fill: u8 = if (pad_char.len > 0) pad_char[0] else ' ';
+        @memset(result[s.len..target], fill);
+        return result;
+    }
+
+    pub fn split_string(s: []const u8, delimiter: []const u8) []const u8 {
+        // Returns a single bump-allocated buffer: count (as 4-byte LE) followed by
+        // length-prefixed segments.  The Zap wrapper peels segments off with slice().
+        if (delimiter.len == 0) return s;
+
+        // First pass: count segments and total size
+        var seg_count: usize = 1;
+        var total: usize = 0;
+        {
+            var pos: usize = 0;
+            while (pos < s.len) {
+                if (pos + delimiter.len <= s.len and std.mem.eql(u8, s[pos .. pos + delimiter.len], delimiter)) {
+                    seg_count += 1;
+                    pos += delimiter.len;
+                } else {
+                    total += 1;
+                    pos += 1;
+                }
+            }
+        }
+
+        // For simplicity, encode as "seg1\x00seg2\x00seg3" (null-separated).
+        // The Zap side counts nulls to split.
+        const result_len = total + seg_count - 1; // segments + null separators
+        const result = bumpAlloc(result_len);
+        if (result.len == 0) return s;
+        var dst: usize = 0;
+        var pos: usize = 0;
+        while (pos < s.len) {
+            if (pos + delimiter.len <= s.len and std.mem.eql(u8, s[pos .. pos + delimiter.len], delimiter)) {
+                if (dst < result_len) {
+                    result[dst] = 0;
+                    dst += 1;
+                }
+                pos += delimiter.len;
+            } else {
+                if (dst < result_len) {
+                    result[dst] = s[pos];
+                    dst += 1;
+                }
+                pos += 1;
+            }
+        }
+        return result[0..dst];
+    }
+
+    pub fn split_count(s: []const u8) i64 {
+        if (s.len == 0) return 1;
+        var count: i64 = 1;
+        for (s) |c| {
+            if (c == 0) count += 1;
+        }
+        return count;
+    }
+
+    pub fn split_get(s: []const u8, index: i64) []const u8 {
+        const idx: usize = if (index >= 0) @intCast(index) else return "";
+        var seg_start: usize = 0;
+        var current: usize = 0;
+        for (s, 0..) |c, i| {
+            if (c == 0) {
+                if (current == idx) return s[seg_start..i];
+                current += 1;
+                seg_start = i + 1;
+            }
+        }
+        if (current == idx) return s[seg_start..s.len];
+        return "";
+    }
+
+    pub fn repeat_string(s: []const u8, count: i64) []const u8 {
+        if (count <= 0 or s.len == 0) return "";
+        const n: usize = @intCast(count);
+        const result = bumpAlloc(s.len * n);
+        if (result.len == 0) return s;
+        for (0..n) |i| {
+            @memcpy(result[i * s.len .. (i + 1) * s.len], s);
+        }
+        return result;
     }
 
     pub fn atom_name(id: anytype) []const u8 {
@@ -1060,13 +1280,31 @@ pub const TestTracker = struct {
 
     pub fn summary() i64 {
         const stdout = std.fs.File.stdout().deprecatedWriter();
-        stdout.print("\n\n{d} tests, {d} failures\n{d} assertions, {d} failures\n", .{
-            test_count,
-            test_failures,
-            assertion_count,
-            assertion_failures,
-        }) catch {};
+        stdout.print("\n\n", .{}) catch {};
+        writeI64(test_count);
+        stdout.print(" tests, ", .{}) catch {};
+        writeI64(test_failures);
+        stdout.print(" failures\n", .{}) catch {};
+        writeI64(assertion_count);
+        stdout.print(" assertions, ", .{}) catch {};
+        writeI64(assertion_failures);
+        stdout.print(" failures\n", .{}) catch {};
         return test_failures;
+    }
+
+    fn writeI64(val: i64) void {
+        const stdout = std.fs.File.stdout().deprecatedWriter();
+        if (val < 0) {
+            stdout.print("-", .{}) catch {};
+            writeI64(-val);
+            return;
+        }
+        if (val >= 10) {
+            writeI64(@divTrunc(val, 10));
+        }
+        const digit: u8 = @intCast(@mod(val, 10));
+        const buf = [1]u8{'0' + digit};
+        _ = stdout.write(&buf) catch 0;
     }
 };
 
@@ -1229,26 +1467,222 @@ pub const BinaryHelpers = struct {
 // ListHelpers — List cons (prepend) for for-comprehension results
 // ============================================================
 
+// ============================================================
+// ListCell — Concrete cons-cell for pointer-based lists.
+//
+// Lists use nullable pointers: null = empty, non-null = cons cell.
+// This allows runtime empty/non-empty checks that survive ZIR.
+// ============================================================
+
+/// Type alias for list values — used by the ZIR builder to type list parameters.
+pub const ListType = ?*const ListCell;
+
+pub const ListCell = struct {
+    head: i64,
+    tail: ?*const ListCell,
+
+    /// Return a typed empty list (null pointer with correct type).
+    pub fn empty() ?*const ListCell {
+        return null;
+    }
+
+    /// Allocate a new cons cell on the bump allocator.
+    pub fn cons(head: i64, tail: ?*const ListCell) ?*const ListCell {
+        const bytes = bumpAlloc(@sizeOf(ListCell));
+        if (bytes.len == 0) return null;
+        const cell: *ListCell = @ptrCast(@alignCast(bytes.ptr));
+        cell.* = .{ .head = head, .tail = tail };
+        return cell;
+    }
+
+    /// Get the head value. Returns 0 for empty lists.
+    pub fn getHead(list: ?*const ListCell) i64 {
+        if (list) |cell| return cell.head;
+        return 0;
+    }
+
+    /// Get the tail. Returns null for empty or single-element lists.
+    pub fn getTail(list: ?*const ListCell) ?*const ListCell {
+        if (list) |cell| return cell.tail;
+        return null;
+    }
+
+    /// Check if a list is empty.
+    pub fn isEmpty(list: ?*const ListCell) bool {
+        return list == null;
+    }
+
+    /// Get the length of a list.
+    pub fn length(list: ?*const ListCell) i64 {
+        var current = list;
+        var count: i64 = 0;
+        while (current) |cell| {
+            count += 1;
+            current = cell.tail;
+        }
+        return count;
+    }
+
+    /// Get element at index (zero-based). Returns 0 if out of bounds.
+    pub fn get(list: ?*const ListCell, index: i64) i64 {
+        var current = list;
+        var i: i64 = 0;
+        while (current) |cell| {
+            if (i == index) return cell.head;
+            current = cell.tail;
+            i += 1;
+        }
+        return 0;
+    }
+
+    /// Last element. Returns 0 for empty.
+    pub fn last(list: ?*const ListCell) i64 {
+        var current = list;
+        var result: i64 = 0;
+        while (current) |cell| {
+            result = cell.head;
+            current = cell.tail;
+        }
+        return result;
+    }
+
+    /// Sum of all elements.
+    pub fn sum(list: ?*const ListCell) i64 {
+        var current = list;
+        var total: i64 = 0;
+        while (current) |cell| {
+            total += cell.head;
+            current = cell.tail;
+        }
+        return total;
+    }
+
+    /// Product of all elements. Returns 1 for empty.
+    pub fn product(list: ?*const ListCell) i64 {
+        var current = list;
+        var total: i64 = 1;
+        while (current) |cell| {
+            total *= cell.head;
+            current = cell.tail;
+        }
+        return total;
+    }
+
+    /// Maximum element. Returns 0 for empty.
+    pub fn maxVal(list: ?*const ListCell) i64 {
+        if (list == null) return 0;
+        var current = list;
+        var result: i64 = list.?.head;
+        while (current) |cell| {
+            if (cell.head > result) result = cell.head;
+            current = cell.tail;
+        }
+        return result;
+    }
+
+    /// Minimum element. Returns 0 for empty.
+    pub fn minVal(list: ?*const ListCell) i64 {
+        if (list == null) return 0;
+        var current = list;
+        var result: i64 = list.?.head;
+        while (current) |cell| {
+            if (cell.head < result) result = cell.head;
+            current = cell.tail;
+        }
+        return result;
+    }
+
+    /// Check if the list contains a value.
+    pub fn contains(list: ?*const ListCell, value: i64) bool {
+        var current = list;
+        while (current) |cell| {
+            if (cell.head == value) return true;
+            current = cell.tail;
+        }
+        return false;
+    }
+
+    /// Reverse a list.
+    pub fn reverse(list: ?*const ListCell) ?*const ListCell {
+        var current = list;
+        var result: ?*const ListCell = null;
+        while (current) |cell| {
+            result = cons(cell.head, result);
+            current = cell.tail;
+        }
+        return result;
+    }
+
+    /// Append a value to the end.
+    pub fn append(list: ?*const ListCell, value: i64) ?*const ListCell {
+        // reverse, prepend, reverse
+        return reverse(cons(value, reverse(list)));
+    }
+
+    /// Concatenate two lists.
+    pub fn concat(first: ?*const ListCell, second: ?*const ListCell) ?*const ListCell {
+        if (first == null) return second;
+        var reversed_first = reverse(first);
+        var result = second;
+        while (reversed_first) |cell| {
+            result = cons(cell.head, result);
+            reversed_first = cell.tail;
+        }
+        return result;
+    }
+
+    /// Take first N elements.
+    pub fn take(list: ?*const ListCell, count: i64) ?*const ListCell {
+        if (count <= 0 or list == null) return null;
+        var current = list;
+        var collected: ?*const ListCell = null;
+        var remaining: i64 = count;
+        while (current) |cell| {
+            if (remaining <= 0) break;
+            collected = cons(cell.head, collected);
+            current = cell.tail;
+            remaining -= 1;
+        }
+        return reverse(collected);
+    }
+
+    /// Drop first N elements.
+    pub fn drop(list: ?*const ListCell, count: i64) ?*const ListCell {
+        if (count <= 0) return list;
+        var current = list;
+        var remaining: i64 = count;
+        while (current) |cell| {
+            if (remaining <= 0) return current;
+            current = cell.tail;
+            remaining -= 1;
+        }
+        return null;
+    }
+
+    /// Remove duplicates, preserving first occurrence order.
+    pub fn uniq(list: ?*const ListCell) ?*const ListCell {
+        var current = list;
+        var result: ?*const ListCell = null;
+        while (current) |cell| {
+            if (!contains(result, cell.head)) {
+                result = cons(cell.head, result);
+            }
+            current = cell.tail;
+        }
+        return reverse(result);
+    }
+};
+
 pub const ListHelpers = struct {
     /// Check if a list is empty (void = empty, anything else = non-empty).
-    pub fn isEmpty(list: anytype) bool {
+    pub fn isEmpty_legacy(list: anytype) bool {
         return @sizeOf(@TypeOf(list)) == 0;
     }
 
-    /// Get the length of a cons-cell list.
-    pub fn length(list: anytype) i64 {
-        const T = @TypeOf(list);
-        if (@sizeOf(T) == 0) return 0;
-        const info = @typeInfo(T);
-        if (info != .@"struct") return 0;
-        const has_tail = comptime blk: {
-            for (info.@"struct".fields) |f| {
-                if (std.mem.eql(u8, f.name, "tail")) break :blk true;
-            }
-            break :blk false;
-        };
-        if (!has_tail) return 0;
-        return 1 + length(list.tail);
+    /// Get the length of a cons-cell list (legacy anonymous struct version).
+    pub fn length_legacy(list: anytype) i64 {
+        if (@sizeOf(@TypeOf(list)) == 0) return 0;
+        return 1 + length_legacy(list.tail);
     }
 };
 

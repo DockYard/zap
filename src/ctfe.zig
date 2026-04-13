@@ -817,6 +817,14 @@ fn hashInstruction(hasher: *std.hash.Wyhash, instr: ir.Instruction) void {
             hasher.update(std.mem.asBytes(&v.list));
             hasher.update(std.mem.asBytes(&v.index));
         },
+        .list_is_not_empty => |v| {
+            hasher.update(std.mem.asBytes(&v.dest));
+            hasher.update(std.mem.asBytes(&v.list));
+        },
+        .list_head, .list_tail => |v| {
+            hasher.update(std.mem.asBytes(&v.dest));
+            hasher.update(std.mem.asBytes(&v.list));
+        },
         .map_has_key => |v| {
             hasher.update(std.mem.asBytes(&v.dest));
             hasher.update(std.mem.asBytes(&v.map));
@@ -1062,6 +1070,11 @@ fn hashInstruction(hasher: *std.hash.Wyhash, instr: ir.Instruction) void {
             hasher.update(std.mem.asBytes(&v.dest));
             if (v.token) |t| hasher.update(std.mem.asBytes(&t));
             hasher.update(std.mem.asBytes(&v.constructor_tag));
+            hashZigType(hasher, v.dest_type);
+        },
+        .int_widen, .float_widen => |v| {
+            hasher.update(std.mem.asBytes(&v.dest));
+            hasher.update(std.mem.asBytes(&v.source));
             hashZigType(hasher, v.dest_type);
         },
         .phi => |v| {
@@ -1517,6 +1530,70 @@ pub const Interpreter = struct {
             .list_get => |lg| {
                 const result = try self.evalListGet(lg, frame);
                 frame.setLocal(lg.dest, result);
+                return .continued;
+            },
+            .list_is_not_empty => |lne| {
+                const list_val = try self.readLocal(frame, lne.list);
+                const is_not_empty: bool = switch (list_val) {
+                    .list => |l| l.elems.len > 0,
+                    .nil => false,
+                    else => true,
+                };
+                frame.setLocal(lne.dest, .{ .bool_val = is_not_empty });
+                return .continued;
+            },
+            .list_head => |lh| {
+                const list_val = try self.readLocal(frame, lh.list);
+                switch (list_val) {
+                    .list => |l| {
+                        if (l.elems.len == 0) {
+                            try self.emitError(.index_out_of_bounds, "list_head on empty list");
+                            return error.CtfeFailure;
+                        }
+                        frame.setLocal(lh.dest, l.elems[0]);
+                    },
+                    .tuple => |t| {
+                        if (t.elems.len == 0) {
+                            try self.emitError(.index_out_of_bounds, "list_head on empty cons cell");
+                            return error.CtfeFailure;
+                        }
+                        frame.setLocal(lh.dest, t.elems[0]);
+                    },
+                    else => {
+                        try self.emitError(.type_error, "list_head on non-list value");
+                        return error.CtfeFailure;
+                    },
+                }
+                return .continued;
+            },
+            .list_tail => |lt| {
+                const list_val = try self.readLocal(frame, lt.list);
+                switch (list_val) {
+                    .list => |l| {
+                        if (l.elems.len == 0) {
+                            try self.emitError(.index_out_of_bounds, "list_tail on empty list");
+                            return error.CtfeFailure;
+                        }
+                        if (l.elems.len == 1) {
+                            frame.setLocal(lt.dest, .nil);
+                        } else {
+                            const tail_elems = try self.allocator.alloc(CtValue, l.elems.len - 1);
+                            @memcpy(tail_elems, l.elems[1..]);
+                            frame.setLocal(lt.dest, .{ .list = .{ .alloc_id = l.alloc_id, .elems = tail_elems } });
+                        }
+                    },
+                    .tuple => |t| {
+                        if (t.elems.len < 2) {
+                            try self.emitError(.index_out_of_bounds, "list_tail on cons cell with no tail");
+                            return error.CtfeFailure;
+                        }
+                        frame.setLocal(lt.dest, t.elems[1]);
+                    },
+                    else => {
+                        try self.emitError(.type_error, "list_tail on non-list value");
+                        return error.CtfeFailure;
+                    },
+                }
                 return .continued;
             },
             .map_has_key => |mhk| {
@@ -1995,6 +2072,12 @@ pub const Interpreter = struct {
                     return .continued;
                 };
                 frame.setLocal(bmp.dest, .{ .bool_val = std.mem.startsWith(u8, source, bmp.expected) });
+                return .continued;
+            },
+
+            // === Numeric widening (identity at CTFE — values are untyped) ===
+            .int_widen, .float_widen => |nw| {
+                frame.setLocal(nw.dest, try self.readLocal(frame, nw.source));
                 return .continued;
             },
 

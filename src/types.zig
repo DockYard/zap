@@ -376,6 +376,42 @@ pub const TypeStore = struct {
 
         return false;
     }
+
+    /// Check if a value of type `from` can be implicitly widened to type `to`.
+    /// Widening is lossless numeric coercion:
+    ///   Integer: i8→i16→i32→i64, u8→u16→u32→u64
+    ///   Unsigned→Signed: u8→i16, u16→i32, u32→i64 (needs strictly more bits)
+    ///   Float: f16→f32→f64
+    ///   No cross-family (int↔float) widening.
+    pub fn canWidenTo(self: *const TypeStore, from: TypeId, to: TypeId) bool {
+        if (from == to) return false;
+        if (from == UNKNOWN or to == UNKNOWN) return false;
+        const from_t = self.getType(from);
+        const to_t = self.getType(to);
+
+        // Integer widening
+        if (from_t == .int and to_t == .int) {
+            const f = from_t.int;
+            const t = to_t.int;
+            if (f.signedness == t.signedness) {
+                // Same signedness: just need wider bits
+                return t.bits > f.bits;
+            }
+            // Unsigned → Signed: target must have strictly more bits
+            if (f.signedness == .unsigned and t.signedness == .signed) {
+                return t.bits > f.bits;
+            }
+            // Signed → Unsigned: never implicit (lossy for negatives)
+            return false;
+        }
+
+        // Float widening
+        if (from_t == .float and to_t == .float) {
+            return to_t.float.bits > from_t.float.bits;
+        }
+
+        return false;
+    }
 };
 
 // ============================================================

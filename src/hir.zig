@@ -231,6 +231,7 @@ pub const CallExpr = struct {
 pub const CallArg = struct {
     expr: *const Expr,
     mode: ValueMode = .share,
+    expected_type: types_mod.TypeId = types_mod.TypeStore.UNKNOWN,
 };
 
 pub const NamedCall = struct {
@@ -374,6 +375,8 @@ pub const Decision = union(enum) {
     check_tuple: CheckTupleNode,
     /// Check list length
     check_list: CheckListNode,
+    /// Check list cons (non-empty list with head/tail extraction)
+    check_list_cons: CheckListConsNode,
     /// Check binary data (length + segment extraction)
     check_binary: CheckBinaryNode,
     /// Bind a variable and continue
@@ -443,6 +446,17 @@ pub const CheckTupleNode = struct {
 pub const CheckListNode = struct {
     scrutinee: *const Expr,
     expected_length: u32,
+    success: *const Decision,
+    failure: *const Decision,
+};
+
+pub const CheckListConsNode = struct {
+    scrutinee: *const Expr,
+    /// Number of head elements extracted (typically 1 for [h | t])
+    head_count: u32,
+    /// Scrutinee IDs for extracted heads and tail
+    head_scrutinee_ids: []const u32,
+    tail_scrutinee_id: u32,
     success: *const Decision,
     failure: *const Decision,
 };
@@ -703,6 +717,22 @@ fn compileConstructorColumn(
         .span = .{ .start = 0, .end = 0 },
     };
 
+    // Check if any row has a list_cons pattern — if so, prefer compileListConsCheck
+    // because it handles both cons and empty patterns correctly.
+    var has_list_cons = false;
+    for (matrix.rows) |row| {
+        if (row.patterns.len > 0 and !isWildcardPattern(row.patterns[0])) {
+            if (row.patterns[0].?.* == .list_cons) {
+                has_list_cons = true;
+                break;
+            }
+        }
+    }
+
+    if (has_list_cons) {
+        return compileListConsCheck(allocator, matrix, scrutinee_ids, scrutinee_expr, next_id);
+    }
+
     switch (first_constructor.?.*) {
         .literal => |lit| {
             switch (lit) {
@@ -723,6 +753,10 @@ fn compileConstructorColumn(
         .list => {
             // List constructors -> check_list (same structure as check_tuple but for slices)
             return compileListCheck(allocator, matrix, scrutinee_ids, scrutinee_expr, next_id);
+        },
+        .list_cons => {
+            // List cons patterns -> check_list_cons (non-empty check + head/tail extraction)
+            return compileListConsCheck(allocator, matrix, scrutinee_ids, scrutinee_expr, next_id);
         },
         .binary_match => {
             // Binary constructors -> check_binary
@@ -1184,6 +1218,110 @@ fn compileListCheck(
     return current_failure;
 }
 
+fn compileListConsCheck(
+    allocator: std.mem.Allocator,
+    matrix: PatternMatrix,
+    scrutinee_ids: []const u32,
+    scrutinee_expr: *const Expr,
+    next_id: *u32,
+) anyerror!*const Decision {
+    const remaining_scrutinees = if (scrutinee_ids.len > 1) scrutinee_ids[1..] else @as([]const u32, &.{});
+
+    // Build wildcard/empty failure base (rows with wildcard or [] patterns)
+    var wildcard_rows: std.ArrayList(PatternRow) = .empty;
+    for (matrix.rows) |row| {
+        if (row.patterns.len == 0) continue;
+        const pat = row.patterns[0];
+        if (isWildcardPattern(pat) or (pat != null and pat.?.* == .list and pat.?.list.len == 0)) {
+            const new_pats = if (row.patterns.len > 1) row.patterns[1..] else @as([]const ?*const MatchPattern, &.{});
+            try wildcard_rows.append(allocator, .{ .patterns = new_pats, .body_index = row.body_index, .guard = row.guard });
+        }
+    }
+    const failure = try compilePatternMatrix(allocator, .{
+        .rows = try wildcard_rows.toOwnedSlice(allocator),
+        .column_count = if (matrix.column_count > 0) matrix.column_count - 1 else 0,
+    }, remaining_scrutinees, next_id);
+
+    // For cons patterns, extract heads and tail into new scrutinee columns.
+    // Determine head_count from the first cons pattern.
+    var head_count: u32 = 1;
+    for (matrix.rows) |row| {
+        if (row.patterns.len == 0) continue;
+        const pat = row.patterns[0];
+        if (!isWildcardPattern(pat) and pat.?.* == .list_cons) {
+            head_count = @intCast(pat.?.list_cons.heads.len);
+            break;
+        }
+    }
+
+    // Allocate scrutinee IDs for head elements and tail
+    var head_ids: std.ArrayList(u32) = .empty;
+    for (0..head_count) |_| {
+        try head_ids.append(allocator, next_id.*);
+        next_id.* += 1;
+    }
+    const tail_id = next_id.*;
+    next_id.* += 1;
+
+    // Build success rows: expand [h | t] into h, t columns
+    var new_scrutinee_list: std.ArrayList(u32) = .empty;
+    for (head_ids.items) |hid| try new_scrutinee_list.append(allocator, hid);
+    try new_scrutinee_list.append(allocator, tail_id);
+    for (remaining_scrutinees) |s| try new_scrutinee_list.append(allocator, s);
+
+    const new_col_count = head_count + 1 + (matrix.column_count - 1);
+
+    var success_rows: std.ArrayList(PatternRow) = .empty;
+    for (matrix.rows) |row| {
+        if (row.patterns.len == 0) continue;
+        const pat = row.patterns[0];
+        const rest_pats = if (row.patterns.len > 1) row.patterns[1..] else @as([]const ?*const MatchPattern, &.{});
+
+        if (!isWildcardPattern(pat) and pat.?.* == .list_cons) {
+            // Expand [h1, h2, ... | t] into h1, h2, ..., t columns
+            var expanded: std.ArrayList(?*const MatchPattern) = .empty;
+            for (pat.?.list_cons.heads) |head| {
+                try expanded.append(allocator, head);
+            }
+            try expanded.append(allocator, pat.?.list_cons.tail);
+            for (rest_pats) |rp| try expanded.append(allocator, rp);
+            try success_rows.append(allocator, .{
+                .patterns = try expanded.toOwnedSlice(allocator),
+                .body_index = row.body_index,
+                .guard = row.guard,
+            });
+        } else if (isWildcardPattern(pat)) {
+            // Wildcards match cons too — expand as N+1 wildcards
+            var expanded: std.ArrayList(?*const MatchPattern) = .empty;
+            for (0..(head_count + 1)) |_| {
+                try expanded.append(allocator, null);
+            }
+            for (rest_pats) |rp| try expanded.append(allocator, rp);
+            try success_rows.append(allocator, .{
+                .patterns = try expanded.toOwnedSlice(allocator),
+                .body_index = row.body_index,
+                .guard = row.guard,
+            });
+        }
+    }
+
+    const success_decision = try compilePatternMatrix(allocator, .{
+        .rows = try success_rows.toOwnedSlice(allocator),
+        .column_count = new_col_count,
+    }, try new_scrutinee_list.toOwnedSlice(allocator), next_id);
+
+    const d = try allocator.create(Decision);
+    d.* = .{ .check_list_cons = .{
+        .scrutinee = scrutinee_expr,
+        .head_count = head_count,
+        .head_scrutinee_ids = try head_ids.toOwnedSlice(allocator),
+        .tail_scrutinee_id = tail_id,
+        .success = success_decision,
+        .failure = failure,
+    } };
+    return d;
+}
+
 fn compileBinaryCheck(
     allocator: std.mem.Allocator,
     matrix: PatternMatrix,
@@ -1499,6 +1637,37 @@ pub const HirBuilder = struct {
             };
         }
         return ownerships;
+    }
+
+    /// Resolve the declared parameter types for a function by name and arity.
+    /// Used to populate CallArg.expected_type for implicit numeric widening.
+    fn resolveFunctionParamTypes(self: *HirBuilder, name: ast.StringId, arity: u32) ?[]const types_mod.TypeId {
+        const scope_id = self.current_clause_scope orelse self.current_module_scope orelse self.graph.prelude_scope;
+        const family_id = self.graph.resolveFamily(scope_id, name, arity) orelse return null;
+        const family = self.graph.getFamily(family_id);
+        if (family.clauses.items.len == 0) return null;
+        const clause_ref = family.clauses.items[0];
+        if (clause_ref.clause_index >= clause_ref.decl.clauses.len) return null;
+        const clause = clause_ref.decl.clauses[clause_ref.clause_index];
+
+        const param_types = self.allocator.alloc(types_mod.TypeId, clause.params.len) catch return null;
+        for (clause.params, 0..) |param, idx| {
+            param_types[idx] = blk: {
+                if (param.pattern.* == .bind) {
+                    const clause_scope = self.graph.node_scope_map.get(clause.meta.span.start) orelse clause.meta.scope_id;
+                    if (self.graph.resolveBinding(clause_scope, param.pattern.bind.name)) |binding_id| {
+                        if (self.graph.bindings.items[binding_id].type_id) |prov| {
+                            break :blk prov.type_id;
+                        }
+                    }
+                }
+                if (param.type_annotation) |ann| {
+                    break :blk self.resolveTypeExpr(ann);
+                }
+                break :blk types_mod.TypeStore.UNKNOWN;
+            };
+        }
+        return param_types;
     }
 
     fn resolveFunctionValueGroup(self: *const HirBuilder, name: ast.StringId) ?u32 {
@@ -2690,6 +2859,28 @@ pub const HirBuilder = struct {
                     self.applyCallArgModes(args.items, callee.type_id);
                 }
 
+                // Populate expected_type on each arg for implicit widening.
+                // For direct and bare-named calls, resolve from the scope graph.
+                if (call.callee.* == .var_ref) {
+                    if (self.resolveFunctionParamTypes(call.callee.var_ref.name, @intCast(call.args.len))) |param_types| {
+                        const count = @min(args.items.len, param_types.len);
+                        for (args.items[0..count], param_types[0..count]) |*arg, param_type| {
+                            arg.expected_type = param_type;
+                        }
+                    }
+                } else if (call.callee.* == .field_access) {
+                    // Module-qualified call: resolve via callee's function type
+                    if (callee_expr) |callee| {
+                        const callee_type = self.type_store.getType(callee.type_id);
+                        if (callee_type == .function) {
+                            const count = @min(args.items.len, callee_type.function.params.len);
+                            for (args.items[0..count], callee_type.function.params[0..count]) |*arg, param_type| {
+                                arg.expected_type = param_type;
+                            }
+                        }
+                    }
+                }
+
                 if (target == .direct) {
                     const group_id = target.direct.function_group_id;
                     const group_captures = self.group_captures.get(group_id) orelse &.{};
@@ -3282,6 +3473,20 @@ pub const HirBuilder = struct {
                 else
                     mapAstOwnership(ft.return_ownership);
                 return store_ptr.addFunctionType(params, return_type, param_ownerships, ret_ownership) catch types_mod.TypeStore.UNKNOWN;
+            },
+            .list => |lt| {
+                const elem_type = self.resolveTypeExpr(lt.element);
+                const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
+                return store_ptr.addType(.{ .list = .{ .element = elem_type } }) catch types_mod.TypeStore.UNKNOWN;
+            },
+            .map => |mt| {
+                if (mt.fields.len > 0) {
+                    const key_type = self.resolveTypeExpr(mt.fields[0].key);
+                    const value_type = self.resolveTypeExpr(mt.fields[0].value);
+                    const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
+                    return store_ptr.addType(.{ .map = .{ .key = key_type, .value = value_type } }) catch types_mod.TypeStore.UNKNOWN;
+                }
+                return types_mod.TypeStore.UNKNOWN;
             },
             else => types_mod.TypeStore.UNKNOWN,
         };

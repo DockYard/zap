@@ -562,6 +562,14 @@ pub const UseDefInfo = struct {
                 try info.recordDef(lg.dest, block);
                 try info.recordUse(lg.list, block);
             },
+            .list_is_not_empty => |lne| {
+                try info.recordDef(lne.dest, block);
+                try info.recordUse(lne.list, block);
+            },
+            .list_head, .list_tail => |lht| {
+                try info.recordDef(lht.dest, block);
+                try info.recordUse(lht.list, block);
+            },
             .map_has_key => |mhk| {
                 try info.recordDef(mhk.dest, block);
                 try info.recordUse(mhk.map, block);
@@ -809,6 +817,12 @@ pub const UseDefInfo = struct {
                 try info.recordUse(bmp.source, block);
             },
 
+            // Numeric widening.
+            .int_widen, .float_widen => |nw| {
+                try info.recordDef(nw.dest, block);
+                try info.recordUse(nw.source, block);
+            },
+
             // Non-data instructions.
             .branch, .jump, .match_fail, .match_error_return => {},
         }
@@ -1011,6 +1025,8 @@ fn instructionUsesLocal(local: ir.LocalId, instr: ir.Instruction) bool {
         .index_get => |ig| return ig.object == local,
         .list_len_check => |llc| return llc.scrutinee == local,
         .list_get => |lg| return lg.list == local,
+        .list_is_not_empty => |lne| return lne.list == local,
+        .list_head, .list_tail => |lht| return lht.list == local,
         .map_has_key => |mhk| return mhk.map == local or mhk.key == local,
         .map_get => |mg| return mg.map == local or mg.key == local or mg.default == local,
         .binary_op => |bo| return bo.lhs == local or bo.rhs == local,
@@ -1734,6 +1750,8 @@ pub const RegionSolver = struct {
             .index_get => |ig| ig.dest,
             .list_len_check => |llc| llc.dest,
             .list_get => |lg| lg.dest,
+            .list_is_not_empty => |lne| lne.dest,
+            .list_head, .list_tail => |lht| lht.dest,
             .map_has_key => |mhk| mhk.dest,
             .map_get => |mg| mg.dest,
             .binary_op => |bo| bo.dest,
