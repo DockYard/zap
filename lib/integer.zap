@@ -119,7 +119,7 @@ pub module Integer {
     """
 
   pub fn remainder(dividend :: i64, divisor :: i64) -> i64 {
-    :zig.Prelude.rem_i64(dividend, divisor)
+    dividend - dividend / divisor * divisor
   }
 
   @doc = """
@@ -174,7 +174,7 @@ pub module Integer {
   pub fn count_digits(value :: i64) -> i64 {
     case value < 10 {
       true -> 1
-      _ -> 1 + count_digits(:zig.Prelude.div_i64(value, 10))
+      _ -> 1 + count_digits(value / 10)
     }
   }
 

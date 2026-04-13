@@ -25,6 +25,18 @@ pub module Test.ArithmeticTest {
     test("cube function") {
       assert(cube(3) == 27)
     }
+
+    test("integer division") {
+      assert(10 / 3 == 3)
+    }
+
+    test("integer division exact") {
+      assert(12 / 4 == 3)
+    }
+
+    test("integer remainder") {
+      assert(10 - 10 / 3 * 3 == 1)
+    }
   }
 
   fn add(a :: i64, b :: i64) -> i64 {

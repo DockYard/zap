@@ -1,0 +1,54 @@
+pub module File {
+  @moduledoc = """
+    Functions for reading and writing files.
+
+    All paths are relative to the current working directory.
+    File operations return empty strings or false on failure.
+
+    ## Examples
+
+        content = File.read("config.txt")
+        File.write("output.txt", "Hello, world!")
+        File.exists?("config.txt")  # => true
+    """
+
+  @doc = """
+    Reads the entire contents of a file as a string.
+    Returns an empty string if the file cannot be read.
+
+    ## Examples
+
+        File.read("hello.txt")  # => "Hello, world!"
+        File.read("missing.txt")  # => ""
+    """
+
+  pub fn read(path :: String) -> String {
+    :zig.Prelude.file_read(path)
+  }
+
+  @doc = """
+    Writes a string to a file, creating it if it doesn't exist
+    and overwriting if it does. Returns true on success.
+
+    ## Examples
+
+        File.write("output.txt", "Hello!")  # => true
+    """
+
+  pub fn write(path :: String, content :: String) -> Bool {
+    :zig.Prelude.file_write(path, content)
+  }
+
+  @doc = """
+    Returns true if the file exists at the given path.
+
+    ## Examples
+
+        File.exists?("build.zap")   # => true
+        File.exists?("missing.txt")  # => false
+    """
+
+  pub fn exists?(path :: String) -> Bool {
+    :zig.Prelude.file_exists(path)
+  }
+}

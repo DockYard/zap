@@ -1188,6 +1188,54 @@ pub const Prelude = struct {
         return result;
     }
 
+    // --- File I/O ---
+
+    pub fn file_read(path: []const u8) []const u8 {
+        // Copy path to null-terminated buffer for OS call
+        var path_buf: [4096]u8 = undefined;
+        if (path.len >= path_buf.len) return "";
+        @memcpy(path_buf[0..path.len], path);
+        path_buf[path.len] = 0;
+        const path_z: [*:0]const u8 = path_buf[0..path.len :0];
+
+        const file = std.fs.cwd().openFileZ(path_z, .{}) catch return "";
+        defer file.close();
+
+        // Read up to remaining bump space
+        const max_size = BUMP_SIZE - bump_offset;
+        if (max_size == 0) return "";
+        const result = bumpAlloc(max_size);
+        if (result.len == 0) return "";
+
+        const bytes_read = file.readAll(result) catch return "";
+        return result[0..bytes_read];
+    }
+
+    pub fn file_write(path: []const u8, content: []const u8) bool {
+        var path_buf: [4096]u8 = undefined;
+        if (path.len >= path_buf.len) return false;
+        @memcpy(path_buf[0..path.len], path);
+        path_buf[path.len] = 0;
+        const path_z: [*:0]const u8 = path_buf[0..path.len :0];
+
+        const file = std.fs.cwd().createFileZ(path_z, .{}) catch return false;
+        defer file.close();
+
+        file.writeAll(content) catch return false;
+        return true;
+    }
+
+    pub fn file_exists(path: []const u8) bool {
+        var path_buf: [4096]u8 = undefined;
+        if (path.len >= path_buf.len) return false;
+        @memcpy(path_buf[0..path.len], path);
+        path_buf[path.len] = 0;
+        const path_z: [*:0]const u8 = path_buf[0..path.len :0];
+
+        std.fs.cwd().accessZ(path_z, .{}) catch return false;
+        return true;
+    }
+
     pub fn atom_name(id: anytype) []const u8 {
         const T = @TypeOf(id);
         if (T == u32) return atomToString(id);
