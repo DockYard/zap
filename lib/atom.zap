@@ -30,19 +30,4 @@ pub module Atom {
     :zig.Prelude.atom_name(atom)
   }
 
-  @doc = """
-    Creates an atom from a string.
-
-    Delegates to `String.to_atom/1`. If the atom doesn't
-    already exist, it is created and interned.
-
-    ## Examples
-
-        Atom.from_string("hello")  # => :hello
-        Atom.from_string("ok")     # => :ok
-    """
-
-  pub fn from_string(name :: String) -> Atom {
-    String.to_atom(name)
-  }
 }

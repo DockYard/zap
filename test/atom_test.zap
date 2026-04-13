@@ -30,13 +30,6 @@ pub module Test.AtomTest {
       assert(Atom.to_string(:ok) == "ok")
     }
 
-    test("from_string creates atom") {
-      assert(Atom.from_string("ok") == :ok)
-    }
-
-    test("from_string roundtrip") {
-      assert(Atom.to_string(Atom.from_string("test")) == "test")
-    }
   }
 
   fn status(:ok :: Atom) -> String {
