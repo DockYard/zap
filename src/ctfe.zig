@@ -757,9 +757,13 @@ fn hashInstruction(hasher: *std.hash.Wyhash, instr: ir.Instruction) void {
             hasher.update(std.mem.asBytes(&v.dest));
             hasher.update(std.mem.asBytes(&v.index));
         },
-        .tuple_init, .list_init => |v| {
+        .tuple_init => |v| {
             hasher.update(std.mem.asBytes(&v.dest));
-            hashLocalIds(hasher, v.elements);
+            for (v.elements) |elem| hasher.update(std.mem.asBytes(&elem));
+        },
+        .list_init => |li| {
+            hasher.update(std.mem.asBytes(&li.dest));
+            for (li.elements) |elem| hasher.update(std.mem.asBytes(&elem));
         },
         .list_cons => |v| {
             hasher.update(std.mem.asBytes(&v.dest));

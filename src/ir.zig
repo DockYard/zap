@@ -131,7 +131,7 @@ pub const Instruction = union(enum) {
 
     // Aggregates
     tuple_init: AggregateInit,
-    list_init: AggregateInit,
+    list_init: ListInit,
     list_cons: ListCons,
     map_init: MapInit,
     struct_init: StructInit,
@@ -330,32 +330,43 @@ pub const IndexGet = struct {
     index: u32,
 };
 
+pub const ListInit = struct {
+    dest: LocalId,
+    elements: []const LocalId,
+    element_type: ZigType = .i64,
+};
+
 pub const ListCons = struct {
     dest: LocalId,
     head: LocalId,
     tail: LocalId,
+    element_type: ZigType = .i64,
 };
 
 pub const ListLenCheck = struct {
     dest: LocalId,
     scrutinee: LocalId,
     expected_len: u32,
+    element_type: ZigType = .i64,
 };
 
 pub const ListGet = struct {
     dest: LocalId,
     list: LocalId,
     index: u32,
+    element_type: ZigType = .i64,
 };
 
 pub const ListIsNotEmpty = struct {
     dest: LocalId,
     list: LocalId,
+    element_type: ZigType = .i64,
 };
 
 pub const ListHeadTail = struct {
     dest: LocalId,
     list: LocalId,
+    element_type: ZigType = .i64,
 };
 
 pub const MapHasKey = struct {
@@ -866,6 +877,28 @@ pub const IrBuilder = struct {
         self.known_function_names.deinit();
     }
 
+    /// Extract the list element ZigType from an HIR expression's type_id.
+    /// Returns .i64 as default when type info is unavailable or not a list type.
+    fn listElementTypeFromHir(self: *const IrBuilder, type_id: types_mod.TypeId) ZigType {
+        const ts = self.type_store orelse return .i64;
+        if (type_id >= ts.types.items.len) return .i64;
+        const typ = ts.types.items[type_id];
+        return switch (typ) {
+            .list => |lt| typeIdToZigTypeWithStore(lt.element, self.type_store),
+            else => .i64,
+        };
+    }
+
+    /// Extract the list element ZigType from a local's known type.
+    /// Falls back to .i64 when the local's type is unknown or not a list.
+    fn listElementTypeForLocal(self: *const IrBuilder, local: LocalId) ZigType {
+        const known = self.known_local_types.get(local) orelse return .i64;
+        return switch (std.meta.activeTag(known)) {
+            .list => known.list.*,
+            else => .i64,
+        };
+    }
+
     pub fn buildProgram(self: *IrBuilder, hir_program: *const hir_mod.Program) !Program {
         // First pass: register all qualified function names for bare call resolution
         for (hir_program.modules) |mod| {
@@ -1075,6 +1108,9 @@ pub const IrBuilder = struct {
                     max_binding_local = @max(max_binding_local, binding.local_index + 1);
                 }
                 for (clause.list_bindings) |binding| {
+                    max_binding_local = @max(max_binding_local, binding.local_index + 1);
+                }
+                for (clause.cons_tail_bindings) |binding| {
                     max_binding_local = @max(max_binding_local, binding.local_index + 1);
                 }
                 for (clause.binary_bindings) |binding| {
@@ -1470,6 +1506,9 @@ pub const IrBuilder = struct {
                     for (clause.list_bindings) |binding| {
                         max_binding_local = @max(max_binding_local, binding.local_index + 1);
                     }
+                    for (clause.cons_tail_bindings) |binding| {
+                        max_binding_local = @max(max_binding_local, binding.local_index + 1);
+                    }
                     for (clause.binary_bindings) |binding| {
                         max_binding_local = @max(max_binding_local, binding.local_index + 1);
                     }
@@ -1519,6 +1558,10 @@ pub const IrBuilder = struct {
                 try self.current_instrs.append(self.allocator, .{
                     .param_get = .{ .dest = param_local, .index = @intCast(i) },
                 });
+                const param_type = typeIdToZigTypeWithStore(first_clause.params[i].type_id, self.type_store);
+                if (param_type != .any) {
+                    try self.known_local_types.put(param_local, param_type);
+                }
                 try try_scrutinee_map.put(@intCast(i), param_local);
             }
 
@@ -2704,10 +2747,11 @@ pub const IrBuilder = struct {
             },
             .check_list => |cl| {
                 const scrutinee_local = self.resolveScrutinee(cl.scrutinee, scrutinee_map);
+                const elem_type = self.listElementTypeForLocal(scrutinee_local);
                 const len_check_local = self.next_local;
                 self.next_local += 1;
                 try self.current_instrs.append(self.allocator, .{
-                    .list_len_check = .{ .dest = len_check_local, .scrutinee = scrutinee_local, .expected_len = cl.expected_length },
+                    .list_len_check = .{ .dest = len_check_local, .scrutinee = scrutinee_local, .expected_len = cl.expected_length, .element_type = elem_type },
                 });
                 const saved = self.current_instrs;
                 self.current_instrs = .empty;
@@ -2716,8 +2760,9 @@ pub const IrBuilder = struct {
                     const elem_local = self.next_local;
                     self.next_local += 1;
                     try self.current_instrs.append(self.allocator, .{
-                        .list_get = .{ .dest = elem_local, .list = scrutinee_local, .index = i },
+                        .list_get = .{ .dest = elem_local, .list = scrutinee_local, .index = i, .element_type = elem_type },
                     });
+                    try self.known_local_types.put(elem_local, elem_type);
                     try scrutinee_map.put(findParamGetIdInDecision(cl.success, i), elem_local);
                 }
                 try self.lowerDecisionTreeForCase(cl.success, case_arms, scrutinee_map, 0);
@@ -2730,10 +2775,12 @@ pub const IrBuilder = struct {
             },
             .check_list_cons => |clc| {
                 const scrutinee_local = self.resolveScrutinee(clc.scrutinee, scrutinee_map);
+                const elem_type = self.listElementTypeForLocal(scrutinee_local);
+                const scrutinee_list_type = self.known_local_types.get(scrutinee_local) orelse .any;
                 const not_empty_local = self.next_local;
                 self.next_local += 1;
                 try self.current_instrs.append(self.allocator, .{
-                    .list_is_not_empty = .{ .dest = not_empty_local, .list = scrutinee_local },
+                    .list_is_not_empty = .{ .dest = not_empty_local, .list = scrutinee_local, .element_type = elem_type },
                 });
                 const saved = self.current_instrs;
                 self.current_instrs = .empty;
@@ -2743,23 +2790,26 @@ pub const IrBuilder = struct {
                     const head_local = self.next_local;
                     self.next_local += 1;
                     try self.current_instrs.append(self.allocator, .{
-                        .list_head = .{ .dest = head_local, .list = current_list },
+                        .list_head = .{ .dest = head_local, .list = current_list, .element_type = elem_type },
                     });
+                    try self.known_local_types.put(head_local, elem_type);
                     try scrutinee_map.put(clc.head_scrutinee_ids[i], head_local);
                     if (i + 1 < clc.head_count) {
                         const next_list = self.next_local;
                         self.next_local += 1;
                         try self.current_instrs.append(self.allocator, .{
-                            .list_tail = .{ .dest = next_list, .list = current_list },
+                            .list_tail = .{ .dest = next_list, .list = current_list, .element_type = elem_type },
                         });
+                        try self.known_local_types.put(next_list, scrutinee_list_type);
                         current_list = next_list;
                     }
                 }
                 const tail_local = self.next_local;
                 self.next_local += 1;
                 try self.current_instrs.append(self.allocator, .{
-                    .list_tail = .{ .dest = tail_local, .list = current_list },
+                    .list_tail = .{ .dest = tail_local, .list = current_list, .element_type = elem_type },
                 });
+                try self.known_local_types.put(tail_local, scrutinee_list_type);
                 try scrutinee_map.put(clc.tail_scrutinee_id, tail_local);
                 try self.lowerDecisionTreeForCase(clc.success, case_arms, scrutinee_map, 0);
                 const success_body = try self.current_instrs.toOwnedSlice(self.allocator);
@@ -2866,15 +2916,42 @@ pub const IrBuilder = struct {
                         try self.current_instrs.append(self.allocator, .{
                             .param_get = .{ .dest = pl, .index = binding.param_index },
                         });
+                        // Track fallback param's type so listElementTypeForLocal works
+                        if (binding.param_index < clause.params.len) {
+                            const param_type = typeIdToZigTypeWithStore(clause.params[binding.param_index].type_id, self.type_store);
+                            if (param_type != .any) {
+                                try self.known_local_types.put(pl, param_type);
+                            }
+                        }
                         break :blk pl;
                     };
+                    const list_elem_type = self.listElementTypeForLocal(list_local);
                     try self.current_instrs.append(self.allocator, .{
                         .list_get = .{
                             .dest = binding.local_index,
                             .list = list_local,
                             .index = binding.element_index,
+                            .element_type = list_elem_type,
                         },
                     });
+                    try self.known_local_types.put(binding.local_index, list_elem_type);
+                }
+                // Emit cons tail bindings: copy decision tree tail locals to binding locals
+                for (clause.cons_tail_bindings) |binding| {
+                    // The tail was extracted by check_list_cons and stored in scrutinee_map.
+                    // Find the tail local and copy it to the binding's local_index.
+                    // The scrutinee_map maps scrutinee IDs → locals, but we need to find
+                    // the tail by param_index. Look for the list param's tail local.
+                    const list_local = scrutinee_map.get(binding.param_index) orelse continue;
+                    // The tail is the list local itself (after head extraction, the remaining
+                    // scrutinee entries represent tails). Search for a tail scrutinee.
+                    // For simplicity, use list_tail on the original list to get the tail.
+                    const list_elem_type = self.listElementTypeForLocal(list_local);
+                    const scrutinee_list_type = self.known_local_types.get(list_local) orelse .any;
+                    try self.current_instrs.append(self.allocator, .{
+                        .list_tail = .{ .dest = binding.local_index, .list = list_local, .element_type = list_elem_type },
+                    });
+                    try self.known_local_types.put(binding.local_index, scrutinee_list_type);
                 }
                 // Emit binary bindings
                 try self.emitBinaryBindings(clause);
@@ -2973,11 +3050,12 @@ pub const IrBuilder = struct {
             },
             .check_list => |cl| {
                 const scrutinee_local = self.resolveScrutinee(cl.scrutinee, scrutinee_map);
+                const elem_type = self.listElementTypeForLocal(scrutinee_local);
                 // Emit: __local_N = scrutinee.len == expected_length
                 const len_check_local = self.next_local;
                 self.next_local += 1;
                 try self.current_instrs.append(self.allocator, .{
-                    .list_len_check = .{ .dest = len_check_local, .scrutinee = scrutinee_local, .expected_len = cl.expected_length },
+                    .list_len_check = .{ .dest = len_check_local, .scrutinee = scrutinee_local, .expected_len = cl.expected_length, .element_type = elem_type },
                 });
                 const saved = self.current_instrs;
                 self.current_instrs = .empty;
@@ -2987,8 +3065,9 @@ pub const IrBuilder = struct {
                     const elem_local = self.next_local;
                     self.next_local += 1;
                     try self.current_instrs.append(self.allocator, .{
-                        .list_get = .{ .dest = elem_local, .list = scrutinee_local, .index = i },
+                        .list_get = .{ .dest = elem_local, .list = scrutinee_local, .index = i, .element_type = elem_type },
                     });
+                    try self.known_local_types.put(elem_local, elem_type);
                     try scrutinee_map.put(findParamGetIdInDecision(cl.success, i), elem_local);
                 }
                 try self.lowerDecisionTreeForDispatch(cl.success, clauses, scrutinee_map);
@@ -3001,11 +3080,13 @@ pub const IrBuilder = struct {
             },
             .check_list_cons => |clc| {
                 const scrutinee_local = self.resolveScrutinee(clc.scrutinee, scrutinee_map);
+                const elem_type = self.listElementTypeForLocal(scrutinee_local);
+                const scrutinee_list_type = self.known_local_types.get(scrutinee_local) orelse .any;
                 // Emit non-empty check: ListCell.isEmpty(list) == false
                 const not_empty_local = self.next_local;
                 self.next_local += 1;
                 try self.current_instrs.append(self.allocator, .{
-                    .list_is_not_empty = .{ .dest = not_empty_local, .list = scrutinee_local },
+                    .list_is_not_empty = .{ .dest = not_empty_local, .list = scrutinee_local, .element_type = elem_type },
                 });
                 const saved = self.current_instrs;
                 self.current_instrs = .empty;
@@ -3016,15 +3097,17 @@ pub const IrBuilder = struct {
                     const head_local = self.next_local;
                     self.next_local += 1;
                     try self.current_instrs.append(self.allocator, .{
-                        .list_head = .{ .dest = head_local, .list = current_list },
+                        .list_head = .{ .dest = head_local, .list = current_list, .element_type = elem_type },
                     });
+                    try self.known_local_types.put(head_local, elem_type);
                     try scrutinee_map.put(clc.head_scrutinee_ids[i], head_local);
                     if (i + 1 < clc.head_count) {
                         const next_list = self.next_local;
                         self.next_local += 1;
                         try self.current_instrs.append(self.allocator, .{
-                            .list_tail = .{ .dest = next_list, .list = current_list },
+                            .list_tail = .{ .dest = next_list, .list = current_list, .element_type = elem_type },
                         });
+                        try self.known_local_types.put(next_list, scrutinee_list_type);
                         current_list = next_list;
                     }
                 }
@@ -3032,8 +3115,9 @@ pub const IrBuilder = struct {
                 const tail_local = self.next_local;
                 self.next_local += 1;
                 try self.current_instrs.append(self.allocator, .{
-                    .list_tail = .{ .dest = tail_local, .list = current_list },
+                    .list_tail = .{ .dest = tail_local, .list = current_list, .element_type = elem_type },
                 });
+                try self.known_local_types.put(tail_local, scrutinee_list_type);
                 try scrutinee_map.put(clc.tail_scrutinee_id, tail_local);
 
                 try self.lowerDecisionTreeForDispatch(clc.success, clauses, scrutinee_map);
@@ -3262,6 +3346,10 @@ pub const IrBuilder = struct {
                         try self.current_instrs.append(self.allocator, .{
                             .local_set = .{ .dest = ls.index, .value = val },
                         });
+                    }
+                    // Propagate type from value to assignment target
+                    if (self.known_local_types.get(val)) |src_type| {
+                        try self.known_local_types.put(ls.index, src_type);
                     }
                     last_local = ls.index;
                 },
@@ -3497,6 +3585,9 @@ pub const IrBuilder = struct {
                             const moved_local = self.next_local;
                             self.next_local += 1;
                             try self.current_instrs.append(self.allocator, .{ .move_value = .{ .dest = moved_local, .source = arg_local } });
+                            if (self.known_local_types.get(arg_local)) |src_type| {
+                                try self.known_local_types.put(moved_local, src_type);
+                            }
                             break :blk moved_local;
                         },
                         .share => blk: {
@@ -3504,6 +3595,9 @@ pub const IrBuilder = struct {
                                 const shared_local = self.next_local;
                                 self.next_local += 1;
                                 try self.current_instrs.append(self.allocator, .{ .share_value = .{ .dest = shared_local, .source = arg_local } });
+                                if (self.known_local_types.get(arg_local)) |src_type| {
+                                    try self.known_local_types.put(shared_local, src_type);
+                                }
                                 try shared_release_locals.append(self.allocator, shared_local);
                                 break :blk shared_local;
                             }
@@ -3644,6 +3738,11 @@ pub const IrBuilder = struct {
                         });
                     },
                 }
+                // Track the call result's type from the HIR expression
+                const call_result_type = typeIdToZigTypeWithStore(expr.type_id, self.type_store);
+                if (call_result_type != .any and call_result_type != .void) {
+                    try self.known_local_types.put(dest, call_result_type);
+                }
                 for (shared_release_locals.items) |shared_local| {
                     try self.current_instrs.append(self.allocator, .{ .release = .{ .value = shared_local } });
                 }
@@ -3674,18 +3773,22 @@ pub const IrBuilder = struct {
                     try locals.append(self.allocator, try self.lowerExpr(elem));
                 }
                 const elements = try locals.toOwnedSlice(self.allocator);
+                const elem_type = self.listElementTypeFromHir(expr.type_id);
                 try self.current_instrs.append(self.allocator, .{
-                    .list_init = .{ .dest = dest, .elements = elements },
+                    .list_init = .{ .dest = dest, .elements = elements, .element_type = elem_type },
                 });
-                try self.known_local_types.put(dest, .any);
+                const list_zig_type = typeIdToZigTypeWithStore(expr.type_id, self.type_store);
+                try self.known_local_types.put(dest, list_zig_type);
             },
             .list_cons => |lc| {
                 const head = try self.lowerExpr(lc.head);
                 const tail = try self.lowerExpr(lc.tail);
+                const elem_type = self.listElementTypeFromHir(expr.type_id);
                 try self.current_instrs.append(self.allocator, .{
-                    .list_cons = .{ .dest = dest, .head = head, .tail = tail },
+                    .list_cons = .{ .dest = dest, .head = head, .tail = tail, .element_type = elem_type },
                 });
-                try self.known_local_types.put(dest, .any);
+                const list_zig_type = typeIdToZigTypeWithStore(expr.type_id, self.type_store);
+                try self.known_local_types.put(dest, list_zig_type);
             },
             .panic => |msg| {
                 _ = try self.lowerExpr(msg);
@@ -3906,6 +4009,10 @@ pub const IrBuilder = struct {
                 try self.current_instrs.append(self.allocator, .{
                     .capture_get = .{ .dest = dest, .index = index },
                 });
+                const capture_zig_type = typeIdToZigTypeWithStore(expr.type_id, self.type_store);
+                if (capture_zig_type != .any) {
+                    try self.known_local_types.put(dest, capture_zig_type);
+                }
             },
             .closure_create => |cc| {
                 var capture_locals: std.ArrayList(LocalId) = .empty;

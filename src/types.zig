@@ -154,12 +154,22 @@ pub const Type = union(enum) {
 // Type store
 // ============================================================
 
+/// Inferred signature for a compiler-generated function (e.g., __for_N helpers).
+/// Populated by the type checker from call-site argument types; read by the HIR
+/// builder when param/return annotations are null.
+pub const InferredSignature = struct {
+    param_types: []const TypeId,
+    return_type: TypeId,
+};
+
 pub const TypeStore = struct {
     allocator: std.mem.Allocator,
     types: std.ArrayList(Type),
     interner: *const ast.StringInterner,
     name_to_type: std.AutoHashMap(ast.StringId, TypeId),
     next_var: TypeVarId,
+    /// Inferred signatures for generated functions, keyed by function name StringId.
+    inferred_signatures: std.AutoHashMap(ast.StringId, InferredSignature),
 
     // Well-known type IDs
     pub const BOOL: TypeId = 0;
@@ -190,6 +200,7 @@ pub const TypeStore = struct {
             .interner = interner,
             .name_to_type = std.AutoHashMap(ast.StringId, TypeId).init(allocator),
             .next_var = 0,
+            .inferred_signatures = std.AutoHashMap(ast.StringId, InferredSignature).init(allocator),
         };
         store.registerBuiltins() catch {};
         return store;
@@ -198,6 +209,7 @@ pub const TypeStore = struct {
     pub fn deinit(self: *TypeStore) void {
         self.types.deinit(self.allocator);
         self.name_to_type.deinit();
+        self.inferred_signatures.deinit();
     }
 
     fn registerBuiltins(self: *TypeStore) !void {
@@ -1963,6 +1975,9 @@ pub const TypeChecker = struct {
                 .attribute => |attr| {
                     try self.checkAttributeDecl(attr);
                 },
+                .module_level_expr => |expr| {
+                    _ = try self.inferExpr(expr);
+                },
                 else => {},
             }
         }
@@ -2993,6 +3008,64 @@ pub const TypeChecker = struct {
                             }
                         }
                     }
+
+                    // Infer types for generated helpers from call-site argument types.
+                    // When a generated function has UNKNOWN param types, propagate the
+                    // concrete argument types into an InferredSignature so the HIR builder
+                    // can read them instead of falling back to UNKNOWN/NEVER.
+                    var has_unknown_params = false;
+                    for (signature.params) |p| {
+                        if (p == TypeStore.UNKNOWN) {
+                            has_unknown_params = true;
+                            break;
+                        }
+                    }
+
+                    if (has_unknown_params or signature.return_type == TypeStore.UNKNOWN) {
+                        var inferred_params = try self.allocator.alloc(TypeId, signature.params.len);
+                        for (call.args, 0..) |arg, idx| {
+                            const arg_type = try self.inferExpr(arg);
+                            if (idx < signature.params.len) {
+                                inferred_params[idx] = if (signature.params[idx] == TypeStore.UNKNOWN)
+                                    arg_type
+                                else
+                                    signature.params[idx];
+                            }
+                        }
+                        // Infer return type from the param types: for list-processing
+                        // helpers, the return type matches the parameter's list type.
+                        const inferred_return = if (signature.return_type == TypeStore.UNKNOWN) blk: {
+                            // If the first param is a list type, the return is likely a list too.
+                            if (inferred_params.len > 0 and inferred_params[0] != TypeStore.UNKNOWN) {
+                                const param_type = self.store.getType(inferred_params[0]);
+                                if (param_type == .list) break :blk inferred_params[0];
+                            }
+                            break :blk signature.return_type;
+                        } else signature.return_type;
+
+                        // Only store the inferred signature if it has concrete (non-UNKNOWN)
+                        // param types. Recursive calls within the helper body produce UNKNOWN
+                        // args; the actual external call site produces concrete types.
+                        var has_concrete = false;
+                        for (inferred_params) |ip| {
+                            if (ip != TypeStore.UNKNOWN and ip != TypeStore.ERROR) {
+                                has_concrete = true;
+                                break;
+                            }
+                        }
+                        if (has_concrete) {
+                            try self.store.inferred_signatures.put(vr.name, .{
+                                .param_types = inferred_params,
+                                .return_type = inferred_return,
+                            });
+                        }
+
+
+                        const borrowed = try self.applyCallOwnershipWithSafeParams(call.args, signature.toFunctionType(), safe_params);
+                        defer self.endBorrowedBindings(borrowed) catch {};
+                        return inferred_return;
+                    }
+
                     for (call.args, 0..) |arg, idx| {
                         const arg_type = try self.inferExpr(arg);
                         if (idx < signature.params.len) {

@@ -1,4 +1,5 @@
 const std = @import("std");
+const ast = @import("ast.zig");
 const hir = @import("hir.zig");
 const types_mod = @import("types.zig");
 const scope_mod = @import("scope.zig");
@@ -27,11 +28,13 @@ pub fn monomorphize(
     program: *const hir.Program,
     store: *TypeStore,
     next_group_id: *u32,
+    interner: *ast.StringInterner,
 ) !MonomorphResult {
     var ctx = MonomorphContext{
         .allocator = allocator,
         .store = store,
         .next_group_id = next_group_id,
+        .interner = interner,
         .generic_groups = std.AutoHashMap(u32, *const hir.FunctionGroup).init(allocator),
         .specializations = std.AutoHashMap(u64, u32).init(allocator),
         .new_groups = .empty,
@@ -100,7 +103,20 @@ pub fn monomorphize(
         });
     }
 
-    // Phase D: Rewrite call sites in all expressions
+    // Also handle top-level functions: add specializations and collect into new slice
+    var new_top_fns: std.ArrayListUnmanaged(hir.FunctionGroup) = .empty;
+    for (program.top_functions) |group| {
+        try new_top_fns.append(allocator, group);
+    }
+    for (ctx.new_groups.items) |entry| {
+        for (program.top_functions) |orig_group| {
+            if (entry.source_group_id == orig_group.id) {
+                try new_top_fns.append(allocator, entry.group);
+            }
+        }
+    }
+
+    // Phase D: Rewrite call sites in all expressions (modules + top functions)
     for (new_modules.items) |*mod| {
         for (mod.functions) |*group| {
             for (group.clauses) |clause| {
@@ -108,11 +124,16 @@ pub fn monomorphize(
             }
         }
     }
+    for (new_top_fns.items) |*group| {
+        for (group.clauses) |clause| {
+            ctx.rewriteBlock(clause.body);
+        }
+    }
 
     return .{
         .program = .{
             .modules = try new_modules.toOwnedSlice(allocator),
-            .top_functions = program.top_functions,
+            .top_functions = try new_top_fns.toOwnedSlice(allocator),
         },
         .specialization_count = @intCast(ctx.new_groups.items.len),
     };
@@ -127,6 +148,10 @@ const MonomorphContext = struct {
     allocator: Allocator,
     store: *TypeStore,
     next_group_id: *u32,
+    interner: *ast.StringInterner,
+    /// Active substitution map during cloning. Set by cloneGroupWithSubs,
+    /// used by cloneExpr/cloneDecision to substitute type_ids.
+    current_subs: ?*const SubstitutionMap = null,
     /// Map from group_id → FunctionGroup for generic functions
     generic_groups: std.AutoHashMap(u32, *const hir.FunctionGroup),
     /// Map from hash(group_id, type_args) → specialized group_id
@@ -185,12 +210,20 @@ const MonomorphContext = struct {
 
                 if (!can_specialize) return;
 
-                // Collect concrete type args (the bound type variables)
+                // Collect concrete type args sorted by type variable ID for determinism
                 var type_args: std.ArrayListUnmanaged(TypeId) = .empty;
                 defer type_args.deinit(self.allocator);
+                var var_ids: std.ArrayListUnmanaged(types_mod.TypeVarId) = .empty;
+                defer var_ids.deinit(self.allocator);
                 var it = subs.bindings.iterator();
                 while (it.next()) |entry| {
-                    try type_args.append(self.allocator, entry.value_ptr.*);
+                    try var_ids.append(self.allocator, entry.key_ptr.*);
+                }
+                std.mem.sort(types_mod.TypeVarId, var_ids.items, {}, std.sort.asc(types_mod.TypeVarId));
+                for (var_ids.items) |var_id| {
+                    if (subs.bindings.get(var_id)) |concrete| {
+                        try type_args.append(self.allocator, concrete);
+                    }
                 }
 
                 if (type_args.items.len == 0) return; // Not actually generic
@@ -256,11 +289,14 @@ const MonomorphContext = struct {
             .case => |cd| {
                 try self.scanExpr(cd.scrutinee);
                 for (cd.arms) |arm| {
+                    if (arm.guard) |g| try self.scanExpr(g);
                     try self.scanBlock(arm.body);
                 }
             },
             .match => |m| try self.scanExpr(m.scrutinee),
-            .closure_create => {},
+            .closure_create => |cc| {
+                for (cc.captures) |cap| try self.scanExpr(cap.expr);
+            },
             // Literals and refs — no sub-expressions
             .int_lit, .float_lit, .string_lit, .atom_lit, .bool_lit, .nil_lit => {},
             .local_get, .param_get, .capture_get => {},
@@ -274,6 +310,10 @@ const MonomorphContext = struct {
         subs: *const SubstitutionMap,
         new_id: u32,
     ) !hir.FunctionGroup {
+        const saved_subs = self.current_subs;
+        self.current_subs = subs;
+        defer self.current_subs = saved_subs;
+
         var new_clauses: std.ArrayListUnmanaged(hir.Clause) = .empty;
         for (group.clauses) |clause| {
             // Substitute types in params
@@ -284,28 +324,33 @@ const MonomorphContext = struct {
                     .type_id = subs.applyToType(self.store, param.type_id),
                     .ownership = param.ownership,
                     .pattern = param.pattern,
-                    .default = param.default,
+                    .default = if (param.default) |d| try self.cloneExpr(d) else null,
                 };
             }
 
             try new_clauses.append(self.allocator, .{
                 .params = new_params,
                 .return_type = subs.applyToType(self.store, clause.return_type),
-                .decision = clause.decision,
-                .body = clause.body,
-                .refinement = clause.refinement,
+                .decision = try self.cloneDecision(clause.decision),
+                .body = try self.cloneBlock(clause.body),
+                .refinement = if (clause.refinement) |r| try self.cloneExpr(r) else null,
                 .tuple_bindings = clause.tuple_bindings,
                 .struct_bindings = clause.struct_bindings,
                 .list_bindings = clause.list_bindings,
+                .cons_tail_bindings = clause.cons_tail_bindings,
                 .binary_bindings = clause.binary_bindings,
                 .map_bindings = clause.map_bindings,
             });
         }
 
+        const base_name = self.interner.get(group.name);
+        const mangled_str = mangleName(self.allocator, base_name, self.store, subs) catch base_name;
+        const mangled_name = self.interner.intern(mangled_str) catch group.name;
+
         return .{
             .id = new_id,
             .scope_id = group.scope_id,
-            .name = group.name,
+            .name = mangled_name,
             .arity = group.arity,
             .is_local = group.is_local,
             .captures = group.captures,
@@ -313,6 +358,258 @@ const MonomorphContext = struct {
             .fallback_parent = group.fallback_parent,
         };
     }
+
+    // -- Deep cloning for specialized copies -----------------------------------
+
+    fn cloneBlock(self: *MonomorphContext, block: *const hir.Block) !*const hir.Block {
+        var new_stmts: std.ArrayListUnmanaged(hir.Stmt) = .empty;
+        for (block.stmts) |stmt| {
+            try new_stmts.append(self.allocator, try self.cloneStmt(stmt));
+        }
+        const result = try self.allocator.create(hir.Block);
+        result.* = .{
+            .stmts = try new_stmts.toOwnedSlice(self.allocator),
+            .result_type = if (self.current_subs) |subs|
+                subs.applyToType(self.store, block.result_type)
+            else
+                block.result_type,
+        };
+        return result;
+    }
+
+    fn cloneStmt(self: *MonomorphContext, stmt: hir.Stmt) !hir.Stmt {
+        return switch (stmt) {
+            .expr => |e| .{ .expr = try self.cloneExpr(e) },
+            .local_set => |ls| .{ .local_set = .{
+                .index = ls.index,
+                .value = try self.cloneExpr(ls.value),
+            } },
+            .function_group => |fg| .{ .function_group = fg }, // local fns: share, not specialized
+        };
+    }
+
+    fn cloneExpr(self: *MonomorphContext, expr: *const hir.Expr) error{OutOfMemory}!*const hir.Expr {
+        const result = try self.allocator.create(hir.Expr);
+        const substituted_type = if (self.current_subs) |subs|
+            subs.applyToType(self.store, expr.type_id)
+        else
+            expr.type_id;
+        result.* = .{
+            .kind = try self.cloneExprKind(expr.kind),
+            .type_id = substituted_type,
+            .span = expr.span,
+        };
+        return result;
+    }
+
+    fn cloneExprKind(self: *MonomorphContext, kind: hir.ExprKind) error{OutOfMemory}!hir.ExprKind {
+        return switch (kind) {
+            // Literals and refs — no heap pointers to clone
+            .int_lit, .float_lit, .string_lit, .atom_lit, .bool_lit, .nil_lit => kind,
+            .local_get, .param_get, .capture_get => kind,
+            .never => kind,
+
+            .binary => |b| .{ .binary = .{
+                .op = b.op,
+                .lhs = try self.cloneExpr(b.lhs),
+                .rhs = try self.cloneExpr(b.rhs),
+            } },
+            .unary => |u| .{ .unary = .{
+                .op = u.op,
+                .operand = try self.cloneExpr(u.operand),
+            } },
+            .call => |c| blk: {
+                var new_args = try self.allocator.alloc(hir.CallArg, c.args.len);
+                for (c.args, 0..) |arg, i| {
+                    new_args[i] = .{
+                        .expr = try self.cloneExpr(arg.expr),
+                        .mode = arg.mode,
+                        .expected_type = if (self.current_subs) |subs|
+                            subs.applyToType(self.store, arg.expected_type)
+                        else
+                            arg.expected_type,
+                    };
+                }
+                break :blk .{ .call = .{ .target = c.target, .args = new_args } };
+            },
+            .tuple_init => |elems| blk: {
+                var new_elems = try self.allocator.alloc(*const hir.Expr, elems.len);
+                for (elems, 0..) |e, i| new_elems[i] = try self.cloneExpr(e);
+                break :blk .{ .tuple_init = new_elems };
+            },
+            .list_init => |elems| blk: {
+                var new_elems = try self.allocator.alloc(*const hir.Expr, elems.len);
+                for (elems, 0..) |e, i| new_elems[i] = try self.cloneExpr(e);
+                break :blk .{ .list_init = new_elems };
+            },
+            .list_cons => |lc| .{ .list_cons = .{
+                .head = try self.cloneExpr(lc.head),
+                .tail = try self.cloneExpr(lc.tail),
+            } },
+            .map_init => |entries| blk: {
+                var new_entries = try self.allocator.alloc(hir.MapEntry, entries.len);
+                for (entries, 0..) |entry, i| {
+                    new_entries[i] = .{
+                        .key = try self.cloneExpr(entry.key),
+                        .value = try self.cloneExpr(entry.value),
+                    };
+                }
+                break :blk .{ .map_init = new_entries };
+            },
+            .struct_init => |si| blk: {
+                var new_fields = try self.allocator.alloc(hir.StructFieldInit, si.fields.len);
+                for (si.fields, 0..) |f, i| {
+                    new_fields[i] = .{ .name = f.name, .value = try self.cloneExpr(f.value) };
+                }
+                const substituted_struct_type = if (self.current_subs) |subs|
+                    subs.applyToType(self.store, si.type_id)
+                else
+                    si.type_id;
+                break :blk .{ .struct_init = .{ .type_id = substituted_struct_type, .fields = new_fields } };
+            },
+            .field_get => |fg| .{ .field_get = .{
+                .object = try self.cloneExpr(fg.object),
+                .field = fg.field,
+            } },
+            .branch => |br| .{ .branch = .{
+                .condition = try self.cloneExpr(br.condition),
+                .then_block = try self.cloneBlock(br.then_block),
+                .else_block = if (br.else_block) |eb| try self.cloneBlock(eb) else null,
+            } },
+            .case => |cd| blk: {
+                var new_arms = try self.allocator.alloc(hir.CaseArm, cd.arms.len);
+                for (cd.arms, 0..) |arm, i| {
+                    new_arms[i] = .{
+                        .pattern = arm.pattern,
+                        .guard = if (arm.guard) |g| try self.cloneExpr(g) else null,
+                        .body = try self.cloneBlock(arm.body),
+                        .bindings = arm.bindings,
+                    };
+                }
+                break :blk .{ .case = .{ .scrutinee = try self.cloneExpr(cd.scrutinee), .arms = new_arms } };
+            },
+            .block => |b| .{ .block = (try self.cloneBlock(&b)).* },
+            .panic => |e| .{ .panic = try self.cloneExpr(e) },
+            .unwrap => |e| .{ .unwrap = try self.cloneExpr(e) },
+            .union_init => |ui| .{ .union_init = .{
+                .union_type_id = if (self.current_subs) |subs|
+                    subs.applyToType(self.store, ui.union_type_id)
+                else
+                    ui.union_type_id,
+                .variant_name = ui.variant_name,
+                .value = try self.cloneExpr(ui.value),
+            } },
+            .error_pipe => |ep| blk: {
+                var new_steps = try self.allocator.alloc(hir.ErrorPipeStep, ep.steps.len);
+                for (ep.steps, 0..) |step, i| {
+                    new_steps[i] = .{
+                        .expr = try self.cloneExpr(step.expr),
+                        .is_dispatched = step.is_dispatched,
+                    };
+                }
+                break :blk .{ .error_pipe = .{ .steps = new_steps, .handler = try self.cloneExpr(ep.handler) } };
+            },
+            .match => |m| .{ .match = .{
+                .scrutinee = try self.cloneExpr(m.scrutinee),
+                .decision = try self.cloneDecision(m.decision),
+            } },
+            .closure_create => |cc| blk: {
+                if (cc.captures.len == 0) break :blk kind;
+                var new_captures = try self.allocator.alloc(hir.CaptureValue, cc.captures.len);
+                for (cc.captures, 0..) |cap, i| {
+                    new_captures[i] = .{
+                        .expr = try self.cloneExpr(cap.expr),
+                        .ownership = cap.ownership,
+                    };
+                }
+                break :blk .{ .closure_create = .{
+                    .function_group_id = cc.function_group_id,
+                    .captures = new_captures,
+                } };
+            },
+        };
+    }
+
+    // -- Decision tree deep cloning -------------------------------------------
+
+    fn cloneDecision(self: *MonomorphContext, decision: *const hir.Decision) error{OutOfMemory}!*const hir.Decision {
+        const result = try self.allocator.create(hir.Decision);
+        result.* = switch (decision.*) {
+            .success => |leaf| .{ .success = leaf },
+            .failure => .failure,
+            .guard => |g| .{ .guard = .{
+                .condition = try self.cloneExpr(g.condition),
+                .success = try self.cloneDecision(g.success),
+                .failure = try self.cloneDecision(g.failure),
+            } },
+            .switch_tag => |s| blk: {
+                var new_cases = try self.allocator.alloc(hir.SwitchCase, s.cases.len);
+                for (s.cases, 0..) |case, i| {
+                    new_cases[i] = .{
+                        .tag = case.tag,
+                        .bindings = case.bindings,
+                        .next = try self.cloneDecision(case.next),
+                    };
+                }
+                break :blk .{ .switch_tag = .{
+                    .scrutinee = try self.cloneExpr(s.scrutinee),
+                    .cases = new_cases,
+                    .default = try self.cloneDecision(s.default),
+                } };
+            },
+            .switch_literal => |s| blk: {
+                var new_cases = try self.allocator.alloc(hir.LiteralCase, s.cases.len);
+                for (s.cases, 0..) |case, i| {
+                    new_cases[i] = .{
+                        .value = case.value,
+                        .next = try self.cloneDecision(case.next),
+                    };
+                }
+                break :blk .{ .switch_literal = .{
+                    .scrutinee = try self.cloneExpr(s.scrutinee),
+                    .cases = new_cases,
+                    .default = try self.cloneDecision(s.default),
+                } };
+            },
+            .check_tuple => |ct| .{ .check_tuple = .{
+                .scrutinee = try self.cloneExpr(ct.scrutinee),
+                .expected_arity = ct.expected_arity,
+                .element_scrutinee_ids = ct.element_scrutinee_ids,
+                .success = try self.cloneDecision(ct.success),
+                .failure = try self.cloneDecision(ct.failure),
+            } },
+            .check_list => |cl| .{ .check_list = .{
+                .scrutinee = try self.cloneExpr(cl.scrutinee),
+                .expected_length = cl.expected_length,
+                .success = try self.cloneDecision(cl.success),
+                .failure = try self.cloneDecision(cl.failure),
+            } },
+            .check_list_cons => |clc| .{ .check_list_cons = .{
+                .scrutinee = try self.cloneExpr(clc.scrutinee),
+                .head_count = clc.head_count,
+                .head_scrutinee_ids = clc.head_scrutinee_ids,
+                .tail_scrutinee_id = clc.tail_scrutinee_id,
+                .success = try self.cloneDecision(clc.success),
+                .failure = try self.cloneDecision(clc.failure),
+            } },
+            .check_binary => |cb| .{ .check_binary = .{
+                .scrutinee = try self.cloneExpr(cb.scrutinee),
+                .min_byte_size = cb.min_byte_size,
+                .segments = cb.segments,
+                .success = try self.cloneDecision(cb.success),
+                .failure = try self.cloneDecision(cb.failure),
+            } },
+            .bind => |b| .{ .bind = .{
+                .name = b.name,
+                .local_index = b.local_index,
+                .source = try self.cloneExpr(b.source),
+                .next = try self.cloneDecision(b.next),
+            } },
+        };
+        return result;
+    }
+
+    // -- Rewriting call sites -------------------------------------------------
 
     fn rewriteBlock(self: *MonomorphContext, block: *const hir.Block) void {
         for (block.stmts) |stmt| {
@@ -354,9 +651,17 @@ const MonomorphContext = struct {
 
                 var type_args: std.ArrayListUnmanaged(TypeId) = .empty;
                 defer type_args.deinit(self.allocator);
+                var rewrite_var_ids: std.ArrayListUnmanaged(types_mod.TypeVarId) = .empty;
+                defer rewrite_var_ids.deinit(self.allocator);
                 var it = subs.bindings.iterator();
                 while (it.next()) |entry| {
-                    type_args.append(self.allocator, entry.value_ptr.*) catch {};
+                    rewrite_var_ids.append(self.allocator, entry.key_ptr.*) catch {};
+                }
+                std.mem.sort(types_mod.TypeVarId, rewrite_var_ids.items, {}, std.sort.asc(types_mod.TypeVarId));
+                for (rewrite_var_ids.items) |var_id| {
+                    if (subs.bindings.get(var_id)) |concrete| {
+                        type_args.append(self.allocator, concrete) catch {};
+                    }
                 }
 
                 const key = hashInstantiation(target_id, type_args.items);
@@ -398,13 +703,34 @@ const MonomorphContext = struct {
                 self.rewriteBlock(br.then_block);
                 if (br.else_block) |eb| self.rewriteBlock(eb);
             },
+            .map_init => |entries| {
+                for (entries) |entry| {
+                    self.rewriteExpr(entry.key);
+                    self.rewriteExpr(entry.value);
+                }
+            },
+            .struct_init => |si| {
+                for (si.fields) |field| self.rewriteExpr(field.value);
+            },
+            .field_get => |fg| self.rewriteExpr(fg.object),
             .block => |b| self.rewriteBlock(&b),
             .panic => |e| self.rewriteExpr(e),
             .unwrap => |e| self.rewriteExpr(e),
             .union_init => |ui| self.rewriteExpr(ui.value),
+            .error_pipe => |ep| {
+                for (ep.steps) |step| self.rewriteExpr(step.expr);
+                self.rewriteExpr(ep.handler);
+            },
             .case => |cd| {
                 self.rewriteExpr(cd.scrutinee);
-                for (cd.arms) |arm| self.rewriteBlock(arm.body);
+                for (cd.arms) |arm| {
+                    if (arm.guard) |g| self.rewriteExpr(g);
+                    self.rewriteBlock(arm.body);
+                }
+            },
+            .match => |m| self.rewriteExpr(m.scrutinee),
+            .closure_create => |cc| {
+                for (cc.captures) |cap| self.rewriteExpr(cap.expr);
             },
             else => {},
         }
@@ -460,4 +786,62 @@ fn hashInstantiation(group_id: u32, type_args: []const TypeId) u64 {
         hasher.update(std.mem.asBytes(&arg));
     }
     return hasher.final();
+}
+
+/// Generate a mangled name for a specialized function.
+/// E.g. "length" with type args [String] → "length__String"
+fn mangleName(allocator: Allocator, base_name: []const u8, store: *const TypeStore, subs: *const SubstitutionMap) ![]const u8 {
+    if (subs.bindings.count() == 0) return base_name;
+
+    // Collect and sort type variable IDs for deterministic name mangling
+    var var_ids: std.ArrayListUnmanaged(types_mod.TypeVarId) = .empty;
+    defer var_ids.deinit(allocator);
+    var it = subs.bindings.iterator();
+    while (it.next()) |entry| {
+        try var_ids.append(allocator, entry.key_ptr.*);
+    }
+    std.mem.sort(types_mod.TypeVarId, var_ids.items, {}, std.sort.asc(types_mod.TypeVarId));
+
+    var parts: std.ArrayListUnmanaged(u8) = .empty;
+    try parts.appendSlice(allocator, base_name);
+    try parts.appendSlice(allocator, "__");
+
+    for (var_ids.items, 0..) |var_id, i| {
+        if (i > 0) try parts.append(allocator, '_');
+        const concrete_type = subs.bindings.get(var_id) orelse continue;
+        const type_name = typeIdToMangledName(store, concrete_type);
+        try parts.appendSlice(allocator, type_name);
+    }
+
+    return try parts.toOwnedSlice(allocator);
+}
+
+/// Convert a TypeId to a short mangled name for function specialization.
+fn typeIdToMangledName(store: *const TypeStore, type_id: TypeId) []const u8 {
+    const typ = store.getType(type_id);
+    return switch (typ) {
+        .int => |it| switch (it.bits) {
+            8 => if (it.signedness == .signed) "i8" else "u8",
+            16 => if (it.signedness == .signed) "i16" else "u16",
+            32 => if (it.signedness == .signed) "i32" else "u32",
+            64 => if (it.signedness == .signed) "i64" else "u64",
+            else => "int",
+        },
+        .float => |ft| switch (ft.bits) {
+            16 => "f16",
+            32 => "f32",
+            64 => "f64",
+            else => "float",
+        },
+        .bool_type => "Bool",
+        .string_type => "String",
+        .atom_type => "Atom",
+        .nil_type => "Nil",
+        .list => "List",
+        .map => "Map",
+        .tuple => "Tuple",
+        .function => "Fn",
+        .unknown => "Any",
+        else => "T",
+    };
 }

@@ -410,7 +410,7 @@ pub fn compileFiles(
 
     // Monomorphization pass
     var mono_next_group_id = hir_builder.next_group_id;
-    const mono_result = zap.monomorphize.monomorphize(alloc, &hir_program, @constCast(&type_checker.store), &mono_next_group_id) catch {
+    const mono_result = zap.monomorphize.monomorphize(alloc, &hir_program, @constCast(&type_checker.store), &mono_next_group_id, &ctx.interner) catch {
         ctx.diag_engine.err("Error during monomorphization", .{ .start = 0, .end = 0 }) catch {};
         if (options.show_progress) progress.print("\r\x1b[K", .{}) catch {};
         emitContextDiagnostics(ctx, alloc);
@@ -662,7 +662,7 @@ fn compileSingleModuleIr(
 
     // Monomorphization pass
     var mono_next_group_id2 = hir_builder.next_group_id;
-    const mono_result2 = zap.monomorphize.monomorphize(alloc, &hir_program, @constCast(&type_checker.store), &mono_next_group_id2) catch {
+    const mono_result2 = zap.monomorphize.monomorphize(alloc, &hir_program, @constCast(&type_checker.store), &mono_next_group_id2, &ctx.interner) catch {
         ctx.diag_engine.err("Error during monomorphization", .{ .start = 0, .end = 0 }) catch {};
         emitContextDiagnostics(ctx, alloc);
         return error.HirFailed;

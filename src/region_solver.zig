@@ -511,9 +511,15 @@ pub const UseDefInfo = struct {
             .param_get => |pg| try info.recordDef(pg.dest, block),
 
             // Aggregate constructors.
-            .tuple_init, .list_init => |ai| {
+            .tuple_init => |ai| {
                 try info.recordDef(ai.dest, block);
                 for (ai.elements) |elem| {
+                    try info.recordUse(elem, block);
+                }
+            },
+            .list_init => |li| {
+                try info.recordDef(li.dest, block);
+                for (li.elements) |elem| {
                     try info.recordUse(elem, block);
                 }
             },
@@ -1116,8 +1122,12 @@ fn instructionUsesLocal(local: ir.LocalId, instr: ir.Instruction) bool {
             for (mc.captures) |cap| if (cap == local) return true;
             return false;
         },
-        .tuple_init, .list_init => |ai| {
+        .tuple_init => |ai| {
             for (ai.elements) |elem| if (elem == local) return true;
+            return false;
+        },
+        .list_init => |li| {
+            for (li.elements) |elem| if (elem == local) return true;
             return false;
         },
         .list_cons => |lc| return lc.head == local or lc.tail == local,
@@ -1393,9 +1403,15 @@ pub const ConstraintGenerator = struct {
                     try self.addConstraint(self.regionOf(field.value), dest_region, .store_into_container);
                 }
             },
-            .tuple_init, .list_init => |ai| {
+            .tuple_init => |ai| {
                 const dest_region = self.regionOf(ai.dest);
                 for (ai.elements) |elem| {
+                    try self.addConstraint(self.regionOf(elem), dest_region, .store_into_container);
+                }
+            },
+            .list_init => |li| {
+                const dest_region = self.regionOf(li.dest);
+                for (li.elements) |elem| {
                     try self.addConstraint(self.regionOf(elem), dest_region, .store_into_container);
                 }
             },
@@ -1740,7 +1756,8 @@ pub const RegionSolver = struct {
             .local_get => |lg| lg.dest,
             .local_set => |ls| ls.dest,
             .param_get => |pg| pg.dest,
-            .tuple_init, .list_init => |ai| ai.dest,
+            .tuple_init => |ai| ai.dest,
+            .list_init => |li| li.dest,
             .list_cons => |lc| lc.dest,
             .map_init => |mi| mi.dest,
             .struct_init => |si| si.dest,

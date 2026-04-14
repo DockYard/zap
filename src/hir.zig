@@ -68,6 +68,7 @@ pub const Clause = struct {
     tuple_bindings: []const TupleBinding,
     struct_bindings: []const StructBinding = &.{},
     list_bindings: []const ListBinding = &.{},
+    cons_tail_bindings: []const ConsTailBinding = &.{},
     binary_bindings: []const BinaryBinding = &.{},
     map_bindings: []const MapBinding = &.{},
 };
@@ -97,6 +98,13 @@ pub const ListBinding = struct {
     name: ast.StringId,
     param_index: u32,
     element_index: u32,
+    local_index: u32,
+};
+
+/// Binding for a cons pattern tail: [_ | tail] binds the remaining list.
+pub const ConsTailBinding = struct {
+    name: ast.StringId,
+    param_index: u32,
     local_index: u32,
 };
 
@@ -1460,6 +1468,7 @@ pub const HirBuilder = struct {
     current_tuple_bindings: std.ArrayList(TupleBinding),
     current_struct_bindings: std.ArrayList(StructBinding),
     current_list_bindings: std.ArrayList(ListBinding),
+    current_cons_tail_bindings: std.ArrayList(ConsTailBinding),
     current_binary_bindings: std.ArrayList(BinaryBinding),
     current_map_bindings: std.ArrayList(MapBinding),
     current_case_bindings: std.ArrayList(CaseBinding),
@@ -1468,6 +1477,7 @@ pub const HirBuilder = struct {
     current_clause_scope: ?scope_mod.ScopeId,
     current_function_root_scope: ?scope_mod.ScopeId,
     current_function_name: ?[]const u8,
+    current_function_name_id: ?ast.StringId,
     family_to_group: std.AutoHashMap(scope_mod.FunctionFamilyId, u32),
     group_captures: std.AutoHashMap(u32, []const Capture),
     current_capture_map: std.AutoHashMap(ast.StringId, u32),
@@ -1496,6 +1506,7 @@ pub const HirBuilder = struct {
             .current_tuple_bindings = .empty,
             .current_struct_bindings = .empty,
             .current_list_bindings = .empty,
+            .current_cons_tail_bindings = .empty,
             .current_binary_bindings = .empty,
             .current_map_bindings = .empty,
             .current_case_bindings = .empty,
@@ -1504,6 +1515,7 @@ pub const HirBuilder = struct {
             .current_clause_scope = null,
             .current_function_root_scope = null,
             .current_function_name = null,
+            .current_function_name_id = null,
             .family_to_group = std.AutoHashMap(scope_mod.FunctionFamilyId, u32).init(allocator),
             .group_captures = std.AutoHashMap(u32, []const Capture).init(allocator),
             .current_capture_map = std.AutoHashMap(ast.StringId, u32).init(allocator),
@@ -1837,6 +1849,11 @@ pub const HirBuilder = struct {
                 return try self.create(Expr, .{ .kind = .{ .local_get = binding.local_index }, .type_id = type_id, .span = span });
             }
         }
+        for (self.current_cons_tail_bindings.items) |binding| {
+            if (binding.name == name) {
+                return try self.create(Expr, .{ .kind = .{ .local_get = binding.local_index }, .type_id = type_id, .span = span });
+            }
+        }
         for (self.current_binary_bindings.items) |binding| {
             if (binding.name == name) {
                 return try self.create(Expr, .{ .kind = .{ .local_get = binding.local_index }, .type_id = type_id, .span = span });
@@ -2150,6 +2167,7 @@ pub const HirBuilder = struct {
         decls: []const *const ast.FunctionDecl,
     ) ![]const Clause {
         self.current_function_name = self.interner.get(decls[0].name);
+        self.current_function_name_id = decls[0].name;
 
         var clauses: std.ArrayList(Clause) = .empty;
         for (decls) |func| {
@@ -2184,6 +2202,7 @@ pub const HirBuilder = struct {
         };
 
         self.current_function_name = self.interner.get(decls[0].name);
+        self.current_function_name_id = decls[0].name;
 
         var clauses: std.ArrayList(Clause) = .empty;
         for (decls) |func| {
@@ -2221,7 +2240,9 @@ pub const HirBuilder = struct {
         }
 
         const saved_function_name = self.current_function_name;
+        const saved_function_name_id = self.current_function_name_id;
         self.current_function_name = self.interner.get(func.name);
+        self.current_function_name_id = func.name;
         const saved_next_local = self.next_local;
         const saved_root_scope = self.current_function_root_scope;
         const saved_capture_map = self.current_capture_map;
@@ -2243,6 +2264,7 @@ pub const HirBuilder = struct {
         self.current_function_root_scope = saved_root_scope;
         self.next_local = saved_next_local;
         self.current_function_name = saved_function_name;
+        self.current_function_name_id = saved_function_name_id;
 
         return .{
             .id = group_id,
@@ -2262,12 +2284,24 @@ pub const HirBuilder = struct {
         self.current_clause_scope = self.graph.node_scope_map.get(clause.meta.span.start) orelse clause.meta.scope_id;
         defer self.current_clause_scope = prev_clause_scope;
 
+        // Check for inferred signature from the type checker (populated for
+        // generated helpers like __for_N from call-site argument types).
+        const inferred_sig = if (self.current_function_name_id) |name_id|
+            self.type_store.inferred_signatures.get(name_id)
+        else
+            null;
+
         var params: std.ArrayList(TypedParam) = .empty;
-        for (clause.params) |param| {
+        for (clause.params, 0..) |param, param_idx| {
             const type_id = if (param.type_annotation) |ann|
                 self.resolveTypeExpr(ann)
-            else
-                types_mod.TypeStore.UNKNOWN;
+            else if (inferred_sig) |sig| blk: {
+                // Use type inferred from call-site argument types
+                break :blk if (param_idx < sig.param_types.len)
+                    sig.param_types[param_idx]
+                else
+                    types_mod.TypeStore.UNKNOWN;
+            } else types_mod.TypeStore.UNKNOWN;
 
             // When a struct pattern has no module_name (parsed from %{...} :: Type),
             // inject the type name from the type annotation
@@ -2311,6 +2345,8 @@ pub const HirBuilder = struct {
 
         const return_type = if (clause.return_type) |rt|
             self.resolveTypeExpr(rt)
+        else if (inferred_sig) |sig|
+            sig.return_type
         else
             types_mod.TypeStore.NEVER;
 
@@ -2365,6 +2401,7 @@ pub const HirBuilder = struct {
 
         // Process list patterns to create bindings for destructured list elements
         self.current_list_bindings = .empty;
+        self.current_cons_tail_bindings = .empty;
         for (params.items, 0..) |param, param_idx| {
             if (param.pattern) |pat| {
                 if (pat.* == .list) {
@@ -2379,6 +2416,32 @@ pub const HirBuilder = struct {
                                 .local_index = local_idx,
                             });
                         }
+                    }
+                }
+                // Cons patterns [h | t]: register head elements as list bindings
+                // and the tail as an assignment binding so the body can reference
+                // them via local_get instead of falling through to capture_get.
+                if (pat.* == .list_cons) {
+                    for (pat.list_cons.heads, 0..) |head_pat, elem_idx| {
+                        if (head_pat.* == .bind) {
+                            const local_idx = self.next_local;
+                            self.next_local += 1;
+                            try self.current_list_bindings.append(self.allocator, .{
+                                .name = head_pat.bind,
+                                .param_index = @intCast(param_idx),
+                                .element_index = @intCast(elem_idx),
+                                .local_index = local_idx,
+                            });
+                        }
+                    }
+                    if (pat.list_cons.tail.* == .bind) {
+                        const tail_local_idx = self.next_local;
+                        self.next_local += 1;
+                        try self.current_cons_tail_bindings.append(self.allocator, .{
+                            .name = pat.list_cons.tail.bind,
+                            .param_index = @intCast(param_idx),
+                            .local_index = tail_local_idx,
+                        });
                     }
                 }
             }
@@ -2456,6 +2519,7 @@ pub const HirBuilder = struct {
             .tuple_bindings = try self.current_tuple_bindings.toOwnedSlice(self.allocator),
             .struct_bindings = try self.current_struct_bindings.toOwnedSlice(self.allocator),
             .list_bindings = try self.current_list_bindings.toOwnedSlice(self.allocator),
+            .cons_tail_bindings = try self.current_cons_tail_bindings.toOwnedSlice(self.allocator),
             .binary_bindings = try self.current_binary_bindings.toOwnedSlice(self.allocator),
             .map_bindings = try self.current_map_bindings.toOwnedSlice(self.allocator),
         };

@@ -84,6 +84,7 @@ pub const Desugarer = struct {
             .priv_function => |func| .{ .priv_function = try self.desugarFunctionDecl(func) },
             .macro => |mac| .{ .macro = try self.desugarFunctionDecl(mac) },
             .priv_macro => |mac| .{ .priv_macro = try self.desugarFunctionDecl(mac) },
+            .module_level_expr => |expr| .{ .module_level_expr = try self.desugarExpr(expr) },
             else => item,
         };
     }

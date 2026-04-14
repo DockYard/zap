@@ -1006,6 +1006,31 @@ pub fn ctValueToExpr(
         }
     }
 
+    // For comprehension: {:for, meta, [var_atom, iterable, filter, body]}
+    if (std.mem.eql(u8, form_name, "for")) {
+        if (arg_elems.len == 4) {
+            const var_name = if (arg_elems[0] == .atom)
+                try interner.intern(arg_elems[0].atom)
+            else
+                try interner.intern("_");
+            const iterable = try ctValueToExpr(alloc, interner, arg_elems[1]);
+            const filter_expr = if (arg_elems[2] != .nil)
+                try ctValueToExpr(alloc, interner, arg_elems[2])
+            else
+                null;
+            const body = try ctValueToExpr(alloc, interner, arg_elems[3]);
+            const expr = try alloc.create(ast.Expr);
+            expr.* = .{ .for_expr = .{
+                .meta = node_meta,
+                .var_name = var_name,
+                .iterable = iterable,
+                .filter = filter_expr,
+                .body = body,
+            } };
+            return expr;
+        }
+    }
+
     // Error pipe: {:~>, meta, [chain, handler]}
     if (std.mem.eql(u8, form_name, "~>")) {
         if (arg_elems.len == 2) {

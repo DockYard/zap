@@ -2053,6 +2053,185 @@ pub const MapCell = struct {
     }
 };
 
+// ============================================================
+// Generic ListCell factory — produces monomorphic list types
+// for any element type T. Used for string lists, atom lists, etc.
+// ============================================================
+
+pub fn ListCellOf(comptime T: type) type {
+    return struct {
+        const Self = @This();
+        head: T,
+        tail: ?*const Self,
+
+        pub fn empty() ?*const Self {
+            return null;
+        }
+
+        pub fn cons(head: T, tail: ?*const Self) ?*const Self {
+            const bytes = bumpAlloc(@sizeOf(Self));
+            if (bytes.len == 0) return null;
+            const cell: *Self = @ptrCast(@alignCast(bytes.ptr));
+            cell.* = .{ .head = head, .tail = tail };
+            return cell;
+        }
+
+        pub fn getHead(list: ?*const Self) T {
+            if (list) |cell| return cell.head;
+            return std.mem.zeroes(T);
+        }
+
+        pub fn getTail(list: ?*const Self) ?*const Self {
+            if (list) |cell| return cell.tail;
+            return null;
+        }
+
+        pub fn isEmpty(list: ?*const Self) bool {
+            return list == null;
+        }
+
+        pub fn length(list: ?*const Self) i64 {
+            var current = list;
+            var count: i64 = 0;
+            while (current) |cell| {
+                count += 1;
+                current = cell.tail;
+            }
+            return count;
+        }
+
+        pub fn get(list: ?*const Self, index: i64) T {
+            var current = list;
+            var i: i64 = 0;
+            while (current) |cell| {
+                if (i == index) return cell.head;
+                current = cell.tail;
+                i += 1;
+            }
+            return std.mem.zeroes(T);
+        }
+
+        pub fn last(list: ?*const Self) T {
+            var current = list;
+            var result: T = std.mem.zeroes(T);
+            while (current) |cell| {
+                result = cell.head;
+                current = cell.tail;
+            }
+            return result;
+        }
+
+        pub fn reverse(list: ?*const Self) ?*const Self {
+            var current = list;
+            var result: ?*const Self = null;
+            while (current) |cell| {
+                result = cons(cell.head, result);
+                current = cell.tail;
+            }
+            return result;
+        }
+
+        pub fn contains(list: ?*const Self, value: T) bool {
+            var current = list;
+            while (current) |cell| {
+                if (std.mem.eql(u8, std.mem.asBytes(&cell.head), std.mem.asBytes(&value))) return true;
+                current = cell.tail;
+            }
+            return false;
+        }
+
+        pub fn append(list: ?*const Self, value: T) ?*const Self {
+            return reverse(cons(value, reverse(list)));
+        }
+
+        pub fn concat(first: ?*const Self, second: ?*const Self) ?*const Self {
+            if (first == null) return second;
+            var reversed_first = reverse(first);
+            var result = second;
+            while (reversed_first) |cell| {
+                result = cons(cell.head, result);
+                reversed_first = cell.tail;
+            }
+            return result;
+        }
+
+        pub fn take(list: ?*const Self, count: i64) ?*const Self {
+            if (count <= 0 or list == null) return null;
+            var current = list;
+            var collected: ?*const Self = null;
+            var remaining: i64 = count;
+            while (current) |cell| {
+                if (remaining <= 0) break;
+                collected = cons(cell.head, collected);
+                current = cell.tail;
+                remaining -= 1;
+            }
+            return reverse(collected);
+        }
+
+        pub fn drop(list: ?*const Self, count: i64) ?*const Self {
+            if (count <= 0) return list;
+            var current = list;
+            var remaining: i64 = count;
+            while (current) |cell| {
+                if (remaining <= 0) return current;
+                current = cell.tail;
+                remaining -= 1;
+            }
+            return null;
+        }
+
+        pub fn uniq(list: ?*const Self) ?*const Self {
+            var current = list;
+            var result: ?*const Self = null;
+            while (current) |cell| {
+                if (!contains(result, cell.head)) {
+                    result = cons(cell.head, result);
+                }
+                current = cell.tail;
+            }
+            return reverse(result);
+        }
+
+        // Higher-order functions
+        pub fn mapFn(list: ?*const Self, callback: anytype) ?*const Self {
+            var current = list;
+            var result: ?*const Self = null;
+            while (current) |cell| {
+                result = cons(callback(cell.head), result);
+                current = cell.tail;
+            }
+            return reverse(result);
+        }
+
+        pub fn filterFn(list: ?*const Self, predicate: anytype) ?*const Self {
+            var current = list;
+            var result: ?*const Self = null;
+            while (current) |cell| {
+                if (predicate(cell.head)) {
+                    result = cons(cell.head, result);
+                }
+                current = cell.tail;
+            }
+            return reverse(result);
+        }
+
+        pub fn reduceFn(list: ?*const Self, initial: anytype, callback: anytype) @TypeOf(initial) {
+            var current = list;
+            var acc = initial;
+            while (current) |cell| {
+                acc = callback(acc, cell.head);
+                current = cell.tail;
+            }
+            return acc;
+        }
+    };
+}
+
+// Concrete instantiations for known element types
+pub const StringListCell = ListCellOf([]const u8);
+pub const StringListType = ?*const StringListCell;
+
 pub const ListHelpers = struct {
     /// Check if a list is empty (void = empty, anything else = non-empty).
     pub fn isEmpty_legacy(list: anytype) bool {
