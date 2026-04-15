@@ -163,10 +163,10 @@ pub const LambdaSetAnalyzer = struct {
     program: *const ir.Program,
 
     /// Per-value lambda sets: (function_id, local_id) -> set of closure FunctionIds.
-    lambda_sets: std.AutoArrayHashMap(lattice.ValueKey, FunctionIdSet),
+    lambda_sets: std.AutoHashMap(lattice.ValueKey, FunctionIdSet),
 
     /// Per-function-parameter lambda sets.
-    param_lambda_sets: std.AutoArrayHashMap(ParamKey, FunctionIdSet),
+    param_lambda_sets: std.AutoHashMap(ParamKey, FunctionIdSet),
 
     /// Function name -> FunctionId resolution.
     name_to_id: std.StringHashMap(ir.FunctionId),
@@ -175,20 +175,20 @@ pub const LambdaSetAnalyzer = struct {
     call_site_decisions: std.ArrayList(CallSiteDecision),
 
     /// Contifiable closures (function_id -> true if contifiable).
-    contifiable: std.AutoArrayHashMap(ir.FunctionId, bool),
+    contifiable: std.AutoHashMap(ir.FunctionId, bool),
 
     /// Worklist for fixpoint iteration.
     worklist: std.ArrayList(WorkItem),
 
     /// Tracks which (function, local) pairs are already on the worklist.
-    on_worklist: std.AutoArrayHashMap(lattice.ValueKey, void),
+    on_worklist: std.AutoHashMap(lattice.ValueKey, void),
 
     /// Per-closure usage tracking for contification.
-    closure_usage: std.AutoArrayHashMap(ir.FunctionId, UsageKind),
+    closure_usage: std.AutoHashMap(ir.FunctionId, UsageKind),
 
     /// Return value propagation: maps callee FunctionId to list of
     /// (caller function, dest local) pairs that receive the return value.
-    return_sites: std.AutoArrayHashMap(ir.FunctionId, ReturnSiteList),
+    return_sites: std.AutoHashMap(ir.FunctionId, ReturnSiteList),
 
     const ReturnSiteList = struct {
         items: std.ArrayList(lattice.ValueKey),
@@ -211,15 +211,15 @@ pub const LambdaSetAnalyzer = struct {
         var self = LambdaSetAnalyzer{
             .allocator = allocator,
             .program = program,
-            .lambda_sets = std.AutoArrayHashMap(lattice.ValueKey, FunctionIdSet).init(allocator),
-            .param_lambda_sets = std.AutoArrayHashMap(ParamKey, FunctionIdSet).init(allocator),
+            .lambda_sets = std.AutoHashMap(lattice.ValueKey, FunctionIdSet).init(allocator),
+            .param_lambda_sets = std.AutoHashMap(ParamKey, FunctionIdSet).init(allocator),
             .name_to_id = std.StringHashMap(ir.FunctionId).init(allocator),
             .call_site_decisions = .empty,
-            .contifiable = std.AutoArrayHashMap(ir.FunctionId, bool).init(allocator),
+            .contifiable = std.AutoHashMap(ir.FunctionId, bool).init(allocator),
             .worklist = .empty,
-            .on_worklist = std.AutoArrayHashMap(lattice.ValueKey, void).init(allocator),
-            .closure_usage = std.AutoArrayHashMap(ir.FunctionId, UsageKind).init(allocator),
-            .return_sites = std.AutoArrayHashMap(ir.FunctionId, ReturnSiteList).init(allocator),
+            .on_worklist = std.AutoHashMap(lattice.ValueKey, void).init(allocator),
+            .closure_usage = std.AutoHashMap(ir.FunctionId, UsageKind).init(allocator),
+            .return_sites = std.AutoHashMap(ir.FunctionId, ReturnSiteList).init(allocator),
         };
 
         // Build name -> id map
@@ -518,7 +518,7 @@ pub const LambdaSetAnalyzer = struct {
             iterations += 1;
             const item = self.worklist.orderedRemove(0);
             const key = lattice.ValueKey{ .function = item.function, .local = item.local };
-            _ = self.on_worklist.swapRemove(key);
+            _ = self.on_worklist.remove(key);
 
             // Propagate through all instructions in this function that use this local
             try self.propagateFromLocal(item.function, item.local);

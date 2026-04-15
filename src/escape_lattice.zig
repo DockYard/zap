@@ -1016,11 +1016,15 @@ pub const AnalysisContext = struct {
         self.function_summaries.deinit();
 
         // Clean up lambda set member slices (allocated by toLambdaSet).
-        for (self.lambda_sets.items) |ls| {
-            if (ls.members.len > 0) {
-                // Only free if not a static/comptime slice.
-                // Dynamically allocated slices from toLambdaSet use self.allocator.
-                self.allocator.free(ls.members);
+        {
+            var ls_iter = self.lambda_sets.iterator();
+            while (ls_iter.next()) |entry| {
+                const ls = entry.value_ptr.*;
+                if (ls.members.len > 0) {
+                    // Only free if not a static/comptime slice.
+                    // Dynamically allocated slices from toLambdaSet use self.allocator.
+                    self.allocator.free(ls.members);
+                }
             }
         }
         self.lambda_sets.deinit();
@@ -1052,9 +1056,13 @@ pub const AnalysisContext = struct {
         self.outlives_constraints.deinit(self.allocator);
         self.closure_tiers.deinit();
 
-        for (self.call_specializations.items) |spec| {
-            if (spec.lambda_set.members.len > 0) {
-                self.allocator.free(spec.lambda_set.members);
+        {
+            var cs_iter = self.call_specializations.iterator();
+            while (cs_iter.next()) |entry| {
+                const spec = entry.value_ptr.*;
+                if (spec.lambda_set.members.len > 0) {
+                    self.allocator.free(spec.lambda_set.members);
+                }
             }
         }
         self.call_specializations.deinit();

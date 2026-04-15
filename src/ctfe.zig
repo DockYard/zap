@@ -557,7 +557,23 @@ fn cloneCtfeErrors(alloc: std.mem.Allocator, errors: []const CtfeError) ![]const
 ///     help: possible infinite recursion or unexpectedly large compile-time loop
 pub fn formatCtfeError(alloc: std.mem.Allocator, err: CtfeError) ![]const u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
-    const w = buf.writer(alloc);
+    // Writer shim for Zig 0.16 (ArrayListUnmanaged no longer has .writer())
+    const Writer = struct {
+        list: *std.ArrayListUnmanaged(u8),
+        a: std.mem.Allocator,
+        pub fn print(self_w: @This(), comptime fmt_str: []const u8, args: anytype) !void {
+            const s = try std.fmt.allocPrint(self_w.a, fmt_str, args);
+            defer self_w.a.free(s);
+            try self_w.list.appendSlice(self_w.a, s);
+        }
+        pub fn writeAll(self_w: @This(), data: []const u8) !void {
+            try self_w.list.appendSlice(self_w.a, data);
+        }
+        pub fn writeByte(self_w: @This(), byte: u8) !void {
+            try self_w.list.append(self_w.a, byte);
+        }
+    };
+    const w = Writer{ .list = &buf, .a = alloc };
 
     // Main error line
     try w.print("error: {s}\n", .{err.message});
@@ -609,13 +625,12 @@ pub fn formatCtfeError(alloc: std.mem.Allocator, err: CtfeError) ![]const u8 {
 
 /// Emit all CTFE errors to stderr using the diagnostic format.
 pub fn emitCtfeErrors(alloc: std.mem.Allocator, errors: []const CtfeError) void {
-    const stderr = std.fs.File.stderr().deprecatedWriter();
     for (errors) |err| {
         const formatted = formatCtfeError(alloc, err) catch {
-            stderr.print("ctfe error: {s}\n", .{err.message}) catch {};
+            std.debug.print("ctfe error: {s}\n", .{err.message});
             continue;
         };
-        stderr.writeAll(formatted) catch {};
+        std.debug.print("{s}", .{formatted});
         alloc.free(formatted);
     }
 }
@@ -4479,7 +4494,7 @@ pub const PersistentCache = struct {
                     if (ev.present and current == null) return false;
                     if (!ev.present and current != null) return false;
                     if (current) |v| {
-                        const current_hash = std.hash.Wyhash.hash(0, v);
+                        const current_hash = std.hash.Wyhash.hash(0, std.mem.span(v));
                         if (current_hash != ev.value_hash) return false;
                     }
                 },

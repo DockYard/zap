@@ -214,16 +214,17 @@ pub const DependencyGraph = struct {
 pub fn discoverZapFiles(allocator: std.mem.Allocator, path: []const u8) ![]const []const u8 {
     const dir_path = std.fs.path.dirname(path) orelse ".";
 
-    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch {
+    const pio = std.Options.debug_io;
+    var dir = std.Io.Dir.cwd().openDir(pio, dir_path, .{ .iterate = true }) catch {
         var result = try allocator.alloc([]const u8, 1);
         result[0] = path;
         return result;
     };
-    defer dir.close();
+    defer dir.close(pio);
 
     var candidate_paths: std.ArrayList([]const u8) = .empty;
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(pio)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".zap")) continue;
         const full_path = if (std.mem.eql(u8, dir_path, "."))
@@ -245,7 +246,7 @@ pub fn discoverZapFiles(allocator: std.mem.Allocator, path: []const u8) ![]const
     var all_referenced: std.ArrayList([]const u8) = .empty;
 
     for (candidate_paths.items) |cp| {
-        const source = std.fs.cwd().readFileAlloc(allocator, cp, 10 * 1024 * 1024) catch continue;
+        const source = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, cp, allocator, .limited(10 * 1024 * 1024)) catch continue;
         var parser = @import("parser.zig").Parser.init(allocator, source);
         defer parser.deinit();
         const program = parser.parseProgram() catch continue;

@@ -28,7 +28,7 @@ pub const ArcOptimizer = struct {
     ctx: *lattice.AnalysisContext,
 
     /// Values that should skip ARC operations.
-    skip_arc: std.AutoArrayHashMap(lattice.ValueKey, SkipReason),
+    skip_arc: std.AutoHashMap(lattice.ValueKey, SkipReason),
 
     /// Optimized ARC operations to emit.
     optimized_ops: std.ArrayList(lattice.ArcOperation),
@@ -53,7 +53,7 @@ pub const ArcOptimizer = struct {
             .allocator = allocator,
             .program = program,
             .ctx = ctx,
-            .skip_arc = std.AutoArrayHashMap(lattice.ValueKey, SkipReason).init(allocator),
+            .skip_arc = std.AutoHashMap(lattice.ValueKey, SkipReason).init(allocator),
             .optimized_ops = .empty,
         };
     }
@@ -154,7 +154,7 @@ pub const ArcOptimizer = struct {
         if (ops.len < 2) return;
 
         // Track which ops to remove (by index).
-        var remove_set = std.AutoArrayHashMap(usize, void).init(self.allocator);
+        var remove_set = std.AutoHashMap(usize, void).init(self.allocator);
         defer remove_set.deinit();
 
         // Pass 1: Find retain/release pairs on the same value at the same point.
@@ -250,7 +250,7 @@ pub const ArcOptimizer = struct {
             if (!is_recursive) continue;
 
             // Find parameters in this function (loop-invariant by definition).
-            var param_locals = std.AutoArrayHashMap(ir.LocalId, void).init(self.allocator);
+            var param_locals = std.AutoHashMap(ir.LocalId, void).init(self.allocator);
             defer param_locals.deinit();
             for (func.body) |block| {
                 for (block.instructions) |instr| {

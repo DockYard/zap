@@ -1154,7 +1154,7 @@ test "cloneFunctionWithOffset rewrites nested function references" {
 }
 
 /// Run a compiled binary by name from zap-out/bin/.
-pub fn runBinary(allocator: std.mem.Allocator, bin_path: []const u8, program_args: []const []const u8) !u8 {
+pub fn runBinary(allocator: std.mem.Allocator, pio: std.Io, bin_path: []const u8, program_args: []const []const u8) !u8 {
     var argv: std.ArrayListUnmanaged([]const u8) = .empty;
     defer argv.deinit(allocator);
     try argv.append(allocator, bin_path);
@@ -1162,15 +1162,16 @@ pub fn runBinary(allocator: std.mem.Allocator, bin_path: []const u8, program_arg
         try argv.append(allocator, arg);
     }
 
-    var child = std.process.Child.init(argv.items, allocator);
-    child.stderr_behavior = .Inherit;
-    child.stdout_behavior = .Inherit;
-    child.stdin_behavior = .Inherit;
-    try child.spawn();
-    const term = try child.wait();
+    var child = try std.process.spawn(pio, .{
+        .argv = argv.items,
+        .stderr = .inherit,
+        .stdout = .inherit,
+        .stdin = .inherit,
+    });
+    const term = try child.wait(pio);
 
     return switch (term) {
-        .Exited => |code| code,
+        .exited => |code| code,
         else => 1,
     };
 }

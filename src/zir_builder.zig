@@ -628,6 +628,28 @@ pub const ZirDriver = struct {
         full_module: []const u8, // "Zest_Runtime" (full module name for @import)
     };
 
+    /// Deduplicate a function list by local_name, keeping the last occurrence.
+    /// Returns a new ArrayListUnmanaged with unique entries.
+    fn deduplicateFunctions(allocator: std.mem.Allocator, funcs: []const ir.Function) !std.ArrayListUnmanaged(ir.Function) {
+        // Build a map of local_name → last index
+        var last_index = std.StringHashMap(usize).init(allocator);
+        for (funcs, 0..) |func, i| {
+            const key = if (func.local_name.len > 0) func.local_name else func.name;
+            try last_index.put(key, i);
+        }
+        // Collect functions in order, keeping only the last occurrence of each name
+        var result: std.ArrayListUnmanaged(ir.Function) = .empty;
+        for (funcs, 0..) |func, i| {
+            const key = if (func.local_name.len > 0) func.local_name else func.name;
+            if (last_index.get(key)) |last_i| {
+                if (last_i == i) {
+                    try result.append(allocator, func);
+                }
+            }
+        }
+        return result;
+    }
+
     // -- Program emission -----------------------------------------------------
 
     pub fn buildProgram(self: *ZirDriver, program: ir.Program) !void {
@@ -642,21 +664,36 @@ pub const ZirDriver = struct {
         // Track ALL module names (including @native-only) for re-export generation
         var all_module_names = std.StringHashMap(void).init(self.allocator);
 
-        for (program.functions) |func| {
-            // Register module name even for @native functions (for re-export modules)
-            if (func.module_name) |mod| {
-                try all_module_names.put(mod, {});
+        // Deduplicate functions by (module, local_name), keeping the LAST
+        // occurrence. The IR may contain duplicate entries from monomorphization;
+        // duplicates cause putNoClobber assertion failures in Zig 0.16's scanNamespace.
+        // We keep the last occurrence because decl_ref/decl_val resolve to the final
+        // declaration in the namespace.
+        {
+            // First pass: collect all functions per module, allowing duplicates.
+            var raw_root_funcs: std.ArrayListUnmanaged(ir.Function) = .empty;
+            var raw_module_funcs = std.StringHashMap(std.ArrayListUnmanaged(ir.Function)).init(self.allocator);
+            for (program.functions) |func| {
+                if (func.module_name) |mod| {
+                    try all_module_names.put(mod, {});
+                }
+                const is_entry = if (program.entry) |eid| func.id == eid else false;
+                if (is_entry or func.module_name == null) {
+                    try raw_root_funcs.append(self.allocator, func);
+                } else {
+                    const mod = func.module_name.?;
+                    const gop = try raw_module_funcs.getOrPut(mod);
+                    if (!gop.found_existing) gop.value_ptr.* = .empty;
+                    try gop.value_ptr.append(self.allocator, func);
+                }
             }
 
-
-            const is_entry = if (program.entry) |eid| func.id == eid else false;
-            if (is_entry or func.module_name == null) {
-                try root_funcs.append(self.allocator, func);
-            } else {
-                const mod = func.module_name.?;
-                const gop = try module_funcs.getOrPut(mod);
-                if (!gop.found_existing) gop.value_ptr.* = .empty;
-                try gop.value_ptr.append(self.allocator, func);
+            // Second pass: deduplicate by local_name within each group, keeping last.
+            root_funcs = try deduplicateFunctions(self.allocator, raw_root_funcs.items);
+            var raw_iter = raw_module_funcs.iterator();
+            while (raw_iter.next()) |entry| {
+                const deduped = try deduplicateFunctions(self.allocator, entry.value_ptr.items);
+                try module_funcs.put(entry.key_ptr.*, deduped);
             }
         }
 
@@ -1110,12 +1147,13 @@ pub const ZirDriver = struct {
                 try self.setLocal(@intCast(i), param_ref);
             }
         } else if (is_main and func.params.len == 1) {
-            // Inject: const args = std.os.argv (no allocation needed)
-            const std_import = zir_builder_emit_import(self.handle, "std", 3);
-            if (std_import == error_ref) return error.EmitFailed;
-            const os_mod = zir_builder_emit_field_val(self.handle, std_import, "os", 2);
-            if (os_mod == error_ref) return error.EmitFailed;
-            const args_ref = zir_builder_emit_field_val(self.handle, os_mod, "argv", 4);
+            // Inject: const args = @import("zap_runtime").getArgv()
+            // In Zig 0.16, std.os.argv was removed; use runtime helper instead.
+            const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+            if (rt_import == error_ref) return error.EmitFailed;
+            const get_argv_fn = zir_builder_emit_field_val(self.handle, rt_import, "getArgv", 7);
+            if (get_argv_fn == error_ref) return error.EmitFailed;
+            const args_ref = zir_builder_emit_call_ref(self.handle, get_argv_fn, @as([*]const u32, &.{}), 0);
             if (args_ref == error_ref) return error.EmitFailed;
 
             // Store as the first param's local ref
@@ -2781,17 +2819,10 @@ pub const ZirDriver = struct {
             },
 
             .call_dispatch => |cd| {
-                var name_buf: [20]u8 = undefined;
-                const name_slice: []const u8 = std.fmt.bufPrint(&name_buf, "dispatch_{d}", .{cd.group_id}) catch
-                    @as([]const u8, "dispatch");
-                var args : std.ArrayListUnmanaged(u32) = .empty;
-                defer args.deinit(self.allocator);
-                for (cd.args) |arg| {
-                    const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
-                    try args.append(self.allocator, ref);
-                }
-                const ref = zir_builder_emit_call(self.handle, name_slice.ptr, @intCast(name_slice.len), args.items.ptr, @intCast(args.items.len));
-                if (ref != error_ref) try self.setLocal(cd.dest, ref);
+                // Resolve the dispatch group to the actual function and call it.
+                // The group_id is a valid FunctionId created during IR building.
+                const ref = try self.emitNamedCallToTarget(cd.group_id, &.{}, cd.args);
+                try self.setLocal(cd.dest, ref);
             },
             .call_closure => |cc| {
                 const lattice = @import("escape_lattice.zig");
@@ -3025,7 +3056,7 @@ pub const ZirDriver = struct {
                 // for all function references passed as callback parameters.
                 if (mc.captures.len == 0) {
                     const fn_ref = if (is_cross_module and target_module != null)
-                        try self.emitCrossModuleRef(target_module.?, emit_name)
+                        try self.emitCrossModuleRef(target_module.?, target_func.local_name)
                     else
                         zir_builder_emit_decl_ref(self.handle, emit_name.ptr, @intCast(emit_name.len));
                     if (fn_ref == error_ref) return error.EmitFailed;
@@ -4116,14 +4147,38 @@ pub const ZirDriver = struct {
                 return error.EmitFailed;
             }
 
-            // Extract each field from the payload and bind to the correct local
-            for (case.field_bindings) |fb| {
-                const field_ref = zir_builder_emit_field_val(self.handle, payload_ref, fb.field_name.ptr, @intCast(fb.field_name.len));
-                if (field_ref == error_ref) {
-                    self.allocator.free(current_else_insts);
-                    return error.EmitFailed;
+            // Extract each field from the payload and bind to the correct local.
+            // For scalar payloads (e.g., u8 from binary pattern matching), field
+            // access is invalid — bind the payload directly instead.
+            // Detect scalar payloads by checking if field names are numeric indices
+            // ("0", "1", etc.), which indicate tuple-style extraction on a scalar.
+            const is_scalar_payload = blk: {
+                if (case.field_bindings.len == 0) break :blk false;
+                const first_name = case.field_bindings[0].field_name;
+                break :blk first_name.len > 0 and first_name[0] >= '0' and first_name[0] <= '9';
+            };
+
+            if (is_scalar_payload and case.field_bindings.len == 1) {
+                // Single scalar binding (e.g., <<a, _>> extracting one byte):
+                // the payload IS the value, no field extraction needed.
+                try self.setLocal(case.field_bindings[0].local_index, payload_ref);
+            } else if (is_scalar_payload) {
+                // Multiple bindings on a scalar payload — bind first to
+                // the payload directly, remaining are not extractable.
+                try self.setLocal(case.field_bindings[0].local_index, payload_ref);
+                for (case.field_bindings[1..]) |fb| {
+                    try self.setLocal(fb.local_index, payload_ref);
                 }
-                try self.setLocal(fb.local_index, field_ref);
+            } else {
+                // Struct payload: extract fields normally.
+                for (case.field_bindings) |fb| {
+                    const field_ref = zir_builder_emit_field_val(self.handle, payload_ref, fb.field_name.ptr, @intCast(fb.field_name.len));
+                    if (field_ref == error_ref) {
+                        self.allocator.free(current_else_insts);
+                        return error.EmitFailed;
+                    }
+                    try self.setLocal(fb.local_index, field_ref);
+                }
             }
 
             for (case.body_instrs) |bi| try self.emitInstruction(bi);

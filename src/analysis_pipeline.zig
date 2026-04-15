@@ -109,18 +109,18 @@ pub fn runAnalysisPipeline(
 
     for (program.functions) |*func| {
         // Extract per-function escape states.
-        var func_escape = std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.EscapeState).init(alloc);
-        defer func_escape.deinit();
+        var func_escape: std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.EscapeState) = .empty;
+        defer func_escape.deinit(alloc);
         var es_iter = ctx.escape_states.iterator();
         while (es_iter.next()) |entry| {
             if (entry.key_ptr.function == func.id) {
-                try func_escape.put(entry.key_ptr.local, entry.value_ptr.*);
+                try func_escape.put(alloc, entry.key_ptr.local, entry.value_ptr.*);
             }
         }
 
         // Extract per-function alloc sites by scanning IR for allocating instructions.
-        var func_alloc_sites = std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.AllocSiteId).init(alloc);
-        defer func_alloc_sites.deinit();
+        var func_alloc_sites: std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.AllocSiteId) = .empty;
+        defer func_alloc_sites.deinit(alloc);
         {
             var next_site: lattice.AllocSiteId = 0;
             for (func.body) |block| {
@@ -135,7 +135,7 @@ pub fn runAnalysisPipeline(
                         else => null,
                     };
                     if (maybe_dest) |dest| {
-                        try func_alloc_sites.put(dest, next_site);
+                        try func_alloc_sites.put(alloc, dest, next_site);
                         next_site += 1;
                     }
                 }

@@ -34,7 +34,7 @@ Download the latest release tarball for your platform. Extract it — the archiv
 
 Zap links against a fork of the Zig compiler (`libzap_compiler.a`) with LLVM enabled. Building from source requires:
 
-- **Zig 0.15.2** (install via [asdf](https://asdf-vm.com/), [zigup](https://github.com/marler8/zigup), or [ziglang.org](https://ziglang.org/download/))
+- **Zig 0.16.0** (install via [asdf](https://asdf-vm.com/), [zigup](https://github.com/marler8/zigup), or [ziglang.org](https://ziglang.org/download/))
 
 ```sh
 git clone https://github.com/DockYard/zap.git
@@ -45,7 +45,7 @@ zig build          # Builds the zap binary
 
 This produces the compiler binary at `zig-out/bin/zap`.
 
-`zig build setup` automatically downloads the correct `zap-deps` tarball for your platform (macOS Apple Silicon, Linux arm64, or Linux x86_64) from the [Zig fork releases](https://github.com/DockYard/zig/releases/tag/v0.15.2-zap.1). You can also pass custom paths if you have your own build of the Zig fork:
+`zig build setup` automatically downloads the correct `zap-deps` tarball for your platform (macOS Apple Silicon, Linux arm64, or Linux x86_64) from the [Zig fork releases](https://github.com/DockYard/zig/releases/tag/v0.16.0-zap.1). You can also pass custom paths if you have your own build of the Zig fork:
 
 ```sh
 zig build \
@@ -679,24 +679,24 @@ The build follows the same process as the official [zig-bootstrap](https://codeb
 - C/C++ compiler (Xcode command line tools on macOS, GCC on Linux)
 - CMake 3.19+
 - Ninja
-- Zig 0.15.2 (only needed if skipping the bootstrap)
+- Zig 0.16.0 (only needed if skipping the bootstrap)
 
-### Step 1: Clone zig-bootstrap 0.15.2
+### Step 1: Clone zig-bootstrap 0.16.0
 
 ```sh
-git clone --depth 1 --branch 0.15.2 \
+git clone --depth 1 --branch 0.16.0 \
   https://codeberg.org/ziglang/zig-bootstrap.git \
-  ~/zig-bootstrap-0.15.2
+  ~/zig-bootstrap-0.16.0
 ```
 
 ### Step 2: Build LLVM, Clang, LLD from source (host)
 
 ```sh
-cd ~/zig-bootstrap-0.15.2
+cd ~/zig-bootstrap-0.16.0
 mkdir -p out/build-llvm-host && cd out/build-llvm-host
 cmake ../../llvm \
-  -DCMAKE_INSTALL_PREFIX="$HOME/zig-bootstrap-0.15.2/out/host" \
-  -DCMAKE_PREFIX_PATH="$HOME/zig-bootstrap-0.15.2/out/host" \
+  -DCMAKE_INSTALL_PREFIX="$HOME/zig-bootstrap-0.16.0/out/host" \
+  -DCMAKE_PREFIX_PATH="$HOME/zig-bootstrap-0.16.0/out/host" \
   -DCMAKE_BUILD_TYPE=Release \
   -DLLVM_ENABLE_PROJECTS="lld;clang" \
   -DLLVM_ENABLE_BINDINGS=OFF \
@@ -724,13 +724,13 @@ This takes ~20 minutes.
 ### Step 3: Build host Zig via CMake
 
 ```sh
-cd ~/zig-bootstrap-0.15.2
+cd ~/zig-bootstrap-0.16.0
 mkdir -p out/build-zig-host && cd out/build-zig-host
 cmake ../../zig \
-  -DCMAKE_INSTALL_PREFIX="$HOME/zig-bootstrap-0.15.2/out/host" \
-  -DCMAKE_PREFIX_PATH="$HOME/zig-bootstrap-0.15.2/out/host" \
+  -DCMAKE_INSTALL_PREFIX="$HOME/zig-bootstrap-0.16.0/out/host" \
+  -DCMAKE_PREFIX_PATH="$HOME/zig-bootstrap-0.16.0/out/host" \
   -DCMAKE_BUILD_TYPE=Release \
-  -DZIG_VERSION="0.15.2" \
+  -DZIG_VERSION="0.16.0" \
   -GNinja
 cmake --build . --target install
 ```
@@ -740,7 +740,7 @@ This bootstraps through wasm2c -> zig1 -> zig2 -> stage3. Takes ~15 minutes.
 ### Step 4: Rebuild LLVM with Zig as the compiler
 
 ```sh
-cd ~/zig-bootstrap-0.15.2
+cd ~/zig-bootstrap-0.16.0
 ROOTDIR="$(pwd)"
 TARGET="aarch64-macos-none"  # or x86_64-linux-gnu, etc.
 MCPU="baseline"
@@ -841,7 +841,7 @@ This takes ~30 minutes. The output at `out/aarch64-macos-none-baseline/lib/` con
 
 ```sh
 cd ~/projects/zig   # the Zap Zig fork
-ROOTDIR="$HOME/zig-bootstrap-0.15.2"
+ROOTDIR="$HOME/zig-bootstrap-0.16.0"
 TARGET="aarch64-macos-none"
 MCPU="baseline"
 ZIG="$ROOTDIR/out/host/bin/zig"
@@ -852,7 +852,7 @@ $ZIG build lib \
   -Doptimize=ReleaseSafe \
   -Dtarget="$TARGET" \
   -Dcpu="$MCPU" \
-  -Dversion-string="0.15.2"
+  -Dversion-string="0.16.0"
 ```
 
 Output: `zig-out/lib/libzig_compiler.a`
@@ -861,7 +861,7 @@ Output: `zig-out/lib/libzig_compiler.a`
 
 ```sh
 cd ~/projects/zap
-zig build -Dllvm-lib-path="$HOME/zig-bootstrap-0.15.2/out/aarch64-macos-none-baseline/lib"
+zig build -Dllvm-lib-path="$HOME/zig-bootstrap-0.16.0/out/aarch64-macos-none-baseline/lib"
 ```
 
 Output: `zig-out/bin/zap`

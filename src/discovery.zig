@@ -141,7 +141,7 @@ pub fn discover(
         graph.file_source_root.put(file_path, resolved.source_root_name) catch return error.OutOfMemory;
 
         // Read and scan the file for module references
-        const source = std.fs.cwd().readFileAlloc(alloc, file_path, 10 * 1024 * 1024) catch
+        const source = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, file_path, alloc, .limited(10 * 1024 * 1024)) catch
             return error.ReadError;
 
         // Track whether this module is private (defmodulep)
@@ -278,7 +278,7 @@ fn resolveModuleToFile(
     for (source_roots) |root| {
         const full_path = std.fs.path.join(alloc, &.{ root.path, rel_path }) catch continue;
         // Check if the file exists
-        std.fs.cwd().access(full_path, .{}) catch continue;
+        std.Io.Dir.cwd().access(std.Options.debug_io, full_path, .{}) catch continue;
         return .{ .path = full_path, .source_root_name = root.name };
     }
 
@@ -538,12 +538,12 @@ test "discover: single file with no references" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
         .sub_path = "app.zap",
         .data = "pub module App {\n  pub fn main() -> i64 {\n    42\n  }\n}\n",
     });
 
-    const tmp_path = try tmp_dir.dir.realpathAlloc(alloc, ".");
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
     const roots = &[_]SourceRoot{.{ .name = "project", .path = tmp_path }};
 
     var graph = try discover(alloc, "App", roots, &BUILTIN_TYPE_NAMES, null);
@@ -562,20 +562,20 @@ test "discover: transitive references" {
     defer tmp_dir.cleanup();
 
     // App → Helper → Util (3 files, transitive chain)
-    try tmp_dir.dir.writeFile(.{
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
         .sub_path = "app.zap",
         .data = "pub module App {\n  pub fn main() -> i64 {\n    Helper.run()\n  }\n}\n",
     });
-    try tmp_dir.dir.writeFile(.{
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
         .sub_path = "helper.zap",
         .data = "pub module Helper {\n  pub fn run() -> i64 {\n    Util.value()\n  }\n}\n",
     });
-    try tmp_dir.dir.writeFile(.{
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
         .sub_path = "util.zap",
         .data = "pub module Util {\n  pub fn value() -> i64 {\n    1\n  }\n}\n",
     });
 
-    const tmp_path = try tmp_dir.dir.realpathAlloc(alloc, ".");
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
     const roots = &[_]SourceRoot{.{ .name = "project", .path = tmp_path }};
 
     var graph = try discover(alloc, "App", roots, &BUILTIN_TYPE_NAMES, null);
@@ -602,16 +602,16 @@ test "discover: circular dependency detected" {
     defer tmp_dir.cleanup();
 
     // A → B → A (cycle)
-    try tmp_dir.dir.writeFile(.{
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
         .sub_path = "cycle_a.zap",
         .data = "pub module CycleA {\n  pub fn go() -> i64 {\n    CycleB.go()\n  }\n}\n",
     });
-    try tmp_dir.dir.writeFile(.{
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
         .sub_path = "cycle_b.zap",
         .data = "pub module CycleB {\n  pub fn go() -> i64 {\n    CycleA.go()\n  }\n}\n",
     });
 
-    const tmp_path = try tmp_dir.dir.realpathAlloc(alloc, ".");
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
     const roots = &[_]SourceRoot{.{ .name = "project", .path = tmp_path }};
 
     const result = discover(alloc, "CycleA", roots, &BUILTIN_TYPE_NAMES, null);
@@ -627,12 +627,12 @@ test "discover: module not found" {
     defer tmp_dir.cleanup();
 
     // App references NonExistent which doesn't exist
-    try tmp_dir.dir.writeFile(.{
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
         .sub_path = "app.zap",
         .data = "pub module App {\n  pub fn main() -> i64 {\n    NonExistent.foo()\n  }\n}\n",
     });
 
-    const tmp_path = try tmp_dir.dir.realpathAlloc(alloc, ".");
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
     const roots = &[_]SourceRoot{.{ .name = "project", .path = tmp_path }};
 
     const result = discover(alloc, "App", roots, &BUILTIN_TYPE_NAMES, null);
@@ -648,20 +648,20 @@ test "discover: module found in dep root" {
     defer tmp_dir.cleanup();
 
     // Project references DepMod which is in a separate dep root
-    tmp_dir.dir.makePath("project") catch {};
-    tmp_dir.dir.makePath("dep_lib") catch {};
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "project") catch {};
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "dep_lib") catch {};
 
-    try tmp_dir.dir.writeFile(.{
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
         .sub_path = "project/app.zap",
         .data = "pub module App {\n  pub fn main() -> i64 {\n    DepMod.value()\n  }\n}\n",
     });
-    try tmp_dir.dir.writeFile(.{
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
         .sub_path = "dep_lib/dep_mod.zap",
         .data = "pub module DepMod {\n  pub fn value() -> i64 {\n    99\n  }\n}\n",
     });
 
-    const project_path = try tmp_dir.dir.realpathAlloc(alloc, "project");
-    const dep_path = try tmp_dir.dir.realpathAlloc(alloc, "dep_lib");
+    const project_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, "project", alloc);
+    const dep_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, "dep_lib", alloc);
     const roots = &[_]SourceRoot{
         .{ .name = "project", .path = project_path },
         .{ .name = "dep:mylib", .path = dep_path },

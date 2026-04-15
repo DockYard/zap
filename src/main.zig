@@ -7,9 +7,14 @@ const zir_builder = zap.zir_builder;
 const zig_lib_archive = @import("zig_lib_archive");
 
 /// Global Io instance for main thread operations.
+var global_io_impl: std.Io.Threaded = undefined;
 var global_io: Io = std.Options.debug_io;
 
 pub fn main(init: std.process.Init.Minimal) !void {
+    // Initialize threaded I/O for process spawning and other operations.
+    global_io_impl = .init(std.heap.page_allocator, .{});
+    global_io = global_io_impl.io();
+
     var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
     const allocator = debug_allocator.allocator();
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -103,7 +108,7 @@ fn cmdRun(allocator: std.mem.Allocator, args: []const []const u8) !void {
     defer allocator.free(output_path);
 
     // Run the built binary
-    const exit_code = compiler.runBinary(allocator, output_path, parsed.run_args) catch |err| {
+    const exit_code = compiler.runBinary(allocator, global_io, output_path, parsed.run_args) catch |err| {
         // stderr writer removed in 0.16
         std.debug.print("Error running program: {}\n", .{err});
         std.process.exit(1);
@@ -221,14 +226,14 @@ fn cmdInit(allocator: std.mem.Allocator) !void {
     defer dir.close(global_io);
 
     var iter = dir.iterate();
-    if (iter.next() catch null) |_| {
+    if (iter.next(global_io) catch null) |_| {
         // stderr writer removed in 0.16
         std.debug.print("Error: directory is not empty\n", .{});
         std.process.exit(1);
     }
 
     // Derive names from directory
-    const cwd_path = try std.Io.Dir.cwd().realpathAlloc(global_io, ".", allocator);
+    const cwd_path = try std.Io.Dir.cwd().realPathFileAlloc(global_io, ".", allocator);
     defer allocator.free(cwd_path);
     const dir_name = std.fs.path.basename(cwd_path);
 
@@ -338,8 +343,7 @@ fn cmdInit(allocator: std.mem.Allocator) !void {
     defer allocator.free(test_source);
     try writeFile(test_path, test_source);
 
-    const stdout = std.fs.File.stdout().deprecatedWriter();
-    try stdout.print("Created project '{s}'\n\n  zap build\n  zap run\n  zap run test\n", .{project_name});
+    std.debug.print("Created project '{s}'\n\n  zap build\n  zap run\n  zap run test\n", .{project_name});
 }
 
 // ---------------------------------------------------------------------------
@@ -472,7 +476,7 @@ fn buildTarget(
                         var dir = dir_handle;
                         defer dir.close(global_io);
                         var it = dir.iterate();
-                        while (it.next() catch null) |entry| {
+                        while (it.next(global_io) catch null) |entry| {
                             if (entry.kind == .directory) {
                                 const subdir = try std.fs.path.join(alloc, &.{ dep_resolved, entry.name });
                                 try source_roots.append(alloc, .{ .name = dep_name, .path = subdir });
@@ -645,7 +649,7 @@ fn buildTarget(
         var deduped: std.ArrayListUnmanaged([]const u8) = .empty;
         for (source_files.items) |sf| {
             // Normalize: resolve to real path for comparison
-            const key = std.Io.Dir.cwd().realpathAlloc(global_io, sf, alloc) catch sf;
+            const key = std.fs.path.resolve(alloc, &.{sf}) catch sf;
             if (!seen.contains(key)) {
                 seen.put(key, {}) catch {};
                 deduped.append(alloc, sf) catch {};
@@ -713,7 +717,7 @@ fn buildTarget(
 
             // Fallback: strip project root and common prefixes
             const rel_path = if (std.mem.startsWith(u8, sf, project_root))
-                std.mem.trimLeft(u8, sf[project_root.len..], "/")
+                std.mem.trimStart(u8, sf[project_root.len..], "/")
             else
                 sf;
 
@@ -772,8 +776,7 @@ fn buildTarget(
     };
 
     if (cache_valid) {
-        const progress = std.fs.File.stderr().deprecatedWriter();
-        progress.print("[cached] {s}\n", .{output_path}) catch {};
+        std.debug.print("[cached] {s}\n", .{output_path});
         return try allocator.dupe(u8, output_path);
     }
 
@@ -1124,7 +1127,7 @@ fn walkAndMatch(
     defer dir.close(global_io);
     var iter = dir.iterate();
 
-    while (iter.next() catch null) |entry| {
+    while (iter.next(global_io) catch null) |entry| {
         const full_path = try std.fs.path.join(alloc, &.{ dir_path, entry.name });
 
         if (entry.kind == .directory and recurse) {

@@ -109,12 +109,18 @@ pub const GeneralizedEscapeAnalyzer = struct {
         self.local_alloc_sites.deinit();
         self.borrow_sites.deinit(self.allocator);
         self.alloc_site_map.deinit();
-        for (self.aliases.items) |*list| {
-            list.deinit(self.allocator);
+        {
+            var alias_iter = self.aliases.iterator();
+            while (alias_iter.next()) |entry| {
+                entry.value_ptr.deinit(self.allocator);
+            }
         }
         self.aliases.deinit();
-        for (self.field_name_lists.items) |names| {
-            self.allocator.free(names);
+        {
+            var fnl_iter = self.field_name_lists.iterator();
+            while (fnl_iter.next()) |entry| {
+                self.allocator.free(entry.value_ptr.*);
+            }
         }
         self.field_name_lists.deinit();
     }

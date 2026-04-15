@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 // Pre-built dependency version — update when releasing new zap-deps
-const zap_deps_version = "v0.15.2-zap.1";
+const zap_deps_version = "v0.16.0-zap.1";
 const zap_deps_base_url = "https://github.com/DockYard/zig/releases/download/" ++ zap_deps_version;
 const host_triple = @tagName(builtin.cpu.arch) ++ "-" ++ @tagName(builtin.os.tag) ++ "-" ++ @tagName(builtin.abi);
 const default_deps_dir = "zap-deps/" ++ host_triple;

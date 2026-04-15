@@ -1,4 +1,42 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
+const runtime_io = std.Options.debug_io;
+
+/// Platform-portable access to process argv (replacement for removed getArgv() in 0.16).
+pub fn getArgv() []const [*:0]const u8 {
+    if (comptime builtin.os.tag == .macos) {
+        const c = struct {
+            extern "c" fn _NSGetArgc() *c_int;
+            extern "c" fn _NSGetArgv() *[*]const [*:0]const u8;
+        };
+        const argc: usize = @intCast(c._NSGetArgc().*);
+        const argv = c._NSGetArgv().*;
+        return argv[0..argc];
+    } else if (comptime builtin.os.tag == .linux) {
+        // On Linux, use /proc/self/cmdline as fallback or linker-provided __libc_argv.
+        const c = struct {
+            extern "c" var __libc_argc: c_int;
+            extern "c" var __libc_argv: [*]const [*:0]const u8;
+        };
+        const argc: usize = @intCast(c.__libc_argc);
+        return c.__libc_argv[0..argc];
+    } else {
+        return &.{};
+    }
+}
+
+/// Write formatted output to stdout (replaces deprecatedWriter pattern).
+fn stdoutPrint(comptime fmt: []const u8, args: anytype) void {
+    var buf: [4096]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, fmt, args) catch return;
+    std.Io.File.stdout().writeStreamingAll(runtime_io, msg) catch {};
+}
+
+/// Write raw bytes to stdout.
+fn stdoutWrite(bytes: []const u8) void {
+    std.Io.File.stdout().writeStreamingAll(runtime_io, bytes) catch {};
+}
 
 // ============================================================
 // Static Bump Allocator
@@ -333,10 +371,10 @@ pub fn atomEq(a: u32, b: u32) bool {
 // ============================================================
 
 pub const BuilderRuntime = struct {
-    /// Construct Zap.Env from std.os.argv.
+    /// Construct Zap.Env from getArgv().
     /// argv[0] = binary, argv[1] = target, argv[2] = os, argv[3] = arch
     pub fn buildEnvFromArgv() struct { target: u32, os: u32, arch: u32 } {
-        const argv = std.os.argv;
+        const argv = getArgv();
         return .{
             .target = if (argv.len > 1) atomIntern(argv[1], @intCast(std.mem.len(argv[1]))) else 0,
             .os = if (argv.len > 2) atomIntern(argv[2], @intCast(std.mem.len(argv[2]))) else 0,
@@ -349,18 +387,17 @@ pub const BuilderRuntime = struct {
         const T = @TypeOf(manifest);
         const info = @typeInfo(T);
         if (info != .@"struct") return; // void or non-struct — nothing to serialize
-        const stdout = std.fs.File.stdout().deprecatedWriter();
-        inline for (info.@"struct".fields) |field| {
+                inline for (info.@"struct".fields) |field| {
             const value = @field(manifest, field.name);
             const FT = @TypeOf(value);
             if (FT == []const u8) {
-                stdout.print("{s}={s}\n", .{ field.name, value }) catch {};
+                stdoutPrint("{s}={s}\n", .{ field.name, value });
             } else if (FT == u32) {
-                stdout.print("{s}={s}\n", .{ field.name, atomToString(value) }) catch {};
+                stdoutPrint("{s}={s}\n", .{ field.name, atomToString(value) });
             } else if (@typeInfo(FT) == .int) {
-                stdout.print("{s}={d}\n", .{ field.name, value }) catch {};
+                stdoutPrint("{s}={d}\n", .{ field.name, value });
             } else if (FT == bool) {
-                stdout.print("{s}={}\n", .{ field.name, value }) catch {};
+                stdoutPrint("{s}={}\n", .{ field.name, value });
             }
         }
     }
@@ -731,45 +768,46 @@ pub const ZapString = struct {
 // ============================================================
 
 pub fn panic(message: []const u8) noreturn {
-    const stderr = std.fs.File.stderr().deprecatedWriter();
-    stderr.print("** (NilError) {s}\n", .{message}) catch {};
+        std.debug.print("** (NilError) {s}\n", .{message});
     std.process.exit(1);
 }
 
 pub const Prelude = struct {
     pub fn println(value: anytype) void {
-        const stdout = std.fs.File.stdout().deprecatedWriter();
-        const T = @TypeOf(value);
+                const T = @TypeOf(value);
         const info = @typeInfo(T);
         if (T == []const u8 or (info == .pointer and @typeInfo(std.meta.Child(T)) == .array)) {
-            stdout.print("{s}\n", .{value}) catch {};
+            stdoutPrint("{s}\n", .{value});
         } else if (info == .int or info == .comptime_int) {
-            stdout.print("{d}\n", .{value}) catch {};
+            stdoutPrint("{d}\n", .{value});
         } else if (info == .float or info == .comptime_float) {
-            stdout.print("{d}\n", .{value}) catch {};
+            stdoutPrint("{d}\n", .{value});
         } else if (T == bool) {
-            stdout.print("{}\n", .{value}) catch {};
+            stdoutPrint("{}\n", .{value});
         } else if (info == .@"enum") {
-            stdout.print(":{s}\n", .{@tagName(value)}) catch {};
+            stdoutPrint(":{s}\n", .{@tagName(value)});
         } else if (T == u32) {
             // Could be an atom ID — print as atom if it looks up
             const name = atomToString(value);
             if (!std.mem.eql(u8, name, "<unknown_atom>")) {
-                stdout.print(":{s}\n", .{name}) catch {};
+                stdoutPrint(":{s}\n", .{name});
             } else {
-                stdout.print("{d}\n", .{value}) catch {};
+                stdoutPrint("{d}\n", .{value});
             }
         } else {
             // For tuples, structs, and other compound types, use inspect formatting
-            inspectWrite(stdout, value);
-            stdout.print("\n", .{}) catch {};
+            var iw_buf: [4096]u8 = undefined;
+            var iw = std.Io.File.stdout().writer(runtime_io, &iw_buf);
+            inspectWrite(&iw, value);
+            stdoutPrint("\n", .{});
         }
     }
 
     pub fn inspect(value: anytype) InspectReturn(@TypeOf(value)) {
-        const stdout = std.fs.File.stdout().deprecatedWriter();
-        inspectWrite(stdout, value);
-        stdout.print("\n", .{}) catch {};
+        var iw_buf: [4096]u8 = undefined;
+        var iw = std.Io.File.stdout().writer(runtime_io, &iw_buf);
+        inspectWrite(&iw, value);
+        stdoutPrint("\n", .{});
         const RT = InspectReturn(@TypeOf(value));
         if (RT == void) return;
         return value;
@@ -874,13 +912,12 @@ pub const Prelude = struct {
     }
 
     pub fn print_str(value: anytype) void {
-        const stdout = std.fs.File.stdout().deprecatedWriter();
-        const T = @TypeOf(value);
+                const T = @TypeOf(value);
         const info = @typeInfo(T);
         if (T == []const u8 or (info == .pointer and @typeInfo(std.meta.Child(T)) == .array)) {
-            stdout.print("{s}", .{value}) catch {};
+            stdoutPrint("{s}", .{value});
         } else {
-            stdout.print("{any}", .{value}) catch {};
+            stdoutPrint("{any}", .{value});
         }
     }
 
@@ -1191,15 +1228,9 @@ pub const Prelude = struct {
     // --- File I/O ---
 
     pub fn file_read(path: []const u8) []const u8 {
-        // Copy path to null-terminated buffer for OS call
-        var path_buf: [4096]u8 = undefined;
-        if (path.len >= path_buf.len) return "";
-        @memcpy(path_buf[0..path.len], path);
-        path_buf[path.len] = 0;
-        const path_z: [*:0]const u8 = path_buf[0..path.len :0];
-
-        const file = std.fs.cwd().openFileZ(path_z, .{}) catch return "";
-        defer file.close();
+        const pio = runtime_io;
+        const file = std.Io.Dir.cwd().openFile(pio, path, .{}) catch return "";
+        defer file.close(pio);
 
         // Read up to remaining bump space
         const max_size = BUMP_SIZE - bump_offset;
@@ -1207,32 +1238,21 @@ pub const Prelude = struct {
         const result = bumpAlloc(max_size);
         if (result.len == 0) return "";
 
-        const bytes_read = file.readAll(result) catch return "";
+        const bytes_read = file.readPositionalAll(pio, result, 0) catch return "";
         return result[0..bytes_read];
     }
 
     pub fn file_write(path: []const u8, content: []const u8) bool {
-        var path_buf: [4096]u8 = undefined;
-        if (path.len >= path_buf.len) return false;
-        @memcpy(path_buf[0..path.len], path);
-        path_buf[path.len] = 0;
-        const path_z: [*:0]const u8 = path_buf[0..path.len :0];
+        const pio = runtime_io;
+        const file = std.Io.Dir.cwd().createFile(pio, path, .{}) catch return false;
+        defer file.close(pio);
 
-        const file = std.fs.cwd().createFileZ(path_z, .{}) catch return false;
-        defer file.close();
-
-        file.writeAll(content) catch return false;
+        file.writeStreamingAll(pio, content) catch return false;
         return true;
     }
 
     pub fn file_exists(path: []const u8) bool {
-        var path_buf: [4096]u8 = undefined;
-        if (path.len >= path_buf.len) return false;
-        @memcpy(path_buf[0..path.len], path);
-        path_buf[path.len] = 0;
-        const path_z: [*:0]const u8 = path_buf[0..path.len :0];
-
-        std.fs.cwd().accessZ(path_z, .{}) catch return false;
+        std.Io.Dir.cwd().access(runtime_io, path, .{}) catch return false;
         return true;
     }
 
@@ -1262,14 +1282,14 @@ pub const Prelude = struct {
         std.process.exit(1);
     }
 
-    // CLI argument access — use std.os.argv directly (no allocation)
+    // CLI argument access — use getArgv() directly (no allocation)
     pub fn arg_count() i64 {
-        const argv = std.os.argv;
+        const argv = getArgv();
         return if (argv.len > 0) @as(i64, @intCast(argv.len)) - 1 else 0;
     }
 
     pub fn arg_at(index: anytype) []const u8 {
-        const argv = std.os.argv;
+        const argv = getArgv();
         const T = @TypeOf(index);
         const idx: usize = if (T == comptime_int or @typeInfo(T) == .int)
             @intCast(index)
@@ -1317,33 +1337,29 @@ pub const TestTracker = struct {
     }
 
     pub fn print_dot() void {
-        const stdout = std.fs.File.stdout().deprecatedWriter();
-        stdout.print("\x1b[1;32m.\x1b[0m", .{}) catch {};
+                stdoutPrint("\x1b[1;32m.\x1b[0m", .{});
     }
 
     pub fn print_fail() void {
-        const stdout = std.fs.File.stdout().deprecatedWriter();
-        stdout.print("\x1b[1;31mF\x1b[0m", .{}) catch {};
+                stdoutPrint("\x1b[1;31mF\x1b[0m", .{});
     }
 
     pub fn summary() i64 {
-        const stdout = std.fs.File.stdout().deprecatedWriter();
-        stdout.print("\n\n", .{}) catch {};
+                stdoutPrint("\n\n", .{});
         writeI64(test_count);
-        stdout.print(" tests, ", .{}) catch {};
+        stdoutPrint(" tests, ", .{});
         writeI64(test_failures);
-        stdout.print(" failures\n", .{}) catch {};
+        stdoutPrint(" failures\n", .{});
         writeI64(assertion_count);
-        stdout.print(" assertions, ", .{}) catch {};
+        stdoutPrint(" assertions, ", .{});
         writeI64(assertion_failures);
-        stdout.print(" failures\n", .{}) catch {};
+        stdoutPrint(" failures\n", .{});
         return test_failures;
     }
 
     fn writeI64(val: i64) void {
-        const stdout = std.fs.File.stdout().deprecatedWriter();
-        if (val < 0) {
-            stdout.print("-", .{}) catch {};
+                if (val < 0) {
+            stdoutPrint("-", .{});
             writeI64(-val);
             return;
         }
@@ -1352,7 +1368,7 @@ pub const TestTracker = struct {
         }
         const digit: u8 = @intCast(@mod(val, 10));
         const buf = [1]u8{'0' + digit};
-        _ = stdout.write(&buf) catch 0;
+        stdoutWrite(&buf);
     }
 };
 

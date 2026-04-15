@@ -8,6 +8,8 @@ const std = @import("std");
 const zap = @import("root.zig");
 const BuildConfig = zap.builder.BuildConfig;
 
+const io = std.Options.debug_io;
+
 pub const LockEntry = struct {
     name: []const u8,
     source_type: []const u8, // "git", "path", "zig", "system"
@@ -21,7 +23,7 @@ pub const LockEntry = struct {
 pub fn readLockfile(alloc: std.mem.Allocator, project_root: []const u8) ?[]const LockEntry {
     const lock_path = std.fs.path.join(alloc, &.{ project_root, "zap.lock" }) catch return null;
     defer alloc.free(lock_path);
-    const content = std.fs.cwd().readFileAlloc(alloc, lock_path, 1024 * 1024) catch return null;
+    const content = std.Io.Dir.cwd().readFileAlloc(io, lock_path, alloc, .limited(1024 * 1024)) catch return null;
 
     var entries: std.ArrayListUnmanaged(LockEntry) = .empty;
     var lines = std.mem.splitScalar(u8, content, '\n');
@@ -58,15 +60,16 @@ pub fn writeLockfile(
     entries: []const LockEntry,
 ) !void {
     const lock_path = try std.fs.path.join(alloc, &.{ project_root, "zap.lock" });
-    var file = try std.fs.cwd().createFile(lock_path, .{});
-    defer file.close();
-    const writer = file.deprecatedWriter();
 
-    try writer.writeAll("# zap.lock — auto-generated, do not edit\n");
-    try writer.writeAll("# name\ttype\turl\tresolved\tcommit\tintegrity\n");
+    // Build content in memory.
+    var content: std.ArrayListUnmanaged(u8) = .empty;
+    defer content.deinit(alloc);
+
+    try content.appendSlice(alloc, "# zap.lock — auto-generated, do not edit\n");
+    try content.appendSlice(alloc, "# name\ttype\turl\tresolved\tcommit\tintegrity\n");
 
     for (entries) |entry| {
-        try writer.print("{s}\t{s}\t{s}\t{s}\t{s}\t{s}\n", .{
+        const line = try std.fmt.allocPrint(alloc, "{s}\t{s}\t{s}\t{s}\t{s}\t{s}\n", .{
             entry.name,
             entry.source_type,
             entry.url,
@@ -74,7 +77,14 @@ pub fn writeLockfile(
             entry.commit,
             entry.integrity,
         });
+        defer alloc.free(line);
+        try content.appendSlice(alloc, line);
     }
+
+    // Write atomically.
+    const file = std.Io.Dir.cwd().createFile(io, lock_path, .{}) catch |err| return err;
+    defer file.close(io);
+    file.writeStreamingAll(io, content.items) catch |err| return err;
 }
 
 /// Find a lock entry by dep name.
@@ -96,16 +106,16 @@ pub fn fetchGitDep(
     ref: ?[]const u8,
     locked_commit: ?[]const u8,
 ) !struct { path: []const u8, commit: []const u8, integrity: []const u8 } {
-    const home = std.posix.getenv("HOME") orelse "/tmp";
+    const home: []const u8 = if (std.c.getenv("HOME")) |ptr| std.mem.span(ptr) else "/tmp";
     const cache_base = try std.fs.path.join(alloc, &.{ home, ".cache", "zap", "deps" });
-    std.fs.cwd().makePath(cache_base) catch {};
+    std.Io.Dir.cwd().createDirPath(io, cache_base) catch {};
 
     // If we have a locked commit, check the cache first
     if (locked_commit) |commit| {
         const cache_dir = try std.fmt.allocPrint(alloc, "{s}/{s}-{s}", .{
             cache_base, name, commit[0..@min(commit.len, 8)],
         });
-        if (std.fs.cwd().access(cache_dir, .{})) |_| {
+        if (std.Io.Dir.cwd().access(io, cache_dir, .{})) |_| {
             // Compute integrity from cached content
             const integrity = computeDirectoryHash(alloc, cache_dir) catch "-";
             return .{ .path = cache_dir, .commit = commit, .integrity = integrity };
@@ -115,7 +125,7 @@ pub fn fetchGitDep(
     // Clone to a temp directory, then move to cache
     const tmp_dir = try std.fmt.allocPrint(alloc, "{s}/{s}-tmp", .{ cache_base, name });
     // Remove any leftover tmp dir
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
+    std.Io.Dir.cwd().deleteTree(io, tmp_dir) catch {};
 
     // Build git clone command
     var clone_args: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -132,31 +142,29 @@ pub fn fetchGitDep(
     try clone_args.append(alloc, tmp_dir);
 
     // Execute git clone
-    const clone_result = std.process.Child.run(.{
-        .allocator = alloc,
+    const clone_result = std.process.run(alloc, io, .{
         .argv = clone_args.items,
-        .max_output_bytes = 1024 * 1024,
+        .stdout_limit = .limited(1024 * 1024),
+        .stderr_limit = .limited(1024 * 1024),
     }) catch {
-        const stderr = std.fs.File.stderr().deprecatedWriter();
-        stderr.print("Error: git clone failed for dep `{s}` from {s}\n", .{ name, url }) catch {};
+        std.debug.print("Error: git clone failed for dep `{s}` from {s}\n", .{ name, url });
         return error.GitCloneFailed;
     };
-    if (clone_result.term != .Exited or clone_result.term.Exited != 0) {
-        const stderr = std.fs.File.stderr().deprecatedWriter();
-        stderr.print("Error: git clone failed for dep `{s}` from {s}\n", .{ name, url }) catch {};
+    if (clone_result.term != .exited or clone_result.term.exited != 0) {
+        std.debug.print("Error: git clone failed for dep `{s}` from {s}\n", .{ name, url });
         return error.GitCloneFailed;
     }
 
     // Get the commit hash
-    const rev_result = std.process.Child.run(.{
-        .allocator = alloc,
+    const rev_result = std.process.run(alloc, io, .{
         .argv = &.{ "git", "-C", tmp_dir, "rev-parse", "HEAD" },
-        .max_output_bytes = 256,
+        .stdout_limit = .limited(256),
+        .stderr_limit = .limited(256),
     }) catch {
         return error.GitCloneFailed;
     };
 
-    const commit = std.mem.trimRight(u8, rev_result.stdout, "\n\r ");
+    const commit = std.mem.trimEnd(u8, rev_result.stdout, "\n\r ");
     const commit_owned = try alloc.dupe(u8, commit);
 
     // Move to final cache location
@@ -164,8 +172,8 @@ pub fn fetchGitDep(
         cache_base, name, commit_owned[0..@min(commit_owned.len, 8)],
     });
     // Remove existing if it's there (shouldn't be, but be safe)
-    std.fs.cwd().deleteTree(cache_dir) catch {};
-    std.fs.cwd().rename(tmp_dir, cache_dir) catch {
+    std.Io.Dir.cwd().deleteTree(io, cache_dir) catch {};
+    std.Io.Dir.cwd().rename(tmp_dir, std.Io.Dir.cwd(), cache_dir, io) catch {
         // If rename fails (cross-device), try to use tmp_dir directly
         const integrity = computeDirectoryHash(alloc, tmp_dir) catch "-";
         return .{ .path = tmp_dir, .commit = commit_owned, .integrity = integrity };
@@ -184,14 +192,14 @@ fn computeDirectoryHash(alloc: std.mem.Allocator, dir_path: []const u8) ![]const
     hasher.update(dir_path);
 
     // Walk the directory and hash all .zap file contents
-    var dir = try std.fs.cwd().openDir(dir_path, .{ .iterate = true });
-    defer dir.close();
+    var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
+    defer dir.close(io);
 
     var iter = dir.iterate();
-    while (iter.next() catch null) |entry| {
+    while (iter.next(io) catch null) |entry| {
         if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".zap")) {
             hasher.update(entry.name);
-            const content = dir.readFileAlloc(alloc, entry.name, 10 * 1024 * 1024) catch continue;
+            const content = dir.readFileAlloc(io, entry.name, alloc, .limited(10 * 1024 * 1024)) catch continue;
             defer alloc.free(content);
             hasher.update(content);
         }
@@ -212,7 +220,7 @@ fn computeDirectoryHash(alloc: std.mem.Allocator, dir_path: []const u8) ![]const
 pub const FetchError = error{
     GitCloneFailed,
     OutOfMemory,
-} || std.fs.File.OpenError || std.posix.RenameError;
+} || std.fs.File.OpenError;
 
 test "readLockfile: returns null for missing file" {
     const result = readLockfile(std.testing.allocator, "/nonexistent/path");
@@ -226,7 +234,7 @@ test "writeLockfile and readLockfile round-trip" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const tmp_path = try tmp_dir.dir.realpathAlloc(alloc, ".");
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
 
     const entries = &[_]LockEntry{
         .{
@@ -289,7 +297,7 @@ test "writeLockfile: overwrites existing" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const tmp_path = try tmp_dir.dir.realpathAlloc(alloc, ".");
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
 
     // Write initial lockfile
     try writeLockfile(alloc, tmp_path, &.{
@@ -314,12 +322,11 @@ test "computeDirectoryHash: produces consistent hash" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const tmp_path = try tmp_dir.dir.realpathAlloc(alloc, ".");
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
 
-    try tmp_dir.dir.writeFile(.{
-        .sub_path = "test.zap",
-        .data = "pub module Test {}\n",
-    });
+    const file = try tmp_dir.dir.createFile(io, "test.zap", .{});
+    try file.writeStreamingAll(io, "pub module Test {}\n");
+    file.close(io);
 
     const hash1 = try computeDirectoryHash(alloc, tmp_path);
     const hash2 = try computeDirectoryHash(alloc, tmp_path);

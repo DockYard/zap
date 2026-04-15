@@ -1,5 +1,15 @@
 const std = @import("std");
 
+var test_io_impl: std.Io.Threaded = undefined;
+var test_io_initialized: bool = false;
+fn getTestIo() std.Io {
+    if (!test_io_initialized) {
+        test_io_impl = .init(std.heap.page_allocator, .{});
+        test_io_initialized = true;
+    }
+    return test_io_impl.io();
+}
+
 // ============================================================
 // ZIR Integration Tests
 //
@@ -20,7 +30,7 @@ const TestError = error{
     StdoutStreamTooLong,
     StderrStreamTooLong,
     CurrentWorkingDirectoryUnlinked,
-} || std.posix.ReadError || std.posix.PollError || std.process.Child.SpawnError;
+} || std.posix.ReadError || std.posix.PollError || std.process.SpawnError;
 
 const TestResult = struct {
     stdout: []const u8,
@@ -35,7 +45,7 @@ const TestResult = struct {
         self.allocator.free(self.stderr);
         if (self.output_dir) |dir| {
             // Clean up compiled output
-            std.fs.cwd().deleteTree(dir) catch {};
+            std.Io.Dir.cwd().deleteTree(getTestIo(), dir) catch {};
             self.allocator.free(dir);
         }
     }
@@ -47,7 +57,7 @@ fn compileOnly(source: []const u8) TestError!void {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    tmp_dir.dir.makePath("lib") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(getTestIo(), "lib") catch return error.Unexpected;
 
     const build_source =
         \\pub module TestProg.Builder {
@@ -68,33 +78,30 @@ fn compileOnly(source: []const u8) TestError!void {
         \\}
     ;
 
-    tmp_dir.dir.writeFile(.{ .sub_path = "build.zap", .data = build_source }) catch return error.Unexpected;
-    tmp_dir.dir.writeFile(.{ .sub_path = "lib/test_prog.zap", .data = source }) catch return error.Unexpected;
+    tmp_dir.dir.writeFile(getTestIo(), .{ .sub_path = "build.zap", .data = build_source }) catch return error.Unexpected;
+    tmp_dir.dir.writeFile(getTestIo(), .{ .sub_path = "lib/test_prog.zap", .data = source }) catch return error.Unexpected;
 
-    const tmp_dir_path = tmp_dir.dir.realpathAlloc(allocator, ".") catch return error.Unexpected;
+    const tmp_dir_path = tmp_dir.dir.realPathFileAlloc(getTestIo(), ".", allocator) catch return error.Unexpected;
     defer allocator.free(tmp_dir_path);
 
-    const zap_binary_raw = std.process.getEnvVarOwned(allocator, "ZAP_BINARY") catch |err| switch (err) {
-        error.EnvironmentVariableNotFound => allocator.dupe(u8, "zig-out/bin/zap") catch return error.OutOfMemory,
-        else => return error.Unexpected,
-    };
-    defer allocator.free(zap_binary_raw);
+    const zap_binary_raw: []const u8 = if (std.c.getenv("ZAP_BINARY")) |ptr| std.mem.span(ptr) else "zig-out/bin/zap";
 
     const zap_binary = if (std.fs.path.isAbsolute(zap_binary_raw))
         allocator.dupe(u8, zap_binary_raw) catch return error.OutOfMemory
     else
-        std.fs.cwd().realpathAlloc(allocator, zap_binary_raw) catch return error.Unexpected;
+        std.Io.Dir.cwd().realPathFileAlloc(getTestIo(), zap_binary_raw, allocator) catch return error.Unexpected;
     defer allocator.free(zap_binary);
 
     const compile_argv: []const []const u8 = &.{ zap_binary, "build", "test_prog" };
-    var compile_child = std.process.Child.init(compile_argv, allocator);
-    compile_child.cwd = tmp_dir_path;
-    compile_child.stderr_behavior = .Ignore;
-    compile_child.stdout_behavior = .Ignore;
-    const compile_term = compile_child.spawnAndWait() catch return error.CompilationFailed;
+    var compile_child = std.process.spawn(getTestIo(), .{
+        .argv = compile_argv,
+        .stderr = .inherit,
+        .stdout = .inherit,
+    }) catch return error.CompilationFailed;
+    const compile_term = compile_child.wait(getTestIo()) catch return error.CompilationFailed;
 
     const compile_exit = switch (compile_term) {
-        .Exited => |code| code,
+        .exited => |code| code,
         else => return error.CompilationFailed,
     };
 
@@ -109,7 +116,7 @@ fn compileAndRun(source: []const u8) TestError!TestResult {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    tmp_dir.dir.makePath("lib") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(getTestIo(), "lib") catch return error.Unexpected;
 
     const build_source =
         \\pub module TestProg.Builder {
@@ -130,39 +137,36 @@ fn compileAndRun(source: []const u8) TestError!TestResult {
         \\}
     ;
 
-    tmp_dir.dir.writeFile(.{ .sub_path = "build.zap", .data = build_source }) catch
+    tmp_dir.dir.writeFile(getTestIo(), .{ .sub_path = "build.zap", .data = build_source }) catch
         return error.Unexpected;
-    tmp_dir.dir.writeFile(.{ .sub_path = "lib/test_prog.zap", .data = source }) catch
+    tmp_dir.dir.writeFile(getTestIo(), .{ .sub_path = "lib/test_prog.zap", .data = source }) catch
         return error.Unexpected;
 
     // Get the real path to the temp project directory.
-    const tmp_dir_path = tmp_dir.dir.realpathAlloc(allocator, ".") catch
+    const tmp_dir_path = tmp_dir.dir.realPathFileAlloc(getTestIo(), ".", allocator) catch
         return error.Unexpected;
     defer allocator.free(tmp_dir_path);
 
     // Get zap binary path from environment or use default.
-    const zap_binary_raw = std.process.getEnvVarOwned(allocator, "ZAP_BINARY") catch |err| switch (err) {
-        error.EnvironmentVariableNotFound => allocator.dupe(u8, "zig-out/bin/zap") catch return error.OutOfMemory,
-        else => return error.Unexpected,
-    };
-    defer allocator.free(zap_binary_raw);
+    const zap_binary_raw: []const u8 = if (std.c.getenv("ZAP_BINARY")) |ptr| std.mem.span(ptr) else "zig-out/bin/zap";
 
     const zap_binary = if (std.fs.path.isAbsolute(zap_binary_raw))
         allocator.dupe(u8, zap_binary_raw) catch return error.OutOfMemory
     else
-        std.fs.cwd().realpathAlloc(allocator, zap_binary_raw) catch return error.Unexpected;
+        std.Io.Dir.cwd().realPathFileAlloc(getTestIo(), zap_binary_raw, allocator) catch return error.Unexpected;
     defer allocator.free(zap_binary);
 
     // Compile: zap build test_prog
     const compile_argv: []const []const u8 = &.{ zap_binary, "build", "test_prog" };
-    var compile_child = std.process.Child.init(compile_argv, allocator);
-    compile_child.cwd = tmp_dir_path;
-    compile_child.stderr_behavior = .Ignore;
-    compile_child.stdout_behavior = .Ignore;
-    const compile_term = compile_child.spawnAndWait() catch return error.CompilationFailed;
+    var compile_child = std.process.spawn(getTestIo(), .{
+        .argv = compile_argv,
+        .stderr = .inherit,
+        .stdout = .inherit,
+    }) catch return error.CompilationFailed;
+    const compile_term = compile_child.wait(getTestIo()) catch return error.CompilationFailed;
 
     const compile_exit = switch (compile_term) {
-        .Exited => |code| code,
+        .exited => |code| code,
         else => return error.CompilationFailed,
     };
 
@@ -172,21 +176,20 @@ fn compileAndRun(source: []const u8) TestError!TestResult {
     }
 
     // The zap binary outputs to zap-out/bin/test_prog (relative to cwd)
-    const compiled_binary = tmp_dir.dir.realpathAlloc(allocator, "zap-out/bin/test_prog") catch {
+    const compiled_binary = tmp_dir.dir.realPathFileAlloc(getTestIo(), "zap-out/bin/test_prog", allocator) catch {
         std.debug.print("\n=== COMPILED BINARY NOT FOUND ===\n", .{});
         return error.CompilationFailed;
     };
     defer allocator.free(compiled_binary);
 
     // Run the compiled binary
-    const run_result = std.process.Child.run(.{
-        .allocator = allocator,
+    const run_result = std.process.run(allocator, getTestIo(), .{
         .argv = &.{compiled_binary},
-        .max_output_bytes = 256 * 1024,
+        .stdout_limit = .limited(256 * 1024), .stderr_limit = .limited(256 * 1024),
     }) catch return error.RunFailed;
 
     const run_exit = switch (run_result.term) {
-        .Exited => |code| code,
+        .exited => |code| code,
         else => {
             allocator.free(run_result.stdout);
             allocator.free(run_result.stderr);
@@ -195,7 +198,7 @@ fn compileAndRun(source: []const u8) TestError!TestResult {
     };
 
     // Build output dir path for cleanup
-    const output_dir = tmp_dir.dir.realpathAlloc(allocator, "zap-out") catch null;
+    const output_dir = tmp_dir.dir.realPathFileAlloc(getTestIo(), "zap-out", allocator) catch null;
 
     return .{
         .stdout = run_result.stdout,
@@ -218,7 +221,7 @@ fn compileAndRunWithFiles(source: []const u8, extra_files: []const ExtraFile) Te
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    tmp_dir.dir.makePath("lib") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(getTestIo(), "lib") catch return error.Unexpected;
 
     const build_source =
         \\pub module TestProg.Builder {
@@ -239,45 +242,42 @@ fn compileAndRunWithFiles(source: []const u8, extra_files: []const ExtraFile) Te
         \\}
     ;
 
-    tmp_dir.dir.writeFile(.{ .sub_path = "build.zap", .data = build_source }) catch
+    tmp_dir.dir.writeFile(getTestIo(), .{ .sub_path = "build.zap", .data = build_source }) catch
         return error.Unexpected;
-    tmp_dir.dir.writeFile(.{ .sub_path = "lib/test_prog.zap", .data = source }) catch
+    tmp_dir.dir.writeFile(getTestIo(), .{ .sub_path = "lib/test_prog.zap", .data = source }) catch
         return error.Unexpected;
 
     for (extra_files) |ef| {
         // Ensure parent directory exists
         if (std.fs.path.dirname(ef.path)) |dir| {
-            tmp_dir.dir.makePath(dir) catch {};
+            tmp_dir.dir.createDirPath(getTestIo(), dir) catch {};
         }
-        tmp_dir.dir.writeFile(.{ .sub_path = ef.path, .data = ef.data }) catch
+        tmp_dir.dir.writeFile(getTestIo(), .{ .sub_path = ef.path, .data = ef.data }) catch
             return error.Unexpected;
     }
 
-    const tmp_dir_path = tmp_dir.dir.realpathAlloc(allocator, ".") catch
+    const tmp_dir_path = tmp_dir.dir.realPathFileAlloc(getTestIo(), ".", allocator) catch
         return error.Unexpected;
     defer allocator.free(tmp_dir_path);
 
-    const zap_binary_raw = std.process.getEnvVarOwned(allocator, "ZAP_BINARY") catch |err| switch (err) {
-        error.EnvironmentVariableNotFound => allocator.dupe(u8, "zig-out/bin/zap") catch return error.OutOfMemory,
-        else => return error.Unexpected,
-    };
-    defer allocator.free(zap_binary_raw);
+    const zap_binary_raw: []const u8 = if (std.c.getenv("ZAP_BINARY")) |ptr| std.mem.span(ptr) else "zig-out/bin/zap";
 
     const zap_binary = if (std.fs.path.isAbsolute(zap_binary_raw))
         allocator.dupe(u8, zap_binary_raw) catch return error.OutOfMemory
     else
-        std.fs.cwd().realpathAlloc(allocator, zap_binary_raw) catch return error.Unexpected;
+        std.Io.Dir.cwd().realPathFileAlloc(getTestIo(), zap_binary_raw, allocator) catch return error.Unexpected;
     defer allocator.free(zap_binary);
 
     const compile_argv: []const []const u8 = &.{ zap_binary, "build", "test_prog" };
-    var compile_child = std.process.Child.init(compile_argv, allocator);
-    compile_child.cwd = tmp_dir_path;
-    compile_child.stderr_behavior = .Ignore;
-    compile_child.stdout_behavior = .Ignore;
-    const compile_term = compile_child.spawnAndWait() catch return error.CompilationFailed;
+    var compile_child = std.process.spawn(getTestIo(), .{
+        .argv = compile_argv,
+        .stderr = .inherit,
+        .stdout = .inherit,
+    }) catch return error.CompilationFailed;
+    const compile_term = compile_child.wait(getTestIo()) catch return error.CompilationFailed;
 
     const compile_exit = switch (compile_term) {
-        .Exited => |code| code,
+        .exited => |code| code,
         else => return error.CompilationFailed,
     };
 
@@ -286,19 +286,18 @@ fn compileAndRunWithFiles(source: []const u8, extra_files: []const ExtraFile) Te
         return error.CompilationFailed;
     }
 
-    const compiled_binary = tmp_dir.dir.realpathAlloc(allocator, "zap-out/bin/test_prog") catch {
+    const compiled_binary = tmp_dir.dir.realPathFileAlloc(getTestIo(), "zap-out/bin/test_prog", allocator) catch {
         return error.CompilationFailed;
     };
     defer allocator.free(compiled_binary);
 
-    const run_result = std.process.Child.run(.{
-        .allocator = allocator,
+    const run_result = std.process.run(allocator, getTestIo(), .{
         .argv = &.{compiled_binary},
-        .max_output_bytes = 256 * 1024,
+        .stdout_limit = .limited(256 * 1024), .stderr_limit = .limited(256 * 1024),
     }) catch return error.RunFailed;
 
     const run_exit = switch (run_result.term) {
-        .Exited => |code| code,
+        .exited => |code| code,
         else => {
             allocator.free(run_result.stdout);
             allocator.free(run_result.stderr);
@@ -306,7 +305,7 @@ fn compileAndRunWithFiles(source: []const u8, extra_files: []const ExtraFile) Te
         },
     };
 
-    const output_dir = tmp_dir.dir.realpathAlloc(allocator, "zap-out") catch null;
+    const output_dir = tmp_dir.dir.realPathFileAlloc(getTestIo(), "zap-out", allocator) catch null;
 
     return .{
         .stdout = run_result.stdout,
