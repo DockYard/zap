@@ -55,7 +55,7 @@ pub fn build(b: *std.Build) void {
 
     // If using defaults and deps don't exist, fail with a helpful message
     if (user_lib == null) {
-        std.fs.cwd().access(zig_compiler_lib_path, .{}) catch {
+        std.Io.Dir.cwd().access(b.graph.io, zig_compiler_lib_path, .{}) catch {
             const fail = b.addSystemCommand(&.{
                 "sh", "-c",
                 "printf '\\n" ++
@@ -119,13 +119,14 @@ pub fn build(b: *std.Build) void {
     if (llvm_lib_path) |lib_path| {
         exe.root_module.addLibraryPath(.{ .cwd_relative = lib_path });
 
+        // Clang libraries from LLVM 21 (zig-bootstrap 0.16.0)
         const clang_libs = [_][]const u8{
             "clangFrontendTool",           "clangCodeGen",                "clangFrontend",
             "clangDriver",                 "clangSerialization",          "clangSema",
             "clangStaticAnalyzerFrontend", "clangStaticAnalyzerCheckers", "clangStaticAnalyzerCore",
             "clangAnalysis",               "clangASTMatchers",            "clangAST",
             "clangParse",                  "clangAPINotes",               "clangBasic",
-            "clangEdit",                   "clangLex",                    "clangARCMigrate",
+            "clangEdit",                   "clangLex",
             "clangRewriteFrontend",        "clangRewrite",                "clangCrossTU",
             "clangIndex",                  "clangToolingCore",            "clangExtractAPI",
             "clangSupport",                "clangInstallAPI",
@@ -141,6 +142,7 @@ pub fn build(b: *std.Build) void {
             exe.root_module.linkSystemLibrary(lib_name, .{ .preferred_link_mode = .static });
         }
 
+        // LLVM 21 libraries (zig-bootstrap 0.16.0)
         const llvm_libs = [_][]const u8{
             "LLVMWindowsManifest",         "LLVMXRay",                  "LLVMLibDriver",
             "LLVMDlltoolDriver",           "LLVMTelemetry",             "LLVMTextAPIBinaryReader",
@@ -182,30 +184,31 @@ pub fn build(b: *std.Build) void {
             "LLVMOrcDebugging",            "LLVMOrcJIT",                "LLVMWindowsDriver",
             "LLVMMCJIT",                   "LLVMJITLink",               "LLVMInterpreter",
             "LLVMExecutionEngine",         "LLVMRuntimeDyld",           "LLVMOrcTargetProcess",
-            "LLVMOrcShared",               "LLVMDWP",                   "LLVMDebugInfoLogicalView",
-            "LLVMDebugInfoGSYM",           "LLVMOption",                "LLVMObjectYAML",
-            "LLVMObjCopy",                 "LLVMMCA",                   "LLVMMCDisassembler",
-            "LLVMLTO",                     "LLVMPasses",                "LLVMHipStdPar",
-            "LLVMCFGuard",                 "LLVMCoroutines",            "LLVMipo",
-            "LLVMVectorize",               "LLVMSandboxIR",             "LLVMLinker",
-            "LLVMInstrumentation",         "LLVMFrontendOpenMP",        "LLVMFrontendOffloading",
+            "LLVMOrcShared",               "LLVMDWP",                   "LLVMDWARFCFIChecker",
+            "LLVMDebugInfoLogicalView",    "LLVMOption",                "LLVMObjCopy",
+            "LLVMMCA",                     "LLVMMCDisassembler",        "LLVMLTO",
             "LLVMFrontendOpenACC",         "LLVMFrontendHLSL",          "LLVMFrontendDriver",
-            "LLVMFrontendAtomic",          "LLVMExtensions",            "Polly",
-            "PollyISL",                    "LLVMDWARFLinkerParallel",   "LLVMDWARFLinkerClassic",
-            "LLVMDWARFLinker",             "LLVMGlobalISel",            "LLVMMIRParser",
-            "LLVMAsmPrinter",              "LLVMSelectionDAG",          "LLVMCodeGen",
-            "LLVMTarget",                  "LLVMObjCARCOpts",           "LLVMCodeGenTypes",
-            "LLVMCGData",                  "LLVMIRPrinter",             "LLVMInterfaceStub",
-            "LLVMFileCheck",               "LLVMFuzzMutate",            "LLVMScalarOpts",
-            "LLVMInstCombine",             "LLVMAggressiveInstCombine", "LLVMTransformUtils",
-            "LLVMBitWriter",               "LLVMAnalysis",              "LLVMProfileData",
-            "LLVMSymbolize",               "LLVMDebugInfoBTF",          "LLVMDebugInfoPDB",
-            "LLVMDebugInfoMSF",            "LLVMDebugInfoCodeView",     "LLVMDebugInfoDWARF",
-            "LLVMObject",                  "LLVMTextAPI",               "LLVMMCParser",
-            "LLVMIRReader",                "LLVMAsmParser",             "LLVMMC",
-            "LLVMBitReader",               "LLVMFuzzerCLI",             "LLVMCore",
-            "LLVMRemarks",                 "LLVMBitstreamReader",       "LLVMBinaryFormat",
-            "LLVMTargetParser",            "LLVMSupport",               "LLVMDemangle",
+            "LLVMExtensions",              "LLVMPasses",                "LLVMHipStdPar",
+            "LLVMCoroutines",              "LLVMCFGuard",               "LLVMipo",
+            "LLVMInstrumentation",         "LLVMVectorize",             "LLVMSandboxIR",
+            "LLVMLinker",                  "LLVMFrontendOpenMP",        "LLVMFrontendDirective",
+            "LLVMFrontendAtomic",          "LLVMFrontendOffloading",    "LLVMObjectYAML",
+            "LLVMDWARFLinkerParallel",     "LLVMDWARFLinkerClassic",    "LLVMDWARFLinker",
+            "LLVMGlobalISel",              "LLVMMIRParser",             "LLVMAsmPrinter",
+            "LLVMSelectionDAG",            "LLVMCodeGen",               "LLVMTarget",
+            "LLVMObjCARCOpts",             "LLVMCodeGenTypes",          "LLVMCGData",
+            "LLVMIRPrinter",               "LLVMInterfaceStub",         "LLVMFileCheck",
+            "LLVMFuzzMutate",              "LLVMScalarOpts",            "LLVMInstCombine",
+            "LLVMAggressiveInstCombine",   "LLVMTransformUtils",        "LLVMBitWriter",
+            "LLVMAnalysis",                "LLVMProfileData",           "LLVMSymbolize",
+            "LLVMDebugInfoBTF",            "LLVMDebugInfoPDB",          "LLVMDebugInfoMSF",
+            "LLVMDebugInfoCodeView",       "LLVMDebugInfoGSYM",         "LLVMDebugInfoDWARF",
+            "LLVMDebugInfoDWARFLowLevel",  "LLVMObject",                "LLVMTextAPI",
+            "LLVMMCParser",                "LLVMIRReader",              "LLVMAsmParser",
+            "LLVMMC",                      "LLVMBitReader",             "LLVMFuzzerCLI",
+            "LLVMCore",                    "LLVMRemarks",               "LLVMBitstreamReader",
+            "LLVMBinaryFormat",            "LLVMTargetParser",          "LLVMSupport",
+            "LLVMDemangle",
         };
         for (llvm_libs) |lib_name| {
             exe.root_module.linkSystemLibrary(lib_name, .{ .preferred_link_mode = .static });
@@ -236,11 +239,11 @@ pub fn build(b: *std.Build) void {
     const examples_step = b.step("examples", "Build all examples");
     examples_step.dependOn(b.getInstallStep());
 
-    if (std.fs.cwd().openDir("examples", .{ .iterate = true })) |dir_| {
+    if (std.Io.Dir.cwd().openDir(b.graph.io, "examples", .{ .iterate = true })) |dir_| {
         var dir = dir_;
-        defer dir.close();
+        defer dir.close(b.graph.io);
         var it = dir.iterate();
-        while (it.next() catch null) |entry| {
+        while (it.next(b.graph.io) catch null) |entry| {
             if (entry.kind != .directory) continue;
             // Each example dir has a build.zap with a target matching the dir name
             const example_run = b.addRunArtifact(exe);
