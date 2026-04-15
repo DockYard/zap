@@ -29,9 +29,9 @@ pub const CfgEdge = struct {
 pub const Cfg = struct {
     allocator: std.mem.Allocator,
     /// Successors for each block.
-    successors: std.AutoArrayHashMap(ir.LabelId, LabelList),
+    successors: std.AutoArrayHashMapUnmanaged(ir.LabelId, LabelList),
     /// Predecessors for each block (inverse of successors).
-    predecessors: std.AutoArrayHashMap(ir.LabelId, LabelList),
+    predecessors: std.AutoArrayHashMapUnmanaged(ir.LabelId, LabelList),
     /// All block labels in the function (in order).
     block_labels: LabelList,
 
@@ -40,8 +40,8 @@ pub const Cfg = struct {
     pub fn init(allocator: std.mem.Allocator) Cfg {
         return .{
             .allocator = allocator,
-            .successors = std.AutoArrayHashMap(ir.LabelId, LabelList).init(allocator),
-            .predecessors = std.AutoArrayHashMap(ir.LabelId, LabelList).init(allocator),
+            .successors = std.AutoArrayHashMapUnmanaged(ir.LabelId, LabelList).init(allocator),
+            .predecessors = std.AutoArrayHashMapUnmanaged(ir.LabelId, LabelList).init(allocator),
             .block_labels = .empty,
         };
     }
@@ -208,21 +208,21 @@ pub const Cfg = struct {
 pub const DominatorTree = struct {
     allocator: std.mem.Allocator,
     /// Immediate dominator for each block (indexed by block label).
-    idom: std.AutoArrayHashMap(ir.LabelId, ir.LabelId),
+    idom: std.AutoArrayHashMapUnmanaged(ir.LabelId, ir.LabelId),
     /// Depth of each block in the dominator tree.
-    depth: std.AutoArrayHashMap(ir.LabelId, u32),
+    depth: std.AutoArrayHashMapUnmanaged(ir.LabelId, u32),
     /// Entry block label.
     entry: ir.LabelId,
     /// Reverse postorder numbering for the iterative algorithm.
-    rpo_number: std.AutoArrayHashMap(ir.LabelId, u32),
+    rpo_number: std.AutoArrayHashMapUnmanaged(ir.LabelId, u32),
 
     pub fn init(allocator: std.mem.Allocator) DominatorTree {
         return .{
             .allocator = allocator,
-            .idom = std.AutoArrayHashMap(ir.LabelId, ir.LabelId).init(allocator),
-            .depth = std.AutoArrayHashMap(ir.LabelId, u32).init(allocator),
+            .idom = std.AutoArrayHashMapUnmanaged(ir.LabelId, ir.LabelId).init(allocator),
+            .depth = std.AutoArrayHashMapUnmanaged(ir.LabelId, u32).init(allocator),
             .entry = 0,
-            .rpo_number = std.AutoArrayHashMap(ir.LabelId, u32).init(allocator),
+            .rpo_number = std.AutoArrayHashMapUnmanaged(ir.LabelId, u32).init(allocator),
         };
     }
 
@@ -252,7 +252,7 @@ pub const DominatorTree = struct {
         // Step 1: Compute reverse postorder (RPO) via DFS.
         var rpo: std.ArrayListUnmanaged(ir.LabelId) = .empty;
         defer rpo.deinit(allocator);
-        var visited = std.AutoArrayHashMap(ir.LabelId, void).init(allocator);
+        var visited = std.AutoArrayHashMapUnmanaged(ir.LabelId, void).init(allocator);
         defer visited.deinit();
 
         try dfsPostorder(allocator, cfg, tree.entry, &visited, &rpo);
@@ -324,7 +324,7 @@ pub const DominatorTree = struct {
         allocator: std.mem.Allocator,
         cfg: *const Cfg,
         node: ir.LabelId,
-        visited: *std.AutoArrayHashMap(ir.LabelId, void),
+        visited: *std.AutoArrayHashMapUnmanaged(ir.LabelId, void),
         postorder: *std.ArrayListUnmanaged(ir.LabelId),
     ) !void {
         if (visited.contains(node)) return;
@@ -420,15 +420,15 @@ pub const DominatorTree = struct {
 pub const UseDefInfo = struct {
     allocator: std.mem.Allocator,
     /// Block where each local is defined.
-    def_block: std.AutoArrayHashMap(ir.LocalId, ir.LabelId),
+    def_block: std.AutoArrayHashMapUnmanaged(ir.LocalId, ir.LabelId),
     /// Blocks where each local is used.
-    use_blocks: std.AutoArrayHashMap(ir.LocalId, std.ArrayListUnmanaged(ir.LabelId)),
+    use_blocks: std.AutoArrayHashMapUnmanaged(ir.LocalId, std.ArrayListUnmanaged(ir.LabelId)),
 
     pub fn init(allocator: std.mem.Allocator) UseDefInfo {
         return .{
             .allocator = allocator,
-            .def_block = std.AutoArrayHashMap(ir.LocalId, ir.LabelId).init(allocator),
-            .use_blocks = std.AutoArrayHashMap(ir.LocalId, std.ArrayListUnmanaged(ir.LabelId)).init(allocator),
+            .def_block = std.AutoArrayHashMapUnmanaged(ir.LocalId, ir.LabelId).init(allocator),
+            .use_blocks = std.AutoArrayHashMapUnmanaged(ir.LocalId, std.ArrayListUnmanaged(ir.LabelId)).init(allocator),
         };
     }
 
@@ -854,12 +854,12 @@ pub const UseDefInfo = struct {
 /// only the LCA of def/use blocks.
 pub const LiveBlockSet = struct {
     allocator: std.mem.Allocator,
-    blocks: std.AutoArrayHashMap(ir.LabelId, void),
+    blocks: std.AutoArrayHashMapUnmanaged(ir.LabelId, void),
 
     pub fn init(allocator: std.mem.Allocator) LiveBlockSet {
         return .{
             .allocator = allocator,
-            .blocks = std.AutoArrayHashMap(ir.LabelId, void).init(allocator),
+            .blocks = std.AutoArrayHashMapUnmanaged(ir.LabelId, void).init(allocator),
         };
     }
 
@@ -910,14 +910,14 @@ pub const LiveBlockSet = struct {
 /// loop-carried values that are live into a header on the next iteration.
 pub const LocalBlockLiveness = struct {
     allocator: std.mem.Allocator,
-    live_in: std.AutoArrayHashMap(ir.LabelId, bool),
-    live_out: std.AutoArrayHashMap(ir.LabelId, bool),
+    live_in: std.AutoArrayHashMapUnmanaged(ir.LabelId, bool),
+    live_out: std.AutoArrayHashMapUnmanaged(ir.LabelId, bool),
 
     pub fn init(allocator: std.mem.Allocator) LocalBlockLiveness {
         return .{
             .allocator = allocator,
-            .live_in = std.AutoArrayHashMap(ir.LabelId, bool).init(allocator),
-            .live_out = std.AutoArrayHashMap(ir.LabelId, bool).init(allocator),
+            .live_in = std.AutoArrayHashMapUnmanaged(ir.LabelId, bool).init(allocator),
+            .live_out = std.AutoArrayHashMapUnmanaged(ir.LabelId, bool).init(allocator),
         };
     }
 
@@ -943,9 +943,9 @@ pub const LocalBlockLiveness = struct {
         var result = LocalBlockLiveness.init(allocator);
         errdefer result.deinit();
 
-        var use_before_def = std.AutoArrayHashMap(ir.LabelId, bool).init(allocator);
+        var use_before_def = std.AutoArrayHashMapUnmanaged(ir.LabelId, bool).init(allocator);
         defer use_before_def.deinit();
-        var kill = std.AutoArrayHashMap(ir.LabelId, bool).init(allocator);
+        var kill = std.AutoArrayHashMapUnmanaged(ir.LabelId, bool).init(allocator);
         defer kill.deinit();
 
         for (func.body) |block| {
@@ -1184,14 +1184,14 @@ pub const ConstraintGenerator = struct {
     function_id: ir.FunctionId,
     constraints: std.ArrayListUnmanaged(lattice.OutlivesConstraint),
     /// Region assignments built so far (values -> regions).
-    region_of: std.AutoArrayHashMap(ir.LocalId, lattice.RegionId),
+    region_of: std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.RegionId),
 
     pub fn init(allocator: std.mem.Allocator, function_id: ir.FunctionId) ConstraintGenerator {
         return .{
             .allocator = allocator,
             .function_id = function_id,
             .constraints = .empty,
-            .region_of = std.AutoArrayHashMap(ir.LocalId, lattice.RegionId).init(allocator),
+            .region_of = std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.RegionId).init(allocator),
         };
     }
 
@@ -1446,24 +1446,24 @@ pub const ConstraintGenerator = struct {
 pub const FunctionRegionResult = struct {
     allocator: std.mem.Allocator,
     /// Region assigned to each local.
-    region_assignments: std.AutoArrayHashMap(ir.LocalId, lattice.RegionId),
+    region_assignments: std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.RegionId),
     /// Allocation site summaries.
-    alloc_summaries: std.AutoArrayHashMap(lattice.AllocSiteId, lattice.AllocSiteSummary),
+    alloc_summaries: std.AutoArrayHashMapUnmanaged(lattice.AllocSiteId, lattice.AllocSiteSummary),
     /// Generated outlives constraints.
     outlives_constraints: std.ArrayListUnmanaged(lattice.OutlivesConstraint),
     /// Multiplicity for each region.
-    multiplicities: std.AutoArrayHashMap(lattice.RegionId, lattice.Multiplicity),
+    multiplicities: std.AutoArrayHashMapUnmanaged(lattice.RegionId, lattice.Multiplicity),
     /// Storage mode for each region.
-    storage_modes: std.AutoArrayHashMap(lattice.RegionId, lattice.StorageMode),
+    storage_modes: std.AutoArrayHashMapUnmanaged(lattice.RegionId, lattice.StorageMode),
 
     pub fn init(allocator: std.mem.Allocator) FunctionRegionResult {
         return .{
             .allocator = allocator,
-            .region_assignments = std.AutoArrayHashMap(ir.LocalId, lattice.RegionId).init(allocator),
-            .alloc_summaries = std.AutoArrayHashMap(lattice.AllocSiteId, lattice.AllocSiteSummary).init(allocator),
+            .region_assignments = std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.RegionId).init(allocator),
+            .alloc_summaries = std.AutoArrayHashMapUnmanaged(lattice.AllocSiteId, lattice.AllocSiteSummary).init(allocator),
             .outlives_constraints = .empty,
-            .multiplicities = std.AutoArrayHashMap(lattice.RegionId, lattice.Multiplicity).init(allocator),
-            .storage_modes = std.AutoArrayHashMap(lattice.RegionId, lattice.StorageMode).init(allocator),
+            .multiplicities = std.AutoArrayHashMapUnmanaged(lattice.RegionId, lattice.Multiplicity).init(allocator),
+            .storage_modes = std.AutoArrayHashMapUnmanaged(lattice.RegionId, lattice.StorageMode).init(allocator),
         };
     }
 
@@ -1497,8 +1497,8 @@ pub const RegionSolver = struct {
     pub fn solveFunction(
         self: *RegionSolver,
         func: *const ir.Function,
-        escape_states: *const std.AutoArrayHashMap(ir.LocalId, lattice.EscapeState),
-        alloc_sites: *const std.AutoArrayHashMap(ir.LocalId, lattice.AllocSiteId),
+        escape_states: *const std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.EscapeState),
+        alloc_sites: *const std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.AllocSiteId),
     ) !FunctionRegionResult {
         var result = FunctionRegionResult.init(self.allocator);
         errdefer result.deinit();
@@ -1557,7 +1557,7 @@ pub const RegionSolver = struct {
         cfg: *const Cfg,
         dom_tree: *const DominatorTree,
         use_def: *const UseDefInfo,
-        escape_states: *const std.AutoArrayHashMap(ir.LocalId, lattice.EscapeState),
+        escape_states: *const std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.EscapeState),
     ) !void {
         _ = self;
         // Iterate over all locals that have definitions.
@@ -1603,7 +1603,7 @@ pub const RegionSolver = struct {
         self: *RegionSolver,
         result: *FunctionRegionResult,
         dom_tree: *const DominatorTree,
-        escape_states: *const std.AutoArrayHashMap(ir.LocalId, lattice.EscapeState),
+        escape_states: *const std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.EscapeState),
     ) !void {
         _ = self;
         _ = escape_states;
@@ -1665,7 +1665,7 @@ pub const RegionSolver = struct {
     fn inferMultiplicities(
         self: *RegionSolver,
         result: *FunctionRegionResult,
-        alloc_sites: *const std.AutoArrayHashMap(ir.LocalId, lattice.AllocSiteId),
+        alloc_sites: *const std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.AllocSiteId),
         dom_tree: *const DominatorTree,
         cfg: *const Cfg,
         func: *const ir.Function,
@@ -1673,15 +1673,15 @@ pub const RegionSolver = struct {
         _ = self;
 
         // Count allocation sites per region.
-        var region_alloc_counts = std.AutoArrayHashMap(lattice.RegionId, u32).init(result.allocator);
+        var region_alloc_counts = std.AutoArrayHashMapUnmanaged(lattice.RegionId, u32).init(result.allocator);
         defer region_alloc_counts.deinit();
 
         // Track whether any alloc site in a region is in a loop.
-        var region_has_loop_alloc = std.AutoArrayHashMap(lattice.RegionId, bool).init(result.allocator);
+        var region_has_loop_alloc = std.AutoArrayHashMapUnmanaged(lattice.RegionId, bool).init(result.allocator);
         defer region_has_loop_alloc.deinit();
 
         // Build a set of blocks that are in loops.
-        var loop_blocks = std.AutoArrayHashMap(ir.LabelId, bool).init(result.allocator);
+        var loop_blocks = std.AutoArrayHashMapUnmanaged(ir.LabelId, bool).init(result.allocator);
         defer loop_blocks.deinit();
         for (func.body) |block| {
             try loop_blocks.put(block.label, dom_tree.isInLoop(block.label, cfg));
@@ -1722,7 +1722,7 @@ pub const RegionSolver = struct {
 
         // Assign multiplicities.
         // Collect all unique regions.
-        var all_regions = std.AutoArrayHashMap(lattice.RegionId, void).init(result.allocator);
+        var all_regions = std.AutoArrayHashMapUnmanaged(lattice.RegionId, void).init(result.allocator);
         defer all_regions.deinit();
         var region_iter = result.region_assignments.iterator();
         while (region_iter.next()) |entry| {
@@ -1804,7 +1804,7 @@ pub const RegionSolver = struct {
     fn analyzeStorageModes(
         self: *RegionSolver,
         result: *FunctionRegionResult,
-        alloc_sites: *const std.AutoArrayHashMap(ir.LocalId, lattice.AllocSiteId),
+        alloc_sites: *const std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.AllocSiteId),
         use_def: *const UseDefInfo,
         cfg: *const Cfg,
         func: *const ir.Function,
@@ -1924,8 +1924,8 @@ pub const RegionSolver = struct {
     fn buildAllocSummaries(
         self: *RegionSolver,
         result: *FunctionRegionResult,
-        escape_states: *const std.AutoArrayHashMap(ir.LocalId, lattice.EscapeState),
-        alloc_sites: *const std.AutoArrayHashMap(ir.LocalId, lattice.AllocSiteId),
+        escape_states: *const std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.EscapeState),
+        alloc_sites: *const std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.AllocSiteId),
     ) !void {
         _ = self;
 
@@ -2187,13 +2187,13 @@ test "RegionSolver: value defined and used in same block -> block region" {
         .captures = &.{},
     };
 
-    var escape_states = std.AutoArrayHashMap(ir.LocalId, lattice.EscapeState).init(allocator);
+    var escape_states = std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.EscapeState).init(allocator);
     defer escape_states.deinit();
     try escape_states.put(0, .block_local);
     try escape_states.put(1, .block_local);
     try escape_states.put(10, .function_local);
 
-    var alloc_sites = std.AutoArrayHashMap(ir.LocalId, lattice.AllocSiteId).init(allocator);
+    var alloc_sites = std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.AllocSiteId).init(allocator);
     defer alloc_sites.deinit();
 
     var solver = RegionSolver.init(allocator);
@@ -2236,12 +2236,12 @@ test "RegionSolver: value defined in block A, used in block B -> LCA region" {
         .captures = &.{},
     };
 
-    var escape_states = std.AutoArrayHashMap(ir.LocalId, lattice.EscapeState).init(allocator);
+    var escape_states = std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.EscapeState).init(allocator);
     defer escape_states.deinit();
     try escape_states.put(0, .function_local);
     try escape_states.put(1, .function_local);
 
-    var alloc_sites = std.AutoArrayHashMap(ir.LocalId, lattice.AllocSiteId).init(allocator);
+    var alloc_sites = std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.AllocSiteId).init(allocator);
     defer alloc_sites.deinit();
 
     var solver = RegionSolver.init(allocator);
@@ -2280,11 +2280,11 @@ test "RegionSolver: returned value -> heap region" {
         .captures = &.{},
     };
 
-    var escape_states = std.AutoArrayHashMap(ir.LocalId, lattice.EscapeState).init(allocator);
+    var escape_states = std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.EscapeState).init(allocator);
     defer escape_states.deinit();
     try escape_states.put(0, .global_escape);
 
-    var alloc_sites = std.AutoArrayHashMap(ir.LocalId, lattice.AllocSiteId).init(allocator);
+    var alloc_sites = std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.AllocSiteId).init(allocator);
     defer alloc_sites.deinit();
     try alloc_sites.put(0, 0);
 
@@ -2329,12 +2329,12 @@ test "RegionSolver: single allocation not in loop -> multiplicity=one" {
         .captures = &.{},
     };
 
-    var escape_states = std.AutoArrayHashMap(ir.LocalId, lattice.EscapeState).init(allocator);
+    var escape_states = std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.EscapeState).init(allocator);
     defer escape_states.deinit();
     try escape_states.put(0, .function_local);
     try escape_states.put(1, .function_local);
 
-    var alloc_sites = std.AutoArrayHashMap(ir.LocalId, lattice.AllocSiteId).init(allocator);
+    var alloc_sites = std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.AllocSiteId).init(allocator);
     defer alloc_sites.deinit();
     try alloc_sites.put(0, 0);
 
@@ -2392,13 +2392,13 @@ test "RegionSolver: allocation in loop -> multiplicity=many" {
         .captures = &.{},
     };
 
-    var escape_states = std.AutoArrayHashMap(ir.LocalId, lattice.EscapeState).init(allocator);
+    var escape_states = std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.EscapeState).init(allocator);
     defer escape_states.deinit();
     try escape_states.put(0, .function_local);
     try escape_states.put(1, .function_local);
     try escape_states.put(5, .function_local);
 
-    var alloc_sites = std.AutoArrayHashMap(ir.LocalId, lattice.AllocSiteId).init(allocator);
+    var alloc_sites = std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.AllocSiteId).init(allocator);
     defer alloc_sites.deinit();
     try alloc_sites.put(0, 0);
 
@@ -2456,13 +2456,13 @@ test "RegionSolver: dead values in region at alloc point -> atbot" {
         .captures = &.{},
     };
 
-    var escape_states = std.AutoArrayHashMap(ir.LocalId, lattice.EscapeState).init(allocator);
+    var escape_states = std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.EscapeState).init(allocator);
     defer escape_states.deinit();
     try escape_states.put(0, .function_local);
     try escape_states.put(1, .function_local);
     try escape_states.put(5, .function_local);
 
-    var alloc_sites = std.AutoArrayHashMap(ir.LocalId, lattice.AllocSiteId).init(allocator);
+    var alloc_sites = std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.AllocSiteId).init(allocator);
     defer alloc_sites.deinit();
     try alloc_sites.put(0, 0);
 
@@ -2530,7 +2530,7 @@ test "RegionSolver: live values in region at alloc point -> attop" {
         .captures = &.{},
     };
 
-    var escape_states = std.AutoArrayHashMap(ir.LocalId, lattice.EscapeState).init(allocator);
+    var escape_states = std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.EscapeState).init(allocator);
     defer escape_states.deinit();
     try escape_states.put(0, .function_local);
     try escape_states.put(1, .function_local);
@@ -2538,7 +2538,7 @@ test "RegionSolver: live values in region at alloc point -> attop" {
     try escape_states.put(4, .function_local);
     try escape_states.put(5, .function_local);
 
-    var alloc_sites = std.AutoArrayHashMap(ir.LocalId, lattice.AllocSiteId).init(allocator);
+    var alloc_sites = std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.AllocSiteId).init(allocator);
     defer alloc_sites.deinit();
     try alloc_sites.put(0, 0);
     try alloc_sites.put(3, 1);
@@ -2620,14 +2620,14 @@ test "RegionSolver: constraint violation promotes to wider region" {
         .captures = &.{},
     };
 
-    var escape_states = std.AutoArrayHashMap(ir.LocalId, lattice.EscapeState).init(allocator);
+    var escape_states = std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.EscapeState).init(allocator);
     defer escape_states.deinit();
     try escape_states.put(0, .function_local);
     try escape_states.put(1, .function_local);
     try escape_states.put(2, .global_escape);
     try escape_states.put(5, .function_local);
 
-    var alloc_sites = std.AutoArrayHashMap(ir.LocalId, lattice.AllocSiteId).init(allocator);
+    var alloc_sites = std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.AllocSiteId).init(allocator);
     defer alloc_sites.deinit();
     try alloc_sites.put(0, 0);
     try alloc_sites.put(1, 1);
@@ -2672,11 +2672,11 @@ test "RegionSolver: arg_escape_safe alloc site maps to caller_region strategy" {
         .captures = &.{},
     };
 
-    var escape_states = std.AutoArrayHashMap(ir.LocalId, lattice.EscapeState).init(allocator);
+    var escape_states = std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.EscapeState).init(allocator);
     defer escape_states.deinit();
     try escape_states.put(0, .arg_escape_safe);
 
-    var alloc_sites = std.AutoArrayHashMap(ir.LocalId, lattice.AllocSiteId).init(allocator);
+    var alloc_sites = std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.AllocSiteId).init(allocator);
     defer alloc_sites.deinit();
     try alloc_sites.put(0, 0);
 
@@ -2731,13 +2731,13 @@ test "RegionSolver: loop-carried value remains function-frame stable" {
         .captures = &.{},
     };
 
-    var escape_states = std.AutoArrayHashMap(ir.LocalId, lattice.EscapeState).init(allocator);
+    var escape_states = std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.EscapeState).init(allocator);
     defer escape_states.deinit();
     try escape_states.put(0, .function_local);
     try escape_states.put(1, .function_local);
     try escape_states.put(2, .function_local);
 
-    var alloc_sites = std.AutoArrayHashMap(ir.LocalId, lattice.AllocSiteId).init(allocator);
+    var alloc_sites = std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.AllocSiteId).init(allocator);
     defer alloc_sites.deinit();
 
     var solver = RegionSolver.init(allocator);
@@ -3066,11 +3066,11 @@ test "RegionSolver: escapeToStrategy integration" {
             .captures = &.{},
         };
 
-        var escape_states = std.AutoArrayHashMap(ir.LocalId, lattice.EscapeState).init(allocator);
+        var escape_states = std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.EscapeState).init(allocator);
         defer escape_states.deinit();
         try escape_states.put(0, .no_escape);
 
-        var alloc_sites = std.AutoArrayHashMap(ir.LocalId, lattice.AllocSiteId).init(allocator);
+        var alloc_sites = std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.AllocSiteId).init(allocator);
         defer alloc_sites.deinit();
         try alloc_sites.put(0, 0);
 
@@ -3109,12 +3109,12 @@ test "RegionSolver: escapeToStrategy integration" {
             .captures = &.{},
         };
 
-        var escape_states = std.AutoArrayHashMap(ir.LocalId, lattice.EscapeState).init(allocator);
+        var escape_states = std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.EscapeState).init(allocator);
         defer escape_states.deinit();
         try escape_states.put(0, .function_local);
         try escape_states.put(1, .function_local);
 
-        var alloc_sites = std.AutoArrayHashMap(ir.LocalId, lattice.AllocSiteId).init(allocator);
+        var alloc_sites = std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.AllocSiteId).init(allocator);
         defer alloc_sites.deinit();
         try alloc_sites.put(0, 0);
 

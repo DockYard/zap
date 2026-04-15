@@ -317,6 +317,15 @@ pub const DiagnosticEngine = struct {
             pub fn writeAll(self_w: @This(), data: []const u8) !void {
                 try self_w.list.appendSlice(self_w.alloc, data);
             }
+            pub fn writeByte(self_w: @This(), byte: u8) !void {
+                try self_w.list.append(self_w.alloc, byte);
+            }
+            pub fn writeByteNTimes(self_w: @This(), byte: u8, n: usize) !void {
+                var i: usize = 0;
+                while (i < n) : (i += 1) {
+                    try self_w.list.append(self_w.alloc, byte);
+                }
+            }
         };
         const writer = Writer{ .list = &buf, .alloc = allocator };
         const color = Color{ .enabled = self.use_color };

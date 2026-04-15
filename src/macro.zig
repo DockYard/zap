@@ -791,8 +791,8 @@ pub const MacroEngine = struct {
         const clause = &clause_ref.decl.clauses[clause_ref.clause_index];
 
         // Fast path: bare quote body → use Phase 2 template expansion
-        if ((clause.body orelse &[_]ast.Stmt{}).len == 1 and (clause.body orelse &[_]ast.Stmt{})[0] == .expr) {
-            const body_expr = (clause.body orelse &[_]ast.Stmt{})[0].expr;
+        if ((clause.body orelse @as([]const ast.Stmt, &.{})).len == 1 and (clause.body orelse @as([]const ast.Stmt, &.{}))[0] == .expr) {
+            const body_expr = (clause.body orelse @as([]const ast.Stmt, &.{}))[0].expr;
             if (body_expr.* == .quote_expr) {
                 self.generation += 1;
                 return try self.expandQuote(body_expr, call.args, clause.params);
@@ -820,7 +820,7 @@ pub const MacroEngine = struct {
 
             // Convert body statements to CtValue and evaluate them
             var result: ctfe.CtValue = .nil;
-            for (clause.body orelse &[_]ast.Stmt{}) |stmt| {
+            for (clause.body orelse @as([]const ast.Stmt, &.{})) |stmt| {
                 const stmt_ct = try ast_data.stmtToCtValue(self.allocator, self.interner, &store, stmt);
                 result = macro_eval.eval(&env, stmt_ct) catch .nil;
             }
@@ -1047,8 +1047,8 @@ pub const MacroEngine = struct {
 
         // Skip identity macros (quote { unquote(left) OP unquote(right) })
         // to avoid infinite expansion loops
-        if ((clause.body orelse &[_]ast.Stmt{}).len == 1 and (clause.body orelse &[_]ast.Stmt{})[0] == .expr) {
-            const body_expr = (clause.body orelse &[_]ast.Stmt{})[0].expr;
+        if ((clause.body orelse @as([]const ast.Stmt, &.{})).len == 1 and (clause.body orelse @as([]const ast.Stmt, &.{}))[0] == .expr) {
+            const body_expr = (clause.body orelse @as([]const ast.Stmt, &.{}))[0].expr;
             if (body_expr.* == .quote_expr) {
                 const qbody = body_expr.quote_expr.body;
                 // Identity check: single binary_op or pipe with both sides unquoted
@@ -1074,8 +1074,8 @@ pub const MacroEngine = struct {
         const rhs_ct = ast_data.exprToCtValue(self.allocator, self.interner, &store, rhs) catch return null;
         _ = meta;
 
-        if ((clause.body orelse &[_]ast.Stmt{}).len == 1 and (clause.body orelse &[_]ast.Stmt{})[0] == .expr) {
-            const body_expr = (clause.body orelse &[_]ast.Stmt{})[0].expr;
+        if ((clause.body orelse @as([]const ast.Stmt, &.{})).len == 1 and (clause.body orelse @as([]const ast.Stmt, &.{}))[0] == .expr) {
+            const body_expr = (clause.body orelse @as([]const ast.Stmt, &.{}))[0].expr;
             if (body_expr.* == .quote_expr) {
                 // Template macro
                 var param_map = std.StringHashMap(ctfe.CtValue).init(self.allocator);
@@ -1116,7 +1116,7 @@ pub const MacroEngine = struct {
 
             // Evaluate the macro body
             var result: ctfe.CtValue = .nil;
-            for (clause.body orelse &[_]ast.Stmt{}) |stmt| {
+            for (clause.body orelse @as([]const ast.Stmt, &.{})) |stmt| {
                 const stmt_ct = ast_data.stmtToCtValue(self.allocator, self.interner, &store, stmt) catch return null;
                 result = macro_eval.eval(&env, stmt_ct) catch return null;
             }
@@ -1375,8 +1375,8 @@ pub const MacroEngine = struct {
         var store = ctfe.AllocationStore{};
         const item_ct = ast_data.moduleItemToCtValue(self.allocator, self.interner, &store, item) catch return null;
 
-        if ((clause.body orelse &[_]ast.Stmt{}).len == 1 and (clause.body orelse &[_]ast.Stmt{})[0] == .expr) {
-            const body_expr = (clause.body orelse &[_]ast.Stmt{})[0].expr;
+        if ((clause.body orelse @as([]const ast.Stmt, &.{})).len == 1 and (clause.body orelse @as([]const ast.Stmt, &.{}))[0] == .expr) {
+            const body_expr = (clause.body orelse @as([]const ast.Stmt, &.{}))[0].expr;
             if (body_expr.* == .quote_expr) {
                 // Template macro with real transformation
                 var decl_param_map = std.StringHashMap(ctfe.CtValue).init(self.allocator);
@@ -1413,7 +1413,7 @@ pub const MacroEngine = struct {
         }
 
         var result: ctfe.CtValue = .nil;
-        for (clause.body orelse &[_]ast.Stmt{}) |stmt| {
+        for (clause.body orelse @as([]const ast.Stmt, &.{})) |stmt| {
             const stmt_ct = ast_data.stmtToCtValue(self.allocator, self.interner, &store, stmt) catch return null;
             result = macro_eval.eval(&env, stmt_ct) catch return null;
         }
@@ -1448,8 +1448,8 @@ pub const MacroEngine = struct {
             .nil;
 
         // Evaluate the __using__ macro body
-        if ((clause.body orelse &[_]ast.Stmt{}).len == 1 and (clause.body orelse &[_]ast.Stmt{})[0] == .expr) {
-            const body_expr = (clause.body orelse &[_]ast.Stmt{})[0].expr;
+        if ((clause.body orelse @as([]const ast.Stmt, &.{})).len == 1 and (clause.body orelse @as([]const ast.Stmt, &.{}))[0] == .expr) {
+            const body_expr = (clause.body orelse @as([]const ast.Stmt, &.{}))[0].expr;
             if (body_expr.* == .quote_expr) {
                 // Template macro: substitute opts into quote body
                 var param_map = std.StringHashMap(ctfe.CtValue).init(self.allocator);
@@ -1492,7 +1492,7 @@ pub const MacroEngine = struct {
         }
 
         var result: ctfe.CtValue = .nil;
-        for (clause.body orelse &[_]ast.Stmt{}) |stmt| {
+        for (clause.body orelse @as([]const ast.Stmt, &.{})) |stmt| {
             const stmt_ct = ast_data.stmtToCtValue(self.allocator, self.interner, &store, stmt) catch return null;
             result = macro_eval.eval(&env, stmt_ct) catch return null;
         }

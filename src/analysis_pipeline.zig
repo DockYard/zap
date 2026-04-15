@@ -109,7 +109,7 @@ pub fn runAnalysisPipeline(
 
     for (program.functions) |*func| {
         // Extract per-function escape states.
-        var func_escape = std.AutoArrayHashMap(ir.LocalId, lattice.EscapeState).init(alloc);
+        var func_escape = std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.EscapeState).init(alloc);
         defer func_escape.deinit();
         var es_iter = ctx.escape_states.iterator();
         while (es_iter.next()) |entry| {
@@ -119,7 +119,7 @@ pub fn runAnalysisPipeline(
         }
 
         // Extract per-function alloc sites by scanning IR for allocating instructions.
-        var func_alloc_sites = std.AutoArrayHashMap(ir.LocalId, lattice.AllocSiteId).init(alloc);
+        var func_alloc_sites = std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.AllocSiteId).init(alloc);
         defer func_alloc_sites.deinit();
         {
             var next_site: lattice.AllocSiteId = 0;

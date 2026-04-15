@@ -158,7 +158,7 @@ pub fn detectZigLibDir(allocator: std.mem.Allocator) ?[]const u8 {
     //    e.g., if exe is /usr/local/bin/zap, check:
     //      /usr/local/lib/zig/std/std.zig  (../lib/zig/)
     //      /usr/local/lib/std/std.zig      (../lib/)
-    if (std.fs.selfExePathAlloc(allocator)) |exe_path| {
+    if (std.process.executablePathAlloc(std.Options.debug_io, allocator)) |exe_path| {
         defer allocator.free(exe_path);
         const exe_dir = std.fs.path.dirname(exe_path) orelse "";
         const parent_dir = std.fs.path.dirname(exe_dir) orelse "";
@@ -176,7 +176,7 @@ pub fn detectZigLibDir(allocator: std.mem.Allocator) ?[]const u8 {
             };
             defer allocator.free(check);
 
-            std.fs.cwd().access(check, .{}) catch {
+            std.Io.Dir.cwd().access(std.Options.debug_io, check, .{}) catch {
                 allocator.free(candidate);
                 continue;
             };
@@ -206,7 +206,7 @@ pub fn detectZigLibDir(allocator: std.mem.Allocator) ?[]const u8 {
         if (check_path) |c| {
             defer allocator.free(c);
             const accessible = blk: {
-                std.fs.cwd().access(c, .{}) catch break :blk false;
+                std.Io.Dir.cwd().access(std.Options.debug_io, c, .{}) catch break :blk false;
                 break :blk true;
             };
             if (accessible) {
@@ -219,7 +219,7 @@ pub fn detectZigLibDir(allocator: std.mem.Allocator) ?[]const u8 {
         const check = std.fs.path.join(allocator, &.{ candidate, "std", "std.zig" }) catch continue;
         defer allocator.free(check);
 
-        std.fs.cwd().access(check, .{}) catch continue;
+        std.Io.Dir.cwd().access(std.Options.debug_io, check, .{}) catch continue;
 
         return allocator.dupe(u8, candidate) catch return null;
     }

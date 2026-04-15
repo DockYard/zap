@@ -4454,9 +4454,9 @@ pub const PersistentCache = struct {
         const data = serializeResult(alloc, result) catch return;
         defer alloc.free(data);
 
-        const file = std.Io.Dir.cwd().createFile(path, .{}) catch return;
-        defer file.close();
-        file.writeAll(data) catch return;
+        const file = std.Io.Dir.cwd().createFile(std.Options.debug_io, path, .{}) catch return;
+        defer file.close(std.Options.debug_io);
+        file.writeStreamingAll(std.Options.debug_io, data) catch return;
     }
 
     /// Validate that all dependencies in a cached result are still current.
@@ -4475,7 +4475,7 @@ pub const PersistentCache = struct {
                     if (current_hash != f.content_hash) return false;
                 },
                 .env_var => |ev| {
-                    const current = std.c.getenv(ev.name);
+                    const current = std.c.getenv(@ptrCast(ev.name.ptr));
                     if (ev.present and current == null) return false;
                     if (!ev.present and current != null) return false;
                     if (current) |v| {

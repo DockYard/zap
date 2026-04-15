@@ -218,7 +218,7 @@ fn cmdInit(allocator: std.mem.Allocator) !void {
         std.debug.print("Error: cannot open current directory\n", .{});
         std.process.exit(1);
     };
-    defer dir.close();
+    defer dir.close(global_io);
 
     var iter = dir.iterate();
     if (iter.next() catch null) |_| {
@@ -470,7 +470,7 @@ fn buildTarget(
                     // Scan for subdirectories containing .zap files
                     if (std.Io.Dir.cwd().openDir(global_io, dep_resolved, .{ .iterate = true })) |dir_handle| {
                         var dir = dir_handle;
-                        defer dir.close();
+                        defer dir.close(global_io);
                         var it = dir.iterate();
                         while (it.next() catch null) |entry| {
                             if (entry.kind == .directory) {
@@ -1121,7 +1121,7 @@ fn walkAndMatch(
     results: *std.ArrayListUnmanaged([]const u8),
 ) !void {
     var dir = std.Io.Dir.cwd().openDir(global_io, dir_path, .{ .iterate = true }) catch return;
-    defer dir.close();
+    defer dir.close(global_io);
     var iter = dir.iterate();
 
     while (iter.next() catch null) |entry| {
@@ -1242,10 +1242,10 @@ fn extractEmbeddedZigLib(allocator: std.mem.Allocator) ![]const u8 {
     std.Io.Dir.cwd().createDirPath(global_io, lib_dir) catch {};
 
     var dir = std.Io.Dir.cwd().openDir(global_io, lib_dir, .{}) catch return error.FileNotFound;
-    defer dir.close();
+    defer dir.close(global_io);
 
     var reader = std.Io.Reader.fixed(zig_lib_archive.data);
-    std.tar.pipeToFileSystem(dir, &reader, .{}) catch return error.FileNotFound;
+    std.tar.extract(global_io, dir, &reader, .{}) catch return error.FileNotFound;
 
     return lib_dir;
 }
