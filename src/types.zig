@@ -1911,6 +1911,18 @@ pub const TypeChecker = struct {
         }
     }
 
+    /// Check if a binding is shadowed by a later binding with the same name
+    /// that IS referenced. This handles the case where the scope collector creates
+    /// duplicate bindings (e.g., function parameters in :zig bridge call scopes).
+    fn isBindingShadowed(self: *const TypeChecker, binding: scope_mod.Binding, bid: scope_mod.BindingId) bool {
+        for (self.graph.bindings.items[bid + 1 ..], (bid + 1)..) |other, other_i| {
+            if (other.name == binding.name and self.referenced_bindings.contains(@intCast(other_i))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     pub fn checkUnusedBindings(self: *TypeChecker) !void {
         for (self.graph.bindings.items, 0..) |binding, i| {
             const bid: scope_mod.BindingId = @intCast(i);
@@ -1927,6 +1939,11 @@ pub const TypeChecker = struct {
             // Skip bindings in case clause scopes (pattern match variables)
             const binding_scope = self.graph.getScope(binding.scope_id);
             if (binding_scope.kind == .case_clause) continue;
+            // Skip bindings that are shadowed by a later binding with the same name
+            // in a child scope. The shadowing binding takes the references, leaving
+            // the original appearing "unused". This happens with function parameters
+            // in :zig bridge calls where the scope collector creates duplicate bindings.
+            if (self.isBindingShadowed(binding, bid)) continue;
 
             try self.addRichError(
                 try std.fmt.allocPrint(self.allocator, "variable `{s}` is unused", .{name}),
@@ -2963,6 +2980,19 @@ pub const TypeChecker = struct {
         );
     }
 
+    /// Check if a field_access chain roots at an atom_literal (`:zig` bridge call).
+    /// Handles nested chains like :zig.Module.func by traversing to the root.
+    fn isZigBridgeCall(fa: ast.FieldAccess) bool {
+        var obj = fa.object;
+        while (true) {
+            switch (obj.*) {
+                .atom_literal => return true,
+                .field_access => |inner_fa| obj = inner_fa.object,
+                else => return false,
+            }
+        }
+    }
+
     fn inferCall(self: *TypeChecker, call: *const ast.CallExpr) !TypeId {
         const arity: u32 = @intCast(call.args.len);
 
@@ -3118,8 +3148,10 @@ pub const TypeChecker = struct {
         // Module-qualified call: IO.puts(...) is a call with field_access callee
         if (call.callee.* == .field_access) {
             const fa = call.callee.field_access;
-            // :zig.func(args) — bridge call; infer args to mark bindings as used
-            if (fa.object.* == .atom_literal) {
+            // :zig.func(args) or :zig.Module.func(args) — bridge call;
+            // infer args to mark bindings as used. Traverse field access chain
+            // to find the root object (handles :zig.A.B.func nested chains).
+            if (isZigBridgeCall(fa)) {
                 for (call.args) |arg| {
                     _ = try self.inferExpr(arg);
                     // Mark any var_ref args as referenced directly
@@ -5113,6 +5145,80 @@ test "unused function parameter produces warning" {
         }
     }
     try std.testing.expect(found_unused);
+}
+
+test "zig bridge call parameters not flagged as unused" {
+    // Regression: :zig.Module.func(param) calls should mark parameters as used.
+    // Previously, the scope collector created duplicate binding IDs for function
+    // parameters, and the :zig bridge call resolved to the duplicate — leaving
+    // the original parameter binding appearing unused.
+    const source =
+        \\pub module Test {
+        \\  pub fn get(map :: i64, key :: i64) -> i64 {
+        \\    :zig.Prelude.add(map, key)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+    try checker.checkUnusedBindings();
+
+    // No unused variable warnings should be emitted for map or key
+    for (checker.errors.items) |err| {
+        if (std.mem.indexOf(u8, err.message, "is unused") != null) {
+            std.debug.print("Unexpected unused warning: {s}\n", .{err.message});
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "nested zig bridge call parameters not flagged as unused" {
+    // Regression: :zig.A.B.func(param) nested bridge calls should also work.
+    const source =
+        \\pub module Test {
+        \\  pub fn read(path :: i64) -> i64 {
+        \\    :zig.MapCell.get(path)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+    try checker.checkUnusedBindings();
+
+    for (checker.errors.items) |err| {
+        if (std.mem.indexOf(u8, err.message, "is unused") != null) {
+            std.debug.print("Unexpected unused warning: {s}\n", .{err.message});
+            return error.TestUnexpectedResult;
+        }
+    }
 }
 
 // ============================================================
