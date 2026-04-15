@@ -279,7 +279,7 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
                     else
                         return .nil;
 
-                    var words = std.ArrayListUnmanaged(CtValue){};
+                    var words : std.ArrayListUnmanaged(CtValue) = .empty;
                     var i: usize = 0;
                     while (i < content.len) {
                         while (i < content.len and (content[i] == ' ' or content[i] == '\t' or content[i] == '\n' or content[i] == '\r')) : (i += 1) {}
@@ -660,7 +660,7 @@ fn injectSetupIntoTests(
 
     // Check if it's a __block__
     if (form == .atom and std.mem.eql(u8, form.atom, "__block__") and args == .list) {
-        var new_stmts = std.ArrayListUnmanaged(CtValue){};
+        var new_stmts : std.ArrayListUnmanaged(CtValue) = .empty;
 
         for (args.list.elems) |stmt| {
             // Skip setup() and teardown() calls — they've been consumed
@@ -681,7 +681,7 @@ fn injectSetupIntoTests(
                     const ctx_var = try ast_data.makeTuple3(alloc, store, .{ .atom = "ctx" }, empty, .nil);
                     const ctx_assign = try ast_data.makeTuple3(alloc, store, .{ .atom = "=" }, empty, try ast_data.makeList(alloc, store, &.{ ctx_var, setup_body }));
 
-                    var body_stmts = std.ArrayListUnmanaged(CtValue){};
+                    var body_stmts : std.ArrayListUnmanaged(CtValue) = .empty;
                     try body_stmts.append(alloc, ctx_assign);
                     try body_stmts.append(alloc, test_body);
                     if (teardown_body != .nil) try body_stmts.append(alloc, teardown_body);
@@ -697,7 +697,7 @@ fn injectSetupIntoTests(
                     const test_body = test_args.list.elems[1];
 
                     const empty = try ast_data.emptyList(alloc, store);
-                    var body_stmts = std.ArrayListUnmanaged(CtValue){};
+                    var body_stmts : std.ArrayListUnmanaged(CtValue) = .empty;
                     try body_stmts.append(alloc, test_body);
                     try body_stmts.append(alloc, teardown_body);
                     const new_test_body = try ast_data.makeTuple3(alloc, store, .{ .atom = "__block__" }, empty, try ast_data.makeListFromSlice(alloc, store, body_stmts.items));

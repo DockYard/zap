@@ -107,7 +107,7 @@ const Color = struct {
 };
 
 pub fn detectColor() bool {
-    if (std.posix.getenv("NO_COLOR")) |_| return false;
+    if (std.c.getenv("NO_COLOR")) |_| return false;
     return std.posix.isatty(std.fs.File.stderr().handle);
 }
 

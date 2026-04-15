@@ -64,7 +64,7 @@ pub fn exprToCtValue(
         // Calls: {:name, meta, [args...]}
         .call => |v| {
             const form = try calleeToCtValue(alloc, interner, store, v.callee);
-            var arg_vals = std.ArrayListUnmanaged(CtValue){};
+            var arg_vals : std.ArrayListUnmanaged(CtValue) = .empty;
             for (v.args) |arg| {
                 try arg_vals.append(alloc, try exprToCtValue(alloc, interner, store, arg));
             }
@@ -105,7 +105,7 @@ pub fn exprToCtValue(
 
         // Tuple: {:{}, meta, [elements...]}
         .tuple => |v| {
-            var elem_vals = std.ArrayListUnmanaged(CtValue){};
+            var elem_vals : std.ArrayListUnmanaged(CtValue) = .empty;
             for (v.elements) |elem| {
                 try elem_vals.append(alloc, try exprToCtValue(alloc, interner, store, elem));
             }
@@ -115,7 +115,7 @@ pub fn exprToCtValue(
 
         // List: bare list [elements...]
         .list => |v| {
-            var elem_vals = std.ArrayListUnmanaged(CtValue){};
+            var elem_vals : std.ArrayListUnmanaged(CtValue) = .empty;
             for (v.elements) |elem| {
                 try elem_vals.append(alloc, try exprToCtValue(alloc, interner, store, elem));
             }
@@ -124,7 +124,7 @@ pub fn exprToCtValue(
 
         // Block: {:__block__, meta, [stmts...]}
         .block => |v| {
-            var stmt_vals = std.ArrayListUnmanaged(CtValue){};
+            var stmt_vals : std.ArrayListUnmanaged(CtValue) = .empty;
             for (v.stmts) |stmt| {
                 try stmt_vals.append(alloc, try stmtToCtValue(alloc, interner, store, stmt));
             }
@@ -136,7 +136,7 @@ pub fn exprToCtValue(
         .if_expr => |v| {
             const cond = try exprToCtValue(alloc, interner, store, v.condition);
             const then_val = try blockToCtValue(alloc, interner, store, v.then_block);
-            var kw_elems = std.ArrayListUnmanaged(CtValue){};
+            var kw_elems : std.ArrayListUnmanaged(CtValue) = .empty;
             try kw_elems.append(alloc, try makeKeywordPair(alloc, store, "do", then_val));
             if (v.else_block) |else_block| {
                 const else_val = try blockToCtValue(alloc, interner, store, else_block);
@@ -150,7 +150,7 @@ pub fn exprToCtValue(
         // Case: {:case, meta, [subject, [do: [clauses...]]]}
         .case_expr => |v| {
             const subject = try exprToCtValue(alloc, interner, store, v.scrutinee);
-            var clause_vals = std.ArrayListUnmanaged(CtValue){};
+            var clause_vals : std.ArrayListUnmanaged(CtValue) = .empty;
             for (v.clauses) |clause| {
                 try clause_vals.append(alloc, try caseClauseToCtValue(alloc, interner, store, clause));
             }
@@ -163,7 +163,7 @@ pub fn exprToCtValue(
 
         // Module ref: {:__aliases__, meta, [:Part1, :Part2, ...]}
         .module_ref => |v| {
-            var parts = std.ArrayListUnmanaged(CtValue){};
+            var parts : std.ArrayListUnmanaged(CtValue) = .empty;
             for (v.name.parts) |part| {
                 try parts.append(alloc, CtValue{ .atom = interner.get(part) });
             }
@@ -173,7 +173,7 @@ pub fn exprToCtValue(
 
         // Quote: {:quote, meta, [body]}
         .quote_expr => |v| {
-            var body_vals = std.ArrayListUnmanaged(CtValue){};
+            var body_vals : std.ArrayListUnmanaged(CtValue) = .empty;
             for (v.body) |stmt| {
                 try body_vals.append(alloc, try stmtToCtValue(alloc, interner, store, stmt));
             }
@@ -208,7 +208,7 @@ pub fn exprToCtValue(
             const chain = try exprToCtValue(alloc, interner, store, v.chain);
             const handler = switch (v.handler) {
                 .block => |clauses| blk: {
-                    var clause_vals = std.ArrayListUnmanaged(CtValue){};
+                    var clause_vals : std.ArrayListUnmanaged(CtValue) = .empty;
                     for (clauses) |clause| {
                         try clause_vals.append(alloc, try caseClauseToCtValue(alloc, interner, store, clause));
                     }
@@ -222,7 +222,7 @@ pub fn exprToCtValue(
 
         // Map: {:%{}, meta, [pairs...]}
         .map => |v| {
-            var pair_vals = std.ArrayListUnmanaged(CtValue){};
+            var pair_vals : std.ArrayListUnmanaged(CtValue) = .empty;
             for (v.fields) |field| {
                 const key = try exprToCtValue(alloc, interner, store, field.key);
                 const val = try exprToCtValue(alloc, interner, store, field.value);
@@ -234,7 +234,7 @@ pub fn exprToCtValue(
 
         // Struct: {:%, meta, [name, {:%{}, [], [fields...]}]}
         .struct_expr => |v| {
-            var field_vals = std.ArrayListUnmanaged(CtValue){};
+            var field_vals : std.ArrayListUnmanaged(CtValue) = .empty;
             for (v.fields) |field| {
                 const key: CtValue = .{ .atom = interner.get(field.name) };
                 const val = try exprToCtValue(alloc, interner, store, field.value);
@@ -242,7 +242,7 @@ pub fn exprToCtValue(
             }
             const fields_list = try makeListFromSlice(alloc, store, field_vals.items);
             const map_node = try makeTuple3(alloc, store, .{ .atom = "%{}" }, try emptyList(alloc, store), fields_list);
-            var name_parts = std.ArrayListUnmanaged(CtValue){};
+            var name_parts : std.ArrayListUnmanaged(CtValue) = .empty;
             for (v.module_name.parts) |part| {
                 try name_parts.append(alloc, CtValue{ .atom = interner.get(part) });
             }
@@ -253,7 +253,7 @@ pub fn exprToCtValue(
 
         // Intrinsic: {:__intrinsic__, meta, [:name, args...]}
         .intrinsic => |v| {
-            var arg_vals = std.ArrayListUnmanaged(CtValue){};
+            var arg_vals : std.ArrayListUnmanaged(CtValue) = .empty;
             try arg_vals.append(alloc, CtValue{ .atom = interner.get(v.name) });
             for (v.args) |arg| {
                 try arg_vals.append(alloc, try exprToCtValue(alloc, interner, store, arg));
@@ -264,7 +264,7 @@ pub fn exprToCtValue(
 
         // String interpolation: {:<<>>, meta, [parts...]} where each part is a string or expr
         .string_interpolation => |v| {
-            var part_vals = std.ArrayListUnmanaged(CtValue){};
+            var part_vals : std.ArrayListUnmanaged(CtValue) = .empty;
             for (v.parts) |part| {
                 switch (part) {
                     .literal => |sid| try part_vals.append(alloc, try makeTuple3(alloc, store, .{ .string = interner.get(sid) }, try emptyList(alloc, store), .nil)),
@@ -286,7 +286,7 @@ pub fn exprToCtValue(
         },
         .cond_expr => |v| {
             // {:cond, meta, [do: [clauses...]]} where each clause is {:->, [], [[condition], body]}
-            var clause_vals = std.ArrayListUnmanaged(CtValue){};
+            var clause_vals : std.ArrayListUnmanaged(CtValue) = .empty;
             for (v.clauses) |clause| {
                 const cond = try exprToCtValue(alloc, interner, store, clause.condition);
                 const body = try blockToCtValue(alloc, interner, store, clause.body);
@@ -305,7 +305,7 @@ pub fn exprToCtValue(
             return makeTuple3(alloc, store, .{ .atom = "@" }, try metaToList(alloc, store, v.meta, null), args);
         },
         .binary_literal => |v| {
-            var seg_vals = std.ArrayListUnmanaged(CtValue){};
+            var seg_vals : std.ArrayListUnmanaged(CtValue) = .empty;
             for (v.segments) |seg| {
                 const val = switch (seg.value) {
                     .expr => |e| try exprToCtValue(alloc, interner, store, e),
@@ -372,7 +372,7 @@ pub fn stmtToCtValue(
             return fn_ct;
         },
         .import_decl => |id| {
-            var parts = std.ArrayListUnmanaged(CtValue){};
+            var parts : std.ArrayListUnmanaged(CtValue) = .empty;
             for (id.module_path.parts) |part| {
                 try parts.append(alloc, CtValue{ .atom = interner.get(part) });
             }
@@ -425,7 +425,7 @@ pub fn patternToCtValue(
             return makeTuple3(alloc, store, .{ .atom = "^" }, try metaToList(alloc, store, v.meta, null), args);
         },
         .tuple => |v| {
-            var elems = std.ArrayListUnmanaged(CtValue){};
+            var elems : std.ArrayListUnmanaged(CtValue) = .empty;
             for (v.elements) |elem| {
                 try elems.append(alloc, try patternToCtValue(alloc, interner, store, elem));
             }
@@ -433,14 +433,14 @@ pub fn patternToCtValue(
             return makeTuple3(alloc, store, .{ .atom = "{}" }, try metaToList(alloc, store, v.meta, null), args);
         },
         .list => |v| {
-            var elems = std.ArrayListUnmanaged(CtValue){};
+            var elems : std.ArrayListUnmanaged(CtValue) = .empty;
             for (v.elements) |elem| {
                 try elems.append(alloc, try patternToCtValue(alloc, interner, store, elem));
             }
             return makeListFromSlice(alloc, store, elems.items);
         },
         .list_cons => |v| {
-            var head_vals = std.ArrayListUnmanaged(CtValue){};
+            var head_vals : std.ArrayListUnmanaged(CtValue) = .empty;
             for (v.heads) |h| {
                 try head_vals.append(alloc, try patternToCtValue(alloc, interner, store, h));
             }
@@ -451,12 +451,12 @@ pub fn patternToCtValue(
         },
         .struct_pattern => |v| {
             // {:%, meta, [module_name, {:%{}, [], [field_pairs...]}]}
-            var parts = std.ArrayListUnmanaged(CtValue){};
+            var parts : std.ArrayListUnmanaged(CtValue) = .empty;
             for (v.module_name.parts) |part| {
                 try parts.append(alloc, CtValue{ .atom = interner.get(part) });
             }
             const name_val = try makeTuple3(alloc, store, .{ .atom = "__aliases__" }, try emptyList(alloc, store), try makeListFromSlice(alloc, store, parts.items));
-            var field_vals = std.ArrayListUnmanaged(CtValue){};
+            var field_vals : std.ArrayListUnmanaged(CtValue) = .empty;
             for (v.fields) |field| {
                 const fname: CtValue = .{ .atom = interner.get(field.name) };
                 const fpat = try patternToCtValue(alloc, interner, store, field.pattern);
@@ -468,7 +468,7 @@ pub fn patternToCtValue(
         },
         .map => |v| {
             // {:%{}, meta, [field_pairs...]}
-            var field_vals = std.ArrayListUnmanaged(CtValue){};
+            var field_vals : std.ArrayListUnmanaged(CtValue) = .empty;
             for (v.fields) |field| {
                 const key = try exprToCtValue(alloc, interner, store, field.key);
                 const val = try patternToCtValue(alloc, interner, store, field.value);
@@ -479,7 +479,7 @@ pub fn patternToCtValue(
         .paren => |v| patternToCtValue(alloc, interner, store, v.inner),
         .binary => |v| {
             // {:<<>>, meta, [segments...]} — simplified representation
-            var seg_vals = std.ArrayListUnmanaged(CtValue){};
+            var seg_vals : std.ArrayListUnmanaged(CtValue) = .empty;
             for (v.segments) |seg| {
                 const val = switch (seg.value) {
                     .pattern => |p| try patternToCtValue(alloc, interner, store, p),
@@ -544,7 +544,7 @@ fn makeKeywordPair(alloc: Allocator, store: *AllocationStore, key: []const u8, v
 
 /// Convert NodeMeta to a keyword list CtValue.
 fn metaToList(alloc: Allocator, store: *AllocationStore, meta: ast.NodeMeta, type_name: ?[]const u8) !CtValue {
-    var pairs = std.ArrayListUnmanaged(CtValue){};
+    var pairs : std.ArrayListUnmanaged(CtValue) = .empty;
     if (meta.span.line > 0) {
         try pairs.append(alloc, try makeKeywordPair(alloc, store, "line", .{ .int = @intCast(meta.span.line) }));
     }
@@ -568,7 +568,7 @@ fn blockToCtValue(
     if (stmts.len == 1) {
         return stmtToCtValue(alloc, interner, store, stmts[0]);
     }
-    var vals = std.ArrayListUnmanaged(CtValue){};
+    var vals : std.ArrayListUnmanaged(CtValue) = .empty;
     for (stmts) |stmt| {
         try vals.append(alloc, try stmtToCtValue(alloc, interner, store, stmt));
     }
@@ -582,7 +582,7 @@ fn paramsToCtList(
     store: *AllocationStore,
     params: []const ast.Param,
 ) error{OutOfMemory}!CtValue {
-    var vals = std.ArrayListUnmanaged(CtValue){};
+    var vals : std.ArrayListUnmanaged(CtValue) = .empty;
     for (params) |param| {
         const pat = try patternToCtValue(alloc, interner, store, param.pattern);
         if (param.type_annotation) |type_expr| {
@@ -611,7 +611,7 @@ fn calleeToCtValue(
             return makeTuple3(alloc, store, .{ .atom = "." }, try metaToList(alloc, store, v.meta, null), args);
         },
         .module_ref => |v| {
-            var parts = std.ArrayListUnmanaged(CtValue){};
+            var parts : std.ArrayListUnmanaged(CtValue) = .empty;
             for (v.name.parts) |part| {
                 try parts.append(alloc, CtValue{ .atom = interner.get(part) });
             }
@@ -664,7 +664,7 @@ pub fn ctValueToExpr(
 
     // A bare list represents a Zap list literal
     if (value == .list) {
-        var elems = std.ArrayListUnmanaged(*const ast.Expr){};
+        var elems : std.ArrayListUnmanaged(*const ast.Expr) = .empty;
         for (value.list.elems) |elem| {
             try elems.append(alloc, try ctValueToExpr(alloc, interner, elem));
         }
@@ -821,7 +821,7 @@ pub fn ctValueToExpr(
 
     // Special forms
     if (std.mem.eql(u8, form_name, "__block__")) {
-        var stmts = std.ArrayListUnmanaged(ast.Stmt){};
+        var stmts : std.ArrayListUnmanaged(ast.Stmt) = .empty;
         for (arg_elems) |elem| {
             try stmts.append(alloc, try ctValueToStmt(alloc, interner, elem));
         }
@@ -831,7 +831,7 @@ pub fn ctValueToExpr(
     }
 
     if (std.mem.eql(u8, form_name, "{}")) {
-        var elems = std.ArrayListUnmanaged(*const ast.Expr){};
+        var elems : std.ArrayListUnmanaged(*const ast.Expr) = .empty;
         for (arg_elems) |elem| {
             try elems.append(alloc, try ctValueToExpr(alloc, interner, elem));
         }
@@ -841,7 +841,7 @@ pub fn ctValueToExpr(
     }
 
     if (std.mem.eql(u8, form_name, "%{}")) {
-        var fields = std.ArrayListUnmanaged(ast.MapField){};
+        var fields : std.ArrayListUnmanaged(ast.MapField) = .empty;
         for (arg_elems) |pair| {
             if (pair == .tuple and pair.tuple.elems.len == 2) {
                 const key = try ctValueToExpr(alloc, interner, pair.tuple.elems[0]);
@@ -878,7 +878,7 @@ pub fn ctValueToExpr(
     }
 
     if (std.mem.eql(u8, form_name, "__aliases__")) {
-        var parts = std.ArrayListUnmanaged(ast.StringId){};
+        var parts : std.ArrayListUnmanaged(ast.StringId) = .empty;
         for (arg_elems) |elem| {
             if (elem == .atom) {
                 try parts.append(alloc, try interner.intern(elem.atom));
@@ -925,7 +925,7 @@ pub fn ctValueToExpr(
     if (std.mem.eql(u8, form_name, "case")) {
         if (arg_elems.len == 2) {
             const subject = try ctValueToExpr(alloc, interner, arg_elems[0]);
-            var clauses = std.ArrayListUnmanaged(ast.CaseClause){};
+            var clauses : std.ArrayListUnmanaged(ast.CaseClause) = .empty;
 
             const kw = arg_elems[1];
             if (kw == .list) {
@@ -951,7 +951,7 @@ pub fn ctValueToExpr(
 
     // Cond: {:cond, meta, [do: [clauses...]]}
     if (std.mem.eql(u8, form_name, "cond")) {
-        var clauses = std.ArrayListUnmanaged(ast.CondClause){};
+        var clauses : std.ArrayListUnmanaged(ast.CondClause) = .empty;
         if (arg_elems.len == 1 and arg_elems[0] == .list) {
             for (arg_elems[0].list.elems) |pair| {
                 if (pair == .tuple and pair.tuple.elems.len == 2 and pair.tuple.elems[0] == .atom) {
@@ -982,7 +982,7 @@ pub fn ctValueToExpr(
 
     // String interpolation: {:<<>>, meta, [parts...]}
     if (std.mem.eql(u8, form_name, "<<>>")) {
-        var parts = std.ArrayListUnmanaged(ast.StringPart){};
+        var parts : std.ArrayListUnmanaged(ast.StringPart) = .empty;
         for (arg_elems) |part| {
             if (part == .tuple and part.tuple.elems.len == 3 and part.tuple.elems[0] == .string) {
                 try parts.append(alloc, .{ .literal = try interner.intern(part.tuple.elems[0].string) });
@@ -1038,7 +1038,7 @@ pub fn ctValueToExpr(
             // Handler can be a list of clauses or an expression
             const handler_val = arg_elems[1];
             if (handler_val == .list) {
-                var clauses = std.ArrayListUnmanaged(ast.CaseClause){};
+                var clauses : std.ArrayListUnmanaged(ast.CaseClause) = .empty;
                 for (handler_val.list.elems) |clause_val| {
                     try clauses.append(alloc, try ctValueToCaseClause(alloc, interner, clause_val));
                 }
@@ -1064,7 +1064,7 @@ pub fn ctValueToExpr(
 
     if (std.mem.eql(u8, form_name, "quote")) {
         if (arg_elems.len == 1 and arg_elems[0] == .list) {
-            var stmts = std.ArrayListUnmanaged(ast.Stmt){};
+            var stmts : std.ArrayListUnmanaged(ast.Stmt) = .empty;
             for (arg_elems[0].list.elems) |elem| {
                 try stmts.append(alloc, .{ .expr = try ctValueToExpr(alloc, interner, elem) });
             }
@@ -1282,7 +1282,7 @@ pub fn ctValueToExpr(
         const callee = try alloc.create(ast.Expr);
         callee.* = .{ .var_ref = .{ .meta = node_meta, .name = try interner.intern(form_name) } };
 
-        var call_args = std.ArrayListUnmanaged(*const ast.Expr){};
+        var call_args : std.ArrayListUnmanaged(*const ast.Expr) = .empty;
         for (arg_elems) |elem| {
             try call_args.append(alloc, try ctValueToExpr(alloc, interner, elem));
         }
@@ -1337,7 +1337,7 @@ fn ctValueToStmts(
     if (value == .tuple and value.tuple.elems.len == 3) {
         if (value.tuple.elems[0] == .atom and std.mem.eql(u8, value.tuple.elems[0].atom, "__block__")) {
             if (value.tuple.elems[2] == .list) {
-                var stmts = std.ArrayListUnmanaged(ast.Stmt){};
+                var stmts : std.ArrayListUnmanaged(ast.Stmt) = .empty;
                 for (value.tuple.elems[2].list.elems) |elem| {
                     try stmts.append(alloc, try ctValueToStmt(alloc, interner, elem));
                 }
@@ -1476,7 +1476,7 @@ fn ctValueToPattern(
         // List cons: {:|, meta, [heads_list, tail]}
         if (form == .atom and std.mem.eql(u8, form.atom, "|")) {
             if (pat_args == .list and pat_args.list.elems.len == 2) {
-                var heads = std.ArrayListUnmanaged(*const ast.Pattern){};
+                var heads : std.ArrayListUnmanaged(*const ast.Pattern) = .empty;
                 if (pat_args.list.elems[0] == .list) {
                     for (pat_args.list.elems[0].list.elems) |h| {
                         try heads.append(alloc, try ctValueToPattern(alloc, interner, h));
@@ -1495,14 +1495,14 @@ fn ctValueToPattern(
                 const aliases_ct = pat_args.list.elems[0];
                 const map_ct = pat_args.list.elems[1];
                 // Extract module name
-                var parts = std.ArrayListUnmanaged(ast.StringId){};
+                var parts : std.ArrayListUnmanaged(ast.StringId) = .empty;
                 if (aliases_ct == .tuple and aliases_ct.tuple.elems.len == 3 and aliases_ct.tuple.elems[2] == .list) {
                     for (aliases_ct.tuple.elems[2].list.elems) |part| {
                         if (part == .atom) try parts.append(alloc, try interner.intern(part.atom));
                     }
                 }
                 // Extract fields
-                var fields = std.ArrayListUnmanaged(ast.StructPatternField){};
+                var fields : std.ArrayListUnmanaged(ast.StructPatternField) = .empty;
                 if (map_ct == .tuple and map_ct.tuple.elems.len == 3 and map_ct.tuple.elems[2] == .list) {
                     for (map_ct.tuple.elems[2].list.elems) |pair| {
                         if (pair == .tuple and pair.tuple.elems.len == 2 and pair.tuple.elems[0] == .atom) {
@@ -1526,7 +1526,7 @@ fn ctValueToPattern(
         // Map pattern: {:%{}, meta, [field_pairs...]}
         if (form == .atom and std.mem.eql(u8, form.atom, "%{}")) {
             if (pat_args == .list) {
-                var fields = std.ArrayListUnmanaged(ast.MapPatternField){};
+                var fields : std.ArrayListUnmanaged(ast.MapPatternField) = .empty;
                 for (pat_args.list.elems) |pair| {
                     if (pair == .tuple and pair.tuple.elems.len == 2) {
                         try fields.append(alloc, .{
@@ -1544,7 +1544,7 @@ fn ctValueToPattern(
         // Tuple pattern: {:{}, meta, [elems...]}
         if (form == .atom and std.mem.eql(u8, form.atom, "{}")) {
             if (pat_args == .list) {
-                var elems = std.ArrayListUnmanaged(*const ast.Pattern){};
+                var elems : std.ArrayListUnmanaged(*const ast.Pattern) = .empty;
                 for (pat_args.list.elems) |elem| {
                     try elems.append(alloc, try ctValueToPattern(alloc, interner, elem));
                 }
@@ -1557,7 +1557,7 @@ fn ctValueToPattern(
 
     // Bare list → list pattern
     if (value == .list) {
-        var elems = std.ArrayListUnmanaged(*const ast.Pattern){};
+        var elems : std.ArrayListUnmanaged(*const ast.Pattern) = .empty;
         for (value.list.elems) |elem| {
             try elems.append(alloc, try ctValueToPattern(alloc, interner, elem));
         }
@@ -1638,7 +1638,7 @@ pub fn typeExprToCtValue(
                 return CtValue{ .atom = interner.get(n.name) };
             }
             // Generic type: {:TypeName, [], [args...]}
-            var arg_vals = std.ArrayListUnmanaged(CtValue){};
+            var arg_vals : std.ArrayListUnmanaged(CtValue) = .empty;
             for (n.args) |arg| {
                 try arg_vals.append(alloc, try typeExprToCtValue(alloc, interner, store, arg));
             }
@@ -1646,7 +1646,7 @@ pub fn typeExprToCtValue(
         },
         .variable => |v| CtValue{ .atom = interner.get(v.name) },
         .tuple => |t| {
-            var elem_vals = std.ArrayListUnmanaged(CtValue){};
+            var elem_vals : std.ArrayListUnmanaged(CtValue) = .empty;
             for (t.elements) |elem| {
                 try elem_vals.append(alloc, try typeExprToCtValue(alloc, interner, store, elem));
             }
@@ -1657,7 +1657,7 @@ pub fn typeExprToCtValue(
             return makeTuple3(alloc, store, .{ .atom = "list" }, try emptyList(alloc, store), try makeList(alloc, store, &.{elem}));
         },
         .map => |m| {
-            var field_vals = std.ArrayListUnmanaged(CtValue){};
+            var field_vals : std.ArrayListUnmanaged(CtValue) = .empty;
             for (m.fields) |field| {
                 const key = try typeExprToCtValue(alloc, interner, store, field.key);
                 const val = try typeExprToCtValue(alloc, interner, store, field.value);
@@ -1666,7 +1666,7 @@ pub fn typeExprToCtValue(
             return makeTuple3(alloc, store, .{ .atom = "map" }, try emptyList(alloc, store), try makeListFromSlice(alloc, store, field_vals.items));
         },
         .function => |f| {
-            var param_vals = std.ArrayListUnmanaged(CtValue){};
+            var param_vals : std.ArrayListUnmanaged(CtValue) = .empty;
             for (f.params) |p| {
                 try param_vals.append(alloc, try typeExprToCtValue(alloc, interner, store, p));
             }
@@ -1677,14 +1677,14 @@ pub fn typeExprToCtValue(
         .never => makeTuple3(alloc, store, .{ .atom = "Never" }, try emptyList(alloc, store), .nil),
         .paren => |p| typeExprToCtValue(alloc, interner, store, p.inner),
         .struct_type => |s| {
-            var parts = std.ArrayListUnmanaged(CtValue){};
+            var parts : std.ArrayListUnmanaged(CtValue) = .empty;
             for (s.module_name.parts) |part| {
                 try parts.append(alloc, CtValue{ .atom = interner.get(part) });
             }
             return makeTuple3(alloc, store, .{ .atom = "__aliases__" }, try emptyList(alloc, store), try makeListFromSlice(alloc, store, parts.items));
         },
         .union_type => |u| {
-            var member_vals = std.ArrayListUnmanaged(CtValue){};
+            var member_vals : std.ArrayListUnmanaged(CtValue) = .empty;
             for (u.members) |m| {
                 try member_vals.append(alloc, try typeExprToCtValue(alloc, interner, store, m));
             }
@@ -1727,7 +1727,7 @@ pub fn ctValueToTypeExpr(
             }
 
             if (std.mem.eql(u8, form.atom, "tuple") and args == .list) {
-                var elems = std.ArrayListUnmanaged(*const ast.TypeExpr){};
+                var elems : std.ArrayListUnmanaged(*const ast.TypeExpr) = .empty;
                 for (args.list.elems) |elem| {
                     try elems.append(alloc, try ctValueToTypeExpr(alloc, interner, elem));
                 }
@@ -1744,7 +1744,7 @@ pub fn ctValueToTypeExpr(
 
             // Map type: {:map, [], [field_pairs...]}
             if (std.mem.eql(u8, form.atom, "map") and args == .list) {
-                var fields = std.ArrayListUnmanaged(ast.TypeMapField){};
+                var fields : std.ArrayListUnmanaged(ast.TypeMapField) = .empty;
                 for (args.list.elems) |pair| {
                     if (pair == .tuple and pair.tuple.elems.len == 2) {
                         try fields.append(alloc, .{
@@ -1762,7 +1762,7 @@ pub fn ctValueToTypeExpr(
             if (std.mem.eql(u8, form.atom, "fn_type") and args == .list and args.list.elems.len == 2) {
                 const param_list = args.list.elems[0];
                 const ret = try ctValueToTypeExpr(alloc, interner, args.list.elems[1]);
-                var params = std.ArrayListUnmanaged(*const ast.TypeExpr){};
+                var params : std.ArrayListUnmanaged(*const ast.TypeExpr) = .empty;
                 if (param_list == .list) {
                     for (param_list.list.elems) |p| {
                         try params.append(alloc, try ctValueToTypeExpr(alloc, interner, p));
@@ -1785,7 +1785,7 @@ pub fn ctValueToTypeExpr(
 
             // Union type: {:union_type, [], [member_types...]}
             if (std.mem.eql(u8, form.atom, "union_type") and args == .list) {
-                var members = std.ArrayListUnmanaged(*const ast.TypeExpr){};
+                var members : std.ArrayListUnmanaged(*const ast.TypeExpr) = .empty;
                 for (args.list.elems) |m| {
                     try members.append(alloc, try ctValueToTypeExpr(alloc, interner, m));
                 }
@@ -1796,7 +1796,7 @@ pub fn ctValueToTypeExpr(
 
             // Struct type: {:__aliases__, [], [:Part1, :Part2, ...]}
             if (std.mem.eql(u8, form.atom, "__aliases__") and args == .list) {
-                var parts = std.ArrayListUnmanaged(ast.StringId){};
+                var parts : std.ArrayListUnmanaged(ast.StringId) = .empty;
                 for (args.list.elems) |part| {
                     if (part == .atom) try parts.append(alloc, try interner.intern(part.atom));
                 }
@@ -1811,7 +1811,7 @@ pub fn ctValueToTypeExpr(
 
             // Named type with args or simple name
             if (args == .nil or args == .list) {
-                var type_args = std.ArrayListUnmanaged(*const ast.TypeExpr){};
+                var type_args : std.ArrayListUnmanaged(*const ast.TypeExpr) = .empty;
                 if (args == .list) {
                     for (args.list.elems) |a| {
                         try type_args.append(alloc, try ctValueToTypeExpr(alloc, interner, a));
@@ -1838,11 +1838,11 @@ pub fn functionDeclToCtValue(
     store: *AllocationStore,
     decl: *const ast.FunctionDecl,
 ) error{OutOfMemory}!CtValue {
-    var clause_vals = std.ArrayListUnmanaged(CtValue){};
+    var clause_vals : std.ArrayListUnmanaged(CtValue) = .empty;
 
     for (decl.clauses) |clause| {
         // Params
-        var param_vals = std.ArrayListUnmanaged(CtValue){};
+        var param_vals : std.ArrayListUnmanaged(CtValue) = .empty;
         for (clause.params) |param| {
             try param_vals.append(alloc, try paramToCtValue(alloc, interner, store, param));
         }
@@ -1852,14 +1852,14 @@ pub fn functionDeclToCtValue(
         const head = try makeTuple3(alloc, store, .{ .atom = interner.get(decl.name) }, try emptyList(alloc, store), params_list);
 
         // Keyword opts: [return: type, do: body]
-        var kw_elems = std.ArrayListUnmanaged(CtValue){};
+        var kw_elems : std.ArrayListUnmanaged(CtValue) = .empty;
         if (clause.return_type) |rt| {
             try kw_elems.append(alloc, try makeKeywordPair(alloc, store, "return", try typeExprToCtValue(alloc, interner, store, rt)));
         }
 
         // Body (optional — @native functions have no body)
         if (clause.body) |body_stmts| {
-            var body_vals = std.ArrayListUnmanaged(CtValue){};
+            var body_vals : std.ArrayListUnmanaged(CtValue) = .empty;
             for (body_stmts) |stmt| {
                 try body_vals.append(alloc, try stmtToCtValue(alloc, interner, store, stmt));
             }
@@ -1883,7 +1883,7 @@ pub fn functionDeclToCtValue(
     }
 
     // Metadata with visibility
-    var meta_elems = std.ArrayListUnmanaged(CtValue){};
+    var meta_elems : std.ArrayListUnmanaged(CtValue) = .empty;
     try meta_elems.append(alloc, try makeKeywordPair(alloc, store, "visibility", .{
         .atom = if (decl.visibility == .public) "pub" else "private",
     }));
@@ -1925,14 +1925,14 @@ pub fn moduleDeclToCtValue(
     decl: *const ast.ModuleDecl,
 ) error{OutOfMemory}!CtValue {
     // Module name as atom
-    var name_parts = std.ArrayListUnmanaged(CtValue){};
+    var name_parts : std.ArrayListUnmanaged(CtValue) = .empty;
     for (decl.name.parts) |part| {
         try name_parts.append(alloc, CtValue{ .atom = interner.get(part) });
     }
     const name_val = try makeTuple3(alloc, store, .{ .atom = "__aliases__" }, try emptyList(alloc, store), try makeListFromSlice(alloc, store, name_parts.items));
 
     // Items
-    var item_vals = std.ArrayListUnmanaged(CtValue){};
+    var item_vals : std.ArrayListUnmanaged(CtValue) = .empty;
     for (decl.items) |item| {
         try item_vals.append(alloc, try moduleItemToCtValue(alloc, interner, store, item));
     }
@@ -1941,7 +1941,7 @@ pub fn moduleDeclToCtValue(
     const opts = try makeList(alloc, store, &.{do_pair});
 
     // Metadata
-    var meta_elems = std.ArrayListUnmanaged(CtValue){};
+    var meta_elems : std.ArrayListUnmanaged(CtValue) = .empty;
     try meta_elems.append(alloc, try makeKeywordPair(alloc, store, "visibility", .{
         .atom = if (decl.is_private) "private" else "pub",
     }));
@@ -1961,7 +1961,7 @@ pub fn structDeclToCtValue(
 ) error{OutOfMemory}!CtValue {
     const name_val: CtValue = if (decl.name) |n| .{ .atom = interner.get(n) } else .nil;
 
-    var field_vals = std.ArrayListUnmanaged(CtValue){};
+    var field_vals : std.ArrayListUnmanaged(CtValue) = .empty;
     for (decl.fields) |field| {
         const field_name: CtValue = .{ .atom = interner.get(field.name) };
         const field_type = try typeExprToCtValue(alloc, interner, store, field.type_expr);
@@ -2000,7 +2000,7 @@ pub fn moduleItemToCtValue(
         .union_decl => |u| {
             // {:union, [], [:Name, [variants...]]}
             const name_val: CtValue = .{ .atom = interner.get(u.name) };
-            var variant_vals = std.ArrayListUnmanaged(CtValue){};
+            var variant_vals : std.ArrayListUnmanaged(CtValue) = .empty;
             for (u.variants) |v| {
                 if (v.type_expr) |te| {
                     // Data variant: {:VariantName, type}
@@ -2016,7 +2016,7 @@ pub fn moduleItemToCtValue(
             return makeTuple3(alloc, store, .{ .atom = "union" }, try emptyList(alloc, store), args);
         },
         .import_decl => |id| {
-            var parts = std.ArrayListUnmanaged(CtValue){};
+            var parts : std.ArrayListUnmanaged(CtValue) = .empty;
             for (id.module_path.parts) |part| {
                 try parts.append(alloc, CtValue{ .atom = interner.get(part) });
             }
@@ -2025,7 +2025,7 @@ pub fn moduleItemToCtValue(
             return makeTuple3(alloc, store, .{ .atom = "import" }, try emptyList(alloc, store), args);
         },
         .use_decl => |ud| {
-            var parts = std.ArrayListUnmanaged(CtValue){};
+            var parts : std.ArrayListUnmanaged(CtValue) = .empty;
             for (ud.module_path.parts) |part| {
                 try parts.append(alloc, CtValue{ .atom = interner.get(part) });
             }
@@ -2035,15 +2035,15 @@ pub fn moduleItemToCtValue(
         },
         .alias_decl => |ad| {
             // {:alias, [], [module_path, as_name]}
-            var parts = std.ArrayListUnmanaged(CtValue){};
+            var parts : std.ArrayListUnmanaged(CtValue) = .empty;
             for (ad.module_path.parts) |part| {
                 try parts.append(alloc, CtValue{ .atom = interner.get(part) });
             }
             const mod_val = try makeTuple3(alloc, store, .{ .atom = "__aliases__" }, try emptyList(alloc, store), try makeListFromSlice(alloc, store, parts.items));
-            var arg_vals = std.ArrayListUnmanaged(CtValue){};
+            var arg_vals : std.ArrayListUnmanaged(CtValue) = .empty;
             try arg_vals.append(alloc, mod_val);
             if (ad.as_name) |as_name| {
-                var as_parts = std.ArrayListUnmanaged(CtValue){};
+                var as_parts : std.ArrayListUnmanaged(CtValue) = .empty;
                 for (as_name.parts) |part| {
                     try as_parts.append(alloc, CtValue{ .atom = interner.get(part) });
                 }
@@ -2068,7 +2068,7 @@ pub fn moduleItemToCtValue(
         .attribute => |attr| {
             // {:@, [], [:name, value]} or {:@, [], [:name]}
             const name: CtValue = .{ .atom = interner.get(attr.name) };
-            var arg_vals = std.ArrayListUnmanaged(CtValue){};
+            var arg_vals : std.ArrayListUnmanaged(CtValue) = .empty;
             try arg_vals.append(alloc, name);
             if (attr.value) |val| {
                 try arg_vals.append(alloc, try exprToCtValue(alloc, interner, store, val));
@@ -2122,7 +2122,7 @@ pub fn ctValueToModuleItem(
         if (args != .list) return null;
 
         // Each clause: {:->, [], [{:name, [], [params...]}, [return: type, do: body]]}
-        var clauses = std.ArrayListUnmanaged(ast.FunctionClause){};
+        var clauses : std.ArrayListUnmanaged(ast.FunctionClause) = .empty;
         var func_name: ast.StringId = 0;
 
         for (args.list.elems) |clause_ct| {
@@ -2141,7 +2141,7 @@ pub fn ctValueToModuleItem(
             }
 
             // Params
-            var params = std.ArrayListUnmanaged(ast.Param){};
+            var params : std.ArrayListUnmanaged(ast.Param) = .empty;
             if (head.tuple.elems[2] == .list) {
                 for (head.tuple.elems[2].list.elems) |param_ct| {
                     try params.append(alloc, try ctValueToParam(alloc, interner, param_ct));
@@ -2197,7 +2197,7 @@ pub fn ctValueToModuleItem(
             if (aliases == .tuple and aliases.tuple.elems.len == 3) {
                 if (aliases.tuple.elems[0] == .atom and std.mem.eql(u8, aliases.tuple.elems[0].atom, "__aliases__")) {
                     if (aliases.tuple.elems[2] == .list) {
-                        var parts = std.ArrayListUnmanaged(ast.StringId){};
+                        var parts : std.ArrayListUnmanaged(ast.StringId) = .empty;
                         for (aliases.tuple.elems[2].list.elems) |part| {
                             if (part == .atom) try parts.append(alloc, try interner.intern(part.atom));
                         }
@@ -2220,7 +2220,7 @@ pub fn ctValueToModuleItem(
             const name_val = args.list.elems[0];
             const fields_val = args.list.elems[1];
             const name_id: ?ast.StringId = if (name_val == .atom) try interner.intern(name_val.atom) else null;
-            var fields = std.ArrayListUnmanaged(ast.StructFieldDecl){};
+            var fields : std.ArrayListUnmanaged(ast.StructFieldDecl) = .empty;
             if (fields_val == .list) {
                 for (fields_val.list.elems) |pair| {
                     if (pair == .tuple and pair.tuple.elems.len == 2 and pair.tuple.elems[0] == .atom) {
@@ -2250,7 +2250,7 @@ pub fn ctValueToModuleItem(
             if (aliases == .tuple and aliases.tuple.elems.len == 3) {
                 if (aliases.tuple.elems[0] == .atom and std.mem.eql(u8, aliases.tuple.elems[0].atom, "__aliases__")) {
                     if (aliases.tuple.elems[2] == .list) {
-                        var parts = std.ArrayListUnmanaged(ast.StringId){};
+                        var parts : std.ArrayListUnmanaged(ast.StringId) = .empty;
                         for (aliases.tuple.elems[2].list.elems) |part| {
                             if (part == .atom) try parts.append(alloc, try interner.intern(part.atom));
                         }
@@ -2272,7 +2272,7 @@ pub fn ctValueToModuleItem(
         if (args == .list and args.list.elems.len >= 1) {
             const name_val = args.list.elems[0];
             const name_id: ast.StringId = if (name_val == .atom) try interner.intern(name_val.atom) else 0;
-            var variants = std.ArrayListUnmanaged(ast.UnionVariant){};
+            var variants : std.ArrayListUnmanaged(ast.UnionVariant) = .empty;
             if (args.list.elems.len >= 2 and args.list.elems[1] == .list) {
                 for (args.list.elems[1].list.elems) |v| {
                     if (v == .atom) {
@@ -2320,7 +2320,7 @@ pub fn ctValueToModuleItem(
     if (std.mem.eql(u8, form_name, "alias")) {
         if (args == .list and args.list.elems.len >= 1) {
             const mod_aliases = args.list.elems[0];
-            var mod_parts = std.ArrayListUnmanaged(ast.StringId){};
+            var mod_parts : std.ArrayListUnmanaged(ast.StringId) = .empty;
             if (mod_aliases == .tuple and mod_aliases.tuple.elems.len == 3 and mod_aliases.tuple.elems[2] == .list) {
                 for (mod_aliases.tuple.elems[2].list.elems) |part| {
                     if (part == .atom) try mod_parts.append(alloc, try interner.intern(part.atom));
@@ -2330,7 +2330,7 @@ pub fn ctValueToModuleItem(
             if (args.list.elems.len >= 2) {
                 const as_aliases = args.list.elems[1];
                 if (as_aliases == .tuple and as_aliases.tuple.elems.len == 3 and as_aliases.tuple.elems[2] == .list) {
-                    var as_parts = std.ArrayListUnmanaged(ast.StringId){};
+                    var as_parts : std.ArrayListUnmanaged(ast.StringId) = .empty;
                     for (as_aliases.tuple.elems[2].list.elems) |part| {
                         if (part == .atom) try as_parts.append(alloc, try interner.intern(part.atom));
                     }
@@ -2379,7 +2379,7 @@ pub fn ctValueToModuleItem(
     if (std.mem.eql(u8, form_name, "module")) {
         if (args == .list and args.list.elems.len >= 2) {
             const name_ct = args.list.elems[0];
-            var name_parts = std.ArrayListUnmanaged(ast.StringId){};
+            var name_parts : std.ArrayListUnmanaged(ast.StringId) = .empty;
             if (name_ct == .tuple and name_ct.tuple.elems.len == 3 and name_ct.tuple.elems[2] == .list) {
                 for (name_ct.tuple.elems[2].list.elems) |part| {
                     if (part == .atom) try name_parts.append(alloc, try interner.intern(part.atom));

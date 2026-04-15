@@ -14,9 +14,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const allocator = debug_allocator.allocator();
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const io = global_io;
-    _ = io; // used by Dir operations throughout
-
     const args = try init.args.toSlice(arena.allocator());
 
     if (args.len < 2) {
@@ -139,7 +136,7 @@ fn cmdDeps(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     const project_root = try discoverBuildFile(allocator, null);
     const build_file_path = try std.fs.path.join(allocator, &.{ project_root, "build.zap" });
-    const build_source = std.Io.Dir.cwd().readFileAlloc(allocator, build_file_path, 10 * 1024 * 1024) catch {
+    const build_source = std.Io.Dir.cwd().readFileAlloc(global_io, build_file_path, allocator, .limited(10 * 1024 * 1024)) catch {
         std.debug.print("Error: could not read build.zap\n", .{});
         std.process.exit(1);
     };
@@ -216,7 +213,7 @@ fn cmdDeps(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
 fn cmdInit(allocator: std.mem.Allocator) !void {
     // Check directory is empty
-    var dir = std.Io.Dir.cwd().openDir(".", .{ .iterate = true }) catch {
+    var dir = std.Io.Dir.cwd().openDir(global_io, ".", .{ .iterate = true }) catch {
         // stderr writer removed in 0.16
         std.debug.print("Error: cannot open current directory\n", .{});
         std.process.exit(1);
@@ -231,7 +228,7 @@ fn cmdInit(allocator: std.mem.Allocator) !void {
     }
 
     // Derive names from directory
-    const cwd_path = try std.Io.Dir.cwd().realpathAlloc(allocator, ".");
+    const cwd_path = try std.Io.Dir.cwd().realpathAlloc(global_io, ".", allocator);
     defer allocator.free(cwd_path);
     const dir_name = std.fs.path.basename(cwd_path);
 
@@ -244,8 +241,8 @@ fn cmdInit(allocator: std.mem.Allocator) !void {
     defer allocator.free(module_name);
 
     // Generate files
-    try std.Io.Dir.cwd().makePath("lib");
-    try std.Io.Dir.cwd().makePath("test");
+    try std.Io.Dir.cwd().createDirPath(global_io, "lib");
+    try std.Io.Dir.cwd().createDirPath(global_io, "test");
 
     // .gitignore
     try writeFile(".gitignore",
@@ -352,7 +349,7 @@ fn cmdInit(allocator: std.mem.Allocator) !void {
 /// Detect the zap stdlib lib directory by walking up from the executable path
 /// looking for a `lib/` directory containing `kernel.zap`.
 fn detectZapLibDir(allocator: std.mem.Allocator) ?[]const u8 {
-    const exe_path = std.fs.selfExePathAlloc(allocator) catch return null;
+    const exe_path = std.process.executablePathAlloc(global_io, allocator) catch return null;
     defer allocator.free(exe_path);
 
     // Walk up directories from the executable
@@ -365,7 +362,7 @@ fn detectZapLibDir(allocator: std.mem.Allocator) ?[]const u8 {
         };
         defer allocator.free(kernel_path);
 
-        if (std.Io.Dir.cwd().access(kernel_path, .{})) |_| {
+        if (std.Io.Dir.cwd().access(global_io, kernel_path, .{})) |_| {
             return lib_dir;
         } else |_| {
             allocator.free(lib_dir);
@@ -374,7 +371,7 @@ fn detectZapLibDir(allocator: std.mem.Allocator) ?[]const u8 {
     }
 
     // Fallback: check if ./lib/kernel.zap exists (for running from project root)
-    if (std.Io.Dir.cwd().access("lib/kernel.zap", .{})) |_| {
+    if (std.Io.Dir.cwd().access(global_io, "lib/kernel.zap", .{})) |_| {
         return allocator.dupe(u8, "lib") catch null;
     } else |_| {}
 
@@ -401,7 +398,7 @@ fn buildTarget(
 
     // Read build.zap
     const build_file_path = try std.fs.path.join(alloc, &.{ project_root, "build.zap" });
-    const build_source = std.Io.Dir.cwd().readFileAlloc(alloc, build_file_path, 10 * 1024 * 1024) catch |err| {
+    const build_source = std.Io.Dir.cwd().readFileAlloc(global_io, build_file_path, alloc, .limited(10 * 1024 * 1024)) catch |err| {
         std.debug.print("Error reading build.zap: {}\n", .{err});
         std.process.exit(1);
     };
@@ -438,7 +435,7 @@ fn buildTarget(
     // and glob-based compilation paths.
     {
         const lib_dir = try std.fs.path.join(alloc, &.{ project_root, "lib" });
-        if (std.Io.Dir.cwd().access(lib_dir, .{})) |_| {
+        if (std.Io.Dir.cwd().access(global_io, lib_dir, .{})) |_| {
             try source_roots.append(alloc, .{ .name = "project", .path = lib_dir });
         } else |_| {}
         try source_roots.append(alloc, .{ .name = "project", .path = project_root });
@@ -459,19 +456,19 @@ fn buildTarget(
 
                     // Try dep_dir/lib/ first (standard layout), fall back to dep_dir/
                     const dep_lib_dir = try std.fs.path.join(alloc, &.{ dep_dir, "lib" });
-                    if (std.Io.Dir.cwd().access(dep_lib_dir, .{})) |_| {
+                    if (std.Io.Dir.cwd().access(global_io, dep_lib_dir, .{})) |_| {
                         try source_roots.append(alloc, .{ .name = dep_name, .path = dep_lib_dir });
                     } else |_| {
                         try source_roots.append(alloc, .{ .name = dep_name, .path = dep_dir });
                     }
 
                     // Also add subdirectories that contain modules (e.g., lib/zap/ for Zap.Env)
-                    const dep_resolved = if (std.Io.Dir.cwd().access(dep_lib_dir, .{}))
+                    const dep_resolved = if (std.Io.Dir.cwd().access(global_io, dep_lib_dir, .{}))
                         dep_lib_dir
                     else |_|
                         dep_dir;
                     // Scan for subdirectories containing .zap files
-                    if (std.Io.Dir.cwd().openDir(dep_resolved, .{ .iterate = true })) |dir_handle| {
+                    if (std.Io.Dir.cwd().openDir(global_io, dep_resolved, .{ .iterate = true })) |dir_handle| {
                         var dir = dir_handle;
                         defer dir.close();
                         var it = dir.iterate();
@@ -521,7 +518,7 @@ fn buildTarget(
 
                     // Add dep's lib dir as source root
                     const dep_lib_dir = try std.fs.path.join(alloc, &.{ result.path, "lib" });
-                    if (std.Io.Dir.cwd().access(dep_lib_dir, .{})) |_| {
+                    if (std.Io.Dir.cwd().access(global_io, dep_lib_dir, .{})) |_| {
                         try source_roots.append(alloc, .{ .name = dep_name, .path = dep_lib_dir });
                     } else |_| {
                         try source_roots.append(alloc, .{ .name = dep_name, .path = result.path });
@@ -556,7 +553,7 @@ fn buildTarget(
     if (zap_lib_dir) |zap_lib| {
         try source_roots.append(alloc, .{ .name = "zap_stdlib", .path = zap_lib });
         const zap_subdir = try std.fs.path.join(alloc, &.{ zap_lib, "zap" });
-        if (std.Io.Dir.cwd().access(zap_subdir, .{})) |_| {
+        if (std.Io.Dir.cwd().access(global_io, zap_subdir, .{})) |_| {
             try source_roots.append(alloc, .{ .name = "zap_stdlib", .path = zap_subdir });
         } else |_| {}
     }
@@ -648,7 +645,7 @@ fn buildTarget(
         var deduped: std.ArrayListUnmanaged([]const u8) = .empty;
         for (source_files.items) |sf| {
             // Normalize: resolve to real path for comparison
-            const key = std.Io.Dir.cwd().realpathAlloc(alloc, sf) catch sf;
+            const key = std.Io.Dir.cwd().realpathAlloc(global_io, sf, alloc) catch sf;
             if (!seen.contains(key)) {
                 seen.put(key, {}) catch {};
                 deduped.append(alloc, sf) catch {};
@@ -673,7 +670,7 @@ fn buildTarget(
         // Skip build.zap — it's build configuration, not project source
         if (std.mem.eql(u8, std.fs.path.basename(sf), "build.zap")) continue;
 
-        const src = try std.Io.Dir.cwd().readFileAlloc(alloc, sf, 10 * 1024 * 1024);
+        const src = try std.Io.Dir.cwd().readFileAlloc(global_io, sf, alloc, .limited(10 * 1024 * 1024));
         try source_units.append(alloc, .{ .file_path = sf, .source = src });
 
         // Skip validation for dep/stdlib source files — they're external code
@@ -751,8 +748,8 @@ fn buildTarget(
         .lib => "zap-out/lib",
         .obj => "zap-out/obj",
     };
-    std.Io.Dir.cwd().makePath(".zap-cache") catch {};
-    std.Io.Dir.cwd().makePath(out_dir) catch {};
+    std.Io.Dir.cwd().createDirPath(global_io, ".zap-cache") catch {};
+    std.Io.Dir.cwd().createDirPath(global_io, out_dir) catch {};
 
     const output_filename = switch (config.kind) {
         .bin => output_name,
@@ -767,10 +764,10 @@ fn buildTarget(
     const hash_file = try std.fmt.allocPrint(alloc, ".zap-cache/{s}.hash", .{target_name});
 
     const cache_valid = blk: {
-        const stored = std.Io.Dir.cwd().readFileAlloc(alloc, hash_file, 16) catch break :blk false;
+        const stored = std.Io.Dir.cwd().readFileAlloc(global_io, hash_file, alloc, .limited(16)) catch break :blk false;
         defer alloc.free(stored);
         if (!std.mem.eql(u8, stored, cache_key_hex)) break :blk false;
-        std.Io.Dir.cwd().access(output_path, .{}) catch break :blk false;
+        std.Io.Dir.cwd().access(global_io, output_path, .{}) catch break :blk false;
         break :blk true;
     };
 
@@ -882,10 +879,11 @@ fn buildTarget(
     };
 
     // Save cache hash
-    std.Io.Dir.cwd().writeFile(.{
-        .sub_path = hash_file,
-        .data = cache_key_hex,
-    }) catch {};
+    {
+        var hash_f = std.Io.Dir.cwd().createFile(global_io, hash_file, .{}) catch return try allocator.dupe(u8, output_path);
+        defer hash_f.close(global_io);
+        hash_f.writeStreamingAll(global_io, cache_key_hex) catch {};
+    }
 
     // Return a durable copy of the output path
     return try allocator.dupe(u8, output_path);
@@ -1002,7 +1000,7 @@ test "computeBuildCacheKey includes manifest result hash" {
 fn discoverBuildFile(allocator: std.mem.Allocator, override: ?[]const u8) ![]const u8 {
     if (override) |path| {
         // Verify the override file exists
-        std.Io.Dir.cwd().access(path, .{}) catch {
+        std.Io.Dir.cwd().access(global_io, path, .{}) catch {
             // stderr writer removed in 0.16
             std.debug.print("Error: build file not found: {s}\n", .{path});
             std.process.exit(1);
@@ -1015,7 +1013,7 @@ fn discoverBuildFile(allocator: std.mem.Allocator, override: ?[]const u8) ![]con
     }
 
     // Default: look for build.zap in cwd
-    std.Io.Dir.cwd().access("build.zap", .{}) catch {
+    std.Io.Dir.cwd().access(global_io, "build.zap", .{}) catch {
         // stderr writer removed in 0.16
         std.debug.print("Error: no build.zap found in current directory\n", .{});
         std.process.exit(1);
@@ -1122,7 +1120,7 @@ fn walkAndMatch(
     recurse: bool,
     results: *std.ArrayListUnmanaged([]const u8),
 ) !void {
-    var dir = std.Io.Dir.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
+    var dir = std.Io.Dir.cwd().openDir(global_io, dir_path, .{ .iterate = true }) catch return;
     defer dir.close();
     var iter = dir.iterate();
 
@@ -1238,13 +1236,13 @@ fn extractEmbeddedZigLib(allocator: std.mem.Allocator) ![]const u8 {
     const marker = try std.fs.path.join(allocator, &.{ lib_dir, "std", "std.zig" });
     defer allocator.free(marker);
 
-    if (std.Io.Dir.cwd().access(marker, .{})) |_| {
+    if (std.Io.Dir.cwd().access(global_io, marker, .{})) |_| {
         return lib_dir;
     } else |_| {}
 
-    std.Io.Dir.cwd().makePath(lib_dir) catch {};
+    std.Io.Dir.cwd().createDirPath(global_io, lib_dir) catch {};
 
-    var dir = std.Io.Dir.cwd().openDir(lib_dir, .{}) catch return error.FileNotFound;
+    var dir = std.Io.Dir.cwd().openDir(global_io, lib_dir, .{}) catch return error.FileNotFound;
     defer dir.close();
 
     var reader = std.Io.Reader.fixed(zig_lib_archive.data);
@@ -1254,11 +1252,13 @@ fn extractEmbeddedZigLib(allocator: std.mem.Allocator) ![]const u8 {
 }
 
 fn writeFile(path: []const u8, content: []const u8) !void {
-    std.Io.Dir.cwd().writeFile(.{
-        .sub_path = path,
-        .data = content,
-    }) catch |err| {
-        // stderr writer removed in 0.16
+    const io = global_io;
+    var file = std.Io.Dir.cwd().createFile(io, path, .{}) catch |err| {
+        std.debug.print("Error writing {s}: {}\n", .{ path, err });
+        return err;
+    };
+    defer file.close(global_io);
+    file.writeStreamingAll(io, content) catch |err| {
         std.debug.print("Error writing {s}: {}\n", .{ path, err });
         return err;
     };

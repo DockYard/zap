@@ -939,31 +939,31 @@ pub const AnalysisContext = struct {
     allocator: std.mem.Allocator,
 
     /// Per-SSA-value escape state (indexed by function+local).
-    escape_states: std.AutoArrayHashMap(ValueKey, EscapeState),
+    escape_states: std.AutoHashMap(ValueKey, EscapeState),
 
     /// Per-SSA-value region assignment.
-    region_assignments: std.AutoArrayHashMap(ValueKey, RegionId),
+    region_assignments: std.AutoHashMap(ValueKey, RegionId),
 
     /// Per-SSA-value ownership state (third dimension of the product lattice).
-    ownership_states: std.AutoArrayHashMap(ValueKey, OwnershipState),
+    ownership_states: std.AutoHashMap(ValueKey, OwnershipState),
 
     /// Per-allocation-site summary.
-    alloc_summaries: std.AutoArrayHashMap(AllocSiteId, AllocSiteSummary),
+    alloc_summaries: std.AutoHashMap(AllocSiteId, AllocSiteSummary),
 
     /// Per-function interprocedural summary.
-    function_summaries: std.AutoArrayHashMap(ir.FunctionId, FunctionSummary),
+    function_summaries: std.AutoHashMap(ir.FunctionId, FunctionSummary),
 
     /// Lambda sets per function-typed binding.
-    lambda_sets: std.AutoArrayHashMap(ValueKey, LambdaSet),
+    lambda_sets: std.AutoHashMap(ValueKey, LambdaSet),
 
     /// Virtual object states for partial escape analysis (per block).
-    virtual_objects: std.AutoArrayHashMap(BlockVirtualKey, VirtualObject),
+    virtual_objects: std.AutoHashMap(BlockVirtualKey, VirtualObject),
 
     /// Field escape maps for composite types.
-    field_escapes: std.AutoArrayHashMap(ValueKey, FieldEscapeMap),
+    field_escapes: std.AutoHashMap(ValueKey, FieldEscapeMap),
 
     /// Borrow legality verdicts.
-    borrow_verdicts: std.AutoArrayHashMap(BorrowSiteId, BorrowVerdict),
+    borrow_verdicts: std.AutoHashMap(BorrowSiteId, BorrowVerdict),
 
     /// Reuse pairs discovered by Perceus.
     reuse_pairs: std.ArrayList(ReusePair),
@@ -972,7 +972,7 @@ pub const AnalysisContext = struct {
     drop_specializations: std.ArrayList(DropSpecialization),
 
     /// Allocation strategy decisions.
-    alloc_strategies: std.AutoArrayHashMap(AllocSiteId, AllocationStrategy),
+    alloc_strategies: std.AutoHashMap(AllocSiteId, AllocationStrategy),
 
     /// ARC operation placement.
     arc_ops: std.ArrayList(ArcOperation),
@@ -981,30 +981,30 @@ pub const AnalysisContext = struct {
     outlives_constraints: std.ArrayList(OutlivesConstraint),
 
     /// Closure environment tier decisions.
-    closure_tiers: std.AutoArrayHashMap(ir.FunctionId, ClosureEnvTier),
+    closure_tiers: std.AutoHashMap(ir.FunctionId, ClosureEnvTier),
 
     /// Per-call-site specialization decisions.
-    call_specializations: std.AutoArrayHashMap(CallSiteKey, CallSiteSpecialization),
+    call_specializations: std.AutoHashMap(CallSiteKey, CallSiteSpecialization),
 
     pub fn init(allocator: std.mem.Allocator) AnalysisContext {
         return .{
             .allocator = allocator,
-            .escape_states = std.AutoArrayHashMap(ValueKey, EscapeState).init(allocator),
-            .region_assignments = std.AutoArrayHashMap(ValueKey, RegionId).init(allocator),
-            .ownership_states = std.AutoArrayHashMap(ValueKey, OwnershipState).init(allocator),
-            .alloc_summaries = std.AutoArrayHashMap(AllocSiteId, AllocSiteSummary).init(allocator),
-            .function_summaries = std.AutoArrayHashMap(ir.FunctionId, FunctionSummary).init(allocator),
-            .lambda_sets = std.AutoArrayHashMap(ValueKey, LambdaSet).init(allocator),
-            .virtual_objects = std.AutoArrayHashMap(BlockVirtualKey, VirtualObject).init(allocator),
-            .field_escapes = std.AutoArrayHashMap(ValueKey, FieldEscapeMap).init(allocator),
-            .borrow_verdicts = std.AutoArrayHashMap(BorrowSiteId, BorrowVerdict).init(allocator),
+            .escape_states = std.AutoHashMap(ValueKey, EscapeState).init(allocator),
+            .region_assignments = std.AutoHashMap(ValueKey, RegionId).init(allocator),
+            .ownership_states = std.AutoHashMap(ValueKey, OwnershipState).init(allocator),
+            .alloc_summaries = std.AutoHashMap(AllocSiteId, AllocSiteSummary).init(allocator),
+            .function_summaries = std.AutoHashMap(ir.FunctionId, FunctionSummary).init(allocator),
+            .lambda_sets = std.AutoHashMap(ValueKey, LambdaSet).init(allocator),
+            .virtual_objects = std.AutoHashMap(BlockVirtualKey, VirtualObject).init(allocator),
+            .field_escapes = std.AutoHashMap(ValueKey, FieldEscapeMap).init(allocator),
+            .borrow_verdicts = std.AutoHashMap(BorrowSiteId, BorrowVerdict).init(allocator),
             .reuse_pairs = .empty,
             .drop_specializations = .empty,
-            .alloc_strategies = std.AutoArrayHashMap(AllocSiteId, AllocationStrategy).init(allocator),
+            .alloc_strategies = std.AutoHashMap(AllocSiteId, AllocationStrategy).init(allocator),
             .arc_ops = .empty,
             .outlives_constraints = .empty,
-            .closure_tiers = std.AutoArrayHashMap(ir.FunctionId, ClosureEnvTier).init(allocator),
-            .call_specializations = std.AutoArrayHashMap(CallSiteKey, CallSiteSpecialization).init(allocator),
+            .closure_tiers = std.AutoHashMap(ir.FunctionId, ClosureEnvTier).init(allocator),
+            .call_specializations = std.AutoHashMap(CallSiteKey, CallSiteSpecialization).init(allocator),
         };
     }
 

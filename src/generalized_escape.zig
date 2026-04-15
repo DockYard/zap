@@ -49,10 +49,10 @@ pub const GeneralizedEscapeAnalyzer = struct {
     worklist: std.ArrayList(ValueKey),
 
     /// Set for fast membership check in worklist.
-    in_worklist: std.AutoArrayHashMap(ValueKey, void),
+    in_worklist: std.AutoHashMap(ValueKey, void),
 
     /// Maps each local to the alloc site that produced it (per-function).
-    local_alloc_sites: std.AutoArrayHashMap(ValueKey, AllocSiteId),
+    local_alloc_sites: std.AutoHashMap(ValueKey, AllocSiteId),
 
     /// Next alloc site id counter.
     next_alloc_site: AllocSiteId,
@@ -64,15 +64,15 @@ pub const GeneralizedEscapeAnalyzer = struct {
     borrow_sites: std.ArrayList(BorrowSite),
 
     /// Maps ValueKey -> AllocSiteId for lookup during summary computation.
-    alloc_site_map: std.AutoArrayHashMap(ValueKey, AllocSiteId),
+    alloc_site_map: std.AutoHashMap(ValueKey, AllocSiteId),
 
     /// Maps locals to the set of locals they alias (via local_get, local_set).
     /// When a local's escape state changes, all aliases must be updated.
-    aliases: std.AutoArrayHashMap(ValueKey, std.ArrayList(ValueKey)),
+    aliases: std.AutoHashMap(ValueKey, std.ArrayList(ValueKey)),
 
     /// Maps struct/tuple values to their ordered field name lists.
     /// Used for per-field escape tracking at field_get/field_set.
-    field_name_lists: std.AutoArrayHashMap(ValueKey, []const []const u8),
+    field_name_lists: std.AutoHashMap(ValueKey, []const []const u8),
 
     const BorrowSite = struct {
         /// Unique ID for this borrow site.
@@ -91,14 +91,14 @@ pub const GeneralizedEscapeAnalyzer = struct {
             .program = program,
             .ctx = AnalysisContext.init(allocator),
             .worklist = .empty,
-            .in_worklist = std.AutoArrayHashMap(ValueKey, void).init(allocator),
-            .local_alloc_sites = std.AutoArrayHashMap(ValueKey, AllocSiteId).init(allocator),
+            .in_worklist = std.AutoHashMap(ValueKey, void).init(allocator),
+            .local_alloc_sites = std.AutoHashMap(ValueKey, AllocSiteId).init(allocator),
             .next_alloc_site = 0,
             .next_borrow_site = 0,
             .borrow_sites = .empty,
-            .alloc_site_map = std.AutoArrayHashMap(ValueKey, AllocSiteId).init(allocator),
-            .aliases = std.AutoArrayHashMap(ValueKey, std.ArrayList(ValueKey)).init(allocator),
-            .field_name_lists = std.AutoArrayHashMap(ValueKey, []const []const u8).init(allocator),
+            .alloc_site_map = std.AutoHashMap(ValueKey, AllocSiteId).init(allocator),
+            .aliases = std.AutoHashMap(ValueKey, std.ArrayList(ValueKey)).init(allocator),
+            .field_name_lists = std.AutoHashMap(ValueKey, []const []const u8).init(allocator),
         };
     }
 
@@ -121,7 +121,7 @@ pub const GeneralizedEscapeAnalyzer = struct {
 
     /// Inject interprocedural function summaries so that seedCallArgs
     /// can refine call argument escape states.
-    pub fn setFunctionSummaries(self: *GeneralizedEscapeAnalyzer, summaries: *const std.AutoArrayHashMap(ir.FunctionId, lattice.FunctionSummary)) !void {
+    pub fn setFunctionSummaries(self: *GeneralizedEscapeAnalyzer, summaries: *const std.AutoHashMap(ir.FunctionId, lattice.FunctionSummary)) !void {
         var it = summaries.iterator();
         while (it.next()) |entry| {
             try self.ctx.function_summaries.put(entry.key_ptr.*, entry.value_ptr.*);
@@ -719,7 +719,7 @@ pub const GeneralizedEscapeAnalyzer = struct {
 
     fn computeSummaries(self: *GeneralizedEscapeAnalyzer) !void {
         // Count alloc sites per function for multiplicity heuristic.
-        var func_alloc_counts = std.AutoArrayHashMap(ir.FunctionId, u32).init(self.allocator);
+        var func_alloc_counts = std.AutoHashMap(ir.FunctionId, u32).init(self.allocator);
         defer func_alloc_counts.deinit();
         {
             var count_iter = self.local_alloc_sites.iterator();

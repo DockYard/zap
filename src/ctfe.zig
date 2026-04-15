@@ -2863,7 +2863,7 @@ pub const Interpreter = struct {
         };
 
         // Read the file
-        const content = std.fs.cwd().readFileAlloc(self.allocator, path, 10 * 1024 * 1024) catch {
+        const content = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, path, self.allocator, .limited(10 * 1024 * 1024)) catch {
             // Record dependency on absent file
             self.dependencies.append(self.allocator, .{
                 .file = .{ .path = path, .content_hash = 0 },
@@ -2902,7 +2902,7 @@ pub const Interpreter = struct {
         // Read the env var
         // Use a null-terminated copy for getenv
         const name_z = self.allocator.dupeZ(u8, name) catch return error.OutOfMemory;
-        const value = std.posix.getenv(name_z);
+        const value = std.c.getenv(name_z);
 
         if (value) |v| {
             const val_copy = self.allocator.dupe(u8, v) catch return error.OutOfMemory;
@@ -3763,7 +3763,7 @@ pub fn evaluateComputedAttributes(
     interp.interner = interner;
     interp.compile_options_hash = compile_options_hash;
     if (cache_dir) |dir| {
-        std.fs.cwd().makePath(dir) catch {};
+        std.Io.Dir.cwd().createDirPath(std.Options.debug_io, dir) catch {};
         interp.persistent_cache = PersistentCache.init(dir);
     }
 
@@ -3834,7 +3834,7 @@ pub fn evaluateModuleAttributesInOrder(
     interp.interner = interner;
     interp.compile_options_hash = compile_options_hash;
     if (cache_dir) |dir| {
-        std.fs.cwd().makePath(dir) catch {};
+        std.Io.Dir.cwd().createDirPath(std.Options.debug_io, dir) catch {};
         interp.persistent_cache = PersistentCache.init(dir);
     }
 
@@ -3912,7 +3912,7 @@ pub fn evaluateComputedAttributesForModule(
     interp.interner = interner;
     interp.compile_options_hash = compile_options_hash;
     if (cache_dir) |dir| {
-        std.fs.cwd().makePath(dir) catch {};
+        std.Io.Dir.cwd().createDirPath(std.Options.debug_io, dir) catch {};
         interp.persistent_cache = PersistentCache.init(dir);
     }
 
@@ -4140,7 +4140,7 @@ fn evaluateConstExpr(
             const func_id = interp.function_by_name.get(callee_name) orelse
                 return error.NotComputable;
 
-            var ct_args = std.ArrayListUnmanaged(CtValue).empty;
+            var ct_args : std.ArrayListUnmanaged(CtValue) = .empty;
             for (call.args) |arg| {
                 ct_args.append(alloc, try evaluateConstExpr(alloc, interp, arg, mod_name, interner)) catch return error.OutOfMemory;
             }
@@ -4435,7 +4435,7 @@ pub const PersistentCache = struct {
         const path = std.fmt.allocPrint(alloc, "{s}/{s}.ctfe", .{ self.cache_dir, hex_key }) catch return null;
         defer alloc.free(path);
 
-        const data = std.fs.cwd().readFileAlloc(alloc, path, 1024 * 1024) catch return null;
+        const data = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, path, alloc, .limited(1024 * 1024)) catch return null;
         defer alloc.free(data);
 
         return deserializeResult(alloc, data) catch null;
@@ -4446,7 +4446,7 @@ pub const PersistentCache = struct {
         const hex_key = std.fmt.allocPrint(alloc, "{x:0>16}", .{key}) catch return;
         defer alloc.free(hex_key);
 
-        std.fs.cwd().makePath(self.cache_dir) catch return;
+        std.Io.Dir.cwd().createDirPath(std.Options.debug_io, self.cache_dir) catch return;
 
         const path = std.fmt.allocPrint(alloc, "{s}/{s}.ctfe", .{ self.cache_dir, hex_key }) catch return;
         defer alloc.free(path);
@@ -4454,7 +4454,7 @@ pub const PersistentCache = struct {
         const data = serializeResult(alloc, result) catch return;
         defer alloc.free(data);
 
-        const file = std.fs.cwd().createFile(path, .{}) catch return;
+        const file = std.Io.Dir.cwd().createFile(path, .{}) catch return;
         defer file.close();
         file.writeAll(data) catch return;
     }
@@ -4469,13 +4469,13 @@ pub const PersistentCache = struct {
         for (deps) |dep| {
             switch (dep) {
                 .file => |f| {
-                    const content = std.fs.cwd().readFileAlloc(alloc, f.path, 10 * 1024 * 1024) catch return false;
+                    const content = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, f.path, alloc, .limited(10 * 1024 * 1024)) catch return false;
                     defer alloc.free(content);
                     const current_hash = std.hash.Wyhash.hash(0, content);
                     if (current_hash != f.content_hash) return false;
                 },
                 .env_var => |ev| {
-                    const current = std.posix.getenv(ev.name);
+                    const current = std.c.getenv(ev.name);
                     if (ev.present and current == null) return false;
                     if (!ev.present and current != null) return false;
                     if (current) |v| {

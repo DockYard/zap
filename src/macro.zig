@@ -852,7 +852,7 @@ pub const MacroEngine = struct {
         var store = ctfe.AllocationStore{};
 
         // Convert each statement in the quote body to CtValue
-        var body_vals = std.ArrayListUnmanaged(ctfe.CtValue){};
+        var body_vals : std.ArrayListUnmanaged(ctfe.CtValue) = .empty;
         for (quote.body) |stmt| {
             try body_vals.append(self.allocator, try ast_data.stmtToCtValue(self.allocator, self.interner, &store, stmt));
         }
@@ -872,7 +872,7 @@ pub const MacroEngine = struct {
         }
 
         // Substitute :unquote nodes in the CtValue tree
-        var substituted_vals = std.ArrayListUnmanaged(ctfe.CtValue){};
+        var substituted_vals : std.ArrayListUnmanaged(ctfe.CtValue) = .empty;
         for (body_vals.items) |val| {
             try substituted_vals.append(self.allocator, try self.substituteCtValue(val, &param_map, &store));
         }
@@ -883,7 +883,7 @@ pub const MacroEngine = struct {
         }
 
         // Multiple statements → wrap in block
-        var stmts = std.ArrayListUnmanaged(ast.Stmt){};
+        var stmts : std.ArrayListUnmanaged(ast.Stmt) = .empty;
         for (substituted_vals.items) |val| {
             const expr = try ast_data.ctValueToExpr(self.allocator, self.interner, val);
             try stmts.append(self.allocator, .{ .expr = expr });
@@ -955,7 +955,7 @@ pub const MacroEngine = struct {
 
         // Recurse into bare lists — with unquote_splicing support
         if (value == .list) {
-            var result_elems = std.ArrayListUnmanaged(ctfe.CtValue){};
+            var result_elems : std.ArrayListUnmanaged(ctfe.CtValue) = .empty;
             var changed = false;
             for (value.list.elems) |elem| {
                 // Check for unquote_splicing: {:unquote_splicing, _, [list_expr]}
@@ -1087,7 +1087,7 @@ pub const MacroEngine = struct {
                     param_map.put(self.interner.get(clause.params[1].pattern.bind.name), rhs_ct) catch return null;
                 }
 
-                var body_vals = std.ArrayListUnmanaged(ctfe.CtValue){};
+                var body_vals : std.ArrayListUnmanaged(ctfe.CtValue) = .empty;
                 for (body_expr.quote_expr.body) |stmt| {
                     const stmt_ct = ast_data.stmtToCtValue(self.allocator, self.interner, &store, stmt) catch return null;
                     body_vals.append(self.allocator, self.substituteCtValue(stmt_ct, &param_map, &store) catch return null) catch return null;
@@ -1295,7 +1295,7 @@ pub const MacroEngine = struct {
                     }
                 }
 
-                var body_vals = std.ArrayListUnmanaged(ctfe.CtValue){};
+                var body_vals : std.ArrayListUnmanaged(ctfe.CtValue) = .empty;
                 for (body_expr.quote_expr.body) |stmt| {
                     const stmt_ct = ast_data.stmtToCtValue(self.allocator, self.interner, &store, stmt) catch return null;
                     body_vals.append(self.allocator, self.substituteCtValue(stmt_ct, &param_map, &store) catch return null) catch return null;
@@ -1388,7 +1388,7 @@ pub const MacroEngine = struct {
                     }
                 }
 
-                var body_vals = std.ArrayListUnmanaged(ctfe.CtValue){};
+                var body_vals : std.ArrayListUnmanaged(ctfe.CtValue) = .empty;
                 for (body_expr.quote_expr.body) |stmt| {
                     const stmt_ct = ast_data.stmtToCtValue(self.allocator, self.interner, &store, stmt) catch return null;
                     body_vals.append(self.allocator, self.substituteCtValue(stmt_ct, &decl_param_map, &store) catch return null) catch return null;
@@ -1461,7 +1461,7 @@ pub const MacroEngine = struct {
                     }
                 }
 
-                var body_vals = std.ArrayListUnmanaged(ctfe.CtValue){};
+                var body_vals : std.ArrayListUnmanaged(ctfe.CtValue) = .empty;
                 for (body_expr.quote_expr.body) |stmt| {
                     const stmt_ct = ast_data.stmtToCtValue(self.allocator, self.interner, &store, stmt) catch return null;
                     body_vals.append(self.allocator, self.substituteCtValue(stmt_ct, &param_map, &store) catch return null) catch return null;

@@ -377,7 +377,7 @@ pub const ZirDriver = struct {
     /// Used for declaration-body tuple_decl (param-like instructions).
     fn mapTupleElementType(self: *ZirDriver, zig_type: ir.ZigType) u32 {
         if (zig_type == .tuple) {
-            var inner_refs = std.ArrayListUnmanaged(u32).empty;
+            var inner_refs : std.ArrayListUnmanaged(u32) = .empty;
             defer inner_refs.deinit(self.allocator);
             for (zig_type.tuple) |inner_elem| {
                 inner_refs.append(self.allocator, self.mapTupleElementType(inner_elem)) catch return 0;
@@ -404,7 +404,7 @@ pub const ZirDriver = struct {
     /// Returns the Ref to the emitted tuple_decl instruction.
     fn emitBodyLocalTupleType(self: *ZirDriver, zig_type: ir.ZigType) u32 {
         if (zig_type != .tuple) return mapReturnType(zig_type);
-        var inner_refs = std.ArrayListUnmanaged(u32).empty;
+        var inner_refs : std.ArrayListUnmanaged(u32) = .empty;
         defer inner_refs.deinit(self.allocator);
         for (zig_type.tuple) |inner_elem| {
             inner_refs.append(self.allocator, self.emitBodyLocalTupleType(inner_elem)) catch return 0;
@@ -522,11 +522,11 @@ pub const ZirDriver = struct {
     fn refForValueLocal(self: *ZirDriver, local: ir.LocalId) BuildError!u32 {
         if (self.reuse_backed_tuple_locals.get(local)) |arity| {
             const ptr_ref = try self.refForLocal(local);
-            var names_ptrs = std.ArrayListUnmanaged([*]const u8).empty;
+            var names_ptrs : std.ArrayListUnmanaged([*]const u8) = .empty;
             defer names_ptrs.deinit(self.allocator);
-            var names_lens = std.ArrayListUnmanaged(u32).empty;
+            var names_lens : std.ArrayListUnmanaged(u32) = .empty;
             defer names_lens.deinit(self.allocator);
-            var values = std.ArrayListUnmanaged(u32).empty;
+            var values : std.ArrayListUnmanaged(u32) = .empty;
             defer values.deinit(self.allocator);
             for (0..arity) |i| {
                 const name = indexFieldName(i);
@@ -555,11 +555,11 @@ pub const ZirDriver = struct {
             const ptr_ref = try self.refForLocal(local);
             const struct_def = self.findStructDef(type_name) orelse return error.EmitFailed;
 
-            var names_ptrs = std.ArrayListUnmanaged([*]const u8).empty;
+            var names_ptrs : std.ArrayListUnmanaged([*]const u8) = .empty;
             defer names_ptrs.deinit(self.allocator);
-            var names_lens = std.ArrayListUnmanaged(u32).empty;
+            var names_lens : std.ArrayListUnmanaged(u32) = .empty;
             defer names_lens.deinit(self.allocator);
-            var values = std.ArrayListUnmanaged(u32).empty;
+            var values : std.ArrayListUnmanaged(u32) = .empty;
             defer values.deinit(self.allocator);
 
             for (struct_def.fields) |field| {
@@ -1026,7 +1026,7 @@ pub const ZirDriver = struct {
         // For tuple return types, set up the computed return type via tuple_decl.
         // Nested tuples are handled by recursively emitting tuple_decl instructions.
         if (func.return_type == .tuple) {
-            var type_refs = std.ArrayListUnmanaged(u32).empty;
+            var type_refs : std.ArrayListUnmanaged(u32) = .empty;
             defer type_refs.deinit(self.allocator);
             for (func.return_type.tuple) |elem_type| {
                 try type_refs.append(self.allocator, self.mapTupleElementType(elem_type));
@@ -1041,11 +1041,11 @@ pub const ZirDriver = struct {
         // the union type as the return type via union_decl in the declaration body.
         if (func.return_type == .struct_ref) {
             if (self.findUnionDef(func.return_type.struct_ref)) |union_def| {
-                var name_ptrs = std.ArrayListUnmanaged([*]const u8).empty;
+                var name_ptrs : std.ArrayListUnmanaged([*]const u8) = .empty;
                 defer name_ptrs.deinit(self.allocator);
-                var name_lens = std.ArrayListUnmanaged(u32).empty;
+                var name_lens : std.ArrayListUnmanaged(u32) = .empty;
                 defer name_lens.deinit(self.allocator);
-                var type_refs = std.ArrayListUnmanaged(u32).empty;
+                var type_refs : std.ArrayListUnmanaged(u32) = .empty;
                 defer type_refs.deinit(self.allocator);
 
                 for (union_def.variants) |variant| {
@@ -1416,7 +1416,7 @@ pub const ZirDriver = struct {
     fn emitNamedCallToTarget(self: *ZirDriver, target_id: ir.FunctionId, captures: []const ir.LocalId, args_locals: []const ir.LocalId) !u32 {
         const target_func = self.findFunctionById(target_id) orelse return error.EmitFailed;
         const lowering = self.getClosureLowering(target_id, captures.len);
-        var args = std.ArrayListUnmanaged(u32).empty;
+        var args : std.ArrayListUnmanaged(u32) = .empty;
         defer args.deinit(self.allocator);
         if (lowering.direct_capture_params) {
             for (captures) |capture| {
@@ -1595,7 +1595,7 @@ pub const ZirDriver = struct {
         const call_fn_ref = zir_builder_emit_field_val(self.handle, callee_ref, "call_fn", 7);
         if (call_fn_ref == error_ref) return false;
 
-        var fallback_args = std.ArrayListUnmanaged(u32).empty;
+        var fallback_args : std.ArrayListUnmanaged(u32) = .empty;
         defer fallback_args.deinit(self.allocator);
         for (cc.args) |arg| {
             const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
@@ -1867,7 +1867,7 @@ pub const ZirDriver = struct {
 
             // Named calls
             .call_named => |cn| {
-                var args = std.ArrayListUnmanaged(u32).empty;
+                var args : std.ArrayListUnmanaged(u32) = .empty;
                 defer args.deinit(self.allocator);
                 for (cn.args) |arg| {
                     const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
@@ -1944,7 +1944,7 @@ pub const ZirDriver = struct {
             },
 
             .try_call_named => |tcn| {
-                var args = std.ArrayListUnmanaged(u32).empty;
+                var args : std.ArrayListUnmanaged(u32) = .empty;
                 defer args.deinit(self.allocator);
                 for (tcn.args) |arg| {
                     const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
@@ -2019,7 +2019,7 @@ pub const ZirDriver = struct {
 
             // Builtin calls — emit @import("zap_runtime").Module.function(args)
             .call_builtin => |cb| {
-                var args = std.ArrayListUnmanaged(u32).empty;
+                var args : std.ArrayListUnmanaged(u32) = .empty;
                 defer args.deinit(self.allocator);
                 for (cb.args) |arg| {
                     const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
@@ -2068,7 +2068,7 @@ pub const ZirDriver = struct {
                 // emits a tail call that reuses the current stack frame.
                 // Tail calls are always intra-module (self-recursion).
                 zir_builder_set_call_modifier(self.handle, 4); // always_tail
-                var args = std.ArrayListUnmanaged(u32).empty;
+                var args : std.ArrayListUnmanaged(u32) = .empty;
                 defer args.deinit(self.allocator);
                 for (tc.args) |arg| {
                     const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
@@ -2119,7 +2119,7 @@ pub const ZirDriver = struct {
                         break :blk @as(?[]const u8, null);
                     };
                     if (func_name) |fname| {
-                        var args = std.ArrayListUnmanaged(u32).empty;
+                        var args : std.ArrayListUnmanaged(u32) = .empty;
                         defer args.deinit(self.allocator);
                         for (cd.args) |arg| {
                             const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
@@ -2244,11 +2244,11 @@ pub const ZirDriver = struct {
             // Aggregates
             .tuple_init => |ti| {
                 // Build field names ("0", "1", "2", ...) and value refs
-                var names_ptrs = std.ArrayListUnmanaged([*]const u8).empty;
+                var names_ptrs : std.ArrayListUnmanaged([*]const u8) = .empty;
                 defer names_ptrs.deinit(self.allocator);
-                var names_lens = std.ArrayListUnmanaged(u32).empty;
+                var names_lens : std.ArrayListUnmanaged(u32) = .empty;
                 defer names_lens.deinit(self.allocator);
-                var values = std.ArrayListUnmanaged(u32).empty;
+                var values : std.ArrayListUnmanaged(u32) = .empty;
                 defer values.deinit(self.allocator);
 
                 for (ti.elements, 0..) |elem, i| {
@@ -2418,11 +2418,11 @@ pub const ZirDriver = struct {
                 }
             },
             .struct_init => |si| {
-                var names_ptrs = std.ArrayListUnmanaged([*]const u8).empty;
+                var names_ptrs : std.ArrayListUnmanaged([*]const u8) = .empty;
                 defer names_ptrs.deinit(self.allocator);
-                var names_lens = std.ArrayListUnmanaged(u32).empty;
+                var names_lens : std.ArrayListUnmanaged(u32) = .empty;
                 defer names_lens.deinit(self.allocator);
-                var values = std.ArrayListUnmanaged(u32).empty;
+                var values : std.ArrayListUnmanaged(u32) = .empty;
                 defer values.deinit(self.allocator);
 
                 for (si.fields) |field| {
@@ -2784,7 +2784,7 @@ pub const ZirDriver = struct {
                 var name_buf: [20]u8 = undefined;
                 const name_slice: []const u8 = std.fmt.bufPrint(&name_buf, "dispatch_{d}", .{cd.group_id}) catch
                     @as([]const u8, "dispatch");
-                var args = std.ArrayListUnmanaged(u32).empty;
+                var args : std.ArrayListUnmanaged(u32) = .empty;
                 defer args.deinit(self.allocator);
                 for (cd.args) |arg| {
                     const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
@@ -2803,7 +2803,7 @@ pub const ZirDriver = struct {
                 // specialization logic that might try to destructure a closure struct.
                 if (callee_is_param) {
                     const callee_ref = self.refForLocal(cc.callee) catch return error.EmitFailed;
-                    var args = std.ArrayListUnmanaged(u32).empty;
+                    var args : std.ArrayListUnmanaged(u32) = .empty;
                     defer args.deinit(self.allocator);
                     for (cc.args) |arg| {
                         const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
@@ -2944,7 +2944,7 @@ pub const ZirDriver = struct {
                     // (from a 0-capture make_closure), emit a direct call_ref without
                     // trying to destructure a closure struct.
                     if (callee_is_param or self.isBareFunctionRef(cc.callee)) {
-                        var args = std.ArrayListUnmanaged(u32).empty;
+                        var args : std.ArrayListUnmanaged(u32) = .empty;
                         defer args.deinit(self.allocator);
                         for (cc.args) |arg| {
                             const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
@@ -2960,7 +2960,7 @@ pub const ZirDriver = struct {
                     const call_fn_ref = zir_builder_emit_field_val(self.handle, callee_ref, "call_fn", 7);
                     if (call_fn_ref == error_ref) {
                         // Fallback: callee might be a bare function ref, not a closure struct
-                        var args = std.ArrayListUnmanaged(u32).empty;
+                        var args : std.ArrayListUnmanaged(u32) = .empty;
                         defer args.deinit(self.allocator);
                         for (cc.args) |arg| {
                             const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
@@ -2976,7 +2976,7 @@ pub const ZirDriver = struct {
                     if (env_ref == error_ref) return error.EmitFailed;
 
                     // Build args: env as first argument, then user args
-                    var full_args = std.ArrayListUnmanaged(u32).empty;
+                    var full_args : std.ArrayListUnmanaged(u32) = .empty;
                     defer full_args.deinit(self.allocator);
                     try full_args.append(self.allocator, env_ref);
                     for (cc.args) |arg| {
@@ -3034,11 +3034,11 @@ pub const ZirDriver = struct {
                 }
 
                 // Build the environment tuple: .{ capture0, capture1, ... }
-                var env_names_ptrs = std.ArrayListUnmanaged([*]const u8).empty;
+                var env_names_ptrs : std.ArrayListUnmanaged([*]const u8) = .empty;
                 defer env_names_ptrs.deinit(self.allocator);
-                var env_names_lens = std.ArrayListUnmanaged(u32).empty;
+                var env_names_lens : std.ArrayListUnmanaged(u32) = .empty;
                 defer env_names_lens.deinit(self.allocator);
-                var env_values = std.ArrayListUnmanaged(u32).empty;
+                var env_values : std.ArrayListUnmanaged(u32) = .empty;
                 defer env_values.deinit(self.allocator);
 
                 for (mc.captures, 0..) |cap, i| {
@@ -4177,17 +4177,17 @@ pub const ZirDriver = struct {
 
         // Pre-emit all body instructions with body_tracking OFF.
         // Collect instruction indices and result Refs for each prong.
-        var names_ptrs = std.ArrayListUnmanaged([*]const u8).empty;
+        var names_ptrs : std.ArrayListUnmanaged([*]const u8) = .empty;
         defer names_ptrs.deinit(self.allocator);
-        var names_lens = std.ArrayListUnmanaged(u32).empty;
+        var names_lens : std.ArrayListUnmanaged(u32) = .empty;
         defer names_lens.deinit(self.allocator);
-        var captures = std.ArrayListUnmanaged(u32).empty;
+        var captures : std.ArrayListUnmanaged(u32) = .empty;
         defer captures.deinit(self.allocator);
-        var body_lens = std.ArrayListUnmanaged(u32).empty;
+        var body_lens : std.ArrayListUnmanaged(u32) = .empty;
         defer body_lens.deinit(self.allocator);
-        var body_results = std.ArrayListUnmanaged(u32).empty;
+        var body_results : std.ArrayListUnmanaged(u32) = .empty;
         defer body_results.deinit(self.allocator);
-        var all_body_insts = std.ArrayListUnmanaged(u32).empty;
+        var all_body_insts : std.ArrayListUnmanaged(u32) = .empty;
         defer all_body_insts.deinit(self.allocator);
 
         // We need the future switch_block Ref for payload capture binding.
@@ -4243,7 +4243,7 @@ pub const ZirDriver = struct {
                 if (bi == .call_named) {
                     const cn = bi.call_named;
                     if (pre_resolved_fns.get(cn.name)) |fn_ref| {
-                        var call_args = std.ArrayListUnmanaged(u32).empty;
+                        var call_args : std.ArrayListUnmanaged(u32) = .empty;
                         defer call_args.deinit(self.allocator);
                         for (cn.args) |arg| {
                             const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);

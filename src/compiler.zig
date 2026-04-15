@@ -153,13 +153,13 @@ pub fn collectAllFromUnits(
     source_units: []const SourceUnit,
     options: CompileOptions,
 ) CompileError!CompilationContext {
-    const progress = std.fs.File.stderr().deprecatedWriter();
+    // progress writer: use debug.print in 0.16
     var step: u32 = 0;
     const total_steps: u32 = 11;
     const file_path = if (source_units.len > 0) source_units[0].file_path else "<memory>";
 
     if (options.show_progress) {
-        progress.print("Compiling\n", .{}) catch {};
+        std.debug.print("Compiling\n", .{});
     }
 
     var diag_engine = zap.DiagnosticEngine.init(alloc);
@@ -167,7 +167,7 @@ pub fn collectAllFromUnits(
 
     // Parse each source unit independently with a shared interner.
     step += 1;
-    if (options.show_progress) progress.print("\r\x1b[K  [{d}/{d}] Parse", .{ step, total_steps }) catch {};
+    if (options.show_progress) std.debug.print("\r\x1b[K  [{d}/{d}] Parse", .{ step, total_steps });
 
     const all_source_units = source_units;
     const merged_source = try mergeSourceUnits(alloc, all_source_units);
@@ -183,7 +183,7 @@ pub fn collectAllFromUnits(
 
         parsed_programs[i] = parser.parseProgram() catch {
             emitParseErrorsFromUnits(alloc, parser.errors.items, all_source_units, diag_engine.use_color);
-            if (options.show_progress) progress.print("\r\x1b[K", .{}) catch {};
+            if (options.show_progress) std.debug.print("\r\x1b[K", .{});
             return error.ParseFailed;
         };
 
@@ -198,7 +198,7 @@ pub fn collectAllFromUnits(
         }
     }
     if (diag_engine.hasErrors()) {
-        if (options.show_progress) progress.print("\r\x1b[K", .{}) catch {};
+        if (options.show_progress) std.debug.print("\r\x1b[K", .{});
         emitDiagnostics(&diag_engine, alloc);
         return error.ParseFailed;
     }
@@ -209,7 +209,7 @@ pub fn collectAllFromUnits(
     // Collect declarations from explicit per-module programs instead of
     // rebuilding the graph from the merged AST.
     step += 1;
-    if (options.show_progress) progress.print("\r\x1b[K  [{d}/{d}] Collect", .{ step, total_steps }) catch {};
+    if (options.show_progress) std.debug.print("\r\x1b[K  [{d}/{d}] Collect", .{ step, total_steps });
 
     var collector = zap.Collector.init(alloc, &interner);
     for (module_programs) |entry| {
@@ -217,7 +217,7 @@ pub fn collectAllFromUnits(
             for (collector.errors.items) |collect_err| {
                 diag_engine.err(collect_err.message, collect_err.span) catch {};
             }
-            if (options.show_progress) progress.print("\r\x1b[K", .{}) catch {};
+            if (options.show_progress) std.debug.print("\r\x1b[K", .{});
             emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
             return error.CollectFailed;
         };
@@ -231,7 +231,7 @@ pub fn collectAllFromUnits(
             for (collector.errors.items) |collect_err| {
                 diag_engine.err(collect_err.message, collect_err.span) catch {};
             }
-            if (options.show_progress) progress.print("\r\x1b[K", .{}) catch {};
+            if (options.show_progress) std.debug.print("\r\x1b[K", .{});
             emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
             return error.CollectFailed;
         };
@@ -242,7 +242,7 @@ pub fn collectAllFromUnits(
         for (collector.errors.items) |collect_err| {
             diag_engine.err(collect_err.message, collect_err.span) catch {};
         }
-        if (options.show_progress) progress.print("\r\x1b[K", .{}) catch {};
+        if (options.show_progress) std.debug.print("\r\x1b[K", .{});
         emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
         return error.CollectFailed;
     };
@@ -251,7 +251,7 @@ pub fn collectAllFromUnits(
         diag_engine.err(collect_err.message, collect_err.span) catch {};
     }
     if (diag_engine.hasErrors()) {
-        if (options.show_progress) progress.print("\r\x1b[K", .{}) catch {};
+        if (options.show_progress) std.debug.print("\r\x1b[K", .{});
         emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
         return error.CollectFailed;
     }
@@ -283,13 +283,13 @@ pub fn compileFiles(
     ctx: *CompilationContext,
     options: CompileOptions,
 ) CompileError!CompileResult {
-    const progress = std.fs.File.stderr().deprecatedWriter();
+    // progress writer: use debug.print in 0.16
     const total_steps: u32 = 11;
     var step: u32 = 2; // already past parse + collect
 
     // Attribute substitution (replace @name references with attribute values)
     step += 1;
-    if (options.show_progress) progress.print("\r\x1b[K  [{d}/{d}] Substitute attributes", .{ step, total_steps }) catch {};
+    if (options.show_progress) std.debug.print("\r\x1b[K  [{d}/{d}] Substitute attributes", .{ step, total_steps });
 
     var subst_errors: std.ArrayListUnmanaged(zap.attr_substitute.SubstitutionError) = .empty;
     const substituted_program = zap.attr_substitute.substituteAttributes(
@@ -300,7 +300,7 @@ pub fn compileFiles(
         &subst_errors,
     ) catch {
         ctx.diag_engine.err("Error during attribute substitution", .{ .start = 0, .end = 0 }) catch {};
-        if (options.show_progress) progress.print("\r\x1b[K", .{}) catch {};
+        if (options.show_progress) std.debug.print("\r\x1b[K", .{});
         emitContextDiagnostics(ctx, alloc);
         return error.DesugarFailed;
     };
@@ -308,14 +308,14 @@ pub fn compileFiles(
         ctx.diag_engine.err(subst_err.message, subst_err.span) catch {};
     }
     if (ctx.diag_engine.hasErrors()) {
-        if (options.show_progress) progress.print("\r\x1b[K", .{}) catch {};
+        if (options.show_progress) std.debug.print("\r\x1b[K", .{});
         emitContextDiagnostics(ctx, alloc);
         return error.DesugarFailed;
     }
 
     // Macro expansion
     step += 1;
-    if (options.show_progress) progress.print("\r\x1b[K  [{d}/{d}] Expand macros", .{ step, total_steps }) catch {};
+    if (options.show_progress) std.debug.print("\r\x1b[K  [{d}/{d}] Expand macros", .{ step, total_steps });
 
     var macro_engine = zap.MacroEngine.init(alloc, &ctx.interner, &ctx.collector.graph);
     defer macro_engine.deinit();
@@ -323,7 +323,7 @@ pub fn compileFiles(
         for (macro_engine.errors.items) |macro_err| {
             ctx.diag_engine.err(macro_err.message, macro_err.span) catch {};
         }
-        if (options.show_progress) progress.print("\r\x1b[K", .{}) catch {};
+        if (options.show_progress) std.debug.print("\r\x1b[K", .{});
         emitContextDiagnostics(ctx, alloc);
         return error.MacroExpansionFailed;
     };
@@ -332,19 +332,19 @@ pub fn compileFiles(
         ctx.diag_engine.err(macro_err.message, macro_err.span) catch {};
     }
     if (ctx.diag_engine.hasErrors()) {
-        if (options.show_progress) progress.print("\r\x1b[K", .{}) catch {};
+        if (options.show_progress) std.debug.print("\r\x1b[K", .{});
         emitContextDiagnostics(ctx, alloc);
         return error.MacroExpansionFailed;
     }
 
     // Desugaring
     step += 1;
-    if (options.show_progress) progress.print("\r\x1b[K  [{d}/{d}] Desugar", .{ step, total_steps }) catch {};
+    if (options.show_progress) std.debug.print("\r\x1b[K  [{d}/{d}] Desugar", .{ step, total_steps });
 
     var desugarer = zap.Desugarer.init(alloc, &ctx.interner);
     const desugared_program = desugarer.desugarProgram(&expanded_program) catch {
         ctx.diag_engine.err("Error during desugaring", .{ .start = 0, .end = 0 }) catch {};
-        if (options.show_progress) progress.print("\r\x1b[K", .{}) catch {};
+        if (options.show_progress) std.debug.print("\r\x1b[K", .{});
         emitContextDiagnostics(ctx, alloc);
         return error.DesugarFailed;
     };
@@ -374,7 +374,7 @@ pub fn compileFiles(
 
     // Type checking (first pass)
     step += 1;
-    if (options.show_progress) progress.print("\r\x1b[K  [{d}/{d}] Type check", .{ step, total_steps }) catch {};
+    if (options.show_progress) std.debug.print("\r\x1b[K  [{d}/{d}] Type check", .{ step, total_steps });
 
     var type_checker = zap.types.TypeChecker.init(alloc, &ctx.interner, &ctx.collector.graph);
     defer type_checker.deinit();
@@ -386,7 +386,7 @@ pub fn compileFiles(
 
     // HIR lowering
     step += 1;
-    if (options.show_progress) progress.print("\r\x1b[K  [{d}/{d}] HIR", .{ step, total_steps }) catch {};
+    if (options.show_progress) std.debug.print("\r\x1b[K  [{d}/{d}] HIR", .{ step, total_steps });
 
     var hir_builder = zap.hir.HirBuilder.init(alloc, &ctx.interner, &ctx.collector.graph, &type_checker.store);
     defer hir_builder.deinit();
@@ -394,7 +394,7 @@ pub fn compileFiles(
         for (hir_builder.errors.items) |hir_err| {
             ctx.diag_engine.err(hir_err.message, hir_err.span) catch {};
         }
-        if (options.show_progress) progress.print("\r\x1b[K", .{}) catch {};
+        if (options.show_progress) std.debug.print("\r\x1b[K", .{});
         emitContextDiagnostics(ctx, alloc);
         return error.HirFailed;
     };
@@ -403,7 +403,7 @@ pub fn compileFiles(
         ctx.diag_engine.err(hir_err.message, hir_err.span) catch {};
     }
     if (ctx.diag_engine.hasErrors()) {
-        if (options.show_progress) progress.print("\r\x1b[K", .{}) catch {};
+        if (options.show_progress) std.debug.print("\r\x1b[K", .{});
         emitContextDiagnostics(ctx, alloc);
         return error.HirFailed;
     }
@@ -412,7 +412,7 @@ pub fn compileFiles(
     var mono_next_group_id = hir_builder.next_group_id;
     const mono_result = zap.monomorphize.monomorphize(alloc, &hir_program, @constCast(&type_checker.store), &mono_next_group_id, &ctx.interner) catch {
         ctx.diag_engine.err("Error during monomorphization", .{ .start = 0, .end = 0 }) catch {};
-        if (options.show_progress) progress.print("\r\x1b[K", .{}) catch {};
+        if (options.show_progress) std.debug.print("\r\x1b[K", .{});
         emitContextDiagnostics(ctx, alloc);
         return error.HirFailed;
     };
@@ -420,14 +420,14 @@ pub fn compileFiles(
 
     // IR lowering
     step += 1;
-    if (options.show_progress) progress.print("\r\x1b[K  [{d}/{d}] IR", .{ step, total_steps }) catch {};
+    if (options.show_progress) std.debug.print("\r\x1b[K  [{d}/{d}] IR", .{ step, total_steps });
 
     var ir_builder = zap.ir.IrBuilder.init(alloc, &ctx.interner);
     ir_builder.type_store = &type_checker.store;
     defer ir_builder.deinit();
     var ir_program = ir_builder.buildProgram(&mono_program) catch {
         ctx.diag_engine.err("Error during IR lowering", .{ .start = 0, .end = 0 }) catch {};
-        if (options.show_progress) progress.print("\r\x1b[K", .{}) catch {};
+        if (options.show_progress) std.debug.print("\r\x1b[K", .{});
         emitContextDiagnostics(ctx, alloc);
         return error.IrFailed;
     };
@@ -456,11 +456,11 @@ pub fn compileFiles(
 
     // Analysis pipeline
     step += 1;
-    if (options.show_progress) progress.print("\r\x1b[K  [{d}/{d}] Escape analysis", .{ step, total_steps }) catch {};
+    if (options.show_progress) std.debug.print("\r\x1b[K  [{d}/{d}] Escape analysis", .{ step, total_steps });
 
     var pipeline_result = zap.analysis_pipeline.runAnalysisPipeline(alloc, &ir_program) catch {
         ctx.diag_engine.err("Error during escape analysis", .{ .start = 0, .end = 0 }) catch {};
-        if (options.show_progress) progress.print("\r\x1b[K", .{}) catch {};
+        if (options.show_progress) std.debug.print("\r\x1b[K", .{});
         emitContextDiagnostics(ctx, alloc);
         return error.IrFailed;
     };
@@ -490,18 +490,18 @@ pub fn compileFiles(
         }) catch {};
     }
     if (ctx.diag_engine.hasErrors()) {
-        if (options.show_progress) progress.print("\r\x1b[K", .{}) catch {};
+        if (options.show_progress) std.debug.print("\r\x1b[K", .{});
         emitContextDiagnostics(ctx, alloc);
         return error.TypeCheckFailed;
     }
 
     // Emit warnings
     if (ctx.diag_engine.warningCount() > 0) {
-        if (options.show_progress) progress.print("\r\x1b[K", .{}) catch {};
+        if (options.show_progress) std.debug.print("\r\x1b[K", .{});
         emitContextDiagnostics(ctx, alloc);
     }
 
-    if (options.show_progress) progress.print("\r\x1b[K", .{}) catch {};
+    if (options.show_progress) std.debug.print("\r\x1b[K", .{});
 
     return .{ .ir_program = ir_program, .analysis_context = pipeline_result.context };
 }
@@ -714,18 +714,18 @@ pub fn compileModuleByModule(
     module_order: []const []const u8,
     options: CompileOptions,
 ) CompileError!CompileResult {
-    const progress = std.fs.File.stderr().deprecatedWriter();
+    // progress writer: use debug.print in 0.16
 
     // Collect all IR functions and type defs across modules
-    var all_functions = std.ArrayListUnmanaged(ir.Function).empty;
-    var all_type_defs = std.ArrayListUnmanaged(ir.TypeDef).empty;
+    var all_functions : std.ArrayListUnmanaged(ir.Function) = .empty;
+    var all_type_defs : std.ArrayListUnmanaged(ir.TypeDef) = .empty;
     var entry_id: ?ir.FunctionId = null;
     var func_id_offset: u32 = 0;
 
     // Process each module in dependency order
     for (module_order, 0..) |mod_name, mod_idx| {
         if (options.show_progress) {
-            progress.print("\r\x1b[K  [module {d}/{d}] {s}", .{ mod_idx + 1, module_order.len, mod_name }) catch {};
+            std.debug.print("\r\x1b[K  [module {d}/{d}] {s}", .{ mod_idx + 1, module_order.len, mod_name });
         }
         const unit = lookupCompilationUnit(ctx, mod_name) orelse {
             ctx.diag_engine.err("Module compilation unit disappeared during per-module compilation", .{ .start = 0, .end = 0 }) catch {};
@@ -1090,9 +1090,9 @@ pub fn compileToNative(
 ) !void {
     var result = try compileFrontend(alloc, source, file_path, frontend_opts);
 
-    const progress = std.fs.File.stderr().deprecatedWriter();
+    // progress writer: use debug.print in 0.16
     if (frontend_opts.show_progress) {
-        progress.print("\r\x1b[K  [8/10] ZIR", .{}) catch {};
+        std.debug.print("\r\x1b[K  [8/10] ZIR", .{});
     }
 
     var opts = backend_opts;
@@ -1102,15 +1102,15 @@ pub fn compileToNative(
     try zap.zir_backend.compile(alloc, result.ir_program, opts);
 
     if (frontend_opts.show_progress) {
-        progress.print("\r\x1b[K  [9/10] Sema + Codegen", .{}) catch {};
-        progress.print("\r\x1b[K  [10/10] Linked {s}\n", .{output_path}) catch {};
+        std.debug.print("\r\x1b[K  [9/10] Sema + Codegen", .{});
+        std.debug.print("\r\x1b[K  [10/10] Linked {s}\n", .{output_path});
     }
 }
 
 fn emitDiagnostics(diag_engine: *zap.DiagnosticEngine, alloc: std.mem.Allocator) void {
     const rendered = diag_engine.format(alloc) catch return;
-    const stderr = std.fs.File.stderr().deprecatedWriter();
-    stderr.print("{s}", .{rendered}) catch {};
+    // stderr writer: use debug.print in 0.16
+    std.debug.print("{s}", .{rendered});
 }
 
 const testing = std.testing;

@@ -98,7 +98,7 @@ pub fn ctfeManifestDetailed(
     interp.capabilities = ctfe.CapabilitySet.build;
     interp.build_opts = build_opts;
     interp.compile_options_hash = ctfe.hashCompileOptions(target_name, build_opts.get("optimize") orelse "release_safe");
-    std.fs.cwd().makePath(".zap-cache/ctfe") catch {};
+    std.Io.Dir.cwd().createDirPath(std.Options.debug_io, ".zap-cache/ctfe") catch {};
     interp.persistent_cache = ctfe.PersistentCache.init(".zap-cache/ctfe");
 
     // Find the manifest function by scanning IR functions for one ending in "__manifest"
@@ -121,9 +121,9 @@ pub fn ctfeManifestDetailed(
     // Evaluate manifest/1
     const manifest_result = interp.evalAndExport(manifest_id, &.{env_const}, ctfe.CapabilitySet.build) catch {
         // Report CTFE errors
-        const stderr = std.fs.File.stderr().deprecatedWriter();
+        // stderr removed in 0.16
         for (interp.errors.items) |err| {
-            stderr.print("  ctfe error: {s}\n", .{err.message}) catch {};
+            std.debug.print("  ctfe error: {s}\n", .{err.message});
         }
         return error.CtfeFailed;
     };
@@ -141,14 +141,14 @@ fn readLibSourceUnits(
     dir_path: []const u8,
     source_units: *std.ArrayListUnmanaged(compiler.SourceUnit),
 ) !void {
-    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
-    defer dir.close();
+    var dir = std.Io.Dir.cwd().openDir(std.Options.debug_io, dir_path, .{ .iterate = true }) catch return;
+    defer dir.close(std.Options.debug_io);
     var iter = dir.iterate();
-    while (iter.next() catch null) |entry| {
+    while (iter.next(std.Options.debug_io) catch null) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".zap")) continue;
         const file_path = try std.fs.path.join(alloc, &.{ dir_path, entry.name });
-        const source = std.fs.cwd().readFileAlloc(alloc, file_path, 10 * 1024 * 1024) catch continue;
+        const source = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, file_path, alloc, .limited(10 * 1024 * 1024)) catch continue;
         try source_units.append(alloc, .{ .file_path = file_path, .source = source });
     }
 }
