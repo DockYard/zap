@@ -2902,7 +2902,7 @@ pub const Interpreter = struct {
         // Read the env var
         // Use a null-terminated copy for getenv
         const name_z = self.allocator.dupeZ(u8, name) catch return error.OutOfMemory;
-        const value = std.c.getenv(name_z);
+        const value_ptr = std.c.getenv(name_z); const value: ?[]const u8 = if (value_ptr) |p| std.mem.span(p) else null;
 
         if (value) |v| {
             const val_copy = self.allocator.dupe(u8, v) catch return error.OutOfMemory;

@@ -145,14 +145,14 @@ pub fn compile(allocator: std.mem.Allocator, program: ir.Program, options: Compi
 /// Caller owns the returned memory.
 pub fn detectZigLibDir(allocator: std.mem.Allocator) ?[]const u8 {
     // 1. Try the ZAP_ZIG_LIB_DIR environment variable (project-specific override).
-    if (std.process.getEnvVarOwned(allocator, "ZAP_ZIG_LIB_DIR")) |dir| {
-        return dir;
-    } else |_| {}
+    if (std.c.getenv("ZAP_ZIG_LIB_DIR")) |ptr| {
+        return std.mem.span(ptr);
+    }
 
     // 2. Try the ZIG_LIB_DIR environment variable.
-    if (std.process.getEnvVarOwned(allocator, "ZIG_LIB_DIR")) |dir| {
-        return dir;
-    } else |_| {}
+    if (std.c.getenv("ZIG_LIB_DIR")) |ptr| {
+        return std.mem.span(ptr);
+    }
 
     // 3. Try paths relative to the self executable.
     //    e.g., if exe is /usr/local/bin/zap, check:
@@ -186,12 +186,11 @@ pub fn detectZigLibDir(allocator: std.mem.Allocator) ?[]const u8 {
     } else |_| {}
 
     // 4. Try well-known paths based on the system zig installation.
-    const home_dir = std.process.getEnvVarOwned(allocator, "HOME") catch null;
-    defer if (home_dir) |h| allocator.free(h);
+    const home_dir: ?[]const u8 = if (std.c.getenv("HOME")) |ptr| std.mem.span(ptr) else null;
 
     // Build asdf candidate only if HOME is available.
     const asdf_candidate: ?[]const u8 = if (home_dir) |h|
-        std.fs.path.join(allocator, &.{ h, ".asdf/installs/zig/0.15.2/lib" }) catch null
+        std.fs.path.join(allocator, &.{ h, ".asdf/installs/zig/0.16.0/lib" }) catch null
     else
         null;
     defer if (asdf_candidate) |c| allocator.free(c);

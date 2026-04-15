@@ -1016,7 +1016,7 @@ pub const AnalysisContext = struct {
         self.function_summaries.deinit();
 
         // Clean up lambda set member slices (allocated by toLambdaSet).
-        for (self.lambda_sets.values()) |ls| {
+        for (self.lambda_sets.items) |ls| {
             if (ls.members.len > 0) {
                 // Only free if not a static/comptime slice.
                 // Dynamically allocated slices from toLambdaSet use self.allocator.
@@ -1052,7 +1052,7 @@ pub const AnalysisContext = struct {
         self.outlives_constraints.deinit(self.allocator);
         self.closure_tiers.deinit();
 
-        for (self.call_specializations.values()) |spec| {
+        for (self.call_specializations.items) |spec| {
             if (spec.lambda_set.members.len > 0) {
                 self.allocator.free(spec.lambda_set.members);
             }

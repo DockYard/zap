@@ -33,13 +33,13 @@ pub const CallGraph = struct {
     program: *const ir.Program,
 
     /// Adjacency lists: function -> list of callees (as owned slices)
-    callees: std.AutoArrayHashMap(ir.FunctionId, FuncIdList),
+    callees: std.AutoHashMap(ir.FunctionId, FuncIdList),
 
     /// Reverse adjacency lists: function -> list of callers (as owned slices)
-    callers: std.AutoArrayHashMap(ir.FunctionId, FuncIdList),
+    callers: std.AutoHashMap(ir.FunctionId, FuncIdList),
 
     /// Closure creation tracking: closure function -> creating function
-    closure_creators: std.AutoArrayHashMap(ir.FunctionId, ir.FunctionId),
+    closure_creators: std.AutoHashMap(ir.FunctionId, ir.FunctionId),
 
     /// Name-to-function-id lookup for resolving call_named
     name_to_id: std.StringHashMap(ir.FunctionId),
@@ -93,9 +93,9 @@ pub const CallGraph = struct {
         var graph = CallGraph{
             .allocator = allocator,
             .program = program,
-            .callees = std.AutoArrayHashMap(ir.FunctionId, FuncIdList).init(allocator),
-            .callers = std.AutoArrayHashMap(ir.FunctionId, FuncIdList).init(allocator),
-            .closure_creators = std.AutoArrayHashMap(ir.FunctionId, ir.FunctionId).init(allocator),
+            .callees = std.AutoHashMap(ir.FunctionId, FuncIdList).init(allocator),
+            .callers = std.AutoHashMap(ir.FunctionId, FuncIdList).init(allocator),
+            .closure_creators = std.AutoHashMap(ir.FunctionId, ir.FunctionId).init(allocator),
             .name_to_id = std.StringHashMap(ir.FunctionId).init(allocator),
             .all_function_ids = all_ids,
         };
@@ -278,7 +278,7 @@ pub fn computeSccs(allocator: std.mem.Allocator, graph: *const CallGraph) !SccRe
     var state = TarjanState{
         .allocator = allocator,
         .graph = graph,
-        .nodes = std.AutoArrayHashMap(ir.FunctionId, TarjanNode).init(allocator),
+        .nodes = std.AutoHashMap(ir.FunctionId, TarjanNode).init(allocator),
         .stack_items = try allocator.alloc(ir.FunctionId, graph.all_function_ids.len),
         .stack_len = 0,
         .scc_list = try allocator.alloc([]const ir.FunctionId, graph.all_function_ids.len),
@@ -314,7 +314,7 @@ pub fn computeSccs(allocator: std.mem.Allocator, graph: *const CallGraph) !SccRe
 const TarjanState = struct {
     allocator: std.mem.Allocator,
     graph: *const CallGraph,
-    nodes: std.AutoArrayHashMap(ir.FunctionId, TarjanNode),
+    nodes: std.AutoHashMap(ir.FunctionId, TarjanNode),
     stack_items: []ir.FunctionId,
     stack_len: usize,
     scc_list: [][]const ir.FunctionId,
@@ -381,14 +381,14 @@ const TarjanState = struct {
 pub const InterproceduralAnalyzer = struct {
     allocator: std.mem.Allocator,
     call_graph: CallGraph,
-    summaries: std.AutoArrayHashMap(ir.FunctionId, lattice.FunctionSummary),
+    summaries: std.AutoHashMap(ir.FunctionId, lattice.FunctionSummary),
     program: *const ir.Program,
 
     pub fn init(allocator: std.mem.Allocator, program: *const ir.Program) !InterproceduralAnalyzer {
         return .{
             .allocator = allocator,
             .call_graph = try CallGraph.build(allocator, program),
-            .summaries = std.AutoArrayHashMap(ir.FunctionId, lattice.FunctionSummary).init(allocator),
+            .summaries = std.AutoHashMap(ir.FunctionId, lattice.FunctionSummary).init(allocator),
             .program = program,
         };
     }
@@ -462,17 +462,17 @@ pub const InterproceduralAnalyzer = struct {
             ps.* = lattice.ParamSummary.safe();
         }
 
-        var aliases = std.AutoArrayHashMap(ir.LocalId, ParamSet).init(self.allocator);
+        var aliases = std.AutoHashMap(ir.LocalId, ParamSet).init(self.allocator);
         defer aliases.deinit();
 
-        var fresh_locals = std.AutoArrayHashMap(ir.LocalId, void).init(self.allocator);
+        var fresh_locals = std.AutoHashMap(ir.LocalId, void).init(self.allocator);
         defer fresh_locals.deinit();
 
         var return_sources = ReturnSourceCollector.init(self.allocator);
         defer return_sources.deinit();
 
         // Track dereference depth per local (for escape_deref_depth computation).
-        var deref_depths = std.AutoArrayHashMap(ir.LocalId, i8).init(self.allocator);
+        var deref_depths = std.AutoHashMap(ir.LocalId, i8).init(self.allocator);
         defer deref_depths.deinit();
 
         // Initialize params at deref depth 0.
@@ -560,8 +560,8 @@ pub const InterproceduralAnalyzer = struct {
     fn trackDerefDepths(
         self: *InterproceduralAnalyzer,
         instrs: []const ir.Instruction,
-        aliases: *const std.AutoArrayHashMap(ir.LocalId, ParamSet),
-        deref_depths: *std.AutoArrayHashMap(ir.LocalId, i8),
+        aliases: *const std.AutoHashMap(ir.LocalId, ParamSet),
+        deref_depths: *std.AutoHashMap(ir.LocalId, i8),
         num_params: usize,
         param_summaries: []lattice.ParamSummary,
     ) void {
@@ -604,8 +604,8 @@ pub const InterproceduralAnalyzer = struct {
         instructions: []const ir.Instruction,
         num_params: usize,
         param_summaries: []lattice.ParamSummary,
-        aliases: *std.AutoArrayHashMap(ir.LocalId, ParamSet),
-        fresh_locals: *std.AutoArrayHashMap(ir.LocalId, void),
+        aliases: *std.AutoHashMap(ir.LocalId, ParamSet),
+        fresh_locals: *std.AutoHashMap(ir.LocalId, void),
         return_sources: *ReturnSourceCollector,
     ) !void {
         for (instructions) |instr| {
@@ -1056,8 +1056,8 @@ pub const InterproceduralAnalyzer = struct {
         self: *InterproceduralAnalyzer,
         val: ir.LocalId,
         param_summaries: []lattice.ParamSummary,
-        aliases: *std.AutoArrayHashMap(ir.LocalId, ParamSet),
-        fresh_locals: *std.AutoArrayHashMap(ir.LocalId, void),
+        aliases: *std.AutoHashMap(ir.LocalId, ParamSet),
+        fresh_locals: *std.AutoHashMap(ir.LocalId, void),
         return_sources: *ReturnSourceCollector,
     ) !void {
         _ = self;
@@ -1080,7 +1080,7 @@ pub const InterproceduralAnalyzer = struct {
         args: []const ir.LocalId,
         callee_id: ir.FunctionId,
         param_summaries: []lattice.ParamSummary,
-        aliases: *std.AutoArrayHashMap(ir.LocalId, ParamSet),
+        aliases: *std.AutoHashMap(ir.LocalId, ParamSet),
     ) void {
         if (self.summaries.get(callee_id)) |callee_summary| {
             for (args, 0..) |arg, arg_idx| {
@@ -1263,7 +1263,7 @@ const ReturnSourceCollector = struct {
 
 /// Mark a local's param aliases as escaping to heap.
 fn markEscapeToHeap(
-    aliases: *std.AutoArrayHashMap(ir.LocalId, ParamSet),
+    aliases: *std.AutoHashMap(ir.LocalId, ParamSet),
     local: ir.LocalId,
     param_summaries: []lattice.ParamSummary,
 ) void {
@@ -1281,7 +1281,7 @@ fn markEscapeToHeap(
 fn markArgsPassedToUnknown(
     args: []const ir.LocalId,
     param_summaries: []lattice.ParamSummary,
-    aliases: *std.AutoArrayHashMap(ir.LocalId, ParamSet),
+    aliases: *std.AutoHashMap(ir.LocalId, ParamSet),
 ) void {
     for (args) |arg| {
         if (aliases.get(arg)) |param_set| {

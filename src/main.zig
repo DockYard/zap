@@ -1228,8 +1228,7 @@ fn toPascalCase(allocator: std.mem.Allocator, snake: []const u8) ![]const u8 {
 }
 
 fn extractEmbeddedZigLib(allocator: std.mem.Allocator) ![]const u8 {
-    const home = std.process.getEnvVarOwned(allocator, "HOME") catch return error.FileNotFound;
-    defer allocator.free(home);
+    const home = std.mem.span(std.c.getenv("HOME") orelse return error.FileNotFound);
 
     const lib_dir = try std.fs.path.join(allocator, &.{ home, ".cache", "zap", "zig-lib" });
 

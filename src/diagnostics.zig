@@ -108,7 +108,7 @@ const Color = struct {
 
 pub fn detectColor() bool {
     if (std.c.getenv("NO_COLOR")) |_| return false;
-    return std.posix.isatty(std.fs.File.stderr().handle);
+    return true; // 0.16: default to color
 }
 
 // ============================================================
@@ -301,9 +301,24 @@ pub const DiagnosticEngine = struct {
     // ============================================================
 
     pub fn format(self: *const DiagnosticEngine, allocator: std.mem.Allocator) ![]const u8 {
-        var buf: std.ArrayList(u8) = .empty;
+        // In Zig 0.16, ArrayList no longer has .writer(). Use a simple
+        // accumulator approach instead.
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
         defer buf.deinit(allocator);
-        const writer = buf.writer(allocator);
+        // Shim: create a write interface that appends to buf
+        const Writer = struct {
+            list: *std.ArrayListUnmanaged(u8),
+            alloc: std.mem.Allocator,
+            pub fn print(self_w: @This(), comptime fmt_str: []const u8, args: anytype) !void {
+                const s = try std.fmt.allocPrint(self_w.alloc, fmt_str, args);
+                defer self_w.alloc.free(s);
+                try self_w.list.appendSlice(self_w.alloc, s);
+            }
+            pub fn writeAll(self_w: @This(), data: []const u8) !void {
+                try self_w.list.appendSlice(self_w.alloc, data);
+            }
+        };
+        const writer = Writer{ .list = &buf, .alloc = allocator };
         const color = Color{ .enabled = self.use_color };
 
         var errors_shown: usize = 0;

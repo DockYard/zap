@@ -760,7 +760,7 @@ pub fn ctValueToExpr(
 
                 // Build the call with the dot-access callee
                 const arg_elems = if (args == .list) args.list.elems else &[_]CtValue{};
-                var call_args: std.ArrayListUnmanaged(*const ast.Expr) = .{};
+                var call_args: std.ArrayListUnmanaged(*const ast.Expr) = .empty;
                 for (arg_elems) |arg| {
                     try call_args.append(alloc, try ctValueToExpr(alloc, interner, arg));
                 }

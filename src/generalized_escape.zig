@@ -109,11 +109,11 @@ pub const GeneralizedEscapeAnalyzer = struct {
         self.local_alloc_sites.deinit();
         self.borrow_sites.deinit(self.allocator);
         self.alloc_site_map.deinit();
-        for (self.aliases.values()) |*list| {
+        for (self.aliases.items) |*list| {
             list.deinit(self.allocator);
         }
         self.aliases.deinit();
-        for (self.field_name_lists.values()) |names| {
+        for (self.field_name_lists.items) |names| {
             self.allocator.free(names);
         }
         self.field_name_lists.deinit();
@@ -696,7 +696,7 @@ pub const GeneralizedEscapeAnalyzer = struct {
         while (self.worklist.items.len > 0 and iterations < max_iterations) {
             iterations += 1;
             const key = self.worklist.orderedRemove(0);
-            _ = self.in_worklist.orderedRemove(key);
+            _ = self.in_worklist.remove(key);
 
             // Propagate this value's escape state to all its aliases.
             const escape = self.ctx.getEscape(key);
