@@ -375,6 +375,28 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
                 }
             }
 
+            // build_test_fns(describe_name, body, setup_body, teardown_body)
+            if (std.mem.eql(u8, form_name, "build_test_fns")) {
+                if (arg_elems.len == 4) {
+                    const desc = try eval(env, arg_elems[0]);
+                    const body = try eval(env, arg_elems[1]);
+                    const setup = try eval(env, arg_elems[2]);
+                    const teardown = try eval(env, arg_elems[3]);
+                    const desc_str = extractString(desc) orelse return .nil;
+                    return buildTestFunctions(env.alloc, env.store, desc_str, body, setup, teardown) catch return .nil;
+                }
+            }
+
+            // build_test_fn(name, body)
+            if (std.mem.eql(u8, form_name, "build_test_fn")) {
+                if (arg_elems.len == 2) {
+                    const name_val = try eval(env, arg_elems[0]);
+                    const body_val = try eval(env, arg_elems[1]);
+                    const name_str = extractString(name_val) orelse return .nil;
+                    return buildSingleTestFunction(env.alloc, env.store, name_str, body_val) catch return .nil;
+                }
+            }
+
             // length(list_or_tuple) — get length
             if (std.mem.eql(u8, form_name, "length")) {
                 if (arg_elems.len == 1) {
@@ -788,4 +810,150 @@ fn buildFnDeclCtValue(alloc: Allocator, store: *AllocationStore, name: []const u
 
     // Function: {:fn, meta, clauses}
     return ast_data.makeTuple3(alloc, store, .{ .atom = "fn" }, meta, clauses);
+}
+
+fn slugifyString(alloc: Allocator, input: []const u8) ![]const u8 {
+    const result = try alloc.alloc(u8, input.len);
+    for (input, 0..) |c, i| {
+        if (c == ' ' or c == '-' or c == '\t' or c == '\n') {
+            result[i] = '_';
+        } else if (std.ascii.isUpper(c)) {
+            result[i] = std.ascii.toLower(c);
+        } else if (std.ascii.isAlphanumeric(c) or c == '_') {
+            result[i] = c;
+        } else {
+            result[i] = '_';
+        }
+    }
+    return result;
+}
+
+/// Build a plain function call: {:fn_name, [], []}
+fn buildCall0(alloc: Allocator, store: *AllocationStore, name: []const u8) !CtValue {
+    const empty = try ast_data.emptyList(alloc, store);
+    return ast_data.makeTuple3(alloc, store, .{ .atom = name }, empty, empty);
+}
+
+/// Build a test function declaration (pub, String return, given body).
+fn buildTestFnDecl(alloc: Allocator, store: *AllocationStore, name: []const u8, body: CtValue) !CtValue {
+    const empty = try ast_data.emptyList(alloc, store);
+    const head = try ast_data.makeTuple3(alloc, store, .{ .atom = name }, empty, empty);
+    const return_pair = try ast_data.makeTuple2(alloc, store, .{ .atom = "return" }, .{ .atom = "String" });
+    const do_pair = try ast_data.makeTuple2(alloc, store, .{ .atom = "do" }, body);
+    const opts = try ast_data.makeList(alloc, store, &.{ return_pair, do_pair });
+    const clause_args = try ast_data.makeList(alloc, store, &.{ head, opts });
+    const clause = try ast_data.makeTuple3(alloc, store, .{ .atom = "->" }, empty, clause_args);
+    const clauses = try ast_data.makeList(alloc, store, &.{clause});
+    const vis_pair = try ast_data.makeTuple2(alloc, store, .{ .atom = "visibility" }, .{ .string = "pub" });
+    const fn_meta = try ast_data.makeList(alloc, store, &.{vis_pair});
+    return ast_data.makeTuple3(alloc, store, .{ .atom = "fn" }, fn_meta, clauses);
+}
+
+/// Build test functions from a describe block.
+/// Returns a __block__ containing:
+///   - function declarations (test_*)
+///   - tracking call expressions (begin_test; call; end_test; print_result; ".")
+fn buildTestFunctions(
+    alloc: Allocator,
+    store: *AllocationStore,
+    describe_name: []const u8,
+    body: CtValue,
+    setup_body: CtValue,
+    teardown_body: CtValue,
+) !CtValue {
+    if (body != .tuple or body.tuple.elems.len != 3) return .nil;
+    const form = body.tuple.elems[0];
+    const args = body.tuple.elems[2];
+    if (form != .atom or !std.mem.eql(u8, form.atom, "__block__") or args != .list) return .nil;
+
+    const desc_slug = try slugifyString(alloc, describe_name);
+    const empty = try ast_data.emptyList(alloc, store);
+    var result_items: std.ArrayListUnmanaged(CtValue) = .empty;
+
+    for (args.list.elems) |stmt| {
+        if (isCallNamed(stmt, "setup") or isCallNamed(stmt, "teardown")) continue;
+
+        if (isCallNamed(stmt, "test")) {
+            const test_args = stmt.tuple.elems[2];
+            if (test_args != .list or test_args.list.elems.len < 2) continue;
+
+            const test_name_str = extractString(test_args.list.elems[0]) orelse continue;
+            const test_slug = try slugifyString(alloc, test_name_str);
+            const fn_name = try std.fmt.allocPrint(alloc, "test_{s}_{s}", .{ desc_slug, test_slug });
+
+            // Determine test body
+            const has_context = test_args.list.elems.len == 3 and setup_body != .nil;
+            const raw_body = if (has_context) test_args.list.elems[2] else test_args.list.elems[test_args.list.elems.len - 1];
+
+            // Build function body: [setup?; body_stmts...; teardown?; "ok"]
+            var fn_body_stmts: std.ArrayListUnmanaged(CtValue) = .empty;
+            if (has_context) {
+                const ctx_var = try ast_data.makeTuple3(alloc, store, .{ .atom = "ctx" }, empty, .nil);
+                const ctx_assign = try ast_data.makeTuple3(alloc, store, .{ .atom = "=" }, empty, try ast_data.makeList(alloc, store, &.{ ctx_var, setup_body }));
+                try fn_body_stmts.append(alloc, ctx_assign);
+            }
+            // Flatten __block__ bodies
+            if (raw_body == .tuple and raw_body.tuple.elems.len == 3 and
+                raw_body.tuple.elems[0] == .atom and std.mem.eql(u8, raw_body.tuple.elems[0].atom, "__block__") and
+                raw_body.tuple.elems[2] == .list)
+            {
+                for (raw_body.tuple.elems[2].list.elems) |inner| try fn_body_stmts.append(alloc, inner);
+            } else {
+                try fn_body_stmts.append(alloc, raw_body);
+            }
+            if (teardown_body != .nil) try fn_body_stmts.append(alloc, teardown_body);
+            try fn_body_stmts.append(alloc, .{ .string = "ok" });
+
+            const fn_body = try ast_data.makeTuple3(alloc, store, .{ .atom = "__block__" }, empty, try ast_data.makeListFromSlice(alloc, store, fn_body_stmts.items));
+            const fn_decl = try buildTestFnDecl(alloc, store, fn_name, fn_body);
+            try result_items.append(alloc, fn_decl);
+
+            // Tracking call: begin_test(); test_fn(); end_test(); print_result(); "."
+            const tracking = try ast_data.makeTuple3(alloc, store, .{ .atom = "__block__" }, empty, try ast_data.makeList(alloc, store, &.{
+                try buildCall0(alloc, store, "begin_test"),
+                try buildCall0(alloc, store, fn_name),
+                try buildCall0(alloc, store, "end_test"),
+                try buildCall0(alloc, store, "print_result"),
+                .{ .string = "." },
+            }));
+            try result_items.append(alloc, tracking);
+        } else {
+            try result_items.append(alloc, stmt);
+        }
+    }
+
+    // Return as __block__ (mixed content: fn decls + tracking exprs)
+    return ast_data.makeTuple3(alloc, store, .{ .atom = "__block__" }, empty, try ast_data.makeListFromSlice(alloc, store, result_items.items));
+}
+
+/// Build a standalone test function + tracking call.
+fn buildSingleTestFunction(alloc: Allocator, store: *AllocationStore, name: []const u8, body: CtValue) !CtValue {
+    const slug = try slugifyString(alloc, name);
+    const fn_name = try std.fmt.allocPrint(alloc, "test_{s}", .{slug});
+    const empty = try ast_data.emptyList(alloc, store);
+
+    var fn_body_stmts: std.ArrayListUnmanaged(CtValue) = .empty;
+    if (body == .tuple and body.tuple.elems.len == 3 and
+        body.tuple.elems[0] == .atom and std.mem.eql(u8, body.tuple.elems[0].atom, "__block__") and
+        body.tuple.elems[2] == .list)
+    {
+        for (body.tuple.elems[2].list.elems) |inner| try fn_body_stmts.append(alloc, inner);
+    } else {
+        try fn_body_stmts.append(alloc, body);
+    }
+    try fn_body_stmts.append(alloc, .{ .string = "ok" });
+
+    const fn_body = try ast_data.makeTuple3(alloc, store, .{ .atom = "__block__" }, empty, try ast_data.makeListFromSlice(alloc, store, fn_body_stmts.items));
+    const fn_decl = try buildTestFnDecl(alloc, store, fn_name, fn_body);
+
+    const tracking = try ast_data.makeTuple3(alloc, store, .{ .atom = "__block__" }, empty, try ast_data.makeList(alloc, store, &.{
+        try buildCall0(alloc, store, "begin_test"),
+        try buildCall0(alloc, store, fn_name),
+        try buildCall0(alloc, store, "end_test"),
+        try buildCall0(alloc, store, "print_result"),
+        .{ .string = "." },
+    }));
+
+    // Return as __block__ (mixed: fn decl + tracking expr)
+    return ast_data.makeTuple3(alloc, store, .{ .atom = "__block__" }, empty, try ast_data.makeList(alloc, store, &.{ fn_decl, tracking }));
 }

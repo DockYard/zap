@@ -8,6 +8,10 @@ pub module Zest.Case {
     Setup runs fresh before EACH test that requests context.
     Teardown runs after each test. Assertions are non-fatal.
 
+    The `describe` and `test` macros expand into function declarations
+    so that each test becomes a named pub function (test_*) that is
+    called at module level.
+
     ## Examples
 
         pub module Test.MyTest {
@@ -46,9 +50,9 @@ pub module Zest.Case {
   @doc = """
     Groups related tests under a descriptive label.
 
-    Scans the body for `setup` and `teardown` blocks. The setup
-    body is injected into each `test/3` call so it re-runs fresh
-    before every test. Teardown is injected after each test body.
+    Scans the body for `setup` and `teardown` blocks, then
+    transforms each `test` call into a pub function declaration
+    with begin_test/end_test/print_result tracking calls injected.
 
     ## Examples
 
@@ -64,15 +68,14 @@ pub module Zest.Case {
   pub macro describe(_name :: Expr, body :: Expr) -> Expr {
     _setup_body = find_setup(body)
     _teardown_body = find_teardown(body)
-    inject_setup(body, _setup_body, _teardown_body)
+    build_test_fns(_name, body, _setup_body, _teardown_body)
   }
 
   @doc = """
     Defines a test case without context.
 
-    Calls `begin_test` before running the body and `end_test`
-    after. If any assertion fails, the test is marked as failed
-    but execution continues (non-fatal).
+    Expands into a pub function declaration named test_<slugified_name>
+    with begin_test/end_test/print_result tracking calls wrapping the body.
 
     ## Examples
 
@@ -82,18 +85,40 @@ pub module Zest.Case {
     """
 
   pub macro test(_name :: Expr, body :: Expr) -> Expr {
-    quote {
-      :zig.TestTracker.begin_test()
-      unquote(body)
-      :zig.TestTracker.end_test()
-      "."
-    }
+    build_test_fn(_name, body)
+  }
+
+  @doc = """
+    Wraps `begin_test` for explicit use.
+    """
+
+  pub fn begin_test() -> Atom {
+    :zig.TestTracker.begin_test()
+    :ok
+  }
+
+  @doc = """
+    Wraps `end_test` for explicit use.
+    """
+
+  pub fn end_test() -> Atom {
+    :zig.TestTracker.end_test()
+    :ok
+  }
+
+  @doc = """
+    Wraps `print_result` for explicit use.
+    """
+
+  pub fn print_result() -> Atom {
+    :zig.TestTracker.print_result()
+    :ok
   }
 
   @doc = """
     Asserts that a boolean value is `true`.
 
-    Non-fatal: returns "F" on failure, does not stop execution.
+    Non-fatal: returns :fail on failure, does not stop execution.
     """
 
   pub fn assert(value :: Bool) -> String {

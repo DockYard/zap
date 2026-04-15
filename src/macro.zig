@@ -210,14 +210,6 @@ pub const MacroEngine = struct {
                     };
                     if (expanded_items.changed) changed = true;
                     for (expanded_items.items) |expanded_item| {
-                        // Register generated function declarations in the scope graph
-                        // so they're visible for call resolution in later pipeline passes.
-                        switch (expanded_item) {
-                            .function, .priv_function => |func| {
-                                self.registerGeneratedFunction(func, mod_scope);
-                            },
-                            else => {},
-                        }
                         try new_items.append(self.allocator, expanded_item);
                     }
                 },
@@ -1131,29 +1123,6 @@ pub const MacroEngine = struct {
     }
 
     // ============================================================
-    // Generated declaration registration
-    // ============================================================
-
-    /// Register a macro-generated function declaration in the scope graph
-    /// so it's visible for call resolution in later pipeline passes.
-    fn registerGeneratedFunction(self: *MacroEngine, func: *const ast.FunctionDecl, mod_scope: ?scope.ScopeId) void {
-        const parent = mod_scope orelse return;
-        for (func.clauses, 0..) |clause, clause_idx| {
-            const arity: u32 = @intCast(clause.params.len);
-            const key = scope.FamilyKey{ .name = func.name, .arity = arity };
-            const parent_data = self.graph.getScopeMut(parent);
-            if (!parent_data.function_families.contains(key)) {
-                const family_id = self.graph.createFamily(parent, func.name, arity, func.visibility) catch return;
-                const family = &self.graph.families.items[family_id];
-                family.clauses.append(self.allocator, .{
-                    .decl = func,
-                    .clause_index = @intCast(clause_idx),
-                }) catch return;
-            }
-        }
-    }
-
-    // ============================================================
     // Module-level expression expansion
     // ============================================================
 
@@ -1166,6 +1135,23 @@ pub const MacroEngine = struct {
     /// that produces a function declaration (or other module item), convert
     /// it to the appropriate ModuleItem variant. Otherwise keep it as a
     /// module_level_expr for collection into a generated run/0 function.
+    /// Patch a generated module item's source span so the scope collector
+    /// and HIR builder can associate it with the correct module scope.
+    fn patchModuleItemSpan(mi: ast.ModuleItem, span: ast.SourceSpan) ast.ModuleItem {
+        switch (mi) {
+            .function, .priv_function => |func| {
+                const mf = @constCast(func);
+                mf.meta.span = span;
+                const clauses_mut = @constCast(mf.clauses);
+                for (clauses_mut) |*clause| {
+                    clause.meta.span = span;
+                }
+            },
+            else => {},
+        }
+        return mi;
+    }
+
     fn expandModuleLevelExpr(self: *MacroEngine, expr: *const ast.Expr) !ExpandedModuleItems {
         // Check if this is a macro call (identifier + args)
         if (expr.* == .call and expr.call.callee.* == .var_ref) {
@@ -1190,13 +1176,17 @@ pub const MacroEngine = struct {
                         return .{ .items = items, .changed = expanded.changed };
                     };
 
-                    // Try converting the result to module items
+                    // Try converting the result to module items.
+                    // Patch source spans so generated declarations inherit the call site's
+                    // position — this ensures the scope collector associates them with the
+                    // correct module scope (not the default prelude scope).
                     const interner_mut: *ast.StringInterner = @constCast(self.interner);
+                    const call_span = expr.call.meta.span;
 
                     // Single module item (e.g., function declaration)
                     if (ast_data.ctValueToModuleItem(self.allocator, interner_mut, result_ct) catch null) |mi| {
                         const items = try self.allocator.alloc(ast.ModuleItem, 1);
-                        items[0] = mi;
+                        items[0] = patchModuleItemSpan(mi, call_span);
                         return .{ .items = items, .changed = true };
                     }
 
@@ -1223,25 +1213,43 @@ pub const MacroEngine = struct {
                                         var items: std.ArrayList(ast.ModuleItem) = .empty;
                                         for (result_ct.tuple.elems[2].list.elems) |elem| {
                                             if (ast_data.ctValueToModuleItem(self.allocator, interner_mut, elem) catch null) |mi| {
-                                                try items.append(self.allocator, mi);
+                                                try items.append(self.allocator, patchModuleItemSpan(mi, call_span));
+                                            }
+                                        }
+                                        if (items.items.len > 0) {
+                                            return .{ .items = try items.toOwnedSlice(self.allocator), .changed = true };
+                                        }
+                                    } else {
+                                        // Mixed content: extract each element individually.
+                                        // Function declarations → ModuleItem::function
+                                        // Expressions → ModuleItem::module_level_expr
+                                        var items: std.ArrayList(ast.ModuleItem) = .empty;
+                                        for (result_ct.tuple.elems[2].list.elems) |elem_expr| {
+                                            if (ast_data.ctValueToModuleItem(self.allocator, interner_mut, elem_expr) catch null) |mi| {
+                                                try items.append(self.allocator, patchModuleItemSpan(mi, call_span));
+                                            } else {
+                                                const converted = ast_data.ctValueToExpr(self.allocator, self.interner, elem_expr) catch continue;
+                                                try items.append(self.allocator, .{ .module_level_expr = converted });
                                             }
                                         }
                                         if (items.items.len > 0) {
                                             return .{ .items = try items.toOwnedSlice(self.allocator), .changed = true };
                                         }
                                     }
-                                    // Mixed content: keep as single block expression
                                 }
                             }
                         }
                     }
 
-                    // List of module items
+                    // List of module items (may be mixed with expressions)
                     if (result_ct == .list) {
                         var items: std.ArrayList(ast.ModuleItem) = .empty;
-                        for (result_ct.list.elems) |elem| {
-                            if (ast_data.ctValueToModuleItem(self.allocator, interner_mut, elem) catch null) |mi| {
-                                try items.append(self.allocator, mi);
+                        for (result_ct.list.elems) |list_elem| {
+                            if (ast_data.ctValueToModuleItem(self.allocator, interner_mut, list_elem) catch null) |mi| {
+                                try items.append(self.allocator, patchModuleItemSpan(mi, call_span));
+                            } else {
+                                const list_expr = ast_data.ctValueToExpr(self.allocator, self.interner, list_elem) catch continue;
+                                try items.append(self.allocator, .{ .module_level_expr = list_expr });
                             }
                         }
                         if (items.items.len > 0) {

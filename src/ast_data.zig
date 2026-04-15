@@ -673,6 +673,47 @@ pub fn ctValueToExpr(
         return expr;
     }
 
+    // Bare primitive CtValues — convert directly to AST expressions.
+    // This handles cases where macro-generated function bodies contain
+    // bare strings, atoms, ints, etc. that are not wrapped in 3-tuples.
+    if (value == .string) {
+        const expr = try alloc.create(ast.Expr);
+        expr.* = .{ .string_literal = .{ .meta = meta, .value = try interner.intern(value.string) } };
+        return expr;
+    }
+    if (value == .int) {
+        const expr = try alloc.create(ast.Expr);
+        expr.* = .{ .int_literal = .{ .meta = meta, .value = value.int } };
+        return expr;
+    }
+    if (value == .float) {
+        const expr = try alloc.create(ast.Expr);
+        expr.* = .{ .float_literal = .{ .meta = meta, .value = value.float } };
+        return expr;
+    }
+    if (value == .bool_val) {
+        const expr = try alloc.create(ast.Expr);
+        expr.* = .{ .bool_literal = .{ .meta = meta, .value = value.bool_val } };
+        return expr;
+    }
+    if (value == .atom) {
+        // Atoms prefixed with ":" are atom literals; otherwise treat as variable references
+        if (value.atom.len > 0 and value.atom[0] == ':') {
+            const expr = try alloc.create(ast.Expr);
+            expr.* = .{ .atom_literal = .{ .meta = meta, .value = try interner.intern(value.atom[1..]) } };
+            return expr;
+        } else if (value.atom.len > 0 and (value.atom[0] == '_' or std.ascii.isLower(value.atom[0]))) {
+            const expr = try alloc.create(ast.Expr);
+            expr.* = .{ .var_ref = .{ .meta = meta, .name = try interner.intern(value.atom) } };
+            return expr;
+        }
+    }
+    if (value == .nil) {
+        const expr = try alloc.create(ast.Expr);
+        expr.* = .{ .nil_literal = .{ .meta = meta } };
+        return expr;
+    }
+
     // Must be a 3-tuple: {form, metadata, args}
     if (value != .tuple or value.tuple.elems.len != 3) {
         // Fallback: nil literal

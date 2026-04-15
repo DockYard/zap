@@ -1320,6 +1320,11 @@ pub const TestTracker = struct {
     pub fn end_test() void {
         if (current_test_failed) {
             test_failures += 1;
+        }
+    }
+
+    pub fn print_result() void {
+        if (current_test_failed) {
             print_fail();
         } else {
             print_dot();
