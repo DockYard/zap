@@ -2112,13 +2112,11 @@ pub const HirBuilder = struct {
             }
             if (belongs_to_module) continue; // Already handled via fn_groups
 
-            var decl_list: std.ArrayList(*const ast.FunctionDecl) = .empty;
-            for (family.clauses.items) |clause_ref| {
-                try decl_list.append(self.allocator, clause_ref.decl);
-            }
-            if (decl_list.items.len > 0) {
-                try functions.append(self.allocator, try self.buildMergedFunctionGroup(decl_list.items, mod_scope));
-            }
+            // Skip function families from other modules — they will be
+            // compiled when their own module is processed. Including them
+            // here would compile unexpanded AST (e.g., if_expr not yet
+            // desugared) from foreign modules.
+            continue;
         }
 
         return .{
