@@ -1120,6 +1120,41 @@ pub const Prelude = struct {
         return @bitReverse(x);
     }
 
+    // --- Integer predicates ---
+    pub fn sign_i64(x: i64) i64 {
+        if (x > 0) return 1;
+        if (x < 0) return -1;
+        return 0;
+    }
+
+    pub fn even_i64(x: i64) bool {
+        return @rem(x, 2) == 0;
+    }
+
+    pub fn odd_i64(x: i64) bool {
+        return @rem(x, 2) != 0;
+    }
+
+    pub fn gcd_i64(a: i64, b: i64) i64 {
+        var x = if (a < 0) -a else a;
+        var y = if (b < 0) -b else b;
+        while (y != 0) {
+            const t = y;
+            y = @rem(x, t);
+            x = t;
+        }
+        return x;
+    }
+
+    pub fn lcm_i64(a: i64, b: i64) i64 {
+        if (a == 0 and b == 0) return 0;
+        const g = gcd_i64(a, b);
+        if (g == 0) return 0;
+        const abs_a = if (a < 0) -a else a;
+        const abs_b = if (b < 0) -b else b;
+        return @divTrunc(abs_a, g) * abs_b;
+    }
+
     // --- Saturating arithmetic ---
     pub fn add_sat_i64(a: i64, b: i64) i64 {
         return a +| b;
@@ -1175,11 +1210,11 @@ pub const Prelude = struct {
     }
 
     pub fn trim_leading(s: []const u8) []const u8 {
-        return std.mem.trimLeft(u8, s, " \t\n\r");
+        return std.mem.trimStart(u8, s, " \t\n\r");
     }
 
     pub fn trim_trailing(s: []const u8) []const u8 {
-        return std.mem.trimRight(u8, s, " \t\n\r");
+        return std.mem.trimEnd(u8, s, " \t\n\r");
     }
 
     pub fn string_count(haystack: []const u8, needle: []const u8) i64 {

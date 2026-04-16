@@ -406,15 +406,7 @@ pub module Integer {
     """
 
   pub fn sign(value :: i64) -> i64 {
-    if value > 0 {
-      1
-    } else {
-      if value < 0 {
-        -1
-      } else {
-        0
-      }
-    }
+    :zig.Prelude.sign_i64(value)
   }
 
   @doc = """
@@ -428,7 +420,7 @@ pub module Integer {
     """
 
   pub fn even?(value :: i64) -> Bool {
-    Integer.remainder(value, 2) == 0
+    :zig.Prelude.even_i64(value)
   }
 
   @doc = """
@@ -442,7 +434,7 @@ pub module Integer {
     """
 
   pub fn odd?(value :: i64) -> Bool {
-    Integer.remainder(value, 2) != 0
+    :zig.Prelude.odd_i64(value)
   }
 
   @doc = """
@@ -457,15 +449,7 @@ pub module Integer {
     """
 
   pub fn gcd(first :: i64, second :: i64) -> i64 {
-    gcd_helper(Integer.abs(first), Integer.abs(second))
-  }
-
-  fn gcd_helper(first :: i64, second :: i64) -> i64 {
-    if second == 0 {
-      first
-    } else {
-      gcd_helper(second, Integer.remainder(first, second))
-    }
+    :zig.Prelude.gcd_i64(first, second)
   }
 
   @doc = """
@@ -479,10 +463,6 @@ pub module Integer {
     """
 
   pub fn lcm(first :: i64, second :: i64) -> i64 {
-    if first == 0 and second == 0 {
-      0
-    } else {
-      Integer.abs(first * second) / Integer.gcd(first, second)
-    }
+    :zig.Prelude.lcm_i64(first, second)
   }
 }
