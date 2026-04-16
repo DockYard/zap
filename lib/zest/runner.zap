@@ -37,18 +37,22 @@ pub module Zest.Runner {
   }
 
   @doc = """
-    Parses `--seed` from CLI arguments and applies it to the
-    test tracker. If `--seed <integer>` is present, sets the
-    seed explicitly for reproducible ordering. Otherwise the
-    tracker generates a seed from the system clock.
+    Parses `--seed` and `--timeout` from CLI arguments and applies
+    them to the test tracker. If `--seed <integer>` is present,
+    sets the seed explicitly for reproducible ordering. Otherwise
+    the tracker generates a seed from the system clock.
 
-    Call this before running any tests to ensure the seed is
-    set for deterministic ordering.
+    If `--timeout <milliseconds>` is present, sets a per-test
+    timeout. Tests exceeding the timeout are marked as failed
+    with a yellow "T" indicator.
+
+    Call this before running any tests to ensure the seed and
+    timeout are set.
     """
 
   pub fn configure() -> Atom {
-    parse_seed_arg(0, System.arg_count())
-  }
+    parse_cli_args(0, System.arg_count())
+  end
 
   @doc = """
     Prints the test summary with counts and exits with a
@@ -75,23 +79,32 @@ pub module Zest.Runner {
 
   @doc = """
     Recursively scans CLI arguments for `--seed <value>` and
-    sets the test tracker seed when found.
+    `--timeout <milliseconds>`, applying each to the test tracker.
     """
 
-  pub fn parse_seed_arg(index :: i64, count :: i64) -> Atom {
+  pub fn parse_cli_args(index :: i64, count :: i64) -> Atom {
     if index >= count {
       :ok
     } else {
       if System.arg_at(index) == "--seed" {
         if index + 1 < count {
           :zig.TestTracker.set_seed(Integer.parse(System.arg_at(index + 1)))
-          :ok
+          parse_cli_args(index + 2, count)
         } else {
           :ok
         }
       } else {
-        parse_seed_arg(index + 1, count)
+        if System.arg_at(index) == "--timeout" {
+          if index + 1 < count {
+            :zig.TestTracker.set_timeout(Integer.parse(System.arg_at(index + 1)))
+            parse_cli_args(index + 2, count)
+          } else {
+            :ok
+          }
+        } else {
+          parse_cli_args(index + 1, count)
+        }
       }
     }
-  }
+  end
 }

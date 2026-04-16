@@ -26,26 +26,28 @@ pub fn readLockfile(alloc: std.mem.Allocator, project_root: []const u8) ?[]const
     const content = std.Io.Dir.cwd().readFileAlloc(io, lock_path, alloc, .limited(1024 * 1024)) catch return null;
 
     var entries: std.ArrayListUnmanaged(LockEntry) = .empty;
-    var lines = std.mem.splitScalar(u8, content, '\n');
-    while (lines.next()) |line| {
+    var rest: []const u8 = content;
+    while (rest.len > 0) {
+        const line, const remaining = std.mem.cutScalar(u8, rest, '\n') orelse .{ rest, "" };
+        rest = remaining;
+
         // Skip comments and empty lines
         if (line.len == 0) continue;
         if (line[0] == '#') continue;
 
-        var fields = std.mem.splitScalar(u8, line, '\t');
-        const name = fields.next() orelse continue;
-        const source_type = fields.next() orelse continue;
-        const url = fields.next() orelse continue;
-        const resolved_ref = fields.next() orelse continue;
-        const commit = fields.next() orelse continue;
-        const integrity = fields.next() orelse continue;
+        // Parse tab-separated fields using std.mem.cutScalar (Zig 0.16)
+        const name, const after_name = std.mem.cutScalar(u8, line, '\t') orelse continue;
+        const source_type, const after_type = std.mem.cutScalar(u8, after_name, '\t') orelse continue;
+        const url_field, const after_url = std.mem.cutScalar(u8, after_type, '\t') orelse continue;
+        const resolved_ref, const after_ref = std.mem.cutScalar(u8, after_url, '\t') orelse continue;
+        const commit_field, const integrity = std.mem.cutScalar(u8, after_ref, '\t') orelse continue;
 
         entries.append(alloc, .{
             .name = name,
             .source_type = source_type,
-            .url = url,
+            .url = url_field,
             .resolved_ref = resolved_ref,
-            .commit = commit,
+            .commit = commit_field,
             .integrity = integrity,
         }) catch continue;
     }

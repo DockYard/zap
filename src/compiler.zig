@@ -52,6 +52,10 @@ pub const CompileOptions = struct {
     ctfe_target: ?[]const u8 = null,
     /// Optimize mode used when hashing CTFE cache keys.
     ctfe_optimize: ?[]const u8 = null,
+    /// Io instance for parallel compilation. When set with level_boundaries,
+    /// modules within the same dependency level are compiled concurrently
+    /// using Io.Group.
+    io: ?std.Io = null,
 };
 
 fn ctfeCompileOptionsHash(options: CompileOptions) u64 {
@@ -629,7 +633,15 @@ pub fn mergeAndFinalize(
     alloc: std.mem.Allocator,
     ir_program: *ir.Program,
 ) CompileError!CompileResult {
-    var pipeline_result = zap.analysis_pipeline.runAnalysisPipeline(alloc, ir_program) catch {
+    return mergeAndFinalizeWithIo(alloc, ir_program, null);
+}
+
+fn mergeAndFinalizeWithIo(
+    alloc: std.mem.Allocator,
+    ir_program: *ir.Program,
+    pio: ?std.Io,
+) CompileError!CompileResult {
+    var pipeline_result = zap.analysis_pipeline.runAnalysisPipelineWithIo(alloc, ir_program, pio) catch {
         return error.IrFailed;
     };
     zap.contification_rewrite.rewriteContifiedContinuations(alloc, ir_program, &pipeline_result.context) catch |err| switch (err) {
@@ -797,15 +809,111 @@ pub fn compileModuleByModule(
     module_order: []const []const u8,
     options: CompileOptions,
 ) CompileError!CompileResult {
-    // progress writer: use debug.print in 0.16
+    const pio = options.io;
 
     // Collect all IR functions and type defs across modules
-    var all_functions : std.ArrayListUnmanaged(ir.Function) = .empty;
-    var all_type_defs : std.ArrayListUnmanaged(ir.TypeDef) = .empty;
+    var all_functions: std.ArrayListUnmanaged(ir.Function) = .empty;
+    var all_type_defs: std.ArrayListUnmanaged(ir.TypeDef) = .empty;
     var entry_id: ?ir.FunctionId = null;
     var func_id_offset: u32 = 0;
 
-    // Process each module in dependency order
+    // If we have level boundaries and a valid Io, compile modules in parallel
+    // within each dependency level. Modules at the same level have no
+    // inter-dependencies and can safely compile concurrently.
+    if (options.level_boundaries) |boundaries| {
+        if (pio != null and boundaries.len > 0) {
+            const io_val = pio.?;
+            var level_start: usize = 0;
+            for (boundaries) |boundary| {
+                const level_end: usize = @intCast(boundary);
+                const level_modules = module_order[level_start..level_end];
+
+                if (level_modules.len > 1) {
+                    // Parallel: compile all modules in this level concurrently
+                    const task_results = alloc.alloc(ModuleCompileResult, level_modules.len) catch
+                        return error.OutOfMemory;
+                    defer alloc.free(task_results);
+
+                    var group: std.Io.Group = .init;
+                    for (level_modules, 0..) |mod_name, i| {
+                        task_results[i] = .{ .err = false };
+                        if (options.show_progress) {
+                            std.debug.print("\r\x1b[K  [level] {s}", .{mod_name});
+                        }
+                        group.async(io_val, compileModuleTask, .{ alloc, ctx, mod_name, options, &task_results[i] });
+                    }
+                    group.await(io_val) catch {};
+
+                    // Check results and merge
+                    for (task_results) |result| {
+                        if (result.err) return error.IrFailed;
+                    }
+                } else if (level_modules.len == 1) {
+                    // Single module in level: compile directly (no concurrency overhead)
+                    const mod_name = level_modules[0];
+                    if (options.show_progress) {
+                        std.debug.print("\r\x1b[K  [module] {s}", .{mod_name});
+                    }
+                    const unit = lookupCompilationUnit(ctx, mod_name) orelse {
+                        ctx.diag_engine.err("Module compilation unit disappeared during per-module compilation", .{ .start = 0, .end = 0 }) catch {};
+                        emitDiagnostics(&ctx.diag_engine, alloc);
+                        return error.CollectFailed;
+                    };
+                    try compileFile(alloc, ctx, unit, options);
+                }
+
+                // Merge this level's results into combined program
+                for (level_modules) |mod_name| {
+                    const unit = lookupCompilationUnit(ctx, mod_name) orelse continue;
+                    const mod_ir = unit.ir_program orelse return error.IrFailed;
+                    for (mod_ir.functions) |func| {
+                        const adjusted = try cloneFunctionWithOffset(alloc, func, func_id_offset);
+                        all_functions.append(alloc, adjusted) catch return error.OutOfMemory;
+                    }
+                    if (mod_ir.entry) |eid| {
+                        entry_id = func_id_offset + eid;
+                    }
+                    func_id_offset += @intCast(mod_ir.functions.len);
+                    for (mod_ir.type_defs) |td| {
+                        all_type_defs.append(alloc, td) catch return error.OutOfMemory;
+                    }
+                }
+
+                level_start = level_end;
+            }
+
+            // Handle any remaining modules after the last boundary
+            for (module_order[level_start..]) |mod_name| {
+                if (options.show_progress) {
+                    std.debug.print("\r\x1b[K  [module] {s}", .{mod_name});
+                }
+                const unit = lookupCompilationUnit(ctx, mod_name) orelse continue;
+                try compileFile(alloc, ctx, unit, options);
+                const mod_ir = unit.ir_program orelse return error.IrFailed;
+                for (mod_ir.functions) |func| {
+                    const adjusted = try cloneFunctionWithOffset(alloc, func, func_id_offset);
+                    all_functions.append(alloc, adjusted) catch return error.OutOfMemory;
+                }
+                if (mod_ir.entry) |eid| {
+                    entry_id = func_id_offset + eid;
+                }
+                func_id_offset += @intCast(mod_ir.functions.len);
+                for (mod_ir.type_defs) |td| {
+                    all_type_defs.append(alloc, td) catch return error.OutOfMemory;
+                }
+            }
+
+            // Build merged IR program
+            var merged_ir = ir.Program{
+                .functions = all_functions.items,
+                .type_defs = all_type_defs.items,
+                .entry = entry_id,
+            };
+            return mergeAndFinalizeWithIo(alloc, &merged_ir, pio);
+        }
+    }
+
+    // Fallback: sequential compilation (no level_boundaries or no Io)
     for (module_order, 0..) |mod_name, mod_idx| {
         if (options.show_progress) {
             std.debug.print("\r\x1b[K  [module {d}/{d}] {s}", .{ mod_idx + 1, module_order.len, mod_name });
@@ -841,6 +949,30 @@ pub fn compileModuleByModule(
 
     // Run analysis pipeline on merged result
     return mergeAndFinalize(alloc, &merged_ir);
+}
+
+const ModuleCompileResult = struct {
+    err: bool = false,
+};
+
+fn compileModuleTask(
+    alloc: std.mem.Allocator,
+    ctx: *CompilationContext,
+    mod_name: []const u8,
+    options: CompileOptions,
+    result: *ModuleCompileResult,
+) void {
+    const unit = lookupCompilationUnit(ctx, mod_name) orelse {
+        result.err = true;
+        return;
+    };
+    compileFile(alloc, ctx, unit, options) catch {
+        result.err = true;
+        return;
+    };
+    if (unit.ir_program == null) {
+        result.err = true;
+    }
 }
 
 /// Extract a single-module ast.Program from the merged program.

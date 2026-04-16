@@ -120,6 +120,20 @@ extern "c" fn zir_builder_emit_struct_init_typed(handle: ?*ZirBuilderHandle, str
 extern "c" fn zir_builder_emit_tuple_decl(handle: ?*ZirBuilderHandle, types_ptr: [*]const u32, types_len: u32) u32;
 extern "c" fn zir_builder_emit_tuple_decl_body(handle: ?*ZirBuilderHandle, types_ptr: [*]const u32, types_len: u32) u32;
 
+// Short-circuit boolean operators (Zig 0.16 bool_br_and / bool_br_or ZIR instructions)
+extern "c" fn zir_builder_emit_bool_br_and(handle: ?*ZirBuilderHandle, lhs: u32, rhs_body_ptr: [*]const u32, rhs_body_len: u32, rhs_result: u32) u32;
+extern "c" fn zir_builder_emit_bool_br_or(handle: ?*ZirBuilderHandle, lhs: u32, rhs_body_ptr: [*]const u32, rhs_body_len: u32, rhs_result: u32) u32;
+
+// Stack allocation (Zig 0.16 alloc/load ZIR instructions for non-escaping values)
+extern "c" fn zir_builder_emit_alloc(handle: ?*ZirBuilderHandle, type_ref: u32) u32;
+extern "c" fn zir_builder_emit_alloc_mut(handle: ?*ZirBuilderHandle, type_ref: u32) u32;
+extern "c" fn zir_builder_emit_load(handle: ?*ZirBuilderHandle, ptr_ref: u32) u32;
+extern "c" fn zir_builder_emit_make_ptr_const(handle: ?*ZirBuilderHandle, alloc_ref: u32) u32;
+
+// Loop instructions (Zig 0.16 loop/repeat ZIR instructions)
+extern "c" fn zir_builder_emit_loop(handle: ?*ZirBuilderHandle, body_ptr: [*]const u32, body_len: u32) u32;
+extern "c" fn zir_builder_emit_repeat(handle: ?*ZirBuilderHandle) i32;
+
 // Body management
 extern "c" fn zir_builder_pop_body_inst(handle: ?*ZirBuilderHandle) u32;
 
@@ -130,6 +144,80 @@ extern "c" fn zir_builder_inject_module(builder_handle: ?*ZirBuilderHandle, comp
 // Module management
 extern "c" fn zir_compilation_add_module(ctx: ?*ZirContext, name: [*:0]const u8, source_path: [*:0]const u8) i32;
 extern "c" fn zir_compilation_add_module_source(ctx: ?*ZirContext, name: [*:0]const u8, source_ptr: [*]const u8, source_len: u32) i32;
+
+// Pointer casting
+extern "c" fn zir_builder_emit_ptr_cast(handle: ?*ZirBuilderHandle, dest_type: u32, operand: u32) u32;
+extern "c" fn zir_builder_emit_ptr_cast_full(handle: ?*ZirBuilderHandle, flags_bits: u8, dest_type: u32, operand: u32) u32;
+
+// Debug and validation
+extern "c" fn zir_builder_emit_dbg_stmt(handle: ?*ZirBuilderHandle, line: u32, column: u32) i32;
+extern "c" fn zir_builder_emit_ensure_result_used(handle: ?*ZirBuilderHandle, operand: u32) i32;
+
+// Math builtins (unary float operations — Zig 0.16 @sqrt, @sin, etc.)
+extern "c" fn zir_builder_emit_sqrt(handle: ?*ZirBuilderHandle, operand: u32) u32;
+extern "c" fn zir_builder_emit_sin(handle: ?*ZirBuilderHandle, operand: u32) u32;
+extern "c" fn zir_builder_emit_cos(handle: ?*ZirBuilderHandle, operand: u32) u32;
+extern "c" fn zir_builder_emit_exp(handle: ?*ZirBuilderHandle, operand: u32) u32;
+extern "c" fn zir_builder_emit_exp2(handle: ?*ZirBuilderHandle, operand: u32) u32;
+extern "c" fn zir_builder_emit_log(handle: ?*ZirBuilderHandle, operand: u32) u32;
+extern "c" fn zir_builder_emit_log2(handle: ?*ZirBuilderHandle, operand: u32) u32;
+extern "c" fn zir_builder_emit_log10(handle: ?*ZirBuilderHandle, operand: u32) u32;
+extern "c" fn zir_builder_emit_abs(handle: ?*ZirBuilderHandle, operand: u32) u32;
+extern "c" fn zir_builder_emit_floor(handle: ?*ZirBuilderHandle, operand: u32) u32;
+extern "c" fn zir_builder_emit_ceil(handle: ?*ZirBuilderHandle, operand: u32) u32;
+extern "c" fn zir_builder_emit_round(handle: ?*ZirBuilderHandle, operand: u32) u32;
+extern "c" fn zir_builder_emit_trunc_float(handle: ?*ZirBuilderHandle, operand: u32) u32;
+
+// Saturating arithmetic (Zig 0.16 +|, -|, *|, <<|)
+extern "c" fn zir_builder_emit_add_sat(handle: ?*ZirBuilderHandle, lhs: u32, rhs: u32) u32;
+extern "c" fn zir_builder_emit_sub_sat(handle: ?*ZirBuilderHandle, lhs: u32, rhs: u32) u32;
+extern "c" fn zir_builder_emit_mul_sat(handle: ?*ZirBuilderHandle, lhs: u32, rhs: u32) u32;
+extern "c" fn zir_builder_emit_shl_sat(handle: ?*ZirBuilderHandle, lhs: u32, rhs: u32) u32;
+
+// Overflow-detecting arithmetic (returns struct {result, overflow_bit})
+extern "c" fn zir_builder_emit_add_with_overflow(handle: ?*ZirBuilderHandle, lhs: u32, rhs: u32) u32;
+extern "c" fn zir_builder_emit_sub_with_overflow(handle: ?*ZirBuilderHandle, lhs: u32, rhs: u32) u32;
+extern "c" fn zir_builder_emit_mul_with_overflow(handle: ?*ZirBuilderHandle, lhs: u32, rhs: u32) u32;
+
+// Type introspection (Zig 0.16 @sizeOf, @alignOf, etc.)
+extern "c" fn zir_builder_emit_size_of(handle: ?*ZirBuilderHandle, type_ref: u32) u32;
+extern "c" fn zir_builder_emit_align_of(handle: ?*ZirBuilderHandle, type_ref: u32) u32;
+extern "c" fn zir_builder_emit_bit_size_of(handle: ?*ZirBuilderHandle, type_ref: u32) u32;
+extern "c" fn zir_builder_emit_offset_of(handle: ?*ZirBuilderHandle, type_ref: u32, field_name: [*:0]const u8) u32;
+
+// Type naming
+extern "c" fn zir_builder_emit_tag_name(handle: ?*ZirBuilderHandle, operand: u32) u32;
+extern "c" fn zir_builder_emit_type_name(handle: ?*ZirBuilderHandle, type_ref: u32) u32;
+
+// Compile-time type checks (Zig 0.16 @hasDecl, @hasField)
+extern "c" fn zir_builder_emit_has_decl(handle: ?*ZirBuilderHandle, type_ref: u32, name: [*:0]const u8) u32;
+extern "c" fn zir_builder_emit_has_field(handle: ?*ZirBuilderHandle, type_ref: u32, name: [*:0]const u8) u32;
+
+// Pointer/integer conversions
+extern "c" fn zir_builder_emit_int_from_ptr(handle: ?*ZirBuilderHandle, operand: u32) u32;
+extern "c" fn zir_builder_emit_ptr_from_int(handle: ?*ZirBuilderHandle, operand: u32, type_ref: u32) u32;
+
+// Type reification (Zig 0.16 @Int, @Struct, @Enum, @Union, @Pointer, @Tuple replacing @Type)
+extern "c" fn zir_builder_emit_reify_int(handle: ?*ZirBuilderHandle, signedness_ref: u32, bit_count_ref: u32) u32;
+extern "c" fn zir_builder_emit_reify_struct(handle: ?*ZirBuilderHandle, layout_ref: u32, backing_ty_ref: u32, field_names_ref: u32, field_types_ref: u32, field_attrs_ref: u32) u32;
+extern "c" fn zir_builder_emit_reify_enum(handle: ?*ZirBuilderHandle, tag_ty_ref: u32, mode_ref: u32, field_names_ref: u32, field_values_ref: u32) u32;
+extern "c" fn zir_builder_emit_reify_union(handle: ?*ZirBuilderHandle, layout_ref: u32, arg_ty_ref: u32, field_names_ref: u32, field_types_ref: u32, field_attrs_ref: u32) u32;
+extern "c" fn zir_builder_emit_reify_pointer(handle: ?*ZirBuilderHandle, size_ref: u32, attrs_ref: u32, elem_ty_ref: u32, sentinel_ref: u32) u32;
+extern "c" fn zir_builder_emit_reify_tuple(handle: ?*ZirBuilderHandle, field_types_ref: u32) u32;
+
+// Vector/SIMD operations (Zig 0.16 @Vector, @splat, @shuffle, @reduce)
+extern "c" fn zir_builder_emit_vector_type(handle: ?*ZirBuilderHandle, len: u32, elem_type_ref: u32) u32;
+extern "c" fn zir_builder_emit_splat(handle: ?*ZirBuilderHandle, scalar: u32, len: u32) u32;
+extern "c" fn zir_builder_emit_shuffle(handle: ?*ZirBuilderHandle, a: u32, b: u32, mask: u32) u32;
+extern "c" fn zir_builder_emit_reduce(handle: ?*ZirBuilderHandle, operand: u32, operation: u8) u32;
+
+// Slice decomposition
+extern "c" fn zir_builder_emit_slice_start(handle: ?*ZirBuilderHandle, operand: u32, start: u32) u32;
+extern "c" fn zir_builder_emit_slice_end(handle: ?*ZirBuilderHandle, operand: u32, start: u32, end: u32) u32;
+extern "c" fn zir_builder_emit_slice_length(handle: ?*ZirBuilderHandle, operand: u32, start: u32, length: u32) u32;
+
+// Error union type construction
+extern "c" fn zir_builder_emit_error_union_type(handle: ?*ZirBuilderHandle, error_set: u32, payload: u32) u32;
 
 // ---------------------------------------------------------------------------
 // Error sentinel
@@ -156,8 +244,8 @@ fn mapBinopTag(op: ir.BinaryOp.Op) ?u8 {
         .gt => @intFromEnum(Zir.Inst.Tag.cmp_gt),
         .lte => @intFromEnum(Zir.Inst.Tag.cmp_lte),
         .gte => @intFromEnum(Zir.Inst.Tag.cmp_gte),
-        .bool_and => @intFromEnum(Zir.Inst.Tag.bit_and),
-        .bool_or => @intFromEnum(Zir.Inst.Tag.bit_or),
+        .bool_and => null, // handled via bool_br_and (short-circuit)
+        .bool_or => null, // handled via bool_br_or (short-circuit)
         .string_eq, .string_neq => null, // handled specially via std.mem.eql
         .concat => null, // TODO: array_cat
     };
@@ -353,6 +441,24 @@ pub const ZirDriver = struct {
         self.reuse_backed_union_locals.deinit(self.allocator);
         self.reuse_backed_tuple_locals.deinit(self.allocator);
         self.capture_param_refs.deinit(self.allocator);
+    }
+
+    /// Check if a function contains tail calls to itself (via IR tail_call instructions).
+    /// The IR builder already detects and marks tail-recursive calls as tail_call.
+    /// When present, the function body could be wrapped in a ZIR loop instruction
+    /// with tail calls converted to parameter updates + repeat, avoiding stack growth.
+    fn hasTailCalls(func: ir.Function) bool {
+        for (func.body) |block| {
+            for (block.instructions) |instr| {
+                switch (instr) {
+                    .tail_call => |tc| {
+                        if (std.mem.eql(u8, tc.name, func.name)) return true;
+                    },
+                    else => {},
+                }
+            }
+        }
+        return false;
     }
 
     /// Check if ARC operations should be skipped for a value.
@@ -1817,7 +1923,19 @@ pub const ZirDriver = struct {
 
             // Binary operations
             .binary_op => |bo| {
-                if (mapBinopTag(bo.op)) |tag| {
+                if (bo.op == .bool_and or bo.op == .bool_or) {
+                    // Emit short-circuit bool_br_and / bool_br_or ZIR instructions.
+                    // The RHS is wrapped in a body so it's only evaluated when needed.
+                    const lhs = self.refForLocal(bo.lhs) catch return;
+                    const rhs = self.refForLocal(bo.rhs) catch return;
+                    // Body is empty (RHS already evaluated as a local), just pass the result.
+                    const empty_body = [_]u32{};
+                    const ref = if (bo.op == .bool_and)
+                        self.emitBoolBrAnd(lhs, &empty_body, rhs) catch return error.EmitFailed
+                    else
+                        self.emitBoolBrOr(lhs, &empty_body, rhs) catch return error.EmitFailed;
+                    try self.setLocal(bo.dest, ref);
+                } else if (mapBinopTag(bo.op)) |tag| {
                     const lhs = self.refForLocal(bo.lhs) catch return;
                     const rhs = self.refForLocal(bo.rhs) catch return;
                     const ref = zir_builder_emit_binop(self.handle, tag, lhs, rhs);
@@ -2501,6 +2619,28 @@ pub const ZirDriver = struct {
                     }
                     try self.markReuseBackedStructLocal(si.dest, si.type_name);
                     try self.setLocal(si.dest, ptr_ref);
+                } else if (self.shouldSkipArc(si.dest)) {
+                    // Stack allocation path: escape analysis determined this value
+                    // does not escape the current function. Use ZIR alloc + store
+                    // to place it on the stack instead of the arena.
+                    _ = self.reuse_backed_struct_locals.remove(si.dest);
+                    // First create the struct value to get its type
+                    const seed_ref = zir_builder_emit_struct_init_anon(
+                        self.handle,
+                        names_ptrs.items.ptr,
+                        names_lens.items.ptr,
+                        values.items.ptr,
+                        @intCast(values.items.len),
+                    );
+                    if (seed_ref == error_ref) return error.EmitFailed;
+                    const type_ref = zir_builder_emit_typeof(self.handle, seed_ref);
+                    if (type_ref == error_ref) return error.EmitFailed;
+                    // Allocate on stack and store
+                    const alloc_ref = self.emitAlloc(type_ref) catch return error.EmitFailed;
+                    if (zir_builder_emit_store(self.handle, alloc_ref, seed_ref) != 0) return error.EmitFailed;
+                    const const_ptr = self.emitMakePtrConst(alloc_ref) catch return error.EmitFailed;
+                    const loaded = self.emitLoad(const_ptr) catch return error.EmitFailed;
+                    try self.setLocal(si.dest, loaded);
                 } else {
                     _ = self.reuse_backed_struct_locals.remove(si.dest);
                     const result = zir_builder_emit_struct_init_anon(
@@ -3586,6 +3726,63 @@ pub const ZirDriver = struct {
                 void_ref,
             );
         }
+    }
+
+    /// Emit a short-circuit boolean AND via ZIR bool_br_and instruction.
+    /// The rhs is only evaluated if lhs is true. Returns the ref for the result.
+    fn emitBoolBrAnd(self: *ZirDriver, lhs_ref: u32, rhs_body: []const u32, rhs_result: u32) BuildError!u32 {
+        const ref = zir_builder_emit_bool_br_and(self.handle, lhs_ref, rhs_body.ptr, @intCast(rhs_body.len), rhs_result);
+        if (ref == error_ref) return error.EmitFailed;
+        return ref;
+    }
+
+    /// Emit a short-circuit boolean OR via ZIR bool_br_or instruction.
+    /// The rhs is only evaluated if lhs is false. Returns the ref for the result.
+    fn emitBoolBrOr(self: *ZirDriver, lhs_ref: u32, rhs_body: []const u32, rhs_result: u32) BuildError!u32 {
+        const ref = zir_builder_emit_bool_br_or(self.handle, lhs_ref, rhs_body.ptr, @intCast(rhs_body.len), rhs_result);
+        if (ref == error_ref) return error.EmitFailed;
+        return ref;
+    }
+
+    /// Emit a stack allocation (ZIR alloc instruction).
+    /// Returns a pointer ref to the allocated memory.
+    fn emitAlloc(self: *ZirDriver, type_ref: u32) BuildError!u32 {
+        const ref = zir_builder_emit_alloc(self.handle, type_ref);
+        if (ref == error_ref) return error.EmitFailed;
+        return ref;
+    }
+
+    /// Emit a mutable stack allocation (ZIR alloc_mut instruction).
+    fn emitAllocMut(self: *ZirDriver, type_ref: u32) BuildError!u32 {
+        const ref = zir_builder_emit_alloc_mut(self.handle, type_ref);
+        if (ref == error_ref) return error.EmitFailed;
+        return ref;
+    }
+
+    /// Emit a load from a pointer (ZIR load instruction).
+    fn emitLoad(self: *ZirDriver, ptr_ref: u32) BuildError!u32 {
+        const ref = zir_builder_emit_load(self.handle, ptr_ref);
+        if (ref == error_ref) return error.EmitFailed;
+        return ref;
+    }
+
+    /// Emit make_ptr_const to finalize an alloc into a const pointer.
+    fn emitMakePtrConst(self: *ZirDriver, alloc_ref: u32) BuildError!u32 {
+        const ref = zir_builder_emit_make_ptr_const(self.handle, alloc_ref);
+        if (ref == error_ref) return error.EmitFailed;
+        return ref;
+    }
+
+    /// Emit a loop instruction with body. The body must contain a break or repeat.
+    fn emitLoop(self: *ZirDriver, body: []const u32) BuildError!u32 {
+        const ref = zir_builder_emit_loop(self.handle, body.ptr, @intCast(body.len));
+        if (ref == error_ref) return error.EmitFailed;
+        return ref;
+    }
+
+    /// Emit a repeat instruction (jump back to loop header).
+    fn emitRepeat(self: *ZirDriver) BuildError!void {
+        if (zir_builder_emit_repeat(self.handle) != 0) return error.EmitFailed;
     }
 
     /// Emit a switch_literal as a chain of if-else-bodies:

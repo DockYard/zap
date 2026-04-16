@@ -41,35 +41,25 @@ fn stdoutWrite(bytes: []const u8) void {
 // ============================================================
 // Arena Allocator
 // Uses std.heap.ArenaAllocator backed by page_allocator.
-// Thread-safe in Zig 0.16. Lazily initialized on first use.
+// Thread-safe and lock-free in Zig 0.16. Init is cheap (no
+// allocation until first use), so no lazy initialization needed.
 // ============================================================
 
-var runtime_arena: ?std.heap.ArenaAllocator = null;
-
-fn getArena() *std.heap.ArenaAllocator {
-    if (runtime_arena == null) {
-        runtime_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    }
-    return &runtime_arena.?;
-}
+var runtime_arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
 fn bumpAlloc(len: usize) []u8 {
-    const a = getArena();
     // Use alignedAlloc with pointer alignment (8 on 64-bit) so that bump-allocated
     // memory can safely be cast to pointer types via @ptrCast(@alignCast(...)).
-    const aligned = a.allocator().alignedAlloc(u8, .@"8", len) catch return &.{};
+    const aligned = runtime_arena.allocator().alignedAlloc(u8, .@"8", len) catch return &.{};
     return @alignCast(aligned);
 }
 
 fn bumpAllocSlice(comptime T: type, len: usize) []T {
-    const a = getArena();
-    return a.allocator().alloc(T, len) catch return &.{};
+    return runtime_arena.allocator().alloc(T, len) catch return &.{};
 }
 
 pub fn resetAllocator() void {
-    if (runtime_arena) |*a| {
-        a.reset(.retain_capacity);
-    }
+    runtime_arena.reset(.retain_capacity);
 }
 
 // ============================================================
@@ -1241,7 +1231,12 @@ pub const Prelude = struct {
         defer file.close(pio);
 
         const max_file_size = 1024 * 1024; // 1MB max read
-        const result = bumpAlloc(max_file_size);
+        const file_len = file.length(pio) catch 0;
+        const read_size: usize = if (file_len > 0)
+            @min(@as(usize, @intCast(file_len)), max_file_size)
+        else
+            max_file_size;
+        const result = bumpAlloc(read_size);
         if (result.len == 0) return "";
 
         const bytes_read = file.readPositionalAll(pio, result, 0) catch return "";
@@ -1319,6 +1314,9 @@ pub const TestTracker = struct {
     var current_test_failed: bool = false;
     var seed: i64 = 0;
     var seed_set: bool = false;
+    var timeout_ms: i64 = 0; // per-test timeout in milliseconds (0 = no timeout)
+    var test_start_ns: i96 = 0; // timestamp when current test started
+    var timeout_count: i64 = 0; // number of tests that timed out
 
     pub fn set_seed(s: i64) void {
         seed = s;
@@ -1336,9 +1334,35 @@ pub const TestTracker = struct {
         return seed;
     }
 
+    pub fn set_timeout(ms: i64) void {
+        timeout_ms = ms;
+    }
+
+    pub fn get_timeout() i64 {
+        return timeout_ms;
+    }
+
     pub fn begin_test() void {
         current_test_failed = false;
         test_count += 1;
+        if (timeout_ms > 0) {
+            const timestamp = std.Io.Timestamp.now(runtime_io, .real);
+            test_start_ns = timestamp.nanoseconds;
+        }
+    }
+
+    pub fn check_timeout() bool {
+        if (timeout_ms <= 0) return false;
+        const now = std.Io.Timestamp.now(runtime_io, .real);
+        const elapsed_ns = now.nanoseconds - test_start_ns;
+        const timeout_ns: i96 = @as(i96, timeout_ms) * 1_000_000;
+        if (elapsed_ns > timeout_ns) {
+            current_test_failed = true;
+            timeout_count += 1;
+            stdoutPrint("\x1b[1;33mT\x1b[0m", .{}); // yellow T for timeout
+            return true;
+        }
+        return false;
     }
 
     pub fn end_test() void {
@@ -1366,21 +1390,32 @@ pub const TestTracker = struct {
     }
 
     pub fn print_dot() void {
-                stdoutPrint("\x1b[1;32m.\x1b[0m", .{});
+        stdoutPrint("\x1b[1;32m.\x1b[0m", .{});
     }
 
     pub fn print_fail() void {
-                stdoutPrint("\x1b[1;31mF\x1b[0m", .{});
+        stdoutPrint("\x1b[1;31mF\x1b[0m", .{});
     }
 
     pub fn summary() i64 {
         stdoutPrint("\n\nSeed: ", .{});
         writeI64(get_seed());
+        if (timeout_ms > 0) {
+            stdoutPrint("\nTimeout: ", .{});
+            writeI64(timeout_ms);
+            stdoutPrint("ms", .{});
+        }
         stdoutPrint("\n", .{});
         writeI64(test_count);
         stdoutPrint(" tests, ", .{});
         writeI64(test_failures);
-        stdoutPrint(" failures\n", .{});
+        stdoutPrint(" failures", .{});
+        if (timeout_count > 0) {
+            stdoutPrint(" (", .{});
+            writeI64(timeout_count);
+            stdoutPrint(" timed out)", .{});
+        }
+        stdoutPrint("\n", .{});
         writeI64(assertion_count);
         stdoutPrint(" assertions, ", .{});
         writeI64(assertion_failures);
@@ -1389,7 +1424,7 @@ pub const TestTracker = struct {
     }
 
     fn writeI64(val: i64) void {
-                if (val < 0) {
+        if (val < 0) {
             stdoutPrint("-", .{});
             writeI64(-val);
             return;
@@ -1861,17 +1896,14 @@ pub const ListCell = struct {
             current = cell.tail;
             i += 1;
         }
-        // Insertion sort (stable, simple)
-        var j: usize = 1;
-        while (j < len) : (j += 1) {
-            const key = arr[j];
-            var k: usize = j;
-            while (k > 0 and comparator(key, arr[k - 1])) {
-                arr[k] = arr[k - 1];
-                k -= 1;
+        // Pattern-defeating quicksort — O(n log n) worst case, replaces O(n²) insertion sort.
+        const Ctx = struct {
+            cmp: @TypeOf(comparator),
+            fn lessThan(ctx: @This(), a: i64, b: i64) bool {
+                return ctx.cmp(a, b);
             }
-            arr[k] = key;
-        }
+        };
+        std.sort.pdq(i64, arr, Ctx{ .cmp = comparator }, Ctx.lessThan);
         // Build list from sorted array
         var result: ?*const ListCell = null;
         var ri: usize = len;
@@ -2056,17 +2088,18 @@ pub const MapCell = struct {
             const new_node = allocHamtNode() orelse return null;
 
             // Copy entries before idx
-            for (0..idx) |i| {
-                new_entries[i] = node.children_entries[i];
-                new_nodes[i] = node.children_nodes[i];
+            if (idx > 0) {
+                @memcpy(new_entries[0..idx], node.children_entries[0..idx]);
+                @memcpy(new_nodes[0..idx], node.children_nodes[0..idx]);
             }
             // Insert new leaf at idx
             new_entries[idx] = .{ .key = key, .value = value };
             new_nodes[idx] = null; // leaf
             // Copy entries after idx
-            for (idx..old_count) |i| {
-                new_entries[i + 1] = node.children_entries[i];
-                new_nodes[i + 1] = node.children_nodes[i];
+            const after = old_count - idx;
+            if (after > 0) {
+                @memcpy(new_entries[idx + 1 ..][0..after], node.children_entries[idx..][0..after]);
+                @memcpy(new_nodes[idx + 1 ..][0..after], node.children_nodes[idx..][0..after]);
             }
 
             new_node.* = .{
@@ -2134,10 +2167,9 @@ pub const MapCell = struct {
         const new_nodes = allocNodePtrs(count) orelse return null;
         const new_node = allocHamtNode() orelse return null;
 
-        for (0..count) |i| {
-            new_entries[i] = if (i == idx) entry else node.children_entries[i];
-            new_nodes[i] = node.children_nodes[i];
-        }
+        @memcpy(new_entries[0..count], node.children_entries[0..count]);
+        @memcpy(new_nodes[0..count], node.children_nodes[0..count]);
+        new_entries[idx] = entry;
 
         new_node.* = .{
             .bitmap = node.bitmap,
@@ -2154,10 +2186,10 @@ pub const MapCell = struct {
         const new_nodes = allocNodePtrs(count) orelse return null;
         const new_node = allocHamtNode() orelse return null;
 
-        for (0..count) |i| {
-            new_entries[i] = if (i == idx and entry != null) entry.? else node.children_entries[i];
-            new_nodes[i] = if (i == idx) sub else node.children_nodes[i];
-        }
+        @memcpy(new_entries[0..count], node.children_entries[0..count]);
+        @memcpy(new_nodes[0..count], node.children_nodes[0..count]);
+        if (entry) |e| new_entries[idx] = e;
+        new_nodes[idx] = sub;
 
         new_node.* = .{
             .bitmap = node.bitmap,
@@ -2206,8 +2238,7 @@ pub const MapCell = struct {
                 hamtCollect(sub, result);
             } else {
                 // Use a fixed-size buffer approach since we can't return errors
-                const a = getArena();
-                result.append(a.allocator(), node.children_entries[i]) catch {};
+                result.append(runtime_arena.allocator(), node.children_entries[i]) catch {};
             }
         }
     }

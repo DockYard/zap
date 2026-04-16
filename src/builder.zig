@@ -20,6 +20,13 @@ pub const BuildConfig = struct {
     paths: []const []const u8 = &.{},
     deps: []const Dep = &.{},
     build_opts: std.StringHashMapUnmanaged([]const u8) = .empty,
+    /// Test timeout in milliseconds (0 = no timeout). Zig 0.16 supports
+    /// native unit test timeouts in the build system.
+    test_timeout: i64 = 0,
+    /// Zig 0.16 error formatting style: "short" or "long".
+    error_style: ?[]const u8 = null,
+    /// Zig 0.16: enable verbose multi-line error output.
+    multiline_errors: bool = false,
 
     pub const Kind = enum { bin, lib, obj };
     pub const Optimize = enum { debug, release_safe, release_fast, release_small };
@@ -27,6 +34,9 @@ pub const BuildConfig = struct {
     pub const Dep = struct {
         name: []const u8,
         source: DepSource,
+        /// Local path override for development (Zig 0.16 local package override).
+        /// When set, overrides git/path source with a local directory during dev.
+        local_override: ?[]const u8 = null,
     };
 
     pub const DepSource = union(enum) {

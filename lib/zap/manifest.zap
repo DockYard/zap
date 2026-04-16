@@ -8,4 +8,7 @@ pub struct Zap.Manifest {
   paths :: [String] = []
   deps :: [Zap.Dep] = []
   build_opts :: [{String, String}] = []
+  test_timeout :: i64 = 0
+  error_style :: String = ""
+  multiline_errors :: Bool = false
 }

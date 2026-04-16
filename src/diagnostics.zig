@@ -129,6 +129,7 @@ pub const DiagnosticEngine = struct {
     line_offset: u32,
     max_errors: u32,
     use_color: bool,
+    mutex: std.atomic.Mutex = .unlocked,
 
     pub fn init(allocator: std.mem.Allocator) DiagnosticEngine {
         return .{
@@ -201,6 +202,8 @@ pub const DiagnosticEngine = struct {
     }
 
     pub fn reportDiagnostic(self: *DiagnosticEngine, diag: Diagnostic) !void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
         try self.diagnostics.append(self.allocator, diag);
     }
 

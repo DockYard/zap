@@ -5,4 +5,5 @@ pub struct Zap.Dep {
   git_tag :: String = ""
   git_branch :: String = ""
   git_rev :: String = ""
+  local_override :: String = ""
 }

@@ -46,6 +46,7 @@ pub const StringInterner = struct {
     allocator: std.mem.Allocator,
     strings: std.ArrayList([]const u8),
     map: std.StringHashMap(StringId),
+    mutex: std.atomic.Mutex = .unlocked,
 
     pub fn init(allocator: std.mem.Allocator) StringInterner {
         return .{
@@ -61,6 +62,8 @@ pub const StringInterner = struct {
     }
 
     pub fn intern(self: *StringInterner, str: []const u8) !StringId {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
         if (self.map.get(str)) |id| {
             return id;
         }
@@ -71,6 +74,9 @@ pub const StringInterner = struct {
     }
 
     pub fn get(self: *const StringInterner, id: StringId) []const u8 {
+        const mutex_ptr = @constCast(&self.mutex);
+        while (!mutex_ptr.tryLock()) std.atomic.spinLoopHint();
+        defer mutex_ptr.unlock();
         return self.strings.items[id];
     }
 };

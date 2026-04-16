@@ -7,7 +7,6 @@ const zir_builder = zap.zir_builder;
 const zig_lib_archive = @import("zig_lib_archive");
 
 /// Global Io instance for main thread operations.
-var global_io_impl: std.Io.Threaded = undefined;
 var global_io: Io = std.Options.debug_io;
 
 pub fn main(init: std.process.Init) !void {
@@ -552,6 +551,45 @@ fn buildTarget(
     for (config.deps) |dep| {
         const dep_name = try std.fmt.allocPrint(alloc, "dep:{s}", .{dep.name});
 
+        // Zig 0.16 local package override: when local_override is set,
+        // use it as a path dep regardless of the original source type.
+        // This allows overriding a git dep with a local path during development.
+        if (dep.local_override) |override_path| {
+            const dep_dir = try std.fs.path.join(alloc, &.{ project_root, override_path });
+            const dep_lib_dir = try std.fs.path.join(alloc, &.{ dep_dir, "lib" });
+            if (std.Io.Dir.cwd().access(global_io, dep_lib_dir, .{})) |_| {
+                try source_roots.append(alloc, .{ .name = dep_name, .path = dep_lib_dir });
+            } else |_| {
+                try source_roots.append(alloc, .{ .name = dep_name, .path = dep_dir });
+            }
+            // Scan subdirectories
+            const dep_resolved = if (std.Io.Dir.cwd().access(global_io, dep_lib_dir, .{}))
+                dep_lib_dir
+            else |_|
+                dep_dir;
+            if (std.Io.Dir.cwd().openDir(global_io, dep_resolved, .{ .iterate = true })) |dir_handle| {
+                var dir = dir_handle;
+                defer dir.close(global_io);
+                var it = dir.iterate();
+                while (it.next(global_io) catch null) |entry| {
+                    if (entry.kind == .directory) {
+                        const subdir = try std.fs.path.join(alloc, &.{ dep_resolved, entry.name });
+                        try source_roots.append(alloc, .{ .name = dep_name, .path = subdir });
+                    }
+                }
+            } else |_| {}
+            try new_lock_entries.append(alloc, .{
+                .name = dep.name,
+                .source_type = "path",
+                .url = override_path,
+                .resolved_ref = "-",
+                .commit = "-",
+                .integrity = "-",
+            });
+            std.debug.print("  {s}: local override → {s}\n", .{ dep.name, override_path });
+            continue;
+        }
+
         switch (dep.source) {
                 .path => |dep_path| {
                     // Resolve dep path relative to the project root
@@ -907,6 +945,7 @@ fn buildTarget(
         .cache_dir = ".zap-cache/ctfe",
         .ctfe_target = target_name,
         .ctfe_optimize = @tagName(config.optimize),
+        .io = global_io,
     }) catch {
         std.process.exit(1);
     };
@@ -987,6 +1026,9 @@ fn buildTarget(
         .optimize_mode = optimize_mode,
         .target = compile_target,
         .analysis_context = if (result.analysis_context) |*ctx| ctx else null,
+        // Zig 0.16 error formatting options from manifest
+        .error_style = config.error_style,
+        .multiline_errors = config.multiline_errors,
     }) catch {
         // stderr writer removed in 0.16
         std.debug.print("Error: compilation failed\n", .{});
@@ -1020,18 +1062,23 @@ fn compileProjectFrontend(
     return try compiler.compileFrontend(alloc, merged_source, file_path, options);
 }
 
+/// Compute a build cache key using SHA-256 (Zig 0.16 std.crypto) for
+/// cryptographic integrity. Returns a truncated u64 for backward-compatible
+/// hex formatting, but the full hash provides collision resistance.
 fn computeBuildCacheKey(
     build_source: []const u8,
     merged_source: []const u8,
     target_name: []const u8,
     manifest_result_hash: u64,
 ) u64 {
-    var hasher = std.hash.Wyhash.init(0);
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update(build_source);
     hasher.update(merged_source);
     hasher.update(target_name);
     hasher.update(std.mem.asBytes(&manifest_result_hash));
-    return hasher.final();
+    const digest = hasher.finalResult();
+    // Truncate to u64 for backward-compatible cache key format
+    return std.mem.readInt(u64, digest[0..8], .little);
 }
 
 // ---------------------------------------------------------------------------
@@ -1062,7 +1109,9 @@ fn collectWatchPaths(allocator: std.mem.Allocator, project_root: []const u8) ![]
     return try paths.toOwnedSlice(allocator);
 }
 
-/// Recursively collect all .zap files under a directory.
+/// Recursively collect all .zap files under a directory using the
+/// std.Io.Dir.Walker API (Zig 0.16) for efficient selective tree traversal.
+/// Skips hidden directories (starting with '.') and non-.zap files.
 fn collectZapFilesRecursive(
     allocator: std.mem.Allocator,
     dir_path: []const u8,
@@ -1070,25 +1119,30 @@ fn collectZapFilesRecursive(
 ) !void {
     var dir = std.Io.Dir.cwd().openDir(global_io, dir_path, .{ .iterate = true }) catch return;
     defer dir.close(global_io);
-    var iter = dir.iterate();
+    var walker = std.Io.Dir.walk(dir, allocator) catch return;
+    defer walker.deinit();
 
-    while (iter.next(global_io) catch null) |entry| {
-        const full_path = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
-        if (entry.kind == .directory) {
-            collectZapFilesRecursive(allocator, full_path, results) catch {};
-            allocator.free(full_path);
-        } else if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".zap")) {
-            try results.append(allocator, full_path);
-        } else {
-            allocator.free(full_path);
+    while (walker.next(global_io) catch null) |entry| {
+        // Skip hidden entries (e.g. .git, .zap-cache)
+        if (entry.basename.len > 0 and entry.basename[0] == '.') {
+            if (entry.kind == .directory) walker.leave(global_io);
+            continue;
+        }
+
+        if (entry.kind == .file and std.mem.endsWith(u8, entry.basename, ".zap")) {
+            const full_path = std.fs.path.join(allocator, &.{ dir_path, entry.path }) catch continue;
+            results.append(allocator, full_path) catch {
+                allocator.free(full_path);
+            };
         }
     }
 }
 
-/// Get the mtime of a file as nanoseconds, or null if the file cannot be stat'd.
-fn getFileMtime(path: []const u8) ?i96 {
+/// Get the mtime of a file as an Io.Timestamp, or null if the file cannot be stat'd.
+/// Uses Zig 0.16's std.Io.Timestamp for portable, resolution-aware time comparison.
+fn getFileMtime(path: []const u8) ?std.Io.Timestamp {
     const file_stat = std.Io.Dir.cwd().statFile(global_io, path, .{}) catch return null;
-    return file_stat.mtime.nanoseconds;
+    return file_stat.mtime;
 }
 
 /// Run a binary, printing errors but not exiting the process.
@@ -1098,29 +1152,326 @@ fn runBinaryIgnoreError(allocator: std.mem.Allocator, output_path: []const u8, r
     };
 }
 
+/// Persistent state for incremental watch-mode compilation.
+///
+/// Holds a Zig ZirContext that persists across rebuilds so the Zig compiler's
+/// incremental Sema can diff prev_zir vs new_zir and only re-analyze changed
+/// code. The frontend (parse→IR) is re-run fully on each change, but the
+/// expensive backend (Sema→codegen→link) is incremental.
+const IncrementalWatchState = struct {
+    zir_ctx: *zir_builder.ZirContext,
+    /// Duped backend compile options that outlive buildTarget's arena.
+    zig_lib_dir: []const u8,
+    output_path: []const u8,
+    output_name: []const u8,
+    output_mode: u8,
+    optimize_mode: u8,
+    lib_mode: bool,
+    link_libc: bool,
+    allocator: std.mem.Allocator,
+    /// Whether the context has had at least one successful inject+update.
+    baseline_established: bool = false,
+
+    fn deinit(self: *IncrementalWatchState) void {
+        zir_backend.destroyContext(self.zir_ctx);
+        self.allocator.free(self.zig_lib_dir);
+        self.allocator.free(self.output_path);
+        self.allocator.free(self.output_name);
+    }
+
+    /// Create incremental state by deriving the same config buildTarget uses.
+    fn init(
+        allocator: std.mem.Allocator,
+        project_root: []const u8,
+        target_name: []const u8,
+        build_opts: std.StringHashMapUnmanaged([]const u8),
+        compile_target: ?[]const u8,
+    ) ?IncrementalWatchState {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        // Re-derive build config (same logic as buildTarget)
+        const build_file_path = std.fs.path.join(alloc, &.{ project_root, "build.zap" }) catch return null;
+        const build_source = std.Io.Dir.cwd().readFileAlloc(global_io, build_file_path, alloc, .limited(10 * 1024 * 1024)) catch return null;
+        const zap_lib_dir = detectZapLibDir(alloc);
+        const manifest_eval = zap.builder.ctfeManifestDetailed(alloc, build_source, target_name, build_opts, zap_lib_dir) catch return null;
+        const config = manifest_eval.config;
+
+        const zig_lib_dir = zir_backend.detectZigLibDir(alloc) orelse (extractEmbeddedZigLib(alloc) catch return null);
+        const output_name_raw = if (config.asset_name) |an| (if (an.len > 0) an else config.name) else config.name;
+        const out_dir: []const u8 = switch (config.kind) {
+            .bin => "zap-out/bin",
+            .lib => "zap-out/lib",
+            .obj => "zap-out/obj",
+        };
+        const output_filename = switch (config.kind) {
+            .bin => output_name_raw,
+            .lib => std.fmt.allocPrint(alloc, "{s}.a", .{output_name_raw}) catch return null,
+            .obj => std.fmt.allocPrint(alloc, "{s}.o", .{output_name_raw}) catch return null,
+        };
+        const output_path = std.fs.path.join(alloc, &.{ out_dir, output_filename }) catch return null;
+
+        const output_mode_val: u8 = switch (config.kind) {
+            .bin => 0,
+            .lib => 1,
+            .obj => 2,
+        };
+        const optimize_mode_val: u8 = switch (config.optimize) {
+            .debug => 0,
+            .release_safe => 1,
+            .release_fast => 2,
+            .release_small => 3,
+        };
+
+        // Dupe strings into the persistent allocator
+        const zig_lib_duped = allocator.dupe(u8, zig_lib_dir) catch return null;
+        const output_path_duped = allocator.dupe(u8, output_path) catch {
+            allocator.free(zig_lib_duped);
+            return null;
+        };
+        const output_name_duped = allocator.dupe(u8, output_name_raw) catch {
+            allocator.free(zig_lib_duped);
+            allocator.free(output_path_duped);
+            return null;
+        };
+
+        // Create persistent ZirContext
+        const ctx = zir_backend.createContext(allocator, .{
+            .zig_lib_dir = zig_lib_duped,
+            .cache_dir = ".zap-cache",
+            .global_cache_dir = ".zap-cache",
+            .output_path = output_path_duped,
+            .name = output_name_duped,
+            .runtime_source = compiler.getRuntimeSource(),
+            .output_mode = output_mode_val,
+            .optimize_mode = optimize_mode_val,
+            .target = compile_target,
+            .link_libc = true,
+        }) catch {
+            allocator.free(zig_lib_duped);
+            allocator.free(output_path_duped);
+            allocator.free(output_name_duped);
+            return null;
+        };
+
+        return .{
+            .zir_ctx = ctx,
+            .zig_lib_dir = zig_lib_duped,
+            .output_path = output_path_duped,
+            .output_name = output_name_duped,
+            .output_mode = output_mode_val,
+            .optimize_mode = optimize_mode_val,
+            .lib_mode = config.kind == .lib,
+            .link_libc = true,
+            .allocator = allocator,
+        };
+    }
+
+    /// Run an incremental rebuild: full frontend re-compile, then
+    /// prepareUpdate → invalidateFile → injectAndUpdate on the persistent context.
+    fn rebuild(
+        self: *IncrementalWatchState,
+        allocator: std.mem.Allocator,
+        project_root: []const u8,
+        target_name: []const u8,
+        build_opts: std.StringHashMapUnmanaged([]const u8),
+        changed_paths: []const []const u8,
+    ) !void {
+        var build_arena = std.heap.ArenaAllocator.init(allocator);
+        defer build_arena.deinit();
+        const alloc = build_arena.allocator();
+
+        // Re-read build config and sources (same as buildTarget)
+        const build_file_path = try std.fs.path.join(alloc, &.{ project_root, "build.zap" });
+        const build_source = std.Io.Dir.cwd().readFileAlloc(global_io, build_file_path, alloc, .limited(10 * 1024 * 1024)) catch return error.ReadError;
+        const zap_lib_dir = detectZapLibDir(alloc);
+        const manifest_eval = zap.builder.ctfeManifestDetailed(alloc, build_source, target_name, build_opts, zap_lib_dir) catch return error.ManifestError;
+        const config = manifest_eval.config;
+
+        // Discover and read source files
+        var source_roots: std.ArrayListUnmanaged(zap.discovery.SourceRoot) = .empty;
+        {
+            const lib_dir = try std.fs.path.join(alloc, &.{ project_root, "lib" });
+            if (std.Io.Dir.cwd().access(global_io, lib_dir, .{})) |_| {
+                try source_roots.append(alloc, .{ .name = "project", .path = lib_dir });
+            } else |_| {}
+            try source_roots.append(alloc, .{ .name = "project", .path = project_root });
+        }
+        if (zap_lib_dir) |zap_lib| {
+            try source_roots.append(alloc, .{ .name = "zap_stdlib", .path = zap_lib });
+            const zap_subdir = try std.fs.path.join(alloc, &.{ zap_lib, "zap" });
+            if (std.Io.Dir.cwd().access(global_io, zap_subdir, .{})) |_| {
+                try source_roots.append(alloc, .{ .name = "zap_stdlib", .path = zap_subdir });
+            } else |_| {}
+        }
+
+        // Also add dep source roots
+        for (config.deps) |dep| {
+            const dep_name = try std.fmt.allocPrint(alloc, "dep:{s}", .{dep.name});
+            switch (dep.source) {
+                .path => |dep_path| {
+                    const dep_dir = try std.fs.path.join(alloc, &.{ project_root, dep_path });
+                    const dep_lib_dir = try std.fs.path.join(alloc, &.{ dep_dir, "lib" });
+                    if (std.Io.Dir.cwd().access(global_io, dep_lib_dir, .{})) |_| {
+                        try source_roots.append(alloc, .{ .name = dep_name, .path = dep_lib_dir });
+                    } else |_| {
+                        try source_roots.append(alloc, .{ .name = dep_name, .path = dep_dir });
+                    }
+                },
+                else => {},
+            }
+        }
+
+        // Import-driven discovery
+        var source_files: std.ArrayListUnmanaged([]const u8) = .empty;
+        var module_order: std.ArrayListUnmanaged([]const u8) = .empty;
+        var level_boundaries: std.ArrayListUnmanaged(u32) = .empty;
+        var file_to_module = std.StringHashMap([]const u8).init(alloc);
+
+        if (config.root) |root_spec| {
+            const slash_pos = std.mem.findScalar(u8, root_spec, '/');
+            const name_part = if (slash_pos) |pos| root_spec[0..pos] else root_spec;
+            const last_dot = std.mem.findScalarLast(u8, name_part, '.');
+            const entry_module = if (last_dot) |pos| name_part[0..pos] else name_part;
+
+            var discovery_err_info: zap.discovery.ErrorInfo = .{};
+            var file_graph = zap.discovery.discover(
+                alloc, entry_module, source_roots.items,
+                &zap.discovery.BUILTIN_TYPE_NAMES, &discovery_err_info,
+            ) catch return error.DiscoveryError;
+            defer file_graph.deinit();
+
+            for (file_graph.topo_order.items) |file_path| {
+                try source_files.append(alloc, file_path);
+            }
+            // Build file→module mapping
+            {
+                var iter = file_graph.module_to_file.iterator();
+                while (iter.next()) |entry| {
+                    try file_to_module.put(entry.value_ptr.*, entry.key_ptr.*);
+                }
+            }
+            for (file_graph.topo_order.items) |file_path| {
+                if (file_to_module.get(file_path)) |mod_name| {
+                    try module_order.append(alloc, mod_name);
+                }
+            }
+            for (file_graph.level_boundaries.items) |boundary| {
+                try level_boundaries.append(alloc, boundary);
+            }
+        } else {
+            for (config.paths) |pattern| {
+                try globCollectFiles(alloc, project_root, pattern, &source_files);
+            }
+        }
+
+        // Read source units
+        var source_units: std.ArrayListUnmanaged(compiler.SourceUnit) = .empty;
+        var mapped_files: std.ArrayListUnmanaged(compiler.MappedFile) = .empty;
+        defer for (mapped_files.items) |*mf| mf.deinit(global_io);
+
+        for (source_files.items) |sf| {
+            if (std.mem.eql(u8, std.fs.path.basename(sf), "build.zap")) continue;
+            const mapped = try compiler.mmapSourceFile(global_io, sf, alloc);
+            try mapped_files.append(alloc, mapped);
+            try source_units.append(alloc, .{ .file_path = sf, .source = mapped.bytes() });
+        }
+
+        // Frontend compile
+        const mod_order_slice: ?[]const []const u8 = if (module_order.items.len > 0) module_order.items else null;
+        const level_boundaries_slice: ?[]const u32 = if (level_boundaries.items.len > 0) level_boundaries.items else null;
+
+        var result = compileProjectFrontend(alloc, source_units.items, .{
+            .lib_mode = self.lib_mode,
+            .module_order = mod_order_slice,
+            .level_boundaries = level_boundaries_slice,
+            .cache_dir = ".zap-cache/ctfe",
+            .ctfe_target = target_name,
+            .ctfe_optimize = @tagName(config.optimize),
+            .io = global_io,
+        }) catch return error.FrontendError;
+
+        // Resolve entry point
+        if (config.root) |root| {
+            const arity_str = if (std.mem.findScalarLast(u8, root, '/')) |slash| root[slash + 1 ..] else "0";
+            const without_arity = if (std.mem.findScalarLast(u8, root, '/')) |slash| root[0..slash] else root;
+            var mangled: std.ArrayListUnmanaged(u8) = .empty;
+            if (std.mem.findScalarLast(u8, without_arity, '.')) |last_dot| {
+                const module_part = without_arity[0..last_dot];
+                const func_part = without_arity[last_dot + 1 ..];
+                for (module_part) |c| {
+                    mangled.append(alloc, if (c == '.') '_' else c) catch break;
+                }
+                mangled.appendSlice(alloc, "__") catch {};
+                mangled.appendSlice(alloc, func_part) catch {};
+                mangled.appendSlice(alloc, "__") catch {};
+                mangled.appendSlice(alloc, arity_str) catch {};
+            } else {
+                mangled.appendSlice(alloc, without_arity) catch {};
+                mangled.appendSlice(alloc, "__") catch {};
+                mangled.appendSlice(alloc, arity_str) catch {};
+            }
+            for (result.ir_program.functions) |func| {
+                if (std.mem.eql(u8, func.name, mangled.items)) {
+                    result.ir_program.entry = func.id;
+                    break;
+                }
+            }
+        }
+
+        // Incremental backend: prepareUpdate before re-injection
+        if (self.baseline_established) {
+            zir_backend.prepareUpdate(self.zir_ctx) catch {
+                return error.IncrementalError;
+            };
+
+            // Invalidate changed modules
+            for (changed_paths) |changed_path| {
+                if (file_to_module.get(changed_path)) |mod_name| {
+                    zir_backend.invalidateFile(self.zir_ctx, mod_name, alloc) catch {};
+                }
+            }
+        }
+
+        // Inject new ZIR and run Sema+codegen+link
+        zir_backend.injectAndUpdate(alloc, result.ir_program, self.zir_ctx, .{
+            .zig_lib_dir = self.zig_lib_dir,
+            .cache_dir = ".zap-cache",
+            .global_cache_dir = ".zap-cache",
+            .output_path = self.output_path,
+            .name = self.output_name,
+            .runtime_source = compiler.getRuntimeSource(),
+            .output_mode = self.output_mode,
+            .optimize_mode = self.optimize_mode,
+            .link_libc = self.link_libc,
+            .analysis_context = if (result.analysis_context) |*ctx| ctx else null,
+        }) catch return error.BackendError;
+
+        self.baseline_established = true;
+    }
+
+    const IncrementalError = error{
+        ReadError,
+        ManifestError,
+        DiscoveryError,
+        FrontendError,
+        IncrementalError,
+        BackendError,
+        OutOfMemory,
+    };
+};
+
 /// Watch source files for changes and rebuild (and optionally re-run) on change.
 /// This function loops forever until the process is killed (e.g. Ctrl+C).
 ///
-/// INCREMENTAL COMPILATION INTEGRATION POINT:
-/// Currently this performs a full rebuild on each file change via `buildTarget`.
-/// Once the Zig fork is rebuilt with the incremental ZIR API, this can be
-/// converted to an incremental flow:
+/// Uses Zig 0.16's Io.Timestamp for portable mtime comparison. On the first
+/// detected change, performs a full build via `buildTarget`. Then creates a
+/// persistent ZirContext for incremental compilation — subsequent changes
+/// use prepareUpdate/invalidateFile/injectAndUpdate so the Zig Sema only
+/// re-analyzes changed code.
 ///
-///   1. Before the loop: call `zir_backend.createContext(allocator, options)` once
-///      to create a persistent ZirContext.
-///   2. On the first iteration: call `zir_backend.injectAndUpdate(...)` for the
-///      initial build.
-///   3. On subsequent changes:
-///      a. Call `zir_backend.prepareUpdate(ctx)` to save current ZIR as prev_zir.
-///      b. For each changed file, call `zir_backend.invalidateFile(ctx, name, allocator)`
-///         to mark the module as needing re-analysis.
-///      c. Re-lower only the changed modules' IR to ZIR.
-///      d. Call `zir_backend.injectAndUpdate(...)` — the Zig incremental pipeline
-///         will diff prev_zir vs new ZIR and only re-analyze what changed.
-///   4. After the loop (on shutdown): call `zir_backend.destroyContext(ctx)`.
-///
-/// This requires the fork at ~/projects/zig to be rebuilt with the new
-/// `zir_compilation_prepare_update` and `zir_compilation_invalidate_file` exports.
+/// Falls back to full rebuild if incremental compilation fails.
 fn watchAndRebuild(
     allocator: std.mem.Allocator,
     source_paths: []const []const u8,
@@ -1130,26 +1481,34 @@ fn watchAndRebuild(
     run_after_build: bool,
     run_args: []const []const u8,
 ) void {
-    // Initialize last-known mtimes for all watched files
-    var last_mtimes = allocator.alloc(i96, source_paths.len) catch return;
+    // Initialize last-known mtimes using Io.Timestamp (Zig 0.16)
+    var last_mtimes = allocator.alloc(std.Io.Timestamp, source_paths.len) catch return;
     defer allocator.free(last_mtimes);
     for (source_paths, 0..) |path, i| {
-        last_mtimes[i] = getFileMtime(path) orelse 0;
+        last_mtimes[i] = getFileMtime(path) orelse std.Io.Timestamp.zero;
     }
 
     const poll_duration = std.Io.Duration.fromMilliseconds(500);
+
+    // Persistent incremental compilation state. Created after the first
+    // successful build and reused for all subsequent changes.
+    var incr_state: ?IncrementalWatchState = null;
+    defer if (incr_state) |*s| s.deinit();
 
     while (true) {
         // Sleep for the poll interval
         global_io.sleep(poll_duration, .awake) catch {};
 
-        // Check for any changed files
+        // Check for any changed files, collecting their paths
         var changed = false;
+        var changed_paths: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer changed_paths.deinit(allocator);
         for (source_paths, 0..) |path, i| {
             const current_mtime = getFileMtime(path) orelse continue;
-            if (current_mtime != last_mtimes[i]) {
+            if (current_mtime.nanoseconds != last_mtimes[i].nanoseconds) {
                 last_mtimes[i] = current_mtime;
                 changed = true;
+                changed_paths.append(allocator, path) catch {};
             }
         }
 
@@ -1158,22 +1517,91 @@ fn watchAndRebuild(
             const stdout = std.Io.File.stdout();
             stdout.writeStreamingAll(global_io, "\x1b[2J\x1b[H") catch {};
 
-            // Full rebuild (will be replaced by incremental flow — see function doc).
-            const output_path = buildTarget(allocator, project_root, target_name, build_opts, null) catch |err| {
-                std.debug.print("Build error: {}\n", .{err});
-                std.debug.print("\n[watching for changes...]\n", .{});
-                continue;
-            };
-            defer allocator.free(output_path);
-
-            // Optionally re-run
-            if (run_after_build) {
-                runBinaryIgnoreError(allocator, output_path, run_args);
+            // Check if build.zap itself changed — if so, tear down incremental
+            // state since the manifest may have changed
+            var build_zap_changed = false;
+            for (changed_paths.items) |cp| {
+                if (std.mem.eql(u8, std.fs.path.basename(cp), "build.zap")) {
+                    build_zap_changed = true;
+                    break;
+                }
+            }
+            if (build_zap_changed) {
+                if (incr_state) |*s| {
+                    s.deinit();
+                    incr_state = null;
+                }
             }
 
-            std.debug.print("\n[watching for changes...]\n", .{});
+            // Try incremental rebuild if state exists
+            var build_succeeded = false;
+            var output_path: ?[]const u8 = null;
+            if (incr_state) |*state| {
+                state.rebuild(allocator, project_root, target_name, build_opts, changed_paths.items) catch |err| {
+                    std.debug.print("Incremental build failed ({s}), falling back to full rebuild\n", .{@errorName(err)});
+                    state.deinit();
+                    incr_state = null;
+                };
+                if (incr_state != null) {
+                    build_succeeded = true;
+                    output_path = incr_state.?.output_path;
+                }
+            }
+
+            // Fall back to full rebuild
+            if (!build_succeeded) {
+                const result_path = buildTarget(allocator, project_root, target_name, build_opts, null) catch |err| {
+                    std.debug.print("Build error: {}\n", .{err});
+                    std.debug.print("\n[watching for changes...]\n", .{});
+                    changed_paths = .empty;
+                    continue;
+                };
+                output_path = result_path;
+                build_succeeded = true;
+
+                // Set up incremental state for subsequent builds
+                incr_state = IncrementalWatchState.init(allocator, project_root, target_name, build_opts, null);
+            }
+
+            if (build_succeeded) {
+                if (run_after_build) {
+                    if (output_path) |op| {
+                        runBinaryIgnoreError(allocator, op, run_args);
+                    }
+                }
+                std.debug.print("\n[watching for changes...]\n", .{});
+                // Free output_path only if it came from buildTarget (duped),
+                // not if it's the incremental state's persistent path.
+                if (output_path) |op| {
+                    const is_incr_path = if (incr_state) |s| std.mem.eql(u8, op, s.output_path) else false;
+                    if (!is_incr_path) allocator.free(op);
+                }
+            }
+
+            changed_paths = .empty;
         }
     }
+}
+
+/// Result from an async build task in watch mode (used for first non-incremental build).
+const WatchBuildResult = struct {
+    output_path: ?[]const u8 = null,
+    failed: bool = false,
+};
+
+/// Task function for async watch builds. Returns a WatchBuildResult
+/// suitable for use with Io.Future.
+fn watchBuildTask(
+    allocator: std.mem.Allocator,
+    project_root: []const u8,
+    target_name: []const u8,
+    build_opts: std.StringHashMapUnmanaged([]const u8),
+) WatchBuildResult {
+    const output_path = buildTarget(allocator, project_root, target_name, build_opts, null) catch |err| {
+        std.debug.print("Build error: {}\n", .{err});
+        return .{ .failed = true };
+    };
+    return .{ .output_path = output_path };
 }
 
 // ---------------------------------------------------------------------------

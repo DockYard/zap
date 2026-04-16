@@ -63,6 +63,8 @@ extern "c" fn zir_compilation_prepare_update(ctx: *ZirContext) i32;
 
 extern "c" fn zir_compilation_invalidate_file(ctx: *ZirContext, name: [*:0]const u8) i32;
 
+extern "c" fn zir_compilation_add_link_lib(ctx: *ZirContext, name: [*:0]const u8) i32;
+
 // ---------------------------------------------------------------------------
 // High-level API
 // ---------------------------------------------------------------------------
@@ -97,6 +99,10 @@ pub const CompileOptions = struct {
     output_mode: u8 = 0,
     /// Optimize mode: 0=Debug, 1=ReleaseSafe, 2=ReleaseFast, 3=ReleaseSmall.
     optimize_mode: u8 = 0,
+    /// Zig 0.16 error formatting: "short" or "long" (controls --error-style).
+    error_style: ?[]const u8 = null,
+    /// Zig 0.16: enable verbose multi-line error output (--multiline-errors).
+    multiline_errors: bool = false,
     /// For Lib output: true=dynamic (.so/.dylib), false=static (.a).
     is_dynamic: bool = false,
     /// Whether to link libc.
@@ -191,6 +197,16 @@ pub fn invalidateFile(ctx: *ZirContext, name: []const u8, allocator: std.mem.All
     const name_z = allocator.dupeZ(u8, name) catch return error.OutOfMemory;
     defer allocator.free(name_z);
     if (zir_compilation_invalidate_file(ctx, name_z) != 0) {
+        return error.CompilationFailed;
+    }
+}
+
+/// Link a system library by name (e.g., "m" for libm).
+/// Must be called after createContext and before injectAndUpdate.
+pub fn addLinkLib(ctx: *ZirContext, name: []const u8, allocator: std.mem.Allocator) CompileError!void {
+    const name_z = allocator.dupeZ(u8, name) catch return error.OutOfMemory;
+    defer allocator.free(name_z);
+    if (zir_compilation_add_link_lib(ctx, name_z) != 0) {
         return error.CompilationFailed;
     }
 }

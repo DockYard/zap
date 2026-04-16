@@ -37,12 +37,22 @@ pub const PipelineResult = struct {
 ///   2. Interprocedural summary computation (call graph, SCC, summaries)
 ///   3. Re-run escape analysis with interprocedural summaries (feedback loop)
 ///   4. Region solving per function (dom tree, LCA, multiplicity, storage modes)
+///      — parallelized with Io.Group when io is provided
 ///   5. Lambda set specialization (0-CFA, contification)
 ///   6. Perceus reuse analysis (deconstruction/construction pairing)
 ///   7. Build legacy result for backward compat
 pub fn runAnalysisPipeline(
     alloc: std.mem.Allocator,
     program: *const ir.Program,
+) !PipelineResult {
+    return runAnalysisPipelineWithIo(alloc, program, null);
+}
+
+/// Run the analysis pipeline with optional Io for parallel execution.
+pub fn runAnalysisPipelineWithIo(
+    alloc: std.mem.Allocator,
+    program: *const ir.Program,
+    pio: ?std.Io,
 ) !PipelineResult {
     var pipeline_diagnostics: std.ArrayList(diagnostics.Diagnostic) = .empty;
     errdefer pipeline_diagnostics.deinit(alloc);
@@ -104,24 +114,45 @@ pub fn runAnalysisPipeline(
 
     // --------------------------------------------------------
     // Phase 4: Region solving per function
+    //   Parallelized with Io.Group when io is available.
+    //   Each function's region solving is independent: it reads
+    //   from the shared escape context and produces local results.
+    //   Results are merged sequentially after all tasks complete.
     // --------------------------------------------------------
-    var solver = region_solver.RegionSolver.init(alloc);
+    if (pio != null and program.functions.len > 1) {
+        // Parallel region solving
+        const io_val = pio.?;
+        const region_results = try alloc.alloc(RegionTaskResult, program.functions.len);
+        defer alloc.free(region_results);
 
-    for (program.functions) |*func| {
-        // Extract per-function escape states.
-        var func_escape: std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.EscapeState) = .empty;
-        defer func_escape.deinit(alloc);
-        var es_iter = ctx.escape_states.iterator();
-        while (es_iter.next()) |entry| {
-            if (entry.key_ptr.function == func.id) {
-                try func_escape.put(alloc, entry.key_ptr.local, entry.value_ptr.*);
-            }
+        // Initialize all results
+        for (region_results) |*r| {
+            r.* = .{};
         }
 
-        // Extract per-function alloc sites by scanning IR for allocating instructions.
-        var func_alloc_sites: std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.AllocSiteId) = .empty;
-        defer func_alloc_sites.deinit(alloc);
-        {
+        // Extract per-function data and launch parallel tasks
+        const func_escapes = try alloc.alloc(std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.EscapeState), program.functions.len);
+        defer {
+            for (func_escapes) |*fe| fe.deinit(alloc);
+            alloc.free(func_escapes);
+        }
+        const func_alloc_sites_arr = try alloc.alloc(std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.AllocSiteId), program.functions.len);
+        defer {
+            for (func_alloc_sites_arr) |*fas| fas.deinit(alloc);
+            alloc.free(func_alloc_sites_arr);
+        }
+
+        // Prepare per-function inputs (sequential — reads shared ctx)
+        for (program.functions, 0..) |func, fi| {
+            func_escapes[fi] = .empty;
+            var es_iter = ctx.escape_states.iterator();
+            while (es_iter.next()) |entry| {
+                if (entry.key_ptr.function == func.id) {
+                    try func_escapes[fi].put(alloc, entry.key_ptr.local, entry.value_ptr.*);
+                }
+            }
+
+            func_alloc_sites_arr[fi] = .empty;
             var next_site: lattice.AllocSiteId = 0;
             for (func.body) |block| {
                 for (block.instructions) |instr| {
@@ -135,37 +166,102 @@ pub fn runAnalysisPipeline(
                         else => null,
                     };
                     if (maybe_dest) |dest| {
-                        try func_alloc_sites.put(alloc, dest, next_site);
+                        try func_alloc_sites_arr[fi].put(alloc, dest, next_site);
                         next_site += 1;
                     }
                 }
             }
         }
 
-        // Run region solver on this function.
-        var region_result = solver.solveFunction(func, &func_escape, &func_alloc_sites) catch {
-            // If region solving fails for a function (e.g., empty function),
-            // continue with other functions.
-            continue;
-        };
-        defer region_result.deinit();
+        // Launch parallel region solving tasks
+        var group: std.Io.Group = .init;
+        for (program.functions, 0..) |*func, fi| {
+            group.async(io_val, regionSolveTask, .{
+                alloc, func, &func_escapes[fi], &func_alloc_sites_arr[fi], &region_results[fi],
+            });
+        }
+        group.await(io_val) catch {};
 
-        // Merge region assignments back into context.
-        var ra_iter = region_result.region_assignments.iterator();
-        while (ra_iter.next()) |entry| {
-            const vkey = lattice.ValueKey{ .function = func.id, .local = entry.key_ptr.* };
-            try ctx.region_assignments.put(vkey, entry.value_ptr.*);
+        // Merge results sequentially
+        for (region_results) |*result| {
+            if (!result.solved) continue;
+
+            var ra_iter = result.region_assignments.iterator();
+            while (ra_iter.next()) |entry| {
+                const vkey = lattice.ValueKey{ .function = result.func_id, .local = entry.key_ptr.* };
+                try ctx.region_assignments.put(vkey, entry.value_ptr.*);
+            }
+
+            var ras_iter = result.alloc_summaries.iterator();
+            while (ras_iter.next()) |entry| {
+                try ctx.alloc_summaries.put(entry.key_ptr.*, entry.value_ptr.*);
+            }
+
+            for (result.outlives_constraints.items) |c| {
+                try ctx.outlives_constraints.append(alloc, c);
+            }
         }
 
-        // Merge updated alloc summaries.
-        var ras_iter = region_result.alloc_summaries.iterator();
-        while (ras_iter.next()) |entry| {
-            try ctx.alloc_summaries.put(entry.key_ptr.*, entry.value_ptr.*);
+        // Clean up results
+        for (region_results) |*result| {
+            result.deinit();
         }
+    } else {
+        // Sequential fallback
+        var solver = region_solver.RegionSolver.init(alloc);
 
-        // Merge outlives constraints.
-        for (region_result.outlives_constraints.items) |c| {
-            try ctx.outlives_constraints.append(alloc, c);
+        for (program.functions) |*func| {
+            var func_escape: std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.EscapeState) = .empty;
+            defer func_escape.deinit(alloc);
+            var es_iter = ctx.escape_states.iterator();
+            while (es_iter.next()) |entry| {
+                if (entry.key_ptr.function == func.id) {
+                    try func_escape.put(alloc, entry.key_ptr.local, entry.value_ptr.*);
+                }
+            }
+
+            var func_alloc_sites: std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.AllocSiteId) = .empty;
+            defer func_alloc_sites.deinit(alloc);
+            {
+                var next_site: lattice.AllocSiteId = 0;
+                for (func.body) |block| {
+                    for (block.instructions) |instr| {
+                        const maybe_dest: ?ir.LocalId = switch (instr) {
+                            .struct_init => |si| si.dest,
+                            .tuple_init => |ti| ti.dest,
+                            .list_init => |li| li.dest,
+                            .map_init => |mi| mi.dest,
+                            .make_closure => |mc| mc.dest,
+                            .union_init => |ui| ui.dest,
+                            else => null,
+                        };
+                        if (maybe_dest) |dest| {
+                            try func_alloc_sites.put(alloc, dest, next_site);
+                            next_site += 1;
+                        }
+                    }
+                }
+            }
+
+            var region_result = solver.solveFunction(func, &func_escape, &func_alloc_sites) catch {
+                continue;
+            };
+            defer region_result.deinit();
+
+            var ra_iter = region_result.region_assignments.iterator();
+            while (ra_iter.next()) |entry| {
+                const vkey = lattice.ValueKey{ .function = func.id, .local = entry.key_ptr.* };
+                try ctx.region_assignments.put(vkey, entry.value_ptr.*);
+            }
+
+            var ras_iter = region_result.alloc_summaries.iterator();
+            while (ras_iter.next()) |entry| {
+                try ctx.alloc_summaries.put(entry.key_ptr.*, entry.value_ptr.*);
+            }
+
+            for (region_result.outlives_constraints.items) |c| {
+                try ctx.outlives_constraints.append(alloc, c);
+            }
         }
     }
 
@@ -260,6 +356,49 @@ pub fn runAnalysisPipeline(
         .context = ctx,
         .diagnostics = pipeline_diagnostics,
     };
+}
+
+/// Result from a parallel region solving task. Mirrors the fields of
+/// region_solver.FunctionRegionResult that get merged into AnalysisContext.
+const RegionTaskResult = struct {
+    solved: bool = false,
+    func_id: ir.FunctionId = 0,
+    region_assignments: std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.RegionId) = .empty,
+    alloc_summaries: std.AutoArrayHashMapUnmanaged(lattice.AllocSiteId, lattice.AllocSiteSummary) = .empty,
+    outlives_constraints: std.ArrayListUnmanaged(lattice.OutlivesConstraint) = .empty,
+    task_alloc: std.mem.Allocator = undefined,
+
+    fn deinit(self: *RegionTaskResult) void {
+        if (!self.solved) return;
+        self.region_assignments.deinit(self.task_alloc);
+        self.alloc_summaries.deinit(self.task_alloc);
+        self.outlives_constraints.deinit(self.task_alloc);
+    }
+};
+
+fn regionSolveTask(
+    alloc: std.mem.Allocator,
+    func: *const ir.Function,
+    func_escape: *const std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.EscapeState),
+    func_alloc_sites: *const std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.AllocSiteId),
+    result: *RegionTaskResult,
+) void {
+    var solver = region_solver.RegionSolver.init(alloc);
+    var region_result = solver.solveFunction(func, func_escape, func_alloc_sites) catch {
+        return;
+    };
+    // Transfer ownership of data to the result struct
+    result.solved = true;
+    result.func_id = func.id;
+    result.task_alloc = alloc;
+    result.region_assignments = region_result.region_assignments;
+    result.alloc_summaries = region_result.alloc_summaries;
+    result.outlives_constraints = region_result.outlives_constraints;
+    // Prevent the deferred deinit from freeing our data
+    region_result.region_assignments = .empty;
+    region_result.alloc_summaries = .empty;
+    region_result.outlives_constraints = .empty;
+    region_result.deinit();
 }
 
 fn unknownAnalysisSpan() ast.SourceSpan {
