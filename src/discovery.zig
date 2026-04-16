@@ -137,11 +137,11 @@ pub fn discover(
         if (graph.module_to_file.contains(module_name)) continue;
         if (graph.stdlib_modules.contains(module_name)) continue;
 
-        // Resolve module name to file path
-        const resolved = resolveModuleToFile(alloc, module_name, source_roots) orelse {
-            if (err_info) |info| info.unresolved_module = module_name;
-            return error.ModuleNotFound;
-        };
+        // Resolve module name to file path.
+        // If the name can't be resolved, it may be a union variant, struct
+        // name, or other non-module uppercase identifier — skip it silently.
+        // The compiler will catch genuinely missing modules during compilation.
+        const resolved = resolveModuleToFile(alloc, module_name, source_roots) orelse continue;
         const file_path = resolved.path;
 
         graph.module_to_file.put(module_name, file_path) catch return error.OutOfMemory;
@@ -282,11 +282,26 @@ fn resolveModuleToFile(
 ) ?ResolvedFile {
     const rel_path = moduleNameToRelPath(alloc, module_name) catch return null;
 
+    // Try the full relative path first
     for (source_roots) |root| {
         const full_path = std.fs.path.join(alloc, &.{ root.path, rel_path }) catch continue;
-        // Check if the file exists
         std.Io.Dir.cwd().access(std.Options.debug_io, full_path, .{}) catch continue;
         return .{ .path = full_path, .source_root_name = root.name };
+    }
+
+    // If the module name has a prefix (e.g., "Test.StringTest"), try stripping
+    // the first segment and resolving within each source root. This handles the
+    // convention where `test/` is a source root and modules are named
+    // `Test.ModuleName` — the `Test.` prefix maps to the source root, not to
+    // a subdirectory within it.
+    if (std.mem.indexOfScalar(u8, module_name, '.')) |dot_pos| {
+        const suffix = module_name[dot_pos + 1 ..];
+        const suffix_path = moduleNameToRelPath(alloc, suffix) catch return null;
+        for (source_roots) |root| {
+            const full_path = std.fs.path.join(alloc, &.{ root.path, suffix_path }) catch continue;
+            std.Io.Dir.cwd().access(std.Options.debug_io, full_path, .{}) catch continue;
+            return .{ .path = full_path, .source_root_name = root.name };
+        }
     }
 
     return null;
@@ -326,16 +341,93 @@ fn extractModuleReferences(
 
     var lexer = zap.Lexer.init(source);
 
-    // Scan tokens looking for module_identifier patterns
+    // Track context to distinguish module references from union variants,
+    // struct names, and other non-module uppercase identifiers.
+    // We skip uppercase identifiers that appear inside union/struct/enum bodies
+    // as bare names (without a dot-call or being after `use`/`import`).
+    var inside_union_body = false;
+    var inside_struct_body = false;
+    var brace_depth: u32 = 0;
+    var union_brace_depth: u32 = 0;
+    var struct_brace_depth: u32 = 0;
+    var prev_tag: zap.Token.Tag = .eof;
+
     while (true) {
         const tok = lexer.next();
         if (tok.tag == .eof) break;
 
+        // Track brace nesting for union/struct body detection
+        if (tok.tag == .left_brace) {
+            brace_depth += 1;
+        } else if (tok.tag == .right_brace) {
+            if (brace_depth > 0) brace_depth -= 1;
+            if (inside_union_body and brace_depth < union_brace_depth) {
+                inside_union_body = false;
+            }
+            if (inside_struct_body and brace_depth < struct_brace_depth) {
+                inside_struct_body = false;
+            }
+        }
+
+        // Detect entering union body: `union Name {` or `pub union Name {`
+        if (tok.tag == .keyword_union) {
+            var peek = lexer;
+            const name_tok = peek.next();
+            if (name_tok.tag == .module_identifier) {
+                const brace_tok = peek.next();
+                if (brace_tok.tag == .left_brace) {
+                    inside_union_body = true;
+                    union_brace_depth = brace_depth + 1;
+                }
+            }
+        }
+
+        // Detect entering struct body: `struct Name {` or `pub struct Name {`
+        if (tok.tag == .keyword_struct) {
+            var peek = lexer;
+            const name_tok = peek.next();
+            if (name_tok.tag == .module_identifier) {
+                const brace_tok = peek.next();
+                if (brace_tok.tag == .left_brace) {
+                    inside_struct_body = true;
+                    struct_brace_depth = brace_depth + 1;
+                }
+            }
+        }
+
         if (tok.tag == .module_identifier) {
+            const name_text = tok.slice(source);
+
+            // Skip: bare uppercase identifiers inside union bodies are variants, not modules.
+            // e.g., `pub union Color { Red, Green, Blue }` — Red/Green/Blue are variants.
+            if (inside_union_body) {
+                // Check if this is a bare variant name (not followed by `.function()`)
+                var peek = lexer;
+                const next = peek.next();
+                if (next.tag != .dot) {
+                    // Bare name inside union body — skip as variant declaration
+                    continue;
+                }
+                // If followed by dot, it's a qualified reference like Module.function — proceed
+            }
+
+            // Skip: identifiers after `::` are type annotations, not module calls.
+            // Exception: if followed by `.` it's a module-qualified type like `Zap.Env`.
+            if (prev_tag == .double_colon) {
+                var peek = lexer;
+                const next = peek.next();
+                if (next.tag != .dot) {
+                    // Bare type annotation like `:: String` — handled by BUILTIN_TYPE_NAMES
+                    // For user types like `:: Color`, skip as type reference
+                    // (the module is declared locally, not imported)
+                    continue;
+                }
+            }
+
             // Collect the full dotted module name: Foo.Bar.Baz
             var name_buf: std.ArrayListUnmanaged(u8) = .empty;
             defer name_buf.deinit(alloc);
-            try name_buf.appendSlice(alloc, tok.slice(source));
+            try name_buf.appendSlice(alloc, name_text);
 
             // Look ahead for .ModuleIdentifier chains
             var peek_lexer = lexer;
@@ -357,12 +449,9 @@ fn extractModuleReferences(
 
             const module_name = try alloc.dupe(u8, name_buf.items);
             try refs.put(module_name, {});
-
-            // Also register parent modules for nested names
-            // "Config.Parser" → also register "Config" as a potential reference
-            // (but only if Config.Parser is the module — Config alone might not be)
-            // For discovery, we try the most specific name first and fall back.
         }
+
+        prev_tag = tok.tag;
     }
 
     // Convert to array

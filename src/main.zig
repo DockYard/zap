@@ -508,6 +508,10 @@ fn buildTarget(
         if (std.Io.Dir.cwd().access(global_io, lib_dir, .{})) |_| {
             try source_roots.append(alloc, .{ .name = "project", .path = lib_dir });
         } else |_| {}
+        const test_dir = try std.fs.path.join(alloc, &.{ project_root, "test" });
+        if (std.Io.Dir.cwd().access(global_io, test_dir, .{})) |_| {
+            try source_roots.append(alloc, .{ .name = "project", .path = test_dir });
+        } else |_| {}
         try source_roots.append(alloc, .{ .name = "project", .path = project_root });
     }
 
@@ -875,7 +879,37 @@ fn buildTarget(
             break :blk rel_path;
         };
 
-        if (compiler.validateOneModulePerFile(alloc, mapped.bytes(), lib_rel)) |err_msg| {
+        // Determine if this file is under a named source root (like `test/`)
+        // that adds a module name prefix. Files in `test/` directory use `Test.`
+        // prefix convention: `test/string_test.zap` → `Test.StringTest`.
+        const source_root_dir_name: ?[]const u8 = blk: {
+            const norm_sf = if (std.mem.startsWith(u8, sf, "./")) sf[2..] else sf;
+            for (source_roots.items) |root| {
+                if (std.mem.eql(u8, root.name, "project")) {
+                    const norm_root = if (std.mem.startsWith(u8, root.path, "./"))
+                        root.path[2..]
+                    else
+                        root.path;
+                    const root_slash = try std.fmt.allocPrint(alloc, "{s}/", .{norm_root});
+                    if (std.mem.startsWith(u8, norm_sf, root_slash)) {
+                        // Return the directory basename (e.g., "test" from "./test/")
+                        break :blk std.fs.path.basename(norm_root);
+                    }
+                }
+            }
+            break :blk null;
+        };
+
+        // For files under `test/`, prepend "test/" to the relative path so
+        // validation expects `Test.ModuleName` to match `test/module_name.zap`.
+        const validation_path = if (source_root_dir_name) |dir_name| blk: {
+            if (!std.mem.eql(u8, dir_name, "lib")) {
+                break :blk try std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir_name, lib_rel });
+            }
+            break :blk lib_rel;
+        } else lib_rel;
+
+        if (compiler.validateOneModulePerFile(alloc, mapped.bytes(), validation_path)) |err_msg| {
             std.debug.print("Error: {s}\n", .{err_msg});
             validation_failed = true;
         }

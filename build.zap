@@ -7,7 +7,6 @@ pub module Zap.Builder {
           version: "0.1.0",
           kind: :bin,
           root: "Test.TestRunner.main/1",
-          paths: ["test/**/*.zap"],
           deps: [{:zap_stdlib, {:path, "lib"}}]
         }
       _ ->
