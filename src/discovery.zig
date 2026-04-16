@@ -36,6 +36,11 @@ pub const FileGraph = struct {
     /// Files in topological order (dependencies before dependents)
     topo_order: std.ArrayListUnmanaged([]const u8),
 
+    /// Indices into topo_order marking where each dependency level ends.
+    /// Modules within the same level have no dependencies on each other
+    /// and can be compiled in parallel.
+    level_boundaries: std.ArrayListUnmanaged(u32) = .empty,
+
     /// Stdlib module names (not discovered from files)
     stdlib_modules: std.StringHashMap(void),
 
@@ -54,6 +59,7 @@ pub const FileGraph = struct {
             .file_imports = std.StringHashMap(std.ArrayListUnmanaged([]const u8)).init(allocator),
             .file_imported_by = std.StringHashMap(std.ArrayListUnmanaged([]const u8)).init(allocator),
             .topo_order = .empty,
+            .level_boundaries = .empty,
             .stdlib_modules = std.StringHashMap(void).init(allocator),
             .file_source_root = std.StringHashMap([]const u8).init(allocator),
             .module_is_private = std.StringHashMap(bool).init(allocator),
@@ -73,6 +79,7 @@ pub const FileGraph = struct {
         }
         self.file_imported_by.deinit();
         self.topo_order.deinit(self.allocator);
+        self.level_boundaries.deinit(self.allocator);
         self.stdlib_modules.deinit();
         self.file_source_root.deinit();
         self.module_is_private.deinit();
@@ -396,37 +403,52 @@ fn topologicalSort(alloc: std.mem.Allocator, graph: *FileGraph) DiscoveryError!v
         }
     }
 
-    // Queue files with in-degree 0 (no dependencies — leaf libraries)
-    var queue: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer queue.deinit(alloc);
+    // Seed the current wave with all files that have in-degree 0 (no dependencies — leaf libraries).
+    // Process in waves: each wave contains files whose dependencies are all in previous waves.
+    // Files within the same wave are independent and can be compiled in parallel.
+    var current_wave: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer current_wave.deinit(alloc);
+    var next_wave: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer next_wave.deinit(alloc);
 
     var deg_it = in_degree.iterator();
     while (deg_it.next()) |entry| {
         if (entry.value_ptr.* == 0) {
-            queue.append(alloc, entry.key_ptr.*) catch return error.OutOfMemory;
+            current_wave.append(alloc, entry.key_ptr.*) catch return error.OutOfMemory;
         }
     }
 
     var sorted_count: u32 = 0;
-    while (queue.items.len > 0) {
-        const file = queue.orderedRemove(0);
-        graph.topo_order.append(alloc, file) catch return error.OutOfMemory;
-        sorted_count += 1;
+    while (current_wave.items.len > 0) {
+        // Process all files in the current wave
+        for (current_wave.items) |file| {
+            graph.topo_order.append(alloc, file) catch return error.OutOfMemory;
+            sorted_count += 1;
 
-        // This file is now "resolved." Decrement in-degree of all files that
-        // depend on this file (i.e., files that import this file's module).
-        if (graph.file_imported_by.get(file)) |dependents| {
-            for (dependents.items) |dependent_file| {
-                if (in_degree.getPtr(dependent_file)) |deg| {
-                    if (deg.* > 0) {
-                        deg.* -= 1;
-                        if (deg.* == 0) {
-                            queue.append(alloc, dependent_file) catch return error.OutOfMemory;
+            // Decrement in-degree of all files that depend on this file.
+            // If a dependent's in-degree reaches 0, it belongs in the next wave.
+            if (graph.file_imported_by.get(file)) |dependents| {
+                for (dependents.items) |dependent_file| {
+                    if (in_degree.getPtr(dependent_file)) |deg| {
+                        if (deg.* > 0) {
+                            deg.* -= 1;
+                            if (deg.* == 0) {
+                                next_wave.append(alloc, dependent_file) catch return error.OutOfMemory;
+                            }
                         }
                     }
                 }
             }
         }
+
+        // Record the boundary: all files up to sorted_count belong to this level
+        graph.level_boundaries.append(alloc, sorted_count) catch return error.OutOfMemory;
+
+        // Swap waves: next_wave becomes current, and we clear next_wave for reuse
+        const tmp = current_wave;
+        current_wave = next_wave;
+        next_wave = tmp;
+        next_wave.clearRetainingCapacity();
     }
 
     const total_files = in_degree.count();
@@ -678,4 +700,113 @@ test "discover: module found in dep root" {
     const dep_mod_file = graph.module_to_file.get("DepMod").?;
     const dep_root = graph.file_source_root.get(dep_mod_file).?;
     try std.testing.expectEqualStrings("dep:mylib", dep_root);
+}
+
+test "discover: level_boundaries for single file" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "app.zap",
+        .data = "pub module App {\n  pub fn main() -> i64 {\n    42\n  }\n}\n",
+    });
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
+    const roots = &[_]SourceRoot{.{ .name = "project", .path = tmp_path }};
+
+    var graph = try discover(alloc, "App", roots, &BUILTIN_TYPE_NAMES, null);
+    defer graph.deinit();
+
+    // Single file → one level with boundary at 1
+    try std.testing.expectEqual(@as(usize, 1), graph.level_boundaries.items.len);
+    try std.testing.expectEqual(@as(u32, 1), graph.level_boundaries.items[0]);
+}
+
+test "discover: level_boundaries for linear chain" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    // App → Helper → Util (linear chain = 3 levels)
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "app.zap",
+        .data = "pub module App {\n  pub fn main() -> i64 {\n    Helper.run()\n  }\n}\n",
+    });
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "helper.zap",
+        .data = "pub module Helper {\n  pub fn run() -> i64 {\n    Util.value()\n  }\n}\n",
+    });
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "util.zap",
+        .data = "pub module Util {\n  pub fn value() -> i64 {\n    1\n  }\n}\n",
+    });
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
+    const roots = &[_]SourceRoot{.{ .name = "project", .path = tmp_path }};
+
+    var graph = try discover(alloc, "App", roots, &BUILTIN_TYPE_NAMES, null);
+    defer graph.deinit();
+
+    // Linear chain: 3 levels (Util), (Helper), (App) → boundaries [1, 2, 3]
+    try std.testing.expectEqual(@as(usize, 3), graph.level_boundaries.items.len);
+    try std.testing.expectEqual(@as(u32, 1), graph.level_boundaries.items[0]);
+    try std.testing.expectEqual(@as(u32, 2), graph.level_boundaries.items[1]);
+    try std.testing.expectEqual(@as(u32, 3), graph.level_boundaries.items[2]);
+}
+
+test "discover: level_boundaries for diamond dependency" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    // Diamond: App → {Left, Right} → Base
+    // Level 0: Base (no deps)
+    // Level 1: Left, Right (both depend only on Base)
+    // Level 2: App (depends on Left and Right)
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "app.zap",
+        .data = "pub module App {\n  pub fn main() -> i64 {\n    Left.go() + Right.go()\n  }\n}\n",
+    });
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "left.zap",
+        .data = "pub module Left {\n  pub fn go() -> i64 {\n    Base.value()\n  }\n}\n",
+    });
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "right.zap",
+        .data = "pub module Right {\n  pub fn go() -> i64 {\n    Base.value()\n  }\n}\n",
+    });
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "base.zap",
+        .data = "pub module Base {\n  pub fn value() -> i64 {\n    1\n  }\n}\n",
+    });
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
+    const roots = &[_]SourceRoot{.{ .name = "project", .path = tmp_path }};
+
+    var graph = try discover(alloc, "App", roots, &BUILTIN_TYPE_NAMES, null);
+    defer graph.deinit();
+
+    // Diamond: 3 levels → boundaries [1, 3, 4]
+    // Level 0: [Base] → boundary at 1
+    // Level 1: [Left, Right] → boundary at 3
+    // Level 2: [App] → boundary at 4
+    try std.testing.expectEqual(@as(usize, 3), graph.level_boundaries.items.len);
+    try std.testing.expectEqual(@as(u32, 1), graph.level_boundaries.items[0]);
+    try std.testing.expectEqual(@as(u32, 3), graph.level_boundaries.items[1]);
+    try std.testing.expectEqual(@as(u32, 4), graph.level_boundaries.items[2]);
+
+    // Level 1 should contain both Left and Right (in some order)
+    const level1_start: usize = graph.level_boundaries.items[0];
+    const level1_end: usize = graph.level_boundaries.items[1];
+    try std.testing.expectEqual(@as(usize, 2), level1_end - level1_start);
 }

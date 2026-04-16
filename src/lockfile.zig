@@ -234,10 +234,10 @@ pub const GitDepResult = struct {
     fetch_error: bool = false,
 };
 
-/// Fetch multiple git dependencies in parallel using OS threads.
+/// Fetch multiple git dependencies in parallel using Io.Group.
 ///
-/// Spawns one thread per dependency for concurrent git clone operations.
-/// Each thread uses its own arena allocator to avoid contention.
+/// Uses Zig 0.16's structured concurrency via Io.Group for bounded
+/// parallel git clone operations. Falls back to sequential on failure.
 /// Returns results in the same order as the input requests.
 pub fn fetchGitDepsParallel(
     alloc: std.mem.Allocator,
@@ -245,9 +245,10 @@ pub fn fetchGitDepsParallel(
 ) ![]GitDepResult {
     if (requests.len == 0) return &.{};
 
-    // For a single dep, just fetch directly (no thread overhead)
+    const results = try alloc.alloc(GitDepResult, requests.len);
+
+    // For a single dep, just fetch directly (no concurrency overhead)
     if (requests.len == 1) {
-        const results = try alloc.alloc(GitDepResult, 1);
         const req = requests[0];
         const fetch_result = fetchGitDep(alloc, req.name, req.url, req.ref, req.locked_commit) catch {
             results[0] = .{
@@ -268,75 +269,39 @@ pub fn fetchGitDepsParallel(
         return results;
     }
 
-    // Parallel fetch using threads
-    const results = try alloc.alloc(GitDepResult, requests.len);
-
-    const ThreadContext = struct {
-        request: GitDepRequest,
-        result: *GitDepResult,
-        thread_alloc: std.mem.Allocator,
-
-        fn run(ctx: *const @This()) void {
-            const req = ctx.request;
-            const fetch_result = fetchGitDep(ctx.thread_alloc, req.name, req.url, req.ref, req.locked_commit) catch {
-                ctx.result.* = .{
-                    .name = req.name,
-                    .path = "",
-                    .commit = "",
-                    .integrity = "-",
-                    .fetch_error = true,
-                };
-                return;
-            };
-            ctx.result.* = .{
-                .name = req.name,
-                .path = fetch_result.path,
-                .commit = fetch_result.commit,
-                .integrity = fetch_result.integrity,
-            };
-        }
-    };
-
-    var contexts = try alloc.alloc(ThreadContext, requests.len);
-    defer alloc.free(contexts);
+    // Parallel fetch using Io.Group (structured concurrency)
+    var group: std.Io.Group = .init;
     for (requests, 0..) |req, i| {
-        contexts[i] = .{
-            .request = req,
-            .result = &results[i],
-            .thread_alloc = alloc,
-        };
+        group.async(io, fetchGitDepTask, .{ alloc, req, &results[i] });
     }
-
-    // Spawn threads
-    var threads = try alloc.alloc(std.Thread, requests.len);
-    defer alloc.free(threads);
-
-    for (contexts, 0..) |*ctx, i| {
-        threads[i] = std.Thread.spawn(.{}, ThreadContext.run, .{ctx}) catch {
-            // If thread spawn fails, fetch sequentially as fallback
-            results[i] = .{
-                .name = ctx.request.name,
-                .path = "",
-                .commit = "",
-                .integrity = "-",
-                .fetch_error = true,
-            };
-            continue;
-        };
-    }
-
-    // Join all threads
-    for (threads) |thread| {
-        thread.join();
-    }
+    group.await(io) catch {};
 
     return results;
+}
+
+fn fetchGitDepTask(alloc: std.mem.Allocator, req: GitDepRequest, result: *GitDepResult) void {
+    const fetch_result = fetchGitDep(alloc, req.name, req.url, req.ref, req.locked_commit) catch {
+        result.* = .{
+            .name = req.name,
+            .path = "",
+            .commit = "",
+            .integrity = "-",
+            .fetch_error = true,
+        };
+        return;
+    };
+    result.* = .{
+        .name = req.name,
+        .path = fetch_result.path,
+        .commit = fetch_result.commit,
+        .integrity = fetch_result.integrity,
+    };
 }
 
 pub const FetchError = error{
     GitCloneFailed,
     OutOfMemory,
-} || std.fs.File.OpenError;
+} || std.Io.File.OpenError;
 
 test "readLockfile: returns null for missing file" {
     const result = readLockfile(std.testing.allocator, "/nonexistent/path");

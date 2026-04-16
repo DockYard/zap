@@ -10,16 +10,11 @@ const zig_lib_archive = @import("zig_lib_archive");
 var global_io_impl: std.Io.Threaded = undefined;
 var global_io: Io = std.Options.debug_io;
 
-pub fn main(init: std.process.Init.Minimal) !void {
-    // Initialize threaded I/O for process spawning and other operations.
-    global_io_impl = .init(std.heap.page_allocator, .{});
-    global_io = global_io_impl.io();
-
-    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
-    const allocator = debug_allocator.allocator();
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const args = try init.args.toSlice(arena.allocator());
+pub fn main(init: std.process.Init) !void {
+    // Use Io and allocator from Init — no manual setup needed.
+    global_io = init.io;
+    const allocator = init.gpa;
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     if (args.len < 2) {
         printUsage();
@@ -501,6 +496,9 @@ fn buildTarget(
     var source_roots: std.ArrayListUnmanaged(zap.discovery.SourceRoot) = .empty;
     // Module names in topological order for CTFE evaluation
     var module_order: std.ArrayListUnmanaged([]const u8) = .empty;
+    // Level boundaries from dependency-level discovery (indices into module_order
+    // where each parallel compilation level ends)
+    var level_boundaries: std.ArrayListUnmanaged(u32) = .empty;
 
     // Build source roots from deps — always done regardless of discovery mode.
     // This ensures dep files (stdlib, etc.) are available in both import-driven
@@ -724,6 +722,13 @@ fn buildTarget(
                 try module_order.append(alloc, mod_name);
             }
         }
+
+        // Copy level boundaries from the file graph. These mark where each
+        // dependency level ends in module_order — modules within the same
+        // level have no inter-dependencies and can be compiled in parallel.
+        for (file_graph.level_boundaries.items) |boundary| {
+            try level_boundaries.append(alloc, boundary);
+        }
     } else {
         // Glob-based file collection from paths
         for (config.paths) |pattern| {
@@ -766,7 +771,7 @@ fn buildTarget(
     // which reduces allocation pressure and lets the OS manage paging.
     var source_units: std.ArrayListUnmanaged(compiler.SourceUnit) = .empty;
     var mapped_files: std.ArrayListUnmanaged(compiler.MappedFile) = .empty;
-    defer for (mapped_files.items) |mf| mf.deinit();
+    defer for (mapped_files.items) |*mf| mf.deinit(global_io);
 
     // Validate one-module-per-file and name=path for each source file
     var validation_failed = false;
@@ -890,10 +895,15 @@ fn buildTarget(
         module_order.items
     else
         null;
+    const level_boundaries_slice: ?[]const u32 = if (level_boundaries.items.len > 0)
+        level_boundaries.items
+    else
+        null;
 
     var result = compileProjectFrontend(alloc, source_units.items, .{
         .lib_mode = lib_mode,
         .module_order = mod_order_slice,
+        .level_boundaries = level_boundaries_slice,
         .cache_dir = ".zap-cache/ctfe",
         .ctfe_target = target_name,
         .ctfe_optimize = @tagName(config.optimize),
@@ -983,11 +993,13 @@ fn buildTarget(
         std.process.exit(1);
     };
 
-    // Save cache hash
+    // Save cache hash atomically (write to .tmp then rename)
     {
-        var hash_f = std.Io.Dir.cwd().createFile(global_io, hash_file, .{}) catch return try allocator.dupe(u8, output_path);
-        defer hash_f.close(global_io);
+        const tmp_hash_file = try std.fmt.allocPrint(alloc, "{s}.tmp", .{hash_file});
+        var hash_f = std.Io.Dir.cwd().createFile(global_io, tmp_hash_file, .{}) catch return try allocator.dupe(u8, output_path);
         hash_f.writeStreamingAll(global_io, cache_key_hex) catch {};
+        hash_f.close(global_io);
+        std.Io.Dir.cwd().rename(tmp_hash_file, std.Io.Dir.cwd(), hash_file, global_io) catch {};
     }
 
     // Return a durable copy of the output path
@@ -1088,6 +1100,27 @@ fn runBinaryIgnoreError(allocator: std.mem.Allocator, output_path: []const u8, r
 
 /// Watch source files for changes and rebuild (and optionally re-run) on change.
 /// This function loops forever until the process is killed (e.g. Ctrl+C).
+///
+/// INCREMENTAL COMPILATION INTEGRATION POINT:
+/// Currently this performs a full rebuild on each file change via `buildTarget`.
+/// Once the Zig fork is rebuilt with the incremental ZIR API, this can be
+/// converted to an incremental flow:
+///
+///   1. Before the loop: call `zir_backend.createContext(allocator, options)` once
+///      to create a persistent ZirContext.
+///   2. On the first iteration: call `zir_backend.injectAndUpdate(...)` for the
+///      initial build.
+///   3. On subsequent changes:
+///      a. Call `zir_backend.prepareUpdate(ctx)` to save current ZIR as prev_zir.
+///      b. For each changed file, call `zir_backend.invalidateFile(ctx, name, allocator)`
+///         to mark the module as needing re-analysis.
+///      c. Re-lower only the changed modules' IR to ZIR.
+///      d. Call `zir_backend.injectAndUpdate(...)` — the Zig incremental pipeline
+///         will diff prev_zir vs new ZIR and only re-analyze what changed.
+///   4. After the loop (on shutdown): call `zir_backend.destroyContext(ctx)`.
+///
+/// This requires the fork at ~/projects/zig to be rebuilt with the new
+/// `zir_compilation_prepare_update` and `zir_compilation_invalidate_file` exports.
 fn watchAndRebuild(
     allocator: std.mem.Allocator,
     source_paths: []const []const u8,
@@ -1125,7 +1158,7 @@ fn watchAndRebuild(
             const stdout = std.Io.File.stdout();
             stdout.writeStreamingAll(global_io, "\x1b[2J\x1b[H") catch {};
 
-            // Rebuild
+            // Full rebuild (will be replaced by incremental flow — see function doc).
             const output_path = buildTarget(allocator, project_root, target_name, build_opts, null) catch |err| {
                 std.debug.print("Build error: {}\n", .{err});
                 std.debug.print("\n[watching for changes...]\n", .{});

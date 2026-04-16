@@ -41,6 +41,10 @@ pub const CompileOptions = struct {
     /// Module names in dependency order for CTFE evaluation.
     /// When set, computed attributes are evaluated per-module in this order.
     module_order: ?[]const []const u8 = null,
+    /// Indices into module_order marking where each dependency level ends.
+    /// Modules within the same level have no dependencies on each other
+    /// and can be compiled in parallel. Populated by import-driven discovery.
+    level_boundaries: ?[]const u32 = null,
     /// Directory for persistent CTFE cache. When set, computed attribute
     /// results are cached to disk and reused across builds.
     cache_dir: ?[]const u8 = null,
@@ -132,92 +136,46 @@ pub const SourceUnit = struct {
 };
 
 /// A memory-mapped file that provides zero-copy read access to source contents.
-/// On POSIX systems (Darwin, Linux), the file is mapped via mmap, reducing
-/// allocation pressure and allowing the OS to manage paging. On unsupported
-/// platforms, falls back to a regular heap-allocated read.
+/// Uses Zig 0.16's std.Io.File.MemoryMap for cross-platform memory mapping.
 pub const MappedFile = struct {
-    data: []align(std.heap.page_size_min) const u8,
-    /// When true, `data` was obtained via mmap and must be released with munmap.
-    /// When false, `data` is heap-allocated and the caller owns it via `fallback_allocator`.
-    is_mmap: bool,
-    fallback_allocator: ?std.mem.Allocator,
+    memory_map: ?std.Io.File.MemoryMap,
+    file: ?std.Io.File,
 
-    pub fn deinit(self: MappedFile) void {
-        if (self.is_mmap) {
-            const mutable_data: []align(std.heap.page_size_min) u8 = @constCast(self.data);
-            std.posix.munmap(mutable_data);
-        } else if (self.fallback_allocator) |alloc| {
-            const mutable_data: []align(std.heap.page_size_min) u8 = @constCast(self.data);
-            alloc.free(mutable_data);
-        }
+    pub fn deinit(self: *MappedFile, io: std.Io) void {
+        if (self.memory_map) |*mm| mm.destroy(io);
+        if (self.file) |f| f.close(io);
     }
 
     /// Return the mapped bytes as a plain slice for use in SourceUnit.source.
     pub fn bytes(self: MappedFile) []const u8 {
-        return self.data;
+        if (self.memory_map) |mm| return mm.memory;
+        return &.{};
     }
 };
 
-const builtin = @import("builtin");
-const native_os = builtin.os.tag;
-
-/// Whether the current target supports memory-mapped file I/O.
-pub const has_mmap = switch (native_os) {
-    .macos, .linux, .freebsd, .netbsd, .openbsd, .dragonfly => true,
-    else => false,
-};
-
-/// Memory-map a source file for read-only access. On POSIX systems with mmap
-/// support, this avoids copying file contents into heap memory. On other
-/// platforms (Windows, WASM), falls back to a regular allocated read.
-///
-/// Empty files are handled by returning a zero-length aligned slice without
-/// calling mmap (which rejects zero-length mappings).
+/// Memory-map a source file for read-only access using Zig 0.16's
+/// std.Io.File.MemoryMap. Empty files return a null memory map.
 pub fn mmapSourceFile(io: std.Io, file_path: []const u8, fallback_allocator: std.mem.Allocator) !MappedFile {
+    _ = fallback_allocator;
     const file = try std.Io.Dir.cwd().openFile(io, file_path, .{});
-    defer file.close(io);
+    errdefer file.close(io);
 
     const file_stat = try file.stat(io);
     const file_size = file_stat.size;
 
-    // mmap cannot map zero-length regions; return an empty aligned slice.
     if (file_size == 0) {
-        const empty: []align(std.heap.page_size_min) const u8 = &.{};
-        return MappedFile{
-            .data = empty,
-            .is_mmap = false,
-            .fallback_allocator = null,
-        };
+        file.close(io);
+        return MappedFile{ .memory_map = null, .file = null };
     }
 
-    if (has_mmap) {
-        const mapped = try std.posix.mmap(
-            null,
-            file_size,
-            .{ .READ = true },
-            .{ .TYPE = .PRIVATE },
-            file.handle,
-            0,
-        );
-        return MappedFile{
-            .data = mapped,
-            .is_mmap = true,
-            .fallback_allocator = null,
-        };
-    } else {
-        // Fallback: regular allocated read for platforms without mmap.
-        const buf = try std.Io.Dir.cwd().readFileAlloc(io, file_path, fallback_allocator, .limited(10 * 1024 * 1024));
-        // readFileAlloc returns []u8 which is not page-aligned. We need to
-        // copy into an aligned allocation so MappedFile.data has uniform type.
-        const aligned_buf = try fallback_allocator.alignedAlloc(u8, std.heap.page_size_min, buf.len);
-        @memcpy(aligned_buf, buf);
-        fallback_allocator.free(buf);
-        return MappedFile{
-            .data = aligned_buf,
-            .is_mmap = false,
-            .fallback_allocator = fallback_allocator,
-        };
-    }
+    const mm = try file.createMemoryMap(io, .{
+        .len = file_size,
+        .protection = .{ .read = true, .write = false },
+        .populate = false,
+    });
+    errdefer mm.destroy(io);
+
+    return MappedFile{ .memory_map = mm, .file = file };
 }
 
 /// Pass 1: Parse all source files and collect declarations into a shared context.
@@ -254,7 +212,9 @@ pub fn collectAllFromUnits(
     var diag_engine = zap.DiagnosticEngine.init(alloc);
     diag_engine.use_color = zap.diagnostics.detectColor();
 
-    // Parse each source unit independently with a shared interner.
+    // Parse each source unit with its own local interner, then merge
+    // interners and remap AST StringIds. This architecture supports
+    // parallel parsing (each parser is independent).
     step += 1;
     if (options.show_progress) std.debug.print("\r\x1b[K  [{d}/{d}] Parse", .{ step, total_steps });
 
@@ -264,10 +224,12 @@ pub fn collectAllFromUnits(
     setDiagnosticSources(&diag_engine, all_source_units);
     diag_engine.setLineOffset(0);
 
-    var interner = ast.StringInterner.init(alloc);
+    var global_interner = ast.StringInterner.init(alloc);
     const parsed_programs = try alloc.alloc(ast.Program, all_source_units.len);
+    const local_interners = try alloc.alloc(ast.StringInterner, all_source_units.len);
     for (all_source_units, 0..) |unit, i| {
-        var parser = zap.Parser.initWithSharedInterner(alloc, unit.source, &interner, @intCast(i));
+        local_interners[i] = ast.StringInterner.init(alloc);
+        var parser = zap.Parser.initWithSharedInterner(alloc, unit.source, &local_interners[i], @intCast(i));
         defer parser.deinit();
 
         parsed_programs[i] = parser.parseProgram() catch {
@@ -286,6 +248,16 @@ pub fn collectAllFromUnits(
             }) catch {};
         }
     }
+
+    // Merge local interners into the global interner and remap ASTs.
+    for (0..all_source_units.len) |i| {
+        const remap = buildInternerRemap(alloc, &local_interners[i], &global_interner) catch
+            return error.OutOfMemory;
+        remapProgram(alloc, &parsed_programs[i], remap) catch
+            return error.OutOfMemory;
+    }
+    var interner = global_interner;
+
     if (diag_engine.hasErrors()) {
         if (options.show_progress) std.debug.print("\r\x1b[K", .{});
         emitDiagnostics(&diag_engine, alloc);
@@ -1402,6 +1374,1000 @@ pub fn validateOneModulePerFile(
 /// Get the embedded runtime source.
 pub fn getRuntimeSource() []const u8 {
     return runtime_source;
+}
+
+// ============================================================
+// Interner merging and AST remapping
+// ============================================================
+
+/// Build a remap table from a local interner to the global interner.
+/// For each string in `local_interner`, interns it into `global_interner`
+/// and records the mapping: `remap[local_id] = global_id`.
+fn buildInternerRemap(
+    alloc: std.mem.Allocator,
+    local_interner: *const ast.StringInterner,
+    global_interner: *ast.StringInterner,
+) ![]ast.StringId {
+    const remap = try alloc.alloc(ast.StringId, local_interner.strings.items.len);
+    for (local_interner.strings.items, 0..) |str, i| {
+        remap[i] = try global_interner.intern(str);
+    }
+    return remap;
+}
+
+/// Remap every StringId in a parsed Program using the given remap table.
+/// This walks all AST nodes exhaustively.
+fn remapProgram(
+    alloc: std.mem.Allocator,
+    program: *ast.Program,
+    remap: []const ast.StringId,
+) !void {
+    // Remap modules (mutable copy needed since program.modules is []const)
+    if (program.modules.len > 0) {
+        const mutable_modules = try alloc.alloc(ast.ModuleDecl, program.modules.len);
+        @memcpy(mutable_modules, program.modules);
+        for (mutable_modules) |*mod| {
+            try remapModuleDecl(alloc, mod, remap);
+        }
+        program.modules = mutable_modules;
+    }
+
+    // Remap top_items
+    if (program.top_items.len > 0) {
+        const mutable_top_items = try alloc.alloc(ast.TopItem, program.top_items.len);
+        @memcpy(mutable_top_items, program.top_items);
+        for (mutable_top_items) |*item| {
+            try remapTopItem(alloc, item, remap);
+        }
+        program.top_items = mutable_top_items;
+    }
+}
+
+fn remapModuleName(alloc: std.mem.Allocator, name: *ast.ModuleName, remap: []const ast.StringId) !void {
+    if (name.parts.len > 0) {
+        const mutable_parts = try alloc.alloc(ast.StringId, name.parts.len);
+        for (name.parts, 0..) |part, i| {
+            mutable_parts[i] = remap[part];
+        }
+        name.parts = mutable_parts;
+    }
+}
+
+fn remapModuleDecl(alloc: std.mem.Allocator, mod: *ast.ModuleDecl, remap: []const ast.StringId) !void {
+    try remapModuleName(alloc, &mod.name, remap);
+    if (mod.parent) |p| mod.parent = remap[p];
+    if (mod.items.len > 0) {
+        const mutable_items = try alloc.alloc(ast.ModuleItem, mod.items.len);
+        @memcpy(mutable_items, mod.items);
+        for (mutable_items) |*item| {
+            try remapModuleItem(alloc, item, remap);
+        }
+        mod.items = mutable_items;
+    }
+}
+
+fn remapTopItem(alloc: std.mem.Allocator, item: *ast.TopItem, remap: []const ast.StringId) !void {
+    switch (item.*) {
+        .module, .priv_module => |mod_ptr| {
+            const mutable = try alloc.create(ast.ModuleDecl);
+            mutable.* = mod_ptr.*;
+            try remapModuleDecl(alloc, mutable, remap);
+            item.* = if (item.* == .module) .{ .module = mutable } else .{ .priv_module = mutable };
+        },
+        .type_decl => |td| {
+            const mutable = try alloc.create(ast.TypeDecl);
+            mutable.* = td.*;
+            try remapTypeDecl(alloc, mutable, remap);
+            item.* = .{ .type_decl = mutable };
+        },
+        .opaque_decl => |od| {
+            const mutable = try alloc.create(ast.OpaqueDecl);
+            mutable.* = od.*;
+            try remapOpaqueDecl(alloc, mutable, remap);
+            item.* = .{ .opaque_decl = mutable };
+        },
+        .struct_decl => |sd| {
+            const mutable = try alloc.create(ast.StructDecl);
+            mutable.* = sd.*;
+            try remapStructDecl(alloc, mutable, remap);
+            item.* = .{ .struct_decl = mutable };
+        },
+        .union_decl => |ud| {
+            const mutable = try alloc.create(ast.UnionDecl);
+            mutable.* = ud.*;
+            try remapUnionDecl(alloc, mutable, remap);
+            item.* = .{ .union_decl = mutable };
+        },
+        .function, .priv_function => |fd| {
+            const mutable = try alloc.create(ast.FunctionDecl);
+            mutable.* = fd.*;
+            try remapFunctionDecl(alloc, mutable, remap);
+            item.* = if (item.* == .function) .{ .function = mutable } else .{ .priv_function = mutable };
+        },
+        .macro, .priv_macro => |fd| {
+            const mutable = try alloc.create(ast.FunctionDecl);
+            mutable.* = fd.*;
+            try remapFunctionDecl(alloc, mutable, remap);
+            item.* = if (item.* == .macro) .{ .macro = mutable } else .{ .priv_macro = mutable };
+        },
+    }
+}
+
+fn remapModuleItem(alloc: std.mem.Allocator, item: *ast.ModuleItem, remap: []const ast.StringId) !void {
+    switch (item.*) {
+        .type_decl => |td| {
+            const mutable = try alloc.create(ast.TypeDecl);
+            mutable.* = td.*;
+            try remapTypeDecl(alloc, mutable, remap);
+            item.* = .{ .type_decl = mutable };
+        },
+        .opaque_decl => |od| {
+            const mutable = try alloc.create(ast.OpaqueDecl);
+            mutable.* = od.*;
+            try remapOpaqueDecl(alloc, mutable, remap);
+            item.* = .{ .opaque_decl = mutable };
+        },
+        .struct_decl => |sd| {
+            const mutable = try alloc.create(ast.StructDecl);
+            mutable.* = sd.*;
+            try remapStructDecl(alloc, mutable, remap);
+            item.* = .{ .struct_decl = mutable };
+        },
+        .union_decl => |ud| {
+            const mutable = try alloc.create(ast.UnionDecl);
+            mutable.* = ud.*;
+            try remapUnionDecl(alloc, mutable, remap);
+            item.* = .{ .union_decl = mutable };
+        },
+        .function, .priv_function => |fd| {
+            const mutable = try alloc.create(ast.FunctionDecl);
+            mutable.* = fd.*;
+            try remapFunctionDecl(alloc, mutable, remap);
+            item.* = if (item.* == .function) .{ .function = mutable } else .{ .priv_function = mutable };
+        },
+        .macro, .priv_macro => |fd| {
+            const mutable = try alloc.create(ast.FunctionDecl);
+            mutable.* = fd.*;
+            try remapFunctionDecl(alloc, mutable, remap);
+            item.* = if (item.* == .macro) .{ .macro = mutable } else .{ .priv_macro = mutable };
+        },
+        .alias_decl => |ad| {
+            const mutable = try alloc.create(ast.AliasDecl);
+            mutable.* = ad.*;
+            try remapModuleName(alloc, &mutable.module_path, remap);
+            if (mutable.as_name) |*as_name| try remapModuleName(alloc, as_name, remap);
+            item.* = .{ .alias_decl = mutable };
+        },
+        .import_decl => |id| {
+            const mutable = try alloc.create(ast.ImportDecl);
+            mutable.* = id.*;
+            try remapImportDecl(alloc, mutable, remap);
+            item.* = .{ .import_decl = mutable };
+        },
+        .use_decl => |ud| {
+            const mutable = try alloc.create(ast.UseDecl);
+            mutable.* = ud.*;
+            try remapModuleName(alloc, &mutable.module_path, remap);
+            if (mutable.opts) |opts| {
+                const mutable_opts = try alloc.create(ast.Expr);
+                mutable_opts.* = opts.*;
+                try remapExpr(alloc, mutable_opts, remap);
+                mutable.opts = mutable_opts;
+            }
+            item.* = .{ .use_decl = mutable };
+        },
+        .attribute => |attr| {
+            const mutable = try alloc.create(ast.AttributeDecl);
+            mutable.* = attr.*;
+            mutable.name = remap[attr.name];
+            if (mutable.type_expr) |te| {
+                const mutable_te = try alloc.create(ast.TypeExpr);
+                mutable_te.* = te.*;
+                try remapTypeExpr(alloc, mutable_te, remap);
+                mutable.type_expr = mutable_te;
+            }
+            if (mutable.value) |v| {
+                const mutable_v = try alloc.create(ast.Expr);
+                mutable_v.* = v.*;
+                try remapExpr(alloc, mutable_v, remap);
+                mutable.value = mutable_v;
+            }
+            item.* = .{ .attribute = mutable };
+        },
+        .module_level_expr => |expr| {
+            const mutable = try alloc.create(ast.Expr);
+            mutable.* = expr.*;
+            try remapExpr(alloc, mutable, remap);
+            item.* = .{ .module_level_expr = mutable };
+        },
+    }
+}
+
+fn remapTypeDecl(alloc: std.mem.Allocator, td: *ast.TypeDecl, remap: []const ast.StringId) !void {
+    td.name = remap[td.name];
+    try remapTypeParams(alloc, td, remap);
+    const mutable_body = try alloc.create(ast.TypeExpr);
+    mutable_body.* = td.body.*;
+    try remapTypeExpr(alloc, mutable_body, remap);
+    td.body = mutable_body;
+}
+
+fn remapOpaqueDecl(alloc: std.mem.Allocator, od: *ast.OpaqueDecl, remap: []const ast.StringId) !void {
+    od.name = remap[od.name];
+    try remapOpaqueParams(alloc, od, remap);
+    const mutable_body = try alloc.create(ast.TypeExpr);
+    mutable_body.* = od.body.*;
+    try remapTypeExpr(alloc, mutable_body, remap);
+    od.body = mutable_body;
+}
+
+fn remapTypeParams(alloc: std.mem.Allocator, td: *ast.TypeDecl, remap: []const ast.StringId) !void {
+    if (td.params.len > 0) {
+        const mutable_params = try alloc.alloc(ast.TypeParam, td.params.len);
+        for (td.params, 0..) |p, i| {
+            mutable_params[i] = p;
+            mutable_params[i].name = remap[p.name];
+        }
+        td.params = mutable_params;
+    }
+}
+
+fn remapOpaqueParams(alloc: std.mem.Allocator, od: *ast.OpaqueDecl, remap: []const ast.StringId) !void {
+    if (od.params.len > 0) {
+        const mutable_params = try alloc.alloc(ast.TypeParam, od.params.len);
+        for (od.params, 0..) |p, i| {
+            mutable_params[i] = p;
+            mutable_params[i].name = remap[p.name];
+        }
+        od.params = mutable_params;
+    }
+}
+
+fn remapStructDecl(alloc: std.mem.Allocator, sd: *ast.StructDecl, remap: []const ast.StringId) !void {
+    if (sd.name) |n| sd.name = remap[n];
+    if (sd.parent) |p| sd.parent = remap[p];
+    if (sd.fields.len > 0) {
+        const mutable_fields = try alloc.alloc(ast.StructFieldDecl, sd.fields.len);
+        for (sd.fields, 0..) |f, i| {
+            mutable_fields[i] = f;
+            mutable_fields[i].name = remap[f.name];
+            const mutable_te = try alloc.create(ast.TypeExpr);
+            mutable_te.* = f.type_expr.*;
+            try remapTypeExpr(alloc, mutable_te, remap);
+            mutable_fields[i].type_expr = mutable_te;
+            if (f.default) |def| {
+                const mutable_def = try alloc.create(ast.Expr);
+                mutable_def.* = def.*;
+                try remapExpr(alloc, mutable_def, remap);
+                mutable_fields[i].default = mutable_def;
+            }
+        }
+        sd.fields = mutable_fields;
+    }
+}
+
+fn remapUnionDecl(alloc: std.mem.Allocator, ud: *ast.UnionDecl, remap: []const ast.StringId) !void {
+    ud.name = remap[ud.name];
+    if (ud.variants.len > 0) {
+        const mutable_variants = try alloc.alloc(ast.UnionVariant, ud.variants.len);
+        for (ud.variants, 0..) |v, i| {
+            mutable_variants[i] = v;
+            mutable_variants[i].name = remap[v.name];
+            if (v.type_expr) |te| {
+                const mutable_te = try alloc.create(ast.TypeExpr);
+                mutable_te.* = te.*;
+                try remapTypeExpr(alloc, mutable_te, remap);
+                mutable_variants[i].type_expr = mutable_te;
+            }
+        }
+        ud.variants = mutable_variants;
+    }
+}
+
+fn remapFunctionDecl(alloc: std.mem.Allocator, fd: *ast.FunctionDecl, remap: []const ast.StringId) !void {
+    fd.name = remap[fd.name];
+    if (fd.clauses.len > 0) {
+        const mutable_clauses = try alloc.alloc(ast.FunctionClause, fd.clauses.len);
+        for (fd.clauses, 0..) |clause, i| {
+            mutable_clauses[i] = clause;
+            try remapFunctionClause(alloc, &mutable_clauses[i], remap);
+        }
+        fd.clauses = mutable_clauses;
+    }
+}
+
+fn remapFunctionClause(alloc: std.mem.Allocator, clause: *ast.FunctionClause, remap: []const ast.StringId) !void {
+    if (clause.params.len > 0) {
+        const mutable_params = try alloc.alloc(ast.Param, clause.params.len);
+        for (clause.params, 0..) |p, i| {
+            mutable_params[i] = p;
+            const mutable_pat = try alloc.create(ast.Pattern);
+            mutable_pat.* = p.pattern.*;
+            try remapPattern(alloc, mutable_pat, remap);
+            mutable_params[i].pattern = mutable_pat;
+            if (p.type_annotation) |ta| {
+                const mutable_ta = try alloc.create(ast.TypeExpr);
+                mutable_ta.* = ta.*;
+                try remapTypeExpr(alloc, mutable_ta, remap);
+                mutable_params[i].type_annotation = mutable_ta;
+            }
+            if (p.default) |def| {
+                const mutable_def = try alloc.create(ast.Expr);
+                mutable_def.* = def.*;
+                try remapExpr(alloc, mutable_def, remap);
+                mutable_params[i].default = mutable_def;
+            }
+        }
+        clause.params = mutable_params;
+    }
+    if (clause.return_type) |rt| {
+        const mutable_rt = try alloc.create(ast.TypeExpr);
+        mutable_rt.* = rt.*;
+        try remapTypeExpr(alloc, mutable_rt, remap);
+        clause.return_type = mutable_rt;
+    }
+    if (clause.refinement) |ref| {
+        const mutable_ref = try alloc.create(ast.Expr);
+        mutable_ref.* = ref.*;
+        try remapExpr(alloc, mutable_ref, remap);
+        clause.refinement = mutable_ref;
+    }
+    if (clause.body) |body| {
+        try remapStmtsForClause(alloc, clause, remap, body);
+    }
+}
+
+fn remapStmtsForClause(alloc: std.mem.Allocator, clause: *ast.FunctionClause, remap: []const ast.StringId, body: []const ast.Stmt) !void {
+    const mutable_body = try alloc.alloc(ast.Stmt, body.len);
+    @memcpy(mutable_body, body);
+    for (mutable_body) |*stmt| {
+        try remapStmt(alloc, stmt, remap);
+    }
+    clause.body = mutable_body;
+}
+
+fn remapStmt(alloc: std.mem.Allocator, stmt: *ast.Stmt, remap: []const ast.StringId) !void {
+    switch (stmt.*) {
+        .expr => |e| {
+            const mutable = try alloc.create(ast.Expr);
+            mutable.* = e.*;
+            try remapExpr(alloc, mutable, remap);
+            stmt.* = .{ .expr = mutable };
+        },
+        .assignment => |a| {
+            const mutable = try alloc.create(ast.Assignment);
+            mutable.* = a.*;
+            const mutable_pat = try alloc.create(ast.Pattern);
+            mutable_pat.* = a.pattern.*;
+            try remapPattern(alloc, mutable_pat, remap);
+            mutable.pattern = mutable_pat;
+            const mutable_val = try alloc.create(ast.Expr);
+            mutable_val.* = a.value.*;
+            try remapExpr(alloc, mutable_val, remap);
+            mutable.value = mutable_val;
+            stmt.* = .{ .assignment = mutable };
+        },
+        .function_decl => |fd| {
+            const mutable = try alloc.create(ast.FunctionDecl);
+            mutable.* = fd.*;
+            try remapFunctionDecl(alloc, mutable, remap);
+            stmt.* = .{ .function_decl = mutable };
+        },
+        .macro_decl => |fd| {
+            const mutable = try alloc.create(ast.FunctionDecl);
+            mutable.* = fd.*;
+            try remapFunctionDecl(alloc, mutable, remap);
+            stmt.* = .{ .macro_decl = mutable };
+        },
+        .import_decl => |id| {
+            const mutable = try alloc.create(ast.ImportDecl);
+            mutable.* = id.*;
+            try remapImportDecl(alloc, mutable, remap);
+            stmt.* = .{ .import_decl = mutable };
+        },
+    }
+}
+
+fn remapImportDecl(alloc: std.mem.Allocator, id: *ast.ImportDecl, remap: []const ast.StringId) !void {
+    try remapModuleName(alloc, &id.module_path, remap);
+    if (id.filter) |*filter| {
+        switch (filter.*) {
+            .only => |entries| {
+                const mutable_entries = try alloc.alloc(ast.ImportEntry, entries.len);
+                for (entries, 0..) |entry, i| {
+                    mutable_entries[i] = switch (entry) {
+                        .function => |f| .{ .function = .{ .name = remap[f.name], .arity = f.arity } },
+                        .type_import => |t| .{ .type_import = remap[t] },
+                    };
+                }
+                filter.* = .{ .only = mutable_entries };
+            },
+            .except => |entries| {
+                const mutable_entries = try alloc.alloc(ast.ImportEntry, entries.len);
+                for (entries, 0..) |entry, i| {
+                    mutable_entries[i] = switch (entry) {
+                        .function => |f| .{ .function = .{ .name = remap[f.name], .arity = f.arity } },
+                        .type_import => |t| .{ .type_import = remap[t] },
+                    };
+                }
+                filter.* = .{ .except = mutable_entries };
+            },
+        }
+    }
+}
+
+fn remapExpr(alloc: std.mem.Allocator, expr: *ast.Expr, remap: []const ast.StringId) !void {
+    switch (expr.*) {
+        .string_literal => |*sl| sl.value = remap[sl.value],
+        .atom_literal => |*al| al.value = remap[al.value],
+        .var_ref => |*vr| vr.name = remap[vr.name],
+        .module_ref => |*mr| try remapModuleName(alloc, &mr.name, remap),
+        .field_access => |*fa| {
+            const mutable_obj = try alloc.create(ast.Expr);
+            mutable_obj.* = fa.object.*;
+            try remapExpr(alloc, mutable_obj, remap);
+            fa.object = mutable_obj;
+            fa.field = remap[fa.field];
+        },
+        .intrinsic => |*intr| {
+            intr.name = remap[intr.name];
+            if (intr.args.len > 0) {
+                const mutable_args = try alloc.alloc(*const ast.Expr, intr.args.len);
+                for (intr.args, 0..) |arg, i| {
+                    const mutable = try alloc.create(ast.Expr);
+                    mutable.* = arg.*;
+                    try remapExpr(alloc, mutable, remap);
+                    mutable_args[i] = mutable;
+                }
+                intr.args = mutable_args;
+            }
+        },
+        .attr_ref => |*ar| ar.name = remap[ar.name],
+        .for_expr => |*fe| {
+            fe.var_name = remap[fe.var_name];
+            const mutable_iter = try alloc.create(ast.Expr);
+            mutable_iter.* = fe.iterable.*;
+            try remapExpr(alloc, mutable_iter, remap);
+            fe.iterable = mutable_iter;
+            if (fe.filter) |f| {
+                const mutable_filter = try alloc.create(ast.Expr);
+                mutable_filter.* = f.*;
+                try remapExpr(alloc, mutable_filter, remap);
+                fe.filter = mutable_filter;
+            }
+            const mutable_body = try alloc.create(ast.Expr);
+            mutable_body.* = fe.body.*;
+            try remapExpr(alloc, mutable_body, remap);
+            fe.body = mutable_body;
+        },
+        .string_interpolation => |*si| {
+            if (si.parts.len > 0) {
+                const mutable_parts = try alloc.alloc(ast.StringPart, si.parts.len);
+                for (si.parts, 0..) |part, i| {
+                    mutable_parts[i] = switch (part) {
+                        .literal => |lit| .{ .literal = remap[lit] },
+                        .expr => |e| blk: {
+                            const mutable = try alloc.create(ast.Expr);
+                            mutable.* = e.*;
+                            try remapExpr(alloc, mutable, remap);
+                            break :blk .{ .expr = mutable };
+                        },
+                    };
+                }
+                si.parts = mutable_parts;
+            }
+        },
+        .struct_expr => |*se| {
+            try remapModuleName(alloc, &se.module_name, remap);
+            if (se.update_source) |us| {
+                const mutable = try alloc.create(ast.Expr);
+                mutable.* = us.*;
+                try remapExpr(alloc, mutable, remap);
+                se.update_source = mutable;
+            }
+            if (se.fields.len > 0) {
+                const mutable_fields = try alloc.alloc(ast.StructField, se.fields.len);
+                for (se.fields, 0..) |f, i| {
+                    mutable_fields[i] = f;
+                    mutable_fields[i].name = remap[f.name];
+                    const mutable_val = try alloc.create(ast.Expr);
+                    mutable_val.* = f.value.*;
+                    try remapExpr(alloc, mutable_val, remap);
+                    mutable_fields[i].value = mutable_val;
+                }
+                se.fields = mutable_fields;
+            }
+        },
+        .function_ref => |*fr| {
+            if (fr.module) |*m| try remapModuleName(alloc, m, remap);
+            fr.function = remap[fr.function];
+        },
+        .binary_op => |*bo| {
+            const mutable_lhs = try alloc.create(ast.Expr);
+            mutable_lhs.* = bo.lhs.*;
+            try remapExpr(alloc, mutable_lhs, remap);
+            bo.lhs = mutable_lhs;
+            const mutable_rhs = try alloc.create(ast.Expr);
+            mutable_rhs.* = bo.rhs.*;
+            try remapExpr(alloc, mutable_rhs, remap);
+            bo.rhs = mutable_rhs;
+        },
+        .unary_op => |*uo| {
+            const mutable = try alloc.create(ast.Expr);
+            mutable.* = uo.operand.*;
+            try remapExpr(alloc, mutable, remap);
+            uo.operand = mutable;
+        },
+        .call => |*ce| {
+            const mutable_callee = try alloc.create(ast.Expr);
+            mutable_callee.* = ce.callee.*;
+            try remapExpr(alloc, mutable_callee, remap);
+            ce.callee = mutable_callee;
+            if (ce.args.len > 0) {
+                const mutable_args = try alloc.alloc(*const ast.Expr, ce.args.len);
+                for (ce.args, 0..) |arg, i| {
+                    const mutable = try alloc.create(ast.Expr);
+                    mutable.* = arg.*;
+                    try remapExpr(alloc, mutable, remap);
+                    mutable_args[i] = mutable;
+                }
+                ce.args = mutable_args;
+            }
+        },
+        .pipe => |*pe| {
+            const mutable_lhs = try alloc.create(ast.Expr);
+            mutable_lhs.* = pe.lhs.*;
+            try remapExpr(alloc, mutable_lhs, remap);
+            pe.lhs = mutable_lhs;
+            const mutable_rhs = try alloc.create(ast.Expr);
+            mutable_rhs.* = pe.rhs.*;
+            try remapExpr(alloc, mutable_rhs, remap);
+            pe.rhs = mutable_rhs;
+        },
+        .unwrap => |*uw| {
+            const mutable = try alloc.create(ast.Expr);
+            mutable.* = uw.expr.*;
+            try remapExpr(alloc, mutable, remap);
+            uw.expr = mutable;
+        },
+        .if_expr => |*ie| {
+            const mutable_cond = try alloc.create(ast.Expr);
+            mutable_cond.* = ie.condition.*;
+            try remapExpr(alloc, mutable_cond, remap);
+            ie.condition = mutable_cond;
+            try remapStmtSlice(alloc, &ie.then_block, remap);
+            if (ie.else_block) |*eb| {
+                try remapStmtSlice(alloc, eb, remap);
+            }
+        },
+        .case_expr => |*ce| {
+            const mutable_scrutinee = try alloc.create(ast.Expr);
+            mutable_scrutinee.* = ce.scrutinee.*;
+            try remapExpr(alloc, mutable_scrutinee, remap);
+            ce.scrutinee = mutable_scrutinee;
+            if (ce.clauses.len > 0) {
+                const mutable_clauses = try alloc.alloc(ast.CaseClause, ce.clauses.len);
+                for (ce.clauses, 0..) |c, i| {
+                    mutable_clauses[i] = c;
+                    try remapCaseClause(alloc, &mutable_clauses[i], remap);
+                }
+                ce.clauses = mutable_clauses;
+            }
+        },
+        .cond_expr => |*ce| {
+            if (ce.clauses.len > 0) {
+                const mutable_clauses = try alloc.alloc(ast.CondClause, ce.clauses.len);
+                for (ce.clauses, 0..) |c, i| {
+                    mutable_clauses[i] = c;
+                    const mutable_cond = try alloc.create(ast.Expr);
+                    mutable_cond.* = c.condition.*;
+                    try remapExpr(alloc, mutable_cond, remap);
+                    mutable_clauses[i].condition = mutable_cond;
+                    try remapStmtSlice(alloc, &mutable_clauses[i].body, remap);
+                }
+                ce.clauses = mutable_clauses;
+            }
+        },
+        .tuple => |*te| {
+            if (te.elements.len > 0) {
+                const mutable_elems = try alloc.alloc(*const ast.Expr, te.elements.len);
+                for (te.elements, 0..) |elem, i| {
+                    const mutable = try alloc.create(ast.Expr);
+                    mutable.* = elem.*;
+                    try remapExpr(alloc, mutable, remap);
+                    mutable_elems[i] = mutable;
+                }
+                te.elements = mutable_elems;
+            }
+        },
+        .list => |*le| {
+            if (le.elements.len > 0) {
+                const mutable_elems = try alloc.alloc(*const ast.Expr, le.elements.len);
+                for (le.elements, 0..) |elem, i| {
+                    const mutable = try alloc.create(ast.Expr);
+                    mutable.* = elem.*;
+                    try remapExpr(alloc, mutable, remap);
+                    mutable_elems[i] = mutable;
+                }
+                le.elements = mutable_elems;
+            }
+        },
+        .map => |*me| {
+            if (me.update_source) |us| {
+                const mutable = try alloc.create(ast.Expr);
+                mutable.* = us.*;
+                try remapExpr(alloc, mutable, remap);
+                me.update_source = mutable;
+            }
+            if (me.fields.len > 0) {
+                const mutable_fields = try alloc.alloc(ast.MapField, me.fields.len);
+                for (me.fields, 0..) |f, i| {
+                    const mutable_key = try alloc.create(ast.Expr);
+                    mutable_key.* = f.key.*;
+                    try remapExpr(alloc, mutable_key, remap);
+                    const mutable_val = try alloc.create(ast.Expr);
+                    mutable_val.* = f.value.*;
+                    try remapExpr(alloc, mutable_val, remap);
+                    mutable_fields[i] = .{ .key = mutable_key, .value = mutable_val };
+                }
+                me.fields = mutable_fields;
+            }
+        },
+        .list_cons_expr => |*lce| {
+            const mutable_head = try alloc.create(ast.Expr);
+            mutable_head.* = lce.head.*;
+            try remapExpr(alloc, mutable_head, remap);
+            lce.head = mutable_head;
+            const mutable_tail = try alloc.create(ast.Expr);
+            mutable_tail.* = lce.tail.*;
+            try remapExpr(alloc, mutable_tail, remap);
+            lce.tail = mutable_tail;
+        },
+        .quote_expr => |*qe| {
+            try remapStmtSlice(alloc, &qe.body, remap);
+        },
+        .unquote_expr => |*ue| {
+            const mutable = try alloc.create(ast.Expr);
+            mutable.* = ue.expr.*;
+            try remapExpr(alloc, mutable, remap);
+            ue.expr = mutable;
+        },
+        .unquote_splicing_expr => |*use_| {
+            const mutable = try alloc.create(ast.Expr);
+            mutable.* = use_.expr.*;
+            try remapExpr(alloc, mutable, remap);
+            use_.expr = mutable;
+        },
+        .panic_expr => |*pe| {
+            const mutable = try alloc.create(ast.Expr);
+            mutable.* = pe.message.*;
+            try remapExpr(alloc, mutable, remap);
+            pe.message = mutable;
+        },
+        .error_pipe => |*ep| {
+            const mutable_chain = try alloc.create(ast.Expr);
+            mutable_chain.* = ep.chain.*;
+            try remapExpr(alloc, mutable_chain, remap);
+            ep.chain = mutable_chain;
+            switch (ep.handler) {
+                .block => |clauses| {
+                    if (clauses.len > 0) {
+                        const mutable_clauses = try alloc.alloc(ast.CaseClause, clauses.len);
+                        for (clauses, 0..) |c, i| {
+                            mutable_clauses[i] = c;
+                            try remapCaseClause(alloc, &mutable_clauses[i], remap);
+                        }
+                        ep.handler = .{ .block = mutable_clauses };
+                    }
+                },
+                .function => |f| {
+                    const mutable = try alloc.create(ast.Expr);
+                    mutable.* = f.*;
+                    try remapExpr(alloc, mutable, remap);
+                    ep.handler = .{ .function = mutable };
+                },
+            }
+        },
+        .block => |*be| {
+            try remapStmtSlice(alloc, &be.stmts, remap);
+        },
+        .binary_literal => |*bl| {
+            try remapBinarySegments(alloc, bl, remap);
+        },
+        .anonymous_function => |*af| {
+            const mutable_decl = try alloc.create(ast.FunctionDecl);
+            mutable_decl.* = af.decl.*;
+            try remapFunctionDecl(alloc, mutable_decl, remap);
+            af.decl = mutable_decl;
+        },
+        .type_annotated => |*ta| {
+            const mutable_expr = try alloc.create(ast.Expr);
+            mutable_expr.* = ta.expr.*;
+            try remapExpr(alloc, mutable_expr, remap);
+            ta.expr = mutable_expr;
+            const mutable_te = try alloc.create(ast.TypeExpr);
+            mutable_te.* = ta.type_expr.*;
+            try remapTypeExpr(alloc, mutable_te, remap);
+            ta.type_expr = mutable_te;
+        },
+        // These have no StringId fields — only meta and numeric/bool values
+        .int_literal, .float_literal, .bool_literal, .nil_literal => {},
+    }
+}
+
+fn remapStmtSlice(alloc: std.mem.Allocator, stmts: *[]const ast.Stmt, remap: []const ast.StringId) !void {
+    if (stmts.len > 0) {
+        const mutable = try alloc.alloc(ast.Stmt, stmts.len);
+        @memcpy(mutable, stmts.*);
+        for (mutable) |*stmt| {
+            try remapStmt(alloc, stmt, remap);
+        }
+        stmts.* = mutable;
+    }
+}
+
+fn remapCaseClause(alloc: std.mem.Allocator, clause: *ast.CaseClause, remap: []const ast.StringId) !void {
+    const mutable_pat = try alloc.create(ast.Pattern);
+    mutable_pat.* = clause.pattern.*;
+    try remapPattern(alloc, mutable_pat, remap);
+    clause.pattern = mutable_pat;
+    if (clause.type_annotation) |ta| {
+        const mutable_ta = try alloc.create(ast.TypeExpr);
+        mutable_ta.* = ta.*;
+        try remapTypeExpr(alloc, mutable_ta, remap);
+        clause.type_annotation = mutable_ta;
+    }
+    if (clause.guard) |g| {
+        const mutable_g = try alloc.create(ast.Expr);
+        mutable_g.* = g.*;
+        try remapExpr(alloc, mutable_g, remap);
+        clause.guard = mutable_g;
+    }
+    try remapStmtSlice(alloc, &clause.body, remap);
+}
+
+fn remapBinarySegments(alloc: std.mem.Allocator, bl: *ast.BinaryLiteral, remap: []const ast.StringId) !void {
+    if (bl.segments.len > 0) {
+        const mutable_segs = try alloc.alloc(ast.BinarySegment, bl.segments.len);
+        for (bl.segments, 0..) |seg, i| {
+            mutable_segs[i] = seg;
+            try remapBinarySegment(alloc, &mutable_segs[i], remap);
+        }
+        bl.segments = mutable_segs;
+    }
+}
+
+fn remapBinarySegment(alloc: std.mem.Allocator, seg: *ast.BinarySegment, remap: []const ast.StringId) !void {
+    switch (seg.value) {
+        .expr => |e| {
+            const mutable = try alloc.create(ast.Expr);
+            mutable.* = e.*;
+            try remapExpr(alloc, mutable, remap);
+            seg.value = .{ .expr = mutable };
+        },
+        .pattern => |p| {
+            const mutable = try alloc.create(ast.Pattern);
+            mutable.* = p.*;
+            try remapPattern(alloc, mutable, remap);
+            seg.value = .{ .pattern = mutable };
+        },
+        .string_literal => |sl| seg.value = .{ .string_literal = remap[sl] },
+    }
+    if (seg.size) |*size| {
+        switch (size.*) {
+            .variable => |v| size.* = .{ .variable = remap[v] },
+            .literal => {},
+        }
+    }
+}
+
+fn remapPattern(alloc: std.mem.Allocator, pattern: *ast.Pattern, remap: []const ast.StringId) !void {
+    switch (pattern.*) {
+        .bind => |*bp| bp.name = remap[bp.name],
+        .pin => |*pp| pp.name = remap[pp.name],
+        .literal => |*lp| {
+            switch (lp.*) {
+                .string => |*s| s.value = remap[s.value],
+                .atom => |*a| a.value = remap[a.value],
+                .int, .float, .bool_lit, .nil => {},
+            }
+        },
+        .tuple => |*tp| {
+            if (tp.elements.len > 0) {
+                const mutable_elems = try alloc.alloc(*const ast.Pattern, tp.elements.len);
+                for (tp.elements, 0..) |elem, i| {
+                    const mutable = try alloc.create(ast.Pattern);
+                    mutable.* = elem.*;
+                    try remapPattern(alloc, mutable, remap);
+                    mutable_elems[i] = mutable;
+                }
+                tp.elements = mutable_elems;
+            }
+        },
+        .list => |*lp| {
+            if (lp.elements.len > 0) {
+                const mutable_elems = try alloc.alloc(*const ast.Pattern, lp.elements.len);
+                for (lp.elements, 0..) |elem, i| {
+                    const mutable = try alloc.create(ast.Pattern);
+                    mutable.* = elem.*;
+                    try remapPattern(alloc, mutable, remap);
+                    mutable_elems[i] = mutable;
+                }
+                lp.elements = mutable_elems;
+            }
+        },
+        .list_cons => |*lcp| {
+            if (lcp.heads.len > 0) {
+                const mutable_heads = try alloc.alloc(*const ast.Pattern, lcp.heads.len);
+                for (lcp.heads, 0..) |h, i| {
+                    const mutable = try alloc.create(ast.Pattern);
+                    mutable.* = h.*;
+                    try remapPattern(alloc, mutable, remap);
+                    mutable_heads[i] = mutable;
+                }
+                lcp.heads = mutable_heads;
+            }
+            const mutable_tail = try alloc.create(ast.Pattern);
+            mutable_tail.* = lcp.tail.*;
+            try remapPattern(alloc, mutable_tail, remap);
+            lcp.tail = mutable_tail;
+        },
+        .map => |*mp| {
+            if (mp.fields.len > 0) {
+                const mutable_fields = try alloc.alloc(ast.MapPatternField, mp.fields.len);
+                for (mp.fields, 0..) |f, i| {
+                    const mutable_key = try alloc.create(ast.Expr);
+                    mutable_key.* = f.key.*;
+                    try remapExpr(alloc, mutable_key, remap);
+                    const mutable_val = try alloc.create(ast.Pattern);
+                    mutable_val.* = f.value.*;
+                    try remapPattern(alloc, mutable_val, remap);
+                    mutable_fields[i] = .{ .key = mutable_key, .value = mutable_val };
+                }
+                mp.fields = mutable_fields;
+            }
+        },
+        .struct_pattern => |*sp| {
+            try remapModuleName(alloc, &sp.module_name, remap);
+            if (sp.fields.len > 0) {
+                const mutable_fields = try alloc.alloc(ast.StructPatternField, sp.fields.len);
+                for (sp.fields, 0..) |f, i| {
+                    mutable_fields[i] = f;
+                    mutable_fields[i].name = remap[f.name];
+                    const mutable_pat = try alloc.create(ast.Pattern);
+                    mutable_pat.* = f.pattern.*;
+                    try remapPattern(alloc, mutable_pat, remap);
+                    mutable_fields[i].pattern = mutable_pat;
+                }
+                sp.fields = mutable_fields;
+            }
+        },
+        .paren => |*pp| {
+            const mutable = try alloc.create(ast.Pattern);
+            mutable.* = pp.inner.*;
+            try remapPattern(alloc, mutable, remap);
+            pp.inner = mutable;
+        },
+        .binary => |*bp| {
+            if (bp.segments.len > 0) {
+                const mutable_segs = try alloc.alloc(ast.BinarySegment, bp.segments.len);
+                for (bp.segments, 0..) |seg, i| {
+                    mutable_segs[i] = seg;
+                    try remapBinarySegment(alloc, &mutable_segs[i], remap);
+                }
+                bp.segments = mutable_segs;
+            }
+        },
+        .wildcard => {},
+    }
+}
+
+fn remapTypeExpr(alloc: std.mem.Allocator, te: *ast.TypeExpr, remap: []const ast.StringId) !void {
+    switch (te.*) {
+        .name => |*tne| {
+            tne.name = remap[tne.name];
+            if (tne.args.len > 0) {
+                const mutable_args = try alloc.alloc(*const ast.TypeExpr, tne.args.len);
+                for (tne.args, 0..) |arg, i| {
+                    const mutable = try alloc.create(ast.TypeExpr);
+                    mutable.* = arg.*;
+                    try remapTypeExpr(alloc, mutable, remap);
+                    mutable_args[i] = mutable;
+                }
+                tne.args = mutable_args;
+            }
+        },
+        .variable => |*tve| tve.name = remap[tve.name],
+        .tuple => |*tte| {
+            if (tte.elements.len > 0) {
+                const mutable_elems = try alloc.alloc(*const ast.TypeExpr, tte.elements.len);
+                for (tte.elements, 0..) |elem, i| {
+                    const mutable = try alloc.create(ast.TypeExpr);
+                    mutable.* = elem.*;
+                    try remapTypeExpr(alloc, mutable, remap);
+                    mutable_elems[i] = mutable;
+                }
+                tte.elements = mutable_elems;
+            }
+        },
+        .list => |*tle| {
+            const mutable = try alloc.create(ast.TypeExpr);
+            mutable.* = tle.element.*;
+            try remapTypeExpr(alloc, mutable, remap);
+            tle.element = mutable;
+        },
+        .map => |*tme| {
+            if (tme.fields.len > 0) {
+                const mutable_fields = try alloc.alloc(ast.TypeMapField, tme.fields.len);
+                for (tme.fields, 0..) |f, i| {
+                    const mutable_key = try alloc.create(ast.TypeExpr);
+                    mutable_key.* = f.key.*;
+                    try remapTypeExpr(alloc, mutable_key, remap);
+                    const mutable_val = try alloc.create(ast.TypeExpr);
+                    mutable_val.* = f.value.*;
+                    try remapTypeExpr(alloc, mutable_val, remap);
+                    mutable_fields[i] = .{ .key = mutable_key, .value = mutable_val };
+                }
+                tme.fields = mutable_fields;
+            }
+        },
+        .struct_type => |*tse| {
+            try remapModuleName(alloc, &tse.module_name, remap);
+            if (tse.fields.len > 0) {
+                const mutable_fields = try alloc.alloc(ast.TypeStructField, tse.fields.len);
+                for (tse.fields, 0..) |f, i| {
+                    mutable_fields[i] = f;
+                    mutable_fields[i].name = remap[f.name];
+                    const mutable_te = try alloc.create(ast.TypeExpr);
+                    mutable_te.* = f.type_expr.*;
+                    try remapTypeExpr(alloc, mutable_te, remap);
+                    mutable_fields[i].type_expr = mutable_te;
+                }
+                tse.fields = mutable_fields;
+            }
+        },
+        .union_type => |*tue| {
+            if (tue.members.len > 0) {
+                const mutable_members = try alloc.alloc(*const ast.TypeExpr, tue.members.len);
+                for (tue.members, 0..) |m, i| {
+                    const mutable = try alloc.create(ast.TypeExpr);
+                    mutable.* = m.*;
+                    try remapTypeExpr(alloc, mutable, remap);
+                    mutable_members[i] = mutable;
+                }
+                tue.members = mutable_members;
+            }
+        },
+        .function => |*tfe| {
+            if (tfe.params.len > 0) {
+                const mutable_params = try alloc.alloc(*const ast.TypeExpr, tfe.params.len);
+                for (tfe.params, 0..) |p, i| {
+                    const mutable = try alloc.create(ast.TypeExpr);
+                    mutable.* = p.*;
+                    try remapTypeExpr(alloc, mutable, remap);
+                    mutable_params[i] = mutable;
+                }
+                tfe.params = mutable_params;
+            }
+            const mutable_ret = try alloc.create(ast.TypeExpr);
+            mutable_ret.* = tfe.return_type.*;
+            try remapTypeExpr(alloc, mutable_ret, remap);
+            tfe.return_type = mutable_ret;
+        },
+        .literal => |*tle| {
+            switch (tle.value) {
+                .string => |s| tle.value = .{ .string = remap[s] },
+                .int, .bool_val, .nil => {},
+            }
+        },
+        .paren => |*tpe| {
+            const mutable = try alloc.create(ast.TypeExpr);
+            mutable.* = tpe.inner.*;
+            try remapTypeExpr(alloc, mutable, remap);
+            tpe.inner = mutable;
+        },
+        .never => {},
+    }
 }
 
 // ============================================================

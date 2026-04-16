@@ -68,8 +68,7 @@ fn bumpAllocSlice(comptime T: type, len: usize) []T {
 
 pub fn resetAllocator() void {
     if (runtime_arena) |*a| {
-        a.deinit();
-        runtime_arena = null;
+        a.reset(.retain_capacity);
     }
 }
 
@@ -858,7 +857,7 @@ pub const Prelude = struct {
         } else if (info == .int or info == .comptime_int) {
             writer.print("{d}", .{value}) catch {};
         } else if (info == .float or info == .comptime_float) {
-            const rounded: i64 = @intFromFloat(value);
+            const rounded: i64 = @trunc(value);
             if (value == @as(@TypeOf(value), @floatFromInt(rounded))) {
                 writer.print("{d}.0", .{rounded}) catch {};
             } else {
@@ -1052,7 +1051,7 @@ pub const Prelude = struct {
     }
 
     pub fn f64_to_i64(x: f64) i64 {
-        return @intFromFloat(x);
+        return @trunc(x);
     }
 
     pub fn i64_to_f64(x: i64) f64 {
@@ -1328,11 +1327,10 @@ pub const TestTracker = struct {
 
     pub fn get_seed() i64 {
         if (!seed_set) {
-            // Generate seed from system clock (microseconds since epoch)
-            var tv: std.c.timeval = undefined;
-            _ = std.c.gettimeofday(&tv, null);
-            const usec: i64 = @as(i64, @intCast(tv.sec)) *% 1_000_000 +% @as(i64, @intCast(tv.usec));
-            seed = if (usec < 0) -usec else usec;
+            // Generate seed from system clock via Zig 0.16 Io.Timestamp
+            const timestamp = std.Io.Timestamp.now(runtime_io, .real);
+            const abs_nanos: i96 = if (timestamp.nanoseconds < 0) -timestamp.nanoseconds else timestamp.nanoseconds;
+            seed = @intCast(abs_nanos & 0x7FFFFFFFFFFFFFFF);
             seed_set = true;
         }
         return seed;

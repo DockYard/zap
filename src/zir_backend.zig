@@ -59,6 +59,10 @@ extern "c" fn zir_compilation_set_builder_entry(
     entry_name: [*:0]const u8,
 ) i32;
 
+extern "c" fn zir_compilation_prepare_update(ctx: *ZirContext) i32;
+
+extern "c" fn zir_compilation_invalidate_file(ctx: *ZirContext, name: [*:0]const u8) i32;
+
 // ---------------------------------------------------------------------------
 // High-level API
 // ---------------------------------------------------------------------------
@@ -107,12 +111,15 @@ pub const CompileOptions = struct {
     analysis_context: ?*const @import("escape_lattice.zig").AnalysisContext = null,
 };
 
-/// Compile a Zap IR program to a native binary via ZIR.
+/// Create a ZirContext compilation context from the given options.
 ///
-/// This is the replacement for the `codegen.zig -> write .zig file -> zig build`
-/// flow. Instead: `ir.Program -> ZirDriver (C-ABI) -> inject -> Zig compiler -> binary`.
-pub fn compile(allocator: std.mem.Allocator, program: ir.Program, options: CompileOptions) CompileError!void {
-    // Phase 1: Create compilation context.
+/// This is the first phase of compilation: it creates the Zig compilation
+/// context, configures builder mode and runtime source, but does NOT inject
+/// ZIR or run the update. The returned context can be reused across multiple
+/// incremental updates by calling `injectAndUpdate` repeatedly.
+///
+/// The caller owns the returned context and must call `destroyContext` when done.
+pub fn createContext(allocator: std.mem.Allocator, options: CompileOptions) CompileError!*ZirContext {
     const zig_lib_z = allocator.dupeZ(u8, options.zig_lib_dir) catch return error.OutOfMemory;
     defer allocator.free(zig_lib_z);
     const cache_z = allocator.dupeZ(u8, options.cache_dir) catch return error.OutOfMemory;
@@ -131,33 +138,80 @@ pub fn compile(allocator: std.mem.Allocator, program: ir.Program, options: Compi
             return error.CompilationCreateFailed;
     } else zir_compilation_create(zig_lib_z, cache_z, global_cache_z, output_z, name_z, options.output_mode, options.optimize_mode, options.is_dynamic, options.link_libc) orelse
         return error.CompilationCreateFailed;
-    defer zir_compilation_destroy(ctx);
 
     // Configure builder mode if entry point is specified.
     if (options.builder_entry) |entry| {
         const entry_z = allocator.dupeZ(u8, entry) catch return error.OutOfMemory;
         defer allocator.free(entry_z);
         if (zir_compilation_set_builder_entry(ctx, entry_z) != 0) {
+            zir_compilation_destroy(ctx);
             return error.CompilationFailed;
         }
     }
 
-    // Phase 2a: Register embedded runtime source if provided.
+    // Register embedded runtime source if provided.
     if (options.runtime_source) |source| {
         if (zir_compilation_add_module_source(ctx, "zap_runtime", source.ptr, @intCast(source.len)) != 0) {
+            zir_compilation_destroy(ctx);
             return error.CompilationFailed;
         }
     }
 
-    // Phase 2b: Build ZIR via C-ABI calls and inject into compilation.
+    return ctx;
+}
+
+/// Inject ZIR from a Zap IR program into the context and run the Zig
+/// compilation update (Sema + codegen + link).
+///
+/// This is the second phase of compilation. For a fresh build, call after
+/// `createContext`. For an incremental rebuild, call `prepareUpdate` first
+/// to save the old ZIR, then call this to inject new ZIR and update.
+pub fn injectAndUpdate(allocator: std.mem.Allocator, program: ir.Program, ctx: *ZirContext, options: CompileOptions) CompileError!void {
+    // Build ZIR via C-ABI calls and inject into compilation.
     const lib_mode = options.output_mode == 1;
     try zir_builder.buildAndInject(allocator, program, ctx, null, lib_mode, options.builder_entry, options.analysis_context);
 
-    // Phase 3: Run Sema + codegen + link.
+    // Run Sema + codegen + link.
     if (zir_compilation_update(ctx) != 0) {
         zir_compilation_print_errors(ctx);
         return error.CompilationFailed;
     }
+}
+
+/// Prepare the context for an incremental update by saving current ZIR as
+/// prev_zir for all injected files. Call this before re-injecting new ZIR.
+pub fn prepareUpdate(ctx: *ZirContext) CompileError!void {
+    if (zir_compilation_prepare_update(ctx) != 0) {
+        return error.CompilationFailed;
+    }
+}
+
+/// Mark a named module's root file as changed for incremental recompilation.
+pub fn invalidateFile(ctx: *ZirContext, name: []const u8, allocator: std.mem.Allocator) CompileError!void {
+    const name_z = allocator.dupeZ(u8, name) catch return error.OutOfMemory;
+    defer allocator.free(name_z);
+    if (zir_compilation_invalidate_file(ctx, name_z) != 0) {
+        return error.CompilationFailed;
+    }
+}
+
+/// Destroy a ZirContext that was created via `createContext`.
+pub fn destroyContext(ctx: *ZirContext) void {
+    zir_compilation_destroy(ctx);
+}
+
+/// Compile a Zap IR program to a native binary via ZIR.
+///
+/// This is the replacement for the `codegen.zig -> write .zig file -> zig build`
+/// flow. Instead: `ir.Program -> ZirDriver (C-ABI) -> inject -> Zig compiler -> binary`.
+///
+/// For non-incremental use: creates context, injects ZIR, updates, and destroys.
+/// For incremental use, call `createContext`, `injectAndUpdate`, `prepareUpdate`,
+/// and `destroyContext` separately.
+pub fn compile(allocator: std.mem.Allocator, program: ir.Program, options: CompileOptions) CompileError!void {
+    const ctx = try createContext(allocator, options);
+    defer destroyContext(ctx);
+    try injectAndUpdate(allocator, program, ctx, options);
 }
 
 /// Detect the Zig lib directory.
