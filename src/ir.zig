@@ -4264,51 +4264,42 @@ fn typeIdToZigTypeStr(type_id: types_mod.TypeId) []const u8 {
     return typeIdToZigTypeStrWithStore(type_id, null);
 }
 
-fn typeIdToZigTypeStrWithStore(type_id: types_mod.TypeId, type_store: ?*const types_mod.TypeStore) []const u8 {
-    return switch (type_id) {
-        types_mod.TypeStore.BOOL => "bool",
-        types_mod.TypeStore.STRING => "[]const u8",
-        types_mod.TypeStore.ATOM => "[]const u8",
-        types_mod.TypeStore.NIL => "?void",
-        types_mod.TypeStore.NEVER => "noreturn",
-        types_mod.TypeStore.I64 => "i64",
-        types_mod.TypeStore.I32 => "i32",
-        types_mod.TypeStore.I16 => "i16",
-        types_mod.TypeStore.I8 => "i8",
-        types_mod.TypeStore.U64 => "u64",
-        types_mod.TypeStore.U32 => "u32",
-        types_mod.TypeStore.U16 => "u16",
-        types_mod.TypeStore.U8 => "u8",
-        types_mod.TypeStore.F64 => "f64",
-        types_mod.TypeStore.F32 => "f32",
-        types_mod.TypeStore.F16 => "f16",
-        types_mod.TypeStore.USIZE => "usize",
-        types_mod.TypeStore.ISIZE => "isize",
-        else => {
-            // Try to resolve user-defined struct/enum types
-            if (type_store) |ts| {
-                if (type_id < ts.types.items.len) {
-                    const typ = ts.types.items[type_id];
-                    switch (typ) {
-                        .struct_type => |st| {
-                            return ts.interner.get(st.name);
-                        },
-                        .tagged_union => |tu| {
-                            return ts.interner.get(tu.name);
-                        },
-                        .opaque_type => |ot| {
-                            return ts.interner.get(ot.name);
-                        },
-                        .function => {
-                            return "zap_runtime.DynClosure";
-                        },
-                        else => {},
-                    }
-                }
-            }
-            return "anytype";
-        },
+/// Convert a ZigType to its Zig source string representation.
+/// Used by typeIdToZigTypeStrWithStore to avoid duplicating the TypeStore lookup.
+fn zigTypeToStr(zig_type: ZigType) []const u8 {
+    return switch (zig_type) {
+        .void => "void",
+        .bool_type => "bool",
+        .i8 => "i8",
+        .i16 => "i16",
+        .i32 => "i32",
+        .i64 => "i64",
+        .u8 => "u8",
+        .u16 => "u16",
+        .u32 => "u32",
+        .u64 => "u64",
+        .f16 => "f16",
+        .f32 => "f32",
+        .f64 => "f64",
+        .usize => "usize",
+        .isize => "isize",
+        .string => "[]const u8",
+        .atom => "[]const u8",
+        .nil => "?void",
+        .struct_ref => |name| name,
+        .tagged_union => |name| name,
+        .function => "zap_runtime.DynClosure",
+        .optional => "anytype",
+        .any => "anytype",
+        else => "anytype",
     };
+}
+
+/// Derives the string representation from the ZigType conversion,
+/// eliminating duplicate TypeStore lookups.
+fn typeIdToZigTypeStrWithStore(type_id: types_mod.TypeId, type_store: ?*const types_mod.TypeStore) []const u8 {
+    const zig_type = typeIdToZigTypeWithStore(type_id, type_store);
+    return zigTypeToStr(zig_type);
 }
 
 // ============================================================

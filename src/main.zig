@@ -36,7 +36,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     } else if (std.mem.eql(u8, command, "run")) {
         try cmdRun(allocator, args[2..]);
     } else if (std.mem.eql(u8, command, "test")) {
-        try cmdRun(allocator, &.{"test"});
+        try cmdTest(allocator, args[2..]);
     } else if (std.mem.eql(u8, command, "init")) {
         try cmdInit(allocator);
     } else if (std.mem.eql(u8, command, "deps")) {
@@ -56,7 +56,7 @@ fn printUsage() void {
         \\Commands:
         \\  build [target]    Build the specified target (defaults to :default)
         \\  run [target]      Build and run the specified bin target (defaults to :default)
-        \\  test              Run the test suite (alias for `run test`)
+        \\  test [options]    Run the test suite
         \\  init              Scaffold a new project in the current directory
         \\  deps update       Re-resolve all dependencies and rewrite zap.lock
         \\  deps update <name> Re-resolve a single dependency
@@ -64,6 +64,9 @@ fn printUsage() void {
         \\Options:
         \\  -Dkey=value       Pass build option to the builder
         \\  --build-file <path>  Use a specific build file (default: build.zap)
+        \\  --watch, -w       Watch source files and rebuild on changes
+        \\  --target <triple> Cross-compile for target (e.g., wasm32-wasi)
+        \\  --seed <integer>  Set the test seed for deterministic ordering
         \\  -- <args...>      Pass arguments to the program (run only)
         \\
         \\Examples:
@@ -71,6 +74,9 @@ fn printUsage() void {
         \\  zap run
         \\  zap build my_app -Doptimize=release_fast
         \\  zap run my_app -- arg1 arg2
+        \\  zap build --watch
+        \\  zap run -w
+        \\  zap test --seed 12345
         \\  zap init
         \\
     , .{});
@@ -88,8 +94,21 @@ fn cmdBuild(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     const project_root = try discoverBuildFile(allocator, parsed.build_file);
     defer allocator.free(project_root);
-    const output_path = try buildTarget(allocator, project_root, target, parsed.build_opts);
+    const output_path = try buildTarget(allocator, project_root, target, parsed.build_opts, parsed.compile_target);
     allocator.free(output_path);
+
+    if (parsed.watch) {
+        const source_paths = collectWatchPaths(allocator, project_root) catch |err| {
+            std.debug.print("Error collecting watch paths: {}\n", .{err});
+            return;
+        };
+        defer {
+            for (source_paths) |p| allocator.free(p);
+            allocator.free(source_paths);
+        }
+        std.debug.print("\n[watching for changes...]\n", .{});
+        watchAndRebuild(allocator, source_paths, project_root, target, parsed.build_opts, false, &.{});
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -104,13 +123,61 @@ fn cmdRun(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     const project_root = try discoverBuildFile(allocator, parsed.build_file);
     defer allocator.free(project_root);
-    const output_path = try buildTarget(allocator, project_root, target, parsed.build_opts);
+    const output_path = try buildTarget(allocator, project_root, target, parsed.build_opts, parsed.compile_target);
     defer allocator.free(output_path);
 
-    // Run the built binary
-    const exit_code = compiler.runBinary(allocator, global_io, output_path, parsed.run_args) catch |err| {
-        // stderr writer removed in 0.16
-        std.debug.print("Error running program: {}\n", .{err});
+    if (parsed.watch) {
+        // In watch mode: run, then watch for changes and rebuild+rerun
+        runBinaryIgnoreError(allocator, output_path, parsed.run_args);
+
+        const source_paths = collectWatchPaths(allocator, project_root) catch |err| {
+            std.debug.print("Error collecting watch paths: {}\n", .{err});
+            return;
+        };
+        defer {
+            for (source_paths) |p| allocator.free(p);
+            allocator.free(source_paths);
+        }
+        std.debug.print("\n[watching for changes...]\n", .{});
+        watchAndRebuild(allocator, source_paths, project_root, target, parsed.build_opts, true, parsed.run_args);
+    } else {
+        // Normal run: build, run, exit with the binary's exit code
+        const exit_code = compiler.runBinary(allocator, global_io, output_path, parsed.run_args) catch |err| {
+            std.debug.print("Error running program: {}\n", .{err});
+            std.process.exit(1);
+        };
+        std.process.exit(exit_code);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Command: test
+// ---------------------------------------------------------------------------
+
+fn cmdTest(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    var parsed = try parseTargetArgs(allocator, args);
+    defer parsed.deinit(allocator);
+
+    const project_root = try discoverBuildFile(allocator, parsed.build_file);
+    defer allocator.free(project_root);
+    const output_path = try buildTarget(allocator, project_root, "test", parsed.build_opts, parsed.compile_target);
+    defer allocator.free(output_path);
+
+    // Build run_args: forward --seed to the test binary if provided
+    var test_run_args: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer test_run_args.deinit(allocator);
+    if (parsed.seed) |seed_value| {
+        try test_run_args.append(allocator, "--seed");
+        try test_run_args.append(allocator, seed_value);
+    }
+    // Also forward any explicit run_args from after --
+    for (parsed.run_args) |arg| {
+        try test_run_args.append(allocator, arg);
+    }
+
+    // Run the built test binary
+    const exit_code = compiler.runBinary(allocator, global_io, output_path, test_run_args.items) catch |err| {
+        std.debug.print("Error running tests: {}\n", .{err});
         std.process.exit(1);
     };
     std.process.exit(exit_code);
@@ -392,6 +459,7 @@ fn buildTarget(
     project_root: []const u8,
     target_name: []const u8,
     build_opts: std.StringHashMapUnmanaged([]const u8),
+    compile_target: ?[]const u8,
 ) ![]const u8 {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -450,6 +518,39 @@ fn buildTarget(
     var new_lock_entries: std.ArrayListUnmanaged(zap.lockfile.LockEntry) = .empty;
     var lockfile_changed = false;
 
+    // Collect git dep requests for parallel fetching
+    var git_requests: std.ArrayListUnmanaged(zap.lockfile.GitDepRequest) = .empty;
+    var git_dep_indices: std.ArrayListUnmanaged(usize) = .empty;
+
+    for (config.deps, 0..) |dep, dep_idx| {
+        switch (dep.source) {
+            .git => |git| {
+                const locked = if (lock_entries) |entries|
+                    zap.lockfile.findEntry(entries, dep.name)
+                else
+                    null;
+                const locked_commit: ?[]const u8 = if (locked) |l|
+                    (if (std.mem.eql(u8, l.commit, "-")) null else l.commit)
+                else
+                    null;
+                const ref = git.tag orelse git.branch orelse git.rev;
+                try git_requests.append(alloc, .{
+                    .name = dep.name,
+                    .url = git.url,
+                    .ref = ref,
+                    .locked_commit = locked_commit,
+                });
+                try git_dep_indices.append(alloc, dep_idx);
+            },
+            else => {},
+        }
+    }
+
+    // Fetch all git deps in parallel
+    const git_results = zap.lockfile.fetchGitDepsParallel(alloc, git_requests.items) catch &.{};
+    var git_result_idx: usize = 0;
+
+    // Process all deps in order
     for (config.deps) |dep| {
         const dep_name = try std.fmt.allocPrint(alloc, "dep:{s}", .{dep.name});
 
@@ -495,52 +596,47 @@ fn buildTarget(
                     });
                 },
                 .git => |git| {
-                    // Check lockfile for cached commit
-                    const locked = if (lock_entries) |entries|
-                        zap.lockfile.findEntry(entries, dep.name)
-                    else
-                        null;
+                    // Use pre-fetched parallel result
+                    if (git_result_idx < git_results.len) {
+                        const result = git_results[git_result_idx];
+                        git_result_idx += 1;
 
-                    const locked_commit: ?[]const u8 = if (locked) |l|
-                        (if (std.mem.eql(u8, l.commit, "-")) null else l.commit)
-                    else
-                        null;
+                        if (result.fetch_error) {
+                            std.debug.print("Error: failed to fetch dep `{s}`\n", .{dep.name});
+                            std.process.exit(1);
+                        }
 
-                    const ref = git.tag orelse git.branch orelse git.rev;
+                        // Add dep's lib dir as source root
+                        const dep_lib_dir = try std.fs.path.join(alloc, &.{ result.path, "lib" });
+                        if (std.Io.Dir.cwd().access(global_io, dep_lib_dir, .{})) |_| {
+                            try source_roots.append(alloc, .{ .name = dep_name, .path = dep_lib_dir });
+                        } else |_| {
+                            try source_roots.append(alloc, .{ .name = dep_name, .path = result.path });
+                        }
 
-                    // Fetch (or use cache)
-                    const result = zap.lockfile.fetchGitDep(
-                        alloc,
-                        dep.name,
-                        git.url,
-                        ref,
-                        locked_commit,
-                    ) catch {
-                        std.debug.print("Error: failed to fetch dep `{s}`\n", .{dep.name});
-                        std.process.exit(1);
-                    };
+                        const ref = git.tag orelse git.branch orelse git.rev;
+                        // Record in lockfile
+                        try new_lock_entries.append(alloc, .{
+                            .name = dep.name,
+                            .source_type = "git",
+                            .url = git.url,
+                            .resolved_ref = ref orelse "-",
+                            .commit = result.commit,
+                            .integrity = result.integrity,
+                        });
 
-                    // Add dep's lib dir as source root
-                    const dep_lib_dir = try std.fs.path.join(alloc, &.{ result.path, "lib" });
-                    if (std.Io.Dir.cwd().access(global_io, dep_lib_dir, .{})) |_| {
-                        try source_roots.append(alloc, .{ .name = dep_name, .path = dep_lib_dir });
-                    } else |_| {
-                        try source_roots.append(alloc, .{ .name = dep_name, .path = result.path });
-                    }
-
-                    // Record in lockfile
-                    try new_lock_entries.append(alloc, .{
-                        .name = dep.name,
-                        .source_type = "git",
-                        .url = git.url,
-                        .resolved_ref = ref orelse "-",
-                        .commit = result.commit,
-                        .integrity = result.integrity,
-                    });
-
-                    // Check if lockfile needs updating
-                    if (locked_commit == null or !std.mem.eql(u8, locked_commit.?, result.commit)) {
-                        lockfile_changed = true;
+                        // Check if lockfile needs updating
+                        const locked = if (lock_entries) |entries|
+                            zap.lockfile.findEntry(entries, dep.name)
+                        else
+                            null;
+                        const locked_commit: ?[]const u8 = if (locked) |l|
+                            (if (std.mem.eql(u8, l.commit, "-")) null else l.commit)
+                        else
+                            null;
+                        if (locked_commit == null or !std.mem.eql(u8, locked_commit.?, result.commit)) {
+                            lockfile_changed = true;
+                        }
                     }
                 },
             }
@@ -666,7 +762,11 @@ fn buildTarget(
 
     // Read sources once up front so validation, cache hashing, and frontend
     // compilation all operate on the same explicit source units.
+    // On POSIX platforms, source files are memory-mapped for zero-copy access
+    // which reduces allocation pressure and lets the OS manage paging.
     var source_units: std.ArrayListUnmanaged(compiler.SourceUnit) = .empty;
+    var mapped_files: std.ArrayListUnmanaged(compiler.MappedFile) = .empty;
+    defer for (mapped_files.items) |mf| mf.deinit();
 
     // Validate one-module-per-file and name=path for each source file
     var validation_failed = false;
@@ -674,8 +774,9 @@ fn buildTarget(
         // Skip build.zap — it's build configuration, not project source
         if (std.mem.eql(u8, std.fs.path.basename(sf), "build.zap")) continue;
 
-        const src = try std.Io.Dir.cwd().readFileAlloc(global_io, sf, alloc, .limited(10 * 1024 * 1024));
-        try source_units.append(alloc, .{ .file_path = sf, .source = src });
+        const mapped = try compiler.mmapSourceFile(global_io, sf, alloc);
+        try mapped_files.append(alloc, mapped);
+        try source_units.append(alloc, .{ .file_path = sf, .source = mapped.bytes() });
 
         // Skip validation for dep/stdlib source files — they're external code
         const is_dep_file = blk: {
@@ -730,7 +831,7 @@ fn buildTarget(
             break :blk rel_path;
         };
 
-        if (compiler.validateOneModulePerFile(alloc, src, lib_rel)) |err_msg| {
+        if (compiler.validateOneModulePerFile(alloc, mapped.bytes(), lib_rel)) |err_msg| {
             std.debug.print("Error: {s}\n", .{err_msg});
             validation_failed = true;
         }
@@ -874,6 +975,7 @@ fn buildTarget(
         .runtime_source = compiler.getRuntimeSource(),
         .output_mode = output_mode_val,
         .optimize_mode = optimize_mode,
+        .target = compile_target,
         .analysis_context = if (result.analysis_context) |*ctx| ctx else null,
     }) catch {
         // stderr writer removed in 0.16
@@ -921,6 +1023,127 @@ fn computeBuildCacheKey(
 }
 
 // ---------------------------------------------------------------------------
+// Watch mode
+// ---------------------------------------------------------------------------
+
+/// Collect all .zap file paths under the project root (lib/, test/, and build.zap)
+/// for watching. Returns owned slices that the caller must free.
+fn collectWatchPaths(allocator: std.mem.Allocator, project_root: []const u8) ![]const []const u8 {
+    var paths: std.ArrayListUnmanaged([]const u8) = .empty;
+
+    // Always watch build.zap
+    const build_zap_path = try std.fs.path.join(allocator, &.{ project_root, "build.zap" });
+    if (std.Io.Dir.cwd().access(global_io, build_zap_path, .{})) |_| {
+        try paths.append(allocator, build_zap_path);
+    } else |_| {
+        allocator.free(build_zap_path);
+    }
+
+    // Watch lib/ and test/ directories
+    const watch_dirs = [_][]const u8{ "lib", "test" };
+    for (&watch_dirs) |dir_name| {
+        const dir_path = try std.fs.path.join(allocator, &.{ project_root, dir_name });
+        defer allocator.free(dir_path);
+        collectZapFilesRecursive(allocator, dir_path, &paths) catch {};
+    }
+
+    return try paths.toOwnedSlice(allocator);
+}
+
+/// Recursively collect all .zap files under a directory.
+fn collectZapFilesRecursive(
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+    results: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    var dir = std.Io.Dir.cwd().openDir(global_io, dir_path, .{ .iterate = true }) catch return;
+    defer dir.close(global_io);
+    var iter = dir.iterate();
+
+    while (iter.next(global_io) catch null) |entry| {
+        const full_path = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
+        if (entry.kind == .directory) {
+            collectZapFilesRecursive(allocator, full_path, results) catch {};
+            allocator.free(full_path);
+        } else if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".zap")) {
+            try results.append(allocator, full_path);
+        } else {
+            allocator.free(full_path);
+        }
+    }
+}
+
+/// Get the mtime of a file as nanoseconds, or null if the file cannot be stat'd.
+fn getFileMtime(path: []const u8) ?i96 {
+    const file_stat = std.Io.Dir.cwd().statFile(global_io, path, .{}) catch return null;
+    return file_stat.mtime.nanoseconds;
+}
+
+/// Run a binary, printing errors but not exiting the process.
+fn runBinaryIgnoreError(allocator: std.mem.Allocator, output_path: []const u8, run_args: []const []const u8) void {
+    _ = compiler.runBinary(allocator, global_io, output_path, run_args) catch |err| {
+        std.debug.print("Error running program: {}\n", .{err});
+    };
+}
+
+/// Watch source files for changes and rebuild (and optionally re-run) on change.
+/// This function loops forever until the process is killed (e.g. Ctrl+C).
+fn watchAndRebuild(
+    allocator: std.mem.Allocator,
+    source_paths: []const []const u8,
+    project_root: []const u8,
+    target_name: []const u8,
+    build_opts: std.StringHashMapUnmanaged([]const u8),
+    run_after_build: bool,
+    run_args: []const []const u8,
+) void {
+    // Initialize last-known mtimes for all watched files
+    var last_mtimes = allocator.alloc(i96, source_paths.len) catch return;
+    defer allocator.free(last_mtimes);
+    for (source_paths, 0..) |path, i| {
+        last_mtimes[i] = getFileMtime(path) orelse 0;
+    }
+
+    const poll_duration = std.Io.Duration.fromMilliseconds(500);
+
+    while (true) {
+        // Sleep for the poll interval
+        global_io.sleep(poll_duration, .awake) catch {};
+
+        // Check for any changed files
+        var changed = false;
+        for (source_paths, 0..) |path, i| {
+            const current_mtime = getFileMtime(path) orelse continue;
+            if (current_mtime != last_mtimes[i]) {
+                last_mtimes[i] = current_mtime;
+                changed = true;
+            }
+        }
+
+        if (changed) {
+            // Clear terminal screen
+            const stdout = std.Io.File.stdout();
+            stdout.writeStreamingAll(global_io, "\x1b[2J\x1b[H") catch {};
+
+            // Rebuild
+            const output_path = buildTarget(allocator, project_root, target_name, build_opts, null) catch |err| {
+                std.debug.print("Build error: {}\n", .{err});
+                std.debug.print("\n[watching for changes...]\n", .{});
+                continue;
+            };
+            defer allocator.free(output_path);
+
+            // Optionally re-run
+            if (run_after_build) {
+                runBinaryIgnoreError(allocator, output_path, run_args);
+            }
+
+            std.debug.print("\n[watching for changes...]\n", .{});
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Argument parsing
 // ---------------------------------------------------------------------------
 
@@ -929,6 +1152,9 @@ const ParsedArgs = struct {
     build_file: ?[]const u8,
     build_opts: std.StringHashMapUnmanaged([]const u8),
     run_args: []const []const u8,
+    seed: ?[]const u8 = null,
+    watch: bool = false,
+    compile_target: ?[]const u8 = null,
 
     fn deinit(self: *ParsedArgs, allocator: std.mem.Allocator) void {
         self.build_opts.deinit(allocator);
@@ -960,6 +1186,24 @@ fn parseTargetArgs(allocator: std.mem.Allocator, args: []const []const u8) !Pars
             } else {
                 // stderr writer removed in 0.16
                 std.debug.print("Error: --build-file requires a path\n", .{});
+                std.process.exit(1);
+            }
+        } else if (std.mem.eql(u8, arg, "--watch") or std.mem.eql(u8, arg, "-w")) {
+            result.watch = true;
+        } else if (std.mem.eql(u8, arg, "--target")) {
+            i += 1;
+            if (i < args.len) {
+                result.compile_target = args[i];
+            } else {
+                std.debug.print("Error: --target requires a triple (e.g., wasm32-wasi)\n", .{});
+                std.process.exit(1);
+            }
+        } else if (std.mem.eql(u8, arg, "--seed")) {
+            i += 1;
+            if (i < args.len) {
+                result.seed = args[i];
+            } else {
+                std.debug.print("Error: --seed requires a value\n", .{});
                 std.process.exit(1);
             }
         } else if (std.mem.startsWith(u8, arg, "-D")) {

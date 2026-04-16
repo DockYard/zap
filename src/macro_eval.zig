@@ -397,6 +397,42 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
                 }
             }
 
+            // defstruct(name, fields) — construct a struct type declaration CtValue.
+            // name: string/atom (type name)
+            // fields: list of {field_name, type_name} tuples
+            // Returns {:struct, meta, [name, fields_list]}
+            if (std.mem.eql(u8, form_name, "defstruct")) {
+                if (arg_elems.len == 2) {
+                    const name_val = try eval(env, arg_elems[0]);
+                    const fields_val = try eval(env, arg_elems[1]);
+                    return buildStructDeclCtValue(env.alloc, env.store, name_val, fields_val) catch return .nil;
+                }
+            }
+
+            // defenum(name, variants) — construct an enum type declaration CtValue.
+            // name: string/atom (type name)
+            // variants: list of atoms
+            // Returns {:union, meta, [name, [variant1, variant2, ...]]}
+            if (std.mem.eql(u8, form_name, "defenum")) {
+                if (arg_elems.len == 2) {
+                    const name_val = try eval(env, arg_elems[0]);
+                    const variants_val = try eval(env, arg_elems[1]);
+                    return buildEnumDeclCtValue(env.alloc, env.store, name_val, variants_val) catch return .nil;
+                }
+            }
+
+            // defunion(name, variants) — construct a tagged union type declaration CtValue.
+            // name: string/atom (type name)
+            // variants: list of atoms or {name, type} tuples
+            // Returns {:union, meta, [name, [variants...]]}
+            if (std.mem.eql(u8, form_name, "defunion")) {
+                if (arg_elems.len == 2) {
+                    const name_val = try eval(env, arg_elems[0]);
+                    const variants_val = try eval(env, arg_elems[1]);
+                    return buildUnionDeclCtValue(env.alloc, env.store, name_val, variants_val) catch return .nil;
+                }
+            }
+
             // length(list_or_tuple) — get length
             if (std.mem.eql(u8, form_name, "length")) {
                 if (arg_elems.len == 1) {
@@ -956,4 +992,131 @@ fn buildSingleTestFunction(alloc: Allocator, store: *AllocationStore, name: []co
 
     // Return as __block__ (mixed: fn decl + tracking expr)
     return ast_data.makeTuple3(alloc, store, .{ .atom = "__block__" }, empty, try ast_data.makeList(alloc, store, &.{ fn_decl, tracking }));
+}
+
+// ============================================================
+// @Struct/@Union/@Enum dynamic type construction builtins
+// ============================================================
+
+/// Build a {:struct, meta, [name, fields]} CtValue from macro arguments.
+/// name_val: atom or string for the type name
+/// fields_val: list of {field_name, type_name} tuples
+fn buildStructDeclCtValue(
+    alloc: Allocator,
+    store: *AllocationStore,
+    name_val: CtValue,
+    fields_val: CtValue,
+) !CtValue {
+    const empty = try ast_data.makeList(alloc, store, &.{});
+
+    // Extract type name as atom
+    const name_atom: CtValue = if (name_val == .string)
+        .{ .atom = name_val.string }
+    else if (name_val == .atom)
+        name_val
+    else
+        return .nil;
+
+    // Build fields list: each field is {name_atom, type_atom}
+    var field_items: std.ArrayListUnmanaged(CtValue) = .empty;
+    if (fields_val == .list) {
+        for (fields_val.list.elems) |field| {
+            if (field == .tuple and field.tuple.elems.len >= 2) {
+                const field_name = field.tuple.elems[0];
+                const field_type = field.tuple.elems[1];
+                // Each field becomes {name, type} tuple
+                const pair = try ast_data.makeTuple2(alloc, store,
+                    if (field_name == .string) CtValue{ .atom = field_name.string } else field_name,
+                    if (field_type == .string) CtValue{ .atom = field_type.string } else field_type,
+                );
+                try field_items.append(alloc, pair);
+            }
+        }
+    }
+    const fields_list = try ast_data.makeList(alloc, store, try field_items.toOwnedSlice(alloc));
+
+    // Return {:struct, meta, [name, fields]}
+    const args_list = try ast_data.makeList(alloc, store, &.{ name_atom, fields_list });
+    return ast_data.makeTuple3(alloc, store, .{ .atom = "struct" }, empty, args_list);
+}
+
+/// Build a {:union, meta, [name, [variants...]]} CtValue for an enum (all unit variants).
+/// name_val: atom or string for the type name
+/// variants_val: list of atoms
+fn buildEnumDeclCtValue(
+    alloc: Allocator,
+    store: *AllocationStore,
+    name_val: CtValue,
+    variants_val: CtValue,
+) !CtValue {
+    const empty = try ast_data.makeList(alloc, store, &.{});
+
+    const name_atom: CtValue = if (name_val == .string)
+        .{ .atom = name_val.string }
+    else if (name_val == .atom)
+        name_val
+    else
+        return .nil;
+
+    // Build variants list: each variant is a bare atom (unit variant)
+    var variant_items: std.ArrayListUnmanaged(CtValue) = .empty;
+    if (variants_val == .list) {
+        for (variants_val.list.elems) |v| {
+            if (v == .atom) {
+                try variant_items.append(alloc, v);
+            } else if (v == .string) {
+                try variant_items.append(alloc, .{ .atom = v.string });
+            }
+        }
+    }
+    const variants_list = try ast_data.makeList(alloc, store, try variant_items.toOwnedSlice(alloc));
+
+    // Return {:union, meta, [name, [variants]]}
+    const args_list = try ast_data.makeList(alloc, store, &.{ name_atom, variants_list });
+    return ast_data.makeTuple3(alloc, store, .{ .atom = "union" }, empty, args_list);
+}
+
+/// Build a {:union, meta, [name, [variants...]]} CtValue for a tagged union.
+/// name_val: atom or string for the type name
+/// variants_val: list of atoms (unit) or {name, type} tuples (data variants)
+fn buildUnionDeclCtValue(
+    alloc: Allocator,
+    store: *AllocationStore,
+    name_val: CtValue,
+    variants_val: CtValue,
+) !CtValue {
+    const empty = try ast_data.makeList(alloc, store, &.{});
+
+    const name_atom: CtValue = if (name_val == .string)
+        .{ .atom = name_val.string }
+    else if (name_val == .atom)
+        name_val
+    else
+        return .nil;
+
+    // Build variants list: each is either atom (unit) or {name, type} tuple
+    var variant_items: std.ArrayListUnmanaged(CtValue) = .empty;
+    if (variants_val == .list) {
+        for (variants_val.list.elems) |v| {
+            if (v == .atom) {
+                try variant_items.append(alloc, v);
+            } else if (v == .string) {
+                try variant_items.append(alloc, .{ .atom = v.string });
+            } else if (v == .tuple and v.tuple.elems.len >= 2) {
+                // {name, type} tagged variant
+                const vname = v.tuple.elems[0];
+                const vtype = v.tuple.elems[1];
+                const pair = try ast_data.makeTuple2(alloc, store,
+                    if (vname == .string) CtValue{ .atom = vname.string } else vname,
+                    if (vtype == .string) CtValue{ .atom = vtype.string } else vtype,
+                );
+                try variant_items.append(alloc, pair);
+            }
+        }
+    }
+    const variants_list = try ast_data.makeList(alloc, store, try variant_items.toOwnedSlice(alloc));
+
+    // Return {:union, meta, [name, [variants]]}
+    const args_list = try ast_data.makeList(alloc, store, &.{ name_atom, variants_list });
+    return ast_data.makeTuple3(alloc, store, .{ .atom = "union" }, empty, args_list);
 }

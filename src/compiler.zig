@@ -131,6 +131,95 @@ pub const SourceUnit = struct {
     source: []const u8,
 };
 
+/// A memory-mapped file that provides zero-copy read access to source contents.
+/// On POSIX systems (Darwin, Linux), the file is mapped via mmap, reducing
+/// allocation pressure and allowing the OS to manage paging. On unsupported
+/// platforms, falls back to a regular heap-allocated read.
+pub const MappedFile = struct {
+    data: []align(std.heap.page_size_min) const u8,
+    /// When true, `data` was obtained via mmap and must be released with munmap.
+    /// When false, `data` is heap-allocated and the caller owns it via `fallback_allocator`.
+    is_mmap: bool,
+    fallback_allocator: ?std.mem.Allocator,
+
+    pub fn deinit(self: MappedFile) void {
+        if (self.is_mmap) {
+            const mutable_data: []align(std.heap.page_size_min) u8 = @constCast(self.data);
+            std.posix.munmap(mutable_data);
+        } else if (self.fallback_allocator) |alloc| {
+            const mutable_data: []align(std.heap.page_size_min) u8 = @constCast(self.data);
+            alloc.free(mutable_data);
+        }
+    }
+
+    /// Return the mapped bytes as a plain slice for use in SourceUnit.source.
+    pub fn bytes(self: MappedFile) []const u8 {
+        return self.data;
+    }
+};
+
+const builtin = @import("builtin");
+const native_os = builtin.os.tag;
+
+/// Whether the current target supports memory-mapped file I/O.
+pub const has_mmap = switch (native_os) {
+    .macos, .linux, .freebsd, .netbsd, .openbsd, .dragonfly => true,
+    else => false,
+};
+
+/// Memory-map a source file for read-only access. On POSIX systems with mmap
+/// support, this avoids copying file contents into heap memory. On other
+/// platforms (Windows, WASM), falls back to a regular allocated read.
+///
+/// Empty files are handled by returning a zero-length aligned slice without
+/// calling mmap (which rejects zero-length mappings).
+pub fn mmapSourceFile(io: std.Io, file_path: []const u8, fallback_allocator: std.mem.Allocator) !MappedFile {
+    const file = try std.Io.Dir.cwd().openFile(io, file_path, .{});
+    defer file.close(io);
+
+    const file_stat = try file.stat(io);
+    const file_size = file_stat.size;
+
+    // mmap cannot map zero-length regions; return an empty aligned slice.
+    if (file_size == 0) {
+        const empty: []align(std.heap.page_size_min) const u8 = &.{};
+        return MappedFile{
+            .data = empty,
+            .is_mmap = false,
+            .fallback_allocator = null,
+        };
+    }
+
+    if (has_mmap) {
+        const mapped = try std.posix.mmap(
+            null,
+            file_size,
+            .{ .READ = true },
+            .{ .TYPE = .PRIVATE },
+            file.handle,
+            0,
+        );
+        return MappedFile{
+            .data = mapped,
+            .is_mmap = true,
+            .fallback_allocator = null,
+        };
+    } else {
+        // Fallback: regular allocated read for platforms without mmap.
+        const buf = try std.Io.Dir.cwd().readFileAlloc(io, file_path, fallback_allocator, .limited(10 * 1024 * 1024));
+        // readFileAlloc returns []u8 which is not page-aligned. We need to
+        // copy into an aligned allocation so MappedFile.data has uniform type.
+        const aligned_buf = try fallback_allocator.alignedAlloc(u8, std.heap.page_size_min, buf.len);
+        @memcpy(aligned_buf, buf);
+        fallback_allocator.free(buf);
+        return MappedFile{
+            .data = aligned_buf,
+            .is_mmap = false,
+            .fallback_allocator = fallback_allocator,
+        };
+    }
+}
+
 /// Pass 1: Parse all source files and collect declarations into a shared context.
 ///
 /// Takes a merged source string (all files concatenated) and a file path for

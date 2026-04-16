@@ -39,29 +39,38 @@ fn stdoutWrite(bytes: []const u8) void {
 }
 
 // ============================================================
-// Static Bump Allocator
-// Avoids std.heap.page_allocator which uses cmpxchg_strong and
-// other operations not supported by the Zig self-hosted backend.
+// Arena Allocator
+// Uses std.heap.ArenaAllocator backed by page_allocator.
+// Thread-safe in Zig 0.16. Lazily initialized on first use.
 // ============================================================
 
-const BUMP_SIZE = 16 * 1024; // 16KB
-var bump_buf: [BUMP_SIZE]u8 = undefined;
-var bump_offset: usize = 0;
+var runtime_arena: ?std.heap.ArenaAllocator = null;
+
+fn getArena() *std.heap.ArenaAllocator {
+    if (runtime_arena == null) {
+        runtime_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    }
+    return &runtime_arena.?;
+}
 
 fn bumpAlloc(len: usize) []u8 {
-    const aligned = (bump_offset + 7) & ~@as(usize, 7); // 8-byte align
-    if (aligned + len > BUMP_SIZE) return &.{};
-    const result = bump_buf[aligned .. aligned + len];
-    bump_offset = aligned + len;
-    return result;
+    const a = getArena();
+    // Use alignedAlloc with pointer alignment (8 on 64-bit) so that bump-allocated
+    // memory can safely be cast to pointer types via @ptrCast(@alignCast(...)).
+    const aligned = a.allocator().alignedAlloc(u8, .@"8", len) catch return &.{};
+    return @alignCast(aligned);
 }
 
 fn bumpAllocSlice(comptime T: type, len: usize) []T {
-    const byte_len = len * @sizeOf(T);
-    const bytes = bumpAlloc(byte_len);
-    if (bytes.len == 0) return &.{};
-    const aligned: [*]T = @ptrCast(@alignCast(bytes.ptr));
-    return aligned[0..len];
+    const a = getArena();
+    return a.allocator().alloc(T, len) catch return &.{};
+}
+
+pub fn resetAllocator() void {
+    if (runtime_arena) |*a| {
+        a.deinit();
+        runtime_arena = null;
+    }
 }
 
 // ============================================================
@@ -1232,10 +1241,8 @@ pub const Prelude = struct {
         const file = std.Io.Dir.cwd().openFile(pio, path, .{}) catch return "";
         defer file.close(pio);
 
-        // Read up to remaining bump space
-        const max_size = BUMP_SIZE - bump_offset;
-        if (max_size == 0) return "";
-        const result = bumpAlloc(max_size);
+        const max_file_size = 1024 * 1024; // 1MB max read
+        const result = bumpAlloc(max_file_size);
         if (result.len == 0) return "";
 
         const bytes_read = file.readPositionalAll(pio, result, 0) catch return "";
@@ -1311,6 +1318,25 @@ pub const TestTracker = struct {
     var assertion_count: i64 = 0;
     var assertion_failures: i64 = 0;
     var current_test_failed: bool = false;
+    var seed: i64 = 0;
+    var seed_set: bool = false;
+
+    pub fn set_seed(s: i64) void {
+        seed = s;
+        seed_set = true;
+    }
+
+    pub fn get_seed() i64 {
+        if (!seed_set) {
+            // Generate seed from system clock (microseconds since epoch)
+            var tv: std.c.timeval = undefined;
+            _ = std.c.gettimeofday(&tv, null);
+            const usec: i64 = @as(i64, @intCast(tv.sec)) *% 1_000_000 +% @as(i64, @intCast(tv.usec));
+            seed = if (usec < 0) -usec else usec;
+            seed_set = true;
+        }
+        return seed;
+    }
 
     pub fn begin_test() void {
         current_test_failed = false;
@@ -1350,7 +1376,9 @@ pub const TestTracker = struct {
     }
 
     pub fn summary() i64 {
-                stdoutPrint("\n\n", .{});
+        stdoutPrint("\n\nSeed: ", .{});
+        writeI64(get_seed());
+        stdoutPrint("\n", .{});
         writeI64(test_count);
         stdoutPrint(" tests, ", .{});
         writeI64(test_failures);
@@ -1894,13 +1922,313 @@ pub const ListCell = struct {
 pub const MapType = ?*const MapCell;
 
 pub const MapCell = struct {
-    entries: [*]const MapEntry,
-    count: u32,
+    // Hybrid representation: flat array for small maps, HAMT trie for larger maps.
+    // The HAMT (Hash Array Mapped Trie) provides O(log32 n) lookup, insert, and
+    // delete for large maps while the flat array remains optimal for <= 8 entries.
+    // All nodes are bump-allocated (persistent/immutable).
+
+    total_count: u32,
+    repr_tag: u8, // 0 = flat, 1 = trie
+    // Payload is one of:
+    //   flat: entries + count stored inline
+    //   trie: root node pointer
+    flat_entries: [*]const MapEntry,
+    flat_count: u32,
+    trie_root: ?*const HamtNode,
+
+    const FLAT_THRESHOLD = 8;
+    const BITS_PER_LEVEL = 5;
+    const BRANCHING_FACTOR = 1 << BITS_PER_LEVEL; // 32
+    const LEVEL_MASK: u32 = BRANCHING_FACTOR - 1; // 0x1F
+    const MAX_DEPTH = 7; // ceil(32 / 5)
 
     pub const MapEntry = struct {
         key: u32, // atom ID
         value: i64,
     };
+
+    /// HAMT trie node: bitmap-indexed with packed children array.
+    /// Each child is either a leaf entry or a pointer to a sub-node.
+    const HamtNode = struct {
+        bitmap: u32,
+        children_entries: [*]const MapEntry, // leaf entries (parallel to children_nodes)
+        children_nodes: [*]const ?*const HamtNode, // sub-nodes (null = leaf at this slot)
+        child_count: u5,
+    };
+
+    /// Murmur3 finalizer for distributing atom IDs across the hash space.
+    fn hashKey(key: u32) u32 {
+        var h = key;
+        h ^= h >> 16;
+        h *%= 0x85ebca6b;
+        h ^= h >> 13;
+        h *%= 0xc2b2ae35;
+        h ^= h >> 16;
+        return h;
+    }
+
+    fn allocMapCell() ?*MapCell {
+        const slice = bumpAllocSlice(MapCell, 1);
+        if (slice.len == 0) return null;
+        return &slice[0];
+    }
+
+    fn allocEntries(count: usize) ?[*]MapEntry {
+        if (count == 0) return @as([*]MapEntry, undefined);
+        const slice = bumpAllocSlice(MapEntry, count);
+        if (slice.len == 0) return null;
+        return slice.ptr;
+    }
+
+    fn allocHamtNode() ?*HamtNode {
+        const slice = bumpAllocSlice(HamtNode, 1);
+        if (slice.len == 0) return null;
+        return &slice[0];
+    }
+
+    fn allocNodePtrs(count: usize) ?[*]?*const HamtNode {
+        if (count == 0) return @as([*]?*const HamtNode, undefined);
+        const slice = bumpAllocSlice(?*const HamtNode, count);
+        if (slice.len == 0) return null;
+        for (0..count) |i| {
+            slice[i] = null;
+        }
+        return slice.ptr;
+    }
+
+    fn makeFlatMap(entries: [*]const MapEntry, count: u32) ?*const MapCell {
+        const cell = allocMapCell() orelse return null;
+        cell.* = .{
+            .total_count = count,
+            .repr_tag = 0,
+            .flat_entries = entries,
+            .flat_count = count,
+            .trie_root = null,
+        };
+        return cell;
+    }
+
+    fn makeTrieMap(root: *const HamtNode, total: u32) ?*const MapCell {
+        const cell = allocMapCell() orelse return null;
+        cell.* = .{
+            .total_count = total,
+            .repr_tag = 1,
+            .flat_entries = undefined,
+            .flat_count = 0,
+            .trie_root = root,
+        };
+        return cell;
+    }
+
+    // === HAMT internal operations ===
+
+    /// Get the index into the bitmap for a given hash at a given depth.
+    fn sparseIndex(bitmap: u32, bit: u32) u5 {
+        return @intCast(@popCount(bitmap & (bit - 1)));
+    }
+
+    fn hamtGet(node: *const HamtNode, key: u32, hash: u32, depth: u5) ?i64 {
+        const shift: u5 = depth * BITS_PER_LEVEL;
+        const bit: u32 = @as(u32, 1) << @intCast((hash >> shift) & LEVEL_MASK);
+
+        if (node.bitmap & bit == 0) return null;
+
+        const idx = sparseIndex(node.bitmap, bit);
+        if (node.children_nodes[idx]) |sub| {
+            // Recurse into sub-node
+            return hamtGet(sub, key, hash, depth + 1);
+        } else {
+            // Leaf entry
+            const entry = node.children_entries[idx];
+            return if (entry.key == key) entry.value else null;
+        }
+    }
+
+    fn hamtPut(node: *const HamtNode, key: u32, value: i64, hash: u32, depth: u5) ?*const HamtNode {
+        const shift: u5 = depth * BITS_PER_LEVEL;
+        const bit: u32 = @as(u32, 1) << @intCast((hash >> shift) & LEVEL_MASK);
+        const idx = sparseIndex(node.bitmap, bit);
+
+        if (node.bitmap & bit == 0) {
+            // Empty slot — insert new leaf
+            const old_count: usize = @intCast(node.child_count);
+            const new_count = old_count + 1;
+            const new_entries = allocEntries(new_count) orelse return null;
+            const new_nodes = allocNodePtrs(new_count) orelse return null;
+            const new_node = allocHamtNode() orelse return null;
+
+            // Copy entries before idx
+            for (0..idx) |i| {
+                new_entries[i] = node.children_entries[i];
+                new_nodes[i] = node.children_nodes[i];
+            }
+            // Insert new leaf at idx
+            new_entries[idx] = .{ .key = key, .value = value };
+            new_nodes[idx] = null; // leaf
+            // Copy entries after idx
+            for (idx..old_count) |i| {
+                new_entries[i + 1] = node.children_entries[i];
+                new_nodes[i + 1] = node.children_nodes[i];
+            }
+
+            new_node.* = .{
+                .bitmap = node.bitmap | bit,
+                .children_entries = new_entries,
+                .children_nodes = new_nodes,
+                .child_count = @intCast(new_count),
+            };
+            return new_node;
+        }
+
+        if (node.children_nodes[idx]) |sub| {
+            // Recurse into existing sub-node
+            const updated_sub = hamtPut(sub, key, value, hash, depth + 1) orelse return null;
+            return copyNodeWithUpdatedChild(node, idx, null, updated_sub);
+        }
+
+        // Existing leaf at this slot
+        const existing = node.children_entries[idx];
+        if (existing.key == key) {
+            // Update value
+            return copyNodeWithUpdatedEntry(node, idx, .{ .key = key, .value = value });
+        }
+
+        // Hash collision at this depth — create sub-node
+        if (depth >= MAX_DEPTH - 1) {
+            // At max depth, just replace (degenerate case)
+            return copyNodeWithUpdatedEntry(node, idx, .{ .key = key, .value = value });
+        }
+
+        // Create a new sub-node containing both the existing and new entries
+        const existing_hash = hashKey(existing.key);
+        const initial_sub = allocHamtNode() orelse return null;
+        initial_sub.* = .{ .bitmap = 0, .children_entries = undefined, .children_nodes = undefined, .child_count = 0 };
+        const sub_with_existing = hamtPut(initial_sub, existing.key, existing.value, existing_hash, depth + 1) orelse return null;
+        const sub_with_both = hamtPut(sub_with_existing, key, value, hash, depth + 1) orelse return null;
+        return copyNodeWithUpdatedChild(node, idx, null, sub_with_both);
+    }
+
+    fn hamtDelete(node: *const HamtNode, key: u32, hash: u32, depth: u5) ?*const HamtNode {
+        const shift: u5 = depth * BITS_PER_LEVEL;
+        const bit: u32 = @as(u32, 1) << @intCast((hash >> shift) & LEVEL_MASK);
+
+        if (node.bitmap & bit == 0) return node; // not found
+
+        const idx = sparseIndex(node.bitmap, bit);
+
+        if (node.children_nodes[idx]) |sub| {
+            const updated = hamtDelete(sub, key, hash, depth + 1) orelse return null;
+            if (updated.child_count == 0) {
+                return removeChildFromNode(node, idx, bit);
+            }
+            return copyNodeWithUpdatedChild(node, idx, null, updated);
+        }
+
+        // Leaf
+        const existing = node.children_entries[idx];
+        if (existing.key != key) return node; // not found
+        return removeChildFromNode(node, idx, bit);
+    }
+
+    fn copyNodeWithUpdatedEntry(node: *const HamtNode, idx: usize, entry: MapEntry) ?*const HamtNode {
+        const count: usize = @intCast(node.child_count);
+        const new_entries = allocEntries(count) orelse return null;
+        const new_nodes = allocNodePtrs(count) orelse return null;
+        const new_node = allocHamtNode() orelse return null;
+
+        for (0..count) |i| {
+            new_entries[i] = if (i == idx) entry else node.children_entries[i];
+            new_nodes[i] = node.children_nodes[i];
+        }
+
+        new_node.* = .{
+            .bitmap = node.bitmap,
+            .children_entries = new_entries,
+            .children_nodes = new_nodes,
+            .child_count = node.child_count,
+        };
+        return new_node;
+    }
+
+    fn copyNodeWithUpdatedChild(node: *const HamtNode, idx: usize, entry: ?MapEntry, sub: *const HamtNode) ?*const HamtNode {
+        const count: usize = @intCast(node.child_count);
+        const new_entries = allocEntries(count) orelse return null;
+        const new_nodes = allocNodePtrs(count) orelse return null;
+        const new_node = allocHamtNode() orelse return null;
+
+        for (0..count) |i| {
+            new_entries[i] = if (i == idx and entry != null) entry.? else node.children_entries[i];
+            new_nodes[i] = if (i == idx) sub else node.children_nodes[i];
+        }
+
+        new_node.* = .{
+            .bitmap = node.bitmap,
+            .children_entries = new_entries,
+            .children_nodes = new_nodes,
+            .child_count = node.child_count,
+        };
+        return new_node;
+    }
+
+    fn removeChildFromNode(node: *const HamtNode, idx: usize, bit: u32) ?*const HamtNode {
+        const old_count: usize = @intCast(node.child_count);
+        if (old_count <= 1) {
+            const empty_node = allocHamtNode() orelse return null;
+            empty_node.* = .{ .bitmap = 0, .children_entries = undefined, .children_nodes = undefined, .child_count = 0 };
+            return empty_node;
+        }
+        const new_count = old_count - 1;
+        const new_entries = allocEntries(new_count) orelse return null;
+        const new_nodes = allocNodePtrs(new_count) orelse return null;
+        const new_node = allocHamtNode() orelse return null;
+
+        var dst: usize = 0;
+        for (0..old_count) |i| {
+            if (i != idx) {
+                new_entries[dst] = node.children_entries[i];
+                new_nodes[dst] = node.children_nodes[i];
+                dst += 1;
+            }
+        }
+
+        new_node.* = .{
+            .bitmap = node.bitmap & ~bit,
+            .children_entries = new_entries,
+            .children_nodes = new_nodes,
+            .child_count = @intCast(new_count),
+        };
+        return new_node;
+    }
+
+    /// Collect all entries from a HAMT trie into a flat list.
+    fn hamtCollect(node: *const HamtNode, result: *std.ArrayListUnmanaged(MapEntry)) void {
+        const count: usize = @intCast(node.child_count);
+        for (0..count) |i| {
+            if (node.children_nodes[i]) |sub| {
+                hamtCollect(sub, result);
+            } else {
+                // Use a fixed-size buffer approach since we can't return errors
+                const a = getArena();
+                result.append(a.allocator(), node.children_entries[i]) catch {};
+            }
+        }
+    }
+
+    /// Convert flat entries to a HAMT trie.
+    fn flatToTrie(entries: [*]const MapEntry, count: u32) ?*const HamtNode {
+        const initial = allocHamtNode() orelse return null;
+        initial.* = .{ .bitmap = 0, .children_entries = undefined, .children_nodes = undefined, .child_count = 0 };
+
+        var root: *const HamtNode = initial;
+        for (0..count) |i| {
+            const entry = entries[i];
+            const hash = hashKey(entry.key);
+            root = hamtPut(root, entry.key, entry.value, hash, 0) orelse return null;
+        }
+        return root;
+    }
+
+    // === Public API (unchanged signatures) ===
 
     pub fn empty() ?*const MapCell {
         return null;
@@ -1909,25 +2237,32 @@ pub const MapCell = struct {
     pub fn fromPairs(key_ids: []const u32, vals: []const i64, count: u32) ?*const MapCell {
         if (count == 0) return null;
         const n: usize = @intCast(count);
-        const cell_bytes = bumpAlloc(@sizeOf(MapCell));
-        if (cell_bytes.len == 0) return null;
-        const entry_bytes = bumpAlloc(n * @sizeOf(MapEntry));
-        if (entry_bytes.len == 0) return null;
-
-        const entry_arr: [*]MapEntry = @ptrCast(@alignCast(entry_bytes.ptr));
+        const entry_arr = allocEntries(n) orelse return null;
         for (0..n) |i| {
             entry_arr[i] = .{ .key = key_ids[i], .value = vals[i] };
         }
 
-        const cell: *MapCell = @ptrCast(@alignCast(cell_bytes.ptr));
-        cell.* = .{ .entries = entry_arr, .count = count };
-        return cell;
+        if (count <= FLAT_THRESHOLD) {
+            return makeFlatMap(entry_arr, count);
+        }
+        // Build HAMT from entries
+        const root = flatToTrie(entry_arr, count) orelse return makeFlatMap(entry_arr, count);
+        return makeTrieMap(root, count);
     }
 
     pub fn get(map: ?*const MapCell, key: u32, default: i64) i64 {
         if (map) |m| {
-            for (m.entries[0..m.count]) |entry| {
-                if (entry.key == key) return entry.value;
+            if (m.repr_tag == 0) {
+                // Flat: linear scan
+                for (m.flat_entries[0..m.flat_count]) |entry| {
+                    if (entry.key == key) return entry.value;
+                }
+            } else {
+                // Trie: hash lookup
+                if (m.trie_root) |root| {
+                    const hash = hashKey(key);
+                    return hamtGet(root, key, hash, 0) orelse default;
+                }
             }
         }
         return default;
@@ -1941,15 +2276,22 @@ pub const MapCell = struct {
 
     pub fn hasKey(map: ?*const MapCell, key: u32) bool {
         if (map) |m| {
-            for (m.entries[0..m.count]) |entry| {
-                if (entry.key == key) return true;
+            if (m.repr_tag == 0) {
+                for (m.flat_entries[0..m.flat_count]) |entry| {
+                    if (entry.key == key) return true;
+                }
+            } else {
+                if (m.trie_root) |root| {
+                    const hash = hashKey(key);
+                    return hamtGet(root, key, hash, 0) != null;
+                }
             }
         }
         return false;
     }
 
     pub fn size(map: ?*const MapCell) i64 {
-        if (map) |m| return @intCast(m.count);
+        if (map) |m| return @intCast(m.total_count);
         return 0;
     }
 
@@ -1958,83 +2300,113 @@ pub const MapCell = struct {
     }
 
     pub fn put(map: ?*const MapCell, key: u32, value: i64) ?*const MapCell {
-        const old_count: usize = if (map) |m| @intCast(m.count) else 0;
+        if (map == null) {
+            // Create new single-entry flat map
+            const entries = allocEntries(1) orelse return null;
+            entries[0] = .{ .key = key, .value = value };
+            return makeFlatMap(entries, 1);
+        }
 
-        // Check if key exists (update) or new (append)
-        var replacing = false;
-        if (map) |m| {
-            for (m.entries[0..m.count]) |entry| {
-                if (entry.key == key) {
-                    replacing = true;
-                    break;
+        const m = map.?;
+
+        if (m.repr_tag == 0) {
+            // Currently flat
+            const old_count: usize = @intCast(m.flat_count);
+
+            // Check if key exists (update)
+            for (0..old_count) |i| {
+                if (m.flat_entries[i].key == key) {
+                    // Update existing key — copy and replace
+                    const new_entries = allocEntries(old_count) orelse return map;
+                    for (0..old_count) |j| {
+                        new_entries[j] = if (j == i) MapEntry{ .key = key, .value = value } else m.flat_entries[j];
+                    }
+                    if (old_count <= FLAT_THRESHOLD) {
+                        return makeFlatMap(new_entries, m.flat_count);
+                    }
+                    const root = flatToTrie(new_entries, m.flat_count) orelse return makeFlatMap(new_entries, m.flat_count);
+                    return makeTrieMap(root, m.flat_count);
                 }
             }
-        }
 
-        const new_count: usize = if (replacing) old_count else old_count + 1;
-        const cell_bytes = bumpAlloc(@sizeOf(MapCell));
-        if (cell_bytes.len == 0) return map;
-        const entry_bytes = bumpAlloc(new_count * @sizeOf(MapEntry));
-        if (entry_bytes.len == 0) return map;
-
-        const new_entries: [*]MapEntry = @ptrCast(@alignCast(entry_bytes.ptr));
-        var dst: usize = 0;
-
-        if (map) |m| {
-            for (m.entries[0..m.count]) |entry| {
-                if (entry.key == key) {
-                    new_entries[dst] = .{ .key = key, .value = value };
-                } else {
-                    new_entries[dst] = entry;
-                }
-                dst += 1;
+            // New key — append
+            const new_count: u32 = m.flat_count + 1;
+            const new_entries = allocEntries(old_count + 1) orelse return map;
+            for (0..old_count) |i| {
+                new_entries[i] = m.flat_entries[i];
             }
+            new_entries[old_count] = .{ .key = key, .value = value };
+
+            if (new_count <= FLAT_THRESHOLD) {
+                return makeFlatMap(new_entries, new_count);
+            }
+            // Promote to trie
+            const root = flatToTrie(new_entries, new_count) orelse return makeFlatMap(new_entries, new_count);
+            return makeTrieMap(root, new_count);
         }
 
-        if (!replacing) {
-            new_entries[dst] = .{ .key = key, .value = value };
+        // Trie mode
+        if (m.trie_root) |root| {
+            const hash = hashKey(key);
+            const was_present = hamtGet(root, key, hash, 0) != null;
+            const new_root = hamtPut(root, key, value, hash, 0) orelse return map;
+            const new_total = if (was_present) m.total_count else m.total_count + 1;
+            return makeTrieMap(new_root, new_total);
         }
-
-        const cell: *MapCell = @ptrCast(@alignCast(cell_bytes.ptr));
-        cell.* = .{ .entries = new_entries, .count = @intCast(new_count) };
-        return cell;
+        return map;
     }
 
     pub fn delete(map: ?*const MapCell, key: u32) ?*const MapCell {
         if (map == null) return null;
         const m = map.?;
-        if (m.count == 0) return null;
 
-        // Check if key exists
-        var found = false;
-        for (m.entries[0..m.count]) |entry| {
-            if (entry.key == key) {
-                found = true;
-                break;
+        if (m.repr_tag == 0) {
+            // Flat mode
+            var found = false;
+            for (m.flat_entries[0..m.flat_count]) |entry| {
+                if (entry.key == key) {
+                    found = true;
+                    break;
+                }
             }
-        }
-        if (!found) return map;
+            if (!found) return map;
 
-        const new_count = m.count - 1;
-        if (new_count == 0) return null;
+            const new_count = m.flat_count - 1;
+            if (new_count == 0) return null;
 
-        const cell_bytes = bumpAlloc(@sizeOf(MapCell));
-        if (cell_bytes.len == 0) return map;
-        const entry_bytes = bumpAlloc(new_count * @sizeOf(MapEntry));
-        if (entry_bytes.len == 0) return map;
-
-        const new_entries: [*]MapEntry = @ptrCast(@alignCast(entry_bytes.ptr));
-        var dst: usize = 0;
-        for (m.entries[0..m.count]) |entry| {
-            if (entry.key != key) {
-                new_entries[dst] = entry;
-                dst += 1;
+            const new_entries = allocEntries(new_count) orelse return map;
+            var dst: usize = 0;
+            for (m.flat_entries[0..m.flat_count]) |entry| {
+                if (entry.key != key) {
+                    new_entries[dst] = entry;
+                    dst += 1;
+                }
             }
+            return makeFlatMap(new_entries, new_count);
         }
 
-        const cell: *MapCell = @ptrCast(@alignCast(cell_bytes.ptr));
-        cell.* = .{ .entries = new_entries, .count = new_count };
-        return cell;
+        // Trie mode
+        if (m.trie_root) |root| {
+            const hash = hashKey(key);
+            if (hamtGet(root, key, hash, 0) == null) return map; // not found
+            const new_root = hamtDelete(root, key, hash, 0) orelse return map;
+            const new_total = m.total_count - 1;
+            if (new_total == 0) return null;
+            // Demote to flat if below threshold
+            if (new_total <= FLAT_THRESHOLD) {
+                var collected: std.ArrayListUnmanaged(MapEntry) = .empty;
+                hamtCollect(new_root, &collected);
+                if (collected.items.len > 0) {
+                    const entries = allocEntries(collected.items.len) orelse return makeTrieMap(new_root, new_total);
+                    for (collected.items, 0..) |entry, i| {
+                        entries[i] = entry;
+                    }
+                    return makeFlatMap(entries, new_total);
+                }
+            }
+            return makeTrieMap(new_root, new_total);
+        }
+        return map;
     }
 
     pub fn merge(map_a: ?*const MapCell, map_b: ?*const MapCell) ?*const MapCell {
@@ -2043,8 +2415,18 @@ pub const MapCell = struct {
         // Apply all entries from b onto a
         var result = map_a;
         const b = map_b.?;
-        for (b.entries[0..b.count]) |entry| {
-            result = put(result, entry.key, entry.value);
+
+        if (b.repr_tag == 0) {
+            for (b.flat_entries[0..b.flat_count]) |entry| {
+                result = put(result, entry.key, entry.value);
+            }
+        } else {
+            // Collect trie entries and apply
+            var collected: std.ArrayListUnmanaged(MapEntry) = .empty;
+            if (b.trie_root) |root| hamtCollect(root, &collected);
+            for (collected.items) |entry| {
+                result = put(result, entry.key, entry.value);
+            }
         }
         return result;
     }
@@ -2052,11 +2434,25 @@ pub const MapCell = struct {
     pub fn keys(map: ?*const MapCell) ?*const ListCell {
         if (map == null) return null;
         const m = map.?;
+
+        if (m.repr_tag == 0) {
+            var result: ?*const ListCell = null;
+            var i: usize = m.flat_count;
+            while (i > 0) {
+                i -= 1;
+                result = ListCell.cons(@intCast(m.flat_entries[i].key), result);
+            }
+            return result;
+        }
+
+        // Trie: collect and build list
+        var collected: std.ArrayListUnmanaged(MapEntry) = .empty;
+        if (m.trie_root) |root| hamtCollect(root, &collected);
         var result: ?*const ListCell = null;
-        var i: usize = m.count;
+        var i: usize = collected.items.len;
         while (i > 0) {
             i -= 1;
-            result = ListCell.cons(@intCast(m.entries[i].key), result);
+            result = ListCell.cons(@intCast(collected.items[i].key), result);
         }
         return result;
     }
@@ -2064,11 +2460,25 @@ pub const MapCell = struct {
     pub fn values(map: ?*const MapCell) ?*const ListCell {
         if (map == null) return null;
         const m = map.?;
+
+        if (m.repr_tag == 0) {
+            var result: ?*const ListCell = null;
+            var i: usize = m.flat_count;
+            while (i > 0) {
+                i -= 1;
+                result = ListCell.cons(m.flat_entries[i].value, result);
+            }
+            return result;
+        }
+
+        // Trie: collect and build list
+        var collected: std.ArrayListUnmanaged(MapEntry) = .empty;
+        if (m.trie_root) |root| hamtCollect(root, &collected);
         var result: ?*const ListCell = null;
-        var i: usize = m.count;
+        var i: usize = collected.items.len;
         while (i > 0) {
             i -= 1;
-            result = ListCell.cons(m.entries[i].value, result);
+            result = ListCell.cons(collected.items[i].value, result);
         }
         return result;
     }

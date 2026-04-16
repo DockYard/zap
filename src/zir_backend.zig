@@ -28,6 +28,19 @@ extern "c" fn zir_compilation_create(
     link_libc: bool,
 ) ?*ZirContext;
 
+extern "c" fn zir_compilation_create_cross(
+    zig_lib_dir: [*:0]const u8,
+    local_cache_dir: [*:0]const u8,
+    global_cache_dir: [*:0]const u8,
+    output_path: [*:0]const u8,
+    root_name: [*:0]const u8,
+    output_mode: u8,
+    optimize_mode: u8,
+    is_dynamic: bool,
+    link_libc: bool,
+    target_triple: ?[*:0]const u8,
+) ?*ZirContext;
+
 extern "c" fn zir_compilation_update(ctx: *ZirContext) i32;
 
 extern "c" fn zir_compilation_destroy(ctx: *ZirContext) void;
@@ -87,6 +100,9 @@ pub const CompileOptions = struct {
     /// Builder mode: compile as a builder binary with a custom entry point.
     /// The entry point function name (mangled, e.g., "FooBar__Builder__manifest").
     builder_entry: ?[]const u8 = null,
+    /// Cross-compilation target triple (e.g., "wasm32-wasi", "aarch64-linux-gnu").
+    /// null means native target.
+    target: ?[]const u8 = null,
     /// Analysis results from the escape/region/ARC pipeline.
     analysis_context: ?*const @import("escape_lattice.zig").AnalysisContext = null,
 };
@@ -108,7 +124,12 @@ pub fn compile(allocator: std.mem.Allocator, program: ir.Program, options: Compi
     const name_z = allocator.dupeZ(u8, options.name) catch return error.OutOfMemory;
     defer allocator.free(name_z);
 
-    const ctx = zir_compilation_create(zig_lib_z, cache_z, global_cache_z, output_z, name_z, options.output_mode, options.optimize_mode, options.is_dynamic, options.link_libc) orelse
+    const ctx = if (options.target) |target| blk: {
+        const target_z = allocator.dupeZ(u8, target) catch return error.OutOfMemory;
+        defer allocator.free(target_z);
+        break :blk zir_compilation_create_cross(zig_lib_z, cache_z, global_cache_z, output_z, name_z, options.output_mode, options.optimize_mode, options.is_dynamic, options.link_libc, target_z) orelse
+            return error.CompilationCreateFailed;
+    } else zir_compilation_create(zig_lib_z, cache_z, global_cache_z, output_z, name_z, options.output_mode, options.optimize_mode, options.is_dynamic, options.link_libc) orelse
         return error.CompilationCreateFailed;
     defer zir_compilation_destroy(ctx);
 

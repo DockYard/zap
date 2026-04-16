@@ -217,6 +217,122 @@ fn computeDirectoryHash(alloc: std.mem.Allocator, dir_path: []const u8) ![]const
     return try std.fmt.allocPrint(alloc, "sha256-{s}", .{hex_buf[0..16]});
 }
 
+/// Description of a git dependency to fetch.
+pub const GitDepRequest = struct {
+    name: []const u8,
+    url: []const u8,
+    ref: ?[]const u8,
+    locked_commit: ?[]const u8,
+};
+
+/// Result of a parallel fetch operation.
+pub const GitDepResult = struct {
+    name: []const u8,
+    path: []const u8,
+    commit: []const u8,
+    integrity: []const u8,
+    fetch_error: bool = false,
+};
+
+/// Fetch multiple git dependencies in parallel using OS threads.
+///
+/// Spawns one thread per dependency for concurrent git clone operations.
+/// Each thread uses its own arena allocator to avoid contention.
+/// Returns results in the same order as the input requests.
+pub fn fetchGitDepsParallel(
+    alloc: std.mem.Allocator,
+    requests: []const GitDepRequest,
+) ![]GitDepResult {
+    if (requests.len == 0) return &.{};
+
+    // For a single dep, just fetch directly (no thread overhead)
+    if (requests.len == 1) {
+        const results = try alloc.alloc(GitDepResult, 1);
+        const req = requests[0];
+        const fetch_result = fetchGitDep(alloc, req.name, req.url, req.ref, req.locked_commit) catch {
+            results[0] = .{
+                .name = req.name,
+                .path = "",
+                .commit = "",
+                .integrity = "-",
+                .fetch_error = true,
+            };
+            return results;
+        };
+        results[0] = .{
+            .name = req.name,
+            .path = fetch_result.path,
+            .commit = fetch_result.commit,
+            .integrity = fetch_result.integrity,
+        };
+        return results;
+    }
+
+    // Parallel fetch using threads
+    const results = try alloc.alloc(GitDepResult, requests.len);
+
+    const ThreadContext = struct {
+        request: GitDepRequest,
+        result: *GitDepResult,
+        thread_alloc: std.mem.Allocator,
+
+        fn run(ctx: *const @This()) void {
+            const req = ctx.request;
+            const fetch_result = fetchGitDep(ctx.thread_alloc, req.name, req.url, req.ref, req.locked_commit) catch {
+                ctx.result.* = .{
+                    .name = req.name,
+                    .path = "",
+                    .commit = "",
+                    .integrity = "-",
+                    .fetch_error = true,
+                };
+                return;
+            };
+            ctx.result.* = .{
+                .name = req.name,
+                .path = fetch_result.path,
+                .commit = fetch_result.commit,
+                .integrity = fetch_result.integrity,
+            };
+        }
+    };
+
+    var contexts = try alloc.alloc(ThreadContext, requests.len);
+    defer alloc.free(contexts);
+    for (requests, 0..) |req, i| {
+        contexts[i] = .{
+            .request = req,
+            .result = &results[i],
+            .thread_alloc = alloc,
+        };
+    }
+
+    // Spawn threads
+    var threads = try alloc.alloc(std.Thread, requests.len);
+    defer alloc.free(threads);
+
+    for (contexts, 0..) |*ctx, i| {
+        threads[i] = std.Thread.spawn(.{}, ThreadContext.run, .{ctx}) catch {
+            // If thread spawn fails, fetch sequentially as fallback
+            results[i] = .{
+                .name = ctx.request.name,
+                .path = "",
+                .commit = "",
+                .integrity = "-",
+                .fetch_error = true,
+            };
+            continue;
+        };
+    }
+
+    // Join all threads
+    for (threads) |thread| {
+        thread.join();
+    }
+
+    return results;
+}
+
 pub const FetchError = error{
     GitCloneFailed,
     OutOfMemory,
