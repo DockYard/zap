@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const env = @import("env.zig");
 
 const runtime_io = std.Options.debug_io;
 
@@ -1048,7 +1049,154 @@ pub const Prelude = struct {
         return @floatFromInt(x);
     }
 
+    // --- Math functions (Zig 0.16 float builtins) ---
+    pub fn sqrt_f64(x: f64) f64 {
+        return @sqrt(x);
+    }
+
+    pub fn sin_f64(x: f64) f64 {
+        return @sin(x);
+    }
+
+    pub fn cos_f64(x: f64) f64 {
+        return @cos(x);
+    }
+
+    pub fn tan_f64(x: f64) f64 {
+        return @tan(x);
+    }
+
+    pub fn exp_f64(x: f64) f64 {
+        return @exp(x);
+    }
+
+    pub fn exp2_f64(x: f64) f64 {
+        return @exp2(x);
+    }
+
+    pub fn log_f64(x: f64) f64 {
+        return @log(x);
+    }
+
+    pub fn log2_f64(x: f64) f64 {
+        return @log2(x);
+    }
+
+    pub fn log10_f64(x: f64) f64 {
+        return @log10(x);
+    }
+
+    // --- Float-to-integer conversions (Zig 0.16 direct builtins) ---
+    pub fn floor_to_i64(x: f64) i64 {
+        return @floor(x);
+    }
+
+    pub fn ceil_to_i64(x: f64) i64 {
+        return @ceil(x);
+    }
+
+    pub fn round_to_i64(x: f64) i64 {
+        return @round(x);
+    }
+
+    // --- Integer bit operations ---
+    pub fn clz_i64(x: i64) i64 {
+        return @intCast(@clz(x));
+    }
+
+    pub fn ctz_i64(x: i64) i64 {
+        return @intCast(@ctz(x));
+    }
+
+    pub fn popcount_i64(x: i64) i64 {
+        return @intCast(@popCount(x));
+    }
+
+    pub fn byte_swap_i64(x: i64) i64 {
+        return @byteSwap(x);
+    }
+
+    pub fn bit_reverse_i64(x: i64) i64 {
+        return @bitReverse(x);
+    }
+
+    // --- Saturating arithmetic ---
+    pub fn add_sat_i64(a: i64, b: i64) i64 {
+        return a +| b;
+    }
+
+    pub fn sub_sat_i64(a: i64, b: i64) i64 {
+        return a -| b;
+    }
+
+    pub fn mul_sat_i64(a: i64, b: i64) i64 {
+        return a *| b;
+    }
+
+    // --- Bitwise operations ---
+    pub fn band_i64(a: i64, b: i64) i64 {
+        return a & b;
+    }
+
+    pub fn bor_i64(a: i64, b: i64) i64 {
+        return a | b;
+    }
+
+    pub fn bxor_i64(a: i64, b: i64) i64 {
+        return a ^ b;
+    }
+
+    pub fn bnot_i64(a: i64) i64 {
+        return ~a;
+    }
+
+    pub fn bsl_i64(a: i64, b: i64) i64 {
+        if (b < 0 or b >= 64) return 0;
+        const shift: u6 = @intCast(b);
+        return a << shift;
+    }
+
+    pub fn bsr_i64(a: i64, b: i64) i64 {
+        if (b < 0 or b >= 64) return if (a < 0) -1 else 0;
+        const shift: u6 = @intCast(b);
+        return a >> shift;
+    }
+
     // --- String operations ---
+    pub fn capitalize(s: []const u8) []const u8 {
+        if (s.len == 0) return s;
+        const result = bumpAlloc(s.len);
+        if (result.len == 0) return s;
+        result[0] = if (s[0] >= 'a' and s[0] <= 'z') s[0] - 32 else s[0];
+        for (s[1..], 0..) |c, i| {
+            result[i + 1] = if (c >= 'A' and c <= 'Z') c + 32 else c;
+        }
+        return result;
+    }
+
+    pub fn trim_leading(s: []const u8) []const u8 {
+        return std.mem.trimLeft(u8, s, " \t\n\r");
+    }
+
+    pub fn trim_trailing(s: []const u8) []const u8 {
+        return std.mem.trimRight(u8, s, " \t\n\r");
+    }
+
+    pub fn string_count(haystack: []const u8, needle: []const u8) i64 {
+        if (needle.len == 0) return 0;
+        var count: i64 = 0;
+        var i: usize = 0;
+        while (i + needle.len <= haystack.len) {
+            if (std.mem.eql(u8, haystack[i..][0..needle.len], needle)) {
+                count += 1;
+                i += needle.len;
+            } else {
+                i += 1;
+            }
+        }
+        return count;
+    }
+
     pub fn upcase(s: []const u8) []const u8 {
         const result = bumpAlloc(s.len);
         if (result.len == 0) return s;
@@ -1265,21 +1413,16 @@ pub const Prelude = struct {
     }
 
     pub fn get_env(name: []const u8) []const u8 {
-        // Copy name to a null-terminated buffer, then use C getenv
-        var buf: [256]u8 = undefined;
-        if (name.len >= buf.len) return "";
-        @memcpy(buf[0..name.len], name);
-        buf[name.len] = 0;
-        const name_z: [*:0]const u8 = buf[0..name.len :0];
-        const result = std.c.getenv(name_z);
-        if (result) |ptr| {
-            return std.mem.sliceTo(ptr, 0);
-        }
-        return "";
+        return env.getenvRuntime(name) orelse "";
     }
 
     pub fn panic(msg: []const u8) noreturn {
         std.debug.print("panic: {s}\n", .{msg});
+        std.process.exit(1);
+    }
+
+    pub fn halt(msg: []const u8) noreturn {
+        std.debug.print("halt: {s}\n", .{msg});
         std.process.exit(1);
     }
 

@@ -1,5 +1,11 @@
 const std = @import("std");
 
+/// Wraps std.c.getenv to return a Zig-native slice (?[]const u8).
+fn getenvSlice(name: [*:0]const u8) ?[]const u8 {
+    const ptr = std.c.getenv(name) orelse return null;
+    return std.mem.span(ptr);
+}
+
 var test_io_impl: std.Io.Threaded = undefined;
 var test_io_initialized: bool = false;
 fn getTestIo() std.Io {
@@ -84,7 +90,7 @@ fn compileOnly(source: []const u8) TestError!void {
     const tmp_dir_path = tmp_dir.dir.realPathFileAlloc(getTestIo(), ".", allocator) catch return error.Unexpected;
     defer allocator.free(tmp_dir_path);
 
-    const zap_binary_raw: []const u8 = if (std.c.getenv("ZAP_BINARY")) |ptr| std.mem.span(ptr) else "zig-out/bin/zap";
+    const zap_binary_raw: []const u8 = getenvSlice("ZAP_BINARY") orelse "zig-out/bin/zap";
 
     const zap_binary = if (std.fs.path.isAbsolute(zap_binary_raw))
         allocator.dupe(u8, zap_binary_raw) catch return error.OutOfMemory
@@ -148,7 +154,7 @@ fn compileAndRun(source: []const u8) TestError!TestResult {
     defer allocator.free(tmp_dir_path);
 
     // Get zap binary path from environment or use default.
-    const zap_binary_raw: []const u8 = if (std.c.getenv("ZAP_BINARY")) |ptr| std.mem.span(ptr) else "zig-out/bin/zap";
+    const zap_binary_raw: []const u8 = getenvSlice("ZAP_BINARY") orelse "zig-out/bin/zap";
 
     const zap_binary = if (std.fs.path.isAbsolute(zap_binary_raw))
         allocator.dupe(u8, zap_binary_raw) catch return error.OutOfMemory
@@ -260,7 +266,7 @@ fn compileAndRunWithFiles(source: []const u8, extra_files: []const ExtraFile) Te
         return error.Unexpected;
     defer allocator.free(tmp_dir_path);
 
-    const zap_binary_raw: []const u8 = if (std.c.getenv("ZAP_BINARY")) |ptr| std.mem.span(ptr) else "zig-out/bin/zap";
+    const zap_binary_raw: []const u8 = getenvSlice("ZAP_BINARY") orelse "zig-out/bin/zap";
 
     const zap_binary = if (std.fs.path.isAbsolute(zap_binary_raw))
         allocator.dupe(u8, zap_binary_raw) catch return error.OutOfMemory

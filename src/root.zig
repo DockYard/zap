@@ -41,6 +41,7 @@ pub const attr_substitute = @import("attr_substitute.zig");
 pub const ctfe = @import("ctfe.zig");
 pub const lockfile = @import("lockfile.zig");
 pub const monomorphize = @import("monomorphize.zig");
+pub const env = @import("env.zig");
 
 test {
     _ = @import("token.zig");
@@ -80,4 +81,5 @@ test {
     _ = @import("attr_substitute.zig");
     _ = @import("ctfe.zig");
     _ = @import("monomorphize.zig");
+    _ = @import("env.zig");
 }

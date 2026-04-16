@@ -7,6 +7,7 @@
 const std = @import("std");
 const zap = @import("root.zig");
 const BuildConfig = zap.builder.BuildConfig;
+const env = @import("env.zig");
 
 const io = std.Options.debug_io;
 
@@ -108,7 +109,7 @@ pub fn fetchGitDep(
     ref: ?[]const u8,
     locked_commit: ?[]const u8,
 ) !struct { path: []const u8, commit: []const u8, integrity: []const u8 } {
-    const home: []const u8 = if (std.c.getenv("HOME")) |ptr| std.mem.span(ptr) else "/tmp";
+    const home: []const u8 = env.getenv("HOME") orelse "/tmp";
     const cache_base = try std.fs.path.join(alloc, &.{ home, ".cache", "zap", "deps" });
     std.Io.Dir.cwd().createDirPath(io, cache_base) catch {};
 

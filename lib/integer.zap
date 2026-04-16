@@ -191,4 +191,298 @@ pub module Integer {
   pub fn to_float(value :: i64) -> f64 {
     :zig.Prelude.i64_to_f64(value)
   }
+
+  # --- Bit operations ---
+
+  @doc = """
+    Returns the number of leading zeros in the binary representation.
+
+    ## Examples
+
+        Integer.count_leading_zeros(1)   # => 63
+        Integer.count_leading_zeros(0)   # => 64
+    """
+
+  pub fn count_leading_zeros(value :: i64) -> i64 {
+    :zig.Prelude.clz_i64(value)
+  }
+
+  @doc = """
+    Returns the number of trailing zeros in the binary representation.
+
+    ## Examples
+
+        Integer.count_trailing_zeros(8)   # => 3
+        Integer.count_trailing_zeros(1)   # => 0
+    """
+
+  pub fn count_trailing_zeros(value :: i64) -> i64 {
+    :zig.Prelude.ctz_i64(value)
+  }
+
+  @doc = """
+    Returns the number of set bits (ones) in the binary representation.
+
+    ## Examples
+
+        Integer.popcount(7)    # => 3
+        Integer.popcount(255)  # => 8
+        Integer.popcount(0)    # => 0
+    """
+
+  pub fn popcount(value :: i64) -> i64 {
+    :zig.Prelude.popcount_i64(value)
+  }
+
+  @doc = """
+    Reverses the byte order of an integer. Useful for converting
+    between big-endian and little-endian representations.
+
+    ## Examples
+
+        Integer.byte_swap(1)  # => 72057594037927936
+    """
+
+  pub fn byte_swap(value :: i64) -> i64 {
+    :zig.Prelude.byte_swap_i64(value)
+  }
+
+  @doc = """
+    Reverses all bits in the binary representation.
+
+    ## Examples
+
+        Integer.bit_reverse(1)  # => -9223372036854775808
+    """
+
+  pub fn bit_reverse(value :: i64) -> i64 {
+    :zig.Prelude.bit_reverse_i64(value)
+  }
+
+  # --- Saturating arithmetic ---
+
+  @doc = """
+    Adds two integers with saturation. If the result would overflow,
+    it clamps to the maximum (or minimum) representable value instead.
+
+    ## Examples
+
+        Integer.add_sat(9223372036854775807, 1)  # => 9223372036854775807
+        Integer.add_sat(3, 4)                     # => 7
+    """
+
+  pub fn add_sat(first :: i64, second :: i64) -> i64 {
+    :zig.Prelude.add_sat_i64(first, second)
+  }
+
+  @doc = """
+    Subtracts two integers with saturation. If the result would
+    underflow, it clamps to the minimum representable value instead.
+
+    ## Examples
+
+        Integer.sub_sat(-9223372036854775808, 1)  # => -9223372036854775808
+        Integer.sub_sat(10, 3)                     # => 7
+    """
+
+  pub fn sub_sat(first :: i64, second :: i64) -> i64 {
+    :zig.Prelude.sub_sat_i64(first, second)
+  }
+
+  @doc = """
+    Multiplies two integers with saturation. If the result would
+    overflow, it clamps to the maximum (or minimum) representable
+    value instead.
+
+    ## Examples
+
+        Integer.mul_sat(9223372036854775807, 2)  # => 9223372036854775807
+        Integer.mul_sat(3, 4)                     # => 12
+    """
+
+  pub fn mul_sat(first :: i64, second :: i64) -> i64 {
+    :zig.Prelude.mul_sat_i64(first, second)
+  }
+
+  # --- Bitwise operations ---
+
+  @doc = """
+    Bitwise AND of two integers.
+
+    ## Examples
+
+        Integer.band(7, 5)    # => 5
+        Integer.band(255, 15) # => 15
+        Integer.band(0, 42)   # => 0
+    """
+
+  pub fn band(first :: i64, second :: i64) -> i64 {
+    :zig.Prelude.band_i64(first, second)
+  }
+
+  @doc = """
+    Bitwise OR of two integers.
+
+    ## Examples
+
+        Integer.bor(5, 3)    # => 7
+        Integer.bor(0, 42)   # => 42
+        Integer.bor(255, 0)  # => 255
+    """
+
+  pub fn bor(first :: i64, second :: i64) -> i64 {
+    :zig.Prelude.bor_i64(first, second)
+  }
+
+  @doc = """
+    Bitwise XOR (exclusive OR) of two integers.
+
+    ## Examples
+
+        Integer.bxor(7, 5)    # => 2
+        Integer.bxor(255, 255) # => 0
+        Integer.bxor(0, 42)   # => 42
+    """
+
+  pub fn bxor(first :: i64, second :: i64) -> i64 {
+    :zig.Prelude.bxor_i64(first, second)
+  }
+
+  @doc = """
+    Bitwise NOT (complement) of an integer.
+
+    Flips all bits in the binary representation.
+
+    ## Examples
+
+        Integer.bnot(0)    # => -1
+        Integer.bnot(-1)   # => 0
+    """
+
+  pub fn bnot(value :: i64) -> i64 {
+    :zig.Prelude.bnot_i64(value)
+  }
+
+  @doc = """
+    Bitwise shift left. Shifts the bits of the first argument
+    left by the number of positions given in the second argument.
+
+    ## Examples
+
+        Integer.bsl(1, 3)    # => 8
+        Integer.bsl(5, 1)    # => 10
+    """
+
+  pub fn bsl(value :: i64, amount :: i64) -> i64 {
+    :zig.Prelude.bsl_i64(value, amount)
+  }
+
+  @doc = """
+    Bitwise shift right (arithmetic). Shifts the bits of the first
+    argument right by the number of positions given in the second
+    argument. Preserves the sign bit.
+
+    ## Examples
+
+        Integer.bsr(8, 3)    # => 1
+        Integer.bsr(10, 1)   # => 5
+    """
+
+  pub fn bsr(value :: i64, amount :: i64) -> i64 {
+    :zig.Prelude.bsr_i64(value, amount)
+  }
+
+  # --- Predicates (pure Zap) ---
+
+  @doc = """
+    Returns the sign of an integer: -1 for negative, 0 for zero,
+    1 for positive.
+
+    ## Examples
+
+        Integer.sign(42)   # => 1
+        Integer.sign(0)    # => 0
+        Integer.sign(-7)   # => -1
+    """
+
+  pub fn sign(value :: i64) -> i64 {
+    if value > 0 {
+      1
+    } else {
+      if value < 0 {
+        -1
+      } else {
+        0
+      }
+    }
+  }
+
+  @doc = """
+    Returns true if the integer is even.
+
+    ## Examples
+
+        Integer.even?(4)   # => true
+        Integer.even?(3)   # => false
+        Integer.even?(0)   # => true
+    """
+
+  pub fn even?(value :: i64) -> Bool {
+    Integer.remainder(value, 2) == 0
+  }
+
+  @doc = """
+    Returns true if the integer is odd.
+
+    ## Examples
+
+        Integer.odd?(3)   # => true
+        Integer.odd?(4)   # => false
+        Integer.odd?(0)   # => false
+    """
+
+  pub fn odd?(value :: i64) -> Bool {
+    Integer.remainder(value, 2) != 0
+  }
+
+  @doc = """
+    Computes the greatest common divisor of two integers
+    using the Euclidean algorithm.
+
+    ## Examples
+
+        Integer.gcd(12, 8)   # => 4
+        Integer.gcd(54, 24)  # => 6
+        Integer.gcd(7, 5)    # => 1
+    """
+
+  pub fn gcd(first :: i64, second :: i64) -> i64 {
+    gcd_helper(Integer.abs(first), Integer.abs(second))
+  }
+
+  fn gcd_helper(first :: i64, second :: i64) -> i64 {
+    if second == 0 {
+      first
+    } else {
+      gcd_helper(second, Integer.remainder(first, second))
+    }
+  }
+
+  @doc = """
+    Computes the least common multiple of two integers.
+
+    ## Examples
+
+        Integer.lcm(4, 6)   # => 12
+        Integer.lcm(3, 5)   # => 15
+        Integer.lcm(7, 7)   # => 7
+    """
+
+  pub fn lcm(first :: i64, second :: i64) -> i64 {
+    if first == 0 and second == 0 {
+      0
+    } else {
+      Integer.abs(first * second) / Integer.gcd(first, second)
+    }
+  }
 }

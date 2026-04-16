@@ -1,5 +1,6 @@
 const std = @import("std");
 const ast = @import("ast.zig");
+const env = @import("env.zig");
 
 // ============================================================
 // Diagnostics Engine
@@ -107,7 +108,7 @@ const Color = struct {
 };
 
 pub fn detectColor() bool {
-    if (std.c.getenv("NO_COLOR")) |_| return false;
+    if (env.getenv("NO_COLOR")) |_| return false;
     return true; // 0.16: default to color
 }
 

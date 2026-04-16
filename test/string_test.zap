@@ -169,5 +169,51 @@ pub module Test.StringTest {
     test("to_float invalid") {
       assert(String.to_float("hello") == 0.0)
     }
+
+    # capitalize
+
+    test("capitalize lowercase") {
+      assert(String.capitalize("hello") == "Hello")
+    }
+
+    test("capitalize uppercase") {
+      assert(String.capitalize("HELLO") == "Hello")
+    }
+
+    test("capitalize empty") {
+      assert(String.capitalize("") == "")
+    }
+
+    # trim_leading / trim_trailing
+
+    test("trim_leading removes leading spaces") {
+      assert(String.trim_leading("  hello  ") == "hello  ")
+    }
+
+    test("trim_trailing removes trailing spaces") {
+      assert(String.trim_trailing("  hello  ") == "  hello")
+    }
+
+    test("trim_leading no whitespace") {
+      assert(String.trim_leading("hello") == "hello")
+    }
+
+    test("trim_trailing no whitespace") {
+      assert(String.trim_trailing("hello") == "hello")
+    }
+
+    # count
+
+    test("count occurrences") {
+      assert(String.count("hello world hello", "hello") == 2)
+    }
+
+    test("count no match") {
+      assert(String.count("hello", "xyz") == 0)
+    }
+
+    test("count non-overlapping") {
+      assert(String.count("aaa", "aa") == 1)
+    }
   }
 }

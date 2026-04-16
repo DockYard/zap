@@ -214,4 +214,118 @@ pub module Enum {
   pub fn flat_map(list :: [i64], callback :: (i64 -> [i64])) -> [i64] {
     :zig.ListCell.flatMapFn(list, callback)
   }
+
+  @doc = """
+    Returns the first `count` elements from the list.
+
+    If `count` exceeds the list length, returns the entire list.
+
+    ## Examples
+
+        Enum.take([1, 2, 3, 4, 5], 3)  # => [1, 2, 3]
+        Enum.take([1, 2], 5)            # => [1, 2]
+        Enum.take([1, 2, 3], 0)         # => []
+    """
+
+  pub fn take(list :: [i64], count :: i64) -> [i64] {
+    List.take(list, count)
+  }
+
+  @doc = """
+    Drops the first `count` elements from the list.
+
+    If `count` exceeds the list length, returns an empty list.
+
+    ## Examples
+
+        Enum.drop([1, 2, 3, 4, 5], 2)  # => [3, 4, 5]
+        Enum.drop([1, 2], 5)            # => []
+        Enum.drop([1, 2, 3], 0)         # => [1, 2, 3]
+    """
+
+  pub fn drop(list :: [i64], count :: i64) -> [i64] {
+    List.drop(list, count)
+  }
+
+  @doc = """
+    Reverses the order of elements in the list.
+
+    ## Examples
+
+        Enum.reverse([1, 2, 3])  # => [3, 2, 1]
+        Enum.reverse([])          # => []
+    """
+
+  pub fn reverse(list :: [i64]) -> [i64] {
+    List.reverse(list)
+  }
+
+  @doc = """
+    Returns true if the list contains the given value.
+
+    ## Examples
+
+        Enum.member?([1, 2, 3], 2)  # => true
+        Enum.member?([1, 2, 3], 5)  # => false
+        Enum.member?([], 1)          # => false
+    """
+
+  pub fn member?(list :: [i64], value :: i64) -> Bool {
+    List.contains?(list, value)
+  }
+
+  @doc = """
+    Returns the element at the given zero-based index.
+    Returns 0 if the index is out of bounds.
+
+    ## Examples
+
+        Enum.at([10, 20, 30], 1)  # => 20
+        Enum.at([10, 20, 30], 0)  # => 10
+    """
+
+  pub fn at(list :: [i64], index :: i64) -> i64 {
+    List.at(list, index)
+  }
+
+  @doc = """
+    Concatenates two lists into a single list.
+
+    ## Examples
+
+        Enum.concat([1, 2], [3, 4])  # => [1, 2, 3, 4]
+        Enum.concat([], [1, 2])       # => [1, 2]
+        Enum.concat([1, 2], [])       # => [1, 2]
+    """
+
+  pub fn concat(first :: [i64], second :: [i64]) -> [i64] {
+    List.concat(first, second)
+  }
+
+  @doc = """
+    Returns a new list with duplicate values removed.
+    Preserves the order of first occurrences.
+
+    ## Examples
+
+        Enum.uniq([1, 2, 2, 3, 1])  # => [1, 2, 3]
+        Enum.uniq([1, 1, 1])         # => [1]
+    """
+
+  pub fn uniq(list :: [i64]) -> [i64] {
+    List.uniq(list)
+  }
+
+  @doc = """
+    Returns true if the list has no elements.
+
+    ## Examples
+
+        Enum.empty?([])        # => true
+        Enum.empty?([1, 2, 3]) # => false
+    """
+
+  pub fn empty?(list :: [i64]) -> Bool {
+    List.empty?(list)
+  }
 }

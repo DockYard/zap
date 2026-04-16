@@ -34,6 +34,7 @@ pub module Test.TestRunner {
     Test.EnumTest.run()
     Test.MapTest.run()
     Test.FileTest.run()
+    Test.MathTest.run()
 
     Zest.Runner.run()
   }

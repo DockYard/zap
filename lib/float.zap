@@ -181,4 +181,52 @@ pub module Float {
   pub fn clamp(value :: f64, lower :: f64, upper :: f64) -> f64 {
     Float.min(Float.max(value, lower), upper)
   }
+
+  @doc = """
+    Floors a float and converts directly to an integer in one step.
+    More efficient than `Float.to_integer(Float.floor(x))`.
+    Uses Zig 0.16's direct float-to-integer conversion builtins.
+
+    ## Examples
+
+        Float.floor_to_integer(3.7)   # => 3
+        Float.floor_to_integer(-2.3)  # => -3
+        Float.floor_to_integer(5.0)   # => 5
+    """
+
+  pub fn floor_to_integer(value :: f64) -> i64 {
+    :zig.Prelude.floor_to_i64(value)
+  }
+
+  @doc = """
+    Ceils a float and converts directly to an integer in one step.
+    More efficient than `Float.to_integer(Float.ceil(x))`.
+    Uses Zig 0.16's direct float-to-integer conversion builtins.
+
+    ## Examples
+
+        Float.ceil_to_integer(3.2)   # => 4
+        Float.ceil_to_integer(-2.7)  # => -2
+        Float.ceil_to_integer(5.0)   # => 5
+    """
+
+  pub fn ceil_to_integer(value :: f64) -> i64 {
+    :zig.Prelude.ceil_to_i64(value)
+  }
+
+  @doc = """
+    Rounds a float and converts directly to an integer in one step.
+    More efficient than `Float.to_integer(Float.round(x))`.
+    Uses Zig 0.16's direct float-to-integer conversion builtins.
+
+    ## Examples
+
+        Float.round_to_integer(3.2)   # => 3
+        Float.round_to_integer(3.7)   # => 4
+        Float.round_to_integer(-2.5)  # => -3
+    """
+
+  pub fn round_to_integer(value :: f64) -> i64 {
+    :zig.Prelude.round_to_i64(value)
+  }
 }

@@ -52,7 +52,7 @@ pub module Zest.Runner {
 
   pub fn configure() -> Atom {
     parse_cli_args(0, System.arg_count())
-  end
+  }
 
   @doc = """
     Prints the test summary with counts and exits with a
@@ -106,5 +106,5 @@ pub module Zest.Runner {
         }
       }
     }
-  end
+  }
 }

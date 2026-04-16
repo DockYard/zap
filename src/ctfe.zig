@@ -10,6 +10,7 @@
 const std = @import("std");
 const ir = @import("ir.zig");
 const ast = @import("ast.zig");
+const env = @import("env.zig");
 
 // ============================================================
 // Symbolic Memory Model
@@ -2915,9 +2916,7 @@ pub const Interpreter = struct {
         };
 
         // Read the env var
-        // Use a null-terminated copy for getenv
-        const name_z = self.allocator.dupeZ(u8, name) catch return error.OutOfMemory;
-        const value_ptr = std.c.getenv(name_z); const value: ?[]const u8 = if (value_ptr) |p| std.mem.span(p) else null;
+        const value: ?[]const u8 = env.getenvRuntime(name);
 
         if (value) |v| {
             const val_copy = self.allocator.dupe(u8, v) catch return error.OutOfMemory;
@@ -4490,11 +4489,11 @@ pub const PersistentCache = struct {
                     if (current_hash != f.content_hash) return false;
                 },
                 .env_var => |ev| {
-                    const current = std.c.getenv(@ptrCast(ev.name.ptr));
+                    const current = env.getenvRuntime(ev.name);
                     if (ev.present and current == null) return false;
                     if (!ev.present and current != null) return false;
                     if (current) |v| {
-                        const current_hash = std.hash.Wyhash.hash(0, std.mem.span(v));
+                        const current_hash = std.hash.Wyhash.hash(0, v);
                         if (current_hash != ev.value_hash) return false;
                     }
                 },

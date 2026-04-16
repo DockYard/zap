@@ -117,5 +117,39 @@ pub module Test.FloatTest {
     test("clamp above range") {
       assert(Float.clamp(15.0, 0.0, 10.0) == 10.0)
     }
+
+    # Direct float-to-integer conversions (Zig 0.16)
+
+    test("floor_to_integer positive") {
+      assert(Float.floor_to_integer(3.7) == 3)
+    }
+
+    test("floor_to_integer negative") {
+      assert(Float.floor_to_integer(-2.3) == -3)
+    }
+
+    test("floor_to_integer exact") {
+      assert(Float.floor_to_integer(5.0) == 5)
+    }
+
+    test("ceil_to_integer positive") {
+      assert(Float.ceil_to_integer(3.2) == 4)
+    }
+
+    test("ceil_to_integer negative") {
+      assert(Float.ceil_to_integer(-2.7) == -2)
+    }
+
+    test("ceil_to_integer exact") {
+      assert(Float.ceil_to_integer(5.0) == 5)
+    }
+
+    test("round_to_integer down") {
+      assert(Float.round_to_integer(3.2) == 3)
+    }
+
+    test("round_to_integer up") {
+      assert(Float.round_to_integer(3.7) == 4)
+    }
   }
 }

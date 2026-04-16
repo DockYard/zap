@@ -71,16 +71,6 @@ fn ctfeCompileOptionsHash(options: CompileOptions) u64 {
 /// `source` is raw Zap source.
 /// `file_path` is used for diagnostic display only.
 /// Diagnostics are emitted to stderr on failure.
-pub fn compileFrontend(
-    alloc: std.mem.Allocator,
-    source: []const u8,
-    file_path: []const u8,
-    options: CompileOptions,
-) CompileError!CompileResult {
-    var ctx = try collectAllFromUnits(alloc, &[_]SourceUnit{.{ .file_path = file_path, .source = source }}, options);
-    return try compileFiles(alloc, &ctx, options);
-}
-
 // ============================================================
 // Per-File Compilation Architecture
 //
@@ -110,10 +100,6 @@ pub const CompilationContext = struct {
     collector: zap.Collector,
     /// Diagnostic engine
     diag_engine: zap.DiagnosticEngine,
-    /// The full source (all files) for diagnostic display
-    full_source: []const u8,
-    /// Source file path for diagnostic display
-    source_path: []const u8,
 };
 
 pub const ModuleProgram = struct {
@@ -207,7 +193,6 @@ pub fn collectAllFromUnits(
     // progress writer: use debug.print in 0.16
     var step: u32 = 0;
     const total_steps: u32 = 11;
-    const file_path = if (source_units.len > 0) source_units[0].file_path else "<memory>";
 
     if (options.show_progress) {
         std.debug.print("Compiling\n", .{});
@@ -223,7 +208,6 @@ pub fn collectAllFromUnits(
     if (options.show_progress) std.debug.print("\r\x1b[K  [{d}/{d}] Parse", .{ step, total_steps });
 
     const all_source_units = source_units;
-    const merged_source = try mergeSourceUnits(alloc, all_source_units);
 
     setDiagnosticSources(&diag_engine, all_source_units);
     diag_engine.setLineOffset(0);
@@ -231,25 +215,69 @@ pub fn collectAllFromUnits(
     var global_interner = ast.StringInterner.init(alloc);
     const parsed_programs = try alloc.alloc(ast.Program, all_source_units.len);
     const local_interners = try alloc.alloc(ast.StringInterner, all_source_units.len);
-    for (all_source_units, 0..) |unit, i| {
-        local_interners[i] = ast.StringInterner.init(alloc);
-        var parser = zap.Parser.initWithSharedInterner(alloc, unit.source, &local_interners[i], @intCast(i));
-        defer parser.deinit();
+    // Parse all files. When Io is available and there are multiple files,
+    // parse in parallel using Io.Group — each parser gets its own local
+    // StringInterner so there is zero contention.
+    if (options.io != null and all_source_units.len > 1) {
+        const io_val = options.io.?;
+        const parse_results = try alloc.alloc(ParseTaskResult, all_source_units.len);
+        defer alloc.free(parse_results);
 
-        parsed_programs[i] = parser.parseProgram() catch {
-            emitParseErrorsFromUnits(alloc, parser.errors.items, all_source_units, diag_engine.use_color);
+        var group: std.Io.Group = .init;
+        for (all_source_units, 0..) |unit, i| {
+            local_interners[i] = ast.StringInterner.init(alloc);
+            parse_results[i] = .{};
+            group.async(io_val, parseFileTask, .{ alloc, unit.source, &local_interners[i], @as(u32, @intCast(i)), &parsed_programs[i], &parse_results[i] });
+        }
+        group.await(io_val) catch {};
+
+        // Check for parse failures and collect errors
+        var any_failed = false;
+        for (parse_results, 0..) |result, i| {
+            if (result.failed) {
+                if (result.errors.len > 0) {
+                    emitParseErrorsFromUnits(alloc, result.errors, all_source_units, diag_engine.use_color);
+                }
+                any_failed = true;
+            } else {
+                for (result.errors) |parse_err| {
+                    diag_engine.reportDiagnostic(.{
+                        .severity = .@"error",
+                        .message = parse_err.message,
+                        .span = parse_err.span,
+                        .label = parse_err.label,
+                        .help = parse_err.help,
+                    }) catch {};
+                }
+            }
+            _ = i;
+        }
+        if (any_failed) {
             if (options.show_progress) std.debug.print("\r\x1b[K", .{});
             return error.ParseFailed;
-        };
+        }
+    } else {
+        // Sequential fallback: single file or no Io available
+        for (all_source_units, 0..) |unit, i| {
+            local_interners[i] = ast.StringInterner.init(alloc);
+            var parser = zap.Parser.initWithSharedInterner(alloc, unit.source, &local_interners[i], @intCast(i));
+            defer parser.deinit();
 
-        for (parser.errors.items) |parse_err| {
-            diag_engine.reportDiagnostic(.{
-                .severity = .@"error",
-                .message = parse_err.message,
-                .span = parse_err.span,
-                .label = parse_err.label,
-                .help = parse_err.help,
-            }) catch {};
+            parsed_programs[i] = parser.parseProgram() catch {
+                emitParseErrorsFromUnits(alloc, parser.errors.items, all_source_units, diag_engine.use_color);
+                if (options.show_progress) std.debug.print("\r\x1b[K", .{});
+                return error.ParseFailed;
+            };
+
+            for (parser.errors.items) |parse_err| {
+                diag_engine.reportDiagnostic(.{
+                    .severity = .@"error",
+                    .message = parse_err.message,
+                    .span = parse_err.span,
+                    .label = parse_err.label,
+                    .help = parse_err.help,
+                }) catch {};
+            }
         }
     }
 
@@ -332,8 +360,6 @@ pub fn collectAllFromUnits(
         .interner = interner,
         .collector = collector,
         .diag_engine = diag_engine,
-        .full_source = merged_source,
-        .source_path = file_path,
     };
 }
 
@@ -1090,15 +1116,6 @@ fn mergePrograms(alloc: std.mem.Allocator, programs: []const ast.Program) !ast.P
     return .{ .modules = modules, .top_items = top_items };
 }
 
-pub fn mergeSourceUnits(alloc: std.mem.Allocator, source_units: []const SourceUnit) ![]const u8 {
-    var combined: std.ArrayListUnmanaged(u8) = .empty;
-    for (source_units) |unit| {
-        try combined.appendSlice(alloc, unit.source);
-        try combined.append(alloc, '\n');
-    }
-    return combined.toOwnedSlice(alloc);
-}
-
 fn emitParseErrorsFromUnits(
     alloc: std.mem.Allocator,
     parse_errors: []const zap.Parser.Error,
@@ -1294,34 +1311,6 @@ fn cloneInstructionWithOffset(alloc: std.mem.Allocator, instr: ir.Instruction, f
 
 /// Compile a Zap source file through the frontend and ZIR backend to produce
 /// a native binary.
-pub fn compileToNative(
-    alloc: std.mem.Allocator,
-    source: []const u8,
-    file_path: []const u8,
-    output_path: []const u8,
-    _: []const u8,
-    frontend_opts: CompileOptions,
-    backend_opts: zap.zir_backend.CompileOptions,
-) !void {
-    var result = try compileFrontend(alloc, source, file_path, frontend_opts);
-
-    // progress writer: use debug.print in 0.16
-    if (frontend_opts.show_progress) {
-        std.debug.print("\r\x1b[K  [8/10] ZIR", .{});
-    }
-
-    var opts = backend_opts;
-    if (result.analysis_context != null) {
-        opts.analysis_context = &result.analysis_context.?;
-    }
-    try zap.zir_backend.compile(alloc, result.ir_program, opts);
-
-    if (frontend_opts.show_progress) {
-        std.debug.print("\r\x1b[K  [9/10] Sema + Codegen", .{});
-        std.debug.print("\r\x1b[K  [10/10] Linked {s}\n", .{output_path});
-    }
-}
-
 fn emitDiagnostics(diag_engine: *zap.DiagnosticEngine, alloc: std.mem.Allocator) void {
     const rendered = diag_engine.format(alloc) catch return;
     // stderr writer: use debug.print in 0.16
@@ -1506,6 +1495,41 @@ pub fn validateOneModulePerFile(
 /// Get the embedded runtime source.
 pub fn getRuntimeSource() []const u8 {
     return runtime_source;
+}
+
+// ============================================================
+// Parallel parsing support
+// ============================================================
+
+/// Per-file result from a parallel parse task.
+const ParseTaskResult = struct {
+    failed: bool = false,
+    errors: []const zap.Parser.Error = &.{},
+};
+
+/// Task function for parallel file parsing via Io.Group.
+/// Each task creates its own parser with a private local interner,
+/// parses the source, and stores the result. No shared mutable state.
+fn parseFileTask(
+    alloc: std.mem.Allocator,
+    source: []const u8,
+    interner: *ast.StringInterner,
+    source_id: u32,
+    out_program: *ast.Program,
+    out_result: *ParseTaskResult,
+) void {
+    var parser = zap.Parser.initWithSharedInterner(alloc, source, interner, source_id);
+    defer parser.deinit();
+
+    out_program.* = parser.parseProgram() catch {
+        out_result.failed = true;
+        out_result.errors = parser.errors.toOwnedSlice(alloc) catch &.{};
+        return;
+    };
+
+    if (parser.errors.items.len > 0) {
+        out_result.errors = parser.errors.toOwnedSlice(alloc) catch &.{};
+    }
 }
 
 // ============================================================
@@ -2610,22 +2634,6 @@ test "buildCompilationUnits derives units from module programs" {
     try std.testing.expectEqual(@as(u32, 0), units[0].module_index.?);
     try std.testing.expectEqualStrings("Bar.Baz", units[1].module_name);
     try std.testing.expectEqual(@as(u32, 1), units[1].module_index.?);
-}
-
-test "mergeSourceUnits concatenates explicit source units" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-    const units = [_]SourceUnit{
-        .{ .file_path = "foo.zap", .source = "pub module Foo {\n}\n" },
-        .{ .file_path = "bar.zap", .source = "pub module Bar {\n}\n" },
-    };
-
-    const merged = try mergeSourceUnits(alloc, &units);
-    try std.testing.expectEqualStrings(
-        "pub module Foo {\n}\n\npub module Bar {\n}\n\n",
-        merged,
-    );
 }
 
 test "per-unit parser assigns source_id and file-local spans" {

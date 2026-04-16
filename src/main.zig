@@ -5,6 +5,7 @@ const compiler = zap.compiler;
 const zir_backend = zap.zir_backend;
 const zir_builder = zap.zir_builder;
 const zig_lib_archive = @import("zig_lib_archive");
+const env = zap.env;
 
 /// Global Io instance for main thread operations.
 var global_io: Io = std.Options.debug_io;
@@ -883,8 +884,6 @@ fn buildTarget(
         std.process.exit(1);
     }
 
-    const merged_source = try compiler.mergeSourceUnits(alloc, source_units.items);
-
     // Determine output path from manifest (needed for cache check)
     const output_name = if (config.asset_name) |an|
         if (an.len > 0) an else config.name
@@ -907,7 +906,7 @@ fn buildTarget(
     const output_path = try std.fs.path.join(alloc, &.{ out_dir, output_filename });
 
     // Compilation caching: hash build.zap + all sources + target name
-    const cache_key = computeBuildCacheKey(build_source, merged_source, target_name, manifest_eval.result_hash);
+    const cache_key = computeBuildCacheKey(build_source, source_units.items, target_name, manifest_eval.result_hash);
     const cache_key_hex = try std.fmt.allocPrint(alloc, "{x:0>16}", .{cache_key});
     const hash_file = try std.fmt.allocPrint(alloc, ".zap-cache/{s}.hash", .{target_name});
 
@@ -1053,13 +1052,19 @@ fn compileProjectFrontend(
     source_units: []const compiler.SourceUnit,
     options: compiler.CompileOptions,
 ) !compiler.CompileResult {
-    if (options.module_order) |module_order| {
-        var ctx = try compiler.collectAllFromUnits(alloc, source_units, options);
-        return try compiler.compileModuleByModule(alloc, &ctx, module_order, options);
-    }
-    const merged_source = try compiler.mergeSourceUnits(alloc, source_units);
-    const file_path = if (source_units.len > 0) source_units[0].file_path else "<memory>";
-    return try compiler.compileFrontend(alloc, merged_source, file_path, options);
+    var ctx = try compiler.collectAllFromUnits(alloc, source_units, options);
+
+    // When module_order is not set (glob-based paths), derive it from the
+    // parsed module programs. This replaces the old legacy merge path.
+    const module_order = options.module_order orelse blk: {
+        var names: std.ArrayListUnmanaged([]const u8) = .empty;
+        for (ctx.module_programs) |mp| {
+            names.append(alloc, mp.name) catch {};
+        }
+        break :blk names.items;
+    };
+
+    return try compiler.compileModuleByModule(alloc, &ctx, module_order, options);
 }
 
 /// Compute a build cache key using SHA-256 (Zig 0.16 std.crypto) for
@@ -1067,13 +1072,17 @@ fn compileProjectFrontend(
 /// hex formatting, but the full hash provides collision resistance.
 fn computeBuildCacheKey(
     build_source: []const u8,
-    merged_source: []const u8,
+    source_units: []const compiler.SourceUnit,
     target_name: []const u8,
     manifest_result_hash: u64,
 ) u64 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update(build_source);
-    hasher.update(merged_source);
+    // Hash each source file individually — no concatenation needed
+    for (source_units) |unit| {
+        hasher.update(unit.file_path);
+        hasher.update(unit.source);
+    }
     hasher.update(target_name);
     hasher.update(std.mem.asBytes(&manifest_result_hash));
     const digest = hasher.finalResult();
@@ -1691,11 +1700,13 @@ const testing = std.testing;
 
 test "computeBuildCacheKey includes manifest result hash" {
     const build_source = "pub module App.Builder {}";
-    const merged_source = "pub module App {}";
+    const units = [_]compiler.SourceUnit{
+        .{ .file_path = "lib/app.zap", .source = "pub module App {}" },
+    };
     const target_name = "default";
 
-    const first = computeBuildCacheKey(build_source, merged_source, target_name, 111);
-    const second = computeBuildCacheKey(build_source, merged_source, target_name, 222);
+    const first = computeBuildCacheKey(build_source, &units, target_name, 111);
+    const second = computeBuildCacheKey(build_source, &units, target_name, 222);
 
     try testing.expect(first != second);
 }
@@ -1936,7 +1947,7 @@ fn toPascalCase(allocator: std.mem.Allocator, snake: []const u8) ![]const u8 {
 }
 
 fn extractEmbeddedZigLib(allocator: std.mem.Allocator) ![]const u8 {
-    const home = std.mem.span(std.c.getenv("HOME") orelse return error.FileNotFound);
+    const home = env.getenv("HOME") orelse return error.FileNotFound;
 
     const lib_dir = try std.fs.path.join(allocator, &.{ home, ".cache", "zap", "zig-lib" });
 

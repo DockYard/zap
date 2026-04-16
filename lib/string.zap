@@ -294,4 +294,66 @@ pub module String {
   pub fn to_float(s :: String) -> f64 {
     Float.parse(s)
   }
+
+  @doc = """
+    Capitalizes the first character and lowercases the rest.
+
+    Only affects ASCII letters.
+
+    ## Examples
+
+        String.capitalize("hello")   # => "Hello"
+        String.capitalize("HELLO")   # => "Hello"
+        String.capitalize("")        # => ""
+    """
+
+  pub fn capitalize(s :: String) -> String {
+    :zig.Prelude.capitalize(s)
+  }
+
+  @doc = """
+    Removes leading whitespace from a string.
+
+    Strips spaces, tabs, newlines, and carriage returns from
+    the beginning only.
+
+    ## Examples
+
+        String.trim_leading("  hello  ")  # => "hello  "
+        String.trim_leading("hello")       # => "hello"
+    """
+
+  pub fn trim_leading(s :: String) -> String {
+    :zig.Prelude.trim_leading(s)
+  }
+
+  @doc = """
+    Removes trailing whitespace from a string.
+
+    Strips spaces, tabs, newlines, and carriage returns from
+    the end only.
+
+    ## Examples
+
+        String.trim_trailing("  hello  ")  # => "  hello"
+        String.trim_trailing("hello")       # => "hello"
+    """
+
+  pub fn trim_trailing(s :: String) -> String {
+    :zig.Prelude.trim_trailing(s)
+  }
+
+  @doc = """
+    Counts non-overlapping occurrences of a substring.
+
+    ## Examples
+
+        String.count("hello world hello", "hello")  # => 2
+        String.count("aaa", "aa")                     # => 1
+        String.count("hello", "xyz")                  # => 0
+    """
+
+  pub fn count(haystack :: String, needle :: String) -> i64 {
+    :zig.Prelude.string_count(haystack, needle)
+  }
 }

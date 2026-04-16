@@ -11,6 +11,7 @@ const std = @import("std");
 const zir_builder = @import("zir_builder.zig");
 const ZirContext = zir_builder.ZirContext;
 const ir = @import("ir.zig");
+const env = @import("env.zig");
 
 // ---------------------------------------------------------------------------
 // Extern declarations for the C-ABI functions in libzig_compiler.a
@@ -236,13 +237,13 @@ pub fn compile(allocator: std.mem.Allocator, program: ir.Program, options: Compi
 /// Caller owns the returned memory.
 pub fn detectZigLibDir(allocator: std.mem.Allocator) ?[]const u8 {
     // 1. Try the ZAP_ZIG_LIB_DIR environment variable (project-specific override).
-    if (std.c.getenv("ZAP_ZIG_LIB_DIR")) |ptr| {
-        return std.mem.span(ptr);
+    if (env.getenv("ZAP_ZIG_LIB_DIR")) |val| {
+        return val;
     }
 
     // 2. Try the ZIG_LIB_DIR environment variable.
-    if (std.c.getenv("ZIG_LIB_DIR")) |ptr| {
-        return std.mem.span(ptr);
+    if (env.getenv("ZIG_LIB_DIR")) |val| {
+        return val;
     }
 
     // 3. Try paths relative to the self executable.
@@ -277,7 +278,7 @@ pub fn detectZigLibDir(allocator: std.mem.Allocator) ?[]const u8 {
     } else |_| {}
 
     // 4. Try well-known paths based on the system zig installation.
-    const home_dir: ?[]const u8 = if (std.c.getenv("HOME")) |ptr| std.mem.span(ptr) else null;
+    const home_dir: ?[]const u8 = env.getenv("HOME");
 
     // Build asdf candidate only if HOME is available.
     const asdf_candidate: ?[]const u8 = if (home_dir) |h|

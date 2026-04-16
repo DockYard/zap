@@ -149,5 +149,153 @@ pub module Test.IntegerTest {
     test("to_float zero") {
       assert(Integer.to_float(0) == 0.0)
     }
+
+    # Bit operations
+
+    test("count_leading_zeros of 1") {
+      assert(Integer.count_leading_zeros(1) == 63)
+    }
+
+    test("count_trailing_zeros of 8") {
+      assert(Integer.count_trailing_zeros(8) == 3)
+    }
+
+    test("count_trailing_zeros of 1") {
+      assert(Integer.count_trailing_zeros(1) == 0)
+    }
+
+    test("popcount of 7") {
+      assert(Integer.popcount(7) == 3)
+    }
+
+    test("popcount of 0") {
+      assert(Integer.popcount(0) == 0)
+    }
+
+    test("popcount of 255") {
+      assert(Integer.popcount(255) == 8)
+    }
+
+    test("byte_swap of 1") {
+      assert(Integer.byte_swap(1) == 72057594037927936)
+    }
+
+    test("bit_reverse of 1") {
+      assert(Integer.bit_reverse(1) == -9223372036854775808)
+    }
+
+    # Saturating arithmetic
+
+    test("add_sat normal") {
+      assert(Integer.add_sat(3, 4) == 7)
+    }
+
+    test("sub_sat normal") {
+      assert(Integer.sub_sat(10, 3) == 7)
+    }
+
+    test("mul_sat normal") {
+      assert(Integer.mul_sat(3, 4) == 12)
+    }
+
+    # Bitwise operations
+
+    test("band basic") {
+      assert(Integer.band(7, 5) == 5)
+    }
+
+    test("band with zero") {
+      assert(Integer.band(0, 42) == 0)
+    }
+
+    test("bor basic") {
+      assert(Integer.bor(5, 3) == 7)
+    }
+
+    test("bor with zero") {
+      assert(Integer.bor(0, 42) == 42)
+    }
+
+    test("bxor basic") {
+      assert(Integer.bxor(7, 5) == 2)
+    }
+
+    test("bxor self is zero") {
+      assert(Integer.bxor(255, 255) == 0)
+    }
+
+    test("bnot zero") {
+      assert(Integer.bnot(0) == -1)
+    }
+
+    test("bnot negative one") {
+      assert(Integer.bnot(-1) == 0)
+    }
+
+    test("bsl by 3") {
+      assert(Integer.bsl(1, 3) == 8)
+    }
+
+    test("bsr by 3") {
+      assert(Integer.bsr(8, 3) == 1)
+    }
+
+    # Predicates
+
+    test("sign positive") {
+      assert(Integer.sign(42) == 1)
+    }
+
+    test("sign zero") {
+      assert(Integer.sign(0) == 0)
+    }
+
+    test("sign negative") {
+      assert(Integer.sign(-7) == -1)
+    }
+
+    test("even? true") {
+      assert(Integer.even?(4) == true)
+    }
+
+    test("even? false") {
+      assert(Integer.even?(3) == false)
+    }
+
+    test("even? zero") {
+      assert(Integer.even?(0) == true)
+    }
+
+    test("odd? true") {
+      assert(Integer.odd?(3) == true)
+    }
+
+    test("odd? false") {
+      assert(Integer.odd?(4) == false)
+    }
+
+    test("gcd basic") {
+      assert(Integer.gcd(12, 8) == 4)
+    }
+
+    test("gcd coprime") {
+      assert(Integer.gcd(7, 5) == 1)
+    }
+
+    test("gcd with larger") {
+      assert(Integer.gcd(54, 24) == 6)
+    }
+
+    test("lcm basic") {
+      assert(Integer.lcm(4, 6) == 12)
+    }
+
+    test("lcm coprime") {
+      assert(Integer.lcm(3, 5) == 15)
+    }
+
+    test("lcm same") {
+      assert(Integer.lcm(7, 7) == 7)
+    }
   }
 }
