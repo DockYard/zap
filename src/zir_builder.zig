@@ -358,7 +358,7 @@ fn mapParamType(zig_type: ir.ZigType) u32 {
 
 pub const ZirDriver = struct {
     handle: *ZirBuilderHandle,
-    local_refs: std.AutoHashMapUnmanaged(ir.LocalId, u32),
+    local_refs: std.AutoHashMapUnmanaged(ir.LocalId, ValueRef),
     param_refs: std.ArrayListUnmanaged(u32),
     allocator: Allocator,
     program: ?ir.Program,
@@ -419,6 +419,15 @@ pub const ZirDriver = struct {
     /// Module currently being emitted (e.g., "IO", "Zest_Case"). Null when emitting root.
     current_emit_module: ?[]const u8 = null,
 
+    const ValueRef = union(enum) {
+        /// Already-materialized ZIR instruction ref
+        inst: u32,
+        /// Declaration reference (materialized lazily via decl_ref or @import)
+        decl: struct {
+            module_name: ?[]const u8, // null => current module
+            decl_name: []const u8,
+        },
+    };
 
     pub fn init(allocator: Allocator) !ZirDriver {
         const handle = zir_builder_create() orelse return error.ZirCreateFailed;
@@ -520,7 +529,11 @@ pub const ZirDriver = struct {
     }
 
     fn setLocal(self: *ZirDriver, local: ir.LocalId, ref: u32) !void {
-        try self.local_refs.put(self.allocator, local, ref);
+        try self.local_refs.put(self.allocator, local, .{ .inst = ref });
+    }
+
+    fn setLocalDecl(self: *ZirDriver, local: ir.LocalId, module_name: ?[]const u8, decl_name: []const u8) !void {
+        try self.local_refs.put(self.allocator, local, .{ .decl = .{ .module_name = module_name, .decl_name = decl_name } });
     }
 
     fn emitAllocatorRef(self: *ZirDriver) BuildError!u32 {
@@ -545,7 +558,22 @@ pub const ZirDriver = struct {
     }
 
     fn refForLocal(self: *ZirDriver, local: ir.LocalId) BuildError!u32 {
-        return self.local_refs.get(local) orelse return error.EmitFailed;
+        const value_ref = self.local_refs.get(local) orelse return error.EmitFailed;
+        return self.materializeValueRef(value_ref);
+    }
+
+    fn materializeValueRef(self: *ZirDriver, value: ValueRef) BuildError!u32 {
+        return switch (value) {
+            .inst => |r| r,
+            .decl => |d| {
+                if (d.module_name) |mod| {
+                    return self.emitCrossModuleRef(mod, d.decl_name);
+                }
+                const ref = zir_builder_emit_decl_ref(self.handle, d.decl_name.ptr, @intCast(d.decl_name.len));
+                if (ref == error_ref) return error.EmitFailed;
+                return ref;
+            },
+        };
     }
 
     fn markReuseBackedStructLocal(self: *ZirDriver, dest: ir.LocalId, type_name: []const u8) !void {
@@ -1864,8 +1892,8 @@ pub const ZirDriver = struct {
                 try self.propagateReuseBackedTupleLocal(lg.dest, lg.source);
                 if (self.closure_function_map.get(lg.source)) |func_id|
                     try self.closure_function_map.put(self.allocator, lg.dest, func_id);
-                if (self.local_refs.get(lg.source)) |ref| {
-                    try self.setLocal(lg.dest, ref);
+                if (self.local_refs.get(lg.source)) |value_ref| {
+                    try self.local_refs.put(self.allocator, lg.dest, value_ref);
                 }
             },
             .local_set => |ls| {
@@ -1874,8 +1902,8 @@ pub const ZirDriver = struct {
                 try self.propagateReuseBackedTupleLocal(ls.dest, ls.value);
                 if (self.closure_function_map.get(ls.value)) |func_id|
                     try self.closure_function_map.put(self.allocator, ls.dest, func_id);
-                if (self.local_refs.get(ls.value)) |ref| {
-                    try self.setLocal(ls.dest, ref);
+                if (self.local_refs.get(ls.value)) |value_ref| {
+                    try self.local_refs.put(self.allocator, ls.dest, value_ref);
                 }
             },
             .move_value => |mv| {
@@ -1884,8 +1912,8 @@ pub const ZirDriver = struct {
                 try self.propagateReuseBackedTupleLocal(mv.dest, mv.source);
                 if (self.closure_function_map.get(mv.source)) |func_id|
                     try self.closure_function_map.put(self.allocator, mv.dest, func_id);
-                if (self.local_refs.get(mv.source)) |ref| {
-                    try self.setLocal(mv.dest, ref);
+                if (self.local_refs.get(mv.source)) |value_ref| {
+                    try self.local_refs.put(self.allocator, mv.dest, value_ref);
                 }
             },
             .share_value => |sv| {
@@ -1894,10 +1922,11 @@ pub const ZirDriver = struct {
                 try self.propagateReuseBackedTupleLocal(sv.dest, sv.source);
                 if (self.closure_function_map.get(sv.source)) |func_id|
                     try self.closure_function_map.put(self.allocator, sv.dest, func_id);
-                if (self.local_refs.get(sv.source)) |ref| {
-                    try self.setLocal(sv.dest, ref);
+                if (self.local_refs.get(sv.source)) |value_ref| {
+                    try self.local_refs.put(self.allocator, sv.dest, value_ref);
 
                     if (!self.shouldSkipArc(sv.source)) {
+                        const materialized_ref = try self.materializeValueRef(value_ref);
                         const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                         if (rt_import == error_ref) return error.EmitFailed;
                         const arc_runtime = zir_builder_emit_field_val(self.handle, rt_import, "ArcRuntime", 10);
@@ -1905,7 +1934,7 @@ pub const ZirDriver = struct {
                         const retain_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "retainAny", 9);
                         if (retain_fn == error_ref) return error.EmitFailed;
 
-                        const args = [_]u32{ref};
+                        const args = [_]u32{materialized_ref};
                         _ = zir_builder_emit_call_ref(self.handle, retain_fn, &args, 1);
                     }
                 }
@@ -1916,8 +1945,9 @@ pub const ZirDriver = struct {
                 // earlier param_get dest assignments.
                 if (pg.index < self.param_refs.items.len) {
                     try self.setLocal(pg.dest, self.param_refs.items[pg.index]);
-                } else if (self.local_refs.get(pg.index)) |ref| {
-                    try self.setLocal(pg.dest, ref);
+                } else if (self.local_refs.get(pg.index)) |value_ref| {
+                    const materialized = try self.materializeValueRef(value_ref);
+                    try self.setLocal(pg.dest, materialized);
                 }
             },
 
@@ -2382,8 +2412,8 @@ pub const ZirDriver = struct {
                 // enclosing case_block's dest local (tracked via current_case_dest).
                 if (self.current_case_dest) |dest| {
                     if (cbr.value) |val| {
-                        if (self.local_refs.get(val)) |ref| {
-                            try self.setLocal(dest, ref);
+                        if (self.local_refs.get(val)) |value_ref| {
+                            try self.local_refs.put(self.allocator, dest, value_ref);
                         }
                     }
                 }
@@ -3195,12 +3225,11 @@ pub const ZirDriver = struct {
                 // This produces *const fn(args...) ret which is the uniform type
                 // for all function references passed as callback parameters.
                 if (mc.captures.len == 0) {
-                    const fn_ref = if (is_cross_module and target_module != null)
-                        try self.emitCrossModuleRef(target_module.?, target_func.local_name)
-                    else
-                        zir_builder_emit_decl_ref(self.handle, emit_name.ptr, @intCast(emit_name.len));
-                    if (fn_ref == error_ref) return error.EmitFailed;
-                    try self.setLocal(mc.dest, fn_ref);
+                    if (is_cross_module and target_module != null) {
+                        try self.setLocalDecl(mc.dest, target_module.?, target_func.local_name);
+                    } else {
+                        try self.setLocalDecl(mc.dest, null, emit_name);
+                    }
                     return;
                 }
 
@@ -3799,8 +3828,8 @@ pub const ZirDriver = struct {
             // No cases — just emit the default body directly
             for (sl.default_instrs) |di| try self.emitInstruction(di);
             if (sl.default_result) |dr| {
-                if (self.local_refs.get(dr)) |ref| {
-                    try self.setLocal(sl.dest, ref);
+                if (self.local_refs.get(dr)) |value_ref| {
+                    try self.local_refs.put(self.allocator, sl.dest, value_ref);
                 }
             }
             return;
@@ -4031,8 +4060,8 @@ pub const ZirDriver = struct {
             for (cb.pre_instrs) |pi| try self.emitInstruction(pi);
             for (cb.default_instrs) |di| try self.emitInstruction(di);
             if (cb.default_result) |dr| {
-                if (self.local_refs.get(dr)) |ref| {
-                    try self.setLocal(cb.dest, ref);
+                if (self.local_refs.get(dr)) |value_ref| {
+                    try self.local_refs.put(self.allocator, cb.dest, value_ref);
                 }
             }
             try self.emitDropSpecializationsForCurrentInstr(cb.dest, null);
@@ -4057,7 +4086,7 @@ pub const ZirDriver = struct {
         // If default_result is still void but default body was captured,
         // check if case_break inside the body set cb.dest
         if (default_result == void_ref and (default_len > 0 or default_pre_instrs.len > 0)) {
-            default_result = self.local_refs.get(cb.dest) orelse void_ref;
+            default_result = if (self.local_refs.get(cb.dest)) |vr| self.materializeValueRef(vr) catch void_ref else void_ref;
         }
 
         var current_else_insts = try self.allocator.alloc(u32, default_len);
@@ -4101,7 +4130,7 @@ pub const ZirDriver = struct {
                 // Emit body instructions at top level
                 for (last_gb.body) |bi| try self.emitInstruction(bi);
                 // The case_break in the body sets cb.dest
-                const result = self.local_refs.get(cb.dest) orelse @intFromEnum(Zir.Inst.Ref.void_value);
+                const result = if (self.local_refs.get(cb.dest)) |vr| try self.materializeValueRef(vr) else @intFromEnum(Zir.Inst.Ref.void_value);
                 try self.setLocal(cb.dest, result);
                 try self.emitDropSpecializationsForCurrentInstr(cb.dest, null);
                 return;
@@ -4113,7 +4142,7 @@ pub const ZirDriver = struct {
             var catchall_len: u32 = 0;
             const catchall_ptr = zir_builder_end_capture(self.handle, &catchall_len);
 
-            const catchall_result: u32 = self.local_refs.get(cb.dest) orelse @intFromEnum(Zir.Inst.Ref.void_value);
+            const catchall_result: u32 = if (self.local_refs.get(cb.dest)) |vr| self.materializeValueRef(vr) catch @intFromEnum(Zir.Inst.Ref.void_value) else @intFromEnum(Zir.Inst.Ref.void_value);
 
             self.allocator.free(current_else_insts);
             current_else_insts = try self.allocator.alloc(u32, catchall_len);
@@ -4147,7 +4176,7 @@ pub const ZirDriver = struct {
 
             // The guard body contains case_break which sets cb.dest via
             // current_case_dest. Use that ref as the body result.
-            const body_result: u32 = self.local_refs.get(cb.dest) orelse void_ref;
+            const body_result: u32 = if (self.local_refs.get(cb.dest)) |vr| self.materializeValueRef(vr) catch void_ref else void_ref;
 
             const body_insts = try self.allocator.alloc(u32, body_len);
             @memcpy(body_insts, body_ptr[0..body_len]);
