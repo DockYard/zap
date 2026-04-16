@@ -1423,7 +1423,7 @@ fn remapProgram(
     }
 }
 
-fn remapModuleName(alloc: std.mem.Allocator, name: *ast.ModuleName, remap: []const ast.StringId) !void {
+fn remapModuleName(alloc: std.mem.Allocator, name: *ast.ModuleName, remap: []const ast.StringId) error{OutOfMemory}!void {
     if (name.parts.len > 0) {
         const mutable_parts = try alloc.alloc(ast.StringId, name.parts.len);
         for (name.parts, 0..) |part, i| {
@@ -1433,7 +1433,7 @@ fn remapModuleName(alloc: std.mem.Allocator, name: *ast.ModuleName, remap: []con
     }
 }
 
-fn remapModuleDecl(alloc: std.mem.Allocator, mod: *ast.ModuleDecl, remap: []const ast.StringId) !void {
+fn remapModuleDecl(alloc: std.mem.Allocator, mod: *ast.ModuleDecl, remap: []const ast.StringId) error{OutOfMemory}!void {
     try remapModuleName(alloc, &mod.name, remap);
     if (mod.parent) |p| mod.parent = remap[p];
     if (mod.items.len > 0) {
@@ -1446,7 +1446,7 @@ fn remapModuleDecl(alloc: std.mem.Allocator, mod: *ast.ModuleDecl, remap: []cons
     }
 }
 
-fn remapTopItem(alloc: std.mem.Allocator, item: *ast.TopItem, remap: []const ast.StringId) !void {
+fn remapTopItem(alloc: std.mem.Allocator, item: *ast.TopItem, remap: []const ast.StringId) error{OutOfMemory}!void {
     switch (item.*) {
         .module, .priv_module => |mod_ptr| {
             const mutable = try alloc.create(ast.ModuleDecl);
@@ -1493,7 +1493,7 @@ fn remapTopItem(alloc: std.mem.Allocator, item: *ast.TopItem, remap: []const ast
     }
 }
 
-fn remapModuleItem(alloc: std.mem.Allocator, item: *ast.ModuleItem, remap: []const ast.StringId) !void {
+fn remapModuleItem(alloc: std.mem.Allocator, item: *ast.ModuleItem, remap: []const ast.StringId) error{OutOfMemory}!void {
     switch (item.*) {
         .type_decl => |td| {
             const mutable = try alloc.create(ast.TypeDecl);
@@ -1583,7 +1583,7 @@ fn remapModuleItem(alloc: std.mem.Allocator, item: *ast.ModuleItem, remap: []con
     }
 }
 
-fn remapTypeDecl(alloc: std.mem.Allocator, td: *ast.TypeDecl, remap: []const ast.StringId) !void {
+fn remapTypeDecl(alloc: std.mem.Allocator, td: *ast.TypeDecl, remap: []const ast.StringId) error{OutOfMemory}!void {
     td.name = remap[td.name];
     try remapTypeParams(alloc, td, remap);
     const mutable_body = try alloc.create(ast.TypeExpr);
@@ -1592,7 +1592,7 @@ fn remapTypeDecl(alloc: std.mem.Allocator, td: *ast.TypeDecl, remap: []const ast
     td.body = mutable_body;
 }
 
-fn remapOpaqueDecl(alloc: std.mem.Allocator, od: *ast.OpaqueDecl, remap: []const ast.StringId) !void {
+fn remapOpaqueDecl(alloc: std.mem.Allocator, od: *ast.OpaqueDecl, remap: []const ast.StringId) error{OutOfMemory}!void {
     od.name = remap[od.name];
     try remapOpaqueParams(alloc, od, remap);
     const mutable_body = try alloc.create(ast.TypeExpr);
@@ -1601,7 +1601,7 @@ fn remapOpaqueDecl(alloc: std.mem.Allocator, od: *ast.OpaqueDecl, remap: []const
     od.body = mutable_body;
 }
 
-fn remapTypeParams(alloc: std.mem.Allocator, td: *ast.TypeDecl, remap: []const ast.StringId) !void {
+fn remapTypeParams(alloc: std.mem.Allocator, td: *ast.TypeDecl, remap: []const ast.StringId) error{OutOfMemory}!void {
     if (td.params.len > 0) {
         const mutable_params = try alloc.alloc(ast.TypeParam, td.params.len);
         for (td.params, 0..) |p, i| {
@@ -1612,7 +1612,7 @@ fn remapTypeParams(alloc: std.mem.Allocator, td: *ast.TypeDecl, remap: []const a
     }
 }
 
-fn remapOpaqueParams(alloc: std.mem.Allocator, od: *ast.OpaqueDecl, remap: []const ast.StringId) !void {
+fn remapOpaqueParams(alloc: std.mem.Allocator, od: *ast.OpaqueDecl, remap: []const ast.StringId) error{OutOfMemory}!void {
     if (od.params.len > 0) {
         const mutable_params = try alloc.alloc(ast.TypeParam, od.params.len);
         for (od.params, 0..) |p, i| {
@@ -1623,7 +1623,7 @@ fn remapOpaqueParams(alloc: std.mem.Allocator, od: *ast.OpaqueDecl, remap: []con
     }
 }
 
-fn remapStructDecl(alloc: std.mem.Allocator, sd: *ast.StructDecl, remap: []const ast.StringId) !void {
+fn remapStructDecl(alloc: std.mem.Allocator, sd: *ast.StructDecl, remap: []const ast.StringId) error{OutOfMemory}!void {
     if (sd.name) |n| sd.name = remap[n];
     if (sd.parent) |p| sd.parent = remap[p];
     if (sd.fields.len > 0) {
@@ -1646,7 +1646,7 @@ fn remapStructDecl(alloc: std.mem.Allocator, sd: *ast.StructDecl, remap: []const
     }
 }
 
-fn remapUnionDecl(alloc: std.mem.Allocator, ud: *ast.UnionDecl, remap: []const ast.StringId) !void {
+fn remapUnionDecl(alloc: std.mem.Allocator, ud: *ast.UnionDecl, remap: []const ast.StringId) error{OutOfMemory}!void {
     ud.name = remap[ud.name];
     if (ud.variants.len > 0) {
         const mutable_variants = try alloc.alloc(ast.UnionVariant, ud.variants.len);
@@ -1664,7 +1664,7 @@ fn remapUnionDecl(alloc: std.mem.Allocator, ud: *ast.UnionDecl, remap: []const a
     }
 }
 
-fn remapFunctionDecl(alloc: std.mem.Allocator, fd: *ast.FunctionDecl, remap: []const ast.StringId) !void {
+fn remapFunctionDecl(alloc: std.mem.Allocator, fd: *ast.FunctionDecl, remap: []const ast.StringId) error{OutOfMemory}!void {
     fd.name = remap[fd.name];
     if (fd.clauses.len > 0) {
         const mutable_clauses = try alloc.alloc(ast.FunctionClause, fd.clauses.len);
@@ -1676,7 +1676,7 @@ fn remapFunctionDecl(alloc: std.mem.Allocator, fd: *ast.FunctionDecl, remap: []c
     }
 }
 
-fn remapFunctionClause(alloc: std.mem.Allocator, clause: *ast.FunctionClause, remap: []const ast.StringId) !void {
+fn remapFunctionClause(alloc: std.mem.Allocator, clause: *ast.FunctionClause, remap: []const ast.StringId) error{OutOfMemory}!void {
     if (clause.params.len > 0) {
         const mutable_params = try alloc.alloc(ast.Param, clause.params.len);
         for (clause.params, 0..) |p, i| {
@@ -1726,7 +1726,7 @@ fn remapStmtsForClause(alloc: std.mem.Allocator, clause: *ast.FunctionClause, re
     clause.body = mutable_body;
 }
 
-fn remapStmt(alloc: std.mem.Allocator, stmt: *ast.Stmt, remap: []const ast.StringId) !void {
+fn remapStmt(alloc: std.mem.Allocator, stmt: *ast.Stmt, remap: []const ast.StringId) error{OutOfMemory}!void {
     switch (stmt.*) {
         .expr => |e| {
             const mutable = try alloc.create(ast.Expr);
@@ -1768,7 +1768,7 @@ fn remapStmt(alloc: std.mem.Allocator, stmt: *ast.Stmt, remap: []const ast.Strin
     }
 }
 
-fn remapImportDecl(alloc: std.mem.Allocator, id: *ast.ImportDecl, remap: []const ast.StringId) !void {
+fn remapImportDecl(alloc: std.mem.Allocator, id: *ast.ImportDecl, remap: []const ast.StringId) error{OutOfMemory}!void {
     try remapModuleName(alloc, &id.module_path, remap);
     if (id.filter) |*filter| {
         switch (filter.*) {
@@ -1796,7 +1796,7 @@ fn remapImportDecl(alloc: std.mem.Allocator, id: *ast.ImportDecl, remap: []const
     }
 }
 
-fn remapExpr(alloc: std.mem.Allocator, expr: *ast.Expr, remap: []const ast.StringId) !void {
+fn remapExpr(alloc: std.mem.Allocator, expr: *ast.Expr, remap: []const ast.StringId) error{OutOfMemory}!void {
     switch (expr.*) {
         .string_literal => |*sl| sl.value = remap[sl.value],
         .atom_literal => |*al| al.value = remap[al.value],
@@ -2095,7 +2095,7 @@ fn remapExpr(alloc: std.mem.Allocator, expr: *ast.Expr, remap: []const ast.Strin
     }
 }
 
-fn remapStmtSlice(alloc: std.mem.Allocator, stmts: *[]const ast.Stmt, remap: []const ast.StringId) !void {
+fn remapStmtSlice(alloc: std.mem.Allocator, stmts: *[]const ast.Stmt, remap: []const ast.StringId) error{OutOfMemory}!void {
     if (stmts.len > 0) {
         const mutable = try alloc.alloc(ast.Stmt, stmts.len);
         @memcpy(mutable, stmts.*);
@@ -2106,7 +2106,7 @@ fn remapStmtSlice(alloc: std.mem.Allocator, stmts: *[]const ast.Stmt, remap: []c
     }
 }
 
-fn remapCaseClause(alloc: std.mem.Allocator, clause: *ast.CaseClause, remap: []const ast.StringId) !void {
+fn remapCaseClause(alloc: std.mem.Allocator, clause: *ast.CaseClause, remap: []const ast.StringId) error{OutOfMemory}!void {
     const mutable_pat = try alloc.create(ast.Pattern);
     mutable_pat.* = clause.pattern.*;
     try remapPattern(alloc, mutable_pat, remap);
@@ -2126,7 +2126,7 @@ fn remapCaseClause(alloc: std.mem.Allocator, clause: *ast.CaseClause, remap: []c
     try remapStmtSlice(alloc, &clause.body, remap);
 }
 
-fn remapBinarySegments(alloc: std.mem.Allocator, bl: *ast.BinaryLiteral, remap: []const ast.StringId) !void {
+fn remapBinarySegments(alloc: std.mem.Allocator, bl: *ast.BinaryLiteral, remap: []const ast.StringId) error{OutOfMemory}!void {
     if (bl.segments.len > 0) {
         const mutable_segs = try alloc.alloc(ast.BinarySegment, bl.segments.len);
         for (bl.segments, 0..) |seg, i| {
@@ -2137,7 +2137,7 @@ fn remapBinarySegments(alloc: std.mem.Allocator, bl: *ast.BinaryLiteral, remap: 
     }
 }
 
-fn remapBinarySegment(alloc: std.mem.Allocator, seg: *ast.BinarySegment, remap: []const ast.StringId) !void {
+fn remapBinarySegment(alloc: std.mem.Allocator, seg: *ast.BinarySegment, remap: []const ast.StringId) error{OutOfMemory}!void {
     switch (seg.value) {
         .expr => |e| {
             const mutable = try alloc.create(ast.Expr);
@@ -2161,7 +2161,7 @@ fn remapBinarySegment(alloc: std.mem.Allocator, seg: *ast.BinarySegment, remap: 
     }
 }
 
-fn remapPattern(alloc: std.mem.Allocator, pattern: *ast.Pattern, remap: []const ast.StringId) !void {
+fn remapPattern(alloc: std.mem.Allocator, pattern: *ast.Pattern, remap: []const ast.StringId) error{OutOfMemory}!void {
     switch (pattern.*) {
         .bind => |*bp| bp.name = remap[bp.name],
         .pin => |*pp| pp.name = remap[pp.name],
@@ -2262,7 +2262,7 @@ fn remapPattern(alloc: std.mem.Allocator, pattern: *ast.Pattern, remap: []const 
     }
 }
 
-fn remapTypeExpr(alloc: std.mem.Allocator, te: *ast.TypeExpr, remap: []const ast.StringId) !void {
+fn remapTypeExpr(alloc: std.mem.Allocator, te: *ast.TypeExpr, remap: []const ast.StringId) error{OutOfMemory}!void {
     switch (te.*) {
         .name => |*tne| {
             tne.name = remap[tne.name];
