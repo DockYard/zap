@@ -661,9 +661,9 @@ fn buildTarget(
         const root_spec = config.root.?;
 
         // Extract module name from root spec: "App.main/0" → "App"
-        const slash_pos = std.mem.indexOfScalar(u8, root_spec, '/');
+        const slash_pos = std.mem.findScalar(u8, root_spec, '/');
         const name_part = if (slash_pos) |pos| root_spec[0..pos] else root_spec;
-        const last_dot = std.mem.lastIndexOfScalar(u8, name_part, '.');
+        const last_dot = std.mem.findScalarLast(u8, name_part, '.');
         const entry_module = if (last_dot) |pos| name_part[0..pos] else name_part;
 
         var discovery_err_info: zap.discovery.ErrorInfo = .{};
@@ -918,18 +918,18 @@ fn buildTarget(
     // e.g. "Test.TestHelper.main/1" -> "Test_TestHelper__main__1"
     if (config.root) |root| {
         // Extract arity suffix: "Test.TestHelper.main/1" -> arity="1"
-        const arity_str = if (std.mem.lastIndexOfScalar(u8, root, '/')) |slash|
+        const arity_str = if (std.mem.findScalarLast(u8, root, '/')) |slash|
             root[slash + 1 ..]
         else
             "0";
-        const without_arity = if (std.mem.lastIndexOfScalar(u8, root, '/')) |slash|
+        const without_arity = if (std.mem.findScalarLast(u8, root, '/')) |slash|
             root[0..slash]
         else
             root;
         // Split on last dot: module prefix vs function name
         // "Test.TestHelper.main" -> module="Test.TestHelper", func="main"
         var mangled: std.ArrayListUnmanaged(u8) = .empty;
-        if (std.mem.lastIndexOfScalar(u8, without_arity, '.')) |last_dot| {
+        if (std.mem.findScalarLast(u8, without_arity, '.')) |last_dot| {
             const module_part = without_arity[0..last_dot];
             const func_part = without_arity[last_dot + 1 ..];
             // Module parts: dots become single underscores
@@ -1242,7 +1242,7 @@ fn parseTargetArgs(allocator: std.mem.Allocator, args: []const []const u8) !Pars
         } else if (std.mem.startsWith(u8, arg, "-D")) {
             // Parse -Dkey=value
             const kv = arg[2..];
-            if (std.mem.indexOfScalar(u8, kv, '=')) |eq| {
+            if (std.mem.findScalar(u8, kv, '=')) |eq| {
                 try result.build_opts.put(allocator, kv[0..eq], kv[eq + 1 ..]);
             } else {
                 try result.build_opts.put(allocator, kv, "true");
@@ -1381,7 +1381,7 @@ fn globCollectFiles(
 
     const base_rel = if (base_end > 0) pattern[0..base_end] else ".";
     const sub_pattern = if (base_end > 0) pattern[base_end..] else pattern;
-    const has_double_star = std.mem.indexOf(u8, sub_pattern, "**") != null;
+    const has_double_star = std.mem.find(u8, sub_pattern, "**") != null;
 
     const base_dir = if (std.mem.eql(u8, base_rel, "."))
         try alloc.dupe(u8, project_root)

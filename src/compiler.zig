@@ -918,7 +918,7 @@ fn buildCompilationUnits(
             // Convert module name to expected file basename: "Foo.Bar" -> "bar.zap"
             // Check each source unit for a match.
             for (source_units, 0..) |unit, si| {
-                if (std.mem.indexOf(u8, unit.source, entry.name)) |_| {
+                if (std.mem.find(u8, unit.source, entry.name)) |_| {
                     break :blk si;
                 }
             }
@@ -2400,7 +2400,7 @@ test "validateOneModulePerFile: zero modules is error" {
     const source = "pub struct Point {\n  x :: i64\n}\n";
     const result = validateOneModulePerFile(alloc, source, "point.zap");
     try std.testing.expect(result != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.?, "found none") != null);
+    try std.testing.expect(std.mem.find(u8, result.?, "found none") != null);
     alloc.free(result.?);
 }
 
@@ -2409,7 +2409,7 @@ test "validateOneModulePerFile: multiple modules is error" {
     const source = "pub module Foo {\n  pub fn foo() -> i64 {\n    1\n  }\n}\npub module Bar {\n  pub fn bar() -> i64 {\n    2\n  }\n}\n";
     const result = validateOneModulePerFile(alloc, source, "foo.zap");
     try std.testing.expect(result != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.?, "found 2") != null);
+    try std.testing.expect(std.mem.find(u8, result.?, "found 2") != null);
     alloc.free(result.?);
 }
 
@@ -2418,7 +2418,7 @@ test "validateOneModulePerFile: name mismatch is error" {
     const source = "pub module WrongName {\n  pub fn foo() -> i64 {\n    1\n  }\n}\n";
     const result = validateOneModulePerFile(alloc, source, "config.zap");
     try std.testing.expect(result != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.?, "does not match") != null);
+    try std.testing.expect(std.mem.find(u8, result.?, "does not match") != null);
     alloc.free(result.?);
 }
 

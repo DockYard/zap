@@ -655,8 +655,8 @@ test "diagnostic engine basic error" {
     try std.testing.expectEqual(@as(usize, 1), engine.errorCount());
 
     const output = try engine.format(alloc);
-    try std.testing.expect(std.mem.indexOf(u8, output, "undefined function `bar/0`") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "test.zip") != null);
+    try std.testing.expect(std.mem.find(u8, output, "undefined function `bar/0`") != null);
+    try std.testing.expect(std.mem.find(u8, output, "test.zip") != null);
 }
 
 test "diagnostic engine multiple diagnostics" {
@@ -686,7 +686,7 @@ test "diagnostic engine type error" {
     try engine.typeError("i64", "String", .{ .start = 0, .end = 5 });
 
     const output = try engine.format(alloc);
-    try std.testing.expect(std.mem.indexOf(u8, output, "type mismatch: expected `i64`, got `String`") != null);
+    try std.testing.expect(std.mem.find(u8, output, "type mismatch: expected `i64`, got `String`") != null);
 }
 
 test "getSourceLine" {
@@ -728,13 +728,13 @@ test "rich format with caret underlines" {
 
     const output = try engine.format(alloc);
     // Header
-    try std.testing.expect(std.mem.indexOf(u8, output, "error: I cannot find a function named `bar/0`") != null);
+    try std.testing.expect(std.mem.find(u8, output, "error: I cannot find a function named `bar/0`") != null);
     // Source line
-    try std.testing.expect(std.mem.indexOf(u8, output, "bar()") != null);
+    try std.testing.expect(std.mem.find(u8, output, "bar()") != null);
     // Caret underline
-    try std.testing.expect(std.mem.indexOf(u8, output, "^^^ not found in this scope") != null);
+    try std.testing.expect(std.mem.find(u8, output, "^^^ not found in this scope") != null);
     // Footer
-    try std.testing.expect(std.mem.indexOf(u8, output, "test.zap:2:3") != null);
+    try std.testing.expect(std.mem.find(u8, output, "test.zap:2:3") != null);
 }
 
 test "rich format with help text" {
@@ -755,7 +755,7 @@ test "rich format with help text" {
     });
 
     const output = try engine.format(alloc);
-    try std.testing.expect(std.mem.indexOf(u8, output, "= help: add `do` after the function signature") != null);
+    try std.testing.expect(std.mem.find(u8, output, "= help: add `do` after the function signature") != null);
 }
 
 test "rich format with error code" {
@@ -774,7 +774,7 @@ test "rich format with error code" {
     });
 
     const output = try engine.format(alloc);
-    try std.testing.expect(std.mem.indexOf(u8, output, "error[Z0001]: missing `do` keyword") != null);
+    try std.testing.expect(std.mem.find(u8, output, "error[Z0001]: missing `do` keyword") != null);
 }
 
 test "max error limit" {
@@ -794,7 +794,7 @@ test "max error limit" {
 
     const output = try engine.format(alloc);
     // Should show overflow message
-    try std.testing.expect(std.mem.indexOf(u8, output, "... and 2 more errors") != null);
+    try std.testing.expect(std.mem.find(u8, output, "... and 2 more errors") != null);
 }
 
 test "box drawing characters present" {
@@ -810,9 +810,9 @@ test "box drawing characters present" {
 
     const output = try engine.format(alloc);
     // Box drawing vertical bar in gutter
-    try std.testing.expect(std.mem.indexOf(u8, output, "\u{2502}") != null);
+    try std.testing.expect(std.mem.find(u8, output, "\u{2502}") != null);
     // Footer box drawing
-    try std.testing.expect(std.mem.indexOf(u8, output, "\u{2514}\u{2500}") != null);
+    try std.testing.expect(std.mem.find(u8, output, "\u{2514}\u{2500}") != null);
 }
 
 test "digitCount" {
@@ -849,9 +849,9 @@ test "secondary spans with tildes" {
     });
 
     const output = try engine.format(alloc);
-    try std.testing.expect(std.mem.indexOf(u8, output, "^^^ not found in this scope") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "~~~~ did you mean `name`?") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "= help:") != null);
+    try std.testing.expect(std.mem.find(u8, output, "^^^ not found in this scope") != null);
+    try std.testing.expect(std.mem.find(u8, output, "~~~~ did you mean `name`?") != null);
+    try std.testing.expect(std.mem.find(u8, output, "= help:") != null);
 }
 
 test "diagnostic engine selects source by span source_id" {
@@ -873,6 +873,6 @@ test "diagnostic engine selects source by span source_id" {
     });
 
     const output = try engine.format(alloc);
-    try std.testing.expect(std.mem.indexOf(u8, output, "second.zap:2:1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "third") != null);
+    try std.testing.expect(std.mem.find(u8, output, "second.zap:2:1") != null);
+    try std.testing.expect(std.mem.find(u8, output, "third") != null);
 }

@@ -705,7 +705,7 @@ pub const ZirDriver = struct {
             var name_iter = all_module_names.iterator();
             while (name_iter.next()) |entry| {
                 const mod_name = entry.key_ptr.*;
-                if (std.mem.lastIndexOfScalar(u8, mod_name, '_')) |sep| {
+                if (std.mem.findScalarLast(u8, mod_name, '_')) |sep| {
                     const parent = mod_name[0..sep];
                     const child = mod_name[sep + 1 ..];
                     const gop = try namespace_children.getOrPut(parent);
@@ -992,7 +992,7 @@ pub const ZirDriver = struct {
         else
             std.mem.eql(u8, func.name, "main") or
                 std.mem.endsWith(u8, func.name, "__main") or
-                std.mem.indexOf(u8, func.name, "__main__") != null;
+                std.mem.find(u8, func.name, "__main__") != null;
 
         // In library mode, skip the main function.
         if (self.lib_mode and is_main) return;
@@ -1919,8 +1919,8 @@ pub const ZirDriver = struct {
                 var resolved_call_name: []const u8 = cn.name;
                 if (self.program) |prog| {
                     for (prog.functions) |func| {
-                        const cn_base = if (std.mem.lastIndexOf(u8, cn.name, "__")) |pos| cn.name[0..pos] else cn.name;
-                        const func_base = if (std.mem.lastIndexOf(u8, func.name, "__")) |pos| func.name[0..pos] else func.name;
+                        const cn_base = if (std.mem.findLast(u8, cn.name, "__")) |pos| cn.name[0..pos] else cn.name;
+                        const func_base = if (std.mem.findLast(u8, func.name, "__")) |pos| func.name[0..pos] else func.name;
                         if (std.mem.eql(u8, func_base, cn_base) and func.defaults.len > 0) {
                             // After inlining, use the function's actual name (with declared arity)
                             resolved_call_name = func.name;
@@ -2066,7 +2066,7 @@ pub const ZirDriver = struct {
 
                 // Parse "Module.function" from the builtin name.
                 // e.g., "Prelude.println" → import zap_runtime, field "Prelude", field "println"
-                if (std.mem.indexOfScalar(u8, cb.name, '.')) |dot_idx| {
+                if (std.mem.findScalar(u8, cb.name, '.')) |dot_idx| {
                     const mod_name = cb.name[0..dot_idx];
                     const func_name = cb.name[dot_idx + 1 ..];
 

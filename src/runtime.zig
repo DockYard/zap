@@ -745,7 +745,7 @@ pub const ZapString = struct {
     }
 
     pub fn contains(haystack: []const u8, needle: []const u8) bool {
-        return std.mem.indexOf(u8, haystack, needle) != null;
+        return std.mem.find(u8, haystack, needle) != null;
     }
 
     pub fn startsWith(s: []const u8, prefix: []const u8) bool {
@@ -1123,7 +1123,7 @@ pub const Prelude = struct {
     pub fn index_of(haystack: []const u8, needle: []const u8) i64 {
         if (needle.len == 0) return 0;
         if (needle.len > haystack.len) return -1;
-        if (std.mem.indexOf(u8, haystack, needle)) |idx| {
+        if (std.mem.find(u8, haystack, needle)) |idx| {
             return @intCast(idx);
         }
         return -1;

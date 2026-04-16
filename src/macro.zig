@@ -1986,7 +1986,7 @@ test "typed macro: nil in String return position is an error" {
 
     // Should have a type error: nil incompatible with String return type
     try std.testing.expect(engine.errors.items.len > 0);
-    try std.testing.expect(std.mem.indexOf(u8, engine.errors.items[0].message, "nil") != null);
+    try std.testing.expect(std.mem.find(u8, engine.errors.items[0].message, "nil") != null);
 }
 
 test "typed macro: valid types produce no errors" {
@@ -2063,7 +2063,7 @@ test "typed macro: missing else branch is an error for non-nil return type" {
 
     // Should error: if without else implicitly returns nil
     try std.testing.expect(engine.errors.items.len > 0);
-    try std.testing.expect(std.mem.indexOf(u8, engine.errors.items[0].message, "nil") != null);
+    try std.testing.expect(std.mem.find(u8, engine.errors.items[0].message, "nil") != null);
 }
 
 test "typed macro: param type mismatch with return type" {

@@ -156,7 +156,7 @@ pub const Parser = struct {
 
     /// Strip underscores from a numeric literal string (e.g., "1_000_000" → "1000000")
     fn stripNumericUnderscores(self: *Parser, text: []const u8) []const u8 {
-        if (std.mem.indexOfScalar(u8, text, '_') == null) return text;
+        if (std.mem.findScalar(u8, text, '_') == null) return text;
         var buf: std.ArrayList(u8) = .empty;
         for (text) |c| {
             if (c != '_') buf.append(self.allocator, c) catch return text;
@@ -166,7 +166,7 @@ pub const Parser = struct {
 
     /// Process escape sequences in a string: \n, \t, \r, \\, \", \0
     fn unescapeString(self: *Parser, text: []const u8) []const u8 {
-        if (std.mem.indexOfScalar(u8, text, '\\') == null) return text;
+        if (std.mem.findScalar(u8, text, '\\') == null) return text;
         var buf: std.ArrayList(u8) = .empty;
         var i: usize = 0;
         while (i < text.len) {

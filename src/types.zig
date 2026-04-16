@@ -3702,7 +3702,7 @@ test "type check arithmetic mismatch reported" {
     try std.testing.expect(checker.errors.items.len > 0);
     // Should report arithmetic type mismatch
     const err_msg = checker.errors.items[0].message;
-    try std.testing.expect(std.mem.indexOf(u8, err_msg, "arithmetic") != null or std.mem.indexOf(u8, err_msg, "cannot perform") != null);
+    try std.testing.expect(std.mem.find(u8, err_msg, "arithmetic") != null or std.mem.find(u8, err_msg, "cannot perform") != null);
 }
 
 test "typeToString returns human-readable names" {
@@ -3782,7 +3782,7 @@ test "type check if condition must be Bool" {
     try std.testing.expect(checker.errors.items.len > 0);
     const err_msg = checker.errors.items[0].message;
     // New contextual message mentions the actual type and if requirement
-    try std.testing.expect(std.mem.indexOf(u8, err_msg, "but `if` requires a `Bool`") != null);
+    try std.testing.expect(std.mem.find(u8, err_msg, "but `if` requires a `Bool`") != null);
 }
 
 test "type check return type mismatch" {
@@ -3813,11 +3813,11 @@ test "type check return type mismatch" {
 
     try std.testing.expect(checker.errors.items.len > 0);
     const err_msg = checker.errors.items[0].message;
-    try std.testing.expect(std.mem.indexOf(u8, err_msg, "returns the wrong type") != null);
+    try std.testing.expect(std.mem.find(u8, err_msg, "returns the wrong type") != null);
     // Rich label should contain the expected/got info
     const err_label = checker.errors.items[0].label orelse "";
-    try std.testing.expect(std.mem.indexOf(u8, err_label, "i64") != null);
-    try std.testing.expect(std.mem.indexOf(u8, err_label, "String") != null);
+    try std.testing.expect(std.mem.find(u8, err_label, "i64") != null);
+    try std.testing.expect(std.mem.find(u8, err_label, "String") != null);
 }
 
 test "type provenance tracks source span on typed parameter" {
@@ -3975,7 +3975,7 @@ test "anonymous closure with borrowed capture cannot escape via assignment" {
 
     var found = false;
     for (checker.errors.items) |err| {
-        if (std.mem.indexOf(u8, err.message, "closure with borrowed captures cannot escape via assignment") != null) {
+        if (std.mem.find(u8, err.message, "closure with borrowed captures cannot escape via assignment") != null) {
             found = true;
             try std.testing.expect(err.help != null);
         }
@@ -4015,7 +4015,7 @@ test "anonymous closure with borrowed capture cannot escape through return" {
 
     var found = false;
     for (checker.errors.items) |err| {
-        if (std.mem.indexOf(u8, err.message, "closure with borrowed captures cannot escape through return") != null) {
+        if (std.mem.find(u8, err.message, "closure with borrowed captures cannot escape through return") != null) {
             found = true;
             try std.testing.expect(err.help != null);
         }
@@ -4052,7 +4052,7 @@ test "anonymous closure missing parameter annotation has closure-specific diagno
 
     var found = false;
     for (checker.errors.items) |err| {
-        if (std.mem.indexOf(u8, err.message, "anonymous function parameter requires a type annotation") != null) {
+        if (std.mem.find(u8, err.message, "anonymous function parameter requires a type annotation") != null) {
             found = true;
             try std.testing.expect(err.help != null);
         }
@@ -4089,7 +4089,7 @@ test "anonymous closure missing return annotation has closure-specific diagnosti
 
     var found = false;
     for (checker.errors.items) |err| {
-        if (std.mem.indexOf(u8, err.message, "anonymous function is missing a return type annotation") != null) {
+        if (std.mem.find(u8, err.message, "anonymous function is missing a return type annotation") != null) {
             found = true;
             try std.testing.expect(err.help != null);
         }
@@ -4130,7 +4130,7 @@ test "higher-order call reports callable signature mismatch for anonymous closur
 
     var found = false;
     for (checker.errors.items) |err| {
-        if (std.mem.indexOf(u8, err.message, "expects callable") != null and err.label != null and std.mem.indexOf(u8, err.label.?, "callable signature mismatch") != null) {
+        if (std.mem.find(u8, err.message, "expects callable") != null and err.label != null and std.mem.find(u8, err.label.?, "callable signature mismatch") != null) {
             found = true;
             try std.testing.expect(err.help != null);
         }
@@ -4177,7 +4177,7 @@ test "higher-order call reports callable signature mismatch for function ref" {
 
     var found = false;
     for (checker.errors.items) |err| {
-        if (std.mem.indexOf(u8, err.message, "expects callable") != null and err.label != null and std.mem.indexOf(u8, err.label.?, "callable signature mismatch") != null) {
+        if (std.mem.find(u8, err.message, "expects callable") != null and err.label != null and std.mem.find(u8, err.label.?, "callable signature mismatch") != null) {
             found = true;
             try std.testing.expect(err.help != null);
         }
@@ -4223,7 +4223,7 @@ test "moved binding use reports ownership error" {
 
     var found = false;
     for (checker.errors.items) |err| {
-        if (std.mem.indexOf(u8, err.message, "already moved") != null) {
+        if (std.mem.find(u8, err.message, "already moved") != null) {
             found = true;
             try std.testing.expect(err.help != null);
         }
@@ -4279,7 +4279,7 @@ test "unique function parameter ownership moves var_ref argument" {
 
     var found = false;
     for (checker.errors.items) |err| {
-        if (std.mem.indexOf(u8, err.message, "already moved") != null) {
+        if (std.mem.find(u8, err.message, "already moved") != null) {
             found = true;
             break;
         }
@@ -4331,7 +4331,7 @@ test "shared binding cannot satisfy unique parameter ownership" {
 
     var found = false;
     for (checker.errors.items) |err| {
-        if (std.mem.indexOf(u8, err.message, "cannot pass shared value") != null) {
+        if (std.mem.find(u8, err.message, "cannot pass shared value") != null) {
             found = true;
             break;
         }
@@ -4374,7 +4374,7 @@ test "named call with unique parameter moves opaque binding" {
 
     var found = false;
     for (checker.errors.items) |err| {
-        if (std.mem.indexOf(u8, err.message, "already moved") != null) {
+        if (std.mem.find(u8, err.message, "already moved") != null) {
             found = true;
             break;
         }
@@ -4447,7 +4447,7 @@ test "borrowed value cannot escape through return" {
 
     var found = false;
     for (checker.errors.items) |err| {
-        if (std.mem.indexOf(u8, err.message, "cannot escape through return") != null) {
+        if (std.mem.find(u8, err.message, "cannot escape through return") != null) {
             found = true;
             break;
         }
@@ -4489,7 +4489,7 @@ test "closure with borrowed capture cannot be returned" {
 
     var found = false;
     for (checker.errors.items) |err| {
-        if (std.mem.indexOf(u8, err.message, "borrowed captures") != null) {
+        if (std.mem.find(u8, err.message, "borrowed captures") != null) {
             found = true;
             break;
         }
@@ -4532,7 +4532,7 @@ test "unique capture moves outer binding" {
 
     var found = false;
     for (checker.errors.items) |err| {
-        if (std.mem.indexOf(u8, err.message, "already moved") != null) {
+        if (std.mem.find(u8, err.message, "already moved") != null) {
             found = true;
             break;
         }
@@ -4578,7 +4578,7 @@ test "closure with borrowed capture cannot be passed as argument" {
 
     var found = false;
     for (checker.errors.items) |err| {
-        if (std.mem.indexOf(u8, err.message, "cannot be passed as an argument") != null) {
+        if (std.mem.find(u8, err.message, "cannot be passed as an argument") != null) {
             found = true;
             break;
         }
@@ -4621,7 +4621,7 @@ test "closure with borrowed capture cannot be assigned" {
 
     var found = false;
     for (checker.errors.items) |err| {
-        if (std.mem.indexOf(u8, err.message, "assignment") != null) {
+        if (std.mem.find(u8, err.message, "assignment") != null) {
             found = true;
             break;
         }
@@ -4663,7 +4663,7 @@ test "closure with borrowed capture cannot be stored in tuple" {
 
     var found = false;
     for (checker.errors.items) |err| {
-        if (std.mem.indexOf(u8, err.message, "tuple storage") != null) {
+        if (std.mem.find(u8, err.message, "tuple storage") != null) {
             found = true;
             break;
         }
@@ -4823,8 +4823,8 @@ test "return type mismatch has secondary span" {
     const err = checker.errors.items[0];
     try std.testing.expect(err.secondary_spans.len > 0);
     const ss_label = err.secondary_spans[0].label;
-    try std.testing.expect(std.mem.indexOf(u8, ss_label, "return type") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ss_label, "i64") != null);
+    try std.testing.expect(std.mem.find(u8, ss_label, "return type") != null);
+    try std.testing.expect(std.mem.find(u8, ss_label, "i64") != null);
 }
 
 test "undefined function suggests similar name" {
@@ -4858,11 +4858,11 @@ test "undefined function suggests similar name" {
     // Should have exactly one error about "fob/2" not found
     var found_err = false;
     for (checker.errors.items) |err| {
-        if (std.mem.indexOf(u8, err.message, "fob/2") != null) {
+        if (std.mem.find(u8, err.message, "fob/2") != null) {
             found_err = true;
             // Should suggest foo/2
             if (err.help) |help| {
-                try std.testing.expect(std.mem.indexOf(u8, help, "foo/2") != null);
+                try std.testing.expect(std.mem.find(u8, help, "foo/2") != null);
             }
         }
     }
@@ -4900,7 +4900,7 @@ test "undefined function no suggestion for unrelated name" {
     // Should have error but no suggestion
     var found_err = false;
     for (checker.errors.items) |err| {
-        if (std.mem.indexOf(u8, err.message, "zzzzz/1") != null) {
+        if (std.mem.find(u8, err.message, "zzzzz/1") != null) {
             found_err = true;
             try std.testing.expect(err.help == null);
         }
@@ -4938,7 +4938,7 @@ test "valid function call produces no error" {
 
     // No "cannot find function" errors
     for (checker.errors.items) |err| {
-        try std.testing.expect(std.mem.indexOf(u8, err.message, "cannot find a function") == null);
+        try std.testing.expect(std.mem.find(u8, err.message, "cannot find a function") == null);
     }
 }
 
@@ -4971,10 +4971,10 @@ test "unused variable produces warning" {
 
     var found_unused = false;
     for (checker.errors.items) |err| {
-        if (std.mem.indexOf(u8, err.message, "variable `x` is unused") != null) {
+        if (std.mem.find(u8, err.message, "variable `x` is unused") != null) {
             found_unused = true;
             try std.testing.expect(err.help != null);
-            try std.testing.expect(std.mem.indexOf(u8, err.help.?, "_x") != null);
+            try std.testing.expect(std.mem.find(u8, err.help.?, "_x") != null);
         }
     }
     try std.testing.expect(found_unused);
@@ -5008,7 +5008,7 @@ test "underscore-prefixed variable no unused warning" {
     try checker.checkUnusedBindings();
 
     for (checker.errors.items) |err| {
-        try std.testing.expect(std.mem.indexOf(u8, err.message, "_x") == null);
+        try std.testing.expect(std.mem.find(u8, err.message, "_x") == null);
     }
 }
 
@@ -5040,7 +5040,7 @@ test "used variable no unused warning" {
     try checker.checkUnusedBindings();
 
     for (checker.errors.items) |err| {
-        try std.testing.expect(std.mem.indexOf(u8, err.message, "variable `x` is unused") == null);
+        try std.testing.expect(std.mem.find(u8, err.message, "variable `x` is unused") == null);
     }
 }
 
@@ -5074,7 +5074,7 @@ test "variable used in zig intrinsic call is not unused" {
     try checker.checkUnusedBindings();
 
     for (checker.errors.items) |err| {
-        try std.testing.expect(std.mem.indexOf(u8, err.message, "variable `name` is unused") == null);
+        try std.testing.expect(std.mem.find(u8, err.message, "variable `name` is unused") == null);
     }
 }
 
@@ -5105,7 +5105,7 @@ test "unknown type name produces error" {
 
     var found_err = false;
     for (checker.errors.items) |err| {
-        if (std.mem.indexOf(u8, err.message, "cannot find a type named `Other`") != null) {
+        if (std.mem.find(u8, err.message, "cannot find a type named `Other`") != null) {
             found_err = true;
         }
     }
@@ -5140,7 +5140,7 @@ test "unused function parameter produces warning" {
 
     var found_unused = false;
     for (checker.errors.items) |err| {
-        if (std.mem.indexOf(u8, err.message, "variable `x` is unused") != null) {
+        if (std.mem.find(u8, err.message, "variable `x` is unused") != null) {
             found_unused = true;
         }
     }
@@ -5179,7 +5179,7 @@ test "zig bridge call parameters not flagged as unused" {
 
     // No unused variable warnings should be emitted for map or key
     for (checker.errors.items) |err| {
-        if (std.mem.indexOf(u8, err.message, "is unused") != null) {
+        if (std.mem.find(u8, err.message, "is unused") != null) {
             std.debug.print("Unexpected unused warning: {s}\n", .{err.message});
             return error.TestUnexpectedResult;
         }
@@ -5214,7 +5214,7 @@ test "nested zig bridge call parameters not flagged as unused" {
     try checker.checkUnusedBindings();
 
     for (checker.errors.items) |err| {
-        if (std.mem.indexOf(u8, err.message, "is unused") != null) {
+        if (std.mem.find(u8, err.message, "is unused") != null) {
             std.debug.print("Unexpected unused warning: {s}\n", .{err.message});
             return error.TestUnexpectedResult;
         }

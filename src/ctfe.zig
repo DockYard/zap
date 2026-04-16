@@ -610,7 +610,7 @@ pub fn formatCtfeError(alloc: std.mem.Allocator, err: CtfeError) ![]const u8 {
         .step_limit_exceeded => try w.writeAll("  help: possible infinite recursion or unexpectedly large compile-time loop\n"),
         .recursion_limit_exceeded => try w.writeAll("  help: recursion depth exceeded — simplify the compile-time computation or increase the limit\n"),
         .capability_violation => try w.print("  help: declare the required capability or remove the compile-time {s}\n", .{
-            if (std.mem.indexOf(u8, err.message, "read_file")) |_| "file access" else if (std.mem.indexOf(u8, err.message, "read_env")) |_| "env access" else if (std.mem.indexOf(u8, err.message, "reflect_module")) |_| "reflection" else "effect",
+            if (std.mem.find(u8, err.message, "read_file")) |_| "file access" else if (std.mem.find(u8, err.message, "read_env")) |_| "env access" else if (std.mem.find(u8, err.message, "reflect_module")) |_| "reflection" else "effect",
         }),
         .use_after_consume => try w.writeAll("  help: a moved or released value was read again during compile-time evaluation\n"),
         .division_by_zero => try w.writeAll("  help: ensure the divisor is non-zero at compile time\n"),
@@ -3503,12 +3503,12 @@ fn computeModuleInterfaceHash(
 }
 
 fn baseFunctionName(function_name: []const u8) []const u8 {
-    const core_name = if (std.mem.indexOf(u8, function_name, "__default_")) |idx|
+    const core_name = if (std.mem.find(u8, function_name, "__default_")) |idx|
         function_name[0..idx]
     else
         function_name;
 
-    return if (std.mem.lastIndexOf(u8, core_name, "__")) |idx|
+    return if (std.mem.findLast(u8, core_name, "__")) |idx|
         core_name[idx + 2 ..]
     else
         core_name;
@@ -7130,12 +7130,12 @@ test "rich diagnostics: formatCtfeError" {
     const formatted = try formatCtfeError(alloc, err);
     defer alloc.free(formatted);
     // Verify it contains the key pieces
-    try testing.expect(std.mem.indexOf(u8, formatted, "step limit exceeded") != null);
-    try testing.expect(std.mem.indexOf(u8, formatted, "Config__generate") != null);
-    try testing.expect(std.mem.indexOf(u8, formatted, "12:4") != null);
-    try testing.expect(std.mem.indexOf(u8, formatted, "@config") != null);
-    try testing.expect(std.mem.indexOf(u8, formatted, "App") != null);
-    try testing.expect(std.mem.indexOf(u8, formatted, "help:") != null);
+    try testing.expect(std.mem.find(u8, formatted, "step limit exceeded") != null);
+    try testing.expect(std.mem.find(u8, formatted, "Config__generate") != null);
+    try testing.expect(std.mem.find(u8, formatted, "12:4") != null);
+    try testing.expect(std.mem.find(u8, formatted, "@config") != null);
+    try testing.expect(std.mem.find(u8, formatted, "App") != null);
+    try testing.expect(std.mem.find(u8, formatted, "help:") != null);
 }
 
 test "cache key includes explicit compile options hash" {
