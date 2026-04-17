@@ -1891,10 +1891,8 @@ pub const HirBuilder = struct {
 
     pub fn buildProgram(self: *HirBuilder, program: *const ast.Program) !Program {
         var modules: std.ArrayList(Module) = .empty;
-        for (program.modules, 0..) |*mod, i| {
-            const mod_scope = if (i < self.graph.modules.items.len)
-                self.graph.modules.items[i].scope_id
-            else
+        for (program.modules) |*mod| {
+            const mod_scope = self.graph.findModuleScope(mod.name) orelse
                 self.graph.prelude_scope;
             self.current_module_scope = mod_scope;
             try modules.append(self.allocator, try self.buildModule(mod, mod_scope));
