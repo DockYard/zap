@@ -389,6 +389,46 @@ pub fn collectAllFromUnits(
     // NOW split into per-module programs from the expanded/desugared AST.
     // All if_expr nodes are gone, all pipes desugared, all macros expanded.
     const module_programs = try buildModulePrograms(alloc, &desugared_program, &interner);
+
+    // Rebuild the scope graph from the desugared AST. The original collector
+    // was built from pre-expansion AST, so its function declaration pointers
+    // are stale. The HIR builder compares AST node pointers to determine
+    // which functions belong to the current module, so the scope graph must
+    // reference the same AST nodes as the desugared module programs.
+    step += 1;
+    if (options.show_progress) std.debug.print("\r\x1b[K  [{d}/{d}] Re-collect", .{ step, total_steps });
+
+    var final_collector = zap.Collector.init(alloc, &interner);
+    for (module_programs) |entry| {
+        final_collector.collectProgramSurface(&entry.program) catch {
+            for (final_collector.errors.items) |collect_err| {
+                diag_engine.err(collect_err.message, collect_err.span) catch {};
+            }
+            if (options.show_progress) std.debug.print("\r\x1b[K", .{});
+            emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
+            return error.CollectFailed;
+        };
+    }
+    if (desugared_program.top_items.len > 0) {
+        const top_only = ast.Program{ .modules = &.{}, .top_items = desugared_program.top_items };
+        final_collector.collectProgramSurface(&top_only) catch {
+            for (final_collector.errors.items) |collect_err| {
+                diag_engine.err(collect_err.message, collect_err.span) catch {};
+            }
+            return error.CollectFailed;
+        };
+    }
+    {
+        const slices = try alloc.alloc(ast.Program, module_programs.len);
+        for (module_programs, 0..) |entry, i| slices[i] = entry.program;
+        final_collector.finalizeCollectedPrograms(slices) catch {
+            for (final_collector.errors.items) |collect_err| {
+                diag_engine.err(collect_err.message, collect_err.span) catch {};
+            }
+            return error.CollectFailed;
+        };
+    }
+
     const units = try buildCompilationUnits(alloc, module_programs, all_source_units);
 
     return .{
@@ -398,7 +438,7 @@ pub fn collectAllFromUnits(
         .units = units,
         .source_units = all_source_units,
         .interner = interner,
-        .collector = collector,
+        .collector = final_collector,
         .diag_engine = diag_engine,
     };
 }

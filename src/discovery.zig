@@ -411,15 +411,13 @@ fn extractModuleReferences(
                 // If followed by dot, it's a qualified reference like Module.function — proceed
             }
 
-            // Skip: identifiers after `::` are type annotations, not module calls.
+            // Skip: identifiers after `::` or `->` are type annotations, not module calls.
+            // `:: String` is a parameter type, `-> Bool` is a return type.
             // Exception: if followed by `.` it's a module-qualified type like `Zap.Env`.
-            if (prev_tag == .double_colon) {
+            if (prev_tag == .double_colon or prev_tag == .arrow) {
                 var peek = lexer;
                 const next = peek.next();
                 if (next.tag != .dot) {
-                    // Bare type annotation like `:: String` — handled by BUILTIN_TYPE_NAMES
-                    // For user types like `:: Color`, skip as type reference
-                    // (the module is declared locally, not imported)
                     continue;
                 }
             }
@@ -546,12 +544,13 @@ fn topologicalSort(alloc: std.mem.Allocator, graph: *FileGraph) DiscoveryError!v
     }
 }
 
-/// Built-in type names that the discovery system should skip (not modules).
-/// These are resolved by the type checker, not by file discovery.
+/// Primitive type names that should not trigger module file discovery.
+/// These names are valid as type annotations (:: Bool, :: Nil) but do NOT
+/// correspond to importable module files. Real modules like Atom, String,
+/// Bool etc. are discovered normally — the type annotation context check
+/// in extractModuleReferences prevents them from being treated as module
+/// references when used after `::`.
 pub const BUILTIN_TYPE_NAMES = [_][]const u8{
-    "Bool",
-    "String",
-    "Atom",
     "Nil",
     "Expr",
     "Never",
