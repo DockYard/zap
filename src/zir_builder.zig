@@ -728,6 +728,39 @@ pub const ZirDriver = struct {
         return null;
     }
 
+    /// Find an IR function by its local_name (unmangled name within its module).
+    /// Used when macro-expanded code references imported functions by bare name
+    /// (e.g., `begin_test` from `use Zest.Case`).
+    /// Matches both exact local_name and base name (without arity suffix).
+    /// Find an IR function by local_name or base name, but ONLY from other modules.
+    /// Used for bare imported names like "begin_test" from `use Zest.Case`.
+    fn findFunctionByLocalName(self: *const ZirDriver, local_name: []const u8) ?ir.Function {
+        if (self.program) |prog| {
+            for (prog.functions) |func| {
+                // Only match functions from OTHER modules
+                if (func.module_name == null) continue;
+                if (self.current_emit_module) |cem| {
+                    if (std.mem.eql(u8, func.module_name.?, cem)) continue;
+                }
+                // Exact match on local_name
+                if (func.local_name.len > 0 and std.mem.eql(u8, func.local_name, local_name)) {
+                    return func;
+                }
+                // Base name match: "begin_test" matches "begin_test__0"
+                if (func.local_name.len > 0) {
+                    const base = if (std.mem.findLast(u8, func.local_name, "__")) |pos|
+                        func.local_name[0..pos]
+                    else
+                        func.local_name;
+                    if (std.mem.eql(u8, base, local_name)) {
+                        return func;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
     /// Find an IR function by its ID.
     fn findFunctionById(self: *const ZirDriver, id: ir.FunctionId) ?ir.Function {
         if (self.program) |prog| {
@@ -789,6 +822,7 @@ pub const ZirDriver = struct {
 
     pub fn buildProgram(self: *ZirDriver, program: ir.Program) !void {
         self.program = program;
+        // Debug removed
 
         const ctx = self.compilation_ctx;
 
@@ -2100,7 +2134,12 @@ pub const ZirDriver = struct {
                 }
 
                 {
-                    const target_func = self.findFunctionByName(resolved_call_name);
+                    // Look up the target function — first by full mangled name,
+                    // then by local_name. Bare names like "begin_test" come from
+                    // macro-expanded code (use/import) where the module prefix
+                    // was stripped during expansion.
+                    const target_func = self.findFunctionByName(resolved_call_name) orelse
+                        self.findFunctionByLocalName(resolved_call_name);
                     const target_module = if (target_func) |tf| tf.module_name else null;
                     const is_cross_module = blk: {
                         if (target_module == null and self.current_emit_module == null) break :blk false;
@@ -2140,19 +2179,33 @@ pub const ZirDriver = struct {
                 zir_builder_set_call_modifier(self.handle, 3); // no_optimizations
 
                 // Resolve name for per-module emission
-                const try_target = self.findFunctionByName(tcn.name);
-                const try_call_name = if (self.current_emit_module != null)
-                    if (try_target) |tf| tf.local_name else tcn.name
-                else
-                    tcn.name;
-                const call_ref = zir_builder_emit_call(
-                    self.handle,
-                    try_call_name.ptr,
-                    @intCast(try_call_name.len),
-                    args.items.ptr,
-                    @intCast(args.items.len),
-                );
-                if (call_ref == error_ref) return error.EmitFailed;
+                const try_target = self.findFunctionByName(tcn.name) orelse
+                    self.findFunctionByLocalName(tcn.name);
+                const try_target_module = if (try_target) |tf| tf.module_name else null;
+                const try_is_cross = blk: {
+                    if (try_target_module == null and self.current_emit_module == null) break :blk false;
+                    if (try_target_module == null or self.current_emit_module == null) break :blk true;
+                    break :blk !std.mem.eql(u8, try_target_module.?, self.current_emit_module.?);
+                };
+
+                const call_ref = if (try_is_cross and try_target_module != null) blk: {
+                    const target_local = if (try_target) |tf| tf.local_name else tcn.name;
+                    break :blk try self.emitCrossModuleCall(try_target_module.?, target_local, args.items);
+                } else blk: {
+                    const try_call_name = if (self.current_emit_module != null)
+                        if (try_target) |tf| tf.local_name else tcn.name
+                    else
+                        tcn.name;
+                    const ref = zir_builder_emit_call(
+                        self.handle,
+                        try_call_name.ptr,
+                        @intCast(try_call_name.len),
+                        args.items.ptr,
+                        @intCast(args.items.len),
+                    );
+                    if (ref == error_ref) return error.EmitFailed;
+                    break :blk ref;
+                };
 
                 // __try returns optional (?ReturnType). null = no match.
                 const is_non_null = zir_builder_emit_is_non_null(self.handle, call_ref);
