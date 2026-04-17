@@ -226,11 +226,21 @@ pub const ScopeGraph = struct {
     types: std.ArrayList(TypeEntry),
     modules: std.ArrayList(ModuleEntry),
     prelude_scope: ScopeId,
-    /// Maps AST node span.start → scope_id, so the type checker can find
-    /// the scope for function clauses and modules without mutating the AST.
-    node_scope_map: std.AutoHashMap(u32, ScopeId),
+    /// Maps (source_id, span.start) → scope_id, so the type checker can
+    /// find the scope for function clauses and modules without mutating
+    /// the AST. Uses a composite key to prevent collisions between
+    /// AST nodes at the same byte offset in different source files.
+    node_scope_map: std.AutoHashMap(u64, ScopeId),
     /// Maps type name (StringId) → TypeId for global type resolution
     type_name_to_id: std.AutoHashMap(ast.StringId, TypeId),
+
+    /// Build the composite key for node_scope_map from a SourceSpan.
+    /// Encodes source_id in the high 32 bits and span.start in the low 32 bits.
+    /// source_id=null maps to 0xFFFFFFFF to avoid colliding with real file IDs.
+    pub fn spanKey(span: ast.SourceSpan) u64 {
+        const sid: u64 = span.source_id orelse 0xFFFFFFFF;
+        return (sid << 32) | @as(u64, span.start);
+    }
 
     pub fn init(allocator: std.mem.Allocator) ScopeGraph {
         var graph = ScopeGraph{
@@ -242,7 +252,7 @@ pub const ScopeGraph = struct {
             .types = .empty,
             .modules = .empty,
             .prelude_scope = 0,
-            .node_scope_map = std.AutoHashMap(u32, ScopeId).init(allocator),
+            .node_scope_map = std.AutoHashMap(u64, ScopeId).init(allocator),
             .type_name_to_id = std.AutoHashMap(ast.StringId, TypeId).init(allocator),
         };
         // Create prelude scope as scope 0

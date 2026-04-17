@@ -96,7 +96,7 @@ pub const Collector = struct {
 
     fn collectModule(self: *Collector, mod: *const ast.ModuleDecl, parent_scope: scope.ScopeId) !void {
         const mod_scope = try self.graph.createScope(parent_scope, .module);
-        try self.graph.node_scope_map.put(mod.meta.span.start, mod_scope);
+        try self.graph.node_scope_map.put(scope.ScopeGraph.spanKey(mod.meta.span), mod_scope);
         try self.graph.registerModule(mod.name, mod_scope, mod);
 
         // Track pending attributes to attach to the next function/macro
@@ -250,7 +250,7 @@ pub const Collector = struct {
             // Create a function scope for each clause
             const fn_scope = try self.graph.createScope(parent_scope, .function);
             // Record scope mapping so the type checker can find it
-            try self.graph.node_scope_map.put(clause.meta.span.start, fn_scope);
+            try self.graph.node_scope_map.put(scope.ScopeGraph.spanKey(clause.meta.span), fn_scope);
 
             // Collect parameter bindings
             for (clause.params) |param| {
@@ -286,7 +286,7 @@ pub const Collector = struct {
             });
 
             const fn_scope = try self.graph.createScope(parent_scope, .function);
-            try self.graph.node_scope_map.put(clause.meta.span.start, fn_scope);
+            try self.graph.node_scope_map.put(scope.ScopeGraph.spanKey(clause.meta.span), fn_scope);
 
             for (clause.params) |param| {
                 try self.collectPatternBindings(param.pattern, fn_scope);

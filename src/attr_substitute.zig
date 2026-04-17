@@ -33,7 +33,7 @@ pub fn substituteAttributes(
     var new_modules: std.ArrayListUnmanaged(ast.ModuleDecl) = .empty;
 
     for (program.modules) |*mod| {
-        const mod_scope = graph.node_scope_map.get(mod.meta.span.start) orelse {
+        const mod_scope = graph.node_scope_map.get(scope.ScopeGraph.spanKey(mod.meta.span)) orelse {
             try new_modules.append(alloc, mod.*);
             continue;
         };

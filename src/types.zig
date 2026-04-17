@@ -1622,7 +1622,7 @@ pub const TypeChecker = struct {
         var captured = std.AutoHashMap(scope_mod.BindingId, void).init(self.allocator);
         defer captured.deinit();
         for (func.clauses) |clause| {
-            const function_scope = self.graph.node_scope_map.get(clause.meta.span.start) orelse clause.meta.scope_id;
+            const function_scope = self.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(clause.meta.span)) orelse clause.meta.scope_id;
             if (clause.body) |body| {
                 for (body) |stmt| {
                     try self.collectCapturedBindingsFromStmt(stmt, function_scope, &captured);
@@ -1956,7 +1956,7 @@ pub const TypeChecker = struct {
 
     fn checkModule(self: *TypeChecker, mod: *const ast.ModuleDecl) !void {
         const prev_scope = self.current_scope;
-        self.current_scope = self.graph.node_scope_map.get(mod.meta.span.start) orelse mod.meta.scope_id;
+        self.current_scope = self.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(mod.meta.span)) orelse mod.meta.scope_id;
         defer self.current_scope = prev_scope;
 
         // Check module extends: validate overridden function return types match parent
@@ -1979,7 +1979,7 @@ pub const TypeChecker = struct {
                     // not via normal var_ref, so the unused-binding check can't see them.
                     // Macro bodies are compile-time code and are NOT type-checked.
                     for (mac.clauses) |clause| {
-                        const macro_scope = self.graph.node_scope_map.get(clause.meta.span.start) orelse clause.meta.scope_id;
+                        const macro_scope = self.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(clause.meta.span)) orelse clause.meta.scope_id;
                         for (clause.params) |param| {
                             if (param.pattern.* == .bind) {
                                 if (self.graph.resolveBinding(macro_scope, param.pattern.bind.name)) |bid| {
@@ -2197,7 +2197,7 @@ pub const TypeChecker = struct {
 
     fn checkFunctionClause(self: *TypeChecker, func: *const ast.FunctionDecl, clause: *const ast.FunctionClause) !void {
         const prev_scope = self.current_scope;
-        self.current_scope = self.graph.node_scope_map.get(clause.meta.span.start) orelse clause.meta.scope_id;
+        self.current_scope = self.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(clause.meta.span)) orelse clause.meta.scope_id;
         defer self.current_scope = prev_scope;
         const is_anon = self.isAnonymousFunctionDecl(func);
 
@@ -2576,7 +2576,7 @@ pub const TypeChecker = struct {
 
             .block => |blk| {
                 const prev_scope = self.current_scope;
-                if (self.graph.node_scope_map.get(blk.meta.span.start)) |block_scope| {
+                if (self.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(blk.meta.span))) |block_scope| {
                     self.current_scope = block_scope;
                 }
                 defer self.current_scope = prev_scope;
@@ -4212,7 +4212,7 @@ test "moved binding use reports ownership error" {
 
     const clause = program.modules[0].items[0].function.clauses[0];
     const expr = clause.body.?[0].expr;
-    const scope_id = checker.graph.node_scope_map.get(clause.meta.span.start) orelse clause.meta.scope_id;
+    const scope_id = checker.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(clause.meta.span)) orelse clause.meta.scope_id;
     checker.current_scope = scope_id;
 
     const x_binding = checker.graph.resolveBinding(scope_id, clause.params[0].pattern.bind.name).?;
@@ -4258,7 +4258,7 @@ test "unique function parameter ownership moves var_ref argument" {
     try checker.checkProgram(&program);
 
     const clause = program.modules[0].items[0].function.clauses[0];
-    const scope_id = checker.graph.node_scope_map.get(clause.meta.span.start) orelse clause.meta.scope_id;
+    const scope_id = checker.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(clause.meta.span)) orelse clause.meta.scope_id;
     checker.current_scope = scope_id;
 
     const f_binding = checker.graph.resolveBinding(scope_id, clause.params[0].pattern.bind.name).?;
@@ -4313,7 +4313,7 @@ test "shared binding cannot satisfy unique parameter ownership" {
     try checker.checkProgram(&program);
 
     const clause = program.modules[0].items[0].function.clauses[0];
-    const scope_id = checker.graph.node_scope_map.get(clause.meta.span.start) orelse clause.meta.scope_id;
+    const scope_id = checker.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(clause.meta.span)) orelse clause.meta.scope_id;
     checker.current_scope = scope_id;
 
     const f_binding = checker.graph.resolveBinding(scope_id, clause.params[0].pattern.bind.name).?;
@@ -4770,7 +4770,7 @@ test "borrowed parameter does not move binding" {
     try checker.checkProgram(&program);
 
     const clause = program.modules[0].items[0].function.clauses[0];
-    const scope_id = checker.graph.node_scope_map.get(clause.meta.span.start) orelse clause.meta.scope_id;
+    const scope_id = checker.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(clause.meta.span)) orelse clause.meta.scope_id;
     checker.current_scope = scope_id;
 
     const f_binding = checker.graph.resolveBinding(scope_id, clause.params[0].pattern.bind.name).?;

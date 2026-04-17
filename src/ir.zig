@@ -4432,7 +4432,7 @@ test "IR call preserves HIR arg modes" {
     try checker.checkProgram(&program);
 
     const apply_clause = program.modules[0].items[0].function.clauses[0];
-    const clause_scope = collector.graph.node_scope_map.get(apply_clause.meta.span.start) orelse apply_clause.meta.scope_id;
+    const clause_scope = collector.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(apply_clause.meta.span)) orelse apply_clause.meta.scope_id;
     const f_binding = collector.graph.resolveBinding(clause_scope, apply_clause.params[0].pattern.bind.name).?;
     const f_type_id = collector.graph.bindings.items[f_binding].type_id.?.type_id;
     const original_fn_type = checker.store.types.items[f_type_id].function;
@@ -4564,7 +4564,7 @@ test "IR closure call preserves borrow mode without ARC ops" {
     try checker.checkProgram(&program);
 
     const apply_clause = program.modules[0].items[1].function.clauses[0];
-    const clause_scope = collector.graph.node_scope_map.get(apply_clause.meta.span.start) orelse apply_clause.meta.scope_id;
+    const clause_scope = collector.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(apply_clause.meta.span)) orelse apply_clause.meta.scope_id;
     const f_binding = collector.graph.resolveBinding(clause_scope, apply_clause.params[0].pattern.bind.name).?;
     const f_type_id = collector.graph.bindings.items[f_binding].type_id.?.type_id;
     const original_fn_type = checker.store.types.items[f_type_id].function;
@@ -4640,7 +4640,7 @@ test "IR shared opaque call emits retain and release" {
     try checker.checkProgram(&program);
 
     const run_clause = program.modules[0].items[2].function.clauses[0];
-    const clause_scope = collector.graph.node_scope_map.get(run_clause.meta.span.start) orelse run_clause.meta.scope_id;
+    const clause_scope = collector.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(run_clause.meta.span)) orelse run_clause.meta.scope_id;
     const fn_binding = collector.graph.resolveBinding(clause_scope, run_clause.params[0].pattern.bind.name).?;
     const fn_type_id = collector.graph.bindings.items[fn_binding].type_id.?.type_id;
     const original_fn_type = checker.store.types.items[fn_type_id].function;

@@ -1635,7 +1635,7 @@ pub const HirBuilder = struct {
         for (clause.params, 0..) |param, idx| {
             ownerships[idx] = blk: {
                 if (param.pattern.* == .bind) {
-                    const clause_scope = self.graph.node_scope_map.get(clause.meta.span.start) orelse clause.meta.scope_id;
+                    const clause_scope = self.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(clause.meta.span)) orelse clause.meta.scope_id;
                     if (self.graph.resolveBinding(clause_scope, param.pattern.bind.name)) |binding_id| {
                         if (self.graph.bindings.items[binding_id].type_id) |prov| {
                             break :blk self.resolveParamOwnership(param, prov.type_id);
@@ -1666,7 +1666,7 @@ pub const HirBuilder = struct {
         for (clause.params, 0..) |param, idx| {
             param_types[idx] = blk: {
                 if (param.pattern.* == .bind) {
-                    const clause_scope = self.graph.node_scope_map.get(clause.meta.span.start) orelse clause.meta.scope_id;
+                    const clause_scope = self.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(clause.meta.span)) orelse clause.meta.scope_id;
                     if (self.graph.resolveBinding(clause_scope, param.pattern.bind.name)) |binding_id| {
                         if (self.graph.bindings.items[binding_id].type_id) |prov| {
                             break :blk prov.type_id;
@@ -2245,7 +2245,7 @@ pub const HirBuilder = struct {
         const saved_root_scope = self.current_function_root_scope;
         const saved_capture_map = self.current_capture_map;
         const saved_capture_list = self.current_capture_list;
-        self.current_function_root_scope = if (func.clauses.len > 0) self.graph.node_scope_map.get(func.clauses[0].meta.span.start) orelse func.clauses[0].meta.scope_id else null;
+        self.current_function_root_scope = if (func.clauses.len > 0) self.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(func.clauses[0].meta.span)) orelse func.clauses[0].meta.scope_id else null;
         self.current_capture_map = std.AutoHashMap(ast.StringId, u32).init(self.allocator);
         self.current_capture_list = .empty;
 
@@ -2279,31 +2279,12 @@ pub const HirBuilder = struct {
     fn buildClause(self: *HirBuilder, clause: *const ast.FunctionClause) !Clause {
         self.next_local = 0;
         const prev_clause_scope = self.current_clause_scope;
-        // Look up the clause's scope from the node_scope_map. For macro-generated
-        // functions (describe/test macros), span.start is 0 (sentinel). With
-        // multiple modules, position 0 is claimed by whichever module was
-        // collected first, causing scope misparenting. Validate the looked-up
-        // scope belongs to the current module by walking the parent chain.
-        self.current_clause_scope = blk: {
-            if (clause.meta.span.start == 0) {
-                break :blk self.current_module_scope orelse clause.meta.scope_id;
-            }
-            const looked_up = self.graph.node_scope_map.get(clause.meta.span.start) orelse
-                break :blk self.current_module_scope orelse clause.meta.scope_id;
-            if (self.current_module_scope) |mod_scope| {
-                var walk: ?scope_mod.ScopeId = looked_up;
-                while (walk) |sid| {
-                    if (sid == mod_scope) break;
-                    const scope_data = self.graph.getScope(sid);
-                    walk = scope_data.parent;
-                } else {
-                    // The looked_up scope doesn't belong to current module.
-                    // Scope belongs to wrong module — fall back to current module scope
-                    break :blk mod_scope;
-                }
-            }
-            break :blk looked_up;
-        };
+        // Look up the clause's scope from the node_scope_map using the
+        // composite (source_id, span.start) key. This prevents collisions
+        // between AST nodes at the same byte offset in different source files.
+        self.current_clause_scope = self.graph.node_scope_map.get(
+            scope_mod.ScopeGraph.spanKey(clause.meta.span),
+        ) orelse self.current_module_scope orelse clause.meta.scope_id;
         defer self.current_clause_scope = prev_clause_scope;
 
         // Check for inferred signature from the type checker (populated for
@@ -3986,7 +3967,7 @@ test "HIR call args adopt function ownership modes" {
     try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
 
     const apply_clause = program.modules[0].items[0].function.clauses[0];
-    const clause_scope = collector.graph.node_scope_map.get(apply_clause.meta.span.start) orelse apply_clause.meta.scope_id;
+    const clause_scope = collector.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(apply_clause.meta.span)) orelse apply_clause.meta.scope_id;
     const f_binding = collector.graph.resolveBinding(clause_scope, apply_clause.params[0].pattern.bind.name).?;
     const f_type_id = collector.graph.bindings.items[f_binding].type_id.?.type_id;
     const original_fn_type = checker.store.types.items[f_type_id].function;
@@ -4083,7 +4064,7 @@ test "HIR closure calls adopt borrowed ownership mode" {
     try checker.checkProgram(&program);
 
     const apply_clause = program.modules[0].items[0].function.clauses[0];
-    const clause_scope = collector.graph.node_scope_map.get(apply_clause.meta.span.start) orelse apply_clause.meta.scope_id;
+    const clause_scope = collector.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(apply_clause.meta.span)) orelse apply_clause.meta.scope_id;
     const f_binding = collector.graph.resolveBinding(clause_scope, apply_clause.params[0].pattern.bind.name).?;
     const f_type_id = collector.graph.bindings.items[f_binding].type_id.?.type_id;
     const original_fn_type = checker.store.types.items[f_type_id].function;
