@@ -2112,16 +2112,11 @@ pub const HirBuilder = struct {
             }
             if (belongs_to_module) continue; // Already handled via fn_groups
 
-            // Include scope-visible functions from other modules. These are
-            // already macro-expanded and desugared (done on the merged program
-            // in collectAllFromUnits), so no unexpanded if_expr will leak.
-            var decl_list: std.ArrayList(*const ast.FunctionDecl) = .empty;
-            for (family.clauses.items) |clause_ref| {
-                try decl_list.append(self.allocator, clause_ref.decl);
-            }
-            if (decl_list.items.len > 0) {
-                try functions.append(self.allocator, try self.buildMergedFunctionGroup(decl_list.items, mod_scope));
-            }
+            // Skip function families from other modules. Each module's
+            // functions are compiled when that module is processed — including
+            // them here pollutes the namespace and causes anytype
+            // monomorphization to pick up wrong types from foreign functions.
+            continue;
         }
 
         return .{
