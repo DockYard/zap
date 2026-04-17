@@ -1,3 +1,7 @@
+## No Workarounds, Hacks, or Shortcuts
+
+**STRICTLY FORBIDDEN.** Never implement workarounds, hacks, temporary fixes, or shortcuts of any kind. Every solution must be the correct, production-grade, long-term fix — regardless of how difficult, expensive, or time-consuming it is. If a proper fix requires deep architectural changes across multiple files, that is the fix. If it requires changes to the Zig fork, make those changes. If it requires redesigning a data structure, redesign it. Cost and time are not concerns — correctness and quality are. Never choose expediency over correctness. Never paper over a root cause with a band-aid. If you find yourself writing a "temporary" fix, stop — find and implement the real solution.
+
 ## Zap is a Language — Implement Features in Zap Code
 
 **THIS IS THE MOST IMPORTANT RULE. VIOLATIONS ARE UNACCEPTABLE.**
