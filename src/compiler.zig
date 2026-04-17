@@ -795,7 +795,10 @@ fn compileSingleModuleIr(
     defer type_checker.deinit();
 
     type_checker.checkProgram(&desugared) catch {};
-    type_checker.checkUnusedBindings() catch {};
+    // Skip checkUnusedBindings — the type checker has a shared scope graph
+    // but only visits this module's bindings. Checking all bindings here
+    // would report false "unused" warnings for bindings in other modules.
+    // Unused binding warnings are emitted during diagnostics instead.
     for (type_checker.errors.items) |type_err| {
         ctx.diag_engine.reportDiagnostic(.{
             .severity = type_err.severity orelse type_severity,
