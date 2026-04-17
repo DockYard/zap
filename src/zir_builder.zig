@@ -2140,6 +2140,7 @@ pub const ZirDriver = struct {
                     // was stripped during expansion.
                     const target_func = self.findFunctionByName(resolved_call_name) orelse
                         self.findFunctionByLocalName(resolved_call_name);
+                    // Debug removed
                     const target_module = if (target_func) |tf| tf.module_name else null;
                     const is_cross_module = blk: {
                         if (target_module == null and self.current_emit_module == null) break :blk false;
@@ -2148,7 +2149,10 @@ pub const ZirDriver = struct {
                     };
 
                     if (is_cross_module and target_module != null) {
-                        const target_local = if (target_func) |tf| tf.local_name else cn.name;
+                        const target_local = if (target_func) |tf|
+                            (if (tf.local_name.len > 0) tf.local_name else cn.name)
+                        else
+                            cn.name;
                         const ref = try self.emitCrossModuleCall(target_module.?, target_local, args.items);
                         try self.setLocal(cn.dest, ref);
                     } else {

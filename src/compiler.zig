@@ -297,48 +297,48 @@ pub fn collectAllFromUnits(
     }
 
     const program = try mergePrograms(alloc, parsed_programs);
-    const module_programs = try buildModulePrograms(alloc, &program, &interner);
 
-    // Collect declarations from explicit per-module programs instead of
-    // rebuilding the graph from the merged AST.
+    // Collect declarations from the merged program first (needed for
+    // macro expansion to resolve Kernel macros etc.)
     step += 1;
     if (options.show_progress) std.debug.print("\r\x1b[K  [{d}/{d}] Collect", .{ step, total_steps });
 
     var collector = zap.Collector.init(alloc, &interner);
-    for (module_programs) |entry| {
-        collector.collectProgramSurface(&entry.program) catch {
-            for (collector.errors.items) |collect_err| {
-                diag_engine.err(collect_err.message, collect_err.span) catch {};
-            }
-            if (options.show_progress) std.debug.print("\r\x1b[K", .{});
-            emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
-            return error.CollectFailed;
-        };
-    }
-
-    // Collect top-level items (struct, enum, etc.) from the merged program.
-    // Per-module programs only contain modules; top_items live on the merged program.
-    if (program.top_items.len > 0) {
-        const top_only = ast.Program{ .modules = &.{}, .top_items = program.top_items };
-        collector.collectProgramSurface(&top_only) catch {
-            for (collector.errors.items) |collect_err| {
-                diag_engine.err(collect_err.message, collect_err.span) catch {};
-            }
-            if (options.show_progress) std.debug.print("\r\x1b[K", .{});
-            emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
-            return error.CollectFailed;
-        };
-    }
-    const program_slices = try alloc.alloc(ast.Program, module_programs.len);
-    for (module_programs, 0..) |entry, i| program_slices[i] = entry.program;
-    collector.finalizeCollectedPrograms(program_slices) catch {
-        for (collector.errors.items) |collect_err| {
-            diag_engine.err(collect_err.message, collect_err.span) catch {};
+    {
+        const pre_module_programs = try buildModulePrograms(alloc, &program, &interner);
+        for (pre_module_programs) |entry| {
+            collector.collectProgramSurface(&entry.program) catch {
+                for (collector.errors.items) |collect_err| {
+                    diag_engine.err(collect_err.message, collect_err.span) catch {};
+                }
+                if (options.show_progress) std.debug.print("\r\x1b[K", .{});
+                emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
+                return error.CollectFailed;
+            };
         }
-        if (options.show_progress) std.debug.print("\r\x1b[K", .{});
-        emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
-        return error.CollectFailed;
-    };
+
+        if (program.top_items.len > 0) {
+            const top_only = ast.Program{ .modules = &.{}, .top_items = program.top_items };
+            collector.collectProgramSurface(&top_only) catch {
+                for (collector.errors.items) |collect_err| {
+                    diag_engine.err(collect_err.message, collect_err.span) catch {};
+                }
+                if (options.show_progress) std.debug.print("\r\x1b[K", .{});
+                emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
+                return error.CollectFailed;
+            };
+        }
+        const pre_slices = try alloc.alloc(ast.Program, pre_module_programs.len);
+        for (pre_module_programs, 0..) |entry, i| pre_slices[i] = entry.program;
+        collector.finalizeCollectedPrograms(pre_slices) catch {
+            for (collector.errors.items) |collect_err| {
+                diag_engine.err(collect_err.message, collect_err.span) catch {};
+            }
+            if (options.show_progress) std.debug.print("\r\x1b[K", .{});
+            emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
+            return error.CollectFailed;
+        };
+    }
 
     for (collector.errors.items) |collect_err| {
         diag_engine.err(collect_err.message, collect_err.span) catch {};
@@ -349,11 +349,51 @@ pub fn collectAllFromUnits(
         return error.CollectFailed;
     }
 
+    // Run macro expansion and desugaring on the MERGED program — all modules
+    // together. This ensures every if_expr is expanded to case_expr, every
+    // pipe is desugared, etc., before the AST is split into per-module programs.
+    // The scope graph (collector) is already populated, so macros can resolve.
+    step += 1;
+    if (options.show_progress) std.debug.print("\r\x1b[K  [{d}/{d}] Macro expand", .{ step, total_steps });
+
+    var macro_engine = zap.MacroEngine.init(alloc, &interner, &collector.graph);
+    defer macro_engine.deinit();
+    const expanded_program = macro_engine.expandProgram(&program) catch {
+        for (macro_engine.errors.items) |macro_err| {
+            diag_engine.err(macro_err.message, macro_err.span) catch {};
+        }
+        if (options.show_progress) std.debug.print("\r\x1b[K", .{});
+        emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
+        return error.MacroExpansionFailed;
+    };
+    for (macro_engine.errors.items) |macro_err| {
+        diag_engine.err(macro_err.message, macro_err.span) catch {};
+    }
+    if (diag_engine.hasErrors()) {
+        if (options.show_progress) std.debug.print("\r\x1b[K", .{});
+        emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
+        return error.MacroExpansionFailed;
+    }
+
+    step += 1;
+    if (options.show_progress) std.debug.print("\r\x1b[K  [{d}/{d}] Desugar", .{ step, total_steps });
+
+    var desugarer = zap.Desugarer.init(alloc, &interner);
+    const desugared_program = desugarer.desugarProgram(&expanded_program) catch {
+        diag_engine.err("Error during desugaring", .{ .start = 0, .end = 0 }) catch {};
+        if (options.show_progress) std.debug.print("\r\x1b[K", .{});
+        emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
+        return error.DesugarFailed;
+    };
+
+    // NOW split into per-module programs from the expanded/desugared AST.
+    // All if_expr nodes are gone, all pipes desugared, all macros expanded.
+    const module_programs = try buildModulePrograms(alloc, &desugared_program, &interner);
     const units = try buildCompilationUnits(alloc, module_programs, all_source_units);
 
     return .{
         .alloc = alloc,
-        .merged_program = program,
+        .merged_program = desugared_program,
         .module_programs = module_programs,
         .units = units,
         .source_units = all_source_units,
@@ -700,8 +740,15 @@ fn compileSingleModuleIr(
 ) CompileError!ir.Program {
     const type_severity: zap.Severity = if (options.strict_types) .@"error" else .warning;
 
+    // Macro expansion and desugaring were already run on the merged program
+    // in collectAllFromUnits. The mod_program AST is fully expanded — no
+    // if_expr, no pipe operators, no unexpanded macros. Proceed directly
+    // to type checking.
+
+    // Attribute substitution still runs per-module since @computed values
+    // are evaluated per-module via CTFE.
     var subst_errors: std.ArrayListUnmanaged(zap.attr_substitute.SubstitutionError) = .empty;
-    const substituted = zap.attr_substitute.substituteAttributes(
+    const desugared = zap.attr_substitute.substituteAttributes(
         alloc,
         mod_program,
         &ctx.collector.graph,
@@ -719,30 +766,6 @@ fn compileSingleModuleIr(
         emitContextDiagnostics(ctx, alloc);
         return error.DesugarFailed;
     }
-
-    var macro_engine = zap.MacroEngine.init(alloc, &ctx.interner, &ctx.collector.graph);
-    defer macro_engine.deinit();
-    const expanded = macro_engine.expandProgram(&substituted) catch {
-        for (macro_engine.errors.items) |macro_err| {
-            ctx.diag_engine.err(macro_err.message, macro_err.span) catch {};
-        }
-        emitContextDiagnostics(ctx, alloc);
-        return error.MacroExpansionFailed;
-    };
-    for (macro_engine.errors.items) |macro_err| {
-        ctx.diag_engine.err(macro_err.message, macro_err.span) catch {};
-    }
-    if (ctx.diag_engine.hasErrors()) {
-        emitContextDiagnostics(ctx, alloc);
-        return error.MacroExpansionFailed;
-    }
-
-    var desugarer = zap.Desugarer.init(alloc, &ctx.interner);
-    const desugared = desugarer.desugarProgram(&expanded) catch {
-        ctx.diag_engine.err("Error during desugaring", .{ .start = 0, .end = 0 }) catch {};
-        emitContextDiagnostics(ctx, alloc);
-        return error.DesugarFailed;
-    };
 
     var type_checker = zap.types.TypeChecker.init(alloc, &ctx.interner, &ctx.collector.graph);
     defer type_checker.deinit();

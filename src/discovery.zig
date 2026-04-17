@@ -729,7 +729,7 @@ test "discover: circular dependency detected" {
     try std.testing.expectError(error.CircularDependency, result);
 }
 
-test "discover: module not found" {
+test "discover: unresolvable references are silently skipped" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -737,7 +737,8 @@ test "discover: module not found" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    // App references NonExistent which doesn't exist
+    // App references NonExistent which doesn't exist — should be skipped
+    // (might be a union variant, struct name, or other non-module identifier)
     try tmp_dir.dir.writeFile(std.Options.debug_io, .{
         .sub_path = "app.zap",
         .data = "pub module App {\n  pub fn main() -> i64 {\n    NonExistent.foo()\n  }\n}\n",
@@ -746,8 +747,15 @@ test "discover: module not found" {
     const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
     const roots = &[_]SourceRoot{.{ .name = "project", .path = tmp_path }};
 
-    const result = discover(alloc, "App", roots, &BUILTIN_TYPE_NAMES, null);
-    try std.testing.expectError(error.ModuleNotFound, result);
+    // Discovery succeeds — unresolvable references don't cause errors.
+    // The compiler will catch genuinely missing modules during compilation.
+    var graph = try discover(alloc, "App", roots, &BUILTIN_TYPE_NAMES, null);
+    defer graph.deinit();
+
+    // App was discovered
+    try std.testing.expect(graph.module_to_file.contains("App"));
+    // NonExistent was NOT discovered (silently skipped)
+    try std.testing.expect(!graph.module_to_file.contains("NonExistent"));
 }
 
 test "discover: module found in dep root" {
