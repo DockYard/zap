@@ -443,13 +443,10 @@ pub fn collectAllFromUnits(
     };
 }
 
-/// Pass 2: Compile the merged program through macro expansion, desugaring,
-/// type checking, HIR, and IR.
-///
-/// This processes all files together (the per-file parallelization will be
-/// added when the type checker and HIR builder support single-module operation).
-/// Returns an ir.Program covering all modules.
-pub fn compileFiles(
+/// Compile the build.zap manifest through the full pipeline.
+/// This is ONLY used by the builder for CTFE manifest evaluation —
+/// NOT for project compilation. Project compilation uses compileModuleByModule.
+pub fn compileForCtfe(
     alloc: std.mem.Allocator,
     ctx: *CompilationContext,
     options: CompileOptions,
@@ -756,19 +753,6 @@ fn mergeAndFinalizeWithIo(
     };
 
     return .{ .ir_program = ir_program.*, .analysis_context = pipeline_result.context };
-}
-
-/// Compile using the per-file architecture: collectAll → compileFiles → result.
-/// This is the new entry point that replaces compileFrontend for the
-/// import-driven pipeline.
-pub fn compilePerFile(
-    alloc: std.mem.Allocator,
-    source: []const u8,
-    file_path: []const u8,
-    options: CompileOptions,
-) CompileError!CompileResult {
-    var ctx = try collectAll(alloc, source, file_path, options);
-    return try compileFiles(alloc, &ctx, options);
 }
 
 fn compileSingleModuleIr(

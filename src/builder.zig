@@ -98,7 +98,7 @@ pub fn ctfeManifestDetailed(
     var ctx = compiler.collectAllFromUnits(alloc, source_units.items, .{
         .show_progress = false,
     }) catch return error.CompileFailed;
-    const result = compiler.compileFiles(alloc, &ctx, .{
+    const result = compiler.compileForCtfe(alloc, &ctx, .{
         .show_progress = false,
     }) catch return error.CompileFailed;
 

@@ -1079,12 +1079,14 @@ fn compileProjectFrontend(
 ) !compiler.CompileResult {
     var ctx = try compiler.collectAllFromUnits(alloc, source_units, options);
 
-    // Always derive module_order from the parsed module programs.
-    // Import-driven discovery provides ordering hints via level_boundaries
-    // but the authoritative list of modules is always ctx.module_programs.
-    // Use compileFiles (all-at-once) — processes all modules together
-    // through type check → HIR → IR → analysis.
-    return try compiler.compileFiles(alloc, &ctx, options);
+    // Derive module_order from the parsed module programs and compile
+    // each module independently through the per-module pipeline.
+    var names: std.ArrayListUnmanaged([]const u8) = .empty;
+    for (ctx.module_programs) |mp| {
+        names.append(alloc, mp.name) catch {};
+    }
+
+    return try compiler.compileModuleByModule(alloc, &ctx, names.items, options);
 }
 
 /// Compute a build cache key using SHA-256 (Zig 0.16 std.crypto) for
