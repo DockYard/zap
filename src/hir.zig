@@ -2279,7 +2279,31 @@ pub const HirBuilder = struct {
     fn buildClause(self: *HirBuilder, clause: *const ast.FunctionClause) !Clause {
         self.next_local = 0;
         const prev_clause_scope = self.current_clause_scope;
-        self.current_clause_scope = self.graph.node_scope_map.get(clause.meta.span.start) orelse clause.meta.scope_id;
+        // Look up the clause's scope from the node_scope_map. For macro-generated
+        // functions (describe/test macros), span.start is 0 (sentinel). With
+        // multiple modules, position 0 is claimed by whichever module was
+        // collected first, causing scope misparenting. Validate the looked-up
+        // scope belongs to the current module by walking the parent chain.
+        self.current_clause_scope = blk: {
+            if (clause.meta.span.start == 0) {
+                break :blk self.current_module_scope orelse clause.meta.scope_id;
+            }
+            const looked_up = self.graph.node_scope_map.get(clause.meta.span.start) orelse
+                break :blk self.current_module_scope orelse clause.meta.scope_id;
+            if (self.current_module_scope) |mod_scope| {
+                var walk: ?scope_mod.ScopeId = looked_up;
+                while (walk) |sid| {
+                    if (sid == mod_scope) break;
+                    const scope_data = self.graph.getScope(sid);
+                    walk = scope_data.parent;
+                } else {
+                    // The looked_up scope doesn't belong to current module.
+                    // Scope belongs to wrong module — fall back to current module scope
+                    break :blk mod_scope;
+                }
+            }
+            break :blk looked_up;
+        };
         defer self.current_clause_scope = prev_clause_scope;
 
         // Check for inferred signature from the type checker (populated for
