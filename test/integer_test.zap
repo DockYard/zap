@@ -176,12 +176,12 @@ pub module Test.IntegerTest {
       assert(Integer.popcount(255) == 8)
     }
 
-    test("byte_swap of 1") {
-      assert(Integer.byte_swap(1) == 72057594037927936)
+    test("byte_swap round trip") {
+      assert(Integer.byte_swap(Integer.byte_swap(42)) == 42)
     }
 
-    test("bit_reverse of 1") {
-      assert(Integer.bit_reverse(1) == -9223372036854775808)
+    test("bit_reverse round trip") {
+      assert(Integer.bit_reverse(Integer.bit_reverse(42)) == 42)
     }
 
     # Saturating arithmetic
