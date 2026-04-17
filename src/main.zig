@@ -936,7 +936,7 @@ fn buildTarget(
     const hash_file = try std.fmt.allocPrint(alloc, ".zap-cache/{s}.hash", .{target_name});
 
     const cache_valid = blk: {
-        const stored = std.Io.Dir.cwd().readFileAlloc(global_io, hash_file, alloc, .limited(16)) catch break :blk false;
+        const stored = std.Io.Dir.cwd().readFileAlloc(global_io, hash_file, alloc, .limited(64)) catch break :blk false;
         defer alloc.free(stored);
         if (!std.mem.eql(u8, stored, cache_key_hex)) break :blk false;
         std.Io.Dir.cwd().access(global_io, output_path, .{}) catch break :blk false;
