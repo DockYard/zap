@@ -699,7 +699,12 @@ fn buildTarget(
         } else |_| {}
     }
 
-    if (config.paths.len == 0 and config.root != null) {
+    if (config.root == null) {
+        std.debug.print("Error: build.zap must specify a root entry point\n", .{});
+        std.process.exit(1);
+    }
+
+    {
         // Import-driven discovery from the entry point
         const root_spec = config.root.?;
 
@@ -772,19 +777,6 @@ fn buildTarget(
         for (file_graph.level_boundaries.items) |boundary| {
             try level_boundaries.append(alloc, boundary);
         }
-    } else {
-        // Glob-based file collection from paths
-        for (config.paths) |pattern| {
-            try globCollectFiles(alloc, project_root, pattern, &source_files);
-        }
-        // Also include dep source files (e.g., stdlib from deps)
-        for (source_roots.items) |root| {
-            if (std.mem.startsWith(u8, root.name, "dep:") or
-                std.mem.eql(u8, root.name, "zap_stdlib"))
-            {
-                try globCollectFiles(alloc, root.path, "*.zap", &source_files);
-            }
-        }
     }
 
     // Deduplicate source files (explicit paths and dep paths may overlap)
@@ -848,9 +840,8 @@ fn buildTarget(
         // Compute the relative path from its source root for validation.
         // Check each source root to find which one this file is under.
         const lib_rel = blk: {
-            if (config.paths.len == 0) {
-                // Import-driven: check the source_roots we built
-                // Normalize paths by stripping leading "./" for consistent matching
+            {
+                // Check source_roots to find which one this file is under.
                 const norm_sf = if (std.mem.startsWith(u8, sf, "./")) sf[2..] else sf;
                 for (source_roots.items) |root| {
                     const norm_root = if (std.mem.startsWith(u8, root.path, "./"))
@@ -1088,15 +1079,14 @@ fn compileProjectFrontend(
 ) !compiler.CompileResult {
     var ctx = try compiler.collectAllFromUnits(alloc, source_units, options);
 
-    // When module_order is not set (glob-based paths), derive it from the
-    // parsed module programs. This replaces the old legacy merge path.
-    const module_order = options.module_order orelse blk: {
-        var names: std.ArrayListUnmanaged([]const u8) = .empty;
-        for (ctx.module_programs) |mp| {
-            names.append(alloc, mp.name) catch {};
-        }
-        break :blk names.items;
-    };
+    // Always derive module_order from the parsed module programs.
+    // Import-driven discovery provides ordering hints via level_boundaries
+    // but the authoritative list of modules is always ctx.module_programs.
+    var names: std.ArrayListUnmanaged([]const u8) = .empty;
+    for (ctx.module_programs) |mp| {
+        names.append(alloc, mp.name) catch {};
+    }
+    const module_order = names.items;
 
     return try compiler.compileModuleByModule(alloc, &ctx, module_order, options);
 }
@@ -1404,9 +1394,8 @@ const IncrementalWatchState = struct {
                 try level_boundaries.append(alloc, boundary);
             }
         } else {
-            for (config.paths) |pattern| {
-                try globCollectFiles(alloc, project_root, pattern, &source_files);
-            }
+            std.debug.print("Error: build.zap must specify a root entry point\n", .{});
+            return error.ManifestError;
         }
 
         // Read source units
