@@ -23,7 +23,7 @@ pub module Enum {
         Enum.map([], fn(x) { x + 1 })          # => []
     """
 
-  pub fn map(list :: [i64], callback :: (i64 -> i64)) -> [i64] {
+  pub fn map(list :: [element], callback :: (element -> result)) -> [result] {
     :zig.ListCell.mapFn(list, callback)
   }
 
@@ -36,7 +36,7 @@ pub module Enum {
         Enum.filter([1, 2, 3], fn(x) { x > 10 })     # => []
     """
 
-  pub fn filter(list :: [i64], predicate :: (i64 -> Bool)) -> [i64] {
+  pub fn filter(list :: [element], predicate :: (element -> Bool)) -> [element] {
     :zig.ListCell.filterFn(list, predicate)
   }
 
@@ -49,7 +49,7 @@ pub module Enum {
         Enum.reject([1, 2, 3, 4], fn(x) { x > 2 })  # => [1, 2]
     """
 
-  pub fn reject(list :: [i64], predicate :: (i64 -> Bool)) -> [i64] {
+  pub fn reject(list :: [element], predicate :: (element -> Bool)) -> [element] {
     :zig.ListCell.rejectFn(list, predicate)
   }
 
@@ -77,7 +77,7 @@ pub module Enum {
         Enum.each([1, 2, 3], fn(x) { IO.puts(Integer.to_string(x)) })
     """
 
-  pub fn each(list :: [i64], callback :: (i64 -> i64)) -> [i64] {
+  pub fn each(list :: [element], callback :: (element -> element)) -> [element] {
     :zig.ListCell.eachFn(list, callback)
   }
 
@@ -91,7 +91,7 @@ pub module Enum {
         Enum.find([1, 2], 0, fn(x) { x > 10 })        # => 0
     """
 
-  pub fn find(list :: [i64], default :: i64, predicate :: (i64 -> Bool)) -> i64 {
+  pub fn find(list :: [element], default :: element, predicate :: (element -> Bool)) -> element {
     :zig.ListCell.findFn(list, default, predicate)
   }
 
@@ -104,7 +104,7 @@ pub module Enum {
         Enum.any?([1, 2, 3], fn(x) { x > 10 })  # => false
     """
 
-  pub fn any?(list :: [i64], predicate :: (i64 -> Bool)) -> Bool {
+  pub fn any?(list :: [element], predicate :: (element -> Bool)) -> Bool {
     :zig.ListCell.anyFn(list, predicate)
   }
 
@@ -117,7 +117,7 @@ pub module Enum {
         Enum.all?([2, 4, 6], fn(x) { x > 3 })   # => false
     """
 
-  pub fn all?(list :: [i64], predicate :: (i64 -> Bool)) -> Bool {
+  pub fn all?(list :: [element], predicate :: (element -> Bool)) -> Bool {
     :zig.ListCell.allFn(list, predicate)
   }
 
@@ -129,7 +129,7 @@ pub module Enum {
         Enum.count([1, 2, 3, 4, 5], fn(x) { x > 2 })  # => 3
     """
 
-  pub fn count(list :: [i64], predicate :: (i64 -> Bool)) -> i64 {
+  pub fn count(list :: [element], predicate :: (element -> Bool)) -> i64 {
     :zig.ListCell.countFn(list, predicate)
   }
 
@@ -227,7 +227,7 @@ pub module Enum {
         Enum.take([1, 2, 3], 0)         # => []
     """
 
-  pub fn take(list :: [i64], count :: i64) -> [i64] {
+  pub fn take(list :: [element], count :: i64) -> [element] {
     List.take(list, count)
   }
 
@@ -243,7 +243,7 @@ pub module Enum {
         Enum.drop([1, 2, 3], 0)         # => [1, 2, 3]
     """
 
-  pub fn drop(list :: [i64], count :: i64) -> [i64] {
+  pub fn drop(list :: [element], count :: i64) -> [element] {
     List.drop(list, count)
   }
 
@@ -256,7 +256,7 @@ pub module Enum {
         Enum.reverse([])          # => []
     """
 
-  pub fn reverse(list :: [i64]) -> [i64] {
+  pub fn reverse(list :: [element]) -> [element] {
     List.reverse(list)
   }
 
@@ -270,7 +270,7 @@ pub module Enum {
         Enum.member?([], 1)          # => false
     """
 
-  pub fn member?(list :: [i64], value :: i64) -> Bool {
+  pub fn member?(list :: [element], value :: element) -> Bool {
     List.contains?(list, value)
   }
 
@@ -284,7 +284,7 @@ pub module Enum {
         Enum.at([10, 20, 30], 0)  # => 10
     """
 
-  pub fn at(list :: [i64], index :: i64) -> i64 {
+  pub fn at(list :: [element], index :: i64) -> element {
     List.at(list, index)
   }
 
@@ -298,7 +298,7 @@ pub module Enum {
         Enum.concat([1, 2], [])       # => [1, 2]
     """
 
-  pub fn concat(first :: [i64], second :: [i64]) -> [i64] {
+  pub fn concat(first :: [element], second :: [element]) -> [element] {
     List.concat(first, second)
   }
 
@@ -312,7 +312,7 @@ pub module Enum {
         Enum.uniq([1, 1, 1])         # => [1]
     """
 
-  pub fn uniq(list :: [i64]) -> [i64] {
+  pub fn uniq(list :: [element]) -> [element] {
     List.uniq(list)
   }
 
@@ -325,7 +325,7 @@ pub module Enum {
         Enum.empty?([1, 2, 3]) # => false
     """
 
-  pub fn empty?(list :: [i64]) -> Bool {
+  pub fn empty?(list :: [element]) -> Bool {
     List.empty?(list)
   }
 }

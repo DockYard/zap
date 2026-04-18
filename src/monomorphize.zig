@@ -244,29 +244,25 @@ const MonomorphContext = struct {
                 var subs = SubstitutionMap.init(self.allocator);
                 defer subs.deinit();
 
-                var can_specialize = true;
+                // Unify argument types with parameter types. UNKNOWN arguments
+                // are skipped rather than failing — partial unification allows
+                // type variables to be bound from the arguments that ARE known
+                // (e.g., binding element=i64 from the list arg even when the
+                // callback arg is an unresolved function reference).
                 for (first_clause.params, call.args) |param, arg| {
                     var arg_type = arg.expr.type_id;
-                    // For UNKNOWN arguments (e.g., empty list []), infer type from
-                    // the parameter. If the parameter is list(type_var), check if the
-                    // arg expression is a list_init — if so, default the element type
-                    // to i64 (the default list element type).
+                    // Empty list default
                     if (arg_type == types_mod.TypeStore.UNKNOWN) {
                         const param_typ = self.store.getType(param.type_id);
                         if (std.meta.activeTag(param_typ) == .list) {
                             if (arg.expr.kind == .list_init) {
-                                // Empty list — default to list(i64)
                                 arg_type = self.store.addType(.{ .list = .{ .element = types_mod.TypeStore.I64 } }) catch types_mod.TypeStore.UNKNOWN;
                             }
                         }
                     }
-                    if (!(self.store.unify(param.type_id, arg_type, &subs) catch false)) {
-                        can_specialize = false;
-                        break;
-                    }
+                    if (arg_type == types_mod.TypeStore.UNKNOWN or arg_type == types_mod.TypeStore.ERROR) continue;
+                    _ = self.store.unify(param.type_id, arg_type, &subs) catch {};
                 }
-
-                if (!can_specialize) return;
 
                 // Collect concrete type args sorted by type variable ID for determinism
                 var type_args: std.ArrayListUnmanaged(TypeId) = .empty;
