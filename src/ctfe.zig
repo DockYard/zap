@@ -1171,9 +1171,9 @@ pub const Interpreter = struct {
             .interner = null,
             .current_attribute_context = null,
         };
-        // Build name -> id index
-        for (program.functions, 0..) |func, i| {
-            interp.function_by_name.put(allocator, func.name, @intCast(i)) catch {};
+        // Build name -> id index (use func.id, NOT array index)
+        for (program.functions) |func| {
+            interp.function_by_name.put(allocator, func.name, func.id) catch {};
         }
         return interp;
     }
@@ -1230,7 +1230,7 @@ pub const Interpreter = struct {
         if (self.persistent_cache) |*pc| {
             if (self.call_stack.items.len == 0) {
                 const pk = PersistentCache.cacheKeyFor(
-                    self.program.functions[function_id].name,
+                    func.name,
                     cache_key.function_hash,
                     cache_key.args_hash,
                     cache_key.capability_flags,
@@ -2108,13 +2108,9 @@ pub const Interpreter = struct {
             .call_dispatch => |cd| {
                 // Dynamic dispatch by group_id — resolve to function by ID
                 const args = try self.collectLocals(cd.args, frame);
-                if (cd.group_id < self.program.functions.len) {
-                    const result = try self.evalFunction(cd.group_id, args);
-                    frame.setLocal(cd.dest, result);
-                } else {
-                    try self.emitError(.undefined_function, "dispatch group not found");
-                    return error.CtfeFailure;
-                }
+                // Use evalFunction which does ID-based lookup (not array index)
+                const result = try self.evalFunction(cd.group_id, args);
+                frame.setLocal(cd.dest, result);
                 return .continued;
             },
             .jump => |j| {
@@ -2671,11 +2667,14 @@ pub const Interpreter = struct {
 
     fn execFunctionBlocksFromCurrent(self: *Interpreter, frame: *Frame) CtfeInterpretError!CtValue {
         const function_id = frame.function_id;
-        if (function_id >= self.program.functions.len) {
+        // Look up function by ID, not array index
+        const func = blk: {
+            for (self.program.functions) |*f| {
+                if (f.id == function_id) break :blk f;
+            }
             try self.emitError(.undefined_function, "invalid function id");
             return error.CtfeFailure;
-        }
-        const func = &self.program.functions[function_id];
+        };
         while (true) {
             const current_label = frame.current_block_label orelse {
                 try self.emitError(.type_error, "missing current block label");
@@ -3243,12 +3242,14 @@ pub const Interpreter = struct {
             return error.CtfeFailure;
         }
 
-        if (function_id >= self.program.functions.len) {
+        // Look up function by ID, not array index
+        const func = blk: {
+            for (self.program.functions) |*f| {
+                if (f.id == function_id) break :blk f;
+            }
             try self.emitError(.undefined_function, "invalid closure function id");
             return error.CtfeFailure;
-        }
-
-        const func = &self.program.functions[function_id];
+        };
         var frame = Frame.init(self.allocator, func, args) catch return error.OutOfMemory;
         defer frame.deinit(self.allocator);
         frame.captures = captures;
