@@ -47,7 +47,7 @@ pub module Test.FunctionTest {
     "Hello, " <> name <> "!"
   }
 
-  fn identity(x :: a) -> a {
+  fn identity(x :: element) -> element {
     x
   }
 }

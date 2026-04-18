@@ -30,35 +30,35 @@ What's missing:
 **Generic functions** — type variables are implicitly introduced by lowercase type names in signatures:
 
 ```zap
-pub fn identity(x :: a) -> a {
+pub fn identity(x :: element) -> element {
   x
 }
 
-pub fn map(list :: [a], f :: (a -> b)) -> [b] {
+pub fn map(list :: [element], f :: (element -> result)) -> [result] {
   # ...
 }
 ```
 
-Lowercase type names (`a`, `b`, `element`, `key`, `value`) that don't resolve to a known type are inferred as type parameters. This matches Haskell/Elixir convention and avoids Rust-style `<T>` angle bracket syntax.
+Lowercase type names (`element`, `result`, `key`, `value`, `accumulator`) that don't resolve to a known type are inferred as type parameters. Use descriptive names — not single letters. This matches Haskell/Elixir convention and avoids Rust-style `<T>` angle bracket syntax.
 
 **Protocol declarations:**
 
 ```zap
 protocol Enumerable(element :: type) {
-  fn reduce(self, acc :: b, f :: (element, b -> b)) -> b
+  fn reduce(self, acc :: accumulator, f :: (element, accumulator -> accumulator)) -> accumulator
 }
 ```
 
 - `protocol` is a new keyword
 - `element :: type` declares a type parameter (the associated type for what the collection yields)
 - `self` is an implicit first parameter referring to the implementing type
-- Functions can introduce their own type variables (`b`)
+- Functions can introduce their own type variables (`accumulator`)
 
 **Protocol implementations:**
 
 ```zap
-impl Enumerable(a) for [a] {
-  fn reduce(self, acc :: b, f :: (a, b -> b)) -> b {
+impl Enumerable(element) for [element] {
+  fn reduce(self, acc :: accumulator, f :: (element, accumulator -> accumulator)) -> accumulator {
     case self {
       [] -> acc
       [head | tail] -> reduce(tail, f.(head, acc), f)
@@ -66,23 +66,23 @@ impl Enumerable(a) for [a] {
   }
 }
 
-impl Enumerable({k, v}) for %{k => v} {
-  fn reduce(self, acc :: b, f :: ({k, v}, b -> b)) -> b {
+impl Enumerable({key, value}) for %{key => value} {
+  fn reduce(self, acc :: accumulator, f :: ({key, value}, accumulator -> accumulator)) -> accumulator {
     :zig.map_reduce(self, acc, f)
   }
 }
 ```
 
 - `impl Protocol(TypeArgs) for ConcreteType` syntax
-- The implementing type can itself be generic (`[a]`, `%{k => v}`)
+- The implementing type can itself be generic (`[element]`, `%{key => value}`)
 - Implementation functions must match the protocol's signature
 
 **Using protocols in function signatures:**
 
 ```zap
-pub fn map(coll :: Enumerable(a), f :: (a -> b)) -> [b] {
-  Enumerable.reduce(coll, [], fn(elem, acc) {
-    List.append(acc, f.(elem))
+pub fn map(coll :: Enumerable(element), f :: (element -> result)) -> [result] {
+  Enumerable.reduce(coll, [], fn(item, acc) {
+    List.append(acc, f.(item))
   })
 }
 ```
@@ -100,15 +100,15 @@ Enum.map([1, 2, 3], fn(x) { x * 2 })
 
 It knows:
 1. `coll` has type `[i64]`
-2. `Enumerable(a) for [a]` matches with `a = i64`
+2. `Enumerable(element) for [element]` matches with `element = i64`
 3. `Enum.map` is monomorphized to `Enum.map__list_i64_i64`
-4. `Enumerable.reduce` calls within are resolved to the `[a]` impl, also monomorphized
+4. `Enumerable.reduce` calls within are resolved to the `[element]` impl, also monomorphized
 
 This produces zero-overhead native code — direct function calls, no indirection.
 
 For `Enum.map(%{"a" => 1, "b" => 2}, fn({k, v}) { v })`:
 1. `coll` has type `%{String => i64}`
-2. `Enumerable({k, v}) for %{k => v}` matches with `k = String, v = i64`
+2. `Enumerable({key, value}) for %{key => value}` matches with `key = String, value = i64`
 3. Different monomorphized version generated
 
 ### ZIR Lowering
@@ -147,7 +147,7 @@ In `resolveTypeExpr()` (line 3220), when resolving a `TypeNameExpr`:
 2. If found → concrete type (existing behavior)
 3. If **not found** and the name is lowercase → create a fresh type variable
 
-Add a `type_var_scope: std.StringHashMap(TypeVarId)` to `TypeChecker` that maps type variable names to their IDs within the current function scope. This ensures `a` in parameter 1 and `a` in parameter 2 refer to the same type variable.
+Add a `type_var_scope: std.StringHashMap(TypeVarId)` to `TypeChecker` that maps type variable names to their IDs within the current function scope. This ensures `element` in parameter 1 and `element` in the return type refer to the same type variable.
 
 ```zig
 // In resolveTypeExpr, TypeExpr.name branch:
@@ -170,10 +170,10 @@ The `type_var_scope` is reset at the start of each function family's type check.
 #### 1.3 Type Checker — unify type variables at call sites
 
 When type-checking a call like `Enum.map(["hello", "world"], fn(s) { ... })`:
-1. The callee's signature has type variables `a`, `b`
+1. The callee's signature has type variables `element`, `result`
 2. The argument `["hello", "world"]` has type `[String]`
-3. Unify `[a]` with `[String]` → binds `a = String`
-4. The callback `fn(s) { ... }` has inferred type `(String -> ?)` — unify with `(a -> b)` → confirms `a = String`, binds `b` to the callback's return type
+3. Unify `[element]` with `[String]` → binds `element = String`
+4. The callback `fn(s) { ... }` has inferred type `(String -> ?)` — unify with `(element -> result)` → confirms `element = String`, binds `result` to the callback's return type
 
 The existing unification algorithm (`types.zig:496-570`) already handles this. The change is ensuring type variables from the callee's signature are instantiated fresh for each call site and unified with the argument types.
 
@@ -201,7 +201,7 @@ Change all function signatures from monomorphic to generic:
 pub fn map(list :: [i64], callback :: (i64 -> i64)) -> [i64]
 
 # After
-pub fn map(list :: [a], callback :: (a -> b)) -> [b]
+pub fn map(list :: [element], callback :: (element -> result)) -> [result]
 ```
 
 Do this for all Enum functions: `map`, `filter`, `reject`, `reduce`, `each`, `find`, `any?`, `all?`, `count`, `sum`, `product`, `max`, `min`, `sort`, `take`, `drop`, `reverse`, `member?`, `at`, `empty?`, `concat`, `uniq`.
@@ -212,13 +212,13 @@ Some functions have natural constraints (e.g., `sum` only works on numeric types
 
 **File: `lib/list.zap`**
 
-Same treatment — change `[i64]` to `[a]` where appropriate:
+Same treatment — change `[i64]` to `[element]` where appropriate:
 
 ```zap
-pub fn head(list :: [a]) -> a
-pub fn tail(list :: [a]) -> [a]
-pub fn append(list :: [a], item :: a) -> [a]
-pub fn contains?(list :: [a], item :: a) -> Bool
+pub fn head(list :: [element]) -> element
+pub fn tail(list :: [element]) -> [element]
+pub fn append(list :: [element], item :: element) -> [element]
+pub fn contains?(list :: [element], item :: element) -> Bool
 ```
 
 ### Phase 2: Protocol Declarations
@@ -390,8 +390,8 @@ pub module Enumerable {
 **File: `lib/list.zap`**
 
 ```zap
-impl Enumerable(a) for [a] {
-  fn reduce(self, acc :: b, f :: (a, b -> b)) -> b {
+impl Enumerable(element) for [element] {
+  fn reduce(self, acc :: accumulator, f :: (element, accumulator -> accumulator)) -> accumulator {
     case self {
       [] -> acc
       [head | tail] -> reduce(tail, f.(head, acc), f)
@@ -405,8 +405,8 @@ impl Enumerable(a) for [a] {
 **File: `lib/map.zap`**
 
 ```zap
-impl Enumerable({k, v}) for %{k => v} {
-  fn reduce(self, acc :: b, f :: ({k, v}, b -> b)) -> b {
+impl Enumerable({key, value}) for %{key => value} {
+  fn reduce(self, acc :: accumulator, f :: ({key, value}, accumulator -> accumulator)) -> accumulator {
     :zig.map_reduce(self, acc, f)
   }
 }
@@ -418,48 +418,48 @@ impl Enumerable({k, v}) for %{k => v} {
 
 ```zap
 pub module Enum {
-  pub fn map(coll :: Enumerable(a), f :: (a -> b)) -> [b] {
-    Enumerable.reduce(coll, [], fn(elem, acc) {
-      List.append(acc, f.(elem))
+  pub fn map(coll :: Enumerable(element), f :: (element -> result)) -> [result] {
+    Enumerable.reduce(coll, [], fn(item, acc) {
+      List.append(acc, f.(item))
     })
   }
 
-  pub fn filter(coll :: Enumerable(a), pred :: (a -> Bool)) -> [a] {
-    Enumerable.reduce(coll, [], fn(elem, acc) {
-      if pred.(elem) { List.append(acc, elem) } else { acc }
+  pub fn filter(coll :: Enumerable(element), pred :: (element -> Bool)) -> [element] {
+    Enumerable.reduce(coll, [], fn(item, acc) {
+      if pred.(item) { List.append(acc, item) } else { acc }
     })
   }
 
-  pub fn reduce(coll :: Enumerable(a), initial :: b, f :: (a, b -> b)) -> b {
+  pub fn reduce(coll :: Enumerable(element), initial :: accumulator, f :: (element, accumulator -> accumulator)) -> accumulator {
     Enumerable.reduce(coll, initial, f)
   }
 
-  pub fn each(coll :: Enumerable(a), f :: (a -> Nil)) -> Atom {
-    Enumerable.reduce(coll, :ok, fn(elem, _acc) {
-      f.(elem)
+  pub fn each(coll :: Enumerable(element), f :: (element -> Nil)) -> Atom {
+    Enumerable.reduce(coll, :ok, fn(item, _acc) {
+      f.(item)
       :ok
     })
   }
 
-  pub fn find(coll :: Enumerable(a), default :: a, pred :: (a -> Bool)) -> a {
+  pub fn find(coll :: Enumerable(element), default :: element, pred :: (element -> Bool)) -> element {
     # Implementation using reduce with early-exit pattern
   }
 
-  pub fn any?(coll :: Enumerable(a), pred :: (a -> Bool)) -> Bool {
-    Enumerable.reduce(coll, false, fn(elem, acc) {
-      if acc { true } else { pred.(elem) }
+  pub fn any?(coll :: Enumerable(element), pred :: (element -> Bool)) -> Bool {
+    Enumerable.reduce(coll, false, fn(item, acc) {
+      if acc { true } else { pred.(item) }
     })
   }
 
-  pub fn all?(coll :: Enumerable(a), pred :: (a -> Bool)) -> Bool {
-    Enumerable.reduce(coll, true, fn(elem, acc) {
-      if acc { pred.(elem) } else { false }
+  pub fn all?(coll :: Enumerable(element), pred :: (element -> Bool)) -> Bool {
+    Enumerable.reduce(coll, true, fn(item, acc) {
+      if acc { pred.(item) } else { false }
     })
   }
 
-  pub fn count(coll :: Enumerable(a), pred :: (a -> Bool)) -> i64 {
-    Enumerable.reduce(coll, 0, fn(elem, acc) {
-      if pred.(elem) { acc + 1 } else { acc }
+  pub fn count(coll :: Enumerable(element), pred :: (element -> Bool)) -> i64 {
+    Enumerable.reduce(coll, 0, fn(item, acc) {
+      if pred.(item) { acc + 1 } else { acc }
     })
   }
 }
@@ -470,8 +470,8 @@ pub module Enum {
 Once the protocol system is in place, define additional protocols:
 
 ```zap
-protocol Comparable(a :: type) {
-  fn compare(self :: a, other :: a) -> Atom  # :lt, :eq, :gt
+protocol Comparable(item :: type) {
+  fn compare(self :: item, other :: item) -> Atom  # :lt, :eq, :gt
 }
 
 protocol Stringable {
@@ -523,13 +523,13 @@ test("filter over map entries") {
 **Phase 1 — Generic Functions: PARTIALLY COMPLETE**
 
 Working:
-- Type variable scoping (same `a` = same TypeVarId per clause)
+- Type variable scoping (same `element` = same TypeVarId per clause)
 - Call site unification (argument types unified against generic params)
 - Monomorphization (detects generic groups, creates specialized copies, rewrites call targets)
 - IR generic function stubs (preserve function ID ordering)
 - ListCell runtime variants (StringListCell, BoolListCell, FloatListCell, AtomListCell)
 - IR builtin rewriting (ListCell → StringListCell when element type is String)
-- End-to-end: `fn identity(x :: a) -> a { x }` works with i64, Bool, String
+- End-to-end: `fn identity(x :: element) -> element { x }` works with i64, Bool, String
 
 **Blocking issue: cross-module monomorphization.** The per-module compilation pipeline runs monomorphization independently per module. When `Test.EnumTest` calls `Enum.map([1,2,3], fn...)`, the monomorphization in the `Enum` module doesn't see call sites from `Test.EnumTest`. This means generic stdlib functions (List, Enum) can't be monomorphized for callers in other modules.
 
@@ -540,4 +540,4 @@ Working:
 - **Dynamic dispatch / existential types** — all dispatch is monomorphized. No `dyn Enumerable` equivalent.
 - **Protocol inheritance** — protocols are flat for now. No `protocol Orderable extends Comparable`.
 - **Default implementations** — protocol functions must be implemented in every impl. No default bodies.
-- **Conditional impls** — no `impl Stringable for [a] where a: Stringable`. Each impl is for a concrete shape.
+- **Conditional impls** — no `impl Stringable for [element] where element: Stringable`. Each impl is for a concrete shape.
