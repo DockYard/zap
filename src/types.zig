@@ -916,6 +916,11 @@ pub const TypeChecker = struct {
     // Monomorphization registry: collects generic function instantiations during type checking
     morph_registry: MonomorphRegistry,
 
+    /// Maps type variable names to TypeIds within the current function scope.
+    /// Reset at the start of each function clause check so that `a` in
+    /// `fn foo(x :: a) -> a` refers to the same type variable.
+    type_var_scope: std.StringHashMap(TypeId),
+
     // Number of stdlib lines prepended (bindings in these lines are skipped for unused checks)
     stdlib_line_count: u32 = 0,
 
@@ -944,6 +949,7 @@ pub const TypeChecker = struct {
             .analysis_context = null,
             .analysis_program = null,
             .morph_registry = MonomorphRegistry.init(allocator),
+            .type_var_scope = std.StringHashMap(TypeId).init(allocator),
         };
     }
 
@@ -954,6 +960,7 @@ pub const TypeChecker = struct {
         self.referenced_bindings.deinit();
         self.ownership_bindings.deinit();
         self.morph_registry.deinit();
+        self.type_var_scope.deinit();
     }
 
     pub fn setAnalysisContext(self: *TypeChecker, context: *const escape_lattice.AnalysisContext, program: *const ir.Program) void {
@@ -2199,6 +2206,11 @@ pub const TypeChecker = struct {
         const prev_scope = self.current_scope;
         self.current_scope = self.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(clause.meta.span)) orelse clause.meta.scope_id;
         defer self.current_scope = prev_scope;
+
+        // Each function clause gets its own type variable scope so that
+        // `a` in `fn foo(x :: a) -> a` refers to the same type variable.
+        self.type_var_scope.clearRetainingCapacity();
+
         const is_anon = self.isAnonymousFunctionDecl(func);
 
         // Resolve parameter types and populate bindings
@@ -3303,7 +3315,19 @@ pub const TypeChecker = struct {
                     );
                     return TypeStore.ERROR;
                 }
-                return try self.store.freshVar();
+
+                // Check if this type variable was already introduced in the current function scope.
+                // This ensures that `a` used in two places within the same function signature
+                // (e.g., `fn identity(x :: a) -> a`) refers to the same type variable.
+                if (self.type_var_scope.get(var_name)) |existing_type_id| {
+                    return existing_type_id;
+                }
+
+                // First occurrence in this function clause — create a fresh type variable
+                // and record it so subsequent uses of the same name resolve to the same type.
+                const fresh_type_id = try self.store.freshVar();
+                try self.type_var_scope.put(var_name, fresh_type_id);
+                return fresh_type_id;
             },
             .tuple => |tt| {
                 var elem_types: std.ArrayList(TypeId) = .empty;
