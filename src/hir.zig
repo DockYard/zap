@@ -1548,15 +1548,38 @@ pub const HirBuilder = struct {
                 return prov.type_id;
             }
         }
+        // Also check if this is a parameter with a type annotation
+        // by looking at the current function's parameter types
+        if (self.current_clause_scope) |cs| {
+            const scope = self.graph.getScope(cs);
+            var it = scope.bindings.iterator();
+            while (it.next()) |entry| {
+                if (entry.key_ptr.* == name) {
+                    const bid = entry.value_ptr.*;
+                    const binding = self.graph.bindings.items[bid];
+                    if (binding.type_id) |prov| {
+                        return prov.type_id;
+                    }
+                }
+            }
+        }
         return types_mod.TypeStore.UNKNOWN;
     }
 
     /// Look up a function's declared return type from the scope graph.
     /// Searches current module scope, then prelude.
-    /// Resolve a function's return type by string name (for cross-module calls).
-    fn resolveFunctionReturnTypeByName(self: *const HirBuilder, name: []const u8, arity: u32) types_mod.TypeId {
-        for (self.graph.families.items) |family| {
-            if (family.arity == arity and std.mem.eql(u8, self.interner.get(family.name), name)) {
+    /// Resolve a function's return type within a specific module (for cross-module calls).
+    fn resolveFunctionReturnTypeInModule(self: *const HirBuilder, mod_name: []const u8, func_name: []const u8, arity: u32) types_mod.TypeId {
+        // Find the module's scope in the scope graph, then search families by scope
+        for (self.graph.modules.items) |mod_entry| {
+            if (mod_entry.name.parts.len == 0) continue;
+            const last_part = self.interner.get(mod_entry.name.parts[mod_entry.name.parts.len - 1]);
+            if (!std.mem.eql(u8, last_part, mod_name)) continue;
+            // Search families that belong to this module's scope
+            for (self.graph.families.items) |family| {
+                if (family.scope_id != mod_entry.scope_id) continue;
+                if (family.arity != arity) continue;
+                if (!std.mem.eql(u8, self.interner.get(family.name), func_name)) continue;
                 if (family.clauses.items.len > 0) {
                     const first_clause = family.clauses.items[0];
                     if (first_clause.clause_index < first_clause.decl.clauses.len) {
@@ -2780,7 +2803,6 @@ pub const HirBuilder = struct {
                 .span = v.meta.span,
             }),
             .var_ref => |v| {
-                // Try to resolve type from scope graph binding
                 var resolved_type = self.resolveBindingType(v.name);
                 if (resolved_type == types_mod.TypeStore.UNKNOWN) {
                     resolved_type = try self.resolveFunctionValueType(v.name);
@@ -3007,7 +3029,7 @@ pub const HirBuilder = struct {
                         } else {
                             // Module-qualified call — resolve return type from the target module
                             if (call.callee.* == .field_access) {
-                                break :blk self.resolveFunctionReturnTypeByName(n.name, @intCast(call.args.len));
+                                break :blk self.resolveFunctionReturnTypeInModule(n.module.?, n.name, @intCast(call.args.len));
                             }
                         }
                         break :blk types_mod.TypeStore.UNKNOWN;

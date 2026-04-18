@@ -2465,6 +2465,10 @@ pub const TypeChecker = struct {
                         }
                     }
                 }
+                // Also try for pattern match bindings
+                if (assign.pattern.* != .bind and assign.pattern.* != .wildcard) {
+                    // Complex patterns — type checking doesn't propagate through these
+                }
                 return value_type;
             },
             .function_decl => |func| {

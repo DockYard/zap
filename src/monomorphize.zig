@@ -246,6 +246,9 @@ const MonomorphContext = struct {
 
                 var can_specialize = true;
                 for (first_clause.params, call.args) |param, arg| {
+                    if (target_id == 56 and (self.current_scan_module_idx orelse 999) >= 44) {
+                        std.debug.print("[mono-unify] mod={d} param={d} arg={d}\n", .{ self.current_scan_module_idx orelse 999, param.type_id, arg.expr.type_id });
+                    }
                     if (!(self.store.unify(param.type_id, arg.expr.type_id, &subs) catch false)) {
                         can_specialize = false;
                         break;
