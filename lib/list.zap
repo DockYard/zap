@@ -49,7 +49,7 @@ pub module List {
         List.head([10, 20, 30])  # => 10
     """
 
-  pub fn head(list :: [i64]) -> i64 {
+  pub fn head(list :: [element]) -> element {
     :zig.ListCell.getHead(list)
   }
 

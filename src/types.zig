@@ -2331,7 +2331,14 @@ pub const TypeChecker = struct {
     fn inferExprBindings(self: *TypeChecker, expr: *const ast.Expr) void {
         switch (expr.*) {
             .block => |blk| {
+                // Enter the block's scope so bindings created inside are visible
+                const prev_scope = self.current_scope;
+                const block_scope = self.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(blk.meta.span));
+                if (block_scope) |bs| {
+                    self.current_scope = bs;
+                }
                 self.inferBodyBindings(blk.stmts);
+                self.current_scope = prev_scope;
             },
             .case_expr => |ce| {
                 _ = self.inferExpr(ce.scrutinee) catch {};

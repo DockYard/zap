@@ -308,6 +308,7 @@ pub const CaseBindKind = enum {
 pub const AssignmentBinding = struct {
     name: ast.StringId,
     local_index: u32,
+    type_id: types_mod.TypeId = types_mod.TypeStore.UNKNOWN,
 };
 
 pub const ListConsHir = struct {
@@ -1541,13 +1542,17 @@ pub const HirBuilder = struct {
     /// Look up a binding's type_id from the scope graph.
     /// Returns the type_id if found, otherwise UNKNOWN.
     fn resolveBindingType(self: *const HirBuilder, name: ast.StringId) types_mod.TypeId {
+        // Check assignment bindings first — these have types from the value
+        // expression and are always valid regardless of scope chain direction.
+        for (self.current_assignment_bindings.items) |binding| {
+            if (binding.name == name and binding.type_id != types_mod.TypeStore.UNKNOWN) {
+                return binding.type_id;
+            }
+        }
+        // Fall back to scope graph binding
         const scope_id = self.current_clause_scope orelse self.current_module_scope orelse self.graph.prelude_scope;
         if (self.graph.resolveBinding(scope_id, name)) |bid| {
             const binding = self.graph.bindings.items[bid];
-            const name_str = self.interner.get(name);
-            if (std.mem.eql(u8, name_str, "result")) {
-                std.debug.print("[hir-resolve] result bid={d} scope={d} has_type={}\n", .{ bid, scope_id, binding.type_id != null });
-            }
             if (binding.type_id) |prov| {
                 return prov.type_id;
             }
@@ -2753,6 +2758,7 @@ pub const HirBuilder = struct {
                         try self.current_assignment_bindings.append(self.allocator, .{
                             .name = assign.pattern.bind.name,
                             .local_index = idx,
+                            .type_id = value.type_id,
                         });
                     }
                     try hir_stmts.append(self.allocator, .{
