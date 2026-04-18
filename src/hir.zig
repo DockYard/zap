@@ -1605,8 +1605,15 @@ pub const HirBuilder = struct {
                 var subs = types_mod.SubstitutionMap.init(self.allocator);
                 for (clause.params, 0..) |param, i| {
                     if (i >= call_args.len) break;
-                    const arg_type = call_args[i].expr.type_id;
-                    if (arg_type == types_mod.TypeStore.UNKNOWN) continue;
+                    var arg_type = call_args[i].expr.type_id;
+                    // For empty lists with UNKNOWN type, default to list(i64)
+                    if (arg_type == types_mod.TypeStore.UNKNOWN) {
+                        if (call_args[i].expr.kind == .list_init and call_args[i].expr.kind.list_init.len == 0) {
+                            const store_ptr2: *types_mod.TypeStore = @constCast(self.type_store);
+                            arg_type = store_ptr2.addType(.{ .list = .{ .element = types_mod.TypeStore.I64 } }) catch types_mod.TypeStore.UNKNOWN;
+                        }
+                        if (arg_type == types_mod.TypeStore.UNKNOWN) continue;
+                    }
                     if (param.type_annotation) |ta| {
                         const param_type = self.resolveTypeExpr(ta);
                         const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
@@ -3044,6 +3051,19 @@ pub const HirBuilder = struct {
                             for (args.items[0..count], callee_type.function.params[0..count]) |*arg, param_type| {
                                 arg.expected_type = param_type;
                             }
+                        }
+                    }
+                }
+
+                // Propagate expected_type to argument expressions with UNKNOWN type.
+                // This is critical for empty list literals ([]) which have no elements
+                // to infer from — their type comes from the calling context.
+                for (args.items) |*arg| {
+                    if (arg.expr.type_id == types_mod.TypeStore.UNKNOWN and arg.expected_type != types_mod.TypeStore.UNKNOWN) {
+                        // Check if the expected type is concrete (no type variables)
+                        const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
+                        if (!store_ptr.containsTypeVars(arg.expected_type)) {
+                            @constCast(arg.expr).type_id = arg.expected_type;
                         }
                     }
                 }

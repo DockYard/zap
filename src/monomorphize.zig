@@ -246,7 +246,21 @@ const MonomorphContext = struct {
 
                 var can_specialize = true;
                 for (first_clause.params, call.args) |param, arg| {
-                    if (!(self.store.unify(param.type_id, arg.expr.type_id, &subs) catch false)) {
+                    var arg_type = arg.expr.type_id;
+                    // For UNKNOWN arguments (e.g., empty list []), infer type from
+                    // the parameter. If the parameter is list(type_var), check if the
+                    // arg expression is a list_init — if so, default the element type
+                    // to i64 (the default list element type).
+                    if (arg_type == types_mod.TypeStore.UNKNOWN) {
+                        const param_typ = self.store.getType(param.type_id);
+                        if (std.meta.activeTag(param_typ) == .list) {
+                            if (arg.expr.kind == .list_init) {
+                                // Empty list — default to list(i64)
+                                arg_type = self.store.addType(.{ .list = .{ .element = types_mod.TypeStore.I64 } }) catch types_mod.TypeStore.UNKNOWN;
+                            }
+                        }
+                    }
+                    if (!(self.store.unify(param.type_id, arg_type, &subs) catch false)) {
                         can_specialize = false;
                         break;
                     }
