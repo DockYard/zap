@@ -23,7 +23,7 @@ pub module List {
         List.empty?([1, 2, 3]) # => false
     """
 
-  pub fn empty?(list :: [i64]) -> Bool {
+  pub fn empty?(list :: [element]) -> Bool {
     :zig.ListCell.isEmpty(list)
   }
 
@@ -36,7 +36,7 @@ pub module List {
         List.length([])         # => 0
     """
 
-  pub fn length(list :: [i64]) -> i64 {
+  pub fn length(list :: [element]) -> i64 {
     :zig.ListCell.length(list)
   }
 
@@ -61,7 +61,7 @@ pub module List {
         List.tail([10, 20, 30])  # => [20, 30]
     """
 
-  pub fn tail(list :: [i64]) -> [i64] {
+  pub fn tail(list :: [element]) -> [element] {
     :zig.ListCell.getTail(list)
   }
 
@@ -74,7 +74,7 @@ pub module List {
         List.at([10, 20, 30], 1)  # => 20
     """
 
-  pub fn at(list :: [i64], index :: i64) -> i64 {
+  pub fn at(list :: [element], index :: i64) -> element {
     :zig.ListCell.get(list, index)
   }
 
@@ -87,7 +87,7 @@ pub module List {
         List.last([1, 2, 3])  # => 3
     """
 
-  pub fn last(list :: [i64]) -> i64 {
+  pub fn last(list :: [element]) -> element {
     :zig.ListCell.last(list)
   }
 
@@ -100,7 +100,7 @@ pub module List {
         List.contains?([1, 2, 3], 5)  # => false
     """
 
-  pub fn contains?(list :: [i64], value :: i64) -> Bool {
+  pub fn contains?(list :: [element], value :: element) -> Bool {
     :zig.ListCell.contains(list, value)
   }
 
@@ -112,7 +112,7 @@ pub module List {
         List.reverse([1, 2, 3])  # => [3, 2, 1]
     """
 
-  pub fn reverse(list :: [i64]) -> [i64] {
+  pub fn reverse(list :: [element]) -> [element] {
     :zig.ListCell.reverse(list)
   }
 
@@ -124,7 +124,7 @@ pub module List {
         List.prepend([2, 3], 1)  # => [1, 2, 3]
     """
 
-  pub fn prepend(list :: [i64], value :: i64) -> [i64] {
+  pub fn prepend(list :: [element], value :: element) -> [element] {
     :zig.ListCell.cons(value, list)
   }
 
@@ -136,7 +136,7 @@ pub module List {
         List.append([1, 2], 3)  # => [1, 2, 3]
     """
 
-  pub fn append(list :: [i64], value :: i64) -> [i64] {
+  pub fn append(list :: [element], value :: element) -> [element] {
     :zig.ListCell.append(list, value)
   }
 
@@ -148,7 +148,7 @@ pub module List {
         List.concat([1, 2], [3, 4])  # => [1, 2, 3, 4]
     """
 
-  pub fn concat(first :: [i64], second :: [i64]) -> [i64] {
+  pub fn concat(first :: [element], second :: [element]) -> [element] {
     :zig.ListCell.concat(first, second)
   }
 
@@ -160,7 +160,7 @@ pub module List {
         List.take([1, 2, 3, 4, 5], 3)  # => [1, 2, 3]
     """
 
-  pub fn take(list :: [i64], count :: i64) -> [i64] {
+  pub fn take(list :: [element], count :: i64) -> [element] {
     :zig.ListCell.take(list, count)
   }
 
@@ -172,7 +172,7 @@ pub module List {
         List.drop([1, 2, 3, 4, 5], 2)  # => [3, 4, 5]
     """
 
-  pub fn drop(list :: [i64], count :: i64) -> [i64] {
+  pub fn drop(list :: [element], count :: i64) -> [element] {
     :zig.ListCell.drop(list, count)
   }
 
@@ -185,7 +185,7 @@ pub module List {
         List.uniq([1, 2, 2, 3, 1])  # => [1, 2, 3]
     """
 
-  pub fn uniq(list :: [i64]) -> [i64] {
+  pub fn uniq(list :: [element]) -> [element] {
     :zig.ListCell.uniq(list)
   }
 }

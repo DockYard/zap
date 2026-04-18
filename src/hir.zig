@@ -1577,6 +1577,52 @@ pub const HirBuilder = struct {
 
     /// Look up a function's declared return type from the scope graph.
     /// Searches current module scope, then prelude.
+    /// Resolve a generic function's return type by unifying argument types with
+    /// parameter types and applying the substitution to the raw return type.
+    fn resolveGenericReturnType(
+        self: *const HirBuilder,
+        mod_name: []const u8,
+        func_name: []const u8,
+        arity: u32,
+        call_args: []const CallArg,
+        raw_return: types_mod.TypeId,
+    ) types_mod.TypeId {
+        // Find the function's parameter types
+        for (self.graph.modules.items) |mod_entry| {
+            if (mod_entry.name.parts.len == 0) continue;
+            const last_part = self.interner.get(mod_entry.name.parts[mod_entry.name.parts.len - 1]);
+            if (!std.mem.eql(u8, last_part, mod_name)) continue;
+            for (self.graph.families.items) |family| {
+                if (family.scope_id != mod_entry.scope_id) continue;
+                if (family.arity != arity) continue;
+                if (!std.mem.eql(u8, self.interner.get(family.name), func_name)) continue;
+                if (family.clauses.items.len == 0) continue;
+                const first_clause = family.clauses.items[0];
+                if (first_clause.clause_index >= first_clause.decl.clauses.len) continue;
+                const clause = first_clause.decl.clauses[first_clause.clause_index];
+                // Build parameter types
+                if (clause.params.len != arity) continue;
+                var subs = types_mod.SubstitutionMap.init(self.allocator);
+                for (clause.params, 0..) |param, i| {
+                    if (i >= call_args.len) break;
+                    const arg_type = call_args[i].expr.type_id;
+                    if (arg_type == types_mod.TypeStore.UNKNOWN) continue;
+                    if (param.type_annotation) |ta| {
+                        const param_type = self.resolveTypeExpr(ta);
+                        const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
+                        _ = store_ptr.unify(param_type, arg_type, &subs) catch {};
+                    }
+                }
+                // Apply substitution to return type
+                if (subs.bindings.count() > 0) {
+                    const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
+                    return subs.applyToType(store_ptr, raw_return);
+                }
+            }
+        }
+        return raw_return;
+    }
+
     /// Resolve a function's return type within a specific module (for cross-module calls).
     fn resolveFunctionReturnTypeInModule(self: *const HirBuilder, mod_name: []const u8, func_name: []const u8, arity: u32) types_mod.TypeId {
         // Find the module's scope in the scope graph, then search families by scope
@@ -3039,7 +3085,17 @@ pub const HirBuilder = struct {
                         } else {
                             // Module-qualified call — resolve return type from the target module
                             if (call.callee.* == .field_access) {
-                                break :blk self.resolveFunctionReturnTypeInModule(n.module.?, n.name, @intCast(call.args.len));
+                                const raw_return = self.resolveFunctionReturnTypeInModule(n.module.?, n.name, @intCast(call.args.len));
+                                // If the return type contains type variables, try to resolve
+                                // them by unifying argument types with parameter types.
+                                if (raw_return != types_mod.TypeStore.UNKNOWN) {
+                                    const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
+                                    if (store_ptr.containsTypeVars(raw_return)) {
+                                        const resolved = self.resolveGenericReturnType(n.module.?, n.name, @intCast(call.args.len), args.items, raw_return);
+                                        break :blk resolved;
+                                    }
+                                }
+                                break :blk raw_return;
                             }
                         }
                         break :blk types_mod.TypeStore.UNKNOWN;

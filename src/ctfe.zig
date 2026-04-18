@@ -1204,12 +1204,15 @@ pub const Interpreter = struct {
             return error.CtfeFailure;
         }
 
-        if (function_id >= self.program.functions.len) {
+        // Look up function by ID (not array index) — function IDs may not
+        // match array indices when generic stubs or monomorphized copies are present.
+        const func = blk: {
+            for (self.program.functions) |*f| {
+                if (f.id == function_id) break :blk f;
+            }
             try self.emitError(.undefined_function, "invalid function id");
             return error.CtfeFailure;
-        }
-
-        const func = &self.program.functions[function_id];
+        };
 
         // Memoization: check in-process cache
         const cache_key = CacheKey{
