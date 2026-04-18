@@ -18,6 +18,17 @@ pub module Test.FunctionTest {
       assert(greet("World") == "Hello, World!")
     }
 
+    test("generic identity with integer") {
+      assert(identity(42) == 42)
+    }
+
+    test("generic identity with bool") {
+      assert(identity(true) == true)
+    }
+
+    test("generic identity with string") {
+      assert(identity("hello") == "hello")
+    }
   }
 
   fn classify(0 :: i64) -> String {
@@ -34,5 +45,9 @@ pub module Test.FunctionTest {
 
   fn greet(name :: String) -> String {
     "Hello, " <> name <> "!"
+  }
+
+  fn identity(x :: a) -> a {
+    x
   }
 }

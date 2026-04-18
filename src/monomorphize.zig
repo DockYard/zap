@@ -242,6 +242,8 @@ const MonomorphContext = struct {
                     .source_group_id = target_id,
                 });
                 try self.specializations.put(key, new_id);
+                // Record this specific call expression for rewriting
+                try self.call_rewrites.put(@intFromPtr(expr), new_id);
             },
             // Recurse into sub-expressions
             .binary => |b| {
@@ -628,45 +630,9 @@ const MonomorphContext = struct {
     fn rewriteExpr(self: *MonomorphContext, expr: *const hir.Expr) void {
         switch (expr.kind) {
             .call => |call| {
-                // Rewrite call target if it points to a generic function
-                const target_id = switch (call.target) {
-                    .direct => |dc| dc.function_group_id,
-                    .dispatch => |dp| dp.function_group_id,
-                    else => return,
-                };
-
-                if (self.generic_groups.get(target_id) == null) return;
-
-                // Find the specialization for this call's arg types
-                const generic_group = self.generic_groups.get(target_id).?;
-                if (generic_group.clauses.len == 0) return;
-                const first_clause = &generic_group.clauses[0];
-                if (first_clause.params.len != call.args.len) return;
-
-                var subs = SubstitutionMap.init(self.allocator);
-                defer subs.deinit();
-                for (first_clause.params, call.args) |param, arg| {
-                    _ = self.store.unify(param.type_id, arg.expr.type_id, &subs) catch {};
-                }
-
-                var type_args: std.ArrayListUnmanaged(TypeId) = .empty;
-                defer type_args.deinit(self.allocator);
-                var rewrite_var_ids: std.ArrayListUnmanaged(types_mod.TypeVarId) = .empty;
-                defer rewrite_var_ids.deinit(self.allocator);
-                var it = subs.bindings.iterator();
-                while (it.next()) |entry| {
-                    rewrite_var_ids.append(self.allocator, entry.key_ptr.*) catch {};
-                }
-                std.mem.sort(types_mod.TypeVarId, rewrite_var_ids.items, {}, std.sort.asc(types_mod.TypeVarId));
-                for (rewrite_var_ids.items) |var_id| {
-                    if (subs.bindings.get(var_id)) |concrete| {
-                        type_args.append(self.allocator, concrete) catch {};
-                    }
-                }
-
-                const key = hashInstantiation(target_id, type_args.items);
-                if (self.specializations.get(key)) |new_id| {
-                    // Rewrite the call target (cast away const for mutation)
+                // Check if this specific call expression was recorded for rewriting
+                // during the scan phase (using pointer identity).
+                if (self.call_rewrites.get(@intFromPtr(expr))) |new_id| {
                     const mutable_expr: *hir.Expr = @constCast(expr);
                     switch (mutable_expr.kind) {
                         .call => |*c| {

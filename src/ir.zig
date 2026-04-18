@@ -1043,10 +1043,20 @@ pub const IrBuilder = struct {
                 }
                 // Emit an empty stub — this function is never called directly;
                 // all call sites are rewritten to point to monomorphized copies.
-                const name = self.interner.get(group.name);
+                const raw_name = if (group.name < self.interner.strings.items.len)
+                    self.interner.get(group.name)
+                else
+                    "generic_stub";
+                const local_name = try std.fmt.allocPrint(self.allocator, "{s}__{d}", .{ raw_name, group.arity });
+                const name_str = if (self.current_module_prefix) |prefix|
+                    try std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ prefix, local_name })
+                else
+                    local_name;
                 try self.functions.append(self.allocator, .{
                     .id = func_id,
-                    .name = name,
+                    .name = name_str,
+                    .module_name = self.current_module_prefix,
+                    .local_name = local_name,
                     .scope_id = group.scope_id,
                     .arity = group.arity,
                     .params = &.{},
