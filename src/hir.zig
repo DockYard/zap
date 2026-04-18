@@ -1544,6 +1544,10 @@ pub const HirBuilder = struct {
         const scope_id = self.current_clause_scope orelse self.current_module_scope orelse self.graph.prelude_scope;
         if (self.graph.resolveBinding(scope_id, name)) |bid| {
             const binding = self.graph.bindings.items[bid];
+            const name_str = self.interner.get(name);
+            if (std.mem.eql(u8, name_str, "result")) {
+                std.debug.print("[hir-resolve] result bid={d} scope={d} has_type={}\n", .{ bid, scope_id, binding.type_id != null });
+            }
             if (binding.type_id) |prov| {
                 return prov.type_id;
             }

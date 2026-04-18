@@ -2286,6 +2286,17 @@ pub const TypeChecker = struct {
     fn checkFunctionDecl(self: *TypeChecker, func: *const ast.FunctionDecl) !void {
         for (func.clauses) |clause| {
             try self.checkFunctionClause(func, &clause);
+            // Traverse the function body to set binding types for assignments.
+            if (clause.body) |body| {
+                if (body.len > 0) {
+                    const prev_scope2 = self.current_scope;
+                    self.current_scope = self.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(clause.meta.span)) orelse clause.meta.scope_id;
+                    for (body) |stmt| {
+                        _ = self.checkStmt(stmt) catch {};
+                    }
+                    self.current_scope = prev_scope2;
+                }
+            }
         }
     }
 
@@ -2464,10 +2475,6 @@ pub const TypeChecker = struct {
                             try self.recordBindingType(bid, value_type, assign.value.getMeta().span);
                         }
                     }
-                }
-                // Also try for pattern match bindings
-                if (assign.pattern.* != .bind and assign.pattern.* != .wildcard) {
-                    // Complex patterns — type checking doesn't propagate through these
                 }
                 return value_type;
             },
