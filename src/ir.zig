@@ -3771,8 +3771,23 @@ pub const IrBuilder = struct {
                     .builtin => |name| {
                         const lowered_args = try args.toOwnedSlice(self.allocator);
                         const lowered_modes = try arg_modes.toOwnedSlice(self.allocator);
+                        // Rewrite ListCell builtins based on the argument's list element type.
+                        // When a generic function like List.head(list :: [a]) is monomorphized
+                        // with a = String, the `:zig.ListCell.getHead(list)` call needs to
+                        // become `StringListCell.getHead(list)` in the ZIR.
+                        const resolved_name = if (std.mem.startsWith(u8, name, "ListCell.") and lowered_args.len > 0) blk: {
+                            const first_arg_type = self.known_local_types.get(lowered_args[0]) orelse .any;
+                            if (std.meta.activeTag(first_arg_type) == .list) {
+                                const cell_name = getListCellName(first_arg_type.list.*);
+                                if (!std.mem.eql(u8, cell_name, "ListCell")) {
+                                    const method = name["ListCell.".len..];
+                                    break :blk try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ cell_name, method });
+                                }
+                            }
+                            break :blk name;
+                        } else name;
                         try self.current_instrs.append(self.allocator, .{
-                            .call_builtin = .{ .dest = dest, .name = name, .args = lowered_args, .arg_modes = lowered_modes },
+                            .call_builtin = .{ .dest = dest, .name = resolved_name, .args = lowered_args, .arg_modes = lowered_modes },
                         });
                     },
                 }
@@ -4202,6 +4217,17 @@ fn findParamGetIdInDecision(decision: *const hir_mod.Decision, target_element: u
         },
         .failure => return target_element,
     }
+}
+
+/// Map a list element ZigType to the runtime ListCell variant name.
+fn getListCellName(element_type: ZigType) []const u8 {
+    return switch (std.meta.activeTag(element_type)) {
+        .string => "StringListCell",
+        .bool_type => "BoolListCell",
+        .f64 => "FloatListCell",
+        .atom => "AtomListCell",
+        else => "ListCell",
+    };
 }
 
 /// Check if a HIR function group is generic (has unresolved type variables in params/return).

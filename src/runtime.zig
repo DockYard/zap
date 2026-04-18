@@ -2869,6 +2869,12 @@ pub fn ListCellOf(comptime T: type) type {
 // Concrete instantiations for known element types
 pub const StringListCell = ListCellOf([]const u8);
 pub const StringListType = ?*const StringListCell;
+pub const BoolListCell = ListCellOf(bool);
+pub const BoolListType = ?*const BoolListCell;
+pub const FloatListCell = ListCellOf(f64);
+pub const FloatListType = ?*const FloatListCell;
+pub const AtomListCell = ListCellOf(u64);
+pub const AtomListType = ?*const AtomListCell;
 
 pub const ListHelpers = struct {
     /// Check if a list is empty (void = empty, anything else = non-empty).

@@ -518,6 +518,23 @@ test("filter over map entries") {
 - **Phase 3 (protocol dispatch):** High risk. Constraint resolution and impl lookup during type checking is the hardest part. Edge cases: overlapping impls, impl for generic types, protocol inheritance.
 - **Phase 4 (stdlib rewrite):** Medium risk. Requires all previous phases to be solid. The `map_reduce` runtime primitive for maps needs to be added.
 
+## Current Status
+
+**Phase 1 — Generic Functions: PARTIALLY COMPLETE**
+
+Working:
+- Type variable scoping (same `a` = same TypeVarId per clause)
+- Call site unification (argument types unified against generic params)
+- Monomorphization (detects generic groups, creates specialized copies, rewrites call targets)
+- IR generic function stubs (preserve function ID ordering)
+- ListCell runtime variants (StringListCell, BoolListCell, FloatListCell, AtomListCell)
+- IR builtin rewriting (ListCell → StringListCell when element type is String)
+- End-to-end: `fn identity(x :: a) -> a { x }` works with i64, Bool, String
+
+**Blocking issue: cross-module monomorphization.** The per-module compilation pipeline runs monomorphization independently per module. When `Test.EnumTest` calls `Enum.map([1,2,3], fn...)`, the monomorphization in the `Enum` module doesn't see call sites from `Test.EnumTest`. This means generic stdlib functions (List, Enum) can't be monomorphized for callers in other modules.
+
+**Fix required:** Move monomorphization to a whole-program pass that runs after all modules are compiled to HIR, or implement cross-module specialization requests where each module records which specializations it needs from imported modules.
+
 ## Non-Goals
 
 - **Dynamic dispatch / existential types** — all dispatch is monomorphized. No `dyn Enumerable` equivalent.
