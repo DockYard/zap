@@ -126,7 +126,6 @@ pub const CompilationUnit = struct {
 pub const ModuleHirResult = struct {
     mod_name: []const u8,
     hir_program: zap.hir.Program,
-    type_store: zap.types.TypeStore,
     next_group_id: u32,
 };
 
@@ -588,7 +587,7 @@ pub fn compileForCtfe(
     step += 1;
     if (options.show_progress) std.debug.print("\r\x1b[K  [{d}/{d}] HIR", .{ step, total_steps });
 
-    var hir_builder = zap.hir.HirBuilder.init(alloc, &ctx.interner, &ctx.collector.graph, &type_checker.store);
+    var hir_builder = zap.hir.HirBuilder.init(alloc, &ctx.interner, &ctx.collector.graph, type_checker.store);
     defer hir_builder.deinit();
     const hir_program = hir_builder.buildProgram(&desugared_program) catch {
         for (hir_builder.errors.items) |hir_err| {
@@ -610,7 +609,7 @@ pub fn compileForCtfe(
 
     // Monomorphization pass
     var mono_next_group_id = hir_builder.next_group_id;
-    const mono_result = zap.monomorphize.monomorphize(alloc, &hir_program, @constCast(&type_checker.store), &mono_next_group_id, &ctx.interner) catch {
+    const mono_result = zap.monomorphize.monomorphize(alloc, &hir_program, type_checker.store, &mono_next_group_id, &ctx.interner) catch {
         ctx.diag_engine.err("Error during monomorphization", .{ .start = 0, .end = 0 }) catch {};
         if (options.show_progress) std.debug.print("\r\x1b[K", .{});
         emitContextDiagnostics(ctx, alloc);
@@ -623,7 +622,7 @@ pub fn compileForCtfe(
     if (options.show_progress) std.debug.print("\r\x1b[K  [{d}/{d}] IR", .{ step, total_steps });
 
     var ir_builder = zap.ir.IrBuilder.init(alloc, &ctx.interner);
-    ir_builder.type_store = &type_checker.store;
+    ir_builder.type_store = type_checker.store;
     defer ir_builder.deinit();
     var ir_program = ir_builder.buildProgram(&mono_program) catch {
         ctx.diag_engine.err("Error during IR lowering", .{ .start = 0, .end = 0 }) catch {};
@@ -772,6 +771,8 @@ fn compileSingleModuleHir(
     ctx: *CompilationContext,
     mod_name: []const u8,
     mod_program: *const ast.Program,
+    shared_store: *zap.types.TypeStore,
+    group_id_offset: u32,
     options: CompileOptions,
 ) CompileError!ModuleHirResult {
     const type_severity: zap.Severity = if (options.strict_types) .@"error" else .warning;
@@ -796,7 +797,10 @@ fn compileSingleModuleHir(
         return error.DesugarFailed;
     }
 
-    var type_checker = zap.types.TypeChecker.init(alloc, &ctx.interner, &ctx.collector.graph);
+    var type_checker = zap.types.TypeChecker.initWithSharedStore(alloc, shared_store, &ctx.interner, &ctx.collector.graph);
+    defer type_checker.deinit();
+
+    shared_store.inferred_signatures.clearRetainingCapacity();
 
     type_checker.checkProgram(&desugared) catch {};
     for (type_checker.errors.items) |type_err| {
@@ -814,7 +818,9 @@ fn compileSingleModuleHir(
         return error.TypeCheckFailed;
     }
 
-    var hir_builder = zap.hir.HirBuilder.init(alloc, &ctx.interner, &ctx.collector.graph, &type_checker.store);
+    var hir_builder = zap.hir.HirBuilder.init(alloc, &ctx.interner, &ctx.collector.graph, shared_store);
+    // Offset group IDs so they're globally unique across modules
+    hir_builder.next_group_id = group_id_offset;
     const hir_program = hir_builder.buildProgram(&desugared) catch {
         for (hir_builder.errors.items) |hir_err| {
             ctx.diag_engine.err(hir_err.message, hir_err.span) catch {};
@@ -833,7 +839,6 @@ fn compileSingleModuleHir(
     return .{
         .mod_name = mod_name,
         .hir_program = hir_program,
-        .type_store = type_checker.store,
         .next_group_id = hir_builder.next_group_id,
     };
 }
@@ -931,7 +936,7 @@ fn compileSingleModuleIr(
         return error.TypeCheckFailed;
     }
 
-    var hir_builder = zap.hir.HirBuilder.init(alloc, &ctx.interner, &ctx.collector.graph, &type_checker.store);
+    var hir_builder = zap.hir.HirBuilder.init(alloc, &ctx.interner, &ctx.collector.graph, type_checker.store);
     defer hir_builder.deinit();
     const hir_program = hir_builder.buildProgram(&desugared) catch {
         for (hir_builder.errors.items) |hir_err| {
@@ -950,7 +955,7 @@ fn compileSingleModuleIr(
 
     // Monomorphization pass
     var mono_next_group_id2 = hir_builder.next_group_id;
-    const mono_result2 = zap.monomorphize.monomorphize(alloc, &hir_program, @constCast(&type_checker.store), &mono_next_group_id2, &ctx.interner) catch {
+    const mono_result2 = zap.monomorphize.monomorphize(alloc, &hir_program, type_checker.store, &mono_next_group_id2, &ctx.interner) catch {
         ctx.diag_engine.err("Error during monomorphization", .{ .start = 0, .end = 0 }) catch {};
         emitContextDiagnostics(ctx, alloc);
         return error.HirFailed;
@@ -958,7 +963,7 @@ fn compileSingleModuleIr(
     const mono_program2 = mono_result2.program;
 
     var ir_builder = zap.ir.IrBuilder.init(alloc, &ctx.interner);
-    ir_builder.type_store = &type_checker.store;
+    ir_builder.type_store = type_checker.store;
     defer ir_builder.deinit();
     const mod_ir = ir_builder.buildProgram(&mono_program2) catch {
         ctx.diag_engine.err("Error during IR lowering", .{ .start = 0, .end = 0 }) catch {};
@@ -1008,196 +1013,89 @@ pub fn compileModuleByModule(
     var all_functions: std.ArrayListUnmanaged(ir.Function) = .empty;
     var all_type_defs: std.ArrayListUnmanaged(ir.TypeDef) = .empty;
     var entry_id: ?ir.FunctionId = null;
-    var func_id_offset: u32 = 0;
 
-    // If we have level boundaries and a valid Io, compile modules in parallel
-    // within each dependency level. Modules at the same level have no
-    // inter-dependencies and can safely compile concurrently.
-    if (options.level_boundaries) |boundaries| {
-        if (pio != null and boundaries.len > 0) {
-            const io_val = pio.?;
-            var level_start: usize = 0;
-            for (boundaries) |boundary| {
-                const level_end: usize = @intCast(boundary);
-                const level_modules = module_order[level_start..level_end];
+    _ = pio;
 
-                if (level_modules.len > 1) {
-                    // Parallel: compile all modules in this level concurrently
-                    const task_results = alloc.alloc(ModuleCompileResult, level_modules.len) catch
-                        return error.OutOfMemory;
-                    defer alloc.free(task_results);
+    // Shared TypeStore + globally-unique group IDs pipeline.
+    {
+        const shared_store = alloc.create(zap.types.TypeStore) catch return error.OutOfMemory;
+        shared_store.* = zap.types.TypeStore.init(alloc, &ctx.interner);
 
-                    var group: std.Io.Group = .init;
-                    for (level_modules, 0..) |mod_name, i| {
-                        task_results[i] = .{ .err = false };
-                        if (options.show_progress) {
-                            std.debug.print("\r\x1b[K  [level] {s}", .{mod_name});
-                        }
-                        group.async(io_val, compileModuleTask, .{ alloc, ctx, mod_name, options, &task_results[i] });
-                    }
-                    group.await(io_val) catch {};
-
-                    // Check results and merge
-                    for (task_results) |result| {
-                        if (result.err) return error.IrFailed;
-                    }
-                } else if (level_modules.len == 1) {
-                    // Single module in level: compile directly (no concurrency overhead)
-                    const mod_name = level_modules[0];
-                    if (options.show_progress) {
-                        std.debug.print("\r\x1b[K  [module] {s}", .{mod_name});
-                    }
-                    const unit = lookupCompilationUnit(ctx, mod_name) orelse {
-                        ctx.diag_engine.err("Module compilation unit disappeared during per-module compilation", .{ .start = 0, .end = 0 }) catch {};
-                        emitDiagnostics(&ctx.diag_engine, alloc);
-                        return error.CollectFailed;
-                    };
-                    try compileFile(alloc, ctx, unit, options);
-                }
-
-                // Merge this level's results into combined program
-                for (level_modules) |mod_name| {
-                    const unit = lookupCompilationUnit(ctx, mod_name) orelse continue;
-                    const mod_ir = unit.ir_program orelse return error.IrFailed;
-                    for (mod_ir.functions) |func| {
-                        const adjusted = try cloneFunctionWithOffset(alloc, func, func_id_offset);
-                        all_functions.append(alloc, adjusted) catch return error.OutOfMemory;
-                    }
-                    if (mod_ir.entry) |eid| {
-                        entry_id = func_id_offset + eid;
-                    }
-                    func_id_offset += @intCast(mod_ir.functions.len);
-                    for (mod_ir.type_defs) |td| {
-                        all_type_defs.append(alloc, td) catch return error.OutOfMemory;
-                    }
-                }
-
-                level_start = level_end;
+        // Phase 1: all modules → HIR with shared TypeStore and globally-unique group IDs
+        var hir_results: std.ArrayListUnmanaged(ModuleHirResult) = .empty;
+        var group_id_offset: u32 = 0;
+        for (module_order, 0..) |mod_name, mod_idx| {
+            if (options.show_progress) {
+                std.debug.print("\r\x1b[K  [hir {d}/{d}] {s}", .{ mod_idx + 1, module_order.len, mod_name });
             }
+            const mod_program = findModuleProgram(ctx, mod_name) orelse continue;
+            const hir_result = compileSingleModuleHir(alloc, ctx, mod_name, mod_program, shared_store, group_id_offset, options) catch continue;
+            group_id_offset = hir_result.next_group_id;
+            hir_results.append(alloc, hir_result) catch return error.OutOfMemory;
+        }
 
-            // Handle any remaining modules after the last boundary
-            for (module_order[level_start..]) |mod_name| {
-                if (options.show_progress) {
-                    std.debug.print("\r\x1b[K  [module] {s}", .{mod_name});
-                }
-                const unit = lookupCompilationUnit(ctx, mod_name) orelse continue;
-                try compileFile(alloc, ctx, unit, options);
-                const mod_ir = unit.ir_program orelse return error.IrFailed;
-                for (mod_ir.functions) |func| {
-                    const adjusted = try cloneFunctionWithOffset(alloc, func, func_id_offset);
-                    all_functions.append(alloc, adjusted) catch return error.OutOfMemory;
-                }
-                if (mod_ir.entry) |eid| {
-                    entry_id = func_id_offset + eid;
-                }
-                func_id_offset += @intCast(mod_ir.functions.len);
-                for (mod_ir.type_defs) |td| {
-                    all_type_defs.append(alloc, td) catch return error.OutOfMemory;
-                }
+        // Phase 2: merge all HIR modules
+        var all_hir_modules: std.ArrayListUnmanaged(zap.hir.Module) = .empty;
+        var all_hir_top_fns: std.ArrayListUnmanaged(zap.hir.FunctionGroup) = .empty;
+        for (hir_results.items) |*result| {
+            for (result.hir_program.modules) |mod| {
+                all_hir_modules.append(alloc, mod) catch return error.OutOfMemory;
             }
+            for (result.hir_program.top_functions) |tf| {
+                all_hir_top_fns.append(alloc, tf) catch return error.OutOfMemory;
+            }
+        }
 
-            // Build merged IR program
-            var merged_ir = ir.Program{
-                .functions = all_functions.items,
-                .type_defs = all_type_defs.items,
-                .entry = entry_id,
+        var combined_hir = zap.hir.Program{
+            .modules = all_hir_modules.toOwnedSlice(alloc) catch return error.OutOfMemory,
+            .top_functions = all_hir_top_fns.toOwnedSlice(alloc) catch return error.OutOfMemory,
+        };
+
+        // Phase 3: whole-program monomorphization
+        {
+            var mono_next = group_id_offset;
+            const mono_result = zap.monomorphize.monomorphize(alloc, &combined_hir, shared_store, &mono_next, &ctx.interner) catch {
+                ctx.diag_engine.err("Error during whole-program monomorphization", .{ .start = 0, .end = 0 }) catch {};
+                emitContextDiagnostics(ctx, alloc);
+                return error.HirFailed;
             };
-            return mergeAndFinalizeWithIo(alloc, &merged_ir, pio);
+            combined_hir = mono_result.program;
         }
-    }
 
-    // Two-phase compilation: HIR → whole-program monomorphization → IR
-    // Phase 1: Compile all modules to HIR
-    var hir_results: std.ArrayListUnmanaged(ModuleHirResult) = .empty;
-    for (module_order, 0..) |mod_name, mod_idx| {
-        if (options.show_progress) {
-            std.debug.print("\r\x1b[K  [hir {d}/{d}] {s}", .{ mod_idx + 1, module_order.len, mod_name });
+        // Phase 4: each module HIR → IR
+        // Function IDs are already globally unique from the HIR stage (group_id_offset),
+        // so no cloneWithOffset needed — just collect functions directly.
+        for (combined_hir.modules) |mod| {
+            const single_mod_hir = zap.hir.Program{
+                .modules = try alloc.dupe(zap.hir.Module, &.{mod}),
+                .top_functions = &.{},
+            };
+            const mod_name_str = if (mod.name.parts.len > 0) ctx.interner.get(mod.name.parts[mod.name.parts.len - 1]) else "unknown";
+            const mod_ir = compileHirToIr(alloc, ctx, mod_name_str, &single_mod_hir, shared_store, options) catch {
+                std.debug.print("IR failed for module: {s}\n", .{mod_name_str});
+                continue;
+            };
+            for (mod_ir.functions) |func| {
+                all_functions.append(alloc, func) catch return error.OutOfMemory;
+            }
+            if (mod_ir.entry) |eid| entry_id = eid;
+            for (mod_ir.type_defs) |td| {
+                all_type_defs.append(alloc, td) catch return error.OutOfMemory;
+            }
         }
-        const mod_program = findModuleProgram(ctx, mod_name) orelse continue;
-        const hir_result = compileSingleModuleHir(alloc, ctx, mod_name, mod_program, options) catch continue;
-        hir_results.append(alloc, hir_result) catch return error.OutOfMemory;
-    }
-
-    // Phase 2: Merge all HIR modules into one program for whole-program monomorphization
-    var all_hir_modules: std.ArrayListUnmanaged(zap.hir.Module) = .empty;
-    var all_hir_top_fns: std.ArrayListUnmanaged(zap.hir.FunctionGroup) = .empty;
-    // Use a combined type store from the first module (they share the scope graph
-    // so type IDs are consistent; we just need the latest type vars)
-    var combined_store: ?*zap.types.TypeStore = null;
-    var max_group_id: u32 = 0;
-    for (hir_results.items) |*result| {
-        for (result.hir_program.modules) |mod| {
-            all_hir_modules.append(alloc, mod) catch return error.OutOfMemory;
-        }
-        for (result.hir_program.top_functions) |tf| {
-            all_hir_top_fns.append(alloc, tf) catch return error.OutOfMemory;
-        }
-        if (combined_store == null) {
-            combined_store = &result.type_store;
-        }
-        if (result.next_group_id > max_group_id) {
-            max_group_id = result.next_group_id;
-        }
-    }
-
-    var combined_hir = zap.hir.Program{
-        .modules = all_hir_modules.toOwnedSlice(alloc) catch return error.OutOfMemory,
-        .top_functions = all_hir_top_fns.toOwnedSlice(alloc) catch return error.OutOfMemory,
-    };
-
-    // Phase 3: Run whole-program monomorphization
-    if (combined_store) |store| {
-        var mono_next = max_group_id;
-        const mono_result = zap.monomorphize.monomorphize(alloc, &combined_hir, @constCast(store), &mono_next, &ctx.interner) catch {
-            ctx.diag_engine.err("Error during whole-program monomorphization", .{ .start = 0, .end = 0 }) catch {};
-            emitContextDiagnostics(ctx, alloc);
-            return error.HirFailed;
-        };
-        combined_hir = mono_result.program;
-    }
-
-    // Phase 4: Compile each module's HIR to IR
-    for (combined_hir.modules) |mod| {
-        // Build a single-module HIR program for IR conversion
-        const single_mod_hir = zap.hir.Program{
-            .modules = try alloc.dupe(zap.hir.Module, &.{mod}),
-            .top_functions = &.{},
-        };
-        const store = combined_store orelse continue;
-        // Resolve module name for CTFE
-        const mod_name_str = if (mod.name.parts.len > 0) ctx.interner.get(mod.name.parts[mod.name.parts.len - 1]) else "unknown";
-        const mod_ir = compileHirToIr(alloc, ctx, mod_name_str, &single_mod_hir, store, options) catch continue;
-        for (mod_ir.functions) |func| {
-            const adjusted = try cloneFunctionWithOffset(alloc, func, func_id_offset);
-            all_functions.append(alloc, adjusted) catch return error.OutOfMemory;
-        }
-        if (mod_ir.entry) |eid| {
-            entry_id = func_id_offset + eid;
-        }
-        func_id_offset += @intCast(mod_ir.functions.len);
-        for (mod_ir.type_defs) |td| {
-            all_type_defs.append(alloc, td) catch return error.OutOfMemory;
-        }
-    }
-    // Also compile top-level functions
-    if (combined_hir.top_functions.len > 0 and combined_store != null) {
-        const top_hir = zap.hir.Program{
-            .modules = &.{},
-            .top_functions = combined_hir.top_functions,
-        };
-        const mod_ir = compileHirToIr(alloc, ctx, "top", &top_hir, combined_store.?, options) catch {
-            return error.IrFailed;
-        };
-        for (mod_ir.functions) |func| {
-            const adjusted = try cloneFunctionWithOffset(alloc, func, func_id_offset);
-            all_functions.append(alloc, adjusted) catch return error.OutOfMemory;
-        }
-        if (mod_ir.entry) |eid| {
-            entry_id = func_id_offset + eid;
-        }
-        func_id_offset += @intCast(mod_ir.functions.len);
-        for (mod_ir.type_defs) |td| {
-            all_type_defs.append(alloc, td) catch return error.OutOfMemory;
+        if (combined_hir.top_functions.len > 0) {
+            const top_hir = zap.hir.Program{
+                .modules = &.{},
+                .top_functions = combined_hir.top_functions,
+            };
+            const mod_ir = compileHirToIr(alloc, ctx, "top", &top_hir, shared_store, options) catch return error.IrFailed;
+            for (mod_ir.functions) |func| {
+                all_functions.append(alloc, func) catch return error.OutOfMemory;
+            }
+            if (mod_ir.entry) |eid| entry_id = eid;
+            for (mod_ir.type_defs) |td| {
+                all_type_defs.append(alloc, td) catch return error.OutOfMemory;
+            }
         }
     }
 

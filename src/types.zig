@@ -237,9 +237,37 @@ pub const TypeStore = struct {
     }
 
     pub fn addType(self: *TypeStore, typ: Type) !TypeId {
+        // Structural deduplication (InternPool pattern).
+        switch (typ) {
+            .type_var, .unknown, .error_type => {},
+            else => {
+                for (self.types.items, 0..) |existing, idx| {
+                    if (typeStructEq(existing, typ)) return @intCast(idx);
+                }
+            },
+        }
         const id: TypeId = @intCast(self.types.items.len);
         try self.types.append(self.allocator, typ);
         return id;
+    }
+
+    fn typeStructEq(a: Type, b: Type) bool {
+        const at = std.meta.activeTag(a);
+        const bt = std.meta.activeTag(b);
+        if (at != bt) return false;
+        return switch (a) {
+            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type => true,
+            .type_var => false,
+            .list => |l| l.element == b.list.element,
+            .tuple => |t| std.mem.eql(TypeId, t.elements, b.tuple.elements),
+            .function => |f| f.return_type == b.function.return_type and std.mem.eql(TypeId, f.params, b.function.params),
+            .map => |m| m.key == b.map.key and m.value == b.map.value,
+            .struct_type => |s| s.name == b.struct_type.name,
+            .tagged_union => |t| t.name == b.tagged_union.name,
+            .opaque_type => |o| o.name == b.opaque_type.name,
+            .applied => |ap| ap.base == b.applied.base and std.mem.eql(TypeId, ap.args, b.applied.args),
+            .union_type => |u| std.mem.eql(TypeId, u.members, b.union_type.members),
+        };
     }
 
     pub fn addFunctionType(
@@ -929,7 +957,8 @@ pub const MonomorphRegistry = struct {
 
 pub const TypeChecker = struct {
     allocator: std.mem.Allocator,
-    store: TypeStore,
+    store: *TypeStore,
+    owns_store: bool = true,
     interner: *const ast.StringInterner,
     graph: *scope_mod.ScopeGraph,
     errors: std.ArrayList(Error),
@@ -972,9 +1001,31 @@ pub const TypeChecker = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator, interner: *const ast.StringInterner, graph: *scope_mod.ScopeGraph) TypeChecker {
+        const store = allocator.create(TypeStore) catch @panic("OOM");
+        store.* = TypeStore.init(allocator, interner);
         return .{
             .allocator = allocator,
-            .store = TypeStore.init(allocator, interner),
+            .store = store,
+            .owns_store = true,
+            .interner = interner,
+            .graph = graph,
+            .errors = .empty,
+            .expr_types = std.AutoHashMap(usize, TypeId).init(allocator),
+            .current_scope = null,
+            .referenced_bindings = std.AutoHashMap(scope_mod.BindingId, void).init(allocator),
+            .ownership_bindings = std.AutoHashMap(scope_mod.BindingId, BindingOwnershipInfo).init(allocator),
+            .analysis_context = null,
+            .analysis_program = null,
+            .morph_registry = MonomorphRegistry.init(allocator),
+            .type_var_scope = std.StringHashMap(TypeId).init(allocator),
+        };
+    }
+
+    pub fn initWithSharedStore(allocator: std.mem.Allocator, shared_store: *TypeStore, interner: *const ast.StringInterner, graph: *scope_mod.ScopeGraph) TypeChecker {
+        return .{
+            .allocator = allocator,
+            .store = shared_store,
+            .owns_store = false,
             .interner = interner,
             .graph = graph,
             .errors = .empty,
@@ -990,7 +1041,10 @@ pub const TypeChecker = struct {
     }
 
     pub fn deinit(self: *TypeChecker) void {
-        self.store.deinit();
+        if (self.owns_store) {
+            self.store.deinit();
+            self.allocator.destroy(self.store);
+        }
         self.errors.deinit(self.allocator);
         self.expr_types.deinit();
         self.referenced_bindings.deinit();
@@ -1836,7 +1890,7 @@ pub const TypeChecker = struct {
             switch (type_entry.kind) {
                 .struct_type => |sd| {
                     const name = sd.name orelse continue;
-                    // Check if the name conflicts with a builtin type
+                    if (self.store.name_to_type.get(name) != null) continue;
                     const name_str = self.interner.get(name);
                     if (self.store.resolveTypeName(name_str) != null) {
                         try self.errors.append(self.allocator, .{
@@ -1900,7 +1954,7 @@ pub const TypeChecker = struct {
                     try self.store.name_to_type.put(name, type_id);
                 },
                 .union_type => |ud| {
-                    // Check if the name conflicts with a builtin type
+                    if (self.store.name_to_type.get(ud.name) != null) continue;
                     const enum_name_str = self.interner.get(ud.name);
                     if (self.store.resolveTypeName(enum_name_str) != null) {
                         try self.errors.append(self.allocator, .{
@@ -1930,6 +1984,7 @@ pub const TypeChecker = struct {
                     try self.store.name_to_type.put(ud.name, type_id);
                 },
                 .opaque_type => |opaque_body| {
+                    if (self.store.name_to_type.get(type_entry.name) != null) continue;
                     const opaque_name_str = self.interner.get(type_entry.name);
                     if (self.store.resolveTypeName(opaque_name_str) != null) {
                         try self.errors.append(self.allocator, .{
@@ -3177,7 +3232,7 @@ pub const TypeChecker = struct {
 
                         // Apply substitutions to resolve the return type
                         const resolved_return = if (!unification_failed)
-                            subs.applyToType(&self.store, signature.return_type)
+                            subs.applyToType(self.store, signature.return_type)
                         else
                             signature.return_type;
 
@@ -3203,7 +3258,7 @@ pub const TypeChecker = struct {
                                     family_id,
                                     type_args_list.items,
                                     bindings_list.items,
-                                    &self.store,
+                                    self.store,
                                 );
                             }
                         }
@@ -3330,7 +3385,7 @@ pub const TypeChecker = struct {
 
                                     // Apply substitutions to resolve the return type
                                     const mod_resolved_return = if (!mod_unification_failed)
-                                        mod_subs.applyToType(&self.store, signature.return_type)
+                                        mod_subs.applyToType(self.store, signature.return_type)
                                     else
                                         signature.return_type;
 
@@ -3355,7 +3410,7 @@ pub const TypeChecker = struct {
                                                 family_id,
                                                 mod_type_args.items,
                                                 mod_bindings.items,
-                                                &self.store,
+                                                self.store,
                                             );
                                         }
                                     }
