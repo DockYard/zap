@@ -35,6 +35,7 @@ pub fn monomorphize(
         .store = store,
         .next_group_id = next_group_id,
         .interner = interner,
+        .program = program,
         .generic_groups = std.AutoHashMap(u32, *const hir.FunctionGroup).init(allocator),
         .specializations = std.AutoHashMap(u64, u32).init(allocator),
         .new_groups = .empty,
@@ -65,13 +66,15 @@ pub fn monomorphize(
     }
 
     // Phase B: Scan all call sites, collect instantiations, create specializations
-    for (program.modules) |mod| {
+    for (program.modules, 0..) |mod, mod_idx| {
+        ctx.current_scan_module_idx = mod_idx;
         for (mod.functions) |*group| {
             for (group.clauses) |clause| {
                 try ctx.scanBlock(clause.body);
             }
         }
     }
+    ctx.current_scan_module_idx = null;
     for (program.top_functions) |*group| {
         for (group.clauses) |clause| {
             try ctx.scanBlock(clause.body);
@@ -79,19 +82,27 @@ pub fn monomorphize(
     }
 
     // Phase C: Build new program with specialized groups added.
-    // For each module, add any specializations that originated from its functions.
+    // Specializations are placed in the CALLING module (target_module_idx)
+    // so that cross-module direct calls resolve within the same module's IR.
+    // If target_module_idx is null, fall back to placing in the defining module.
     var new_modules: std.ArrayListUnmanaged(hir.Module) = .empty;
-    for (program.modules) |mod| {
+    for (program.modules, 0..) |mod, mod_idx| {
         var new_fns: std.ArrayListUnmanaged(hir.FunctionGroup) = .empty;
         for (mod.functions) |group| {
             try new_fns.append(allocator, group);
         }
-        // Add specializations of functions from this module
         for (ctx.new_groups.items) |entry| {
-            // Check if the specialization's source group belongs to this module
-            for (mod.functions) |orig_group| {
-                if (entry.source_group_id == orig_group.id) {
+            if (entry.target_module_idx) |target_idx| {
+                // Cross-module: place in calling module
+                if (target_idx == mod_idx) {
                     try new_fns.append(allocator, entry.group);
+                }
+            } else {
+                // Intra-module: place in defining module
+                for (mod.functions) |orig_group| {
+                    if (entry.source_group_id == orig_group.id) {
+                        try new_fns.append(allocator, entry.group);
+                    }
                 }
             }
         }
@@ -142,6 +153,9 @@ pub fn monomorphize(
 const NewGroupEntry = struct {
     group: hir.FunctionGroup,
     source_group_id: u32,
+    /// Module index where this specialization should be placed.
+    /// For cross-module calls, this is the CALLING module, not the defining module.
+    target_module_idx: ?usize = null,
 };
 
 const MonomorphContext = struct {
@@ -149,6 +163,10 @@ const MonomorphContext = struct {
     store: *TypeStore,
     next_group_id: *u32,
     interner: *ast.StringInterner,
+    /// Reference to the whole HIR program for resolving named cross-module calls
+    program: *const hir.Program,
+    /// Current module index being scanned (for placing specializations)
+    current_scan_module_idx: ?usize = null,
     /// Active substitution map during cloning. Set by cloneGroupWithSubs,
     /// used by cloneExpr/cloneDecision to substitute type_ids.
     current_subs: ?*const SubstitutionMap = null,
@@ -160,6 +178,26 @@ const MonomorphContext = struct {
     new_groups: std.ArrayListUnmanaged(NewGroupEntry),
     /// Map from (call_site_hash) → new_group_id for rewriting
     call_rewrites: std.AutoHashMap(u64, u32),
+
+    /// Resolve a named cross-module call (e.g., List.head) to a function group ID
+    /// by searching all modules in the HIR program.
+    fn resolveNamedCall(self: *const MonomorphContext, nc: hir.NamedCall, arity: u32) ?u32 {
+        const target_module = nc.module orelse return null;
+        for (self.program.modules) |mod| {
+            // Check if this module's name matches the target
+            if (mod.name.parts.len == 0) continue;
+            const last_part = self.interner.get(mod.name.parts[mod.name.parts.len - 1]);
+            if (!std.mem.eql(u8, last_part, target_module)) continue;
+            // Search for the function by name and arity
+            for (mod.functions) |*group| {
+                const group_name = self.interner.get(group.name);
+                if (std.mem.eql(u8, group_name, nc.name) and group.arity == arity) {
+                    return group.id;
+                }
+            }
+        }
+        return null;
+    }
 
     fn scanBlock(self: *MonomorphContext, block: *const hir.Block) error{OutOfMemory}!void {
         for (block.stmts) |stmt| {
@@ -187,10 +225,16 @@ const MonomorphContext = struct {
                 const target_id = switch (call.target) {
                     .direct => |dc| dc.function_group_id,
                     .dispatch => |dp| dp.function_group_id,
+                    .named => |nc| blk: {
+                        const resolved = self.resolveNamedCall(nc, @intCast(call.args.len)) orelse return;
+                        break :blk resolved;
+                    },
                     else => return,
                 };
 
-                const generic_group = self.generic_groups.get(target_id) orelse return;
+                const generic_group = self.generic_groups.get(target_id) orelse {
+                    return;
+                };
 
                 // Unify arg types with param types to find type variable bindings
                 if (generic_group.clauses.len == 0) return;
@@ -240,6 +284,7 @@ const MonomorphContext = struct {
                 try self.new_groups.append(self.allocator, .{
                     .group = specialized,
                     .source_group_id = target_id,
+                    .target_module_idx = self.current_scan_module_idx,
                 });
                 try self.specializations.put(key, new_id);
                 // Record this specific call expression for rewriting
@@ -639,6 +684,13 @@ const MonomorphContext = struct {
                             switch (c.target) {
                                 .direct => |*dc| dc.function_group_id = new_id,
                                 .dispatch => |*dp| dp.function_group_id = new_id,
+                                .named => {
+                                    // Rewrite named cross-module call to direct call
+                                    c.target = .{ .direct = .{
+                                        .function_group_id = new_id,
+                                        .clause_index = 0,
+                                    } };
+                                },
                                 else => {},
                             }
                         },
