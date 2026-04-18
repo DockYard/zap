@@ -3350,13 +3350,12 @@ pub const TypeChecker = struct {
                 return TypeStore.UNKNOWN;
             }
             if (fa.object.* == .module_ref) {
-                // Look up the module's scope and resolve the function there
                 const mod_name = fa.object.module_ref.name;
                 for (self.graph.modules.items) |mod_entry| {
                     if (mod_entry.name.parts.len == mod_name.parts.len) {
                         var match = true;
                         for (mod_entry.name.parts, mod_name.parts) |a, b| {
-                            if (a != b) {
+                            if (a != b and !std.mem.eql(u8, self.interner.get(a), self.interner.get(b))) {
                                 match = false;
                                 break;
                             }
