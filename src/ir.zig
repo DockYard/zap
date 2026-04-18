@@ -1031,6 +1031,34 @@ pub const IrBuilder = struct {
     fn buildFunctionGroup(self: *IrBuilder, group: *const hir_mod.FunctionGroup) !void {
         if (group.clauses.len == 0) return;
 
+        // Skip generic (unmonomorphized) functions — they contain type variables
+        // that can't be lowered to concrete IR types. Only the monomorphized copies
+        // (produced by the monomorphization pass) should be compiled.
+        // Emit a minimal stub to preserve function ID ordering.
+        if (self.type_store) |ts| {
+            if (isGenericHirGroup(ts, group)) {
+                const func_id: FunctionId = group.id;
+                if (self.next_function_id <= func_id) {
+                    self.next_function_id = func_id + 1;
+                }
+                // Emit an empty stub — this function is never called directly;
+                // all call sites are rewritten to point to monomorphized copies.
+                const name = self.interner.get(group.name);
+                try self.functions.append(self.allocator, .{
+                    .id = func_id,
+                    .name = name,
+                    .scope_id = group.scope_id,
+                    .arity = group.arity,
+                    .params = &.{},
+                    .body = &.{},
+                    .return_type = .void,
+                    .is_closure = false,
+                    .captures = &.{},
+                });
+                return;
+            }
+        }
+
         // @native bodyless functions: emit a minimal stub (no body instructions).
         // The actual call routing happens via call_builtin at call sites.
         // We still need to emit the function to preserve function ID ordering.
@@ -4164,6 +4192,46 @@ fn findParamGetIdInDecision(decision: *const hir_mod.Decision, target_element: u
         },
         .failure => return target_element,
     }
+}
+
+/// Check if a HIR function group is generic (has unresolved type variables in params/return).
+fn isGenericHirGroup(store: *const types_mod.TypeStore, group: *const hir_mod.FunctionGroup) bool {
+    if (group.clauses.len == 0) return false;
+    const first_clause = &group.clauses[0];
+    for (first_clause.params) |param| {
+        if (containsTypeVarInStore(store, param.type_id)) return true;
+    }
+    if (containsTypeVarInStore(store, first_clause.return_type)) return true;
+    return false;
+}
+
+fn containsTypeVarInStore(store: *const types_mod.TypeStore, type_id: types_mod.TypeId) bool {
+    if (type_id >= store.types.items.len) return false;
+    const typ = store.types.items[type_id];
+    return switch (typ) {
+        .type_var => true,
+        .list => |lt| containsTypeVarInStore(store, lt.element),
+        .tuple => |tt| {
+            for (tt.elements) |elem| {
+                if (containsTypeVarInStore(store, elem)) return true;
+            }
+            return false;
+        },
+        .function => |ft| {
+            for (ft.params) |param| {
+                if (containsTypeVarInStore(store, param)) return true;
+            }
+            return containsTypeVarInStore(store, ft.return_type);
+        },
+        .map => |mt| containsTypeVarInStore(store, mt.key) or containsTypeVarInStore(store, mt.value),
+        .applied => |at| {
+            for (at.args) |arg| {
+                if (containsTypeVarInStore(store, arg)) return true;
+            }
+            return false;
+        },
+        else => false,
+    };
 }
 
 fn typeIdToZigType(type_id: types_mod.TypeId) ZigType {

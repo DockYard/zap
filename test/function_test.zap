@@ -17,6 +17,7 @@ pub module Test.FunctionTest {
     test("string function greets correctly") {
       assert(greet("World") == "Hello, World!")
     }
+
   }
 
   fn classify(0 :: i64) -> String {

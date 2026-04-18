@@ -1482,6 +1482,9 @@ pub const HirBuilder = struct {
     group_captures: std.AutoHashMap(u32, []const Capture),
     current_capture_map: std.AutoHashMap(ast.StringId, u32),
     current_capture_list: std.ArrayList(Capture),
+    /// Maps type variable names to TypeIds within the current function clause,
+    /// ensuring `a` in `fn foo(x :: a) -> a` refers to the same type variable.
+    hir_type_var_scope: std.StringHashMap(types_mod.TypeId),
     errors: std.ArrayList(Error),
 
     pub const Error = struct {
@@ -1520,6 +1523,7 @@ pub const HirBuilder = struct {
             .group_captures = std.AutoHashMap(u32, []const Capture).init(allocator),
             .current_capture_map = std.AutoHashMap(ast.StringId, u32).init(allocator),
             .current_capture_list = .empty,
+            .hir_type_var_scope = std.StringHashMap(types_mod.TypeId).init(allocator),
             .errors = .empty,
         };
     }
@@ -1530,6 +1534,7 @@ pub const HirBuilder = struct {
         self.current_capture_map.deinit();
         self.current_capture_list.deinit(self.allocator);
         self.current_assignment_bindings.deinit(self.allocator);
+        self.hir_type_var_scope.deinit();
         self.errors.deinit(self.allocator);
     }
 
@@ -2276,6 +2281,7 @@ pub const HirBuilder = struct {
 
     fn buildClause(self: *HirBuilder, clause: *const ast.FunctionClause) !Clause {
         self.next_local = 0;
+        self.hir_type_var_scope.clearRetainingCapacity();
         const prev_clause_scope = self.current_clause_scope;
         // Look up the clause's scope from the node_scope_map using the
         // composite (source_id, span.start) key. This prevents collisions
@@ -3552,6 +3558,19 @@ pub const HirBuilder = struct {
                     return store_ptr.addType(.{ .map = .{ .key = key_type, .value = value_type } }) catch types_mod.TypeStore.UNKNOWN;
                 }
                 return types_mod.TypeStore.UNKNOWN;
+            },
+            .variable => |tv| {
+                // Type variable — ensure the same name within a function clause maps
+                // to the same TypeId so that `fn foo(x :: a) -> a` has consistent types.
+                const var_name = self.interner.get(tv.name);
+                if (self.hir_type_var_scope.get(var_name)) |existing| {
+                    return existing;
+                }
+                const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
+                const fresh = store_ptr.freshVar() catch return types_mod.TypeStore.UNKNOWN;
+                const self_mut: *HirBuilder = @constCast(self);
+                self_mut.hir_type_var_scope.put(var_name, fresh) catch {};
+                return fresh;
             },
             else => types_mod.TypeStore.UNKNOWN,
         };
