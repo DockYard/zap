@@ -3133,9 +3133,19 @@ pub const HirBuilder = struct {
                 for (l.elements) |elem| {
                     try elems.append(self.allocator, try self.buildExpr(elem));
                 }
+                const built_elems = try elems.toOwnedSlice(self.allocator);
+                // Infer list type from first element
+                const list_type_id = if (built_elems.len > 0) blk: {
+                    const elem_type = built_elems[0].type_id;
+                    if (elem_type != types_mod.TypeStore.UNKNOWN) {
+                        const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
+                        break :blk store_ptr.addType(.{ .list = .{ .element = elem_type } }) catch types_mod.TypeStore.UNKNOWN;
+                    }
+                    break :blk types_mod.TypeStore.UNKNOWN;
+                } else types_mod.TypeStore.UNKNOWN;
                 return try self.create(Expr, .{
-                    .kind = .{ .list_init = try elems.toOwnedSlice(self.allocator) },
-                    .type_id = types_mod.TypeStore.UNKNOWN,
+                    .kind = .{ .list_init = built_elems },
+                    .type_id = list_type_id,
                     .span = l.meta.span,
                 });
             },

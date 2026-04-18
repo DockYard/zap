@@ -272,9 +272,17 @@ const MonomorphContext = struct {
 
                 if (type_args.items.len == 0) return; // Not actually generic
 
-                // Check if this instantiation already exists
-                const key = hashInstantiation(target_id, type_args.items);
-                if (self.specializations.get(key)) |_| return;
+                // Check if this instantiation already exists for THIS module.
+                // Each calling module needs its own copy of the specialization
+                // so that call_direct resolves within the module's own IR.
+                const module_salt: u32 = if (self.current_scan_module_idx) |idx| @intCast(idx) else 0;
+                const base_key = hashInstantiation(target_id, type_args.items);
+                const key = base_key +% @as(u64, module_salt) *% 0x9E3779B97F4A7C15;
+                if (self.specializations.get(key)) |existing_id| {
+                    // Already have a specialization for this module — just record the rewrite
+                    try self.call_rewrites.put(@intFromPtr(expr), existing_id);
+                    return;
+                }
 
                 // Create specialized clone
                 const new_id = self.next_group_id.*;
