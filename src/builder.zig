@@ -28,7 +28,19 @@ pub const BuildConfig = struct {
     /// Zig 0.16: enable verbose multi-line error output.
     multiline_errors: bool = false,
 
-    pub const Kind = enum { bin, lib, obj };
+    /// Base URL for source links in generated docs (e.g., "https://github.com/user/repo").
+    source_url: ?[]const u8 = null,
+    /// Path to a Markdown file used as the documentation landing page.
+    landing_page: ?[]const u8 = null,
+    /// Additional documentation page groups: [{group_name, [file_paths]}].
+    doc_groups: []const DocGroup = &.{},
+
+    pub const DocGroup = struct {
+        name: []const u8,
+        pages: []const []const u8,
+    };
+
+    pub const Kind = enum { bin, lib, obj, doc };
     pub const Optimize = enum { debug, release_safe, release_fast, release_small };
 
     pub const Dep = struct {
@@ -203,7 +215,14 @@ fn constValueToBuildConfig(alloc: std.mem.Allocator, val: zap.ctfe.ConstValue) !
                     };
                 } else if (std.mem.eql(u8, field.name, "kind")) {
                     config.kind = switch (field.value) {
-                        .atom => |a| if (std.mem.eql(u8, a, "lib")) .lib else if (std.mem.eql(u8, a, "obj")) .obj else .bin,
+                        .atom => |a| if (std.mem.eql(u8, a, "lib"))
+                            .lib
+                        else if (std.mem.eql(u8, a, "obj"))
+                            .obj
+                        else if (std.mem.eql(u8, a, "doc"))
+                            .doc
+                        else
+                            .bin,
                         else => .bin,
                     };
                 } else if (std.mem.eql(u8, field.name, "root")) {
@@ -251,6 +270,29 @@ fn constValueToBuildConfig(alloc: std.mem.Allocator, val: zap.ctfe.ConstValue) !
                     }
                 } else if (std.mem.eql(u8, field.name, "build_opts")) {
                     try loadBuildOpts(alloc, &config.build_opts, field.value);
+                } else if (std.mem.eql(u8, field.name, "source_url")) {
+                    config.source_url = switch (field.value) {
+                        .string => |s| if (s.len > 0) try alloc.dupe(u8, s) else null,
+                        else => null,
+                    };
+                } else if (std.mem.eql(u8, field.name, "landing_page")) {
+                    config.landing_page = switch (field.value) {
+                        .string => |s| if (s.len > 0) try alloc.dupe(u8, s) else null,
+                        else => null,
+                    };
+                } else if (std.mem.eql(u8, field.name, "doc_groups")) {
+                    switch (field.value) {
+                        .list => |items| {
+                            var groups_list: std.ArrayListUnmanaged(BuildConfig.DocGroup) = .empty;
+                            for (items) |item| {
+                                if (try constValueToDocGroup(alloc, item)) |group| {
+                                    try groups_list.append(alloc, group);
+                                }
+                            }
+                            config.doc_groups = try groups_list.toOwnedSlice(alloc);
+                        },
+                        else => {},
+                    }
                 }
             }
 
@@ -259,6 +301,34 @@ fn constValueToBuildConfig(alloc: std.mem.Allocator, val: zap.ctfe.ConstValue) !
             return config;
         },
         else => return error.ManifestNotFound,
+    }
+}
+
+fn constValueToDocGroup(alloc: std.mem.Allocator, val: zap.ctfe.ConstValue) !?BuildConfig.DocGroup {
+    // Expecting a tuple: {group_name, [page_paths]}
+    switch (val) {
+        .tuple => |fields| {
+            if (fields.len != 2) return null;
+            const name = switch (fields[0]) {
+                .string => |s| try alloc.dupe(u8, s),
+                else => return null,
+            };
+            const pages = switch (fields[1]) {
+                .list => |items| blk: {
+                    var page_list: std.ArrayListUnmanaged([]const u8) = .empty;
+                    for (items) |item| {
+                        switch (item) {
+                            .string => |s| try page_list.append(alloc, try alloc.dupe(u8, s)),
+                            else => {},
+                        }
+                    }
+                    break :blk try page_list.toOwnedSlice(alloc);
+                },
+                else => return null,
+            };
+            return .{ .name = name, .pages = pages };
+        },
+        else => return null,
     }
 }
 

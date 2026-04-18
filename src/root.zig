@@ -42,6 +42,7 @@ pub const ctfe = @import("ctfe.zig");
 pub const lockfile = @import("lockfile.zig");
 pub const monomorphize = @import("monomorphize.zig");
 pub const env = @import("env.zig");
+pub const doc_generator = @import("doc_generator.zig");
 
 test {
     _ = @import("token.zig");

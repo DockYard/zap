@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>List — zap_stdlib</title>
+<link rel="stylesheet" href="../style.css">
+<meta name="zap-docs-base" content="../">
+</head>
+<body>
+<header class="topbar">
+<div class="topbar-left">
+<svg class="zap-mark" width="22" height="22" viewBox="0 0 22 22" fill="none">
+<rect x="0.5" y="0.5" width="21" height="21" rx="3" stroke="var(--border-strong)"/>
+<path d="M6 6 L15 6 L8 13 L16 13 L16 16 L6 16 L13 9 L6 9 Z" fill="var(--accent)"/>
+</svg>
+<a href="../index.html" class="topbar-title">zap_stdlib</a>
+<span class="topbar-version">v0.1.0</span>
+<span class="docs-label">docs</span>
+</div>
+<div class="topbar-center">
+<button class="topbar-search-trigger" id="search-trigger">
+<svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+<circle cx="7" cy="7" r="5" stroke="var(--fg-muted)" stroke-width="1.3"/>
+<line x1="10.6" y1="10.6" x2="14" y2="14" stroke="var(--fg-muted)" stroke-width="1.3" stroke-linecap="round"/>
+</svg>
+<span>Search modules, functions, guides...</span>
+<kbd>⌘</kbd><kbd>K</kbd>
+</button>
+</div>
+<div class="topbar-right">
+<button id="theme-toggle" aria-label="Toggle dark mode" title="Toggle dark mode">
+<span class="theme-icon-light">☀</span>
+<span class="theme-icon-dark">☾</span>
+</button>
+<div class="topbar-divider"></div>
+<a href="https://github.com/DockYard/zap" class="topbar-github" aria-label="GitHub repository" title="GitHub">
+<svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor">
+<path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>
+</svg>
+</a>
+</div>
+</header>
+<div class="layout">
+<nav class="sidebar">
+<div class="sidebar-header"><a href="../index.html" class="sidebar-title">zap_stdlib</a> <span class="sidebar-version">v0.1.0</span></div>
+<div class="sidebar-search"><input type="text" id="search-input" placeholder="Search (Cmd+K)" aria-label="Search documentation"></div>
+<div class="sidebar-group">
+<h4>Modules</h4>
+<ul>
+<li><a href="../modules/Atom.html">Atom</a></li>
+<li><a href="../modules/Bool.html">Bool</a></li>
+<li><a href="../modules/Enum.html">Enum</a></li>
+<li><a href="../modules/File.html">File</a></li>
+<li><a href="../modules/Float.html">Float</a></li>
+<li><a href="../modules/Function.html">Function</a></li>
+<li><a href="../modules/IO.html">IO</a></li>
+<li><a href="../modules/Integer.html">Integer</a></li>
+<li><a href="../modules/Kernel.html">Kernel</a></li>
+<li class="active"><a href="../modules/List.html">List</a></li>
+<li><a href="../modules/Map.html">Map</a></li>
+<li><a href="../modules/Math.html">Math</a></li>
+<li><a href="../modules/String.html">String</a></li>
+<li><a href="../modules/System.html">System</a></li>
+<li><a href="../modules/Zest.html">Zest</a></li>
+</ul>
+</div>
+<div class="sidebar-group">
+<h4>Zest</h4>
+<ul>
+<li><a href="../modules/Zest.Case.html">Zest.Case</a></li>
+<li><a href="../modules/Zest.Runner.html">Zest.Runner</a></li>
+</ul>
+</div>
+</nav>
+<main class="content">
+<div class="title-row">
+<h1>List</h1>
+<div class="title-meta">
+<span class="pub-module-pill">pub module</span>
+<a href="https://github.com/DockYard/zap/blob/v0.1.0/./lib/list.zap" class="source-file">./lib/list.zap</a>
+</div>
+</div>
+<p class="tagline">Functions for working with lists.</p>
+<div class="moduledoc">
+<p>Functions for working with lists.</p>
+<p>Lists in Zap are singly-linked immutable cons cells using
+nullable pointers. An empty list is <code>[]</code> (null), and a
+non-empty list is a chain of cells each holding a head value
+and a tail pointer.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">List.length([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>])         <span class="hl-comment"># =&gt; 3</span>
+List.head([<span class="hl-number">10</span>, <span class="hl-number">20</span>, <span class="hl-number">30</span>])        <span class="hl-comment"># =&gt; 10</span>
+List.reverse([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>])        <span class="hl-comment"># =&gt; [3, 2, 1]</span></code></pre>
+</div>
+<h2 id="functions">Functions</h2>
+<table class="summary">
+<tr><td class="summary-name"><a href="#empty?-1">empty?/1</a></td><td class="summary-doc">Returns `true` if the list has no elements.</td></tr>
+<tr><td class="summary-name"><a href="#length-1">length/1</a></td><td class="summary-doc">Returns the number of elements in the list.</td></tr>
+<tr><td class="summary-name"><a href="#head-1">head/1</a></td><td class="summary-doc">Returns the first element of the list.</td></tr>
+<tr><td class="summary-name"><a href="#tail-1">tail/1</a></td><td class="summary-doc">Returns the list without its first element.</td></tr>
+<tr><td class="summary-name"><a href="#at-2">at/2</a></td><td class="summary-doc">Returns the element at the given zero-based index.</td></tr>
+<tr><td class="summary-name"><a href="#last-1">last/1</a></td><td class="summary-doc">Returns the last element of the list.</td></tr>
+<tr><td class="summary-name"><a href="#contains?-2">contains?/2</a></td><td class="summary-doc">Returns `true` if the list contains the given value.</td></tr>
+<tr><td class="summary-name"><a href="#reverse-1">reverse/1</a></td><td class="summary-doc">Reverses the order of elements.</td></tr>
+<tr><td class="summary-name"><a href="#prepend-2">prepend/2</a></td><td class="summary-doc">Prepends a value to the front of a list.</td></tr>
+<tr><td class="summary-name"><a href="#append-2">append/2</a></td><td class="summary-doc">Appends a value to the end of a list.</td></tr>
+<tr><td class="summary-name"><a href="#concat-2">concat/2</a></td><td class="summary-doc">Concatenates two lists.</td></tr>
+<tr><td class="summary-name"><a href="#take-2">take/2</a></td><td class="summary-doc">Takes the first `count` elements.</td></tr>
+<tr><td class="summary-name"><a href="#drop-2">drop/2</a></td><td class="summary-doc">Drops the first `count` elements.</td></tr>
+<tr><td class="summary-name"><a href="#uniq-1">uniq/1</a></td><td class="summary-doc">Returns a new list with duplicates removed.</td></tr>
+</table>
+<h2>Function Details</h2>
+<div class="function-detail" id="empty?-1">
+<div class="function-header">
+<h3>empty?<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#empty?-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">empty?</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[i64]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="function-doc">
+<p>Returns <code>true</code> if the list has no elements.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">List.empty?([])        <span class="hl-comment"># =&gt; true</span>
+List.empty?([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>]) <span class="hl-comment"># =&gt; false</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="length-1">
+<div class="function-header">
+<h3>length<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#length-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">length</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[i64]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="function-doc">
+<p>Returns the number of elements in the list.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">List.length([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>])  <span class="hl-comment"># =&gt; 3</span>
+List.length([])         <span class="hl-comment"># =&gt; 0</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="head-1">
+<div class="function-header">
+<h3>head<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#head-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">head</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[i64]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="function-doc">
+<p>Returns the first element of the list.
+Returns 0 for an empty list.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">List.head([<span class="hl-number">10</span>, <span class="hl-number">20</span>, <span class="hl-number">30</span>])  <span class="hl-comment"># =&gt; 10</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="tail-1">
+<div class="function-header">
+<h3>tail<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#tail-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">tail</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[i64]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[i64]</span></code></div>
+<div class="function-doc">
+<p>Returns the list without its first element.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">List.tail([<span class="hl-number">10</span>, <span class="hl-number">20</span>, <span class="hl-number">30</span>])  <span class="hl-comment"># =&gt; [20, 30]</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="at-2">
+<div class="function-header">
+<h3>at<span class="arity">/2</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#at-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">at</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[i64]</span><span class="sig-paren">, </span>index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="function-doc">
+<p>Returns the element at the given zero-based index.
+Returns 0 if the index is out of bounds.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">List.at([<span class="hl-number">10</span>, <span class="hl-number">20</span>, <span class="hl-number">30</span>], <span class="hl-number">1</span>)  <span class="hl-comment"># =&gt; 20</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="last-1">
+<div class="function-header">
+<h3>last<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#last-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">last</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[i64]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="function-doc">
+<p>Returns the last element of the list.
+Returns 0 for an empty list.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">List.last([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>])  <span class="hl-comment"># =&gt; 3</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="contains?-2">
+<div class="function-header">
+<h3>contains?<span class="arity">/2</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#contains?-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">contains?</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[i64]</span><span class="sig-paren">, </span>value<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="function-doc">
+<p>Returns <code>true</code> if the list contains the given value.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">List.contains?([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>], <span class="hl-number">2</span>)  <span class="hl-comment"># =&gt; true</span>
+List.contains?([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>], <span class="hl-number">5</span>)  <span class="hl-comment"># =&gt; false</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="reverse-1">
+<div class="function-header">
+<h3>reverse<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#reverse-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">reverse</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[i64]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[i64]</span></code></div>
+<div class="function-doc">
+<p>Reverses the order of elements.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">List.reverse([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>])  <span class="hl-comment"># =&gt; [3, 2, 1]</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="prepend-2">
+<div class="function-header">
+<h3>prepend<span class="arity">/2</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#prepend-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">prepend</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[i64]</span><span class="sig-paren">, </span>value<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[i64]</span></code></div>
+<div class="function-doc">
+<p>Prepends a value to the front of a list.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">List.prepend([<span class="hl-number">2</span>, <span class="hl-number">3</span>], <span class="hl-number">1</span>)  <span class="hl-comment"># =&gt; [1, 2, 3]</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="append-2">
+<div class="function-header">
+<h3>append<span class="arity">/2</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#append-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">append</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[i64]</span><span class="sig-paren">, </span>value<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[i64]</span></code></div>
+<div class="function-doc">
+<p>Appends a value to the end of a list. O(n).</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">List.append([<span class="hl-number">1</span>, <span class="hl-number">2</span>], <span class="hl-number">3</span>)  <span class="hl-comment"># =&gt; [1, 2, 3]</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="concat-2">
+<div class="function-header">
+<h3>concat<span class="arity">/2</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#concat-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">concat</span><span class="sig-paren">(</span>first<span class="sig-separator">::</span><span class="sig-type-pill">[i64]</span><span class="sig-paren">, </span>second<span class="sig-separator">::</span><span class="sig-type-pill">[i64]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[i64]</span></code></div>
+<div class="function-doc">
+<p>Concatenates two lists.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">List.concat([<span class="hl-number">1</span>, <span class="hl-number">2</span>], [<span class="hl-number">3</span>, <span class="hl-number">4</span>])  <span class="hl-comment"># =&gt; [1, 2, 3, 4]</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="take-2">
+<div class="function-header">
+<h3>take<span class="arity">/2</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#take-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">take</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[i64]</span><span class="sig-paren">, </span>count<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[i64]</span></code></div>
+<div class="function-doc">
+<p>Takes the first <code>count</code> elements.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">List.take([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>, <span class="hl-number">4</span>, <span class="hl-number">5</span>], <span class="hl-number">3</span>)  <span class="hl-comment"># =&gt; [1, 2, 3]</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="drop-2">
+<div class="function-header">
+<h3>drop<span class="arity">/2</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#drop-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">drop</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[i64]</span><span class="sig-paren">, </span>count<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[i64]</span></code></div>
+<div class="function-doc">
+<p>Drops the first <code>count</code> elements.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">List.drop([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>, <span class="hl-number">4</span>, <span class="hl-number">5</span>], <span class="hl-number">2</span>)  <span class="hl-comment"># =&gt; [3, 4, 5]</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="uniq-1">
+<div class="function-header">
+<h3>uniq<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#uniq-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">uniq</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[i64]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[i64]</span></code></div>
+<div class="function-doc">
+<p>Returns a new list with duplicates removed.
+Preserves the order of first occurrences.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">List.uniq([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>, <span class="hl-number">1</span>])  <span class="hl-comment"># =&gt; [1, 2, 3]</span></code></pre>
+</div>
+</div>
+</main>
+<aside class="toc">
+<h3>On This Page</h3>
+<ul>
+<li class="toc-section">Functions</li>
+<li><a href="#empty?-1">empty?/1</a></li>
+<li><a href="#length-1">length/1</a></li>
+<li><a href="#head-1">head/1</a></li>
+<li><a href="#tail-1">tail/1</a></li>
+<li><a href="#at-2">at/2</a></li>
+<li><a href="#last-1">last/1</a></li>
+<li><a href="#contains?-2">contains?/2</a></li>
+<li><a href="#reverse-1">reverse/1</a></li>
+<li><a href="#prepend-2">prepend/2</a></li>
+<li><a href="#append-2">append/2</a></li>
+<li><a href="#concat-2">concat/2</a></li>
+<li><a href="#take-2">take/2</a></li>
+<li><a href="#drop-2">drop/2</a></li>
+<li><a href="#uniq-1">uniq/1</a></li>
+</ul>
+</aside>
+</div>
+<div id="search-modal" class="search-modal" hidden>
+<div class="search-backdrop"></div>
+<div class="search-dialog">
+<input type="text" id="search-modal-input" placeholder="Search documentation..." aria-label="Search">
+<ul id="search-results" class="search-results"></ul>
+</div>
+</div>
+<script src="../app.js"></script>
+</body>
+</html>

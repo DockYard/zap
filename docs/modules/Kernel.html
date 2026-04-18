@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kernel — zap_stdlib</title>
+<link rel="stylesheet" href="../style.css">
+<meta name="zap-docs-base" content="../">
+</head>
+<body>
+<header class="topbar">
+<div class="topbar-left">
+<svg class="zap-mark" width="22" height="22" viewBox="0 0 22 22" fill="none">
+<rect x="0.5" y="0.5" width="21" height="21" rx="3" stroke="var(--border-strong)"/>
+<path d="M6 6 L15 6 L8 13 L16 13 L16 16 L6 16 L13 9 L6 9 Z" fill="var(--accent)"/>
+</svg>
+<a href="../index.html" class="topbar-title">zap_stdlib</a>
+<span class="topbar-version">v0.1.0</span>
+<span class="docs-label">docs</span>
+</div>
+<div class="topbar-center">
+<button class="topbar-search-trigger" id="search-trigger">
+<svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+<circle cx="7" cy="7" r="5" stroke="var(--fg-muted)" stroke-width="1.3"/>
+<line x1="10.6" y1="10.6" x2="14" y2="14" stroke="var(--fg-muted)" stroke-width="1.3" stroke-linecap="round"/>
+</svg>
+<span>Search modules, functions, guides...</span>
+<kbd>⌘</kbd><kbd>K</kbd>
+</button>
+</div>
+<div class="topbar-right">
+<button id="theme-toggle" aria-label="Toggle dark mode" title="Toggle dark mode">
+<span class="theme-icon-light">☀</span>
+<span class="theme-icon-dark">☾</span>
+</button>
+<div class="topbar-divider"></div>
+<a href="https://github.com/DockYard/zap" class="topbar-github" aria-label="GitHub repository" title="GitHub">
+<svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor">
+<path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>
+</svg>
+</a>
+</div>
+</header>
+<div class="layout">
+<nav class="sidebar">
+<div class="sidebar-header"><a href="../index.html" class="sidebar-title">zap_stdlib</a> <span class="sidebar-version">v0.1.0</span></div>
+<div class="sidebar-search"><input type="text" id="search-input" placeholder="Search (Cmd+K)" aria-label="Search documentation"></div>
+<div class="sidebar-group">
+<h4>Modules</h4>
+<ul>
+<li><a href="../modules/Atom.html">Atom</a></li>
+<li><a href="../modules/Bool.html">Bool</a></li>
+<li><a href="../modules/Enum.html">Enum</a></li>
+<li><a href="../modules/File.html">File</a></li>
+<li><a href="../modules/Float.html">Float</a></li>
+<li><a href="../modules/Function.html">Function</a></li>
+<li><a href="../modules/IO.html">IO</a></li>
+<li><a href="../modules/Integer.html">Integer</a></li>
+<li class="active"><a href="../modules/Kernel.html">Kernel</a></li>
+<li><a href="../modules/List.html">List</a></li>
+<li><a href="../modules/Map.html">Map</a></li>
+<li><a href="../modules/Math.html">Math</a></li>
+<li><a href="../modules/String.html">String</a></li>
+<li><a href="../modules/System.html">System</a></li>
+<li><a href="../modules/Zest.html">Zest</a></li>
+</ul>
+</div>
+<div class="sidebar-group">
+<h4>Zest</h4>
+<ul>
+<li><a href="../modules/Zest.Case.html">Zest.Case</a></li>
+<li><a href="../modules/Zest.Runner.html">Zest.Runner</a></li>
+</ul>
+</div>
+</nav>
+<main class="content">
+<div class="title-row">
+<h1>Kernel</h1>
+<div class="title-meta">
+<span class="pub-module-pill">pub module</span>
+<a href="https://github.com/DockYard/zap/blob/v0.1.0/./lib/kernel.zap" class="source-file">./lib/kernel.zap</a>
+</div>
+</div>
+<p class="tagline">The default module imported into every Zap module.</p>
+<div class="moduledoc">
+<p>The default module imported into every Zap module.</p>
+<p>Kernel provides the fundamental language constructs implemented
+as macros: control flow (<code>if</code>, <code>unless</code>), boolean operators
+(<code>and</code>, <code>or</code>), the pipe operator (<code>|&gt;</code>), sigils (<code>~s</code>, <code>~S</code>,
+<code>~w</code>, <code>~W</code>), and declaration macros (<code>fn</code>, <code>struct</code>, <code>union</code>).</p>
+<p>You don't need to <code>import Kernel</code> — its macros are available
+everywhere automatically.</p>
+</div>
+<h2 id="macros">Macros</h2>
+<table class="summary">
+<tr><td class="summary-name"><a href="#if-2">if/2</a></td><td class="summary-doc">Conditional expression with a single branch.</td></tr>
+<tr><td class="summary-name"><a href="#if-3">if/3</a></td><td class="summary-doc">Conditional expression with both branches.</td></tr>
+<tr><td class="summary-name"><a href="#unless-2">unless/2</a></td><td class="summary-doc">Negated conditional.</td></tr>
+<tr><td class="summary-name"><a href="#and-2">and/2</a></td><td class="summary-doc">Short-circuit logical AND.</td></tr>
+<tr><td class="summary-name"><a href="#or-2">or/2</a></td><td class="summary-doc">Short-circuit logical OR.</td></tr>
+<tr><td class="summary-name"><a href="#fn-1">fn/1</a></td><td class="summary-doc">Declaration macro for function definitions.</td></tr>
+<tr><td class="summary-name"><a href="#struct-1">struct/1</a></td><td class="summary-doc">Declaration macro for struct definitions.</td></tr>
+<tr><td class="summary-name"><a href="#union-1">union/1</a></td><td class="summary-doc">Declaration macro for union/enum definitions.</td></tr>
+<tr><td class="summary-name"><a href="#sigil_s-2">sigil_s/2</a></td><td class="summary-doc">String sigil with interpolation support.</td></tr>
+<tr><td class="summary-name"><a href="#sigil_S-2">sigil_S/2</a></td><td class="summary-doc">Raw string sigil without interpolation.</td></tr>
+<tr><td class="summary-name"><a href="#sigil_w-2">sigil_w/2</a></td><td class="summary-doc">Word list sigil with interpolation support.</td></tr>
+<tr><td class="summary-name"><a href="#sigil_W-2">sigil_W/2</a></td><td class="summary-doc">Word list sigil without interpolation.</td></tr>
+<tr><td class="summary-name"><a href="#|>-2">|&gt;/2</a></td><td class="summary-doc">Pipe operator.</td></tr>
+</table>
+<h2>Macro Details</h2>
+<div class="function-detail" id="if-2">
+<div class="function-header">
+<h3>if<span class="arity">/2</span></h3>
+<span class="badge">pub macro</span>
+<div style="flex:1"></div>
+<a href="#if-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">if</span><span class="sig-paren">(</span>condition<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">, </span>then_body<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Nil</span></code></div>
+<div class="function-doc">
+<p>Conditional expression with a single branch.</p>
+<p>Evaluates <code>condition</code> and executes <code>then_body</code> if truthy.
+Returns <code>nil</code> if the condition is false.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap"><span class="hl-keyword">if</span> x <span class="hl-op">&gt;</span> <span class="hl-number">0</span> {
+  <span class="hl-string">"positive"</span>
+}</code></pre>
+</div>
+</div>
+<div class="function-detail" id="if-3">
+<div class="function-header">
+<h3>if<span class="arity">/3</span></h3>
+<span class="badge">pub macro</span>
+<div style="flex:1"></div>
+<a href="#if-3" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">if</span><span class="sig-paren">(</span>condition<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">, </span>then_body<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">, </span>else_body<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Nil</span></code></div>
+<div class="function-doc">
+<p>Conditional expression with both branches.</p>
+<p>Evaluates <code>condition</code> and executes <code>then_body</code> if truthy,
+<code>else_body</code> if falsy.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap"><span class="hl-keyword">if</span> x <span class="hl-op">&gt;</span> <span class="hl-number">0</span> {
+  <span class="hl-string">"positive"</span>
+} <span class="hl-keyword">else</span> {
+  <span class="hl-string">"non-positive"</span>
+}</code></pre>
+</div>
+</div>
+<div class="function-detail" id="unless-2">
+<div class="function-header">
+<h3>unless<span class="arity">/2</span></h3>
+<span class="badge">pub macro</span>
+<div style="flex:1"></div>
+<a href="#unless-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">unless</span><span class="sig-paren">(</span>condition<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">, </span>body<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Nil</span></code></div>
+<div class="function-doc">
+<p>Negated conditional. Executes the body when the condition is false.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap"><span class="hl-keyword">unless</span> done {
+  IO.puts(<span class="hl-string">"still working..."</span>)
+}</code></pre>
+</div>
+</div>
+<div class="function-detail" id="and-2">
+<div class="function-header">
+<h3>and<span class="arity">/2</span></h3>
+<span class="badge">pub macro</span>
+<div style="flex:1"></div>
+<a href="#and-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">and</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="function-doc">
+<p>Short-circuit logical AND.</p>
+<p>Returns <code>false</code> immediately if the left operand is false.
+Otherwise evaluates and returns the right operand.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap"><span class="hl-builtin">true</span> <span class="hl-keyword">and</span> <span class="hl-builtin">true</span>    <span class="hl-comment"># =&gt; true</span>
+<span class="hl-builtin">true</span> <span class="hl-keyword">and</span> <span class="hl-builtin">false</span>   <span class="hl-comment"># =&gt; false</span>
+<span class="hl-builtin">false</span> <span class="hl-keyword">and</span> expr   <span class="hl-comment"># =&gt; false (expr not evaluated)</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="or-2">
+<div class="function-header">
+<h3>or<span class="arity">/2</span></h3>
+<span class="badge">pub macro</span>
+<div style="flex:1"></div>
+<a href="#or-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">or</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="function-doc">
+<p>Short-circuit logical OR.</p>
+<p>Returns the left operand immediately if it is truthy.
+Otherwise evaluates and returns the right operand.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap"><span class="hl-builtin">false</span> <span class="hl-keyword">or</span> <span class="hl-builtin">true</span>   <span class="hl-comment"># =&gt; true</span>
+<span class="hl-builtin">false</span> <span class="hl-keyword">or</span> <span class="hl-builtin">false</span>  <span class="hl-comment"># =&gt; false</span>
+<span class="hl-builtin">true</span> <span class="hl-keyword">or</span> expr    <span class="hl-comment"># =&gt; true (expr not evaluated)</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="fn-1">
+<div class="function-header">
+<h3>fn<span class="arity">/1</span></h3>
+<span class="badge">pub macro</span>
+<div style="flex:1"></div>
+<a href="#fn-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">fn</span><span class="sig-paren">(</span>decl<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="function-doc">
+<p>Declaration macro for function definitions.</p>
+<p>Receives the full function declaration AST and returns it.
+Identity transform — provides a hook point for future
+customization such as validation, instrumentation, or
+compile-time checks.</p>
+</div>
+</div>
+<div class="function-detail" id="struct-1">
+<div class="function-header">
+<h3>struct<span class="arity">/1</span></h3>
+<span class="badge">pub macro</span>
+<div style="flex:1"></div>
+<a href="#struct-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">struct</span><span class="sig-paren">(</span>decl<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="function-doc">
+<p>Declaration macro for struct definitions.</p>
+<p>Receives the full struct declaration AST and returns it.
+Identity transform — hook point for future customization.</p>
+</div>
+</div>
+<div class="function-detail" id="union-1">
+<div class="function-header">
+<h3>union<span class="arity">/1</span></h3>
+<span class="badge">pub macro</span>
+<div style="flex:1"></div>
+<a href="#union-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">union</span><span class="sig-paren">(</span>decl<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="function-doc">
+<p>Declaration macro for union/enum definitions.</p>
+<p>Receives the full union declaration AST and returns it.
+Identity transform — hook point for future customization.</p>
+</div>
+</div>
+<div class="function-detail" id="sigil_s-2">
+<div class="function-header">
+<h3>sigil_s<span class="arity">/2</span></h3>
+<span class="badge">pub macro</span>
+<div style="flex:1"></div>
+<a href="#sigil_s-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">sigil_s</span><span class="sig-paren">(</span>content<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">, </span>_opts<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="function-doc">
+<p>String sigil with interpolation support.</p>
+<p><code>~s&quot;hello \#{name}&quot;</code> is equivalent to <code>&quot;hello \#{name}&quot;</code>.
+Lowercase sigils allow <code>\#{}</code> interpolation.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">~s<span class="hl-string">"hello"</span>         <span class="hl-comment"># =&gt; &quot;hello&quot;</span>
+~s<span class="hl-string">"count: \#{42}"</span> <span class="hl-comment"># =&gt; &quot;count: 42&quot;</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="sigil_S-2">
+<div class="function-header">
+<h3>sigil_S<span class="arity">/2</span></h3>
+<span class="badge">pub macro</span>
+<div style="flex:1"></div>
+<a href="#sigil_S-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">sigil_S</span><span class="sig-paren">(</span>content<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">, </span>_opts<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="function-doc">
+<p>Raw string sigil without interpolation.</p>
+<p><code>~S&quot;hello \#{name}&quot;</code> keeps <code>\#{name}</code> as literal characters.
+Uppercase sigils suppress interpolation.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">~S<span class="hl-string">"hello"</span>          <span class="hl-comment"># =&gt; &quot;hello&quot;</span>
+~S<span class="hl-string">"no \#{interp}"</span>   <span class="hl-comment"># =&gt; &quot;no \#{interp}&quot; (literal)</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="sigil_w-2">
+<div class="function-header">
+<h3>sigil_w<span class="arity">/2</span></h3>
+<span class="badge">pub macro</span>
+<div style="flex:1"></div>
+<a href="#sigil_w-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">sigil_w</span><span class="sig-paren">(</span>content<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">, </span>_opts<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="function-doc">
+<p>Word list sigil with interpolation support.</p>
+<p>Splits the string on whitespace and returns a list of strings.
+Lowercase allows <code>\#{}</code> interpolation before splitting.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">~w<span class="hl-string">"foo bar baz"</span>  <span class="hl-comment"># =&gt; [&quot;foo&quot;, &quot;bar&quot;, &quot;baz&quot;]</span>
+~w<span class="hl-string">"hello world"</span>  <span class="hl-comment"># =&gt; [&quot;hello&quot;, &quot;world&quot;]</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="sigil_W-2">
+<div class="function-header">
+<h3>sigil_W<span class="arity">/2</span></h3>
+<span class="badge">pub macro</span>
+<div style="flex:1"></div>
+<a href="#sigil_W-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">sigil_W</span><span class="sig-paren">(</span>content<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">, </span>_opts<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="function-doc">
+<p>Word list sigil without interpolation.</p>
+<p>Splits the string on whitespace and returns a list of strings.
+Uppercase suppresses <code>\#{}</code> interpolation.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">~W<span class="hl-string">"foo bar baz"</span>  <span class="hl-comment"># =&gt; [&quot;foo&quot;, &quot;bar&quot;, &quot;baz&quot;]</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="|>-2">
+<div class="function-header">
+<h3>|&gt;<span class="arity">/2</span></h3>
+<span class="badge">pub macro</span>
+<div style="flex:1"></div>
+<a href="#|>-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">|&gt;</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="function-doc">
+<p>Pipe operator. Passes the left value as the first argument
+to the function call on the right.</p>
+<p><code>x |&gt; f(y)</code> becomes <code>f(x, y)</code>.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap"><span class="hl-number">5</span> <span class="hl-op">|&gt;</span> add_one()              <span class="hl-comment"># =&gt; add_one(5)</span>
+<span class="hl-string">"hello"</span> <span class="hl-op">|&gt;</span> <span class="hl-type">String</span>.length()  <span class="hl-comment"># =&gt; String.length(&quot;hello&quot;)</span>
+x <span class="hl-op">|&gt;</span> f() <span class="hl-op">|&gt;</span> g()            <span class="hl-comment"># =&gt; g(f(x))</span></code></pre>
+</div>
+</div>
+</main>
+<aside class="toc">
+<h3>On This Page</h3>
+<ul>
+<li class="toc-section">Macros</li>
+<li><a href="#if-2">if/2</a></li>
+<li><a href="#if-3">if/3</a></li>
+<li><a href="#unless-2">unless/2</a></li>
+<li><a href="#and-2">and/2</a></li>
+<li><a href="#or-2">or/2</a></li>
+<li><a href="#fn-1">fn/1</a></li>
+<li><a href="#struct-1">struct/1</a></li>
+<li><a href="#union-1">union/1</a></li>
+<li><a href="#sigil_s-2">sigil_s/2</a></li>
+<li><a href="#sigil_S-2">sigil_S/2</a></li>
+<li><a href="#sigil_w-2">sigil_w/2</a></li>
+<li><a href="#sigil_W-2">sigil_W/2</a></li>
+<li><a href="#|>-2">|&gt;/2</a></li>
+</ul>
+</aside>
+</div>
+<div id="search-modal" class="search-modal" hidden>
+<div class="search-backdrop"></div>
+<div class="search-dialog">
+<input type="text" id="search-modal-input" placeholder="Search documentation..." aria-label="Search">
+<ul id="search-results" class="search-results"></ul>
+</div>
+</div>
+<script src="../app.js"></script>
+</body>
+</html>

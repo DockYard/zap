@@ -1,0 +1,542 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>String — zap_stdlib</title>
+<link rel="stylesheet" href="../style.css">
+<meta name="zap-docs-base" content="../">
+</head>
+<body>
+<header class="topbar">
+<div class="topbar-left">
+<svg class="zap-mark" width="22" height="22" viewBox="0 0 22 22" fill="none">
+<rect x="0.5" y="0.5" width="21" height="21" rx="3" stroke="var(--border-strong)"/>
+<path d="M6 6 L15 6 L8 13 L16 13 L16 16 L6 16 L13 9 L6 9 Z" fill="var(--accent)"/>
+</svg>
+<a href="../index.html" class="topbar-title">zap_stdlib</a>
+<span class="topbar-version">v0.1.0</span>
+<span class="docs-label">docs</span>
+</div>
+<div class="topbar-center">
+<button class="topbar-search-trigger" id="search-trigger">
+<svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+<circle cx="7" cy="7" r="5" stroke="var(--fg-muted)" stroke-width="1.3"/>
+<line x1="10.6" y1="10.6" x2="14" y2="14" stroke="var(--fg-muted)" stroke-width="1.3" stroke-linecap="round"/>
+</svg>
+<span>Search modules, functions, guides...</span>
+<kbd>⌘</kbd><kbd>K</kbd>
+</button>
+</div>
+<div class="topbar-right">
+<button id="theme-toggle" aria-label="Toggle dark mode" title="Toggle dark mode">
+<span class="theme-icon-light">☀</span>
+<span class="theme-icon-dark">☾</span>
+</button>
+<div class="topbar-divider"></div>
+<a href="https://github.com/DockYard/zap" class="topbar-github" aria-label="GitHub repository" title="GitHub">
+<svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor">
+<path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>
+</svg>
+</a>
+</div>
+</header>
+<div class="layout">
+<nav class="sidebar">
+<div class="sidebar-header"><a href="../index.html" class="sidebar-title">zap_stdlib</a> <span class="sidebar-version">v0.1.0</span></div>
+<div class="sidebar-search"><input type="text" id="search-input" placeholder="Search (Cmd+K)" aria-label="Search documentation"></div>
+<div class="sidebar-group">
+<h4>Modules</h4>
+<ul>
+<li><a href="../modules/Atom.html">Atom</a></li>
+<li><a href="../modules/Bool.html">Bool</a></li>
+<li><a href="../modules/Enum.html">Enum</a></li>
+<li><a href="../modules/File.html">File</a></li>
+<li><a href="../modules/Float.html">Float</a></li>
+<li><a href="../modules/Function.html">Function</a></li>
+<li><a href="../modules/IO.html">IO</a></li>
+<li><a href="../modules/Integer.html">Integer</a></li>
+<li><a href="../modules/Kernel.html">Kernel</a></li>
+<li><a href="../modules/List.html">List</a></li>
+<li><a href="../modules/Map.html">Map</a></li>
+<li><a href="../modules/Math.html">Math</a></li>
+<li class="active"><a href="../modules/String.html">String</a></li>
+<li><a href="../modules/System.html">System</a></li>
+<li><a href="../modules/Zest.html">Zest</a></li>
+</ul>
+</div>
+<div class="sidebar-group">
+<h4>Zest</h4>
+<ul>
+<li><a href="../modules/Zest.Case.html">Zest.Case</a></li>
+<li><a href="../modules/Zest.Runner.html">Zest.Runner</a></li>
+</ul>
+</div>
+</nav>
+<main class="content">
+<div class="title-row">
+<h1>String</h1>
+<div class="title-meta">
+<span class="pub-module-pill">pub module</span>
+<a href="https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap" class="source-file">./lib/string.zap</a>
+</div>
+</div>
+<p class="tagline">Functions for working with UTF-8 encoded strings.</p>
+<div class="moduledoc">
+<p>Functions for working with UTF-8 encoded strings.</p>
+<p>Strings in Zap are immutable byte sequences (<code>[]const u8</code> in the
+underlying Zig representation). All operations return new strings
+rather than modifying in place.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap"><span class="hl-type">String</span>.length(<span class="hl-string">"hello"</span>)              <span class="hl-comment"># =&gt; 5</span>
+<span class="hl-type">String</span>.contains(<span class="hl-string">"hello world"</span>, <span class="hl-string">"o"</span>) <span class="hl-comment"># =&gt; true</span>
+<span class="hl-type">String</span>.slice(<span class="hl-string">"hello"</span>, <span class="hl-number">0</span>, <span class="hl-number">3</span>)         <span class="hl-comment"># =&gt; &quot;hel&quot;</span></code></pre>
+</div>
+<h2 id="functions">Functions</h2>
+<table class="summary">
+<tr><td class="summary-name"><a href="#length-1">length/1</a></td><td class="summary-doc">Returns the byte length of a string.</td></tr>
+<tr><td class="summary-name"><a href="#byte_at-2">byte_at/2</a></td><td class="summary-doc">Returns the byte at the given index as a single-character string.</td></tr>
+<tr><td class="summary-name"><a href="#contains-2">contains/2</a></td><td class="summary-doc">Returns `true` if `haystack` contains `needle` as a substring.</td></tr>
+<tr><td class="summary-name"><a href="#starts_with-2">starts_with/2</a></td><td class="summary-doc">Returns `true` if the string starts with the given prefix.</td></tr>
+<tr><td class="summary-name"><a href="#ends_with-2">ends_with/2</a></td><td class="summary-doc">Returns `true` if the string ends with the given suffix.</td></tr>
+<tr><td class="summary-name"><a href="#trim-1">trim/1</a></td><td class="summary-doc">Removes leading and trailing whitespace from a string.</td></tr>
+<tr><td class="summary-name"><a href="#slice-3">slice/3</a></td><td class="summary-doc">Returns a substring from `start` (inclusive) to `end` (exclusive).</td></tr>
+<tr><td class="summary-name"><a href="#to_atom-1">to_atom/1</a></td><td class="summary-doc">Converts a string to an atom, creating it if it doesn't exist.</td></tr>
+<tr><td class="summary-name"><a href="#to_existing_atom-1">to_existing_atom/1</a></td><td class="summary-doc">Converts a string to an existing atom.</td></tr>
+<tr><td class="summary-name"><a href="#upcase-1">upcase/1</a></td><td class="summary-doc">Converts all characters to uppercase.</td></tr>
+<tr><td class="summary-name"><a href="#downcase-1">downcase/1</a></td><td class="summary-doc">Converts all characters to lowercase.</td></tr>
+<tr><td class="summary-name"><a href="#reverse-1">reverse/1</a></td><td class="summary-doc">Reverses the bytes of a string.</td></tr>
+<tr><td class="summary-name"><a href="#replace-3">replace/3</a></td><td class="summary-doc">Replaces all occurrences of `pattern` with `replacement`.</td></tr>
+<tr><td class="summary-name"><a href="#index_of-2">index_of/2</a></td><td class="summary-doc">Returns the index of the first occurrence of `needle` in the
+string, or -1 if not found.</td></tr>
+<tr><td class="summary-name"><a href="#pad_leading-3">pad_leading/3</a></td><td class="summary-doc">Pads the string on the left to reach the target length using
+the given padding character.</td></tr>
+<tr><td class="summary-name"><a href="#pad_trailing-3">pad_trailing/3</a></td><td class="summary-doc">Pads the string on the right to reach the target length using
+the given padding character.</td></tr>
+<tr><td class="summary-name"><a href="#repeat-2">repeat/2</a></td><td class="summary-doc">Repeats a string the given number of times.</td></tr>
+<tr><td class="summary-name"><a href="#to_integer-1">to_integer/1</a></td><td class="summary-doc">Parses a string into an integer.</td></tr>
+<tr><td class="summary-name"><a href="#to_float-1">to_float/1</a></td><td class="summary-doc">Parses a string into a float.</td></tr>
+<tr><td class="summary-name"><a href="#capitalize-1">capitalize/1</a></td><td class="summary-doc">Capitalizes the first character and lowercases the rest.</td></tr>
+<tr><td class="summary-name"><a href="#trim_leading-1">trim_leading/1</a></td><td class="summary-doc">Removes leading whitespace from a string.</td></tr>
+<tr><td class="summary-name"><a href="#trim_trailing-1">trim_trailing/1</a></td><td class="summary-doc">Removes trailing whitespace from a string.</td></tr>
+<tr><td class="summary-name"><a href="#count-2">count/2</a></td><td class="summary-doc">Counts non-overlapping occurrences of a substring.</td></tr>
+</table>
+<h2>Function Details</h2>
+<div class="function-detail" id="length-1">
+<div class="function-header">
+<h3>length<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#length-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">length</span><span class="sig-paren">(</span>s<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="function-doc">
+<p>Returns the byte length of a string.</p>
+<p>This returns the number of bytes, not the number of Unicode
+codepoints. For ASCII strings, bytes and characters are the same.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap"><span class="hl-type">String</span>.length(<span class="hl-string">"hello"</span>)  <span class="hl-comment"># =&gt; 5</span>
+<span class="hl-type">String</span>.length(<span class="hl-string">""</span>)       <span class="hl-comment"># =&gt; 0</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="byte_at-2">
+<div class="function-header">
+<h3>byte_at<span class="arity">/2</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#byte_at-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">byte_at</span><span class="sig-paren">(</span>s<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="function-doc">
+<p>Returns the byte at the given index as a single-character string.</p>
+<p>Index is zero-based. Returns an empty string if the index is
+out of bounds.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap"><span class="hl-type">String</span>.byte_at(<span class="hl-string">"hello"</span>, <span class="hl-number">0</span>)  <span class="hl-comment"># =&gt; &quot;h&quot;</span>
+<span class="hl-type">String</span>.byte_at(<span class="hl-string">"hello"</span>, <span class="hl-number">4</span>)  <span class="hl-comment"># =&gt; &quot;o&quot;</span>
+<span class="hl-type">String</span>.byte_at(<span class="hl-string">"hello"</span>, <span class="hl-number">99</span>) <span class="hl-comment"># =&gt; &quot;&quot;</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="contains-2">
+<div class="function-header">
+<h3>contains<span class="arity">/2</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#contains-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">contains</span><span class="sig-paren">(</span>haystack<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>needle<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="function-doc">
+<p>Returns <code>true</code> if <code>haystack</code> contains <code>needle</code> as a substring.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap"><span class="hl-type">String</span>.contains(<span class="hl-string">"hello world"</span>, <span class="hl-string">"world"</span>)  <span class="hl-comment"># =&gt; true</span>
+<span class="hl-type">String</span>.contains(<span class="hl-string">"hello world"</span>, <span class="hl-string">"xyz"</span>)    <span class="hl-comment"># =&gt; false</span>
+<span class="hl-type">String</span>.contains(<span class="hl-string">"hello"</span>, <span class="hl-string">""</span>)             <span class="hl-comment"># =&gt; true</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="starts_with-2">
+<div class="function-header">
+<h3>starts_with<span class="arity">/2</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#starts_with-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">starts_with</span><span class="sig-paren">(</span>s<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>prefix<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="function-doc">
+<p>Returns <code>true</code> if the string starts with the given prefix.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap"><span class="hl-type">String</span>.starts_with(<span class="hl-string">"hello"</span>, <span class="hl-string">"hel"</span>)   <span class="hl-comment"># =&gt; true</span>
+<span class="hl-type">String</span>.starts_with(<span class="hl-string">"hello"</span>, <span class="hl-string">"world"</span>) <span class="hl-comment"># =&gt; false</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="ends_with-2">
+<div class="function-header">
+<h3>ends_with<span class="arity">/2</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#ends_with-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">ends_with</span><span class="sig-paren">(</span>s<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>suffix<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="function-doc">
+<p>Returns <code>true</code> if the string ends with the given suffix.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap"><span class="hl-type">String</span>.ends_with(<span class="hl-string">"hello"</span>, <span class="hl-string">"llo"</span>)    <span class="hl-comment"># =&gt; true</span>
+<span class="hl-type">String</span>.ends_with(<span class="hl-string">"hello"</span>, <span class="hl-string">"world"</span>)  <span class="hl-comment"># =&gt; false</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="trim-1">
+<div class="function-header">
+<h3>trim<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#trim-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">trim</span><span class="sig-paren">(</span>s<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="function-doc">
+<p>Removes leading and trailing whitespace from a string.</p>
+<p>Strips spaces, tabs, newlines, and carriage returns.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap"><span class="hl-type">String</span>.trim(<span class="hl-string">"  hello  "</span>)   <span class="hl-comment"># =&gt; &quot;hello&quot;</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="slice-3">
+<div class="function-header">
+<h3>slice<span class="arity">/3</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#slice-3" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">slice</span><span class="sig-paren">(</span>s<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>start<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>end<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="function-doc">
+<p>Returns a substring from <code>start</code> (inclusive) to <code>end</code> (exclusive).</p>
+<p>Indices are byte-based and zero-indexed. Out-of-bounds indices
+are clamped to the string length.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap"><span class="hl-type">String</span>.slice(<span class="hl-string">"hello world"</span>, <span class="hl-number">0</span>, <span class="hl-number">5</span>)   <span class="hl-comment"># =&gt; &quot;hello&quot;</span>
+<span class="hl-type">String</span>.slice(<span class="hl-string">"hello world"</span>, <span class="hl-number">6</span>, <span class="hl-number">11</span>)  <span class="hl-comment"># =&gt; &quot;world&quot;</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="to_atom-1">
+<div class="function-header">
+<h3>to_atom<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#to_atom-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">to_atom</span><span class="sig-paren">(</span>name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Atom</span></code></div>
+<div class="function-doc">
+<p>Converts a string to an atom, creating it if it doesn't exist.</p>
+<p>Atoms are interned — each unique string maps to a single atom ID.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap"><span class="hl-type">String</span>.to_atom(<span class="hl-string">"ok"</span>)    <span class="hl-comment"># =&gt; :ok</span>
+<span class="hl-type">String</span>.to_atom(<span class="hl-string">"error"</span>) <span class="hl-comment"># =&gt; :error</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="to_existing_atom-1">
+<div class="function-header">
+<h3>to_existing_atom<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#to_existing_atom-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">to_existing_atom</span><span class="sig-paren">(</span>name<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Atom</span></code></div>
+<div class="function-doc">
+<p>Converts a string to an existing atom.</p>
+<p>Unlike <code>to_atom/1</code>, this does not create new atoms. Returns a
+sentinel value if the atom has not been previously interned.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap"><span class="hl-type">String</span>.to_existing_atom(<span class="hl-string">"ok"</span>)  <span class="hl-comment"># =&gt; :ok (if :ok exists)</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="upcase-1">
+<div class="function-header">
+<h3>upcase<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#upcase-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">upcase</span><span class="sig-paren">(</span>s<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="function-doc">
+<p>Converts all characters to uppercase.</p>
+<p>Only affects ASCII letters (a-z).</p>
+<h2>Examples</h2>
+<pre><code class="language-zap"><span class="hl-type">String</span>.upcase(<span class="hl-string">"hello"</span>)      <span class="hl-comment"># =&gt; &quot;HELLO&quot;</span>
+<span class="hl-type">String</span>.upcase(<span class="hl-string">"Hello World"</span>) <span class="hl-comment"># =&gt; &quot;HELLO WORLD&quot;</span>
+<span class="hl-type">String</span>.upcase(<span class="hl-string">"123"</span>)        <span class="hl-comment"># =&gt; &quot;123&quot;</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="downcase-1">
+<div class="function-header">
+<h3>downcase<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#downcase-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">downcase</span><span class="sig-paren">(</span>s<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="function-doc">
+<p>Converts all characters to lowercase.</p>
+<p>Only affects ASCII letters (A-Z).</p>
+<h2>Examples</h2>
+<pre><code class="language-zap"><span class="hl-type">String</span>.downcase(<span class="hl-string">"HELLO"</span>)      <span class="hl-comment"># =&gt; &quot;hello&quot;</span>
+<span class="hl-type">String</span>.downcase(<span class="hl-string">"Hello World"</span>) <span class="hl-comment"># =&gt; &quot;hello world&quot;</span>
+<span class="hl-type">String</span>.downcase(<span class="hl-string">"123"</span>)        <span class="hl-comment"># =&gt; &quot;123&quot;</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="reverse-1">
+<div class="function-header">
+<h3>reverse<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#reverse-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">reverse</span><span class="sig-paren">(</span>s<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="function-doc">
+<p>Reverses the bytes of a string.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap"><span class="hl-type">String</span>.reverse(<span class="hl-string">"hello"</span>)  <span class="hl-comment"># =&gt; &quot;olleh&quot;</span>
+<span class="hl-type">String</span>.reverse(<span class="hl-string">"abc"</span>)    <span class="hl-comment"># =&gt; &quot;cba&quot;</span>
+<span class="hl-type">String</span>.reverse(<span class="hl-string">""</span>)       <span class="hl-comment"># =&gt; &quot;&quot;</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="replace-3">
+<div class="function-header">
+<h3>replace<span class="arity">/3</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#replace-3" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">replace</span><span class="sig-paren">(</span>s<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>pattern<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>replacement<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="function-doc">
+<p>Replaces all occurrences of <code>pattern</code> with <code>replacement</code>.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap"><span class="hl-type">String</span>.replace(<span class="hl-string">"hello world"</span>, <span class="hl-string">"world"</span>, <span class="hl-string">"zap"</span>)  <span class="hl-comment"># =&gt; &quot;hello zap&quot;</span>
+<span class="hl-type">String</span>.replace(<span class="hl-string">"aaa"</span>, <span class="hl-string">"a"</span>, <span class="hl-string">"bb"</span>)                <span class="hl-comment"># =&gt; &quot;bbbbbb&quot;</span>
+<span class="hl-type">String</span>.replace(<span class="hl-string">"hello"</span>, <span class="hl-string">"xyz"</span>, <span class="hl-string">"abc"</span>)           <span class="hl-comment"># =&gt; &quot;hello&quot;</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="index_of-2">
+<div class="function-header">
+<h3>index_of<span class="arity">/2</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#index_of-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">index_of</span><span class="sig-paren">(</span>haystack<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>needle<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="function-doc">
+<p>Returns the index of the first occurrence of <code>needle</code> in the
+string, or -1 if not found.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap"><span class="hl-type">String</span>.index_of(<span class="hl-string">"hello world"</span>, <span class="hl-string">"world"</span>)  <span class="hl-comment"># =&gt; 6</span>
+<span class="hl-type">String</span>.index_of(<span class="hl-string">"hello"</span>, <span class="hl-string">"xyz"</span>)           <span class="hl-comment"># =&gt; -1</span>
+<span class="hl-type">String</span>.index_of(<span class="hl-string">"hello"</span>, <span class="hl-string">""</span>)              <span class="hl-comment"># =&gt; 0</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="pad_leading-3">
+<div class="function-header">
+<h3>pad_leading<span class="arity">/3</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#pad_leading-3" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">pad_leading</span><span class="sig-paren">(</span>s<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>total_length<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>pad_char<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="function-doc">
+<p>Pads the string on the left to reach the target length using
+the given padding character.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap"><span class="hl-type">String</span>.pad_leading(<span class="hl-string">"42"</span>, <span class="hl-number">5</span>, <span class="hl-string">"0"</span>)   <span class="hl-comment"># =&gt; &quot;00042&quot;</span>
+<span class="hl-type">String</span>.pad_leading(<span class="hl-string">"hello"</span>, <span class="hl-number">3</span>, <span class="hl-string">" "</span>) <span class="hl-comment"># =&gt; &quot;hello&quot;</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="pad_trailing-3">
+<div class="function-header">
+<h3>pad_trailing<span class="arity">/3</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#pad_trailing-3" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">pad_trailing</span><span class="sig-paren">(</span>s<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>total_length<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>pad_char<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="function-doc">
+<p>Pads the string on the right to reach the target length using
+the given padding character.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap"><span class="hl-type">String</span>.pad_trailing(<span class="hl-string">"hi"</span>, <span class="hl-number">5</span>, <span class="hl-string">"."</span>)   <span class="hl-comment"># =&gt; &quot;hi...&quot;</span>
+<span class="hl-type">String</span>.pad_trailing(<span class="hl-string">"hello"</span>, <span class="hl-number">3</span>, <span class="hl-string">" "</span>) <span class="hl-comment"># =&gt; &quot;hello&quot;</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="repeat-2">
+<div class="function-header">
+<h3>repeat<span class="arity">/2</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#repeat-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">repeat</span><span class="sig-paren">(</span>s<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>count<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="function-doc">
+<p>Repeats a string the given number of times.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap"><span class="hl-type">String</span>.repeat(<span class="hl-string">"ab"</span>, <span class="hl-number">3</span>)  <span class="hl-comment"># =&gt; &quot;ababab&quot;</span>
+<span class="hl-type">String</span>.repeat(<span class="hl-string">"x"</span>, <span class="hl-number">5</span>)   <span class="hl-comment"># =&gt; &quot;xxxxx&quot;</span>
+<span class="hl-type">String</span>.repeat(<span class="hl-string">"hi"</span>, <span class="hl-number">0</span>)  <span class="hl-comment"># =&gt; &quot;&quot;</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="to_integer-1">
+<div class="function-header">
+<h3>to_integer<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#to_integer-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">to_integer</span><span class="sig-paren">(</span>s<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="function-doc">
+<p>Parses a string into an integer. Returns 0 if the string
+is not a valid integer.</p>
+<p>Delegates to <code>Integer.parse/1</code>.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap"><span class="hl-type">String</span>.to_integer(<span class="hl-string">"42"</span>)    <span class="hl-comment"># =&gt; 42</span>
+<span class="hl-type">String</span>.to_integer(<span class="hl-string">"hello"</span>) <span class="hl-comment"># =&gt; 0</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="to_float-1">
+<div class="function-header">
+<h3>to_float<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#to_float-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">to_float</span><span class="sig-paren">(</span>s<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="function-doc">
+<p>Parses a string into a float. Returns 0.0 if the string
+is not a valid float.</p>
+<p>Delegates to <code>Float.parse/1</code>.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap"><span class="hl-type">String</span>.to_float(<span class="hl-string">"3.14"</span>)    <span class="hl-comment"># =&gt; 3.14</span>
+<span class="hl-type">String</span>.to_float(<span class="hl-string">"hello"</span>)   <span class="hl-comment"># =&gt; 0.0</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="capitalize-1">
+<div class="function-header">
+<h3>capitalize<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#capitalize-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">capitalize</span><span class="sig-paren">(</span>s<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="function-doc">
+<p>Capitalizes the first character and lowercases the rest.</p>
+<p>Only affects ASCII letters.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap"><span class="hl-type">String</span>.capitalize(<span class="hl-string">"hello"</span>)   <span class="hl-comment"># =&gt; &quot;Hello&quot;</span>
+<span class="hl-type">String</span>.capitalize(<span class="hl-string">"HELLO"</span>)   <span class="hl-comment"># =&gt; &quot;Hello&quot;</span>
+<span class="hl-type">String</span>.capitalize(<span class="hl-string">""</span>)        <span class="hl-comment"># =&gt; &quot;&quot;</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="trim_leading-1">
+<div class="function-header">
+<h3>trim_leading<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#trim_leading-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">trim_leading</span><span class="sig-paren">(</span>s<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="function-doc">
+<p>Removes leading whitespace from a string.</p>
+<p>Strips spaces, tabs, newlines, and carriage returns from
+the beginning only.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap"><span class="hl-type">String</span>.trim_leading(<span class="hl-string">"  hello  "</span>)  <span class="hl-comment"># =&gt; &quot;hello  &quot;</span>
+<span class="hl-type">String</span>.trim_leading(<span class="hl-string">"hello"</span>)       <span class="hl-comment"># =&gt; &quot;hello&quot;</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="trim_trailing-1">
+<div class="function-header">
+<h3>trim_trailing<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#trim_trailing-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">trim_trailing</span><span class="sig-paren">(</span>s<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="function-doc">
+<p>Removes trailing whitespace from a string.</p>
+<p>Strips spaces, tabs, newlines, and carriage returns from
+the end only.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap"><span class="hl-type">String</span>.trim_trailing(<span class="hl-string">"  hello  "</span>)  <span class="hl-comment"># =&gt; &quot;  hello&quot;</span>
+<span class="hl-type">String</span>.trim_trailing(<span class="hl-string">"hello"</span>)       <span class="hl-comment"># =&gt; &quot;hello&quot;</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="count-2">
+<div class="function-header">
+<h3>count<span class="arity">/2</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#count-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">count</span><span class="sig-paren">(</span>haystack<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>needle<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="function-doc">
+<p>Counts non-overlapping occurrences of a substring.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap"><span class="hl-type">String</span>.count(<span class="hl-string">"hello world hello"</span>, <span class="hl-string">"hello"</span>)  <span class="hl-comment"># =&gt; 2</span>
+<span class="hl-type">String</span>.count(<span class="hl-string">"aaa"</span>, <span class="hl-string">"aa"</span>)                     <span class="hl-comment"># =&gt; 1</span>
+<span class="hl-type">String</span>.count(<span class="hl-string">"hello"</span>, <span class="hl-string">"xyz"</span>)                  <span class="hl-comment"># =&gt; 0</span></code></pre>
+</div>
+</div>
+</main>
+<aside class="toc">
+<h3>On This Page</h3>
+<ul>
+<li class="toc-section">Functions</li>
+<li><a href="#length-1">length/1</a></li>
+<li><a href="#byte_at-2">byte_at/2</a></li>
+<li><a href="#contains-2">contains/2</a></li>
+<li><a href="#starts_with-2">starts_with/2</a></li>
+<li><a href="#ends_with-2">ends_with/2</a></li>
+<li><a href="#trim-1">trim/1</a></li>
+<li><a href="#slice-3">slice/3</a></li>
+<li><a href="#to_atom-1">to_atom/1</a></li>
+<li><a href="#to_existing_atom-1">to_existing_atom/1</a></li>
+<li><a href="#upcase-1">upcase/1</a></li>
+<li><a href="#downcase-1">downcase/1</a></li>
+<li><a href="#reverse-1">reverse/1</a></li>
+<li><a href="#replace-3">replace/3</a></li>
+<li><a href="#index_of-2">index_of/2</a></li>
+<li><a href="#pad_leading-3">pad_leading/3</a></li>
+<li><a href="#pad_trailing-3">pad_trailing/3</a></li>
+<li><a href="#repeat-2">repeat/2</a></li>
+<li><a href="#to_integer-1">to_integer/1</a></li>
+<li><a href="#to_float-1">to_float/1</a></li>
+<li><a href="#capitalize-1">capitalize/1</a></li>
+<li><a href="#trim_leading-1">trim_leading/1</a></li>
+<li><a href="#trim_trailing-1">trim_trailing/1</a></li>
+<li><a href="#count-2">count/2</a></li>
+</ul>
+</aside>
+</div>
+<div id="search-modal" class="search-modal" hidden>
+<div class="search-backdrop"></div>
+<div class="search-dialog">
+<input type="text" id="search-modal-input" placeholder="Search documentation..." aria-label="Search">
+<ul id="search-results" class="search-results"></ul>
+</div>
+</div>
+<script src="../app.js"></script>
+</body>
+</html>

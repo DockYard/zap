@@ -11,4 +11,7 @@ pub struct Zap.Manifest {
   test_timeout :: i64 = 0
   error_style :: String = ""
   multiline_errors :: Bool = false
+  source_url :: String = ""
+  landing_page :: String = ""
+  doc_groups :: [{String, [String]}] = []
 }

@@ -1,0 +1,673 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Integer — zap_stdlib</title>
+<link rel="stylesheet" href="../style.css">
+<meta name="zap-docs-base" content="../">
+</head>
+<body>
+<header class="topbar">
+<div class="topbar-left">
+<svg class="zap-mark" width="22" height="22" viewBox="0 0 22 22" fill="none">
+<rect x="0.5" y="0.5" width="21" height="21" rx="3" stroke="var(--border-strong)"/>
+<path d="M6 6 L15 6 L8 13 L16 13 L16 16 L6 16 L13 9 L6 9 Z" fill="var(--accent)"/>
+</svg>
+<a href="../index.html" class="topbar-title">zap_stdlib</a>
+<span class="topbar-version">v0.1.0</span>
+<span class="docs-label">docs</span>
+</div>
+<div class="topbar-center">
+<button class="topbar-search-trigger" id="search-trigger">
+<svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+<circle cx="7" cy="7" r="5" stroke="var(--fg-muted)" stroke-width="1.3"/>
+<line x1="10.6" y1="10.6" x2="14" y2="14" stroke="var(--fg-muted)" stroke-width="1.3" stroke-linecap="round"/>
+</svg>
+<span>Search modules, functions, guides...</span>
+<kbd>⌘</kbd><kbd>K</kbd>
+</button>
+</div>
+<div class="topbar-right">
+<button id="theme-toggle" aria-label="Toggle dark mode" title="Toggle dark mode">
+<span class="theme-icon-light">☀</span>
+<span class="theme-icon-dark">☾</span>
+</button>
+<div class="topbar-divider"></div>
+<a href="https://github.com/DockYard/zap" class="topbar-github" aria-label="GitHub repository" title="GitHub">
+<svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor">
+<path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>
+</svg>
+</a>
+</div>
+</header>
+<div class="layout">
+<nav class="sidebar">
+<div class="sidebar-header"><a href="../index.html" class="sidebar-title">zap_stdlib</a> <span class="sidebar-version">v0.1.0</span></div>
+<div class="sidebar-search"><input type="text" id="search-input" placeholder="Search (Cmd+K)" aria-label="Search documentation"></div>
+<div class="sidebar-group">
+<h4>Modules</h4>
+<ul>
+<li><a href="../modules/Atom.html">Atom</a></li>
+<li><a href="../modules/Bool.html">Bool</a></li>
+<li><a href="../modules/Enum.html">Enum</a></li>
+<li><a href="../modules/File.html">File</a></li>
+<li><a href="../modules/Float.html">Float</a></li>
+<li><a href="../modules/Function.html">Function</a></li>
+<li><a href="../modules/IO.html">IO</a></li>
+<li class="active"><a href="../modules/Integer.html">Integer</a></li>
+<li><a href="../modules/Kernel.html">Kernel</a></li>
+<li><a href="../modules/List.html">List</a></li>
+<li><a href="../modules/Map.html">Map</a></li>
+<li><a href="../modules/Math.html">Math</a></li>
+<li><a href="../modules/String.html">String</a></li>
+<li><a href="../modules/System.html">System</a></li>
+<li><a href="../modules/Zest.html">Zest</a></li>
+</ul>
+</div>
+<div class="sidebar-group">
+<h4>Zest</h4>
+<ul>
+<li><a href="../modules/Zest.Case.html">Zest.Case</a></li>
+<li><a href="../modules/Zest.Runner.html">Zest.Runner</a></li>
+</ul>
+</div>
+</nav>
+<main class="content">
+<div class="title-row">
+<h1>Integer</h1>
+<div class="title-meta">
+<span class="pub-module-pill">pub module</span>
+<a href="https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap" class="source-file">./lib/integer.zap</a>
+</div>
+</div>
+<p class="tagline">Functions for working with integers.</p>
+<div class="moduledoc">
+<p>Functions for working with integers.</p>
+<h2>Integer Types</h2>
+<p>Zap supports the following integer types:</p>
+<p>| Signed  | Unsigned | Bits |
+|---------|----------|------|
+| <code>i8</code>    | <code>u8</code>     | 8    |
+| <code>i16</code>   | <code>u16</code>    | 16   |
+| <code>i32</code>   | <code>u32</code>    | 32   |
+| <code>i64</code>   | <code>u64</code>    | 64   |</p>
+<p>The default integer type for literals is <code>i64</code>.</p>
+<h2>Implicit Widening</h2>
+<p>Zap automatically widens narrower integer types to wider ones at
+function call sites when no data is lost. This means you can pass
+an <code>i8</code> value to a function that expects <code>i64</code> without an explicit
+cast — the compiler inserts a zero-cost widening instruction.</p>
+<p><strong>Signed widening:</strong> <code>i8</code> u{2192} <code>i16</code> u{2192} <code>i32</code> u{2192} <code>i64</code></p>
+<p><strong>Unsigned widening:</strong> <code>u8</code> u{2192} <code>u16</code> u{2192} <code>u32</code> u{2192} <code>u64</code></p>
+<p><strong>Unsigned to signed:</strong> <code>u8</code> u{2192} <code>i16</code>, <code>u16</code> u{2192} <code>i32</code>, <code>u32</code> u{2192} <code>i64</code>
+(the signed type must have strictly more bits to represent the full
+unsigned range)</p>
+<p>The following conversions are <strong>not</strong> implicit:</p>
+<ul>
+<li>Signed to unsigned (negative values would be lost)</li>
+<li>Wider to narrower (data truncation)</li>
+<li>Integer to float (precision loss for large values)</li>
+</ul>
+</div>
+<h2 id="functions">Functions</h2>
+<table class="summary">
+<tr><td class="summary-name"><a href="#to_string-1">to_string/1</a></td><td class="summary-doc">Converts an integer to its string representation.</td></tr>
+<tr><td class="summary-name"><a href="#abs-1">abs/1</a></td><td class="summary-doc">Returns the absolute value of an integer.</td></tr>
+<tr><td class="summary-name"><a href="#max-2">max/2</a></td><td class="summary-doc">Returns the larger of two integers.</td></tr>
+<tr><td class="summary-name"><a href="#min-2">min/2</a></td><td class="summary-doc">Returns the smaller of two integers.</td></tr>
+<tr><td class="summary-name"><a href="#parse-1">parse/1</a></td><td class="summary-doc">Parses a string into an integer.</td></tr>
+<tr><td class="summary-name"><a href="#remainder-2">remainder/2</a></td><td class="summary-doc">Computes the remainder of integer division.</td></tr>
+<tr><td class="summary-name"><a href="#pow-2">pow/2</a></td><td class="summary-doc">Raises `base` to the power of `exponent`.</td></tr>
+<tr><td class="summary-name"><a href="#clamp-3">clamp/3</a></td><td class="summary-doc">Clamps a value to be within the given range.</td></tr>
+<tr><td class="summary-name"><a href="#digits-1">digits/1</a></td><td class="summary-doc">Returns the number of digits in an integer.</td></tr>
+<tr><td class="summary-name"><a href="#count_digits-1">count_digits/1</a></td><td class="summary-doc"></td></tr>
+<tr><td class="summary-name"><a href="#to_float-1">to_float/1</a></td><td class="summary-doc">Converts an integer to a floating-point number.</td></tr>
+<tr><td class="summary-name"><a href="#count_leading_zeros-1">count_leading_zeros/1</a></td><td class="summary-doc">Returns the number of leading zeros in the binary representation.</td></tr>
+<tr><td class="summary-name"><a href="#count_trailing_zeros-1">count_trailing_zeros/1</a></td><td class="summary-doc">Returns the number of trailing zeros in the binary representation.</td></tr>
+<tr><td class="summary-name"><a href="#popcount-1">popcount/1</a></td><td class="summary-doc">Returns the number of set bits (ones) in the binary representation.</td></tr>
+<tr><td class="summary-name"><a href="#byte_swap-1">byte_swap/1</a></td><td class="summary-doc">Reverses the byte order of an integer.</td></tr>
+<tr><td class="summary-name"><a href="#bit_reverse-1">bit_reverse/1</a></td><td class="summary-doc">Reverses all bits in the binary representation.</td></tr>
+<tr><td class="summary-name"><a href="#add_sat-2">add_sat/2</a></td><td class="summary-doc">Adds two integers with saturation.</td></tr>
+<tr><td class="summary-name"><a href="#sub_sat-2">sub_sat/2</a></td><td class="summary-doc">Subtracts two integers with saturation.</td></tr>
+<tr><td class="summary-name"><a href="#mul_sat-2">mul_sat/2</a></td><td class="summary-doc">Multiplies two integers with saturation.</td></tr>
+<tr><td class="summary-name"><a href="#band-2">band/2</a></td><td class="summary-doc">Bitwise AND of two integers.</td></tr>
+<tr><td class="summary-name"><a href="#bor-2">bor/2</a></td><td class="summary-doc">Bitwise OR of two integers.</td></tr>
+<tr><td class="summary-name"><a href="#bxor-2">bxor/2</a></td><td class="summary-doc">Bitwise XOR (exclusive OR) of two integers.</td></tr>
+<tr><td class="summary-name"><a href="#bnot-1">bnot/1</a></td><td class="summary-doc">Bitwise NOT (complement) of an integer.</td></tr>
+<tr><td class="summary-name"><a href="#bsl-2">bsl/2</a></td><td class="summary-doc">Bitwise shift left.</td></tr>
+<tr><td class="summary-name"><a href="#bsr-2">bsr/2</a></td><td class="summary-doc">Bitwise shift right (arithmetic).</td></tr>
+<tr><td class="summary-name"><a href="#sign-1">sign/1</a></td><td class="summary-doc">Returns the sign of an integer: -1 for negative, 0 for zero,
+1 for positive.</td></tr>
+<tr><td class="summary-name"><a href="#even?-1">even?/1</a></td><td class="summary-doc">Returns true if the integer is even.</td></tr>
+<tr><td class="summary-name"><a href="#odd?-1">odd?/1</a></td><td class="summary-doc">Returns true if the integer is odd.</td></tr>
+<tr><td class="summary-name"><a href="#gcd-2">gcd/2</a></td><td class="summary-doc">Computes the greatest common divisor of two integers
+using the Euclidean algorithm.</td></tr>
+<tr><td class="summary-name"><a href="#lcm-2">lcm/2</a></td><td class="summary-doc">Computes the least common multiple of two integers.</td></tr>
+</table>
+<h2>Function Details</h2>
+<div class="function-detail" id="to_string-1">
+<div class="function-header">
+<h3>to_string<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#to_string-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">to_string</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="function-doc">
+<p>Converts an integer to its string representation.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Integer.to_string(<span class="hl-number">42</span>)    <span class="hl-comment"># =&gt; &quot;42&quot;</span>
+Integer.to_string(<span class="hl-number">-7</span>)    <span class="hl-comment"># =&gt; &quot;-7&quot;</span>
+Integer.to_string(<span class="hl-number">0</span>)     <span class="hl-comment"># =&gt; &quot;0&quot;</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="abs-1">
+<div class="function-header">
+<h3>abs<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#abs-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">abs</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="function-doc">
+<p>Returns the absolute value of an integer.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Integer.abs(<span class="hl-number">-42</span>)  <span class="hl-comment"># =&gt; 42</span>
+Integer.abs(<span class="hl-number">42</span>)   <span class="hl-comment"># =&gt; 42</span>
+Integer.abs(<span class="hl-number">0</span>)    <span class="hl-comment"># =&gt; 0</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="max-2">
+<div class="function-header">
+<h3>max<span class="arity">/2</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#max-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">max</span><span class="sig-paren">(</span>first<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>second<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="function-doc">
+<p>Returns the larger of two integers.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Integer.max(<span class="hl-number">3</span>, <span class="hl-number">7</span>)    <span class="hl-comment"># =&gt; 7</span>
+Integer.max(<span class="hl-number">10</span>, <span class="hl-number">2</span>)   <span class="hl-comment"># =&gt; 10</span>
+Integer.max(<span class="hl-number">5</span>, <span class="hl-number">5</span>)    <span class="hl-comment"># =&gt; 5</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="min-2">
+<div class="function-header">
+<h3>min<span class="arity">/2</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#min-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">min</span><span class="sig-paren">(</span>first<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>second<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="function-doc">
+<p>Returns the smaller of two integers.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Integer.min(<span class="hl-number">3</span>, <span class="hl-number">7</span>)    <span class="hl-comment"># =&gt; 3</span>
+Integer.min(<span class="hl-number">10</span>, <span class="hl-number">2</span>)   <span class="hl-comment"># =&gt; 2</span>
+Integer.min(<span class="hl-number">5</span>, <span class="hl-number">5</span>)    <span class="hl-comment"># =&gt; 5</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="parse-1">
+<div class="function-header">
+<h3>parse<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#parse-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">parse</span><span class="sig-paren">(</span>input<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="function-doc">
+<p>Parses a string into an integer. Returns 0 if the string
+is not a valid integer representation.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Integer.parse(<span class="hl-string">"42"</span>)    <span class="hl-comment"># =&gt; 42</span>
+Integer.parse(<span class="hl-string">"-7"</span>)    <span class="hl-comment"># =&gt; -7</span>
+Integer.parse(<span class="hl-string">"hello"</span>) <span class="hl-comment"># =&gt; 0</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="remainder-2">
+<div class="function-header">
+<h3>remainder<span class="arity">/2</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#remainder-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">remainder</span><span class="sig-paren">(</span>dividend<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>divisor<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="function-doc">
+<p>Computes the remainder of integer division.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Integer.remainder(<span class="hl-number">10</span>, <span class="hl-number">3</span>)   <span class="hl-comment"># =&gt; 1</span>
+Integer.remainder(<span class="hl-number">7</span>, <span class="hl-number">2</span>)    <span class="hl-comment"># =&gt; 1</span>
+Integer.remainder(<span class="hl-number">6</span>, <span class="hl-number">3</span>)    <span class="hl-comment"># =&gt; 0</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="pow-2">
+<div class="function-header">
+<h3>pow<span class="arity">/2</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#pow-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">pow</span><span class="sig-paren">(</span>base<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>exponent<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="function-doc">
+<p>Raises <code>base</code> to the power of <code>exponent</code>. The exponent must
+be non-negative.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Integer.pow(<span class="hl-number">2</span>, <span class="hl-number">10</span>)   <span class="hl-comment"># =&gt; 1024</span>
+Integer.pow(<span class="hl-number">3</span>, <span class="hl-number">3</span>)    <span class="hl-comment"># =&gt; 27</span>
+Integer.pow(<span class="hl-number">5</span>, <span class="hl-number">0</span>)    <span class="hl-comment"># =&gt; 1</span>
+Integer.pow(<span class="hl-number">7</span>, <span class="hl-number">1</span>)    <span class="hl-comment"># =&gt; 7</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="clamp-3">
+<div class="function-header">
+<h3>clamp<span class="arity">/3</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#clamp-3" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">clamp</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>lower<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>upper<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="function-doc">
+<p>Clamps a value to be within the given range.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Integer.clamp(<span class="hl-number">15</span>, <span class="hl-number">0</span>, <span class="hl-number">10</span>)   <span class="hl-comment"># =&gt; 10</span>
+Integer.clamp(<span class="hl-number">-5</span>, <span class="hl-number">0</span>, <span class="hl-number">10</span>)   <span class="hl-comment"># =&gt; 0</span>
+Integer.clamp(<span class="hl-number">5</span>, <span class="hl-number">0</span>, <span class="hl-number">10</span>)    <span class="hl-comment"># =&gt; 5</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="digits-1">
+<div class="function-header">
+<h3>digits<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#digits-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">digits</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="function-doc">
+<p>Returns the number of digits in an integer. Negative signs
+are not counted.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Integer.digits(<span class="hl-number">42</span>)     <span class="hl-comment"># =&gt; 2</span>
+Integer.digits(<span class="hl-number">0</span>)      <span class="hl-comment"># =&gt; 1</span>
+Integer.digits(<span class="hl-number">-123</span>)   <span class="hl-comment"># =&gt; 3</span>
+Integer.digits(<span class="hl-number">10000</span>)  <span class="hl-comment"># =&gt; 5</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="count_digits-1">
+<div class="function-header">
+<h3>count_digits<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#count_digits-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">count_digits</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+</div>
+<div class="function-detail" id="to_float-1">
+<div class="function-header">
+<h3>to_float<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#to_float-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">to_float</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="function-doc">
+<p>Converts an integer to a floating-point number.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Integer.to_float(<span class="hl-number">42</span>)   <span class="hl-comment"># =&gt; 42.0</span>
+Integer.to_float(<span class="hl-number">-7</span>)   <span class="hl-comment"># =&gt; -7.0</span>
+Integer.to_float(<span class="hl-number">0</span>)    <span class="hl-comment"># =&gt; 0.0</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="count_leading_zeros-1">
+<div class="function-header">
+<h3>count_leading_zeros<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#count_leading_zeros-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">count_leading_zeros</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="function-doc">
+<p>Returns the number of leading zeros in the binary representation.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Integer.count_leading_zeros(<span class="hl-number">1</span>)   <span class="hl-comment"># =&gt; 63</span>
+Integer.count_leading_zeros(<span class="hl-number">0</span>)   <span class="hl-comment"># =&gt; 64</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="count_trailing_zeros-1">
+<div class="function-header">
+<h3>count_trailing_zeros<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#count_trailing_zeros-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">count_trailing_zeros</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="function-doc">
+<p>Returns the number of trailing zeros in the binary representation.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Integer.count_trailing_zeros(<span class="hl-number">8</span>)   <span class="hl-comment"># =&gt; 3</span>
+Integer.count_trailing_zeros(<span class="hl-number">1</span>)   <span class="hl-comment"># =&gt; 0</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="popcount-1">
+<div class="function-header">
+<h3>popcount<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#popcount-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">popcount</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="function-doc">
+<p>Returns the number of set bits (ones) in the binary representation.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Integer.popcount(<span class="hl-number">7</span>)    <span class="hl-comment"># =&gt; 3</span>
+Integer.popcount(<span class="hl-number">255</span>)  <span class="hl-comment"># =&gt; 8</span>
+Integer.popcount(<span class="hl-number">0</span>)    <span class="hl-comment"># =&gt; 0</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="byte_swap-1">
+<div class="function-header">
+<h3>byte_swap<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#byte_swap-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">byte_swap</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="function-doc">
+<p>Reverses the byte order of an integer. Useful for converting
+between big-endian and little-endian representations.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Integer.byte_swap(<span class="hl-number">1</span>)  <span class="hl-comment"># =&gt; 72057594037927936</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="bit_reverse-1">
+<div class="function-header">
+<h3>bit_reverse<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#bit_reverse-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">bit_reverse</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="function-doc">
+<p>Reverses all bits in the binary representation.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Integer.bit_reverse(<span class="hl-number">1</span>)  <span class="hl-comment"># =&gt; -9223372036854775808</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="add_sat-2">
+<div class="function-header">
+<h3>add_sat<span class="arity">/2</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#add_sat-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">add_sat</span><span class="sig-paren">(</span>first<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>second<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="function-doc">
+<p>Adds two integers with saturation. If the result would overflow,
+it clamps to the maximum (or minimum) representable value instead.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Integer.add_sat(<span class="hl-number">9223372036854775807</span>, <span class="hl-number">1</span>)  <span class="hl-comment"># =&gt; 9223372036854775807</span>
+Integer.add_sat(<span class="hl-number">3</span>, <span class="hl-number">4</span>)                     <span class="hl-comment"># =&gt; 7</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="sub_sat-2">
+<div class="function-header">
+<h3>sub_sat<span class="arity">/2</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#sub_sat-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">sub_sat</span><span class="sig-paren">(</span>first<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>second<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="function-doc">
+<p>Subtracts two integers with saturation. If the result would
+underflow, it clamps to the minimum representable value instead.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Integer.sub_sat(<span class="hl-number">-9223372036854775808</span>, <span class="hl-number">1</span>)  <span class="hl-comment"># =&gt; -9223372036854775808</span>
+Integer.sub_sat(<span class="hl-number">10</span>, <span class="hl-number">3</span>)                     <span class="hl-comment"># =&gt; 7</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="mul_sat-2">
+<div class="function-header">
+<h3>mul_sat<span class="arity">/2</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#mul_sat-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">mul_sat</span><span class="sig-paren">(</span>first<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>second<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="function-doc">
+<p>Multiplies two integers with saturation. If the result would
+overflow, it clamps to the maximum (or minimum) representable
+value instead.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Integer.mul_sat(<span class="hl-number">9223372036854775807</span>, <span class="hl-number">2</span>)  <span class="hl-comment"># =&gt; 9223372036854775807</span>
+Integer.mul_sat(<span class="hl-number">3</span>, <span class="hl-number">4</span>)                     <span class="hl-comment"># =&gt; 12</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="band-2">
+<div class="function-header">
+<h3>band<span class="arity">/2</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#band-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">band</span><span class="sig-paren">(</span>first<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>second<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="function-doc">
+<p>Bitwise AND of two integers.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Integer.band(<span class="hl-number">7</span>, <span class="hl-number">5</span>)    <span class="hl-comment"># =&gt; 5</span>
+Integer.band(<span class="hl-number">255</span>, <span class="hl-number">15</span>) <span class="hl-comment"># =&gt; 15</span>
+Integer.band(<span class="hl-number">0</span>, <span class="hl-number">42</span>)   <span class="hl-comment"># =&gt; 0</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="bor-2">
+<div class="function-header">
+<h3>bor<span class="arity">/2</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#bor-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">bor</span><span class="sig-paren">(</span>first<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>second<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="function-doc">
+<p>Bitwise OR of two integers.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Integer.bor(<span class="hl-number">5</span>, <span class="hl-number">3</span>)    <span class="hl-comment"># =&gt; 7</span>
+Integer.bor(<span class="hl-number">0</span>, <span class="hl-number">42</span>)   <span class="hl-comment"># =&gt; 42</span>
+Integer.bor(<span class="hl-number">255</span>, <span class="hl-number">0</span>)  <span class="hl-comment"># =&gt; 255</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="bxor-2">
+<div class="function-header">
+<h3>bxor<span class="arity">/2</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#bxor-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">bxor</span><span class="sig-paren">(</span>first<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>second<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="function-doc">
+<p>Bitwise XOR (exclusive OR) of two integers.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Integer.bxor(<span class="hl-number">7</span>, <span class="hl-number">5</span>)    <span class="hl-comment"># =&gt; 2</span>
+Integer.bxor(<span class="hl-number">255</span>, <span class="hl-number">255</span>) <span class="hl-comment"># =&gt; 0</span>
+Integer.bxor(<span class="hl-number">0</span>, <span class="hl-number">42</span>)   <span class="hl-comment"># =&gt; 42</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="bnot-1">
+<div class="function-header">
+<h3>bnot<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#bnot-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">bnot</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="function-doc">
+<p>Bitwise NOT (complement) of an integer.</p>
+<p>Flips all bits in the binary representation.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Integer.bnot(<span class="hl-number">0</span>)    <span class="hl-comment"># =&gt; -1</span>
+Integer.bnot(<span class="hl-number">-1</span>)   <span class="hl-comment"># =&gt; 0</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="bsl-2">
+<div class="function-header">
+<h3>bsl<span class="arity">/2</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#bsl-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">bsl</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>amount<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="function-doc">
+<p>Bitwise shift left. Shifts the bits of the first argument
+left by the number of positions given in the second argument.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Integer.bsl(<span class="hl-number">1</span>, <span class="hl-number">3</span>)    <span class="hl-comment"># =&gt; 8</span>
+Integer.bsl(<span class="hl-number">5</span>, <span class="hl-number">1</span>)    <span class="hl-comment"># =&gt; 10</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="bsr-2">
+<div class="function-header">
+<h3>bsr<span class="arity">/2</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#bsr-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">bsr</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>amount<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="function-doc">
+<p>Bitwise shift right (arithmetic). Shifts the bits of the first
+argument right by the number of positions given in the second
+argument. Preserves the sign bit.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Integer.bsr(<span class="hl-number">8</span>, <span class="hl-number">3</span>)    <span class="hl-comment"># =&gt; 1</span>
+Integer.bsr(<span class="hl-number">10</span>, <span class="hl-number">1</span>)   <span class="hl-comment"># =&gt; 5</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="sign-1">
+<div class="function-header">
+<h3>sign<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#sign-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">sign</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="function-doc">
+<p>Returns the sign of an integer: -1 for negative, 0 for zero,
+1 for positive.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Integer.sign(<span class="hl-number">42</span>)   <span class="hl-comment"># =&gt; 1</span>
+Integer.sign(<span class="hl-number">0</span>)    <span class="hl-comment"># =&gt; 0</span>
+Integer.sign(<span class="hl-number">-7</span>)   <span class="hl-comment"># =&gt; -1</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="even?-1">
+<div class="function-header">
+<h3>even?<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#even?-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">even?</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="function-doc">
+<p>Returns true if the integer is even.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Integer.even?(<span class="hl-number">4</span>)   <span class="hl-comment"># =&gt; true</span>
+Integer.even?(<span class="hl-number">3</span>)   <span class="hl-comment"># =&gt; false</span>
+Integer.even?(<span class="hl-number">0</span>)   <span class="hl-comment"># =&gt; true</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="odd?-1">
+<div class="function-header">
+<h3>odd?<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#odd?-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">odd?</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="function-doc">
+<p>Returns true if the integer is odd.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Integer.odd?(<span class="hl-number">3</span>)   <span class="hl-comment"># =&gt; true</span>
+Integer.odd?(<span class="hl-number">4</span>)   <span class="hl-comment"># =&gt; false</span>
+Integer.odd?(<span class="hl-number">0</span>)   <span class="hl-comment"># =&gt; false</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="gcd-2">
+<div class="function-header">
+<h3>gcd<span class="arity">/2</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#gcd-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">gcd</span><span class="sig-paren">(</span>first<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>second<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="function-doc">
+<p>Computes the greatest common divisor of two integers
+using the Euclidean algorithm.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Integer.gcd(<span class="hl-number">12</span>, <span class="hl-number">8</span>)   <span class="hl-comment"># =&gt; 4</span>
+Integer.gcd(<span class="hl-number">54</span>, <span class="hl-number">24</span>)  <span class="hl-comment"># =&gt; 6</span>
+Integer.gcd(<span class="hl-number">7</span>, <span class="hl-number">5</span>)    <span class="hl-comment"># =&gt; 1</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="lcm-2">
+<div class="function-header">
+<h3>lcm<span class="arity">/2</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#lcm-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">lcm</span><span class="sig-paren">(</span>first<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>second<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="function-doc">
+<p>Computes the least common multiple of two integers.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Integer.lcm(<span class="hl-number">4</span>, <span class="hl-number">6</span>)   <span class="hl-comment"># =&gt; 12</span>
+Integer.lcm(<span class="hl-number">3</span>, <span class="hl-number">5</span>)   <span class="hl-comment"># =&gt; 15</span>
+Integer.lcm(<span class="hl-number">7</span>, <span class="hl-number">7</span>)   <span class="hl-comment"># =&gt; 7</span></code></pre>
+</div>
+</div>
+</main>
+<aside class="toc">
+<h3>On This Page</h3>
+<ul>
+<li class="toc-section">Functions</li>
+<li><a href="#to_string-1">to_string/1</a></li>
+<li><a href="#abs-1">abs/1</a></li>
+<li><a href="#max-2">max/2</a></li>
+<li><a href="#min-2">min/2</a></li>
+<li><a href="#parse-1">parse/1</a></li>
+<li><a href="#remainder-2">remainder/2</a></li>
+<li><a href="#pow-2">pow/2</a></li>
+<li><a href="#clamp-3">clamp/3</a></li>
+<li><a href="#digits-1">digits/1</a></li>
+<li><a href="#count_digits-1">count_digits/1</a></li>
+<li><a href="#to_float-1">to_float/1</a></li>
+<li><a href="#count_leading_zeros-1">count_leading_zeros/1</a></li>
+<li><a href="#count_trailing_zeros-1">count_trailing_zeros/1</a></li>
+<li><a href="#popcount-1">popcount/1</a></li>
+<li><a href="#byte_swap-1">byte_swap/1</a></li>
+<li><a href="#bit_reverse-1">bit_reverse/1</a></li>
+<li><a href="#add_sat-2">add_sat/2</a></li>
+<li><a href="#sub_sat-2">sub_sat/2</a></li>
+<li><a href="#mul_sat-2">mul_sat/2</a></li>
+<li><a href="#band-2">band/2</a></li>
+<li><a href="#bor-2">bor/2</a></li>
+<li><a href="#bxor-2">bxor/2</a></li>
+<li><a href="#bnot-1">bnot/1</a></li>
+<li><a href="#bsl-2">bsl/2</a></li>
+<li><a href="#bsr-2">bsr/2</a></li>
+<li><a href="#sign-1">sign/1</a></li>
+<li><a href="#even?-1">even?/1</a></li>
+<li><a href="#odd?-1">odd?/1</a></li>
+<li><a href="#gcd-2">gcd/2</a></li>
+<li><a href="#lcm-2">lcm/2</a></li>
+</ul>
+</aside>
+</div>
+<div id="search-modal" class="search-modal" hidden>
+<div class="search-backdrop"></div>
+<div class="search-dialog">
+<input type="text" id="search-modal-input" placeholder="Search documentation..." aria-label="Search">
+<ul id="search-results" class="search-results"></ul>
+</div>
+</div>
+<script src="../app.js"></script>
+</body>
+</html>

@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Float — zap_stdlib</title>
+<link rel="stylesheet" href="../style.css">
+<meta name="zap-docs-base" content="../">
+</head>
+<body>
+<header class="topbar">
+<div class="topbar-left">
+<svg class="zap-mark" width="22" height="22" viewBox="0 0 22 22" fill="none">
+<rect x="0.5" y="0.5" width="21" height="21" rx="3" stroke="var(--border-strong)"/>
+<path d="M6 6 L15 6 L8 13 L16 13 L16 16 L6 16 L13 9 L6 9 Z" fill="var(--accent)"/>
+</svg>
+<a href="../index.html" class="topbar-title">zap_stdlib</a>
+<span class="topbar-version">v0.1.0</span>
+<span class="docs-label">docs</span>
+</div>
+<div class="topbar-center">
+<button class="topbar-search-trigger" id="search-trigger">
+<svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+<circle cx="7" cy="7" r="5" stroke="var(--fg-muted)" stroke-width="1.3"/>
+<line x1="10.6" y1="10.6" x2="14" y2="14" stroke="var(--fg-muted)" stroke-width="1.3" stroke-linecap="round"/>
+</svg>
+<span>Search modules, functions, guides...</span>
+<kbd>⌘</kbd><kbd>K</kbd>
+</button>
+</div>
+<div class="topbar-right">
+<button id="theme-toggle" aria-label="Toggle dark mode" title="Toggle dark mode">
+<span class="theme-icon-light">☀</span>
+<span class="theme-icon-dark">☾</span>
+</button>
+<div class="topbar-divider"></div>
+<a href="https://github.com/DockYard/zap" class="topbar-github" aria-label="GitHub repository" title="GitHub">
+<svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor">
+<path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>
+</svg>
+</a>
+</div>
+</header>
+<div class="layout">
+<nav class="sidebar">
+<div class="sidebar-header"><a href="../index.html" class="sidebar-title">zap_stdlib</a> <span class="sidebar-version">v0.1.0</span></div>
+<div class="sidebar-search"><input type="text" id="search-input" placeholder="Search (Cmd+K)" aria-label="Search documentation"></div>
+<div class="sidebar-group">
+<h4>Modules</h4>
+<ul>
+<li><a href="../modules/Atom.html">Atom</a></li>
+<li><a href="../modules/Bool.html">Bool</a></li>
+<li><a href="../modules/Enum.html">Enum</a></li>
+<li><a href="../modules/File.html">File</a></li>
+<li class="active"><a href="../modules/Float.html">Float</a></li>
+<li><a href="../modules/Function.html">Function</a></li>
+<li><a href="../modules/IO.html">IO</a></li>
+<li><a href="../modules/Integer.html">Integer</a></li>
+<li><a href="../modules/Kernel.html">Kernel</a></li>
+<li><a href="../modules/List.html">List</a></li>
+<li><a href="../modules/Map.html">Map</a></li>
+<li><a href="../modules/Math.html">Math</a></li>
+<li><a href="../modules/String.html">String</a></li>
+<li><a href="../modules/System.html">System</a></li>
+<li><a href="../modules/Zest.html">Zest</a></li>
+</ul>
+</div>
+<div class="sidebar-group">
+<h4>Zest</h4>
+<ul>
+<li><a href="../modules/Zest.Case.html">Zest.Case</a></li>
+<li><a href="../modules/Zest.Runner.html">Zest.Runner</a></li>
+</ul>
+</div>
+</nav>
+<main class="content">
+<div class="title-row">
+<h1>Float</h1>
+<div class="title-meta">
+<span class="pub-module-pill">pub module</span>
+<a href="https://github.com/DockYard/zap/blob/v0.1.0/./lib/float.zap" class="source-file">./lib/float.zap</a>
+</div>
+</div>
+<p class="tagline">Functions for working with floating-point numbers.</p>
+<div class="moduledoc">
+<p>Functions for working with floating-point numbers.</p>
+<h2>Float Types</h2>
+<p>Zap supports the following floating-point types:</p>
+<p>| Type  | Bits | Precision        |
+|-------|------|------------------|
+| <code>f16</code> | 16   | Half precision   |
+| <code>f32</code> | 32   | Single precision |
+| <code>f64</code> | 64   | Double precision |</p>
+<p>The default float type for literals is <code>f64</code>.</p>
+<h2>Implicit Widening</h2>
+<p>Zap automatically widens narrower float types to wider ones at
+function call sites: <code>f16</code> u{2192} <code>f32</code> u{2192} <code>f64</code>. This is
+lossless and zero-cost — the compiler inserts the conversion
+automatically.</p>
+<p>Integer-to-float conversion is <strong>not</strong> implicit because large
+integers cannot be represented exactly in floating-point. Use
+<code>Integer.to_float/1</code> when needed.</p>
+</div>
+<h2 id="functions">Functions</h2>
+<table class="summary">
+<tr><td class="summary-name"><a href="#to_string-1">to_string/1</a></td><td class="summary-doc">Converts a floating-point number to its string representation.</td></tr>
+<tr><td class="summary-name"><a href="#abs-1">abs/1</a></td><td class="summary-doc">Returns the absolute value of a float.</td></tr>
+<tr><td class="summary-name"><a href="#max-2">max/2</a></td><td class="summary-doc">Returns the larger of two floats.</td></tr>
+<tr><td class="summary-name"><a href="#min-2">min/2</a></td><td class="summary-doc">Returns the smaller of two floats.</td></tr>
+<tr><td class="summary-name"><a href="#parse-1">parse/1</a></td><td class="summary-doc">Parses a string into a float.</td></tr>
+<tr><td class="summary-name"><a href="#round-1">round/1</a></td><td class="summary-doc">Rounds a float to the nearest integer value, returned as a float.</td></tr>
+<tr><td class="summary-name"><a href="#floor-1">floor/1</a></td><td class="summary-doc">Returns the largest integer value less than or equal to the
+given float, returned as a float.</td></tr>
+<tr><td class="summary-name"><a href="#ceil-1">ceil/1</a></td><td class="summary-doc">Returns the smallest integer value greater than or equal to
+the given float, returned as a float.</td></tr>
+<tr><td class="summary-name"><a href="#truncate-1">truncate/1</a></td><td class="summary-doc">Truncates a float toward zero, removing the fractional part.</td></tr>
+<tr><td class="summary-name"><a href="#to_integer-1">to_integer/1</a></td><td class="summary-doc">Converts a float to an integer by truncating toward zero.</td></tr>
+<tr><td class="summary-name"><a href="#clamp-3">clamp/3</a></td><td class="summary-doc">Clamps a float to be within the given range.</td></tr>
+<tr><td class="summary-name"><a href="#floor_to_integer-1">floor_to_integer/1</a></td><td class="summary-doc">Floors a float and converts directly to an integer in one step.</td></tr>
+<tr><td class="summary-name"><a href="#ceil_to_integer-1">ceil_to_integer/1</a></td><td class="summary-doc">Ceils a float and converts directly to an integer in one step.</td></tr>
+<tr><td class="summary-name"><a href="#round_to_integer-1">round_to_integer/1</a></td><td class="summary-doc">Rounds a float and converts directly to an integer in one step.</td></tr>
+</table>
+<h2>Function Details</h2>
+<div class="function-detail" id="to_string-1">
+<div class="function-header">
+<h3>to_string<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#to_string-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">to_string</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="function-doc">
+<p>Converts a floating-point number to its string representation.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Float.to_string(<span class="hl-number">3.14</span>)   <span class="hl-comment"># =&gt; &quot;3.14&quot;</span>
+Float.to_string(<span class="hl-number">-0.5</span>)   <span class="hl-comment"># =&gt; &quot;-0.5&quot;</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="abs-1">
+<div class="function-header">
+<h3>abs<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#abs-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">abs</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="function-doc">
+<p>Returns the absolute value of a float.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Float.abs(<span class="hl-number">-3.14</span>)  <span class="hl-comment"># =&gt; 3.14</span>
+Float.abs(<span class="hl-number">2.5</span>)    <span class="hl-comment"># =&gt; 2.5</span>
+Float.abs(<span class="hl-number">0.0</span>)    <span class="hl-comment"># =&gt; 0.0</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="max-2">
+<div class="function-header">
+<h3>max<span class="arity">/2</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#max-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">max</span><span class="sig-paren">(</span>first<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">, </span>second<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="function-doc">
+<p>Returns the larger of two floats.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Float.max(<span class="hl-number">3.0</span>, <span class="hl-number">7.0</span>)    <span class="hl-comment"># =&gt; 7.0</span>
+Float.max(<span class="hl-number">10.5</span>, <span class="hl-number">2.3</span>)   <span class="hl-comment"># =&gt; 10.5</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="min-2">
+<div class="function-header">
+<h3>min<span class="arity">/2</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#min-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">min</span><span class="sig-paren">(</span>first<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">, </span>second<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="function-doc">
+<p>Returns the smaller of two floats.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Float.min(<span class="hl-number">3.0</span>, <span class="hl-number">7.0</span>)    <span class="hl-comment"># =&gt; 3.0</span>
+Float.min(<span class="hl-number">10.5</span>, <span class="hl-number">2.3</span>)   <span class="hl-comment"># =&gt; 2.3</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="parse-1">
+<div class="function-header">
+<h3>parse<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#parse-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">parse</span><span class="sig-paren">(</span>input<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="function-doc">
+<p>Parses a string into a float. Returns 0.0 if the string
+is not a valid float representation.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Float.parse(<span class="hl-string">"3.14"</span>)    <span class="hl-comment"># =&gt; 3.14</span>
+Float.parse(<span class="hl-string">"-0.5"</span>)    <span class="hl-comment"># =&gt; -0.5</span>
+Float.parse(<span class="hl-string">"hello"</span>)   <span class="hl-comment"># =&gt; 0.0</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="round-1">
+<div class="function-header">
+<h3>round<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#round-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">round</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="function-doc">
+<p>Rounds a float to the nearest integer value, returned as a float.
+Rounds half-values away from zero.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Float.round(<span class="hl-number">3.2</span>)   <span class="hl-comment"># =&gt; 3.0</span>
+Float.round(<span class="hl-number">3.7</span>)   <span class="hl-comment"># =&gt; 4.0</span>
+Float.round(<span class="hl-number">-2.5</span>)  <span class="hl-comment"># =&gt; -3.0</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="floor-1">
+<div class="function-header">
+<h3>floor<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#floor-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">floor</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="function-doc">
+<p>Returns the largest integer value less than or equal to the
+given float, returned as a float.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Float.floor(<span class="hl-number">3.7</span>)   <span class="hl-comment"># =&gt; 3.0</span>
+Float.floor(<span class="hl-number">3.0</span>)   <span class="hl-comment"># =&gt; 3.0</span>
+Float.floor(<span class="hl-number">-2.3</span>)  <span class="hl-comment"># =&gt; -3.0</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="ceil-1">
+<div class="function-header">
+<h3>ceil<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#ceil-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">ceil</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="function-doc">
+<p>Returns the smallest integer value greater than or equal to
+the given float, returned as a float.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Float.ceil(<span class="hl-number">3.2</span>)   <span class="hl-comment"># =&gt; 4.0</span>
+Float.ceil(<span class="hl-number">3.0</span>)   <span class="hl-comment"># =&gt; 3.0</span>
+Float.ceil(<span class="hl-number">-2.7</span>)  <span class="hl-comment"># =&gt; -2.0</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="truncate-1">
+<div class="function-header">
+<h3>truncate<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#truncate-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">truncate</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="function-doc">
+<p>Truncates a float toward zero, removing the fractional part.
+Returned as a float.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Float.truncate(<span class="hl-number">3.7</span>)   <span class="hl-comment"># =&gt; 3.0</span>
+Float.truncate(<span class="hl-number">-2.9</span>)  <span class="hl-comment"># =&gt; -2.0</span>
+Float.truncate(<span class="hl-number">5.0</span>)   <span class="hl-comment"># =&gt; 5.0</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="to_integer-1">
+<div class="function-header">
+<h3>to_integer<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#to_integer-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="function-doc">
+<p>Converts a float to an integer by truncating toward zero.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Float.to_integer(<span class="hl-number">3.7</span>)   <span class="hl-comment"># =&gt; 3</span>
+Float.to_integer(<span class="hl-number">-2.9</span>)  <span class="hl-comment"># =&gt; -2</span>
+Float.to_integer(<span class="hl-number">5.0</span>)   <span class="hl-comment"># =&gt; 5</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="clamp-3">
+<div class="function-header">
+<h3>clamp<span class="arity">/3</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#clamp-3" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">clamp</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">, </span>lower<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">, </span>upper<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="function-doc">
+<p>Clamps a float to be within the given range.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Float.clamp(<span class="hl-number">15.0</span>, <span class="hl-number">0.0</span>, <span class="hl-number">10.0</span>)  <span class="hl-comment"># =&gt; 10.0</span>
+Float.clamp(<span class="hl-number">-5.0</span>, <span class="hl-number">0.0</span>, <span class="hl-number">10.0</span>)  <span class="hl-comment"># =&gt; 0.0</span>
+Float.clamp(<span class="hl-number">5.0</span>, <span class="hl-number">0.0</span>, <span class="hl-number">10.0</span>)   <span class="hl-comment"># =&gt; 5.0</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="floor_to_integer-1">
+<div class="function-header">
+<h3>floor_to_integer<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#floor_to_integer-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">floor_to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="function-doc">
+<p>Floors a float and converts directly to an integer in one step.
+More efficient than <code>Float.to_integer(Float.floor(x))</code>.
+Uses Zig 0.16's direct float-to-integer conversion builtins.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Float.floor_to_integer(<span class="hl-number">3.7</span>)   <span class="hl-comment"># =&gt; 3</span>
+Float.floor_to_integer(<span class="hl-number">-2.3</span>)  <span class="hl-comment"># =&gt; -3</span>
+Float.floor_to_integer(<span class="hl-number">5.0</span>)   <span class="hl-comment"># =&gt; 5</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="ceil_to_integer-1">
+<div class="function-header">
+<h3>ceil_to_integer<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#ceil_to_integer-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">ceil_to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="function-doc">
+<p>Ceils a float and converts directly to an integer in one step.
+More efficient than <code>Float.to_integer(Float.ceil(x))</code>.
+Uses Zig 0.16's direct float-to-integer conversion builtins.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Float.ceil_to_integer(<span class="hl-number">3.2</span>)   <span class="hl-comment"># =&gt; 4</span>
+Float.ceil_to_integer(<span class="hl-number">-2.7</span>)  <span class="hl-comment"># =&gt; -2</span>
+Float.ceil_to_integer(<span class="hl-number">5.0</span>)   <span class="hl-comment"># =&gt; 5</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="round_to_integer-1">
+<div class="function-header">
+<h3>round_to_integer<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#round_to_integer-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">round_to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="function-doc">
+<p>Rounds a float and converts directly to an integer in one step.
+More efficient than <code>Float.to_integer(Float.round(x))</code>.
+Uses Zig 0.16's direct float-to-integer conversion builtins.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Float.round_to_integer(<span class="hl-number">3.2</span>)   <span class="hl-comment"># =&gt; 3</span>
+Float.round_to_integer(<span class="hl-number">3.7</span>)   <span class="hl-comment"># =&gt; 4</span>
+Float.round_to_integer(<span class="hl-number">-2.5</span>)  <span class="hl-comment"># =&gt; -3</span></code></pre>
+</div>
+</div>
+</main>
+<aside class="toc">
+<h3>On This Page</h3>
+<ul>
+<li class="toc-section">Functions</li>
+<li><a href="#to_string-1">to_string/1</a></li>
+<li><a href="#abs-1">abs/1</a></li>
+<li><a href="#max-2">max/2</a></li>
+<li><a href="#min-2">min/2</a></li>
+<li><a href="#parse-1">parse/1</a></li>
+<li><a href="#round-1">round/1</a></li>
+<li><a href="#floor-1">floor/1</a></li>
+<li><a href="#ceil-1">ceil/1</a></li>
+<li><a href="#truncate-1">truncate/1</a></li>
+<li><a href="#to_integer-1">to_integer/1</a></li>
+<li><a href="#clamp-3">clamp/3</a></li>
+<li><a href="#floor_to_integer-1">floor_to_integer/1</a></li>
+<li><a href="#ceil_to_integer-1">ceil_to_integer/1</a></li>
+<li><a href="#round_to_integer-1">round_to_integer/1</a></li>
+</ul>
+</aside>
+</div>
+<div id="search-modal" class="search-modal" hidden>
+<div class="search-backdrop"></div>
+<div class="search-dialog">
+<input type="text" id="search-modal-input" placeholder="Search documentation..." aria-label="Search">
+<ul id="search-results" class="search-results"></ul>
+</div>
+</div>
+<script src="../app.js"></script>
+</body>
+</html>

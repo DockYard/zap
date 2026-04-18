@@ -36,6 +36,8 @@ pub fn main(init: std.process.Init) !void {
         try cmdInit(allocator);
     } else if (std.mem.eql(u8, command, "deps")) {
         try cmdDeps(allocator, args[2..]);
+    } else if (std.mem.eql(u8, command, "doc")) {
+        try cmdDoc(allocator, args[2..]);
     } else {
         // stderr writer removed in 0.16
         std.debug.print("Error: unknown command: {s}\n\nRun 'zap --help' for usage.\n", .{command});
@@ -53,6 +55,7 @@ fn printUsage() void {
         \\  run [target]      Build and run the specified bin target (defaults to :default)
         \\  test [options]    Run the test suite
         \\  init              Scaffold a new project in the current directory
+        \\  doc [options]     Generate documentation from @doc attributes
         \\  deps update       Re-resolve all dependencies and rewrite zap.lock
         \\  deps update <name> Re-resolve a single dependency
         \\
@@ -72,6 +75,8 @@ fn printUsage() void {
         \\  zap build --watch
         \\  zap run -w
         \\  zap test --seed 12345
+        \\  zap doc
+        \\  zap doc --no-deps
         \\  zap init
         \\
     , .{});
@@ -176,6 +181,180 @@ fn cmdTest(allocator: std.mem.Allocator, args: []const []const u8) !void {
         std.process.exit(1);
     };
     std.process.exit(exit_code);
+}
+
+// ---------------------------------------------------------------------------
+// Command: doc
+// ---------------------------------------------------------------------------
+
+fn cmdDoc(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    var parsed = try parseTargetArgs(allocator, args);
+    defer parsed.deinit(allocator);
+
+    const project_root = try discoverBuildFile(allocator, parsed.build_file);
+    defer allocator.free(project_root);
+
+    // Check for --no-deps flag
+    var no_deps = false;
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--no-deps")) {
+            no_deps = true;
+        }
+    }
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const builder = zap.builder;
+
+    // Read build.zap
+    const build_file_path = try std.fs.path.join(alloc, &.{ project_root, "build.zap" });
+    const build_source = std.Io.Dir.cwd().readFileAlloc(global_io, build_file_path, alloc, .limited(10 * 1024 * 1024)) catch |err| {
+        std.debug.print("Error reading build.zap: {}\n", .{err});
+        std.process.exit(1);
+    };
+
+    // Detect zap lib dir for stdlib
+    const zap_lib_dir = detectZapLibDir(alloc);
+
+    // Evaluate manifest with :doc target
+    const manifest_eval = builder.ctfeManifestDetailed(alloc, build_source, "doc", parsed.build_opts, zap_lib_dir) catch |err| {
+        std.debug.print("Error: failed to evaluate build.zap manifest for :doc target: {}\n", .{err});
+        std.process.exit(1);
+    };
+    const config = manifest_eval.config;
+
+    // Build source roots from deps
+    var source_roots: std.ArrayListUnmanaged(zap.discovery.SourceRoot) = .empty;
+    {
+        const lib_dir = try std.fs.path.join(alloc, &.{ project_root, "lib" });
+        if (std.Io.Dir.cwd().access(global_io, lib_dir, .{})) |_| {
+            try source_roots.append(alloc, .{ .name = "project", .path = lib_dir });
+        } else |_| {}
+        try source_roots.append(alloc, .{ .name = "project", .path = project_root });
+    }
+
+    // Process deps for source roots (unless --no-deps)
+    if (!no_deps) {
+        for (config.deps) |dep| {
+            const dep_name = try std.fmt.allocPrint(alloc, "dep:{s}", .{dep.name});
+            switch (dep.source) {
+                .path => |dep_path| {
+                    const dep_dir = try std.fs.path.join(alloc, &.{ project_root, dep_path });
+                    const dep_lib_dir = try std.fs.path.join(alloc, &.{ dep_dir, "lib" });
+                    if (std.Io.Dir.cwd().access(global_io, dep_lib_dir, .{})) |_| {
+                        try source_roots.append(alloc, .{ .name = dep_name, .path = dep_lib_dir });
+                    } else |_| {
+                        try source_roots.append(alloc, .{ .name = dep_name, .path = dep_dir });
+                    }
+                    // Scan subdirectories
+                    const dep_resolved = if (std.Io.Dir.cwd().access(global_io, dep_lib_dir, .{}))
+                        dep_lib_dir
+                    else |_|
+                        dep_dir;
+                    if (std.Io.Dir.cwd().openDir(global_io, dep_resolved, .{ .iterate = true })) |dir_handle| {
+                        var dir = dir_handle;
+                        defer dir.close(global_io);
+                        var it = dir.iterate();
+                        while (it.next(global_io) catch null) |entry| {
+                            if (entry.kind == .directory) {
+                                const subdir = try std.fs.path.join(alloc, &.{ dep_resolved, entry.name });
+                                try source_roots.append(alloc, .{ .name = dep_name, .path = subdir });
+                            }
+                        }
+                    } else |_| {}
+                },
+                .git => {},
+            }
+        }
+    }
+
+    // Add zap lib dir as a source root so stdlib modules are discovered
+    if (zap_lib_dir) |zap_lib| {
+        try source_roots.append(alloc, .{ .name = "zap_stdlib", .path = zap_lib });
+        const zap_subdir = try std.fs.path.join(alloc, &.{ zap_lib, "zap" });
+        if (std.Io.Dir.cwd().access(global_io, zap_subdir, .{})) |_| {
+            try source_roots.append(alloc, .{ .name = "zap_stdlib", .path = zap_subdir });
+        } else |_| {}
+        const zest_subdir = try std.fs.path.join(alloc, &.{ zap_lib, "zest" });
+        if (std.Io.Dir.cwd().access(global_io, zest_subdir, .{})) |_| {
+            try source_roots.append(alloc, .{ .name = "zap_stdlib", .path = zest_subdir });
+        } else |_| {}
+    }
+
+    // Discover ALL .zap files from source roots (not import-driven — we want everything)
+    var source_files: std.ArrayListUnmanaged([]const u8) = .empty;
+    for (source_roots.items) |root| {
+        if (std.Io.Dir.cwd().openDir(global_io, root.path, .{ .iterate = true })) |dir_handle| {
+            var dir = dir_handle;
+            defer dir.close(global_io);
+            var it = dir.iterate();
+            while (it.next(global_io) catch null) |entry| {
+                if (entry.kind != .file) continue;
+                if (!std.mem.endsWith(u8, entry.name, ".zap")) continue;
+                const file_path = try std.fs.path.join(alloc, &.{ root.path, entry.name });
+                try source_files.append(alloc, file_path);
+            }
+        } else |_| {}
+    }
+
+    // Deduplicate
+    {
+        var seen = std.StringHashMap(void).init(alloc);
+        var deduped: std.ArrayListUnmanaged([]const u8) = .empty;
+        for (source_files.items) |sf| {
+            const key = std.fs.path.resolve(alloc, &.{sf}) catch sf;
+            if (!seen.contains(key)) {
+                seen.put(key, {}) catch {};
+                deduped.append(alloc, sf) catch {};
+            }
+        }
+        source_files = deduped;
+    }
+
+    if (source_files.items.len == 0) {
+        std.debug.print("Error: no .zap source files found for documentation\n", .{});
+        std.process.exit(1);
+    }
+
+    // Read and parse all source files
+    var source_units: std.ArrayListUnmanaged(compiler.SourceUnit) = .empty;
+    var mapped_files: std.ArrayListUnmanaged(compiler.MappedFile) = .empty;
+
+    for (source_files.items) |sf| {
+        if (std.mem.eql(u8, std.fs.path.basename(sf), "build.zap")) continue;
+        const mapped = try compiler.mmapSourceFile(global_io, sf, alloc);
+        try mapped_files.append(alloc, mapped);
+        try source_units.append(alloc, .{ .file_path = sf, .source = mapped.bytes() });
+    }
+
+    // Parse and collect — this gives us the scope graph with all @doc attributes
+    var ctx = compiler.collectAllFromUnits(alloc, source_units.items, .{
+        .show_progress = false,
+    }) catch {
+        std.debug.print("Error: failed to parse source files for documentation\n", .{});
+        std.process.exit(1);
+    };
+
+    // Generate documentation
+    const doc_generator = zap.doc_generator;
+    doc_generator.generate(alloc, &ctx, .{
+        .project_name = config.name,
+        .project_version = config.version,
+        .source_url = config.source_url,
+        .landing_page = config.landing_page,
+        .doc_groups = config.doc_groups,
+        .output_dir = "docs",
+        .project_root = project_root,
+        .source_units = source_units.items,
+        .no_deps = no_deps,
+    }) catch |err| {
+        std.debug.print("Error generating documentation: {}\n", .{err});
+        std.process.exit(1);
+    };
+
+    std.debug.print("Documentation generated in docs/\n", .{});
 }
 
 // ---------------------------------------------------------------------------
@@ -919,6 +1098,7 @@ fn buildTarget(
         .bin => "zap-out/bin",
         .lib => "zap-out/lib",
         .obj => "zap-out/obj",
+        .doc => "docs",
     };
     std.Io.Dir.cwd().createDirPath(global_io, ".zap-cache") catch {};
     std.Io.Dir.cwd().createDirPath(global_io, out_dir) catch {};
@@ -927,6 +1107,7 @@ fn buildTarget(
         .bin => output_name,
         .lib => try std.fmt.allocPrint(alloc, "{s}.a", .{output_name}),
         .obj => try std.fmt.allocPrint(alloc, "{s}.o", .{output_name}),
+        .doc => output_name,
     };
     const output_path = try std.fs.path.join(alloc, &.{ out_dir, output_filename });
 
@@ -1038,6 +1219,7 @@ fn buildTarget(
         .bin => 0,
         .lib => 1,
         .obj => 2,
+        .doc => 0, // doc target handled by cmdDoc, not buildTarget
     };
     zir_backend.compile(alloc, result.ir_program, .{
         .zig_lib_dir = zig_lib_dir,
@@ -1235,11 +1417,13 @@ const IncrementalWatchState = struct {
             .bin => "zap-out/bin",
             .lib => "zap-out/lib",
             .obj => "zap-out/obj",
+            .doc => "docs",
         };
         const output_filename = switch (config.kind) {
             .bin => output_name_raw,
             .lib => std.fmt.allocPrint(alloc, "{s}.a", .{output_name_raw}) catch return null,
             .obj => std.fmt.allocPrint(alloc, "{s}.o", .{output_name_raw}) catch return null,
+            .doc => output_name_raw,
         };
         const output_path = std.fs.path.join(alloc, &.{ out_dir, output_filename }) catch return null;
 
@@ -1247,6 +1431,7 @@ const IncrementalWatchState = struct {
             .bin => 0,
             .lib => 1,
             .obj => 2,
+            .doc => 0,
         };
         const optimize_mode_val: u8 = switch (config.optimize) {
             .debug => 0,

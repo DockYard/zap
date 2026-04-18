@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Zest — zap_stdlib</title>
+<link rel="stylesheet" href="../style.css">
+<meta name="zap-docs-base" content="../">
+</head>
+<body>
+<header class="topbar">
+<div class="topbar-left">
+<svg class="zap-mark" width="22" height="22" viewBox="0 0 22 22" fill="none">
+<rect x="0.5" y="0.5" width="21" height="21" rx="3" stroke="var(--border-strong)"/>
+<path d="M6 6 L15 6 L8 13 L16 13 L16 16 L6 16 L13 9 L6 9 Z" fill="var(--accent)"/>
+</svg>
+<a href="../index.html" class="topbar-title">zap_stdlib</a>
+<span class="topbar-version">v0.1.0</span>
+<span class="docs-label">docs</span>
+</div>
+<div class="topbar-center">
+<button class="topbar-search-trigger" id="search-trigger">
+<svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+<circle cx="7" cy="7" r="5" stroke="var(--fg-muted)" stroke-width="1.3"/>
+<line x1="10.6" y1="10.6" x2="14" y2="14" stroke="var(--fg-muted)" stroke-width="1.3" stroke-linecap="round"/>
+</svg>
+<span>Search modules, functions, guides...</span>
+<kbd>⌘</kbd><kbd>K</kbd>
+</button>
+</div>
+<div class="topbar-right">
+<button id="theme-toggle" aria-label="Toggle dark mode" title="Toggle dark mode">
+<span class="theme-icon-light">☀</span>
+<span class="theme-icon-dark">☾</span>
+</button>
+<div class="topbar-divider"></div>
+<a href="https://github.com/DockYard/zap" class="topbar-github" aria-label="GitHub repository" title="GitHub">
+<svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor">
+<path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>
+</svg>
+</a>
+</div>
+</header>
+<div class="layout">
+<nav class="sidebar">
+<div class="sidebar-header"><a href="../index.html" class="sidebar-title">zap_stdlib</a> <span class="sidebar-version">v0.1.0</span></div>
+<div class="sidebar-search"><input type="text" id="search-input" placeholder="Search (Cmd+K)" aria-label="Search documentation"></div>
+<div class="sidebar-group">
+<h4>Modules</h4>
+<ul>
+<li><a href="../modules/Atom.html">Atom</a></li>
+<li><a href="../modules/Bool.html">Bool</a></li>
+<li><a href="../modules/Enum.html">Enum</a></li>
+<li><a href="../modules/File.html">File</a></li>
+<li><a href="../modules/Float.html">Float</a></li>
+<li><a href="../modules/Function.html">Function</a></li>
+<li><a href="../modules/IO.html">IO</a></li>
+<li><a href="../modules/Integer.html">Integer</a></li>
+<li><a href="../modules/Kernel.html">Kernel</a></li>
+<li><a href="../modules/List.html">List</a></li>
+<li><a href="../modules/Map.html">Map</a></li>
+<li><a href="../modules/Math.html">Math</a></li>
+<li><a href="../modules/String.html">String</a></li>
+<li><a href="../modules/System.html">System</a></li>
+<li class="active"><a href="../modules/Zest.html">Zest</a></li>
+</ul>
+</div>
+<div class="sidebar-group">
+<h4>Zest</h4>
+<ul>
+<li><a href="../modules/Zest.Case.html">Zest.Case</a></li>
+<li><a href="../modules/Zest.Runner.html">Zest.Runner</a></li>
+</ul>
+</div>
+</nav>
+<main class="content">
+<div class="title-row">
+<h1>Zest</h1>
+<div class="title-meta">
+<span class="pub-module-pill">pub module</span>
+<a href="https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest.zap" class="source-file">./lib/zest.zap</a>
+</div>
+</div>
+<p class="tagline">Zest test framework.</p>
+<div class="moduledoc">
+<p>Zest test framework.</p>
+<p>For test cases: <code>use Zest.Case</code> (provides assert/reject + describe/test DSL).
+For test runner: <code>use Zest.Runner</code> (provides summary).</p>
+<p>This module provides standalone assert and reject functions
+with non-fatal test tracking via <code>:zig.TestTracker</code>. Failed
+assertions mark the current test as failed and return &quot;F&quot;
+but do not stop execution.</p>
+</div>
+<h2 id="functions">Functions</h2>
+<table class="summary">
+<tr><td class="summary-name"><a href="#assert-1">assert/1</a></td><td class="summary-doc">Asserts that a boolean value is `true`.</td></tr>
+<tr><td class="summary-name"><a href="#assert-2">assert/2</a></td><td class="summary-doc">Asserts that a boolean value is `true` with a custom message.</td></tr>
+<tr><td class="summary-name"><a href="#reject-1">reject/1</a></td><td class="summary-doc">Asserts that a boolean value is `false`.</td></tr>
+<tr><td class="summary-name"><a href="#reject-2">reject/2</a></td><td class="summary-doc">Asserts that a boolean value is `false` with a custom message.</td></tr>
+</table>
+<h2>Function Details</h2>
+<div class="function-detail" id="assert-1">
+<div class="function-header">
+<h3>assert<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#assert-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">assert</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">Bool</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="function-doc">
+<p>Asserts that a boolean value is <code>true</code>.</p>
+<p>On success, increments the assertion pass counter and
+returns &quot;.&quot;. On failure, increments the assertion fail
+counter and returns &quot;F&quot;. Execution continues (non-fatal).</p>
+</div>
+</div>
+<div class="function-detail" id="assert-2">
+<div class="function-header">
+<h3>assert<span class="arity">/2</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#assert-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">assert</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">Bool</span><span class="sig-paren">, </span>message<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="function-doc">
+<p>Asserts that a boolean value is <code>true</code> with a custom message.</p>
+<p>On success, increments the assertion pass counter and
+returns &quot;.&quot;. On failure, increments the assertion fail
+counter and returns &quot;F&quot;. Execution continues (non-fatal).</p>
+</div>
+</div>
+<div class="function-detail" id="reject-1">
+<div class="function-header">
+<h3>reject<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#reject-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">reject</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">Bool</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="function-doc">
+<p>Asserts that a boolean value is <code>false</code>.</p>
+<p>On success, increments the assertion pass counter and
+returns &quot;.&quot;. On failure, increments the assertion fail
+counter and returns &quot;F&quot;. Execution continues (non-fatal).</p>
+</div>
+</div>
+<div class="function-detail" id="reject-2">
+<div class="function-header">
+<h3>reject<span class="arity">/2</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#reject-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">reject</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">Bool</span><span class="sig-paren">, </span>message<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="function-doc">
+<p>Asserts that a boolean value is <code>false</code> with a custom message.</p>
+<p>On success, increments the assertion pass counter and
+returns &quot;.&quot;. On failure, increments the assertion fail
+counter and returns &quot;F&quot;. Execution continues (non-fatal).</p>
+</div>
+</div>
+</main>
+<aside class="toc">
+<h3>On This Page</h3>
+<ul>
+<li class="toc-section">Functions</li>
+<li><a href="#assert-1">assert/1</a></li>
+<li><a href="#assert-2">assert/2</a></li>
+<li><a href="#reject-1">reject/1</a></li>
+<li><a href="#reject-2">reject/2</a></li>
+</ul>
+</aside>
+</div>
+<div id="search-modal" class="search-modal" hidden>
+<div class="search-backdrop"></div>
+<div class="search-dialog">
+<input type="text" id="search-modal-input" placeholder="Search documentation..." aria-label="Search">
+<ul id="search-results" class="search-results"></ul>
+</div>
+</div>
+<script src="../app.js"></script>
+</body>
+</html>

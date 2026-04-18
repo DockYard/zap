@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Zest.Case — zap_stdlib</title>
+<link rel="stylesheet" href="../style.css">
+<meta name="zap-docs-base" content="../">
+</head>
+<body>
+<header class="topbar">
+<div class="topbar-left">
+<svg class="zap-mark" width="22" height="22" viewBox="0 0 22 22" fill="none">
+<rect x="0.5" y="0.5" width="21" height="21" rx="3" stroke="var(--border-strong)"/>
+<path d="M6 6 L15 6 L8 13 L16 13 L16 16 L6 16 L13 9 L6 9 Z" fill="var(--accent)"/>
+</svg>
+<a href="../index.html" class="topbar-title">zap_stdlib</a>
+<span class="topbar-version">v0.1.0</span>
+<span class="docs-label">docs</span>
+</div>
+<div class="topbar-center">
+<button class="topbar-search-trigger" id="search-trigger">
+<svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+<circle cx="7" cy="7" r="5" stroke="var(--fg-muted)" stroke-width="1.3"/>
+<line x1="10.6" y1="10.6" x2="14" y2="14" stroke="var(--fg-muted)" stroke-width="1.3" stroke-linecap="round"/>
+</svg>
+<span>Search modules, functions, guides...</span>
+<kbd>⌘</kbd><kbd>K</kbd>
+</button>
+</div>
+<div class="topbar-right">
+<button id="theme-toggle" aria-label="Toggle dark mode" title="Toggle dark mode">
+<span class="theme-icon-light">☀</span>
+<span class="theme-icon-dark">☾</span>
+</button>
+<div class="topbar-divider"></div>
+<a href="https://github.com/DockYard/zap" class="topbar-github" aria-label="GitHub repository" title="GitHub">
+<svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor">
+<path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>
+</svg>
+</a>
+</div>
+</header>
+<div class="layout">
+<nav class="sidebar">
+<div class="sidebar-header"><a href="../index.html" class="sidebar-title">zap_stdlib</a> <span class="sidebar-version">v0.1.0</span></div>
+<div class="sidebar-search"><input type="text" id="search-input" placeholder="Search (Cmd+K)" aria-label="Search documentation"></div>
+<div class="sidebar-group">
+<h4>Modules</h4>
+<ul>
+<li><a href="../modules/Atom.html">Atom</a></li>
+<li><a href="../modules/Bool.html">Bool</a></li>
+<li><a href="../modules/Enum.html">Enum</a></li>
+<li><a href="../modules/File.html">File</a></li>
+<li><a href="../modules/Float.html">Float</a></li>
+<li><a href="../modules/Function.html">Function</a></li>
+<li><a href="../modules/IO.html">IO</a></li>
+<li><a href="../modules/Integer.html">Integer</a></li>
+<li><a href="../modules/Kernel.html">Kernel</a></li>
+<li><a href="../modules/List.html">List</a></li>
+<li><a href="../modules/Map.html">Map</a></li>
+<li><a href="../modules/Math.html">Math</a></li>
+<li><a href="../modules/String.html">String</a></li>
+<li><a href="../modules/System.html">System</a></li>
+<li><a href="../modules/Zest.html">Zest</a></li>
+</ul>
+</div>
+<div class="sidebar-group">
+<h4>Zest</h4>
+<ul>
+<li class="active"><a href="../modules/Zest.Case.html">Zest.Case</a></li>
+<li><a href="../modules/Zest.Runner.html">Zest.Runner</a></li>
+</ul>
+</div>
+</nav>
+<main class="content">
+<div class="title-row">
+<h1>Zest.Case</h1>
+<div class="title-meta">
+<span class="pub-module-pill">pub module</span>
+<a href="https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/case.zap" class="source-file">./lib/zest/case.zap</a>
+</div>
+</div>
+<p class="tagline">Test case DSL for the Zest test framework.</p>
+<div class="moduledoc">
+<p>Test case DSL for the Zest test framework.</p>
+<p>Provides <code>describe</code>, <code>test</code>, <code>assert</code>, <code>reject</code>, <code>setup</code>, and
+<code>teardown</code> for writing structured test cases with test tracking.</p>
+<p>Setup runs fresh before EACH test that requests context.
+Teardown runs after each test. Assertions are non-fatal.</p>
+<p>The <code>describe</code> and <code>test</code> macros expand into function declarations
+so that each test becomes a named pub function (test_*) that is
+called at module level.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">module</span> Test.MyTest {
+  <span class="hl-keyword">use</span> Zest.Case
+
+  <span class="hl-keyword">describe</span>(<span class="hl-string">"my feature"</span>) {
+    <span class="hl-builtin">setup</span>() {
+      <span class="hl-number">42</span>
+    }
+
+    <span class="hl-keyword">test</span>(<span class="hl-string">"uses context"</span>, ctx) {
+      <span class="hl-keyword">assert</span>(ctx <span class="hl-op">==</span> <span class="hl-number">42</span>)
+    }
+
+    <span class="hl-keyword">test</span>(<span class="hl-string">"no context needed"</span>) {
+      <span class="hl-keyword">assert</span>(<span class="hl-builtin">true</span>)
+    }
+
+    <span class="hl-builtin">teardown</span>() {
+      IO.puts(<span class="hl-string">"cleanup"</span>)
+    }
+  }
+}</code></pre>
+</div>
+<h2 id="functions">Functions</h2>
+<table class="summary">
+<tr><td class="summary-name"><a href="#begin_test-0">begin_test/0</a></td><td class="summary-doc">Wraps `begin_test` for explicit use.</td></tr>
+<tr><td class="summary-name"><a href="#end_test-0">end_test/0</a></td><td class="summary-doc">Wraps `end_test` for explicit use.</td></tr>
+<tr><td class="summary-name"><a href="#print_result-0">print_result/0</a></td><td class="summary-doc">Wraps `print_result` for explicit use.</td></tr>
+<tr><td class="summary-name"><a href="#assert-1">assert/1</a></td><td class="summary-doc">Asserts that a boolean value is `true`.</td></tr>
+<tr><td class="summary-name"><a href="#reject-1">reject/1</a></td><td class="summary-doc">Asserts that a boolean value is `false`.</td></tr>
+</table>
+<h2 id="macros">Macros</h2>
+<table class="summary">
+<tr><td class="summary-name"><a href="#describe-2">describe/2</a></td><td class="summary-doc">Groups related tests under a descriptive label.</td></tr>
+<tr><td class="summary-name"><a href="#test-2">test/2</a></td><td class="summary-doc">Defines a test case without context.</td></tr>
+<tr><td class="summary-name"><a href="#setup-1">setup/1</a></td><td class="summary-doc">Declares setup code that runs before each test with context.</td></tr>
+<tr><td class="summary-name"><a href="#teardown-1">teardown/1</a></td><td class="summary-doc">Declares teardown code that runs after each test.</td></tr>
+</table>
+<h2>Function Details</h2>
+<div class="function-detail" id="begin_test-0">
+<div class="function-header">
+<h3>begin_test<span class="arity">/0</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#begin_test-0" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">begin_test</span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Atom</span></code></div>
+<div class="function-doc">
+<p>Wraps <code>begin_test</code> for explicit use.</p>
+</div>
+</div>
+<div class="function-detail" id="end_test-0">
+<div class="function-header">
+<h3>end_test<span class="arity">/0</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#end_test-0" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">end_test</span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Atom</span></code></div>
+<div class="function-doc">
+<p>Wraps <code>end_test</code> for explicit use.</p>
+</div>
+</div>
+<div class="function-detail" id="print_result-0">
+<div class="function-header">
+<h3>print_result<span class="arity">/0</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#print_result-0" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">print_result</span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Atom</span></code></div>
+<div class="function-doc">
+<p>Wraps <code>print_result</code> for explicit use.</p>
+</div>
+</div>
+<div class="function-detail" id="assert-1">
+<div class="function-header">
+<h3>assert<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#assert-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">assert</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">Bool</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="function-doc">
+<p>Asserts that a boolean value is <code>true</code>.</p>
+<p>Non-fatal: returns :fail on failure, does not stop execution.</p>
+</div>
+</div>
+<div class="function-detail" id="reject-1">
+<div class="function-header">
+<h3>reject<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#reject-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">reject</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">Bool</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="function-doc">
+<p>Asserts that a boolean value is <code>false</code>.</p>
+<p>Non-fatal: returns &quot;F&quot; on failure, does not stop execution.</p>
+</div>
+</div>
+<h2>Macro Details</h2>
+<div class="function-detail" id="describe-2">
+<div class="function-header">
+<h3>describe<span class="arity">/2</span></h3>
+<span class="badge">pub macro</span>
+<div style="flex:1"></div>
+<a href="#describe-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">describe</span><span class="sig-paren">(</span>_name<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">, </span>body<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="function-doc">
+<p>Groups related tests under a descriptive label.</p>
+<p>Scans the body for <code>setup</code> and <code>teardown</code> blocks, then
+transforms each <code>test</code> call into a pub function declaration
+with begin_test/end_test/print_result tracking calls injected.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap"><span class="hl-keyword">describe</span>(<span class="hl-string">"math"</span>) {
+  <span class="hl-builtin">setup</span>() { <span class="hl-number">42</span> }
+
+  <span class="hl-keyword">test</span>(<span class="hl-string">"addition"</span>, ctx) {
+    <span class="hl-keyword">assert</span>(ctx <span class="hl-op">==</span> <span class="hl-number">42</span>)
+  }
+}</code></pre>
+</div>
+</div>
+<div class="function-detail" id="test-2">
+<div class="function-header">
+<h3>test<span class="arity">/2</span></h3>
+<span class="badge">pub macro</span>
+<div style="flex:1"></div>
+<a href="#test-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">test</span><span class="sig-paren">(</span>_name<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">, </span>body<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="function-doc">
+<p>Defines a test case without context.</p>
+<p>Expands into a pub function declaration named test_&lt;slugified_name&gt;
+with begin_test/end_test/print_result tracking calls wrapping the body.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap"><span class="hl-keyword">test</span>(<span class="hl-string">"true is true"</span>) {
+  <span class="hl-keyword">assert</span>(<span class="hl-builtin">true</span> <span class="hl-op">==</span> <span class="hl-builtin">true</span>)
+}</code></pre>
+</div>
+</div>
+<div class="function-detail" id="setup-1">
+<div class="function-header">
+<h3>setup<span class="arity">/1</span></h3>
+<span class="badge">pub macro</span>
+<div style="flex:1"></div>
+<a href="#setup-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">setup</span><span class="sig-paren">(</span>body<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="function-doc">
+<p>Declares setup code that runs before each test with context.</p>
+<p>Place inside a <code>describe</code> block. The return value is bound
+to <code>ctx</code> in each <code>test/3</code> call. Runs fresh for every test.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap"><span class="hl-builtin">setup</span>() {
+  connect_db()
+}</code></pre>
+</div>
+</div>
+<div class="function-detail" id="teardown-1">
+<div class="function-header">
+<h3>teardown<span class="arity">/1</span></h3>
+<span class="badge">pub macro</span>
+<div style="flex:1"></div>
+<a href="#teardown-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">teardown</span><span class="sig-paren">(</span>body<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="function-doc">
+<p>Declares teardown code that runs after each test.</p>
+<p>Place inside a <code>describe</code> block. Runs after every test body,
+even if assertions fail (non-fatal assertions).</p>
+<h2>Examples</h2>
+<pre><code class="language-zap"><span class="hl-builtin">teardown</span>() {
+  disconnect_db()
+}</code></pre>
+</div>
+</div>
+</main>
+<aside class="toc">
+<h3>On This Page</h3>
+<ul>
+<li class="toc-section">Functions</li>
+<li><a href="#begin_test-0">begin_test/0</a></li>
+<li><a href="#end_test-0">end_test/0</a></li>
+<li><a href="#print_result-0">print_result/0</a></li>
+<li><a href="#assert-1">assert/1</a></li>
+<li><a href="#reject-1">reject/1</a></li>
+<li class="toc-section">Macros</li>
+<li><a href="#describe-2">describe/2</a></li>
+<li><a href="#test-2">test/2</a></li>
+<li><a href="#setup-1">setup/1</a></li>
+<li><a href="#teardown-1">teardown/1</a></li>
+</ul>
+</aside>
+</div>
+<div id="search-modal" class="search-modal" hidden>
+<div class="search-backdrop"></div>
+<div class="search-dialog">
+<input type="text" id="search-modal-input" placeholder="Search documentation..." aria-label="Search">
+<ul id="search-results" class="search-results"></ul>
+</div>
+</div>
+<script src="../app.js"></script>
+</body>
+</html>
