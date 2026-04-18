@@ -429,6 +429,42 @@ pub const TypeStore = struct {
     // Type unification
     // ============================================================
 
+    /// Check whether `type_id` contains any type variables (`.type_var`) in its structure.
+    /// Used to determine whether a function signature is generic and requires unification.
+    pub fn containsTypeVars(self: *const TypeStore, type_id: TypeId) bool {
+        const typ = self.getType(type_id);
+        return switch (typ) {
+            .type_var => true,
+            .list => |list_type| self.containsTypeVars(list_type.element),
+            .tuple => |tuple_type| {
+                for (tuple_type.elements) |element| {
+                    if (self.containsTypeVars(element)) return true;
+                }
+                return false;
+            },
+            .function => |function_type| {
+                for (function_type.params) |param| {
+                    if (self.containsTypeVars(param)) return true;
+                }
+                return self.containsTypeVars(function_type.return_type);
+            },
+            .map => |map_type| {
+                return self.containsTypeVars(map_type.key) or
+                    self.containsTypeVars(map_type.value);
+            },
+            .applied => |applied_type| {
+                if (self.containsTypeVars(applied_type.base)) return true;
+                for (applied_type.args) |arg| {
+                    if (self.containsTypeVars(arg)) return true;
+                }
+                return false;
+            },
+            // Primitives and non-compound types cannot contain type variables
+            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type => false,
+            .struct_type, .union_type, .tagged_union, .opaque_type => false,
+        };
+    }
+
     /// Check whether `var_id` occurs anywhere inside the type referenced by `type_id`.
     /// Used as an occurs check to prevent constructing infinite types during unification.
     pub fn occursIn(self: *const TypeStore, var_id: TypeVarId, type_id: TypeId, subs: *const SubstitutionMap) bool {
@@ -3108,6 +3144,76 @@ pub const TypeChecker = struct {
                         return inferred_return;
                     }
 
+                    // Check if the signature is generic (contains type variables)
+                    var signature_is_generic = false;
+                    for (signature.params) |param_type| {
+                        if (self.store.containsTypeVars(param_type)) {
+                            signature_is_generic = true;
+                            break;
+                        }
+                    }
+                    if (!signature_is_generic and self.store.containsTypeVars(signature.return_type)) {
+                        signature_is_generic = true;
+                    }
+
+                    if (signature_is_generic) {
+                        // Generic call: use unification to bind type variables
+                        var subs = SubstitutionMap.init(self.allocator);
+                        var unification_failed = false;
+
+                        for (call.args, 0..) |arg, idx| {
+                            const arg_type = try self.inferExpr(arg);
+                            if (idx < signature.params.len) {
+                                const expected = signature.params[idx];
+                                if (expected != TypeStore.UNKNOWN and arg_type != TypeStore.UNKNOWN and arg_type != TypeStore.ERROR) {
+                                    const unified = self.store.unify(expected, arg_type, &subs) catch false;
+                                    if (!unified) {
+                                        try self.reportArgumentTypeMismatch(arg, idx, expected, arg_type);
+                                        unification_failed = true;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Apply substitutions to resolve the return type
+                        const resolved_return = if (!unification_failed)
+                            subs.applyToType(&self.store, signature.return_type)
+                        else
+                            signature.return_type;
+
+                        // Record the instantiation in the monomorphization registry
+                        if (!unification_failed) {
+                            // Collect the concrete type arguments from the substitution bindings
+                            var type_args_list: std.ArrayList(TypeId) = .empty;
+                            var bindings_list: std.ArrayList(MonomorphRegistry.TypeVarBinding) = .empty;
+                            var subs_iter = subs.bindings.iterator();
+                            while (subs_iter.next()) |entry| {
+                                const var_id = entry.key_ptr.*;
+                                const concrete_type = entry.value_ptr.*;
+                                try type_args_list.append(self.allocator, concrete_type);
+                                try bindings_list.append(self.allocator, .{
+                                    .var_id = var_id,
+                                    .concrete_type = concrete_type,
+                                });
+                            }
+
+                            if (type_args_list.items.len > 0) {
+                                const family_id = self.graph.resolveFamily(scope_id, vr.name, arity) orelse 0;
+                                _ = try self.morph_registry.recordInstantiation(
+                                    family_id,
+                                    type_args_list.items,
+                                    bindings_list.items,
+                                    &self.store,
+                                );
+                            }
+                        }
+
+                        const borrowed = try self.applyCallOwnershipWithSafeParams(call.args, signature.toFunctionType(), safe_params);
+                        defer self.endBorrowedBindings(borrowed) catch {};
+                        return resolved_return;
+                    }
+
+                    // Monomorphic call: use existing typeEquals comparison
                     for (call.args, 0..) |arg, idx| {
                         const arg_type = try self.inferExpr(arg);
                         if (idx < signature.params.len) {
@@ -3191,6 +3297,73 @@ pub const TypeChecker = struct {
                         }
                         if (match) {
                             if (try self.resolveFamilySignature(mod_entry.scope_id, fa.field, arity)) |signature| {
+                                // Check if the signature is generic (contains type variables)
+                                var mod_sig_is_generic = false;
+                                for (signature.params) |param_type| {
+                                    if (self.store.containsTypeVars(param_type)) {
+                                        mod_sig_is_generic = true;
+                                        break;
+                                    }
+                                }
+                                if (!mod_sig_is_generic and self.store.containsTypeVars(signature.return_type)) {
+                                    mod_sig_is_generic = true;
+                                }
+
+                                if (mod_sig_is_generic) {
+                                    // Generic call: use unification to bind type variables
+                                    var mod_subs = SubstitutionMap.init(self.allocator);
+                                    var mod_unification_failed = false;
+
+                                    for (call.args, 0..) |arg, idx| {
+                                        const arg_type = try self.inferExpr(arg);
+                                        if (idx < signature.params.len) {
+                                            const expected = signature.params[idx];
+                                            if (expected != TypeStore.UNKNOWN and arg_type != TypeStore.UNKNOWN and arg_type != TypeStore.ERROR) {
+                                                const unified = self.store.unify(expected, arg_type, &mod_subs) catch false;
+                                                if (!unified) {
+                                                    try self.reportArgumentTypeMismatch(arg, idx, expected, arg_type);
+                                                    mod_unification_failed = true;
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Apply substitutions to resolve the return type
+                                    const mod_resolved_return = if (!mod_unification_failed)
+                                        mod_subs.applyToType(&self.store, signature.return_type)
+                                    else
+                                        signature.return_type;
+
+                                    // Record the instantiation in the monomorphization registry
+                                    if (!mod_unification_failed) {
+                                        var mod_type_args: std.ArrayList(TypeId) = .empty;
+                                        var mod_bindings: std.ArrayList(MonomorphRegistry.TypeVarBinding) = .empty;
+                                        var mod_subs_iter = mod_subs.bindings.iterator();
+                                        while (mod_subs_iter.next()) |entry| {
+                                            const var_id = entry.key_ptr.*;
+                                            const concrete_type = entry.value_ptr.*;
+                                            try mod_type_args.append(self.allocator, concrete_type);
+                                            try mod_bindings.append(self.allocator, .{
+                                                .var_id = var_id,
+                                                .concrete_type = concrete_type,
+                                            });
+                                        }
+
+                                        if (mod_type_args.items.len > 0) {
+                                            const family_id = self.graph.resolveFamily(mod_entry.scope_id, fa.field, arity) orelse 0;
+                                            _ = try self.morph_registry.recordInstantiation(
+                                                family_id,
+                                                mod_type_args.items,
+                                                mod_bindings.items,
+                                                &self.store,
+                                            );
+                                        }
+                                    }
+
+                                    return mod_resolved_return;
+                                }
+
+                                // Monomorphic call: use existing typeEquals comparison
                                 for (call.args, 0..) |arg, idx| {
                                     const arg_type = try self.inferExpr(arg);
                                     if (idx < signature.params.len) {
