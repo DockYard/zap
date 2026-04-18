@@ -251,6 +251,11 @@ pub const Collector = struct {
             const fn_scope = try self.graph.createScope(parent_scope, .function);
             // Record scope mapping so the type checker can find it
             try self.graph.node_scope_map.put(scope.ScopeGraph.spanKey(clause.meta.span), fn_scope);
+            // Write scope ID directly onto the clause metadata so macro-generated
+            // functions (which may have colliding spans) have a reliable fallback.
+            // Without this, the default meta.scope_id = 0 (prelude) makes module-level
+            // functions invisible during type inference in macro-generated code.
+            @constCast(&clause.meta).scope_id = fn_scope;
 
             // Collect parameter bindings
             for (clause.params) |param| {

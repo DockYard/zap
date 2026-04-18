@@ -2287,16 +2287,69 @@ pub const TypeChecker = struct {
         for (func.clauses) |clause| {
             try self.checkFunctionClause(func, &clause);
             // Traverse the function body to set binding types for assignments.
+            // Uses inferExpr with catch to never abort on errors — the goal
+            // is type propagation for monomorphization, not error reporting.
             if (clause.body) |body| {
                 if (body.len > 0) {
                     const prev_scope2 = self.current_scope;
                     self.current_scope = self.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(clause.meta.span)) orelse clause.meta.scope_id;
-                    for (body) |stmt| {
-                        _ = self.checkStmt(stmt) catch {};
-                    }
+                    self.inferBodyBindings(body);
                     self.current_scope = prev_scope2;
                 }
             }
+        }
+    }
+
+    /// Recursively traverse statements to infer and record binding types.
+    /// Handles nested blocks, case expressions, and if expressions that
+    /// may contain assignments in macro-generated test function bodies.
+    fn inferBodyBindings(self: *TypeChecker, stmts: []const ast.Stmt) void {
+        for (stmts) |stmt| {
+            switch (stmt) {
+                .assignment => |assign| {
+                    const value_type = self.inferExpr(assign.value) catch TypeStore.UNKNOWN;
+                    if (value_type != TypeStore.UNKNOWN and value_type != TypeStore.ERROR) {
+                        if (assign.pattern.* == .bind) {
+                            if (self.current_scope) |scope_id| {
+                                if (self.graph.resolveBinding(scope_id, assign.pattern.bind.name)) |bid| {
+                                    self.recordBindingType(bid, value_type, assign.value.getMeta().span) catch {};
+                                }
+                            }
+                        }
+                    }
+                },
+                .expr => |expr| {
+                    // Recursively traverse blocks and compound expressions
+                    self.inferExprBindings(expr);
+                },
+                else => {},
+            }
+        }
+    }
+
+    /// Recursively traverse an expression to find nested assignments in blocks.
+    fn inferExprBindings(self: *TypeChecker, expr: *const ast.Expr) void {
+        switch (expr.*) {
+            .block => |blk| {
+                self.inferBodyBindings(blk.stmts);
+            },
+            .case_expr => |ce| {
+                _ = self.inferExpr(ce.scrutinee) catch {};
+                for (ce.clauses) |clause| {
+                    self.inferBodyBindings(clause.body);
+                }
+            },
+            .if_expr => |ie| {
+                _ = self.inferExpr(ie.condition) catch {};
+                self.inferBodyBindings(ie.then_block);
+                if (ie.else_block) |else_block| {
+                    self.inferBodyBindings(else_block);
+                }
+            },
+            .call => {
+                _ = self.inferExpr(expr) catch {};
+            },
+            else => {},
         }
     }
 
@@ -3380,13 +3433,13 @@ pub const TypeChecker = struct {
                                     var mod_unification_failed = false;
 
                                     for (call.args, 0..) |arg, idx| {
-                                        const arg_type = try self.inferExpr(arg);
+                                        const arg_type = self.inferExpr(arg) catch TypeStore.UNKNOWN;
                                         if (idx < signature.params.len) {
                                             const expected = signature.params[idx];
                                             if (expected != TypeStore.UNKNOWN and arg_type != TypeStore.UNKNOWN and arg_type != TypeStore.ERROR) {
                                                 const unified = self.store.unify(expected, arg_type, &mod_subs) catch false;
                                                 if (!unified) {
-                                                    try self.reportArgumentTypeMismatch(arg, idx, expected, arg_type);
+                                                    self.reportArgumentTypeMismatch(arg, idx, expected, arg_type) catch {};
                                                     mod_unification_failed = true;
                                                 }
                                             }
@@ -3428,13 +3481,17 @@ pub const TypeChecker = struct {
                                     return mod_resolved_return;
                                 }
 
-                                // Monomorphic call: use existing typeEquals comparison
+                                // Monomorphic call: check arguments but always return the
+                                // declared return type. Per-argument inference errors must
+                                // not prevent return type resolution — the return type is
+                                // known from the function signature independently of whether
+                                // all argument types can be fully inferred.
                                 for (call.args, 0..) |arg, idx| {
-                                    const arg_type = try self.inferExpr(arg);
+                                    const arg_type = self.inferExpr(arg) catch TypeStore.UNKNOWN;
                                     if (idx < signature.params.len) {
                                         const expected = signature.params[idx];
                                         if (expected != TypeStore.UNKNOWN and arg_type != TypeStore.UNKNOWN and arg_type != TypeStore.ERROR and !self.store.typeEquals(arg_type, expected)) {
-                                            try self.reportArgumentTypeMismatch(arg, idx, expected, arg_type);
+                                            self.reportArgumentTypeMismatch(arg, idx, expected, arg_type) catch {};
                                         }
                                     }
                                 }
