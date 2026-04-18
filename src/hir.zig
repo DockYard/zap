@@ -1553,6 +1553,24 @@ pub const HirBuilder = struct {
 
     /// Look up a function's declared return type from the scope graph.
     /// Searches current module scope, then prelude.
+    /// Resolve a function's return type by string name (for cross-module calls).
+    fn resolveFunctionReturnTypeByName(self: *const HirBuilder, name: []const u8, arity: u32) types_mod.TypeId {
+        for (self.graph.families.items) |family| {
+            if (family.arity == arity and std.mem.eql(u8, self.interner.get(family.name), name)) {
+                if (family.clauses.items.len > 0) {
+                    const first_clause = family.clauses.items[0];
+                    if (first_clause.clause_index < first_clause.decl.clauses.len) {
+                        const clause = first_clause.decl.clauses[first_clause.clause_index];
+                        if (clause.return_type) |rt| {
+                            return self.resolveTypeExpr(rt);
+                        }
+                    }
+                }
+            }
+        }
+        return types_mod.TypeStore.UNKNOWN;
+    }
+
     fn resolveFunctionReturnType(self: *const HirBuilder, name: ast.StringId, arity: u32) types_mod.TypeId {
         const scope_id = self.current_clause_scope orelse self.current_module_scope orelse self.graph.prelude_scope;
         if (self.graph.resolveFamily(scope_id, name, arity)) |fam_id| {
@@ -2982,10 +3000,14 @@ pub const HirBuilder = struct {
                         break :blk types_mod.TypeStore.UNKNOWN;
                     },
                     .named => |n| blk: {
-                        // For bare calls (no module prefix), look up in scope graph
                         if (n.module == null) {
                             if (call.callee.* == .var_ref) {
                                 break :blk self.resolveFunctionReturnType(call.callee.var_ref.name, @intCast(call.args.len));
+                            }
+                        } else {
+                            // Module-qualified call — resolve return type from the target module
+                            if (call.callee.* == .field_access) {
+                                break :blk self.resolveFunctionReturnTypeByName(n.name, @intCast(call.args.len));
                             }
                         }
                         break :blk types_mod.TypeStore.UNKNOWN;
