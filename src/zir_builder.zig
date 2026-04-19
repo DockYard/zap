@@ -1454,11 +1454,11 @@ pub const ZirDriver = struct {
             },
             .immediate_invocation => .{
                 .tier = tier,
-                .needs_env_param = false,
-                .direct_capture_params = has_captures,
-                .needs_closure_object = false,
+                .needs_env_param = has_captures,
+                .direct_capture_params = false,
+                .needs_closure_object = has_captures,
                 .stack_env = false,
-                .storage_scope = .immediate,
+                .storage_scope = if (has_captures) .stack_function else .immediate,
             },
             .block_local => .{
                 .tier = tier,
@@ -4901,9 +4901,9 @@ test "closure lowering helper distinguishes immediate and stack tiers" {
 
     const immediate = ZirDriver.closure_lowering_for_tier(.immediate_invocation, 1);
     try std.testing.expectEqual(lattice.ClosureEnvTier.immediate_invocation, immediate.tier);
-    try std.testing.expect(immediate.direct_capture_params);
-    try std.testing.expect(!immediate.needs_env_param);
-    try std.testing.expect(!immediate.needs_closure_object);
+    try std.testing.expect(!immediate.direct_capture_params);
+    try std.testing.expect(immediate.needs_env_param);
+    try std.testing.expect(immediate.needs_closure_object);
 
     const block_local = ZirDriver.closure_lowering_for_tier(.block_local, 1);
     try std.testing.expect(block_local.needs_env_param);
