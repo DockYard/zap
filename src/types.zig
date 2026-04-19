@@ -260,7 +260,7 @@ pub const TypeStore = struct {
             .type_var => false,
             .list => |l| l.element == b.list.element,
             .tuple => |t| std.mem.eql(TypeId, t.elements, b.tuple.elements),
-            .function => |f| f.return_type == b.function.return_type and std.mem.eql(TypeId, f.params, b.function.params),
+            .function => |f| f.return_type == b.function.return_type and std.mem.eql(TypeId, f.params, b.function.params) and ownershipSlicesEqual(f.param_ownerships, b.function.param_ownerships) and f.return_ownership == b.function.return_ownership,
             .map => |m| m.key == b.map.key and m.value == b.map.value,
             .struct_type => |s| s.name == b.struct_type.name,
             .tagged_union => |t| t.name == b.tagged_union.name,
@@ -2286,17 +2286,6 @@ pub const TypeChecker = struct {
     fn checkFunctionDecl(self: *TypeChecker, func: *const ast.FunctionDecl) !void {
         for (func.clauses) |clause| {
             try self.checkFunctionClause(func, &clause);
-            // Traverse the function body to set binding types for assignments.
-            // Uses inferExpr with catch to never abort on errors — the goal
-            // is type propagation for monomorphization, not error reporting.
-            if (clause.body) |body| {
-                if (body.len > 0) {
-                    const prev_scope2 = self.current_scope;
-                    self.current_scope = self.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(clause.meta.span)) orelse clause.meta.scope_id;
-                    self.inferBodyBindings(body);
-                    self.current_scope = prev_scope2;
-                }
-            }
         }
     }
 
@@ -3731,12 +3720,12 @@ fn rerunWithEscapeAnalysis(
     checker: *TypeChecker,
     program: *const ast.Program,
 ) !void {
-    var hir_builder = @import("hir.zig").HirBuilder.init(alloc, interner, graph, &checker.store);
+    var hir_builder = @import("hir.zig").HirBuilder.init(alloc, interner, graph, checker.store);
     defer hir_builder.deinit();
     const hir_program = try hir_builder.buildProgram(program);
 
     var ir_builder = @import("ir.zig").IrBuilder.init(alloc, interner);
-    ir_builder.type_store = &checker.store;
+    ir_builder.type_store = checker.store;
     defer ir_builder.deinit();
     const ir_program = try ir_builder.buildProgram(&hir_program);
 
@@ -3924,11 +3913,11 @@ test "type check simple function" {
     var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
-    var hir_builder = @import("hir.zig").HirBuilder.init(alloc, parser.interner, &collector.graph, &checker.store);
+    var hir_builder = @import("hir.zig").HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
     defer hir_builder.deinit();
     const hir_program = try hir_builder.buildProgram(&program);
     var ir_builder = @import("ir.zig").IrBuilder.init(alloc, parser.interner);
-    ir_builder.type_store = &checker.store;
+    ir_builder.type_store = checker.store;
     defer ir_builder.deinit();
     const ir_program = try ir_builder.buildProgram(&hir_program);
     var pipeline_result = try @import("analysis_pipeline.zig").runAnalysisPipeline(alloc, &ir_program);

@@ -65,7 +65,9 @@ pub fn monomorphize(
         return .{ .program = program.*, .specialization_count = 0 };
     }
 
-    // Phase B: Scan all call sites, collect instantiations, create specializations
+    // Phase B: Scan all call sites, collect instantiations, create specializations.
+    // After the initial scan, rescan newly created specializations until no more
+    // are produced (transitive closure — e.g. Enum.take calls List.take internally).
     for (program.modules, 0..) |mod, mod_idx| {
         ctx.current_scan_module_idx = mod_idx;
         for (mod.functions) |*group| {
@@ -81,6 +83,42 @@ pub fn monomorphize(
         }
     }
 
+    // Transitive scan: rescan newly created specializations until fixpoint.
+    // Each specialization may contain calls to other generic functions that
+    // also need specialization (e.g. Enum.take → List.take).
+    // Skip specializations that are still generic (contain type vars) — they
+    // came from scanning generic function bodies before the skip was added
+    // or from partial unifications, and their bodies would just create more
+    // bogus generic specializations.
+    // Transitive scan: rescan newly created specializations until fixpoint.
+    {
+        var scan_start: usize = 0;
+        var transitive_iterations: u32 = 0;
+        while (scan_start < ctx.new_groups.items.len) {
+            transitive_iterations += 1;
+            if (transitive_iterations > 10) break; // Safety limit
+            const scan_end = ctx.new_groups.items.len;
+            // Copy entries to scan since scanning may append to new_groups,
+            // which can reallocate and invalidate the items slice.
+            var entries_to_scan: std.ArrayListUnmanaged(NewGroupEntry) = .empty;
+            for (ctx.new_groups.items[scan_start..scan_end]) |entry| {
+                if (!isGenericGroup(store, &entry.group)) {
+                    entries_to_scan.append(allocator, entry) catch break;
+                }
+            }
+            for (entries_to_scan.items) |entry| {
+                ctx.current_scan_module_idx = entry.target_module_idx;
+                for (entry.group.clauses) |clause| {
+                    ctx.current_scan_params = clause.params;
+                    try ctx.scanBlock(clause.body);
+                    ctx.current_scan_params = null;
+                }
+            }
+            entries_to_scan.deinit(allocator);
+            scan_start = scan_end;
+        }
+        ctx.current_scan_module_idx = null;
+    }
     // Phase C: Build new program with specialized groups added.
     // Specializations are placed in the CALLING module (target_module_idx)
     // so that cross-module direct calls resolve within the same module's IR.
@@ -167,6 +205,9 @@ const MonomorphContext = struct {
     program: *const hir.Program,
     /// Current module index being scanned (for placing specializations)
     current_scan_module_idx: ?usize = null,
+    /// Current function params during scan — used to resolve param_get types
+    /// in specialized copies where cloneExpr may not have fully substituted types.
+    current_scan_params: ?[]const hir.TypedParam = null,
     /// Active substitution map during cloning. Set by cloneGroupWithSubs,
     /// used by cloneExpr/cloneDecision to substitute type_ids.
     current_subs: ?*const SubstitutionMap = null,
@@ -251,6 +292,18 @@ const MonomorphContext = struct {
                 // callback arg is an unresolved function reference).
                 for (first_clause.params, call.args) |param, arg| {
                     var arg_type = arg.expr.type_id;
+                    // If the argument is a param_get inside a specialized function,
+                    // use the specialized param's concrete type instead of the
+                    // expression type which may not have been substituted correctly.
+                    if (arg.expr.kind == .param_get and self.current_scan_params != null) {
+                        const pidx = arg.expr.kind.param_get;
+                        if (pidx < self.current_scan_params.?.len) {
+                            const scan_param_type = self.current_scan_params.?[pidx].type_id;
+                            if (!self.store.containsTypeVars(scan_param_type)) {
+                                arg_type = scan_param_type;
+                            }
+                        }
+                    }
                     // Empty list default
                     if (arg_type == types_mod.TypeStore.UNKNOWN) {
                         const param_typ = self.store.getType(param.type_id);
@@ -281,6 +334,13 @@ const MonomorphContext = struct {
                 }
 
                 if (type_args.items.len == 0) return; // Not actually generic
+
+                // Skip if any type arg still contains type variables — this happens
+                // when scanning inside generic function bodies where args are unresolved.
+                // Creating such specializations produces bogus stubs (e.g. head__T).
+                for (type_args.items) |ta| {
+                    if (self.store.containsTypeVars(ta)) return;
+                }
 
                 // Check if this instantiation already exists for THIS module.
                 // Each calling module needs its own copy of the specialization

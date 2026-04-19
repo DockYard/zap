@@ -3112,11 +3112,8 @@ pub const HirBuilder = struct {
                                 break :blk self.resolveFunctionReturnType(call.callee.var_ref.name, @intCast(call.args.len));
                             }
                         } else {
-                            // Module-qualified call — resolve return type from the target module
                             if (call.callee.* == .field_access) {
                                 const raw_return = self.resolveFunctionReturnTypeInModule(n.module.?, n.name, @intCast(call.args.len));
-                                // If the return type contains type variables, try to resolve
-                                // them by unifying argument types with parameter types.
                                 if (raw_return != types_mod.TypeStore.UNKNOWN) {
                                     const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
                                     if (store_ptr.containsTypeVars(raw_return)) {
@@ -3433,7 +3430,11 @@ pub const HirBuilder = struct {
                 });
             },
             .anonymous_function => |anon| {
-                const function_type = try self.resolveFunctionValueType(anon.decl.name);
+                var function_type = try self.resolveFunctionValueType(anon.decl.name);
+                // Fall back to building type from the clause directly if scope lookup fails
+                if (function_type == types_mod.TypeStore.UNKNOWN and anon.decl.clauses.len > 0) {
+                    function_type = try self.buildResolvedFunctionType(anon.decl.clauses[0]);
+                }
                 const group_scope = self.current_clause_scope orelse self.current_module_scope orelse self.graph.prelude_scope;
                 const group = try self.buildFunctionGroup(anon.decl, group_scope, null, true);
                 const group_ptr = try self.create(FunctionGroup, group);
@@ -4023,7 +4024,7 @@ test "HIR opaque typed params default to unique ownership" {
     try checker.checkProgram(&program);
     try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
 
-    var builder = HirBuilder.init(alloc, parser.interner, &collector.graph, &checker.store);
+    var builder = HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
     defer builder.deinit();
     const hir_program = try builder.buildProgram(&program);
 
@@ -4059,7 +4060,7 @@ test "HIR respects borrowed param annotation" {
     defer checker.deinit();
     try checker.checkProgram(&program);
 
-    var builder = HirBuilder.init(alloc, parser.interner, &collector.graph, &checker.store);
+    var builder = HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
     defer builder.deinit();
     const hir_program = try builder.buildProgram(&program);
 
@@ -4151,7 +4152,7 @@ test "HIR call args adopt function ownership modes" {
         },
     };
 
-    var builder = HirBuilder.init(alloc, parser.interner, &collector.graph, &checker.store);
+    var builder = HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
     defer builder.deinit();
     const hir_program = try builder.buildProgram(&program);
 
@@ -4193,7 +4194,7 @@ test "HIR named calls use resolved parameter ownership" {
     try checker.checkProgram(&program);
     try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
 
-    var builder = HirBuilder.init(alloc, parser.interner, &collector.graph, &checker.store);
+    var builder = HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
     defer builder.deinit();
     const hir_program = try builder.buildProgram(&program);
 
@@ -4244,7 +4245,7 @@ test "HIR closure calls adopt borrowed ownership mode" {
         .return_ownership = original_fn_type.return_ownership,
     } };
 
-    var builder = HirBuilder.init(alloc, parser.interner, &collector.graph, &checker.store);
+    var builder = HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
     defer builder.deinit();
     const hir_program = try builder.buildProgram(&program);
 
@@ -4283,7 +4284,7 @@ test "HIR function_ref keeps concrete function type" {
     try checker.checkProgram(&program);
     try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
 
-    var builder = HirBuilder.init(alloc, parser.interner, &collector.graph, &checker.store);
+    var builder = HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
     defer builder.deinit();
     const hir_program = try builder.buildProgram(&program);
 

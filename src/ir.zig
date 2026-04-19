@@ -4550,12 +4550,12 @@ test "IR call preserves HIR arg modes" {
         .return_ownership = original_fn_type.return_ownership,
     } };
 
-    var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, &checker.store);
+    var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
     defer hir_builder.deinit();
     const hir_program = try hir_builder.buildProgram(&program);
 
     var ir_builder = IrBuilder.init(alloc, parser.interner);
-    ir_builder.type_store = &checker.store;
+    ir_builder.type_store = checker.store;
     defer ir_builder.deinit();
     const ir_program = try ir_builder.buildProgram(&hir_program);
 
@@ -4608,12 +4608,12 @@ test "IR named call preserves move mode" {
     defer checker.deinit();
     try checker.checkProgram(&program);
 
-    var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, &checker.store);
+    var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
     defer hir_builder.deinit();
     const hir_program = try hir_builder.buildProgram(&program);
 
     var ir_builder = IrBuilder.init(alloc, parser.interner);
-    ir_builder.type_store = &checker.store;
+    ir_builder.type_store = checker.store;
     defer ir_builder.deinit();
     const ir_program = try ir_builder.buildProgram(&hir_program);
 
@@ -4682,12 +4682,12 @@ test "IR closure call preserves borrow mode without ARC ops" {
         .return_ownership = original_fn_type.return_ownership,
     } };
 
-    var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, &checker.store);
+    var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
     defer hir_builder.deinit();
     const hir_program = try hir_builder.buildProgram(&program);
 
     var ir_builder = IrBuilder.init(alloc, parser.interner);
-    ir_builder.type_store = &checker.store;
+    ir_builder.type_store = checker.store;
     defer ir_builder.deinit();
     const ir_program = try ir_builder.buildProgram(&hir_program);
 
@@ -4758,12 +4758,12 @@ test "IR shared opaque call emits retain and release" {
         .return_ownership = original_fn_type.return_ownership,
     } };
 
-    var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, &checker.store);
+    var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
     defer hir_builder.deinit();
     const hir_program = try hir_builder.buildProgram(&program);
 
     var ir_builder = IrBuilder.init(alloc, parser.interner);
-    ir_builder.type_store = &checker.store;
+    ir_builder.type_store = checker.store;
     defer ir_builder.deinit();
     const ir_program = try ir_builder.buildProgram(&hir_program);
 
