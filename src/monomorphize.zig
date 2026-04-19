@@ -374,20 +374,7 @@ const MonomorphContext = struct {
                     }
                 }
 
-                if (type_args.items.len == 0) {
-                    if (call.target == .named) {
-                        const nc2 = call.target.named;
-                        if (nc2.module != null and std.mem.eql(u8, nc2.name, "empty?") and std.mem.eql(u8, nc2.module.?, "List")) {
-                            std.debug.print("[mono-empty-0args] List.empty? has 0 type_args, arg_type={d} has_vars={} kind={s} rewritten={}\n", .{
-                                call.args[0].expr.type_id,
-                                self.store.containsTypeVars(call.args[0].expr.type_id),
-                                @tagName(call.args[0].expr.kind),
-                                self.call_rewrites.contains(@intFromPtr(call.args[0].expr)),
-                            });
-                        }
-                    }
-                    return;
-                }
+                if (type_args.items.len == 0) return; // Not actually generic
 
                 // Skip if any type arg still contains type variables — this happens
                 // when scanning inside generic function bodies where args are unresolved.
@@ -412,17 +399,14 @@ const MonomorphContext = struct {
                 if (self.specializations.get(key)) |existing_id| {
                     // Already have a specialization for this module — just record the rewrite
                     try self.call_rewrites.put(@intFromPtr(expr), existing_id);
-                    // Update type_id for nested call resolution using the
-                    // existing specialization's return type
+                    // Update type_id for nested call resolution.
+                    // Apply subs to the GENERIC GROUP's return type (which uses the
+                    // same type var IDs as the subs), NOT expr.type_id (which uses
+                    // different type var IDs from the HIR builder's scope).
                     if (self.store.containsTypeVars(expr.type_id)) {
-                        for (self.new_groups.items) |entry| {
-                            if (entry.group.id == existing_id and entry.group.clauses.len > 0) {
-                                const spec_return = entry.group.clauses[0].return_type;
-                                if (!self.store.containsTypeVars(spec_return)) {
-                                    @constCast(expr).type_id = spec_return;
-                                }
-                                break;
-                            }
+                        const concrete_return = subs.applyToType(self.store, first_clause.return_type);
+                        if (!self.store.containsTypeVars(concrete_return)) {
+                            @constCast(expr).type_id = concrete_return;
                         }
                     }
                     return;
@@ -442,27 +426,15 @@ const MonomorphContext = struct {
                 // Record this specific call expression for rewriting
                 try self.call_rewrites.put(@intFromPtr(expr), new_id);
 
-                // Update the call expression's type_id to the concrete return type
-                // from the specialized clone. This is critical for nested calls like
-                // List.empty?(Enum.map([], f)) where the outer call needs the inner
-                // call's concrete return type. We use the specialized clone's return
-                // type rather than subs.applyToType because the expr's type_id uses
-                // different type var IDs than the generic group's params.
+                // Update the call expression's type_id to the concrete return type.
+                // Apply subs to the GENERIC GROUP's return type (first_clause.return_type)
+                // which uses the same type var IDs as the subs map. Do NOT use
+                // expr.type_id because the HIR builder resolves type vars in a separate
+                // scope, producing different type var IDs that aren't in the subs.
                 if (self.store.containsTypeVars(expr.type_id)) {
-                    if (specialized.clauses.len > 0) {
-                        const spec_return = specialized.clauses[0].return_type;
-                        if (!self.store.containsTypeVars(spec_return)) {
-                            @constCast(expr).type_id = spec_return;
-                        } else {
-                            // Fallback: if the specialized return type still has vars,
-                            // try to apply the subs directly to the generic group's
-                            // return type (which uses matching type var IDs)
-                            const generic_return = generic_group.clauses[0].return_type;
-                            const resolved = subs.applyToType(self.store, generic_return);
-                            if (!self.store.containsTypeVars(resolved)) {
-                                @constCast(expr).type_id = resolved;
-                            }
-                        }
+                    const concrete_return = subs.applyToType(self.store, first_clause.return_type);
+                    if (!self.store.containsTypeVars(concrete_return)) {
+                        @constCast(expr).type_id = concrete_return;
                     }
                 }
             },
