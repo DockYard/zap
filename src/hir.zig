@@ -1489,6 +1489,10 @@ pub const HirBuilder = struct {
     current_map_bindings: std.ArrayList(MapBinding),
     current_case_bindings: std.ArrayList(CaseBinding),
     current_assignment_bindings: std.ArrayList(AssignmentBinding),
+    /// Parent function's assignment bindings — used for closure capture detection.
+    /// When a closure references a variable from the parent function's bindings,
+    /// it generates capture_get instead of local_get.
+    parent_assignment_bindings: std.ArrayList(AssignmentBinding),
     current_module_scope: ?scope_mod.ScopeId,
     current_clause_scope: ?scope_mod.ScopeId,
     current_function_root_scope: ?scope_mod.ScopeId,
@@ -1530,6 +1534,7 @@ pub const HirBuilder = struct {
             .current_map_bindings = .empty,
             .current_case_bindings = .empty,
             .current_assignment_bindings = .empty,
+            .parent_assignment_bindings = .empty,
             .current_module_scope = null,
             .current_clause_scope = null,
             .current_function_root_scope = null,
@@ -2002,6 +2007,29 @@ pub const HirBuilder = struct {
             }
         }
 
+        // Check parent function's assignment bindings — these are variables
+        // from the enclosing function that need to be captured, not accessed
+        // directly via local_get.
+        for (self.parent_assignment_bindings.items) |binding| {
+            if (binding.name == name) {
+                // Create a capture for this parent binding
+                const capture_type = binding.type_id;
+                const idx: u32 = @intCast(self.current_capture_list.items.len);
+                try self.current_capture_list.append(self.allocator, .{
+                    .name = binding.name,
+                    .binding_id = 0, // No scope graph binding ID — using local index
+                    .type_id = capture_type,
+                    .ownership = .shared,
+                });
+                try self.current_capture_map.put(binding.name, idx);
+                return try self.create(Expr, .{
+                    .kind = .{ .capture_get = idx },
+                    .type_id = type_id,
+                    .span = span,
+                });
+            }
+        }
+
         if (self.current_clause_scope) |scope_id| {
             if (self.graph.resolveBinding(scope_id, name)) |binding_id| {
                 const capture_result = try self.captureIndexForBinding(binding_id);
@@ -2441,9 +2469,9 @@ pub const HirBuilder = struct {
         self.current_capture_map = std.AutoHashMap(ast.StringId, u32).init(self.allocator);
         self.current_capture_list = .empty;
 
-        // Save and clear parent function's local bindings so that references
-        // to parent variables fall through to the scope graph and trigger
-        // proper capture detection instead of emitting local_get.
+        // Save parent function's local bindings. These need to be available
+        // for capture detection — when a closure references a parent's local
+        // variable, it should generate a capture_get, not a local_get.
         const saved_assignment_bindings = self.current_assignment_bindings;
         const saved_tuple_bindings = self.current_tuple_bindings;
         const saved_struct_bindings = self.current_struct_bindings;
@@ -2451,6 +2479,9 @@ pub const HirBuilder = struct {
         const saved_cons_tail_bindings = self.current_cons_tail_bindings;
         const saved_binary_bindings = self.current_binary_bindings;
         const saved_case_bindings = self.current_case_bindings;
+        // Store parent bindings for capture detection in the nested function
+        const saved_parent_bindings = self.parent_assignment_bindings;
+        self.parent_assignment_bindings = self.current_assignment_bindings;
         self.current_assignment_bindings = .empty;
         self.current_tuple_bindings = .empty;
         self.current_struct_bindings = .empty;
@@ -2480,6 +2511,7 @@ pub const HirBuilder = struct {
         self.current_cons_tail_bindings = saved_cons_tail_bindings;
         self.current_binary_bindings = saved_binary_bindings;
         self.current_case_bindings = saved_case_bindings;
+        self.parent_assignment_bindings = saved_parent_bindings;
 
         return .{
             .id = group_id,

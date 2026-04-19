@@ -681,6 +681,33 @@ pub const Collector = struct {
             .anonymous_function => |anon| {
                 try self.collectFunction(anon.decl, parent_scope);
             },
+            .call => |c| {
+                // Recurse into call arguments to find anonymous functions
+                for (c.args) |arg| {
+                    try self.collectExprScopes(arg, parent_scope);
+                }
+                try self.collectExprScopes(c.callee, parent_scope);
+            },
+            .binary_op => |bo| {
+                try self.collectExprScopes(bo.lhs, parent_scope);
+                try self.collectExprScopes(bo.rhs, parent_scope);
+            },
+            .unary_op => |uo| {
+                try self.collectExprScopes(uo.operand, parent_scope);
+            },
+            .tuple => |tup| {
+                for (tup.elements) |elem| {
+                    try self.collectExprScopes(elem, parent_scope);
+                }
+            },
+            .list => |ll| {
+                for (ll.elements) |elem| {
+                    try self.collectExprScopes(elem, parent_scope);
+                }
+            },
+            .field_access => |fa| {
+                try self.collectExprScopes(fa.object, parent_scope);
+            },
             // For other expressions, we don't create new scopes
             else => {},
         }
