@@ -214,6 +214,24 @@ pub const ModuleEntry = struct {
 };
 
 // ============================================================
+// Protocol and Impl entries
+// ============================================================
+
+pub const ProtocolEntry = struct {
+    name: ast.ModuleName,
+    scope_id: ScopeId,
+    decl: *const ast.ProtocolDecl,
+};
+
+pub const ImplEntry = struct {
+    protocol_name: ast.ModuleName,
+    target_type: ast.ModuleName,
+    scope_id: ScopeId,
+    decl: *const ast.ImplDecl,
+    is_private: bool,
+};
+
+// ============================================================
 // Scope graph — the central store
 // ============================================================
 
@@ -225,6 +243,8 @@ pub const ScopeGraph = struct {
     macro_families: std.ArrayList(MacroFamily),
     types: std.ArrayList(TypeEntry),
     modules: std.ArrayList(ModuleEntry),
+    protocols: std.ArrayList(ProtocolEntry),
+    impls: std.ArrayList(ImplEntry),
     prelude_scope: ScopeId,
     /// Maps (source_id, span.start) → scope_id, so the type checker can
     /// find the scope for function clauses and modules without mutating
@@ -251,6 +271,8 @@ pub const ScopeGraph = struct {
             .macro_families = .empty,
             .types = .empty,
             .modules = .empty,
+            .protocols = .empty,
+            .impls = .empty,
             .prelude_scope = 0,
             .node_scope_map = std.AutoHashMap(u64, ScopeId).init(allocator),
             .type_name_to_id = std.AutoHashMap(ast.StringId, TypeId).init(allocator),
@@ -277,6 +299,8 @@ pub const ScopeGraph = struct {
         self.macro_families.deinit(self.allocator);
         self.types.deinit(self.allocator);
         self.modules.deinit(self.allocator);
+        self.protocols.deinit(self.allocator);
+        self.impls.deinit(self.allocator);
         self.node_scope_map.deinit();
         self.type_name_to_id.deinit();
     }
@@ -446,6 +470,42 @@ pub const ScopeGraph = struct {
             }
         }
         return null;
+    }
+
+    /// Find a protocol by name (matching all parts of ModuleName).
+    pub fn findProtocol(self: *const ScopeGraph, name: ast.ModuleName) ?*const ProtocolEntry {
+        for (self.protocols.items) |*entry| {
+            if (moduleNamesMatch(entry.name, name)) return entry;
+        }
+        return null;
+    }
+
+    /// Find the impl of a given protocol for a given target type.
+    pub fn findImpl(self: *const ScopeGraph, protocol_name: ast.ModuleName, target_type: ast.ModuleName) ?*const ImplEntry {
+        for (self.impls.items) |*entry| {
+            if (moduleNamesMatch(entry.protocol_name, protocol_name) and
+                moduleNamesMatch(entry.target_type, target_type)) return entry;
+        }
+        return null;
+    }
+
+    /// Find ALL impls for a given protocol. Returns matching entries from the impls list.
+    pub fn findImplsForProtocol(self: *const ScopeGraph, protocol_name: ast.ModuleName, allocator: std.mem.Allocator) ![]const *const ImplEntry {
+        var results: std.ArrayListUnmanaged(*const ImplEntry) = .empty;
+        for (self.impls.items) |*entry| {
+            if (moduleNamesMatch(entry.protocol_name, protocol_name)) {
+                try results.append(allocator, entry);
+            }
+        }
+        return try results.toOwnedSlice(allocator);
+    }
+
+    fn moduleNamesMatch(a: ast.ModuleName, b: ast.ModuleName) bool {
+        if (a.parts.len != b.parts.len) return false;
+        for (a.parts, b.parts) |ap, bp| {
+            if (ap != bp) return false;
+        }
+        return true;
     }
 
     /// Check if a function key passes an import filter.

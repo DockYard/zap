@@ -76,8 +76,8 @@ pub const Collector = struct {
                 .union_decl => |ed| try self.collectUnion(ed, self.graph.prelude_scope),
                 .module => {},
                 .priv_module => {},
-                .protocol, .priv_protocol => {}, // Collected in Phase 3
-                .impl_decl, .priv_impl_decl => {}, // Collected in Phase 3
+                .protocol, .priv_protocol => |proto| try self.collectProtocol(proto),
+                .impl_decl, .priv_impl_decl => |impl_d| try self.collectImpl(impl_d),
             }
         }
     }
@@ -229,6 +229,34 @@ pub const Collector = struct {
                 }
             }
         }
+    }
+
+    fn collectProtocol(self: *Collector, proto: *const ast.ProtocolDecl) !void {
+        const proto_scope = try self.graph.createScope(self.graph.prelude_scope, .module);
+        try self.graph.node_scope_map.put(scope.ScopeGraph.spanKey(proto.meta.span), proto_scope);
+        try self.graph.protocols.append(self.allocator, .{
+            .name = proto.name,
+            .scope_id = proto_scope,
+            .decl = proto,
+        });
+    }
+
+    fn collectImpl(self: *Collector, impl_d: *const ast.ImplDecl) !void {
+        const impl_scope = try self.graph.createScope(self.graph.prelude_scope, .module);
+        try self.graph.node_scope_map.put(scope.ScopeGraph.spanKey(impl_d.meta.span), impl_scope);
+
+        // Collect each function in the impl block as a regular function
+        for (impl_d.functions) |func| {
+            try self.collectFunction(func, impl_scope);
+        }
+
+        try self.graph.impls.append(self.allocator, .{
+            .protocol_name = impl_d.protocol_name,
+            .target_type = impl_d.target_type,
+            .scope_id = impl_scope,
+            .decl = impl_d,
+            .is_private = impl_d.is_private,
+        });
     }
 
     pub fn collectFunction(self: *Collector, func: *const ast.FunctionDecl, parent_scope: scope.ScopeId) !void {
@@ -867,4 +895,91 @@ test "collect struct declaration" {
     // Should have 1 type registered (struct)
     try std.testing.expectEqual(@as(usize, 1), collector.graph.types.items.len);
     try std.testing.expect(collector.graph.types.items[0].kind == .struct_type);
+}
+
+test "collect protocol declaration" {
+    const source =
+        \\pub protocol Enumerable {
+        \\  fn each(collection, callback :: (member -> member)) -> collection
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    try std.testing.expectEqual(@as(usize, 1), collector.graph.protocols.items.len);
+    const proto = collector.graph.protocols.items[0];
+    try std.testing.expectEqual(@as(usize, 1), proto.decl.functions.len);
+}
+
+test "collect impl declaration" {
+    const source =
+        \\pub impl Enumerable for List {
+        \\  pub fn each(list :: [member], callback :: (member -> member)) -> [member] {
+        \\    list
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    try std.testing.expectEqual(@as(usize, 1), collector.graph.impls.items.len);
+    const impl_entry = collector.graph.impls.items[0];
+    try std.testing.expectEqual(@as(usize, 1), impl_entry.decl.functions.len);
+    try std.testing.expectEqual(false, impl_entry.is_private);
+}
+
+test "collect protocol and impl together" {
+    const source =
+        \\pub protocol Printable {
+        \\  fn to_string(value) -> String
+        \\}
+        \\pub impl Printable for List {
+        \\  pub fn to_string(list :: [member]) -> String {
+        \\    "list"
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    try std.testing.expectEqual(@as(usize, 1), collector.graph.protocols.items.len);
+    try std.testing.expectEqual(@as(usize, 1), collector.graph.impls.items.len);
+
+    // Verify protocol lookup works
+    const proto_name = collector.graph.protocols.items[0].name;
+    try std.testing.expect(collector.graph.findProtocol(proto_name) != null);
+
+    // Verify impl lookup works
+    const impl_target = collector.graph.impls.items[0].target_type;
+    try std.testing.expect(collector.graph.findImpl(proto_name, impl_target) != null);
 }
