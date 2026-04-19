@@ -1600,13 +1600,15 @@ pub const HirBuilder = struct {
                 const first_clause = family.clauses.items[0];
                 if (first_clause.clause_index >= first_clause.decl.clauses.len) continue;
                 const clause = first_clause.decl.clauses[first_clause.clause_index];
-                // Build parameter types
                 if (clause.params.len != arity) continue;
+                // Resolve param AND return types in the same type var scope
+                // so that type variables like `element` and `result` are shared.
+                const self_mut: *HirBuilder = @constCast(self);
+                self_mut.hir_type_var_scope.clearRetainingCapacity();
                 var subs = types_mod.SubstitutionMap.init(self.allocator);
                 for (clause.params, 0..) |param, i| {
                     if (i >= call_args.len) break;
                     var arg_type = call_args[i].expr.type_id;
-                    // For empty lists with UNKNOWN type, default to list(i64)
                     if (arg_type == types_mod.TypeStore.UNKNOWN) {
                         if (call_args[i].expr.kind == .list_init and call_args[i].expr.kind.list_init.len == 0) {
                             const store_ptr2: *types_mod.TypeStore = @constCast(self.type_store);
@@ -1620,10 +1622,13 @@ pub const HirBuilder = struct {
                         _ = store_ptr.unify(param_type, arg_type, &subs) catch {};
                     }
                 }
-                // Apply substitution to return type
                 if (subs.bindings.count() > 0) {
-                    const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
-                    return subs.applyToType(store_ptr, raw_return);
+                    // Resolve return type in the SAME type var scope as params
+                    if (clause.return_type) |rt| {
+                        const resolved_return = self.resolveTypeExpr(rt);
+                        const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
+                        return subs.applyToType(store_ptr, resolved_return);
+                    }
                 }
             }
         }
@@ -1840,8 +1845,12 @@ pub const HirBuilder = struct {
                 if (family.clauses.items.len == 0) continue;
                 const clause_ref = family.clauses.items[0];
                 const clause = clause_ref.decl.clauses[clause_ref.clause_index];
-                if (found_clause != null) return types_mod.TypeStore.UNKNOWN;
-                found_clause = clause;
+                if (found_clause == null) {
+                    found_clause = clause;
+                }
+                // Don't reject duplicates — the first match wins.
+                // Duplicates can occur when a function is visible from both
+                // the current scope and a parent scope in the chain.
             }
             current = self.graph.getScope(sid).parent;
         }
