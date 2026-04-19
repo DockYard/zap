@@ -269,7 +269,7 @@ pub const AtomTable = struct {
             .lookup = std.StringHashMap(u32).init(allocator),
         };
         // Register well-known atoms
-        const builtins = [_][]const u8{ "nil", "true", "false", "ok", "error" };
+        const builtins = [_][]const u8{ "nil", "true", "false", "ok", "error", "cont", "halt" };
         for (builtins) |name| {
             table.strings.append(allocator, name) catch {};
             table.lookup.put(name, @intCast(table.strings.items.len - 1)) catch {};
@@ -318,7 +318,7 @@ var atom_table_initialized: bool = false;
 fn initAtomTable() void {
     if (atom_table_initialized) return;
     // Register well-known atoms
-    const builtins = [_][]const u8{ "nil", "true", "false", "ok", "error" };
+    const builtins = [_][]const u8{ "nil", "true", "false", "ok", "error", "cont", "halt" };
     for (builtins) |name| {
         const id = atom_count;
         const len: u32 = @intCast(name.len);
@@ -2012,6 +2012,34 @@ pub const ListCell = struct {
             current = cell.tail;
         }
         return acc;
+    }
+
+    /// Reduce with halt/cont control flow.
+    /// The callback returns a Zig tuple struct where:
+    ///   field 0 (u64): atom — 5 = :cont, 6 = :halt
+    ///   field 1: the accumulator value
+    /// Returns a tuple struct with the final {atom, acc}.
+    pub fn reduceHaltCont(list: ?*const ListCell, initial: anytype, callback: anytype) @TypeOf(callback(initial, @as(i64, 0))) {
+        const ATOM_HALT: u64 = 6;
+        var current = list;
+        var acc = initial;
+        while (current) |cell| {
+            const result = callback(acc, cell.head);
+            // Check if the first field (atom) is :halt
+            if (result.@"0" == ATOM_HALT) {
+                return result;
+            }
+            // :cont — extract new accumulator and continue
+            acc = result.@"1";
+            current = cell.tail;
+        }
+        // Exhausted the list — return {:done, final_acc}
+        // Use :cont atom (5) to signal normal completion
+        const ATOM_CONT: u64 = 5;
+        var done_result: @TypeOf(callback(initial, @as(i64, 0))) = undefined;
+        done_result.@"0" = ATOM_CONT;
+        done_result.@"1" = acc;
+        return done_result;
     }
 
     pub fn eachFn(list: ?*const ListCell, callback: anytype) ?*const ListCell {

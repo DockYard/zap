@@ -1,3 +1,3 @@
 pub protocol Enumerable {
-  fn each(collection, callback :: (member -> member)) -> collection
+  fn reduce(collection, accumulator, callback :: (accumulator, member -> {Atom, accumulator})) -> {Atom, accumulator}
 }
