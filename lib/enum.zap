@@ -77,8 +77,8 @@ pub module Enum {
         Enum.each([1, 2, 3], fn(x) { IO.puts(Integer.to_string(x)) })
     """
 
-  pub fn each(collection :: Enumerable(member), callback :: (member -> member)) -> Enumerable(member) {
-    Enumerable.each(collection, callback)
+  pub fn each(list :: [element], callback :: (element -> element)) -> [element] {
+    :zig.ListCell.eachFn(list, callback)
   }
 
   @doc = """
