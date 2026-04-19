@@ -28,6 +28,21 @@ pub const ValueMode = enum {
 pub const Program = struct {
     modules: []const Module,
     top_functions: []const FunctionGroup,
+    protocols: []const ProtocolInfo = &.{},
+    impls: []const ImplInfo = &.{},
+};
+
+pub const ProtocolInfo = struct {
+    name: ast.StringId,
+    function_names: []const ast.StringId,
+    function_arities: []const u32,
+};
+
+pub const ImplInfo = struct {
+    protocol_name: ast.StringId,
+    target_module: ast.StringId,
+    impl_scope_id: scope_mod.ScopeId,
+    function_group_ids: []const u32,
 };
 
 pub const Module = struct {
@@ -2042,9 +2057,70 @@ pub const HirBuilder = struct {
             }
         }
 
+        // Build impl function groups as top-level functions
+        for (self.graph.impls.items) |impl_entry| {
+            self.current_module_scope = impl_entry.scope_id;
+            for (impl_entry.decl.functions) |func| {
+                const entry = try fn_groups.getOrPut(func.name);
+                if (!entry.found_existing) {
+                    entry.value_ptr.* = .empty;
+                    try fn_order.append(self.allocator, func.name);
+                }
+                try entry.value_ptr.append(self.allocator, func);
+            }
+            // Build each impl function as a top-level function group
+            for (impl_entry.decl.functions) |func| {
+                if (fn_groups.getPtr(func.name)) |decls| {
+                    const group = try self.buildMergedFunctionGroup(decls.items, impl_entry.scope_id);
+                    try top_fns.append(self.allocator, group);
+                    // Record group ID for ImplInfo
+                    decls.clearRetainingCapacity();
+                }
+            }
+            self.current_module_scope = null;
+        }
+
+        // Build protocol info from scope graph
+        var protocol_infos: std.ArrayList(ProtocolInfo) = .empty;
+        for (self.graph.protocols.items) |proto| {
+            var names: std.ArrayList(ast.StringId) = .empty;
+            var arities: std.ArrayList(u32) = .empty;
+            for (proto.decl.functions) |sig| {
+                try names.append(self.allocator, sig.name);
+                try arities.append(self.allocator, @intCast(sig.params.len));
+            }
+            try protocol_infos.append(self.allocator, .{
+                .name = proto.name.parts[proto.name.parts.len - 1],
+                .function_names = try names.toOwnedSlice(self.allocator),
+                .function_arities = try arities.toOwnedSlice(self.allocator),
+            });
+        }
+
+        // Build impl info from scope graph
+        var impl_infos: std.ArrayList(ImplInfo) = .empty;
+        for (self.graph.impls.items) |impl_entry| {
+            var group_ids: std.ArrayList(u32) = .empty;
+            // Find function groups that were built from this impl
+            for (top_fns.items) |group| {
+                if (group.scope_id == impl_entry.scope_id) {
+                    try group_ids.append(self.allocator, group.id);
+                }
+            }
+            if (impl_entry.protocol_name.parts.len > 0 and impl_entry.target_type.parts.len > 0) {
+                try impl_infos.append(self.allocator, .{
+                    .protocol_name = impl_entry.protocol_name.parts[impl_entry.protocol_name.parts.len - 1],
+                    .target_module = impl_entry.target_type.parts[impl_entry.target_type.parts.len - 1],
+                    .impl_scope_id = impl_entry.scope_id,
+                    .function_group_ids = try group_ids.toOwnedSlice(self.allocator),
+                });
+            }
+        }
+
         return .{
             .modules = try modules.toOwnedSlice(self.allocator),
             .top_functions = try top_fns.toOwnedSlice(self.allocator),
+            .protocols = try protocol_infos.toOwnedSlice(self.allocator),
+            .impls = try impl_infos.toOwnedSlice(self.allocator),
         };
     }
 
