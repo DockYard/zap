@@ -4250,6 +4250,16 @@ fn containsTypeVarInStore(store: *const types_mod.TypeStore, type_id: types_mod.
             }
             return false;
         },
+        .protocol_constraint => |pc| {
+            // Protocol constraints are always generic — they need dispatch resolution
+            if (pc.type_params.len > 0) {
+                for (pc.type_params) |tp| {
+                    if (containsTypeVarInStore(store, tp)) return true;
+                }
+            }
+            // Bare protocol constraint (no type params) is still generic
+            return true;
+        },
         else => false,
     };
 }

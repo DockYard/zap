@@ -3597,6 +3597,23 @@ pub const TypeChecker = struct {
                     }
                 }
 
+                // Check if this is a protocol name
+                for (self.graph.protocols.items) |proto| {
+                    if (proto.name.parts.len > 0 and proto.name.parts[proto.name.parts.len - 1] == tn.name) {
+                        // Protocol constraint — resolve type params and create constraint type
+                        var type_params: std.ArrayList(TypeId) = .empty;
+                        for (tn.args) |arg| {
+                            type_params.append(self.allocator, try self.resolveTypeExpr(arg)) catch {};
+                        }
+                        return try self.store.addType(.{
+                            .protocol_constraint = .{
+                                .protocol_name = tn.name,
+                                .type_params = type_params.toOwnedSlice(self.allocator) catch &.{},
+                            },
+                        });
+                    }
+                }
+
                 // Unknown type — report error with suggestions
                 var candidates: std.ArrayList([]const u8) = .empty;
                 // Collect builtin type names

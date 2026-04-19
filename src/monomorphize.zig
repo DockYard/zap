@@ -1029,6 +1029,14 @@ fn containsTypeVar(store: *const TypeStore, type_id: TypeId) bool {
     const typ = store.getType(type_id);
     return switch (typ) {
         .type_var => true,
+        .protocol_constraint => |pc| {
+            // Protocol constraints with type var params are generic
+            for (pc.type_params) |tp| {
+                if (containsTypeVar(store, tp)) return true;
+            }
+            // Bare protocol constraint (no type params) is still generic
+            return pc.type_params.len == 0;
+        },
         .list => |lt| containsTypeVar(store, lt.element),
         .tuple => |tt| {
             for (tt.elements) |elem| {
