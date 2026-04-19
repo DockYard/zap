@@ -338,8 +338,15 @@ const MonomorphContext = struct {
                 // Skip if any type arg still contains type variables — this happens
                 // when scanning inside generic function bodies where args are unresolved.
                 // Creating such specializations produces bogus stubs (e.g. head__T).
-                for (type_args.items) |ta| {
-                    if (self.store.containsTypeVars(ta)) return;
+                {
+                    var has_vars = false;
+                    for (type_args.items) |ta| {
+                        if (self.store.containsTypeVars(ta)) {
+                            has_vars = true;
+                            break;
+                        }
+                    }
+                    if (has_vars) return;
                 }
 
                 // Check if this instantiation already exists for THIS module.
@@ -351,6 +358,13 @@ const MonomorphContext = struct {
                 if (self.specializations.get(key)) |existing_id| {
                     // Already have a specialization for this module — just record the rewrite
                     try self.call_rewrites.put(@intFromPtr(expr), existing_id);
+                    // Update type_id for nested call resolution
+                    if (self.store.containsTypeVars(expr.type_id)) {
+                        const concrete_return = subs.applyToType(self.store, expr.type_id);
+                        if (!self.store.containsTypeVars(concrete_return)) {
+                            @constCast(expr).type_id = concrete_return;
+                        }
+                    }
                     return;
                 }
 
@@ -367,6 +381,16 @@ const MonomorphContext = struct {
                 try self.specializations.put(key, new_id);
                 // Record this specific call expression for rewriting
                 try self.call_rewrites.put(@intFromPtr(expr), new_id);
+
+                // Update the call expression's type_id to the concrete return type.
+                // This is critical for nested calls like List.empty?(Enum.map([], f))
+                // where the outer call needs the inner call's concrete return type.
+                if (self.store.containsTypeVars(expr.type_id)) {
+                    const concrete_return = subs.applyToType(self.store, expr.type_id);
+                    if (!self.store.containsTypeVars(concrete_return)) {
+                        @constCast(expr).type_id = concrete_return;
+                    }
+                }
             },
             // Recurse into sub-expressions
             .binary => |b| {
