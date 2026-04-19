@@ -229,6 +229,62 @@ const MonomorphContext = struct {
     /// Map from (call_site_hash) → new_group_id for rewriting
     call_rewrites: std.AutoHashMap(u64, u32),
 
+    /// Check if a named call targets a protocol (e.g., Enumerable.each).
+    /// Returns the protocol name StringId if it matches a registered protocol.
+    fn isProtocolCall(self: *const MonomorphContext, nc: hir.NamedCall) ?ast.StringId {
+        const target_module = nc.module orelse return null;
+        for (self.program.protocols) |proto| {
+            if (std.mem.eql(u8, self.interner.get(proto.name), target_module)) {
+                return proto.name;
+            }
+        }
+        return null;
+    }
+
+    /// Infer the target module name from a concrete type.
+    /// list(T) → "List", map(K,V) → "Map", struct → struct name
+    fn inferTargetModuleName(self: *const MonomorphContext, type_id: TypeId) ?[]const u8 {
+        if (type_id >= self.store.types.items.len) return null;
+        const typ = self.store.types.items[type_id];
+        return switch (typ) {
+            .list => "List",
+            .map => "Map",
+            .struct_type => |s| self.interner.get(s.name),
+            else => null,
+        };
+    }
+
+    /// Resolve a protocol dispatch: given a protocol name, function name,
+    /// and concrete argument type, find the impl's function group ID.
+    fn resolveProtocolDispatch(
+        self: *const MonomorphContext,
+        protocol_name: ast.StringId,
+        function_name: []const u8,
+        concrete_type: TypeId,
+        arity: u32,
+    ) ?u32 {
+        const target_module_name = self.inferTargetModuleName(concrete_type) orelse return null;
+
+        for (self.program.impls) |impl_info| {
+            if (impl_info.protocol_name != protocol_name) continue;
+            if (!std.mem.eql(u8, self.interner.get(impl_info.target_module), target_module_name)) continue;
+
+            // Found the impl. Search its function groups for the matching function.
+            for (impl_info.function_group_ids) |gid| {
+                // Search top-level functions for this group ID
+                for (self.program.top_functions) |*group| {
+                    if (group.id == gid and
+                        std.mem.eql(u8, self.interner.get(group.name), function_name) and
+                        group.arity == arity)
+                    {
+                        return gid;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
     /// Resolve a named cross-module call (e.g., List.head) to a function group ID
     /// by searching all modules in the HIR program.
     fn resolveNamedCall(self: *const MonomorphContext, nc: hir.NamedCall, arity: u32) ?u32 {
@@ -279,11 +335,45 @@ const MonomorphContext = struct {
                     try self.scanExpr(arg.expr);
                 }
 
-                // Check if this calls a generic function
+                // Check if this calls a generic function or a protocol function
                 const target_id = switch (call.target) {
                     .direct => |dc| dc.function_group_id,
                     .dispatch => |dp| dp.function_group_id,
                     .named => |nc| blk: {
+                        // Check for protocol dispatch: Enumerable.each(list, callback)
+                        if (self.isProtocolCall(nc)) |proto_name| {
+                            // Find the concrete type from the first argument
+                            if (call.args.len > 0) {
+                                var arg_type = call.args[0].expr.type_id;
+                                // Resolve local_get types
+                                if (self.store.containsTypeVars(arg_type) and call.args[0].expr.kind == .local_get) {
+                                    if (self.local_types.get(call.args[0].expr.kind.local_get)) |concrete| {
+                                        arg_type = concrete;
+                                    }
+                                }
+                                // Resolve param_get types
+                                if (self.store.containsTypeVars(arg_type) and call.args[0].expr.kind == .param_get and self.current_scan_params != null) {
+                                    const pidx = call.args[0].expr.kind.param_get;
+                                    if (pidx < self.current_scan_params.?.len) {
+                                        const scan_param_type = self.current_scan_params.?[pidx].type_id;
+                                        if (!self.store.containsTypeVars(scan_param_type)) {
+                                            arg_type = scan_param_type;
+                                        }
+                                    }
+                                }
+                                if (!self.store.containsTypeVars(arg_type) and arg_type != types_mod.TypeStore.UNKNOWN) {
+                                    if (self.resolveProtocolDispatch(proto_name, nc.name, arg_type, @intCast(call.args.len))) |impl_gid| {
+                                        // Record rewrite: protocol call → impl function
+                                        try self.call_rewrites.put(@intFromPtr(expr), impl_gid);
+                                        // The impl function may be generic; let the normal
+                                        // monomorphization flow handle it by falling through
+                                        // with the resolved target_id
+                                        break :blk impl_gid;
+                                    }
+                                }
+                            }
+                            return; // Can't resolve protocol dispatch — skip
+                        }
                         const resolved = self.resolveNamedCall(nc, @intCast(call.args.len)) orelse return;
                         break :blk resolved;
                     },
