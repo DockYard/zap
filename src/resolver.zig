@@ -93,6 +93,8 @@ pub const Resolver = struct {
             .union_decl => {},
             .module => {},
             .priv_module => {},
+            .protocol, .priv_protocol => {},
+            .impl_decl, .priv_impl_decl => {},
         }
     }
 

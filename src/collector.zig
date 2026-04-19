@@ -76,6 +76,8 @@ pub const Collector = struct {
                 .union_decl => |ed| try self.collectUnion(ed, self.graph.prelude_scope),
                 .module => {},
                 .priv_module => {},
+                .protocol, .priv_protocol => {}, // Collected in Phase 3
+                .impl_decl, .priv_impl_decl => {}, // Collected in Phase 3
             }
         }
     }

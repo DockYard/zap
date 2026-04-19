@@ -93,6 +93,10 @@ pub const Program = struct {
 pub const TopItem = union(enum) {
     module: *const ModuleDecl,
     priv_module: *const ModuleDecl,
+    protocol: *const ProtocolDecl,
+    priv_protocol: *const ProtocolDecl,
+    impl_decl: *const ImplDecl,
+    priv_impl_decl: *const ImplDecl,
     type_decl: *const TypeDecl,
     opaque_decl: *const OpaqueDecl,
     struct_decl: *const StructDecl,
@@ -118,6 +122,42 @@ pub const ModuleDecl = struct {
 pub const ModuleName = struct {
     parts: []const StringId,
     span: SourceSpan,
+};
+
+// ============================================================
+// Protocol declarations
+// ============================================================
+
+pub const ProtocolDecl = struct {
+    meta: NodeMeta,
+    name: ModuleName,
+    functions: []const ProtocolFunctionSig,
+    is_private: bool = false,
+};
+
+pub const ProtocolFunctionSig = struct {
+    meta: NodeMeta,
+    name: StringId,
+    params: []const ProtocolParam,
+    return_type: ?*const TypeExpr,
+};
+
+pub const ProtocolParam = struct {
+    meta: NodeMeta,
+    name: StringId,
+    type_annotation: ?*const TypeExpr,
+};
+
+// ============================================================
+// Impl declarations
+// ============================================================
+
+pub const ImplDecl = struct {
+    meta: NodeMeta,
+    protocol_name: ModuleName,
+    target_type: ModuleName,
+    functions: []const *const FunctionDecl,
+    is_private: bool = false,
 };
 
 pub const ModuleItem = union(enum) {
