@@ -1037,10 +1037,10 @@ pub const IrBuilder = struct {
         // Emit a minimal stub to preserve function ID ordering.
         if (self.type_store) |ts| {
             if (isGenericHirGroup(ts, group)) {
-                // Generic functions are monomorphized — all call sites are rewritten
-                // to specialized copies. Emit a stub that traps (unreachable) so that
-                // the function name exists in the module for import resolution but
-                // never executes successfully if called by accident.
+                // Generic functions are monomorphized — all call sites should be
+                // rewritten to specialized copies. Emit a stub with the CORRECT
+                // signature (matching arity and using anytype params) so that
+                // @import resolution works without generating self-recursive wrappers.
                 const func_id: FunctionId = group.id;
                 if (self.next_function_id <= func_id) {
                     self.next_function_id = func_id + 1;
@@ -1054,6 +1054,17 @@ pub const IrBuilder = struct {
                     try std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ prefix, local_name })
                 else
                     local_name;
+
+                // Build params with correct arity using anytype
+                var stub_params: std.ArrayList(Param) = .empty;
+                for (0..group.arity) |i| {
+                    const pname = try std.fmt.allocPrint(self.allocator, "__arg_{d}", .{i});
+                    try stub_params.append(self.allocator, .{
+                        .name = pname,
+                        .type_expr = .any,
+                    });
+                }
+
                 const trap_instr = try self.allocator.alloc(Instruction, 1);
                 trap_instr[0] = .{ .ret = .{ .value = null } };
                 const stub_block = try self.allocator.alloc(Block, 1);
@@ -1065,7 +1076,7 @@ pub const IrBuilder = struct {
                     .local_name = local_name,
                     .scope_id = group.scope_id,
                     .arity = group.arity,
-                    .params = &.{},
+                    .params = try stub_params.toOwnedSlice(self.allocator),
                     .body = stub_block,
                     .return_type = .void,
                     .is_closure = false,
