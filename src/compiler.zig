@@ -1786,6 +1786,8 @@ fn remapTopItem(alloc: std.mem.Allocator, item: *ast.TopItem, remap: []const ast
             try remapFunctionDecl(alloc, mutable, remap);
             item.* = if (item.* == .macro) .{ .macro = mutable } else .{ .priv_macro = mutable };
         },
+        .protocol, .priv_protocol => {},
+        .impl_decl, .priv_impl_decl => {},
     }
 }
 

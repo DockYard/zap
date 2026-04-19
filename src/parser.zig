@@ -267,7 +267,7 @@ pub const Parser = struct {
     fn synchronize(self: *Parser) void {
         while (!self.check(.eof)) {
             switch (self.peek()) {
-                .keyword_pub, .keyword_fn, .keyword_module, .keyword_macro, .keyword_struct, .keyword_union, .right_brace => return,
+                .keyword_pub, .keyword_fn, .keyword_module, .keyword_macro, .keyword_struct, .keyword_union, .keyword_protocol, .keyword_impl, .right_brace => return,
                 .newline => {
                     _ = self.advance();
                     // After newline, check if next token starts a new statement
@@ -279,6 +279,8 @@ pub const Parser = struct {
                         .keyword_macro,
                         .keyword_struct,
                         .keyword_union,
+                        .keyword_protocol,
+                        .keyword_impl,
                         .keyword_type,
                         .keyword_opaque,
                         .keyword_alias,
@@ -378,10 +380,26 @@ pub const Parser = struct {
                                 self.synchronize();
                             }
                         },
+                        .keyword_protocol => {
+                            self.restoreLexerState(saved);
+                            if (self.parseProtocolDecl(false)) |proto| {
+                                try top_items.append(self.allocator, .{ .protocol = try self.create(ast.ProtocolDecl, proto) });
+                            } else |_| {
+                                self.synchronize();
+                            }
+                        },
+                        .keyword_impl => {
+                            self.restoreLexerState(saved);
+                            if (self.parseImplDecl(false)) |impl_d| {
+                                try top_items.append(self.allocator, .{ .impl_decl = try self.create(ast.ImplDecl, impl_d) });
+                            } else |_| {
+                                self.synchronize();
+                            }
+                        },
                         else => {
                             self.restoreLexerState(saved);
                             try self.addRichError(
-                                "I was expecting `module`, `fn`, `macro`, `struct`, or `union` after `pub`",
+                                "I was expecting `module`, `fn`, `macro`, `struct`, `union`, `protocol`, or `impl` after `pub`",
                                 self.currentSpan(),
                                 null,
                                 null,
@@ -447,6 +465,20 @@ pub const Parser = struct {
                         self.synchronize();
                     }
                 },
+                .keyword_protocol => {
+                    if (self.parseProtocolDecl(true)) |proto| {
+                        try top_items.append(self.allocator, .{ .priv_protocol = try self.create(ast.ProtocolDecl, proto) });
+                    } else |_| {
+                        self.synchronize();
+                    }
+                },
+                .keyword_impl => {
+                    if (self.parseImplDecl(true)) |impl_d| {
+                        try top_items.append(self.allocator, .{ .priv_impl_decl = try self.create(ast.ImplDecl, impl_d) });
+                    } else |_| {
+                        self.synchronize();
+                    }
+                },
                 .newline => {
                     _ = self.advance();
                 },
@@ -454,7 +486,7 @@ pub const Parser = struct {
                     // Check for misspelled keywords
                     if (self.current.tag == .identifier) {
                         const text = self.current.slice(self.source);
-                        const keywords = [_][]const u8{ "pub", "module", "fn", "macro", "struct", "enum", "type", "opaque" };
+                        const keywords = [_][]const u8{ "pub", "module", "fn", "macro", "struct", "enum", "type", "opaque", "protocol", "impl" };
                         if (similarity.findBestMatch(text, &keywords, 0.75)) |suggestion| {
                             try self.addRichError(
                                 std.fmt.allocPrint(self.allocator, "I was not expecting `{s}` at the top level", .{text}) catch "unexpected identifier at top level",
@@ -732,6 +764,203 @@ pub const Parser = struct {
             .name = name,
             .parent = parent,
             .items = try items.toOwnedSlice(self.allocator),
+            .is_private = is_private,
+        };
+    }
+
+    fn parseProtocolDecl(self: *Parser, is_private: bool) !ast.ProtocolDecl {
+        const start = self.currentSpan();
+        if (self.check(.keyword_pub)) _ = self.advance();
+        _ = try self.expect(.keyword_protocol);
+
+        if (!self.check(.module_identifier)) {
+            try self.addRichError(
+                "I was expecting a protocol name (like `Enumerable`) after `protocol`",
+                start,
+                "protocol declaration starts here",
+                "protocol names must start with an uppercase letter",
+            );
+            return error.ParseError;
+        }
+        const name = try self.parseModuleName();
+
+        _ = try self.expect(.left_brace);
+        self.skipNewlines();
+
+        var functions: std.ArrayList(ast.ProtocolFunctionSig) = .empty;
+        while (!self.check(.right_brace) and !self.check(.eof)) {
+            self.skipNewlines();
+            if (self.check(.right_brace)) break;
+
+            if (self.check(.keyword_fn)) {
+                const sig = try self.parseProtocolFunctionSig();
+                try functions.append(self.allocator, sig);
+            } else if (self.check(.at_sign)) {
+                // Allow @doc and @moduledoc attributes
+                _ = try self.parseAttributeDecl();
+            } else {
+                try self.addRichError(
+                    "only function signatures are allowed inside protocol declarations",
+                    self.currentSpan(),
+                    null,
+                    "protocol bodies contain `fn name(params) -> ReturnType` signatures without bodies",
+                );
+                self.synchronize();
+            }
+            self.skipNewlines();
+        }
+        _ = try self.expect(.right_brace);
+
+        return .{
+            .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
+            .name = name,
+            .functions = try functions.toOwnedSlice(self.allocator),
+            .is_private = is_private,
+        };
+    }
+
+    fn parseProtocolFunctionSig(self: *Parser) !ast.ProtocolFunctionSig {
+        const start = self.currentSpan();
+        _ = try self.expect(.keyword_fn);
+
+        const name_tok = try self.expect(.identifier);
+        const name = try self.internToken(name_tok);
+
+        _ = try self.expect(.left_paren);
+
+        var params: std.ArrayList(ast.ProtocolParam) = .empty;
+        while (!self.check(.right_paren) and !self.check(.eof)) {
+            const param_start = self.currentSpan();
+            const param_name_tok = try self.expect(.identifier);
+            const param_name = try self.internToken(param_name_tok);
+
+            var type_ann: ?*const ast.TypeExpr = null;
+            if (self.match(.double_colon)) {
+                type_ann = try self.parseTypeExpr();
+            }
+
+            try params.append(self.allocator, .{
+                .meta = .{ .span = ast.SourceSpan.merge(param_start, self.previousSpan()) },
+                .name = param_name,
+                .type_annotation = type_ann,
+            });
+
+            if (!self.match(.comma)) break;
+        }
+        _ = try self.expect(.right_paren);
+
+        var return_type: ?*const ast.TypeExpr = null;
+        if (self.match(.arrow)) {
+            return_type = try self.parseTypeExpr();
+        }
+
+        // Protocol functions must NOT have bodies
+        if (self.check(.left_brace)) {
+            try self.addRichError(
+                "protocol functions are signatures only — they cannot have bodies",
+                self.currentSpan(),
+                "unexpected function body",
+                "remove the `{ ... }` body — implementations go in `impl` blocks",
+            );
+            return error.ParseError;
+        }
+
+        return .{
+            .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
+            .name = name,
+            .params = try params.toOwnedSlice(self.allocator),
+            .return_type = return_type,
+        };
+    }
+
+    fn parseImplDecl(self: *Parser, is_private: bool) !ast.ImplDecl {
+        const start = self.currentSpan();
+        if (self.check(.keyword_pub)) _ = self.advance();
+        _ = try self.expect(.keyword_impl);
+
+        if (!self.check(.module_identifier)) {
+            try self.addRichError(
+                "I was expecting a protocol name (like `Enumerable`) after `impl`",
+                start,
+                "impl declaration starts here",
+                "impl blocks look like: `impl ProtocolName for TypeName { ... }`",
+            );
+            return error.ParseError;
+        }
+        const protocol_name = try self.parseModuleName();
+
+        if (!self.match(.keyword_for)) {
+            try self.addRichError(
+                "I was expecting `for` after the protocol name in this `impl` block",
+                self.currentSpan(),
+                null,
+                "impl blocks look like: `impl ProtocolName for TypeName { ... }`",
+            );
+            return error.ParseError;
+        }
+
+        if (!self.check(.module_identifier)) {
+            try self.addRichError(
+                "I was expecting a type name (like `List`) after `for`",
+                self.currentSpan(),
+                null,
+                "impl blocks look like: `impl ProtocolName for TypeName { ... }`",
+            );
+            return error.ParseError;
+        }
+        const target_type = try self.parseModuleName();
+
+        _ = try self.expect(.left_brace);
+        self.skipNewlines();
+
+        var functions: std.ArrayList(*const ast.FunctionDecl) = .empty;
+        while (!self.check(.right_brace) and !self.check(.eof)) {
+            self.skipNewlines();
+            if (self.check(.right_brace)) break;
+
+            if (self.check(.keyword_pub)) {
+                const saved = self.saveLexerState();
+                _ = self.advance();
+                if (self.check(.keyword_fn)) {
+                    self.restoreLexerState(saved);
+                    const func = try self.parseFunctionDecl(.public);
+                    try functions.append(self.allocator, func);
+                } else {
+                    self.restoreLexerState(saved);
+                    try self.addRichError(
+                        "I was expecting `fn` after `pub` inside an impl block",
+                        self.currentSpan(),
+                        null,
+                        "impl blocks can only contain function declarations",
+                    );
+                    self.synchronize();
+                }
+            } else if (self.check(.keyword_fn)) {
+                const func = try self.parseFunctionDecl(.private);
+                try functions.append(self.allocator, func);
+            } else if (self.check(.at_sign)) {
+                // Allow @doc attributes before functions
+                _ = try self.parseAttributeDecl();
+            } else if (self.check(.newline)) {
+                _ = self.advance();
+            } else {
+                try self.addRichError(
+                    "only function declarations are allowed inside `impl` blocks",
+                    self.currentSpan(),
+                    null,
+                    "impl blocks look like: `impl ProtocolName for TypeName { pub fn name(...) { ... } }`",
+                );
+                self.synchronize();
+            }
+            self.skipNewlines();
+        }
+        _ = try self.expect(.right_brace);
+
+        return .{
+            .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
+            .protocol_name = protocol_name,
+            .target_type = target_type,
+            .functions = try functions.toOwnedSlice(self.allocator),
             .is_private = is_private,
         };
     }
@@ -4942,4 +5171,141 @@ test "parse anonymous function expression" {
     try std.testing.expect(expr.* == .anonymous_function);
     try std.testing.expectEqual(@as(usize, 1), expr.anonymous_function.decl.clauses.len);
     try std.testing.expectEqual(@as(usize, 1), expr.anonymous_function.decl.clauses[0].params.len);
+}
+
+test "parse protocol declaration" {
+    const source =
+        \\pub protocol Enumerable {
+        \\  fn each(collection, callback :: (member -> member)) -> collection
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    try std.testing.expectEqual(@as(usize, 1), program.top_items.len);
+
+    const proto = program.top_items[0].protocol;
+    try std.testing.expectEqual(@as(usize, 1), proto.name.parts.len);
+    try std.testing.expectEqual(@as(usize, 1), proto.functions.len);
+    try std.testing.expectEqual(false, proto.is_private);
+
+    const sig = proto.functions[0];
+    try std.testing.expectEqual(@as(usize, 2), sig.params.len);
+    // First param: collection (no type annotation)
+    try std.testing.expect(sig.params[0].type_annotation == null);
+    // Second param: callback (has type annotation)
+    try std.testing.expect(sig.params[1].type_annotation != null);
+    // Return type present
+    try std.testing.expect(sig.return_type != null);
+}
+
+test "parse protocol with multiple function signatures" {
+    const source =
+        \\pub protocol Collection {
+        \\  fn size(collection) -> i64
+        \\  fn empty?(collection) -> Bool
+        \\  fn contains?(collection, value :: member) -> Bool
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const proto = program.top_items[0].protocol;
+    try std.testing.expectEqual(@as(usize, 3), proto.functions.len);
+    try std.testing.expectEqual(@as(usize, 1), proto.functions[0].params.len);
+    try std.testing.expectEqual(@as(usize, 1), proto.functions[1].params.len);
+    try std.testing.expectEqual(@as(usize, 2), proto.functions[2].params.len);
+}
+
+test "parse impl declaration" {
+    const source =
+        \\pub impl Enumerable for List {
+        \\  pub fn each(list :: [member], callback :: (member -> member)) -> [member] {
+        \\    :zig.ListCell.eachFn(list, callback)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    try std.testing.expectEqual(@as(usize, 1), program.top_items.len);
+
+    const impl_d = program.top_items[0].impl_decl;
+    try std.testing.expectEqual(@as(usize, 1), impl_d.protocol_name.parts.len);
+    try std.testing.expectEqual(@as(usize, 1), impl_d.target_type.parts.len);
+    try std.testing.expectEqual(@as(usize, 1), impl_d.functions.len);
+    try std.testing.expectEqual(false, impl_d.is_private);
+}
+
+test "parse impl with multiple functions" {
+    const source =
+        \\pub impl Enumerable for List {
+        \\  pub fn each(list :: [member], callback :: (member -> member)) -> [member] {
+        \\    :zig.ListCell.eachFn(list, callback)
+        \\  }
+        \\
+        \\  pub fn reduce(list :: [member], acc :: result, callback :: (result, member -> result)) -> result {
+        \\    :zig.ListCell.reduceFn(list, acc, callback)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const impl_d = program.top_items[0].impl_decl;
+    try std.testing.expectEqual(@as(usize, 2), impl_d.functions.len);
+}
+
+test "parse private protocol" {
+    const source =
+        \\protocol Internal {
+        \\  fn process(item) -> item
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const proto = program.top_items[0].priv_protocol;
+    try std.testing.expectEqual(true, proto.is_private);
+    try std.testing.expectEqual(@as(usize, 1), proto.functions.len);
+}
+
+test "parse private impl" {
+    const source =
+        \\impl Printable for MyType {
+        \\  pub fn to_string(value :: MyType) -> String {
+        \\    "MyType"
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const impl_d = program.top_items[0].priv_impl_decl;
+    try std.testing.expectEqual(true, impl_d.is_private);
+    try std.testing.expectEqual(@as(usize, 1), impl_d.functions.len);
 }
