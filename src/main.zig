@@ -686,6 +686,18 @@ fn buildTarget(
         const lib_dir = try std.fs.path.join(alloc, &.{ project_root, "lib" });
         if (std.Io.Dir.cwd().access(global_io, lib_dir, .{})) |_| {
             try source_roots.append(alloc, .{ .name = "project", .path = lib_dir });
+            // Scan subdirectories so impl files (e.g., lib/list/enumerable.zap) are discovered
+            if (std.Io.Dir.cwd().openDir(global_io, lib_dir, .{ .iterate = true })) |dir_handle| {
+                var dir = dir_handle;
+                defer dir.close(global_io);
+                var it = dir.iterate();
+                while (it.next(global_io) catch null) |entry| {
+                    if (entry.kind == .directory) {
+                        const subdir = try std.fs.path.join(alloc, &.{ lib_dir, entry.name });
+                        try source_roots.append(alloc, .{ .name = "project", .path = subdir });
+                    }
+                }
+            } else |_| {}
         } else |_| {}
         const test_dir = try std.fs.path.join(alloc, &.{ project_root, "test" });
         if (std.Io.Dir.cwd().access(global_io, test_dir, .{})) |_| {
@@ -934,6 +946,34 @@ fn buildTarget(
         // Collect discovered files in topological order
         for (file_graph.topo_order.items) |file_path| {
             try source_files.append(alloc, file_path);
+        }
+
+        // Also scan source roots for protocol/impl files that aren't discovered
+        // through import-driven resolution (impl files have no module declaration)
+        {
+            var discovered = std.StringHashMap(void).init(alloc);
+            for (source_files.items) |sf| {
+                const key = std.fs.path.resolve(alloc, &.{sf}) catch sf;
+                discovered.put(key, {}) catch {};
+            }
+            for (source_roots.items) |root| {
+                if (std.Io.Dir.cwd().openDir(global_io, root.path, .{ .iterate = true })) |dir_handle| {
+                    var dir = dir_handle;
+                    defer dir.close(global_io);
+                    var it = dir.iterate();
+                    while (it.next(global_io) catch null) |entry| {
+                        if (entry.kind != .file) continue;
+                        if (!std.mem.endsWith(u8, entry.name, ".zap")) continue;
+                        if (std.mem.eql(u8, entry.name, "build.zap")) continue;
+                        const file_path = try std.fs.path.join(alloc, &.{ root.path, entry.name });
+                        const key = std.fs.path.resolve(alloc, &.{file_path}) catch file_path;
+                        if (!discovered.contains(key)) {
+                            try source_files.append(alloc, file_path);
+                            discovered.put(key, {}) catch {};
+                        }
+                    }
+                } else |_| {}
+            }
         }
 
         // Build module order for CTFE: reverse-map file paths to module names

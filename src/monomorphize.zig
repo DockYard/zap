@@ -234,7 +234,8 @@ const MonomorphContext = struct {
     fn isProtocolCall(self: *const MonomorphContext, nc: hir.NamedCall) ?ast.StringId {
         const target_module = nc.module orelse return null;
         for (self.program.protocols) |proto| {
-            if (std.mem.eql(u8, self.interner.get(proto.name), target_module)) {
+            const proto_str = self.interner.get(proto.name);
+            if (std.mem.eql(u8, proto_str, target_module)) {
                 return proto.name;
             }
         }

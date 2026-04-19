@@ -1037,6 +1037,8 @@ pub fn compileModuleByModule(
         // Phase 2: merge all HIR modules
         var all_hir_modules: std.ArrayListUnmanaged(zap.hir.Module) = .empty;
         var all_hir_top_fns: std.ArrayListUnmanaged(zap.hir.FunctionGroup) = .empty;
+        var all_hir_protocols: std.ArrayListUnmanaged(zap.hir.ProtocolInfo) = .empty;
+        var all_hir_impls: std.ArrayListUnmanaged(zap.hir.ImplInfo) = .empty;
         for (hir_results.items) |*result| {
             for (result.hir_program.modules) |mod| {
                 all_hir_modules.append(alloc, mod) catch return error.OutOfMemory;
@@ -1044,11 +1046,19 @@ pub fn compileModuleByModule(
             for (result.hir_program.top_functions) |tf| {
                 all_hir_top_fns.append(alloc, tf) catch return error.OutOfMemory;
             }
+            for (result.hir_program.protocols) |proto| {
+                all_hir_protocols.append(alloc, proto) catch return error.OutOfMemory;
+            }
+            for (result.hir_program.impls) |impl_info| {
+                all_hir_impls.append(alloc, impl_info) catch return error.OutOfMemory;
+            }
         }
 
         var combined_hir = zap.hir.Program{
             .modules = all_hir_modules.toOwnedSlice(alloc) catch return error.OutOfMemory,
             .top_functions = all_hir_top_fns.toOwnedSlice(alloc) catch return error.OutOfMemory,
+            .protocols = all_hir_protocols.toOwnedSlice(alloc) catch return error.OutOfMemory,
+            .impls = all_hir_impls.toOwnedSlice(alloc) catch return error.OutOfMemory,
         };
 
         // Phase 3: whole-program monomorphization
@@ -1545,9 +1555,10 @@ pub fn validateOneModulePerFile(
         return null;
     };
 
-    // Count top-level module declarations (both public and private)
+    // Count top-level declarations (module, protocol, or impl)
     var module_count: u32 = 0;
     var module_name_parts: ?[]const ast.StringId = null;
+    var has_protocol_or_impl = false;
     for (program.top_items) |item| {
         switch (item) {
             .module => |mod| {
@@ -1558,6 +1569,12 @@ pub fn validateOneModulePerFile(
                 module_count += 1;
                 module_name_parts = mod.name.parts;
             },
+            .protocol, .priv_protocol => {
+                has_protocol_or_impl = true;
+            },
+            .impl_decl, .priv_impl_decl => {
+                has_protocol_or_impl = true;
+            },
             else => {},
         }
     }
@@ -1567,6 +1584,11 @@ pub fn validateOneModulePerFile(
             module_count += 1;
             module_name_parts = mod.name.parts;
         }
+    }
+
+    // Protocol and impl files don't need a module declaration
+    if (has_protocol_or_impl and module_count == 0) {
+        return null;
     }
 
     if (module_count == 0) {
@@ -1786,9 +1808,82 @@ fn remapTopItem(alloc: std.mem.Allocator, item: *ast.TopItem, remap: []const ast
             try remapFunctionDecl(alloc, mutable, remap);
             item.* = if (item.* == .macro) .{ .macro = mutable } else .{ .priv_macro = mutable };
         },
-        .protocol, .priv_protocol => {},
-        .impl_decl, .priv_impl_decl => {},
+        .protocol => |pd| {
+            const mutable = try alloc.create(ast.ProtocolDecl);
+            mutable.* = pd.*;
+            try remapProtocolDecl(alloc, mutable, remap);
+            item.* = .{ .protocol = mutable };
+        },
+        .priv_protocol => |pd| {
+            const mutable = try alloc.create(ast.ProtocolDecl);
+            mutable.* = pd.*;
+            try remapProtocolDecl(alloc, mutable, remap);
+            item.* = .{ .priv_protocol = mutable };
+        },
+        .impl_decl => |id| {
+            const mutable = try alloc.create(ast.ImplDecl);
+            mutable.* = id.*;
+            try remapImplDecl(alloc, mutable, remap);
+            item.* = .{ .impl_decl = mutable };
+        },
+        .priv_impl_decl => |id| {
+            const mutable = try alloc.create(ast.ImplDecl);
+            mutable.* = id.*;
+            try remapImplDecl(alloc, mutable, remap);
+            item.* = .{ .priv_impl_decl = mutable };
+        },
     }
+}
+
+fn remapProtocolDecl(alloc: std.mem.Allocator, proto: *ast.ProtocolDecl, remap: []const ast.StringId) error{OutOfMemory}!void {
+    // Remap protocol name parts
+    const new_parts = try alloc.alloc(ast.StringId, proto.name.parts.len);
+    for (proto.name.parts, 0..) |part, i| {
+        new_parts[i] = if (part < remap.len) remap[part] else part;
+    }
+    proto.name.parts = new_parts;
+
+    // Remap function signature names and type expressions
+    const new_fns = try alloc.alloc(ast.ProtocolFunctionSig, proto.functions.len);
+    for (proto.functions, 0..) |sig, i| {
+        var new_sig = sig;
+        new_sig.name = if (sig.name < remap.len) remap[sig.name] else sig.name;
+        // Remap param names
+        const new_params = try alloc.alloc(ast.ProtocolParam, sig.params.len);
+        for (sig.params, 0..) |param, j| {
+            new_params[j] = param;
+            new_params[j].name = if (param.name < remap.len) remap[param.name] else param.name;
+        }
+        new_sig.params = new_params;
+        new_fns[i] = new_sig;
+    }
+    proto.functions = new_fns;
+}
+
+fn remapImplDecl(alloc: std.mem.Allocator, impl_d: *ast.ImplDecl, remap: []const ast.StringId) error{OutOfMemory}!void {
+    // Remap protocol name parts
+    const new_proto_parts = try alloc.alloc(ast.StringId, impl_d.protocol_name.parts.len);
+    for (impl_d.protocol_name.parts, 0..) |part, i| {
+        new_proto_parts[i] = if (part < remap.len) remap[part] else part;
+    }
+    impl_d.protocol_name.parts = new_proto_parts;
+
+    // Remap target type name parts
+    const new_type_parts = try alloc.alloc(ast.StringId, impl_d.target_type.parts.len);
+    for (impl_d.target_type.parts, 0..) |part, i| {
+        new_type_parts[i] = if (part < remap.len) remap[part] else part;
+    }
+    impl_d.target_type.parts = new_type_parts;
+
+    // Remap function declarations inside the impl
+    const new_fns = try alloc.alloc(*const ast.FunctionDecl, impl_d.functions.len);
+    for (impl_d.functions, 0..) |func, i| {
+        const mutable = try alloc.create(ast.FunctionDecl);
+        mutable.* = func.*;
+        try remapFunctionDecl(alloc, mutable, remap);
+        new_fns[i] = mutable;
+    }
+    impl_d.functions = new_fns;
 }
 
 fn remapModuleItem(alloc: std.mem.Allocator, item: *ast.ModuleItem, remap: []const ast.StringId) error{OutOfMemory}!void {
