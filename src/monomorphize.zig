@@ -538,8 +538,28 @@ const MonomorphContext = struct {
             });
         }
 
+        // Include source module name in the mangled specialization name to prevent
+        // name collisions. Without this, List.empty?__i64 and Enum.empty?__i64
+        // produce the same local_name in the calling module, causing the ZIR builder's
+        // deduplication to remove one — the surviving function then calls itself.
         const base_name = self.interner.get(group.name);
-        const mangled_str = mangleName(self.allocator, base_name, self.store, subs) catch base_name;
+        const source_module_prefix = blk: {
+            for (self.program.modules) |mod| {
+                for (mod.functions) |*g| {
+                    if (g.id == group.id) {
+                        if (mod.name.parts.len > 0) {
+                            break :blk self.interner.get(mod.name.parts[mod.name.parts.len - 1]);
+                        }
+                    }
+                }
+            }
+            break :blk "";
+        };
+        const qualified_base = if (source_module_prefix.len > 0)
+            std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ source_module_prefix, base_name }) catch base_name
+        else
+            base_name;
+        const mangled_str = mangleName(self.allocator, qualified_base, self.store, subs) catch qualified_base;
         const mangled_name = self.interner.intern(mangled_str) catch group.name;
 
         return .{
