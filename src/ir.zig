@@ -1045,43 +1045,10 @@ pub const IrBuilder = struct {
                 if (self.next_function_id <= func_id) {
                     self.next_function_id = func_id + 1;
                 }
-                const raw_name = if (group.name < self.interner.strings.items.len)
-                    self.interner.get(group.name)
-                else
-                    "generic_stub";
-                const local_name = try std.fmt.allocPrint(self.allocator, "{s}__{d}", .{ raw_name, group.arity });
-                const name_str = if (self.current_module_prefix) |prefix|
-                    try std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ prefix, local_name })
-                else
-                    local_name;
-
-                // Build params with correct arity using anytype
-                var stub_params: std.ArrayList(Param) = .empty;
-                for (0..group.arity) |i| {
-                    const pname = try std.fmt.allocPrint(self.allocator, "__arg_{d}", .{i});
-                    try stub_params.append(self.allocator, .{
-                        .name = pname,
-                        .type_expr = .any,
-                    });
-                }
-
-                const trap_instr = try self.allocator.alloc(Instruction, 1);
-                trap_instr[0] = .{ .ret = .{ .value = null } };
-                const stub_block = try self.allocator.alloc(Block, 1);
-                stub_block[0] = .{ .label = 0, .instructions = trap_instr };
-                try self.functions.append(self.allocator, .{
-                    .id = func_id,
-                    .name = name_str,
-                    .module_name = self.current_module_prefix,
-                    .local_name = local_name,
-                    .scope_id = group.scope_id,
-                    .arity = group.arity,
-                    .params = try stub_params.toOwnedSlice(self.allocator),
-                    .body = stub_block,
-                    .return_type = .void,
-                    .is_closure = false,
-                    .captures = &.{},
-                });
+                // Don't emit any IR function for generic stubs.
+                // No call_named or call_direct references the stub (all are rewritten).
+                // Emitting a function creates namespace entries that Zig's Sema may
+                // try to resolve, potentially generating self-recursive wrappers.
                 return;
             }
         }
