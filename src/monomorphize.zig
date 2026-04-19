@@ -364,11 +364,9 @@ const MonomorphContext = struct {
                                 }
                                 if (!self.store.containsTypeVars(arg_type) and arg_type != types_mod.TypeStore.UNKNOWN) {
                                     if (self.resolveProtocolDispatch(proto_name, nc.name, arg_type, @intCast(call.args.len))) |impl_gid| {
-                                        // Record rewrite: protocol call → impl function
-                                        try self.call_rewrites.put(@intFromPtr(expr), impl_gid);
-                                        // The impl function may be generic; let the normal
-                                        // monomorphization flow handle it by falling through
-                                        // with the resolved target_id
+                                        // Don't record rewrite here — let the generic
+                                        // specialization path handle it after unification.
+                                        // The impl function is generic and needs monomorphization.
                                         break :blk impl_gid;
                                     }
                                 }

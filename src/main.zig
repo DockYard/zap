@@ -948,8 +948,10 @@ fn buildTarget(
             try source_files.append(alloc, file_path);
         }
 
-        // Also scan source roots for protocol/impl files that aren't discovered
-        // through import-driven resolution (impl files have no module declaration)
+        // Also scan project source roots for protocol/impl files that aren't
+        // discovered through import-driven resolution (impl files have no module
+        // declaration so they can't be found via module name → file path mapping).
+        // Only scan "project" roots, not stdlib/dependency roots.
         {
             var discovered = std.StringHashMap(void).init(alloc);
             for (source_files.items) |sf| {
@@ -957,6 +959,7 @@ fn buildTarget(
                 discovered.put(key, {}) catch {};
             }
             for (source_roots.items) |root| {
+                if (!std.mem.eql(u8, root.name, "project")) continue;
                 if (std.Io.Dir.cwd().openDir(global_io, root.path, .{ .iterate = true })) |dir_handle| {
                     var dir = dir_handle;
                     defer dir.close(global_io);
