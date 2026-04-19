@@ -83,6 +83,9 @@ pub const Type = union(enum) {
     // Opaque
     opaque_type: OpaqueType,
 
+    // Protocol constraint
+    protocol_constraint: ProtocolConstraintType,
+
     // Unknown (for inference)
     unknown,
     error_type,
@@ -147,6 +150,11 @@ pub const Type = union(enum) {
     pub const OpaqueType = struct {
         name: ast.StringId,
         inner: TypeId,
+    };
+
+    pub const ProtocolConstraintType = struct {
+        protocol_name: ast.StringId,
+        type_params: []const TypeId,
     };
 };
 
@@ -267,6 +275,7 @@ pub const TypeStore = struct {
             .opaque_type => |o| o.name == b.opaque_type.name,
             .applied => |ap| ap.base == b.applied.base and std.mem.eql(TypeId, ap.args, b.applied.args),
             .union_type => |u| std.mem.eql(TypeId, u.members, b.union_type.members),
+            .protocol_constraint => |pc| pc.protocol_name == b.protocol_constraint.protocol_name and std.mem.eql(TypeId, pc.type_params, b.protocol_constraint.type_params),
         };
     }
 
@@ -376,6 +385,9 @@ pub const TypeStore = struct {
             if (!ownershipSlicesEqual(ta.function.param_ownerships, tb.function.param_ownerships)) return false;
             return ta.function.return_ownership == tb.function.return_ownership;
         }
+
+        // Protocol constraints match any type — verification deferred to monomorphization
+        if (ta == .protocol_constraint or tb == .protocol_constraint) return true;
 
         // If either side is a union type, check if the other is a member.
         // e.g., String is compatible with String | nil
@@ -487,6 +499,12 @@ pub const TypeStore = struct {
                 }
                 return false;
             },
+            .protocol_constraint => |pc| {
+                for (pc.type_params) |tp| {
+                    if (self.containsTypeVars(tp)) return true;
+                }
+                return false;
+            },
             // Primitives and non-compound types cannot contain type variables
             .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type => false,
             .struct_type, .union_type, .tagged_union, .opaque_type => false,
@@ -527,6 +545,12 @@ pub const TypeStore = struct {
                 if (self.occursIn(var_id, applied_type.base, subs)) return true;
                 for (applied_type.args) |arg| {
                     if (self.occursIn(var_id, arg, subs)) return true;
+                }
+                return false;
+            },
+            .protocol_constraint => |pc| {
+                for (pc.type_params) |tp| {
+                    if (self.occursIn(var_id, tp, subs)) return true;
                 }
                 return false;
             },
@@ -584,6 +608,9 @@ pub const TypeStore = struct {
             subs.bind(type_b.type_var, resolved_a);
             return true;
         }
+
+        // Protocol constraints accept any type — dispatch verified at monomorphization
+        if (type_a == .protocol_constraint or type_b == .protocol_constraint) return true;
 
         // Both are list types: unify element types
         if (type_a == .list and type_b == .list) {
@@ -725,6 +752,23 @@ pub const SubstitutionMap = struct {
                 return store.addType(.{ .map = .{
                     .key = new_key,
                     .value = new_value,
+                } }) catch type_id;
+            },
+            .protocol_constraint => |pc| {
+                var changed = false;
+                const new_params = store.allocator.alloc(TypeId, pc.type_params.len) catch return type_id;
+                for (pc.type_params, 0..) |tp, index| {
+                    const new_tp = self.applyToType(store, tp);
+                    new_params[index] = new_tp;
+                    if (new_tp != tp) changed = true;
+                }
+                if (!changed) {
+                    store.allocator.free(new_params);
+                    return type_id;
+                }
+                return store.addType(.{ .protocol_constraint = .{
+                    .protocol_name = pc.protocol_name,
+                    .type_params = new_params,
                 } }) catch type_id;
             },
             // Primitives and other types pass through unchanged

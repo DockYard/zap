@@ -3625,6 +3625,23 @@ pub const HirBuilder = struct {
                     // If not in TypeStore yet, it may be a forward reference
                     _ = scope_type_id;
                 }
+                // Check if this is a protocol name — create a protocol_constraint type
+                for (self.graph.protocols.items) |proto| {
+                    if (proto.name.parts.len > 0 and proto.name.parts[proto.name.parts.len - 1] == n.name) {
+                        // Resolve type parameters (e.g., Enumerable(member) → [type_var_for_member])
+                        var type_params: std.ArrayList(types_mod.TypeId) = .empty;
+                        for (n.args) |arg| {
+                            type_params.append(self.allocator, self.resolveTypeExpr(arg)) catch {};
+                        }
+                        const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
+                        return store_ptr.addType(.{
+                            .protocol_constraint = .{
+                                .protocol_name = n.name,
+                                .type_params = type_params.toOwnedSlice(self.allocator) catch &.{},
+                            },
+                        }) catch types_mod.TypeStore.UNKNOWN;
+                    }
+                }
                 return types_mod.TypeStore.UNKNOWN;
             },
             .never => types_mod.TypeStore.NEVER,
