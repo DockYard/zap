@@ -40,11 +40,13 @@ pub fn monomorphize(
         .specializations = std.AutoHashMap(u64, u32).init(allocator),
         .new_groups = .empty,
         .call_rewrites = std.AutoHashMap(u64, u32).init(allocator),
+        .local_types = std.AutoHashMap(u32, TypeId).init(allocator),
     };
     defer ctx.generic_groups.deinit();
     defer ctx.specializations.deinit();
     defer ctx.new_groups.deinit(allocator);
     defer ctx.call_rewrites.deinit();
+    defer ctx.local_types.deinit();
 
     // Phase A: Identify generic function groups (those with type_var params)
     for (program.modules) |mod| {
@@ -72,6 +74,7 @@ pub fn monomorphize(
         ctx.current_scan_module_idx = mod_idx;
         for (mod.functions) |*group| {
             for (group.clauses) |clause| {
+                ctx.local_types.clearRetainingCapacity();
                 try ctx.scanBlock(clause.body);
             }
         }
@@ -79,6 +82,7 @@ pub fn monomorphize(
     ctx.current_scan_module_idx = null;
     for (program.top_functions) |*group| {
         for (group.clauses) |clause| {
+            ctx.local_types.clearRetainingCapacity();
             try ctx.scanBlock(clause.body);
         }
     }
@@ -110,6 +114,7 @@ pub fn monomorphize(
                 ctx.current_scan_module_idx = entry.target_module_idx;
                 for (entry.group.clauses) |clause| {
                     ctx.current_scan_params = clause.params;
+                    ctx.local_types.clearRetainingCapacity();
                     try ctx.scanBlock(clause.body);
                     ctx.current_scan_params = null;
                 }
@@ -208,6 +213,10 @@ const MonomorphContext = struct {
     /// Current function params during scan — used to resolve param_get types
     /// in specialized copies where cloneExpr may not have fully substituted types.
     current_scan_params: ?[]const hir.TypedParam = null,
+    /// Tracks concrete types for local variables during scanning.
+    /// When a local_set assigns from a call that was specialized, the local
+    /// gets the concrete return type. Later local_get references can use this.
+    local_types: std.AutoHashMap(u32, TypeId),
     /// Active substitution map during cloning. Set by cloneGroupWithSubs,
     /// used by cloneExpr/cloneDecision to substitute type_ids.
     current_subs: ?*const SubstitutionMap = null,
@@ -244,7 +253,15 @@ const MonomorphContext = struct {
         for (block.stmts) |stmt| {
             switch (stmt) {
                 .expr => |e| try self.scanExpr(e),
-                .local_set => |ls| try self.scanExpr(ls.value),
+                .local_set => |ls| {
+                    try self.scanExpr(ls.value);
+                    // Track the concrete type of this local for later local_get resolution.
+                    // After scanning, the value's type_id may have been updated to concrete.
+                    const val_type = ls.value.type_id;
+                    if (!self.store.containsTypeVars(val_type) and val_type != types_mod.TypeStore.UNKNOWN) {
+                        try self.local_types.put(ls.index, val_type);
+                    }
+                },
                 .function_group => |fg| {
                     for (fg.clauses) |clause| {
                         try self.scanBlock(clause.body);
@@ -307,6 +324,13 @@ const MonomorphContext = struct {
                                     break;
                                 }
                             }
+                        }
+                    }
+                    // If the argument is a local_get, use the tracked concrete type
+                    // from the local_set that assigned it.
+                    if (self.store.containsTypeVars(arg_type) and arg.expr.kind == .local_get) {
+                        if (self.local_types.get(arg.expr.kind.local_get)) |concrete| {
+                            arg_type = concrete;
                         }
                     }
                     // If the argument is a param_get inside a specialized function,
