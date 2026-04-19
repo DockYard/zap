@@ -2004,7 +2004,8 @@ pub const HirBuilder = struct {
 
         if (self.current_clause_scope) |scope_id| {
             if (self.graph.resolveBinding(scope_id, name)) |binding_id| {
-                if (try self.captureIndexForBinding(binding_id)) |capture_idx| {
+                const capture_result = try self.captureIndexForBinding(binding_id);
+                if (capture_result) |capture_idx| {
                     return try self.create(Expr, .{
                         .kind = .{ .capture_get = capture_idx },
                         .type_id = type_id,
@@ -2440,6 +2441,24 @@ pub const HirBuilder = struct {
         self.current_capture_map = std.AutoHashMap(ast.StringId, u32).init(self.allocator);
         self.current_capture_list = .empty;
 
+        // Save and clear parent function's local bindings so that references
+        // to parent variables fall through to the scope graph and trigger
+        // proper capture detection instead of emitting local_get.
+        const saved_assignment_bindings = self.current_assignment_bindings;
+        const saved_tuple_bindings = self.current_tuple_bindings;
+        const saved_struct_bindings = self.current_struct_bindings;
+        const saved_list_bindings = self.current_list_bindings;
+        const saved_cons_tail_bindings = self.current_cons_tail_bindings;
+        const saved_binary_bindings = self.current_binary_bindings;
+        const saved_case_bindings = self.current_case_bindings;
+        self.current_assignment_bindings = .empty;
+        self.current_tuple_bindings = .empty;
+        self.current_struct_bindings = .empty;
+        self.current_list_bindings = .empty;
+        self.current_cons_tail_bindings = .empty;
+        self.current_binary_bindings = .empty;
+        self.current_case_bindings = .empty;
+
         var clauses: std.ArrayList(Clause) = .empty;
         for (func.clauses) |clause| {
             try clauses.append(self.allocator, try self.buildClause(&clause));
@@ -2454,6 +2473,13 @@ pub const HirBuilder = struct {
         self.next_local = saved_next_local;
         self.current_function_name = saved_function_name;
         self.current_function_name_id = saved_function_name_id;
+        self.current_assignment_bindings = saved_assignment_bindings;
+        self.current_tuple_bindings = saved_tuple_bindings;
+        self.current_struct_bindings = saved_struct_bindings;
+        self.current_list_bindings = saved_list_bindings;
+        self.current_cons_tail_bindings = saved_cons_tail_bindings;
+        self.current_binary_bindings = saved_binary_bindings;
+        self.current_case_bindings = saved_case_bindings;
 
         return .{
             .id = group_id,
