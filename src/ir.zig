@@ -1149,8 +1149,9 @@ pub const IrBuilder = struct {
 
         if (group.clauses.len == 1) {
             // Single clause — no dispatch needed
-            // Emit tuple/binary/map bindings if present
+            // Emit tuple/struct/binary/map bindings if present
             try self.emitTupleBindings(first_clause);
+            try self.emitStructBindings(first_clause);
             try self.emitBinaryBindings(first_clause);
             try self.emitMapBindings(first_clause);
             const result_local = try self.lowerBlock(first_clause.body);
@@ -1169,6 +1170,7 @@ pub const IrBuilder = struct {
                     const saved = self.current_instrs;
                     self.current_instrs = .empty;
                     try self.emitTupleBindings(&clause);
+                    try self.emitStructBindings(&clause);
                     const result_local = try self.lowerBlock(clause.body);
                     default_instrs_result = try self.current_instrs.toOwnedSlice(self.allocator);
                     default_result = result_local;
@@ -2358,6 +2360,24 @@ pub const IrBuilder = struct {
         }
     }
 
+    /// Emit field_get instructions to populate struct binding locals.
+    fn emitStructBindings(self: *IrBuilder, clause: *const hir_mod.Clause) !void {
+        for (clause.struct_bindings) |binding| {
+            const struct_local = self.next_local;
+            self.next_local += 1;
+            try self.current_instrs.append(self.allocator, .{
+                .param_get = .{ .dest = struct_local, .index = binding.param_index },
+            });
+            try self.current_instrs.append(self.allocator, .{
+                .field_get = .{
+                    .dest = binding.local_index,
+                    .object = struct_local,
+                    .field = self.interner.get(binding.field_name),
+                },
+            });
+        }
+    }
+
     fn emitMapBindings(self: *IrBuilder, clause: *const hir_mod.Clause) !void {
         for (clause.map_bindings) |binding| {
             // Get the param (the map)
@@ -2975,8 +2995,9 @@ pub const IrBuilder = struct {
                     });
                     try self.known_local_types.put(binding.local_index, scrutinee_list_type);
                 }
-                // Emit binary bindings
+                // Emit binary/struct bindings
                 try self.emitBinaryBindings(clause);
+                try self.emitStructBindings(clause);
                 const result_local = try self.lowerBlock(clause.body);
                 try self.current_instrs.append(self.allocator, .{ .ret = .{ .value = result_local } });
             },

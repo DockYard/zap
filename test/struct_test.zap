@@ -55,6 +55,28 @@ pub module Test.StructTest {
     point.x + point.y
   }
 
+  describe("Struct pattern matching") {
+    test("destructure struct in function parameter") {
+      point = make_point(8, 13)
+      result = extract_x(point)
+      assert(result == 8)
+    }
+
+    test("destructure multiple fields") {
+      point = make_point(5, 12)
+      result = add_fields(point)
+      assert(result == 17)
+    }
+  }
+
+  fn extract_x(%{x: x_val} :: Point) -> i64 {
+    x_val
+  }
+
+  fn add_fields(%{x: x_val, y: y_val} :: Point) -> i64 {
+    x_val + y_val
+  }
+
   fn get_x_from_inline() -> i64 {
     point = %Point{x: 42, y: 99}
     point.x
