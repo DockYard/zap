@@ -116,6 +116,7 @@ pub fn build(b: *std.Build) void {
 
     exe.root_module.addObjectFile(.{ .cwd_relative = zig_compiler_lib_path });
 
+
     if (llvm_lib_path) |lib_path| {
         exe.root_module.addLibraryPath(.{ .cwd_relative = lib_path });
 

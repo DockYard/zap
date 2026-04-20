@@ -1461,6 +1461,57 @@ pub const Prelude = struct {
         std.process.exit(1);
     }
 
+    /// Call a callable value — either a bare function pointer or a closure struct.
+    /// Closure structs have {call_fn, env, env_release} fields.
+    pub inline fn callCallable1(callable: anytype, arg0: anytype) CallReturnType(@TypeOf(callable)) {
+        const T = @TypeOf(callable);
+        if (@typeInfo(T) == .@"struct" and @hasField(T, "call_fn")) {
+            return callable.call_fn(callable.env, arg0);
+        } else {
+            return callable(arg0);
+        }
+    }
+
+    pub inline fn callCallable2(callable: anytype, arg0: anytype, arg1: anytype) CallReturnType(@TypeOf(callable)) {
+        const T = @TypeOf(callable);
+        if (@typeInfo(T) == .@"struct" and @hasField(T, "call_fn")) {
+            return callable.call_fn(callable.env, arg0, arg1);
+        } else {
+            return callable(arg0, arg1);
+        }
+    }
+
+    pub inline fn callCallable3(callable: anytype, arg0: anytype, arg1: anytype, arg2: anytype) CallReturnType(@TypeOf(callable)) {
+        const T = @TypeOf(callable);
+        if (@typeInfo(T) == .@"struct" and @hasField(T, "call_fn")) {
+            return callable.call_fn(callable.env, arg0, arg1, arg2);
+        } else {
+            return callable(arg0, arg1, arg2);
+        }
+    }
+
+    fn CallReturnType(comptime T: type) type {
+        if (@typeInfo(T) == .@"struct" and @hasField(T, "call_fn")) {
+            const fn_info = @typeInfo(@TypeOf(@field(@as(T, undefined), "call_fn")));
+            if (fn_info == .pointer) {
+                const child = @typeInfo(fn_info.pointer.child);
+                if (child == .@"fn") {
+                    return child.@"fn".return_type orelse i64;
+                }
+            }
+            return i64;
+        } else {
+            const info = @typeInfo(T);
+            if (info == .pointer) {
+                const child = @typeInfo(info.pointer.child);
+                if (child == .@"fn") {
+                    return child.@"fn".return_type orelse i64;
+                }
+            }
+            return i64;
+        }
+    }
+
 
     // CLI argument access — use getArgv() directly (no allocation)
     pub fn arg_count() i64 {

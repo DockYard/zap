@@ -952,8 +952,7 @@ fn buildTarget(
         // discovered through import-driven resolution (impl files have no module
         // declaration so they can't be found via module name → file path mapping).
         // Only scan "project" roots, not stdlib/dependency roots.
-        // TODO: Fix duplicate module issue before re-enabling
-        if (false) {
+        {
             var discovered = std.StringHashMap(void).init(alloc);
             for (source_files.items) |sf| {
                 const key = std.fs.path.resolve(alloc, &.{sf}) catch sf;

@@ -1455,11 +1455,11 @@ pub const ZirDriver = struct {
             },
             .immediate_invocation => .{
                 .tier = tier,
-                .needs_env_param = false,
-                .direct_capture_params = has_captures,
-                .needs_closure_object = false,
+                .needs_env_param = has_captures,
+                .direct_capture_params = false,
+                .needs_closure_object = has_captures,
                 .stack_env = false,
-                .storage_scope = .immediate,
+                .storage_scope = if (has_captures) .stack_function else .immediate,
             },
             .block_local => .{
                 .tier = tier,
@@ -3061,16 +3061,48 @@ pub const ZirDriver = struct {
                 const callee_is_param = self.isParamDerivedClosure(cc.callee);
 
                 // Parameter-derived closures: the callee is a function parameter.
-                // Its concrete type is *const fn(args...) ret — a bare function pointer.
-                // Call it directly via call_ref.
+                // It could be either a bare function pointer or a closure struct
+                // with {call_fn, env}. Use Prelude.callCallableN for dispatch.
                 if (callee_is_param) {
                     const callee_ref = self.refForLocal(cc.callee) catch return error.EmitFailed;
-                    var args : std.ArrayListUnmanaged(u32) = .empty;
+                    var args: std.ArrayListUnmanaged(u32) = .empty;
                     defer args.deinit(self.allocator);
                     for (cc.args) |arg| {
-                        const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
-                        try args.append(self.allocator, ref);
+                        const ref2 = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                        try args.append(self.allocator, ref2);
                     }
+
+                    const rt_ref = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                    if (rt_ref != error_ref) {
+                        const prelude_ref = zir_builder_emit_field_val(self.handle, rt_ref, "Prelude", 7);
+                        if (prelude_ref != error_ref) {
+                            const helper_name = switch (args.items.len) {
+                                1 => "callCallable1",
+                                2 => "callCallable2",
+                                3 => "callCallable3",
+                                else => {
+                                    const ref = zir_builder_emit_call_ref(self.handle, callee_ref, args.items.ptr, @intCast(args.items.len));
+                                    if (ref == error_ref) return error.EmitFailed;
+                                    try self.setLocal(cc.dest, ref);
+                                    return;
+                                },
+                            };
+                            const helper_ref = zir_builder_emit_field_val(self.handle, prelude_ref, helper_name.ptr, @intCast(helper_name.len));
+                            if (helper_ref != error_ref) {
+                                var full_args: std.ArrayListUnmanaged(u32) = .empty;
+                                defer full_args.deinit(self.allocator);
+                                try full_args.append(self.allocator, callee_ref);
+                                try full_args.appendSlice(self.allocator, args.items);
+                                const ref = zir_builder_emit_call_ref(self.handle, helper_ref, full_args.items.ptr, @intCast(full_args.items.len));
+                                if (ref != error_ref) {
+                                    try self.setLocal(cc.dest, ref);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+
+                    // Fallback: bare function pointer call
                     const ref = zir_builder_emit_call_ref(self.handle, callee_ref, args.items.ptr, @intCast(args.items.len));
                     if (ref == error_ref) return error.EmitFailed;
                     try self.setLocal(cc.dest, ref);
@@ -4865,9 +4897,9 @@ test "closure lowering helper distinguishes immediate and stack tiers" {
 
     const immediate = ZirDriver.closure_lowering_for_tier(.immediate_invocation, 1);
     try std.testing.expectEqual(lattice.ClosureEnvTier.immediate_invocation, immediate.tier);
-    try std.testing.expect(immediate.direct_capture_params);
-    try std.testing.expect(!immediate.needs_env_param);
-    try std.testing.expect(!immediate.needs_closure_object);
+    try std.testing.expect(!immediate.direct_capture_params);
+    try std.testing.expect(immediate.needs_env_param);
+    try std.testing.expect(immediate.needs_closure_object);
 
     const block_local = ZirDriver.closure_lowering_for_tier(.block_local, 1);
     try std.testing.expect(block_local.needs_env_param);
