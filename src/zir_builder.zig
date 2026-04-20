@@ -756,9 +756,6 @@ pub const ZirDriver = struct {
                     var field_type_refs: std.ArrayListUnmanaged(u32) = .empty;
                     defer field_type_refs.deinit(self.allocator);
 
-                    var field_default_refs: std.ArrayListUnmanaged(u32) = .empty;
-                    defer field_default_refs.deinit(self.allocator);
-                    var has_any_defaults = false;
 
                     for (def.fields) |field| {
                         try field_name_ptrs.append(self.allocator, field.name.ptr);
@@ -766,18 +763,10 @@ pub const ZirDriver = struct {
                         const type_ref = self.mapTypeNameToRef(field.type_expr);
                         try field_type_refs.append(self.allocator, type_ref);
 
-                        // Map default values to ZIR refs
-                        const default_ref: u32 = if (field.default_value) |dv| blk: {
-                            has_any_defaults = true;
-                            break :blk switch (dv) {
-                                .int => |v| if (v == 0) @intFromEnum(Zir.Inst.Ref.zero) else if (v == 1) @intFromEnum(Zir.Inst.Ref.one) else 0,
-                                .bool_val => |v| if (v) @intFromEnum(Zir.Inst.Ref.bool_true) else @intFromEnum(Zir.Inst.Ref.bool_false),
-                                else => 0, // String/float/nil defaults not yet supported as ZIR refs
-                            };
-                        } else 0;
-                        try field_default_refs.append(self.allocator, default_ref);
                     }
 
+                    // Don't emit defaults in struct_decl — the Zap compiler
+                    // fills in missing fields at struct_init time instead.
                     if (zir_builder_add_struct_type(
                         self.handle,
                         short_name.ptr,
@@ -785,7 +774,7 @@ pub const ZirDriver = struct {
                         field_name_ptrs.items.ptr,
                         field_name_lens.items.ptr,
                         field_type_refs.items.ptr,
-                        if (has_any_defaults) field_default_refs.items.ptr else null,
+                        null,
                         @intCast(def.fields.len),
                     ) != 0) {
                         return error.EmitFailed;
@@ -2928,6 +2917,45 @@ pub const ZirDriver = struct {
                     try names_ptrs.append(self.allocator, field.name.ptr);
                     try names_lens.append(self.allocator, @intCast(field.name.len));
                     try values.append(self.allocator, ref);
+                }
+
+                // Fill in missing fields with default values from the struct def.
+                // This ensures struct_init always provides all fields, avoiding
+                // Zig's missing-field error path which can't handle synthetic ZIR.
+                if (self.findStructDef(si.type_name)) |struct_def| {
+                    for (struct_def.fields) |def_field| {
+                        // Check if this field was already provided
+                        var found = false;
+                        for (si.fields) |init_field| {
+                            if (std.mem.eql(u8, init_field.name, def_field.name)) {
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (!found) {
+                            if (def_field.default_value) |default| {
+                                const default_ref: u32 = switch (default) {
+                                    .int => |v| blk: {
+                                        const ref = zir_builder_emit_int(self.handle, v);
+                                        break :blk if (ref == error_ref) @intFromEnum(Zir.Inst.Ref.zero) else ref;
+                                    },
+                                    .bool_val => |v| if (v) @intFromEnum(Zir.Inst.Ref.bool_true) else @intFromEnum(Zir.Inst.Ref.bool_false),
+                                    .float => |v| blk: {
+                                        const ref = zir_builder_emit_float(self.handle, v);
+                                        break :blk if (ref == error_ref) @intFromEnum(Zir.Inst.Ref.zero) else ref;
+                                    },
+                                    .string => |v| blk: {
+                                        const ref = zir_builder_emit_str(self.handle, v.ptr, @intCast(v.len));
+                                        break :blk if (ref == error_ref) @intFromEnum(Zir.Inst.Ref.void_value) else ref;
+                                    },
+                                    .nil => @intFromEnum(Zir.Inst.Ref.void_value),
+                                };
+                                try names_ptrs.append(self.allocator, def_field.name.ptr);
+                                try names_lens.append(self.allocator, @intCast(def_field.name.len));
+                                try values.append(self.allocator, default_ref);
+                            }
+                        }
+                    }
                 }
 
                 if (self.findReusePairForDest(si.dest)) |pair| {

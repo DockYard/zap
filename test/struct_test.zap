@@ -3,6 +3,12 @@ pub struct Point {
   y :: i64
 }
 
+pub struct Config {
+  name :: String
+  count :: i64 = 0
+  enabled :: Bool = true
+}
+
 
 
 
@@ -77,6 +83,28 @@ pub module Test.StructTest {
 
   fn add_fields(%{x: x_val, y: y_val} :: Point) -> i64 {
     x_val + y_val
+  }
+
+  describe("Struct field defaults") {
+    test("uses default value when field omitted") {
+      config = make_config("test")
+      assert(config.count == 0)
+      assert(config.enabled == true)
+    }
+
+    test("overrides default when field provided") {
+      config = make_config_full("prod", 5, false)
+      assert(config.count == 5)
+      assert(config.enabled == false)
+    }
+  }
+
+  fn make_config(config_name :: String) -> Config {
+    %Config{name: config_name}
+  }
+
+  fn make_config_full(config_name :: String, config_count :: i64, is_enabled :: Bool) -> Config {
+    %Config{name: config_name, count: config_count, enabled: is_enabled}
   }
 
   fn get_x_from_inline() -> i64 {
