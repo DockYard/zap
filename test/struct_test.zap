@@ -6,6 +6,14 @@ pub struct Point {
 pub module Test.StructTest {
   use Zest.Case
 
+  describe("Struct creation") {
+    test("struct created in helper function") {
+      result = get_x_from_inline()
+      assert(result == 42)
+    }
+
+  }
+
   describe("Struct return types") {
     test("function returns a struct") {
       point = make_point(5, 7)
@@ -40,5 +48,10 @@ pub module Test.StructTest {
 
   fn sum_point(point :: Point) -> i64 {
     point.x + point.y
+  }
+
+  fn get_x_from_inline() -> i64 {
+    point = %Point{x: 42, y: 99}
+    point.x
   }
 }
