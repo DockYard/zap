@@ -561,11 +561,9 @@ pub const ZirDriver = struct {
         };
     }
 
-    /// Resolve any Zap type to a ZIR type ref, emitting import instructions
-    /// for complex types (list, map) that need runtime type resolution.
-    /// For primitive types, returns well-known refs directly.
-    /// For lists/maps, emits @import("zap_runtime").TypeName.
-    /// For nested tuples, emits tuple_decl recursively.
+    /// Resolve any Zap type to a ZIR type ref for use inside compound type
+    /// declarations (e.g., tuple element types). Emits import instructions
+    /// for complex types that need runtime type resolution.
     fn emitImportedTypeRef(self: *ZirDriver, zig_type: ir.ZigType) BuildError!u32 {
         // Try primitive mapping first
         const simple = mapReturnType(zig_type);
@@ -589,8 +587,7 @@ pub const ZirDriver = struct {
                 return ref;
             },
             .tuple => self.mapTupleElementType(zig_type),
-            .function => @intFromEnum(Zir.Inst.Ref.none), // anytype for function types
-            else => 0, // void for truly unsupported types
+            else => @intFromEnum(Zir.Inst.Ref.none), // anytype — Zig infers
         };
     }
 
@@ -1191,6 +1188,87 @@ pub const ZirDriver = struct {
         return ref;
     }
 
+    /// Emit return type declaration for any type that mapReturnType cannot
+    /// handle as a well-known ZIR ref. This is the single dispatch point for
+    /// all complex return types. Adding a new type to Zap only requires
+    /// adding its case here — or it falls through to generic inference.
+    fn emitComplexReturnType(self: *ZirDriver, return_type: ir.ZigType) !void {
+        switch (return_type) {
+            .list => {
+                const type_name = getListTypeName(getListElementType(return_type));
+                if (zir_builder_set_imported_return_type(self.handle, "zap_runtime", 11, type_name.ptr, @intCast(type_name.len)) != 0)
+                    return error.EmitFailed;
+                self.current_ret_type = 1;
+            },
+            .map => {
+                if (zir_builder_set_imported_return_type(self.handle, "zap_runtime", 11, "MapType", 7) != 0)
+                    return error.EmitFailed;
+                self.current_ret_type = 1;
+            },
+            .tuple => |elements| {
+                var tuple_type_refs: std.ArrayListUnmanaged(u32) = .empty;
+                defer tuple_type_refs.deinit(self.allocator);
+                for (elements) |elem_type| {
+                    const ref = try self.emitImportedTypeRef(elem_type);
+                    try tuple_type_refs.append(self.allocator, ref);
+                }
+                if (zir_builder_set_tuple_return_type(
+                    self.handle,
+                    tuple_type_refs.items.ptr,
+                    @intCast(tuple_type_refs.items.len),
+                ) != 0) {
+                    return error.EmitFailed;
+                }
+                self.current_ret_type = 1;
+            },
+            .struct_ref => |name| {
+                if (self.findUnionDef(name)) |union_def| {
+                    var name_ptrs: std.ArrayListUnmanaged([*]const u8) = .empty;
+                    defer name_ptrs.deinit(self.allocator);
+                    var name_lens: std.ArrayListUnmanaged(u32) = .empty;
+                    defer name_lens.deinit(self.allocator);
+                    var type_refs: std.ArrayListUnmanaged(u32) = .empty;
+                    defer type_refs.deinit(self.allocator);
+
+                    for (union_def.variants) |variant| {
+                        try name_ptrs.append(self.allocator, variant.name.ptr);
+                        try name_lens.append(self.allocator, @intCast(variant.name.len));
+                        const type_ref = if (variant.type_name) |tn|
+                            self.mapTypeNameToRef(tn)
+                        else
+                            0;
+                        try type_refs.append(self.allocator, type_ref);
+                    }
+
+                    if (zir_builder_set_union_return_type(
+                        self.handle,
+                        name_ptrs.items.ptr,
+                        name_lens.items.ptr,
+                        type_refs.items.ptr,
+                        @intCast(union_def.variants.len),
+                    ) != 0) {
+                        return error.EmitFailed;
+                    }
+                    self.current_ret_type = 1;
+                    self.cached_union_ret_type_ref = zir_builder_get_union_ret_type_ref(self.handle);
+                } else {
+                    // Non-union struct: fall through to generic inference
+                    if (zir_builder_set_generic_return_type(self.handle) != 0)
+                        return error.EmitFailed;
+                    self.current_ret_type = 1;
+                }
+            },
+            else => {
+                // Universal fallback: let Zig infer the return type from the
+                // function body. This handles any type — including future types
+                // added to Zap — without requiring compiler changes.
+                if (zir_builder_set_generic_return_type(self.handle) != 0)
+                    return error.EmitFailed;
+                self.current_ret_type = 1;
+            },
+        }
+    }
+
     fn emitFunction(self: *ZirDriver, func: ir.Function) !void {
         // Detect the entry point using the program's entry function ID.
         // When multiple modules define main, only the one matching the
@@ -1225,13 +1303,7 @@ pub const ZirDriver = struct {
         else
             mapReturnType(func.return_type);
 
-        // For complex return types (list, map, tuple), mapReturnType returns 0
-        // (void) but the actual return type is set via dedicated set_*_return_type
-        // calls. Mark as non-void so the ret handler emits value returns.
-        self.current_ret_type = switch (std.meta.activeTag(func.return_type)) {
-            .list, .map, .tuple => 1,
-            else => ret_type,
-        };
+        self.current_ret_type = ret_type;
 
         const emit_name = if (is_main)
             @as([]const u8, "main")
@@ -1251,80 +1323,19 @@ pub const ZirDriver = struct {
                 return error.EmitFailed;
         }
 
-        // Map-returning functions: set return type to @import("zap_runtime").MapType.
-        if (std.meta.activeTag(func.return_type) == .map) {
-            if (zir_builder_set_imported_return_type(self.handle, "zap_runtime", 11, "MapType", 7) != 0)
-                return error.EmitFailed;
-        }
-
-        // List-returning functions: set return type to the correct ListType variant.
-        if (std.meta.activeTag(func.return_type) == .list) {
-            const type_name = getListTypeName(getListElementType(func.return_type));
-            if (zir_builder_set_imported_return_type(self.handle, "zap_runtime", 11, type_name.ptr, @intCast(type_name.len)) != 0)
-                return error.EmitFailed;
+        // Declare the return type. Primitives are handled by mapReturnType
+        // above (well-known ZIR refs). Complex types need dedicated ZIR
+        // instructions emitted into the declaration body. Any type not
+        // explicitly handled falls back to generic return type inference,
+        // which lets Zig determine the return type from the function body.
+        // This ensures ALL types work as return values without hardcoding.
+        // Skip for main — Zig requires main to return void or u8.
+        if (!is_main and ret_type == 0 and func.return_type != .void and func.return_type != .nil) {
+            try self.emitComplexReturnType(func.return_type);
         }
 
         self.tuple_init_count = 0;
         self.tuple_type_stack.clearRetainingCapacity();
-        // For tuple return types, declare the return type in the declaration
-        // body via set_tuple_return_type (emits tuple_decl + break_inline).
-        // Uses emitImportedTypeRef for each element to support all types
-        // including lists, maps, and nested tuples as tuple elements.
-        if (func.return_type == .tuple) {
-            var tuple_type_refs: std.ArrayListUnmanaged(u32) = .empty;
-            defer tuple_type_refs.deinit(self.allocator);
-            for (func.return_type.tuple) |elem_type| {
-                const ref = try self.emitImportedTypeRef(elem_type);
-                try tuple_type_refs.append(self.allocator, ref);
-            }
-            if (zir_builder_set_tuple_return_type(
-                self.handle,
-                tuple_type_refs.items.ptr,
-                @intCast(tuple_type_refs.items.len),
-            ) != 0) {
-                return error.EmitFailed;
-            }
-            self.current_ret_type = 1;
-        }
-
-        // For union return types (struct_ref pointing to a union def), declare
-        // the union type as the return type via union_decl in the declaration body.
-        if (func.return_type == .struct_ref) {
-            if (self.findUnionDef(func.return_type.struct_ref)) |union_def| {
-                var name_ptrs : std.ArrayListUnmanaged([*]const u8) = .empty;
-                defer name_ptrs.deinit(self.allocator);
-                var name_lens : std.ArrayListUnmanaged(u32) = .empty;
-                defer name_lens.deinit(self.allocator);
-                var type_refs : std.ArrayListUnmanaged(u32) = .empty;
-                defer type_refs.deinit(self.allocator);
-
-                for (union_def.variants) |variant| {
-                    try name_ptrs.append(self.allocator, variant.name.ptr);
-                    try name_lens.append(self.allocator, @intCast(variant.name.len));
-                    const type_ref = if (variant.type_name) |tn|
-                        self.mapTypeNameToRef(tn)
-                    else
-                        0;
-                    try type_refs.append(self.allocator, type_ref);
-                }
-
-                if (zir_builder_set_union_return_type(
-                    self.handle,
-                    name_ptrs.items.ptr,
-                    name_lens.items.ptr,
-                    type_refs.items.ptr,
-                    @intCast(union_def.variants.len),
-                ) != 0) {
-                    return error.EmitFailed;
-                }
-                self.current_ret_type = 1;
-                // Emit ret_type instruction ONCE in the function body (body_tracking ON).
-                // Cache for all @unionInit instructions. Must happen here, not inside
-                // branch bodies where body_tracking may be OFF.
-                self.cached_union_ret_type_ref = zir_builder_get_union_ret_type_ref(self.handle);
-
-            }
-        }
 
         // Emit param instructions and register their Refs as locals.
         // Each .param instruction in ZIR declares a parameter with a name and type.
