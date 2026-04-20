@@ -113,6 +113,10 @@ extern "c" fn zir_builder_emit_cond_return(handle: ?*ZirBuilderHandle, condition
 extern "c" fn zir_builder_set_optional_return_type(handle: ?*ZirBuilderHandle) i32;
 extern "c" fn zir_builder_emit_ret_null(handle: ?*ZirBuilderHandle) i32;
 
+// Struct type declarations
+extern "c" fn zir_builder_add_struct_type(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32, field_names_ptrs: [*]const [*]const u8, field_names_lens: [*]const u32, field_type_refs: [*]const u32, fields_len: u32) i32;
+extern "c" fn zir_builder_set_decl_val_return_type(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32) i32;
+
 // Tuple return type
 extern "c" fn zir_builder_set_tuple_return_type(handle: ?*ZirBuilderHandle, types_ptr: [*]const u32, types_len: u32) i32;
 extern "c" fn zir_builder_get_tuple_return_type(handle: ?*ZirBuilderHandle) u32;
@@ -666,6 +670,111 @@ pub const ZirDriver = struct {
         }
     }
 
+    /// Emit struct type declarations for all struct type_defs in the IR program.
+    /// These become named constants in the module's ZIR (e.g., `const Point = struct { x: i64, y: i64 };`).
+    /// Check if any function in the given module references a struct type by name.
+    fn moduleUsesStruct(self: *const ZirDriver, module_name: []const u8, struct_name: []const u8) bool {
+        const prog = self.program orelse return false;
+        for (prog.functions) |func| {
+            // Check if the function belongs to this module
+            const func_module = if (std.mem.lastIndexOf(u8, func.name, "__")) |sep|
+                func.name[0..sep]
+            else
+                func.name;
+            // Convert dots to underscores for comparison
+            var buf: [256]u8 = undefined;
+            if (func_module.len > buf.len) continue;
+            @memcpy(buf[0..func_module.len], func_module);
+            for (buf[0..func_module.len]) |*ch| {
+                if (ch.* == '.') ch.* = '_';
+            }
+            if (!std.mem.eql(u8, buf[0..func_module.len], module_name)) continue;
+
+            // Check if return type references this struct
+            if (std.meta.activeTag(func.return_type) == .struct_ref) {
+                if (std.mem.eql(u8, func.return_type.struct_ref, struct_name)) return true;
+            }
+            // Check params
+            for (func.params) |param| {
+                if (std.meta.activeTag(param.type_expr) == .struct_ref) {
+                    if (std.mem.eql(u8, param.type_expr.struct_ref, struct_name)) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    fn emitStructTypeDecls(self: *ZirDriver) !void {
+        const prog = self.program orelse return;
+        const current_module = self.current_emit_module orelse return;
+        // Track emitted struct names to avoid duplicates
+        var emitted = std.StringHashMap(void).init(self.allocator);
+        defer emitted.deinit();
+        for (prog.type_defs) |type_def| {
+            // Only emit struct types that belong to the current module.
+            // Type names use dot notation (e.g., "Zap.Env"), module names
+            // use underscore notation (e.g., "Zap"). Match by converting
+            // the type name prefix to underscore format.
+            const belongs_to_module = blk: {
+                if (std.mem.lastIndexOf(u8, type_def.name, ".")) |dot_idx| {
+                    const prefix = type_def.name[0..dot_idx];
+                    // Convert dot-separated prefix to underscore for comparison
+                    var buf: [256]u8 = undefined;
+                    if (prefix.len > buf.len) break :blk false;
+                    @memcpy(buf[0..prefix.len], prefix);
+                    for (buf[0..prefix.len]) |*ch| {
+                        if (ch.* == '.') ch.* = '_';
+                    }
+                    break :blk std.mem.eql(u8, buf[0..prefix.len], current_module);
+                }
+                // Top-level structs have no module prefix — emit into
+                // every module that has functions. The duplicate-name
+                // issue is handled by the ZIR builder's deduplication.
+                break :blk true;
+            };
+            if (!belongs_to_module) continue;
+
+            switch (type_def.kind) {
+                .struct_def => |def| {
+                    // Use just the struct name (after the module prefix)
+                    const short_name = if (std.mem.lastIndexOf(u8, type_def.name, ".")) |dot_idx|
+                        type_def.name[dot_idx + 1 ..]
+                    else
+                        type_def.name;
+                    // Skip if already emitted (dedup across multiple type_defs)
+                    if (emitted.contains(short_name)) continue;
+                    emitted.put(short_name, {}) catch continue;
+                    var field_name_ptrs: std.ArrayListUnmanaged([*]const u8) = .empty;
+                    defer field_name_ptrs.deinit(self.allocator);
+                    var field_name_lens: std.ArrayListUnmanaged(u32) = .empty;
+                    defer field_name_lens.deinit(self.allocator);
+                    var field_type_refs: std.ArrayListUnmanaged(u32) = .empty;
+                    defer field_type_refs.deinit(self.allocator);
+
+                    for (def.fields) |field| {
+                        try field_name_ptrs.append(self.allocator, field.name.ptr);
+                        try field_name_lens.append(self.allocator, @intCast(field.name.len));
+                        const type_ref = self.mapTypeNameToRef(field.type_expr);
+                        try field_type_refs.append(self.allocator, type_ref);
+                    }
+
+                    if (zir_builder_add_struct_type(
+                        self.handle,
+                        short_name.ptr,
+                        @intCast(short_name.len),
+                        field_name_ptrs.items.ptr,
+                        field_name_lens.items.ptr,
+                        field_type_refs.items.ptr,
+                        @intCast(def.fields.len),
+                    ) != 0) {
+                        return error.EmitFailed;
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+
     fn findStructDef(self: *const ZirDriver, type_name: []const u8) ?ir.StructDef {
         const prog = self.program orelse return null;
         for (prog.type_defs) |type_def| {
@@ -980,6 +1089,10 @@ pub const ZirDriver = struct {
                 self.current_emit_module = mod_name;
                 self.handle = mod_handle;
 
+                // Emit struct type declarations before functions so they
+                // can be referenced in return types and parameter types.
+                try self.emitStructTypeDecls();
+
                 for (funcs) |func| {
                     self.reuse_backed_struct_locals.clearRetainingCapacity();
                     self.reuse_backed_union_locals.clearRetainingCapacity();
@@ -1270,13 +1383,18 @@ pub const ZirDriver = struct {
                     }
                     self.current_ret_type = 1;
                     self.cached_union_ret_type_ref = zir_builder_get_union_ret_type_ref(self.handle);
+                } else if (self.findStructDef(name) != null) {
+                    // Nominal struct type: reference the struct type declared
+                    // in the current module by name via decl_val.
+                    const short_name = if (std.mem.lastIndexOf(u8, name, ".")) |dot_idx|
+                        name[dot_idx + 1 ..]
+                    else
+                        name;
+                    if (zir_builder_set_decl_val_return_type(self.handle, short_name.ptr, @intCast(short_name.len)) != 0)
+                        return error.EmitFailed;
+                    self.current_ret_type = 1;
                 } else {
-                    // Custom struct: Zap structs are anonymous Zig structs
-                    // (created via struct_init_anon), so there is no named type
-                    // to reference in ZIR. Zig infers the return type from the
-                    // body's struct construction. When Zap moves to nominal
-                    // struct types (via struct_decl), this should emit a proper
-                    // struct type declaration instead.
+                    // Unknown struct_ref: use generic inference
                     if (zir_builder_set_generic_return_type(self.handle) != 0)
                         return error.EmitFailed;
                     self.current_ret_type = 1;
@@ -2827,6 +2945,35 @@ pub const ZirDriver = struct {
                     try self.setLocal(si.dest, loaded);
                 } else {
                     _ = self.reuse_backed_struct_locals.remove(si.dest);
+
+                    // Check if this struct has a nominal type declaration.
+                    // If so, use struct_init_typed to create the value directly
+                    // as the named type (not an anonymous struct).
+                    const short_name = if (std.mem.lastIndexOf(u8, si.type_name, ".")) |dot_idx|
+                        si.type_name[dot_idx + 1 ..]
+                    else
+                        si.type_name;
+                    const has_nominal = self.findStructDef(si.type_name) != null or self.findStructDef(short_name) != null;
+
+                    if (has_nominal) {
+                        const type_ref = zir_builder_emit_decl_val(self.handle, short_name.ptr, @intCast(short_name.len));
+                        if (type_ref != error_ref) {
+                            const result = zir_builder_emit_struct_init_typed(
+                                self.handle,
+                                type_ref,
+                                names_ptrs.items.ptr,
+                                names_lens.items.ptr,
+                                values.items.ptr,
+                                @intCast(values.items.len),
+                            );
+                            if (result != error_ref) {
+                                try self.setLocal(si.dest, result);
+                                return;
+                            }
+                        }
+                    }
+
+                    // Fallback: anonymous struct
                     const result = zir_builder_emit_struct_init_anon(
                         self.handle,
                         names_ptrs.items.ptr,

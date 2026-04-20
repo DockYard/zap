@@ -1,3 +1,8 @@
+pub struct Point {
+  x :: i64
+  y :: i64
+}
+
 pub module Test.ProtocolTest {
   use Zest.Case
 
@@ -13,6 +18,14 @@ pub module Test.ProtocolTest {
       multiplier = 3
       result = apply_fn(7, fn(x :: i64) -> i64 { x * multiplier })
       assert(result == 21)
+    }
+  }
+
+  describe("Struct return types") {
+    test("function creates and returns a struct") {
+      point = make_point(3, 4)
+      assert(point.x == 3)
+      assert(point.y == 4)
     }
   }
 
@@ -67,5 +80,9 @@ pub module Test.ProtocolTest {
     case pair {
       {_status, message} -> message
     }
+  }
+
+  fn make_point(x_val :: i64, y_val :: i64) -> Point {
+    %Point{x: x_val, y: y_val}
   }
 }
