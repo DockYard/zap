@@ -32,6 +32,11 @@ pub module Test.ProtocolTest {
       value = extract_first(pair)
       assert(value == 10)
     }
+
+    test("function returns tuple with string element") {
+      result = wrap_message("hello")
+      assert(extract_message(result) == "hello")
+    }
   }
 
   fn apply_fn(value :: i64, callback :: (i64 -> i64)) -> i64 {
@@ -51,6 +56,16 @@ pub module Test.ProtocolTest {
   fn extract_second(pair :: {i64, i64}) -> i64 {
     case pair {
       {_first, second} -> second
+    }
+  }
+
+  fn wrap_message(message :: String) -> {Atom, String} {
+    {:ok, message}
+  }
+
+  fn extract_message(pair :: {Atom, String}) -> String {
+    case pair {
+      {_status, message} -> message
     }
   }
 }

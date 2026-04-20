@@ -297,6 +297,9 @@ fn mapMainReturnType(zig_type: ir.ZigType) u32 {
     };
 }
 
+/// Map a primitive Zap type to a well-known ZIR type Ref.
+/// Returns 0 for complex types that need instruction emission (use
+/// ZirDriver.emitReturnTypeRef for full coverage).
 fn mapReturnType(zig_type: ir.ZigType) u32 {
     return switch (zig_type) {
         .void => 0,
@@ -321,7 +324,7 @@ fn mapReturnType(zig_type: ir.ZigType) u32 {
             0,
         .atom => @intFromEnum(Zir.Inst.Ref.u32_type), // atoms are interned u32 IDs
         .nil => 0, // void
-        else => 0, // void fallback for unsupported types
+        else => 0, // complex types need emitReturnTypeRef
     };
 }
 
@@ -555,6 +558,39 @@ pub const ZirDriver = struct {
                 if (ref == @intFromEnum(Zir.Inst.Ref.none)) return error.EmitFailed;
                 break :blk ref;
             },
+        };
+    }
+
+    /// Resolve any Zap type to a ZIR type ref, emitting import instructions
+    /// for complex types (list, map) that need runtime type resolution.
+    /// For primitive types, returns well-known refs directly.
+    /// For lists/maps, emits @import("zap_runtime").TypeName.
+    /// For nested tuples, emits tuple_decl recursively.
+    fn emitImportedTypeRef(self: *ZirDriver, zig_type: ir.ZigType) BuildError!u32 {
+        // Try primitive mapping first
+        const simple = mapReturnType(zig_type);
+        if (simple != 0) return simple;
+
+        // Complex types: emit runtime import instructions
+        return switch (zig_type) {
+            .list => {
+                const type_name = getListTypeName(getListElementType(zig_type));
+                const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                if (rt_import == error_ref) return error.EmitFailed;
+                const ref = zir_builder_emit_field_val(self.handle, rt_import, type_name.ptr, @intCast(type_name.len));
+                if (ref == error_ref) return error.EmitFailed;
+                return ref;
+            },
+            .map => {
+                const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                if (rt_import == error_ref) return error.EmitFailed;
+                const ref = zir_builder_emit_field_val(self.handle, rt_import, "MapType", 7);
+                if (ref == error_ref) return error.EmitFailed;
+                return ref;
+            },
+            .tuple => self.mapTupleElementType(zig_type),
+            .function => @intFromEnum(Zir.Inst.Ref.none), // anytype for function types
+            else => 0, // void for truly unsupported types
         };
     }
 
@@ -1189,10 +1225,13 @@ pub const ZirDriver = struct {
         else
             mapReturnType(func.return_type);
 
-        // For list-returning functions, ret_type is 0 (void) from mapReturnType
-        // but the actual return type is set via set_imported_return_type. Mark as
-        // non-void so the ret handler emits value returns, not void returns.
-        self.current_ret_type = if (std.meta.activeTag(func.return_type) == .list or std.meta.activeTag(func.return_type) == .map) 1 else ret_type;
+        // For complex return types (list, map, tuple), mapReturnType returns 0
+        // (void) but the actual return type is set via dedicated set_*_return_type
+        // calls. Mark as non-void so the ret handler emits value returns.
+        self.current_ret_type = switch (std.meta.activeTag(func.return_type)) {
+            .list, .map, .tuple => 1,
+            else => ret_type,
+        };
 
         const emit_name = if (is_main)
             @as([]const u8, "main")
@@ -1229,11 +1268,14 @@ pub const ZirDriver = struct {
         self.tuple_type_stack.clearRetainingCapacity();
         // For tuple return types, declare the return type in the declaration
         // body via set_tuple_return_type (emits tuple_decl + break_inline).
+        // Uses emitImportedTypeRef for each element to support all types
+        // including lists, maps, and nested tuples as tuple elements.
         if (func.return_type == .tuple) {
             var tuple_type_refs: std.ArrayListUnmanaged(u32) = .empty;
             defer tuple_type_refs.deinit(self.allocator);
             for (func.return_type.tuple) |elem_type| {
-                try tuple_type_refs.append(self.allocator, mapReturnType(elem_type));
+                const ref = try self.emitImportedTypeRef(elem_type);
+                try tuple_type_refs.append(self.allocator, ref);
             }
             if (zir_builder_set_tuple_return_type(
                 self.handle,
