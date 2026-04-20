@@ -1529,17 +1529,24 @@ pub const MacroEngine = struct {
         return null;
     }
 
+    /// Find a macro by walking the scope chain from the current module scope.
+    /// Checks local macros first (module-local shadows Kernel), then imports
+    /// (finds Kernel macros via auto-import), then parent scopes.
     fn findMacro(self: *MacroEngine, name: ast.StringId, arity: u32) ?scope.MacroFamilyId {
-        // Search all scopes for a matching macro
-        for (self.graph.scopes.items, 0..) |_, scope_idx| {
-            const sid: scope.ScopeId = @intCast(scope_idx);
-            const key = scope.FamilyKey{ .name = name, .arity = arity };
-            const s = self.graph.getScope(sid);
-            if (s.macros.get(key)) |mid| {
-                return mid;
+        const scope_id = self.current_module_scope orelse self.graph.prelude_scope;
+        const result = self.graph.resolveMacro(scope_id, name, arity);
+        if (result == null) {
+            // Fallback: global scan for backward compatibility during transition
+            for (self.graph.scopes.items, 0..) |_, scope_idx| {
+                const sid: scope.ScopeId = @intCast(scope_idx);
+                const key = scope.FamilyKey{ .name = name, .arity = arity };
+                const s = self.graph.getScope(sid);
+                if (s.macros.get(key)) |mid| {
+                    return mid;
+                }
             }
         }
-        return null;
+        return result;
     }
 
     // ============================================================

@@ -18,24 +18,45 @@ pub const Collector = struct {
     graph: scope.ScopeGraph,
     interner: *const ast.StringInterner,
     errors: std.ArrayList(Error),
+    /// Pre-interned StringId for "Kernel" — used to inject auto-import.
+    kernel_name_id: ?ast.StringId,
 
     pub const Error = struct {
         message: []const u8,
         span: ast.SourceSpan,
     };
 
-    pub fn init(allocator: std.mem.Allocator, interner: *const ast.StringInterner) Collector {
+    pub fn init(allocator: std.mem.Allocator, interner: *const ast.StringInterner, kernel_name_id: ?ast.StringId) Collector {
         return .{
             .allocator = allocator,
             .graph = scope.ScopeGraph.init(allocator),
             .interner = interner,
             .errors = .empty,
+            .kernel_name_id = kernel_name_id,
         };
     }
 
     pub fn deinit(self: *Collector) void {
         self.graph.deinit();
         self.errors.deinit(self.allocator);
+    }
+
+    /// Check if a module has an explicit `import Kernel` or `import Kernel, except: [...]`.
+    fn hasExplicitKernelImport(_: *const Collector, mod: *const ast.ModuleDecl, kernel_id: ast.StringId) bool {
+        for (mod.items) |item| {
+            switch (item) {
+                .import_decl => |id_decl| {
+                    if (id_decl.module_path.parts.len == 1 and id_decl.module_path.parts[0] == kernel_id)
+                        return true;
+                },
+                .use_decl => |ud| {
+                    if (ud.module_path.parts.len == 1 and ud.module_path.parts[0] == kernel_id)
+                        return true;
+                },
+                else => {},
+            }
+        }
+        return false;
     }
 
     fn addError(self: *Collector, message: []const u8, span: ast.SourceSpan) !void {
@@ -100,6 +121,20 @@ pub const Collector = struct {
         const mod_scope = try self.graph.createScope(parent_scope, .module);
         try self.graph.node_scope_map.put(scope.ScopeGraph.spanKey(mod.meta.span), mod_scope);
         try self.graph.registerModule(mod.name, mod_scope, mod);
+
+        // Auto-import Kernel into every module (Elixir-style).
+        // Skip if: (a) this IS Kernel, or (b) module has an explicit Kernel import.
+        if (self.kernel_name_id) |kid| {
+            const is_kernel = mod.name.parts.len == 1 and mod.name.parts[0] == kid;
+            if (!is_kernel and !self.hasExplicitKernelImport(mod, kid)) {
+                try self.graph.getScopeMut(mod_scope).imports.append(self.allocator, .{
+                    .source_module = .{ .parts = @constCast(&[_]ast.StringId{kid}), .span = mod.meta.span },
+                    .filter = .all,
+                    .imported_families = std.AutoHashMap(scope.FamilyKey, scope.FunctionFamilyId).init(self.allocator),
+                    .imported_types = std.AutoHashMap(ast.StringId, scope.TypeId).init(self.allocator),
+                });
+            }
+        }
 
         // Track pending attributes to attach to the next function/macro
         var pending_attrs: std.ArrayListUnmanaged(scope.Attribute) = .empty;
@@ -737,7 +772,7 @@ test "collect simple function" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -772,7 +807,7 @@ test "collect module with functions" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -799,7 +834,7 @@ test "collect type declaration" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -829,7 +864,7 @@ test "collect function family grouping" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -859,7 +894,7 @@ test "collect case expression creates scopes" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -889,7 +924,7 @@ test "collect local def hoisting" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -915,7 +950,7 @@ test "collect struct declaration" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -939,7 +974,7 @@ test "collect protocol declaration" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -965,7 +1000,7 @@ test "collect impl declaration" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -995,7 +1030,7 @@ test "collect protocol and impl together" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 

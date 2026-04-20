@@ -312,10 +312,22 @@ pub fn collectAllFromUnits(
     step += 1;
     if (options.show_progress) std.debug.print("\r\x1b[K  [{d}/{d}] Collect", .{ step, total_steps });
 
-    var collector = zap.Collector.init(alloc, &interner);
+    // Intern "Kernel" before creating the collector — needed for auto-import injection
+    const kernel_name_id = try interner.intern("Kernel");
+    var collector = zap.Collector.init(alloc, &interner, kernel_name_id);
     {
         const pre_module_programs = try buildModulePrograms(alloc, &program, &interner);
+
+        // Collect Kernel FIRST so its scope exists when other modules'
+        // auto-import resolves. This mirrors Elixir's bootstrap ordering.
         for (pre_module_programs) |entry| {
+            if (std.mem.eql(u8, entry.name, "Kernel")) {
+                collector.collectProgramSurface(&entry.program) catch {};
+                break;
+            }
+        }
+        for (pre_module_programs) |entry| {
+            if (std.mem.eql(u8, entry.name, "Kernel")) continue;
             collector.collectProgramSurface(&entry.program) catch {
                 for (collector.errors.items) |collect_err| {
                     diag_engine.err(collect_err.message, collect_err.span) catch {};
@@ -407,8 +419,16 @@ pub fn collectAllFromUnits(
     step += 1;
     if (options.show_progress) std.debug.print("\r\x1b[K  [{d}/{d}] Re-collect", .{ step, total_steps });
 
-    var final_collector = zap.Collector.init(alloc, &interner);
+    var final_collector = zap.Collector.init(alloc, &interner, kernel_name_id);
+    // Collect Kernel first in the second pass too
     for (module_programs) |entry| {
+        if (std.mem.eql(u8, entry.name, "Kernel")) {
+            final_collector.collectProgramSurface(&entry.program) catch {};
+            break;
+        }
+    }
+    for (module_programs) |entry| {
+        if (std.mem.eql(u8, entry.name, "Kernel")) continue;
         final_collector.collectProgramSurface(&entry.program) catch {
             for (final_collector.errors.items) |collect_err| {
                 diag_engine.err(collect_err.message, collect_err.span) catch {};
@@ -2915,7 +2935,7 @@ test "collector can build graph from per-module programs" {
     const program_slices = try alloc.alloc(ast.Program, module_programs.len);
     for (module_programs, 0..) |entry, i| program_slices[i] = entry.program;
 
-    var collector = zap.Collector.init(alloc, parser.interner);
+    var collector = zap.Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     for (module_programs) |entry| {
         try collector.collectProgramSurface(&entry.program);
