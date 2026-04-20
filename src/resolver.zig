@@ -515,7 +515,7 @@ test "resolve simple function" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -544,7 +544,7 @@ test "resolve module with function" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -575,7 +575,7 @@ test "resolve case expression with bindings" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -604,7 +604,7 @@ test "resolve assignment" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 

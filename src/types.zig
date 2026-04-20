@@ -3892,7 +3892,7 @@ test "type checker registers opaque types" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -3983,7 +3983,7 @@ test "type check simple function" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4023,7 +4023,7 @@ test "type check literals" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4054,7 +4054,7 @@ test "type check case expression" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4083,7 +4083,7 @@ test "type check arithmetic mismatch reported" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4131,7 +4131,7 @@ test "type check var_ref resolves to parameter type" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4163,7 +4163,7 @@ test "type check if condition must be Bool" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4195,7 +4195,7 @@ test "type check return type mismatch" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4229,7 +4229,7 @@ test "type provenance tracks source span on typed parameter" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4269,7 +4269,7 @@ test "typed parameter records shared ownership metadata" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4309,7 +4309,7 @@ test "function ref inference defaults param ownerships to shared" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4354,7 +4354,7 @@ test "anonymous closure with borrowed capture cannot escape via assignment" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4394,7 +4394,7 @@ test "anonymous closure with borrowed capture cannot escape through return" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4434,7 +4434,7 @@ test "anonymous closure missing parameter annotation has closure-specific diagno
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4471,7 +4471,7 @@ test "anonymous closure missing return annotation has closure-specific diagnosti
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4512,7 +4512,7 @@ test "higher-order call reports callable signature mismatch for anonymous closur
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4559,7 +4559,7 @@ test "higher-order call reports callable signature mismatch for function ref" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4594,7 +4594,7 @@ test "moved binding use reports ownership error" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4641,7 +4641,7 @@ test "unique function parameter ownership moves var_ref argument" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4696,7 +4696,7 @@ test "shared binding cannot satisfy unique parameter ownership" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4755,7 +4755,7 @@ test "named call with unique parameter moves opaque binding" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4798,7 +4798,7 @@ test "borrowed param annotation keeps binding usable after call" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4828,7 +4828,7 @@ test "borrowed value cannot escape through return" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4870,7 +4870,7 @@ test "closure with borrowed capture cannot be returned" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4913,7 +4913,7 @@ test "unique capture moves outer binding" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4959,7 +4959,7 @@ test "closure with borrowed capture cannot be passed as argument" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -5002,7 +5002,7 @@ test "closure with borrowed capture cannot be assigned" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -5044,7 +5044,7 @@ test "closure with borrowed capture cannot be stored in tuple" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -5086,7 +5086,7 @@ test "closure with borrowed capture may be locally invoked" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -5124,7 +5124,7 @@ test "closure with borrowed capture may be passed to known-safe callee" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -5153,7 +5153,7 @@ test "borrowed parameter does not move binding" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -5203,7 +5203,7 @@ test "return type mismatch has secondary span" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -5239,7 +5239,7 @@ test "undefined function suggests similar name" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -5281,7 +5281,7 @@ test "undefined function no suggestion for unrelated name" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -5320,7 +5320,7 @@ test "valid function call produces no error" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -5352,7 +5352,7 @@ test "unused variable produces warning" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -5390,7 +5390,7 @@ test "underscore-prefixed variable no unused warning" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -5422,7 +5422,7 @@ test "used variable no unused warning" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -5453,11 +5453,11 @@ test "variable used in zig intrinsic call is not unused" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var desugarer = @import("desugar.zig").Desugarer.init(alloc, parser.interner);
+    var desugarer = @import("desugar.zig").Desugarer.init(alloc, parser.interner, null);
     const desugared = try desugarer.desugarProgram(&program);
 
     var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
@@ -5487,7 +5487,7 @@ test "unknown type name produces error" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -5521,7 +5521,7 @@ test "unused function parameter produces warning" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -5560,7 +5560,7 @@ test "zig bridge call parameters not flagged as unused" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -5596,7 +5596,7 @@ test "nested zig bridge call parameters not flagged as unused" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 

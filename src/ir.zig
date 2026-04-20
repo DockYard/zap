@@ -4460,7 +4460,7 @@ test "IR build simple function" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4498,7 +4498,7 @@ test "IR param_get indices are unique for multi-parameter functions" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4557,7 +4557,7 @@ test "IR call preserves HIR arg modes" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4630,7 +4630,7 @@ test "IR named call preserves move mode" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4689,7 +4689,7 @@ test "IR closure call preserves borrow mode without ARC ops" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4765,7 +4765,7 @@ test "IR shared opaque call emits retain and release" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 

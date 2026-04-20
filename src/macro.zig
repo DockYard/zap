@@ -1831,7 +1831,7 @@ test "macro engine no-op on program without macros" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -1870,7 +1870,7 @@ test "macro engine expands simple macro" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -1932,7 +1932,7 @@ test "macro engine reaches fixed point" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -1972,7 +1972,7 @@ test "typed macro: nil in String return position is an error" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -2012,7 +2012,7 @@ test "typed macro: valid types produce no errors" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -2049,7 +2049,7 @@ test "typed macro: missing else branch is an error for non-nil return type" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -2085,7 +2085,7 @@ test "typed macro: param type mismatch with return type" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -2124,7 +2124,7 @@ test "macro substitution into case_expr and block" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner);
+    var collector = Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 

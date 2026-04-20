@@ -1186,7 +1186,7 @@ test "pipe is desugared during macro expansion, not desugar" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var desugarer = Desugarer.init(alloc, parser.interner);
+    var desugarer = Desugarer.init(alloc, parser.interner, null);
     const desugared = try desugarer.desugarProgram(&program);
 
     // Pipe should still be a pipe (desugar doesn't transform it anymore)
@@ -1213,7 +1213,7 @@ test "desugar unwrap operator" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var desugarer = Desugarer.init(alloc, parser.interner);
+    var desugarer = Desugarer.init(alloc, parser.interner, null);
     const desugared = try desugarer.desugarProgram(&program);
 
     // Function body should now have an unwrap expression (passed through)
@@ -1242,7 +1242,7 @@ test "desugar no-op on simple expressions" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var desugarer = Desugarer.init(alloc, parser.interner);
+    var desugarer = Desugarer.init(alloc, parser.interner, null);
     const desugared = try desugarer.desugarProgram(&program);
 
     try std.testing.expectEqual(@as(usize, 1), desugared.modules.len);
