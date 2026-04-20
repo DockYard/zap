@@ -93,7 +93,7 @@ pub module Zest.Case {
     """
 
   pub fn begin_test() -> Atom {
-    :zig.TestTracker.begin_test()
+    :zig.Zest.begin_test()
     :ok
   }
 
@@ -102,7 +102,7 @@ pub module Zest.Case {
     """
 
   pub fn end_test() -> Atom {
-    :zig.TestTracker.end_test()
+    :zig.Zest.end_test()
     :ok
   }
 
@@ -111,7 +111,7 @@ pub module Zest.Case {
     """
 
   pub fn print_result() -> Atom {
-    :zig.TestTracker.print_result()
+    :zig.Zest.print_result()
     :ok
   }
 
@@ -123,10 +123,10 @@ pub module Zest.Case {
 
   pub fn assert(value :: Bool) -> String {
     if value {
-      :zig.TestTracker.pass_assertion()
+      :zig.Zest.pass_assertion()
       "."
     } else {
-      :zig.TestTracker.fail_assertion()
+      :zig.Zest.fail_assertion()
       "F"
     }
   }
@@ -139,10 +139,10 @@ pub module Zest.Case {
 
   pub fn reject(value :: Bool) -> String {
     if not value {
-      :zig.TestTracker.pass_assertion()
+      :zig.Zest.pass_assertion()
       "."
     } else {
-      :zig.TestTracker.fail_assertion()
+      :zig.Zest.fail_assertion()
       "F"
     }
   }

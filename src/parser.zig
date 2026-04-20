@@ -5244,7 +5244,7 @@ test "parse impl declaration" {
     const source =
         \\pub impl Enumerable for List {
         \\  pub fn each(list :: [member], callback :: (member -> member)) -> [member] {
-        \\    :zig.ListCell.eachFn(list, callback)
+        \\    :zig.List.eachFn(list, callback)
         \\  }
         \\}
     ;
@@ -5268,11 +5268,11 @@ test "parse impl with multiple functions" {
     const source =
         \\pub impl Enumerable for List {
         \\  pub fn each(list :: [member], callback :: (member -> member)) -> [member] {
-        \\    :zig.ListCell.eachFn(list, callback)
+        \\    :zig.List.eachFn(list, callback)
         \\  }
         \\
         \\  pub fn reduce(list :: [member], acc :: result, callback :: (result, member -> result)) -> result {
-        \\    :zig.ListCell.reduceFn(list, acc, callback)
+        \\    :zig.List.reduceFn(list, acc, callback)
         \\  }
         \\}
     ;

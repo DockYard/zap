@@ -5583,7 +5583,7 @@ test "nested zig bridge call parameters not flagged as unused" {
     const source =
         \\pub module Test {
         \\  pub fn read(path :: i64) -> i64 {
-        \\    :zig.MapCell.get(path)
+        \\    :zig.Map.get(path)
         \\  }
         \\}
     ;

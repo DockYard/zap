@@ -25,7 +25,7 @@ pub module Map {
     """
 
   pub fn get(map :: %{Atom => i64}, key :: Atom, default :: i64) -> i64 {
-    :zig.MapCell.get(map, key, default)
+    :zig.Map.get(map, key, default)
   }
 
   @doc = """
@@ -38,7 +38,7 @@ pub module Map {
     """
 
   pub fn has_key?(map :: %{Atom => i64}, key :: Atom) -> Bool {
-    :zig.MapCell.hasKey(map, key)
+    :zig.Map.hasKey(map, key)
   }
 
   @doc = """
@@ -51,7 +51,7 @@ pub module Map {
     """
 
   pub fn size(map :: %{Atom => i64}) -> i64 {
-    :zig.MapCell.size(map)
+    :zig.Map.size(map)
   }
 
   @doc = """
@@ -64,7 +64,7 @@ pub module Map {
     """
 
   pub fn empty?(map :: %{Atom => i64}) -> Bool {
-    :zig.MapCell.isEmpty(map)
+    :zig.Map.isEmpty(map)
   }
 
   @doc = """
@@ -78,7 +78,7 @@ pub module Map {
     """
 
   pub fn put(map :: %{Atom => i64}, key :: Atom, value :: i64) -> %{Atom => i64} {
-    :zig.MapCell.put(map, key, value)
+    :zig.Map.put(map, key, value)
   }
 
   @doc = """
@@ -92,7 +92,7 @@ pub module Map {
     """
 
   pub fn delete(map :: %{Atom => i64}, key :: Atom) -> %{Atom => i64} {
-    :zig.MapCell.delete(map, key)
+    :zig.Map.delete(map, key)
   }
 
   @doc = """
@@ -106,7 +106,7 @@ pub module Map {
     """
 
   pub fn merge(map_a :: %{Atom => i64}, map_b :: %{Atom => i64}) -> %{Atom => i64} {
-    :zig.MapCell.merge(map_a, map_b)
+    :zig.Map.merge(map_a, map_b)
   }
 
   @doc = """
@@ -118,7 +118,7 @@ pub module Map {
     """
 
   pub fn keys(map :: %{Atom => i64}) -> [i64] {
-    :zig.MapCell.keys(map)
+    :zig.Map.keys(map)
   }
 
   @doc = """
@@ -130,6 +130,6 @@ pub module Map {
     """
 
   pub fn values(map :: %{Atom => i64}) -> [i64] {
-    :zig.MapCell.values(map)
+    :zig.Map.values(map)
   }
 }

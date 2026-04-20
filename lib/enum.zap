@@ -24,7 +24,7 @@ pub module Enum {
     """
 
   pub fn map(list :: [element], callback :: (element -> result)) -> [result] {
-    :zig.ListCell.mapFn(list, callback)
+    :zig.List.mapFn(list, callback)
   }
 
   @doc = """
@@ -37,7 +37,7 @@ pub module Enum {
     """
 
   pub fn filter(list :: [element], predicate :: (element -> Bool)) -> [element] {
-    :zig.ListCell.filterFn(list, predicate)
+    :zig.List.filterFn(list, predicate)
   }
 
   @doc = """
@@ -50,7 +50,7 @@ pub module Enum {
     """
 
   pub fn reject(list :: [element], predicate :: (element -> Bool)) -> [element] {
-    :zig.ListCell.rejectFn(list, predicate)
+    :zig.List.rejectFn(list, predicate)
   }
 
   @doc = """
@@ -68,7 +68,7 @@ pub module Enum {
     """
 
   pub fn reduce(list :: [i64], initial :: i64, callback :: (i64, i64 -> i64)) -> i64 {
-    :zig.ListCell.enumReduceSimple(list, initial, callback)
+    :zig.List.enumReduceSimple(list, initial, callback)
   }
 
   @doc = """
@@ -83,7 +83,7 @@ pub module Enum {
     """
 
   pub fn reduce_map(map :: %{Atom => i64}, initial :: i64, callback :: (i64, i64 -> i64)) -> i64 {
-    :zig.MapCell.enumReduceValues(map, initial, callback)
+    :zig.Map.enumReduceValues(map, initial, callback)
   }
 
   @doc = """
@@ -96,7 +96,7 @@ pub module Enum {
     """
 
   pub fn each(list :: [element], callback :: (element -> element)) -> [element] {
-    :zig.ListCell.eachFn(list, callback)
+    :zig.List.eachFn(list, callback)
   }
 
   @doc = """
@@ -110,7 +110,7 @@ pub module Enum {
     """
 
   pub fn find(list :: [element], default :: element, predicate :: (element -> Bool)) -> element {
-    :zig.ListCell.findFn(list, default, predicate)
+    :zig.List.findFn(list, default, predicate)
   }
 
   @doc = """
@@ -123,7 +123,7 @@ pub module Enum {
     """
 
   pub fn any?(list :: [element], predicate :: (element -> Bool)) -> Bool {
-    :zig.ListCell.anyFn(list, predicate)
+    :zig.List.anyFn(list, predicate)
   }
 
   @doc = """
@@ -136,7 +136,7 @@ pub module Enum {
     """
 
   pub fn all?(list :: [element], predicate :: (element -> Bool)) -> Bool {
-    :zig.ListCell.allFn(list, predicate)
+    :zig.List.allFn(list, predicate)
   }
 
   @doc = """
@@ -148,7 +148,7 @@ pub module Enum {
     """
 
   pub fn count(list :: [element], predicate :: (element -> Bool)) -> i64 {
-    :zig.ListCell.countFn(list, predicate)
+    :zig.List.countFn(list, predicate)
   }
 
   @doc = """
@@ -188,7 +188,7 @@ pub module Enum {
     """
 
   pub fn max(list :: [i64]) -> i64 {
-    :zig.ListCell.maxVal(list)
+    :zig.List.maxVal(list)
   }
 
   @doc = """
@@ -201,7 +201,7 @@ pub module Enum {
     """
 
   pub fn min(list :: [i64]) -> i64 {
-    :zig.ListCell.minVal(list)
+    :zig.List.minVal(list)
   }
 
   @doc = """
@@ -216,7 +216,7 @@ pub module Enum {
     """
 
   pub fn sort(list :: [i64], comparator :: (i64, i64 -> Bool)) -> [i64] {
-    :zig.ListCell.sortFn(list, comparator)
+    :zig.List.sortFn(list, comparator)
   }
 
   @doc = """
@@ -230,7 +230,7 @@ pub module Enum {
     """
 
   pub fn flat_map(list :: [i64], callback :: (i64 -> [i64])) -> [i64] {
-    :zig.ListCell.flatMapFn(list, callback)
+    :zig.List.flatMapFn(list, callback)
   }
 
   @doc = """

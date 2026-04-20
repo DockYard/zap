@@ -836,7 +836,7 @@ pub const IrBuilder = struct {
     /// Set of function names that need __try variants (populated by error pipe analysis).
     /// Only functions in this set will get __try variants generated.
     try_variant_names: std.StringHashMap(void),
-    /// Maps mangled function names → @native binding strings (e.g., "String__length" → "ZapString.length").
+    /// Maps mangled function names → @native binding strings (e.g., "String__length" → "String.length").
     /// Populated from @native attributes in the scope graph before building function bodies.
 
     pub const UnionDispatchInfo = struct {
@@ -3140,7 +3140,7 @@ pub const IrBuilder = struct {
                 const scrutinee_local = self.resolveScrutinee(clc.scrutinee, scrutinee_map);
                 const elem_type = self.listElementTypeForLocal(scrutinee_local);
                 const scrutinee_list_type = self.known_local_types.get(scrutinee_local) orelse .any;
-                // Emit non-empty check: ListCell.isEmpty(list) == false
+                // Emit non-empty check: List.isEmpty(list) == false
                 const not_empty_local = self.next_local;
                 self.next_local += 1;
                 try self.current_instrs.append(self.allocator, .{
@@ -3791,16 +3791,16 @@ pub const IrBuilder = struct {
                     .builtin => |name| {
                         const lowered_args = try args.toOwnedSlice(self.allocator);
                         const lowered_modes = try arg_modes.toOwnedSlice(self.allocator);
-                        // Rewrite ListCell builtins based on the argument's list element type.
+                        // Rewrite List builtins based on the argument's list element type.
                         // When a generic function like List.head(list :: [a]) is monomorphized
-                        // with a = String, the `:zig.ListCell.getHead(list)` call needs to
-                        // become `StringListCell.getHead(list)` in the ZIR.
-                        const resolved_name = if (std.mem.startsWith(u8, name, "ListCell.") and lowered_args.len > 0) blk: {
+                        // with a = String, the `:zig.List.getHead(list)` call needs to
+                        // become `StringList.getHead(list)` in the ZIR.
+                        const resolved_name = if (std.mem.startsWith(u8, name, "List.") and lowered_args.len > 0) blk: {
                             const first_arg_type = self.known_local_types.get(lowered_args[0]) orelse .any;
                             if (std.meta.activeTag(first_arg_type) == .list) {
-                                const cell_name = getListCellName(first_arg_type.list.*);
-                                if (!std.mem.eql(u8, cell_name, "ListCell")) {
-                                    const method = name["ListCell.".len..];
+                                const cell_name = getListName(first_arg_type.list.*);
+                                if (!std.mem.eql(u8, cell_name, "List")) {
+                                    const method = name["List.".len..];
                                     break :blk try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ cell_name, method });
                                 }
                             }
@@ -4239,14 +4239,14 @@ fn findParamGetIdInDecision(decision: *const hir_mod.Decision, target_element: u
     }
 }
 
-/// Map a list element ZigType to the runtime ListCell variant name.
-fn getListCellName(element_type: ZigType) []const u8 {
+/// Map a list element ZigType to the runtime List variant name.
+fn getListName(element_type: ZigType) []const u8 {
     return switch (std.meta.activeTag(element_type)) {
-        .string => "StringListCell",
-        .bool_type => "BoolListCell",
-        .f64 => "FloatListCell",
-        .atom => "AtomListCell",
-        else => "ListCell",
+        .string => "StringList",
+        .bool_type => "BoolList",
+        .f64 => "FloatList",
+        .atom => "AtomList",
+        else => "List",
     };
 }
 

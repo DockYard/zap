@@ -29,7 +29,7 @@ pub module IO {
     """
 
   pub fn puts(message :: String) -> String {
-    :zig.Prelude.println(message)
+    :zig.IO.println(message)
     message
   }
 
@@ -46,7 +46,7 @@ pub module IO {
     """
 
   pub fn print_str(message :: String) -> String {
-    :zig.Prelude.print_str(message)
+    :zig.IO.print_str(message)
     message
   }
 }

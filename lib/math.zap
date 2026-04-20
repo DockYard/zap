@@ -53,7 +53,7 @@ pub module Math {
     """
 
   pub fn sqrt(value :: f64) -> f64 {
-    :zig.Prelude.sqrt_f64(value)
+    :zig.Math.sqrt_f64(value)
   }
 
   @doc = """
@@ -66,7 +66,7 @@ pub module Math {
     """
 
   pub fn sin(value :: f64) -> f64 {
-    :zig.Prelude.sin_f64(value)
+    :zig.Math.sin_f64(value)
   }
 
   @doc = """
@@ -79,7 +79,7 @@ pub module Math {
     """
 
   pub fn cos(value :: f64) -> f64 {
-    :zig.Prelude.cos_f64(value)
+    :zig.Math.cos_f64(value)
   }
 
   @doc = """
@@ -91,7 +91,7 @@ pub module Math {
     """
 
   pub fn tan(value :: f64) -> f64 {
-    :zig.Prelude.tan_f64(value)
+    :zig.Math.tan_f64(value)
   }
 
   @doc = """
@@ -104,7 +104,7 @@ pub module Math {
     """
 
   pub fn exp(value :: f64) -> f64 {
-    :zig.Prelude.exp_f64(value)
+    :zig.Math.exp_f64(value)
   }
 
   @doc = """
@@ -117,7 +117,7 @@ pub module Math {
     """
 
   pub fn exp2(value :: f64) -> f64 {
-    :zig.Prelude.exp2_f64(value)
+    :zig.Math.exp2_f64(value)
   }
 
   @doc = """
@@ -130,7 +130,7 @@ pub module Math {
     """
 
   pub fn log(value :: f64) -> f64 {
-    :zig.Prelude.log_f64(value)
+    :zig.Math.log_f64(value)
   }
 
   @doc = """
@@ -143,7 +143,7 @@ pub module Math {
     """
 
   pub fn log2(value :: f64) -> f64 {
-    :zig.Prelude.log2_f64(value)
+    :zig.Math.log2_f64(value)
   }
 
   @doc = """
@@ -156,6 +156,6 @@ pub module Math {
     """
 
   pub fn log10(value :: f64) -> f64 {
-    :zig.Prelude.log10_f64(value)
+    :zig.Math.log10_f64(value)
   }
 }

@@ -20,7 +20,7 @@ pub module Bool {
     """
 
   pub fn to_string(value :: Bool) -> String {
-    :zig.Prelude.bool_to_string(value)
+    :zig.Bool.bool_to_string(value)
   }
 
   @doc = """

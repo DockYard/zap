@@ -24,7 +24,7 @@ pub module List {
     """
 
   pub fn empty?(list :: [element]) -> Bool {
-    :zig.ListCell.isEmpty(list)
+    :zig.List.isEmpty(list)
   }
 
   @doc = """
@@ -37,7 +37,7 @@ pub module List {
     """
 
   pub fn length(list :: [element]) -> i64 {
-    :zig.ListCell.length(list)
+    :zig.List.length(list)
   }
 
   @doc = """
@@ -50,7 +50,7 @@ pub module List {
     """
 
   pub fn head(list :: [element]) -> element {
-    :zig.ListCell.getHead(list)
+    :zig.List.getHead(list)
   }
 
   @doc = """
@@ -62,7 +62,7 @@ pub module List {
     """
 
   pub fn tail(list :: [element]) -> [element] {
-    :zig.ListCell.getTail(list)
+    :zig.List.getTail(list)
   }
 
   @doc = """
@@ -75,7 +75,7 @@ pub module List {
     """
 
   pub fn at(list :: [element], index :: i64) -> element {
-    :zig.ListCell.get(list, index)
+    :zig.List.get(list, index)
   }
 
   @doc = """
@@ -88,7 +88,7 @@ pub module List {
     """
 
   pub fn last(list :: [element]) -> element {
-    :zig.ListCell.last(list)
+    :zig.List.last(list)
   }
 
   @doc = """
@@ -101,7 +101,7 @@ pub module List {
     """
 
   pub fn contains?(list :: [element], value :: element) -> Bool {
-    :zig.ListCell.contains(list, value)
+    :zig.List.contains(list, value)
   }
 
   @doc = """
@@ -113,7 +113,7 @@ pub module List {
     """
 
   pub fn reverse(list :: [element]) -> [element] {
-    :zig.ListCell.reverse(list)
+    :zig.List.reverse(list)
   }
 
   @doc = """
@@ -125,7 +125,7 @@ pub module List {
     """
 
   pub fn prepend(list :: [element], value :: element) -> [element] {
-    :zig.ListCell.cons(value, list)
+    :zig.List.cons(value, list)
   }
 
   @doc = """
@@ -137,7 +137,7 @@ pub module List {
     """
 
   pub fn append(list :: [element], value :: element) -> [element] {
-    :zig.ListCell.append(list, value)
+    :zig.List.append(list, value)
   }
 
   @doc = """
@@ -149,7 +149,7 @@ pub module List {
     """
 
   pub fn concat(first :: [element], second :: [element]) -> [element] {
-    :zig.ListCell.concat(first, second)
+    :zig.List.concat(first, second)
   }
 
   @doc = """
@@ -161,7 +161,7 @@ pub module List {
     """
 
   pub fn take(list :: [element], count :: i64) -> [element] {
-    :zig.ListCell.take(list, count)
+    :zig.List.take(list, count)
   }
 
   @doc = """
@@ -173,7 +173,7 @@ pub module List {
     """
 
   pub fn drop(list :: [element], count :: i64) -> [element] {
-    :zig.ListCell.drop(list, count)
+    :zig.List.drop(list, count)
   }
 
   @doc = """
@@ -186,6 +186,6 @@ pub module List {
     """
 
   pub fn uniq(list :: [element]) -> [element] {
-    :zig.ListCell.uniq(list)
+    :zig.List.uniq(list)
   }
 }

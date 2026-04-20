@@ -61,20 +61,20 @@ pub module Zest {
 
   fn assert_check(value :: Bool, _message :: String) -> String {
     if value {
-      :zig.TestTracker.pass_assertion()
+      :zig.Zest.pass_assertion()
       "."
     } else {
-      :zig.TestTracker.fail_assertion()
+      :zig.Zest.fail_assertion()
       "F"
     }
   }
 
   fn reject_check(value :: Bool, _message :: String) -> String {
     if not value {
-      :zig.TestTracker.pass_assertion()
+      :zig.Zest.pass_assertion()
       "."
     } else {
-      :zig.TestTracker.fail_assertion()
+      :zig.Zest.fail_assertion()
       "F"
     }
   }

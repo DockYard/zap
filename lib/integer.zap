@@ -48,7 +48,7 @@ pub module Integer {
     """
 
   pub fn to_string(value :: i64) -> String {
-    :zig.Prelude.i64_to_string(value)
+    :zig.Integer.i64_to_string(value)
   }
 
   @doc = """
@@ -62,7 +62,7 @@ pub module Integer {
     """
 
   pub fn abs(value :: i64) -> i64 {
-    :zig.Prelude.abs_i64(value)
+    :zig.Integer.abs_i64(value)
   }
 
   @doc = """
@@ -76,7 +76,7 @@ pub module Integer {
     """
 
   pub fn max(first :: i64, second :: i64) -> i64 {
-    :zig.Prelude.max_i64(first, second)
+    :zig.Integer.max_i64(first, second)
   }
 
   @doc = """
@@ -90,7 +90,7 @@ pub module Integer {
     """
 
   pub fn min(first :: i64, second :: i64) -> i64 {
-    :zig.Prelude.min_i64(first, second)
+    :zig.Integer.min_i64(first, second)
   }
 
   @doc = """
@@ -105,7 +105,7 @@ pub module Integer {
     """
 
   pub fn parse(input :: String) -> i64 {
-    :zig.Prelude.parse_i64(input)
+    :zig.Integer.parse_i64(input)
   }
 
   @doc = """
@@ -189,7 +189,7 @@ pub module Integer {
     """
 
   pub fn to_float(value :: i64) -> f64 {
-    :zig.Prelude.i64_to_f64(value)
+    :zig.Integer.i64_to_f64(value)
   }
 
   # --- Bit operations ---
@@ -204,7 +204,7 @@ pub module Integer {
     """
 
   pub fn count_leading_zeros(value :: i64) -> i64 {
-    :zig.Prelude.clz_i64(value)
+    :zig.Integer.clz_i64(value)
   }
 
   @doc = """
@@ -217,7 +217,7 @@ pub module Integer {
     """
 
   pub fn count_trailing_zeros(value :: i64) -> i64 {
-    :zig.Prelude.ctz_i64(value)
+    :zig.Integer.ctz_i64(value)
   }
 
   @doc = """
@@ -231,7 +231,7 @@ pub module Integer {
     """
 
   pub fn popcount(value :: i64) -> i64 {
-    :zig.Prelude.popcount_i64(value)
+    :zig.Integer.popcount_i64(value)
   }
 
   @doc = """
@@ -244,7 +244,7 @@ pub module Integer {
     """
 
   pub fn byte_swap(value :: i64) -> i64 {
-    :zig.Prelude.byte_swap_i64(value)
+    :zig.Integer.byte_swap_i64(value)
   }
 
   @doc = """
@@ -256,7 +256,7 @@ pub module Integer {
     """
 
   pub fn bit_reverse(value :: i64) -> i64 {
-    :zig.Prelude.bit_reverse_i64(value)
+    :zig.Integer.bit_reverse_i64(value)
   }
 
   # --- Saturating arithmetic ---
@@ -272,7 +272,7 @@ pub module Integer {
     """
 
   pub fn add_sat(first :: i64, second :: i64) -> i64 {
-    :zig.Prelude.add_sat_i64(first, second)
+    :zig.Integer.add_sat_i64(first, second)
   }
 
   @doc = """
@@ -286,7 +286,7 @@ pub module Integer {
     """
 
   pub fn sub_sat(first :: i64, second :: i64) -> i64 {
-    :zig.Prelude.sub_sat_i64(first, second)
+    :zig.Integer.sub_sat_i64(first, second)
   }
 
   @doc = """
@@ -301,7 +301,7 @@ pub module Integer {
     """
 
   pub fn mul_sat(first :: i64, second :: i64) -> i64 {
-    :zig.Prelude.mul_sat_i64(first, second)
+    :zig.Integer.mul_sat_i64(first, second)
   }
 
   # --- Bitwise operations ---
@@ -317,7 +317,7 @@ pub module Integer {
     """
 
   pub fn band(first :: i64, second :: i64) -> i64 {
-    :zig.Prelude.band_i64(first, second)
+    :zig.Integer.band_i64(first, second)
   }
 
   @doc = """
@@ -331,7 +331,7 @@ pub module Integer {
     """
 
   pub fn bor(first :: i64, second :: i64) -> i64 {
-    :zig.Prelude.bor_i64(first, second)
+    :zig.Integer.bor_i64(first, second)
   }
 
   @doc = """
@@ -345,7 +345,7 @@ pub module Integer {
     """
 
   pub fn bxor(first :: i64, second :: i64) -> i64 {
-    :zig.Prelude.bxor_i64(first, second)
+    :zig.Integer.bxor_i64(first, second)
   }
 
   @doc = """
@@ -360,7 +360,7 @@ pub module Integer {
     """
 
   pub fn bnot(value :: i64) -> i64 {
-    :zig.Prelude.bnot_i64(value)
+    :zig.Integer.bnot_i64(value)
   }
 
   @doc = """
@@ -374,7 +374,7 @@ pub module Integer {
     """
 
   pub fn bsl(value :: i64, amount :: i64) -> i64 {
-    :zig.Prelude.bsl_i64(value, amount)
+    :zig.Integer.bsl_i64(value, amount)
   }
 
   @doc = """
@@ -389,7 +389,7 @@ pub module Integer {
     """
 
   pub fn bsr(value :: i64, amount :: i64) -> i64 {
-    :zig.Prelude.bsr_i64(value, amount)
+    :zig.Integer.bsr_i64(value, amount)
   }
 
   # --- Predicates (pure Zap) ---
@@ -406,7 +406,7 @@ pub module Integer {
     """
 
   pub fn sign(value :: i64) -> i64 {
-    :zig.Prelude.sign_i64(value)
+    :zig.Integer.sign_i64(value)
   }
 
   @doc = """
@@ -420,7 +420,7 @@ pub module Integer {
     """
 
   pub fn even?(value :: i64) -> Bool {
-    :zig.Prelude.even_i64(value)
+    :zig.Integer.even_i64(value)
   }
 
   @doc = """
@@ -434,7 +434,7 @@ pub module Integer {
     """
 
   pub fn odd?(value :: i64) -> Bool {
-    :zig.Prelude.odd_i64(value)
+    :zig.Integer.odd_i64(value)
   }
 
   @doc = """
@@ -449,7 +449,7 @@ pub module Integer {
     """
 
   pub fn gcd(first :: i64, second :: i64) -> i64 {
-    :zig.Prelude.gcd_i64(first, second)
+    :zig.Integer.gcd_i64(first, second)
   }
 
   @doc = """
@@ -463,6 +463,6 @@ pub module Integer {
     """
 
   pub fn lcm(first :: i64, second :: i64) -> i64 {
-    :zig.Prelude.lcm_i64(first, second)
+    :zig.Integer.lcm_i64(first, second)
   }
 }

@@ -26,7 +26,7 @@ pub module String {
     """
 
   pub fn length(s :: String) -> i64 {
-    :zig.ZapString.length(s)
+    :zig.String.length(s)
   }
 
   @doc = """
@@ -43,7 +43,7 @@ pub module String {
     """
 
   pub fn byte_at(s :: String, index :: i64) -> String {
-    :zig.ZapString.byte_at(s, index)
+    :zig.String.byte_at(s, index)
   }
 
   @doc = """
@@ -57,7 +57,7 @@ pub module String {
     """
 
   pub fn contains(haystack :: String, needle :: String) -> Bool {
-    :zig.ZapString.contains(haystack, needle)
+    :zig.String.contains(haystack, needle)
   }
 
   @doc = """
@@ -70,7 +70,7 @@ pub module String {
     """
 
   pub fn starts_with(s :: String, prefix :: String) -> Bool {
-    :zig.ZapString.startsWith(s, prefix)
+    :zig.String.startsWith(s, prefix)
   }
 
   @doc = """
@@ -83,7 +83,7 @@ pub module String {
     """
 
   pub fn ends_with(s :: String, suffix :: String) -> Bool {
-    :zig.ZapString.endsWith(s, suffix)
+    :zig.String.endsWith(s, suffix)
   }
 
   @doc = """
@@ -97,7 +97,7 @@ pub module String {
     """
 
   pub fn trim(s :: String) -> String {
-    :zig.ZapString.trim(s)
+    :zig.String.trim(s)
   }
 
   @doc = """
@@ -113,7 +113,7 @@ pub module String {
     """
 
   pub fn slice(s :: String, start :: i64, end :: i64) -> String {
-    :zig.ZapString.slice(s, start, end)
+    :zig.String.slice(s, start, end)
   }
 
   @doc = """
@@ -128,7 +128,7 @@ pub module String {
     """
 
   pub fn to_atom(name :: String) -> Atom {
-    :zig.ZapString.to_atom(name)
+    :zig.String.to_atom(name)
   }
 
   @doc = """
@@ -143,7 +143,7 @@ pub module String {
     """
 
   pub fn to_existing_atom(name :: String) -> Atom {
-    :zig.ZapString.to_existing_atom(name)
+    :zig.String.to_existing_atom(name)
   }
 
   @doc = """

@@ -23,7 +23,7 @@ pub module File {
     """
 
   pub fn read(path :: String) -> String {
-    :zig.Prelude.file_read(path)
+    :zig.File.file_read(path)
   }
 
   @doc = """
@@ -36,7 +36,7 @@ pub module File {
     """
 
   pub fn write(path :: String, content :: String) -> Bool {
-    :zig.Prelude.file_write(path, content)
+    :zig.File.file_write(path, content)
   }
 
   @doc = """
@@ -49,6 +49,6 @@ pub module File {
     """
 
   pub fn exists?(path :: String) -> Bool {
-    :zig.Prelude.file_exists(path)
+    :zig.File.file_exists(path)
   }
 }

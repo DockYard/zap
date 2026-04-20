@@ -452,7 +452,7 @@ pub const TaggedValue = union(enum) {
     string: []const u8,
     nil: void,
     tuple: []const TaggedValue,
-    list: *const List(TaggedValue),
+    list: *const PersistentList(TaggedValue),
     closure: DynClosure,
 
     pub fn isNil(self: TaggedValue) bool {
@@ -496,7 +496,7 @@ pub const TaggedValue = union(enum) {
 // List — Persistent singly-linked list (spec §30.3)
 // ============================================================
 
-pub fn List(comptime T: type) type {
+pub fn PersistentList(comptime T: type) type {
     return struct {
         const Self = @This();
 
@@ -683,10 +683,10 @@ pub fn ZapMap(comptime K: type, comptime V: type) type {
 }
 
 // ============================================================
-// ZapString — String utilities
+// String — String utilities
 // ============================================================
 
-pub const ZapString = struct {
+pub const String = struct {
     /// Convert a string to an atom, creating it if it doesn't exist.
     pub fn to_atom(name: []const u8) u32 {
         return atomIntern(name.ptr, @intCast(name.len));
@@ -1536,7 +1536,7 @@ pub const Prelude = struct {
 // TestTracker — mutable counters for test/assertion reporting
 // ============================================================
 
-pub const TestTracker = struct {
+pub const Zest = struct {
     var test_count: i64 = 0;
     var test_failures: i64 = 0;
     var assertion_count: i64 = 0;
@@ -1828,18 +1828,18 @@ pub const BinaryHelpers = struct {
 // ============================================================
 
 // ============================================================
-// ListCell — Concrete cons-cell for pointer-based lists.
+// List — Concrete cons-cell for pointer-based lists.
 //
 // Lists use nullable pointers: null = empty, non-null = cons cell.
 // This allows runtime empty/non-empty checks that survive ZIR.
 // ============================================================
 
 /// Type alias for list values — used by the ZIR builder to type list parameters.
-pub const ListType = ?*const ListCell;
+pub const ListType = ?*const List;
 
 // ---- Callable dispatch helpers ----
 // Handle both bare function pointers and closure structs transparently.
-// Used by ListCell, MapCell, and ListCellOf higher-order functions.
+// Used by List, Map, and ListOf higher-order functions.
 
 inline fn call1(callback: anytype, arg0: anytype) @TypeOf(if (@typeInfo(@TypeOf(callback)) == .@"struct" and @hasField(@TypeOf(callback), "call_fn")) callback.call_fn(callback.env, arg0) else callback(arg0)) {
     const T = @TypeOf(callback);
@@ -1859,43 +1859,43 @@ inline fn call2(callback: anytype, arg0: anytype, arg1: anytype) @TypeOf(if (@ty
     }
 }
 
-pub const ListCell = struct {
+pub const List = struct {
     head: i64,
-    tail: ?*const ListCell,
+    tail: ?*const List,
 
     /// Return a typed empty list (null pointer with correct type).
-    pub fn empty() ?*const ListCell {
+    pub fn empty() ?*const List {
         return null;
     }
 
     /// Allocate a new cons cell on the bump allocator.
-    pub fn cons(head: i64, tail: ?*const ListCell) ?*const ListCell {
-        const bytes = bumpAlloc(@sizeOf(ListCell));
+    pub fn cons(head: i64, tail: ?*const List) ?*const List {
+        const bytes = bumpAlloc(@sizeOf(List));
         if (bytes.len == 0) return null;
-        const cell: *ListCell = @ptrCast(@alignCast(bytes.ptr));
+        const cell: *List = @ptrCast(@alignCast(bytes.ptr));
         cell.* = .{ .head = head, .tail = tail };
         return cell;
     }
 
     /// Get the head value. Returns 0 for empty lists.
-    pub fn getHead(list: ?*const ListCell) i64 {
+    pub fn getHead(list: ?*const List) i64 {
         if (list) |cell| return cell.head;
         return 0;
     }
 
     /// Get the tail. Returns null for empty or single-element lists.
-    pub fn getTail(list: ?*const ListCell) ?*const ListCell {
+    pub fn getTail(list: ?*const List) ?*const List {
         if (list) |cell| return cell.tail;
         return null;
     }
 
     /// Check if a list is empty.
-    pub fn isEmpty(list: ?*const ListCell) bool {
+    pub fn isEmpty(list: ?*const List) bool {
         return list == null;
     }
 
     /// Get the length of a list.
-    pub fn length(list: ?*const ListCell) i64 {
+    pub fn length(list: ?*const List) i64 {
         var current = list;
         var count: i64 = 0;
         while (current) |cell| {
@@ -1906,7 +1906,7 @@ pub const ListCell = struct {
     }
 
     /// Get element at index (zero-based). Returns 0 if out of bounds.
-    pub fn get(list: ?*const ListCell, index: i64) i64 {
+    pub fn get(list: ?*const List, index: i64) i64 {
         var current = list;
         var i: i64 = 0;
         while (current) |cell| {
@@ -1918,7 +1918,7 @@ pub const ListCell = struct {
     }
 
     /// Last element. Returns 0 for empty.
-    pub fn last(list: ?*const ListCell) i64 {
+    pub fn last(list: ?*const List) i64 {
         var current = list;
         var result: i64 = 0;
         while (current) |cell| {
@@ -1929,7 +1929,7 @@ pub const ListCell = struct {
     }
 
     /// Sum of all elements.
-    pub fn sum(list: ?*const ListCell) i64 {
+    pub fn sum(list: ?*const List) i64 {
         var current = list;
         var total: i64 = 0;
         while (current) |cell| {
@@ -1940,7 +1940,7 @@ pub const ListCell = struct {
     }
 
     /// Product of all elements. Returns 1 for empty.
-    pub fn product(list: ?*const ListCell) i64 {
+    pub fn product(list: ?*const List) i64 {
         var current = list;
         var total: i64 = 1;
         while (current) |cell| {
@@ -1951,7 +1951,7 @@ pub const ListCell = struct {
     }
 
     /// Maximum element. Returns 0 for empty.
-    pub fn maxVal(list: ?*const ListCell) i64 {
+    pub fn maxVal(list: ?*const List) i64 {
         if (list == null) return 0;
         var current = list;
         var result: i64 = list.?.head;
@@ -1963,7 +1963,7 @@ pub const ListCell = struct {
     }
 
     /// Minimum element. Returns 0 for empty.
-    pub fn minVal(list: ?*const ListCell) i64 {
+    pub fn minVal(list: ?*const List) i64 {
         if (list == null) return 0;
         var current = list;
         var result: i64 = list.?.head;
@@ -1975,7 +1975,7 @@ pub const ListCell = struct {
     }
 
     /// Check if the list contains a value.
-    pub fn contains(list: ?*const ListCell, value: i64) bool {
+    pub fn contains(list: ?*const List, value: i64) bool {
         var current = list;
         while (current) |cell| {
             if (cell.head == value) return true;
@@ -1985,9 +1985,9 @@ pub const ListCell = struct {
     }
 
     /// Reverse a list.
-    pub fn reverse(list: ?*const ListCell) ?*const ListCell {
+    pub fn reverse(list: ?*const List) ?*const List {
         var current = list;
-        var result: ?*const ListCell = null;
+        var result: ?*const List = null;
         while (current) |cell| {
             result = cons(cell.head, result);
             current = cell.tail;
@@ -1996,13 +1996,13 @@ pub const ListCell = struct {
     }
 
     /// Append a value to the end.
-    pub fn append(list: ?*const ListCell, value: i64) ?*const ListCell {
+    pub fn append(list: ?*const List, value: i64) ?*const List {
         // reverse, prepend, reverse
         return reverse(cons(value, reverse(list)));
     }
 
     /// Concatenate two lists.
-    pub fn concat(first: ?*const ListCell, second: ?*const ListCell) ?*const ListCell {
+    pub fn concat(first: ?*const List, second: ?*const List) ?*const List {
         if (first == null) return second;
         var reversed_first = reverse(first);
         var result = second;
@@ -2014,10 +2014,10 @@ pub const ListCell = struct {
     }
 
     /// Take first N elements.
-    pub fn take(list: ?*const ListCell, count: i64) ?*const ListCell {
+    pub fn take(list: ?*const List, count: i64) ?*const List {
         if (count <= 0 or list == null) return null;
         var current = list;
-        var collected: ?*const ListCell = null;
+        var collected: ?*const List = null;
         var remaining: i64 = count;
         while (current) |cell| {
             if (remaining <= 0) break;
@@ -2029,7 +2029,7 @@ pub const ListCell = struct {
     }
 
     /// Drop first N elements.
-    pub fn drop(list: ?*const ListCell, count: i64) ?*const ListCell {
+    pub fn drop(list: ?*const List, count: i64) ?*const List {
         if (count <= 0) return list;
         var current = list;
         var remaining: i64 = count;
@@ -2045,9 +2045,9 @@ pub const ListCell = struct {
 
     // ---- Higher-order functions (for Enum module) ----
 
-    pub fn mapFn(list: ?*const ListCell, callback: anytype) ?*const ListCell {
+    pub fn mapFn(list: ?*const List, callback: anytype) ?*const List {
         var current = list;
-        var result: ?*const ListCell = null;
+        var result: ?*const List = null;
         while (current) |cell| {
             result = cons(call1(callback, cell.head), result);
             current = cell.tail;
@@ -2055,9 +2055,9 @@ pub const ListCell = struct {
         return reverse(result);
     }
 
-    pub fn filterFn(list: ?*const ListCell, predicate: anytype) ?*const ListCell {
+    pub fn filterFn(list: ?*const List, predicate: anytype) ?*const List {
         var current = list;
-        var result: ?*const ListCell = null;
+        var result: ?*const List = null;
         while (current) |cell| {
             if (call1(predicate, cell.head)) {
                 result = cons(cell.head, result);
@@ -2067,9 +2067,9 @@ pub const ListCell = struct {
         return reverse(result);
     }
 
-    pub fn rejectFn(list: ?*const ListCell, predicate: anytype) ?*const ListCell {
+    pub fn rejectFn(list: ?*const List, predicate: anytype) ?*const List {
         var current = list;
-        var result: ?*const ListCell = null;
+        var result: ?*const List = null;
         while (current) |cell| {
             if (!call1(predicate, cell.head)) {
                 result = cons(cell.head, result);
@@ -2081,7 +2081,7 @@ pub const ListCell = struct {
 
     /// Simple reduce: folds a list with a (acc, element) -> acc callback.
     /// Handles both bare function pointers and closure structs (with call_fn/env).
-    pub fn enumReduceSimple(list: ?*const ListCell, initial: i64, callback: anytype) i64 {
+    pub fn enumReduceSimple(list: ?*const List, initial: i64, callback: anytype) i64 {
         var current = list;
         var acc: i64 = initial;
         while (current) |cell| {
@@ -2091,7 +2091,7 @@ pub const ListCell = struct {
         return acc;
     }
 
-    pub fn reduceFn(list: ?*const ListCell, initial: i64, callback: anytype) i64 {
+    pub fn reduceFn(list: ?*const List, initial: i64, callback: anytype) i64 {
         var current = list;
         var acc = initial;
         while (current) |cell| {
@@ -2106,7 +2106,7 @@ pub const ListCell = struct {
     ///   field 0 (u64): atom — 5 = :cont, 6 = :halt
     ///   field 1: the accumulator value
     /// Returns a tuple struct with the final {atom, acc}.
-    pub fn reduceHaltCont(list: ?*const ListCell, initial: anytype, callback: anytype) @TypeOf(callback(initial, @as(i64, 0))) {
+    pub fn reduceHaltCont(list: ?*const List, initial: anytype, callback: anytype) @TypeOf(callback(initial, @as(i64, 0))) {
         const ResultType = @TypeOf(callback(initial, @as(i64, 0)));
         const AccType = @TypeOf(@field(@as(ResultType, undefined), "1"));
         const ATOM_HALT: u64 = 6;
@@ -2127,7 +2127,7 @@ pub const ListCell = struct {
         return done_result;
     }
 
-    pub fn eachFn(list: ?*const ListCell, callback: anytype) ?*const ListCell {
+    pub fn eachFn(list: ?*const List, callback: anytype) ?*const List {
         var current = list;
         while (current) |cell| {
             _ = call1(callback, cell.head);
@@ -2136,7 +2136,7 @@ pub const ListCell = struct {
         return list;
     }
 
-    pub fn findFn(list: ?*const ListCell, default: i64, predicate: anytype) i64 {
+    pub fn findFn(list: ?*const List, default: i64, predicate: anytype) i64 {
         var current = list;
         while (current) |cell| {
             if (call1(predicate, cell.head)) return cell.head;
@@ -2145,7 +2145,7 @@ pub const ListCell = struct {
         return default;
     }
 
-    pub fn anyFn(list: ?*const ListCell, predicate: anytype) bool {
+    pub fn anyFn(list: ?*const List, predicate: anytype) bool {
         var current = list;
         while (current) |cell| {
             if (call1(predicate, cell.head)) return true;
@@ -2154,7 +2154,7 @@ pub const ListCell = struct {
         return false;
     }
 
-    pub fn allFn(list: ?*const ListCell, predicate: anytype) bool {
+    pub fn allFn(list: ?*const List, predicate: anytype) bool {
         var current = list;
         while (current) |cell| {
             if (!call1(predicate, cell.head)) return false;
@@ -2163,7 +2163,7 @@ pub const ListCell = struct {
         return true;
     }
 
-    pub fn countFn(list: ?*const ListCell, predicate: anytype) i64 {
+    pub fn countFn(list: ?*const List, predicate: anytype) i64 {
         var current = list;
         var count: i64 = 0;
         while (current) |cell| {
@@ -2173,7 +2173,7 @@ pub const ListCell = struct {
         return count;
     }
 
-    pub fn sortFn(list: ?*const ListCell, comparator: anytype) ?*const ListCell {
+    pub fn sortFn(list: ?*const List, comparator: anytype) ?*const List {
         // Convert to array, sort, convert back
         const len_val = length(list);
         if (len_val <= 1) return list;
@@ -2196,7 +2196,7 @@ pub const ListCell = struct {
         };
         std.sort.pdq(i64, arr, Ctx{ .cmp = comparator }, Ctx.lessThan);
         // Build list from sorted array
-        var result: ?*const ListCell = null;
+        var result: ?*const List = null;
         var ri: usize = len;
         while (ri > 0) {
             ri -= 1;
@@ -2205,9 +2205,9 @@ pub const ListCell = struct {
         return result;
     }
 
-    pub fn flatMapFn(list: ?*const ListCell, callback: anytype) ?*const ListCell {
+    pub fn flatMapFn(list: ?*const List, callback: anytype) ?*const List {
         var current = list;
-        var result: ?*const ListCell = null;
+        var result: ?*const List = null;
         while (current) |cell| {
             var inner = call1(callback, cell.head);
             while (inner) |inner_cell| {
@@ -2219,9 +2219,9 @@ pub const ListCell = struct {
         return reverse(result);
     }
 
-    pub fn uniq(list: ?*const ListCell) ?*const ListCell {
+    pub fn uniq(list: ?*const List) ?*const List {
         var current = list;
-        var result: ?*const ListCell = null;
+        var result: ?*const List = null;
         while (current) |cell| {
             if (!contains(result, cell.head)) {
                 result = cons(cell.head, result);
@@ -2233,16 +2233,16 @@ pub const ListCell = struct {
 };
 
 // ============================================================
-// MapCell — Concrete flat-array map for pointer-based maps.
+// Map — Concrete flat-array map for pointer-based maps.
 //
 // Maps use nullable pointers: null = empty, non-null = map cell.
 // Entries stored as flat array of {key, value} with linear scan.
 // Keys are atom IDs (u32). Values are i64.
 // ============================================================
 
-pub const MapType = ?*const MapCell;
+pub const MapType = ?*const Map;
 
-pub const MapCell = struct {
+pub const Map = struct {
     // Hybrid representation: flat array for small maps, HAMT trie for larger maps.
     // The HAMT (Hash Array Mapped Trie) provides O(log32 n) lookup, insert, and
     // delete for large maps while the flat array remains optimal for <= 8 entries.
@@ -2288,8 +2288,8 @@ pub const MapCell = struct {
         return h;
     }
 
-    fn allocMapCell() ?*MapCell {
-        const slice = bumpAllocSlice(MapCell, 1);
+    fn allocMap() ?*Map {
+        const slice = bumpAllocSlice(Map, 1);
         if (slice.len == 0) return null;
         return &slice[0];
     }
@@ -2317,8 +2317,8 @@ pub const MapCell = struct {
         return slice.ptr;
     }
 
-    fn makeFlatMap(entries: [*]const MapEntry, count: u32) ?*const MapCell {
-        const cell = allocMapCell() orelse return null;
+    fn makeFlatMap(entries: [*]const MapEntry, count: u32) ?*const Map {
+        const cell = allocMap() orelse return null;
         cell.* = .{
             .total_count = count,
             .repr_tag = 0,
@@ -2329,8 +2329,8 @@ pub const MapCell = struct {
         return cell;
     }
 
-    fn makeTrieMap(root: *const HamtNode, total: u32) ?*const MapCell {
-        const cell = allocMapCell() orelse return null;
+    fn makeTrieMap(root: *const HamtNode, total: u32) ?*const Map {
+        const cell = allocMap() orelse return null;
         cell.* = .{
             .total_count = total,
             .repr_tag = 1,
@@ -2550,11 +2550,11 @@ pub const MapCell = struct {
 
     // === Public API (unchanged signatures) ===
 
-    pub fn empty() ?*const MapCell {
+    pub fn empty() ?*const Map {
         return null;
     }
 
-    pub fn fromPairs(key_ids: []const u32, vals: []const i64, count: u32) ?*const MapCell {
+    pub fn fromPairs(key_ids: []const u32, vals: []const i64, count: u32) ?*const Map {
         if (count == 0) return null;
         const n: usize = @intCast(count);
         const entry_arr = allocEntries(n) orelse return null;
@@ -2570,7 +2570,7 @@ pub const MapCell = struct {
         return makeTrieMap(root, count);
     }
 
-    pub fn get(map: ?*const MapCell, key: u32, default: i64) i64 {
+    pub fn get(map: ?*const Map, key: u32, default: i64) i64 {
         if (map) |m| {
             if (m.repr_tag == 0) {
                 // Flat: linear scan
@@ -2588,13 +2588,13 @@ pub const MapCell = struct {
         return default;
     }
 
-    pub fn getStr(map: ?*const MapCell, key: u32, default: []const u8) []const u8 {
+    pub fn getStr(map: ?*const Map, key: u32, default: []const u8) []const u8 {
         _ = map;
         _ = key;
         return default;
     }
 
-    pub fn hasKey(map: ?*const MapCell, key: u32) bool {
+    pub fn hasKey(map: ?*const Map, key: u32) bool {
         if (map) |m| {
             if (m.repr_tag == 0) {
                 for (m.flat_entries[0..m.flat_count]) |entry| {
@@ -2610,16 +2610,16 @@ pub const MapCell = struct {
         return false;
     }
 
-    pub fn size(map: ?*const MapCell) i64 {
+    pub fn size(map: ?*const Map) i64 {
         if (map) |m| return @intCast(m.total_count);
         return 0;
     }
 
-    pub fn isEmpty(map: ?*const MapCell) bool {
+    pub fn isEmpty(map: ?*const Map) bool {
         return map == null;
     }
 
-    pub fn put(map: ?*const MapCell, key: u32, value: i64) ?*const MapCell {
+    pub fn put(map: ?*const Map, key: u32, value: i64) ?*const Map {
         if (map == null) {
             // Create new single-entry flat map
             const entries = allocEntries(1) orelse return null;
@@ -2676,7 +2676,7 @@ pub const MapCell = struct {
         return map;
     }
 
-    pub fn delete(map: ?*const MapCell, key: u32) ?*const MapCell {
+    pub fn delete(map: ?*const Map, key: u32) ?*const Map {
         if (map == null) return null;
         const m = map.?;
 
@@ -2729,7 +2729,7 @@ pub const MapCell = struct {
         return map;
     }
 
-    pub fn merge(map_a: ?*const MapCell, map_b: ?*const MapCell) ?*const MapCell {
+    pub fn merge(map_a: ?*const Map, map_b: ?*const Map) ?*const Map {
         if (map_a == null) return map_b;
         if (map_b == null) return map_a;
         // Apply all entries from b onto a
@@ -2751,16 +2751,16 @@ pub const MapCell = struct {
         return result;
     }
 
-    pub fn keys(map: ?*const MapCell) ?*const ListCell {
+    pub fn keys(map: ?*const Map) ?*const List {
         if (map == null) return null;
         const m = map.?;
 
         if (m.repr_tag == 0) {
-            var result: ?*const ListCell = null;
+            var result: ?*const List = null;
             var i: usize = m.flat_count;
             while (i > 0) {
                 i -= 1;
-                result = ListCell.cons(@intCast(m.flat_entries[i].key), result);
+                result = List.cons(@intCast(m.flat_entries[i].key), result);
             }
             return result;
         }
@@ -2768,25 +2768,25 @@ pub const MapCell = struct {
         // Trie: collect and build list
         var collected: std.ArrayListUnmanaged(MapEntry) = .empty;
         if (m.trie_root) |root| hamtCollect(root, &collected);
-        var result: ?*const ListCell = null;
+        var result: ?*const List = null;
         var i: usize = collected.items.len;
         while (i > 0) {
             i -= 1;
-            result = ListCell.cons(@intCast(collected.items[i].key), result);
+            result = List.cons(@intCast(collected.items[i].key), result);
         }
         return result;
     }
 
-    pub fn values(map: ?*const MapCell) ?*const ListCell {
+    pub fn values(map: ?*const Map) ?*const List {
         if (map == null) return null;
         const m = map.?;
 
         if (m.repr_tag == 0) {
-            var result: ?*const ListCell = null;
+            var result: ?*const List = null;
             var i: usize = m.flat_count;
             while (i > 0) {
                 i -= 1;
-                result = ListCell.cons(m.flat_entries[i].value, result);
+                result = List.cons(m.flat_entries[i].value, result);
             }
             return result;
         }
@@ -2794,18 +2794,18 @@ pub const MapCell = struct {
         // Trie: collect and build list
         var collected: std.ArrayListUnmanaged(MapEntry) = .empty;
         if (m.trie_root) |root| hamtCollect(root, &collected);
-        var result: ?*const ListCell = null;
+        var result: ?*const List = null;
         var i: usize = collected.items.len;
         while (i > 0) {
             i -= 1;
-            result = ListCell.cons(collected.items[i].value, result);
+            result = List.cons(collected.items[i].value, result);
         }
         return result;
     }
 
     /// Simple reduce: folds map entries with a (acc, key, value) -> acc callback.
     /// Iterates all entries and applies the callback with the accumulator.
-    pub fn enumReduceSimple(map: ?*const MapCell, initial: i64, callback: anytype) i64 {
+    pub fn enumReduceSimple(map: ?*const Map, initial: i64, callback: anytype) i64 {
         if (map == null) return initial;
         const m = map.?;
         var acc: i64 = initial;
@@ -2829,7 +2829,7 @@ pub const MapCell = struct {
     /// Reduce with halt/cont control flow for the Enumerable protocol.
     /// The callback takes (accumulator, value) and returns a tuple where
     /// field "0" is :cont(5) or :halt(6), field "1" is the new accumulator.
-    pub fn reduceHaltCont(map: ?*const MapCell, initial: anytype, callback: anytype) struct { u64, i64 } {
+    pub fn reduceHaltCont(map: ?*const Map, initial: anytype, callback: anytype) struct { u64, i64 } {
         const ResultType = struct { u64, i64 };
         const ATOM_HALT: u64 = 6;
         const ATOM_CONT: u64 = 5;
@@ -2857,7 +2857,7 @@ pub const MapCell = struct {
 
     /// Reduce for Enumerable: folds map values with a (acc, value) -> acc callback.
     /// Only passes the value (not the key) to match the Enumerable protocol.
-    pub fn enumReduceValues(map: ?*const MapCell, initial: i64, callback: anytype) i64 {
+    pub fn enumReduceValues(map: ?*const Map, initial: i64, callback: anytype) i64 {
         if (map == null) return initial;
         const m = map.?;
         var acc: i64 = initial;
@@ -2878,11 +2878,11 @@ pub const MapCell = struct {
 };
 
 // ============================================================
-// Generic ListCell factory — produces monomorphic list types
+// Generic List factory — produces monomorphic list types
 // for any element type T. Used for string lists, atom lists, etc.
 // ============================================================
 
-pub fn ListCellOf(comptime T: type) type {
+pub fn ListOf(comptime T: type) type {
     return struct {
         const Self = @This();
         head: T,
@@ -3053,14 +3053,14 @@ pub fn ListCellOf(comptime T: type) type {
 }
 
 // Concrete instantiations for known element types
-pub const StringListCell = ListCellOf([]const u8);
-pub const StringListType = ?*const StringListCell;
-pub const BoolListCell = ListCellOf(bool);
-pub const BoolListType = ?*const BoolListCell;
-pub const FloatListCell = ListCellOf(f64);
-pub const FloatListType = ?*const FloatListCell;
-pub const AtomListCell = ListCellOf(u64);
-pub const AtomListType = ?*const AtomListCell;
+pub const StringList = ListOf([]const u8);
+pub const StringListType = ?*const StringList;
+pub const BoolList = ListOf(bool);
+pub const BoolListType = ?*const BoolList;
+pub const FloatList = ListOf(f64);
+pub const FloatListType = ?*const FloatList;
+pub const AtomList = ListOf(u64);
+pub const AtomListType = ?*const AtomList;
 
 pub const ListHelpers = struct {
     /// Check if a list is empty (void = empty, anything else = non-empty).
@@ -3272,7 +3272,7 @@ test "List cons and hd/tl" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var list = List(i64).empty;
+    var list = PersistentList(i64).empty;
     list = try list.cons(alloc, 3);
     list = try list.cons(alloc, 2);
     list = try list.cons(alloc, 1);
@@ -3290,7 +3290,7 @@ test "List fromSlice and toSlice" {
     const alloc = arena.allocator();
 
     const items = [_]i64{ 10, 20, 30 };
-    const list = try List(i64).fromSlice(alloc, &items);
+    const list = try PersistentList(i64).fromSlice(alloc, &items);
 
     const slice = try list.toSlice(alloc);
 
@@ -3345,18 +3345,18 @@ test "ZapMap delete" {
     try std.testing.expectEqual(@as(i64, 200), map2.get(2).?);
 }
 
-test "ZapString operations" {
-    try std.testing.expect(ZapString.contains("hello world", "world"));
-    try std.testing.expect(!ZapString.contains("hello world", "xyz"));
-    try std.testing.expect(ZapString.startsWith("hello", "hel"));
-    try std.testing.expect(ZapString.endsWith("hello", "llo"));
-    try std.testing.expectEqualStrings("llo", ZapString.slice("hello", 2, 5));
-    try std.testing.expectEqualStrings("hello", ZapString.trim("  hello  "));
+test "String operations" {
+    try std.testing.expect(String.contains("hello world", "world"));
+    try std.testing.expect(!String.contains("hello world", "xyz"));
+    try std.testing.expect(String.startsWith("hello", "hel"));
+    try std.testing.expect(String.endsWith("hello", "llo"));
+    try std.testing.expectEqualStrings("llo", String.slice("hello", 2, 5));
+    try std.testing.expectEqualStrings("hello", String.trim("  hello  "));
 }
 
-test "ZapString concat" {
+test "String concat" {
     const alloc = std.testing.allocator;
-    const result = try ZapString.concat(alloc, "hello", " world");
+    const result = try String.concat(alloc, "hello", " world");
     defer alloc.free(result);
     try std.testing.expectEqualStrings("hello world", result);
 }

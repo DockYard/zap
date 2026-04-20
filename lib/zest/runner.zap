@@ -2,7 +2,7 @@ pub module Zest.Runner {
   @moduledoc = """
     Finalizes test execution and prints the summary report.
 
-    Delegates to `:zig.TestTracker.summary()` which prints an
+    Delegates to `:zig.Zest.summary()` which prints an
     ExUnit-style summary with test count, assertion count, and
     failure count, then exits with a non-zero code if any tests
     failed.
@@ -59,7 +59,7 @@ pub module Zest.Runner {
     failure code if any tests failed.
 
     Call this as the last line of the test runner's `main`
-    function. It invokes `:zig.TestTracker.summary()` which
+    function. It invokes `:zig.Zest.summary()` which
     outputs the final report to stdout, including the seed
     used for test ordering.
 
@@ -73,7 +73,7 @@ pub module Zest.Runner {
     """
 
   pub fn run() -> String {
-    :zig.TestTracker.summary()
+    :zig.Zest.summary()
     "done"
   }
 
@@ -88,7 +88,7 @@ pub module Zest.Runner {
     } else {
       if System.arg_at(index) == "--seed" {
         if index + 1 < count {
-          :zig.TestTracker.set_seed(Integer.parse(System.arg_at(index + 1)))
+          :zig.Zest.set_seed(Integer.parse(System.arg_at(index + 1)))
           parse_cli_args(index + 2, count)
         } else {
           :ok
@@ -96,7 +96,7 @@ pub module Zest.Runner {
       } else {
         if System.arg_at(index) == "--timeout" {
           if index + 1 < count {
-            :zig.TestTracker.set_timeout(Integer.parse(System.arg_at(index + 1)))
+            :zig.Zest.set_timeout(Integer.parse(System.arg_at(index + 1)))
             parse_cli_args(index + 2, count)
           } else {
             :ok
