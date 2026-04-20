@@ -112,14 +112,9 @@ pub const MacroEngine = struct {
         var changed = false;
         var new_items: std.ArrayList(ast.ModuleItem) = .empty;
 
-        // Find the module's scope for registering generated declarations.
-        // Also set current_module_scope so expression-level macros can register too.
-        const mod_scope: ?scope.ScopeId = blk: {
-            for (self.graph.modules.items) |entry| {
-                if (entry.decl == mod) break :blk entry.scope_id;
-            }
-            break :blk null;
-        };
+        // Find the module's scope by name (not pointer) so it works across
+        // expansion iterations where the ModuleDecl is a copy.
+        const mod_scope: ?scope.ScopeId = self.graph.findModuleScope(mod.name);
         self.current_module_scope = mod_scope;
         defer self.current_module_scope = null;
 
@@ -1532,21 +1527,15 @@ pub const MacroEngine = struct {
     /// Find a macro by walking the scope chain from the current module scope.
     /// Checks local macros first (module-local shadows Kernel), then imports
     /// (finds Kernel macros via auto-import), then parent scopes.
+    /// Find a macro by walking the scope chain from the current module scope.
+    /// Checks local macros first (module-local shadows Kernel), then imports
+    /// (finds Kernel macros via auto-import), then parent scopes.
+    /// Find a macro by walking the scope chain from the current module scope.
+    /// Checks local macros first (module-local shadows Kernel), then imports
+    /// (finds Kernel macros via auto-import), then parent scopes.
     fn findMacro(self: *MacroEngine, name: ast.StringId, arity: u32) ?scope.MacroFamilyId {
         const scope_id = self.current_module_scope orelse self.graph.prelude_scope;
-        const result = self.graph.resolveMacro(scope_id, name, arity);
-        if (result == null) {
-            // Fallback: global scan for backward compatibility during transition
-            for (self.graph.scopes.items, 0..) |_, scope_idx| {
-                const sid: scope.ScopeId = @intCast(scope_idx);
-                const key = scope.FamilyKey{ .name = name, .arity = arity };
-                const s = self.graph.getScope(sid);
-                if (s.macros.get(key)) |mid| {
-                    return mid;
-                }
-            }
-        }
-        return result;
+        return self.graph.resolveMacro(scope_id, name, arity);
     }
 
     // ============================================================

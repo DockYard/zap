@@ -441,7 +441,6 @@ pub const ScopeGraph = struct {
             if (s.macros.get(key)) |mid| {
                 return mid;
             }
-            // Check imported module scopes for macros
             for (s.imports.items) |imp| {
                 if (self.findModuleScope(imp.source_module)) |mod_scope_id| {
                     const mod_scope = self.getScope(mod_scope_id);
@@ -458,9 +457,10 @@ pub const ScopeGraph = struct {
     /// Find a module's scope by its name.
     pub fn findModuleScope(self: *const ScopeGraph, module_name: ast.ModuleName) ?ScopeId {
         for (self.modules.items) |mod_entry| {
-            if (mod_entry.decl.name.parts.len == module_name.parts.len) {
+            // Use stored name (not decl.name) for consistency after remapping
+            if (mod_entry.name.parts.len == module_name.parts.len) {
                 var match = true;
-                for (mod_entry.decl.name.parts, module_name.parts) |a, b| {
+                for (mod_entry.name.parts, module_name.parts) |a, b| {
                     if (a != b) {
                         match = false;
                         break;
