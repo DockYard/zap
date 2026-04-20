@@ -232,7 +232,7 @@ pub fn exprToCtValue(
             return makeTuple3(alloc, store, .{ .atom = "%{}" }, try metaToList(alloc, store, v.meta, null), args);
         },
 
-        // Struct: {:%, meta, [name, {:%{}, [], [fields...]}]}
+        // Struct: {:%, meta, [name, {:%{}, [], [fields...]}, update_source_or_nil]}
         .struct_expr => |v| {
             var field_vals : std.ArrayListUnmanaged(CtValue) = .empty;
             for (v.fields) |field| {
@@ -247,7 +247,11 @@ pub fn exprToCtValue(
                 try name_parts.append(alloc, CtValue{ .atom = interner.get(part) });
             }
             const name_val = try makeListFromSlice(alloc, store, name_parts.items);
-            const args = try makeList(alloc, store, &.{ name_val, map_node });
+            const update_val: CtValue = if (v.update_source) |source|
+                try exprToCtValue(alloc, interner, store, source)
+            else
+                .nil;
+            const args = try makeList(alloc, store, &.{ name_val, map_node, update_val });
             return makeTuple3(alloc, store, .{ .atom = "%" }, try metaToList(alloc, store, v.meta, null), args);
         },
 
@@ -895,9 +899,9 @@ pub fn ctValueToExpr(
         return expr;
     }
 
-    // Struct expression: {:%, meta, [name_list, {:%{}, [], [field_pairs...]}]}
+    // Struct expression: {:%, meta, [name_list, {:%{}, [], [field_pairs...]}, update_or_nil]}
     if (std.mem.eql(u8, form_name, "%")) {
-        if (arg_elems.len == 2) {
+        if (arg_elems.len >= 2) {
             // arg_elems[0] = module name parts (list of atoms)
             // arg_elems[1] = {:%{}, [], [field_pairs...]} (map node with fields)
             var name_parts: std.ArrayListUnmanaged(ast.StringId) = .empty;
@@ -930,11 +934,17 @@ pub fn ctValueToExpr(
                 }
             }
 
+            // Restore update_source if present (3rd arg, non-nil)
+            const update_source: ?*const ast.Expr = if (arg_elems.len >= 3 and arg_elems[2] != .nil)
+                try ctValueToExpr(alloc, interner, arg_elems[2])
+            else
+                null;
+
             const expr = try alloc.create(ast.Expr);
             expr.* = .{ .struct_expr = .{
                 .meta = node_meta,
                 .module_name = .{ .parts = try name_parts.toOwnedSlice(alloc), .span = node_meta.span },
-                .update_source = null,
+                .update_source = update_source,
                 .fields = try fields.toOwnedSlice(alloc),
             } };
             return expr;

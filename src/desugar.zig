@@ -405,11 +405,13 @@ pub const Desugarer = struct {
             });
         };
 
-        // Build a complete field list: for each struct field, either use the
-        // override value or generate a field_access on the source.
+        // Build a complete field list including inherited fields.
+        // For each field, either use the override value or generate
+        // a field_access on the source.
         var all_fields: std.ArrayList(ast.StructField) = .empty;
+        const all_def_fields = self.collectAllStructFields(struct_decl);
 
-        for (struct_decl.fields) |def_field| {
+        for (all_def_fields) |def_field| {
             // Check if this field is overridden
             var override_value: ?*const ast.Expr = null;
             for (override_fields) |of| {
@@ -452,36 +454,52 @@ pub const Desugarer = struct {
 
     /// Find a struct declaration by module name from the scope graph.
     fn findStructDecl(self: *const Desugarer, module_name: ast.ModuleName) ?*const ast.StructDecl {
-        const graph = self.graph orelse {
-            return null;
-        };
+        const graph = self.graph orelse return null;
         if (module_name.parts.len == 0) return null;
-
-        // The struct name is the last part of the module name
         const struct_name_id = module_name.parts[module_name.parts.len - 1];
 
-        // Look up in scope graph's type entries
         if (graph.resolveTypeByName(struct_name_id)) |type_id| {
             if (type_id < graph.types.items.len) {
                 const entry = graph.types.items[type_id];
-                if (entry.kind == .struct_type) {
-                    return entry.kind.struct_type;
-                }
+                if (entry.kind == .struct_type) return entry.kind.struct_type;
             }
         }
 
-        // Fallback: search all types by name string comparison
         const name_str = self.interner.get(struct_name_id);
         for (graph.types.items) |entry| {
             if (entry.kind == .struct_type) {
-                const entry_name = self.interner.get(entry.name);
-                if (std.mem.eql(u8, entry_name, name_str)) {
+                if (std.mem.eql(u8, self.interner.get(entry.name), name_str))
                     return entry.kind.struct_type;
+            }
+        }
+        return null;
+    }
+
+    /// Collect ALL fields for a struct, including inherited fields from
+    /// the extends chain. Returns fields in order: parent fields first,
+    /// then own fields (matching the TypeStore's field ordering).
+    fn collectAllStructFields(self: *const Desugarer, decl: *const ast.StructDecl) []const ast.StructFieldDecl {
+        const graph = self.graph orelse return decl.fields;
+
+        if (decl.parent) |parent_name_id| {
+            // Find parent struct
+            if (graph.resolveTypeByName(parent_name_id)) |parent_type_id| {
+                if (parent_type_id < graph.types.items.len) {
+                    const parent_entry = graph.types.items[parent_type_id];
+                    if (parent_entry.kind == .struct_type) {
+                        const parent_decl = parent_entry.kind.struct_type;
+                        const parent_fields = self.collectAllStructFields(parent_decl);
+                        // Merge: parent fields + own fields
+                        var all_fields: std.ArrayListUnmanaged(ast.StructFieldDecl) = .empty;
+                        all_fields.appendSlice(self.allocator, parent_fields) catch return decl.fields;
+                        all_fields.appendSlice(self.allocator, decl.fields) catch return decl.fields;
+                        return all_fields.toOwnedSlice(self.allocator) catch decl.fields;
+                    }
                 }
             }
         }
 
-        return null;
+        return decl.fields;
     }
 
     // Pipe desugaring removed — now handled in macro engine (Phase 4).

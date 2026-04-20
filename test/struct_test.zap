@@ -9,6 +9,15 @@ pub struct Config {
   enabled :: Bool = true
 }
 
+pub struct Shape {
+  sides :: i64
+}
+
+pub struct Rectangle extends Shape {
+  width :: i64
+  height :: i64
+}
+
 
 
 
@@ -141,6 +150,38 @@ pub module Test.StructTest {
 
   fn update_both(point :: Point, new_x :: i64, new_y :: i64) -> Point {
     %Point{point | x: new_x, y: new_y}
+  }
+
+  describe("Struct inheritance") {
+    test("child struct has parent fields") {
+      rect = make_rectangle(4, 10, 5)
+      assert(rect.sides == 4)
+      assert(rect.width == 10)
+      assert(rect.height == 5)
+    }
+
+    test("child struct update via function") {
+      rect = make_rectangle(4, 10, 5)
+      wider = widen_rectangle(rect, 20)
+      assert(wider.sides == 4)
+      assert(wider.width == 20)
+      assert(wider.height == 5)
+    }
+
+    test("child struct update inline in test") {
+      rect = make_rectangle(4, 10, 5)
+      wider = %Rectangle{rect | width: 20}
+      assert(wider.width == 20)
+      assert(wider.sides == 4)
+    }
+  }
+
+  fn widen_rectangle(rect :: Rectangle, new_width :: i64) -> Rectangle {
+    %Rectangle{rect | width: new_width}
+  }
+
+  fn make_rectangle(num_sides :: i64, rect_width :: i64, rect_height :: i64) -> Rectangle {
+    %Rectangle{sides: num_sides, width: rect_width, height: rect_height}
   }
 
   fn get_x_from_inline() -> i64 {
