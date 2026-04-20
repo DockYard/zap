@@ -146,9 +146,8 @@ pub module Enum {
     """
 
   pub fn sum(list :: [i64]) -> i64 {
-    :zig.ListCell.sum(list)
+    Enum.reduce(list, 0, fn(accumulator :: i64, element :: i64) -> i64 { accumulator + element })
   }
-
 
   @doc = """
     Returns the product of all elements.
@@ -161,7 +160,7 @@ pub module Enum {
     """
 
   pub fn product(list :: [i64]) -> i64 {
-    :zig.ListCell.product(list)
+    Enum.reduce(list, 1, fn(accumulator :: i64, element :: i64) -> i64 { accumulator * element })
   }
 
   @doc = """
