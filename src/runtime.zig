@@ -2056,6 +2056,18 @@ pub const ListCell = struct {
         return reverse(result);
     }
 
+    /// Simple reduce: folds a list with a (acc, element) -> acc callback.
+    /// Takes a bare callback (no halt/cont) and returns the final accumulator.
+    pub fn enumReduceSimple(list: ?*const ListCell, initial: i64, callback: anytype) i64 {
+        var current = list;
+        var acc: i64 = initial;
+        while (current) |cell| {
+            acc = callback(acc, cell.head);
+            current = cell.tail;
+        }
+        return acc;
+    }
+
     pub fn reduceFn(list: ?*const ListCell, initial: i64, callback: anytype) i64 {
         var current = list;
         var acc = initial;
@@ -2072,23 +2084,21 @@ pub const ListCell = struct {
     ///   field 1: the accumulator value
     /// Returns a tuple struct with the final {atom, acc}.
     pub fn reduceHaltCont(list: ?*const ListCell, initial: anytype, callback: anytype) @TypeOf(callback(initial, @as(i64, 0))) {
+        const ResultType = @TypeOf(callback(initial, @as(i64, 0)));
+        const AccType = @TypeOf(@field(@as(ResultType, undefined), "1"));
         const ATOM_HALT: u64 = 6;
+        const ATOM_CONT: u64 = 5;
         var current = list;
-        var acc = initial;
+        var acc: AccType = initial;
         while (current) |cell| {
             const result = callback(acc, cell.head);
-            // Check if the first field (atom) is :halt
             if (result.@"0" == ATOM_HALT) {
                 return result;
             }
-            // :cont — extract new accumulator and continue
             acc = result.@"1";
             current = cell.tail;
         }
-        // Exhausted the list — return {:done, final_acc}
-        // Use :cont atom (5) to signal normal completion
-        const ATOM_CONT: u64 = 5;
-        var done_result: @TypeOf(callback(initial, @as(i64, 0))) = undefined;
+        var done_result: ResultType = undefined;
         done_result.@"0" = ATOM_CONT;
         done_result.@"1" = acc;
         return done_result;

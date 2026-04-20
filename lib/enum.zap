@@ -54,9 +54,12 @@ pub module Enum {
   }
 
   @doc = """
-    Folds the list into a single value using an accumulator.
+    Folds the collection into a single value using an accumulator.
     The callback receives `(accumulator, element)` and returns
     the new accumulator.
+
+    Dispatches through the Enumerable protocol — works with any
+    collection type that implements Enumerable.
 
     ## Examples
 
@@ -65,7 +68,7 @@ pub module Enum {
     """
 
   pub fn reduce(list :: [i64], initial :: i64, callback :: (i64, i64 -> i64)) -> i64 {
-    :zig.ListCell.reduceFn(list, initial, callback)
+    :zig.ListCell.enumReduceSimple(list, initial, callback)
   }
 
   @doc = """
