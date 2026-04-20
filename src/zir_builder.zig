@@ -1271,9 +1271,13 @@ pub const ZirDriver = struct {
                     self.current_ret_type = 1;
                     self.cached_union_ret_type_ref = zir_builder_get_union_ret_type_ref(self.handle);
                 } else {
-                    // Non-union struct_ref: emit as imported type from the
-                    // module where the struct is defined.
-                    if (zir_builder_set_imported_return_type(self.handle, "zap_runtime", 11, name.ptr, @intCast(name.len)) != 0)
+                    // Custom struct: Zap structs are anonymous Zig structs
+                    // (created via struct_init_anon), so there is no named type
+                    // to reference in ZIR. Zig infers the return type from the
+                    // body's struct construction. When Zap moves to nominal
+                    // struct types (via struct_decl), this should emit a proper
+                    // struct type declaration instead.
+                    if (zir_builder_set_generic_return_type(self.handle) != 0)
                         return error.EmitFailed;
                     self.current_ret_type = 1;
                 }
@@ -1283,14 +1287,19 @@ pub const ZirDriver = struct {
                 // which is called separately for __try variants. If we reach
                 // here, the inner type wasn't a primitive — this needs the
                 // optional wrapper on top of the resolved inner type.
-                if (zir_builder_set_imported_return_type(self.handle, "zap_runtime", 11, "OptionalType", 12) != 0)
+                if (zir_builder_set_optional_return_type(self.handle) != 0)
+                    return error.EmitFailed;
+                self.current_ret_type = 1;
+            },
+            .function, .tagged_union, .ptr, .any => {
+                // These types are structural and created anonymously in the
+                // body. Zig infers the return type from the body construction.
+                if (zir_builder_set_generic_return_type(self.handle) != 0)
                     return error.EmitFailed;
                 self.current_ret_type = 1;
             },
             // Primitives are handled by mapReturnType — they never reach here.
             // void/nil have ret_type=0 intentionally — they never reach here.
-            // The remaining variants must be handled explicitly as Zap gains
-            // support for them as return types.
             .void, .nil, .bool_type,
             .i8, .i16, .i32, .i64,
             .u8, .u16, .u32, .u64,
@@ -1298,13 +1307,6 @@ pub const ZirDriver = struct {
             .f16, .f32, .f64,
             .string, .atom,
             => unreachable, // handled by mapReturnType
-
-            .function, .tagged_union, .ptr, .any => {
-                // These types don't have runtime representations yet.
-                // When Zap adds support for returning them, add the
-                // correct ZIR emission here.
-                return error.EmitFailed;
-            },
         }
     }
 
