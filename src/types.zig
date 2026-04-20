@@ -3600,6 +3600,19 @@ pub const TypeChecker = struct {
                     }
                 }
 
+                // Check if this is a module name — modules can be used as
+                // types in impl declarations and type annotations. Any
+                // module name is accepted as a valid type reference. The
+                // monomorphizer resolves the concrete type at specialization.
+                for (self.graph.modules.items) |mod| {
+                    if (mod.name.parts.len > 0) {
+                        const mod_name = self.interner.get(mod.name.parts[mod.name.parts.len - 1]);
+                        if (std.mem.eql(u8, name, mod_name)) {
+                            return TypeStore.UNKNOWN;
+                        }
+                    }
+                }
+
                 // Check if this is a protocol name
                 for (self.graph.protocols.items) |proto| {
                     if (proto.name.parts.len > 0 and proto.name.parts[proto.name.parts.len - 1] == tn.name) {

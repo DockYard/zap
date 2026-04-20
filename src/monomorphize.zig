@@ -244,6 +244,13 @@ const MonomorphContext = struct {
 
     /// Infer the target module name from a concrete type.
     /// list(T) → "List", map(K,V) → "Map", struct → struct name
+    /// Map a concrete type to the module name that implements protocols
+    /// for that type. Every type variant must have an explicit mapping —
+    /// no silent fallthrough to null.
+    /// Map a concrete type to the module name that implements protocols
+    /// for that type. Uses the type system's variant names to derive
+    /// the implementing module. New types (structs, unions) use their
+    /// declared name directly.
     fn inferTargetModuleName(self: *const MonomorphContext, type_id: TypeId) ?[]const u8 {
         if (type_id >= self.store.types.items.len) return null;
         const typ = self.store.types.items[type_id];
@@ -251,7 +258,20 @@ const MonomorphContext = struct {
             .list => "List",
             .map => "Map",
             .struct_type => |s| self.interner.get(s.name),
-            else => null,
+            .tagged_union => |tu| self.interner.get(tu.name),
+            .union_type => null, // anonymous unions don't have module names
+            .string_type => "String",
+            .int => "Integer",
+            .float => "Float",
+            .bool_type => "Bool",
+            .atom_type => "Atom",
+            .tuple => "Tuple",
+            .function => "Function",
+            .nil_type => null,
+            .never => null,
+            .type_var, .applied, .opaque_type, .protocol_constraint,
+            .unknown, .error_type,
+            => null,
         };
     }
 
