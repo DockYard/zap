@@ -1930,17 +1930,6 @@ pub const Parser = struct {
             });
         }
 
-        if (self.check(.bang)) {
-            const end = self.currentSpan();
-            _ = self.advance();
-            expr = try self.create(ast.Expr, .{
-                .unwrap = .{
-                    .meta = .{ .span = ast.SourceSpan.merge(expr.getMeta().span, end) },
-                    .expr = expr,
-                },
-            });
-        }
-
         return expr;
     }
 
@@ -4426,26 +4415,6 @@ test "parse panic expression" {
     const func = program.modules[0].items[0].function;
     const body = func.clauses[0].body.?;
     try std.testing.expect(body[0].expr.* == .panic_expr);
-}
-
-test "parse unwrap operator" {
-    const source =
-        \\pub module Test {
-        \\  pub fn foo(x) {
-        \\    bar(x)!
-        \\  }
-        \\}
-    ;
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
-    defer parser.deinit();
-
-    const program = try parser.parseProgram();
-    const func = program.modules[0].items[0].function;
-    const body = func.clauses[0].body.?;
-    try std.testing.expect(body[0].expr.* == .unwrap);
 }
 
 test "parse local function" {

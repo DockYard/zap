@@ -786,6 +786,13 @@ pub fn panic(message: []const u8) noreturn {
     std.process.exit(1);
 }
 
+pub const Kernel = struct {
+    pub fn raise(message: []const u8) noreturn {
+        std.debug.print("** (RuntimeError) {s}\n", .{message});
+        std.process.exit(1);
+    }
+};
+
 pub const Prelude = struct {
     pub fn println(value: anytype) void {
                 const T = @TypeOf(value);

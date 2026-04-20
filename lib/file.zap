@@ -51,4 +51,21 @@ pub module File {
   pub fn exists?(path :: String) -> Bool {
     :zig.File.file_exists(path)
   }
+
+  @doc = """
+    Reads the entire contents of a file. Raises if the file cannot be read.
+
+    ## Examples
+
+        File.read!("hello.txt")  # => "Hello, world!"
+        File.read!("missing.txt")  # raises RuntimeError
+    """
+
+  pub fn read!(path :: String) -> String {
+    result = File.read(path)
+    case result {
+      "" -> raise("File.read! failed: could not read " <> path)
+      contents -> contents
+    }
+  }
 }

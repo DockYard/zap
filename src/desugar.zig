@@ -160,13 +160,6 @@ pub const Desugarer = struct {
             },
 
             // Unwrap: expr! → optional force-unwrap (panics if nil)
-            .unwrap => |ue| {
-                const inner = try self.desugarExpr(ue.expr);
-                return try self.create(ast.Expr, .{
-                    .unwrap = .{ .meta = ue.meta, .expr = inner },
-                });
-            },
-
             // String interpolation: "hello #{name}" → "hello " <> to_string(name)
             .string_interpolation => |si| {
                 return self.desugarStringInterpolation(&si);
@@ -1194,35 +1187,6 @@ test "pipe is desugared during macro expansion, not desugar" {
     const body = func.clauses[0].body.?;
     try std.testing.expectEqual(@as(usize, 1), body.len);
     try std.testing.expect(body[0].expr.* == .pipe);
-}
-
-test "desugar unwrap operator" {
-    const source =
-        \\pub module Test {
-        \\  pub fn foo(x) {
-        \\    bar(x)!
-        \\  }
-        \\}
-    ;
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    var parser = Parser.init(alloc, source);
-    defer parser.deinit();
-    const program = try parser.parseProgram();
-
-    var desugarer = Desugarer.init(alloc, parser.interner, null);
-    const desugared = try desugarer.desugarProgram(&program);
-
-    // Function body should now have an unwrap expression (passed through)
-    const func = desugared.modules[0].items[0].function;
-    const body = func.clauses[0].body.?;
-    try std.testing.expectEqual(@as(usize, 1), body.len);
-    try std.testing.expect(body[0].expr.* == .unwrap);
-    // Inner expression should be the call
-    try std.testing.expect(body[0].expr.unwrap.expr.* == .call);
 }
 
 test "desugar no-op on simple expressions" {

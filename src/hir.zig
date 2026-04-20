@@ -2497,6 +2497,50 @@ pub const HirBuilder = struct {
 
         const captures = try self.current_capture_list.toOwnedSlice(self.allocator);
         try self.group_captures.put(group_id, captures);
+
+        // Validate function naming conventions:
+        // - Functions ending with ? must return Bool
+        // - Functions ending with ! must call raise() or another ! function
+        const func_name = self.interner.get(func.name);
+        if (func_name.len > 0) {
+            const last_char = func_name[func_name.len - 1];
+            if (last_char == '?') {
+                // ? functions must return Bool
+                for (clauses.items) |clause| {
+                    if (clause.return_type != types_mod.TypeStore.BOOL and
+                        clause.return_type != types_mod.TypeStore.UNKNOWN and
+                        clause.return_type != types_mod.TypeStore.ERROR)
+                    {
+                        try self.errors.append(self.allocator, .{
+                            .message = try std.fmt.allocPrint(self.allocator,
+                                "function '{s}' ends with '?' but does not return Bool — ? functions must always return Bool",
+                                .{func_name}),
+                            .span = func.clauses[0].meta.span,
+                        });
+                        break;
+                    }
+                }
+            }
+            if (last_char == '!') {
+                // ! functions must call raise() or another ! function
+                var has_raise = false;
+                for (clauses.items) |clause| {
+                    if (self.bodyContainsRaise(clause.body)) {
+                        has_raise = true;
+                        break;
+                    }
+                }
+                if (!has_raise) {
+                    try self.errors.append(self.allocator, .{
+                        .message = try std.fmt.allocPrint(self.allocator,
+                            "function '{s}' ends with '!' but does not raise — ! functions must call raise() or another ! function",
+                            .{func_name}),
+                        .span = func.clauses[0].meta.span,
+                    });
+                }
+            }
+        }
+
         self.current_capture_map.deinit();
         self.current_capture_list = saved_capture_list;
         self.current_capture_map = saved_capture_map;
@@ -2522,6 +2566,63 @@ pub const HirBuilder = struct {
             .captures = captures,
             .clauses = try clauses.toOwnedSlice(self.allocator),
             .fallback_parent = fallback_parent,
+        };
+    }
+
+    /// Check if a HIR block contains a call to raise() or a ! function.
+    fn bodyContainsRaise(self: *const HirBuilder, block: *const Block) bool {
+        for (block.stmts) |stmt| {
+            if (self.exprContainsRaise(stmt.expr)) return true;
+        }
+        return false;
+    }
+
+    fn exprContainsRaise(self: *const HirBuilder, expr: *const Expr) bool {
+        return switch (expr.kind) {
+            .call => |call| {
+                // Check if this call targets raise() or a ! function
+                switch (call.target) {
+                    .named => |named| {
+                        if (std.mem.eql(u8, named.name, "raise")) return true;
+                        if (named.name.len > 0 and named.name[named.name.len - 1] == '!') return true;
+                    },
+                    .direct => |direct| {
+                        // Check if the direct target's name ends with !
+                        for (self.graph.families.items) |family| {
+                            if (family.id == direct.function_group_id) {
+                                const fname = self.interner.get(family.name);
+                                if (std.mem.eql(u8, fname, "raise")) return true;
+                                if (fname.len > 0 and fname[fname.len - 1] == '!') return true;
+                                break;
+                            }
+                        }
+                    },
+                    else => {},
+                }
+                // Also check args recursively
+                for (call.args) |arg| {
+                    if (self.exprContainsRaise(arg.expr)) return true;
+                }
+                return false;
+            },
+            .case => |ce| {
+                for (ce.arms) |arm| {
+                    if (self.bodyContainsRaise(arm.body)) return true;
+                }
+                return false;
+            },
+            .binary => |bo| {
+                return self.exprContainsRaise(bo.lhs) or self.exprContainsRaise(bo.rhs);
+            },
+            .block => |blk| {
+                return self.bodyContainsRaise(&blk);
+            },
+            .branch => |br| {
+                if (self.bodyContainsRaise(br.then_block)) return true;
+                if (br.else_block) |eb| return self.bodyContainsRaise(eb);
+                return false;
+            },
+            else => false,
         };
     }
 

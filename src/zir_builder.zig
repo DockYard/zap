@@ -571,6 +571,7 @@ pub const ZirDriver = struct {
         if (std.mem.eql(u8, mod_name, "Map")) return "Map";
         if (std.mem.eql(u8, mod_name, "String")) return "String";
         if (std.mem.eql(u8, mod_name, "Zest")) return "Zest";
+        if (std.mem.eql(u8, mod_name, "Kernel")) return "Kernel";
         // Domain modules route to Prelude (all functions live there)
         if (std.mem.eql(u8, mod_name, "IO")) return "Prelude";
         if (std.mem.eql(u8, mod_name, "Integer")) return "Prelude";

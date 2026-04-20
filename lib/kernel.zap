@@ -240,4 +240,24 @@ pub module Kernel {
     tuple(_name, _meta, _new_args)
   }
 
+  @doc = """
+    Raises a runtime error with the given message.
+
+    This terminates the program immediately. Use in `!` functions
+    to signal unrecoverable errors.
+
+    ## Examples
+
+        raise("something went wrong")
+
+        case File.read(path) {
+          {:ok, contents} -> contents
+          {:error, reason} -> raise("File.read! failed: " <> reason)
+        }
+    """
+
+  pub fn raise(message :: String) -> String {
+    :zig.Kernel.raise(message)
+  }
+
 }

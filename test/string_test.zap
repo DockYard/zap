@@ -27,31 +27,31 @@ pub module Test.StringTest {
     }
 
     test("contains finds substring") {
-      assert(String.contains("hello world", "world"))
+      assert(String.contains?("hello world", "world"))
     }
 
     test("contains misses substring") {
-      reject(String.contains("hello world", "xyz"))
+      reject(String.contains?("hello world", "xyz"))
     }
 
     test("contains empty needle") {
-      assert(String.contains("hello", ""))
+      assert(String.contains?("hello", ""))
     }
 
     test("starts_with match") {
-      assert(String.starts_with("hello", "hel"))
+      assert(String.starts_with?("hello", "hel"))
     }
 
     test("starts_with mismatch") {
-      reject(String.starts_with("hello", "world"))
+      reject(String.starts_with?("hello", "world"))
     }
 
     test("ends_with match") {
-      assert(String.ends_with("hello", "llo"))
+      assert(String.ends_with?("hello", "llo"))
     }
 
     test("ends_with mismatch") {
-      reject(String.ends_with("hello", "world"))
+      reject(String.ends_with?("hello", "world"))
     }
 
     test("trim whitespace") {

@@ -9,7 +9,7 @@ pub module String {
     ## Examples
 
         String.length("hello")              # => 5
-        String.contains("hello world", "o") # => true
+        String.contains?("hello world", "o") # => true
         String.slice("hello", 0, 3)         # => "hel"
     """
 
@@ -51,12 +51,12 @@ pub module String {
 
     ## Examples
 
-        String.contains("hello world", "world")  # => true
-        String.contains("hello world", "xyz")    # => false
-        String.contains("hello", "")             # => true
+        String.contains?("hello world", "world")  # => true
+        String.contains?("hello world", "xyz")    # => false
+        String.contains?("hello", "")             # => true
     """
 
-  pub fn contains(haystack :: String, needle :: String) -> Bool {
+  pub fn contains?(haystack :: String, needle :: String) -> Bool {
     :zig.String.contains(haystack, needle)
   }
 
@@ -65,11 +65,11 @@ pub module String {
 
     ## Examples
 
-        String.starts_with("hello", "hel")   # => true
-        String.starts_with("hello", "world") # => false
+        String.starts_with?("hello", "hel")   # => true
+        String.starts_with?("hello", "world") # => false
     """
 
-  pub fn starts_with(s :: String, prefix :: String) -> Bool {
+  pub fn starts_with?(s :: String, prefix :: String) -> Bool {
     :zig.String.startsWith(s, prefix)
   }
 
@@ -78,11 +78,11 @@ pub module String {
 
     ## Examples
 
-        String.ends_with("hello", "llo")    # => true
-        String.ends_with("hello", "world")  # => false
+        String.ends_with?("hello", "llo")    # => true
+        String.ends_with?("hello", "world")  # => false
     """
 
-  pub fn ends_with(s :: String, suffix :: String) -> Bool {
+  pub fn ends_with?(s :: String, suffix :: String) -> Bool {
     :zig.String.endsWith(s, suffix)
   }
 
