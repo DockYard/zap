@@ -2779,6 +2779,79 @@ pub const MapCell = struct {
         }
         return result;
     }
+
+    /// Simple reduce: folds map entries with a (acc, key, value) -> acc callback.
+    /// Iterates all entries and applies the callback with the accumulator.
+    pub fn enumReduceSimple(map: ?*const MapCell, initial: i64, callback: anytype) i64 {
+        if (map == null) return initial;
+        const m = map.?;
+        var acc: i64 = initial;
+
+        if (m.repr_tag == 0) {
+            // Flat representation
+            for (0..m.flat_count) |i| {
+                acc = callback(acc, @as(i64, @intCast(m.flat_entries[i].key)), m.flat_entries[i].value);
+            }
+        } else if (m.trie_root) |root| {
+            // Trie: collect entries then iterate
+            var collected: std.ArrayListUnmanaged(MapEntry) = .empty;
+            hamtCollect(root, &collected);
+            for (collected.items) |entry| {
+                acc = callback(acc, @as(i64, @intCast(entry.key)), entry.value);
+            }
+        }
+        return acc;
+    }
+
+    /// Reduce with halt/cont control flow for the Enumerable protocol.
+    /// The callback takes (accumulator, value) and returns a tuple where
+    /// field "0" is :cont(5) or :halt(6), field "1" is the new accumulator.
+    pub fn reduceHaltCont(map: ?*const MapCell, initial: anytype, callback: anytype) struct { u64, i64 } {
+        const ResultType = struct { u64, i64 };
+        const ATOM_HALT: u64 = 6;
+        const ATOM_CONT: u64 = 5;
+        if (map == null) return ResultType{ ATOM_CONT, initial };
+        const m = map.?;
+        var acc: i64 = initial;
+
+        if (m.repr_tag == 0) {
+            for (0..m.flat_count) |i| {
+                const result = callback(acc, m.flat_entries[i].value);
+                if (result.@"0" == ATOM_HALT) return ResultType{ result.@"0", result.@"1" };
+                acc = result.@"1";
+            }
+        } else if (m.trie_root) |root| {
+            var collected: std.ArrayListUnmanaged(MapEntry) = .empty;
+            hamtCollect(root, &collected);
+            for (collected.items) |entry| {
+                const result = callback(acc, entry.value);
+                if (result.@"0" == ATOM_HALT) return ResultType{ result.@"0", result.@"1" };
+                acc = result.@"1";
+            }
+        }
+        return ResultType{ ATOM_CONT, acc };
+    }
+
+    /// Reduce for Enumerable: folds map values with a (acc, value) -> acc callback.
+    /// Only passes the value (not the key) to match the Enumerable protocol.
+    pub fn enumReduceValues(map: ?*const MapCell, initial: i64, callback: anytype) i64 {
+        if (map == null) return initial;
+        const m = map.?;
+        var acc: i64 = initial;
+
+        if (m.repr_tag == 0) {
+            for (0..m.flat_count) |i| {
+                acc = callback(acc, m.flat_entries[i].value);
+            }
+        } else if (m.trie_root) |root| {
+            var collected: std.ArrayListUnmanaged(MapEntry) = .empty;
+            hamtCollect(root, &collected);
+            for (collected.items) |entry| {
+                acc = callback(acc, entry.value);
+            }
+        }
+        return acc;
+    }
 };
 
 // ============================================================

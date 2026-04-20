@@ -6,6 +6,17 @@ pub struct Point {
 pub module Test.ProtocolTest {
   use Zest.Case
 
+  describe("Map enumeration") {
+    test("sum map values via reduce") {
+      total = sum_map_values(%{a: 10, b: 20, c: 30})
+      assert(total == 60)
+    }
+  }
+
+  fn sum_map_values(map :: %{Atom => i64}) -> i64 {
+    Enum.reduce_map(map, 0, fn(accumulator :: i64, value :: i64) -> i64 { accumulator + value })
+  }
+
   describe("Protocol dispatch via Enum") {
     test("Enum.each iterates list for side effects") {
       Enum.each([1, 2, 3], fn(x :: i64) -> i64 { x * 2 })

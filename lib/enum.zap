@@ -72,6 +72,21 @@ pub module Enum {
   }
 
   @doc = """
+    Folds map values into a single value using an accumulator.
+    The callback receives `(accumulator, value)` and returns
+    the new accumulator.
+
+    ## Examples
+
+        Enum.reduce_map(%{a: 1, b: 2, c: 3}, 0, fn(acc, val) { acc + val })
+        # => 6
+    """
+
+  pub fn reduce_map(map :: %{Atom => i64}, initial :: i64, callback :: (i64, i64 -> i64)) -> i64 {
+    :zig.MapCell.enumReduceValues(map, initial, callback)
+  }
+
+  @doc = """
     Applies the callback to each element for side effects.
     Returns the original list unchanged.
 
