@@ -587,7 +587,25 @@ pub const ZirDriver = struct {
                 return ref;
             },
             .tuple => self.mapTupleElementType(zig_type),
-            else => @intFromEnum(Zir.Inst.Ref.none), // anytype — Zig infers
+            .struct_ref => |name| {
+                const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                if (rt_import == error_ref) return error.EmitFailed;
+                const ref = zir_builder_emit_field_val(self.handle, rt_import, name.ptr, @intCast(name.len));
+                if (ref == error_ref) return error.EmitFailed;
+                return ref;
+            },
+            // void/nil should not appear as tuple elements
+            .void, .nil => return error.EmitFailed,
+            // Types that don't have runtime representations as tuple elements yet
+            .function, .tagged_union, .ptr, .optional, .any => return error.EmitFailed,
+            // Primitives are handled above by mapReturnType — they never reach here
+            .bool_type,
+            .i8, .i16, .i32, .i64,
+            .u8, .u16, .u32, .u64,
+            .usize, .isize,
+            .f16, .f32, .f64,
+            .string, .atom,
+            => unreachable,
         };
     }
 
@@ -1188,10 +1206,11 @@ pub const ZirDriver = struct {
         return ref;
     }
 
-    /// Emit return type declaration for any type that mapReturnType cannot
-    /// handle as a well-known ZIR ref. This is the single dispatch point for
-    /// all complex return types. Adding a new type to Zap only requires
-    /// adding its case here — or it falls through to generic inference.
+    /// Emit the return type declaration for any type that mapReturnType
+    /// cannot handle as a well-known ZIR ref. Every ZigType variant must
+    /// have a code path here — the developer explicitly declared the return
+    /// type, so the compiler must emit it exactly. If a new type is added
+    /// to Zap without a case here, the build fails loudly.
     fn emitComplexReturnType(self: *ZirDriver, return_type: ir.ZigType) !void {
         switch (return_type) {
             .list => {
@@ -1252,19 +1271,39 @@ pub const ZirDriver = struct {
                     self.current_ret_type = 1;
                     self.cached_union_ret_type_ref = zir_builder_get_union_ret_type_ref(self.handle);
                 } else {
-                    // Non-union struct: fall through to generic inference
-                    if (zir_builder_set_generic_return_type(self.handle) != 0)
+                    // Non-union struct_ref: emit as imported type from the
+                    // module where the struct is defined.
+                    if (zir_builder_set_imported_return_type(self.handle, "zap_runtime", 11, name.ptr, @intCast(name.len)) != 0)
                         return error.EmitFailed;
                     self.current_ret_type = 1;
                 }
             },
-            else => {
-                // Universal fallback: let Zig infer the return type from the
-                // function body. This handles any type — including future types
-                // added to Zap — without requiring compiler changes.
-                if (zir_builder_set_generic_return_type(self.handle) != 0)
+            .optional => {
+                // Optional wrapping is handled by set_optional_return_type
+                // which is called separately for __try variants. If we reach
+                // here, the inner type wasn't a primitive — this needs the
+                // optional wrapper on top of the resolved inner type.
+                if (zir_builder_set_imported_return_type(self.handle, "zap_runtime", 11, "OptionalType", 12) != 0)
                     return error.EmitFailed;
                 self.current_ret_type = 1;
+            },
+            // Primitives are handled by mapReturnType — they never reach here.
+            // void/nil have ret_type=0 intentionally — they never reach here.
+            // The remaining variants must be handled explicitly as Zap gains
+            // support for them as return types.
+            .void, .nil, .bool_type,
+            .i8, .i16, .i32, .i64,
+            .u8, .u16, .u32, .u64,
+            .usize, .isize,
+            .f16, .f32, .f64,
+            .string, .atom,
+            => unreachable, // handled by mapReturnType
+
+            .function, .tagged_union, .ptr, .any => {
+                // These types don't have runtime representations yet.
+                // When Zap adds support for returning them, add the
+                // correct ZIR emission here.
+                return error.EmitFailed;
             },
         }
     }
