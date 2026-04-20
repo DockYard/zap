@@ -1225,16 +1225,23 @@ pub const ZirDriver = struct {
                 return error.EmitFailed;
         }
 
-        // Build the nested tuple type stack in DFS post-order (inner-first).
         self.tuple_init_count = 0;
         self.tuple_type_stack.clearRetainingCapacity();
+        // For tuple return types, declare the return type in the declaration
+        // body via set_tuple_return_type (emits tuple_decl + break_inline).
         if (func.return_type == .tuple) {
-            self.collectNestedTupleTypes(func.return_type);
-        }
-
-        // For tuple return types, mark as non-void so ret handler emits
-        // value returns. The actual tuple type is inferred from the body.
-        if (func.return_type == .tuple) {
+            var tuple_type_refs: std.ArrayListUnmanaged(u32) = .empty;
+            defer tuple_type_refs.deinit(self.allocator);
+            for (func.return_type.tuple) |elem_type| {
+                try tuple_type_refs.append(self.allocator, mapReturnType(elem_type));
+            }
+            if (zir_builder_set_tuple_return_type(
+                self.handle,
+                tuple_type_refs.items.ptr,
+                @intCast(tuple_type_refs.items.len),
+            ) != 0) {
+                return error.EmitFailed;
+            }
             self.current_ret_type = 1;
         }
 

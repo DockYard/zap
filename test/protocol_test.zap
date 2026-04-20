@@ -16,7 +16,41 @@ pub module Test.ProtocolTest {
     }
   }
 
+  describe("Tuple return types") {
+    test("function returns a tuple and passes to another function") {
+      result = extract_first(make_pair(5))
+      assert(result == 5)
+    }
+
+    test("function returns a tuple and passes second element") {
+      result = extract_second(make_pair(7))
+      assert(result == 1)
+    }
+
+    test("case matching on returned tuple") {
+      pair = make_pair(10)
+      value = extract_first(pair)
+      assert(value == 10)
+    }
+  }
+
   fn apply_fn(value :: i64, callback :: (i64 -> i64)) -> i64 {
     callback(value)
+  }
+
+  fn make_pair(input :: i64) -> {i64, i64} {
+    {input, 1}
+  }
+
+  fn extract_first(pair :: {i64, i64}) -> i64 {
+    case pair {
+      {first, _second} -> first
+    }
+  }
+
+  fn extract_second(pair :: {i64, i64}) -> i64 {
+    case pair {
+      {_first, second} -> second
+    }
   }
 }
