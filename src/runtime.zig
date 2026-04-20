@@ -760,6 +760,21 @@ pub const String = struct {
         result[0] = s[i];
         return result;
     }
+
+    // Forwarding functions for string operations that live on Prelude.
+    // These provide the :zig.String.* namespace for all string ops.
+    pub const upcase = Prelude.upcase;
+    pub const downcase = Prelude.downcase;
+    pub const reverse_string = Prelude.reverse_string;
+    pub const replace_string = Prelude.replace_string;
+    pub const index_of = Prelude.index_of;
+    pub const pad_leading = Prelude.pad_leading;
+    pub const pad_trailing = Prelude.pad_trailing;
+    pub const repeat_string = Prelude.repeat_string;
+    pub const capitalize = Prelude.capitalize;
+    pub const trim_leading = Prelude.trim_leading;
+    pub const trim_trailing = Prelude.trim_trailing;
+    pub const string_count = Prelude.string_count;
 };
 
 // ============================================================

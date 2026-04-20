@@ -159,7 +159,7 @@ pub module String {
     """
 
   pub fn upcase(s :: String) -> String {
-    :zig.Prelude.upcase(s)
+    :zig.String.upcase(s)
   }
 
   @doc = """
@@ -175,7 +175,7 @@ pub module String {
     """
 
   pub fn downcase(s :: String) -> String {
-    :zig.Prelude.downcase(s)
+    :zig.String.downcase(s)
   }
 
   @doc = """
@@ -189,7 +189,7 @@ pub module String {
     """
 
   pub fn reverse(s :: String) -> String {
-    :zig.Prelude.reverse_string(s)
+    :zig.String.reverse_string(s)
   }
 
   @doc = """
@@ -203,7 +203,7 @@ pub module String {
     """
 
   pub fn replace(s :: String, pattern :: String, replacement :: String) -> String {
-    :zig.Prelude.replace_string(s, pattern, replacement)
+    :zig.String.replace_string(s, pattern, replacement)
   }
 
   @doc = """
@@ -218,7 +218,7 @@ pub module String {
     """
 
   pub fn index_of(haystack :: String, needle :: String) -> i64 {
-    :zig.Prelude.index_of(haystack, needle)
+    :zig.String.index_of(haystack, needle)
   }
 
   @doc = """
@@ -232,7 +232,7 @@ pub module String {
     """
 
   pub fn pad_leading(s :: String, total_length :: i64, pad_char :: String) -> String {
-    :zig.Prelude.pad_leading(s, total_length, pad_char)
+    :zig.String.pad_leading(s, total_length, pad_char)
   }
 
   @doc = """
@@ -246,7 +246,7 @@ pub module String {
     """
 
   pub fn pad_trailing(s :: String, total_length :: i64, pad_char :: String) -> String {
-    :zig.Prelude.pad_trailing(s, total_length, pad_char)
+    :zig.String.pad_trailing(s, total_length, pad_char)
   }
 
   @doc = """
@@ -260,7 +260,7 @@ pub module String {
     """
 
   pub fn repeat(s :: String, count :: i64) -> String {
-    :zig.Prelude.repeat_string(s, count)
+    :zig.String.repeat_string(s, count)
   }
 
   @doc = """
@@ -308,7 +308,7 @@ pub module String {
     """
 
   pub fn capitalize(s :: String) -> String {
-    :zig.Prelude.capitalize(s)
+    :zig.String.capitalize(s)
   }
 
   @doc = """
@@ -324,7 +324,7 @@ pub module String {
     """
 
   pub fn trim_leading(s :: String) -> String {
-    :zig.Prelude.trim_leading(s)
+    :zig.String.trim_leading(s)
   }
 
   @doc = """
@@ -340,7 +340,7 @@ pub module String {
     """
 
   pub fn trim_trailing(s :: String) -> String {
-    :zig.Prelude.trim_trailing(s)
+    :zig.String.trim_trailing(s)
   }
 
   @doc = """
@@ -354,6 +354,6 @@ pub module String {
     """
 
   pub fn count(haystack :: String, needle :: String) -> i64 {
-    :zig.Prelude.string_count(haystack, needle)
+    :zig.String.string_count(haystack, needle)
   }
 }
