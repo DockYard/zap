@@ -395,9 +395,11 @@ pub const ZirDriver = struct {
     /// Label of the current block.
     current_block_label: ir.LabelId = 0,
     /// True when the current function is a closure (has captures).
-    /// Closures can't use decl_val for module-level type references
-    /// because they're analyzed in a closure scope, not the module scope.
     current_function_is_closure: bool = false,
+    /// Nesting depth of capture contexts (case/switch/if-else bodies).
+    /// When > 0, struct_init_typed can't be used because struct_init_field_type
+    /// instructions (emitted via addInst) don't enter captured bodies.
+    capture_depth: u32 = 0,
     /// Instruction index within the current block.
     current_instr_index: u32 = 0,
     current_block_instructions: []const ir.Instruction = &.{},
@@ -547,6 +549,17 @@ pub const ZirDriver = struct {
 
     fn setLocalDecl(self: *ZirDriver, local: ir.LocalId, module_name: ?[]const u8, decl_name: []const u8) !void {
         try self.local_refs.put(self.allocator, local, .{ .decl = .{ .module_name = module_name, .decl_name = decl_name } });
+    }
+
+    fn beginCapture(self: *ZirDriver) void {
+        zir_builder_begin_capture(self.handle);
+        self.capture_depth += 1;
+    }
+
+    fn endCapture(self: *ZirDriver, out_len: *u32) [*]const u32 {
+        const result = zir_builder_end_capture(self.handle, out_len);
+        if (self.capture_depth > 0) self.capture_depth -= 1;
+        return result;
     }
 
     fn emitAllocatorRef(self: *ZirDriver) BuildError!u32 {
@@ -2052,12 +2065,12 @@ pub const ZirDriver = struct {
             try fallback_args.append(self.allocator, ref);
         }
 
-        zir_builder_begin_capture(self.handle);
+        self.beginCapture();
         const fallback_ref = zir_builder_emit_call_ref(self.handle, callee_ref, fallback_args.items.ptr, @intCast(fallback_args.items.len));
         if (fallback_ref == error_ref) return false;
         try self.setLocal(cc.dest, fallback_ref);
         var else_len: u32 = 0;
-        const else_ptr = zir_builder_end_capture(self.handle, &else_len);
+        const else_ptr = self.endCapture(&else_len);
         var current_else_insts = try self.allocator.alloc(u32, else_len);
         @memcpy(current_else_insts, else_ptr[0..else_len]);
         var current_else_result = fallback_ref;
@@ -2077,11 +2090,11 @@ pub const ZirDriver = struct {
             const cond_ref = zir_builder_emit_binop(self.handle, @intFromEnum(Zir.Inst.Tag.cmp_eq), call_fn_ref, name_ref);
             if (cond_ref == error_ref) return error.EmitFailed;
 
-            zir_builder_begin_capture(self.handle);
+            self.beginCapture();
             const direct_ref = try self.emitNamedCallToTarget(target_id, &.{}, cc.args);
             try self.setLocal(cc.dest, direct_ref);
             var then_len: u32 = 0;
-            const then_ptr = zir_builder_end_capture(self.handle, &then_len);
+            const then_ptr = self.endCapture(&then_len);
             const then_insts = try self.allocator.alloc(u32, then_len);
             @memcpy(then_insts, then_ptr[0..then_len]);
 
@@ -2459,16 +2472,16 @@ pub const ZirDriver = struct {
                 if (is_non_null == error_ref) return error.EmitFailed;
 
                 // Then branch (non-null = matched): unwrap optional payload
-                zir_builder_begin_capture(self.handle);
+                self.beginCapture();
                 const payload = zir_builder_emit_optional_payload_unsafe(self.handle, call_ref);
                 if (payload == error_ref) return error.EmitFailed;
                 var then_len: u32 = 0;
-                const then_ptr = zir_builder_end_capture(self.handle, &then_len);
+                const then_ptr = self.endCapture(&then_len);
                 const then_insts = try self.allocator.alloc(u32, then_len);
                 @memcpy(then_insts, then_ptr[0..then_len]);
 
                 // Else branch (null = no match): evaluate handler with input, return result
-                zir_builder_begin_capture(self.handle);
+                self.beginCapture();
                 // Emit handler instructions (they reference the input local via __err)
                 for (tcn.handler_instrs) |hi| try self.emitInstruction(hi);
                 if (tcn.handler_result) |hr| {
@@ -2477,7 +2490,7 @@ pub const ZirDriver = struct {
                         return error.EmitFailed;
                 }
                 var else_len: u32 = 0;
-                const else_ptr = zir_builder_end_capture(self.handle, &else_len);
+                const else_ptr = self.endCapture(&else_len);
                 const handler_result_ref = if (tcn.handler_result) |hr|
                     self.refForLocal(hr) catch @intFromEnum(Zir.Inst.Ref.void_value)
                 else
@@ -3017,7 +3030,7 @@ pub const ZirDriver = struct {
                     // Use struct_init_typed with decl_val for nominal types
                     // in non-closure functions. Closures can't resolve module-
                     // level decl_val refs, so fall back to struct_init_anon.
-                    if (!self.current_function_is_closure) {
+                    if (!self.current_function_is_closure and self.capture_depth == 0) {
                         const short_name = if (std.mem.lastIndexOf(u8, si.type_name, ".")) |dot_idx|
                             si.type_name[dot_idx + 1 ..]
                         else
@@ -3720,11 +3733,11 @@ pub const ZirDriver = struct {
                 if (is_nonnull == error_ref) return error.EmitFailed;
 
                 // Then branch: extract optional payload
-                zir_builder_begin_capture(self.handle);
+                self.beginCapture();
                 const payload = zir_builder_emit_optional_payload(self.handle, source_ref);
                 if (payload == error_ref) return error.EmitFailed;
                 var then_len: u32 = 0;
-                const then_ptr = zir_builder_end_capture(self.handle, &then_len);
+                const then_ptr = self.endCapture(&then_len);
 
                 // Copy then instructions (capture buffer reused for else)
                 var then_insts = try std.ArrayListUnmanaged(u32).initCapacity(self.allocator, then_len);
@@ -3732,7 +3745,7 @@ pub const ZirDriver = struct {
                 then_insts.appendSliceAssumeCapacity(then_ptr[0..then_len]);
 
                 // Else branch: panic with message
-                zir_builder_begin_capture(self.handle);
+                self.beginCapture();
                 const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                 if (rt_import == error_ref) return error.EmitFailed;
                 const prelude = zir_builder_emit_field_val(self.handle, rt_import, "Prelude", 7);
@@ -3746,7 +3759,7 @@ pub const ZirDriver = struct {
                 const panic_call = zir_builder_emit_call_ref(self.handle, panic_fn, &panic_args, 1);
                 if (panic_call == error_ref) return error.EmitFailed;
                 var else_len: u32 = 0;
-                const else_ptr = zir_builder_end_capture(self.handle, &else_len);
+                const else_ptr = self.endCapture(&else_len);
 
                 // Emit if_else_bodies: if (is_nonnull) { payload } else { panic }
                 const result = zir_builder_emit_if_else_bodies(
@@ -4062,12 +4075,12 @@ pub const ZirDriver = struct {
     /// bodies so that Sema only analyzes the taken branch.
     fn emitIfExpr(self: *ZirDriver, ie: ir.IfExpr) BuildError!void {
         // --- then branch: capture top-level body instructions ---
-        zir_builder_begin_capture(self.handle);
+        self.beginCapture();
         for (ie.then_instrs) |ti| {
             try self.emitInstruction(ti);
         }
         var then_len: u32 = 0;
-        const then_insts_ptr = zir_builder_end_capture(self.handle, &then_len);
+        const then_insts_ptr = self.endCapture(&then_len);
 
         const then_ref: u32 = if (ie.then_result) |tr|
             try self.refForLocal(tr)
@@ -4080,12 +4093,12 @@ pub const ZirDriver = struct {
         then_insts.appendSliceAssumeCapacity(then_insts_ptr[0..then_len]);
 
         // --- else branch: capture top-level body instructions ---
-        zir_builder_begin_capture(self.handle);
+        self.beginCapture();
         for (ie.else_instrs) |ei| {
             try self.emitInstruction(ei);
         }
         var else_len: u32 = 0;
-        const else_insts_ptr = zir_builder_end_capture(self.handle, &else_len);
+        const else_insts_ptr = self.endCapture(&else_len);
 
         const else_ref: u32 = if (ie.else_result) |er|
             try self.refForLocal(er)
@@ -4115,10 +4128,10 @@ pub const ZirDriver = struct {
         const cond_ref = try self.refForLocal(gb.condition);
 
         // Capture body instructions
-        zir_builder_begin_capture(self.handle);
+        self.beginCapture();
         for (gb.body) |bi| try self.emitInstruction(bi);
         var body_len: u32 = 0;
-        const body_ptr = zir_builder_end_capture(self.handle, &body_len);
+        const body_ptr = self.endCapture(&body_len);
 
         // Copy body indices (capture buffer may be reused)
         var body_insts = try std.ArrayListUnmanaged(u32).initCapacity(self.allocator, body_len);
@@ -4235,12 +4248,12 @@ pub const ZirDriver = struct {
         }
 
         // Capture the default body
-        zir_builder_begin_capture(self.handle);
+        self.beginCapture();
         for (sl.default_instrs) |di| {
             try self.emitInstruction(di);
         }
         var default_len: u32 = 0;
-        const default_ptr = zir_builder_end_capture(self.handle, &default_len);
+        const default_ptr = self.endCapture(&default_len);
         const default_result: u32 = if (sl.default_result) |dr|
             self.refForLocal(dr) catch @intFromEnum(Zir.Inst.Ref.void_value)
         else
@@ -4284,12 +4297,12 @@ pub const ZirDriver = struct {
             }
 
             // Capture the case body
-            zir_builder_begin_capture(self.handle);
+            self.beginCapture();
             for (case.body_instrs) |bi| {
                 try self.emitInstruction(bi);
             }
             var case_len: u32 = 0;
-            const case_ptr = zir_builder_end_capture(self.handle, &case_len);
+            const case_ptr = self.endCapture(&case_len);
 
             const case_result: u32 = if (case.result) |r|
                 self.refForLocal(r) catch @intFromEnum(Zir.Inst.Ref.void_value)
@@ -4362,10 +4375,10 @@ pub const ZirDriver = struct {
         for (cb.pre_instrs) |pi| try self.emitInstruction(pi);
 
         // Capture the default body
-        zir_builder_begin_capture(self.handle);
+        self.beginCapture();
         for (cb.default_instrs) |di| try self.emitInstruction(di);
         var default_len: u32 = 0;
-        const default_ptr = zir_builder_end_capture(self.handle, &default_len);
+        const default_ptr = self.endCapture(&default_len);
         const default_result: u32 = if (cb.default_result) |dr|
             self.refForLocal(dr) catch @intFromEnum(Zir.Inst.Ref.void_value)
         else
@@ -4388,13 +4401,13 @@ pub const ZirDriver = struct {
             const cond_ref = try self.refForLocal(arm.condition);
 
             // Capture the arm body
-            zir_builder_begin_capture(self.handle);
+            self.beginCapture();
             for (arm.body_instrs) |bi| try self.emitInstruction(bi);
             if (arm.result) |r| {
                 try self.emitDropSpecializationsForCurrentInstr(r, @intCast(i));
             }
             var arm_len: u32 = 0;
-            const arm_ptr = zir_builder_end_capture(self.handle, &arm_len);
+            const arm_ptr = self.endCapture(&arm_len);
 
             const arm_result: u32 = if (arm.result) |r|
                 self.refForLocal(r) catch @intFromEnum(Zir.Inst.Ref.void_value)
@@ -4472,11 +4485,11 @@ pub const ZirDriver = struct {
         const default_pre_instrs = cb.pre_instrs[default_start..];
 
         // Capture the default body (from both trailing pre_instrs and default_instrs).
-        zir_builder_begin_capture(self.handle);
+        self.beginCapture();
         for (default_pre_instrs) |di| try self.emitInstruction(di);
         for (cb.default_instrs) |di| try self.emitInstruction(di);
         var default_len: u32 = 0;
-        const default_ptr = zir_builder_end_capture(self.handle, &default_len);
+        const default_ptr = self.endCapture(&default_len);
         var default_result: u32 = if (cb.default_result) |dr|
             self.refForLocal(dr) catch void_ref
         else
@@ -4536,10 +4549,10 @@ pub const ZirDriver = struct {
             }
 
             // Multiple guards — capture the last one as default
-            zir_builder_begin_capture(self.handle);
+            self.beginCapture();
             for (last_gb.body) |bi| try self.emitInstruction(bi);
             var catchall_len: u32 = 0;
-            const catchall_ptr = zir_builder_end_capture(self.handle, &catchall_len);
+            const catchall_ptr = self.endCapture(&catchall_len);
 
             const catchall_result: u32 = if (self.local_refs.get(cb.dest)) |vr| self.materializeValueRef(vr) catch @intFromEnum(Zir.Inst.Ref.void_value) else @intFromEnum(Zir.Inst.Ref.void_value);
 
@@ -4567,11 +4580,11 @@ pub const ZirDriver = struct {
             const cond_ref = try self.refForLocal(gb.condition);
 
             // Capture the guard body
-            zir_builder_begin_capture(self.handle);
+            self.beginCapture();
             for (gb.body) |bi| try self.emitInstruction(bi);
             try self.emitDropSpecializationsForCurrentInstr(cb.dest, @intCast(gi));
             var body_len: u32 = 0;
-            const body_ptr = zir_builder_end_capture(self.handle, &body_len);
+            const body_ptr = self.endCapture(&body_len);
 
             // The guard body contains case_break which sets cb.dest via
             // current_case_dest. Use that ref as the body result.
@@ -4634,14 +4647,14 @@ pub const ZirDriver = struct {
         }
 
         // Capture the default body (includes the return)
-        zir_builder_begin_capture(self.handle);
+        self.beginCapture();
         for (sr.default_instrs) |di| try self.emitInstruction(di);
         if (sr.default_result) |dr| {
             const ref = try self.refForLocal(dr);
             if (zir_builder_emit_ret(self.handle, ref) != 0) return error.EmitFailed;
         }
         var default_len: u32 = 0;
-        const default_ptr = zir_builder_end_capture(self.handle, &default_len);
+        const default_ptr = self.endCapture(&default_len);
         const void_ref = @intFromEnum(Zir.Inst.Ref.void_value);
 
         var current_else_insts = try self.allocator.alloc(u32, default_len);
@@ -4675,7 +4688,7 @@ pub const ZirDriver = struct {
             }
 
             // Capture case body (includes the return)
-            zir_builder_begin_capture(self.handle);
+            self.beginCapture();
             for (case.body_instrs) |bi| try self.emitInstruction(bi);
             if (case.return_value) |rv| {
                 const ref = try self.refForLocal(rv);
@@ -4684,7 +4697,7 @@ pub const ZirDriver = struct {
                 }
             }
             var case_len: u32 = 0;
-            const case_ptr = zir_builder_end_capture(self.handle, &case_len);
+            const case_ptr = self.endCapture(&case_len);
 
             const case_insts = try self.allocator.alloc(u32, case_len);
             @memcpy(case_insts, case_ptr[0..case_len]);
@@ -4763,7 +4776,7 @@ pub const ZirDriver = struct {
             }
 
             // Capture case body (payload extraction + field bindings + body + return)
-            zir_builder_begin_capture(self.handle);
+            self.beginCapture();
 
             // Extract variant payload: scrutinee.VariantName → struct payload
             const payload_ref = zir_builder_emit_field_val(self.handle, scrutinee_ref, case.variant_name.ptr, @intCast(case.variant_name.len));
@@ -4814,7 +4827,7 @@ pub const ZirDriver = struct {
                 }
             }
             var case_len: u32 = 0;
-            const case_ptr = zir_builder_end_capture(self.handle, &case_len);
+            const case_ptr = self.endCapture(&case_len);
 
             const case_insts = try self.allocator.alloc(u32, case_len);
             @memcpy(case_insts, case_ptr[0..case_len]);
