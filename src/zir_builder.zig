@@ -114,7 +114,7 @@ extern "c" fn zir_builder_set_optional_return_type(handle: ?*ZirBuilderHandle) i
 extern "c" fn zir_builder_emit_ret_null(handle: ?*ZirBuilderHandle) i32;
 
 // Struct type declarations
-extern "c" fn zir_builder_add_struct_type(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32, field_names_ptrs: [*]const [*]const u8, field_names_lens: [*]const u32, field_type_refs: [*]const u32, fields_len: u32) i32;
+extern "c" fn zir_builder_add_struct_type(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32, field_names_ptrs: [*]const [*]const u8, field_names_lens: [*]const u32, field_type_refs: [*]const u32, field_default_refs: ?[*]const u32, fields_len: u32) i32;
 extern "c" fn zir_builder_set_decl_val_return_type(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32) i32;
 extern "c" fn zir_builder_emit_param_decl_val_type(handle: ?*ZirBuilderHandle, param_name_ptr: [*]const u8, param_name_len: u32, type_name_ptr: [*]const u8, type_name_len: u32) u32;
 
@@ -756,11 +756,26 @@ pub const ZirDriver = struct {
                     var field_type_refs: std.ArrayListUnmanaged(u32) = .empty;
                     defer field_type_refs.deinit(self.allocator);
 
+                    var field_default_refs: std.ArrayListUnmanaged(u32) = .empty;
+                    defer field_default_refs.deinit(self.allocator);
+                    var has_any_defaults = false;
+
                     for (def.fields) |field| {
                         try field_name_ptrs.append(self.allocator, field.name.ptr);
                         try field_name_lens.append(self.allocator, @intCast(field.name.len));
                         const type_ref = self.mapTypeNameToRef(field.type_expr);
                         try field_type_refs.append(self.allocator, type_ref);
+
+                        // Map default values to ZIR refs
+                        const default_ref: u32 = if (field.default_value) |dv| blk: {
+                            has_any_defaults = true;
+                            break :blk switch (dv) {
+                                .int => |v| if (v == 0) @intFromEnum(Zir.Inst.Ref.zero) else if (v == 1) @intFromEnum(Zir.Inst.Ref.one) else 0,
+                                .bool_val => |v| if (v) @intFromEnum(Zir.Inst.Ref.bool_true) else @intFromEnum(Zir.Inst.Ref.bool_false),
+                                else => 0, // String/float/nil defaults not yet supported as ZIR refs
+                            };
+                        } else 0;
+                        try field_default_refs.append(self.allocator, default_ref);
                     }
 
                     if (zir_builder_add_struct_type(
@@ -770,6 +785,7 @@ pub const ZirDriver = struct {
                         field_name_ptrs.items.ptr,
                         field_name_lens.items.ptr,
                         field_type_refs.items.ptr,
+                        if (has_any_defaults) field_default_refs.items.ptr else null,
                         @intCast(def.fields.len),
                     ) != 0) {
                         return error.EmitFailed;

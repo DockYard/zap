@@ -40,6 +40,7 @@ pub const StructDef = struct {
 pub const StructFieldDef = struct {
     name: []const u8,
     type_expr: []const u8,
+    default_value: ?DefaultValue = null,
 };
 
 pub const EnumDef = struct {
@@ -955,9 +956,11 @@ pub const IrBuilder = struct {
                     .struct_type => |st| {
                         var fields: std.ArrayList(StructFieldDef) = .empty;
                         for (st.fields) |field| {
+                            const default_val: ?DefaultValue = if (field.default_expr) |expr| self.extractDefaultValue(expr) else null;
                             try fields.append(self.allocator, .{
                                 .name = self.interner.get(field.name),
                                 .type_expr = typeIdToZigTypeStrWithStore(field.type_id, self.type_store),
+                                .default_value = default_val,
                             });
                         }
                         try type_defs.append(self.allocator, .{
@@ -1025,6 +1028,18 @@ pub const IrBuilder = struct {
             .functions = try self.functions.toOwnedSlice(self.allocator),
             .type_defs = try type_defs.toOwnedSlice(self.allocator),
             .entry = null,
+        };
+    }
+
+    /// Extract a compile-time constant from an AST default expression.
+    fn extractDefaultValue(self: *IrBuilder, expr: *const @import("ast.zig").Expr) ?DefaultValue {
+        return switch (expr.*) {
+            .int_literal => |il| .{ .int = il.value },
+            .float_literal => |fl| .{ .float = fl.value },
+            .bool_literal => |bl| .{ .bool_val = bl.value },
+            .string_literal => |sl| .{ .string = self.interner.get(sl.value) },
+            .nil_literal => .nil,
+            else => null,
         };
     }
 

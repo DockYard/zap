@@ -120,6 +120,7 @@ pub const Type = union(enum) {
     pub const StructField = struct {
         name: ast.StringId,
         type_id: TypeId,
+        default_expr: ?*const ast.Expr = null,
     };
 
     pub const UnionType = struct {
@@ -1967,6 +1968,7 @@ pub const TypeChecker = struct {
                     // Then add own fields (may override parent defaults but type check happens here)
                     for (sd.fields) |field| {
                         const field_type = self.resolveTypeExpr(field.type_expr) catch TypeStore.UNKNOWN;
+                        const default = field.default;
                         // Check if this field already exists from parent
                         var found_parent = false;
                         for (fields.items) |*pf| {
@@ -1988,6 +1990,7 @@ pub const TypeChecker = struct {
                             try fields.append(self.allocator, .{
                                 .name = field.name,
                                 .type_id = field_type,
+                                .default_expr = default,
                             });
                         }
                     }
