@@ -12,6 +12,10 @@ pub module Test.StructTest {
       assert(result == 42)
     }
 
+    test("struct created inline in test via helper") {
+      result = sum_point(make_point(3, 4))
+      assert(result == 7)
+    }
   }
 
   describe("Struct return types") {

@@ -394,10 +394,10 @@ pub const ZirDriver = struct {
     current_function_id: ir.FunctionId = 0,
     /// Label of the current block.
     current_block_label: ir.LabelId = 0,
-    /// Tracks whether ZIR body tracking is currently ON. When OFF (inside
-    /// case/switch arm bodies), struct_init_typed with decl_val refs fails
-    /// because struct_init_field_type instructions can't resolve the ref.
-    is_body_tracking_on: bool = true,
+    /// True when the current function is a closure (has captures).
+    /// Closures can't use decl_val for module-level type references
+    /// because they're analyzed in a closure scope, not the module scope.
+    current_function_is_closure: bool = false,
     /// Instruction index within the current block.
     current_instr_index: u32 = 0,
     current_block_instructions: []const ir.Instruction = &.{},
@@ -1479,6 +1479,7 @@ pub const ZirDriver = struct {
         self.cached_list_type_ref = 0;
         self.skip_next_ret_local = null;
         self.current_function_id = func.id;
+        self.current_function_is_closure = func.captures.len > 0;
         const closure_lowering = self.getClosureLowering(func.id, func.captures.len);
         const ret_type = if (is_main)
             mapMainReturnType(func.return_type)
@@ -2969,39 +2970,33 @@ pub const ZirDriver = struct {
                 } else {
                     _ = self.reuse_backed_struct_locals.remove(si.dest);
 
-                    // Use struct_init_typed when the struct matches a nominal
-                    // type AND we're in the main function body (not inside a
-                    // case/switch arm where body tracking is off). In tracked
-                    // contexts, struct_init_typed ensures the value has the
-                    // exact named type for return type matching. In untracked
-                    // contexts (case arms, test bodies), use struct_init_anon
-                    // and rely on Zig's coercion at param boundaries.
-                    const short_name = if (std.mem.lastIndexOf(u8, si.type_name, ".")) |dot_idx|
-                        si.type_name[dot_idx + 1 ..]
-                    else
-                        si.type_name;
-                    const has_nominal = self.findStructDef(si.type_name) != null or self.findStructDef(short_name) != null;
-
-                    if (has_nominal and self.is_body_tracking_on) {
-                        // Main function body — safe to use struct_init_typed
-                        const type_ref = zir_builder_emit_decl_val(self.handle, short_name.ptr, @intCast(short_name.len));
-                        if (type_ref != error_ref) {
-                            const result = zir_builder_emit_struct_init_typed(
-                                self.handle,
-                                type_ref,
-                                names_ptrs.items.ptr,
-                                names_lens.items.ptr,
-                                values.items.ptr,
-                                @intCast(values.items.len),
-                            );
-                            if (result != error_ref) {
-                                try self.setLocal(si.dest, result);
-                                return;
+                    // Use struct_init_typed with decl_val for nominal types
+                    // in non-closure functions. Closures can't resolve module-
+                    // level decl_val refs, so fall back to struct_init_anon.
+                    if (!self.current_function_is_closure) {
+                        const short_name = if (std.mem.lastIndexOf(u8, si.type_name, ".")) |dot_idx|
+                            si.type_name[dot_idx + 1 ..]
+                        else
+                            si.type_name;
+                        if (self.findStructDef(si.type_name) != null or self.findStructDef(short_name) != null) {
+                            const type_ref = zir_builder_emit_decl_val(self.handle, short_name.ptr, @intCast(short_name.len));
+                            if (type_ref != error_ref) {
+                                const typed_result = zir_builder_emit_struct_init_typed(
+                                    self.handle,
+                                    type_ref,
+                                    names_ptrs.items.ptr,
+                                    names_lens.items.ptr,
+                                    values.items.ptr,
+                                    @intCast(values.items.len),
+                                );
+                                if (typed_result != error_ref) {
+                                    try self.setLocal(si.dest, typed_result);
+                                    return;
+                                }
                             }
                         }
                     }
 
-                    // Fallback: anonymous struct (works in all contexts)
                     const result = zir_builder_emit_struct_init_anon(
                         self.handle,
                         names_ptrs.items.ptr,
@@ -4877,7 +4872,6 @@ pub const ZirDriver = struct {
 
             // Emit body instructions with tracking off
             zir_builder_set_body_tracking(self.handle, false);
-            self.is_body_tracking_on = false;
             const body_start = zir_builder_get_inst_count(self.handle);
 
             for (case.body_instrs) |bi| {
@@ -4902,7 +4896,6 @@ pub const ZirDriver = struct {
 
             const body_end = zir_builder_get_inst_count(self.handle);
             zir_builder_set_body_tracking(self.handle, true);
-            self.is_body_tracking_on = true;
 
             const body_len = body_end - body_start;
             try body_lens.append(self.allocator, body_len);
