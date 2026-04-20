@@ -77,18 +77,32 @@ pub module Test.MapTest {
   }
 
   describe("String value maps") {
-    test("create string value map via function") {
-      names = make_name_map()
-      first = get_name(names, :first)
-      assert(first == "Alice")
+    test("create and access string value map") {
+      names = %{first: "Alice", last: "Smith"}
+      assert(Map.get(names, :first, "") == "Alice")
     }
-  }
 
-  fn make_name_map() -> %{Atom => String} {
-    %{first: "Alice", last: "Smith"}
-  }
+    test("get with missing key returns default") {
+      names = %{first: "Alice", last: "Smith"}
+      assert(Map.get(names, :missing, "unknown") == "unknown")
+    }
 
-  fn get_name(names :: %{Atom => String}, key :: Atom) -> String {
-    :zig.MapAtomString.get(names, key, "")
+    test("size of string value map") {
+      names = %{first: "Alice", last: "Smith"}
+      assert(Map.size(names) == 2)
+    }
+
+    test("has_key? on string value map") {
+      names = %{first: "Alice", last: "Smith"}
+      assert(Map.has_key?(names, :first))
+      reject(Map.has_key?(names, :missing))
+    }
+
+    test("put on string value map") {
+      names = %{first: "Alice"}
+      result = Map.put(names, :last, "Smith")
+      assert(Map.size(result) == 2)
+      assert(Map.get(result, :last, "") == "Smith")
+    }
   }
 }

@@ -838,6 +838,8 @@ pub const IrBuilder = struct {
     /// Set of function names that need __try variants (populated by error pipe analysis).
     /// Only functions in this set will get __try variants generated.
     try_variant_names: std.StringHashMap(void),
+    /// Current function's declared param types (for param_get fallback when expr type is UNKNOWN).
+    current_param_types: std.ArrayListUnmanaged(ZigType) = .empty,
     /// Maps mangled function names → @native binding strings (e.g., "String__length" → "String.length").
     /// Populated from @native attributes in the scope graph before building function bodies.
 
@@ -1082,6 +1084,7 @@ pub const IrBuilder = struct {
         self.next_label = 0;
         self.current_instrs = .empty;
         self.known_local_types.clearRetainingCapacity();
+        self.current_param_types = .empty;
 
         // Use first clause for arity and return type
         const first_clause = &group.clauses[0];
@@ -1132,6 +1135,7 @@ pub const IrBuilder = struct {
                 .type_expr = resolved_type,
                 .type_id = param.type_id,
             });
+            try self.current_param_types.append(self.allocator, resolved_type);
         }
 
         // Reserve local indices used by tuple/struct bindings across all clauses.
@@ -3589,7 +3593,14 @@ pub const IrBuilder = struct {
                     .param_get = .{ .dest = dest, .index = idx },
                 });
                 // Phase 3: track known type from HIR expr type_id
-                const param_zig_type = typeIdToZigTypeWithStore(expr.type_id, self.type_store);
+                var param_zig_type = typeIdToZigTypeWithStore(expr.type_id, self.type_store);
+                // Fallback: if expression type is unknown but we have the declared param type
+                // from the function signature, use that instead. This handles monomorphized
+                // functions where param_get expressions retain UNKNOWN type_ids but the
+                // clause params have concrete types after substitution.
+                if (param_zig_type == .any and idx < self.current_param_types.items.len) {
+                    param_zig_type = self.current_param_types.items[idx];
+                }
                 if (param_zig_type != .any) {
                     try self.known_local_types.put(dest, param_zig_type);
                 }
@@ -3797,17 +3808,31 @@ pub const IrBuilder = struct {
                         // When a generic function like List.head(list :: [a]) is monomorphized
                         // with a = String, the `:zig.List.getHead(list)` call needs to
                         // become `StringList.getHead(list)` in the ZIR.
-                        const resolved_name = if (std.mem.startsWith(u8, name, "List.") and lowered_args.len > 0) blk: {
+                        // Rewrite Map.method calls to the correct variant
+                        // based on the first argument's map type.
+                        const map_resolved = if (std.mem.startsWith(u8, name, "Map.") and lowered_args.len > 0) blk: {
                             const first_arg_type = self.known_local_types.get(lowered_args[0]) orelse .any;
-                            if (std.meta.activeTag(first_arg_type) == .list) {
-                                const cell_name = getListName(first_arg_type.list.*);
-                                if (!std.mem.eql(u8, cell_name, "List")) {
-                                    const method = name["List.".len..];
-                                    break :blk try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ cell_name, method });
+                            if (std.meta.activeTag(first_arg_type) == .map) {
+                                const map_name = getMapName(first_arg_type.map.key.*, first_arg_type.map.value.*);
+                                if (!std.mem.eql(u8, map_name, "Map")) {
+                                    const method = name["Map.".len..];
+                                    break :blk try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ map_name, method });
                                 }
                             }
                             break :blk name;
                         } else name;
+
+                        const resolved_name = if (std.mem.startsWith(u8, map_resolved, "List.") and lowered_args.len > 0) blk: {
+                            const first_arg_type = self.known_local_types.get(lowered_args[0]) orelse .any;
+                            if (std.meta.activeTag(first_arg_type) == .list) {
+                                const cell_name = getListName(first_arg_type.list.*);
+                                if (!std.mem.eql(u8, cell_name, "List")) {
+                                    const method = map_resolved["List.".len..];
+                                    break :blk try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ cell_name, method });
+                                }
+                            }
+                            break :blk map_resolved;
+                        } else map_resolved;
                         try self.current_instrs.append(self.allocator, .{
                             .call_builtin = .{ .dest = dest, .name = resolved_name, .args = lowered_args, .arg_modes = lowered_modes },
                         });
@@ -4091,6 +4116,12 @@ pub const IrBuilder = struct {
                         .value_type = value_type,
                     },
                 });
+                // Track the map's concrete type so Map.method calls can dispatch
+                const kt = try self.allocator.create(ZigType);
+                kt.* = key_type;
+                const vt = try self.allocator.create(ZigType);
+                vt.* = value_type;
+                try self.known_local_types.put(dest, .{ .map = .{ .key = kt, .value = vt } });
             },
             .capture_get => |index| {
                 try self.current_instrs.append(self.allocator, .{
@@ -4254,6 +4285,23 @@ fn findParamGetIdInDecision(decision: *const hir_mod.Decision, target_element: u
 }
 
 /// Map a list element ZigType to the runtime List variant name.
+fn getMapName(key_type: ZigType, value_type: ZigType) []const u8 {
+    if (std.meta.activeTag(key_type) == .atom) {
+        return switch (std.meta.activeTag(value_type)) {
+            .string => "MapAtomString",
+            .bool_type => "MapAtomBool",
+            else => "Map",
+        };
+    }
+    if (std.meta.activeTag(key_type) == .string) {
+        return switch (std.meta.activeTag(value_type)) {
+            .string => "MapStringString",
+            else => "MapStringInt",
+        };
+    }
+    return "Map";
+}
+
 fn getListName(element_type: ZigType) []const u8 {
     return switch (std.meta.activeTag(element_type)) {
         .string => "StringList",

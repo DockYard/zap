@@ -462,6 +462,12 @@ const MonomorphContext = struct {
                                 arg_type = self.store.addType(.{ .list = .{ .element = types_mod.TypeStore.I64 } }) catch types_mod.TypeStore.UNKNOWN;
                             }
                         }
+                        // Empty map default
+                        if (std.meta.activeTag(param_typ) == .map) {
+                            if (arg.expr.kind == .map_init) {
+                                arg_type = self.store.addType(.{ .map = .{ .key = types_mod.TypeStore.ATOM, .value = types_mod.TypeStore.I64 } }) catch types_mod.TypeStore.UNKNOWN;
+                            }
+                        }
                     }
                     if (arg_type == types_mod.TypeStore.UNKNOWN or arg_type == types_mod.TypeStore.ERROR) continue;
                     _ = self.store.unify(param.type_id, arg_type, &subs) catch {};

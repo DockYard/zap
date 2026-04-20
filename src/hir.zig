@@ -3557,9 +3557,20 @@ pub const HirBuilder = struct {
                         .value = value,
                     });
                 }
+                const built_entries = try entries.toOwnedSlice(self.allocator);
+                // Infer map type from first entry's key and value types
+                const map_type_id = if (built_entries.len > 0) blk: {
+                    const key_type = built_entries[0].key.type_id;
+                    const val_type = built_entries[0].value.type_id;
+                    if (key_type != types_mod.TypeStore.UNKNOWN and val_type != types_mod.TypeStore.UNKNOWN) {
+                        const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
+                        break :blk store_ptr.addType(.{ .map = .{ .key = key_type, .value = val_type } }) catch types_mod.TypeStore.UNKNOWN;
+                    }
+                    break :blk types_mod.TypeStore.UNKNOWN;
+                } else types_mod.TypeStore.UNKNOWN;
                 return try self.create(Expr, .{
-                    .kind = .{ .map_init = try entries.toOwnedSlice(self.allocator) },
-                    .type_id = types_mod.TypeStore.UNKNOWN,
+                    .kind = .{ .map_init = built_entries },
+                    .type_id = map_type_id,
                     .span = m.meta.span,
                 });
             },

@@ -2,14 +2,14 @@ pub module Map {
   @moduledoc = """
     Functions for working with maps.
 
-    Maps in Zap are immutable key-value collections. Keys are
-    atoms (interned identifiers), values are integers. Maps use
-    a flat array representation optimized for small collections.
+    Maps in Zap are immutable key-value collections that support
+    any key and value types. The compiler specializes map operations
+    at compile time based on the concrete types used.
 
     ## Examples
 
         m = %{name: "Alice", age: 30}
-        Map.get(m, :name, 0)     # => atom ID for "Alice"
+        Map.get(m, :name, "")    # => "Alice"
         Map.has_key?(m, :name)   # => true
         Map.size(m)              # => 2
     """
@@ -24,8 +24,8 @@ pub module Map {
         Map.get(%{a: 1}, :z, 99)        # => 99
     """
 
-  pub fn get(map :: %{Atom => i64}, key :: Atom, default :: i64) -> i64 {
-    :zig.Map.get(map, key, default)
+  pub fn get(map :: %{key => value}, lookup_key :: key, default :: value) -> value {
+    :zig.Map.get(map, lookup_key, default)
   }
 
   @doc = """
@@ -37,8 +37,8 @@ pub module Map {
         Map.has_key?(%{a: 1}, :z)         # => false
     """
 
-  pub fn has_key?(map :: %{Atom => i64}, key :: Atom) -> Bool {
-    :zig.Map.hasKey(map, key)
+  pub fn has_key?(map :: %{key => value}, lookup_key :: key) -> Bool {
+    :zig.Map.hasKey(map, lookup_key)
   }
 
   @doc = """
@@ -50,7 +50,7 @@ pub module Map {
         Map.size(%{})                    # => 0
     """
 
-  pub fn size(map :: %{Atom => i64}) -> i64 {
+  pub fn size(map :: %{key => value}) -> i64 {
     :zig.Map.size(map)
   }
 
@@ -63,7 +63,7 @@ pub module Map {
         Map.empty?(%{a: 1})  # => false
     """
 
-  pub fn empty?(map :: %{Atom => i64}) -> Bool {
+  pub fn empty?(map :: %{key => value}) -> Bool {
     :zig.Map.isEmpty(map)
   }
 
@@ -77,8 +77,8 @@ pub module Map {
         Map.put(%{a: 1}, :a, 9)  # => %{a: 9}
     """
 
-  pub fn put(map :: %{Atom => i64}, key :: Atom, value :: i64) -> %{Atom => i64} {
-    :zig.Map.put(map, key, value)
+  pub fn put(map :: %{key => value}, new_key :: key, new_value :: value) -> %{key => value} {
+    :zig.Map.put(map, new_key, new_value)
   }
 
   @doc = """
@@ -91,8 +91,8 @@ pub module Map {
         Map.delete(%{a: 1}, :z)         # => %{a: 1}
     """
 
-  pub fn delete(map :: %{Atom => i64}, key :: Atom) -> %{Atom => i64} {
-    :zig.Map.delete(map, key)
+  pub fn delete(map :: %{key => value}, remove_key :: key) -> %{key => value} {
+    :zig.Map.delete(map, remove_key)
   }
 
   @doc = """
@@ -105,7 +105,7 @@ pub module Map {
         # => %{a: 1, b: 9, c: 3}
     """
 
-  pub fn merge(map_a :: %{Atom => i64}, map_b :: %{Atom => i64}) -> %{Atom => i64} {
+  pub fn merge(map_a :: %{key => value}, map_b :: %{key => value}) -> %{key => value} {
     :zig.Map.merge(map_a, map_b)
   }
 
@@ -117,7 +117,7 @@ pub module Map {
         Map.keys(%{a: 1, b: 2})  # => [:a, :b]
     """
 
-  pub fn keys(map :: %{Atom => i64}) -> [i64] {
+  pub fn keys(map :: %{key => value}) -> [key] {
     :zig.Map.keys(map)
   }
 
@@ -129,7 +129,7 @@ pub module Map {
         Map.values(%{a: 1, b: 2})  # => [1, 2]
     """
 
-  pub fn values(map :: %{Atom => i64}) -> [i64] {
+  pub fn values(map :: %{key => value}) -> [value] {
     :zig.Map.values(map)
   }
 }
