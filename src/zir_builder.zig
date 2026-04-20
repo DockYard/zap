@@ -1235,6 +1235,7 @@ pub const ZirDriver = struct {
         // For tuple return types, set up the computed return type via tuple_decl.
         // Nested tuples are handled by recursively emitting tuple_decl instructions.
         if (func.return_type == .tuple) {
+            std.debug.print("[tuple-ret] {s} has tuple return with {d} elements\n", .{ emit_name, func.return_type.tuple.len });
             var type_refs : std.ArrayListUnmanaged(u32) = .empty;
             defer type_refs.deinit(self.allocator);
             for (func.return_type.tuple) |elem_type| {
@@ -1454,11 +1455,11 @@ pub const ZirDriver = struct {
             },
             .immediate_invocation => .{
                 .tier = tier,
-                .needs_env_param = has_captures,
-                .direct_capture_params = false,
-                .needs_closure_object = has_captures,
+                .needs_env_param = false,
+                .direct_capture_params = has_captures,
+                .needs_closure_object = false,
                 .stack_env = false,
-                .storage_scope = if (has_captures) .stack_function else .immediate,
+                .storage_scope = .immediate,
             },
             .block_local => .{
                 .tier = tier,
@@ -3060,53 +3061,16 @@ pub const ZirDriver = struct {
                 const callee_is_param = self.isParamDerivedClosure(cc.callee);
 
                 // Parameter-derived closures: the callee is a function parameter.
-                // It could be either a bare function pointer or a closure struct
-                // with {call_fn, env}. Use @hasField comptime check to dispatch.
+                // Its concrete type is *const fn(args...) ret — a bare function pointer.
+                // Call it directly via call_ref.
                 if (callee_is_param) {
                     const callee_ref = self.refForLocal(cc.callee) catch return error.EmitFailed;
-                    var args: std.ArrayListUnmanaged(u32) = .empty;
+                    var args : std.ArrayListUnmanaged(u32) = .empty;
                     defer args.deinit(self.allocator);
                     for (cc.args) |arg| {
-                        const ref2 = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
-                        try args.append(self.allocator, ref2);
+                        const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                        try args.append(self.allocator, ref);
                     }
-
-                    // Use Prelude.callCallableN to handle both bare function pointers
-                    // and closure structs with {call_fn, env} fields. The runtime
-                    // helper uses comptime @typeInfo to dispatch correctly.
-                    const rt_ref = zir_builder_emit_import(self.handle, "zap_runtime", 11);
-                    if (rt_ref != error_ref) {
-                        const prelude_ref = zir_builder_emit_field_val(self.handle, rt_ref, "Prelude", 7);
-                        if (prelude_ref != error_ref) {
-                            const helper_name = switch (args.items.len) {
-                                1 => "callCallable1",
-                                2 => "callCallable2",
-                                3 => "callCallable3",
-                                else => {
-                                    // Fallback for other arities: bare call
-                                    const ref = zir_builder_emit_call_ref(self.handle, callee_ref, args.items.ptr, @intCast(args.items.len));
-                                    if (ref == error_ref) return error.EmitFailed;
-                                    try self.setLocal(cc.dest, ref);
-                                    return;
-                                },
-                            };
-                            const helper_ref = zir_builder_emit_field_val(self.handle, prelude_ref, helper_name.ptr, @intCast(helper_name.len));
-                            if (helper_ref != error_ref) {
-                                // Build args: callable, arg0, arg1, ...
-                                var full_args: std.ArrayListUnmanaged(u32) = .empty;
-                                defer full_args.deinit(self.allocator);
-                                try full_args.append(self.allocator, callee_ref);
-                                try full_args.appendSlice(self.allocator, args.items);
-                                const ref = zir_builder_emit_call_ref(self.handle, helper_ref, full_args.items.ptr, @intCast(full_args.items.len));
-                                if (ref != error_ref) {
-                                    try self.setLocal(cc.dest, ref);
-                                    return;
-                                }
-                            }
-                        }
-                    }
-
-                    // Fallback: bare function pointer call
                     const ref = zir_builder_emit_call_ref(self.handle, callee_ref, args.items.ptr, @intCast(args.items.len));
                     if (ref == error_ref) return error.EmitFailed;
                     try self.setLocal(cc.dest, ref);
@@ -4901,9 +4865,9 @@ test "closure lowering helper distinguishes immediate and stack tiers" {
 
     const immediate = ZirDriver.closure_lowering_for_tier(.immediate_invocation, 1);
     try std.testing.expectEqual(lattice.ClosureEnvTier.immediate_invocation, immediate.tier);
-    try std.testing.expect(!immediate.direct_capture_params);
-    try std.testing.expect(immediate.needs_env_param);
-    try std.testing.expect(immediate.needs_closure_object);
+    try std.testing.expect(immediate.direct_capture_params);
+    try std.testing.expect(!immediate.needs_env_param);
+    try std.testing.expect(!immediate.needs_closure_object);
 
     const block_local = ZirDriver.closure_lowering_for_tier(.block_local, 1);
     try std.testing.expect(block_local.needs_env_param);

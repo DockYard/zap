@@ -1461,63 +1461,6 @@ pub const Prelude = struct {
         std.process.exit(1);
     }
 
-    /// Call a callable value — either a bare function pointer or a closure struct.
-    /// Closure structs have {call_fn, env, env_release} fields.
-    /// This provides uniform calling convention for Zap function parameters.
-    pub inline fn callCallable1(callable: anytype, arg0: anytype) CallReturnType(@TypeOf(callable), 1) {
-        const T = @TypeOf(callable);
-        if (@typeInfo(T) == .@"struct" and @hasField(T, "call_fn")) {
-            return callable.call_fn(callable.env, arg0);
-        } else {
-            return callable(arg0);
-        }
-    }
-
-    /// 2-argument version of callCallable
-    pub inline fn callCallable2(callable: anytype, arg0: anytype, arg1: anytype) CallReturnType(@TypeOf(callable), 2) {
-        const T = @TypeOf(callable);
-        if (@typeInfo(T) == .@"struct" and @hasField(T, "call_fn")) {
-            return callable.call_fn(callable.env, arg0, arg1);
-        } else {
-            return callable(arg0, arg1);
-        }
-    }
-
-    /// 3-argument version of callCallable
-    pub inline fn callCallable3(callable: anytype, arg0: anytype, arg1: anytype, arg2: anytype) CallReturnType(@TypeOf(callable), 3) {
-        const T = @TypeOf(callable);
-        if (@typeInfo(T) == .@"struct" and @hasField(T, "call_fn")) {
-            return callable.call_fn(callable.env, arg0, arg1, arg2);
-        } else {
-            return callable(arg0, arg1, arg2);
-        }
-    }
-
-    /// Derive return type of a callable (bare fn or closure struct)
-    fn CallReturnType(comptime T: type, comptime arity: u32) type {
-        _ = arity;
-        if (@typeInfo(T) == .@"struct" and @hasField(T, "call_fn")) {
-            // Closure struct — return type from call_fn (skip env param)
-            const fn_info = @typeInfo(@TypeOf(@field(@as(T, undefined), "call_fn")));
-            if (fn_info == .pointer) {
-                const child = @typeInfo(fn_info.pointer.child);
-                if (child == .@"fn") {
-                    return child.@"fn".return_type orelse void;
-                }
-            }
-            return i64; // fallback
-        } else {
-            // Bare function pointer
-            const info = @typeInfo(T);
-            if (info == .pointer) {
-                const child = @typeInfo(info.pointer.child);
-                if (child == .@"fn") {
-                    return child.@"fn".return_type orelse void;
-                }
-            }
-            return i64; // fallback
-        }
-    }
 
     // CLI argument access — use getArgv() directly (no allocation)
     pub fn arg_count() i64 {

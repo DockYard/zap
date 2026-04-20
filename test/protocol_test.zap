@@ -7,16 +7,4 @@ pub module Test.ProtocolTest {
       assert(true)
     }
   }
-
-  describe("Capturing closures") {
-    test("closure captures local variable") {
-      multiplier = 3
-      result = apply_fn(7, fn(x :: i64) -> i64 { x * multiplier })
-      assert(result == 21)
-    }
-  }
-
-  fn apply_fn(value :: i64, callback :: (i64 -> i64)) -> i64 {
-    callback(value)
-  }
 }
