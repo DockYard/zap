@@ -5,6 +5,7 @@ pub struct Point {
 
 
 
+
 pub module Test.StructTest {
   use Zest.Case
 
