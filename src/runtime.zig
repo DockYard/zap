@@ -2255,16 +2255,16 @@ pub const List = struct {
 };
 
 // ============================================================
-// Map — Concrete flat-array map for pointer-based maps.
+// Map — Generic HAMT-based persistent map.
 //
+// MapOf(K, V) generates a type-specific map for any key/value types.
 // Maps use nullable pointers: null = empty, non-null = map cell.
-// Entries stored as flat array of {key, value} with linear scan.
-// Keys are atom IDs (u32). Values are i64.
+// Hybrid: flat array for small maps, HAMT trie for larger.
 // ============================================================
 
-pub const MapType = ?*const Map;
-
-pub const Map = struct {
+pub fn MapOf(comptime K: type, comptime V: type) type {
+    return struct {
+    const Self = @This();
     // Hybrid representation: flat array for small maps, HAMT trie for larger maps.
     // The HAMT (Hash Array Mapped Trie) provides O(log32 n) lookup, insert, and
     // delete for large maps while the flat array remains optimal for <= 8 entries.
@@ -2286,8 +2286,8 @@ pub const Map = struct {
     const MAX_DEPTH = 7; // ceil(32 / 5)
 
     pub const MapEntry = struct {
-        key: u32, // atom ID
-        value: i64,
+        key: K,
+        value: V,
     };
 
     /// HAMT trie node: bitmap-indexed with packed children array.
@@ -2299,9 +2299,25 @@ pub const Map = struct {
         child_count: u5,
     };
 
-    /// Murmur3 finalizer for distributing atom IDs across the hash space.
-    fn hashKey(key: u32) u32 {
-        var h = key;
+    /// Hash a key value for HAMT lookup. Supports u32 (atoms), i64, []const u8 (strings), bool.
+    fn hashKey(key: K) u32 {
+        const raw: u32 = if (K == u32)
+            key
+        else if (K == i64)
+            @truncate(@as(u64, @bitCast(key)))
+        else if (K == []const u8) blk: {
+            var h: u32 = 2166136261;
+            for (key) |byte| {
+                h ^= byte;
+                h *%= 16777619;
+            }
+            break :blk h;
+        } else if (K == bool)
+            if (key) @as(u32, 1) else @as(u32, 0)
+        else
+            0;
+        // Murmur3 finalizer
+        var h = raw;
         h ^= h >> 16;
         h *%= 0x85ebca6b;
         h ^= h >> 13;
@@ -2310,8 +2326,13 @@ pub const Map = struct {
         return h;
     }
 
-    fn allocMap() ?*Map {
-        const slice = bumpAllocSlice(Map, 1);
+    fn keysEqual(a: K, b: K) bool {
+        if (K == []const u8) return std.mem.eql(u8, a, b);
+        return a == b;
+    }
+
+    fn allocMap() ?*Self {
+        const slice = bumpAllocSlice(Self, 1);
         if (slice.len == 0) return null;
         return &slice[0];
     }
@@ -2339,7 +2360,7 @@ pub const Map = struct {
         return slice.ptr;
     }
 
-    fn makeFlatMap(entries: [*]const MapEntry, count: u32) ?*const Map {
+    fn makeFlatMap(entries: [*]const MapEntry, count: u32) ?*const Self {
         const cell = allocMap() orelse return null;
         cell.* = .{
             .total_count = count,
@@ -2351,7 +2372,7 @@ pub const Map = struct {
         return cell;
     }
 
-    fn makeTrieMap(root: *const HamtNode, total: u32) ?*const Map {
+    fn makeTrieMap(root: *const HamtNode, total: u32) ?*?*const Self {
         const cell = allocMap() orelse return null;
         cell.* = .{
             .total_count = total,
@@ -2370,7 +2391,7 @@ pub const Map = struct {
         return @intCast(@popCount(bitmap & (bit - 1)));
     }
 
-    fn hamtGet(node: *const HamtNode, key: u32, hash: u32, depth: u5) ?i64 {
+    fn hamtGet(node: *const HamtNode, key: K, hash: u32, depth: u5) ?V {
         const shift: u5 = depth * BITS_PER_LEVEL;
         const bit: u32 = @as(u32, 1) << @intCast((hash >> shift) & LEVEL_MASK);
 
@@ -2383,11 +2404,11 @@ pub const Map = struct {
         } else {
             // Leaf entry
             const entry = node.children_entries[idx];
-            return if (entry.key == key) entry.value else null;
+            return if (keysEqual(entry.key, key)) entry.value else null;
         }
     }
 
-    fn hamtPut(node: *const HamtNode, key: u32, value: i64, hash: u32, depth: u5) ?*const HamtNode {
+    fn hamtPut(node: *const HamtNode, key: K, value: V, hash: u32, depth: u5) ?*const HamtNode {
         const shift: u5 = depth * BITS_PER_LEVEL;
         const bit: u32 = @as(u32, 1) << @intCast((hash >> shift) & LEVEL_MASK);
         const idx = sparseIndex(node.bitmap, bit);
@@ -2432,7 +2453,7 @@ pub const Map = struct {
 
         // Existing leaf at this slot
         const existing = node.children_entries[idx];
-        if (existing.key == key) {
+        if (keysEqual(existing.key, key)) {
             // Update value
             return copyNodeWithUpdatedEntry(node, idx, .{ .key = key, .value = value });
         }
@@ -2452,7 +2473,7 @@ pub const Map = struct {
         return copyNodeWithUpdatedChild(node, idx, null, sub_with_both);
     }
 
-    fn hamtDelete(node: *const HamtNode, key: u32, hash: u32, depth: u5) ?*const HamtNode {
+    fn hamtDelete(node: *const HamtNode, key: K, hash: u32, depth: u5) ?*const HamtNode {
         const shift: u5 = depth * BITS_PER_LEVEL;
         const bit: u32 = @as(u32, 1) << @intCast((hash >> shift) & LEVEL_MASK);
 
@@ -2470,7 +2491,7 @@ pub const Map = struct {
 
         // Leaf
         const existing = node.children_entries[idx];
-        if (existing.key != key) return node; // not found
+        if (!keysEqual(existing.key, key)) return node; // not found
         return removeChildFromNode(node, idx, bit);
     }
 
@@ -2572,11 +2593,11 @@ pub const Map = struct {
 
     // === Public API (unchanged signatures) ===
 
-    pub fn empty() ?*const Map {
+    pub fn empty() ?*?*const Self {
         return null;
     }
 
-    pub fn fromPairs(key_ids: []const u32, vals: []const i64, count: u32) ?*const Map {
+    pub fn fromPairs(key_ids: []const K, vals: []const V, count: u32) ?*?*const Self {
         if (count == 0) return null;
         const n: usize = @intCast(count);
         const entry_arr = allocEntries(n) orelse return null;
@@ -2592,12 +2613,12 @@ pub const Map = struct {
         return makeTrieMap(root, count);
     }
 
-    pub fn get(map: ?*const Map, key: u32, default: i64) i64 {
+    pub fn get(map: ?*const Self, key: K, default: V) V {
         if (map) |m| {
             if (m.repr_tag == 0) {
                 // Flat: linear scan
                 for (m.flat_entries[0..m.flat_count]) |entry| {
-                    if (entry.key == key) return entry.value;
+                    if (keysEqual(entry.key, key)) return entry.value;
                 }
             } else {
                 // Trie: hash lookup
@@ -2610,17 +2631,17 @@ pub const Map = struct {
         return default;
     }
 
-    pub fn getStr(map: ?*const Map, key: u32, default: []const u8) []const u8 {
+    pub fn getStr(map: ?*const Self, key: K, default: []const u8) []const u8 {
         _ = map;
         _ = key;
         return default;
     }
 
-    pub fn hasKey(map: ?*const Map, key: u32) bool {
+    pub fn hasKey(map: ?*const Self, key: K) bool {
         if (map) |m| {
             if (m.repr_tag == 0) {
                 for (m.flat_entries[0..m.flat_count]) |entry| {
-                    if (entry.key == key) return true;
+                    if (keysEqual(entry.key, key)) return true;
                 }
             } else {
                 if (m.trie_root) |root| {
@@ -2632,16 +2653,16 @@ pub const Map = struct {
         return false;
     }
 
-    pub fn size(map: ?*const Map) i64 {
+    pub fn size(map: ?*?*const Self) i64 {
         if (map) |m| return @intCast(m.total_count);
         return 0;
     }
 
-    pub fn isEmpty(map: ?*const Map) bool {
+    pub fn isEmpty(map: ?*?*const Self) bool {
         return map == null;
     }
 
-    pub fn put(map: ?*const Map, key: u32, value: i64) ?*const Map {
+    pub fn put(map: ?*const Self, key: K, value: V) ?*const Self {
         if (map == null) {
             // Create new single-entry flat map
             const entries = allocEntries(1) orelse return null;
@@ -2657,7 +2678,7 @@ pub const Map = struct {
 
             // Check if key exists (update)
             for (0..old_count) |i| {
-                if (m.flat_entries[i].key == key) {
+                if (keysEqual(m.flat_entries[i].key, key)) {
                     // Update existing key — copy and replace
                     const new_entries = allocEntries(old_count) orelse return map;
                     for (0..old_count) |j| {
@@ -2698,7 +2719,7 @@ pub const Map = struct {
         return map;
     }
 
-    pub fn delete(map: ?*const Map, key: u32) ?*const Map {
+    pub fn delete(map: ?*const Self, key: K) ?*const Self {
         if (map == null) return null;
         const m = map.?;
 
@@ -2706,7 +2727,7 @@ pub const Map = struct {
             // Flat mode
             var found = false;
             for (m.flat_entries[0..m.flat_count]) |entry| {
-                if (entry.key == key) {
+                if (keysEqual(entry.key, key)) {
                     found = true;
                     break;
                 }
@@ -2719,7 +2740,7 @@ pub const Map = struct {
             const new_entries = allocEntries(new_count) orelse return map;
             var dst: usize = 0;
             for (m.flat_entries[0..m.flat_count]) |entry| {
-                if (entry.key != key) {
+                if (!keysEqual(entry.key, key)) {
                     new_entries[dst] = entry;
                     dst += 1;
                 }
@@ -2751,7 +2772,7 @@ pub const Map = struct {
         return map;
     }
 
-    pub fn merge(map_a: ?*const Map, map_b: ?*const Map) ?*const Map {
+    pub fn merge(map_a: ?*const Self, map_b: ?*const Self) ?*const Self {
         if (map_a == null) return map_b;
         if (map_b == null) return map_a;
         // Apply all entries from b onto a
@@ -2773,7 +2794,7 @@ pub const Map = struct {
         return result;
     }
 
-    pub fn keys(map: ?*const Map) ?*const List {
+    pub fn keys(map: ?*?*const Self) ?*const List {
         if (map == null) return null;
         const m = map.?;
 
@@ -2799,7 +2820,7 @@ pub const Map = struct {
         return result;
     }
 
-    pub fn values(map: ?*const Map) ?*const List {
+    pub fn values(map: ?*?*const Self) ?*const List {
         if (map == null) return null;
         const m = map.?;
 
@@ -2827,7 +2848,7 @@ pub const Map = struct {
 
     /// Simple reduce: folds map entries with a (acc, key, value) -> acc callback.
     /// Iterates all entries and applies the callback with the accumulator.
-    pub fn enumReduceSimple(map: ?*const Map, initial: i64, callback: anytype) i64 {
+    pub fn enumReduceSimple(map: ?*?*const Self, initial: i64, callback: anytype) i64 {
         if (map == null) return initial;
         const m = map.?;
         var acc: i64 = initial;
@@ -2851,7 +2872,7 @@ pub const Map = struct {
     /// Reduce with halt/cont control flow for the Enumerable protocol.
     /// The callback takes (accumulator, value) and returns a tuple where
     /// field "0" is :cont(5) or :halt(6), field "1" is the new accumulator.
-    pub fn reduceHaltCont(map: ?*const Map, initial: anytype, callback: anytype) struct { u64, i64 } {
+    pub fn reduceHaltCont(map: ?*?*const Self, initial: anytype, callback: anytype) struct { u64, i64 } {
         const ResultType = struct { u64, i64 };
         const ATOM_HALT: u64 = 6;
         const ATOM_CONT: u64 = 5;
@@ -2879,7 +2900,7 @@ pub const Map = struct {
 
     /// Reduce for Enumerable: folds map values with a (acc, value) -> acc callback.
     /// Only passes the value (not the key) to match the Enumerable protocol.
-    pub fn enumReduceValues(map: ?*const Map, initial: i64, callback: anytype) i64 {
+    pub fn enumReduceValues(map: ?*?*const Self, initial: i64, callback: anytype) i64 {
         if (map == null) return initial;
         const m = map.?;
         var acc: i64 = initial;
@@ -2897,7 +2918,16 @@ pub const Map = struct {
         }
         return acc;
     }
-};
+    }; // end of returned struct
+} // end of MapOf
+
+// Named map type aliases for common key/value combinations
+pub const Map = MapOf(u32, i64);                         // %{Atom => i64}
+pub const MapAtomString = MapOf(u32, []const u8);        // %{Atom => String}
+pub const MapAtomBool = MapOf(u32, bool);                // %{Atom => Bool}
+pub const MapStringInt = MapOf([]const u8, i64);         // %{String => i64}
+pub const MapStringString = MapOf([]const u8, []const u8); // %{String => String}
+pub const MapType = ?*const Map;                          // backward compat
 
 // ============================================================
 // Generic List factory — produces monomorphic list types
