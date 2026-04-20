@@ -36,6 +36,7 @@ pub module Test.TestRunner {
     Test.FileTest.run()
     Test.MathTest.run()
     Test.ProtocolTest.run()
+    Test.StructTest.run()
     Zest.Runner.run()
   }
 }

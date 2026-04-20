@@ -116,6 +116,7 @@ extern "c" fn zir_builder_emit_ret_null(handle: ?*ZirBuilderHandle) i32;
 // Struct type declarations
 extern "c" fn zir_builder_add_struct_type(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32, field_names_ptrs: [*]const [*]const u8, field_names_lens: [*]const u32, field_type_refs: [*]const u32, fields_len: u32) i32;
 extern "c" fn zir_builder_set_decl_val_return_type(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32) i32;
+extern "c" fn zir_builder_emit_param_decl_val_type(handle: ?*ZirBuilderHandle, param_name_ptr: [*]const u8, param_name_len: u32, type_name_ptr: [*]const u8, type_name_len: u32) u32;
 
 // Tuple return type
 extern "c" fn zir_builder_set_tuple_return_type(handle: ?*ZirBuilderHandle, types_ptr: [*]const u32, types_len: u32) i32;
@@ -1281,6 +1282,24 @@ pub const ZirDriver = struct {
     }
 
     fn emitTypedParam(self: *ZirDriver, param: ir.Param) !u32 {
+        // Struct params: use the nominal struct type via decl_val
+        if (std.meta.activeTag(param.type_expr) == .struct_ref) {
+            const name = param.type_expr.struct_ref;
+            const short_name = if (std.mem.lastIndexOf(u8, name, ".")) |dot_idx|
+                name[dot_idx + 1 ..]
+            else
+                name;
+            if (self.findStructDef(name) != null or self.findStructDef(short_name) != null) {
+                const ref = zir_builder_emit_param_decl_val_type(
+                    self.handle,
+                    param.name.ptr,
+                    @intCast(param.name.len),
+                    short_name.ptr,
+                    @intCast(short_name.len),
+                );
+                if (ref != error_ref) return ref;
+            }
+        }
         if (std.meta.activeTag(param.type_expr) == .map) {
             const ref = zir_builder_emit_param_imported_type(
                 self.handle,
