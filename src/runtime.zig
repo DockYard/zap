@@ -2927,7 +2927,13 @@ pub const MapAtomString = MapOf(u32, []const u8);        // %{Atom => String}
 pub const MapAtomBool = MapOf(u32, bool);                // %{Atom => Bool}
 pub const MapStringInt = MapOf([]const u8, i64);         // %{String => i64}
 pub const MapStringString = MapOf([]const u8, []const u8); // %{String => String}
-pub const MapType = ?*const Map;                          // backward compat
+
+// Pointer-type aliases for function return types
+pub const MapType = ?*const Map;
+pub const MapAtomStringType = ?*const MapAtomString;
+pub const MapAtomBoolType = ?*const MapAtomBool;
+pub const MapStringIntType = ?*const MapStringInt;
+pub const MapStringStringType = ?*const MapStringString;
 
 // ============================================================
 // Generic List factory — produces monomorphic list types

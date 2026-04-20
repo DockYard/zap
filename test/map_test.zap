@@ -75,4 +75,20 @@ pub module Test.MapTest {
       assert(List.length(Map.values(%{a: 1, b: 2})) == 2)
     }
   }
+
+  describe("String value maps") {
+    test("create string value map via function") {
+      names = make_name_map()
+      first = get_name(names, :first)
+      assert(first == "Alice")
+    }
+  }
+
+  fn make_name_map() -> %{Atom => String} {
+    %{first: "Alice", last: "Smith"}
+  }
+
+  fn get_name(names :: %{Atom => String}, key :: Atom) -> String {
+    :zig.MapAtomString.get(names, key, "")
+  }
 }

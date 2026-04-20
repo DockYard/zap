@@ -1328,11 +1328,21 @@ pub const ZirDriver = struct {
         return "Map";
     }
 
-    /// Map (key_type, value_type) to the runtime MapType alias name.
+    /// Map (key_type, value_type) to the runtime MapType pointer alias name.
     fn getMapTypeName(key_type: ir.ZigType, value_type: ir.ZigType) []const u8 {
-        // For now, all map types use the same nullable pointer pattern
-        _ = key_type;
-        _ = value_type;
+        if (std.meta.activeTag(key_type) == .atom) {
+            return switch (std.meta.activeTag(value_type)) {
+                .string => "MapAtomStringType",
+                .bool_type => "MapAtomBoolType",
+                else => "MapType",
+            };
+        }
+        if (std.meta.activeTag(key_type) == .string) {
+            return switch (std.meta.activeTag(value_type)) {
+                .string => "MapStringStringType",
+                else => "MapStringIntType",
+            };
+        }
         return "MapType";
     }
 
@@ -1372,14 +1382,16 @@ pub const ZirDriver = struct {
             }
         }
         if (std.meta.activeTag(param.type_expr) == .map) {
+            const mt = param.type_expr.map;
+            const type_name = getMapTypeName(mt.key.*, mt.value.*);
             const ref = zir_builder_emit_param_imported_type(
                 self.handle,
                 param.name.ptr,
                 @intCast(param.name.len),
                 "zap_runtime",
                 11,
-                "MapType",
-                7,
+                type_name.ptr,
+                @intCast(type_name.len),
             );
             if (ref == error_ref) return error.EmitFailed;
             return ref;
@@ -1422,8 +1434,9 @@ pub const ZirDriver = struct {
                     return error.EmitFailed;
                 self.current_ret_type = 1;
             },
-            .map => {
-                if (zir_builder_set_imported_return_type(self.handle, "zap_runtime", 11, "MapType", 7) != 0)
+            .map => |mt| {
+                const type_name = getMapTypeName(mt.key.*, mt.value.*);
+                if (zir_builder_set_imported_return_type(self.handle, "zap_runtime", 11, type_name.ptr, @intCast(type_name.len)) != 0)
                     return error.EmitFailed;
                 self.current_ret_type = 1;
             },
