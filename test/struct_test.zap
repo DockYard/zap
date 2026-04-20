@@ -3,6 +3,7 @@ pub struct Point {
   y :: i64
 }
 
+
 pub module Test.StructTest {
   use Zest.Case
 
