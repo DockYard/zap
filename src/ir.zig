@@ -282,6 +282,8 @@ pub const AggregateInit = struct {
 pub const MapInit = struct {
     dest: LocalId,
     entries: []const MapEntry,
+    key_type: ZigType = .atom,
+    value_type: ZigType = .i64,
 };
 
 pub const MapEntry = struct {
@@ -4069,13 +4071,25 @@ pub const IrBuilder = struct {
             },
             .map_init => |entries| {
                 var ir_entries: std.ArrayList(MapEntry) = .empty;
+                // Infer key/value types from the first entry's HIR type
+                var key_type: ZigType = .atom;
+                var value_type: ZigType = .i64;
+                if (entries.len > 0) {
+                    key_type = typeIdToZigTypeWithStore(entries[0].key.type_id, self.type_store);
+                    value_type = typeIdToZigTypeWithStore(entries[0].value.type_id, self.type_store);
+                }
                 for (entries) |entry| {
                     const key = try self.lowerExpr(entry.key);
                     const value = try self.lowerExpr(entry.value);
                     try ir_entries.append(self.allocator, .{ .key = key, .value = value });
                 }
                 try self.current_instrs.append(self.allocator, .{
-                    .map_init = .{ .dest = dest, .entries = try ir_entries.toOwnedSlice(self.allocator) },
+                    .map_init = .{
+                        .dest = dest,
+                        .entries = try ir_entries.toOwnedSlice(self.allocator),
+                        .key_type = key_type,
+                        .value_type = value_type,
+                    },
                 });
             },
             .capture_get => |index| {

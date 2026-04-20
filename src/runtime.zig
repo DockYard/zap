@@ -2372,7 +2372,7 @@ pub fn MapOf(comptime K: type, comptime V: type) type {
         return cell;
     }
 
-    fn makeTrieMap(root: *const HamtNode, total: u32) ?*?*const Self {
+    fn makeTrieMap(root: *const HamtNode, total: u32) ?*const Self {
         const cell = allocMap() orelse return null;
         cell.* = .{
             .total_count = total,
@@ -2593,11 +2593,11 @@ pub fn MapOf(comptime K: type, comptime V: type) type {
 
     // === Public API (unchanged signatures) ===
 
-    pub fn empty() ?*?*const Self {
+    pub fn empty() ?*const Self {
         return null;
     }
 
-    pub fn fromPairs(key_ids: []const K, vals: []const V, count: u32) ?*?*const Self {
+    pub fn fromPairs(key_ids: []const K, vals: []const V, count: u32) ?*const Self {
         if (count == 0) return null;
         const n: usize = @intCast(count);
         const entry_arr = allocEntries(n) orelse return null;
@@ -2653,12 +2653,12 @@ pub fn MapOf(comptime K: type, comptime V: type) type {
         return false;
     }
 
-    pub fn size(map: ?*?*const Self) i64 {
+    pub fn size(map: ?*const Self) i64 {
         if (map) |m| return @intCast(m.total_count);
         return 0;
     }
 
-    pub fn isEmpty(map: ?*?*const Self) bool {
+    pub fn isEmpty(map: ?*const Self) bool {
         return map == null;
     }
 
@@ -2794,7 +2794,7 @@ pub fn MapOf(comptime K: type, comptime V: type) type {
         return result;
     }
 
-    pub fn keys(map: ?*?*const Self) ?*const List {
+    pub fn keys(map: ?*const Self) ?*const List {
         if (map == null) return null;
         const m = map.?;
 
@@ -2820,7 +2820,7 @@ pub fn MapOf(comptime K: type, comptime V: type) type {
         return result;
     }
 
-    pub fn values(map: ?*?*const Self) ?*const List {
+    pub fn values(map: ?*const Self) ?*const List {
         if (map == null) return null;
         const m = map.?;
 
@@ -2848,7 +2848,7 @@ pub fn MapOf(comptime K: type, comptime V: type) type {
 
     /// Simple reduce: folds map entries with a (acc, key, value) -> acc callback.
     /// Iterates all entries and applies the callback with the accumulator.
-    pub fn enumReduceSimple(map: ?*?*const Self, initial: i64, callback: anytype) i64 {
+    pub fn enumReduceSimple(map: ?*const Self, initial: i64, callback: anytype) i64 {
         if (map == null) return initial;
         const m = map.?;
         var acc: i64 = initial;
@@ -2872,7 +2872,7 @@ pub fn MapOf(comptime K: type, comptime V: type) type {
     /// Reduce with halt/cont control flow for the Enumerable protocol.
     /// The callback takes (accumulator, value) and returns a tuple where
     /// field "0" is :cont(5) or :halt(6), field "1" is the new accumulator.
-    pub fn reduceHaltCont(map: ?*?*const Self, initial: anytype, callback: anytype) struct { u64, i64 } {
+    pub fn reduceHaltCont(map: ?*const Self, initial: anytype, callback: anytype) struct { u64, i64 } {
         const ResultType = struct { u64, i64 };
         const ATOM_HALT: u64 = 6;
         const ATOM_CONT: u64 = 5;
@@ -2900,7 +2900,7 @@ pub fn MapOf(comptime K: type, comptime V: type) type {
 
     /// Reduce for Enumerable: folds map values with a (acc, value) -> acc callback.
     /// Only passes the value (not the key) to match the Enumerable protocol.
-    pub fn enumReduceValues(map: ?*?*const Self, initial: i64, callback: anytype) i64 {
+    pub fn enumReduceValues(map: ?*const Self, initial: i64, callback: anytype) i64 {
         if (map == null) return initial;
         const m = map.?;
         var acc: i64 = initial;

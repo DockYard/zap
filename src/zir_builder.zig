@@ -1310,6 +1310,32 @@ pub const ZirDriver = struct {
         };
     }
 
+    /// Map (key_type, value_type) to the runtime Map variant name.
+    fn getMapName(key_type: ir.ZigType, value_type: ir.ZigType) []const u8 {
+        if (std.meta.activeTag(key_type) == .atom) {
+            return switch (std.meta.activeTag(value_type)) {
+                .string => "MapAtomString",
+                .bool_type => "MapAtomBool",
+                else => "Map", // default: atom => i64
+            };
+        }
+        if (std.meta.activeTag(key_type) == .string) {
+            return switch (std.meta.activeTag(value_type)) {
+                .string => "MapStringString",
+                else => "MapStringInt", // string => i64
+            };
+        }
+        return "Map";
+    }
+
+    /// Map (key_type, value_type) to the runtime MapType alias name.
+    fn getMapTypeName(key_type: ir.ZigType, value_type: ir.ZigType) []const u8 {
+        // For now, all map types use the same nullable pointer pattern
+        _ = key_type;
+        _ = value_type;
+        return "MapType";
+    }
+
     /// Map a list element ZigType to the runtime ListType alias name.
     fn getListTypeName(element_type: ir.ZigType) []const u8 {
         return switch (std.meta.activeTag(element_type)) {
@@ -2913,11 +2939,12 @@ pub const ZirDriver = struct {
                 try self.setLocal(lc.dest, ref);
             },
             .map_init => |mi| {
-                // Maps use MapCell — pointer-based flat array of {key, value} entries.
-                // Build key and value arrays, then call MapCell.fromPairs().
+                // Maps use type-specific MapOf(K, V) variants.
+                // Select the correct runtime variant based on key/value types.
                 const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                 if (rt_import == error_ref) return error.EmitFailed;
-                const map_cell = zir_builder_emit_field_val(self.handle, rt_import, "Map", 3);
+                const map_name = getMapName(mi.key_type, mi.value_type);
+                const map_cell = zir_builder_emit_field_val(self.handle, rt_import, map_name.ptr, @intCast(map_name.len));
                 if (map_cell == error_ref) return error.EmitFailed;
 
                 if (mi.entries.len == 0) {
