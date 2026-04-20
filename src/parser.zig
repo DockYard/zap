@@ -2626,6 +2626,21 @@ pub const Parser = struct {
         // Support multiline: %Name{\n  field: val,\n  ...\n}
         self.skipNewlines();
 
+        // Check for struct update: %Name{expr | field: val, ...}
+        var update_source: ?*const ast.Expr = null;
+        if (self.check(.identifier)) {
+            const saved = self.saveLexerState();
+            const id_tok = self.advance();
+            if (self.check(.pipe)) {
+                _ = self.advance(); // consume |
+                update_source = try self.create(ast.Expr, .{
+                    .var_ref = .{ .meta = .{ .span = ast.SourceSpan.from(id_tok.loc) }, .name = try self.internToken(id_tok) },
+                });
+            } else {
+                self.restoreLexerState(saved);
+            }
+        }
+
         var fields: std.ArrayList(ast.StructField) = .empty;
 
         while (!self.check(.right_brace) and !self.check(.eof)) {
@@ -2647,7 +2662,7 @@ pub const Parser = struct {
             .struct_expr = .{
                 .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
                 .module_name = module_name,
-                .update_source = null,
+                .update_source = update_source,
                 .fields = try fields.toOwnedSlice(self.allocator),
             },
         });

@@ -113,6 +113,36 @@ pub module Test.StructTest {
     %Config{name: config_name, count: config_count, enabled: is_enabled}
   }
 
+  describe("Struct update syntax") {
+    test("updates a single field") {
+      original = make_point(3, 4)
+      updated = update_x(original, 10)
+      assert(updated.x == 10)
+      assert(updated.y == 4)
+    }
+
+    test("updates multiple fields") {
+      original = make_point(1, 2)
+      updated = update_both(original, 10, 20)
+      assert(updated.x == 10)
+      assert(updated.y == 20)
+    }
+
+    test("original is unchanged after update") {
+      original = make_point(5, 6)
+      _updated = update_x(original, 99)
+      assert(original.x == 5)
+    }
+  }
+
+  fn update_x(point :: Point, new_x :: i64) -> Point {
+    %Point{point | x: new_x}
+  }
+
+  fn update_both(point :: Point, new_x :: i64, new_y :: i64) -> Point {
+    %Point{point | x: new_x, y: new_y}
+  }
+
   fn get_x_from_inline() -> i64 {
     point = %Point{x: 42, y: 99}
     point.x

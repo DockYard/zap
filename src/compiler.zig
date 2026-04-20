@@ -387,7 +387,7 @@ pub fn collectAllFromUnits(
     step += 1;
     if (options.show_progress) std.debug.print("\r\x1b[K  [{d}/{d}] Desugar", .{ step, total_steps });
 
-    var desugarer = zap.Desugarer.init(alloc, &interner);
+    var desugarer = zap.Desugarer.init(alloc, &interner, &collector.graph);
     const desugared_program = desugarer.desugarProgram(&expanded_program) catch {
         diag_engine.err("Error during desugaring", .{ .start = 0, .end = 0 }) catch {};
         if (options.show_progress) std.debug.print("\r\x1b[K", .{});
@@ -540,7 +540,7 @@ pub fn compileForCtfe(
     step += 1;
     if (options.show_progress) std.debug.print("\r\x1b[K  [{d}/{d}] Desugar", .{ step, total_steps });
 
-    var desugarer = zap.Desugarer.init(alloc, &ctx.interner);
+    var desugarer = zap.Desugarer.init(alloc, &ctx.interner, &ctx.collector.graph);
     const desugared_program = desugarer.desugarProgram(&expanded_program) catch {
         ctx.diag_engine.err("Error during desugaring", .{ .start = 0, .end = 0 }) catch {};
         if (options.show_progress) std.debug.print("\r\x1b[K", .{});
