@@ -1232,18 +1232,9 @@ pub const ZirDriver = struct {
             self.collectNestedTupleTypes(func.return_type);
         }
 
-        // For tuple return types, set up the computed return type via tuple_decl.
-        // Nested tuples are handled by recursively emitting tuple_decl instructions.
+        // For tuple return types, mark as non-void so ret handler emits
+        // value returns. The actual tuple type is inferred from the body.
         if (func.return_type == .tuple) {
-            std.debug.print("[tuple-ret] {s} has tuple return with {d} elements\n", .{ emit_name, func.return_type.tuple.len });
-            var type_refs : std.ArrayListUnmanaged(u32) = .empty;
-            defer type_refs.deinit(self.allocator);
-            for (func.return_type.tuple) |elem_type| {
-                try type_refs.append(self.allocator, self.mapTupleElementType(elem_type));
-            }
-            if (zir_builder_set_tuple_return_type(self.handle, type_refs.items.ptr, @intCast(type_refs.items.len)) != 0) {
-                return error.EmitFailed;
-            }
             self.current_ret_type = 1;
         }
 
