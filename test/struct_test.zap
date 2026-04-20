@@ -48,6 +48,12 @@ pub module Test.StructTest {
       assert(result == 7)
     }
 
+    test("struct created directly in test body") {
+      point = %Point{x: 99, y: 88}
+      assert(point.x == 99)
+      assert(point.y == 88)
+    }
+
     test("struct created and accessed inline") {
       point = make_point(10, 20)
       assert(point.x == 10)

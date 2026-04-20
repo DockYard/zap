@@ -895,6 +895,52 @@ pub fn ctValueToExpr(
         return expr;
     }
 
+    // Struct expression: {:%, meta, [name_list, {:%{}, [], [field_pairs...]}]}
+    if (std.mem.eql(u8, form_name, "%")) {
+        if (arg_elems.len == 2) {
+            // arg_elems[0] = module name parts (list of atoms)
+            // arg_elems[1] = {:%{}, [], [field_pairs...]} (map node with fields)
+            var name_parts: std.ArrayListUnmanaged(ast.StringId) = .empty;
+            if (arg_elems[0] == .list) {
+                for (arg_elems[0].list.elems) |elem| {
+                    if (elem == .atom) {
+                        try name_parts.append(alloc, try interner.intern(elem.atom));
+                    }
+                }
+            }
+
+            // Extract fields from the map node {:%{}, [], [field_pairs...]}
+            var fields: std.ArrayListUnmanaged(ast.StructField) = .empty;
+            const map_node = arg_elems[1];
+            if (map_node == .tuple and map_node.tuple.elems.len >= 3) {
+                const map_args = map_node.tuple.elems[2];
+                if (map_args == .list) {
+                    for (map_args.list.elems) |pair| {
+                        if (pair == .tuple and pair.tuple.elems.len == 2) {
+                            const key = pair.tuple.elems[0];
+                            const val = pair.tuple.elems[1];
+                            if (key == .atom) {
+                                try fields.append(alloc, .{
+                                    .name = try interner.intern(key.atom),
+                                    .value = try ctValueToExpr(alloc, interner, val),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
+            const expr = try alloc.create(ast.Expr);
+            expr.* = .{ .struct_expr = .{
+                .meta = node_meta,
+                .module_name = .{ .parts = try name_parts.toOwnedSlice(alloc), .span = node_meta.span },
+                .update_source = null,
+                .fields = try fields.toOwnedSlice(alloc),
+            } };
+            return expr;
+        }
+    }
+
     if (std.mem.eql(u8, form_name, "|>")) {
         if (arg_elems.len == 2) {
             const lhs = try ctValueToExpr(alloc, interner, arg_elems[0]);
