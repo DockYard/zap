@@ -1837,6 +1837,28 @@ pub const BinaryHelpers = struct {
 /// Type alias for list values — used by the ZIR builder to type list parameters.
 pub const ListType = ?*const ListCell;
 
+// ---- Callable dispatch helpers ----
+// Handle both bare function pointers and closure structs transparently.
+// Used by ListCell, MapCell, and ListCellOf higher-order functions.
+
+inline fn call1(callback: anytype, arg0: anytype) @TypeOf(if (@typeInfo(@TypeOf(callback)) == .@"struct" and @hasField(@TypeOf(callback), "call_fn")) callback.call_fn(callback.env, arg0) else callback(arg0)) {
+    const T = @TypeOf(callback);
+    if (@typeInfo(T) == .@"struct" and @hasField(T, "call_fn")) {
+        return callback.call_fn(callback.env, arg0);
+    } else {
+        return callback(arg0);
+    }
+}
+
+inline fn call2(callback: anytype, arg0: anytype, arg1: anytype) @TypeOf(if (@typeInfo(@TypeOf(callback)) == .@"struct" and @hasField(@TypeOf(callback), "call_fn")) callback.call_fn(callback.env, arg0, arg1) else callback(arg0, arg1)) {
+    const T = @TypeOf(callback);
+    if (@typeInfo(T) == .@"struct" and @hasField(T, "call_fn")) {
+        return callback.call_fn(callback.env, arg0, arg1);
+    } else {
+        return callback(arg0, arg1);
+    }
+}
+
 pub const ListCell = struct {
     head: i64,
     tail: ?*const ListCell,
@@ -2020,13 +2042,14 @@ pub const ListCell = struct {
     }
 
     /// Remove duplicates, preserving first occurrence order.
+
     // ---- Higher-order functions (for Enum module) ----
 
     pub fn mapFn(list: ?*const ListCell, callback: anytype) ?*const ListCell {
         var current = list;
         var result: ?*const ListCell = null;
         while (current) |cell| {
-            result = cons(callback(cell.head), result);
+            result = cons(call1(callback, cell.head), result);
             current = cell.tail;
         }
         return reverse(result);
@@ -2036,7 +2059,7 @@ pub const ListCell = struct {
         var current = list;
         var result: ?*const ListCell = null;
         while (current) |cell| {
-            if (predicate(cell.head)) {
+            if (call1(predicate, cell.head)) {
                 result = cons(cell.head, result);
             }
             current = cell.tail;
@@ -2048,7 +2071,7 @@ pub const ListCell = struct {
         var current = list;
         var result: ?*const ListCell = null;
         while (current) |cell| {
-            if (!predicate(cell.head)) {
+            if (!call1(predicate, cell.head)) {
                 result = cons(cell.head, result);
             }
             current = cell.tail;
@@ -2057,12 +2080,12 @@ pub const ListCell = struct {
     }
 
     /// Simple reduce: folds a list with a (acc, element) -> acc callback.
-    /// Takes a bare callback (no halt/cont) and returns the final accumulator.
+    /// Handles both bare function pointers and closure structs (with call_fn/env).
     pub fn enumReduceSimple(list: ?*const ListCell, initial: i64, callback: anytype) i64 {
         var current = list;
         var acc: i64 = initial;
         while (current) |cell| {
-            acc = callback(acc, cell.head);
+            acc = call2(callback, acc, cell.head);
             current = cell.tail;
         }
         return acc;
@@ -2072,7 +2095,7 @@ pub const ListCell = struct {
         var current = list;
         var acc = initial;
         while (current) |cell| {
-            acc = callback(acc, cell.head);
+            acc = call2(callback, acc, cell.head);
             current = cell.tail;
         }
         return acc;
@@ -2091,7 +2114,7 @@ pub const ListCell = struct {
         var current = list;
         var acc: AccType = initial;
         while (current) |cell| {
-            const result = callback(acc, cell.head);
+            const result = call2(callback, acc, cell.head);
             if (result.@"0" == ATOM_HALT) {
                 return result;
             }
@@ -2107,7 +2130,7 @@ pub const ListCell = struct {
     pub fn eachFn(list: ?*const ListCell, callback: anytype) ?*const ListCell {
         var current = list;
         while (current) |cell| {
-            _ = callback(cell.head);
+            _ = call1(callback, cell.head);
             current = cell.tail;
         }
         return list;
@@ -2116,7 +2139,7 @@ pub const ListCell = struct {
     pub fn findFn(list: ?*const ListCell, default: i64, predicate: anytype) i64 {
         var current = list;
         while (current) |cell| {
-            if (predicate(cell.head)) return cell.head;
+            if (call1(predicate, cell.head)) return cell.head;
             current = cell.tail;
         }
         return default;
@@ -2125,7 +2148,7 @@ pub const ListCell = struct {
     pub fn anyFn(list: ?*const ListCell, predicate: anytype) bool {
         var current = list;
         while (current) |cell| {
-            if (predicate(cell.head)) return true;
+            if (call1(predicate, cell.head)) return true;
             current = cell.tail;
         }
         return false;
@@ -2134,7 +2157,7 @@ pub const ListCell = struct {
     pub fn allFn(list: ?*const ListCell, predicate: anytype) bool {
         var current = list;
         while (current) |cell| {
-            if (!predicate(cell.head)) return false;
+            if (!call1(predicate, cell.head)) return false;
             current = cell.tail;
         }
         return true;
@@ -2144,7 +2167,7 @@ pub const ListCell = struct {
         var current = list;
         var count: i64 = 0;
         while (current) |cell| {
-            if (predicate(cell.head)) count += 1;
+            if (call1(predicate, cell.head)) count += 1;
             current = cell.tail;
         }
         return count;
@@ -2168,7 +2191,7 @@ pub const ListCell = struct {
         const Ctx = struct {
             cmp: @TypeOf(comparator),
             fn lessThan(ctx: @This(), a: i64, b: i64) bool {
-                return ctx.cmp(a, b);
+                return call2(ctx.cmp, a, b);
             }
         };
         std.sort.pdq(i64, arr, Ctx{ .cmp = comparator }, Ctx.lessThan);
@@ -2186,7 +2209,7 @@ pub const ListCell = struct {
         var current = list;
         var result: ?*const ListCell = null;
         while (current) |cell| {
-            var inner = callback(cell.head);
+            var inner = call1(callback, cell.head);
             while (inner) |inner_cell| {
                 result = cons(inner_cell.head, result);
                 inner = inner_cell.tail;
@@ -2999,7 +3022,7 @@ pub fn ListCellOf(comptime T: type) type {
             var current = list;
             var result: ?*const Self = null;
             while (current) |cell| {
-                result = cons(callback(cell.head), result);
+                result = cons(call1(callback, cell.head), result);
                 current = cell.tail;
             }
             return reverse(result);
@@ -3009,7 +3032,7 @@ pub fn ListCellOf(comptime T: type) type {
             var current = list;
             var result: ?*const Self = null;
             while (current) |cell| {
-                if (predicate(cell.head)) {
+                if (call1(predicate, cell.head)) {
                     result = cons(cell.head, result);
                 }
                 current = cell.tail;
@@ -3021,7 +3044,7 @@ pub fn ListCellOf(comptime T: type) type {
             var current = list;
             var acc = initial;
             while (current) |cell| {
-                acc = callback(acc, cell.head);
+                acc = call2(callback, acc, cell.head);
                 current = cell.tail;
             }
             return acc;

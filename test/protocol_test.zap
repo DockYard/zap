@@ -17,6 +17,34 @@ pub module Test.ProtocolTest {
     Enum.reduce_map(map, 0, fn(accumulator :: i64, value :: i64) -> i64 { accumulator + value })
   }
 
+  describe("Closures with Enum functions") {
+    test("capturing closure with Enum.reduce") {
+      multiplier = 3
+      result = Enum.reduce([1, 2, 3], 0, fn(accumulator :: i64, element :: i64) -> i64 { accumulator + element * multiplier })
+      assert(result == 18)
+    }
+
+    test("capturing closure with Enum.map") {
+      offset = 10
+      result = Enum.map([1, 2, 3], fn(element :: i64) -> i64 { element + offset })
+      assert(List.at(result, 0) == 11)
+      assert(List.at(result, 1) == 12)
+      assert(List.at(result, 2) == 13)
+    }
+
+    test("capturing closure with Enum.filter") {
+      threshold = 2
+      result = Enum.filter([1, 2, 3, 4], fn(element :: i64) -> Bool { element > threshold })
+      assert(List.length(result) == 2)
+    }
+
+    test("capturing closure with Enum.count") {
+      min_val = 3
+      result = Enum.count([1, 2, 3, 4, 5], fn(element :: i64) -> Bool { element >= min_val })
+      assert(result == 3)
+    }
+  }
+
   describe("Protocol dispatch via Enum") {
     test("Enum.each iterates list for side effects") {
       Enum.each([1, 2, 3], fn(x :: i64) -> i64 { x * 2 })
