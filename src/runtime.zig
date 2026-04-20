@@ -490,39 +490,6 @@ pub const TaggedValue = union(enum) {
             .list, .closure => false, // structural equality not supported for these
         };
     }
-
-    /// Convert a raw Zig value to a TaggedValue at comptime.
-    pub fn from(value: anytype) TaggedValue {
-        const T = @TypeOf(value);
-        if (T == TaggedValue) return value;
-        if (T == i64) return .{ .int = value };
-        if (T == f64) return .{ .float = value };
-        if (T == bool) return .{ .bool_val = value };
-        if (T == []const u8) return .{ .string = value };
-        if (T == u32) return .{ .atom = .{ .id = value } }; // atom ID
-        if (@typeInfo(T) == .pointer) {
-            const child = @typeInfo(T).pointer.child;
-            if (child == List) return .{ .list = value };
-        }
-        return .{ .nil = {} };
-    }
-
-    /// Extract the i64 value, or return a default.
-    pub fn toInt(self: TaggedValue, default: i64) i64 {
-        return switch (self) {
-            .int => |v| v,
-            .atom => |a| @as(i64, @intCast(a.id)),
-            else => default,
-        };
-    }
-
-    /// Extract the string value, or return a default.
-    pub fn toStr(self: TaggedValue, default: []const u8) []const u8 {
-        return switch (self) {
-            .string => |v| v,
-            else => default,
-        };
-    }
 };
 
 // ============================================================
@@ -2319,8 +2286,8 @@ pub const Map = struct {
     const MAX_DEPTH = 7; // ceil(32 / 5)
 
     pub const MapEntry = struct {
-        key: TaggedValue,
-        value: TaggedValue,
+        key: u32, // atom ID
+        value: i64,
     };
 
     /// HAMT trie node: bitmap-indexed with packed children array.
@@ -2332,38 +2299,15 @@ pub const Map = struct {
         child_count: u5,
     };
 
-    /// Hash a TaggedValue key for HAMT lookup.
-    fn hashKey(key: TaggedValue) u32 {
-        const raw = switch (key) {
-            .int => |v| @as(u32, @truncate(@as(u64, @bitCast(v)))),
-            .float => |v| @as(u32, @truncate(@as(u64, @bitCast(v)))),
-            .bool_val => |v| if (v) @as(u32, 1) else @as(u32, 0),
-            .atom => |a| a.id,
-            .string => |s| blk: {
-                // FNV-1a hash for strings
-                var h: u32 = 2166136261;
-                for (s) |byte| {
-                    h ^= byte;
-                    h *%= 16777619;
-                }
-                break :blk h;
-            },
-            .nil => 0,
-            else => 0,
-        };
-        // Murmur3 finalizer
-        var h = raw;
+    /// Murmur3 finalizer for distributing atom IDs across the hash space.
+    fn hashKey(key: u32) u32 {
+        var h = key;
         h ^= h >> 16;
         h *%= 0x85ebca6b;
         h ^= h >> 13;
         h *%= 0xc2b2ae35;
         h ^= h >> 16;
         return h;
-    }
-
-    /// Compare two TaggedValue keys for equality.
-    fn keysEqual(a: TaggedValue, b: TaggedValue) bool {
-        return a.eql(b);
     }
 
     fn allocMap() ?*Map {
@@ -2426,7 +2370,7 @@ pub const Map = struct {
         return @intCast(@popCount(bitmap & (bit - 1)));
     }
 
-    fn hamtGet(node: *const HamtNode, key: TaggedValue, hash: u32, depth: u5) ?TaggedValue {
+    fn hamtGet(node: *const HamtNode, key: u32, hash: u32, depth: u5) ?i64 {
         const shift: u5 = depth * BITS_PER_LEVEL;
         const bit: u32 = @as(u32, 1) << @intCast((hash >> shift) & LEVEL_MASK);
 
@@ -2439,11 +2383,11 @@ pub const Map = struct {
         } else {
             // Leaf entry
             const entry = node.children_entries[idx];
-            return if (keysEqual(entry.key, key)) entry.value else null;
+            return if (entry.key == key) entry.value else null;
         }
     }
 
-    fn hamtPut(node: *const HamtNode, key: TaggedValue, value: TaggedValue, hash: u32, depth: u5) ?*const HamtNode {
+    fn hamtPut(node: *const HamtNode, key: u32, value: i64, hash: u32, depth: u5) ?*const HamtNode {
         const shift: u5 = depth * BITS_PER_LEVEL;
         const bit: u32 = @as(u32, 1) << @intCast((hash >> shift) & LEVEL_MASK);
         const idx = sparseIndex(node.bitmap, bit);
@@ -2488,7 +2432,7 @@ pub const Map = struct {
 
         // Existing leaf at this slot
         const existing = node.children_entries[idx];
-        if (keysEqual(existing.key, key)) {
+        if (existing.key == key) {
             // Update value
             return copyNodeWithUpdatedEntry(node, idx, .{ .key = key, .value = value });
         }
@@ -2508,7 +2452,7 @@ pub const Map = struct {
         return copyNodeWithUpdatedChild(node, idx, null, sub_with_both);
     }
 
-    fn hamtDelete(node: *const HamtNode, key: TaggedValue, hash: u32, depth: u5) ?*const HamtNode {
+    fn hamtDelete(node: *const HamtNode, key: u32, hash: u32, depth: u5) ?*const HamtNode {
         const shift: u5 = depth * BITS_PER_LEVEL;
         const bit: u32 = @as(u32, 1) << @intCast((hash >> shift) & LEVEL_MASK);
 
@@ -2526,7 +2470,7 @@ pub const Map = struct {
 
         // Leaf
         const existing = node.children_entries[idx];
-        if (!keysEqual(existing.key, key)) return node; // not found
+        if (existing.key != key) return node; // not found
         return removeChildFromNode(node, idx, bit);
     }
 
@@ -2632,32 +2576,12 @@ pub const Map = struct {
         return null;
     }
 
-    /// Create a map from parallel arrays of keys and values.
-    /// Keys are atom IDs (u32), values are i64 (legacy entry point).
-    /// Use fromTaggedPairs for polymorphic maps.
-    pub fn fromAtomIntPairs(key_ids: []const u32, int_vals: []const i64, count: u32) ?*const Map {
+    pub fn fromPairs(key_ids: []const u32, vals: []const i64, count: u32) ?*const Map {
         if (count == 0) return null;
         const n: usize = @intCast(count);
         const entry_arr = allocEntries(n) orelse return null;
         for (0..n) |i| {
-            entry_arr[i] = .{
-                .key = .{ .atom = .{ .id = key_ids[i] } },
-                .value = .{ .int = int_vals[i] },
-            };
-        }
-        if (count <= FLAT_THRESHOLD) {
-            return makeFlatMap(entry_arr, count);
-        }
-        const root = flatToTrie(entry_arr, count) orelse return makeFlatMap(entry_arr, count);
-        return makeTrieMap(root, count);
-    }
-
-    pub fn fromPairs(pair_keys: []const TaggedValue, vals: []const TaggedValue, count: u32) ?*const Map {
-        if (count == 0) return null;
-        const n: usize = @intCast(count);
-        const entry_arr = allocEntries(n) orelse return null;
-        for (0..n) |i| {
-            entry_arr[i] = .{ .key = pair_keys[i], .value = vals[i] };
+            entry_arr[i] = .{ .key = key_ids[i], .value = vals[i] };
         }
 
         if (count <= FLAT_THRESHOLD) {
@@ -2668,43 +2592,35 @@ pub const Map = struct {
         return makeTrieMap(root, count);
     }
 
-    /// Get a value by key. Accepts any Zig type for key, returns i64 (legacy).
-    pub fn get(map: ?*const Map, key: anytype, default: i64) i64 {
-        const tv = getTagged(map, TaggedValue.from(key));
-        return if (tv) |v| v.toInt(default) else default;
-    }
-
-    fn getTagged(map: ?*const Map, key: TaggedValue) ?TaggedValue {
+    pub fn get(map: ?*const Map, key: u32, default: i64) i64 {
         if (map) |m| {
             if (m.repr_tag == 0) {
+                // Flat: linear scan
                 for (m.flat_entries[0..m.flat_count]) |entry| {
-                    if (keysEqual(entry.key, key)) return entry.value;
+                    if (entry.key == key) return entry.value;
                 }
             } else {
+                // Trie: hash lookup
                 if (m.trie_root) |root| {
                     const hash = hashKey(key);
-                    return hamtGet(root, key, hash, 0);
+                    return hamtGet(root, key, hash, 0) orelse default;
                 }
             }
         }
-        return null;
+        return default;
     }
 
-    pub fn getStr(map: ?*const Map, key: TaggedValue, default: []const u8) []const u8 {
+    pub fn getStr(map: ?*const Map, key: u32, default: []const u8) []const u8 {
         _ = map;
         _ = key;
         return default;
     }
 
-    pub fn hasKey(map: ?*const Map, key: anytype) bool {
-        return hasKeyTagged(map, TaggedValue.from(key));
-    }
-
-    fn hasKeyTagged(map: ?*const Map, key: TaggedValue) bool {
+    pub fn hasKey(map: ?*const Map, key: u32) bool {
         if (map) |m| {
             if (m.repr_tag == 0) {
                 for (m.flat_entries[0..m.flat_count]) |entry| {
-                    if (keysEqual(entry.key, key)) return true;
+                    if (entry.key == key) return true;
                 }
             } else {
                 if (m.trie_root) |root| {
@@ -2725,12 +2641,7 @@ pub const Map = struct {
         return map == null;
     }
 
-    /// Put a key-value pair. Accepts any Zig type and wraps to TaggedValue.
-    pub fn put(map: ?*const Map, key: anytype, value: anytype) ?*const Map {
-        return putTagged(map, TaggedValue.from(key), TaggedValue.from(value));
-    }
-
-    fn putTagged(map: ?*const Map, key: TaggedValue, value: TaggedValue) ?*const Map {
+    pub fn put(map: ?*const Map, key: u32, value: i64) ?*const Map {
         if (map == null) {
             // Create new single-entry flat map
             const entries = allocEntries(1) orelse return null;
@@ -2746,7 +2657,7 @@ pub const Map = struct {
 
             // Check if key exists (update)
             for (0..old_count) |i| {
-                if (keysEqual(m.flat_entries[i].key, key)) {
+                if (m.flat_entries[i].key == key) {
                     // Update existing key — copy and replace
                     const new_entries = allocEntries(old_count) orelse return map;
                     for (0..old_count) |j| {
@@ -2787,11 +2698,7 @@ pub const Map = struct {
         return map;
     }
 
-    pub fn delete(map: ?*const Map, key: anytype) ?*const Map {
-        return deleteTagged(map, TaggedValue.from(key));
-    }
-
-    fn deleteTagged(map: ?*const Map, key: TaggedValue) ?*const Map {
+    pub fn delete(map: ?*const Map, key: u32) ?*const Map {
         if (map == null) return null;
         const m = map.?;
 
@@ -2799,7 +2706,7 @@ pub const Map = struct {
             // Flat mode
             var found = false;
             for (m.flat_entries[0..m.flat_count]) |entry| {
-                if (keysEqual(entry.key, key)) {
+                if (entry.key == key) {
                     found = true;
                     break;
                 }
@@ -2812,7 +2719,7 @@ pub const Map = struct {
             const new_entries = allocEntries(new_count) orelse return map;
             var dst: usize = 0;
             for (m.flat_entries[0..m.flat_count]) |entry| {
-                if (!keysEqual(entry.key, key)) {
+                if (entry.key != key) {
                     new_entries[dst] = entry;
                     dst += 1;
                 }
@@ -2875,7 +2782,7 @@ pub const Map = struct {
             var i: usize = m.flat_count;
             while (i > 0) {
                 i -= 1;
-                result = List.cons(m.flat_entries[i].key.toInt(0), result);
+                result = List.cons(@intCast(m.flat_entries[i].key), result);
             }
             return result;
         }
@@ -2887,7 +2794,7 @@ pub const Map = struct {
         var i: usize = collected.items.len;
         while (i > 0) {
             i -= 1;
-            result = List.cons(collected.items[i].key.toInt(0), result);
+            result = List.cons(@intCast(collected.items[i].key), result);
         }
         return result;
     }
@@ -2901,7 +2808,7 @@ pub const Map = struct {
             var i: usize = m.flat_count;
             while (i > 0) {
                 i -= 1;
-                result = List.cons(m.flat_entries[i].value.toInt(0), result);
+                result = List.cons(m.flat_entries[i].value, result);
             }
             return result;
         }
@@ -2913,7 +2820,7 @@ pub const Map = struct {
         var i: usize = collected.items.len;
         while (i > 0) {
             i -= 1;
-            result = List.cons(collected.items[i].value.toInt(0), result);
+            result = List.cons(collected.items[i].value, result);
         }
         return result;
     }
@@ -2928,14 +2835,14 @@ pub const Map = struct {
         if (m.repr_tag == 0) {
             // Flat representation
             for (0..m.flat_count) |i| {
-                acc = callback(acc, m.flat_entries[i].key.toInt(0), m.flat_entries[i].value.toInt(0));
+                acc = callback(acc, @as(i64, @intCast(m.flat_entries[i].key)), m.flat_entries[i].value);
             }
         } else if (m.trie_root) |root| {
             // Trie: collect entries then iterate
             var collected: std.ArrayListUnmanaged(MapEntry) = .empty;
             hamtCollect(root, &collected);
             for (collected.items) |entry| {
-                acc = callback(acc, entry.key.toInt(0), entry.value.toInt(0));
+                acc = callback(acc, @as(i64, @intCast(entry.key)), entry.value);
             }
         }
         return acc;
@@ -2954,7 +2861,7 @@ pub const Map = struct {
 
         if (m.repr_tag == 0) {
             for (0..m.flat_count) |i| {
-                const result = callback(acc, m.flat_entries[i].value.toInt(0));
+                const result = callback(acc, m.flat_entries[i].value);
                 if (result.@"0" == ATOM_HALT) return ResultType{ result.@"0", result.@"1" };
                 acc = result.@"1";
             }
@@ -2962,7 +2869,7 @@ pub const Map = struct {
             var collected: std.ArrayListUnmanaged(MapEntry) = .empty;
             hamtCollect(root, &collected);
             for (collected.items) |entry| {
-                const result = callback(acc, entry.value.toInt(0));
+                const result = callback(acc, entry.value);
                 if (result.@"0" == ATOM_HALT) return ResultType{ result.@"0", result.@"1" };
                 acc = result.@"1";
             }
@@ -2979,13 +2886,13 @@ pub const Map = struct {
 
         if (m.repr_tag == 0) {
             for (0..m.flat_count) |i| {
-                acc = call2(callback, acc, m.flat_entries[i].value.toInt(0));
+                acc = callback(acc, m.flat_entries[i].value);
             }
         } else if (m.trie_root) |root| {
             var collected: std.ArrayListUnmanaged(MapEntry) = .empty;
             hamtCollect(root, &collected);
             for (collected.items) |entry| {
-                acc = call2(callback, acc, entry.value.toInt(0));
+                acc = callback(acc, entry.value);
             }
         }
         return acc;
