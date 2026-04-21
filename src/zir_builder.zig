@@ -2958,15 +2958,10 @@ pub const ZirDriver = struct {
                 }
             },
             .list_init => |li| {
-                // Lists use named aliases (List, StringList, etc.) because
-                // the hand-written List struct has additional i64-specific methods
-                // not present in the generic ListOf(T). Once List is refactored
-                // to be an alias of ListOf(i64), this can use the generic pattern.
-                const cell_name = getListName(li.element_type);
-                const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
-                if (rt_import == error_ref) return error.EmitFailed;
-                const list_cell = zir_builder_emit_field_val(self.handle, rt_import, cell_name.ptr, @intCast(cell_name.len));
-                if (list_cell == error_ref) return error.EmitFailed;
+                // Lists use generic ListOf(T) instantiation.
+                const elem_type_ref = zigTypeToTypeRef(li.element_type) orelse @intFromEnum(Zir.Inst.Ref.i64_type);
+                const list_type_args = [_]u32{elem_type_ref};
+                const list_cell = self.emitGenericContainerRef("ListOf", &list_type_args) catch return error.EmitFailed;
                 const cons_fn = zir_builder_emit_field_val(self.handle, list_cell, "cons", 4);
                 if (cons_fn == error_ref) return error.EmitFailed;
 
@@ -2996,14 +2991,12 @@ pub const ZirDriver = struct {
                 }
             },
             .list_cons => |lc| {
-                // List cons: uses named aliases (same reason as list_init above).
-                const cell_name = getListName(lc.element_type);
+                // List cons: uses generic ListOf(T) instantiation.
+                const elem_type_ref = zigTypeToTypeRef(lc.element_type) orelse @intFromEnum(Zir.Inst.Ref.i64_type);
+                const list_type_args = [_]u32{elem_type_ref};
                 const head_ref = self.refForLocal(lc.head) catch @intFromEnum(Zir.Inst.Ref.void_value);
                 const tail_ref = self.refForLocal(lc.tail) catch @intFromEnum(Zir.Inst.Ref.void_value);
-                const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
-                if (rt_import == error_ref) return error.EmitFailed;
-                const list_cell = zir_builder_emit_field_val(self.handle, rt_import, cell_name.ptr, @intCast(cell_name.len));
-                if (list_cell == error_ref) return error.EmitFailed;
+                const list_cell = self.emitGenericContainerRef("ListOf", &list_type_args) catch return error.EmitFailed;
                 const cons_fn = zir_builder_emit_field_val(self.handle, list_cell, "cons", 4);
                 if (cons_fn == error_ref) return error.EmitFailed;
                 const call_args = [_]u32{ head_ref, tail_ref };

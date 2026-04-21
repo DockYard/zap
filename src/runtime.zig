@@ -1856,9 +1856,6 @@ pub const BinaryHelpers = struct {
 // This allows runtime empty/non-empty checks that survive ZIR.
 // ============================================================
 
-/// Type alias for list values — used by the ZIR builder to type list parameters.
-pub const ListType = ?*const List;
-
 // ---- Callable dispatch helpers ----
 // Handle both bare function pointers and closure structs transparently.
 // Used by List, Map, and ListOf higher-order functions.
@@ -1881,378 +1878,8 @@ inline fn call2(callback: anytype, arg0: anytype, arg1: anytype) @TypeOf(if (@ty
     }
 }
 
-pub const List = struct {
-    head: i64,
-    tail: ?*const List,
-
-    /// Return a typed empty list (null pointer with correct type).
-    pub fn empty() ?*const List {
-        return null;
-    }
-
-    /// Allocate a new cons cell on the bump allocator.
-    pub fn cons(head: i64, tail: ?*const List) ?*const List {
-        const bytes = bumpAlloc(@sizeOf(List));
-        if (bytes.len == 0) return null;
-        const cell: *List = @ptrCast(@alignCast(bytes.ptr));
-        cell.* = .{ .head = head, .tail = tail };
-        return cell;
-    }
-
-    /// Get the head value. Returns 0 for empty lists.
-    pub fn getHead(list: ?*const List) i64 {
-        if (list) |cell| return cell.head;
-        return 0;
-    }
-
-    /// Get the tail. Returns null for empty or single-element lists.
-    pub fn getTail(list: ?*const List) ?*const List {
-        if (list) |cell| return cell.tail;
-        return null;
-    }
-
-    /// Check if a list is empty.
-    pub fn isEmpty(list: ?*const List) bool {
-        return list == null;
-    }
-
-    /// Get the length of a list.
-    pub fn length(list: ?*const List) i64 {
-        var current = list;
-        var count: i64 = 0;
-        while (current) |cell| {
-            count += 1;
-            current = cell.tail;
-        }
-        return count;
-    }
-
-    /// Get element at index (zero-based). Returns 0 if out of bounds.
-    pub fn get(list: ?*const List, index: i64) i64 {
-        var current = list;
-        var i: i64 = 0;
-        while (current) |cell| {
-            if (i == index) return cell.head;
-            current = cell.tail;
-            i += 1;
-        }
-        return 0;
-    }
-
-    /// Last element. Returns 0 for empty.
-    pub fn last(list: ?*const List) i64 {
-        var current = list;
-        var result: i64 = 0;
-        while (current) |cell| {
-            result = cell.head;
-            current = cell.tail;
-        }
-        return result;
-    }
-
-    /// Sum of all elements.
-    pub fn sum(list: ?*const List) i64 {
-        var current = list;
-        var total: i64 = 0;
-        while (current) |cell| {
-            total += cell.head;
-            current = cell.tail;
-        }
-        return total;
-    }
-
-    /// Product of all elements. Returns 1 for empty.
-    pub fn product(list: ?*const List) i64 {
-        var current = list;
-        var total: i64 = 1;
-        while (current) |cell| {
-            total *= cell.head;
-            current = cell.tail;
-        }
-        return total;
-    }
-
-    /// Maximum element. Returns 0 for empty.
-    pub fn maxVal(list: ?*const List) i64 {
-        if (list == null) return 0;
-        var current = list;
-        var result: i64 = list.?.head;
-        while (current) |cell| {
-            if (cell.head > result) result = cell.head;
-            current = cell.tail;
-        }
-        return result;
-    }
-
-    /// Minimum element. Returns 0 for empty.
-    pub fn minVal(list: ?*const List) i64 {
-        if (list == null) return 0;
-        var current = list;
-        var result: i64 = list.?.head;
-        while (current) |cell| {
-            if (cell.head < result) result = cell.head;
-            current = cell.tail;
-        }
-        return result;
-    }
-
-    /// Check if the list contains a value.
-    pub fn contains(list: ?*const List, value: i64) bool {
-        var current = list;
-        while (current) |cell| {
-            if (cell.head == value) return true;
-            current = cell.tail;
-        }
-        return false;
-    }
-
-    /// Reverse a list.
-    pub fn reverse(list: ?*const List) ?*const List {
-        var current = list;
-        var result: ?*const List = null;
-        while (current) |cell| {
-            result = cons(cell.head, result);
-            current = cell.tail;
-        }
-        return result;
-    }
-
-    /// Append a value to the end.
-    pub fn append(list: ?*const List, value: i64) ?*const List {
-        // reverse, prepend, reverse
-        return reverse(cons(value, reverse(list)));
-    }
-
-    /// Concatenate two lists.
-    pub fn concat(first: ?*const List, second: ?*const List) ?*const List {
-        if (first == null) return second;
-        var reversed_first = reverse(first);
-        var result = second;
-        while (reversed_first) |cell| {
-            result = cons(cell.head, result);
-            reversed_first = cell.tail;
-        }
-        return result;
-    }
-
-    /// Take first N elements.
-    pub fn take(list: ?*const List, count: i64) ?*const List {
-        if (count <= 0 or list == null) return null;
-        var current = list;
-        var collected: ?*const List = null;
-        var remaining: i64 = count;
-        while (current) |cell| {
-            if (remaining <= 0) break;
-            collected = cons(cell.head, collected);
-            current = cell.tail;
-            remaining -= 1;
-        }
-        return reverse(collected);
-    }
-
-    /// Drop first N elements.
-    pub fn drop(list: ?*const List, count: i64) ?*const List {
-        if (count <= 0) return list;
-        var current = list;
-        var remaining: i64 = count;
-        while (current) |cell| {
-            if (remaining <= 0) return current;
-            current = cell.tail;
-            remaining -= 1;
-        }
-        return null;
-    }
-
-    /// Remove duplicates, preserving first occurrence order.
-
-    // ---- Higher-order functions (for Enum module) ----
-
-    pub fn mapFn(list: ?*const List, callback: anytype) ?*const List {
-        var current = list;
-        var result: ?*const List = null;
-        while (current) |cell| {
-            result = cons(call1(callback, cell.head), result);
-            current = cell.tail;
-        }
-        return reverse(result);
-    }
-
-    pub fn filterFn(list: ?*const List, predicate: anytype) ?*const List {
-        var current = list;
-        var result: ?*const List = null;
-        while (current) |cell| {
-            if (call1(predicate, cell.head)) {
-                result = cons(cell.head, result);
-            }
-            current = cell.tail;
-        }
-        return reverse(result);
-    }
-
-    pub fn rejectFn(list: ?*const List, predicate: anytype) ?*const List {
-        var current = list;
-        var result: ?*const List = null;
-        while (current) |cell| {
-            if (!call1(predicate, cell.head)) {
-                result = cons(cell.head, result);
-            }
-            current = cell.tail;
-        }
-        return reverse(result);
-    }
-
-    /// Simple reduce: folds a list with a (acc, element) -> acc callback.
-    /// Handles both bare function pointers and closure structs (with call_fn/env).
-    pub fn enumReduceSimple(list: ?*const List, initial: i64, callback: anytype) i64 {
-        var current = list;
-        var acc: i64 = initial;
-        while (current) |cell| {
-            acc = call2(callback, acc, cell.head);
-            current = cell.tail;
-        }
-        return acc;
-    }
-
-    pub fn reduceFn(list: ?*const List, initial: i64, callback: anytype) i64 {
-        var current = list;
-        var acc = initial;
-        while (current) |cell| {
-            acc = call2(callback, acc, cell.head);
-            current = cell.tail;
-        }
-        return acc;
-    }
-
-    /// Reduce with halt/cont control flow.
-    /// The callback returns a Zig tuple struct where:
-    ///   field 0 (u64): atom — 5 = :cont, 6 = :halt
-    ///   field 1: the accumulator value
-    /// Returns a tuple struct with the final {atom, acc}.
-    pub fn reduceHaltCont(list: ?*const List, initial: anytype, callback: anytype) @TypeOf(callback(initial, @as(i64, 0))) {
-        const ResultType = @TypeOf(callback(initial, @as(i64, 0)));
-        const AccType = @TypeOf(@field(@as(ResultType, undefined), "1"));
-        const ATOM_HALT: u64 = 6;
-        const ATOM_CONT: u64 = 5;
-        var current = list;
-        var acc: AccType = initial;
-        while (current) |cell| {
-            const result = call2(callback, acc, cell.head);
-            if (result.@"0" == ATOM_HALT) {
-                return result;
-            }
-            acc = result.@"1";
-            current = cell.tail;
-        }
-        var done_result: ResultType = undefined;
-        done_result.@"0" = ATOM_CONT;
-        done_result.@"1" = acc;
-        return done_result;
-    }
-
-    pub fn eachFn(list: ?*const List, callback: anytype) ?*const List {
-        var current = list;
-        while (current) |cell| {
-            _ = call1(callback, cell.head);
-            current = cell.tail;
-        }
-        return list;
-    }
-
-    pub fn findFn(list: ?*const List, default: i64, predicate: anytype) i64 {
-        var current = list;
-        while (current) |cell| {
-            if (call1(predicate, cell.head)) return cell.head;
-            current = cell.tail;
-        }
-        return default;
-    }
-
-    pub fn anyFn(list: ?*const List, predicate: anytype) bool {
-        var current = list;
-        while (current) |cell| {
-            if (call1(predicate, cell.head)) return true;
-            current = cell.tail;
-        }
-        return false;
-    }
-
-    pub fn allFn(list: ?*const List, predicate: anytype) bool {
-        var current = list;
-        while (current) |cell| {
-            if (!call1(predicate, cell.head)) return false;
-            current = cell.tail;
-        }
-        return true;
-    }
-
-    pub fn countFn(list: ?*const List, predicate: anytype) i64 {
-        var current = list;
-        var count: i64 = 0;
-        while (current) |cell| {
-            if (call1(predicate, cell.head)) count += 1;
-            current = cell.tail;
-        }
-        return count;
-    }
-
-    pub fn sortFn(list: ?*const List, comparator: anytype) ?*const List {
-        // Convert to array, sort, convert back
-        const len_val = length(list);
-        if (len_val <= 1) return list;
-        const len: usize = @intCast(len_val);
-        const arr = bumpAllocSlice(i64, len);
-        if (arr.len == 0) return list;
-        var current = list;
-        var i: usize = 0;
-        while (current) |cell| {
-            if (i < len) arr[i] = cell.head;
-            current = cell.tail;
-            i += 1;
-        }
-        // Pattern-defeating quicksort — O(n log n) worst case, replaces O(n²) insertion sort.
-        const Ctx = struct {
-            cmp: @TypeOf(comparator),
-            fn lessThan(ctx: @This(), a: i64, b: i64) bool {
-                return call2(ctx.cmp, a, b);
-            }
-        };
-        std.sort.pdq(i64, arr, Ctx{ .cmp = comparator }, Ctx.lessThan);
-        // Build list from sorted array
-        var result: ?*const List = null;
-        var ri: usize = len;
-        while (ri > 0) {
-            ri -= 1;
-            result = cons(arr[ri], result);
-        }
-        return result;
-    }
-
-    pub fn flatMapFn(list: ?*const List, callback: anytype) ?*const List {
-        var current = list;
-        var result: ?*const List = null;
-        while (current) |cell| {
-            var inner = call1(callback, cell.head);
-            while (inner) |inner_cell| {
-                result = cons(inner_cell.head, result);
-                inner = inner_cell.tail;
-            }
-            current = cell.tail;
-        }
-        return reverse(result);
-    }
-
-    pub fn uniq(list: ?*const List) ?*const List {
-        var current = list;
-        var result: ?*const List = null;
-        while (current) |cell| {
-            if (!contains(result, cell.head)) {
-                result = cons(cell.head, result);
-            }
-            current = cell.tail;
-        }
-        return reverse(result);
-    }
-};
+pub const List = ListOf(i64);
+pub const ListType = ?*const List;
 
 // ============================================================
 // Map — Generic HAMT-based persistent map.
@@ -3110,6 +2737,185 @@ pub fn ListOf(comptime T: type) type {
                 current = cell.tail;
             }
             return acc;
+        }
+
+        pub fn rejectFn(list: ?*const Self, predicate: anytype) ?*const Self {
+            var current = list;
+            var result: ?*const Self = null;
+            while (current) |cell| {
+                if (!call1(predicate, cell.head)) {
+                    result = cons(cell.head, result);
+                }
+                current = cell.tail;
+            }
+            return reverse(result);
+        }
+
+        pub fn enumReduceSimple(list: ?*const Self, initial: T, callback: anytype) T {
+            var current = list;
+            var acc: T = initial;
+            while (current) |cell| {
+                acc = call2(callback, acc, cell.head);
+                current = cell.tail;
+            }
+            return acc;
+        }
+
+        pub fn reduceHaltCont(list: ?*const Self, initial: anytype, callback: anytype) @TypeOf(callback(initial, @as(T, std.mem.zeroes(T)))) {
+            const ResultType = @TypeOf(callback(initial, @as(T, std.mem.zeroes(T))));
+            const AccType = @TypeOf(@field(@as(ResultType, undefined), "1"));
+            const ATOM_HALT: u64 = 6;
+            const ATOM_CONT: u64 = 5;
+            var current = list;
+            var acc: AccType = initial;
+            while (current) |cell| {
+                const result = call2(callback, acc, cell.head);
+                if (result.@"0" == ATOM_HALT) {
+                    return result;
+                }
+                acc = result.@"1";
+                current = cell.tail;
+            }
+            var done_result: ResultType = undefined;
+            done_result.@"0" = ATOM_CONT;
+            done_result.@"1" = acc;
+            return done_result;
+        }
+
+        pub fn eachFn(list: ?*const Self, callback: anytype) ?*const Self {
+            var current = list;
+            while (current) |cell| {
+                _ = call1(callback, cell.head);
+                current = cell.tail;
+            }
+            return list;
+        }
+
+        pub fn findFn(list: ?*const Self, default: T, predicate: anytype) T {
+            var current = list;
+            while (current) |cell| {
+                if (call1(predicate, cell.head)) return cell.head;
+                current = cell.tail;
+            }
+            return default;
+        }
+
+        pub fn anyFn(list: ?*const Self, predicate: anytype) bool {
+            var current = list;
+            while (current) |cell| {
+                if (call1(predicate, cell.head)) return true;
+                current = cell.tail;
+            }
+            return false;
+        }
+
+        pub fn allFn(list: ?*const Self, predicate: anytype) bool {
+            var current = list;
+            while (current) |cell| {
+                if (!call1(predicate, cell.head)) return false;
+                current = cell.tail;
+            }
+            return true;
+        }
+
+        pub fn countFn(list: ?*const Self, predicate: anytype) i64 {
+            var current = list;
+            var count: i64 = 0;
+            while (current) |cell| {
+                if (call1(predicate, cell.head)) count += 1;
+                current = cell.tail;
+            }
+            return count;
+        }
+
+        pub fn sortFn(list: ?*const Self, comparator: anytype) ?*const Self {
+            const len_val = length(list);
+            if (len_val <= 1) return list;
+            const len: usize = @intCast(len_val);
+            const arr = bumpAllocSlice(T, len);
+            if (arr.len == 0) return list;
+            var current = list;
+            var i: usize = 0;
+            while (current) |cell| {
+                if (i < len) arr[i] = cell.head;
+                current = cell.tail;
+                i += 1;
+            }
+            const Ctx = struct {
+                cmp: @TypeOf(comparator),
+                fn lessThan(ctx: @This(), a: T, b: T) bool {
+                    return call2(ctx.cmp, a, b);
+                }
+            };
+            std.sort.pdq(T, arr, Ctx{ .cmp = comparator }, Ctx.lessThan);
+            var result: ?*const Self = null;
+            var ri: usize = len;
+            while (ri > 0) {
+                ri -= 1;
+                result = cons(arr[ri], result);
+            }
+            return result;
+        }
+
+        pub fn flatMapFn(list: ?*const Self, callback: anytype) ?*const Self {
+            var current = list;
+            var result: ?*const Self = null;
+            while (current) |cell| {
+                var inner = call1(callback, cell.head);
+                while (inner) |inner_cell| {
+                    result = cons(inner_cell.head, result);
+                    inner = inner_cell.tail;
+                }
+                current = cell.tail;
+            }
+            return reverse(result);
+        }
+
+        // Numeric-only methods (only instantiated when T is an integer type)
+        pub fn sum(list: ?*const Self) T {
+            if (comptime @typeInfo(T) != .int) @compileError("sum requires integer element type");
+            var current = list;
+            var total: T = 0;
+            while (current) |cell| {
+                total += cell.head;
+                current = cell.tail;
+            }
+            return total;
+        }
+
+        pub fn product(list: ?*const Self) T {
+            if (comptime @typeInfo(T) != .int) @compileError("product requires integer element type");
+            var current = list;
+            var total: T = 1;
+            while (current) |cell| {
+                total *= cell.head;
+                current = cell.tail;
+            }
+            return total;
+        }
+
+        pub fn maxVal(list: ?*const Self) T {
+            if (comptime @typeInfo(T) != .int) @compileError("maxVal requires integer element type");
+            if (list == null) return 0;
+            var current = list;
+            var result: T = list.?.head;
+            while (current) |cell| {
+                if (cell.head > result) result = cell.head;
+                current = cell.tail;
+            }
+            return result;
+        }
+
+        pub fn minVal(list: ?*const Self) T {
+            if (comptime @typeInfo(T) != .int) @compileError("minVal requires integer element type");
+            if (list == null) return 0;
+            var current = list;
+            var result: T = list.?.head;
+            while (current) |cell| {
+                if (cell.head < result) result = cell.head;
+                current = cell.tail;
+            }
+            return result;
         }
     };
 }
