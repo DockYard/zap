@@ -976,11 +976,22 @@ pub const Prelude = struct {
     }
 
     /// Write a string to stderr followed by a newline.
-    /// Switch terminal mode. 0 = Normal (line-buffered), 1 = Raw (char-at-a-time).
-    pub fn set_terminal_mode(mode: i64) void {
+    /// Switch terminal mode. Accepts atom ID for Mode.Raw or Mode.Normal.
+    pub fn set_terminal_mode(mode: anytype) void {
         const posix = std.posix;
         const stdin_fd = posix.STDIN_FILENO;
-        if (mode == 1) {
+        // Convert mode to boolean: Raw = true, Normal/other = false
+        const is_raw = blk: {
+            const T = @TypeOf(mode);
+            if (T == i64) break :blk mode == 1;
+            if (T == u32) {
+                const name = atomToString(mode);
+                break :blk std.mem.eql(u8, name, "Raw");
+            }
+            if (@typeInfo(T) == .int) break :blk @as(i64, @intCast(mode)) == 1;
+            break :blk false;
+        };
+        if (is_raw) {
             // Raw mode: disable canonical mode and echo
             var termios = posix.tcgetattr(stdin_fd) catch return;
             // Save original settings on first call

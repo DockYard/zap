@@ -22,11 +22,11 @@ pub module Snake {
     IO.puts("")
     IO.puts("  Collect the * to score!")
     IO.puts("  Press any key to start...")
-    IO.mode(1, fn() -> i64 {
+    IO.mode(Mode.Raw, fn() -> String {
       IO.get_char()
       run(10, 5, 3, 2, 0)
+      "done"
     })
-    "done"
   }
 
   fn run(player_x :: i64, player_y :: i64, food_x :: i64, food_y :: i64, score :: i64) -> i64 {

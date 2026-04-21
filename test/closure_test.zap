@@ -62,6 +62,7 @@ pub module Test.ClosureTest {
   }
 
   fn mode_test() -> i64 {
-    IO.mode(0, fn() -> i64 { 42 })
+    IO.mode(Mode.Normal, fn() -> String { "ok" })
+    42
   }
 }

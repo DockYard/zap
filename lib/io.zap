@@ -1,3 +1,8 @@
+pub union Mode {
+  Raw
+  Normal
+}
+
 pub module IO {
   @moduledoc = """
     Functions for standard input/output operations.
@@ -85,44 +90,35 @@ pub module IO {
   @doc = """
     Switches the terminal input mode.
 
-    Pass 1 for raw mode (keypress-at-a-time, no echo) or
-    0 for normal mode (line-buffered with echo).
-
-    Raw mode is useful for games and interactive applications
-    where you need immediate key response without Enter.
-
-    Always restore normal mode before exiting.
-
     ## Examples
 
-        IO.mode(1)           # raw mode
-        key = IO.get_char()  # reads single keypress
-        IO.mode(0)           # restore normal mode
+        IO.mode(Mode.Raw)      # keypress-at-a-time, no echo
+        key = IO.get_char()
+        IO.mode(Mode.Normal)   # restore line-buffered mode
     """
 
-  pub fn mode(mode_value :: i64) -> i64 {
+  pub fn mode(mode_value :: Atom) -> Atom {
     :zig.IO.set_terminal_mode(mode_value)
     mode_value
   }
 
   @doc = """
     Switches terminal mode, runs the callback, then restores
-    the previous mode. Ensures the terminal is always restored
-    even if the callback completes normally.
+    normal mode automatically.
 
     ## Examples
 
-        IO.mode(1, fn() -> i64 {
+        IO.mode(Mode.Raw, fn() -> i64 {
           key = IO.get_char()
           IO.puts("You pressed: " <> key)
           0
         })
     """
 
-  pub fn mode(mode_value :: i64, callback :: ( -> result)) -> result {
+  pub fn mode(mode_value :: Atom, callback :: ( -> String)) -> String {
     :zig.IO.set_terminal_mode(mode_value)
     value = callback()
-    :zig.IO.set_terminal_mode(0)
+    :zig.IO.set_terminal_mode(Mode.Normal)
     value
   }
 
