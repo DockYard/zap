@@ -2154,9 +2154,11 @@ pub const HirBuilder = struct {
     }
 
     fn buildModule(self: *HirBuilder, mod: *const ast.ModuleDecl, mod_scope: scope_mod.ScopeId) !Module {
-        // Group module functions by name
-        var fn_order: std.ArrayList(ast.StringId) = .empty;
-        var fn_groups = std.AutoHashMap(ast.StringId, std.ArrayList(*const ast.FunctionDecl)).init(self.allocator);
+        // Group module functions by {name, arity} so that same-name
+        // functions with different arities become separate groups.
+        const FnGroupKey = struct { name: ast.StringId, arity: u32 };
+        var fn_order: std.ArrayList(FnGroupKey) = .empty;
+        var fn_groups = std.AutoHashMap(FnGroupKey, std.ArrayList(*const ast.FunctionDecl)).init(self.allocator);
         defer fn_groups.deinit();
 
         var type_defs: std.ArrayList(TypeDef) = .empty;
@@ -2164,10 +2166,12 @@ pub const HirBuilder = struct {
         for (mod.items) |item| {
             switch (item) {
                 .function, .priv_function => |func| {
-                    const entry = try fn_groups.getOrPut(func.name);
+                    const arity: u32 = if (func.clauses.len > 0) @intCast(func.clauses[0].params.len) else 0;
+                    const key = FnGroupKey{ .name = func.name, .arity = arity };
+                    const entry = try fn_groups.getOrPut(key);
                     if (!entry.found_existing) {
                         entry.value_ptr.* = .empty;
-                        try fn_order.append(self.allocator, func.name);
+                        try fn_order.append(self.allocator, key);
                     }
                     try entry.value_ptr.append(self.allocator, func);
                 },
@@ -2227,7 +2231,7 @@ pub const HirBuilder = struct {
                 // (it will exist because test modules import Zest.Runner which has run)
                 if (run_name) |rn| {
                     var has_run = false;
-                    if (fn_groups.get(rn)) |_| has_run = true;
+                    if (fn_groups.get(.{ .name = rn, .arity = 0 })) |_| has_run = true;
                     if (!has_run) {
                         // Build AST statements from the module-level expressions
                         var stmts = try self.allocator.alloc(ast.Stmt, module_exprs.items.len);
@@ -2267,10 +2271,11 @@ pub const HirBuilder = struct {
                             .visibility = .public,
                         };
 
-                        const entry = try fn_groups.getOrPut(rn);
+                        const run_key = FnGroupKey{ .name = rn, .arity = 0 };
+                        const entry = try fn_groups.getOrPut(run_key);
                         if (!entry.found_existing) {
                             entry.value_ptr.* = .empty;
-                            try fn_order.append(self.allocator, rn);
+                            try fn_order.append(self.allocator, run_key);
                         }
                         try entry.value_ptr.append(self.allocator, run_decl);
                     }
@@ -2281,10 +2286,9 @@ pub const HirBuilder = struct {
         // Pre-register all declared function families in family_to_group
         // so that function references like &name/arity can resolve any
         // sibling function regardless of declaration order.
-        for (fn_order.items) |name| {
-            if (fn_groups.getPtr(name)) |decls| {
-                const arity: u32 = if (decls.items[0].clauses.len > 0) @intCast(decls.items[0].clauses[0].params.len) else 0;
-                if (self.graph.resolveFamily(mod_scope, decls.items[0].name, arity)) |family_id| {
+        for (fn_order.items) |key| {
+            if (fn_groups.getPtr(key)) |_| {
+                if (self.graph.resolveFamily(mod_scope, key.name, key.arity)) |family_id| {
                     if (!self.family_to_group.contains(family_id)) {
                         const pre_id = self.next_group_id;
                         self.next_group_id += 1;
@@ -2295,8 +2299,8 @@ pub const HirBuilder = struct {
         }
 
         var functions: std.ArrayList(FunctionGroup) = .empty;
-        for (fn_order.items) |name| {
-            if (fn_groups.getPtr(name)) |decls| {
+        for (fn_order.items) |key| {
+            if (fn_groups.getPtr(key)) |decls| {
                 try functions.append(self.allocator, try self.buildMergedFunctionGroup(decls.items, mod_scope));
             }
         }
@@ -2309,7 +2313,7 @@ pub const HirBuilder = struct {
         var inherited_iter = mod_scope_data.function_families.iterator();
         while (inherited_iter.next()) |entry| {
             const family_key = entry.key_ptr.*;
-            if (fn_groups.contains(family_key.name)) continue;
+            if (fn_groups.contains(.{ .name = family_key.name, .arity = family_key.arity })) continue;
 
             const family_id = entry.value_ptr.*;
             const family = self.graph.getFamily(family_id);

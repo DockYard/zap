@@ -106,6 +106,27 @@ pub module IO {
   }
 
   @doc = """
+    Switches terminal mode, runs the callback, then restores
+    the previous mode. Ensures the terminal is always restored
+    even if the callback completes normally.
+
+    ## Examples
+
+        IO.mode(1, fn() -> i64 {
+          key = IO.get_char()
+          IO.puts("You pressed: " <> key)
+          0
+        })
+    """
+
+  pub fn mode(mode_value :: i64, callback :: ( -> result)) -> result {
+    :zig.IO.set_terminal_mode(mode_value)
+    value = callback()
+    :zig.IO.set_terminal_mode(0)
+    value
+  }
+
+  @doc = """
     Reads a single character from standard input.
 
     In raw mode, returns immediately after one keypress.

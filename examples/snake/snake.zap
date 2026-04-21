@@ -22,10 +22,10 @@ pub module Snake {
     IO.puts("")
     IO.puts("  Collect the * to score!")
     IO.puts("  Press any key to start...")
-    IO.mode(1)
-    IO.get_char()
-    run(10, 5, 3, 2, 0)
-    IO.mode(0)
+    IO.mode(1, fn() -> i64 {
+      IO.get_char()
+      run(10, 5, 3, 2, 0)
+    })
     "done"
   }
 

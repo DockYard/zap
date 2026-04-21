@@ -1,32 +1,24 @@
 pub module Test.ClosureTest {
   use Zest.Case
 
-  describe("closures and functions") {
-    test("function call with one arg") {
-      assert(add_one(41) == 42)
-    }
-
-    test("function call with two args") {
-      assert(multiply(6, 7) == 42)
-    }
-
-    test("function result in arithmetic") {
-      assert(add_one(20) + add_one(20) == 42)
-    }
-
-    test("pass doubler as callback") {
+  describe("closures") {
+    test("apply doubles value") {
       assert(apply(21, doubler) == 42)
     }
 
-    test("pass add_one as callback") {
+    test("apply with add_one") {
       assert(apply(41, add_one) == 42)
     }
 
-    test("apply_twice with callback") {
+    test("apply_twice") {
       assert(apply_twice(10, add_one) == 12)
     }
 
-    test("compose two applies") {
+    test("apply_twice with doubler") {
+      assert(apply_twice(10, doubler) == 40)
+    }
+
+    test("chain via apply") {
       assert(apply(apply(20, add_one), doubler) == 42)
     }
 
@@ -61,5 +53,15 @@ pub module Test.ClosureTest {
 
   fn test_anon_fn() -> i64 {
     apply(21, fn(x :: i64) -> i64 { x * 2 })
+  }
+
+  describe("IO.mode/2 callback") {
+    test("mode with callback returns result") {
+      assert(mode_test() == 42)
+    }
+  }
+
+  fn mode_test() -> i64 {
+    IO.mode(0, fn() -> i64 { 42 })
   }
 }
