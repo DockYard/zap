@@ -2975,6 +2975,9 @@ pub const ZirDriver = struct {
 
             // Enum literal — intern as atom
             .enum_literal => |el| {
+                // Emit as runtime atom ID (u32) for pattern matching dispatch.
+                // When used as a list/map element, the list_init handler will
+                // use the correct container type and Zig handles the coercion.
                 const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                 if (rt_import == error_ref) return error.EmitFailed;
                 const intern_fn = zir_builder_emit_field_val(self.handle, rt_import, "atomIntern", 10);
