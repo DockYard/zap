@@ -3824,10 +3824,8 @@ pub const IrBuilder = struct {
                             const first_arg_type = self.known_local_types.get(lowered_args[0]) orelse .any;
                             if (std.meta.activeTag(first_arg_type) == .list) {
                                 const cell_name = getListName(first_arg_type.list.*);
-                                if (!std.mem.eql(u8, cell_name, "List")) {
-                                    const method = map_resolved["List.".len..];
-                                    break :blk try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ cell_name, method });
-                                }
+                                const method = map_resolved["List.".len..];
+                                break :blk try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ cell_name, method });
                             }
                             break :blk map_resolved;
                         } else map_resolved;
