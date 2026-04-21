@@ -188,4 +188,9 @@ pub module Test.StructTest {
     point = %Point{x: 42, y: 99}
     point.x
   }
+
+  fn get_x_from_inline() -> i64 {
+    point = %Point{x: 42, y: 99}
+    point.x
+  }
 }
