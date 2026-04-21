@@ -115,6 +115,7 @@ extern "c" fn zir_builder_emit_ret_null(handle: ?*ZirBuilderHandle) i32;
 
 // Struct type declarations
 extern "c" fn zir_builder_add_struct_type(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32, field_names_ptrs: [*]const [*]const u8, field_names_lens: [*]const u32, field_type_refs: [*]const u32, field_default_refs: ?[*]const u32, fields_len: u32) i32;
+extern "c" fn zir_builder_add_enum_type(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32, variant_names_ptrs: [*]const [*]const u8, variant_names_lens: [*]const u32, variants_len: u32) i32;
 extern "c" fn zir_builder_set_decl_val_return_type(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32) i32;
 extern "c" fn zir_builder_emit_param_decl_val_type(handle: ?*ZirBuilderHandle, param_name_ptr: [*]const u8, param_name_len: u32, type_name_ptr: [*]const u8, type_name_len: u32) u32;
 
@@ -818,6 +819,32 @@ pub const ZirDriver = struct {
                         return error.EmitFailed;
                     }
                 },
+                .enum_def => |def| {
+                    const short_name = if (std.mem.lastIndexOf(u8, type_def.name, ".")) |dot_idx|
+                        type_def.name[dot_idx + 1 ..]
+                    else
+                        type_def.name;
+                    if (emitted.contains(short_name)) continue;
+                    emitted.put(short_name, {}) catch continue;
+                    var variant_name_ptrs: std.ArrayListUnmanaged([*]const u8) = .empty;
+                    defer variant_name_ptrs.deinit(self.allocator);
+                    var variant_name_lens: std.ArrayListUnmanaged(u32) = .empty;
+                    defer variant_name_lens.deinit(self.allocator);
+                    for (def.variants) |variant| {
+                        try variant_name_ptrs.append(self.allocator, variant.ptr);
+                        try variant_name_lens.append(self.allocator, @intCast(variant.len));
+                    }
+                    if (zir_builder_add_enum_type(
+                        self.handle,
+                        short_name.ptr,
+                        @intCast(short_name.len),
+                        variant_name_ptrs.items.ptr,
+                        variant_name_lens.items.ptr,
+                        @intCast(def.variants.len),
+                    ) != 0) {
+                        return error.EmitFailed;
+                    }
+                },
                 else => {},
             }
         }
@@ -1347,6 +1374,20 @@ pub const ZirDriver = struct {
                     );
                     if (ref != error_ref) return ref;
                 }
+                return null;
+            },
+            .tagged_union => |name| {
+                // Enum/union type via decl_val
+                const short_name = if (std.mem.lastIndexOf(u8, name, ".")) |dot_idx|
+                    name[dot_idx + 1 ..]
+                else
+                    name;
+                const ref = zir_builder_emit_decl_val(
+                    self.handle,
+                    short_name.ptr,
+                    @intCast(short_name.len),
+                );
+                if (ref != error_ref) return ref;
                 return null;
             },
             .list => |inner| {

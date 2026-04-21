@@ -32,4 +32,15 @@ pub module Test.UnionTest {
   fn color_name(Color.Blue :: Color) -> String {
     "blue"
   }
+
+  describe("Lists of enums") {
+    test("list of colors length") {
+      assert(color_list_length() == 3)
+    }
+  }
+
+  fn color_list_length() -> i64 {
+    colors = [Color.Red, Color.Green, Color.Blue]
+    List.length(colors)
+  }
 }
