@@ -1,14 +1,16 @@
 pub module Snake {
   @moduledoc = """
-    A simple turn-based snake game for the terminal.
+    A terminal snake game.
 
-    Move with w/a/s/d + Enter. Collect * stars to score.
-    Hit a wall and it's game over. Press q to quit.
+    Move with w/a/s/d keys (no Enter needed).
+    Collect * stars to score. Hit a wall and it's game over.
+    Press q to quit.
 
     Run with: cd examples/snake && zap run snake
     """
 
   pub fn main(_args :: [String]) -> String {
+    IO.puts("\x1b[2J\x1b[H")
     IO.puts("  ___ _  _   _   _  _____")
     IO.puts(" / __| \\| | /_\\ | |/ / __|")
     IO.puts(" \\__ \\ .` |/ _ \\|   <| _|")
@@ -19,18 +21,19 @@ pub module Snake {
     IO.puts("  q = quit")
     IO.puts("")
     IO.puts("  Collect the * to score!")
-    IO.puts("  Press Enter to start...")
-    IO.gets()
+    IO.puts("  Press any key to start...")
+    IO.mode(1)
+    IO.get_char()
     run(10, 5, 3, 2, 0)
+    IO.mode(0)
     "done"
   }
 
   fn run(player_x :: i64, player_y :: i64, food_x :: i64, food_y :: i64, score :: i64) -> i64 {
-    clear()
+    IO.print_str("\x1b[2J\x1b[H")
     draw(player_x, player_y, food_x, food_y, score)
-    IO.print_str("> ")
-    input = IO.gets()
-    handle_input(player_x, player_y, food_x, food_y, score, input)
+    key = IO.get_char()
+    handle_input(player_x, player_y, food_x, food_y, score, key)
   }
 
   fn handle_input(px :: i64, py :: i64, fx :: i64, fy :: i64, score :: i64, input :: String) -> i64 {
@@ -42,7 +45,7 @@ pub module Snake {
       ny = move_y(py, input)
       hit_wall = wall_check(nx, ny)
       if hit_wall {
-        clear()
+        IO.print_str("\x1b[2J\x1b[H")
         IO.puts("  CRASH! You hit a wall!")
         IO.puts("")
         game_over(score)
@@ -126,17 +129,11 @@ pub module Snake {
     Integer.remainder(score * 5 + 1, 8) + 1
   }
 
-  fn clear() -> String {
-    IO.puts(String.repeat("\n", 25))
-    ""
-  }
-
   fn draw(px :: i64, py :: i64, fx :: i64, fy :: i64, score :: i64) -> String {
     IO.puts("  +" <> String.repeat("-", 20) <> "+")
     draw_rows(0, px, py, fx, fy)
     IO.puts("  +" <> String.repeat("-", 20) <> "+")
     IO.puts("  Score: " <> Integer.to_string(score))
-    IO.puts("")
     ""
   }
 

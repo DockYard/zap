@@ -81,4 +81,46 @@ pub module IO {
     :zig.IO.warn(message)
     message
   }
+
+  @doc = """
+    Switches the terminal input mode.
+
+    Pass 1 for raw mode (keypress-at-a-time, no echo) or
+    0 for normal mode (line-buffered with echo).
+
+    Raw mode is useful for games and interactive applications
+    where you need immediate key response without Enter.
+
+    Always restore normal mode before exiting.
+
+    ## Examples
+
+        IO.mode(1)           # raw mode
+        key = IO.get_char()  # reads single keypress
+        IO.mode(0)           # restore normal mode
+    """
+
+  pub fn mode(mode_value :: i64) -> i64 {
+    :zig.IO.set_terminal_mode(mode_value)
+    mode_value
+  }
+
+  @doc = """
+    Reads a single character from standard input.
+
+    In raw mode, returns immediately after one keypress.
+    In normal mode, blocks until Enter then returns the first character.
+
+    Returns a single-character string, or empty string on EOF.
+
+    ## Examples
+
+        IO.mode(1)
+        key = IO.get_char()
+        IO.mode(0)
+    """
+
+  pub fn get_char() -> String {
+    :zig.IO.get_char()
+  }
 }

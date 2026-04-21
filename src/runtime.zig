@@ -48,6 +48,10 @@ fn stdoutWrite(bytes: []const u8) void {
 
 var runtime_arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
+// Terminal mode state for raw/normal switching
+var original_termios: std.posix.termios = undefined;
+var raw_mode_saved: bool = false;
+
 fn bumpAlloc(len: usize) []u8 {
     // Use alignedAlloc with pointer alignment (8 on 64-bit) so that bump-allocated
     // memory can safely be cast to pointer types via @ptrCast(@alignCast(...)).
@@ -953,12 +957,13 @@ pub const Prelude = struct {
         var len: usize = 0;
         // Read one byte at a time until newline or EOF
         while (len < buf.len - 1) {
-            var one: [1]u8 = undefined;
-            const bufs: []const []u8 = &.{&one};
-            const n = stdin.readStreaming(pio, bufs) catch break;
+            var one_buf = [_]u8{0};
+            const one_slice: []u8 = &one_buf;
+            const bufs = [_][]u8{one_slice};
+            const n = stdin.readStreaming(pio, &bufs) catch break;
             if (n == 0) break; // EOF
-            if (one[0] == '\n') break;
-            buf[len] = one[0];
+            if (one_buf[0] == '\n') break;
+            buf[len] = one_buf[0];
             len += 1;
         }
         // Strip trailing \r if present (Windows line endings)
@@ -971,6 +976,49 @@ pub const Prelude = struct {
     }
 
     /// Write a string to stderr followed by a newline.
+    /// Switch terminal mode. 0 = Normal (line-buffered), 1 = Raw (char-at-a-time).
+    pub fn set_terminal_mode(mode: i64) void {
+        const posix = std.posix;
+        const stdin_fd = posix.STDIN_FILENO;
+        if (mode == 1) {
+            // Raw mode: disable canonical mode and echo
+            var termios = posix.tcgetattr(stdin_fd) catch return;
+            // Save original settings on first call
+            if (!raw_mode_saved) {
+                original_termios = termios;
+                raw_mode_saved = true;
+            }
+            termios.lflag.ICANON = false;
+            termios.lflag.ECHO = false;
+            // Read returns after 1 byte
+            termios.cc[@intFromEnum(posix.V.MIN)] = 1;
+            termios.cc[@intFromEnum(posix.V.TIME)] = 0;
+            posix.tcsetattr(stdin_fd, .FLUSH, termios) catch return;
+        } else {
+            // Normal mode: restore original settings
+            if (raw_mode_saved) {
+                posix.tcsetattr(stdin_fd, .FLUSH, original_termios) catch return;
+            }
+        }
+    }
+
+    /// Read a single character from stdin. Returns a 1-byte string.
+    /// In raw mode, returns immediately after one keypress.
+    /// In normal mode, blocks until Enter then returns first char.
+    pub fn get_char() []const u8 {
+        const stdin = std.Io.File.stdin();
+        const pio = runtime_io;
+        var one_buf = [_]u8{0};
+        const one_slice: []u8 = &one_buf;
+        const bufs = [_][]u8{one_slice};
+        const n = stdin.readStreaming(pio, &bufs) catch return "";
+        if (n == 0) return "";
+        const result = bumpAlloc(1);
+        if (result.len == 0) return "";
+        result[0] = one_buf[0];
+        return result;
+    }
+
     pub fn warn(message: []const u8) void {
         const stderr = std.Io.File.stderr();
         stderr.writeStreamingAll(runtime_io, message) catch {};
