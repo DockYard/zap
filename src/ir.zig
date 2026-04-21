@@ -3811,12 +3811,19 @@ pub const IrBuilder = struct {
                                 const method = name["Map.".len..];
                                 // For struct/enum value types, encode for generic MapOf dispatch
                                 if (std.meta.activeTag(val_zig) == .struct_ref) {
-                                    const key_name = if (std.meta.activeTag(key_zig) == .atom) "u32" else if (std.meta.activeTag(key_zig) == .string) "str" else "u32";
-                                    break :blk try std.fmt.allocPrint(self.allocator, "MapOf:{s}:{s}.{s}", .{ key_name, val_zig.struct_ref, method });
-                                }
-                                if (std.meta.activeTag(val_zig) == .tagged_union) {
-                                    const key_name = if (std.meta.activeTag(key_zig) == .atom) "u32" else if (std.meta.activeTag(key_zig) == .string) "str" else "u32";
-                                    break :blk try std.fmt.allocPrint(self.allocator, "MapOf:{s}:{s}.{s}", .{ key_name, val_zig.tagged_union, method });
+                                    // Skip enum values — they use u32 atom IDs
+                                    const is_val_enum = if (self.type_store) |ts| val_enum: {
+                                        for (ts.types.items) |typ| {
+                                            if (typ == .tagged_union) {
+                                                if (std.mem.eql(u8, ts.interner.get(typ.tagged_union.name), val_zig.struct_ref)) break :val_enum true;
+                                            }
+                                        }
+                                        break :val_enum false;
+                                    } else false;
+                                    if (!is_val_enum) {
+                                        const key_name = if (std.meta.activeTag(key_zig) == .atom) "u32" else if (std.meta.activeTag(key_zig) == .string) "str" else "u32";
+                                        break :blk try std.fmt.allocPrint(self.allocator, "MapOf:{s}:{s}.{s}", .{ key_name, val_zig.struct_ref, method });
+                                    }
                                 }
                                 // For nested map/list value types, encode for generic dispatch
                                 if (std.meta.activeTag(val_zig) == .map or std.meta.activeTag(val_zig) == .list) {
@@ -3834,12 +3841,22 @@ pub const IrBuilder = struct {
                             if (std.meta.activeTag(first_arg_type) == .list) {
                                 const elem_zig = first_arg_type.list.*;
                                 const method = map_resolved["List.".len..];
-                                // For struct/enum/nested element types, encode for generic dispatch
+                                // For struct element types, encode for generic dispatch.
+                                // Enums (tagged_union mapped to struct_ref) use u32 atom IDs
+                                // and go through the default named alias path.
                                 if (std.meta.activeTag(elem_zig) == .struct_ref) {
-                                    break :blk try std.fmt.allocPrint(self.allocator, "ListOf:{s}.{s}", .{ elem_zig.struct_ref, method });
-                                }
-                                if (std.meta.activeTag(elem_zig) == .tagged_union) {
-                                    break :blk try std.fmt.allocPrint(self.allocator, "ListOf:{s}.{s}", .{ elem_zig.tagged_union, method });
+                                    // Check if this is actually an enum — enums use u32, not struct dispatch
+                                    const is_enum = if (self.type_store) |ts| blk_enum: {
+                                        for (ts.types.items) |typ| {
+                                            if (typ == .tagged_union) {
+                                                if (std.mem.eql(u8, ts.interner.get(typ.tagged_union.name), elem_zig.struct_ref)) break :blk_enum true;
+                                            }
+                                        }
+                                        break :blk_enum false;
+                                    } else false;
+                                    if (!is_enum) {
+                                        break :blk try std.fmt.allocPrint(self.allocator, "ListOf:{s}.{s}", .{ elem_zig.struct_ref, method });
+                                    }
                                 }
                                 if (std.meta.activeTag(elem_zig) == .list) {
                                     // Nested list: ListOf(?*const ListOf(T))

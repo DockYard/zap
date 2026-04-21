@@ -821,32 +821,6 @@ pub const ZirDriver = struct {
                         return error.EmitFailed;
                     }
                 },
-                .enum_def => |def| {
-                    const short_name = if (std.mem.lastIndexOf(u8, type_def.name, ".")) |dot_idx|
-                        type_def.name[dot_idx + 1 ..]
-                    else
-                        type_def.name;
-                    if (emitted.contains(short_name)) continue;
-                    emitted.put(short_name, {}) catch continue;
-                    var variant_name_ptrs: std.ArrayListUnmanaged([*]const u8) = .empty;
-                    defer variant_name_ptrs.deinit(self.allocator);
-                    var variant_name_lens: std.ArrayListUnmanaged(u32) = .empty;
-                    defer variant_name_lens.deinit(self.allocator);
-                    for (def.variants) |variant| {
-                        try variant_name_ptrs.append(self.allocator, variant.ptr);
-                        try variant_name_lens.append(self.allocator, @intCast(variant.len));
-                    }
-                    if (zir_builder_add_enum_type(
-                        self.handle,
-                        short_name.ptr,
-                        @intCast(short_name.len),
-                        variant_name_ptrs.items.ptr,
-                        variant_name_lens.items.ptr,
-                        @intCast(def.variants.len),
-                    ) != 0) {
-                        return error.EmitFailed;
-                    }
-                },
                 else => {},
             }
         }
@@ -1377,12 +1351,16 @@ pub const ZirDriver = struct {
         // Dynamic resolution for complex types
         return switch (zig_type) {
             .struct_ref => |name| {
-                // Reference the struct/enum type via decl_val in the current module
+                // Enums: use u32 atom ID representation (no decl_val needed)
                 const short_name = if (std.mem.lastIndexOf(u8, name, ".")) |dot_idx|
                     name[dot_idx + 1 ..]
                 else
                     name;
-                if (self.findAnyTypeDef(name) or self.findAnyTypeDef(short_name)) {
+                if (self.findEnumDef(name) or self.findEnumDef(short_name)) {
+                    return @intFromEnum(Zir.Inst.Ref.u32_type);
+                }
+                // Structs: reference via decl_val
+                if (self.findStructDef(name) != null or self.findStructDef(short_name) != null) {
                     const ref = zir_builder_emit_decl_val(
                         self.handle,
                         short_name.ptr,
@@ -1392,19 +1370,12 @@ pub const ZirDriver = struct {
                 }
                 return null;
             },
-            .tagged_union => |name| {
-                // Enum/union type via decl_val
-                const short_name = if (std.mem.lastIndexOf(u8, name, ".")) |dot_idx|
-                    name[dot_idx + 1 ..]
-                else
-                    name;
-                const ref = zir_builder_emit_decl_val(
-                    self.handle,
-                    short_name.ptr,
-                    @intCast(short_name.len),
-                );
-                if (ref != error_ref) return ref;
-                return null;
+            .tagged_union => {
+                // Enums use u32 atom IDs at runtime — use u32 as the element
+                // type for ListOf/MapOf rather than the Zig enum type.
+                // This ensures enum values from lists are compatible with
+                // Zap's atom-based pattern dispatch.
+                return @intFromEnum(Zir.Inst.Ref.u32_type);
             },
             .list => |inner| {
                 // Nested list: element type is ?*const ListOf(T)
@@ -2819,8 +2790,6 @@ pub const ZirDriver = struct {
                             if (fn_ref != error_ref) {
                                 const ref = zir_builder_emit_call_ref(self.handle, fn_ref, args.items.ptr, @intCast(args.items.len));
                                 if (ref != error_ref) {
-                                    // (getHead, get, last) return a Zig enum value, but Zap's
-                                    // atom-based dispatch expects u32. Convert via @intFromEnum.
                                     try self.setLocal(cb.dest, ref);
                                     break :blk true;
                                 }
@@ -3297,45 +3266,10 @@ pub const ZirDriver = struct {
                     var current: u32 = zir_builder_emit_call_ref(self.handle, empty_fn, &.{}, 0);
                     if (current == error_ref) return error.EmitFailed;
 
-                    // Check if elements are enum variants that need enum literal emission
-                    const is_enum_list = blk: {
-                        if (elem_type_ref == null) break :blk false;
-                        if (std.meta.activeTag(li.element_type) != .struct_ref) break :blk false;
-                        const short_name = if (std.mem.lastIndexOf(u8, li.element_type.struct_ref, ".")) |dot_idx|
-                            li.element_type.struct_ref[dot_idx + 1 ..]
-                        else
-                            li.element_type.struct_ref;
-                        break :blk self.findEnumDef(li.element_type.struct_ref) or self.findEnumDef(short_name);
-                    };
-
                     var i: usize = li.elements.len;
                     while (i > 0) {
                         i -= 1;
-                        var elem_ref = self.refForLocal(li.elements[i]) catch @intFromEnum(Zir.Inst.Ref.void_value);
-                        // For enum lists: the element local holds a u32 atom ID from atomIntern.
-                        // We need to emit a Zig enum literal instead, which Zig will coerce
-                        // to the correct enum type. Look up the variant name from the IR
-                        // instructions to find the original enum_literal instruction.
-                        if (is_enum_list) {
-                            // Search IR for the enum_literal that produced this local
-                            if (self.program) |prog| {
-                                for (prog.functions) |func| {
-                                    if (func.id != self.current_function_id) continue;
-                                    for (func.body) |block| {
-                                        for (block.instructions) |fn_instr| {
-                                            if (fn_instr == .enum_literal) {
-                                                if (fn_instr.enum_literal.dest == li.elements[i]) {
-                                                    const variant = fn_instr.enum_literal.variant;
-                                                    const lit_ref = zir_builder_emit_enum_literal(self.handle, variant.ptr, @intCast(variant.len));
-                                                    if (lit_ref != error_ref) elem_ref = lit_ref;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    break;
-                                }
-                            }
-                        }
+                        const elem_ref = self.refForLocal(li.elements[i]) catch @intFromEnum(Zir.Inst.Ref.void_value);
                         const call_args = [_]u32{ elem_ref, current };
                         current = zir_builder_emit_call_ref(self.handle, cons_fn, &call_args, 2);
                         if (current == error_ref) return error.EmitFailed;
@@ -3390,39 +3324,9 @@ pub const ZirDriver = struct {
                     const put_fn = zir_builder_emit_field_val(self.handle, map_cell, "put", 3);
                     if (put_fn == error_ref) return error.EmitFailed;
 
-                    // Check if values need enum literal re-emission
-                    const val_is_enum = blk: {
-                        if (std.meta.activeTag(mi.value_type) != .struct_ref) break :blk false;
-                        const short_name = if (std.mem.lastIndexOf(u8, mi.value_type.struct_ref, ".")) |dot_idx|
-                            mi.value_type.struct_ref[dot_idx + 1 ..]
-                        else
-                            mi.value_type.struct_ref;
-                        break :blk self.findEnumDef(mi.value_type.struct_ref) or self.findEnumDef(short_name);
-                    };
-
                     for (mi.entries) |entry| {
                         const key_ref = self.refForLocal(entry.key) catch @intFromEnum(Zir.Inst.Ref.void_value);
-                        var val_ref = self.refForLocal(entry.value) catch @intFromEnum(Zir.Inst.Ref.void_value);
-                        // For enum values: re-emit as Zig enum literal
-                        if (val_is_enum) {
-                            if (self.program) |prog| {
-                                for (prog.functions) |func| {
-                                    if (func.id != self.current_function_id) continue;
-                                    for (func.body) |block| {
-                                        for (block.instructions) |fn_instr| {
-                                            if (fn_instr == .enum_literal) {
-                                                if (fn_instr.enum_literal.dest == entry.value) {
-                                                    const variant = fn_instr.enum_literal.variant;
-                                                    const lit_ref = zir_builder_emit_enum_literal(self.handle, variant.ptr, @intCast(variant.len));
-                                                    if (lit_ref != error_ref) val_ref = lit_ref;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    break;
-                                }
-                            }
-                        }
+                        const val_ref = self.refForLocal(entry.value) catch @intFromEnum(Zir.Inst.Ref.void_value);
                         const call_args = [_]u32{ current, key_ref, val_ref };
                         current = zir_builder_emit_call_ref(self.handle, put_fn, &call_args, 3);
                         if (current == error_ref) return error.EmitFailed;

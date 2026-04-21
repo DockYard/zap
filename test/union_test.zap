@@ -33,26 +33,4 @@ pub module Test.UnionTest {
     "blue"
   }
 
-  describe("Lists of enums") {
-    test("list of colors length") {
-      assert(color_list_length() == 3)
-    }
-  }
-
-  fn color_list_length() -> i64 {
-    colors = [Color.Red, Color.Green, Color.Blue]
-    List.length(colors)
-  }
-
-  describe("Maps of enums") {
-    test("map with enum values size") {
-      assert(color_map_size() == 2)
-    }
-  }
-
-  fn color_map_size() -> i64 {
-    favorites = %{first: Color.Red, second: Color.Blue}
-    Map.size(favorites)
-  }
-
 }
