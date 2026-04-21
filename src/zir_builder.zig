@@ -862,6 +862,20 @@ pub const ZirDriver = struct {
         return null;
     }
 
+    fn findEnumDef(self: *const ZirDriver, type_name: []const u8) bool {
+        const prog = self.program orelse return false;
+        for (prog.type_defs) |type_def| {
+            if (!std.mem.eql(u8, type_def.name, type_name)) continue;
+            return type_def.kind == .enum_def;
+        }
+        return false;
+    }
+
+    /// Check if a type name corresponds to any known type definition (struct, enum, or union).
+    fn findAnyTypeDef(self: *const ZirDriver, type_name: []const u8) bool {
+        return self.findStructDef(type_name) != null or self.findEnumDef(type_name) or self.findUnionDef(type_name) != null;
+    }
+
     fn findUnionDef(self: *const ZirDriver, type_name: []const u8) ?ir.UnionDef {
         const prog = self.program orelse return null;
         for (prog.type_defs) |type_def| {
@@ -1361,12 +1375,12 @@ pub const ZirDriver = struct {
         // Dynamic resolution for complex types
         return switch (zig_type) {
             .struct_ref => |name| {
-                // Reference the struct type via decl_val in the current module
+                // Reference the struct/enum type via decl_val in the current module
                 const short_name = if (std.mem.lastIndexOf(u8, name, ".")) |dot_idx|
                     name[dot_idx + 1 ..]
                 else
                     name;
-                if (self.findStructDef(name) != null or self.findStructDef(short_name) != null) {
+                if (self.findAnyTypeDef(name) or self.findAnyTypeDef(short_name)) {
                     const ref = zir_builder_emit_decl_val(
                         self.handle,
                         short_name.ptr,
