@@ -4290,12 +4290,14 @@ fn getMapName(key_type: ZigType, value_type: ZigType) []const u8 {
         return switch (std.meta.activeTag(value_type)) {
             .string => "MapAtomString",
             .bool_type => "MapAtomBool",
+            .f64 => "MapAtomFloat",
             else => "Map",
         };
     }
     if (std.meta.activeTag(key_type) == .string) {
         return switch (std.meta.activeTag(value_type)) {
             .string => "MapStringString",
+            .f64 => "MapStringFloat",
             else => "MapStringInt",
         };
     }

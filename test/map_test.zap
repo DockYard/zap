@@ -105,4 +105,23 @@ pub module Test.MapTest {
       assert(Map.get(result, :last, "") == "Smith")
     }
   }
+
+  describe("Float value maps") {
+    test("create and access float value map") {
+      scores = %{math: 95.5, science: 88.0}
+      assert(Map.get(scores, :math, 0.0) == 95.5)
+    }
+
+    test("size of float value map") {
+      scores = %{math: 95.5, science: 88.0}
+      assert(Map.size(scores) == 2)
+    }
+
+    test("put on float value map") {
+      scores = %{math: 95.5}
+      result = Map.put(scores, :science, 88.0)
+      assert(Map.size(result) == 2)
+      assert(Map.get(result, :science, 0.0) == 88.0)
+    }
+  }
 }

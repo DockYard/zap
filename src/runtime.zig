@@ -2925,15 +2925,19 @@ pub fn MapOf(comptime K: type, comptime V: type) type {
 pub const Map = MapOf(u32, i64);                         // %{Atom => i64}
 pub const MapAtomString = MapOf(u32, []const u8);        // %{Atom => String}
 pub const MapAtomBool = MapOf(u32, bool);                // %{Atom => Bool}
+pub const MapAtomFloat = MapOf(u32, f64);                // %{Atom => Float}
 pub const MapStringInt = MapOf([]const u8, i64);         // %{String => i64}
 pub const MapStringString = MapOf([]const u8, []const u8); // %{String => String}
+pub const MapStringFloat = MapOf([]const u8, f64);       // %{String => Float}
 
 // Pointer-type aliases for function return types
 pub const MapType = ?*const Map;
 pub const MapAtomStringType = ?*const MapAtomString;
 pub const MapAtomBoolType = ?*const MapAtomBool;
+pub const MapAtomFloatType = ?*const MapAtomFloat;
 pub const MapStringIntType = ?*const MapStringInt;
 pub const MapStringStringType = ?*const MapStringString;
+pub const MapStringFloatType = ?*const MapStringFloat;
 
 // ============================================================
 // Generic List factory — produces monomorphic list types

@@ -1316,12 +1316,14 @@ pub const ZirDriver = struct {
             return switch (std.meta.activeTag(value_type)) {
                 .string => "MapAtomString",
                 .bool_type => "MapAtomBool",
+                .f64 => "MapAtomFloat",
                 else => "Map", // default: atom => i64
             };
         }
         if (std.meta.activeTag(key_type) == .string) {
             return switch (std.meta.activeTag(value_type)) {
                 .string => "MapStringString",
+                .f64 => "MapStringFloat",
                 else => "MapStringInt", // string => i64
             };
         }
@@ -1334,12 +1336,14 @@ pub const ZirDriver = struct {
             return switch (std.meta.activeTag(value_type)) {
                 .string => "MapAtomStringType",
                 .bool_type => "MapAtomBoolType",
+                .f64 => "MapAtomFloatType",
                 else => "MapType",
             };
         }
         if (std.meta.activeTag(key_type) == .string) {
             return switch (std.meta.activeTag(value_type)) {
                 .string => "MapStringStringType",
+                .f64 => "MapStringFloatType",
                 else => "MapStringIntType",
             };
         }
