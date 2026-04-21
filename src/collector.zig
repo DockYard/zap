@@ -127,8 +127,10 @@ pub const Collector = struct {
         if (self.kernel_name_id) |kid| {
             const is_kernel = mod.name.parts.len == 1 and mod.name.parts[0] == kid;
             if (!is_kernel and !self.hasExplicitKernelImport(mod, kid)) {
+                const parts = try self.allocator.alloc(ast.StringId, 1);
+                parts[0] = kid;
                 try self.graph.getScopeMut(mod_scope).imports.append(self.allocator, .{
-                    .source_module = .{ .parts = @constCast(&[_]ast.StringId{kid}), .span = mod.meta.span },
+                    .source_module = .{ .parts = parts, .span = mod.meta.span },
                     .filter = .all,
                     .imported_families = std.AutoHashMap(scope.FamilyKey, scope.FunctionFamilyId).init(self.allocator),
                     .imported_types = std.AutoHashMap(ast.StringId, scope.TypeId).init(self.allocator),
