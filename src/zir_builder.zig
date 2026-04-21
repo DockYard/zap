@@ -1302,7 +1302,7 @@ pub const ZirDriver = struct {
     /// Map an ir.ZigType to a ZIR type Ref constant for use as a comptime
     /// type argument when calling generic constructors (MapOf, ListOf).
     /// Returns null for complex types (structs, nested containers) that
-    /// require dynamic resolution via field_val/decl_val.
+    /// require dynamic resolution via emitTypeRef.
     fn zigTypeToTypeRef(zig_type: ir.ZigType) ?u32 {
         return switch (zig_type) {
             .bool_type => @intFromEnum(Zir.Inst.Ref.bool_type),
@@ -1321,6 +1321,34 @@ pub const ZirDriver = struct {
             .f64 => @intFromEnum(Zir.Inst.Ref.f64_type),
             .string => @intFromEnum(Zir.Inst.Ref.slice_const_u8_type),
             .atom => @intFromEnum(Zir.Inst.Ref.u32_type), // atoms are u32 at runtime
+            else => null,
+        };
+    }
+
+    /// Emit a ZIR type reference for any ZigType, including complex types
+    /// like structs that need decl_val resolution. Returns the ZIR ref for
+    /// the type, or null if the type cannot be resolved.
+    fn emitContainerElementTypeRef(self: *ZirDriver, zig_type: ir.ZigType) BuildError!?u32 {
+        // Try static resolution first
+        if (zigTypeToTypeRef(zig_type)) |ref| return ref;
+        // Dynamic resolution for complex types
+        return switch (zig_type) {
+            .struct_ref => |name| {
+                // Reference the struct type via decl_val in the current module
+                const short_name = if (std.mem.lastIndexOf(u8, name, ".")) |dot_idx|
+                    name[dot_idx + 1 ..]
+                else
+                    name;
+                if (self.findStructDef(name) != null or self.findStructDef(short_name) != null) {
+                    const ref = zir_builder_emit_decl_val(
+                        self.handle,
+                        short_name.ptr,
+                        @intCast(short_name.len),
+                    );
+                    if (ref != error_ref) return ref;
+                }
+                return null;
+            },
             else => null,
         };
     }
@@ -2963,15 +2991,22 @@ pub const ZirDriver = struct {
                 }
             },
             .list_init => |li| {
-                // Lists use named aliases (List, StringList, etc.) to ensure type
-                // identity with method calls that reference the same aliases.
-                // ListOf(T) called from user code creates a different type than the
-                // named alias even though structurally identical.
-                const cell_name = getListName(li.element_type);
-                const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
-                if (rt_import == error_ref) return error.EmitFailed;
-                const list_cell = zir_builder_emit_field_val(self.handle, rt_import, cell_name.ptr, @intCast(cell_name.len));
-                if (list_cell == error_ref) return error.EmitFailed;
+                // For primitive element types, use named aliases for type identity.
+                // For complex types (structs), use generic ListOf(T) instantiation.
+                const elem_type_ref = try self.emitContainerElementTypeRef(li.element_type);
+                const list_cell = if (elem_type_ref != null and zigTypeToTypeRef(li.element_type) == null) blk: {
+                    // Complex type: use generic ListOf(T)
+                    const type_args = [_]u32{elem_type_ref.?};
+                    break :blk self.emitGenericContainerRef("ListOf", &type_args) catch return error.EmitFailed;
+                } else blk: {
+                    // Primitive type: use named alias for type identity
+                    const cell_name = getListName(li.element_type);
+                    const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                    if (rt_import == error_ref) return error.EmitFailed;
+                    const ref = zir_builder_emit_field_val(self.handle, rt_import, cell_name.ptr, @intCast(cell_name.len));
+                    if (ref == error_ref) return error.EmitFailed;
+                    break :blk ref;
+                };
                 const cons_fn = zir_builder_emit_field_val(self.handle, list_cell, "cons", 4);
                 if (cons_fn == error_ref) return error.EmitFailed;
 
@@ -3001,14 +3036,20 @@ pub const ZirDriver = struct {
                 }
             },
             .list_cons => |lc| {
-                // List cons: uses named aliases for type identity.
-                const cell_name = getListName(lc.element_type);
                 const head_ref = self.refForLocal(lc.head) catch @intFromEnum(Zir.Inst.Ref.void_value);
                 const tail_ref = self.refForLocal(lc.tail) catch @intFromEnum(Zir.Inst.Ref.void_value);
-                const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
-                if (rt_import == error_ref) return error.EmitFailed;
-                const list_cell = zir_builder_emit_field_val(self.handle, rt_import, cell_name.ptr, @intCast(cell_name.len));
-                if (list_cell == error_ref) return error.EmitFailed;
+                const elem_type_ref = try self.emitContainerElementTypeRef(lc.element_type);
+                const list_cell = if (elem_type_ref != null and zigTypeToTypeRef(lc.element_type) == null) blk: {
+                    const type_args = [_]u32{elem_type_ref.?};
+                    break :blk self.emitGenericContainerRef("ListOf", &type_args) catch return error.EmitFailed;
+                } else blk: {
+                    const cell_name = getListName(lc.element_type);
+                    const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                    if (rt_import == error_ref) return error.EmitFailed;
+                    const ref = zir_builder_emit_field_val(self.handle, rt_import, cell_name.ptr, @intCast(cell_name.len));
+                    if (ref == error_ref) return error.EmitFailed;
+                    break :blk ref;
+                };
                 const cons_fn = zir_builder_emit_field_val(self.handle, list_cell, "cons", 4);
                 if (cons_fn == error_ref) return error.EmitFailed;
                 const call_args = [_]u32{ head_ref, tail_ref };
@@ -3018,9 +3059,9 @@ pub const ZirDriver = struct {
             },
             .map_init => |mi| {
                 // Maps use generic MapOf(K, V) instantiation.
-                // Call MapOf with the key/value type refs to get the container type.
-                const key_type_ref = zigTypeToTypeRef(mi.key_type) orelse @intFromEnum(Zir.Inst.Ref.u32_type);
-                const val_type_ref = zigTypeToTypeRef(mi.value_type) orelse @intFromEnum(Zir.Inst.Ref.i64_type);
+                // For complex types (structs), emit type refs dynamically.
+                const key_type_ref = (try self.emitContainerElementTypeRef(mi.key_type)) orelse @intFromEnum(Zir.Inst.Ref.u32_type);
+                const val_type_ref = (try self.emitContainerElementTypeRef(mi.value_type)) orelse @intFromEnum(Zir.Inst.Ref.i64_type);
                 const map_type_args = [_]u32{ key_type_ref, val_type_ref };
                 const map_cell = self.emitGenericContainerRef("MapOf", &map_type_args) catch return error.EmitFailed;
 
