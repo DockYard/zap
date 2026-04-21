@@ -41,6 +41,22 @@ pub module Test.EnumTest {
       assert(Enum.reduce([], 42, add) == 42)
     }
 
+    test("reduce strings via concat") {
+      assert(Enum.reduce(["a", "b", "c"], "", concat_str) == "abc")
+    }
+
+    test("sort strings by length") {
+      result = Enum.sort(["ccc", "a", "bb"], str_less_than)
+      assert(List.head(result) == "a")
+      assert(List.last(result) == "ccc")
+    }
+
+    test("flat_map strings") {
+      result = Enum.flat_map(["hi", "yo"], double_str)
+      assert(List.length(result) == 4)
+      assert(List.head(result) == "hi")
+    }
+
     test("find first match") {
       assert(Enum.find([1, 2, 3, 4], 0, greater_than_two) == 3)
     }
@@ -271,5 +287,17 @@ pub module Test.EnumTest {
 
   fn greater_than(a :: i64, b :: i64) -> Bool {
     a > b
+  }
+
+  fn concat_str(acc :: String, x :: String) -> String {
+    acc <> x
+  }
+
+  fn str_less_than(a :: String, b :: String) -> Bool {
+    String.length(a) < String.length(b)
+  }
+
+  fn double_str(s :: String) -> [String] {
+    [s, s]
   }
 }
