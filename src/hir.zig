@@ -3590,7 +3590,7 @@ pub const HirBuilder = struct {
                 unreachable;
             },
             .struct_expr => |se| {
-                // Resolve struct type from module name (e.g., %{name: "Alice"} :: User)
+                // Resolve struct type from module name (e.g., %Point{x: 1, y: 2})
                 var struct_type_id = types_mod.TypeStore.UNKNOWN;
                 if (se.module_name.parts.len > 0) {
                     const type_name_id = se.module_name.parts[se.module_name.parts.len - 1];

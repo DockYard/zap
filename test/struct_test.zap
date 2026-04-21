@@ -193,4 +193,5 @@ pub module Test.StructTest {
     point = %Point{x: 42, y: 99}
     point.x
   }
+
 }
