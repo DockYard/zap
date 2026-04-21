@@ -950,11 +950,23 @@ pub const Prelude = struct {
         const stdin = std.Io.File.stdin();
         const pio = runtime_io;
         var buf: [4096]u8 = undefined;
-        const line = stdin.readLine(pio, &buf) catch return "";
-        if (line.len == 0) return "";
-        const result = bumpAlloc(line.len);
+        var len: usize = 0;
+        // Read one byte at a time until newline or EOF
+        while (len < buf.len - 1) {
+            var one: [1]u8 = undefined;
+            const bufs: []const []u8 = &.{&one};
+            const n = stdin.readStreaming(pio, bufs) catch break;
+            if (n == 0) break; // EOF
+            if (one[0] == '\n') break;
+            buf[len] = one[0];
+            len += 1;
+        }
+        // Strip trailing \r if present (Windows line endings)
+        if (len > 0 and buf[len - 1] == '\r') len -= 1;
+        if (len == 0) return "";
+        const result = bumpAlloc(len);
         if (result.len == 0) return "";
-        @memcpy(result, line);
+        @memcpy(result, buf[0..len]);
         return result;
     }
 
