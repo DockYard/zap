@@ -1056,18 +1056,10 @@ pub const IrBuilder = struct {
         // Emit a minimal stub to preserve function ID ordering.
         if (self.type_store) |ts| {
             if (isGenericHirGroup(ts, group)) {
-                // Generic functions are monomorphized — all call sites should be
-                // rewritten to specialized copies. Emit a stub with the CORRECT
-                // signature (matching arity and using anytype params) so that
-                // @import resolution works without generating self-recursive wrappers.
                 const func_id: FunctionId = group.id;
                 if (self.next_function_id <= func_id) {
                     self.next_function_id = func_id + 1;
                 }
-                // Don't emit any IR function for generic stubs.
-                // No call_named or call_direct references the stub (all are rewritten).
-                // Emitting a function creates namespace entries that Zig's Sema may
-                // try to resolve, potentially generating self-recursive wrappers.
                 return;
             }
         }
@@ -3594,11 +3586,11 @@ pub const IrBuilder = struct {
                 });
                 // Phase 3: track known type from HIR expr type_id
                 var param_zig_type = typeIdToZigTypeWithStore(expr.type_id, self.type_store);
-                // Fallback: if expression type is unknown but we have the declared param type
-                // from the function signature, use that instead. This handles monomorphized
-                // functions where param_get expressions retain UNKNOWN type_ids but the
-                // clause params have concrete types after substitution.
-                if (param_zig_type == .any and idx < self.current_param_types.items.len) {
+                // Always prefer the declared param type from the function signature.
+                // The expression's type_id may be stale (from before monomorphization)
+                // or incorrectly concretized. The function's declared param types are
+                // the authoritative source of truth after monomorphization.
+                if (idx < self.current_param_types.items.len) {
                     param_zig_type = self.current_param_types.items[idx];
                 }
                 if (param_zig_type != .any) {
@@ -3823,9 +3815,11 @@ pub const IrBuilder = struct {
                         const resolved_name = if (std.mem.startsWith(u8, map_resolved, "List.") and lowered_args.len > 0) blk: {
                             const first_arg_type = self.known_local_types.get(lowered_args[0]) orelse .any;
                             if (std.meta.activeTag(first_arg_type) == .list) {
-                                const cell_name = getListName(first_arg_type.list.*);
+                                const elem_zig = first_arg_type.list.*;
+                                const cell_name = getListName(elem_zig);
                                 const method = map_resolved["List.".len..];
-                                break :blk try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ cell_name, method });
+                                const resolved = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ cell_name, method });
+                                    break :blk resolved;
                             }
                             break :blk map_resolved;
                         } else map_resolved;
