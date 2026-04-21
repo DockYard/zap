@@ -1350,26 +1350,40 @@ pub const ZirDriver = struct {
                 return null;
             },
             .list => |inner| {
-                // Nested list: ListOf(ListOf(T))
-                // First resolve the inner element type, then call ListOf
+                // Nested list: element type is ?*const ListOf(T)
+                // Get the inner ListOf(T) type, call .empty() on it,
+                // then use @TypeOf to get the optional pointer type.
                 const inner_ref = try self.emitContainerElementTypeRef(inner.*);
                 if (inner_ref) |iref| {
                     const type_args = [_]u32{iref};
                     const inner_list = self.emitGenericContainerRef("ListOf", &type_args) catch return null;
-                    // We need the OPTIONAL POINTER type: ?*const ListOf(T)
-                    // ListOf(T) returns a type, and list values are ?*const Self
-                    // The emit_optional_type wraps in ?T
-                    return inner_list;
+                    // Call .empty() to get a value of type ?*const ListOf(T)
+                    const empty_fn = zir_builder_emit_field_val(self.handle, inner_list, "empty", 5);
+                    if (empty_fn == error_ref) return null;
+                    const empty_val = zir_builder_emit_call_ref(self.handle, empty_fn, &.{}, 0);
+                    if (empty_val == error_ref) return null;
+                    // @TypeOf(empty_val) gives ?*const ListOf(T)
+                    const type_ref = zir_builder_emit_typeof(self.handle, empty_val);
+                    if (type_ref == error_ref) return null;
+                    return type_ref;
                 }
                 return null;
             },
             .map => |mt| {
-                // Nested map: MapOf(K, MapOf(...)) or similar
+                // Nested map: element type is ?*const MapOf(K, V)
                 const key_ref = try self.emitContainerElementTypeRef(mt.key.*);
                 const val_ref = try self.emitContainerElementTypeRef(mt.value.*);
                 if (key_ref != null and val_ref != null) {
                     const type_args = [_]u32{ key_ref.?, val_ref.? };
-                    return self.emitGenericContainerRef("MapOf", &type_args) catch null;
+                    const inner_map = self.emitGenericContainerRef("MapOf", &type_args) catch return null;
+                    // Call .empty() to get ?*const MapOf(K, V), then @TypeOf
+                    const empty_fn = zir_builder_emit_field_val(self.handle, inner_map, "empty", 5);
+                    if (empty_fn == error_ref) return null;
+                    const empty_val = zir_builder_emit_call_ref(self.handle, empty_fn, &.{}, 0);
+                    if (empty_val == error_ref) return null;
+                    const type_ref = zir_builder_emit_typeof(self.handle, empty_val);
+                    if (type_ref == error_ref) return null;
+                    return type_ref;
                 }
                 return null;
             },
@@ -1498,8 +1512,11 @@ pub const ZirDriver = struct {
         }
         if (std.meta.activeTag(param.type_expr) == .map) {
             const mt = param.type_expr.map;
-            // For struct/enum value types, use anytype
-            if (std.meta.activeTag(mt.value.*) == .struct_ref or std.meta.activeTag(mt.value.*) == .tagged_union) {
+            // For complex value types (struct/enum/nested), use anytype
+            if (std.meta.activeTag(mt.value.*) == .struct_ref or
+                std.meta.activeTag(mt.value.*) == .tagged_union or
+                std.meta.activeTag(mt.value.*) == .list or
+                std.meta.activeTag(mt.value.*) == .map) {
                 const ref = zir_builder_emit_param(
                     self.handle,
                     param.name.ptr,
@@ -1526,7 +1543,10 @@ pub const ZirDriver = struct {
             const elem_type = getListElementType(param.type_expr);
             // For struct element lists, use anytype — the generic ListOf(T)
             // can't be expressed as a named type alias for arbitrary T.
-            if (std.meta.activeTag(elem_type) == .struct_ref) {
+            if (std.meta.activeTag(elem_type) == .struct_ref or
+                std.meta.activeTag(elem_type) == .tagged_union or
+                std.meta.activeTag(elem_type) == .list or
+                std.meta.activeTag(elem_type) == .map) {
                 const ref = zir_builder_emit_param(
                     self.handle,
                     param.name.ptr,
@@ -2783,6 +2803,45 @@ pub const ZirDriver = struct {
                         }
                     }
                     break :blk2 false;
+                } else if (std.mem.startsWith(u8, cb.name, "ListOfNested:")) blk3: {
+                    // Handle "ListOfNested:inner_type.method" for nested list dispatch
+                    const after_prefix = cb.name["ListOfNested:".len..];
+                    if (std.mem.findScalar(u8, after_prefix, '.')) |dot_idx| {
+                        const inner_type_name = after_prefix[0..dot_idx];
+                        const method_name = after_prefix[dot_idx + 1 ..];
+                        // Resolve the inner element type
+                        const inner_type_ref = if (std.mem.eql(u8, inner_type_name, "i64"))
+                            @intFromEnum(Zir.Inst.Ref.i64_type)
+                        else if (std.mem.eql(u8, inner_type_name, "string"))
+                            @intFromEnum(Zir.Inst.Ref.slice_const_u8_type)
+                        else if (std.mem.eql(u8, inner_type_name, "f64"))
+                            @intFromEnum(Zir.Inst.Ref.f64_type)
+                        else if (std.mem.eql(u8, inner_type_name, "bool_type"))
+                            @intFromEnum(Zir.Inst.Ref.bool_type)
+                        else
+                            @intFromEnum(Zir.Inst.Ref.i64_type);
+                        // Build ListOf(inner), call .empty(), @TypeOf for the pointer type
+                        const inner_args = [_]u32{inner_type_ref};
+                        const inner_list = self.emitGenericContainerRef("ListOf", &inner_args) catch break :blk3 false;
+                        const empty_fn = zir_builder_emit_field_val(self.handle, inner_list, "empty", 5);
+                        if (empty_fn == error_ref) break :blk3 false;
+                        const empty_val = zir_builder_emit_call_ref(self.handle, empty_fn, &.{}, 0);
+                        if (empty_val == error_ref) break :blk3 false;
+                        const elem_type_ref = zir_builder_emit_typeof(self.handle, empty_val);
+                        if (elem_type_ref == error_ref) break :blk3 false;
+                        // Now call ListOf(@TypeOf(empty_val)).method
+                        const outer_args = [_]u32{elem_type_ref};
+                        const outer_list = self.emitGenericContainerRef("ListOf", &outer_args) catch break :blk3 false;
+                        const fn_ref = zir_builder_emit_field_val(self.handle, outer_list, method_name.ptr, @intCast(method_name.len));
+                        if (fn_ref != error_ref) {
+                            const ref = zir_builder_emit_call_ref(self.handle, fn_ref, args.items.ptr, @intCast(args.items.len));
+                            if (ref != error_ref) {
+                                try self.setLocal(cb.dest, ref);
+                                break :blk3 true;
+                            }
+                        }
+                    }
+                    break :blk3 false;
                 } else false;
 
                 if (!generic_handled) {

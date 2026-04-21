@@ -46,6 +46,27 @@ pub module Test.ListTest {
     test("last") { reject(List.last([true, true, false])) }
   }
 
+  describe("Nested lists") {
+    test("list of integer lists length") {
+      assert(nested_list_length() == 2)
+    }
+
+    test("inner list head") {
+      assert(inner_list_head() == 1)
+    }
+  }
+
+  fn nested_list_length() -> i64 {
+    nested = [[1, 2, 3], [4, 5]]
+    List.length(nested)
+  }
+
+  fn inner_list_head() -> i64 {
+    nested = [[1, 2, 3], [4, 5]]
+    first = List.head(nested)
+    List.head(first)
+  }
+
   describe("Bang variants") {
     test("head! on non-empty") { assert(List.head!([10, 20, 30]) == 10) }
     test("last! on non-empty") { assert(List.last!([1, 2, 3]) == 3) }

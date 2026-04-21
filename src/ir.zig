@@ -3829,10 +3829,17 @@ pub const IrBuilder = struct {
                             if (std.meta.activeTag(first_arg_type) == .list) {
                                 const elem_zig = first_arg_type.list.*;
                                 const method = map_resolved["List.".len..];
-                                // For struct element types, encode the struct name
-                                // so the ZIR builder can use generic ListOf(T)
+                                // For struct/enum/nested element types, encode for generic dispatch
                                 if (std.meta.activeTag(elem_zig) == .struct_ref) {
                                     break :blk try std.fmt.allocPrint(self.allocator, "ListOf:{s}.{s}", .{ elem_zig.struct_ref, method });
+                                }
+                                if (std.meta.activeTag(elem_zig) == .tagged_union) {
+                                    break :blk try std.fmt.allocPrint(self.allocator, "ListOf:{s}.{s}", .{ elem_zig.tagged_union, method });
+                                }
+                                if (std.meta.activeTag(elem_zig) == .list) {
+                                    // Nested list: ListOf(?*const ListOf(T))
+                                    // Use "ListOfNested:inner_type.method" encoding
+                                    break :blk try std.fmt.allocPrint(self.allocator, "ListOfNested:{s}.{s}", .{ @tagName(elem_zig.list.*), method });
                                 }
                                 const cell_name = getListName(elem_zig);
                                 break :blk try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ cell_name, method });
