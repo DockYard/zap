@@ -67,7 +67,7 @@ pub module Enum {
         Enum.reduce([2, 3, 4], 1, fn(acc, x) { acc * x })   # => 24
     """
 
-  pub fn reduce(list :: [i64], initial :: i64, callback :: (i64, i64 -> i64)) -> i64 {
+  pub fn reduce(list :: [element], initial :: element, callback :: (element, element -> element)) -> element {
     :zig.List.enumReduceSimple(list, initial, callback)
   }
 
@@ -215,7 +215,7 @@ pub module Enum {
         Enum.sort([3, 1, 2], fn(a, b) { a > b })  # => [3, 2, 1]
     """
 
-  pub fn sort(list :: [i64], comparator :: (i64, i64 -> Bool)) -> [i64] {
+  pub fn sort(list :: [element], comparator :: (element, element -> Bool)) -> [element] {
     :zig.List.sortFn(list, comparator)
   }
 
@@ -229,7 +229,7 @@ pub module Enum {
         # => [1, 10, 2, 20, 3, 30]
     """
 
-  pub fn flat_map(list :: [i64], callback :: (i64 -> [i64])) -> [i64] {
+  pub fn flat_map(list :: [element], callback :: (element -> [element])) -> [element] {
     :zig.List.flatMapFn(list, callback)
   }
 

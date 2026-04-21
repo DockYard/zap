@@ -117,6 +117,7 @@ extern "c" fn zir_builder_emit_ret_null(handle: ?*ZirBuilderHandle) i32;
 extern "c" fn zir_builder_add_struct_type(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32, field_names_ptrs: [*]const [*]const u8, field_names_lens: [*]const u32, field_type_refs: [*]const u32, field_default_refs: ?[*]const u32, fields_len: u32) i32;
 extern "c" fn zir_builder_add_enum_type(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32, variant_names_ptrs: [*]const [*]const u8, variant_names_lens: [*]const u32, variants_len: u32) i32;
 extern "c" fn zir_builder_emit_enum_from_int(handle: ?*ZirBuilderHandle, operand: u32, type_ref: u32) u32;
+extern "c" fn zir_builder_emit_int_from_enum(handle: ?*ZirBuilderHandle, operand: u32) u32;
 extern "c" fn zir_builder_set_decl_val_return_type(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32) i32;
 extern "c" fn zir_builder_emit_param_decl_val_type(handle: ?*ZirBuilderHandle, param_name_ptr: [*]const u8, param_name_len: u32, type_name_ptr: [*]const u8, type_name_len: u32) u32;
 
@@ -2818,6 +2819,8 @@ pub const ZirDriver = struct {
                             if (fn_ref != error_ref) {
                                 const ref = zir_builder_emit_call_ref(self.handle, fn_ref, args.items.ptr, @intCast(args.items.len));
                                 if (ref != error_ref) {
+                                    // (getHead, get, last) return a Zig enum value, but Zap's
+                                    // atom-based dispatch expects u32. Convert via @intFromEnum.
                                     try self.setLocal(cb.dest, ref);
                                     break :blk true;
                                 }
