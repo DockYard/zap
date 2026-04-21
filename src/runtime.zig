@@ -775,6 +775,7 @@ pub const String = struct {
     pub const trim_leading = Prelude.trim_leading;
     pub const trim_trailing = Prelude.trim_trailing;
     pub const string_count = Prelude.string_count;
+    pub const split_to_list = Prelude.split_to_list;
 };
 
 // ============================================================
@@ -1366,6 +1367,35 @@ pub const Prelude = struct {
         const fill: u8 = if (pad_char.len > 0) pad_char[0] else ' ';
         @memset(result[s.len..target], fill);
         return result;
+    }
+
+    /// Split a string by delimiter, returning a StringList (linked list of strings).
+    pub fn split_to_list(s: []const u8, delimiter: []const u8) ?*const StringList {
+        if (delimiter.len == 0) {
+            return StringList.cons(s, null);
+        }
+        // Build the list in reverse, then reverse it
+        var result: ?*const StringList = null;
+        var pos: usize = 0;
+        var seg_start: usize = 0;
+        while (pos < s.len) {
+            if (pos + delimiter.len <= s.len and std.mem.eql(u8, s[pos .. pos + delimiter.len], delimiter)) {
+                const seg = s[seg_start..pos];
+                const seg_copy = bumpAlloc(seg.len);
+                if (seg_copy.len > 0) @memcpy(seg_copy, seg);
+                result = StringList.cons(seg_copy, result);
+                pos += delimiter.len;
+                seg_start = pos;
+            } else {
+                pos += 1;
+            }
+        }
+        // Last segment
+        const last_seg = s[seg_start..];
+        const last_copy = bumpAlloc(last_seg.len);
+        if (last_copy.len > 0) @memcpy(last_copy, last_seg);
+        result = StringList.cons(last_copy, result);
+        return StringList.reverse(result);
     }
 
     pub fn split_string(s: []const u8, delimiter: []const u8) []const u8 {

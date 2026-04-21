@@ -216,4 +216,37 @@ pub module Test.StringTest {
       assert(String.count("aaa", "aa") == 1)
     }
   }
+
+  describe("String.split") {
+    test("split by comma") {
+      parts = String.split("a,b,c", ",")
+      assert(List.length(parts) == 3)
+      assert(List.head(parts) == "a")
+      assert(List.last(parts) == "c")
+    }
+
+    test("split no delimiter found") {
+      parts = String.split("hello", ",")
+      assert(List.length(parts) == 1)
+      assert(List.head(parts) == "hello")
+    }
+
+    test("split by space") {
+      parts = String.split("hello world zap", " ")
+      assert(List.length(parts) == 3)
+      assert(List.head(parts) == "hello")
+    }
+
+    test("split empty delimiter returns whole string") {
+      parts = String.split("hello", "")
+      assert(List.length(parts) == 1)
+      assert(List.head(parts) == "hello")
+    }
+
+    test("split with trailing delimiter") {
+      parts = String.split("a,b,", ",")
+      assert(List.length(parts) == 3)
+      assert(List.last(parts) == "")
+    }
+  }
 }

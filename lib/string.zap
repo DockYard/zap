@@ -356,4 +356,18 @@ pub module String {
   pub fn count(haystack :: String, needle :: String) -> i64 {
     :zig.String.string_count(haystack, needle)
   }
+
+  @doc = """
+    Splits a string by a delimiter, returning a list of strings.
+
+    ## Examples
+
+        String.split("a,b,c", ",")     # => ["a", "b", "c"]
+        String.split("hello", "")       # => ["hello"]
+        String.split("no match", ",")   # => ["no match"]
+    """
+
+  pub fn split(s :: String, delimiter :: String) -> [String] {
+    :zig.String.split_to_list(s, delimiter)
+  }
 }
