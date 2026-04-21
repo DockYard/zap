@@ -49,4 +49,36 @@ pub module IO {
     :zig.IO.print_str(message)
     message
   }
+
+  @doc = """
+    Reads a line from standard input.
+
+    Returns the line without the trailing newline.
+    Returns an empty string on EOF.
+
+    ## Examples
+
+        name = IO.gets()
+        IO.puts("Hello, " <> name)
+    """
+
+  pub fn gets() -> String {
+    :zig.IO.gets()
+  }
+
+  @doc = """
+    Prints a message to standard error followed by a newline.
+
+    Useful for logging and error messages that should not
+    mix with normal output.
+
+    ## Examples
+
+        IO.warn("something went wrong")
+    """
+
+  pub fn warn(message :: String) -> String {
+    :zig.IO.warn(message)
+    message
+  }
 }

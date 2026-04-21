@@ -582,6 +582,7 @@ pub const ZirDriver = struct {
         if (std.mem.eql(u8, mod_name, "Math")) return "Prelude";
         if (std.mem.eql(u8, mod_name, "File")) return "Prelude";
         if (std.mem.eql(u8, mod_name, "System")) return "Prelude";
+        if (std.mem.eql(u8, mod_name, "Path")) return "Prelude";
         // Default: use the module name as-is (Prelude, etc.)
         return mod_name;
     }

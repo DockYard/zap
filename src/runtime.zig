@@ -942,6 +942,27 @@ pub const Prelude = struct {
         }
     }
 
+    /// Read a line from stdin. Returns the line without the trailing newline.
+    /// Returns an empty string on EOF or error.
+    pub fn gets() []const u8 {
+        const stdin = std.Io.File.stdin();
+        const pio = runtime_io;
+        var buf: [4096]u8 = undefined;
+        const line = stdin.readLine(pio, &buf) catch return "";
+        if (line.len == 0) return "";
+        const result = bumpAlloc(line.len);
+        if (result.len == 0) return "";
+        @memcpy(result, line);
+        return result;
+    }
+
+    /// Write a string to stderr followed by a newline.
+    pub fn warn(message: []const u8) void {
+        const stderr = std.Io.File.stderr();
+        stderr.writeStreamingAll(runtime_io, message) catch {};
+        stderr.writeStreamingAll(runtime_io, "\n") catch {};
+    }
+
     pub fn i64_to_string(value: i64) []const u8 {
         var buf: [32]u8 = undefined;
         const slice = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return "?";
@@ -1460,6 +1481,106 @@ pub const Prelude = struct {
     pub fn file_exists(path: []const u8) bool {
         std.Io.Dir.cwd().access(runtime_io, path, .{}) catch return false;
         return true;
+    }
+
+    pub fn file_rm(path: []const u8) bool {
+        std.Io.Dir.cwd().deleteFile(runtime_io, path) catch return false;
+        return true;
+    }
+
+    pub fn file_mkdir(path: []const u8) bool {
+        std.Io.Dir.cwd().createDirPath(runtime_io, path) catch return false;
+        return true;
+    }
+
+    pub fn file_rmdir(path: []const u8) bool {
+        std.Io.Dir.cwd().deleteDir(runtime_io, path) catch return false;
+        return true;
+    }
+
+    pub fn file_rename(old_path: []const u8, new_path: []const u8) bool {
+        const cwd = std.Io.Dir.cwd();
+        std.Io.Dir.rename(cwd, old_path, cwd, new_path, runtime_io) catch return false;
+        return true;
+    }
+
+    pub fn file_cp(src: []const u8, dest: []const u8) bool {
+        const content = file_read(src);
+        if (content.len == 0) return false;
+        return file_write(dest, content);
+    }
+
+    pub fn file_is_dir(path: []const u8) bool {
+        const stat = std.Io.Dir.cwd().statFile(runtime_io, path, .{}) catch return false;
+        return stat.kind == .directory;
+    }
+
+    pub fn file_is_regular(path: []const u8) bool {
+        const stat = std.Io.Dir.cwd().statFile(runtime_io, path, .{}) catch return false;
+        return stat.kind == .file;
+    }
+
+    // --- System ---
+
+    pub fn sys_cwd() []const u8 {
+        var buf: [4096]u8 = undefined;
+        const cwd = std.process.getCwd(&buf) catch return "";
+        const result = bumpAlloc(cwd.len);
+        if (result.len == 0) return "";
+        @memcpy(result, cwd);
+        return result;
+    }
+
+    // --- Path operations (pure string manipulation) ---
+
+    pub fn path_join(a: []const u8, b: []const u8) []const u8 {
+        if (a.len == 0) return b;
+        if (b.len == 0) return a;
+        const need_sep = a[a.len - 1] != '/';
+        const total = a.len + b.len + @as(usize, if (need_sep) 1 else 0);
+        const result = bumpAlloc(total);
+        if (result.len == 0) return "";
+        @memcpy(result[0..a.len], a);
+        if (need_sep) {
+            result[a.len] = '/';
+            @memcpy(result[a.len + 1 ..][0..b.len], b);
+        } else {
+            @memcpy(result[a.len..][0..b.len], b);
+        }
+        return result;
+    }
+
+    pub fn path_basename(path: []const u8) []const u8 {
+        if (path.len == 0) return "";
+        var i: usize = path.len;
+        while (i > 0) {
+            i -= 1;
+            if (path[i] == '/') return path[i + 1 ..];
+        }
+        return path;
+    }
+
+    pub fn path_dirname(path: []const u8) []const u8 {
+        if (path.len == 0) return ".";
+        var i: usize = path.len;
+        while (i > 0) {
+            i -= 1;
+            if (path[i] == '/') {
+                if (i == 0) return "/";
+                return path[0..i];
+            }
+        }
+        return ".";
+    }
+
+    pub fn path_extname(path: []const u8) []const u8 {
+        const base = path_basename(path);
+        var i: usize = base.len;
+        while (i > 0) {
+            i -= 1;
+            if (base[i] == '.') return base[i..];
+        }
+        return "";
     }
 
     pub fn atom_name(id: anytype) []const u8 {

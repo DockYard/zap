@@ -70,4 +70,16 @@ pub module System {
   pub fn get_build_opt(name :: String) -> String {
     :zig.System.get_build_opt(name)
   }
+
+  @doc = """
+    Returns the current working directory.
+
+    ## Examples
+
+        System.cwd()  # => "/Users/dev/project"
+    """
+
+  pub fn cwd() -> String {
+    :zig.System.sys_cwd()
+  }
 }
