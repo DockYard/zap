@@ -3814,10 +3814,8 @@ pub const IrBuilder = struct {
                             const first_arg_type = self.known_local_types.get(lowered_args[0]) orelse .any;
                             if (std.meta.activeTag(first_arg_type) == .map) {
                                 const map_name = getMapName(first_arg_type.map.key.*, first_arg_type.map.value.*);
-                                if (!std.mem.eql(u8, map_name, "Map")) {
-                                    const method = name["Map.".len..];
-                                    break :blk try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ map_name, method });
-                                }
+                                const method = name["Map.".len..];
+                                break :blk try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ map_name, method });
                             }
                             break :blk name;
                         } else name;
@@ -4291,7 +4289,7 @@ fn getMapName(key_type: ZigType, value_type: ZigType) []const u8 {
             .string => "MapAtomString",
             .bool_type => "MapAtomBool",
             .f64 => "MapAtomFloat",
-            else => "Map",
+            else => "MapAtomInt",
         };
     }
     if (std.meta.activeTag(key_type) == .string) {
@@ -4301,7 +4299,7 @@ fn getMapName(key_type: ZigType, value_type: ZigType) []const u8 {
             else => "MapStringInt",
         };
     }
-    return "Map";
+    return "MapAtomInt";
 }
 
 fn getListName(element_type: ZigType) []const u8 {

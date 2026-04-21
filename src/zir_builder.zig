@@ -568,7 +568,7 @@ pub const ZirDriver = struct {
     fn mapToRuntimeModule(mod_name: []const u8) []const u8 {
         // These modules have their own runtime structs
         if (std.mem.eql(u8, mod_name, "List")) return "List";
-        if (std.mem.eql(u8, mod_name, "Map")) return "Map";
+        if (std.mem.eql(u8, mod_name, "Map")) return "MapAtomInt";
         if (std.mem.eql(u8, mod_name, "String")) return "String";
         if (std.mem.eql(u8, mod_name, "Zest")) return "Zest";
         if (std.mem.eql(u8, mod_name, "Kernel")) return "Kernel";
@@ -1317,17 +1317,17 @@ pub const ZirDriver = struct {
                 .string => "MapAtomString",
                 .bool_type => "MapAtomBool",
                 .f64 => "MapAtomFloat",
-                else => "Map", // default: atom => i64
+                else => "MapAtomInt",
             };
         }
         if (std.meta.activeTag(key_type) == .string) {
             return switch (std.meta.activeTag(value_type)) {
                 .string => "MapStringString",
                 .f64 => "MapStringFloat",
-                else => "MapStringInt", // string => i64
+                else => "MapStringInt",
             };
         }
-        return "Map";
+        return "MapAtomInt";
     }
 
     /// Map (key_type, value_type) to the runtime MapType pointer alias name.
@@ -1337,7 +1337,7 @@ pub const ZirDriver = struct {
                 .string => "MapAtomStringType",
                 .bool_type => "MapAtomBoolType",
                 .f64 => "MapAtomFloatType",
-                else => "MapType",
+                else => "MapAtomIntType",
             };
         }
         if (std.meta.activeTag(key_type) == .string) {
@@ -1347,7 +1347,7 @@ pub const ZirDriver = struct {
                 else => "MapStringIntType",
             };
         }
-        return "MapType";
+        return "MapAtomIntType";
     }
 
     /// Map a list element ZigType to the runtime ListType alias name.
@@ -3241,7 +3241,7 @@ pub const ZirDriver = struct {
                 const key_ref = self.refForLocal(mhk.key) catch return;
                 const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                 if (rt_import == error_ref) return error.EmitFailed;
-                const map_cell = zir_builder_emit_field_val(self.handle, rt_import, "Map", 3);
+                const map_cell = zir_builder_emit_field_val(self.handle, rt_import, "MapAtomInt", 10);
                 if (map_cell == error_ref) return error.EmitFailed;
                 const fn_ref = zir_builder_emit_field_val(self.handle, map_cell, "hasKey", 6);
                 if (fn_ref == error_ref) return error.EmitFailed;
@@ -3257,7 +3257,7 @@ pub const ZirDriver = struct {
                 const default_ref = self.refForLocal(mg.default) catch return;
                 const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                 if (rt_import == error_ref) return error.EmitFailed;
-                const map_cell = zir_builder_emit_field_val(self.handle, rt_import, "Map", 3);
+                const map_cell = zir_builder_emit_field_val(self.handle, rt_import, "MapAtomInt", 10);
                 if (map_cell == error_ref) return error.EmitFailed;
                 const fn_ref = zir_builder_emit_field_val(self.handle, map_cell, "get", 3);
                 if (fn_ref == error_ref) return error.EmitFailed;

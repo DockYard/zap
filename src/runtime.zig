@@ -2922,16 +2922,16 @@ pub fn MapOf(comptime K: type, comptime V: type) type {
 } // end of MapOf
 
 // Named map type aliases for common key/value combinations
-pub const Map = MapOf(u32, i64);                         // %{Atom => i64}
+pub const MapAtomInt = MapOf(u32, i64);                  // %{Atom => i64}
 pub const MapAtomString = MapOf(u32, []const u8);        // %{Atom => String}
 pub const MapAtomBool = MapOf(u32, bool);                // %{Atom => Bool}
-pub const MapAtomFloat = MapOf(u32, f64);                // %{Atom => Float}
+pub const MapAtomFloat = MapOf(u32, f64);                // %{Atom => f64}
 pub const MapStringInt = MapOf([]const u8, i64);         // %{String => i64}
 pub const MapStringString = MapOf([]const u8, []const u8); // %{String => String}
-pub const MapStringFloat = MapOf([]const u8, f64);       // %{String => Float}
+pub const MapStringFloat = MapOf([]const u8, f64);       // %{String => f64}
 
 // Pointer-type aliases for function return types
-pub const MapType = ?*const Map;
+pub const MapAtomIntType = ?*const MapAtomInt;
 pub const MapAtomStringType = ?*const MapAtomString;
 pub const MapAtomBoolType = ?*const MapAtomBool;
 pub const MapAtomFloatType = ?*const MapAtomFloat;
