@@ -3522,12 +3522,23 @@ pub const HirBuilder = struct {
                     try elems.append(self.allocator, try self.buildExpr(elem));
                 }
                 const built_elems = try elems.toOwnedSlice(self.allocator);
-                // Infer list type from first element
+                // Infer list type from elements — use first element with known type
                 const list_type_id = if (built_elems.len > 0) blk: {
-                    const elem_type = built_elems[0].type_id;
-                    if (elem_type != types_mod.TypeStore.UNKNOWN) {
-                        const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
-                        break :blk store_ptr.addType(.{ .list = .{ .element = elem_type } }) catch types_mod.TypeStore.UNKNOWN;
+                    for (built_elems) |elem| {
+                        if (elem.type_id != types_mod.TypeStore.UNKNOWN) {
+                            const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
+                            break :blk store_ptr.addType(.{ .list = .{ .element = elem.type_id } }) catch types_mod.TypeStore.UNKNOWN;
+                        }
+                    }
+                    // All elements UNKNOWN — check element kinds for type inference
+                    // String literals that went through CtValue round-trip may be
+                    // encoded as call expressions to the string interpolation form.
+                    // Check if elements are string_lit directly.
+                    for (built_elems) |elem| {
+                        if (elem.kind == .string_lit) {
+                            const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
+                            break :blk store_ptr.addType(.{ .list = .{ .element = types_mod.TypeStore.STRING } }) catch types_mod.TypeStore.UNKNOWN;
+                        }
                     }
                     break :blk types_mod.TypeStore.UNKNOWN;
                 } else types_mod.TypeStore.UNKNOWN;

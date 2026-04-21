@@ -1635,9 +1635,6 @@ pub const ZirDriver = struct {
             func.local_name
         else
             func.name;
-        if (std.mem.indexOf(u8, emit_name, "List_head") != null) {
-            std.debug.print("DEBUG EMIT_FUNC: name={s} local={s}\n", .{ func.name, emit_name });
-        }
         if (zir_builder_begin_func(self.handle, emit_name.ptr, @intCast(emit_name.len), ret_type) != 0) {
             return error.BeginFuncFailed;
         }
@@ -2777,9 +2774,6 @@ pub const ZirDriver = struct {
                                     if (target_func) |tf| tf.local_name else fname
                                 else
                                     fname;
-                                if (std.mem.indexOf(u8, call_name, "List_head") != null) {
-                                    std.debug.print("DEBUG CALL: target_id={d} call_name={s} fname={s}\n", .{ cd.function, call_name, fname });
-                                }
                                 const ref = zir_builder_emit_call(
                                     self.handle,
                                     call_name.ptr,
