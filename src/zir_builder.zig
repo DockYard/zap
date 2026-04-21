@@ -1297,6 +1297,60 @@ pub const ZirDriver = struct {
     /// List types (`[T]`) are emitted as `?*const zap_runtime.List`.
     const LIST_PARAM_SENTINEL: u32 = 0xFFFFFFFE;
 
+    /// Map an ir.ZigType to a ZIR type Ref constant for use as a comptime
+    /// type argument when calling generic constructors (MapOf, ListOf).
+    /// Returns null for complex types (structs, nested containers) that
+    /// require dynamic resolution via field_val/decl_val.
+    fn zigTypeToTypeRef(zig_type: ir.ZigType) ?u32 {
+        return switch (zig_type) {
+            .bool_type => @intFromEnum(Zir.Inst.Ref.bool_type),
+            .i8 => @intFromEnum(Zir.Inst.Ref.i8_type),
+            .i16 => @intFromEnum(Zir.Inst.Ref.i16_type),
+            .i32 => @intFromEnum(Zir.Inst.Ref.i32_type),
+            .i64 => @intFromEnum(Zir.Inst.Ref.i64_type),
+            .u8 => @intFromEnum(Zir.Inst.Ref.u8_type),
+            .u16 => @intFromEnum(Zir.Inst.Ref.u16_type),
+            .u32 => @intFromEnum(Zir.Inst.Ref.u32_type),
+            .u64 => @intFromEnum(Zir.Inst.Ref.u64_type),
+            .usize => @intFromEnum(Zir.Inst.Ref.usize_type),
+            .isize => @intFromEnum(Zir.Inst.Ref.isize_type),
+            .f16 => @intFromEnum(Zir.Inst.Ref.f16_type),
+            .f32 => @intFromEnum(Zir.Inst.Ref.f32_type),
+            .f64 => @intFromEnum(Zir.Inst.Ref.f64_type),
+            .string => @intFromEnum(Zir.Inst.Ref.slice_const_u8_type),
+            .atom => @intFromEnum(Zir.Inst.Ref.u32_type), // atoms are u32 at runtime
+            else => null,
+        };
+    }
+
+    /// Emit a comptime generic container instantiation.
+    /// Calls `@import("zap_runtime").{generic_name}(type_args...)` and returns
+    /// the ZIR ref to the instantiated type. This enables truly generic
+    /// containers without pre-declared named aliases.
+    fn emitGenericContainerRef(
+        self: *ZirDriver,
+        generic_name: []const u8,
+        type_args: []const u32,
+    ) BuildError!u32 {
+        const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+        if (rt_import == error_ref) return error.EmitFailed;
+        const generic_fn = zir_builder_emit_field_val(
+            self.handle,
+            rt_import,
+            generic_name.ptr,
+            @intCast(generic_name.len),
+        );
+        if (generic_fn == error_ref) return error.EmitFailed;
+        const instantiated = zir_builder_emit_call_ref(
+            self.handle,
+            generic_fn,
+            type_args.ptr,
+            @intCast(type_args.len),
+        );
+        if (instantiated == error_ref) return error.EmitFailed;
+        return instantiated;
+    }
+
     /// Emit a function parameter, handling list types specially.
     /// List params use zir_builder_emit_param_imported_type for correct ZIR encoding.
     /// Map a list element ZigType to the runtime List variant name.
@@ -2904,8 +2958,10 @@ pub const ZirDriver = struct {
                 }
             },
             .list_init => |li| {
-                // Lists are pointer-based cons cells via List (or StringList, etc).
-                // Element type determines which runtime cell type to use.
+                // Lists use named aliases (List, StringList, etc.) because
+                // the hand-written List struct has additional i64-specific methods
+                // not present in the generic ListOf(T). Once List is refactored
+                // to be an alias of ListOf(i64), this can use the generic pattern.
                 const cell_name = getListName(li.element_type);
                 const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                 if (rt_import == error_ref) return error.EmitFailed;
@@ -2940,7 +2996,7 @@ pub const ZirDriver = struct {
                 }
             },
             .list_cons => |lc| {
-                // List cons: uses element-type-aware cell type
+                // List cons: uses named aliases (same reason as list_init above).
                 const cell_name = getListName(lc.element_type);
                 const head_ref = self.refForLocal(lc.head) catch @intFromEnum(Zir.Inst.Ref.void_value);
                 const tail_ref = self.refForLocal(lc.tail) catch @intFromEnum(Zir.Inst.Ref.void_value);
@@ -2956,13 +3012,12 @@ pub const ZirDriver = struct {
                 try self.setLocal(lc.dest, ref);
             },
             .map_init => |mi| {
-                // Maps use type-specific MapOf(K, V) variants.
-                // Select the correct runtime variant based on key/value types.
-                const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
-                if (rt_import == error_ref) return error.EmitFailed;
-                const map_name = getMapName(mi.key_type, mi.value_type);
-                const map_cell = zir_builder_emit_field_val(self.handle, rt_import, map_name.ptr, @intCast(map_name.len));
-                if (map_cell == error_ref) return error.EmitFailed;
+                // Maps use generic MapOf(K, V) instantiation.
+                // Call MapOf with the key/value type refs to get the container type.
+                const key_type_ref = zigTypeToTypeRef(mi.key_type) orelse @intFromEnum(Zir.Inst.Ref.u32_type);
+                const val_type_ref = zigTypeToTypeRef(mi.value_type) orelse @intFromEnum(Zir.Inst.Ref.i64_type);
+                const map_type_args = [_]u32{ key_type_ref, val_type_ref };
+                const map_cell = self.emitGenericContainerRef("MapOf", &map_type_args) catch return error.EmitFailed;
 
                 if (mi.entries.len == 0) {
                     // Empty map: MapCell.empty()
