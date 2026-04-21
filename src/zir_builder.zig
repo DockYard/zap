@@ -2898,6 +2898,50 @@ pub const ZirDriver = struct {
                         }
                     }
                     break :blk3 false;
+                } else if (std.mem.startsWith(u8, cb.name, "MapOfNested:")) blk4: {
+                    // Handle "MapOfNested:keytype:valtype.method" for nested map dispatch
+                    const after_prefix = cb.name["MapOfNested:".len..];
+                    if (std.mem.findScalar(u8, after_prefix, ':')) |colon_idx| {
+                        const key_type_name = after_prefix[0..colon_idx];
+                        const rest = after_prefix[colon_idx + 1 ..];
+                        if (std.mem.findScalar(u8, rest, '.')) |dot_idx| {
+                            const val_type_name = rest[0..dot_idx];
+                            const method_name = rest[dot_idx + 1 ..];
+                            // Resolve key type
+                            const key_ref: u32 = if (std.mem.eql(u8, key_type_name, "u32"))
+                                @intFromEnum(Zir.Inst.Ref.u32_type)
+                            else if (std.mem.eql(u8, key_type_name, "str"))
+                                @intFromEnum(Zir.Inst.Ref.slice_const_u8_type)
+                            else
+                                @intFromEnum(Zir.Inst.Ref.u32_type);
+                            // For nested map values, build the value type as ?*const MapOf(K, V)
+                            // For now, use the same key type for inner map (atom keys)
+                            if (std.mem.eql(u8, val_type_name, "map")) {
+                                // Inner map: MapOf(u32, i64) as default inner type
+                                const inner_key = @intFromEnum(Zir.Inst.Ref.u32_type);
+                                const inner_val = @intFromEnum(Zir.Inst.Ref.i64_type);
+                                const inner_args = [_]u32{ inner_key, inner_val };
+                                const inner_map = self.emitGenericContainerRef("MapOf", &inner_args) catch break :blk4 false;
+                                const empty_fn = zir_builder_emit_field_val(self.handle, inner_map, "empty", 5);
+                                if (empty_fn == error_ref) break :blk4 false;
+                                const empty_val = zir_builder_emit_call_ref(self.handle, empty_fn, &.{}, 0);
+                                if (empty_val == error_ref) break :blk4 false;
+                                const val_type = zir_builder_emit_typeof(self.handle, empty_val);
+                                if (val_type == error_ref) break :blk4 false;
+                                const outer_args = [_]u32{ key_ref, val_type };
+                                const outer_map = self.emitGenericContainerRef("MapOf", &outer_args) catch break :blk4 false;
+                                const fn_ref = zir_builder_emit_field_val(self.handle, outer_map, method_name.ptr, @intCast(method_name.len));
+                                if (fn_ref != error_ref) {
+                                    const ref = zir_builder_emit_call_ref(self.handle, fn_ref, args.items.ptr, @intCast(args.items.len));
+                                    if (ref != error_ref) {
+                                        try self.setLocal(cb.dest, ref);
+                                        break :blk4 true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    break :blk4 false;
                 } else false;
 
                 if (!generic_handled) {
@@ -3343,9 +3387,39 @@ pub const ZirDriver = struct {
                     const put_fn = zir_builder_emit_field_val(self.handle, map_cell, "put", 3);
                     if (put_fn == error_ref) return error.EmitFailed;
 
+                    // Check if values need enum literal re-emission
+                    const val_is_enum = blk: {
+                        if (std.meta.activeTag(mi.value_type) != .struct_ref) break :blk false;
+                        const short_name = if (std.mem.lastIndexOf(u8, mi.value_type.struct_ref, ".")) |dot_idx|
+                            mi.value_type.struct_ref[dot_idx + 1 ..]
+                        else
+                            mi.value_type.struct_ref;
+                        break :blk self.findEnumDef(mi.value_type.struct_ref) or self.findEnumDef(short_name);
+                    };
+
                     for (mi.entries) |entry| {
                         const key_ref = self.refForLocal(entry.key) catch @intFromEnum(Zir.Inst.Ref.void_value);
-                        const val_ref = self.refForLocal(entry.value) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                        var val_ref = self.refForLocal(entry.value) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                        // For enum values: re-emit as Zig enum literal
+                        if (val_is_enum) {
+                            if (self.program) |prog| {
+                                for (prog.functions) |func| {
+                                    if (func.id != self.current_function_id) continue;
+                                    for (func.body) |block| {
+                                        for (block.instructions) |fn_instr| {
+                                            if (fn_instr == .enum_literal) {
+                                                if (fn_instr.enum_literal.dest == entry.value) {
+                                                    const variant = fn_instr.enum_literal.variant;
+                                                    const lit_ref = zir_builder_emit_enum_literal(self.handle, variant.ptr, @intCast(variant.len));
+                                                    if (lit_ref != error_ref) val_ref = lit_ref;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
+                        }
                         const call_args = [_]u32{ current, key_ref, val_ref };
                         current = zir_builder_emit_call_ref(self.handle, put_fn, &call_args, 3);
                         if (current == error_ref) return error.EmitFailed;

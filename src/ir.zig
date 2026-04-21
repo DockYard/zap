@@ -3818,6 +3818,11 @@ pub const IrBuilder = struct {
                                     const key_name = if (std.meta.activeTag(key_zig) == .atom) "u32" else if (std.meta.activeTag(key_zig) == .string) "str" else "u32";
                                     break :blk try std.fmt.allocPrint(self.allocator, "MapOf:{s}:{s}.{s}", .{ key_name, val_zig.tagged_union, method });
                                 }
+                                // For nested map/list value types, encode for generic dispatch
+                                if (std.meta.activeTag(val_zig) == .map or std.meta.activeTag(val_zig) == .list) {
+                                    const key_name = if (std.meta.activeTag(key_zig) == .atom) "u32" else if (std.meta.activeTag(key_zig) == .string) "str" else "u32";
+                                    break :blk try std.fmt.allocPrint(self.allocator, "MapOfNested:{s}:{s}.{s}", .{ key_name, @tagName(std.meta.activeTag(val_zig)), method });
+                                }
                                 const map_name = getMapName(key_zig, val_zig);
                                 break :blk try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ map_name, method });
                             }

@@ -164,6 +164,27 @@ pub module Test.MapTest {
     }
   }
 
+  describe("Nested maps") {
+    test("nested map size") {
+      assert(nested_map_size() == 2)
+    }
+
+    test("inner map access") {
+      assert(inner_map_value() == 42)
+    }
+  }
+
+  fn nested_map_size() -> i64 {
+    nested = %{a: %{x: 1, y: 2}, b: %{x: 3, y: 4}}
+    Map.size(nested)
+  }
+
+  fn inner_map_value() -> i64 {
+    nested = %{settings: %{port: 42, timeout: 30}}
+    inner = Map.get(nested, :settings, %{port: 0, timeout: 0})
+    Map.get(inner, :port, 0)
+  }
+
   describe("Bool value maps") {
     test("create and access") {
       flags = %{active: true, admin: false}
