@@ -1349,6 +1349,30 @@ pub const ZirDriver = struct {
                 }
                 return null;
             },
+            .list => |inner| {
+                // Nested list: ListOf(ListOf(T))
+                // First resolve the inner element type, then call ListOf
+                const inner_ref = try self.emitContainerElementTypeRef(inner.*);
+                if (inner_ref) |iref| {
+                    const type_args = [_]u32{iref};
+                    const inner_list = self.emitGenericContainerRef("ListOf", &type_args) catch return null;
+                    // We need the OPTIONAL POINTER type: ?*const ListOf(T)
+                    // ListOf(T) returns a type, and list values are ?*const Self
+                    // The emit_optional_type wraps in ?T
+                    return inner_list;
+                }
+                return null;
+            },
+            .map => |mt| {
+                // Nested map: MapOf(K, MapOf(...)) or similar
+                const key_ref = try self.emitContainerElementTypeRef(mt.key.*);
+                const val_ref = try self.emitContainerElementTypeRef(mt.value.*);
+                if (key_ref != null and val_ref != null) {
+                    const type_args = [_]u32{ key_ref.?, val_ref.? };
+                    return self.emitGenericContainerRef("MapOf", &type_args) catch null;
+                }
+                return null;
+            },
             else => null,
         };
     }
@@ -1474,6 +1498,17 @@ pub const ZirDriver = struct {
         }
         if (std.meta.activeTag(param.type_expr) == .map) {
             const mt = param.type_expr.map;
+            // For struct/enum value types, use anytype
+            if (std.meta.activeTag(mt.value.*) == .struct_ref or std.meta.activeTag(mt.value.*) == .tagged_union) {
+                const ref = zir_builder_emit_param(
+                    self.handle,
+                    param.name.ptr,
+                    @intCast(param.name.len),
+                    @intFromEnum(Zir.Inst.Ref.none),
+                );
+                if (ref == error_ref) return error.EmitFailed;
+                return ref;
+            }
             const type_name = getMapTypeName(mt.key.*, mt.value.*);
             const ref = zir_builder_emit_param_imported_type(
                 self.handle,
@@ -2714,6 +2749,40 @@ pub const ZirDriver = struct {
                         }
                     }
                     break :blk false;
+                } else if (std.mem.startsWith(u8, cb.name, "MapOf:")) blk2: {
+                    // Handle "MapOf:keytype:ValueStructName.method"
+                    const after_prefix = cb.name["MapOf:".len..];
+                    // Parse key_type_name:value_struct_name.method
+                    if (std.mem.findScalar(u8, after_prefix, ':')) |colon_idx| {
+                        const key_type_name = after_prefix[0..colon_idx];
+                        const rest = after_prefix[colon_idx + 1 ..];
+                        if (std.mem.findScalar(u8, rest, '.')) |dot_idx| {
+                            const value_struct_name = rest[0..dot_idx];
+                            const method_name = rest[dot_idx + 1 ..];
+                            // Resolve key type ref
+                            const key_ref: u32 = if (std.mem.eql(u8, key_type_name, "u32"))
+                                @intFromEnum(Zir.Inst.Ref.u32_type)
+                            else if (std.mem.eql(u8, key_type_name, "str"))
+                                @intFromEnum(Zir.Inst.Ref.slice_const_u8_type)
+                            else
+                                @intFromEnum(Zir.Inst.Ref.u32_type);
+                            // Resolve value type via decl_val
+                            const val_ref = zir_builder_emit_decl_val(self.handle, value_struct_name.ptr, @intCast(value_struct_name.len));
+                            if (val_ref != error_ref) {
+                                const type_args = [_]u32{ key_ref, val_ref };
+                                const map_type = self.emitGenericContainerRef("MapOf", &type_args) catch break :blk2 false;
+                                const fn_ref = zir_builder_emit_field_val(self.handle, map_type, method_name.ptr, @intCast(method_name.len));
+                                if (fn_ref != error_ref) {
+                                    const ref = zir_builder_emit_call_ref(self.handle, fn_ref, args.items.ptr, @intCast(args.items.len));
+                                    if (ref != error_ref) {
+                                        try self.setLocal(cb.dest, ref);
+                                        break :blk2 true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    break :blk2 false;
                 } else false;
 
                 if (!generic_handled) {

@@ -3806,8 +3806,19 @@ pub const IrBuilder = struct {
                         const map_resolved = if (std.mem.startsWith(u8, name, "Map.") and lowered_args.len > 0) blk: {
                             const first_arg_type = self.known_local_types.get(lowered_args[0]) orelse .any;
                             if (std.meta.activeTag(first_arg_type) == .map) {
-                                const map_name = getMapName(first_arg_type.map.key.*, first_arg_type.map.value.*);
+                                const key_zig = first_arg_type.map.key.*;
+                                const val_zig = first_arg_type.map.value.*;
                                 const method = name["Map.".len..];
+                                // For struct/enum value types, encode for generic MapOf dispatch
+                                if (std.meta.activeTag(val_zig) == .struct_ref) {
+                                    const key_name = if (std.meta.activeTag(key_zig) == .atom) "u32" else if (std.meta.activeTag(key_zig) == .string) "str" else "u32";
+                                    break :blk try std.fmt.allocPrint(self.allocator, "MapOf:{s}:{s}.{s}", .{ key_name, val_zig.struct_ref, method });
+                                }
+                                if (std.meta.activeTag(val_zig) == .tagged_union) {
+                                    const key_name = if (std.meta.activeTag(key_zig) == .atom) "u32" else if (std.meta.activeTag(key_zig) == .string) "str" else "u32";
+                                    break :blk try std.fmt.allocPrint(self.allocator, "MapOf:{s}:{s}.{s}", .{ key_name, val_zig.tagged_union, method });
+                                }
+                                const map_name = getMapName(key_zig, val_zig);
                                 break :blk try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ map_name, method });
                             }
                             break :blk name;

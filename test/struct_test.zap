@@ -224,4 +224,25 @@ pub module Test.StructTest {
     last = List.last(points)
     last.y
   }
+
+  describe("Maps of structs") {
+    test("map with struct values") {
+      assert(get_origin_x() == 0)
+    }
+
+    test("map with struct values size") {
+      assert(point_map_size() == 2)
+    }
+  }
+
+  fn get_origin_x() -> i64 {
+    points = %{origin: %Point{x: 0, y: 0}, end: %Point{x: 10, y: 20}}
+    origin = Map.get(points, :origin, %Point{x: -1, y: -1})
+    origin.x
+  }
+
+  fn point_map_size() -> i64 {
+    points = %{a: %Point{x: 1, y: 2}, b: %Point{x: 3, y: 4}}
+    Map.size(points)
+  }
 }
