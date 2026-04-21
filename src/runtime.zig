@@ -776,6 +776,7 @@ pub const String = struct {
     pub const trim_trailing = Prelude.trim_trailing;
     pub const string_count = Prelude.string_count;
     pub const split_to_list = Prelude.split_to_list;
+    pub const string_join = Prelude.string_join;
 };
 
 // ============================================================
@@ -1396,6 +1397,39 @@ pub const Prelude = struct {
         if (last_copy.len > 0) @memcpy(last_copy, last_seg);
         result = StringList.cons(last_copy, result);
         return StringList.reverse(result);
+    }
+
+    /// Join a list of strings with a separator.
+    pub fn string_join(list: ?*const StringList, separator: []const u8) []const u8 {
+        if (list == null) return "";
+        // First pass: compute total length
+        var total: usize = 0;
+        var count: usize = 0;
+        var current = list;
+        while (current) |cell| {
+            total += cell.head.len;
+            count += 1;
+            current = cell.tail;
+        }
+        if (count == 0) return "";
+        total += separator.len * (count - 1);
+        const result = bumpAlloc(total);
+        if (result.len == 0) return "";
+        // Second pass: copy segments
+        var dst: usize = 0;
+        var first = true;
+        current = list;
+        while (current) |cell| {
+            if (!first and separator.len > 0) {
+                @memcpy(result[dst..][0..separator.len], separator);
+                dst += separator.len;
+            }
+            @memcpy(result[dst..][0..cell.head.len], cell.head);
+            dst += cell.head.len;
+            first = false;
+            current = cell.tail;
+        }
+        return result[0..dst];
     }
 
     pub fn split_string(s: []const u8, delimiter: []const u8) []const u8 {

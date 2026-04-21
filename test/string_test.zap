@@ -217,6 +217,20 @@ pub module Test.StringTest {
     }
   }
 
+  describe("String.join") {
+    test("join with comma") {
+      assert(String.join(["a", "b", "c"], ", ") == "a, b, c")
+    }
+
+    test("join single element") {
+      assert(String.join(["hello"], "-") == "hello")
+    }
+
+    test("join with empty separator") {
+      assert(String.join(["a", "b", "c"], "") == "abc")
+    }
+  }
+
   describe("String.split") {
     test("split by comma") {
       parts = String.split("a,b,c", ",")

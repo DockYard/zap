@@ -54,4 +54,5 @@ pub module Test.UnionTest {
     favorites = %{first: Color.Red, second: Color.Blue}
     Map.size(favorites)
   }
+
 }

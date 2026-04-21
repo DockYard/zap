@@ -370,4 +370,18 @@ pub module String {
   pub fn split(s :: String, delimiter :: String) -> [String] {
     :zig.String.split_to_list(s, delimiter)
   }
+
+  @doc = """
+    Joins a list of strings with a separator.
+
+    ## Examples
+
+        String.join(["a", "b", "c"], ", ")  # => "a, b, c"
+        String.join(["hello"], "-")          # => "hello"
+        String.join([], ", ")                # => ""
+    """
+
+  pub fn join(parts :: [String], separator :: String) -> String {
+    :zig.String.string_join(parts, separator)
+  }
 }
