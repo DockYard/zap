@@ -158,6 +158,12 @@ pub module Test.MapTest {
     }
   }
 
+  describe("Bang variants") {
+    test("get! on existing key") {
+      assert(Map.get!(%{a: 42, b: 99}, :a, 0) == 42)
+    }
+  }
+
   describe("Bool value maps") {
     test("create and access") {
       flags = %{active: true, admin: false}

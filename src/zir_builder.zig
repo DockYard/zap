@@ -308,6 +308,7 @@ fn mapMainReturnType(zig_type: ir.ZigType) u32 {
 fn mapReturnType(zig_type: ir.ZigType) u32 {
     return switch (zig_type) {
         .void => 0,
+        .never => @intFromEnum(Zir.Inst.Ref.noreturn_type),
         .bool_type => @intFromEnum(Zir.Inst.Ref.bool_type),
         .i8 => @intFromEnum(Zir.Inst.Ref.i8_type),
         .i16 => @intFromEnum(Zir.Inst.Ref.i16_type),
@@ -639,8 +640,8 @@ pub const ZirDriver = struct {
                 if (ref == error_ref) return error.EmitFailed;
                 return ref;
             },
-            // void/nil should not appear as tuple elements
-            .void, .nil => return error.EmitFailed,
+            // void/nil/never should not appear as tuple elements
+            .void, .nil, .never => return error.EmitFailed,
             // Types that don't have runtime representations as tuple elements yet
             .function, .tagged_union, .ptr, .optional, .any => return error.EmitFailed,
             // Primitives are handled above by mapReturnType — they never reach here
@@ -1582,7 +1583,7 @@ pub const ZirDriver = struct {
             },
             // Primitives are handled by mapReturnType — they never reach here.
             // void/nil have ret_type=0 intentionally — they never reach here.
-            .void, .nil, .bool_type,
+            .void, .nil, .never, .bool_type,
             .i8, .i16, .i32, .i64,
             .u8, .u16, .u32, .u64,
             .usize, .isize,

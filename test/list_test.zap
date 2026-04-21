@@ -45,4 +45,10 @@ pub module Test.ListTest {
     test("head") { assert(List.head([true, false])) }
     test("last") { reject(List.last([true, true, false])) }
   }
+
+  describe("Bang variants") {
+    test("head! on non-empty") { assert(List.head!([10, 20, 30]) == 10) }
+    test("last! on non-empty") { assert(List.last!([1, 2, 3]) == 3) }
+    test("at! valid index") { assert(List.at!([10, 20, 30], 1) == 20) }
+  }
 }

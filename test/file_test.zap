@@ -21,5 +21,9 @@ pub module Test.FileTest {
     test("read after write") {
       assert(File.read("_test_tmp.txt") == "hello zap")
     }
+
+    test("read! returns content for existing file") {
+      assert(File.read!("_test_tmp.txt") == "hello zap")
+    }
   }
 }

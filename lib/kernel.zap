@@ -256,7 +256,7 @@ pub module Kernel {
         }
     """
 
-  pub fn raise(message :: String) -> String {
+  pub fn raise(message :: String) -> Never {
     :zig.Kernel.raise(message)
   }
 

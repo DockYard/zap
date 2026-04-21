@@ -132,4 +132,23 @@ pub module Map {
   pub fn values(map :: %{key => value}) -> [value] {
     :zig.Map.values(map)
   }
+
+  @doc = """
+    Returns the value for the given key.
+    Raises if the key is not found.
+
+    ## Examples
+
+        Map.get!(%{a: 1, b: 2}, :a)  # => 1
+        Map.get!(%{a: 1}, :z)        # raises
+    """
+
+  pub fn get!(map :: %{key => value}, lookup_key :: key, default :: value) -> value {
+    result = Map.has_key?(map, lookup_key)
+    if result {
+      Map.get(map, lookup_key, default)
+    } else {
+      raise("Map.get! key not found")
+    }
+  }
 }

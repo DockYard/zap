@@ -188,4 +188,61 @@ pub module List {
   pub fn uniq(list :: [element]) -> [element] {
     :zig.List.uniq(list)
   }
+
+  @doc = """
+    Returns the first element of the list.
+    Raises if the list is empty.
+
+    ## Examples
+
+        List.head!([10, 20])  # => 10
+        List.head!([])        # raises
+    """
+
+  pub fn head!(list :: [element]) -> element {
+    is_empty = List.empty?(list)
+    if is_empty {
+      raise("List.head! called on empty list")
+    } else {
+      List.head(list)
+    }
+  }
+
+  @doc = """
+    Returns the last element of the list.
+    Raises if the list is empty.
+
+    ## Examples
+
+        List.last!([1, 2, 3])  # => 3
+        List.last!([])         # raises
+    """
+
+  pub fn last!(list :: [element]) -> element {
+    is_empty = List.empty?(list)
+    if is_empty {
+      raise("List.last! called on empty list")
+    } else {
+      List.last(list)
+    }
+  }
+
+  @doc = """
+    Returns the element at the given zero-based index.
+    Raises if the index is out of bounds.
+
+    ## Examples
+
+        List.at!([10, 20, 30], 1)  # => 20
+        List.at!([10, 20], 5)      # raises
+    """
+
+  pub fn at!(list :: [element], index :: i64) -> element {
+    in_bounds = index < List.length(list)
+    if in_bounds {
+      List.at(list, index)
+    } else {
+      raise("List.at! index out of bounds")
+    }
+  }
 }

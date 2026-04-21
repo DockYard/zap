@@ -792,6 +792,7 @@ pub const ZigType = union(enum) {
     tagged_union: []const u8,
     optional: *const ZigType,
     ptr: *const ZigType,
+    never, // noreturn — function that never returns (e.g., raise)
     any, // for generics
 
     pub const MapType = struct {
@@ -4364,7 +4365,7 @@ fn typeIdToZigTypeWithStore(type_id: types_mod.TypeId, type_store: ?*const types
         types_mod.TypeStore.STRING => .string,
         types_mod.TypeStore.ATOM => .atom,
         types_mod.TypeStore.NIL => .nil,
-        types_mod.TypeStore.NEVER => .void,
+        types_mod.TypeStore.NEVER => .never,
         types_mod.TypeStore.I64 => .i64,
         types_mod.TypeStore.I32 => .i32,
         types_mod.TypeStore.I16 => .i16,
