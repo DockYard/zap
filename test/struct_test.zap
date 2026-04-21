@@ -245,4 +245,28 @@ pub module Test.StructTest {
     points = %{a: %Point{x: 1, y: 2}, b: %Point{x: 3, y: 4}}
     Map.size(points)
   }
+
+  describe("Struct list pattern dispatch") {
+    test("extract x from head of point list") {
+      assert(first_point_x_via_pattern() == 10)
+    }
+  }
+
+  fn first_point_x_via_pattern() -> i64 {
+    points = [%Point{x: 10, y: 20}, %Point{x: 30, y: 40}]
+    first = List.head(points)
+    extract_x(first)
+  }
+
+  describe("Map get with struct values") {
+    test("get struct from map and access field") {
+      assert(get_origin_y() == 0)
+    }
+  }
+
+  fn get_origin_y() -> i64 {
+    points = %{origin: %Point{x: 0, y: 0}, end: %Point{x: 10, y: 20}}
+    origin = Map.get(points, :origin, %Point{x: -1, y: -1})
+    origin.y
+  }
 }
