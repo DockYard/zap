@@ -1748,10 +1748,17 @@ pub const ZirDriver = struct {
         self.current_function_id = func.id;
         self.current_function_is_closure = func.captures.len > 0;
         const closure_lowering = self.getClosureLowering(func.id, func.captures.len);
-        const ret_type = if (is_main)
+        var ret_type = if (is_main)
             mapMainReturnType(func.return_type)
         else
             mapReturnType(func.return_type);
+        // Enum return types use u32 atom IDs in Zap's representation
+        if (ret_type == 0 and std.meta.activeTag(func.return_type) == .struct_ref) {
+            const rname = func.return_type.struct_ref;
+            const short = if (std.mem.lastIndexOf(u8, rname, ".")) |di| rname[di + 1 ..] else rname;
+            if (self.findEnumDef(rname) or self.findEnumDef(short))
+                ret_type = @intFromEnum(Zir.Inst.Ref.u32_type);
+        }
 
         self.current_ret_type = ret_type;
 
@@ -2914,6 +2921,34 @@ pub const ZirDriver = struct {
                         }
                     }
                     break :blk4 false;
+                } else if (std.mem.startsWith(u8, cb.name, "ListOfU32.")) blk5: {
+                    // Handle "ListOfU32.method" for enum element lists (atoms are u32)
+                    const method_name = cb.name["ListOfU32.".len..];
+                    const type_args = [_]u32{@intFromEnum(Zir.Inst.Ref.u32_type)};
+                    const list_type = self.emitGenericContainerRef("ListOf", &type_args) catch break :blk5 false;
+                    const fn_ref = zir_builder_emit_field_val(self.handle, list_type, method_name.ptr, @intCast(method_name.len));
+                    if (fn_ref != error_ref) {
+                        const ref = zir_builder_emit_call_ref(self.handle, fn_ref, args.items.ptr, @intCast(args.items.len));
+                        if (ref != error_ref) {
+                            try self.setLocal(cb.dest, ref);
+                            break :blk5 true;
+                        }
+                    }
+                    break :blk5 false;
+                } else if (std.mem.startsWith(u8, cb.name, "MapOfU32Val.")) blk6: {
+                    // Handle "MapOfU32Val.method" for maps with enum values (atoms are u32)
+                    const method_name = cb.name["MapOfU32Val.".len..];
+                    const type_args = [_]u32{ @intFromEnum(Zir.Inst.Ref.u32_type), @intFromEnum(Zir.Inst.Ref.u32_type) };
+                    const map_type = self.emitGenericContainerRef("MapOf", &type_args) catch break :blk6 false;
+                    const fn_ref = zir_builder_emit_field_val(self.handle, map_type, method_name.ptr, @intCast(method_name.len));
+                    if (fn_ref != error_ref) {
+                        const ref = zir_builder_emit_call_ref(self.handle, fn_ref, args.items.ptr, @intCast(args.items.len));
+                        if (ref != error_ref) {
+                            try self.setLocal(cb.dest, ref);
+                            break :blk6 true;
+                        }
+                    }
+                    break :blk6 false;
                 } else false;
 
                 if (!generic_handled) {

@@ -3811,7 +3811,6 @@ pub const IrBuilder = struct {
                                 const method = name["Map.".len..];
                                 // For struct/enum value types, encode for generic MapOf dispatch
                                 if (std.meta.activeTag(val_zig) == .struct_ref) {
-                                    // Skip enum values — they use u32 atom IDs
                                     const is_val_enum = if (self.type_store) |ts| val_enum: {
                                         for (ts.types.items) |typ| {
                                             if (typ == .tagged_union) {
@@ -3820,7 +3819,10 @@ pub const IrBuilder = struct {
                                         }
                                         break :val_enum false;
                                     } else false;
-                                    if (!is_val_enum) {
+                                    if (is_val_enum) {
+                                        // Enum values use u32 — route to MapOf(u32, u32)
+                                        break :blk try std.fmt.allocPrint(self.allocator, "MapOfU32Val.{s}", .{method});
+                                    } else {
                                         const key_name = if (std.meta.activeTag(key_zig) == .atom) "u32" else if (std.meta.activeTag(key_zig) == .string) "str" else "u32";
                                         break :blk try std.fmt.allocPrint(self.allocator, "MapOf:{s}:{s}.{s}", .{ key_name, val_zig.struct_ref, method });
                                     }
@@ -3845,7 +3847,7 @@ pub const IrBuilder = struct {
                                 // Enums (tagged_union mapped to struct_ref) use u32 atom IDs
                                 // and go through the default named alias path.
                                 if (std.meta.activeTag(elem_zig) == .struct_ref) {
-                                    // Check if this is actually an enum — enums use u32, not struct dispatch
+                                    // Check if this is actually an enum — enums use u32 atom IDs
                                     const is_enum = if (self.type_store) |ts| blk_enum: {
                                         for (ts.types.items) |typ| {
                                             if (typ == .tagged_union) {
@@ -3854,7 +3856,10 @@ pub const IrBuilder = struct {
                                         }
                                         break :blk_enum false;
                                     } else false;
-                                    if (!is_enum) {
+                                    if (is_enum) {
+                                        // Enum lists use ListOf(u32) — encode for generic dispatch
+                                        break :blk try std.fmt.allocPrint(self.allocator, "ListOfU32.{s}", .{method});
+                                    } else {
                                         break :blk try std.fmt.allocPrint(self.allocator, "ListOf:{s}.{s}", .{ elem_zig.struct_ref, method });
                                     }
                                 }
