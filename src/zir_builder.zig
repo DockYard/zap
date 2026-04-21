@@ -1488,7 +1488,20 @@ pub const ZirDriver = struct {
             return ref;
         }
         if (std.meta.activeTag(param.type_expr) == .list) {
-            const type_name = getListTypeName(getListElementType(param.type_expr));
+            const elem_type = getListElementType(param.type_expr);
+            // For struct element lists, use anytype — the generic ListOf(T)
+            // can't be expressed as a named type alias for arbitrary T.
+            if (std.meta.activeTag(elem_type) == .struct_ref) {
+                const ref = zir_builder_emit_param(
+                    self.handle,
+                    param.name.ptr,
+                    @intCast(param.name.len),
+                    @intFromEnum(Zir.Inst.Ref.none), // anytype
+                );
+                if (ref == error_ref) return error.EmitFailed;
+                return ref;
+            }
+            const type_name = getListTypeName(elem_type);
             const ref = zir_builder_emit_param_imported_type(
                 self.handle,
                 param.name.ptr,
@@ -2679,6 +2692,31 @@ pub const ZirDriver = struct {
                     try args.append(self.allocator, ref);
                 }
 
+                // Handle generic container calls: "ListOf:StructName.method"
+                // These are emitted by the IR builder for struct element lists.
+                const generic_handled = if (std.mem.startsWith(u8, cb.name, "ListOf:")) blk: {
+                    const after_prefix = cb.name["ListOf:".len..];
+                    if (std.mem.findScalar(u8, after_prefix, '.')) |dot_idx| {
+                        const struct_name = after_prefix[0..dot_idx];
+                        const method_name = after_prefix[dot_idx + 1 ..];
+                        const type_ref = zir_builder_emit_decl_val(self.handle, struct_name.ptr, @intCast(struct_name.len));
+                        if (type_ref != error_ref) {
+                            const type_args = [_]u32{type_ref};
+                            const list_type = self.emitGenericContainerRef("ListOf", &type_args) catch break :blk false;
+                            const fn_ref = zir_builder_emit_field_val(self.handle, list_type, method_name.ptr, @intCast(method_name.len));
+                            if (fn_ref != error_ref) {
+                                const ref = zir_builder_emit_call_ref(self.handle, fn_ref, args.items.ptr, @intCast(args.items.len));
+                                if (ref != error_ref) {
+                                    try self.setLocal(cb.dest, ref);
+                                    break :blk true;
+                                }
+                            }
+                        }
+                    }
+                    break :blk false;
+                } else false;
+
+                if (!generic_handled) {
                 // Parse "Module.function" from the builtin name.
                 // e.g., "IO.println" → import zap_runtime, field "Prelude", field "println"
                 // Module names are mapped to runtime struct names. Domain
@@ -2720,6 +2758,7 @@ pub const ZirDriver = struct {
                     if (ref == error_ref) return error.EmitFailed;
                     try self.setLocal(cb.dest, ref);
                 }
+                } // end if (!generic_handled)
             },
 
             // Tail calls — call + ret
@@ -3147,13 +3186,23 @@ pub const ZirDriver = struct {
                 }
 
                 if (self.findReusePairForDest(si.dest)) |pair| {
-                    const seed_ref = zir_builder_emit_struct_init_anon(
-                        self.handle,
-                        names_ptrs.items.ptr,
-                        names_lens.items.ptr,
-                        values.items.ptr,
-                        @intCast(values.items.len),
-                    );
+                    // Use struct_init_typed for named structs to preserve type identity
+                    const seed_ref = blk: {
+                        if (!self.current_function_is_closure and self.capture_depth == 0) {
+                            const short_name = if (std.mem.lastIndexOf(u8, si.type_name, ".")) |dot_idx|
+                                si.type_name[dot_idx + 1 ..]
+                            else
+                                si.type_name;
+                            if (self.findStructDef(si.type_name) != null or self.findStructDef(short_name) != null) {
+                                const decl_ref = zir_builder_emit_decl_val(self.handle, short_name.ptr, @intCast(short_name.len));
+                                if (decl_ref != error_ref) {
+                                    const typed = zir_builder_emit_struct_init_typed(self.handle, decl_ref, names_ptrs.items.ptr, names_lens.items.ptr, values.items.ptr, @intCast(values.items.len));
+                                    if (typed != error_ref) break :blk typed;
+                                }
+                            }
+                        }
+                        break :blk zir_builder_emit_struct_init_anon(self.handle, names_ptrs.items.ptr, names_lens.items.ptr, values.items.ptr, @intCast(values.items.len));
+                    };
                     if (seed_ref == error_ref) return error.EmitFailed;
                     const type_ref = zir_builder_emit_typeof(self.handle, seed_ref);
                     if (type_ref == error_ref) return error.EmitFailed;
@@ -3182,14 +3231,23 @@ pub const ZirDriver = struct {
                     // does not escape the current function. Use ZIR alloc + store
                     // to place it on the stack instead of the arena.
                     _ = self.reuse_backed_struct_locals.remove(si.dest);
-                    // First create the struct value to get its type
-                    const seed_ref = zir_builder_emit_struct_init_anon(
-                        self.handle,
-                        names_ptrs.items.ptr,
-                        names_lens.items.ptr,
-                        values.items.ptr,
-                        @intCast(values.items.len),
-                    );
+                    // Use struct_init_typed for named structs to preserve type identity
+                    const seed_ref = blk: {
+                        if (!self.current_function_is_closure and self.capture_depth == 0) {
+                            const short_name = if (std.mem.lastIndexOf(u8, si.type_name, ".")) |dot_idx|
+                                si.type_name[dot_idx + 1 ..]
+                            else
+                                si.type_name;
+                            if (self.findStructDef(si.type_name) != null or self.findStructDef(short_name) != null) {
+                                const decl_ref = zir_builder_emit_decl_val(self.handle, short_name.ptr, @intCast(short_name.len));
+                                if (decl_ref != error_ref) {
+                                    const typed = zir_builder_emit_struct_init_typed(self.handle, decl_ref, names_ptrs.items.ptr, names_lens.items.ptr, values.items.ptr, @intCast(values.items.len));
+                                    if (typed != error_ref) break :blk typed;
+                                }
+                            }
+                        }
+                        break :blk zir_builder_emit_struct_init_anon(self.handle, names_ptrs.items.ptr, names_lens.items.ptr, values.items.ptr, @intCast(values.items.len));
+                    };
                     if (seed_ref == error_ref) return error.EmitFailed;
                     const type_ref = zir_builder_emit_typeof(self.handle, seed_ref);
                     if (type_ref == error_ref) return error.EmitFailed;

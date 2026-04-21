@@ -3817,10 +3817,14 @@ pub const IrBuilder = struct {
                             const first_arg_type = self.known_local_types.get(lowered_args[0]) orelse .any;
                             if (std.meta.activeTag(first_arg_type) == .list) {
                                 const elem_zig = first_arg_type.list.*;
-                                const cell_name = getListName(elem_zig);
                                 const method = map_resolved["List.".len..];
-                                const resolved = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ cell_name, method });
-                                    break :blk resolved;
+                                // For struct element types, encode the struct name
+                                // so the ZIR builder can use generic ListOf(T)
+                                if (std.meta.activeTag(elem_zig) == .struct_ref) {
+                                    break :blk try std.fmt.allocPrint(self.allocator, "ListOf:{s}.{s}", .{ elem_zig.struct_ref, method });
+                                }
+                                const cell_name = getListName(elem_zig);
+                                break :blk try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ cell_name, method });
                             }
                             break :blk map_resolved;
                         } else map_resolved;

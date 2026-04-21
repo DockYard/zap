@@ -332,11 +332,19 @@ const MonomorphContext = struct {
                 .expr => |e| try self.scanExpr(e),
                 .local_set => |ls| {
                     try self.scanExpr(ls.value);
-                    // Track the concrete type of this local for later local_get resolution.
-                    // After scanning, the value's type_id may have been updated to concrete.
                     const val_type = ls.value.type_id;
                     if (!self.store.containsTypeVars(val_type) and val_type != types_mod.TypeStore.UNKNOWN) {
                         try self.local_types.put(ls.index, val_type);
+                    }
+                    // Also track the type when the value is a list_init with known element types
+                    if (val_type == types_mod.TypeStore.UNKNOWN and ls.value.kind == .list_init) {
+                        const elems = ls.value.kind.list_init;
+                        if (elems.len > 0 and elems[0].type_id != types_mod.TypeStore.UNKNOWN) {
+                            const inferred = self.store.addType(.{ .list = .{ .element = elems[0].type_id } }) catch types_mod.TypeStore.UNKNOWN;
+                            if (inferred != types_mod.TypeStore.UNKNOWN) {
+                                try self.local_types.put(ls.index, inferred);
+                            }
+                        }
                     }
                 },
                 .function_group => |fg| {
@@ -435,9 +443,10 @@ const MonomorphContext = struct {
                             }
                         }
                     }
-                    // If the argument is a local_get, use the tracked concrete type
-                    // from the local_set that assigned it.
-                    if (self.store.containsTypeVars(arg_type) and arg.expr.kind == .local_get) {
+                    // If the argument is a local_get, always check tracked types.
+                    // The expression's type_id may be UNKNOWN even when the local
+                    // was assigned a concrete type (struct lists, etc.).
+                    if (arg.expr.kind == .local_get) {
                         if (self.local_types.get(arg.expr.kind.local_get)) |concrete| {
                             arg_type = concrete;
                         }
@@ -1151,6 +1160,8 @@ fn typeIdToMangledName(store: *const TypeStore, type_id: TypeId) []const u8 {
         .tuple => "Tuple",
         .function => "Fn",
         .unknown => "Any",
+        .struct_type => |st| @constCast(store).interner.get(st.name),
+        .tagged_union => |tu| @constCast(store).interner.get(tu.name),
         else => "T",
     };
 }

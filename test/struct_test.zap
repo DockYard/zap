@@ -194,4 +194,34 @@ pub module Test.StructTest {
     point.x
   }
 
+  describe("Lists of structs") {
+    test("list of points length") {
+      assert(point_list_length() == 2)
+    }
+
+    test("head of point list") {
+      assert(first_point_x() == 1)
+    }
+
+    test("last of point list") {
+      assert(last_point_y() == 4)
+    }
+  }
+
+  fn point_list_length() -> i64 {
+    points = [%Point{x: 1, y: 2}, %Point{x: 3, y: 4}]
+    List.length(points)
+  }
+
+  fn first_point_x() -> i64 {
+    points = [%Point{x: 1, y: 2}, %Point{x: 3, y: 4}]
+    first = List.head(points)
+    first.x
+  }
+
+  fn last_point_y() -> i64 {
+    points = [%Point{x: 1, y: 2}, %Point{x: 3, y: 4}]
+    last = List.last(points)
+    last.y
+  }
 }
