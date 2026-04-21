@@ -116,6 +116,7 @@ extern "c" fn zir_builder_emit_ret_null(handle: ?*ZirBuilderHandle) i32;
 // Struct type declarations
 extern "c" fn zir_builder_add_struct_type(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32, field_names_ptrs: [*]const [*]const u8, field_names_lens: [*]const u32, field_type_refs: [*]const u32, field_default_refs: ?[*]const u32, fields_len: u32) i32;
 extern "c" fn zir_builder_add_enum_type(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32, variant_names_ptrs: [*]const [*]const u8, variant_names_lens: [*]const u32, variants_len: u32) i32;
+extern "c" fn zir_builder_emit_enum_from_int(handle: ?*ZirBuilderHandle, operand: u32, type_ref: u32) u32;
 extern "c" fn zir_builder_set_decl_val_return_type(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32) i32;
 extern "c" fn zir_builder_emit_param_decl_val_type(handle: ?*ZirBuilderHandle, param_name_ptr: [*]const u8, param_name_len: u32, type_name_ptr: [*]const u8, type_name_len: u32) u32;
 
@@ -3249,10 +3250,45 @@ pub const ZirDriver = struct {
                     var current: u32 = zir_builder_emit_call_ref(self.handle, empty_fn, &.{}, 0);
                     if (current == error_ref) return error.EmitFailed;
 
+                    // Check if elements are enum variants that need enum literal emission
+                    const is_enum_list = blk: {
+                        if (elem_type_ref == null) break :blk false;
+                        if (std.meta.activeTag(li.element_type) != .struct_ref) break :blk false;
+                        const short_name = if (std.mem.lastIndexOf(u8, li.element_type.struct_ref, ".")) |dot_idx|
+                            li.element_type.struct_ref[dot_idx + 1 ..]
+                        else
+                            li.element_type.struct_ref;
+                        break :blk self.findEnumDef(li.element_type.struct_ref) or self.findEnumDef(short_name);
+                    };
+
                     var i: usize = li.elements.len;
                     while (i > 0) {
                         i -= 1;
-                        const elem_ref = self.refForLocal(li.elements[i]) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                        var elem_ref = self.refForLocal(li.elements[i]) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                        // For enum lists: the element local holds a u32 atom ID from atomIntern.
+                        // We need to emit a Zig enum literal instead, which Zig will coerce
+                        // to the correct enum type. Look up the variant name from the IR
+                        // instructions to find the original enum_literal instruction.
+                        if (is_enum_list) {
+                            // Search IR for the enum_literal that produced this local
+                            if (self.program) |prog| {
+                                for (prog.functions) |func| {
+                                    if (func.id != self.current_function_id) continue;
+                                    for (func.body) |block| {
+                                        for (block.instructions) |fn_instr| {
+                                            if (fn_instr == .enum_literal) {
+                                                if (fn_instr.enum_literal.dest == li.elements[i]) {
+                                                    const variant = fn_instr.enum_literal.variant;
+                                                    const lit_ref = zir_builder_emit_enum_literal(self.handle, variant.ptr, @intCast(variant.len));
+                                                    if (lit_ref != error_ref) elem_ref = lit_ref;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
+                        }
                         const call_args = [_]u32{ elem_ref, current };
                         current = zir_builder_emit_call_ref(self.handle, cons_fn, &call_args, 2);
                         if (current == error_ref) return error.EmitFailed;
