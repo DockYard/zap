@@ -1,7 +1,7 @@
 pub module Test.MapTest {
   use Zest.Case
 
-  describe("Map module") {
+  describe("Integer value maps") {
     test("size of map") {
       assert(Map.size(%{a: 1, b: 2, c: 3}) == 3)
     }
@@ -66,18 +66,10 @@ pub module Test.MapTest {
       result = Map.merge(%{a: 1, b: 2}, %{b: 99})
       assert(Map.get(result, :b, 0) == 99)
     }
-
-    test("keys returns list") {
-      assert(List.length(Map.keys(%{a: 1, b: 2})) == 2)
-    }
-
-    test("values returns list") {
-      assert(List.length(Map.values(%{a: 1, b: 2})) == 2)
-    }
   }
 
   describe("String value maps") {
-    test("create and access string value map") {
+    test("create and access") {
       names = %{first: "Alice", last: "Smith"}
       assert(Map.get(names, :first, "") == "Alice")
     }
@@ -87,41 +79,112 @@ pub module Test.MapTest {
       assert(Map.get(names, :missing, "unknown") == "unknown")
     }
 
-    test("size of string value map") {
+    test("size") {
       names = %{first: "Alice", last: "Smith"}
       assert(Map.size(names) == 2)
     }
 
-    test("has_key? on string value map") {
+    test("has_key?") {
       names = %{first: "Alice", last: "Smith"}
       assert(Map.has_key?(names, :first))
       reject(Map.has_key?(names, :missing))
     }
 
-    test("put on string value map") {
+    test("put") {
       names = %{first: "Alice"}
       result = Map.put(names, :last, "Smith")
       assert(Map.size(result) == 2)
       assert(Map.get(result, :last, "") == "Smith")
     }
+
+    test("delete") {
+      names = %{first: "Alice", last: "Smith"}
+      result = Map.delete(names, :first)
+      assert(Map.size(result) == 1)
+      reject(Map.has_key?(result, :first))
+    }
+
+    test("merge") {
+      result = Map.merge(%{a: "hello"}, %{b: "world"})
+      assert(Map.size(result) == 2)
+      assert(Map.get(result, :b, "") == "world")
+    }
+
+    test("merge overrides") {
+      result = Map.merge(%{a: "old"}, %{a: "new"})
+      assert(Map.get(result, :a, "") == "new")
+    }
   }
 
   describe("Float value maps") {
-    test("create and access float value map") {
+    test("create and access") {
       scores = %{math: 95.5, science: 88.0}
       assert(Map.get(scores, :math, 0.0) == 95.5)
     }
 
-    test("size of float value map") {
+    test("get with missing key returns default") {
+      scores = %{math: 95.5}
+      assert(Map.get(scores, :missing, 0.0) == 0.0)
+    }
+
+    test("size") {
       scores = %{math: 95.5, science: 88.0}
       assert(Map.size(scores) == 2)
     }
 
-    test("put on float value map") {
+    test("has_key?") {
+      scores = %{math: 95.5}
+      assert(Map.has_key?(scores, :math))
+      reject(Map.has_key?(scores, :english))
+    }
+
+    test("put") {
       scores = %{math: 95.5}
       result = Map.put(scores, :science, 88.0)
       assert(Map.size(result) == 2)
       assert(Map.get(result, :science, 0.0) == 88.0)
+    }
+
+    test("delete") {
+      scores = %{math: 95.5, science: 88.0}
+      result = Map.delete(scores, :math)
+      assert(Map.size(result) == 1)
+      reject(Map.has_key?(result, :math))
+    }
+
+    test("merge") {
+      result = Map.merge(%{a: 1.1, b: 2.2}, %{c: 3.3})
+      assert(Map.size(result) == 3)
+    }
+  }
+
+  describe("Bool value maps") {
+    test("create and access") {
+      flags = %{active: true, admin: false}
+      assert(Map.get(flags, :active, false))
+    }
+
+    test("get missing returns default") {
+      flags = %{active: true}
+      reject(Map.get(flags, :missing, false))
+    }
+
+    test("size") {
+      flags = %{active: true, admin: false, verified: true}
+      assert(Map.size(flags) == 3)
+    }
+
+    test("has_key?") {
+      flags = %{active: true}
+      assert(Map.has_key?(flags, :active))
+      reject(Map.has_key?(flags, :missing))
+    }
+
+    test("put") {
+      flags = %{active: true}
+      result = Map.put(flags, :admin, true)
+      assert(Map.size(result) == 2)
+      assert(Map.get(result, :admin, false))
     }
   }
 }

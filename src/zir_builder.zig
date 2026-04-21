@@ -1408,6 +1408,9 @@ pub const ZirDriver = struct {
     fn getListTypeName(element_type: ir.ZigType) []const u8 {
         return switch (std.meta.activeTag(element_type)) {
             .string => "StringListType",
+            .bool_type => "BoolListType",
+            .f64 => "FloatListType",
+            .atom => "AtomListType",
             else => "ListType",
         };
     }
