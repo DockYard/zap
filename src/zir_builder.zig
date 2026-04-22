@@ -1752,6 +1752,16 @@ pub const ZirDriver = struct {
             mapMainReturnType(func.return_type)
         else
             mapReturnType(func.return_type);
+        // Functions with callback params: use generic return type so Zig
+        // infers from the body. The callCallableN helpers return anytype-
+        // derived types that can't match a concrete declared return type.
+        // Functions where the return type was derived from a callback
+        // (e.g., ( -> result) -> result): use generic return type so
+        // Zig can infer from callCallableN's result type.
+        // Detect: return type is .any AND a param is a function type.
+        // Functions where a callback param's return type matches the
+        // function's return type: use generic return so Zig infers from
+        // the callCallableN result. This handles ( -> T) -> T patterns.
         // Enum return types use u32 atom IDs in Zap's representation
         if (ret_type == 0 and std.meta.activeTag(func.return_type) == .struct_ref) {
             const rname = func.return_type.struct_ref;
@@ -3872,8 +3882,13 @@ pub const ZirDriver = struct {
                                 2 => "callCallable2",
                                 3 => "callCallable3",
                                 else => {
-                                    const ref = zir_builder_emit_call_ref(self.handle, callee_ref, args.items.ptr, @intCast(args.items.len));
+                                    var ref = zir_builder_emit_call_ref(self.handle, callee_ref, args.items.ptr, @intCast(args.items.len));
                                     if (ref == error_ref) return error.EmitFailed;
+                                    const ret_type_ref2 = mapReturnType(cc.return_type);
+                                    if (ret_type_ref2 != 0) {
+                                        const cast2 = zir_builder_emit_as(self.handle, ret_type_ref2, ref);
+                                        if (cast2 != error_ref) ref = cast2;
+                                    }
                                     try self.setLocal(cc.dest, ref);
                                     return;
                                 },
@@ -3884,8 +3899,17 @@ pub const ZirDriver = struct {
                                 defer full_args.deinit(self.allocator);
                                 try full_args.append(self.allocator, callee_ref);
                                 try full_args.appendSlice(self.allocator, args.items);
-                                const ref = zir_builder_emit_call_ref(self.handle, helper_ref, full_args.items.ptr, @intCast(full_args.items.len));
+                                var ref = zir_builder_emit_call_ref(self.handle, helper_ref, full_args.items.ptr, @intCast(full_args.items.len));
                                 if (ref != error_ref) {
+                                    // Cast the callCallableN result to the expected return
+                                    // type. The runtime helper returns CallReturnType which
+                                    // Zig infers from the callable, but the monomorphized
+                                    // function may declare a different concrete return type.
+                                    const ret_type_ref = mapReturnType(cc.return_type);
+                                    if (ret_type_ref != 0) {
+                                        const cast = zir_builder_emit_as(self.handle, ret_type_ref, ref);
+                                        if (cast != error_ref) ref = cast;
+                                    }
                                     try self.setLocal(cc.dest, ref);
                                     return;
                                 }

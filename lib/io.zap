@@ -116,10 +116,7 @@ pub module IO {
     """
 
   pub fn mode(mode_value :: Atom, callback :: ( -> String)) -> String {
-    :zig.IO.set_terminal_mode(mode_value)
-    callback_result = callback()
-    :zig.IO.set_terminal_mode(Mode.Normal)
-    callback_result
+    callback()
   }
 
   @doc = """

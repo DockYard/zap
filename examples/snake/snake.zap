@@ -25,7 +25,7 @@ pub module Snake {
     IO.mode(Mode.Raw, fn() -> String {
       IO.get_char()
       run(10, 5, 3, 2, 0)
-      "done"
+      ""
     })
   }
 

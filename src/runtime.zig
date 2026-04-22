@@ -1731,7 +1731,7 @@ pub const Prelude = struct {
 
     /// Call a callable value — either a bare function pointer or a closure struct.
     /// Closure structs have {call_fn, env, env_release} fields.
-    pub inline fn callCallable0(callable: anytype) CallReturnType(@TypeOf(callable)) {
+    pub inline fn callCallable0(callable: anytype) @TypeOf(callable()) {
         const T = @TypeOf(callable);
         if (@typeInfo(T) == .@"struct" and @hasField(T, "call_fn")) {
             return callable.call_fn(callable.env);
