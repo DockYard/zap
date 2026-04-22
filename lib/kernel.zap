@@ -260,4 +260,20 @@ pub module Kernel {
     :zig.Kernel.raise(message)
   }
 
+  @doc = """
+    Suspends the current process for the given number of milliseconds.
+
+    Returns the number of milliseconds slept. Useful for game loops,
+    rate limiting, and timed delays.
+
+    ## Examples
+
+        sleep(100)    # pause for 100ms
+        sleep(1000)   # pause for 1 second
+    """
+
+  pub fn sleep(milliseconds :: i64) -> i64 {
+    :zig.Kernel.sleep(milliseconds)
+  }
+
 }

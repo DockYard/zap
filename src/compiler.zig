@@ -1049,7 +1049,10 @@ pub fn compileModuleByModule(
                 std.debug.print("\r\x1b[K  [hir {d}/{d}] {s}", .{ mod_idx + 1, module_order.len, mod_name });
             }
             const mod_program = findModuleProgram(ctx, mod_name) orelse continue;
-            const hir_result = compileSingleModuleHir(alloc, ctx, mod_name, mod_program, shared_store, group_id_offset, options) catch continue;
+            const hir_result = compileSingleModuleHir(alloc, ctx, mod_name, mod_program, shared_store, group_id_offset, options) catch |err| {
+                std.debug.print("DEBUG: module {s} failed: {}\n", .{ mod_name, err });
+                continue;
+            };
             group_id_offset = hir_result.next_group_id;
             hir_results.append(alloc, hir_result) catch return error.OutOfMemory;
         }

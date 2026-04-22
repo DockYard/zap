@@ -6,6 +6,7 @@ pub module Snake.Builder {
           name: "snake",
           version: "0.1.0",
           kind: :bin,
+          optimize: :release_small,
           root: "Snake.main/1",
           paths: ["./*.zap"], deps: [{:zap_stdlib, {:path, "../../lib"}}]
         }

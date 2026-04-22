@@ -1836,8 +1836,21 @@ pub const Interpreter = struct {
                 frame.setLocal(mt.dest, .{ .bool_val = matches });
                 return .continued;
             },
-            .match_fail => {
-                try self.emitError(.match_failure, "no matching clause at compile time");
+            .match_fail => |mf| {
+                if (mf.message_local) |ml| {
+                    // Panic expression — surface the actual message
+                    const msg_val = self.readLocal(frame, ml) catch {
+                        try self.emitError(.match_failure, mf.message);
+                        return error.CtfeFailure;
+                    };
+                    const msg = switch (msg_val) {
+                        .string => |s| s,
+                        else => mf.message,
+                    };
+                    try self.emitError(.match_failure, msg);
+                } else {
+                    try self.emitError(.match_failure, "no matching clause at compile time");
+                }
                 return error.CtfeFailure;
             },
             .match_error_return => {

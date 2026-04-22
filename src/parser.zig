@@ -2024,6 +2024,7 @@ pub const Parser = struct {
     fn parsePrimaryExpr(self: *Parser) !*const ast.Expr {
         switch (self.peek()) {
             .int_literal => return self.parseIntLiteral(),
+            .char_literal => return self.parseCharLiteral(),
             .float_literal => return self.parseFloatLiteral(),
             .string_literal => return self.parseStringLiteral(),
             .string_literal_start => return self.parseStringInterpolation(),
@@ -2155,6 +2156,36 @@ pub const Parser = struct {
         const tok = self.advance();
         const text = self.stripNumericUnderscores(tok.slice(self.source));
         const value = std.fmt.parseInt(i64, text, 0) catch 0;
+        return self.create(ast.Expr, .{
+            .int_literal = .{ .meta = .{ .span = ast.SourceSpan.from(tok.loc) }, .value = value },
+        });
+    }
+
+    fn parseCharLiteral(self: *Parser) !*const ast.Expr {
+        const tok = self.advance();
+        const text = tok.slice(self.source); // e.g. "?A", "?\\n", "?\\x1b"
+        const value: i64 = if (text.len >= 3 and text[1] == '\\') blk: {
+            // Escape sequence
+            break :blk switch (text[2]) {
+                'n' => 10,
+                't' => 9,
+                'r' => 13,
+                's' => 32,
+                '\\' => 92,
+                '0' => 0,
+                'a' => 7,
+                'e' => 27,
+                'x', 'X' => if (text.len > 3)
+                    std.fmt.parseInt(i64, text[3..], 16) catch 0
+                else
+                    0,
+                else => text[2],
+            };
+        } else if (text.len >= 2) blk: {
+            break :blk @intCast(text[1]);
+        } else blk: {
+            break :blk 0;
+        };
         return self.create(ast.Expr, .{
             .int_literal = .{ .meta = .{ .span = ast.SourceSpan.from(tok.loc) }, .value = value },
         });
@@ -3074,6 +3105,28 @@ pub const Parser = struct {
                 const tok = self.advance();
                 const text = self.stripNumericUnderscores(tok.slice(self.source));
                 const value = std.fmt.parseInt(i64, text, 0) catch 0;
+                return self.create(ast.Pattern, .{
+                    .literal = .{ .int = .{
+                        .meta = .{ .span = ast.SourceSpan.from(tok.loc) },
+                        .value = value,
+                    } },
+                });
+            },
+            .char_literal => {
+                // ?A → 65 — parse as int literal pattern
+                const tok = self.advance();
+                const text = tok.slice(self.source);
+                const value: i64 = if (text.len >= 3 and text[1] == '\\') blk: {
+                    break :blk switch (text[2]) {
+                        'n' => 10, 't' => 9, 'r' => 13, 's' => 32,
+                        '\\' => 92, '0' => 0, 'a' => 7, 'e' => 27,
+                        'x', 'X' => if (text.len > 3)
+                            std.fmt.parseInt(i64, text[3..], 16) catch 0
+                        else
+                            0,
+                        else => text[2],
+                    };
+                } else if (text.len >= 2) @intCast(text[1]) else 0;
                 return self.create(ast.Pattern, .{
                     .literal = .{ .int = .{
                         .meta = .{ .span = ast.SourceSpan.from(tok.loc) },

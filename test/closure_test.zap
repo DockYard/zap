@@ -69,4 +69,13 @@ pub module Test.ClosureTest {
     callback()
   }
 
+  describe("cross-module generic callback") {
+    test("IO.mode/2 returns callback result") {
+      assert(mode_test() == 42)
+    }
+  }
+
+  fn mode_test() -> i64 {
+    IO.mode(IO.Mode.Normal, fn() -> i64 { 42 })
+  }
 }

@@ -570,11 +570,25 @@ pub const PatternMatrix = struct {
 // Compiles a matrix of patterns into a Decision tree.
 // ============================================================
 
+/// Maps bind names to their scrutinee IDs for variable unification (pin patterns).
+pub const BoundScrutinees = std.AutoHashMap(ast.StringId, u32);
+
 pub fn compilePatternMatrix(
     allocator: std.mem.Allocator,
     matrix: PatternMatrix,
     scrutinee_ids: []const u32,
     next_id: *u32,
+) anyerror!*const Decision {
+    var empty_bound: BoundScrutinees = BoundScrutinees.init(allocator);
+    return compilePatternMatrixWithBindings(allocator, matrix, scrutinee_ids, next_id, &empty_bound);
+}
+
+fn compilePatternMatrixWithBindings(
+    allocator: std.mem.Allocator,
+    matrix: PatternMatrix,
+    scrutinee_ids: []const u32,
+    next_id: *u32,
+    bound_scrutinees: *BoundScrutinees,
 ) anyerror!*const Decision {
     // Base case: no rows → failure
     if (matrix.rows.len == 0) {
@@ -613,11 +627,18 @@ pub fn compilePatternMatrix(
 
     switch (col0_class) {
         .all_wildcard => {
-            // Variable Rule: strip column 0, recurse
-            return stripColumnAndRecurse(allocator, matrix, scrutinee_ids, next_id);
+            // Variable Rule: strip column 0, recurse.
+            // Record any bind in column 0 so pins in later columns can reference it.
+            if (matrix.rows.len > 0 and matrix.rows[0].patterns.len > 0) {
+                const pat = matrix.rows[0].patterns[0];
+                if (pat != null and pat.?.* == .bind and scrutinee_ids.len > 0) {
+                    bound_scrutinees.put(pat.?.bind, scrutinee_ids[0]) catch {};
+                }
+            }
+            return stripColumnAndRecurse(allocator, matrix, scrutinee_ids, next_id, bound_scrutinees);
         },
         .all_constructor, .mixture => {
-            return compileConstructorColumn(allocator, matrix, scrutinee_ids, next_id);
+            return compileConstructorColumn(allocator, matrix, scrutinee_ids, next_id, bound_scrutinees);
         },
     }
 }
@@ -638,6 +659,9 @@ fn classifyColumn(matrix: PatternMatrix) ColumnClass {
         } else {
             switch (pat.?.*) {
                 .wildcard, .bind => has_wildcard = true,
+                // Pin (variable unification) acts as a constructor — it
+                // constrains which values match via an equality guard.
+                .pin => has_constructor = true,
                 else => has_constructor = true,
             }
         }
@@ -660,6 +684,7 @@ fn stripColumnAndRecurse(
     matrix: PatternMatrix,
     scrutinee_ids: []const u32,
     next_id: *u32,
+    bound_scrutinees: *BoundScrutinees,
 ) anyerror!*const Decision {
     // Collect bindings from column 0 for first matching row
     // Then strip column 0 and recurse
@@ -683,10 +708,10 @@ fn stripColumnAndRecurse(
 
     // Check if column 0 first row has a bind pattern that needs to be recorded
     const first_pat = if (matrix.rows[0].patterns.len > 0) matrix.rows[0].patterns[0] else null;
-    const sub_decision = try compilePatternMatrix(allocator, .{
+    const sub_decision = try compilePatternMatrixWithBindings(allocator, .{
         .rows = new_rows,
         .column_count = matrix.column_count - 1,
-    }, new_scrutinees, next_id);
+    }, new_scrutinees, next_id, bound_scrutinees);
 
     if (first_pat != null and first_pat.?.* == .bind) {
         // Emit a bind node
@@ -716,6 +741,7 @@ fn compileConstructorColumn(
     matrix: PatternMatrix,
     scrutinee_ids: []const u32,
     next_id: *u32,
+    bound_scrutinees: *BoundScrutinees,
 ) anyerror!*const Decision {
     // Collect distinct constructors
     const scrutinee_id = scrutinee_ids[0];
@@ -731,7 +757,7 @@ fn compileConstructorColumn(
 
     if (first_constructor == null) {
         // All wildcards - use variable rule
-        return stripColumnAndRecurse(allocator, matrix, scrutinee_ids, next_id);
+        return stripColumnAndRecurse(allocator, matrix, scrutinee_ids, next_id, bound_scrutinees);
     }
 
     const scrutinee_expr = try allocator.create(Expr);
@@ -754,7 +780,7 @@ fn compileConstructorColumn(
     }
 
     if (has_list_cons) {
-        return compileListConsCheck(allocator, matrix, scrutinee_ids, scrutinee_expr, next_id);
+        return compileListConsCheck(allocator, matrix, scrutinee_ids, scrutinee_expr, next_id, bound_scrutinees);
     }
 
     switch (first_constructor.?.*) {
@@ -762,33 +788,37 @@ fn compileConstructorColumn(
             switch (lit) {
                 .atom => {
                     // Atom literals -> switch_tag
-                    return compileAtomSwitch(allocator, matrix, scrutinee_ids, scrutinee_expr, next_id);
+                    return compileAtomSwitch(allocator, matrix, scrutinee_ids, scrutinee_expr, next_id, bound_scrutinees);
                 },
                 else => {
                     // Int/float/string/bool/nil literals -> switch_literal
-                    return compileLiteralSwitch(allocator, matrix, scrutinee_ids, scrutinee_expr, next_id);
+                    return compileLiteralSwitch(allocator, matrix, scrutinee_ids, scrutinee_expr, next_id, bound_scrutinees);
                 },
             }
         },
         .tuple => {
             // Tuple constructors -> check_tuple
-            return compileTupleCheck(allocator, matrix, scrutinee_ids, scrutinee_expr, next_id);
+            return compileTupleCheck(allocator, matrix, scrutinee_ids, scrutinee_expr, next_id, bound_scrutinees);
         },
         .list => {
             // List constructors -> check_list (same structure as check_tuple but for slices)
-            return compileListCheck(allocator, matrix, scrutinee_ids, scrutinee_expr, next_id);
+            return compileListCheck(allocator, matrix, scrutinee_ids, scrutinee_expr, next_id, bound_scrutinees);
         },
         .list_cons => {
             // List cons patterns -> check_list_cons (non-empty check + head/tail extraction)
-            return compileListConsCheck(allocator, matrix, scrutinee_ids, scrutinee_expr, next_id);
+            return compileListConsCheck(allocator, matrix, scrutinee_ids, scrutinee_expr, next_id, bound_scrutinees);
         },
         .binary_match => {
             // Binary constructors -> check_binary
-            return compileBinaryCheck(allocator, matrix, scrutinee_ids, scrutinee_expr, next_id);
+            return compileBinaryCheck(allocator, matrix, scrutinee_ids, scrutinee_expr, next_id, bound_scrutinees);
+        },
+        .pin => {
+            // Pin (variable unification) -> guard with equality check
+            return compilePinGuard(allocator, matrix, scrutinee_ids, scrutinee_expr, next_id, bound_scrutinees);
         },
         else => {
             // Fallback: treat as variable rule
-            return stripColumnAndRecurse(allocator, matrix, scrutinee_ids, next_id);
+            return stripColumnAndRecurse(allocator, matrix, scrutinee_ids, next_id, bound_scrutinees);
         },
     }
 }
@@ -799,6 +829,7 @@ fn compileLiteralSwitch(
     scrutinee_ids: []const u32,
     scrutinee_expr: *const Expr,
     next_id: *u32,
+    bound_scrutinees: *BoundScrutinees,
 ) anyerror!*const Decision {
     // Collect distinct literal values
     const DistinctLit = struct {
@@ -850,10 +881,10 @@ fn compileLiteralSwitch(
         }
 
         const new_scrutinees = if (scrutinee_ids.len > 1) scrutinee_ids[1..] else @as([]const u32, &.{});
-        const sub_decision = try compilePatternMatrix(allocator, .{
+        const sub_decision = try compilePatternMatrixWithBindings(allocator, .{
             .rows = try sub_rows.toOwnedSlice(allocator),
             .column_count = matrix.column_count - 1,
-        }, new_scrutinees, next_id);
+        }, new_scrutinees, next_id, bound_scrutinees);
 
         try cases.append(allocator, .{
             .value = dv.value,
@@ -877,10 +908,10 @@ fn compileLiteralSwitch(
     }
 
     const new_scrutinees = if (scrutinee_ids.len > 1) scrutinee_ids[1..] else @as([]const u32, &.{});
-    const default_decision = try compilePatternMatrix(allocator, .{
+    const default_decision = try compilePatternMatrixWithBindings(allocator, .{
         .rows = try default_rows.toOwnedSlice(allocator),
         .column_count = matrix.column_count - 1,
-    }, new_scrutinees, next_id);
+    }, new_scrutinees, next_id, bound_scrutinees);
 
     const d = try allocator.create(Decision);
     d.* = .{ .switch_literal = .{
@@ -897,6 +928,7 @@ fn compileAtomSwitch(
     scrutinee_ids: []const u32,
     scrutinee_expr: *const Expr,
     next_id: *u32,
+    bound_scrutinees: *BoundScrutinees,
 ) anyerror!*const Decision {
     // Collect distinct atom values
     var distinct_atoms: std.ArrayList(ast.StringId) = .empty;
@@ -943,10 +975,10 @@ fn compileAtomSwitch(
         }
 
         const new_scrutinees = if (scrutinee_ids.len > 1) scrutinee_ids[1..] else @as([]const u32, &.{});
-        const sub_decision = try compilePatternMatrix(allocator, .{
+        const sub_decision = try compilePatternMatrixWithBindings(allocator, .{
             .rows = try sub_rows.toOwnedSlice(allocator),
             .column_count = matrix.column_count - 1,
-        }, new_scrutinees, next_id);
+        }, new_scrutinees, next_id, bound_scrutinees);
 
         try switch_cases.append(allocator, .{
             .tag = atom_id,
@@ -969,12 +1001,11 @@ fn compileAtomSwitch(
             });
         }
     }
-
     const new_scrutinees = if (scrutinee_ids.len > 1) scrutinee_ids[1..] else @as([]const u32, &.{});
-    const default_decision = try compilePatternMatrix(allocator, .{
+    const default_decision = try compilePatternMatrixWithBindings(allocator, .{
         .rows = try default_rows.toOwnedSlice(allocator),
         .column_count = matrix.column_count - 1,
-    }, new_scrutinees, next_id);
+    }, new_scrutinees, next_id, bound_scrutinees);
 
     const d = try allocator.create(Decision);
     d.* = .{ .switch_tag = .{
@@ -985,12 +1016,111 @@ fn compileAtomSwitch(
     return d;
 }
 
+/// Compile a pin pattern (variable unification) into a guard node.
+/// `fn foo(x, [x | rest])` — the pin on the second `x` becomes a guard
+/// checking that the scrutinee equals the binding from the earlier column.
+fn compilePinGuard(
+    allocator: std.mem.Allocator,
+    matrix: PatternMatrix,
+    scrutinee_ids: []const u32,
+    scrutinee_expr: *const Expr,
+    next_id: *u32,
+    bound_scrutinees: *BoundScrutinees,
+) anyerror!*const Decision {
+    // Find the pin name from the first non-wildcard row
+    var pin_name: ?ast.StringId = null;
+    for (matrix.rows) |row| {
+        if (row.patterns.len > 0 and !isWildcardPattern(row.patterns[0])) {
+            if (row.patterns[0].?.* == .pin) {
+                pin_name = row.patterns[0].?.pin;
+                break;
+            }
+        }
+    }
+    if (pin_name == null) {
+        return stripColumnAndRecurse(allocator, matrix, scrutinee_ids, next_id, bound_scrutinees);
+    }
+
+    // Build a guard expression: scrutinee == pinned_variable
+    // The pinned variable is a param_get referencing the earlier binding's scrutinee.
+    // We look up the scrutinee ID from bound_scrutinees which was recorded when the
+    // original bind was processed.
+    const bound_id = bound_scrutinees.get(pin_name.?) orelse 0;
+    const pin_var_expr = try allocator.create(Expr);
+    pin_var_expr.* = .{
+        .kind = .{ .param_get = bound_id },
+        .type_id = types_mod.TypeStore.UNKNOWN,
+        .span = .{ .start = 0, .end = 0 },
+    };
+
+    const guard_condition = try allocator.create(Expr);
+    guard_condition.* = .{
+        .kind = .{ .binary = .{
+            .op = .equal,
+            .lhs = scrutinee_expr,
+            .rhs = pin_var_expr,
+        } },
+        .type_id = types_mod.TypeStore.UNKNOWN,
+        .span = .{ .start = 0, .end = 0 },
+    };
+
+    // Matching rows: rows with pin or wildcard in column 0
+    var match_rows: std.ArrayList(PatternRow) = .empty;
+    for (matrix.rows) |row| {
+        if (row.patterns.len == 0) continue;
+        const pat = row.patterns[0];
+        if (isWildcardPattern(pat) or (pat != null and pat.?.* == .pin)) {
+            const new_pats = if (row.patterns.len > 1) row.patterns[1..] else @as([]const ?*const MatchPattern, &.{});
+            try match_rows.append(allocator, .{
+                .patterns = new_pats,
+                .body_index = row.body_index,
+                .guard = row.guard,
+            });
+        }
+    }
+
+    // Default rows: only wildcards
+    var default_rows: std.ArrayList(PatternRow) = .empty;
+    for (matrix.rows) |row| {
+        if (row.patterns.len == 0) continue;
+        if (isWildcardPattern(row.patterns[0])) {
+            const new_pats = if (row.patterns.len > 1) row.patterns[1..] else @as([]const ?*const MatchPattern, &.{});
+            try default_rows.append(allocator, .{
+                .patterns = new_pats,
+                .body_index = row.body_index,
+                .guard = row.guard,
+            });
+        }
+    }
+
+    const new_scrutinees = if (scrutinee_ids.len > 1) scrutinee_ids[1..] else @as([]const u32, &.{});
+
+    const success = try compilePatternMatrixWithBindings(allocator, .{
+        .rows = try match_rows.toOwnedSlice(allocator),
+        .column_count = matrix.column_count - 1,
+    }, new_scrutinees, next_id, bound_scrutinees);
+
+    const failure = try compilePatternMatrixWithBindings(allocator, .{
+        .rows = try default_rows.toOwnedSlice(allocator),
+        .column_count = matrix.column_count - 1,
+    }, new_scrutinees, next_id, bound_scrutinees);
+
+    const d = try allocator.create(Decision);
+    d.* = .{ .guard = .{
+        .condition = guard_condition,
+        .success = success,
+        .failure = failure,
+    } };
+    return d;
+}
+
 fn compileTupleCheck(
     allocator: std.mem.Allocator,
     matrix: PatternMatrix,
     scrutinee_ids: []const u32,
     scrutinee_expr: *const Expr,
     next_id: *u32,
+    bound_scrutinees: *BoundScrutinees,
 ) anyerror!*const Decision {
     // Collect unique arities from tuple patterns
     var arities: std.ArrayList(u32) = .empty;
@@ -1031,10 +1161,10 @@ fn compileTupleCheck(
 
     var current_failure: *const Decision = undefined;
     if (wildcard_rows.items.len > 0) {
-        current_failure = try compilePatternMatrix(allocator, .{
+        current_failure = try compilePatternMatrixWithBindings(allocator, .{
             .rows = try wildcard_rows.toOwnedSlice(allocator),
             .column_count = matrix.column_count - 1,
-        }, remaining_scrutinees, next_id);
+        }, remaining_scrutinees, next_id, bound_scrutinees);
     } else {
         const f = try allocator.create(Decision);
         f.* = .failure;
@@ -1106,10 +1236,10 @@ fn compileTupleCheck(
         }
 
         const new_col_count = arity + (matrix.column_count - 1);
-        const success_decision = try compilePatternMatrix(allocator, .{
+        const success_decision = try compilePatternMatrixWithBindings(allocator, .{
             .rows = try success_rows.toOwnedSlice(allocator),
             .column_count = new_col_count,
-        }, try new_scrutinee_list.toOwnedSlice(allocator), next_id);
+        }, try new_scrutinee_list.toOwnedSlice(allocator), next_id, bound_scrutinees);
 
         const d = try allocator.create(Decision);
         d.* = .{ .check_tuple = .{
@@ -1131,6 +1261,7 @@ fn compileListCheck(
     scrutinee_ids: []const u32,
     scrutinee_expr: *const Expr,
     next_id: *u32,
+    bound_scrutinees: *BoundScrutinees,
 ) anyerror!*const Decision {
     // Collect unique lengths from list patterns
     var lengths: std.ArrayList(u32) = .empty;
@@ -1163,10 +1294,10 @@ fn compileListCheck(
             try wildcard_rows.append(allocator, .{ .patterns = new_pats, .body_index = row.body_index, .guard = row.guard });
         }
     }
-    var current_failure = try compilePatternMatrix(allocator, .{
+    var current_failure = try compilePatternMatrixWithBindings(allocator, .{
         .rows = try wildcard_rows.toOwnedSlice(allocator),
         .column_count = if (matrix.column_count > 0) matrix.column_count - 1 else 0,
-    }, remaining_scrutinees, next_id);
+    }, remaining_scrutinees, next_id, bound_scrutinees);
 
     // For each unique length, build a check_list node
     var i: usize = lengths.items.len;
@@ -1224,10 +1355,10 @@ fn compileListCheck(
             }
         }
 
-        const success_decision = try compilePatternMatrix(allocator, .{
+        const success_decision = try compilePatternMatrixWithBindings(allocator, .{
             .rows = try success_rows.toOwnedSlice(allocator),
             .column_count = new_col_count,
-        }, try new_scrutinee_list.toOwnedSlice(allocator), next_id);
+        }, try new_scrutinee_list.toOwnedSlice(allocator), next_id, bound_scrutinees);
 
         const d = try allocator.create(Decision);
         d.* = .{ .check_list = .{
@@ -1248,6 +1379,7 @@ fn compileListConsCheck(
     scrutinee_ids: []const u32,
     scrutinee_expr: *const Expr,
     next_id: *u32,
+    bound_scrutinees: *BoundScrutinees,
 ) anyerror!*const Decision {
     const remaining_scrutinees = if (scrutinee_ids.len > 1) scrutinee_ids[1..] else @as([]const u32, &.{});
 
@@ -1261,10 +1393,10 @@ fn compileListConsCheck(
             try wildcard_rows.append(allocator, .{ .patterns = new_pats, .body_index = row.body_index, .guard = row.guard });
         }
     }
-    const failure = try compilePatternMatrix(allocator, .{
+    const failure = try compilePatternMatrixWithBindings(allocator, .{
         .rows = try wildcard_rows.toOwnedSlice(allocator),
         .column_count = if (matrix.column_count > 0) matrix.column_count - 1 else 0,
-    }, remaining_scrutinees, next_id);
+    }, remaining_scrutinees, next_id, bound_scrutinees);
 
     // For cons patterns, extract heads and tail into new scrutinee columns.
     // Determine head_count from the first cons pattern.
@@ -1329,10 +1461,10 @@ fn compileListConsCheck(
         }
     }
 
-    const success_decision = try compilePatternMatrix(allocator, .{
+    const success_decision = try compilePatternMatrixWithBindings(allocator, .{
         .rows = try success_rows.toOwnedSlice(allocator),
         .column_count = new_col_count,
-    }, try new_scrutinee_list.toOwnedSlice(allocator), next_id);
+    }, try new_scrutinee_list.toOwnedSlice(allocator), next_id, bound_scrutinees);
 
     const d = try allocator.create(Decision);
     d.* = .{ .check_list_cons = .{
@@ -1352,6 +1484,7 @@ fn compileBinaryCheck(
     scrutinee_ids: []const u32,
     scrutinee_expr: *const Expr,
     next_id: *u32,
+    bound_scrutinees: *BoundScrutinees,
 ) anyerror!*const Decision {
     // Calculate min byte size from the first binary pattern's segments
     // Accumulate bits for sub-byte types, then convert to bytes
@@ -1407,10 +1540,10 @@ fn compileBinaryCheck(
 
     var failure: *const Decision = undefined;
     if (wildcard_rows.items.len > 0) {
-        failure = try compilePatternMatrix(allocator, .{
+        failure = try compilePatternMatrixWithBindings(allocator, .{
             .rows = try wildcard_rows.toOwnedSlice(allocator),
             .column_count = matrix.column_count - 1,
-        }, remaining_scrutinees, next_id);
+        }, remaining_scrutinees, next_id, bound_scrutinees);
     } else {
         const f = try allocator.create(Decision);
         f.* = .failure;
@@ -1439,10 +1572,10 @@ fn compileBinaryCheck(
         }
     }
 
-    const success = try compilePatternMatrix(allocator, .{
+    const success = try compilePatternMatrixWithBindings(allocator, .{
         .rows = try success_rows.toOwnedSlice(allocator),
         .column_count = matrix.column_count - 1,
-    }, remaining_scrutinees, next_id);
+    }, remaining_scrutinees, next_id, bound_scrutinees);
 
     const d = try allocator.create(Decision);
     d.* = .{ .check_binary = .{
@@ -1498,6 +1631,11 @@ pub const HirBuilder = struct {
     current_function_root_scope: ?scope_mod.ScopeId,
     current_function_name: ?[]const u8,
     current_function_name_id: ?ast.StringId,
+    /// Variable names already bound in the current clause's parameters.
+    /// When a bind pattern reuses a name from this set, it becomes a pin
+    /// (equality check) instead of a fresh binding — Elixir-style variable
+    /// unification.
+    clause_bound_names: std.AutoHashMap(ast.StringId, void),
     family_to_group: std.AutoHashMap(scope_mod.FunctionFamilyId, u32),
     group_captures: std.AutoHashMap(u32, []const Capture),
     current_capture_map: std.AutoHashMap(ast.StringId, u32),
@@ -1540,6 +1678,7 @@ pub const HirBuilder = struct {
             .current_function_root_scope = null,
             .current_function_name = null,
             .current_function_name_id = null,
+            .clause_bound_names = std.AutoHashMap(ast.StringId, void).init(allocator),
             .family_to_group = std.AutoHashMap(scope_mod.FunctionFamilyId, u32).init(allocator),
             .group_captures = std.AutoHashMap(u32, []const Capture).init(allocator),
             .current_capture_map = std.AutoHashMap(ast.StringId, u32).init(allocator),
@@ -2649,6 +2788,11 @@ pub const HirBuilder = struct {
         else
             null;
 
+        // Track bound names for variable unification. When a bind pattern
+        // reuses a name from an earlier parameter, compilePattern converts
+        // it to a pin (equality guard) — like Elixir's variable unification.
+        self.clause_bound_names.clearRetainingCapacity();
+
         var params: std.ArrayList(TypedParam) = .empty;
         for (clause.params, 0..) |param, param_idx| {
             const type_id = if (param.type_annotation) |ann|
@@ -2699,6 +2843,10 @@ pub const HirBuilder = struct {
                 .pattern = match_pattern,
                 .default = default_expr,
             });
+
+            // Record bound names from this parameter so later parameters
+            // can detect variable unification (repeated names → pin patterns).
+            self.collectBoundNames(param.pattern);
         }
 
         const return_type = if (clause.return_type) |rt|
@@ -2887,10 +3035,45 @@ pub const HirBuilder = struct {
     // Pattern compilation (spec §17)
     // ============================================================
 
+    /// Recursively collect all bound variable names from an AST pattern.
+    fn collectBoundNames(self: *HirBuilder, pattern: *const ast.Pattern) void {
+        switch (pattern.*) {
+            .bind => |b| {
+                // Don't track underscore-prefixed names (discards)
+                const name_str = self.interner.get(b.name);
+                if (name_str.len > 0 and name_str[0] != '_') {
+                    self.clause_bound_names.put(b.name, {}) catch {};
+                }
+            },
+            .list_cons => |lc| {
+                for (lc.heads) |h| self.collectBoundNames(h);
+                self.collectBoundNames(lc.tail);
+            },
+            .tuple => |t| {
+                for (t.elements) |e| self.collectBoundNames(e);
+            },
+            .list => |l| {
+                for (l.elements) |e| self.collectBoundNames(e);
+            },
+            .paren => |p| self.collectBoundNames(p.inner),
+            else => {},
+        }
+    }
+
     fn compilePattern(self: *HirBuilder, pattern: *const ast.Pattern) anyerror!?*const MatchPattern {
         return switch (pattern.*) {
             .wildcard => try self.create(MatchPattern, .wildcard),
-            .bind => |b| try self.create(MatchPattern, .{ .bind = b.name }),
+            .bind => |b| {
+                // Variable unification: if this name was already bound by a
+                // previous parameter, emit a pin (equality check) instead of
+                // a fresh binding. This implements Elixir-style patterns like
+                // `fn foo(x, [x | rest])` where the second `x` must equal the first.
+                const name_str = self.interner.get(b.name);
+                if (name_str.len > 0 and name_str[0] != '_' and self.clause_bound_names.contains(b.name)) {
+                    return try self.create(MatchPattern, .{ .pin = b.name });
+                }
+                return try self.create(MatchPattern, .{ .bind = b.name });
+            },
             .literal => |lit| try self.create(MatchPattern, .{
                 .literal = switch (lit) {
                     .int => |v| .{ .int = v.value },
@@ -3626,10 +3809,20 @@ pub const HirBuilder = struct {
                     const func_name = self.interner.get(fa.field);
                     const mod_name = self.moduleNameToString(fa.object.module_ref.name);
 
-                    // Check if this is an enum variant access (e.g. Color.Red)
+                    // Check if this is an enum variant access (e.g. Color.Red
+                    // or IO.Mode.Raw for a union defined inside a module)
                     const mod_parts = fa.object.module_ref.name.parts;
-                    if (mod_parts.len == 1) {
-                        if (self.type_store.name_to_type.get(mod_parts[0])) |tid| {
+                    // Direct type name: Color.Red (1 part)
+                    const type_name_id: ?ast.StringId = if (mod_parts.len == 1)
+                        mod_parts[0]
+                    // Module-qualified type: IO.Mode.Normal (2 parts — last is the type)
+                    else if (mod_parts.len >= 2)
+                        mod_parts[mod_parts.len - 1]
+                    else
+                        null;
+
+                    if (type_name_id) |tname| {
+                        if (self.type_store.name_to_type.get(tname)) |tid| {
                             const typ = self.type_store.getType(tid);
                             if (typ == .tagged_union) {
                                 return try self.create(Expr, .{
@@ -3731,9 +3924,13 @@ pub const HirBuilder = struct {
                 });
             },
             .module_ref => |mr| {
-                // Check for enum variant reference (e.g., Color.Red parsed as module_ref ["Color", "Red"])
-                if (mr.name.parts.len == 2) {
-                    if (self.type_store.name_to_type.get(mr.name.parts[0])) |tid| {
+                // Check for enum variant reference:
+                //   Color.Red → parts ["Color", "Red"] (type is parts[0], variant is parts[1])
+                //   IO.Mode.Raw → parts ["IO", "Mode", "Raw"] (type is parts[-2], variant is parts[-1])
+                if (mr.name.parts.len >= 2) {
+                    const type_name = mr.name.parts[mr.name.parts.len - 2];
+                    const variant_name = mr.name.parts[mr.name.parts.len - 1];
+                    if (self.type_store.name_to_type.get(type_name)) |tid| {
                         const typ = self.type_store.getType(tid);
                         if (typ == .tagged_union) {
                             return try self.create(Expr, .{
@@ -3744,7 +3941,7 @@ pub const HirBuilder = struct {
                                             .type_id = tid,
                                             .span = mr.meta.span,
                                         }),
-                                        .field = mr.name.parts[1],
+                                        .field = variant_name,
                                     },
                                 },
                                 .type_id = tid,

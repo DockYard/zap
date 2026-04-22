@@ -21,6 +21,7 @@ pub const Token = struct {
         string_literal_part, // middle part between interpolations
         string_literal_end, // end of interpolated string
         atom_literal,
+        char_literal, // ?A → 65, ?\n → 10
 
         // Identifiers
         identifier,

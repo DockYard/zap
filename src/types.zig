@@ -1328,6 +1328,19 @@ pub const TypeChecker = struct {
             const param_type = if (param.type_annotation) |ann|
                 try self.resolveTypeExpr(ann)
             else blk: {
+                // Infer type from literal patterns — string, int, float, atom,
+                // bool, nil patterns carry their type implicitly, just like
+                // Elixir's `def foo("w")` or `def foo(0)`.
+                if (param.pattern.* == .literal) {
+                    break :blk switch (param.pattern.literal) {
+                        .string => self.store.addType(.string_type) catch TypeStore.UNKNOWN,
+                        .int => self.store.addType(.{ .int = .{ .signedness = .signed, .bits = 64 } }) catch TypeStore.UNKNOWN,
+                        .float => self.store.addType(.{ .float = .{ .bits = 64 } }) catch TypeStore.UNKNOWN,
+                        .atom => self.store.addType(.atom_type) catch TypeStore.UNKNOWN,
+                        .bool_lit => self.store.addType(.bool_type) catch TypeStore.UNKNOWN,
+                        .nil => self.store.addType(.nil_type) catch TypeStore.UNKNOWN,
+                    };
+                }
                 // Generated functions (e.g., __for_N) may lack type annotations.
                 // Skip error for generated code (name starts with __ or zero span).
                 const func_name = self.interner.get(name);
@@ -2425,6 +2438,17 @@ pub const TypeChecker = struct {
                         }
                     }
                 }
+            } else if (param.pattern.* == .literal) {
+                // Infer type from literal pattern — no annotation needed
+                const param_type = switch (param.pattern.literal) {
+                    .string => self.store.addType(.string_type) catch TypeStore.UNKNOWN,
+                    .int => self.store.addType(.{ .int = .{ .signedness = .signed, .bits = 64 } }) catch TypeStore.UNKNOWN,
+                    .float => self.store.addType(.{ .float = .{ .bits = 64 } }) catch TypeStore.UNKNOWN,
+                    .atom => self.store.addType(.atom_type) catch TypeStore.UNKNOWN,
+                    .bool_lit => self.store.addType(.bool_type) catch TypeStore.UNKNOWN,
+                    .nil => self.store.addType(.nil_type) catch TypeStore.UNKNOWN,
+                };
+                _ = QualifiedType.init(param_type, self.resolveParamOwnership(param, param_type));
             } else {
                 // Generated functions (span 0:0) may lack type annotations.
                 // Only error for user-written functions with real source locations.

@@ -509,7 +509,7 @@ pub const ScopeGraph = struct {
     }
 
     /// Check if a function key passes an import filter.
-    fn passesImportFilter(self: *const ScopeGraph, filter: ImportFilter, key: FamilyKey) bool {
+    pub fn passesImportFilter(self: *const ScopeGraph, filter: ImportFilter, key: FamilyKey) bool {
         _ = self;
         switch (filter) {
             .all => return true,

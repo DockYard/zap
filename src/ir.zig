@@ -639,6 +639,8 @@ pub const MatchType = struct {
 
 pub const MatchFail = struct {
     message: []const u8,
+    /// For panic expressions, the local holding the runtime message string.
+    message_local: ?LocalId = null,
 };
 
 /// Like match_fail but returns error.NoMatchingClause instead of panicking.
@@ -1060,6 +1062,16 @@ pub const IrBuilder = struct {
                 const func_id: FunctionId = group.id;
                 if (self.next_function_id <= func_id) {
                     self.next_function_id = func_id + 1;
+                }
+                const gn2 = self.interner.get(group.name);
+                if (std.mem.indexOf(u8, gn2, "mode") != null and std.mem.indexOf(u8, gn2, "IO") != null) {
+                    std.debug.print("DEBUG SKIP GENERIC: {s} id={d}\n", .{ gn2, group.id });
+                    if (group.clauses.len > 0) {
+                        for (group.clauses[0].params) |p| {
+                            std.debug.print("  param type_id={d} has_vars={}\n", .{ p.type_id, containsTypeVarInStore(ts, p.type_id) });
+                        }
+                        std.debug.print("  return={d} has_vars={}\n", .{ group.clauses[0].return_type, containsTypeVarInStore(ts, group.clauses[0].return_type) });
+                    }
                 }
                 return;
             }
@@ -2722,7 +2734,7 @@ pub const IrBuilder = struct {
                 });
             },
             .guard => |guard_node| {
-                const guard_local = try self.lowerExpr(guard_node.condition);
+                const guard_local = try self.lowerGuardExpr(guard_node.condition, scrutinee_map);
                 const saved = self.current_instrs;
                 self.current_instrs = .empty;
                 try self.lowerDecisionTreeForCase(guard_node.success, case_arms, scrutinee_map, 0);
@@ -3028,7 +3040,7 @@ pub const IrBuilder = struct {
                 }
             },
             .guard => |guard_node| {
-                const guard_local = try self.lowerExpr(guard_node.condition);
+                const guard_local = try self.lowerGuardExpr(guard_node.condition, scrutinee_map);
                 const saved = self.current_instrs;
                 self.current_instrs = .empty;
                 try self.lowerDecisionTreeForDispatch(guard_node.success, clauses, scrutinee_map);
@@ -3330,6 +3342,63 @@ pub const IrBuilder = struct {
             }
         }
         return 0;
+    }
+
+    /// Lower a guard expression from the decision tree, resolving param_get
+    /// indices through the scrutinee map. In the decision tree, param_get
+    /// indices are scrutinee IDs (not raw parameter indices), so they must be
+    /// resolved to the IR locals that hold the corresponding values.
+    fn lowerGuardExpr(self: *IrBuilder, expr: *const hir_mod.Expr, scrutinee_map: *std.AutoHashMap(u32, LocalId)) !LocalId {
+        switch (expr.kind) {
+            .param_get => |idx| {
+                // Resolve through scrutinee map first (scrutinee IDs from decision tree)
+                if (scrutinee_map.get(idx)) |local| {
+                    const dest = self.next_local;
+                    self.next_local += 1;
+                    try self.current_instrs.append(self.allocator, .{
+                        .local_get = .{ .dest = dest, .source = local },
+                    });
+                    return dest;
+                }
+                // Fall back to raw param_get for actual parameter references
+                const dest = self.next_local;
+                self.next_local += 1;
+                try self.current_instrs.append(self.allocator, .{
+                    .param_get = .{ .dest = dest, .index = idx },
+                });
+                return dest;
+            },
+            .binary => |bin| {
+                const lhs = try self.lowerGuardExpr(bin.lhs, scrutinee_map);
+                const rhs = try self.lowerGuardExpr(bin.rhs, scrutinee_map);
+                const dest = self.next_local;
+                self.next_local += 1;
+                const ir_op: BinaryOp.Op = switch (bin.op) {
+                    .add => .add,
+                    .sub => .sub,
+                    .mul => .mul,
+                    .div => .div,
+                    .rem_op => .rem_op,
+                    .equal => .eq,
+                    .not_equal => .neq,
+                    .less => .lt,
+                    .greater => .gt,
+                    .less_equal => .lte,
+                    .greater_equal => .gte,
+                    .and_op => .bool_and,
+                    .or_op => .bool_or,
+                    .concat => .concat,
+                };
+                try self.current_instrs.append(self.allocator, .{
+                    .binary_op = .{ .dest = dest, .op = ir_op, .lhs = lhs, .rhs = rhs },
+                });
+                return dest;
+            },
+            else => {
+                // For other expression kinds, fall through to generic lowerExpr
+                return self.lowerExpr(expr);
+            },
+        }
     }
 
     /// Check if a scrutinee has a known type that allows skipping runtime type checks (Phase 3).
@@ -3931,9 +4000,9 @@ pub const IrBuilder = struct {
                 try self.known_local_types.put(dest, list_zig_type);
             },
             .panic => |msg| {
-                _ = try self.lowerExpr(msg);
+                const msg_local = try self.lowerExpr(msg);
                 try self.current_instrs.append(self.allocator, .{
-                    .match_fail = .{ .message = "panic" },
+                    .match_fail = .{ .message = "panic", .message_local = msg_local },
                 });
             },
             .never => {

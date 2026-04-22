@@ -108,6 +108,14 @@ pub const ErrorInfo = struct {
 /// `entry_module` is e.g. "App" (extracted from build.zap root "App.main/0").
 /// `source_roots` are directories to search for module files, in priority order.
 /// The first root is typically the project's own lib dir.
+/// Modules that are auto-imported into every module (Elixir-style).
+/// Discovery must include these even when no source file explicitly
+/// references them, because their exports are available as bare calls
+/// via the auto-import mechanism in the collector.
+pub const AUTO_IMPORTS = [_][]const u8{
+    "Kernel",
+};
+
 pub fn discover(
     alloc: std.mem.Allocator,
     entry_module: []const u8,
@@ -129,6 +137,12 @@ pub fn discover(
 
     // Seed with entry module
     queue.append(alloc, entry_module) catch return error.OutOfMemory;
+
+    // Seed auto-imported modules. These are always compiled because their
+    // exports are implicitly available in every module (like Elixir's Kernel).
+    for (&AUTO_IMPORTS) |auto_mod| {
+        queue.append(alloc, auto_mod) catch return error.OutOfMemory;
+    }
 
     while (queue.items.len > 0) {
         const module_name = queue.orderedRemove(0);

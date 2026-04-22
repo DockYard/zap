@@ -2,7 +2,22 @@ const std = @import("std");
 const builtin = @import("builtin");
 const env = @import("env.zig");
 
-const runtime_io = std.Options.debug_io;
+const STDOUT_FD = std.posix.STDOUT_FILENO;
+const STDERR_FD = std.posix.STDERR_FILENO;
+const STDIN_FD = std.posix.STDIN_FILENO;
+
+fn posixWrite(fd: std.posix.fd_t, bytes: []const u8) void {
+    var written: usize = 0;
+    while (written < bytes.len) {
+        const rc = std.c.write(fd, bytes[written..].ptr, bytes[written..].len);
+        if (rc <= 0) break;
+        written += @intCast(rc);
+    }
+}
+
+fn posixRead(fd: std.posix.fd_t, buf: []u8) usize {
+    return std.posix.read(fd, buf) catch 0;
+}
 
 /// Platform-portable access to process argv (replacement for removed getArgv() in 0.16).
 pub fn getArgv() []const [*:0]const u8 {
@@ -27,16 +42,16 @@ pub fn getArgv() []const [*:0]const u8 {
     }
 }
 
-/// Write formatted output to stdout (replaces deprecatedWriter pattern).
+/// Write formatted output to stdout using POSIX write.
 fn stdoutPrint(comptime fmt: []const u8, args: anytype) void {
     var buf: [4096]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, fmt, args) catch return;
-    std.Io.File.stdout().writeStreamingAll(runtime_io, msg) catch {};
+    posixWrite(STDOUT_FD, msg);
 }
 
 /// Write raw bytes to stdout.
 fn stdoutWrite(bytes: []const u8) void {
-    std.Io.File.stdout().writeStreamingAll(runtime_io, bytes) catch {};
+    posixWrite(STDOUT_FD, bytes);
 }
 
 // ============================================================
@@ -788,14 +803,46 @@ pub const String = struct {
 // ============================================================
 
 pub fn panic(message: []const u8) noreturn {
-        std.debug.print("** (NilError) {s}\n", .{message});
+        posixWrite(STDERR_FD, "** (NilError) ");
+        posixWrite(STDERR_FD, message);
+        posixWrite(STDERR_FD, "\n");
     std.process.exit(1);
 }
 
 pub const Kernel = struct {
     pub fn raise(message: []const u8) noreturn {
-        std.debug.print("** (RuntimeError) {s}\n", .{message});
+        posixWrite(STDERR_FD, "** (RuntimeError) ");
+        posixWrite(STDERR_FD, message);
+        posixWrite(STDERR_FD, "\n");
         std.process.exit(1);
+    }
+
+    pub fn sleep(milliseconds: i64) i64 {
+        if (milliseconds <= 0) return milliseconds;
+        const ms: u64 = @intCast(milliseconds);
+        var ts = std.posix.timespec{
+            .sec = @intCast(ms / 1000),
+            .nsec = @intCast((ms % 1000) * 1_000_000),
+        };
+        while (true) {
+            const rc = std.c.nanosleep(&ts, &ts);
+            if (rc == 0) break;
+            if (std.posix.errno(rc) != .INTR) break;
+        }
+        return milliseconds;
+    }
+};
+
+/// Simple fixed-buffer writer for inspect formatting.
+/// Replaces the std.Io.File writer with direct buffer writes.
+const BufWriter = struct {
+    buf: []u8,
+    pos: usize,
+
+    pub fn print(self: *BufWriter, comptime fmt: []const u8, args: anytype) !void {
+        const remaining = self.buf[self.pos..];
+        const result = std.fmt.bufPrint(remaining, fmt, args) catch return;
+        self.pos += result.len;
     }
 };
 
@@ -824,16 +871,18 @@ pub const Prelude = struct {
         } else {
             // For tuples, structs, and other compound types, use inspect formatting
             var iw_buf: [4096]u8 = undefined;
-            var iw = std.Io.File.stdout().writer(runtime_io, &iw_buf);
+            var iw = BufWriter{ .buf = &iw_buf, .pos = 0 };
             inspectWrite(&iw, value);
+            posixWrite(STDOUT_FD, iw_buf[0..iw.pos]);
             stdoutPrint("\n", .{});
         }
     }
 
     pub fn inspect(value: anytype) InspectReturn(@TypeOf(value)) {
         var iw_buf: [4096]u8 = undefined;
-        var iw = std.Io.File.stdout().writer(runtime_io, &iw_buf);
+        var iw = BufWriter{ .buf = &iw_buf, .pos = 0 };
         inspectWrite(&iw, value);
+        posixWrite(STDOUT_FD, iw_buf[0..iw.pos]);
         stdoutPrint("\n", .{});
         const RT = InspectReturn(@TypeOf(value));
         if (RT == void) return;
@@ -951,16 +1000,12 @@ pub const Prelude = struct {
     /// Read a line from stdin. Returns the line without the trailing newline.
     /// Returns an empty string on EOF or error.
     pub fn gets() []const u8 {
-        const stdin = std.Io.File.stdin();
-        const pio = runtime_io;
         var buf: [4096]u8 = undefined;
         var len: usize = 0;
         // Read one byte at a time until newline or EOF
         while (len < buf.len - 1) {
             var one_buf = [_]u8{0};
-            const one_slice: []u8 = &one_buf;
-            const bufs = [_][]u8{one_slice};
-            const n = stdin.readStreaming(pio, &bufs) catch break;
+            const n = posixRead(STDIN_FD, &one_buf);
             if (n == 0) break; // EOF
             if (one_buf[0] == '\n') break;
             buf[len] = one_buf[0];
@@ -1003,16 +1048,39 @@ pub const Prelude = struct {
         }
     }
 
+    /// Non-blocking read of a single character from stdin.
+    /// Returns a 1-byte string if a key is available, or "" if not.
+    /// Must be in raw mode for meaningful use.
+    pub fn try_get_char() []const u8 {
+        const posix = std.posix;
+        const stdin_fd = posix.STDIN_FILENO;
+        const POLLIN: i16 = 0x0001;
+
+        // poll with timeout 0 = return immediately
+        var fds = [_]std.c.pollfd{.{
+            .fd = stdin_fd,
+            .events = POLLIN,
+            .revents = 0,
+        }};
+        const ready = posix.poll(&fds, 0) catch return "";
+        if (ready == 0) return "";
+
+        // Data available — read one byte
+        var one_buf = [_]u8{0};
+        const n = posixRead(STDIN_FD, &one_buf);
+        if (n == 0) return "";
+        const result_buf = bumpAlloc(1);
+        if (result_buf.len == 0) return "";
+        result_buf[0] = one_buf[0];
+        return result_buf;
+    }
+
     /// Read a single character from stdin. Returns a 1-byte string.
     /// In raw mode, returns immediately after one keypress.
     /// In normal mode, blocks until Enter then returns first char.
     pub fn get_char() []const u8 {
-        const stdin = std.Io.File.stdin();
-        const pio = runtime_io;
         var one_buf = [_]u8{0};
-        const one_slice: []u8 = &one_buf;
-        const bufs = [_][]u8{one_slice};
-        const n = stdin.readStreaming(pio, &bufs) catch return "";
+        const n = posixRead(STDIN_FD, &one_buf);
         if (n == 0) return "";
         const result = bumpAlloc(1);
         if (result.len == 0) return "";
@@ -1021,9 +1089,8 @@ pub const Prelude = struct {
     }
 
     pub fn warn(message: []const u8) void {
-        const stderr = std.Io.File.stderr();
-        stderr.writeStreamingAll(runtime_io, message) catch {};
-        stderr.writeStreamingAll(runtime_io, "\n") catch {};
+        posixWrite(STDERR_FD, message);
+        posixWrite(STDERR_FD, "\n");
     }
 
     pub fn i64_to_string(value: i64) []const u8 {
@@ -1577,56 +1644,63 @@ pub const Prelude = struct {
     // --- File I/O ---
 
     pub fn file_read(path: []const u8) []const u8 {
-        const pio = runtime_io;
-        const file = std.Io.Dir.cwd().openFile(pio, path, .{}) catch return "";
-        defer file.close(pio);
-
-        const max_file_size = 1024 * 1024; // 1MB max read
-        const file_len = file.length(pio) catch 0;
-        const read_size: usize = if (file_len > 0)
-            @min(@as(usize, @intCast(file_len)), max_file_size)
-        else
-            max_file_size;
+        const path_z = std.posix.toPosixPath(path) catch return "";
+        const fd = std.posix.openat(std.posix.AT.FDCWD, &path_z, .{}, 0) catch return "";
+        defer _ = std.c.close(fd);
+        var stat: std.c.Stat = undefined;
+        if (std.c.fstat(fd, &stat) != 0) return "";
+        const file_size: usize = @intCast(@max(stat.size, 0));
+        if (file_size == 0) return "";
+        const read_size = @min(file_size, 1024 * 1024);
         const result = bumpAlloc(read_size);
         if (result.len == 0) return "";
-
-        const bytes_read = file.readPositionalAll(pio, result, 0) catch return "";
-        return result[0..bytes_read];
+        var total: usize = 0;
+        while (total < read_size) {
+            const n = std.posix.read(fd, result[total..read_size]) catch break;
+            if (n == 0) break;
+            total += n;
+        }
+        return result[0..total];
     }
 
     pub fn file_write(path: []const u8, content: []const u8) bool {
-        const pio = runtime_io;
-        const file = std.Io.Dir.cwd().createFile(pio, path, .{}) catch return false;
-        defer file.close(pio);
-
-        file.writeStreamingAll(pio, content) catch return false;
+        const path_z = std.posix.toPosixPath(path) catch return false;
+        const fd = std.posix.openat(std.posix.AT.FDCWD, &path_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644) catch return false;
+        defer _ = std.c.close(fd);
+        var written: usize = 0;
+        while (written < content.len) {
+            const rc = std.c.write(fd, content[written..].ptr, content[written..].len);
+            if (rc <= 0) return false;
+            written += @intCast(rc);
+        }
         return true;
     }
 
     pub fn file_exists(path: []const u8) bool {
-        std.Io.Dir.cwd().access(runtime_io, path, .{}) catch return false;
-        return true;
+        const path_z = std.posix.toPosixPath(path) catch return false;
+        return std.c.faccessat(std.posix.AT.FDCWD, &path_z, std.posix.F_OK, 0) == 0;
     }
 
     pub fn file_rm(path: []const u8) bool {
-        std.Io.Dir.cwd().deleteFile(runtime_io, path) catch return false;
-        return true;
+        const path_z = std.posix.toPosixPath(path) catch return false;
+        return std.c.unlinkat(std.posix.AT.FDCWD, &path_z, 0) == 0;
     }
 
     pub fn file_mkdir(path: []const u8) bool {
-        std.Io.Dir.cwd().createDirPath(runtime_io, path) catch return false;
-        return true;
+        const path_z = std.posix.toPosixPath(path) catch return false;
+        return std.c.mkdirat(std.posix.AT.FDCWD, &path_z, 0o755) == 0;
     }
 
     pub fn file_rmdir(path: []const u8) bool {
-        std.Io.Dir.cwd().deleteDir(runtime_io, path) catch return false;
-        return true;
+        const path_z = std.posix.toPosixPath(path) catch return false;
+        const AT_REMOVEDIR: u32 = 0x80; // POSIX standard
+        return std.c.unlinkat(std.posix.AT.FDCWD, &path_z, AT_REMOVEDIR) == 0;
     }
 
     pub fn file_rename(old_path: []const u8, new_path: []const u8) bool {
-        const cwd = std.Io.Dir.cwd();
-        std.Io.Dir.rename(cwd, old_path, cwd, new_path, runtime_io) catch return false;
-        return true;
+        const old_z = std.posix.toPosixPath(old_path) catch return false;
+        const new_z = std.posix.toPosixPath(new_path) catch return false;
+        return std.c.renameat(std.posix.AT.FDCWD, &old_z, std.posix.AT.FDCWD, &new_z) == 0;
     }
 
     pub fn file_cp(src: []const u8, dest: []const u8) bool {
@@ -1636,13 +1710,17 @@ pub const Prelude = struct {
     }
 
     pub fn file_is_dir(path: []const u8) bool {
-        const stat = std.Io.Dir.cwd().statFile(runtime_io, path, .{}) catch return false;
-        return stat.kind == .directory;
+        const path_z = std.posix.toPosixPath(path) catch return false;
+        var stat: std.c.Stat = undefined;
+        if (std.c.fstatat(std.posix.AT.FDCWD, &path_z, &stat, 0) != 0) return false;
+        return stat.mode & std.posix.S.IFMT == std.posix.S.IFDIR;
     }
 
     pub fn file_is_regular(path: []const u8) bool {
-        const stat = std.Io.Dir.cwd().statFile(runtime_io, path, .{}) catch return false;
-        return stat.kind == .file;
+        const path_z = std.posix.toPosixPath(path) catch return false;
+        var stat: std.c.Stat = undefined;
+        if (std.c.fstatat(std.posix.AT.FDCWD, &path_z, &stat, 0) != 0) return false;
+        return stat.mode & std.posix.S.IFMT == std.posix.S.IFREG;
     }
 
     // --- System ---
@@ -1720,12 +1798,16 @@ pub const Prelude = struct {
     }
 
     pub fn panic(msg: []const u8) noreturn {
-        std.debug.print("panic: {s}\n", .{msg});
+        posixWrite(STDERR_FD, "panic: ");
+        posixWrite(STDERR_FD, msg);
+        posixWrite(STDERR_FD, "\n");
         std.process.exit(1);
     }
 
     pub fn halt(msg: []const u8) noreturn {
-        std.debug.print("halt: {s}\n", .{msg});
+        posixWrite(STDERR_FD, "halt: ");
+        posixWrite(STDERR_FD, msg);
+        posixWrite(STDERR_FD, "\n");
         std.process.exit(1);
     }
 
@@ -1832,10 +1914,11 @@ pub const Zest = struct {
 
     pub fn get_seed() i64 {
         if (!seed_set) {
-            // Generate seed from system clock via Zig 0.16 Io.Timestamp
-            const timestamp = std.Io.Timestamp.now(runtime_io, .real);
-            const abs_nanos: i96 = if (timestamp.nanoseconds < 0) -timestamp.nanoseconds else timestamp.nanoseconds;
-            seed = @intCast(abs_nanos & 0x7FFFFFFFFFFFFFFF);
+            var ts: std.c.timespec = .{ .sec = 0, .nsec = 0 };
+            _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+            const abs_nanos: i96 = @as(i96, ts.sec) * 1_000_000_000 + @as(i96, ts.nsec);
+            const positive = if (abs_nanos < 0) -abs_nanos else abs_nanos;
+            seed = @intCast(positive & 0x7FFFFFFFFFFFFFFF);
             seed_set = true;
         }
         return seed;
@@ -1853,15 +1936,18 @@ pub const Zest = struct {
         current_test_failed = false;
         test_count += 1;
         if (timeout_ms > 0) {
-            const timestamp = std.Io.Timestamp.now(runtime_io, .real);
-            test_start_ns = timestamp.nanoseconds;
+            var ts: std.c.timespec = .{ .sec = 0, .nsec = 0 };
+            _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+            test_start_ns = @as(i96, ts.sec) * 1_000_000_000 + @as(i96, ts.nsec);
         }
     }
 
     pub fn check_timeout() bool {
         if (timeout_ms <= 0) return false;
-        const now = std.Io.Timestamp.now(runtime_io, .real);
-        const elapsed_ns = now.nanoseconds - test_start_ns;
+        var ts: std.c.timespec = .{ .sec = 0, .nsec = 0 };
+            _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+        const now_ns: i96 = @as(i96, ts.sec) * 1_000_000_000 + @as(i96, ts.nsec);
+        const elapsed_ns = now_ns - test_start_ns;
         const timeout_ns: i96 = @as(i96, timeout_ms) * 1_000_000;
         if (elapsed_ns > timeout_ns) {
             current_test_failed = true;

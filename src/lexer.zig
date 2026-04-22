@@ -80,6 +80,11 @@ pub const Lexer = struct {
             return self.lexAtom();
         }
 
+        // Character literals: ?A → 65, ?\n → 10, etc.
+        if (c == '?' and self.pos + 1 < self.source.len) {
+            return self.lexCharLiteral();
+        }
+
         // Numbers
         if (isDigit(c)) {
             return self.lexNumber();
@@ -289,6 +294,34 @@ pub const Lexer = struct {
             return self.makeToken(.float_literal, start, self.pos);
         }
         return self.makeToken(.int_literal, start, self.pos);
+    }
+
+    fn lexCharLiteral(self: *Lexer) Token {
+        const start = self.pos;
+        self.pos += 1; // skip '?'
+        if (self.pos >= self.source.len) {
+            return self.makeToken(.invalid, start, self.pos);
+        }
+        const ch = self.source[self.pos];
+        if (ch == '\\') {
+            // Escape sequence: ?\n ?\t ?\r ?\s ?\\ ?\xNN
+            self.pos += 1;
+            if (self.pos >= self.source.len) {
+                return self.makeToken(.invalid, start, self.pos);
+            }
+            const esc = self.source[self.pos];
+            self.pos += 1;
+            if (esc == 'x' or esc == 'X') {
+                // Hex escape: ?\x1b — consume hex digits
+                while (self.pos < self.source.len and isHexDigit(self.source[self.pos])) {
+                    self.pos += 1;
+                }
+            }
+            return self.makeToken(.char_literal, start, self.pos);
+        }
+        // Single character: ?A ?b ?0
+        self.pos += 1;
+        return self.makeToken(.char_literal, start, self.pos);
     }
 
     fn lexIdentifier(self: *Lexer) Token {

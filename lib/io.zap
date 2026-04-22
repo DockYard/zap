@@ -1,9 +1,9 @@
-pub union Mode {
-  Raw
-  Normal
-}
-
 pub module IO {
+  pub union Mode {
+    Raw
+    Normal
+  }
+
   @moduledoc = """
     Functions for standard input/output operations.
 
@@ -97,7 +97,7 @@ pub module IO {
         IO.mode(Mode.Normal)   # restore line-buffered mode
     """
 
-  pub fn mode(mode_value :: Atom) -> Atom {
+  pub fn mode(mode_value :: Mode) -> Mode {
     :zig.IO.set_terminal_mode(mode_value)
     mode_value
   }
@@ -115,8 +115,11 @@ pub module IO {
         })
     """
 
-  pub fn mode(mode_value :: Atom, callback :: ( -> String)) -> String {
-    callback()
+  pub fn mode(mode_value :: Mode, callback :: ( -> result)) -> result {
+    :zig.IO.set_terminal_mode(mode_value)
+    result = callback()
+    :zig.IO.set_terminal_mode(Mode.Normal)
+    result
   }
 
   @doc = """
@@ -136,5 +139,25 @@ pub module IO {
 
   pub fn get_char() -> String {
     :zig.IO.get_char()
+  }
+
+  @doc = """
+    Non-blocking read of a single character from standard input.
+
+    Returns a single-character string if a key is available, or
+    an empty string if no input is waiting. Must be in raw mode
+    for meaningful use.
+
+    ## Examples
+
+        IO.mode(Mode.Raw)
+        key = IO.try_get_char()
+        if key == "" {
+          IO.puts("no key pressed")
+        }
+    """
+
+  pub fn try_get_char() -> String {
+    :zig.IO.try_get_char()
   }
 }
