@@ -498,7 +498,7 @@ const MonomorphContext = struct {
                     }
                 }
 
-                if (type_args.items.len == 0) return; // Not actually generic
+                if (type_args.items.len == 0) return;
 
                 // Skip if any type arg still contains type variables — this happens
                 // when scanning inside generic function bodies where args are unresolved.

@@ -3867,6 +3867,7 @@ pub const ZirDriver = struct {
                         const prelude_ref = zir_builder_emit_field_val(self.handle, rt_ref, "Prelude", 7);
                         if (prelude_ref != error_ref) {
                             const helper_name = switch (args.items.len) {
+                                0 => "callCallable0",
                                 1 => "callCallable1",
                                 2 => "callCallable2",
                                 3 => "callCallable3",

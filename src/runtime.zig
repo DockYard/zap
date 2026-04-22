@@ -976,21 +976,11 @@ pub const Prelude = struct {
     }
 
     /// Write a string to stderr followed by a newline.
-    /// Switch terminal mode. Accepts atom ID for Mode.Raw or Mode.Normal.
-    pub fn set_terminal_mode(mode: anytype) void {
+    /// Switch terminal mode. Accepts u32 atom ID — checks atom name for "Raw".
+    pub fn set_terminal_mode(mode: u32) void {
         const posix = std.posix;
         const stdin_fd = posix.STDIN_FILENO;
-        // Convert mode to boolean: Raw = true, Normal/other = false
-        const is_raw = blk: {
-            const T = @TypeOf(mode);
-            if (T == i64) break :blk mode == 1;
-            if (T == u32) {
-                const name = atomToString(mode);
-                break :blk std.mem.eql(u8, name, "Raw");
-            }
-            if (@typeInfo(T) == .int) break :blk @as(i64, @intCast(mode)) == 1;
-            break :blk false;
-        };
+        const is_raw = std.mem.eql(u8, atomToString(mode), "Raw");
         if (is_raw) {
             // Raw mode: disable canonical mode and echo
             var termios = posix.tcgetattr(stdin_fd) catch return;
@@ -1741,6 +1731,15 @@ pub const Prelude = struct {
 
     /// Call a callable value — either a bare function pointer or a closure struct.
     /// Closure structs have {call_fn, env, env_release} fields.
+    pub inline fn callCallable0(callable: anytype) CallReturnType(@TypeOf(callable)) {
+        const T = @TypeOf(callable);
+        if (@typeInfo(T) == .@"struct" and @hasField(T, "call_fn")) {
+            return callable.call_fn(callable.env);
+        } else {
+            return callable();
+        }
+    }
+
     pub inline fn callCallable1(callable: anytype, arg0: anytype) CallReturnType(@TypeOf(callable)) {
         const T = @TypeOf(callable);
         if (@typeInfo(T) == .@"struct" and @hasField(T, "call_fn")) {

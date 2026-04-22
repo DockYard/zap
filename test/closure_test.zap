@@ -55,14 +55,18 @@ pub module Test.ClosureTest {
     apply(21, fn(x :: i64) -> i64 { x * 2 })
   }
 
-  describe("IO.mode/2 callback") {
-    test("mode with callback returns result") {
-      assert(mode_test() == 42)
+  describe("zero-arg callback") {
+    test("wrap_call returns callback result") {
+      assert(wrap_test() == 42)
     }
   }
 
-  fn mode_test() -> i64 {
-    IO.mode(Mode.Normal, fn() -> String { "ok" })
-    42
+  fn wrap_test() -> i64 {
+    wrap_call(fn() -> i64 { 42 })
   }
+
+  fn wrap_call(callback :: ( -> i64)) -> i64 {
+    callback()
+  }
+
 }
