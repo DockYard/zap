@@ -15,7 +15,7 @@ pub impl Enumerable for List {
         # => {:cont, 6}
   """
 
-  pub fn reduce(list :: [member], acc, callback :: (acc, member -> {Atom, acc})) -> {Atom, acc} {
+  pub fn reduce(list :: [member], acc :: acc, callback :: (acc, member -> {Atom, acc})) -> {Atom, acc} {
     :zig.ListCell.reduceHaltCont(list, acc, callback)
   }
 }

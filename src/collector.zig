@@ -485,20 +485,8 @@ pub const Collector = struct {
     }
 
     fn collectUnion(self: *Collector, ed: *const ast.UnionDecl, parent_scope: scope.ScopeId) !void {
-        // For dotted-name unions (e.g., IO.Mode defined in a separate file),
-        // register under the short name so the parent struct can reference it
-        // unqualified (e.g., Mode.Raw inside the IO struct).
-        const registration_name = blk: {
-            const full_name = self.interner.get(ed.name);
-            if (std.mem.lastIndexOfScalar(u8, full_name, '.')) |dot_pos| {
-                const short_name = full_name[dot_pos + 1 ..];
-                const interner_mut = @constCast(self.interner);
-                break :blk try interner_mut.intern(short_name);
-            }
-            break :blk ed.name;
-        };
         _ = try self.graph.registerType(
-            registration_name,
+            ed.name,
             parent_scope,
             .{ .union_type = ed },
             &.{},

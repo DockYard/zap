@@ -25,16 +25,19 @@ pub struct Snake {
 
   pub fn main(_args :: [String]) -> String {
     "\x1b[2J\x1b[H" |> IO.print_str()
-    IO.puts(green("  ___ _  _   _   _  _____"))
-    IO.puts(green(" / __| \\| | /_\\ | |/ / __|"))
-    IO.puts(green(" \\__ \\ .` |/ _ \\|   <| _|"))
-    IO.puts(green(" |___/_|\\_/_/ \\_\\_|\\_\\___|"))
-    IO.puts("")
-    IO.puts("  wasd / arrows = move")
-    IO.puts("  q = quit")
-    IO.puts("")
-    IO.puts("  Collect the " <> yellow("*") <> " to grow!")
-    IO.puts("  Press any key to start...")
+    IO.puts(green("""
+      ___ _  _   _   _  _____
+     / __| \\| | /_\\ | |/ / __|
+     \\__ \\ .` |/ _ \\|   <| _|
+     |___/_|\\_/_/ \\_\\_|\\_\\___|
+    """) <> """
+
+      wasd / arrows = move
+      q = quit
+
+      Collect the \#{yellow("*")} to grow!
+      Press any key to start...
+    """)
     IO.mode(IO.Mode.Raw, fn() -> String {
       IO.get_char()
       "\x1b[2J\x1b[H" |> IO.print_str()

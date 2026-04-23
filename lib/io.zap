@@ -87,12 +87,12 @@ pub struct IO {
 
     ## Examples
 
-        IO.mode(Mode.Raw)      # keypress-at-a-time, no echo
+        IO.mode(IO.Mode.Raw)      # keypress-at-a-time, no echo
         key = IO.get_char()
-        IO.mode(Mode.Normal)   # restore line-buffered mode
+        IO.mode(IO.Mode.Normal)   # restore line-buffered mode
     """
 
-  pub fn mode(mode_value :: Mode) -> Mode {
+  pub fn mode(mode_value :: IO.Mode) -> IO.Mode {
     :zig.IO.set_terminal_mode(mode_value)
     mode_value
   }
@@ -103,17 +103,17 @@ pub struct IO {
 
     ## Examples
 
-        IO.mode(Mode.Raw, fn() -> i64 {
+        IO.mode(IO.Mode.Raw, fn() -> i64 {
           key = IO.get_char()
           IO.puts("You pressed: " <> key)
           0
         })
     """
 
-  pub fn mode(mode_value :: Mode, callback :: ( -> result)) -> result {
+  pub fn mode(mode_value :: IO.Mode, callback :: ( -> result)) -> result {
     :zig.IO.set_terminal_mode(mode_value)
     result = callback()
-    :zig.IO.set_terminal_mode(Mode.Normal)
+    :zig.IO.set_terminal_mode(IO.Mode.Normal)
     result
   }
 
@@ -145,7 +145,7 @@ pub struct IO {
 
     ## Examples
 
-        IO.mode(Mode.Raw)
+        IO.mode(IO.Mode.Raw)
         key = IO.try_get_char()
         if key == "" {
           IO.puts("no key pressed")

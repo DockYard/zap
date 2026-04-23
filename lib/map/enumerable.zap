@@ -12,7 +12,7 @@ pub impl Enumerable for Map {
         # => {:cont, 6}
   """
 
-  pub fn reduce(map :: Map, acc, callback :: (acc, member -> {Atom, acc})) -> {Atom, acc} {
+  pub fn reduce(map :: Map, acc :: acc, callback :: (acc, member -> {Atom, acc})) -> {Atom, acc} {
     :zig.MapCell.reduceHaltCont(map, acc, callback)
   }
 }

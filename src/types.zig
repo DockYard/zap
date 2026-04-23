@@ -2017,9 +2017,8 @@ pub const TypeChecker = struct {
                     try self.store.name_to_type.put(name, type_id);
                 },
                 .union_type => |ud| {
-                    const union_name = type_entry.name;
-                    if (self.store.name_to_type.get(union_name) != null) continue;
-                    const enum_name_str = self.interner.get(union_name);
+                    if (self.store.name_to_type.get(ud.name) != null) continue;
+                    const enum_name_str = self.interner.get(ud.name);
                     if (self.store.resolveTypeName(enum_name_str) != null) {
                         try self.errors.append(self.allocator, .{
                             .message = try std.fmt.allocPrint(self.allocator, "`{s}` shadows a builtin type — choose a different name", .{enum_name_str}),
@@ -2042,10 +2041,10 @@ pub const TypeChecker = struct {
                         });
                     }
                     const type_id = try self.store.addType(.{ .tagged_union = .{
-                        .name = union_name,
+                        .name = ud.name,
                         .variants = try variant_entries.toOwnedSlice(self.allocator),
                     } });
-                    try self.store.name_to_type.put(union_name, type_id);
+                    try self.store.name_to_type.put(ud.name, type_id);
                 },
                 .opaque_type => |opaque_body| {
                     if (self.store.name_to_type.get(type_entry.name) != null) continue;
@@ -2338,6 +2337,11 @@ pub const TypeChecker = struct {
             .priv_function => |func| try self.checkFunctionDecl(func),
             .macro, .priv_macro => {}, // Macro bodies are compile-time code — not type-checked
             .struct_decl, .priv_struct_decl => {},
+            .impl_decl, .priv_impl_decl => |impl_d| {
+                for (impl_d.functions) |func| {
+                    try self.checkFunctionDecl(func);
+                }
+            },
             else => {},
         }
     }

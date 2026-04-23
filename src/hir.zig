@@ -3810,36 +3810,47 @@ pub const HirBuilder = struct {
                     const mod_name = self.structNameToString(fa.object.module_ref.name);
 
                     // Check if this is an enum variant access (e.g. Color.Red
-                    // or IO.Mode.Raw for a union defined inside a module)
+                    // or IO.Mode.Raw for a dotted-name union)
                     const mod_parts = fa.object.module_ref.name.parts;
-                    // Direct type name: Color.Red (1 part)
-                    const type_name_id: ?ast.StringId = if (mod_parts.len == 1)
-                        mod_parts[0]
-                    // Module-qualified type: IO.Mode.Normal (2 parts — last is the type)
-                    else if (mod_parts.len >= 2)
-                        mod_parts[mod_parts.len - 1]
-                    else
-                        null;
 
-                    if (type_name_id) |tname| {
-                        if (self.type_store.name_to_type.get(tname)) |tid| {
-                            const typ = self.type_store.getType(tid);
-                            if (typ == .tagged_union) {
-                                return try self.create(Expr, .{
-                                    .kind = .{
-                                        .field_get = .{
-                                            .object = try self.create(Expr, .{
-                                                .kind = .nil_lit, // placeholder for enum type ref
-                                                .type_id = tid,
-                                                .span = fa.object.getMeta().span,
-                                            }),
-                                            .field = fa.field,
-                                        },
-                                    },
-                                    .type_id = tid,
-                                    .span = fa.meta.span,
-                                });
+                    // Try to resolve as a union type. For dotted names like IO.Mode,
+                    // build the full dotted name and look it up.
+                    const resolved_tid: ?types_mod.TypeId = blk: {
+                        if (mod_parts.len >= 2) {
+                            // Build full dotted name (e.g., "IO.Mode")
+                            var name_buf: std.ArrayList(u8) = .empty;
+                            for (mod_parts, 0..) |part, i| {
+                                if (i > 0) name_buf.append(self.allocator, '.') catch {};
+                                name_buf.appendSlice(self.allocator, self.interner.get(part)) catch {};
                             }
+                            const interner_mut = @constCast(self.interner);
+                            const full_name_id = interner_mut.intern(name_buf.items) catch break :blk null;
+                            if (self.type_store.name_to_type.get(full_name_id)) |tid| break :blk tid;
+                            // Fall back to last part only
+                            if (self.type_store.name_to_type.get(mod_parts[mod_parts.len - 1])) |tid| break :blk tid;
+                        } else if (mod_parts.len == 1) {
+                            if (self.type_store.name_to_type.get(mod_parts[0])) |tid| break :blk tid;
+                        }
+                        break :blk null;
+                    };
+
+                    if (resolved_tid) |tid| {
+                        const typ = self.type_store.getType(tid);
+                        if (typ == .tagged_union) {
+                            return try self.create(Expr, .{
+                                .kind = .{
+                                    .field_get = .{
+                                        .object = try self.create(Expr, .{
+                                            .kind = .nil_lit, // placeholder for enum type ref
+                                            .type_id = tid,
+                                            .span = fa.object.getMeta().span,
+                                        }),
+                                        .field = fa.field,
+                                    },
+                                },
+                                .type_id = tid,
+                                .span = fa.meta.span,
+                            });
                         }
                     }
 
@@ -3926,11 +3937,28 @@ pub const HirBuilder = struct {
             .module_ref => |mr| {
                 // Check for enum variant reference:
                 //   Color.Red → parts ["Color", "Red"] (type is parts[0], variant is parts[1])
-                //   IO.Mode.Raw → parts ["IO", "Mode", "Raw"] (type is parts[-2], variant is parts[-1])
+                //   IO.Mode.Raw → parts ["IO", "Mode", "Raw"] (type is "IO.Mode", variant is "Raw")
                 if (mr.name.parts.len >= 2) {
-                    const type_name = mr.name.parts[mr.name.parts.len - 2];
                     const variant_name = mr.name.parts[mr.name.parts.len - 1];
-                    if (self.type_store.name_to_type.get(type_name)) |tid| {
+                    // Build the type name from all parts except the last (the variant)
+                    const type_tid: ?types_mod.TypeId = blk: {
+                        // Try just the penultimate part (e.g., "Color" from Color.Red)
+                        const simple_name = mr.name.parts[mr.name.parts.len - 2];
+                        if (self.type_store.name_to_type.get(simple_name)) |tid| break :blk tid;
+                        // Try the full dotted prefix (e.g., "IO.Mode" from IO.Mode.Raw)
+                        if (mr.name.parts.len >= 3) {
+                            var name_buf: std.ArrayList(u8) = .empty;
+                            for (mr.name.parts[0 .. mr.name.parts.len - 1], 0..) |part, i| {
+                                if (i > 0) name_buf.append(self.allocator, '.') catch {};
+                                name_buf.appendSlice(self.allocator, self.interner.get(part)) catch {};
+                            }
+                            const interner_mut = @constCast(self.interner);
+                            const full_name_id = interner_mut.intern(name_buf.items) catch break :blk null;
+                            if (self.type_store.name_to_type.get(full_name_id)) |tid| break :blk tid;
+                        }
+                        break :blk null;
+                    };
+                    if (type_tid) |tid| {
                         const typ = self.type_store.getType(tid);
                         if (typ == .tagged_union) {
                             return try self.create(Expr, .{
