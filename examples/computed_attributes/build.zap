@@ -1,4 +1,4 @@
-pub module ComputedAttributes.Builder {
+pub struct ComputedAttributes.Builder {
   pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
     case env.target {
       :computed_attributes ->

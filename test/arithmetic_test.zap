@@ -1,4 +1,4 @@
-pub module Test.ArithmeticTest {
+pub struct Test.ArithmeticTest {
   use Zest.Case
 
   describe("arithmetic") {

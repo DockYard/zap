@@ -6,7 +6,7 @@
 # Run with:
 #   APP_NAME=demo APP_PORT=8080 zap run env_config
 
-pub module EnvConfig {
+pub struct EnvConfig {
   pub fn main(_args :: [String]) -> String {
     IO.puts("App name: " <> System.get_env("APP_NAME"))
     IO.puts("Port: " <> System.get_env("APP_PORT"))

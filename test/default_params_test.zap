@@ -1,4 +1,4 @@
-pub module Test.DefaultParamsTest {
+pub struct Test.DefaultParamsTest {
   use Zest.Case
 
   describe("default params") {

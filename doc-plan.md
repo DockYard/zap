@@ -2,7 +2,7 @@
 
 ## Overview
 
-`zap doc` generates a static HTML documentation site and Markdown files from `@doc` and `@moduledoc` attributes in `.zap` source files. It reuses the existing parser and collector pipeline — no new parsing logic needed. The output is a self-contained `docs/` directory.
+`zap doc` generates a static HTML documentation site and Markdown files from `@fndoc` and `@structdoc` attributes in `.zap` source files. It reuses the existing parser and collector pipeline — no new parsing logic needed. The output is a self-contained `docs/` directory.
 
 ## Command
 
@@ -17,7 +17,7 @@ zap doc --format markdown  # Markdown only (no HTML)
 All doc config lives in `build.zap` as a `:doc` target:
 
 ```zap
-pub module Zap.Builder {
+pub struct Zap.Builder {
   pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
     case env.target {
       :doc ->
@@ -72,9 +72,9 @@ zap doc
   ├── 5. Collect modules/functions/attributes (reuse collector)
   │
   ├── 6. Extract documentation data from scope graph:
-  │      ├── ModuleEntry → @moduledoc, module name
-  │      ├── FunctionFamily → @doc, name, arity, params, types, visibility
-  │      ├── MacroFamily → @doc, name, arity, params
+  │      ├── ModuleEntry → @structdoc, module name
+  │      ├── FunctionFamily → @fndoc, name, arity, params, types, visibility
+  │      ├── MacroFamily → @fndoc, name, arity, params
   │      └── TypeEntry → struct/union definitions
   │
   ├── 7. Build DocModule tree (intermediate representation)
@@ -89,9 +89,9 @@ zap doc
 ### No New Parsing
 
 The existing pipeline (parser → collector → scope graph) already:
-- Parses `@doc` and `@moduledoc` as `AttributeDecl` AST nodes
-- Associates `@doc` with the next `FunctionFamily` or `MacroFamily`
-- Associates `@moduledoc` with the `ModuleEntry`
+- Parses `@fndoc` and `@structdoc` as `AttributeDecl` AST nodes
+- Associates `@fndoc` with the next `FunctionFamily` or `MacroFamily`
+- Associates `@structdoc` with the `ModuleEntry`
 - Stores attribute values (string heredocs) accessible via `Attribute.value`
 - Tracks function signatures with parameter names, types, and return types
 
@@ -141,7 +141,7 @@ DocPage
 
 DocModule
   name: String                        # e.g., "String", "Zest.Case"
-  moduledoc: String                   # rendered HTML from @moduledoc
+  moduledoc: String                   # rendered HTML from @structdoc
   source_file: String                 # e.g., "lib/string.zap"
   functions: []DocFunction
   macros: []DocFunction               # same shape as functions
@@ -151,11 +151,11 @@ DocFunction
   name: String                        # e.g., "length"
   arity: u32                          # e.g., 1
   signature: String                   # e.g., "length(string :: String) -> i64"
-  doc: String                         # rendered HTML from @doc
-  summary: String                     # first sentence of @doc (for summary table)
+  doc: String                         # rendered HTML from @fndoc
+  summary: String                     # first sentence of @fndoc (for summary table)
   source_line: u32                    # line number in source file
   visibility: enum { pub, private }
-  group: ?String                      # from @doc group: "..." attribute
+  group: ?String                      # from @fndoc group: "..." attribute
 
 DocType
   name: String
@@ -208,13 +208,13 @@ Three-panel layout (left sidebar, content, right TOC):
 
 1. **Module name** as h1
 2. **Source file** link (e.g., "lib/string.zap")
-3. **@moduledoc** rendered as HTML
-4. **Summary table** — compact list: `name/arity` | first sentence of `@doc`
+3. **@structdoc** rendered as HTML
+4. **Summary table** — compact list: `name/arity` | first sentence of `@fndoc`
    - Functions and macros in separate tables
 5. **Function details** — for each pub function:
    - `### name(param1, param2)` as anchor heading
    - Signature with types: `(string :: String) -> i64`
-   - Full `@doc` rendered as HTML
+   - Full `@fndoc` rendered as HTML
    - `[source]` link → `{source_url}/blob/v{version}/{source_file}#L{line}`
 6. **Macro details** — same format
 7. **Types** — struct/union definitions with field docs
@@ -263,7 +263,7 @@ Generated at build time as `search-index.json`:
 
 ### Auto-Linking
 
-In rendered `@doc` and `@moduledoc` Markdown, backtick references to known symbols are auto-linked:
+In rendered `@fndoc` and `@structdoc` Markdown, backtick references to known symbols are auto-linked:
 
 - `` `String.length/1` `` → `<a href="modules/String.html#length/1">String.length/1</a>`
 - `` `Enum` `` → `<a href="modules/Enum.html">Enum</a>`
@@ -318,7 +318,7 @@ One `.md` file per module in `docs/api/`:
 
 Functions for working with UTF-8 encoded strings.
 
-...full @moduledoc...
+...full @structdoc...
 
 ## Functions
 
@@ -330,7 +330,7 @@ pub fn length(string :: String) -> i64
 
 Returns the number of bytes in the given string.
 
-...full @doc...
+...full @fndoc...
 
 ---
 
@@ -350,7 +350,7 @@ Returns the number of bytes in the given string.
 ### Phase 2: Doc Extraction (medium)
 5. Create `src/doc_generator.zig`
 6. Implement scope graph walking: iterate modules, function families, macro families
-7. Extract @doc/@moduledoc string values from attributes
+7. Extract @fndoc/@structdoc string values from attributes
 8. Build `DocProject` / `DocModule` / `DocFunction` data model
 9. Extract function signatures from AST (param names, types, return type)
 

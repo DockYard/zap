@@ -1,22 +1,17 @@
-pub module IO {
-  pub union Mode {
-    Raw
-    Normal
-  }
+@doc = """
+  Functions for standard input/output operations.
 
-  @moduledoc = """
-    Functions for standard input/output operations.
+  `IO` provides the basic building blocks for printing to stdout.
+  All functions return their input, making them composable in
+  pipe chains.
 
-    `IO` provides the basic building blocks for printing to stdout.
-    All functions return their input, making them composable in
-    pipe chains.
+  ## Examples
 
-    ## Examples
+      IO.puts("Hello, world!")
+      "result" |> IO.puts()
+  """
 
-        IO.puts("Hello, world!")
-        "result" |> IO.puts()
-    """
-
+pub struct IO {
   @doc = """
     Prints a value to standard output followed by a newline.
 

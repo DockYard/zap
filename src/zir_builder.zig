@@ -44,6 +44,7 @@ extern "c" fn zir_builder_emit_bool_not(handle: ?*ZirBuilderHandle, operand: u32
 extern "c" fn zir_builder_emit_call(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32, args_ptr: [*]const u32, args_len: u32) u32;
 extern "c" fn zir_builder_emit_ret(handle: ?*ZirBuilderHandle, operand: u32) i32;
 extern "c" fn zir_builder_emit_ret_void(handle: ?*ZirBuilderHandle) i32;
+extern "c" fn zir_builder_emit_unreachable(handle: ?*ZirBuilderHandle) i32;
 
 // Import, field access, struct init, call-by-ref
 extern "c" fn zir_builder_emit_import(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32) u32;
@@ -3842,6 +3843,8 @@ pub const ZirDriver = struct {
 
                 const args = [_]u32{msg_ref};
                 _ = zir_builder_emit_call_ref(self.handle, panic_fn, &args, 1);
+                // panic is noreturn — emit unreachable so Zig knows control never continues
+                _ = zir_builder_emit_unreachable(self.handle);
             },
             .match_error_return => {
                 // No-match in __try variant: return null.

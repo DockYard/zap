@@ -1,4 +1,4 @@
-pub module Test.CondTest {
+pub struct Test.CondTest {
   use Zest.Case
 
   describe("cond") {

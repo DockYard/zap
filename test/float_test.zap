@@ -1,7 +1,7 @@
-pub module Test.FloatTest {
+pub struct Test.FloatTest {
   use Zest.Case
 
-  describe("Float module") {
+  describe("Float struct") {
     test("to_string positive") {
       assert(Float.to_string(3.14) == "3.14")
     }

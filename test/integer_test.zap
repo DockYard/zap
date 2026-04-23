@@ -1,7 +1,7 @@
-pub module Test.IntegerTest {
+pub struct Test.IntegerTest {
   use Zest.Case
 
-  describe("Integer module") {
+  describe("Integer struct") {
     test("to_string positive") {
       assert(Integer.to_string(42) == "42")
     }

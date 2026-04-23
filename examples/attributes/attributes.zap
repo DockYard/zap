@@ -7,9 +7,9 @@
 # Run with:
 #   zap run attributes
 
-pub module Attributes {
-  @moduledoc :: String = "Attribute examples"
+@doc :: String = "Attribute examples"
 
+pub struct Attributes {
   @doc :: String = "Entry point"
   pub fn main(_args :: [String]) -> String {
     IO.puts("App: " <> Config.app_name())

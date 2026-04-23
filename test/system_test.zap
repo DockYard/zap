@@ -1,7 +1,7 @@
-pub module Test.SystemTest {
+pub struct Test.SystemTest {
   use Zest.Case
 
-  describe("System module") {
+  describe("System struct") {
     test("cwd returns non-empty string") {
       assert(String.length(System.cwd()) > 0)
     }

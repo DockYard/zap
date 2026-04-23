@@ -2999,7 +2999,7 @@ pub const Interpreter = struct {
         };
 
         // Find module scope
-        const mod_scope_id = self.findModuleScopeByName(graph, mod_name_str) orelse {
+        const mod_scope_id = self.findStructScopeByName(graph, mod_name_str) orelse {
             try self.emitError(.undefined_function, "module not found for reflection");
             return error.CtfeFailure;
         };
@@ -3056,7 +3056,7 @@ pub const Interpreter = struct {
         };
 
         // Record dependency with interface hash
-        const mod_scope_id = self.findModuleScopeByName(graph, mod_name_str);
+        const mod_scope_id = self.findStructScopeByName(graph, mod_name_str);
         const iface_hash = if (mod_scope_id) |sid| computeModuleInterfaceHash(graph, sid, self.interner, mod_name_str) else 0;
         try self.dependencies.append(self.allocator, .{
             .reflected_module = .{ .module_name = mod_name_str, .interface_hash = iface_hash },
@@ -3064,8 +3064,8 @@ pub const Interpreter = struct {
 
         // Find module entry and collect its attributes
         var result_list: std.ArrayListUnmanaged(CtValue) = .empty;
-        for (graph.modules.items) |mod_entry| {
-            if (self.moduleNameMatches(mod_entry.name, mod_name_str)) {
+        for (graph.structs.items) |mod_entry| {
+            if (self.structNameMatches(mod_entry.name, mod_name_str)) {
                 for (mod_entry.attributes.items) |attr| {
                     const name_str = if (self.interner) |int| int.get(attr.name) else "?";
                     const tuple_elems = self.allocator.alloc(CtValue, 2) catch return error.OutOfMemory;
@@ -3112,7 +3112,7 @@ pub const Interpreter = struct {
         };
 
         // Record dependency with interface hash
-        const mod_scope_id = self.findModuleScopeByName(graph, mod_name_str) orelse {
+        const mod_scope_id = self.findStructScopeByName(graph, mod_name_str) orelse {
             try self.dependencies.append(self.allocator, .{
                 .reflected_module = .{ .module_name = mod_name_str, .interface_hash = 0 },
             });
@@ -3126,7 +3126,7 @@ pub const Interpreter = struct {
         var result_list: std.ArrayListUnmanaged(CtValue) = .empty;
         for (graph.types.items) |type_entry| {
             // Check if type belongs to this module by matching scope
-            if (self.moduleNameMatchesByScope(graph, type_entry.scope_id, mod_name_str)) {
+            if (self.structNameMatchesByScope(graph, type_entry.scope_id, mod_name_str)) {
                 const name_str = if (self.interner) |int| int.get(type_entry.name) else "?";
                 result_list.append(self.allocator, .{ .atom = name_str }) catch return error.OutOfMemory;
             }
@@ -3136,16 +3136,16 @@ pub const Interpreter = struct {
         return .{ .list = .{ .alloc_id = alloc_id, .elems = result_list.items } };
     }
 
-    fn findModuleScopeByName(self: *Interpreter, graph: *const scope.ScopeGraph, name_str: []const u8) ?scope.ScopeId {
-        for (graph.modules.items) |mod_entry| {
-            if (self.moduleNameMatches(mod_entry.name, name_str)) {
+    fn findStructScopeByName(self: *Interpreter, graph: *const scope.ScopeGraph, name_str: []const u8) ?scope.ScopeId {
+        for (graph.structs.items) |mod_entry| {
+            if (self.structNameMatches(mod_entry.name, name_str)) {
                 return mod_entry.scope_id;
             }
         }
         return null;
     }
 
-    fn moduleNameMatches(self: *Interpreter, name: ast.ModuleName, target: []const u8) bool {
+    fn structNameMatches(self: *Interpreter, name: ast.StructName, target: []const u8) bool {
         const int = self.interner orelse return false;
         // Build the full name from parts and compare
         if (name.parts.len == 1) {
@@ -3169,13 +3169,13 @@ pub const Interpreter = struct {
         return std.mem.eql(u8, buf[0..pos], target);
     }
 
-    fn moduleNameMatchesByScope(self: *Interpreter, graph: *const scope.ScopeGraph, type_scope_id: scope.ScopeId, mod_name_str: []const u8) bool {
+    fn structNameMatchesByScope(self: *Interpreter, graph: *const scope.ScopeGraph, type_scope_id: scope.ScopeId, mod_name_str: []const u8) bool {
         // Walk up from type's scope to find the module
         var sid = type_scope_id;
         while (true) {
-            for (graph.modules.items) |mod_entry| {
+            for (graph.structs.items) |mod_entry| {
                 if (mod_entry.scope_id == sid) {
-                    return self.moduleNameMatches(mod_entry.name, mod_name_str);
+                    return self.structNameMatches(mod_entry.name, mod_name_str);
                 }
             }
             const s = graph.getScope(sid);
@@ -3498,7 +3498,7 @@ fn computeModuleInterfaceHash(
 
     // Hash module attributes
     var attr_hash: u64 = 0;
-    for (graph.modules.items) |mod_entry| {
+    for (graph.structs.items) |mod_entry| {
         if (mod_entry.scope_id == mod_scope_id) {
             for (mod_entry.attributes.items) |attr| {
                 var ah = std.hash.Wyhash.init(0);
@@ -3802,7 +3802,7 @@ pub fn evaluateComputedAttributes(
     var failed: u32 = 0;
 
     // Walk module-level attributes
-    for (graph.modules.items) |*mod_entry| {
+    for (graph.structs.items) |*mod_entry| {
         for (mod_entry.attributes.items) |*attr| {
             if (attr.computed_value != null) continue; // already computed
             if (tryEvalAttribute(alloc, &interp, attr, mod_entry.name, interner)) {
@@ -3816,7 +3816,7 @@ pub fn evaluateComputedAttributes(
     // Walk function-level attributes
     for (graph.families.items) |*family| {
         // Find the enclosing module for name mangling
-        const mod_name = findModuleForScope(graph, family.scope_id);
+        const mod_name = findStructForScope(graph, family.scope_id);
         for (family.attributes.items) |*attr| {
             if (attr.computed_value != null) continue;
             if (tryEvalAttribute(alloc, &interp, attr, mod_name, interner)) {
@@ -3875,8 +3875,8 @@ pub fn evaluateModuleAttributesInOrder(
     // Process modules in dependency order
     for (module_order) |mod_name| {
         // Find the module entry matching this name
-        for (graph.modules.items) |*mod_entry| {
-            if (moduleNameMatchesStr(mod_entry.name, mod_name, interner)) {
+        for (graph.structs.items) |*mod_entry| {
+            if (structNameMatchesStr(mod_entry.name, mod_name, interner)) {
                 // Evaluate module-level attributes
                 for (mod_entry.attributes.items) |*attr| {
                     if (attr.computed_value != null) continue;
@@ -3906,7 +3906,7 @@ pub fn evaluateModuleAttributesInOrder(
     }
 
     // Also process any modules not in the order list (stdlib, etc.)
-    for (graph.modules.items) |*mod_entry| {
+    for (graph.structs.items) |*mod_entry| {
         for (mod_entry.attributes.items) |*attr| {
             if (attr.computed_value != null) continue;
             if (tryEvalAttribute(alloc, &interp, attr, mod_entry.name, interner)) {
@@ -3950,8 +3950,8 @@ pub fn evaluateComputedAttributesForModule(
     var evaluated: u32 = 0;
     var failed: u32 = 0;
 
-    for (graph.modules.items) |*mod_entry| {
-        if (!moduleNameMatchesStr(mod_entry.name, module_name, interner)) continue;
+    for (graph.structs.items) |*mod_entry| {
+        if (!structNameMatchesStr(mod_entry.name, module_name, interner)) continue;
 
         for (mod_entry.attributes.items) |*attr| {
             if (attr.computed_value != null) continue;
@@ -3984,7 +3984,7 @@ pub fn evaluateComputedAttributesForModule(
     };
 }
 
-fn moduleNameMatchesStr(name: ast.ModuleName, target: []const u8, interner: *const ast.StringInterner) bool {
+fn structNameMatchesStr(name: ast.StructName, target: []const u8, interner: *const ast.StringInterner) bool {
     if (name.parts.len == 1) {
         return std.mem.eql(u8, interner.get(name.parts[0]), target);
     }
@@ -4010,14 +4010,14 @@ fn tryEvalAttribute(
     alloc: std.mem.Allocator,
     interp: *Interpreter,
     attr: *scope.Attribute,
-    mod_name: ?ast.ModuleName,
+    mod_name: ?ast.StructName,
     interner: *const ast.StringInterner,
 ) !void {
     const value_expr = attr.value orelse return error.NotComputable;
 
     const prev_context = interp.current_attribute_context;
     defer interp.current_attribute_context = prev_context;
-    const module_name_str = if (mod_name) |mn| try moduleNameToString(alloc, mn, interner) else null;
+    const module_name_str = if (mod_name) |mn| try structNameToString(alloc, mn, interner) else null;
     defer if (module_name_str) |name| alloc.free(name);
     if (mod_name) |mn| {
         _ = mn;
@@ -4100,7 +4100,7 @@ fn evaluateConstExpr(
     alloc: std.mem.Allocator,
     interp: *Interpreter,
     expr: *const ast.Expr,
-    mod_name: ?ast.ModuleName,
+    mod_name: ?ast.StructName,
     interner: *const ast.StringInterner,
 ) AttrEvalInternalError!CtValue {
     if (astLiteralToCtValue(expr, interner)) |lit| return lit;
@@ -4136,7 +4136,7 @@ fn evaluateConstExpr(
         .struct_expr => |s| blk: {
             if (s.update_source != null) return error.NotComputable;
             const fields = alloc.alloc(CtValue.CtFieldValue, s.fields.len) catch return error.OutOfMemory;
-            const type_name = try moduleNameToString(alloc, s.module_name, interner);
+            const type_name = try structNameToString(alloc, s.module_name, interner);
             for (s.fields, 0..) |field, i| {
                 fields[i] = .{
                     .name = interner.get(field.name),
@@ -4149,7 +4149,7 @@ fn evaluateConstExpr(
         .attr_ref => |ar| blk: {
             const graph = interp.scope_graph orelse return error.NotComputable;
             const current_module = mod_name orelse return error.NotComputable;
-            for (graph.modules.items) |mod_entry| {
+            for (graph.structs.items) |mod_entry| {
                 if (!std.meta.eql(mod_entry.name, current_module)) continue;
                 for (mod_entry.attributes.items) |attr| {
                     if (attr.name != ar.name) continue;
@@ -4187,7 +4187,7 @@ fn evaluateConstBinaryOp(
     alloc: std.mem.Allocator,
     interp: *Interpreter,
     op: ast.BinaryOp,
-    mod_name: ?ast.ModuleName,
+    mod_name: ?ast.StructName,
     interner: *const ast.StringInterner,
 ) AttrEvalInternalError!CtValue {
     const lhs = try evaluateConstExpr(alloc, interp, op.lhs, mod_name, interner);
@@ -4303,7 +4303,7 @@ fn evaluateConstUnaryOp(
     alloc: std.mem.Allocator,
     interp: *Interpreter,
     op: ast.UnaryOp,
-    mod_name: ?ast.ModuleName,
+    mod_name: ?ast.StructName,
     interner: *const ast.StringInterner,
 ) AttrEvalInternalError!CtValue {
     const operand = try evaluateConstExpr(alloc, interp, op.operand, mod_name, interner);
@@ -4328,7 +4328,7 @@ const AttrEvalInternalError = error{
 fn resolveCalleeName(
     alloc: std.mem.Allocator,
     callee: *const ast.Expr,
-    mod_name: ?ast.ModuleName,
+    mod_name: ?ast.StructName,
     interner: *const ast.StringInterner,
 ) ?[]const u8 {
     switch (callee.*) {
@@ -4336,7 +4336,7 @@ fn resolveCalleeName(
         .var_ref => |vr| {
             const func_name = interner.get(vr.name);
             if (mod_name) |mn| {
-                const prefix = moduleNameToPrefix(alloc, mn, interner) catch return null;
+                const prefix = structNameToPrefix(alloc, mn, interner) catch return null;
                 return std.fmt.allocPrint(alloc, "{s}__{s}", .{ prefix, func_name }) catch null;
             }
             return func_name;
@@ -4347,7 +4347,7 @@ fn resolveCalleeName(
             const field_name = interner.get(fa.field);
             switch (fa.object.*) {
                 .module_ref => |mr| {
-                    const prefix = moduleNameToPrefix(alloc, mr.name, interner) catch return null;
+                    const prefix = structNameToPrefix(alloc, mr.name, interner) catch return null;
                     return std.fmt.allocPrint(alloc, "{s}__{s}", .{ prefix, field_name }) catch null;
                 },
                 .var_ref => |vr| {
@@ -4361,11 +4361,11 @@ fn resolveCalleeName(
     }
 }
 
-/// Convert an ast.ModuleName to a prefix string, matching IR builder convention.
+/// Convert an ast.StructName to a prefix string, matching IR builder convention.
 /// Single-part: "IO". Multi-part: "IO_File".
-fn moduleNameToPrefix(
+fn structNameToPrefix(
     alloc: std.mem.Allocator,
-    name: ast.ModuleName,
+    name: ast.StructName,
     interner: *const ast.StringInterner,
 ) ![]const u8 {
     if (name.parts.len == 1) {
@@ -4379,9 +4379,9 @@ fn moduleNameToPrefix(
     return buf.toOwnedSlice(alloc);
 }
 
-fn moduleNameToString(
+fn structNameToString(
     alloc: std.mem.Allocator,
-    name: ast.ModuleName,
+    name: ast.StructName,
     interner: *const ast.StringInterner,
 ) ![]const u8 {
     if (name.parts.len == 1) {
@@ -4396,26 +4396,26 @@ fn moduleNameToString(
 }
 
 /// Find the enclosing module name for a scope, walking up the scope tree.
-fn findModuleForScope(graph: *const scope.ScopeGraph, scope_id: scope.ScopeId) ?ast.ModuleName {
+fn findStructForScope(graph: *const scope.ScopeGraph, scope_id: scope.ScopeId) ?ast.StructName {
     // Check if this scope directly belongs to a module
-    for (graph.modules.items) |mod_entry| {
+    for (graph.structs.items) |mod_entry| {
         if (mod_entry.scope_id == scope_id) return mod_entry.name;
     }
     // Walk up parent scopes
     const s = graph.getScope(scope_id);
     if (s.parent) |parent_id| {
-        return findModuleForScope(graph, parent_id);
+        return findStructForScope(graph, parent_id);
     }
     return null;
 }
 
-fn findModuleScopeByNameForCache(
+fn findStructScopeByNameForCache(
     graph: *const scope.ScopeGraph,
     interner: *const ast.StringInterner,
     module_name: []const u8,
 ) ?scope.ScopeId {
-    for (graph.modules.items) |mod_entry| {
-        if (moduleNameMatchesStr(mod_entry.name, module_name, interner)) {
+    for (graph.structs.items) |mod_entry| {
+        if (structNameMatchesStr(mod_entry.name, module_name, interner)) {
             return mod_entry.scope_id;
         }
     }
@@ -4517,7 +4517,7 @@ pub const PersistentCache = struct {
                 .reflected_module => |rm| {
                     const current_graph = graph orelse return false;
                     const current_interner = interner orelse return false;
-                    const mod_scope_id = findModuleScopeByNameForCache(current_graph, current_interner, rm.module_name) orelse return false;
+                    const mod_scope_id = findStructScopeByNameForCache(current_graph, current_interner, rm.module_name) orelse return false;
                     const current_hash = computeModuleInterfaceHash(current_graph, mod_scope_id, current_interner, rm.module_name);
                     if (current_hash != rm.interface_hash) return false;
                 },
@@ -5958,8 +5958,8 @@ test "evaluateComputedAttributes: call expression" {
         .args = &.{},
     } };
 
-    // Create a stub module decl (needed for ModuleEntry)
-    const mod_decl = try alloc.create(ast.ModuleDecl);
+    // Create a stub module decl (needed for StructEntry)
+    const mod_decl = try alloc.create(ast.StructDecl);
     mod_decl.* = .{
         .meta = .{ .span = .{ .start = 0, .end = 0 } },
         .name = .{ .parts = &.{foo_id}, .span = .{ .start = 0, .end = 0 } },
@@ -5967,14 +5967,14 @@ test "evaluateComputedAttributes: call expression" {
     };
 
     // Register the module with the attribute
-    try graph.modules.append(alloc, .{
+    try graph.structs.append(alloc, .{
         .name = .{ .parts = &.{foo_id}, .span = .{ .start = 0, .end = 0 } },
         .scope_id = mod_scope,
         .decl = mod_decl,
     });
 
     // Add the @config attribute with call expression value
-    graph.modules.items[0].attributes.append(alloc, .{
+    graph.structs.items[0].attributes.append(alloc, .{
         .name = config_id,
         .value = call_expr,
     }) catch {};
@@ -5985,7 +5985,7 @@ test "evaluateComputedAttributes: call expression" {
     try testing.expectEqual(@as(u32, 0), result.failed);
 
     // Verify the computed value was stored
-    const attr = &graph.modules.items[0].attributes.items[0];
+    const attr = &graph.structs.items[0].attributes.items[0];
     try testing.expect(attr.computed_value != null);
     try testing.expectEqual(@as(i64, 42), attr.computed_value.?.int);
 }
@@ -6038,19 +6038,19 @@ test "evaluateComputedAttributes: failing attribute records attribute context" {
         .args = &.{},
     } };
 
-    const mod_decl = try alloc.create(ast.ModuleDecl);
+    const mod_decl = try alloc.create(ast.StructDecl);
     mod_decl.* = .{
         .meta = .{ .span = .{ .start = 0, .end = 0 } },
         .name = .{ .parts = &.{foo_id}, .span = .{ .start = 0, .end = 0 } },
         .items = &.{},
     };
 
-    try graph.modules.append(alloc, .{
+    try graph.structs.append(alloc, .{
         .name = .{ .parts = &.{foo_id}, .span = .{ .start = 0, .end = 0 } },
         .scope_id = mod_scope,
         .decl = mod_decl,
     });
-    graph.modules.items[0].attributes.append(alloc, .{
+    graph.structs.items[0].attributes.append(alloc, .{
         .name = config_id,
         .value = call_expr,
     }) catch {};
@@ -6091,19 +6091,19 @@ test "evaluateComputedAttributes: binary expression value" {
         .rhs = rhs,
     } };
 
-    const mod_decl = try alloc.create(ast.ModuleDecl);
+    const mod_decl = try alloc.create(ast.StructDecl);
     mod_decl.* = .{
         .meta = .{ .span = .{ .start = 0, .end = 0 } },
         .name = .{ .parts = &.{foo_id}, .span = .{ .start = 0, .end = 0 } },
         .items = &.{},
     };
 
-    try graph.modules.append(alloc, .{
+    try graph.structs.append(alloc, .{
         .name = .{ .parts = &.{foo_id}, .span = .{ .start = 0, .end = 0 } },
         .scope_id = mod_scope,
         .decl = mod_decl,
     });
-    graph.modules.items[0].attributes.append(alloc, .{
+    graph.structs.items[0].attributes.append(alloc, .{
         .name = config_id,
         .value = expr,
     }) catch {};
@@ -6111,7 +6111,7 @@ test "evaluateComputedAttributes: binary expression value" {
     const result = try evaluateComputedAttributes(alloc, &program, &graph, &interner, null, 0);
     try testing.expectEqual(@as(u32, 1), result.evaluated);
     try testing.expectEqual(@as(u32, 0), result.failed);
-    try testing.expectEqual(@as(i64, 42), graph.modules.items[0].attributes.items[0].computed_value.?.int);
+    try testing.expectEqual(@as(i64, 42), graph.structs.items[0].attributes.items[0].computed_value.?.int);
 }
 
 test "evaluateComputedAttributes: call expression with computed args" {
@@ -6172,19 +6172,19 @@ test "evaluateComputedAttributes: call expression with computed args" {
         .args = &.{arg_expr},
     } };
 
-    const mod_decl = try alloc.create(ast.ModuleDecl);
+    const mod_decl = try alloc.create(ast.StructDecl);
     mod_decl.* = .{
         .meta = .{ .span = .{ .start = 0, .end = 0 } },
         .name = .{ .parts = &.{foo_id}, .span = .{ .start = 0, .end = 0 } },
         .items = &.{},
     };
 
-    try graph.modules.append(alloc, .{
+    try graph.structs.append(alloc, .{
         .name = .{ .parts = &.{foo_id}, .span = .{ .start = 0, .end = 0 } },
         .scope_id = mod_scope,
         .decl = mod_decl,
     });
-    graph.modules.items[0].attributes.append(alloc, .{
+    graph.structs.items[0].attributes.append(alloc, .{
         .name = config_id,
         .value = call_expr,
     }) catch {};
@@ -6192,7 +6192,7 @@ test "evaluateComputedAttributes: call expression with computed args" {
     const result = try evaluateComputedAttributes(alloc, &program, &graph, &interner, null, 0);
     try testing.expectEqual(@as(u32, 1), result.evaluated);
     try testing.expectEqual(@as(u32, 0), result.failed);
-    try testing.expectEqual(@as(i64, 42), graph.modules.items[0].attributes.items[0].computed_value.?.int);
+    try testing.expectEqual(@as(i64, 42), graph.structs.items[0].attributes.items[0].computed_value.?.int);
 }
 
 test "evaluateComputedAttributes: attr_ref can use earlier computed attribute" {
@@ -6229,25 +6229,25 @@ test "evaluateComputedAttributes: attr_ref can use earlier computed attribute" {
         .rhs = rhs,
     } };
 
-    const mod_decl = try alloc.create(ast.ModuleDecl);
+    const mod_decl = try alloc.create(ast.StructDecl);
     mod_decl.* = .{
         .meta = .{ .span = .{ .start = 0, .end = 0 } },
         .name = .{ .parts = &.{foo_id}, .span = .{ .start = 0, .end = 0 } },
         .items = &.{},
     };
 
-    try graph.modules.append(alloc, .{
+    try graph.structs.append(alloc, .{
         .name = .{ .parts = &.{foo_id}, .span = .{ .start = 0, .end = 0 } },
         .scope_id = mod_scope,
         .decl = mod_decl,
     });
-    graph.modules.items[0].attributes.append(alloc, .{ .name = base_id, .value = base_expr }) catch {};
-    graph.modules.items[0].attributes.append(alloc, .{ .name = config_id, .value = config_expr }) catch {};
+    graph.structs.items[0].attributes.append(alloc, .{ .name = base_id, .value = base_expr }) catch {};
+    graph.structs.items[0].attributes.append(alloc, .{ .name = config_id, .value = config_expr }) catch {};
 
     const result = try evaluateComputedAttributes(alloc, &program, &graph, &interner, null, 0);
     try testing.expectEqual(@as(u32, 2), result.evaluated);
     try testing.expectEqual(@as(u32, 0), result.failed);
-    try testing.expectEqual(@as(i64, 42), graph.modules.items[0].attributes.items[1].computed_value.?.int);
+    try testing.expectEqual(@as(i64, 42), graph.structs.items[0].attributes.items[1].computed_value.?.int);
 }
 
 test "tryEvalAttribute: literal int value" {
@@ -6269,19 +6269,19 @@ test "tryEvalAttribute: literal int value" {
     const lit_expr = try alloc.create(ast.Expr);
     lit_expr.* = .{ .int_literal = .{ .meta = .{ .span = .{ .start = 0, .end = 0 } }, .value = 8080 } };
 
-    const mod_decl = try alloc.create(ast.ModuleDecl);
+    const mod_decl = try alloc.create(ast.StructDecl);
     mod_decl.* = .{
         .meta = .{ .span = .{ .start = 0, .end = 0 } },
         .name = .{ .parts = &.{foo_id}, .span = .{ .start = 0, .end = 0 } },
         .items = &.{},
     };
 
-    try graph.modules.append(alloc, .{
+    try graph.structs.append(alloc, .{
         .name = .{ .parts = &.{foo_id}, .span = .{ .start = 0, .end = 0 } },
         .scope_id = mod_scope,
         .decl = mod_decl,
     });
-    graph.modules.items[0].attributes.append(alloc, .{
+    graph.structs.items[0].attributes.append(alloc, .{
         .name = port_id,
         .value = lit_expr,
     }) catch {};
@@ -6289,7 +6289,7 @@ test "tryEvalAttribute: literal int value" {
     const result = try evaluateComputedAttributes(alloc, &program, &graph, &interner, null, 0);
     try testing.expectEqual(@as(u32, 1), result.evaluated);
 
-    const attr = &graph.modules.items[0].attributes.items[0];
+    const attr = &graph.structs.items[0].attributes.items[0];
     try testing.expect(attr.computed_value != null);
     try testing.expectEqual(@as(i64, 8080), attr.computed_value.?.int);
 }
@@ -6313,19 +6313,19 @@ test "tryEvalAttribute: literal string value" {
     const lit_expr = try alloc.create(ast.Expr);
     lit_expr.* = .{ .string_literal = .{ .meta = .{ .span = .{ .start = 0, .end = 0 } }, .value = val_id } };
 
-    const mod_decl = try alloc.create(ast.ModuleDecl);
+    const mod_decl = try alloc.create(ast.StructDecl);
     mod_decl.* = .{
         .meta = .{ .span = .{ .start = 0, .end = 0 } },
         .name = .{ .parts = &.{foo_id}, .span = .{ .start = 0, .end = 0 } },
         .items = &.{},
     };
 
-    try graph.modules.append(alloc, .{
+    try graph.structs.append(alloc, .{
         .name = .{ .parts = &.{foo_id}, .span = .{ .start = 0, .end = 0 } },
         .scope_id = mod_scope,
         .decl = mod_decl,
     });
-    graph.modules.items[0].attributes.append(alloc, .{
+    graph.structs.items[0].attributes.append(alloc, .{
         .name = name_id,
         .value = lit_expr,
     }) catch {};
@@ -6333,7 +6333,7 @@ test "tryEvalAttribute: literal string value" {
     const result = try evaluateComputedAttributes(alloc, &program, &graph, &interner, null, 0);
     try testing.expectEqual(@as(u32, 1), result.evaluated);
 
-    const attr = &graph.modules.items[0].attributes.items[0];
+    const attr = &graph.structs.items[0].attributes.items[0];
     try testing.expect(attr.computed_value != null);
     try testing.expectEqualStrings("myapp", attr.computed_value.?.string);
 }
@@ -7196,13 +7196,13 @@ test "validateDependencies: reflected_module validates against matching graph" {
     var interner = ast.StringInterner.init(alloc);
     const test_id = try interner.intern("Test");
 
-    const mod_decl = try alloc.create(ast.ModuleDecl);
+    const mod_decl = try alloc.create(ast.StructDecl);
     mod_decl.* = .{
         .meta = .{ .span = .{ .start = 0, .end = 0 } },
         .name = .{ .parts = &.{test_id}, .span = .{ .start = 0, .end = 0 } },
         .items = &.{},
     };
-    try graph.modules.append(alloc, .{
+    try graph.structs.append(alloc, .{
         .name = .{ .parts = &.{test_id}, .span = .{ .start = 0, .end = 0 } },
         .scope_id = mod_scope,
         .decl = mod_decl,
@@ -7226,18 +7226,18 @@ test "validateDependencies: reflected_module invalidates on interface change" {
     const test_id = try interner.intern("Test");
     const config_id = try interner.intern("config");
 
-    const mod_decl = try alloc.create(ast.ModuleDecl);
+    const mod_decl = try alloc.create(ast.StructDecl);
     mod_decl.* = .{
         .meta = .{ .span = .{ .start = 0, .end = 0 } },
         .name = .{ .parts = &.{test_id}, .span = .{ .start = 0, .end = 0 } },
         .items = &.{},
     };
-    try graph.modules.append(alloc, .{
+    try graph.structs.append(alloc, .{
         .name = .{ .parts = &.{test_id}, .span = .{ .start = 0, .end = 0 } },
         .scope_id = mod_scope,
         .decl = mod_decl,
     });
-    graph.modules.items[0].attributes.append(alloc, .{
+    graph.structs.items[0].attributes.append(alloc, .{
         .name = config_id,
         .computed_value = .{ .int = 1 },
     }) catch {};
@@ -7247,7 +7247,7 @@ test "validateDependencies: reflected_module invalidates on interface change" {
         .{ .reflected_module = .{ .module_name = "Test", .interface_hash = iface_hash } },
     };
 
-    graph.modules.items[0].attributes.items[0].computed_value = .{ .int = 2 };
+    graph.structs.items[0].attributes.items[0].computed_value = .{ .int = 2 };
     try testing.expect(!PersistentCache.validateDependencies(alloc, &deps, &graph, &interner));
 }
 

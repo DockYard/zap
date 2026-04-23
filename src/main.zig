@@ -519,7 +519,7 @@ fn cmdInit(allocator: std.mem.Allocator) !void {
 
     // build.zap
     const build_zap = try std.fmt.allocPrint(allocator,
-        \\pub module {s}.Builder {{
+        \\pub struct {s}.Builder {{
         \\  pub fn manifest(env :: Zap.Env) -> Zap.Manifest {{
         \\    case env.target {{
         \\      :{s} -> {s}(env)
@@ -560,7 +560,7 @@ fn cmdInit(allocator: std.mem.Allocator) !void {
     const lib_path = try std.fmt.allocPrint(allocator, "lib/{s}.zap", .{project_name});
     defer allocator.free(lib_path);
     const lib_source = try std.fmt.allocPrint(allocator,
-        \\pub module {s} {{
+        \\pub struct {s} {{
         \\  pub fn main(_args :: [String]) {{
         \\    IO.puts("Howdy!")
         \\  }}
@@ -574,7 +574,7 @@ fn cmdInit(allocator: std.mem.Allocator) !void {
     const test_path = try std.fmt.allocPrint(allocator, "test/{s}_test.zap", .{project_name});
     defer allocator.free(test_path);
     const test_source = try std.fmt.allocPrint(allocator,
-        \\pub module {s}Test {{
+        \\pub struct {s}Test {{
         \\  pub fn main(_args :: [String]) {{
         \\    IO.puts("Test Suite TBD")
         \\  }}
@@ -915,7 +915,7 @@ fn buildTarget(
         ) catch |err| switch (err) {
             error.ModuleNotFound => {
                 if (discovery_err_info.unresolved_module) |mod| {
-                    const expected = zap.discovery.moduleNameToRelPath(alloc, mod) catch "?";
+                    const expected = zap.discovery.structNameToRelPath(alloc, mod) catch "?";
                     std.debug.print("Error: Module `{s}` not found — expected {s} in one of the source roots\n", .{ mod, expected });
                 } else if (discovery_err_info.boundary_module) |mod| {
                     std.debug.print("Error: Module `{s}` is private (module without pub) in {s} — cannot be accessed from {s}\n", .{
@@ -1114,7 +1114,7 @@ fn buildTarget(
         };
 
         // For files under `test/`, prepend "test/" to the relative path so
-        // validation expects `Test.ModuleName` to match `test/module_name.zap`.
+        // validation expects `Test.StructName` to match `test/module_name.zap`.
         const validation_path = if (source_root_dir_name) |dir_name| blk: {
             if (!std.mem.eql(u8, dir_name, "lib")) {
                 break :blk try std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir_name, lib_rel });
@@ -1122,7 +1122,7 @@ fn buildTarget(
             break :blk lib_rel;
         } else lib_rel;
 
-        if (compiler.validateOneModulePerFile(alloc, mapped.bytes(), validation_path)) |err_msg| {
+        if (compiler.validateOneStructPerFile(alloc, mapped.bytes(), validation_path)) |err_msg| {
             std.debug.print("Error: {s}\n", .{err_msg});
             validation_failed = true;
         }
@@ -1948,9 +1948,9 @@ fn parseTargetArgs(allocator: std.mem.Allocator, args: []const []const u8) !Pars
 const testing = std.testing;
 
 test "computeBuildCacheKey includes manifest result hash" {
-    const build_source = "pub module App.Builder {}";
+    const build_source = "pub struct App.Builder {}";
     const units = [_]compiler.SourceUnit{
-        .{ .file_path = "lib/app.zap", .source = "pub module App {}" },
+        .{ .file_path = "lib/app.zap", .source = "pub struct App {}" },
     };
     const target_name = "default";
 

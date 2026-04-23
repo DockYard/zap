@@ -1,17 +1,17 @@
-pub module File {
-  @moduledoc = """
-    Functions for reading and writing files.
+@doc = """
+  Functions for reading and writing files.
 
-    All paths are relative to the current working directory.
-    File operations return empty strings or false on failure.
+  All paths are relative to the current working directory.
+  File operations return empty strings or false on failure.
 
-    ## Examples
+  ## Examples
 
-        content = File.read("config.txt")
-        File.write("output.txt", "Hello, world!")
-        File.exists?("config.txt")  # => true
-    """
+      content = File.read("config.txt")
+      File.write("output.txt", "Hello, world!")
+      File.exists?("config.txt")  # => true
+  """
 
+pub struct File {
   @doc = """
     Reads the entire contents of a file as a string.
     Returns an empty string if the file cannot be read.

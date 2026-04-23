@@ -68,7 +68,7 @@ pub const Scope = struct {
 // ============================================================
 
 pub const ImportedScope = struct {
-    source_module: ast.ModuleName,
+    source_module: ast.StructName,
     filter: ImportFilter,
     imported_families: std.AutoHashMap(FamilyKey, FunctionFamilyId),
     imported_types: std.AutoHashMap(ast.StringId, TypeId),
@@ -205,11 +205,11 @@ pub const Attribute = struct {
     computed_value: ?ctfe.ConstValue = null,
 };
 
-pub const ModuleEntry = struct {
-    name: ast.ModuleName,
+pub const StructEntry = struct {
+    name: ast.StructName,
     scope_id: ScopeId,
-    decl: *const ast.ModuleDecl,
-    /// Module-level attributes (@moduledoc, @author, etc.)
+    decl: *const ast.StructDecl,
+    /// Struct-level attributes (@doc, @author, etc.)
     attributes: std.ArrayListUnmanaged(Attribute) = .empty,
 };
 
@@ -218,14 +218,15 @@ pub const ModuleEntry = struct {
 // ============================================================
 
 pub const ProtocolEntry = struct {
-    name: ast.ModuleName,
+    name: ast.StructName,
     scope_id: ScopeId,
     decl: *const ast.ProtocolDecl,
+    attributes: std.ArrayListUnmanaged(Attribute) = .empty,
 };
 
 pub const ImplEntry = struct {
-    protocol_name: ast.ModuleName,
-    target_type: ast.ModuleName,
+    protocol_name: ast.StructName,
+    target_type: ast.StructName,
     scope_id: ScopeId,
     decl: *const ast.ImplDecl,
     is_private: bool,
@@ -242,7 +243,7 @@ pub const ScopeGraph = struct {
     families: std.ArrayList(FunctionFamily),
     macro_families: std.ArrayList(MacroFamily),
     types: std.ArrayList(TypeEntry),
-    modules: std.ArrayList(ModuleEntry),
+    structs: std.ArrayList(StructEntry),
     protocols: std.ArrayList(ProtocolEntry),
     impls: std.ArrayList(ImplEntry),
     prelude_scope: ScopeId,
@@ -270,7 +271,7 @@ pub const ScopeGraph = struct {
             .families = .empty,
             .macro_families = .empty,
             .types = .empty,
-            .modules = .empty,
+            .structs = .empty,
             .protocols = .empty,
             .impls = .empty,
             .prelude_scope = 0,
@@ -298,7 +299,7 @@ pub const ScopeGraph = struct {
         }
         self.macro_families.deinit(self.allocator);
         self.types.deinit(self.allocator);
-        self.modules.deinit(self.allocator);
+        self.structs.deinit(self.allocator);
         self.protocols.deinit(self.allocator);
         self.impls.deinit(self.allocator);
         self.node_scope_map.deinit();
@@ -380,8 +381,8 @@ pub const ScopeGraph = struct {
         return self.type_name_to_id.get(name);
     }
 
-    pub fn registerModule(self: *ScopeGraph, name: ast.ModuleName, scope_id: ScopeId, decl: *const ast.ModuleDecl) !void {
-        try self.modules.append(self.allocator, .{
+    pub fn registerStruct(self: *ScopeGraph, name: ast.StructName, scope_id: ScopeId, decl: *const ast.StructDecl) !void {
+        try self.structs.append(self.allocator, .{
             .name = name,
             .scope_id = scope_id,
             .decl = decl,
@@ -418,7 +419,7 @@ pub const ScopeGraph = struct {
                     return fid;
                 }
                 // Also search the source module's scope directly
-                if (self.findModuleScope(imp.source_module)) |mod_scope_id| {
+                if (self.findStructScope(imp.source_module)) |mod_scope_id| {
                     const mod_scope = self.getScope(mod_scope_id);
                     if (mod_scope.function_families.get(key)) |fid| {
                         // Check import filter
@@ -442,7 +443,7 @@ pub const ScopeGraph = struct {
                 return mid;
             }
             for (s.imports.items) |imp| {
-                if (self.findModuleScope(imp.source_module)) |mod_scope_id| {
+                if (self.findStructScope(imp.source_module)) |mod_scope_id| {
                     const mod_scope = self.getScope(mod_scope_id);
                     if (mod_scope.macros.get(key)) |mid| {
                         if (self.passesImportFilter(imp.filter, key)) return mid;
@@ -455,8 +456,8 @@ pub const ScopeGraph = struct {
     }
 
     /// Find a module's scope by its name.
-    pub fn findModuleScope(self: *const ScopeGraph, module_name: ast.ModuleName) ?ScopeId {
-        for (self.modules.items) |mod_entry| {
+    pub fn findStructScope(self: *const ScopeGraph, module_name: ast.StructName) ?ScopeId {
+        for (self.structs.items) |mod_entry| {
             // Use stored name (not decl.name) for consistency after remapping
             if (mod_entry.name.parts.len == module_name.parts.len) {
                 var match = true;
@@ -472,35 +473,35 @@ pub const ScopeGraph = struct {
         return null;
     }
 
-    /// Find a protocol by name (matching all parts of ModuleName).
-    pub fn findProtocol(self: *const ScopeGraph, name: ast.ModuleName) ?*const ProtocolEntry {
+    /// Find a protocol by name (matching all parts of StructName).
+    pub fn findProtocol(self: *const ScopeGraph, name: ast.StructName) ?*const ProtocolEntry {
         for (self.protocols.items) |*entry| {
-            if (moduleNamesMatch(entry.name, name)) return entry;
+            if (structNamesMatch(entry.name, name)) return entry;
         }
         return null;
     }
 
     /// Find the impl of a given protocol for a given target type.
-    pub fn findImpl(self: *const ScopeGraph, protocol_name: ast.ModuleName, target_type: ast.ModuleName) ?*const ImplEntry {
+    pub fn findImpl(self: *const ScopeGraph, protocol_name: ast.StructName, target_type: ast.StructName) ?*const ImplEntry {
         for (self.impls.items) |*entry| {
-            if (moduleNamesMatch(entry.protocol_name, protocol_name) and
-                moduleNamesMatch(entry.target_type, target_type)) return entry;
+            if (structNamesMatch(entry.protocol_name, protocol_name) and
+                structNamesMatch(entry.target_type, target_type)) return entry;
         }
         return null;
     }
 
     /// Find ALL impls for a given protocol. Returns matching entries from the impls list.
-    pub fn findImplsForProtocol(self: *const ScopeGraph, protocol_name: ast.ModuleName, allocator: std.mem.Allocator) ![]const *const ImplEntry {
+    pub fn findImplsForProtocol(self: *const ScopeGraph, protocol_name: ast.StructName, allocator: std.mem.Allocator) ![]const *const ImplEntry {
         var results: std.ArrayListUnmanaged(*const ImplEntry) = .empty;
         for (self.impls.items) |*entry| {
-            if (moduleNamesMatch(entry.protocol_name, protocol_name)) {
+            if (structNamesMatch(entry.protocol_name, protocol_name)) {
                 try results.append(allocator, entry);
             }
         }
         return try results.toOwnedSlice(allocator);
     }
 
-    fn moduleNamesMatch(a: ast.ModuleName, b: ast.ModuleName) bool {
+    fn structNamesMatch(a: ast.StructName, b: ast.StructName) bool {
         if (a.parts.len != b.parts.len) return false;
         for (a.parts, b.parts) |ap, bp| {
             if (ap != bp) return false;

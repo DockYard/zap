@@ -1,42 +1,42 @@
-pub module Integer {
-  @moduledoc = """
-    Functions for working with integers.
+@doc = """
+  Functions for working with integers.
 
-    ## Integer Types
+  ## Integer Types
 
-    Zap supports the following integer types:
+  Zap supports the following integer types:
 
-    | Signed  | Unsigned | Bits |
-    |---------|----------|------|
-    | `i8`    | `u8`     | 8    |
-    | `i16`   | `u16`    | 16   |
-    | `i32`   | `u32`    | 32   |
-    | `i64`   | `u64`    | 64   |
+  | Signed  | Unsigned | Bits |
+  |---------|----------|------|
+  | `i8`    | `u8`     | 8    |
+  | `i16`   | `u16`    | 16   |
+  | `i32`   | `u32`    | 32   |
+  | `i64`   | `u64`    | 64   |
 
-    The default integer type for literals is `i64`.
+  The default integer type for literals is `i64`.
 
-    ## Implicit Widening
+  ## Implicit Widening
 
-    Zap automatically widens narrower integer types to wider ones at
-    function call sites when no data is lost. This means you can pass
-    an `i8` value to a function that expects `i64` without an explicit
-    cast — the compiler inserts a zero-cost widening instruction.
+  Zap automatically widens narrower integer types to wider ones at
+  function call sites when no data is lost. This means you can pass
+  an `i8` value to a function that expects `i64` without an explicit
+  cast — the compiler inserts a zero-cost widening instruction.
 
-    **Signed widening:** `i8` \u{2192} `i16` \u{2192} `i32` \u{2192} `i64`
+  **Signed widening:** `i8` \u{2192} `i16` \u{2192} `i32` \u{2192} `i64`
 
-    **Unsigned widening:** `u8` \u{2192} `u16` \u{2192} `u32` \u{2192} `u64`
+  **Unsigned widening:** `u8` \u{2192} `u16` \u{2192} `u32` \u{2192} `u64`
 
-    **Unsigned to signed:** `u8` \u{2192} `i16`, `u16` \u{2192} `i32`, `u32` \u{2192} `i64`
-    (the signed type must have strictly more bits to represent the full
-    unsigned range)
+  **Unsigned to signed:** `u8` \u{2192} `i16`, `u16` \u{2192} `i32`, `u32` \u{2192} `i64`
+  (the signed type must have strictly more bits to represent the full
+  unsigned range)
 
-    The following conversions are **not** implicit:
+  The following conversions are **not** implicit:
 
-    - Signed to unsigned (negative values would be lost)
-    - Wider to narrower (data truncation)
-    - Integer to float (precision loss for large values)
-    """
+  - Signed to unsigned (negative values would be lost)
+  - Wider to narrower (data truncation)
+  - Integer to float (precision loss for large values)
+  """
 
+pub struct Integer {
   @doc = """
     Converts an integer to its string representation.
 

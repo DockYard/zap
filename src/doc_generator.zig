@@ -69,8 +69,8 @@ pub fn generate(
     var modules: std.ArrayListUnmanaged(DocModule) = .empty;
     var seen_modules = std.StringHashMap(void).init(alloc);
 
-    for (graph.modules.items) |mod_entry| {
-        const mod_name = resolveModuleName(alloc, mod_entry.name, interner) catch continue;
+    for (graph.structs.items) |mod_entry| {
+        const mod_name = resolveStructName(alloc, mod_entry.name, interner) catch continue;
 
         // Skip duplicate modules (same module discovered from multiple source roots)
         if (seen_modules.contains(mod_name)) continue;
@@ -85,8 +85,8 @@ pub fn generate(
         // Find the source file for this module
         const source_file = findModuleSourceFile(mod_name, options.source_units) orelse "";
 
-        // Extract @moduledoc
-        const moduledoc = extractDocAttribute(alloc, mod_entry.attributes, "moduledoc", interner) orelse "";
+        // Extract @doc for the struct
+        const moduledoc = extractDocAttribute(alloc, mod_entry.attributes, "doc", interner) orelse "";
 
         // Collect public functions and macros
         var functions: std.ArrayListUnmanaged(DocFunction) = .empty;
@@ -228,7 +228,7 @@ const DocFunction = struct {
 // Extraction helpers
 // ============================================================
 
-fn resolveModuleName(alloc: std.mem.Allocator, name: ast.ModuleName, interner: *const ast.StringInterner) ![]const u8 {
+fn resolveStructName(alloc: std.mem.Allocator, name: ast.StructName, interner: *const ast.StringInterner) ![]const u8 {
     if (name.parts.len == 0) return "";
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     for (name.parts, 0..) |part, i| {
@@ -474,7 +474,7 @@ fn computeLineNumber(meta: ast.NodeMeta, source_units: []const compiler.SourceUn
 
 fn findModuleSourceFile(mod_name: []const u8, source_units: []const compiler.SourceUnit) ?[]const u8 {
     for (source_units) |unit| {
-        if (std.mem.indexOf(u8, unit.source, "pub module ")) |idx| {
+        if (std.mem.indexOf(u8, unit.source, "pub struct ")) |idx| {
             const rest = unit.source[idx + 11 ..];
             if (std.mem.startsWith(u8, rest, mod_name)) {
                 if (rest.len > mod_name.len) {
@@ -567,13 +567,13 @@ fn generateModulePage(alloc: std.mem.Allocator, mod: DocModule, project: DocProj
     appendSidebar(&h, project, mod.name, options, "../");
     h.str("<main class=\"content\">\n");
 
-    // Module header — title row with name left, pub module pill + source right
+    // Module header — title row with name left, pub struct pill + source right
     h.str("<div class=\"title-row\">\n");
     h.str("<h1>");
     appendHtmlEscaped(&h, mod.name);
     h.str("</h1>\n");
     h.str("<div class=\"title-meta\">\n");
-    h.str("<span class=\"pub-module-pill\">pub module</span>\n");
+    h.str("<span class=\"pub-module-pill\">pub struct</span>\n");
     if (mod.source_file.len > 0) {
         if (options.source_url) |base_url| {
             h.str("<a href=\"");

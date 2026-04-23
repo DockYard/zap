@@ -1,4 +1,4 @@
-pub module Test.TestRunner {
+pub struct Test.TestRunner {
   use Zest.Runner
 
   pub fn main(_args :: [String]) -> String {
@@ -14,7 +14,7 @@ pub module Test.TestRunner {
     Test.MacroTest.run()
     Test.RecursionTest.run()
     Test.GuardTest.run()
-    Test.MultiModuleTest.run()
+    Test.MultiStructTest.run()
     Test.ImportTest.run()
     Test.UnionTest.run()
     Test.CondTest.run()

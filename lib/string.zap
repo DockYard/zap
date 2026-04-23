@@ -1,18 +1,18 @@
-pub module String {
-  @moduledoc = """
-    Functions for working with UTF-8 encoded strings.
+@doc = """
+  Functions for working with UTF-8 encoded strings.
 
-    Strings in Zap are immutable byte sequences (`[]const u8` in the
-    underlying Zig representation). All operations return new strings
-    rather than modifying in place.
+  Strings in Zap are immutable byte sequences (`[]const u8` in the
+  underlying Zig representation). All operations return new strings
+  rather than modifying in place.
 
-    ## Examples
+  ## Examples
 
-        String.length("hello")              # => 5
-        String.contains?("hello world", "o") # => true
-        String.slice("hello", 0, 3)         # => "hel"
-    """
+      String.length("hello")              # => 5
+      String.contains?("hello world", "o") # => true
+      String.slice("hello", 0, 3)         # => "hel"
+  """
 
+pub struct String {
   @doc = """
     Returns the byte length of a string.
 

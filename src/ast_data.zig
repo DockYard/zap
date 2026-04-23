@@ -1255,7 +1255,7 @@ pub fn ctValueToExpr(
             if (clause_ct.tuple.elems[0] == .atom and std.mem.eql(u8, clause_ct.tuple.elems[0].atom, "->")) {
                 // Use the original value tuple directly for conversion
                 const interner_mut: *ast.StringInterner = @constCast(interner);
-                if (ctValueToModuleItem(alloc, interner_mut, value) catch null) |mi| {
+                if (ctValueToStructItem(alloc, interner_mut, value) catch null) |mi| {
                     switch (mi) {
                         .function, .priv_function => |decl| {
                             // Wrap in a block: { function_decl; call_to_function }
@@ -1716,7 +1716,7 @@ fn stringToUnop(name: []const u8) ?ast.UnaryOp.Op {
 }
 
 // ============================================================
-// Declaration conversion: FunctionDecl, ModuleDecl, StructDecl → CtValue
+// Declaration conversion: FunctionDecl, StructDecl → CtValue
 // ============================================================
 
 /// Convert a TypeExpr to CtValue.
@@ -2013,13 +2013,13 @@ fn paramToCtValue(
     return pat_val;
 }
 
-/// Convert a ModuleDecl to CtValue:
+/// Convert a StructDecl to CtValue:
 /// {:module, [visibility: :pub], [:Name, [do: [items...]]]}
 pub fn moduleDeclToCtValue(
     alloc: Allocator,
     interner: *const ast.StringInterner,
     store: *AllocationStore,
-    decl: *const ast.ModuleDecl,
+    decl: *const ast.StructDecl,
 ) error{OutOfMemory}!CtValue {
     // Module name as atom
     var name_parts : std.ArrayListUnmanaged(CtValue) = .empty;
@@ -2031,7 +2031,7 @@ pub fn moduleDeclToCtValue(
     // Items
     var item_vals : std.ArrayListUnmanaged(CtValue) = .empty;
     for (decl.items) |item| {
-        try item_vals.append(alloc, try moduleItemToCtValue(alloc, interner, store, item));
+        try item_vals.append(alloc, try structItemToCtValue(alloc, interner, store, item));
     }
     const items_list = try makeListFromSlice(alloc, store, item_vals.items);
     const do_pair = try makeKeywordPair(alloc, store, "do", items_list);
@@ -2056,7 +2056,7 @@ pub fn structDeclToCtValue(
     store: *AllocationStore,
     decl: *const ast.StructDecl,
 ) error{OutOfMemory}!CtValue {
-    const name_val: CtValue = if (decl.name) |n| .{ .atom = interner.get(n) } else .nil;
+    const name_val: CtValue = if (decl.name.parts.len > 0) .{ .atom = interner.get(decl.name.parts[0]) } else .nil;
 
     var field_vals : std.ArrayListUnmanaged(CtValue) = .empty;
     for (decl.fields) |field| {
@@ -2070,12 +2070,12 @@ pub fn structDeclToCtValue(
     return makeTuple3(alloc, store, .{ .atom = "struct" }, try emptyList(alloc, store), args);
 }
 
-/// Convert a ModuleItem to CtValue.
-pub fn moduleItemToCtValue(
+/// Convert a StructItem to CtValue.
+pub fn structItemToCtValue(
     alloc: Allocator,
     interner: *const ast.StringInterner,
     store: *AllocationStore,
-    item: ast.ModuleItem,
+    item: ast.StructItem,
 ) error{OutOfMemory}!CtValue {
     return switch (item) {
         .function, .priv_function => |f| functionDeclToCtValue(alloc, interner, store, f),
@@ -2173,23 +2173,23 @@ pub fn moduleItemToCtValue(
             const args = try makeListFromSlice(alloc, store, arg_vals.items);
             return makeTuple3(alloc, store, .{ .atom = "@" }, try emptyList(alloc, store), args);
         },
-        .module_level_expr => |expr| {
+        .struct_level_expr => |expr| {
             return exprToCtValue(alloc, interner, store, expr);
         },
     };
 }
 
 // ============================================================
-// Reverse declaration conversion: CtValue → ModuleItem
+// Reverse declaration conversion: CtValue → StructItem
 // ============================================================
 
-/// Convert a CtValue back to a ModuleItem.
+/// Convert a CtValue back to a StructItem.
 /// Expects {:fn, meta, clauses} or {:macro, meta, clauses} etc.
-pub fn ctValueToModuleItem(
+pub fn ctValueToStructItem(
     alloc: Allocator,
     interner: *ast.StringInterner,
     value: CtValue,
-) error{OutOfMemory}!?ast.ModuleItem {
+) error{OutOfMemory}!?ast.StructItem {
     if (value != .tuple or value.tuple.elems.len != 3) return null;
 
     const form = value.tuple.elems[0];
@@ -2316,7 +2316,11 @@ pub fn ctValueToModuleItem(
         if (args == .list and args.list.elems.len == 2) {
             const name_val = args.list.elems[0];
             const fields_val = args.list.elems[1];
-            const name_id: ?ast.StringId = if (name_val == .atom) try interner.intern(name_val.atom) else null;
+            const name_parts: []const ast.StringId = if (name_val == .atom) blk: {
+                const parts = try alloc.alloc(ast.StringId, 1);
+                parts[0] = try interner.intern(name_val.atom);
+                break :blk parts;
+            } else &.{};
             var fields : std.ArrayListUnmanaged(ast.StructFieldDecl) = .empty;
             if (fields_val == .list) {
                 for (fields_val.list.elems) |pair| {
@@ -2333,7 +2337,7 @@ pub fn ctValueToModuleItem(
             const decl = try alloc.create(ast.StructDecl);
             decl.* = .{
                 .meta = .{ .span = .{ .start = 0, .end = 0 } },
-                .name = name_id,
+                .name = .{ .parts = name_parts, .span = .{ .start = 0, .end = 0 } },
                 .fields = try fields.toOwnedSlice(alloc),
             };
             return .{ .struct_decl = decl };
@@ -2423,7 +2427,7 @@ pub fn ctValueToModuleItem(
                     if (part == .atom) try mod_parts.append(alloc, try interner.intern(part.atom));
                 }
             }
-            var as_name: ?ast.ModuleName = null;
+            var as_name: ?ast.StructName = null;
             if (args.list.elems.len >= 2) {
                 const as_aliases = args.list.elems[1];
                 if (as_aliases == .tuple and as_aliases.tuple.elems.len == 3 and as_aliases.tuple.elems[2] == .list) {
@@ -2484,14 +2488,13 @@ pub fn ctValueToModuleItem(
             }
             // Extract items from [do: [items...]]
             // For now, return an empty module — full item reconstruction is complex
-            const decl = try alloc.create(ast.ModuleDecl);
+            const decl = try alloc.create(ast.StructDecl);
             decl.* = .{
                 .meta = .{ .span = .{ .start = 0, .end = 0 } },
                 .name = .{ .parts = try name_parts.toOwnedSlice(alloc), .span = .{ .start = 0, .end = 0 } },
-                .items = &.{},
             };
-            // Module goes in TopItem, not ModuleItem — return null for now
-            // (modules inside modules are rare)
+            // Struct goes in TopItem, not StructItem — return null for now
+            // (structs inside structs are rare)
         }
     }
 
@@ -2934,8 +2937,8 @@ test "round-trip: function declaration to CtValue" {
     };
 
     // Convert to CtValue
-    const item: ast.ModuleItem = .{ .function = func_decl };
-    const ct = try moduleItemToCtValue(alloc, &interner, &store, item);
+    const item: ast.StructItem = .{ .function = func_decl };
+    const ct = try structItemToCtValue(alloc, &interner, &store, item);
 
     // Should be a 3-tuple with form :fn
     try std.testing.expect(ct == .tuple);
@@ -2944,7 +2947,7 @@ test "round-trip: function declaration to CtValue" {
     try std.testing.expect(std.mem.eql(u8, ct.tuple.elems[0].atom, "fn"));
 
     // Round-trip back
-    const back = ctValueToModuleItem(alloc, &interner, ct) catch null;
+    const back = ctValueToStructItem(alloc, &interner, ct) catch null;
     try std.testing.expect(back != null);
     try std.testing.expect(back.? == .function);
 }
@@ -2966,16 +2969,18 @@ test "round-trip: struct declaration to CtValue" {
     fields[0] = .{ .meta = meta, .name = try interner.intern("x"), .type_expr = i64_type, .default = null };
     fields[1] = .{ .meta = meta, .name = try interner.intern("y"), .type_expr = i64_type, .default = null };
 
+    const name_parts = try alloc.alloc(ast.StringId, 1);
+    name_parts[0] = try interner.intern("Point");
     const struct_decl = try alloc.create(ast.StructDecl);
     struct_decl.* = .{
         .meta = meta,
-        .name = try interner.intern("Point"),
+        .name = .{ .parts = name_parts, .span = .{ .start = 0, .end = 0 } },
         .fields = fields,
     };
 
     // Convert to CtValue
-    const item: ast.ModuleItem = .{ .struct_decl = struct_decl };
-    const ct = try moduleItemToCtValue(alloc, &interner, &store, item);
+    const item: ast.StructItem = .{ .struct_decl = struct_decl };
+    const ct = try structItemToCtValue(alloc, &interner, &store, item);
 
     // Should be a 3-tuple with form :struct
     try std.testing.expect(ct == .tuple);
@@ -2984,7 +2989,7 @@ test "round-trip: struct declaration to CtValue" {
     try std.testing.expect(std.mem.eql(u8, ct.tuple.elems[0].atom, "struct"));
 
     // Round-trip back
-    const back = ctValueToModuleItem(alloc, &interner, ct) catch null;
+    const back = ctValueToStructItem(alloc, &interner, ct) catch null;
     try std.testing.expect(back != null);
     try std.testing.expect(back.? == .struct_decl);
 }

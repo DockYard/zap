@@ -66,7 +66,7 @@ fn compileOnly(source: []const u8) TestError!void {
     tmp_dir.dir.createDirPath(getTestIo(), "lib") catch return error.Unexpected;
 
     const build_source =
-        \\pub module TestProg.Builder {
+        \\pub struct TestProg.Builder {
         \\  pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
         \\    case env.target {
         \\      :test_prog ->
@@ -125,7 +125,7 @@ fn compileAndRun(source: []const u8) TestError!TestResult {
     tmp_dir.dir.createDirPath(getTestIo(), "lib") catch return error.Unexpected;
 
     const build_source =
-        \\pub module TestProg.Builder {
+        \\pub struct TestProg.Builder {
         \\  pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
         \\    case env.target {
         \\      :test_prog ->
@@ -230,7 +230,7 @@ fn compileAndRunWithFiles(source: []const u8, extra_files: []const ExtraFile) Te
     tmp_dir.dir.createDirPath(getTestIo(), "lib") catch return error.Unexpected;
 
     const build_source =
-        \\pub module TestProg.Builder {
+        \\pub struct TestProg.Builder {
         \\  pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
         \\    case env.target {
         \\      :test_prog ->
@@ -328,7 +328,7 @@ fn compileAndRunWithFiles(source: []const u8, extra_files: []const ExtraFile) Te
 
 test "ZIR: integer arithmetic" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn main() -> String {
         \\    Kernel.inspect(20 + 22)
         \\    "done"
@@ -342,7 +342,7 @@ test "ZIR: integer arithmetic" {
 
 test "ZIR: string literal" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn main() -> String {
         \\    IO.puts("hello world")
         \\    "done"
@@ -356,7 +356,7 @@ test "ZIR: string literal" {
 
 test "ZIR: string escape sequences" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn main() -> String {
         \\    IO.print_str("line1\nline2\n")
         \\    "done"
@@ -370,7 +370,7 @@ test "ZIR: string escape sequences" {
 
 test "ZIR: boolean" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn main() -> String {
         \\    Kernel.inspect(true)
         \\    "done"
@@ -388,7 +388,7 @@ test "ZIR: boolean" {
 
 test "ZIR: multi-function call" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn add(a :: i64, b :: i64) -> i64 {
         \\    a + b
         \\  }
@@ -406,7 +406,7 @@ test "ZIR: multi-function call" {
 
 test "ZIR: void function" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn main() -> String {
         \\    "done"
         \\  }
@@ -423,7 +423,7 @@ test "ZIR: void function" {
 
 test "ZIR: if-else true branch" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn main() -> String {
         \\    if true {
         \\      IO.puts("yes")
@@ -441,7 +441,7 @@ test "ZIR: if-else true branch" {
 
 test "ZIR: if-else false branch" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn main() -> String {
         \\    if false {
         \\      IO.puts("yes")
@@ -463,7 +463,7 @@ test "ZIR: if-else false branch" {
 
 test "ZIR: case with atoms" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn main() -> String {
         \\    case :ok {
         \\      :ok -> IO.puts("matched")
@@ -480,7 +480,7 @@ test "ZIR: case with atoms" {
 
 test "ZIR: case with ints" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn main() -> String {
         \\    case 1 {
         \\      1 -> IO.puts("one")
@@ -501,7 +501,7 @@ test "ZIR: case with ints" {
 
 test "ZIR: recursive sum" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn sum_to(n :: i64) -> i64 {
         \\    case n {
         \\      0 -> 1
@@ -523,7 +523,7 @@ test "ZIR: recursive sum" {
 
 test "ZIR: multiple helper functions" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn double(x :: i64) -> i64 {
         \\    x + x
         \\  }
@@ -549,7 +549,7 @@ test "ZIR: multiple helper functions" {
 
 test "ZIR: lambda lifted local def" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn bar() -> i64 {
         \\    pub fn forty_two() -> i64 {
         \\      42
@@ -571,7 +571,7 @@ test "ZIR: lambda lifted local def" {
 
 test "ZIR: function-local captured closure" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn make_adder(x :: i64) -> i64 {
         \\    pub fn add(y :: i64) -> i64 {
         \\      x + y
@@ -593,7 +593,7 @@ test "ZIR: function-local captured closure" {
 
 test "ZIR: aliased function-local captured closure" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn compute(base :: i64) -> i64 {
         \\    pub fn offset(n :: i64) -> i64 {
         \\      base + n
@@ -617,7 +617,7 @@ test "ZIR: captured closure called through multiple paths" {
     // Two closures that capture the same variable, selected by case.
     // Exercises closure creation + env struct emission for different functions.
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn compute(base :: i64, mode :: i64) -> i64 {
         \\    pub fn add_ten(y :: i64) -> i64 {
         \\      base + y + 10
@@ -647,7 +647,7 @@ test "ZIR: captured closure called through multiple paths" {
 
 test "ZIR: module function ref is first-class callable" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn double(x :: i64) -> i64 {
         \\    x * 2
         \\  }
@@ -669,7 +669,7 @@ test "ZIR: module function ref is first-class callable" {
 
 test "ZIR: local function ref is first-class callable" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn double(x :: i64) -> i64 {
         \\    x * 2
         \\  }
@@ -691,7 +691,7 @@ test "ZIR: local function ref is first-class callable" {
 
 test "ZIR: nested local function ref captures environment" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn make_and_apply(base :: i64) -> i64 {
         \\    pub fn add_base(x :: i64) -> i64 {
         \\      base + x
@@ -717,7 +717,7 @@ test "ZIR: nested local function ref captures environment" {
 
 test "ZIR: anonymous closure is first-class callable" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn apply(x :: i64, f :: (i64 -> i64)) -> i64 {
         \\    f(x)
         \\  }
@@ -738,7 +738,7 @@ test "ZIR: anonymous closure is first-class callable" {
 
 test "ZIR: anonymous closure captures environment" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn apply(x :: i64, f :: (i64 -> i64)) -> i64 {
         \\    f(x)
         \\  }
@@ -767,7 +767,7 @@ test "ZIR: cond with comparisons (nested captured bodies)" {
     // in a ZIR condbr body. Inner cases must be able to reference function
     // params from the parent scope. This requires nestable capture buffers.
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn describe(x :: i64) -> String {
         \\    cond {
         \\      x == 1 -> "one"
@@ -803,7 +803,7 @@ test "ZIR: catch basin ~> catches unmatched multi-clause function" {
     // The __try variant correctly returns error.NoMatchingClause and the
     // addCatch block correctly unwraps it — the type inference is the issue.
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn process("ok" :: String) -> String {
         \\    "matched"
         \\  }
@@ -842,7 +842,7 @@ test "ZIR: catch basin ~> catches unmatched multi-clause function" {
 
 test "ZIR: catch basin receives unmatched value" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn parse("one" :: String) -> String {
         \\    "1"
         \\  }
@@ -869,7 +869,7 @@ test "ZIR: catch basin receives unmatched value" {
 
 test "ZIR: catch basin handler pattern matches on unmatched value" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn process("ok" :: String) -> String {
         \\    "success"
         \\  }
@@ -909,7 +909,7 @@ test "ZIR: catch basin handler pattern matches on unmatched value" {
 
 test "ZIR: catch basin short-circuits multi-step pipe" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn validate("good" :: String) -> String {
         \\    "valid"
         \\  }
@@ -949,7 +949,7 @@ test "ZIR: catch basin short-circuits multi-step pipe" {
 
 test "ZIR: macro generates function from trailing block" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub macro make_fn(name :: Expr, body :: Expr) -> Expr {
         \\    quote {
         \\      pub fn generated() -> String {
@@ -976,7 +976,7 @@ test "ZIR: macro generates function from trailing block" {
 
 test "ZIR: macro receives trailing block as AST" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub macro my_test(name :: Expr, body :: Expr) -> Expr {
         \\    quote {
         \\      IO.puts(unquote(name))
@@ -1000,7 +1000,7 @@ test "ZIR: macro receives trailing block as AST" {
 
 test "ZIR: trailing block as last argument" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn with_block(name :: String, body :: String) -> String {
         \\    name <> ": " <> body
         \\  }
@@ -1021,7 +1021,7 @@ test "ZIR: trailing block as last argument" {
 
 test "ZIR: nested trailing blocks" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn outer(name :: String, body :: String) -> String {
         \\    "[" <> name <> " " <> body <> "]"
         \\  }
@@ -1048,7 +1048,7 @@ test "ZIR: nested trailing blocks" {
 
 test "ZIR: catch basin ~> with function handler" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn parse("one" :: String) -> String {
         \\    "1"
         \\  }
@@ -1078,7 +1078,7 @@ test "ZIR: catch basin ~> with function handler" {
 
 test "ZIR: catch basin ~> function handler with extra args" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn parse("ok" :: String) -> String {
         \\    "parsed"
         \\  }
@@ -1107,7 +1107,7 @@ test "ZIR: catch basin ~> function handler with extra args" {
 
 test "ZIR: struct literal field access" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub struct Point {
         \\    x :: i64
         \\    y :: i64
@@ -1134,7 +1134,7 @@ test "ZIR: struct literal field access" {
 
 test "ZIR: string interpolation with string variable" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn greet(name :: String) -> String {
         \\    "Hello, #{name}!"
         \\  }
@@ -1152,7 +1152,7 @@ test "ZIR: string interpolation with string variable" {
 
 test "ZIR: string interpolation with integer via to_string" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn main() -> String {
         \\    n = 42
         \\    IO.puts("The answer is #{n}")
@@ -1167,7 +1167,7 @@ test "ZIR: string interpolation with integer via to_string" {
 
 test "ZIR: string interpolation multiple expressions" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn main() -> String {
         \\    a = "foo"
         \\    b = "bar"
@@ -1187,7 +1187,7 @@ test "ZIR: string interpolation multiple expressions" {
 
 test "ZIR: binary pattern byte extraction" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn first_byte(data :: String) -> i64 {
         \\    case data {
         \\      <<a, _>> -> a
@@ -1208,7 +1208,7 @@ test "ZIR: binary pattern byte extraction" {
 
 test "ZIR: binary pattern string rest" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn skip_first(data :: String) -> String {
         \\    case data {
         \\      <<_, rest::String>> -> rest
@@ -1229,7 +1229,7 @@ test "ZIR: binary pattern string rest" {
 
 test "ZIR compile: binary pattern string prefix" {
     try compileOnly(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn check_get(data :: String) -> String {
         \\    case data {
         \\      <<"GET "::String, path::String>> -> path
@@ -1250,7 +1250,7 @@ test "ZIR compile: binary pattern string prefix" {
 
 test "ZIR: pipe chain with Integer.to_string" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn double(x :: i64) -> i64 {
         \\    x * 2
         \\  }
@@ -1276,7 +1276,7 @@ test "ZIR: pipe chain with Integer.to_string" {
 
 test "ZIR: multi-clause function with pipes" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn factorial(0 :: i64) -> i64 {
         \\    1
         \\  }
@@ -1304,7 +1304,7 @@ test "ZIR: multi-clause function with pipes" {
 
 test "ZIR: string concat operator" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn main() -> String {
         \\    IO.puts("hello" <> " " <> "world")
         \\    "done"
@@ -1322,7 +1322,7 @@ test "ZIR: string concat operator" {
 
 test "ZIR: function guards" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn classify(n :: i64) -> String if n > 0 {
         \\    "positive"
         \\  }
@@ -1354,7 +1354,7 @@ test "ZIR: function guards" {
 
 test "ZIR: multi-clause string pattern matching" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn parse("one" :: String) -> String {
         \\    "1"
         \\  }
@@ -1386,7 +1386,7 @@ test "ZIR: multi-clause string pattern matching" {
 
 test "ZIR: atom pattern matching in functions" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn status(:ok :: Atom) -> String {
         \\    "success"
         \\  }
@@ -1413,7 +1413,7 @@ test "ZIR: atom pattern matching in functions" {
 
 test "ZIR: default parameter values" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn add(a :: i64, b :: i64 = 10) -> i64 {
         \\    a + b
         \\  }
@@ -1436,7 +1436,7 @@ test "ZIR: default parameter values" {
 
 test "ZIR: three-argument function with string concat" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn join(a :: String, sep :: String, b :: String) -> String {
         \\    a <> sep <> b
         \\  }
@@ -1458,7 +1458,7 @@ test "ZIR: three-argument function with string concat" {
 
 test "ZIR: union variant pattern matching" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub union Color {
         \\    Red
         \\    Green
@@ -1496,7 +1496,7 @@ test "ZIR: union variant pattern matching" {
 
 test "ZIR: tuple pattern matching in case" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn sum_pair(t :: {i64, i64}) -> i64 {
         \\    case t {
         \\      {a, b} -> a + b
@@ -1516,7 +1516,7 @@ test "ZIR: tuple pattern matching in case" {
 
 test "ZIR: tuple wildcard pattern" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn second(t :: {i64, i64}) -> i64 {
         \\    case t {
         \\      {_, b} -> b
@@ -1540,7 +1540,7 @@ test "ZIR: tuple wildcard pattern" {
 
 test "ZIR: variable assignment chain" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn main() -> String {
         \\    a = 10
         \\    b = a + 20
@@ -1561,7 +1561,7 @@ test "ZIR: variable assignment chain" {
 
 test "ZIR: nested case expressions" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn classify(x :: i64, y :: i64) -> String {
         \\    case x {
         \\      0 -> case y {
@@ -1595,7 +1595,7 @@ test "ZIR: nested case expressions" {
 
 test "ZIR: float arithmetic" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn area(radius :: f64) -> f64 {
         \\    3.14159 * radius * radius
         \\  }
@@ -1618,7 +1618,7 @@ test "ZIR: float arithmetic" {
 
 test "ZIR: for comprehension doubles list" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn sum([] :: [i64]) -> i64 {
         \\    0
         \\  }
@@ -1641,7 +1641,7 @@ test "ZIR: for comprehension doubles list" {
 
 test "ZIR: for comprehension over string" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn join([] :: [String]) -> String {
         \\    ""
         \\  }
@@ -1666,7 +1666,7 @@ test "ZIR: for comprehension over string" {
 
 test "ZIR: for comprehension with filter" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn sum([] :: [i64]) -> i64 {
         \\    0
         \\  }
@@ -1693,7 +1693,7 @@ test "ZIR: for comprehension with filter" {
 
 test "ZIR: tail recursive countdown (small)" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn countdown(0 :: i64) -> i64 {
         \\    0
         \\  }
@@ -1723,7 +1723,7 @@ test "ZIR: tail recursive countdown (small)" {
 
 test "ZIR: use Module imports functions" {
     var result = try compileAndRunWithFiles(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  use Helper
         \\
         \\  pub fn main() -> String {
@@ -1733,7 +1733,7 @@ test "ZIR: use Module imports functions" {
         \\}
     , &.{
         .{ .path = "lib/helper.zap", .data = 
-        \\pub module Helper {
+        \\pub struct Helper {
         \\  pub fn greet(name :: String) -> String {
         \\    "Hello, " <> name <> "!"
         \\  }
@@ -1747,7 +1747,7 @@ test "ZIR: use Module imports functions" {
 
 test "ZIR: use Module with __using__ callback injects function" {
     var result = try compileAndRunWithFiles(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  use Greeter
         \\
         \\  pub fn main() -> String {
@@ -1757,7 +1757,7 @@ test "ZIR: use Module with __using__ callback injects function" {
         \\}
     , &.{
         .{ .path = "lib/greeter.zap", .data = 
-        \\pub module Greeter {
+        \\pub struct Greeter {
         \\  pub macro __using__(_opts :: Expr) -> Expr {
         \\    quote {
         \\      pub fn hello() -> String {
@@ -1779,7 +1779,7 @@ test "ZIR: use Module with __using__ callback injects function" {
 
 test "ZIR: map literal creation" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn main() -> String {
         \\    m = %{name: "Alice", age: 30}
         \\    IO.puts(Map.get(m, :name, "unknown"))
@@ -1794,7 +1794,7 @@ test "ZIR: map literal creation" {
 
 test "ZIR: map get with default" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn main() -> String {
         \\    m = %{x: 10, y: 20}
         \\    Kernel.inspect(Map.get(m, :x, 0))
@@ -1810,7 +1810,7 @@ test "ZIR: map get with default" {
 
 test "ZIR: map update syntax" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn main() -> String {
         \\    m = %{name: "Alice", age: 30}
         \\    m2 = %{m | name: "Bob"}
@@ -1827,7 +1827,7 @@ test "ZIR: map update syntax" {
 
 test "ZIR: map has_key check" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn main() -> String {
         \\    m = %{name: "Alice", age: 30}
         \\    if Map.has_key(m, :name) {
@@ -1851,7 +1851,7 @@ test "ZIR: map has_key check" {
 
 test "ZIR: map pattern matching in function" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn greet(%{name: n, greeting: g} :: %{Atom -> String}) -> String {
         \\    g <> ", " <> n <> "!"
         \\  }
@@ -1869,7 +1869,7 @@ test "ZIR: map pattern matching in function" {
 
 test "ZIR: map size" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn main() -> String {
         \\    m = %{a: 1, b: 2, c: 3}
         \\    Kernel.inspect(Map.size(m))
@@ -1888,7 +1888,7 @@ test "ZIR: map size" {
 
 test "ZIR: list literal and fixed-length pattern" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn sum_list(xs :: [i64]) -> i64 {
         \\    case xs {
         \\      [a, b, c] -> a + b + c
@@ -1909,7 +1909,7 @@ test "ZIR: list literal and fixed-length pattern" {
 
 test "ZIR: list cons pattern [h | t]" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn head(xs :: [i64]) -> i64 {
         \\    case xs {
         \\      [h | _] -> h
@@ -1930,7 +1930,7 @@ test "ZIR: list cons pattern [h | t]" {
 
 test "ZIR: recursive list sum with cons pattern" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn sum([] :: [i64]) -> i64 {
         \\    0
         \\  }
@@ -1952,7 +1952,7 @@ test "ZIR: recursive list sum with cons pattern" {
 
 test "ZIR: list length via recursion" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn len([] :: [i64]) -> i64 {
         \\    0
         \\  }
@@ -1974,7 +1974,7 @@ test "ZIR: list length via recursion" {
 
 test "ZIR: list map via recursion" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn double_all([] :: [i64]) -> [i64] {
         \\    []
         \\  }
@@ -2004,7 +2004,7 @@ test "ZIR: list map via recursion" {
 
 test "ZIR: keyword list sugar" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn get_name(opts :: [{Atom, String}]) -> String {
         \\    case opts {
         \\      [name: n] -> n
@@ -2025,7 +2025,7 @@ test "ZIR: keyword list sugar" {
 
 test "ZIR: keyword list with multiple keys" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn get_age(opts :: [{Atom, i64}]) -> i64 {
         \\    case opts {
         \\      [name: _, age: a] -> a
@@ -2046,7 +2046,7 @@ test "ZIR: keyword list with multiple keys" {
 
 test "ZIR: keyword list assignment pattern" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn main() -> String {
         \\    opts = [greeting: "Hello", name: "World"]
         \\    case opts {
@@ -2064,7 +2064,7 @@ test "ZIR: keyword list assignment pattern" {
 
 test "ZIR: list of strings with pattern matching" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn first([] :: [String]) -> String {
         \\    "empty"
         \\  }
@@ -2087,7 +2087,7 @@ test "ZIR: list of strings with pattern matching" {
 
 test "ZIR: tail recursive countdown (large, guaranteed TCO)" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn countdown(0 :: i64) -> i64 {
         \\    0
         \\  }
@@ -2109,7 +2109,7 @@ test "ZIR: tail recursive countdown (large, guaranteed TCO)" {
 
 test "ZIR: String.length cross-module call" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn main() -> String {
         \\    Kernel.inspect(String.length("hello"))
         \\    "done"
@@ -2123,7 +2123,7 @@ test "ZIR: String.length cross-module call" {
 
 test "ZIR: String.slice cross-module call" {
     var result = try compileAndRun(
-        \\pub module TestProg {
+        \\pub struct TestProg {
         \\  pub fn main() -> String {
         \\    IO.puts(String.slice("hello", 0, 3))
         \\    "done"

@@ -1,4 +1,4 @@
-pub module CtfeBasics.Builder {
+pub struct CtfeBasics.Builder {
   pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
     case env.target {
       :ctfe_basics ->

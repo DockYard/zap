@@ -3,7 +3,7 @@
 # Run with:
 #   zap run when_macro
 
-pub module WhenMacro {
+pub struct WhenMacro {
   pub fn main(_args :: [String]) -> String {
     Guards.check(10)
     |> IO.puts()

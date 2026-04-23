@@ -1,4 +1,4 @@
-pub module PatternMatch {
+pub struct PatternMatch {
   pub fn describe(_ :: Atom) -> String {
     "HEY YO!"
   }

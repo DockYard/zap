@@ -99,8 +99,6 @@ pub fn ctfeManifestDetailed(
     // Read stdlib files from zap lib dir if available
     if (zap_lib_dir) |lib_dir| {
         try readLibSourceUnits(alloc, lib_dir, &source_units);
-        const zap_subdir = try std.fs.path.join(alloc, &.{ lib_dir, "zap" });
-        try readLibSourceUnits(alloc, zap_subdir, &source_units);
     }
 
     // Add build.zap as the final source unit
@@ -157,7 +155,8 @@ pub fn ctfeManifestDetailed(
     };
 }
 
-/// Read all .zap files from a directory and add them as source units.
+/// Read all .zap files from a directory and its subdirectories recursively,
+/// adding them as source units.
 fn readLibSourceUnits(
     alloc: std.mem.Allocator,
     dir_path: []const u8,
@@ -167,6 +166,11 @@ fn readLibSourceUnits(
     defer dir.close(std.Options.debug_io);
     var iter = dir.iterate();
     while (iter.next(std.Options.debug_io) catch null) |entry| {
+        if (entry.kind == .directory) {
+            const subdir_path = try std.fs.path.join(alloc, &.{ dir_path, entry.name });
+            try readLibSourceUnits(alloc, subdir_path, source_units);
+            continue;
+        }
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".zap")) continue;
         const file_path = try std.fs.path.join(alloc, &.{ dir_path, entry.name });

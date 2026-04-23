@@ -1,15 +1,15 @@
-pub module Bool {
-  @moduledoc = """
-    Functions for working with boolean values.
+@doc = """
+  Functions for working with boolean values.
 
-    Zap has two boolean values: `true` and `false`. Booleans are
-    used in conditionals, guards, and logical expressions.
+  Zap has two boolean values: `true` and `false`. Booleans are
+  used in conditionals, guards, and logical expressions.
 
-    The Kernel module provides `and`, `or`, and `not` macros for
-    use in expressions. This module provides functional equivalents
-    that can be passed as values or used in pipes.
-    """
+  The Kernel module provides `and`, `or`, and `not` macros for
+  use in expressions. This module provides functional equivalents
+  that can be passed as values or used in pipes.
+  """
 
+pub struct Bool {
   @doc = """
     Converts a boolean to its string representation.
 

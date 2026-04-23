@@ -251,7 +251,7 @@ const MonomorphContext = struct {
     /// for that type. Uses the type system's variant names to derive
     /// the implementing module. New types (structs, unions) use their
     /// declared name directly.
-    fn inferTargetModuleName(self: *const MonomorphContext, type_id: TypeId) ?[]const u8 {
+    fn inferTargetStructName(self: *const MonomorphContext, type_id: TypeId) ?[]const u8 {
         if (type_id >= self.store.types.items.len) return null;
         const typ = self.store.types.items[type_id];
         return switch (typ) {
@@ -284,11 +284,11 @@ const MonomorphContext = struct {
         concrete_type: TypeId,
         arity: u32,
     ) ?u32 {
-        const target_module_name = self.inferTargetModuleName(concrete_type) orelse return null;
+        const target_struct_name = self.inferTargetStructName(concrete_type) orelse return null;
 
         for (self.program.impls) |impl_info| {
             if (impl_info.protocol_name != protocol_name) continue;
-            if (!std.mem.eql(u8, self.interner.get(impl_info.target_module), target_module_name)) continue;
+            if (!std.mem.eql(u8, self.interner.get(impl_info.target_module), target_struct_name)) continue;
 
             // Found the impl. Search its function groups for the matching function.
             for (impl_info.function_group_ids) |gid| {

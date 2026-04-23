@@ -1,7 +1,7 @@
-pub module Test.StringTest {
+pub struct Test.StringTest {
   use Zest.Case
 
-  describe("String module") {
+  describe("String struct") {
     test("string concatenation") {
       assert(("Hello" <> ", " <> "world!") == "Hello, world!")
     }

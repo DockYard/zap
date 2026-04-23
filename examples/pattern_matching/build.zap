@@ -1,4 +1,4 @@
-pub module PatternMatching.Builder {
+pub struct PatternMatching.Builder {
   pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
     case env.target {
       :pattern_matching ->

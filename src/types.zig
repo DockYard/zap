@@ -201,6 +201,7 @@ pub const TypeStore = struct {
     pub const ISIZE: TypeId = 17;
     pub const UNKNOWN: TypeId = 18;
     pub const ERROR: TypeId = 19;
+    pub const VOID: TypeId = NIL;
 
     pub fn init(allocator: std.mem.Allocator, interner: *const ast.StringInterner) TypeStore {
         var store = TypeStore{
@@ -329,6 +330,7 @@ pub const TypeStore = struct {
         if (std.mem.eql(u8, name, "String")) return STRING;
         if (std.mem.eql(u8, name, "Atom")) return ATOM;
         if (std.mem.eql(u8, name, "Nil")) return NIL;
+        if (std.mem.eql(u8, name, "Void")) return VOID;
         if (std.mem.eql(u8, name, "Never")) return NEVER;
         if (std.mem.eql(u8, name, "i64")) return I64;
         if (std.mem.eql(u8, name, "i32")) return I32;
@@ -1375,7 +1377,7 @@ pub const TypeChecker = struct {
 
     fn resolveFunctionRefSignature(self: *TypeChecker, fr: ast.FunctionRefExpr) !?FunctionSignature {
         if (fr.module) |module_name| {
-            const module_scope = self.graph.findModuleScope(module_name) orelse return null;
+            const module_scope = self.graph.findStructScope(module_name) orelse return null;
             return try self.resolveFamilySignature(module_scope, fr.function, fr.arity);
         }
 
@@ -1537,16 +1539,16 @@ pub const TypeChecker = struct {
     fn enclosingModuleQualifiedName(self: *const TypeChecker, scope_id: scope_mod.ScopeId) ?[]u8 {
         var current: ?scope_mod.ScopeId = scope_id;
         while (current) |sid| {
-            for (self.graph.modules.items) |module| {
+            for (self.graph.structs.items) |module| {
                 if (module.scope_id != sid) continue;
-                return self.moduleNameToString(module.name);
+                return self.structNameToString(module.name);
             }
             current = self.graph.getScope(sid).parent;
         }
         return null;
     }
 
-    fn moduleNameToString(self: *const TypeChecker, name: ast.ModuleName) []u8 {
+    fn structNameToString(self: *const TypeChecker, name: ast.StructName) []u8 {
         if (name.parts.len == 0) return self.allocator.alloc(u8, 0) catch return &[_]u8{};
         var total_len: usize = 0;
         for (name.parts, 0..) |part, idx| {
@@ -1893,8 +1895,8 @@ pub const TypeChecker = struct {
         // Register user-defined types (structs, enums) from scope graph into TypeStore
         try self.registerUserTypes();
 
-        for (program.modules) |*mod| {
-            try self.checkModule(mod);
+        for (program.structs) |*mod| {
+            try self.checkStruct(mod);
         }
         for (program.top_items) |item| {
             // Only `def main()` is allowed at the top level — all other functions must be inside a module
@@ -1947,7 +1949,8 @@ pub const TypeChecker = struct {
         for (self.graph.types.items) |type_entry| {
             switch (type_entry.kind) {
                 .struct_type => |sd| {
-                    const name = sd.name orelse continue;
+                    const name = type_entry.name;
+                    if (name == 0) continue;
                     if (self.store.name_to_type.get(name) != null) continue;
                     const name_str = self.interner.get(name);
                     if (self.store.resolveTypeName(name_str) != null) {
@@ -2014,8 +2017,9 @@ pub const TypeChecker = struct {
                     try self.store.name_to_type.put(name, type_id);
                 },
                 .union_type => |ud| {
-                    if (self.store.name_to_type.get(ud.name) != null) continue;
-                    const enum_name_str = self.interner.get(ud.name);
+                    const union_name = type_entry.name;
+                    if (self.store.name_to_type.get(union_name) != null) continue;
+                    const enum_name_str = self.interner.get(union_name);
                     if (self.store.resolveTypeName(enum_name_str) != null) {
                         try self.errors.append(self.allocator, .{
                             .message = try std.fmt.allocPrint(self.allocator, "`{s}` shadows a builtin type — choose a different name", .{enum_name_str}),
@@ -2038,10 +2042,10 @@ pub const TypeChecker = struct {
                         });
                     }
                     const type_id = try self.store.addType(.{ .tagged_union = .{
-                        .name = ud.name,
+                        .name = union_name,
                         .variants = try variant_entries.toOwnedSlice(self.allocator),
                     } });
-                    try self.store.name_to_type.put(ud.name, type_id);
+                    try self.store.name_to_type.put(union_name, type_id);
                 },
                 .opaque_type => |opaque_body| {
                     if (self.store.name_to_type.get(type_entry.name) != null) continue;
@@ -2112,14 +2116,14 @@ pub const TypeChecker = struct {
         }
     }
 
-    fn checkModule(self: *TypeChecker, mod: *const ast.ModuleDecl) !void {
+    fn checkStruct(self: *TypeChecker, mod: *const ast.StructDecl) !void {
         const prev_scope = self.current_scope;
         self.current_scope = self.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(mod.meta.span)) orelse mod.meta.scope_id;
         defer self.current_scope = prev_scope;
 
         // Check module extends: validate overridden function return types match parent
         if (mod.parent) |parent_name| {
-            try self.checkModuleExtendsSignatures(mod, parent_name);
+            try self.checkStructExtendsSignatures(mod, parent_name);
         }
 
         for (mod.items) |item| {
@@ -2150,7 +2154,7 @@ pub const TypeChecker = struct {
                 .attribute => |attr| {
                     try self.checkAttributeDecl(attr);
                 },
-                .module_level_expr => |expr| {
+                .struct_level_expr => |expr| {
                     _ = try self.inferExpr(expr);
                 },
                 else => {},
@@ -2270,10 +2274,10 @@ pub const TypeChecker = struct {
         };
     }
 
-    fn checkModuleExtendsSignatures(self: *TypeChecker, mod: *const ast.ModuleDecl, parent_name: ast.StringId) !void {
+    fn checkStructExtendsSignatures(self: *TypeChecker, mod: *const ast.StructDecl, parent_name: ast.StringId) !void {
         // Find parent module
-        var parent_mod: ?*const ast.ModuleDecl = null;
-        for (self.graph.modules.items) |mod_entry| {
+        var parent_mod: ?*const ast.StructDecl = null;
+        for (self.graph.structs.items) |mod_entry| {
             if (mod_entry.name.parts.len == 1 and mod_entry.name.parts[0] == parent_name) {
                 parent_mod = mod_entry.decl;
                 break;
@@ -2333,8 +2337,7 @@ pub const TypeChecker = struct {
             .function => |func| try self.checkFunctionDecl(func),
             .priv_function => |func| try self.checkFunctionDecl(func),
             .macro, .priv_macro => {}, // Macro bodies are compile-time code — not type-checked
-            .module => {},
-            .priv_module => {},
+            .struct_decl, .priv_struct_decl => {},
             else => {},
         }
     }
@@ -2962,7 +2965,8 @@ pub const TypeChecker = struct {
                                     for (self.graph.types.items) |te| {
                                         if (te.kind == .struct_type) {
                                             const sd = te.kind.struct_type;
-                                            if (sd.name) |n| {
+                                            if (sd.name.parts.len > 0) {
+                                                const n = sd.name.parts[0];
                                                 if (n == type_name_id) {
                                                     for (sd.fields) |f| {
                                                         if (f.name == req_field.name and f.default != null) {
@@ -2978,7 +2982,8 @@ pub const TypeChecker = struct {
                                                             for (self.graph.types.items) |pte| {
                                                                 if (pte.kind == .struct_type) {
                                                                     const psd = pte.kind.struct_type;
-                                                                    if (psd.name) |pn| {
+                                                                    if (psd.name.parts.len > 0) {
+                                                                        const pn = psd.name.parts[0];
                                                                         if (pn == parent_name) {
                                                                             for (psd.fields) |pf| {
                                                                                 if (pf.name == req_field.name and pf.default != null) {
@@ -3471,7 +3476,7 @@ pub const TypeChecker = struct {
             }
             if (fa.object.* == .module_ref) {
                 const mod_name = fa.object.module_ref.name;
-                for (self.graph.modules.items) |mod_entry| {
+                for (self.graph.structs.items) |mod_entry| {
                     if (mod_entry.name.parts.len == mod_name.parts.len) {
                         var match = true;
                         for (mod_entry.name.parts, mod_name.parts) |a, b| {
@@ -3628,7 +3633,7 @@ pub const TypeChecker = struct {
                 // types in impl declarations and type annotations. Any
                 // module name is accepted as a valid type reference. The
                 // monomorphizer resolves the concrete type at specialization.
-                for (self.graph.modules.items) |mod| {
+                for (self.graph.structs.items) |mod| {
                     if (mod.name.parts.len > 0) {
                         const mod_name = self.interner.get(mod.name.parts[mod.name.parts.len - 1]);
                         if (std.mem.eql(u8, name, mod_name)) {
@@ -3903,7 +3908,7 @@ test "type store addFunctionType preserves ownership metadata" {
 
 test "type checker registers opaque types" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  opaque Handle = String
         \\}
     ;
@@ -3992,7 +3997,7 @@ const Collector = @import("collector.zig").Collector;
 
 test "type check simple function" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn add(x :: i64, y :: i64) -> i64 {
         \\    x + y
         \\  }
@@ -4032,7 +4037,7 @@ test "type check simple function" {
 
 test "type check literals" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn foo() -> i64 {
         \\    42
         \\  }
@@ -4060,7 +4065,7 @@ test "type check literals" {
 
 test "type check case expression" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn foo(x :: Atom) -> Nil {
         \\    case x {
         \\      {:ok, v} -> v
@@ -4092,7 +4097,7 @@ test "type check case expression" {
 test "type check arithmetic mismatch reported" {
     // String + i64 should produce a type error
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn bad() -> i64 {
         \\    "hello" + 42
         \\  }
@@ -4140,7 +4145,7 @@ test "typeToString returns human-readable names" {
 test "type check var_ref resolves to parameter type" {
     // x is declared as i64, so x + 1 should not error (both i64)
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn double(x :: i64) -> i64 {
         \\    x + x
         \\  }
@@ -4170,7 +4175,7 @@ test "type check var_ref resolves to parameter type" {
 test "type check if condition must be Bool" {
     // Using an integer as if condition should produce an error
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn bad() -> i64 {
         \\    if 42 {
         \\      1
@@ -4204,7 +4209,7 @@ test "type check if condition must be Bool" {
 test "type check return type mismatch" {
     // Function declares i64 return but body returns a string
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn bad() -> i64 {
         \\    "not a number"
         \\  }
@@ -4238,7 +4243,7 @@ test "type check return type mismatch" {
 
 test "type provenance tracks source span on typed parameter" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn add(x :: i64) {
         \\    x
         \\  }
@@ -4278,7 +4283,7 @@ test "type provenance tracks source span on typed parameter" {
 
 test "typed parameter records shared ownership metadata" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn add(x :: i64) {
         \\    x
         \\  }
@@ -4318,7 +4323,7 @@ test "typed parameter records shared ownership metadata" {
 
 test "function ref inference defaults param ownerships to shared" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn main(args :: Nil) -> (Nil -> Nil) {
         \\    Foo.main/1
         \\  }
@@ -4346,7 +4351,7 @@ test "function ref inference defaults param ownerships to shared" {
     }
     try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
 
-    const main_func = program.modules[0].items[0].function;
+    const main_func = program.structs[0].items[0].function;
     const fn_ref_expr = main_func.clauses[0].body.?[0].expr;
     const inferred = try checker.inferExpr(fn_ref_expr);
     const typ = checker.store.getType(inferred);
@@ -4360,7 +4365,7 @@ test "function ref inference defaults param ownerships to shared" {
 
 test "anonymous closure with borrowed capture cannot escape via assignment" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn run(x :: borrowed String) -> Nil {
         \\    f = fn() -> String {
         \\      x
@@ -4386,7 +4391,7 @@ test "anonymous closure with borrowed capture cannot escape via assignment" {
     defer checker.deinit();
     try checker.checkProgram(&program);
 
-    const decl = program.modules[0].items[0].function.clauses[0].body.?[0].assignment.value.anonymous_function.decl;
+    const decl = program.structs[0].items[0].function.clauses[0].body.?[0].assignment.value.anonymous_function.decl;
     try std.testing.expect(checker.functionDeclCapturesBorrowed(decl));
 
     var found = false;
@@ -4401,7 +4406,7 @@ test "anonymous closure with borrowed capture cannot escape via assignment" {
 
 test "anonymous closure with borrowed capture cannot escape through return" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn run(x :: borrowed String) -> (String -> String) {
         \\    fn(y :: String) -> String {
         \\      x <> y
@@ -4426,7 +4431,7 @@ test "anonymous closure with borrowed capture cannot escape through return" {
     defer checker.deinit();
     try checker.checkProgram(&program);
 
-    const expr = program.modules[0].items[0].function.clauses[0].body.?[0].expr;
+    const expr = program.structs[0].items[0].function.clauses[0].body.?[0].expr;
     try std.testing.expect(checker.functionDeclCapturesBorrowed(expr.anonymous_function.decl));
 
     var found = false;
@@ -4441,7 +4446,7 @@ test "anonymous closure with borrowed capture cannot escape through return" {
 
 test "anonymous closure missing parameter annotation has closure-specific diagnostic" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn run() -> (i64 -> i64) {
         \\    fn(x) -> i64 {
         \\      x + 1
@@ -4478,7 +4483,7 @@ test "anonymous closure missing parameter annotation has closure-specific diagno
 
 test "anonymous closure missing return annotation has closure-specific diagnostic" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn run() -> (i64 -> i64) {
         \\    fn(x :: i64) {
         \\      x + 1
@@ -4515,7 +4520,7 @@ test "anonymous closure missing return annotation has closure-specific diagnosti
 
 test "higher-order call reports callable signature mismatch for anonymous closure" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn apply(f :: (i64 -> i64)) -> i64 {
         \\    f(41)
         \\  }
@@ -4556,7 +4561,7 @@ test "higher-order call reports callable signature mismatch for anonymous closur
 
 test "higher-order call reports callable signature mismatch for function ref" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn double(x :: i64) -> i64 {
         \\    x * 2
         \\  }
@@ -4603,7 +4608,7 @@ test "higher-order call reports callable signature mismatch for function ref" {
 
 test "moved binding use reports ownership error" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn echo(x :: String) {
         \\    x
         \\  }
@@ -4626,7 +4631,7 @@ test "moved binding use reports ownership error" {
     defer checker.deinit();
     try checker.checkProgram(&program);
 
-    const clause = program.modules[0].items[0].function.clauses[0];
+    const clause = program.structs[0].items[0].function.clauses[0];
     const expr = clause.body.?[0].expr;
     const scope_id = checker.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(clause.meta.span)) orelse clause.meta.scope_id;
     checker.current_scope = scope_id;
@@ -4649,7 +4654,7 @@ test "moved binding use reports ownership error" {
 
 test "unique function parameter ownership moves var_ref argument" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn caller(f, x) {
         \\    f(x)
         \\    x
@@ -4673,7 +4678,7 @@ test "unique function parameter ownership moves var_ref argument" {
     defer checker.deinit();
     try checker.checkProgram(&program);
 
-    const clause = program.modules[0].items[0].function.clauses[0];
+    const clause = program.structs[0].items[0].function.clauses[0];
     const scope_id = checker.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(clause.meta.span)) orelse clause.meta.scope_id;
     checker.current_scope = scope_id;
 
@@ -4705,7 +4710,7 @@ test "unique function parameter ownership moves var_ref argument" {
 
 test "shared binding cannot satisfy unique parameter ownership" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn caller(f, x) {
         \\    f(x)
         \\  }
@@ -4728,7 +4733,7 @@ test "shared binding cannot satisfy unique parameter ownership" {
     defer checker.deinit();
     try checker.checkProgram(&program);
 
-    const clause = program.modules[0].items[0].function.clauses[0];
+    const clause = program.structs[0].items[0].function.clauses[0];
     const scope_id = checker.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(clause.meta.span)) orelse clause.meta.scope_id;
     checker.current_scope = scope_id;
 
@@ -4757,7 +4762,7 @@ test "shared binding cannot satisfy unique parameter ownership" {
 
 test "named call with unique parameter moves opaque binding" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  opaque Handle = String
         \\
         \\  pub fn take(handle :: Handle) {
@@ -4800,7 +4805,7 @@ test "named call with unique parameter moves opaque binding" {
 
 test "borrowed param annotation keeps binding usable after call" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  opaque Handle = String
         \\
         \\  pub fn inspect(handle :: borrowed Handle) -> Nil {
@@ -4835,7 +4840,7 @@ test "borrowed param annotation keeps binding usable after call" {
 
 test "borrowed value cannot escape through return" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  opaque Handle = String
         \\
         \\  pub fn inspect(handle :: borrowed Handle) {
@@ -4873,7 +4878,7 @@ test "borrowed value cannot escape through return" {
 
 test "closure with borrowed capture cannot be returned" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  opaque Handle = String
         \\
         \\  pub fn make(handle :: borrowed Handle) {
@@ -4915,7 +4920,7 @@ test "closure with borrowed capture cannot be returned" {
 
 test "unique capture moves outer binding" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  opaque Handle = String
         \\
         \\  pub fn make(handle :: unique Handle) {
@@ -4958,7 +4963,7 @@ test "unique capture moves outer binding" {
 
 test "closure with borrowed capture cannot be passed as argument" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  opaque Handle = String
         \\
         \\  pub fn apply(f :: (-> Handle)) {
@@ -5004,7 +5009,7 @@ test "closure with borrowed capture cannot be passed as argument" {
 
 test "closure with borrowed capture cannot be assigned" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  opaque Handle = String
         \\
         \\  pub fn make(handle :: borrowed Handle) {
@@ -5047,7 +5052,7 @@ test "closure with borrowed capture cannot be assigned" {
 
 test "closure with borrowed capture cannot be stored in tuple" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  opaque Handle = String
         \\
         \\  pub fn make(handle :: borrowed Handle) {
@@ -5089,7 +5094,7 @@ test "closure with borrowed capture cannot be stored in tuple" {
 
 test "closure with borrowed capture may be locally invoked" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  opaque Handle = String
         \\
         \\  pub fn make(handle :: borrowed Handle) -> Bool {
@@ -5123,7 +5128,7 @@ test "closure with borrowed capture may be locally invoked" {
 
 test "closure with borrowed capture may be passed to known-safe callee" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  opaque Handle = String
         \\
         \\  pub fn apply(f :: (borrowed Handle -> Bool), handle :: borrowed Handle) -> Bool {
@@ -5161,7 +5166,7 @@ test "closure with borrowed capture may be passed to known-safe callee" {
 
 test "borrowed parameter does not move binding" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn caller(f, x) {
         \\    f(x)
         \\    x
@@ -5185,7 +5190,7 @@ test "borrowed parameter does not move binding" {
     defer checker.deinit();
     try checker.checkProgram(&program);
 
-    const clause = program.modules[0].items[0].function.clauses[0];
+    const clause = program.structs[0].items[0].function.clauses[0];
     const scope_id = checker.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(clause.meta.span)) orelse clause.meta.scope_id;
     checker.current_scope = scope_id;
 
@@ -5212,7 +5217,7 @@ test "borrowed parameter does not move binding" {
 
 test "return type mismatch has secondary span" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn bad() -> i64 {
         \\    "not a number"
         \\  }
@@ -5245,7 +5250,7 @@ test "return type mismatch has secondary span" {
 
 test "undefined function suggests similar name" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn foo(a, b) {
         \\    a + b
         \\  }
@@ -5287,7 +5292,7 @@ test "undefined function suggests similar name" {
 
 test "undefined function no suggestion for unrelated name" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn foo(a) {
         \\    a
         \\  }
@@ -5326,7 +5331,7 @@ test "undefined function no suggestion for unrelated name" {
 
 test "valid function call produces no error" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn foo(a, b) {
         \\    a + b
         \\  }
@@ -5360,7 +5365,7 @@ test "valid function call produces no error" {
 
 test "unused variable produces warning" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn foo() {
         \\    x = 42
         \\    1
@@ -5398,7 +5403,7 @@ test "unused variable produces warning" {
 
 test "underscore-prefixed variable no unused warning" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn foo() {
         \\    _x = 42
         \\    1
@@ -5430,7 +5435,7 @@ test "underscore-prefixed variable no unused warning" {
 
 test "used variable no unused warning" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn foo() {
         \\    x = 42
         \\    x + 1
@@ -5462,7 +5467,7 @@ test "used variable no unused warning" {
 
 test "variable used in zig intrinsic call is not unused" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn greet(name :: String) -> String {
         \\    :zig.to_atom(name)
         \\  }
@@ -5496,7 +5501,7 @@ test "variable used in zig intrinsic call is not unused" {
 
 test "unknown type name produces error" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn foo(x :: Other) {
         \\    x
         \\  }
@@ -5530,7 +5535,7 @@ test "unknown type name produces error" {
 
 test "unused function parameter produces warning" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn foo(x :: i64) {
         \\    42
         \\  }
@@ -5569,7 +5574,7 @@ test "zig bridge call parameters not flagged as unused" {
     // parameters, and the :zig bridge call resolved to the duplicate — leaving
     // the original parameter binding appearing unused.
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn get(map :: i64, key :: i64) -> i64 {
         \\    :zig.Prelude.add(map, key)
         \\  }
@@ -5605,7 +5610,7 @@ test "zig bridge call parameters not flagged as unused" {
 test "nested zig bridge call parameters not flagged as unused" {
     // Regression: :zig.A.B.func(param) nested bridge calls should also work.
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn read(path :: i64) -> i64 {
         \\    :zig.Map.get(path)
         \\  }

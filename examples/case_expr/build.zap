@@ -1,4 +1,4 @@
-pub module CaseExpr.Builder {
+pub struct CaseExpr.Builder {
   pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
     case env.target {
       :case_expr ->

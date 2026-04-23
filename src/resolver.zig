@@ -50,13 +50,13 @@ pub const Resolver = struct {
 
     pub fn resolveProgram(self: *Resolver, program: *const ast.Program) !void {
         // Resolve modules
-        for (program.modules, 0..) |*mod, i| {
+        for (program.structs, 0..) |*mod, i| {
             // Find the module scope
-            if (i < self.graph.modules.items.len) {
-                const mod_entry = &self.graph.modules.items[i];
+            if (i < self.graph.structs.items.len) {
+                const mod_entry = &self.graph.structs.items[i];
                 const saved = self.current_scope;
                 self.current_scope = mod_entry.scope_id;
-                try self.resolveModule(mod);
+                try self.resolveStruct(mod);
                 self.current_scope = saved;
             }
         }
@@ -67,7 +67,7 @@ pub const Resolver = struct {
         }
     }
 
-    fn resolveModule(self: *Resolver, mod: *const ast.ModuleDecl) !void {
+    fn resolveStruct(self: *Resolver, mod: *const ast.StructDecl) !void {
         for (mod.items) |item| {
             switch (item) {
                 .function => |func| try self.resolveFunctionDecl(func),
@@ -89,12 +89,11 @@ pub const Resolver = struct {
             .priv_macro => |mac| try self.resolveFunctionDecl(mac),
             .type_decl => |td| try self.resolveTypeDecl(td),
             .opaque_decl => |od| try self.resolveOpaqueDecl(od),
-            .struct_decl => {},
+            .struct_decl, .priv_struct_decl => {},
             .union_decl => {},
-            .module => {},
-            .priv_module => {},
             .protocol, .priv_protocol => {},
             .impl_decl, .priv_impl_decl => {},
+            .attribute => {},
         }
     }
 
@@ -500,7 +499,7 @@ const Collector = @import("collector.zig").Collector;
 
 test "resolve simple function" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn add(x :: i64, y :: i64) -> i64 {
         \\    x + y
         \\  }
@@ -529,7 +528,7 @@ test "resolve simple function" {
 
 test "resolve module with function" {
     const source =
-        \\pub module Math {
+        \\pub struct Math {
         \\  pub fn add(x :: i64, y :: i64) -> i64 {
         \\    x + y
         \\  }
@@ -557,7 +556,7 @@ test "resolve module with function" {
 
 test "resolve case expression with bindings" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn foo(x :: Atom) -> Nil {
         \\    case x {
         \\      {:ok, v} -> v
@@ -588,7 +587,7 @@ test "resolve case expression with bindings" {
 
 test "resolve assignment" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn foo() {
         \\    x = 42
         \\    x

@@ -1,15 +1,15 @@
-pub module Snake {
-  @moduledoc = """
-    A terminal snake game demonstrating Zap language features:
-    pattern matching, guards, pipes, char literals, and closures.
+@doc = """
+  A terminal snake game demonstrating Zap language features:
+  pattern matching, guards, pipes, char literals, and closures.
 
-    Move with w/a/s/d or arrow keys.
-    Collect * to grow. Hit a wall or yourself and it's game over.
-    Press q to quit.
+  Move with w/a/s/d or arrow keys.
+  Collect * to grow. Hit a wall or yourself and it's game over.
+  Press q to quit.
 
-    Run with: cd examples/snake && zap run snake
-    """
+  Run with: cd examples/snake && zap run snake
+  """
 
+pub struct Snake {
   # -- ANSI color helpers ------------------------------------------------------
 
   fn green(text :: String) -> String { "\x1b[32m" <> text <> "\x1b[0m" }

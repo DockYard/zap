@@ -1,19 +1,19 @@
-pub module List {
-  @moduledoc = """
-    Functions for working with lists.
+@doc = """
+  Functions for working with lists.
 
-    Lists in Zap are singly-linked immutable cons cells using
-    nullable pointers. An empty list is `[]` (null), and a
-    non-empty list is a chain of cells each holding a head value
-    and a tail pointer.
+  Lists in Zap are singly-linked immutable cons cells using
+  nullable pointers. An empty list is `[]` (null), and a
+  non-empty list is a chain of cells each holding a head value
+  and a tail pointer.
 
-    ## Examples
+  ## Examples
 
-        List.length([1, 2, 3])         # => 3
-        List.head([10, 20, 30])        # => 10
-        List.reverse([1, 2, 3])        # => [3, 2, 1]
-    """
+      List.length([1, 2, 3])         # => 3
+      List.head([10, 20, 30])        # => 10
+      List.reverse([1, 2, 3])        # => [3, 2, 1]
+  """
 
+pub struct List {
   @doc = """
     Returns `true` if the list has no elements.
 

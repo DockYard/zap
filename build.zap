@@ -1,4 +1,4 @@
-pub module Zap.Builder {
+pub struct Zap.Builder {
   pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
     case env.target {
       :test ->

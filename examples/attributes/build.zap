@@ -1,4 +1,4 @@
-pub module Attributes.Builder {
+pub struct Attributes.Builder {
   pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
     case env.target {
       :attributes ->

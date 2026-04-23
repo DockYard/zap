@@ -1,7 +1,7 @@
-pub module Test.BoolTest {
+pub struct Test.BoolTest {
   use Zest.Case
 
-  describe("Bool module") {
+  describe("Bool struct") {
     test("to_string true") {
       assert(Bool.to_string(true) == "true")
     }

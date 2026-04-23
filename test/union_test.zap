@@ -1,9 +1,9 @@
-pub module Test.UnionTest {
+pub struct Test.UnionTest {
   use Zest.Case
 
   pub union Color {
-    Red
-    Green
+    Red,
+    Green,
     Blue
   }
 

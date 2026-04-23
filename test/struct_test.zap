@@ -21,7 +21,7 @@ pub struct Rectangle extends Shape {
 
 
 
-pub module Test.StructTest {
+pub struct Test.StructTest {
   use Zest.Case
 
   describe("Struct creation") {

@@ -1,16 +1,16 @@
-pub module Kernel {
-  @moduledoc = """
-    The default module imported into every Zap module.
+@doc = """
+  The default module imported into every Zap module.
 
-    Kernel provides the fundamental language constructs implemented
-    as macros: control flow (`if`, `unless`), boolean operators
-    (`and`, `or`), the pipe operator (`|>`), sigils (`~s`, `~S`,
-    `~w`, `~W`), and declaration macros (`fn`, `struct`, `union`).
+  Kernel provides the fundamental language constructs implemented
+  as macros: control flow (`if`, `unless`), boolean operators
+  (`and`, `or`), the pipe operator (`|>`), sigils (`~s`, `~S`,
+  `~w`, `~W`), and declaration macros (`fn`, `struct`, `union`).
 
-    You don't need to `import Kernel` — its macros are available
-    everywhere automatically.
-    """
+  You don't need to `import Kernel` — its macros are available
+  everywhere automatically.
+  """
 
+pub struct Kernel {
   @doc = """
     Conditional expression with a single branch.
 

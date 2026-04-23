@@ -2,7 +2,7 @@
 #
 # Demonstrates case/switch on atom values.
 
-pub module CaseExpr {
+pub struct CaseExpr {
   pub fn describe(x :: i64) -> String {
     case x {
       0 ->

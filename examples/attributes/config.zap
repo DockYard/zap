@@ -1,4 +1,4 @@
-pub module Config {
+pub struct Config {
   @timeout :: i64 = 5000
   pub fn timeout() -> i64 {
     @timeout

@@ -1,4 +1,4 @@
-pub module Test.IfElseTest {
+pub struct Test.IfElseTest {
   use Zest.Case
 
   describe("if else") {

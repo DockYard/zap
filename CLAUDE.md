@@ -31,14 +31,14 @@ Zap is a general-purpose programming language. Features, behaviors, library func
 
 ## Documentation
 
-**All public Zap functions MUST have `@doc` attributes.** Every `pub fn` and `pub macro` in `lib/*.zap` files must have a `@doc` string describing what it does. Use heredoc `"""` for multi-line docs. No exceptions.
+**All public Zap functions MUST have `@fndoc` attributes.** Every `pub fn` and `pub macro` in `lib/*.zap` files must have a `@fndoc` string describing what it does. Use heredoc `"""` for multi-line docs. No exceptions.
 
 ## Zap Code Quality
 
 - **Blank line after every heredoc closing `"""`**. The `"""` must be followed by an empty line before the next declaration or attribute. No exceptions.
-- **`@moduledoc` goes inside the module body**, immediately after `pub module Name {`.
-- **`@doc` goes immediately before the function/macro it documents**, with a blank line between the closing `"""` and the `pub fn`/`pub macro`.
-- **All `@doc` and `@moduledoc` use heredoc `"""`** for multi-line content.
+- **`@structdoc` goes inside the struct body**, immediately after `pub struct Name {`.
+- **`@fndoc` goes immediately before the function/macro it documents**, with a blank line between the closing `"""` and the `pub fn`/`pub macro`.
+- **All `@fndoc` and `@structdoc` use heredoc `"""`** for multi-line content.
 - **Escape `#{` in doc examples** as `\#{` to prevent interpolation inside heredocs.
 - **Always use descriptive names.** Never use short or cryptic variable names, parameter names, or helper names when writing new code. Prefer explicit names that make the code readable without extra context.
 

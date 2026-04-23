@@ -1,31 +1,31 @@
-pub module Float {
-  @moduledoc = """
-    Functions for working with floating-point numbers.
+@doc = """
+  Functions for working with floating-point numbers.
 
-    ## Float Types
+  ## Float Types
 
-    Zap supports the following floating-point types:
+  Zap supports the following floating-point types:
 
-    | Type  | Bits | Precision        |
-    |-------|------|------------------|
-    | `f16` | 16   | Half precision   |
-    | `f32` | 32   | Single precision |
-    | `f64` | 64   | Double precision |
+  | Type  | Bits | Precision        |
+  |-------|------|------------------|
+  | `f16` | 16   | Half precision   |
+  | `f32` | 32   | Single precision |
+  | `f64` | 64   | Double precision |
 
-    The default float type for literals is `f64`.
+  The default float type for literals is `f64`.
 
-    ## Implicit Widening
+  ## Implicit Widening
 
-    Zap automatically widens narrower float types to wider ones at
-    function call sites: `f16` \u{2192} `f32` \u{2192} `f64`. This is
-    lossless and zero-cost — the compiler inserts the conversion
-    automatically.
+  Zap automatically widens narrower float types to wider ones at
+  function call sites: `f16` \u{2192} `f32` \u{2192} `f64`. This is
+  lossless and zero-cost — the compiler inserts the conversion
+  automatically.
 
-    Integer-to-float conversion is **not** implicit because large
-    integers cannot be represented exactly in floating-point. Use
-    `Integer.to_float/1` when needed.
-    """
+  Integer-to-float conversion is **not** implicit because large
+  integers cannot be represented exactly in floating-point. Use
+  `Integer.to_float/1` when needed.
+  """
 
+pub struct Float {
   @doc = """
     Converts a floating-point number to its string representation.
 

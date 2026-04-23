@@ -1,4 +1,4 @@
-pub module Multifile.Builder {
+pub struct Multifile.Builder {
   pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
     case env.target {
       :multifile ->

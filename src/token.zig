@@ -30,7 +30,6 @@ pub const Token = struct {
         // Keywords
         keyword_pub,
         keyword_fn,
-        keyword_module,
         keyword_struct,
         keyword_union,
         keyword_macro,
@@ -128,7 +127,6 @@ pub const Token = struct {
     pub const keywords = std.StaticStringMap(Tag).initComptime(.{
         .{ "pub", .keyword_pub },
         .{ "fn", .keyword_fn },
-        .{ "module", .keyword_module },
         .{ "struct", .keyword_struct },
         .{ "union", .keyword_union },
         .{ "macro", .keyword_macro },
@@ -177,13 +175,14 @@ pub const Token = struct {
 
 test "keyword lookup" {
     try std.testing.expectEqual(Token.Tag.keyword_fn, Token.getKeyword("fn").?);
-    try std.testing.expectEqual(Token.Tag.keyword_module, Token.getKeyword("module").?);
+    try std.testing.expectEqual(Token.Tag.keyword_struct, Token.getKeyword("struct").?);
     try std.testing.expectEqual(Token.Tag.keyword_pub, Token.getKeyword("pub").?);
     try std.testing.expect(Token.getKeyword("foobar") == null);
+    try std.testing.expect(Token.getKeyword("module") == null);
 }
 
 test "token slice" {
-    const source = "pub module Foo {";
+    const source = "pub struct Foo {";
     const tok = Token{
         .tag = .keyword_pub,
         .loc = .{ .start = 0, .end = 3 },

@@ -1,4 +1,4 @@
-pub module Factorial.Builder {
+pub struct Factorial.Builder {
   pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
     case env.target {
       :factorial ->

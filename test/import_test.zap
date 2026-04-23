@@ -1,4 +1,4 @@
-pub module Test.ImportTest {
+pub struct Test.ImportTest {
   use Zest.Case
   import Test.MultiModuleHelper
 

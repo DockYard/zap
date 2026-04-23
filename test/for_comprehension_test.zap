@@ -1,4 +1,4 @@
-pub module Test.ForComprehensionTest {
+pub struct Test.ForComprehensionTest {
   use Zest.Case
 
   fn double_all([] :: [i64]) -> [i64] {

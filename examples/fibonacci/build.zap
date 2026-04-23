@@ -1,4 +1,4 @@
-pub module Fibonacci.Builder {
+pub struct Fibonacci.Builder {
   pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
     case env.target {
       :fibonacci ->

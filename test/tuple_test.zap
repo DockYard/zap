@@ -1,4 +1,4 @@
-pub module Test.TupleTest {
+pub struct Test.TupleTest {
   use Zest.Case
 
   describe("tuples") {

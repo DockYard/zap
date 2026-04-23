@@ -635,7 +635,7 @@ test "lex module identifier" {
 }
 
 test "lex braces" {
-    const source = "pub module Foo {\n  pub fn bar() :: i64 {\n    42\n  }\n}";
+    const source = "pub struct Foo {\n  pub fn bar() :: i64 {\n    42\n  }\n}";
     var lexer = Lexer.init(source);
 
     var has_left_brace = false;

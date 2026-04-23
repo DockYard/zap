@@ -378,7 +378,7 @@ Same as IR — monomorphized functions lower to ZIR as concrete functions. No ch
 **File: `lib/enumerable.zap`**
 
 ```zap
-pub module Enumerable {
+pub struct Enumerable {
   protocol Enumerable(element :: type) {
     fn reduce(self, acc :: b, f :: (element, b -> b)) -> b
   }
@@ -417,7 +417,7 @@ impl Enumerable({key, value}) for %{key => value} {
 **File: `lib/enum.zap`**
 
 ```zap
-pub module Enum {
+pub struct Enum {
   pub fn map(coll :: Enumerable(element), f :: (element -> result)) -> [result] {
     Enumerable.reduce(coll, [], fn(item, acc) {
       List.append(acc, f.(item))

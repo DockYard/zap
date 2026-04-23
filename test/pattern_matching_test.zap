@@ -1,4 +1,4 @@
-pub module Test.PatternMatchingTest {
+pub struct Test.PatternMatchingTest {
   use Zest.Case
 
   describe("pattern matching") {

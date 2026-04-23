@@ -1,7 +1,7 @@
-pub module Test.PathTest {
+pub struct Test.PathTest {
   use Zest.Case
 
-  describe("Path module") {
+  describe("Path struct") {
     test("join two segments") {
       assert(Path.join("src", "main.zap") == "src/main.zap")
     }

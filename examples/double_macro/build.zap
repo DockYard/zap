@@ -1,4 +1,4 @@
-pub module DoubleMacro.Builder {
+pub struct DoubleMacro.Builder {
   pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
     case env.target {
       :double_macro ->

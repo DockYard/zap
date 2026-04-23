@@ -1,19 +1,19 @@
-pub module Map {
-  @moduledoc = """
-    Functions for working with maps.
+@doc = """
+  Functions for working with maps.
 
-    Maps in Zap are immutable key-value collections that support
-    any key and value types. The compiler specializes map operations
-    at compile time based on the concrete types used.
+  Maps in Zap are immutable key-value collections that support
+  any key and value types. The compiler specializes map operations
+  at compile time based on the concrete types used.
 
-    ## Examples
+  ## Examples
 
-        m = %{name: "Alice", age: 30}
-        Map.get(m, :name, "")    # => "Alice"
-        Map.has_key?(m, :name)   # => true
-        Map.size(m)              # => 2
-    """
+      m = %{name: "Alice", age: 30}
+      Map.get(m, :name, "")    # => "Alice"
+      Map.has_key?(m, :name)   # => true
+      Map.size(m)              # => 2
+  """
 
+pub struct Map {
   @doc = """
     Returns the value for the given key, or the default if
     the key is not found.

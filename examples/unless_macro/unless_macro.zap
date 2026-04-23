@@ -3,7 +3,7 @@
 # Run with:
 #   zap run unless_macro
 
-pub module UnlessMacro {
+pub struct UnlessMacro {
   pub fn check(x :: i64) -> String if x > 10 {
     "big number"
   }

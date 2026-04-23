@@ -1,4 +1,4 @@
-pub module Test.MapTest {
+pub struct Test.MapTest {
   use Zest.Case
 
   describe("Integer value maps") {

@@ -30,17 +30,17 @@ pub fn substituteAttributes(
     interner: *ast.StringInterner,
     errors: *std.ArrayListUnmanaged(SubstitutionError),
 ) !ast.Program {
-    var new_modules: std.ArrayListUnmanaged(ast.ModuleDecl) = .empty;
+    var new_structs: std.ArrayListUnmanaged(ast.StructDecl) = .empty;
 
-    for (program.modules) |*mod| {
+    for (program.structs) |*mod| {
         const mod_scope = graph.node_scope_map.get(scope.ScopeGraph.spanKey(mod.meta.span)) orelse {
-            try new_modules.append(alloc, mod.*);
+            try new_structs.append(alloc, mod.*);
             continue;
         };
 
         // Collect module-level attributes for this module
         var mod_attrs: std.ArrayListUnmanaged(scope.Attribute) = .empty;
-        for (graph.modules.items) |mod_entry| {
+        for (graph.structs.items) |mod_entry| {
             if (mod_entry.scope_id == mod_scope) {
                 for (mod_entry.attributes.items) |attr| {
                     try mod_attrs.append(alloc, attr);
@@ -49,7 +49,7 @@ pub fn substituteAttributes(
             }
         }
 
-        var new_items: std.ArrayListUnmanaged(ast.ModuleItem) = .empty;
+        var new_items: std.ArrayListUnmanaged(ast.StructItem) = .empty;
 
         for (mod.items) |item| {
             switch (item) {
@@ -89,11 +89,11 @@ pub fn substituteAttributes(
 
         var new_mod = mod.*;
         new_mod.items = try new_items.toOwnedSlice(alloc);
-        try new_modules.append(alloc, new_mod);
+        try new_structs.append(alloc, new_mod);
     }
 
     return .{
-        .modules = try new_modules.toOwnedSlice(alloc),
+        .structs = try new_structs.toOwnedSlice(alloc),
         .top_items = program.top_items,
     };
 }

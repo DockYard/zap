@@ -166,7 +166,7 @@ pub fn discover(
             return error.ReadError;
 
         // Track whether this module is private (defmodulep)
-        graph.module_is_private.put(module_name, isPrivateModule(source)) catch return error.OutOfMemory;
+        graph.module_is_private.put(module_name, isPrivateStruct(source)) catch return error.OutOfMemory;
 
         const refs = extractModuleReferences(alloc, source, module_name) catch
             return error.OutOfMemory;
@@ -255,7 +255,7 @@ fn enforceDepBoundaries(alloc: std.mem.Allocator, graph: *FileGraph, err_info: ?
 /// Convert a module name to a relative file path.
 /// "Config.Parser" → "config/parser.zap"
 /// Caller owns the returned slice and must free it with the same allocator.
-pub fn moduleNameToRelPath(alloc: std.mem.Allocator, module_name: []const u8) ![]const u8 {
+pub fn structNameToRelPath(alloc: std.mem.Allocator, module_name: []const u8) ![]const u8 {
     var result: std.ArrayListUnmanaged(u8) = .empty;
 
     var it = std.mem.splitScalar(u8, module_name, '.');
@@ -294,7 +294,7 @@ fn resolveModuleToFile(
     module_name: []const u8,
     source_roots: []const SourceRoot,
 ) ?ResolvedFile {
-    const rel_path = moduleNameToRelPath(alloc, module_name) catch return null;
+    const rel_path = structNameToRelPath(alloc, module_name) catch return null;
 
     // Try the full relative path first
     for (source_roots) |root| {
@@ -306,11 +306,11 @@ fn resolveModuleToFile(
     // If the module name has a prefix (e.g., "Test.StringTest"), try stripping
     // the first segment and resolving within each source root. This handles the
     // convention where `test/` is a source root and modules are named
-    // `Test.ModuleName` — the `Test.` prefix maps to the source root, not to
+    // `Test.StructName` — the `Test.` prefix maps to the source root, not to
     // a subdirectory within it.
     if (std.mem.indexOfScalar(u8, module_name, '.')) |dot_pos| {
         const suffix = module_name[dot_pos + 1 ..];
-        const suffix_path = moduleNameToRelPath(alloc, suffix) catch return null;
+        const suffix_path = structNameToRelPath(alloc, suffix) catch return null;
         for (source_roots) |root| {
             const full_path = std.fs.path.join(alloc, &.{ root.path, suffix_path }) catch continue;
             std.Io.Dir.cwd().access(std.Options.debug_io, full_path, .{}) catch continue;
@@ -323,14 +323,14 @@ fn resolveModuleToFile(
 
 /// Check if a source file declares its module without `pub` (private).
 /// Uses the lexer for a fast scan — no full parsing needed.
-/// A `module Name {` declaration is private; `pub module Name {` is public.
-fn isPrivateModule(source: []const u8) bool {
+/// A `struct Name {` declaration is private; `pub struct Name {` is public.
+fn isPrivateStruct(source: []const u8) bool {
     var lexer = zap.Lexer.init(source);
     while (true) {
         const tok = lexer.next();
         if (tok.tag == .eof) break;
-        if (tok.tag == .keyword_module) return true; // bare `module` = private
-        if (tok.tag == .keyword_pub) return false; // `pub module` = public
+        if (tok.tag == .keyword_struct) return true; // bare `struct` = private
+        if (tok.tag == .keyword_pub) return false; // `pub struct` = public
     }
     return false;
 }
@@ -574,30 +574,30 @@ pub const BUILTIN_TYPE_NAMES = [_][]const u8{
 // Tests
 // ============================================================
 
-test "moduleNameToRelPath: simple module" {
+test "structNameToRelPath: simple module" {
     const alloc = std.testing.allocator;
-    const result = try moduleNameToRelPath(alloc, "Config");
+    const result = try structNameToRelPath(alloc, "Config");
     defer alloc.free(result);
     try std.testing.expectEqualStrings("config.zap", result);
 }
 
-test "moduleNameToRelPath: nested module" {
+test "structNameToRelPath: nested module" {
     const alloc = std.testing.allocator;
-    const result = try moduleNameToRelPath(alloc, "Config.Parser");
+    const result = try structNameToRelPath(alloc, "Config.Parser");
     defer alloc.free(result);
     try std.testing.expectEqualStrings("config/parser.zap", result);
 }
 
-test "moduleNameToRelPath: PascalCase to snake_case" {
+test "structNameToRelPath: PascalCase to snake_case" {
     const alloc = std.testing.allocator;
-    const result = try moduleNameToRelPath(alloc, "JsonParser");
+    const result = try structNameToRelPath(alloc, "JsonParser");
     defer alloc.free(result);
     try std.testing.expectEqualStrings("json_parser.zap", result);
 }
 
-test "moduleNameToRelPath: deeply nested" {
+test "structNameToRelPath: deeply nested" {
     const alloc = std.testing.allocator;
-    const result = try moduleNameToRelPath(alloc, "App.Http.Middleware");
+    const result = try structNameToRelPath(alloc, "App.Http.Middleware");
     defer alloc.free(result);
     try std.testing.expectEqualStrings("app/http/middleware.zap", result);
 }
@@ -607,7 +607,7 @@ test "extractModuleReferences: finds qualified calls" {
     defer arena.deinit();
     const alloc = arena.allocator();
     const source =
-        \\pub module App {
+        \\pub struct App {
         \\  pub fn main() -> String {
         \\    Config.load("/etc/app")
         \\    IO.puts("hello")
@@ -632,7 +632,7 @@ test "extractModuleReferences: finds nested module references" {
     defer arena.deinit();
     const alloc = arena.allocator();
     const source =
-        \\pub module App {
+        \\pub struct App {
         \\  pub fn main() -> String {
         \\    Config.Parser.parse("data")
         \\  }
@@ -647,10 +647,9 @@ test "extractModuleReferences: finds nested module references" {
     try std.testing.expect(found);
 }
 
-test "isPrivateModule: detects bare module" {
-    try std.testing.expect(isPrivateModule("module Foo {\n}\n"));
-    try std.testing.expect(!isPrivateModule("pub module Foo {\n}\n"));
-    try std.testing.expect(!isPrivateModule("pub struct Foo {\n}\n"));
+test "isPrivateStruct: detects bare struct" {
+    try std.testing.expect(isPrivateStruct("struct Foo {\n}\n"));
+    try std.testing.expect(!isPrivateStruct("pub struct Foo {\n}\n"));
 }
 
 test "discover: single file with no references" {
@@ -664,7 +663,7 @@ test "discover: single file with no references" {
 
     try tmp_dir.dir.writeFile(std.Options.debug_io, .{
         .sub_path = "app.zap",
-        .data = "pub module App {\n  pub fn main() -> i64 {\n    42\n  }\n}\n",
+        .data = "pub struct App {\n  pub fn main() -> i64 {\n    42\n  }\n}\n",
     });
 
     const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
@@ -688,15 +687,15 @@ test "discover: transitive references" {
     // App → Helper → Util (3 files, transitive chain)
     try tmp_dir.dir.writeFile(std.Options.debug_io, .{
         .sub_path = "app.zap",
-        .data = "pub module App {\n  pub fn main() -> i64 {\n    Helper.run()\n  }\n}\n",
+        .data = "pub struct App {\n  pub fn main() -> i64 {\n    Helper.run()\n  }\n}\n",
     });
     try tmp_dir.dir.writeFile(std.Options.debug_io, .{
         .sub_path = "helper.zap",
-        .data = "pub module Helper {\n  pub fn run() -> i64 {\n    Util.value()\n  }\n}\n",
+        .data = "pub struct Helper {\n  pub fn run() -> i64 {\n    Util.value()\n  }\n}\n",
     });
     try tmp_dir.dir.writeFile(std.Options.debug_io, .{
         .sub_path = "util.zap",
-        .data = "pub module Util {\n  pub fn value() -> i64 {\n    1\n  }\n}\n",
+        .data = "pub struct Util {\n  pub fn value() -> i64 {\n    1\n  }\n}\n",
     });
 
     const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
@@ -728,11 +727,11 @@ test "discover: circular dependency detected" {
     // A → B → A (cycle)
     try tmp_dir.dir.writeFile(std.Options.debug_io, .{
         .sub_path = "cycle_a.zap",
-        .data = "pub module CycleA {\n  pub fn go() -> i64 {\n    CycleB.go()\n  }\n}\n",
+        .data = "pub struct CycleA {\n  pub fn go() -> i64 {\n    CycleB.go()\n  }\n}\n",
     });
     try tmp_dir.dir.writeFile(std.Options.debug_io, .{
         .sub_path = "cycle_b.zap",
-        .data = "pub module CycleB {\n  pub fn go() -> i64 {\n    CycleA.go()\n  }\n}\n",
+        .data = "pub struct CycleB {\n  pub fn go() -> i64 {\n    CycleA.go()\n  }\n}\n",
     });
 
     const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
@@ -754,7 +753,7 @@ test "discover: unresolvable references are silently skipped" {
     // (might be a union variant, struct name, or other non-module identifier)
     try tmp_dir.dir.writeFile(std.Options.debug_io, .{
         .sub_path = "app.zap",
-        .data = "pub module App {\n  pub fn main() -> i64 {\n    NonExistent.foo()\n  }\n}\n",
+        .data = "pub struct App {\n  pub fn main() -> i64 {\n    NonExistent.foo()\n  }\n}\n",
     });
 
     const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
@@ -785,11 +784,11 @@ test "discover: module found in dep root" {
 
     try tmp_dir.dir.writeFile(std.Options.debug_io, .{
         .sub_path = "project/app.zap",
-        .data = "pub module App {\n  pub fn main() -> i64 {\n    DepMod.value()\n  }\n}\n",
+        .data = "pub struct App {\n  pub fn main() -> i64 {\n    DepMod.value()\n  }\n}\n",
     });
     try tmp_dir.dir.writeFile(std.Options.debug_io, .{
         .sub_path = "dep_lib/dep_mod.zap",
-        .data = "pub module DepMod {\n  pub fn value() -> i64 {\n    99\n  }\n}\n",
+        .data = "pub struct DepMod {\n  pub fn value() -> i64 {\n    99\n  }\n}\n",
     });
 
     const project_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, "project", alloc);
@@ -822,7 +821,7 @@ test "discover: level_boundaries for single file" {
 
     try tmp_dir.dir.writeFile(std.Options.debug_io, .{
         .sub_path = "app.zap",
-        .data = "pub module App {\n  pub fn main() -> i64 {\n    42\n  }\n}\n",
+        .data = "pub struct App {\n  pub fn main() -> i64 {\n    42\n  }\n}\n",
     });
 
     const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
@@ -847,15 +846,15 @@ test "discover: level_boundaries for linear chain" {
     // App → Helper → Util (linear chain = 3 levels)
     try tmp_dir.dir.writeFile(std.Options.debug_io, .{
         .sub_path = "app.zap",
-        .data = "pub module App {\n  pub fn main() -> i64 {\n    Helper.run()\n  }\n}\n",
+        .data = "pub struct App {\n  pub fn main() -> i64 {\n    Helper.run()\n  }\n}\n",
     });
     try tmp_dir.dir.writeFile(std.Options.debug_io, .{
         .sub_path = "helper.zap",
-        .data = "pub module Helper {\n  pub fn run() -> i64 {\n    Util.value()\n  }\n}\n",
+        .data = "pub struct Helper {\n  pub fn run() -> i64 {\n    Util.value()\n  }\n}\n",
     });
     try tmp_dir.dir.writeFile(std.Options.debug_io, .{
         .sub_path = "util.zap",
-        .data = "pub module Util {\n  pub fn value() -> i64 {\n    1\n  }\n}\n",
+        .data = "pub struct Util {\n  pub fn value() -> i64 {\n    1\n  }\n}\n",
     });
 
     const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
@@ -885,19 +884,19 @@ test "discover: level_boundaries for diamond dependency" {
     // Level 2: App (depends on Left and Right)
     try tmp_dir.dir.writeFile(std.Options.debug_io, .{
         .sub_path = "app.zap",
-        .data = "pub module App {\n  pub fn main() -> i64 {\n    Left.go() + Right.go()\n  }\n}\n",
+        .data = "pub struct App {\n  pub fn main() -> i64 {\n    Left.go() + Right.go()\n  }\n}\n",
     });
     try tmp_dir.dir.writeFile(std.Options.debug_io, .{
         .sub_path = "left.zap",
-        .data = "pub module Left {\n  pub fn go() -> i64 {\n    Base.value()\n  }\n}\n",
+        .data = "pub struct Left {\n  pub fn go() -> i64 {\n    Base.value()\n  }\n}\n",
     });
     try tmp_dir.dir.writeFile(std.Options.debug_io, .{
         .sub_path = "right.zap",
-        .data = "pub module Right {\n  pub fn go() -> i64 {\n    Base.value()\n  }\n}\n",
+        .data = "pub struct Right {\n  pub fn go() -> i64 {\n    Base.value()\n  }\n}\n",
     });
     try tmp_dir.dir.writeFile(std.Options.debug_io, .{
         .sub_path = "base.zap",
-        .data = "pub module Base {\n  pub fn value() -> i64 {\n    1\n  }\n}\n",
+        .data = "pub struct Base {\n  pub fn value() -> i64 {\n    1\n  }\n}\n",
     });
 
     const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);

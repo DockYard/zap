@@ -1,4 +1,4 @@
-pub module Hello.Builder {
+pub struct Hello.Builder {
   pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
     case env.target {
       :hello ->

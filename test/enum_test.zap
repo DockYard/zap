@@ -1,7 +1,7 @@
-pub module Test.EnumTest {
+pub struct Test.EnumTest {
   use Zest.Case
 
-  describe("Enum module") {
+  describe("Enum struct") {
     test("map doubles values") {
       result = Enum.map([1, 2, 3], double)
       assert(List.head(result) == 2)

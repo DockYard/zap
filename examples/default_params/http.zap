@@ -1,6 +1,6 @@
 # String concatenation and function calls
 
-pub module Http {
+pub struct Http {
   pub fn get(url :: String) -> String {
     "GET " <> url
   }

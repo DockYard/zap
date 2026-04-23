@@ -1,4 +1,4 @@
-pub module Math {
+pub struct Math {
   pub macro double(value :: i64) -> i64 {
     quote {
       unquote(value) + unquote(value)

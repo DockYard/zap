@@ -1,4 +1,4 @@
-pub module Test.PipesTest {
+pub struct Test.PipesTest {
   use Zest.Case
 
   describe("pipes") {

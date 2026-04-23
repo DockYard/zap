@@ -1,7 +1,7 @@
-# Geometry module --- uses types from types.zap via cross-file resolution.
+# Geometry struct --- uses types from types.zap via cross-file resolution.
 # Demonstrates automatic union synthesis across file boundaries.
 
-pub module Geometry {
+pub struct Geometry {
   pub fn area(%{radius: r} :: Circle) -> f64 {
     3.14159 * r * r
   }

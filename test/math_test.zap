@@ -1,7 +1,7 @@
-pub module Test.MathTest {
+pub struct Test.MathTest {
   use Zest.Case
 
-  describe("Math module") {
+  describe("Math struct") {
     test("pi value") {
       assert(Math.pi() == 3.141592653589793)
     }

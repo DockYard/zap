@@ -1,4 +1,4 @@
-pub module ErrorPipe.Builder {
+pub struct ErrorPipe.Builder {
   pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
     case env.target {
       :error_pipe ->

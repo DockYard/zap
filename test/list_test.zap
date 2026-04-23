@@ -1,4 +1,4 @@
-pub module Test.ListTest {
+pub struct Test.ListTest {
   use Zest.Case
 
   describe("Integer lists") {

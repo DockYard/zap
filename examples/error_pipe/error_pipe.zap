@@ -1,4 +1,4 @@
-pub module ErrorPipe {
+pub struct ErrorPipe {
   # Multi-clause function: only matches certain strings.
   # Unmatched inputs flow to the ~> catch basin.
   pub fn parse_number("one" :: String) -> String {

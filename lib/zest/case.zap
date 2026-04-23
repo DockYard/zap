@@ -1,42 +1,42 @@
-pub module Zest.Case {
-  @moduledoc = """
-    Test case DSL for the Zest test framework.
+@doc = """
+  Test case DSL for the Zest test framework.
 
-    Provides `describe`, `test`, `assert`, `reject`, `setup`, and
-    `teardown` for writing structured test cases with test tracking.
+  Provides `describe`, `test`, `assert`, `reject`, `setup`, and
+  `teardown` for writing structured test cases with test tracking.
 
-    Setup runs fresh before EACH test that requests context.
-    Teardown runs after each test. Assertions are non-fatal.
+  Setup runs fresh before EACH test that requests context.
+  Teardown runs after each test. Assertions are non-fatal.
 
-    The `describe` and `test` macros expand into function declarations
-    so that each test becomes a named pub function (test_*) that is
-    called at module level.
+  The `describe` and `test` macros expand into function declarations
+  so that each test becomes a named pub function (test_*) that is
+  called at module level.
 
-    ## Examples
+  ## Examples
 
-        pub module Test.MyTest {
-          use Zest.Case
+      pub struct Test.MyTest {
+        use Zest.Case
 
-          describe("my feature") {
-            setup() {
-              42
-            }
+        describe("my feature") {
+          setup() {
+            42
+          }
 
-            test("uses context", ctx) {
-              assert(ctx == 42)
-            }
+          test("uses context", ctx) {
+            assert(ctx == 42)
+          }
 
-            test("no context needed") {
-              assert(true)
-            }
+          test("no context needed") {
+            assert(true)
+          }
 
-            teardown() {
-              IO.puts("cleanup")
-            }
+          teardown() {
+            IO.puts("cleanup")
           }
         }
-    """
+      }
+  """
 
+pub struct Zest.Case {
   @doc = """
     Imports `Zest.Case` into the calling module.
     """

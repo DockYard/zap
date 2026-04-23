@@ -1,4 +1,4 @@
-pub module Animal {
+pub struct Animal {
   pub fn speak() -> String {
     "..."
   }

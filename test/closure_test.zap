@@ -1,4 +1,4 @@
-pub module Test.ClosureTest {
+pub struct Test.ClosureTest {
   use Zest.Case
 
   describe("closures") {
@@ -69,7 +69,7 @@ pub module Test.ClosureTest {
     callback()
   }
 
-  describe("cross-module generic callback") {
+  describe("cross-struct generic callback") {
     test("IO.mode/2 returns callback result") {
       assert(mode_test() == 42)
     }

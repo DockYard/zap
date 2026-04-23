@@ -1,4 +1,4 @@
-pub module Guards.Builder {
+pub struct Guards.Builder {
   pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
     case env.target {
       :guards ->

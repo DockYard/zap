@@ -1,4 +1,4 @@
-pub module MathModule.Builder {
+pub struct MathModule.Builder {
   pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
     case env.target {
       :math_module ->

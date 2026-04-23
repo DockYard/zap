@@ -1,29 +1,29 @@
-pub module Zest.Runner {
-  @moduledoc = """
-    Finalizes test execution and prints the summary report.
+@doc = """
+  Finalizes test execution and prints the summary report.
 
-    Delegates to `:zig.Zest.summary()` which prints an
-    ExUnit-style summary with test count, assertion count, and
-    failure count, then exits with a non-zero code if any tests
-    failed.
+  Delegates to `:zig.Zest.summary()` which prints an
+  ExUnit-style summary with test count, assertion count, and
+  failure count, then exits with a non-zero code if any tests
+  failed.
 
-    Supports seed-based deterministic test ordering. Pass
-    `--seed <integer>` on the command line to reproduce a
-    specific test run. Without `--seed`, a random seed is
-    generated from the system clock.
+  Supports seed-based deterministic test ordering. Pass
+  `--seed <integer>` on the command line to reproduce a
+  specific test run. Without `--seed`, a random seed is
+  generated from the system clock.
 
-    ## Examples
+  ## Examples
 
-        pub module Test.TestRunner {
-          use Zest.Runner
+      pub struct Test.TestRunner {
+        use Zest.Runner
 
-          pub fn main(_args :: [String]) -> String {
-            Test.MyTest.run()
-            Zest.Runner.run()
-          }
+        pub fn main(_args :: [String]) -> String {
+          Test.MyTest.run()
+          Zest.Runner.run()
         }
-    """
+      }
+  """
 
+pub struct Zest.Runner {
   @doc = """
     Imports `Zest.Runner` into the calling module.
 

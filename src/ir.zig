@@ -910,7 +910,7 @@ pub const IrBuilder = struct {
     pub fn buildProgram(self: *IrBuilder, hir_program: *const hir_mod.Program) !Program {
         // First pass: register all qualified function names for bare call resolution
         for (hir_program.modules) |mod| {
-            const module_prefix = self.moduleNameToPrefix(mod.name);
+            const module_prefix = self.structNameToPrefix(mod.name);
             for (mod.functions) |func_group| {
                 const func_name = self.interner.get(func_group.name);
                 const qualified = try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ module_prefix, func_name, func_group.arity });
@@ -927,7 +927,7 @@ pub const IrBuilder = struct {
         // that need __try variants. This must happen before building function bodies
         // so that __try variants are generated during buildFunctionGroup.
         for (hir_program.modules) |mod| {
-            const module_prefix = self.moduleNameToPrefix(mod.name);
+            const module_prefix = self.structNameToPrefix(mod.name);
             for (mod.functions) |func_group| {
                 for (func_group.clauses) |clause| {
                     try self.scanForTryVariantNames(clause.body, module_prefix);
@@ -944,7 +944,7 @@ pub const IrBuilder = struct {
 
         // Fourth pass: build function bodies
         for (hir_program.modules) |mod| {
-            const module_prefix = self.moduleNameToPrefix(mod.name);
+            const module_prefix = self.structNameToPrefix(mod.name);
             self.current_module_prefix = module_prefix;
             for (mod.functions) |func_group| {
                 try self.buildFunctionGroup(&func_group);
@@ -4298,9 +4298,9 @@ pub const IrBuilder = struct {
         return name;
     }
 
-    /// Convert an ast.ModuleName to a prefix string for function naming.
+    /// Convert an ast.StructName to a prefix string for function naming.
     /// Single-part: "IO". Multi-part: "IO_File".
-    fn moduleNameToPrefix(self: *IrBuilder, name: ast.ModuleName) []const u8 {
+    fn structNameToPrefix(self: *IrBuilder, name: ast.StructName) []const u8 {
         if (name.parts.len == 1) {
             return self.interner.get(name.parts[0]);
         }
@@ -4618,7 +4618,7 @@ const Collector = @import("collector.zig").Collector;
 
 test "IR build simple function" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn add(x :: i64, y :: i64) -> i64 {
         \\    x + y
         \\  }
@@ -4656,7 +4656,7 @@ test "IR build simple function" {
 
 test "IR param_get indices are unique for multi-parameter functions" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn add(a, b) {
         \\    a + b
         \\  }
@@ -4715,7 +4715,7 @@ test "IR param_get indices are unique for multi-parameter functions" {
 
 test "IR call preserves HIR arg modes" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn apply(f :: (String -> String), x :: String) {
         \\    f(x)
         \\  }
@@ -4738,7 +4738,7 @@ test "IR call preserves HIR arg modes" {
     defer checker.deinit();
     try checker.checkProgram(&program);
 
-    const apply_clause = program.modules[0].items[0].function.clauses[0];
+    const apply_clause = program.structs[0].items[0].function.clauses[0];
     const clause_scope = collector.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(apply_clause.meta.span)) orelse apply_clause.meta.scope_id;
     const f_binding = collector.graph.resolveBinding(clause_scope, apply_clause.params[0].pattern.bind.name).?;
     const f_type_id = collector.graph.bindings.items[f_binding].type_id.?.type_id;
@@ -4782,7 +4782,7 @@ test "IR call preserves HIR arg modes" {
 
 test "IR named call preserves move mode" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  opaque Handle = String
         \\
         \\  pub fn take(handle :: Handle) {
@@ -4845,7 +4845,7 @@ test "IR named call preserves move mode" {
 
 test "IR closure call preserves borrow mode without ARC ops" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  opaque Handle = String
         \\
         \\  pub fn apply(f :: (Handle -> Handle), x :: Handle) {
@@ -4870,7 +4870,7 @@ test "IR closure call preserves borrow mode without ARC ops" {
     defer checker.deinit();
     try checker.checkProgram(&program);
 
-    const apply_clause = program.modules[0].items[1].function.clauses[0];
+    const apply_clause = program.structs[0].items[1].function.clauses[0];
     const clause_scope = collector.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(apply_clause.meta.span)) orelse apply_clause.meta.scope_id;
     const f_binding = collector.graph.resolveBinding(clause_scope, apply_clause.params[0].pattern.bind.name).?;
     const f_type_id = collector.graph.bindings.items[f_binding].type_id.?.type_id;
@@ -4917,7 +4917,7 @@ test "IR closure call preserves borrow mode without ARC ops" {
 
 test "IR shared opaque call emits retain and release" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  opaque Handle = String
         \\
         \\  pub fn use(handle :: Handle) {
@@ -4946,7 +4946,7 @@ test "IR shared opaque call emits retain and release" {
     defer checker.deinit();
     try checker.checkProgram(&program);
 
-    const run_clause = program.modules[0].items[2].function.clauses[0];
+    const run_clause = program.structs[0].items[2].function.clauses[0];
     const clause_scope = collector.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(run_clause.meta.span)) orelse run_clause.meta.scope_id;
     const fn_binding = collector.graph.resolveBinding(clause_scope, run_clause.params[0].pattern.bind.name).?;
     const fn_type_id = collector.graph.bindings.items[fn_binding].type_id.?.type_id;

@@ -1,4 +1,4 @@
-pub module Fibonacci {
+pub struct Fibonacci {
   pub fn fib(0 :: i64) -> i64 {
     0
   }

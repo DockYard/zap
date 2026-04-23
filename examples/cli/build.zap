@@ -1,4 +1,4 @@
-pub module Cli.Builder {
+pub struct Cli.Builder {
   pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
     case env.target {
       :cli ->

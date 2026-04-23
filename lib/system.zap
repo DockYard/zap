@@ -1,11 +1,11 @@
-pub module System {
-  @moduledoc = """
-    Functions for interacting with the operating system.
+@doc = """
+  Functions for interacting with the operating system.
 
-    Provides access to command-line arguments, environment variables,
-    and build-time configuration options.
-    """
+  Provides access to command-line arguments, environment variables,
+  and build-time configuration options.
+  """
 
+pub struct System {
   @doc = """
     Returns the number of command-line arguments passed to the program.
 

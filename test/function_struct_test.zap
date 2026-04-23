@@ -1,7 +1,7 @@
-pub module Test.FunctionModuleTest {
+pub struct Test.FunctionStructTest {
   use Zest.Case
 
-  describe("Function module") {
+  describe("Function struct") {
     test("identity returns the input value") {
       assert(Function.identity(42) == 42)
     }

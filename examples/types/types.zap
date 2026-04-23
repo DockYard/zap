@@ -1,9 +1,9 @@
 # Type system examples
 #
 # Demonstrates supported types: scalars, compound types,
-# structs, enums, and module inheritance.
+# structs, enums, and struct inheritance.
 
-pub module Types {
+pub struct Types {
   pub fn main(_args :: [String]) -> String {
     IO.puts("=== Scalars ===")
     IO.puts(Integer.to_string(Scalars.int()))

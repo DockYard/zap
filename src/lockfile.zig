@@ -409,7 +409,7 @@ test "computeDirectoryHash: produces consistent hash" {
     const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
 
     const file = try tmp_dir.dir.createFile(io, "test.zap", .{});
-    try file.writeStreamingAll(io, "pub module Test {}\n");
+    try file.writeStreamingAll(io, "pub struct Test {}\n");
     file.close(io);
 
     const hash1 = try computeDirectoryHash(alloc, tmp_path);

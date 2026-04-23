@@ -22,7 +22,7 @@ Parametric polymorphism (generics) so that collection functions like `List.head`
 ### Example of what works today (intra-module generics)
 
 ```zap
-pub module Test.FunctionTest {
+pub struct Test.FunctionTest {
   # This function is generic — `element` is a type variable
   fn identity(x :: element) -> element {
     x
@@ -41,14 +41,14 @@ This works end-to-end: 446 tests pass, 478 assertions.
 
 ```zap
 # In lib/list.zap
-pub module List {
+pub struct List {
   pub fn head(list :: [element]) -> element {
     :zig.ListCell.getHead(list)
   }
 }
 
 # In test/enum_test.zap
-pub module Test.EnumTest {
+pub struct Test.EnumTest {
   test("map doubles values") {
     result = Enum.map([1, 2, 3], double)
     assert(List.head(result) == 2)    # ← This call needs cross-module monomorphization

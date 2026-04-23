@@ -1,4 +1,4 @@
-pub module DefaultParams.Builder {
+pub struct DefaultParams.Builder {
   pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
     case env.target {
       :default_params ->

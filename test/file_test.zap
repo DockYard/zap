@@ -1,7 +1,7 @@
-pub module Test.FileTest {
+pub struct Test.FileTest {
   use Zest.Case
 
-  describe("File module") {
+  describe("File struct") {
     test("exists? on missing file") {
       reject(File.exists?("_nonexistent_file_xyz.txt"))
     }

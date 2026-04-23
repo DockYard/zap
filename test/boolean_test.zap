@@ -1,4 +1,4 @@
-pub module Test.BooleanTest {
+pub struct Test.BooleanTest {
   use Zest.Case
 
   describe("booleans") {

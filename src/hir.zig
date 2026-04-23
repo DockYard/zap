@@ -46,7 +46,7 @@ pub const ImplInfo = struct {
 };
 
 pub const Module = struct {
-    name: ast.ModuleName,
+    name: ast.StructName,
     scope_id: scope_mod.ScopeId,
     functions: []const FunctionGroup,
     types: []const TypeDef,
@@ -1747,7 +1747,7 @@ pub const HirBuilder = struct {
         raw_return: types_mod.TypeId,
     ) types_mod.TypeId {
         // Find the function's parameter types
-        for (self.graph.modules.items) |mod_entry| {
+        for (self.graph.structs.items) |mod_entry| {
             if (mod_entry.name.parts.len == 0) continue;
             const last_part = self.interner.get(mod_entry.name.parts[mod_entry.name.parts.len - 1]);
             if (!std.mem.eql(u8, last_part, mod_name)) continue;
@@ -1797,7 +1797,7 @@ pub const HirBuilder = struct {
     /// Resolve a function's return type within a specific module (for cross-module calls).
     fn resolveFunctionReturnTypeInModule(self: *const HirBuilder, mod_name: []const u8, func_name: []const u8, arity: u32) types_mod.TypeId {
         // Find the module's scope in the scope graph, then search families by scope
-        for (self.graph.modules.items) |mod_entry| {
+        for (self.graph.structs.items) |mod_entry| {
             if (mod_entry.name.parts.len == 0) continue;
             const last_part = self.interner.get(mod_entry.name.parts[mod_entry.name.parts.len - 1]);
             if (!std.mem.eql(u8, last_part, mod_name)) continue;
@@ -2023,7 +2023,7 @@ pub const HirBuilder = struct {
 
     fn resolveFunctionRefType(self: *HirBuilder, fr: ast.FunctionRefExpr) anyerror!types_mod.TypeId {
         const scope_id = if (fr.module) |module_name|
-            self.graph.findModuleScope(module_name)
+            self.graph.findStructScope(module_name)
         else
             self.current_clause_scope orelse self.current_module_scope orelse self.graph.prelude_scope;
 
@@ -2038,7 +2038,7 @@ pub const HirBuilder = struct {
 
     fn resolveFunctionRefGroup(self: *const HirBuilder, fr: ast.FunctionRefExpr) ?u32 {
         const scope_id = if (fr.module) |module_name|
-            self.graph.findModuleScope(module_name)
+            self.graph.findStructScope(module_name)
         else
             self.current_clause_scope orelse self.current_module_scope orelse self.graph.prelude_scope;
 
@@ -2191,11 +2191,11 @@ pub const HirBuilder = struct {
 
     pub fn buildProgram(self: *HirBuilder, program: *const ast.Program) !Program {
         var modules: std.ArrayList(Module) = .empty;
-        for (program.modules) |*mod| {
-            const mod_scope = self.graph.findModuleScope(mod.name) orelse
+        for (program.structs) |*mod| {
+            const mod_scope = self.graph.findStructScope(mod.name) orelse
                 self.graph.prelude_scope;
             self.current_module_scope = mod_scope;
-            try modules.append(self.allocator, try self.buildModule(mod, mod_scope));
+            try modules.append(self.allocator, try self.buildStruct(mod, mod_scope));
             self.current_module_scope = null;
         }
 
@@ -2292,7 +2292,7 @@ pub const HirBuilder = struct {
         };
     }
 
-    fn buildModule(self: *HirBuilder, mod: *const ast.ModuleDecl, mod_scope: scope_mod.ScopeId) !Module {
+    fn buildStruct(self: *HirBuilder, mod: *const ast.StructDecl, mod_scope: scope_mod.ScopeId) !Module {
         // Group module functions by {name, arity} so that same-name
         // functions with different arities become separate groups.
         const FnGroupKey = struct { name: ast.StringId, arity: u32 };
@@ -2330,7 +2330,7 @@ pub const HirBuilder = struct {
                 },
                 .struct_decl => |sd| {
                     try type_defs.append(self.allocator, .{
-                        .name = sd.name orelse 0,
+                        .name = if (sd.name.parts.len > 0) sd.name.parts[0] else 0,
                         .type_id = types_mod.TypeStore.UNKNOWN,
                         .kind = .struct_type,
                     });
@@ -2352,8 +2352,8 @@ pub const HirBuilder = struct {
         {
             var module_exprs: std.ArrayList(*const ast.Expr) = .empty;
             for (mod.items) |item| {
-                if (item == .module_level_expr) {
-                    try module_exprs.append(self.allocator, item.module_level_expr);
+                if (item == .struct_level_expr) {
+                    try module_exprs.append(self.allocator, item.struct_level_expr);
                 }
             }
             if (module_exprs.items.len > 0) {
@@ -3399,7 +3399,7 @@ pub const HirBuilder = struct {
                         // protocols are not allowed. Protocols define interfaces;
                         // use the implementing module (e.g., Enum) instead.
                         if (self.graph.findProtocol(fa.object.module_ref.name)) |_| {
-                            const protocol_name = self.moduleNameToString(fa.object.module_ref.name);
+                            const protocol_name = self.structNameToString(fa.object.module_ref.name);
                             const func_name = self.interner.get(fa.field);
                             const msg = std.fmt.allocPrint(self.allocator,
                                 "cannot call '{s}.{s}()' — '{s}' is a protocol, not a module. " ++
@@ -3413,7 +3413,7 @@ pub const HirBuilder = struct {
                             return error.CompileError;
                         }
                         const func_name = self.interner.get(fa.field);
-                        const mod_name = self.moduleNameToString(fa.object.module_ref.name);
+                        const mod_name = self.structNameToString(fa.object.module_ref.name);
                         // Module-qualified call — @native resolution happens at IR level
                         break :blk .{ .named = .{ .module = mod_name, .name = func_name } };
                     }
@@ -3807,7 +3807,7 @@ pub const HirBuilder = struct {
                 // Module-qualified reference (e.g. Math.square without call parens)
                 if (fa.object.* == .module_ref) {
                     const func_name = self.interner.get(fa.field);
-                    const mod_name = self.moduleNameToString(fa.object.module_ref.name);
+                    const mod_name = self.structNameToString(fa.object.module_ref.name);
 
                     // Check if this is an enum variant access (e.g. Color.Red
                     // or IO.Mode.Raw for a union defined inside a module)
@@ -4232,7 +4232,7 @@ pub const HirBuilder = struct {
         // Check imports on this scope
         for (mod_scope.imports.items) |imp| {
             if (self.importMatchesFunction(imp, name, arity)) {
-                return self.moduleNameToString(imp.source_module);
+                return self.structNameToString(imp.source_module);
             }
         }
 
@@ -4279,10 +4279,10 @@ pub const HirBuilder = struct {
     }
 
     /// Check if a module (by name) exports a specific function.
-    fn sourceModuleHasFunction(self: *const HirBuilder, mod_name: ast.ModuleName, name: ast.StringId, arity: u32) bool {
+    fn sourceModuleHasFunction(self: *const HirBuilder, mod_name: ast.StructName, name: ast.StringId, arity: u32) bool {
         // Find the module in the scope graph
-        for (self.graph.modules.items) |mod_entry| {
-            if (self.moduleNamesEqual(mod_entry.name, mod_name)) {
+        for (self.graph.structs.items) |mod_entry| {
+            if (self.structNamesEqual(mod_entry.name, mod_name)) {
                 const mod_scope = self.graph.getScope(mod_entry.scope_id);
                 const key = scope_mod.FamilyKey{ .name = name, .arity = arity };
                 return mod_scope.function_families.get(key) != null;
@@ -4291,8 +4291,8 @@ pub const HirBuilder = struct {
         return false;
     }
 
-    /// Compare two ModuleNames for equality (all parts must match).
-    fn moduleNamesEqual(_: *const HirBuilder, a: ast.ModuleName, b: ast.ModuleName) bool {
+    /// Compare two StructNames for equality (all parts must match).
+    fn structNamesEqual(_: *const HirBuilder, a: ast.StructName, b: ast.StructName) bool {
         if (a.parts.len != b.parts.len) return false;
         for (a.parts, b.parts) |pa, pb| {
             if (pa != pb) return false;
@@ -4300,7 +4300,7 @@ pub const HirBuilder = struct {
         return true;
     }
 
-    fn moduleNameToString(self: *const HirBuilder, name: ast.ModuleName) []const u8 {
+    fn structNameToString(self: *const HirBuilder, name: ast.StructName) []const u8 {
         // For single-part module names like "IO", just return the part
         if (name.parts.len == 1) {
             return self.interner.get(name.parts[0]);
@@ -4356,7 +4356,7 @@ const Collector = @import("collector.zig").Collector;
 
 test "HIR build simple function" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn add(x :: i64, y :: i64) -> i64 {
         \\    x + y
         \\  }
@@ -4388,7 +4388,7 @@ test "HIR build simple function" {
 
 test "HIR build module" {
     const source =
-        \\pub module Math {
+        \\pub struct Math {
         \\  pub fn add(x :: i64, y :: i64) -> i64 {
         \\    x + y
         \\  }
@@ -4420,7 +4420,7 @@ test "HIR build module" {
 
 test "HIR pattern compilation" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn foo(x :: Atom) -> Nil {
         \\    case x {
         \\      {:ok, v} -> v
@@ -4456,7 +4456,7 @@ test "HIR pattern compilation" {
 
 test "HIR typed params default to shared ownership" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn add(x :: i64, y :: i64) -> i64 {
         \\    x + y
         \\  }
@@ -4490,7 +4490,7 @@ test "HIR typed params default to shared ownership" {
 
 test "HIR opaque typed params default to unique ownership" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  opaque Handle = String
         \\
         \\  pub fn use(handle :: Handle) -> Handle {
@@ -4527,7 +4527,7 @@ test "HIR opaque typed params default to unique ownership" {
 
 test "HIR respects borrowed param annotation" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  opaque Handle = String
         \\
         \\  pub fn inspect(handle :: borrowed Handle) {
@@ -4562,7 +4562,7 @@ test "HIR respects borrowed param annotation" {
 
 test "HIR call args default to share mode" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn foo(x) {
         \\    x
         \\  }
@@ -4601,7 +4601,7 @@ test "HIR call args default to share mode" {
 
 test "HIR call args adopt function ownership modes" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn apply(f :: (String -> String), x :: String) -> String {
         \\    f(x)
         \\  }
@@ -4625,7 +4625,7 @@ test "HIR call args adopt function ownership modes" {
     try checker.checkProgram(&program);
     try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
 
-    const apply_clause = program.modules[0].items[0].function.clauses[0];
+    const apply_clause = program.structs[0].items[0].function.clauses[0];
     const clause_scope = collector.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(apply_clause.meta.span)) orelse apply_clause.meta.scope_id;
     const f_binding = collector.graph.resolveBinding(clause_scope, apply_clause.params[0].pattern.bind.name).?;
     const f_type_id = collector.graph.bindings.items[f_binding].type_id.?.type_id;
@@ -4656,7 +4656,7 @@ test "HIR call args adopt function ownership modes" {
 
 test "HIR named calls use resolved parameter ownership" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  opaque Handle = String
         \\
         \\  pub fn take(handle :: Handle) -> Handle {
@@ -4699,7 +4699,7 @@ test "HIR named calls use resolved parameter ownership" {
 
 test "HIR closure calls adopt borrowed ownership mode" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn apply(f :: (String -> String), x :: String) {
         \\    f(x)
         \\  }
@@ -4722,7 +4722,7 @@ test "HIR closure calls adopt borrowed ownership mode" {
     defer checker.deinit();
     try checker.checkProgram(&program);
 
-    const apply_clause = program.modules[0].items[0].function.clauses[0];
+    const apply_clause = program.structs[0].items[0].function.clauses[0];
     const clause_scope = collector.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(apply_clause.meta.span)) orelse apply_clause.meta.scope_id;
     const f_binding = collector.graph.resolveBinding(clause_scope, apply_clause.params[0].pattern.bind.name).?;
     const f_type_id = collector.graph.bindings.items[f_binding].type_id.?.type_id;
@@ -4748,7 +4748,7 @@ test "HIR closure calls adopt borrowed ownership mode" {
 
 test "HIR function_ref keeps concrete function type" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn double(x :: i64) -> i64 {
         \\    x * 2
         \\  }

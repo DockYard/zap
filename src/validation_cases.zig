@@ -1,5 +1,5 @@
 pub const borrowed_closure_arg =
-    \\pub module Test {
+    \\pub struct Test {
     \\  opaque Handle = String
     \\
     \\  pub fn run(use_fn :: (borrowed Handle -> Handle), handle :: Handle) -> Handle {
@@ -9,7 +9,7 @@ pub const borrowed_closure_arg =
 ;
 
 pub const shared_closure_arg =
-    \\pub module Test {
+    \\pub struct Test {
     \\  opaque Handle = String
     \\
     \\  pub fn run(use_fn :: (shared Handle -> Handle), handle :: Handle) -> Handle {
@@ -19,7 +19,7 @@ pub const shared_closure_arg =
 ;
 
 pub const switch_dispatch =
-    \\pub module Foo {
+    \\pub struct Foo {
     \\  pub fn inc(x :: i64) -> i64 {
     \\    x + 1
     \\  }
@@ -47,7 +47,7 @@ pub const switch_dispatch =
 ;
 
 pub const non_escaping_closure =
-    \\pub module Foo {
+    \\pub struct Foo {
     \\  pub fn run(x :: i64) -> i64 {
     \\    f = fn(y :: i64) -> i64 {
     \\      x + y

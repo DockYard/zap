@@ -301,30 +301,18 @@ pub fn analyzeProgram(
 
     for (program.top_items) |item| {
         switch (item) {
-            .struct_decl => |sd| {
-                if (sd.name) |name| {
-                    try def_types.append(allocator, interner.get(name));
+            .struct_decl, .priv_struct_decl => |sd| {
+                if (sd.name.parts.len > 0) {
+                    const struct_name = interner.get(sd.name.parts[0]);
+                    try def_modules.append(allocator, struct_name);
                 }
-                // If extends, references parent type
+                // Check for extends (references parent struct)
                 if (sd.parent) |parent| {
-                    try ref_types.append(allocator, interner.get(parent));
-                }
-            },
-            .union_decl => |ed| {
-                try def_types.append(allocator, interner.get(ed.name));
-            },
-            .module => |mod| {
-                if (mod.name.parts.len > 0) {
-                    const mod_name = interner.get(mod.name.parts[0]);
-                    try def_modules.append(allocator, mod_name);
-                }
-                // Check for extends (references parent module)
-                if (mod.parent) |parent| {
                     try ref_modules.append(allocator, interner.get(parent));
                 }
-                // Scan module functions for type references and main
-                for (mod.items) |mod_item| {
-                    switch (mod_item) {
+                // Scan struct functions for type references and main
+                for (sd.items) |struct_item| {
+                    switch (struct_item) {
                         .function => |func_decl| {
                             for (func_decl.clauses) |*clause| {
                                 try collectTypeRefsFromFunction(allocator, clause, interner, &ref_types);
@@ -341,6 +329,13 @@ pub fn analyzeProgram(
                         else => {},
                     }
                 }
+                // Also register struct field types
+                for (sd.fields) |field| {
+                    _ = field;
+                }
+            },
+            .union_decl => |ed| {
+                try def_types.append(allocator, interner.get(ed.name));
             },
             .function => |func_decl| {
                 const fname = interner.get(func_decl.name);

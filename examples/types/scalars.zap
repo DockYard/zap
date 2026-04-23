@@ -1,4 +1,4 @@
-pub module Scalars {
+pub struct Scalars {
   pub fn int() -> i64 {
     42
   }

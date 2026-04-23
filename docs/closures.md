@@ -9,7 +9,7 @@ You can reference an existing function value with `&name/arity` or `&Module.name
 Local function reference:
 
 ```zap
-pub module Demo {
+pub struct Demo {
   pub fn double(x :: i64) -> i64 {
     x * 2
   }
@@ -24,7 +24,7 @@ pub module Demo {
 Module-qualified function reference:
 
 ```zap
-pub module Demo {
+pub struct Demo {
   pub fn apply(x :: i64, f :: (i64 -> i64)) -> i64 {
     f(x)
   }
@@ -44,7 +44,7 @@ pub module Demo {
 Anonymous closures use `fn(...) -> ReturnType { ... }`.
 
 ```zap
-pub module Demo {
+pub struct Demo {
   pub fn run() -> i64 {
     add_one = fn(x :: i64) -> i64 {
       x + 1
@@ -58,7 +58,7 @@ pub module Demo {
 Anonymous closures can capture surrounding bindings:
 
 ```zap
-pub module Demo {
+pub struct Demo {
   pub fn run() -> i64 {
     offset = 10
 
@@ -76,7 +76,7 @@ pub module Demo {
 Function values use ordinary function types.
 
 ```zap
-pub module Demo {
+pub struct Demo {
   pub fn apply(x :: i64, f :: (i64 -> i64)) -> i64 {
     f(x)
   }
@@ -127,7 +127,7 @@ Closures that capture borrowed values cannot escape their borrow scope by being 
 Invalid:
 
 ```zap
-pub module Demo {
+pub struct Demo {
   pub fn run(x :: borrowed String) -> Nil {
     f = fn() -> String {
       x
@@ -141,7 +141,7 @@ pub module Demo {
 Invalid:
 
 ```zap
-pub module Demo {
+pub struct Demo {
   pub fn run(x :: borrowed String) -> (String -> String) {
     fn(y :: String) -> String {
       x <> y

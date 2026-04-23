@@ -86,40 +86,32 @@ pub const StringInterner = struct {
 // ============================================================
 
 pub const Program = struct {
-    modules: []const ModuleDecl,
+    structs: []const StructDecl,
     top_items: []const TopItem,
 };
 
 pub const TopItem = union(enum) {
-    module: *const ModuleDecl,
-    priv_module: *const ModuleDecl,
+    struct_decl: *const StructDecl,
+    priv_struct_decl: *const StructDecl,
     protocol: *const ProtocolDecl,
     priv_protocol: *const ProtocolDecl,
     impl_decl: *const ImplDecl,
     priv_impl_decl: *const ImplDecl,
     type_decl: *const TypeDecl,
     opaque_decl: *const OpaqueDecl,
-    struct_decl: *const StructDecl,
     union_decl: *const UnionDecl,
     function: *const FunctionDecl,
     priv_function: *const FunctionDecl,
     macro: *const FunctionDecl,
     priv_macro: *const FunctionDecl,
+    attribute: *const AttributeDecl,
 };
 
 // ============================================================
-// Module
+// Names
 // ============================================================
 
-pub const ModuleDecl = struct {
-    meta: NodeMeta,
-    name: ModuleName,
-    parent: ?StringId = null,
-    items: []const ModuleItem,
-    is_private: bool = false,
-};
-
-pub const ModuleName = struct {
+pub const StructName = struct {
     parts: []const StringId,
     span: SourceSpan,
 };
@@ -130,7 +122,7 @@ pub const ModuleName = struct {
 
 pub const ProtocolDecl = struct {
     meta: NodeMeta,
-    name: ModuleName,
+    name: StructName,
     functions: []const ProtocolFunctionSig,
     is_private: bool = false,
 };
@@ -154,13 +146,13 @@ pub const ProtocolParam = struct {
 
 pub const ImplDecl = struct {
     meta: NodeMeta,
-    protocol_name: ModuleName,
-    target_type: ModuleName,
+    protocol_name: StructName,
+    target_type: StructName,
     functions: []const *const FunctionDecl,
     is_private: bool = false,
 };
 
-pub const ModuleItem = union(enum) {
+pub const StructItem = union(enum) {
     type_decl: *const TypeDecl,
     opaque_decl: *const OpaqueDecl,
     struct_decl: *const StructDecl,
@@ -173,9 +165,9 @@ pub const ModuleItem = union(enum) {
     import_decl: *const ImportDecl,
     use_decl: *const UseDecl,
     attribute: *const AttributeDecl,
-    /// Expression at module level (e.g., macro calls like describe/test).
+    /// Expression at struct level (e.g., macro calls like describe/test).
     /// Collected into an auto-generated run/0 function by the HIR builder.
-    module_level_expr: *const Expr,
+    struct_level_expr: *const Expr,
 };
 
 // ============================================================
@@ -207,9 +199,11 @@ pub const TypeParam = struct {
 
 pub const StructDecl = struct {
     meta: NodeMeta,
-    name: ?StringId = null,
+    name: StructName,
     parent: ?StringId = null,
-    fields: []const StructFieldDecl,
+    items: []const StructItem = &.{},
+    fields: []const StructFieldDecl = &.{},
+    is_private: bool = false,
 };
 
 pub const StructFieldDecl = struct {
@@ -277,19 +271,19 @@ pub const Param = struct {
 
 pub const AliasDecl = struct {
     meta: NodeMeta,
-    module_path: ModuleName,
-    as_name: ?ModuleName,
+    module_path: StructName,
+    as_name: ?StructName,
 };
 
 pub const ImportDecl = struct {
     meta: NodeMeta,
-    module_path: ModuleName,
+    module_path: StructName,
     filter: ?ImportFilter,
 };
 
 pub const UseDecl = struct {
     meta: NodeMeta,
-    module_path: ModuleName,
+    module_path: StructName,
     opts: ?*const Expr,
 };
 
@@ -496,7 +490,7 @@ pub const VarRef = struct {
 
 pub const ModuleRef = struct {
     meta: NodeMeta,
-    name: ModuleName,
+    name: StructName,
 };
 
 pub const TupleExpr = struct {
@@ -522,7 +516,7 @@ pub const MapField = struct {
 
 pub const StructExpr = struct {
     meta: NodeMeta,
-    module_name: ModuleName,
+    module_name: StructName,
     update_source: ?*const Expr,
     fields: []const StructField,
 };
@@ -780,7 +774,7 @@ pub const MapPatternField = struct {
 
 pub const StructPattern = struct {
     meta: NodeMeta,
-    module_name: ModuleName,
+    module_name: StructName,
     fields: []const StructPatternField,
 };
 
@@ -850,7 +844,7 @@ pub const BinaryPattern = struct {
 
 pub const FunctionRefExpr = struct {
     meta: NodeMeta,
-    module: ?ModuleName, // null for local function references
+    module: ?StructName, // null for local function references
     function: StringId,
     arity: u32,
 };
@@ -927,7 +921,7 @@ pub const TypeMapField = struct {
 
 pub const TypeStructExpr = struct {
     meta: NodeMeta,
-    module_name: ModuleName,
+    module_name: StructName,
     fields: []const TypeStructField,
 };
 

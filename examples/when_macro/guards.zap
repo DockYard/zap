@@ -1,4 +1,4 @@
-pub module Guards {
+pub struct Guards {
   pub fn check(n :: i64) -> String if n > 0 {
     "positive"
   }

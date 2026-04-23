@@ -1,18 +1,18 @@
-pub module Path {
-  @moduledoc = """
-    Functions for manipulating file system paths.
+@doc = """
+  Functions for manipulating file system paths.
 
-    All operations are pure string manipulation — they do not
-    access the file system.
+  All operations are pure string manipulation — they do not
+  access the file system.
 
-    ## Examples
+  ## Examples
 
-        Path.join("src", "main.zap")  # => "src/main.zap"
-        Path.basename("/usr/bin/zap")  # => "zap"
-        Path.dirname("/usr/bin/zap")   # => "/usr/bin"
-        Path.extname("main.zap")       # => ".zap"
-    """
+      Path.join("src", "main.zap")  # => "src/main.zap"
+      Path.basename("/usr/bin/zap")  # => "zap"
+      Path.dirname("/usr/bin/zap")   # => "/usr/bin"
+      Path.extname("main.zap")       # => ".zap"
+  """
 
+pub struct Path {
   @doc = """
     Joins two path segments with a separator.
 

@@ -30,9 +30,9 @@ Every `.zap` file should define one module whose name matches its path.
 
 Examples:
 
-- `lib/io.zap` -> `pub module IO { ... }`
-- `lib/zest/case.zap` -> `pub module Zest.Case { ... }`
-- `test/function_test.zap` -> `pub module Test.FunctionTest { ... }`
+- `lib/io.zap` -> `pub struct IO { ... }`
+- `lib/zest/case.zap` -> `pub struct Zest.Case { ... }`
+- `test/function_test.zap` -> `pub struct Test.FunctionTest { ... }`
 
 ### Put Functions Inside Modules
 
@@ -41,7 +41,7 @@ Do not write top-level functions outside a module.
 Write:
 
 ```zap
-pub module Math {
+pub struct Math {
   pub fn square(x :: i64) -> i64 {
     x * x
   }
@@ -105,9 +105,9 @@ pub fn process(n :: String, g :: String) -> String {
 }
 ```
 
-### Module And Function Naming
+### Struct And Function Naming
 
-- Modules use `PascalCase`
+- Structs use `PascalCase`
 - Namespaced modules use dotted `PascalCase`: `Zest.Case`, `Test.FunctionTest`
 - Functions use `snake_case`
 
@@ -656,13 +656,13 @@ Do not move stdlib behavior into Zig just because it is easier.
 
 ## Documentation Style In lib/
 
-Every public function and macro in `lib/*.zap` must have `@doc`.
-Every public module should have `@moduledoc`.
+Every public function and macro in `lib/*.zap` must have `@fndoc`.
+Every public struct should have `@structdoc`.
 
 Use heredocs:
 
 ```zap
-@doc = """
+@fndoc = """
   Returns the byte length of a string.
   """
 
@@ -673,8 +673,8 @@ pub fn length(text_value :: String) -> i64 {
 
 Rules:
 
-- `@moduledoc` goes immediately inside the module body
-- `@doc` goes immediately before the documented declaration
+- `@structdoc` goes immediately inside the struct body
+- `@fndoc` goes immediately before the documented declaration
 - leave a blank line after the closing `"""`
 - escape `#{` as `\#{` in doc examples
 
@@ -685,7 +685,7 @@ Follow the repo's Zest pattern.
 Write tests like this:
 
 ```zap
-pub module Test.MyFeatureTest {
+pub struct Test.MyFeatureTest {
   use Zest.Case
 
   pub fn run() -> String {

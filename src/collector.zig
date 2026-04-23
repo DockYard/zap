@@ -42,7 +42,7 @@ pub const Collector = struct {
     }
 
     /// Check if a module has an explicit `import Kernel` or `import Kernel, except: [...]`.
-    fn hasExplicitKernelImport(_: *const Collector, mod: *const ast.ModuleDecl, kernel_id: ast.StringId) bool {
+    fn hasExplicitKernelImport(_: *const Collector, mod: *const ast.StructDecl, kernel_id: ast.StringId) bool {
         for (mod.items) |item| {
             switch (item) {
                 .import_decl => |id_decl| {
@@ -71,45 +71,102 @@ pub const Collector = struct {
         try self.collectProgramSurface(program);
 
         // Second pass: resolve struct extends (copy parent fields into children)
-        try self.resolveStructExtends();
+        try self.resolveNestedStructExtends();
 
         // Third pass: resolve module extends (copy parent function families into children)
-        try self.resolveModuleExtends(program);
+        try self.resolveStructExtends(program);
     }
 
     pub fn collectProgramSurface(self: *Collector, program: *const ast.Program) !void {
-        // Process top-level modules
-        for (program.modules) |*mod| {
-            try self.collectModule(mod, self.graph.prelude_scope);
+        // Process top-level structs
+        for (program.structs) |*mod| {
+            try self.collectStruct(mod, self.graph.prelude_scope);
         }
 
-        // Process top-level items (functions, types outside modules)
-        // Modules are already processed above via program.modules, skip them here
+        // Process top-level items (functions, types outside structs)
+        // Structs are already processed above via program.structs, skip them here.
+        // Top-level @doc attributes are attached to the next definition.
+        var pending_top_doc: ?scope.Attribute = null;
         for (program.top_items) |item| {
             switch (item) {
-                .function => |func| try self.collectFunction(func, self.graph.prelude_scope),
-                .priv_function => |func| try self.collectFunction(func, self.graph.prelude_scope),
-                .macro => |mac| try self.collectMacro(mac, self.graph.prelude_scope),
-                .priv_macro => |mac| try self.collectMacro(mac, self.graph.prelude_scope),
-                .type_decl => |td| try self.collectType(td, self.graph.prelude_scope),
-                .opaque_decl => |od| try self.collectOpaque(od, self.graph.prelude_scope),
-                .struct_decl => |sd| try self.collectStruct(sd, self.graph.prelude_scope),
-                .union_decl => |ed| try self.collectUnion(ed, self.graph.prelude_scope),
-                .module => {},
-                .priv_module => {},
-                .protocol, .priv_protocol => |proto| try self.collectProtocol(proto),
-                .impl_decl, .priv_impl_decl => |impl_d| try self.collectImpl(impl_d),
+                .attribute => |attr| {
+                    pending_top_doc = .{
+                        .name = attr.name,
+                        .type_expr = attr.type_expr,
+                        .value = attr.value,
+                    };
+                },
+                .struct_decl, .priv_struct_decl => |sd| {
+                    // Struct already collected above. Attach pending @doc if any.
+                    if (pending_top_doc) |doc_attr| {
+                        for (self.graph.structs.items) |*mod_entry| {
+                            if (mod_entry.decl == sd) {
+                                try mod_entry.attributes.append(self.allocator, doc_attr);
+                                break;
+                            }
+                        }
+                        pending_top_doc = null;
+                    }
+                },
+                .union_decl => |ed| {
+                    try self.collectUnion(ed, self.graph.prelude_scope);
+                    if (pending_top_doc) |_| {
+                        // TODO: attach doc to union type entry when attribute storage is added
+                        pending_top_doc = null;
+                    }
+                },
+                .protocol, .priv_protocol => |proto| {
+                    try self.collectProtocol(proto);
+                    if (pending_top_doc) |doc_attr| {
+                        // Attach doc to the protocol entry
+                        for (self.graph.protocols.items) |*proto_entry| {
+                            if (proto_entry.decl == proto) {
+                                try proto_entry.attributes.append(self.allocator, doc_attr);
+                                break;
+                            }
+                        }
+                        pending_top_doc = null;
+                    }
+                },
+                .function => |func| {
+                    try self.collectFunction(func, self.graph.prelude_scope);
+                    pending_top_doc = null;
+                },
+                .priv_function => |func| {
+                    try self.collectFunction(func, self.graph.prelude_scope);
+                    pending_top_doc = null;
+                },
+                .macro => |mac| {
+                    try self.collectMacro(mac, self.graph.prelude_scope);
+                    pending_top_doc = null;
+                },
+                .priv_macro => |mac| {
+                    try self.collectMacro(mac, self.graph.prelude_scope);
+                    pending_top_doc = null;
+                },
+                .type_decl => |td| {
+                    try self.collectType(td, self.graph.prelude_scope);
+                    pending_top_doc = null;
+                },
+                .opaque_decl => |od| {
+                    try self.collectOpaque(od, self.graph.prelude_scope);
+                    pending_top_doc = null;
+                },
+                .impl_decl, .priv_impl_decl => |impl_d| {
+                    try self.collectImpl(impl_d);
+                    pending_top_doc = null;
+                },
             }
         }
     }
 
     pub fn finalizeCollectedPrograms(self: *Collector, programs: []const ast.Program) !void {
         // Second pass: resolve struct extends (copy parent fields into children)
-        try self.resolveStructExtends();
+        try self.resolveNestedStructExtends();
 
         // Third pass: resolve module extends (copy parent function families into children)
         for (programs) |program| {
-            try self.resolveModuleExtends(&program);
+            try self.resolveStructExtends(&program);
         }
     }
 
@@ -117,10 +174,59 @@ pub const Collector = struct {
     // Module collection
     // ============================================================
 
-    fn collectModule(self: *Collector, mod: *const ast.ModuleDecl, parent_scope: scope.ScopeId) !void {
+    fn collectStruct(self: *Collector, mod: *const ast.StructDecl, parent_scope: scope.ScopeId) !void {
+        // Check for duplicate module declarations (only for module-like structs with items)
+        if (mod.items.len > 0) {
+            for (self.graph.structs.items) |existing| {
+                if (existing.name.parts.len == mod.name.parts.len) {
+                    var all_equal = true;
+                    for (existing.name.parts, mod.name.parts) |a, b| {
+                        if (a != b) {
+                            all_equal = false;
+                            break;
+                        }
+                    }
+                    if (all_equal) {
+                        // Build the full qualified name for the error message
+                        var name_parts: std.ArrayListUnmanaged(u8) = .empty;
+                        for (mod.name.parts, 0..) |part, i| {
+                            if (i > 0) name_parts.appendSlice(self.allocator, ".") catch {};
+                            name_parts.appendSlice(self.allocator, self.interner.get(part)) catch {};
+                        }
+                        const full_name = name_parts.items;
+                        const msg = std.fmt.allocPrint(self.allocator, "struct '{s}' is already defined", .{full_name}) catch return error.OutOfMemory;
+                        try self.addError(msg, mod.meta.span);
+                        return;
+                    }
+                }
+            }
+        }
+
         const mod_scope = try self.graph.createScope(parent_scope, .module);
         try self.graph.node_scope_map.put(scope.ScopeGraph.spanKey(mod.meta.span), mod_scope);
-        try self.graph.registerModule(mod.name, mod_scope, mod);
+        try self.graph.registerStruct(mod.name, mod_scope, mod);
+
+        // If the struct has fields, also register it as a type so the type checker can find it
+        if (mod.fields.len > 0 and mod.name.parts.len > 0) {
+            // Build the full qualified name (e.g., "Zap.Env") for type registration
+            const type_name_id = if (mod.name.parts.len == 1)
+                mod.name.parts[0]
+            else blk: {
+                var name_buf: std.ArrayListUnmanaged(u8) = .empty;
+                for (mod.name.parts, 0..) |part, i| {
+                    if (i > 0) name_buf.appendSlice(self.allocator, ".") catch {};
+                    name_buf.appendSlice(self.allocator, self.interner.get(part)) catch {};
+                }
+                const interner_mut = @constCast(self.interner);
+                break :blk try interner_mut.intern(name_buf.items);
+            };
+            _ = try self.graph.registerType(
+                type_name_id,
+                mod_scope,
+                .{ .struct_type = mod },
+                &.{},
+            );
+        }
 
         // Auto-import Kernel into every module (Elixir-style).
         // Skip if: (a) this IS Kernel, or (b) module has an explicit Kernel import.
@@ -160,30 +266,16 @@ pub const Collector = struct {
                     pending_attrs = .empty;
                 },
                 .attribute => |attr| {
-                    const attr_name = self.interner.get(attr.name);
-                    if (std.mem.eql(u8, attr_name, "moduledoc")) {
-                        // @moduledoc is always module-level — attach immediately
-                        for (self.graph.modules.items) |*mod_entry| {
-                            if (mod_entry.scope_id == mod_scope) {
-                                try mod_entry.attributes.append(self.allocator, .{
-                                    .name = attr.name,
-                                    .type_expr = attr.type_expr,
-                                    .value = attr.value,
-                                });
-                                break;
-                            }
-                        }
-                    } else {
-                        try pending_attrs.append(self.allocator, .{
-                            .name = attr.name,
-                            .type_expr = attr.type_expr,
-                            .value = attr.value,
-                        });
-                    }
+                    // All attributes inside struct bodies are pending for the next definition
+                    try pending_attrs.append(self.allocator, .{
+                        .name = attr.name,
+                        .type_expr = attr.type_expr,
+                        .value = attr.value,
+                    });
                 },
                 .type_decl => |td| try self.collectType(td, mod_scope),
                 .opaque_decl => |od| try self.collectOpaque(od, mod_scope),
-                .struct_decl => |sd| try self.collectStruct(sd, mod_scope),
+                .struct_decl => |sd| try self.collectNestedStruct(sd, mod_scope),
                 .union_decl => |ed| try self.collectUnion(ed, mod_scope),
                 .alias_decl => |ad| try self.collectAlias(ad, mod_scope),
                 .import_decl => |id_decl| try self.collectImport(id_decl, mod_scope),
@@ -197,7 +289,7 @@ pub const Collector = struct {
                     };
                     try self.collectImport(import_decl, mod_scope);
                 },
-                .module_level_expr => |expr| {
+                .struct_level_expr => |expr| {
                     try self.collectExprScopes(expr, mod_scope);
                 },
             }
@@ -206,7 +298,7 @@ pub const Collector = struct {
         // Any remaining pending attributes are module-level (not attached to a function)
         if (pending_attrs.items.len > 0) {
             // Find the module entry and attach the attributes
-            for (self.graph.modules.items) |*mod_entry| {
+            for (self.graph.structs.items) |*mod_entry| {
                 if (mod_entry.scope_id == mod_scope) {
                     for (pending_attrs.items) |attr| {
                         try mod_entry.attributes.append(self.allocator, attr);
@@ -382,8 +474,8 @@ pub const Collector = struct {
         _ = try self.graph.registerType(od.name, parent_scope, .{ .opaque_type = od.body }, od.params);
     }
 
-    fn collectStruct(self: *Collector, sd: *const ast.StructDecl, parent_scope: scope.ScopeId) !void {
-        const name = sd.name orelse 0; // Named structs use their own name; module-scoped use sentinel
+    fn collectNestedStruct(self: *Collector, sd: *const ast.StructDecl, parent_scope: scope.ScopeId) !void {
+        const name = if (sd.name.parts.len > 0) sd.name.parts[0] else 0; // Named structs use their own name; module-scoped use sentinel
         _ = try self.graph.registerType(
             name,
             parent_scope,
@@ -393,8 +485,20 @@ pub const Collector = struct {
     }
 
     fn collectUnion(self: *Collector, ed: *const ast.UnionDecl, parent_scope: scope.ScopeId) !void {
+        // For dotted-name unions (e.g., IO.Mode defined in a separate file),
+        // register under the short name so the parent struct can reference it
+        // unqualified (e.g., Mode.Raw inside the IO struct).
+        const registration_name = blk: {
+            const full_name = self.interner.get(ed.name);
+            if (std.mem.lastIndexOfScalar(u8, full_name, '.')) |dot_pos| {
+                const short_name = full_name[dot_pos + 1 ..];
+                const interner_mut = @constCast(self.interner);
+                break :blk try interner_mut.intern(short_name);
+            }
+            break :blk ed.name;
+        };
         _ = try self.graph.registerType(
-            ed.name,
+            registration_name,
             parent_scope,
             .{ .union_type = ed },
             &.{},
@@ -405,7 +509,7 @@ pub const Collector = struct {
     // Extends resolution
     // ============================================================
 
-    fn resolveStructExtends(self: *Collector) !void {
+    fn resolveNestedStructExtends(self: *Collector) !void {
         // For each registered type that is a struct with a parent, resolve it
         for (self.graph.types.items) |*type_entry| {
             if (type_entry.kind != .struct_type) continue;
@@ -431,7 +535,8 @@ pub const Collector = struct {
             }
 
             // Detect cycles: walk the parent chain and check for self-reference
-            const child_name = sd.name orelse continue;
+            if (sd.name.parts.len == 0) continue;
+            const child_name = sd.name.parts[0];
             var current_parent: ?ast.StringId = parent_name;
             while (current_parent) |cp| {
                 if (cp == child_name) {
@@ -456,14 +561,14 @@ pub const Collector = struct {
         }
     }
 
-    fn resolveModuleExtends(self: *Collector, program: *const ast.Program) !void {
+    fn resolveStructExtends(self: *Collector, program: *const ast.Program) !void {
         // For each module with a parent, copy parent's public function families
-        for (program.modules) |*mod| {
+        for (program.structs) |*mod| {
             const parent_name = mod.parent orelse continue;
 
             // Find parent module by name
             var parent_scope_id: ?scope.ScopeId = null;
-            for (self.graph.modules.items) |mod_entry| {
+            for (self.graph.structs.items) |mod_entry| {
                 if (mod_entry.name.parts.len == 1 and mod_entry.name.parts[0] == parent_name) {
                     parent_scope_id = mod_entry.scope_id;
                     break;
@@ -480,7 +585,7 @@ pub const Collector = struct {
 
             // Find child module scope
             var child_scope_id: ?scope.ScopeId = null;
-            for (self.graph.modules.items) |mod_entry| {
+            for (self.graph.structs.items) |mod_entry| {
                 if (mod_entry.decl == mod) {
                     child_scope_id = mod_entry.scope_id;
                     break;
@@ -759,7 +864,7 @@ const Parser = @import("parser.zig").Parser;
 
 test "collect simple function" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn add(x :: i64, y :: i64) -> i64 {
         \\    x + y
         \\  }
@@ -790,7 +895,7 @@ test "collect simple function" {
 
 test "collect module with functions" {
     const source =
-        \\pub module Math {
+        \\pub struct Math {
         \\  pub fn add(x :: i64, y :: i64) -> i64 {
         \\    x + y
         \\  }
@@ -818,12 +923,12 @@ test "collect module with functions" {
     // 2 function families
     try std.testing.expectEqual(@as(usize, 2), collector.graph.families.items.len);
     // 1 module
-    try std.testing.expectEqual(@as(usize, 1), collector.graph.modules.items.len);
+    try std.testing.expectEqual(@as(usize, 1), collector.graph.structs.items.len);
 }
 
 test "collect type declaration" {
     const source =
-        \\pub module Types {
+        \\pub struct Types {
         \\  type Result(a, e) = {:ok, a} | {:error, e}
         \\}
     ;
@@ -847,7 +952,7 @@ test "collect type declaration" {
 
 test "collect function family grouping" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn factorial(0 :: i64) -> i64 {
         \\    1
         \\  }
@@ -878,7 +983,7 @@ test "collect function family grouping" {
 
 test "collect case expression creates scopes" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn foo(x :: Atom) -> Nil {
         \\    case x {
         \\      {:ok, v} -> v
@@ -908,7 +1013,7 @@ test "collect case expression creates scopes" {
 
 test "collect local def hoisting" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn outer(x :: i64) -> String {
         \\    pub fn inner(s :: String) -> String {
         \\      s
@@ -936,7 +1041,7 @@ test "collect local def hoisting" {
 
 test "collect struct declaration" {
     const source =
-        \\pub module User {
+        \\pub struct User {
         \\  struct {
         \\    name :: String
         \\    age :: i64
@@ -1046,4 +1151,35 @@ test "collect protocol and impl together" {
     // Verify impl lookup works
     const impl_target = collector.graph.impls.items[0].target_type;
     try std.testing.expect(collector.graph.findImpl(proto_name, impl_target) != null);
+}
+
+test "duplicate struct declaration produces error" {
+    const source =
+        \\pub struct Foo {
+        \\  pub fn bar() -> String {
+        \\    "hello"
+        \\  }
+        \\}
+        \\pub struct Foo {
+        \\  pub fn baz() -> String {
+        \\    "world"
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    collector.collectProgram(&program) catch {};
+
+    try std.testing.expect(collector.errors.items.len > 0);
+    const err_msg = collector.errors.items[0].message;
+    try std.testing.expect(std.mem.indexOf(u8, err_msg, "already defined") != null);
 }

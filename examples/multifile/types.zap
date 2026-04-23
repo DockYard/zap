@@ -14,10 +14,10 @@ pub struct Rectangle extends Shape {
 }
 
 pub union Color {
-  Red
-  Green
+  Red,
+  Green,
   Blue
 }
 
-pub module Types {
+pub struct Types {
 }

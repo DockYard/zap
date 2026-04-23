@@ -1,19 +1,19 @@
-pub module Enum {
-  @moduledoc = """
-    Functions for enumerating and transforming collections.
+@doc = """
+  Functions for enumerating and transforming collections.
 
-    Enum provides higher-order functions that operate on lists
-    using callbacks. All functions accept a list and a function
-    argument, enabling map, filter, reduce, and other functional
-    patterns.
+  Enum provides higher-order functions that operate on lists
+  using callbacks. All functions accept a list and a function
+  argument, enabling map, filter, reduce, and other functional
+  patterns.
 
-    ## Examples
+  ## Examples
 
-        Enum.map([1, 2, 3], fn(x) { x * 2 })       # => [2, 4, 6]
-        Enum.filter([1, 2, 3, 4], fn(x) { x > 2 })  # => [3, 4]
-        Enum.reduce([1, 2, 3], 0, fn(acc, x) { acc + x })  # => 6
-    """
+      Enum.map([1, 2, 3], fn(x) { x * 2 })       # => [2, 4, 6]
+      Enum.filter([1, 2, 3, 4], fn(x) { x > 2 })  # => [3, 4]
+      Enum.reduce([1, 2, 3], 0, fn(acc, x) { acc + x })  # => 6
+  """
 
+pub struct Enum {
   @doc = """
     Transforms each element by applying the callback function.
 

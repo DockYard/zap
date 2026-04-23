@@ -1,4 +1,4 @@
-pub module Test.ZestFeaturesTest {
+pub struct Test.ZestFeaturesTest {
   use Zest.Case
 
   describe("multiple assertions per test") {
@@ -87,7 +87,7 @@ pub module Test.ZestFeaturesTest {
   }
 
   describe("test with helper functions") {
-    test("can call module functions") {
+    test("can call struct functions") {
       assert(double(21) == 42)
     }
 

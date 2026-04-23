@@ -57,19 +57,19 @@ pub const MacroEngine = struct {
         // Validate macro type annotations before expansion
         try self.validateMacros();
 
-        var current_modules = program.modules;
+        var current_structs = program.structs;
         var current_top_items = program.top_items;
         var iteration: u32 = 0;
 
         while (iteration < self.max_expansions) : (iteration += 1) {
             var changed = false;
 
-            // Expand modules
-            var new_modules: std.ArrayList(ast.ModuleDecl) = .empty;
-            for (current_modules) |mod| {
-                const expanded = try self.expandModule(&mod);
+            // Expand structs
+            var new_structs: std.ArrayList(ast.StructDecl) = .empty;
+            for (current_structs) |mod| {
+                const expanded = try self.expandStruct(&mod);
                 if (expanded.changed) changed = true;
-                try new_modules.append(self.allocator, expanded.module);
+                try new_structs.append(self.allocator, expanded.module);
             }
 
             // Expand top-level items
@@ -80,7 +80,7 @@ pub const MacroEngine = struct {
                 try new_top_items.append(self.allocator, expanded.item);
             }
 
-            current_modules = try new_modules.toOwnedSlice(self.allocator);
+            current_structs = try new_structs.toOwnedSlice(self.allocator);
             current_top_items = try new_top_items.toOwnedSlice(self.allocator);
 
             if (!changed) break;
@@ -94,7 +94,7 @@ pub const MacroEngine = struct {
         }
 
         return .{
-            .modules = current_modules,
+            .structs = current_structs,
             .top_items = current_top_items,
         };
     }
@@ -104,17 +104,17 @@ pub const MacroEngine = struct {
     // ============================================================
 
     const ExpandedModule = struct {
-        module: ast.ModuleDecl,
+        module: ast.StructDecl,
         changed: bool,
     };
 
-    fn expandModule(self: *MacroEngine, mod: *const ast.ModuleDecl) !ExpandedModule {
+    fn expandStruct(self: *MacroEngine, mod: *const ast.StructDecl) !ExpandedModule {
         var changed = false;
-        var new_items: std.ArrayList(ast.ModuleItem) = .empty;
+        var new_items: std.ArrayList(ast.StructItem) = .empty;
 
         // Find the module's scope by name (not pointer) so it works across
-        // expansion iterations where the ModuleDecl is a copy.
-        const mod_scope: ?scope.ScopeId = self.graph.findModuleScope(mod.name);
+        // expansion iterations where the StructDecl is a copy.
+        const mod_scope: ?scope.ScopeId = self.graph.findStructScope(mod.name);
         self.current_module_scope = mod_scope;
         defer self.current_module_scope = null;
 
@@ -198,8 +198,8 @@ pub const MacroEngine = struct {
                         }
                     }
                 },
-                .module_level_expr => |expr| {
-                    const expanded_items = self.expandModuleLevelExpr(expr) catch {
+                .struct_level_expr => |expr| {
+                    const expanded_items = self.expandStructLevelExpr(expr) catch {
                         try new_items.append(self.allocator, item);
                         continue;
                     };
@@ -221,6 +221,7 @@ pub const MacroEngine = struct {
                 .name = mod.name,
                 .parent = mod.parent,
                 .items = try new_items.toOwnedSlice(self.allocator),
+                .fields = mod.fields,
                 .is_private = mod.is_private,
             },
             .changed = changed,
@@ -1121,18 +1122,18 @@ pub const MacroEngine = struct {
     // Module-level expression expansion
     // ============================================================
 
-    const ExpandedModuleItems = struct {
-        items: []const ast.ModuleItem,
+    const ExpandedStructItems = struct {
+        items: []const ast.StructItem,
         changed: bool,
     };
 
-    /// Expand a module-level expression. If the expression is a macro call
-    /// that produces a function declaration (or other module item), convert
-    /// it to the appropriate ModuleItem variant. Otherwise keep it as a
-    /// module_level_expr for collection into a generated run/0 function.
+    /// Expand a struct-level expression. If the expression is a macro call
+    /// that produces a function declaration (or other struct item), convert
+    /// it to the appropriate StructItem variant. Otherwise keep it as a
+    /// struct_level_expr for collection into a generated run/0 function.
     /// Patch a generated module item's source span so the scope collector
     /// and HIR builder can associate it with the correct module scope.
-    fn patchModuleItemSpan(mi: ast.ModuleItem, span: ast.SourceSpan) ast.ModuleItem {
+    fn patchStructItemSpan(mi: ast.StructItem, span: ast.SourceSpan) ast.StructItem {
         switch (mi) {
             .function, .priv_function => |func| {
                 const mf = @constCast(func);
@@ -1147,7 +1148,7 @@ pub const MacroEngine = struct {
         return mi;
     }
 
-    fn expandModuleLevelExpr(self: *MacroEngine, expr: *const ast.Expr) !ExpandedModuleItems {
+    fn expandStructLevelExpr(self: *MacroEngine, expr: *const ast.Expr) !ExpandedStructItems {
         // Check if this is a macro call (identifier + args)
         if (expr.* == .call and expr.call.callee.* == .var_ref) {
             const name = expr.call.callee.var_ref.name;
@@ -1166,8 +1167,8 @@ pub const MacroEngine = struct {
                     ) orelse {
                         // Macro evaluation failed — keep as expression
                         const expanded = try self.expandExpr(expr);
-                        const items = try self.allocator.alloc(ast.ModuleItem, 1);
-                        items[0] = .{ .module_level_expr = expanded.expr };
+                        const items = try self.allocator.alloc(ast.StructItem, 1);
+                        items[0] = .{ .struct_level_expr = expanded.expr };
                         return .{ .items = items, .changed = expanded.changed };
                     };
 
@@ -1179,9 +1180,9 @@ pub const MacroEngine = struct {
                     const call_span = expr.call.meta.span;
 
                     // Single module item (e.g., function declaration)
-                    if (ast_data.ctValueToModuleItem(self.allocator, interner_mut, result_ct) catch null) |mi| {
-                        const items = try self.allocator.alloc(ast.ModuleItem, 1);
-                        items[0] = patchModuleItemSpan(mi, call_span);
+                    if (ast_data.ctValueToStructItem(self.allocator, interner_mut, result_ct) catch null) |mi| {
+                        const items = try self.allocator.alloc(ast.StructItem, 1);
+                        items[0] = patchStructItemSpan(mi, call_span);
                         return .{ .items = items, .changed = true };
                     }
 
@@ -1192,11 +1193,11 @@ pub const MacroEngine = struct {
                                 if (result_ct.tuple.elems[2] == .list) {
                                     // Check if ALL elements are module items. If any element
                                     // is not a module item (e.g., an assignment like ctx = 42),
-                                    // keep the entire block as a single module_level_expr to
+                                    // keep the entire block as a single struct_level_expr to
                                     // preserve variable bindings and control flow.
                                     var all_module_items = true;
                                     for (result_ct.tuple.elems[2].list.elems) |elem| {
-                                        if (ast_data.ctValueToModuleItem(self.allocator, interner_mut, elem) catch null) |_| {
+                                        if (ast_data.ctValueToStructItem(self.allocator, interner_mut, elem) catch null) |_| {
                                             // is a module item
                                         } else {
                                             all_module_items = false;
@@ -1205,10 +1206,10 @@ pub const MacroEngine = struct {
                                     }
 
                                     if (all_module_items) {
-                                        var items: std.ArrayList(ast.ModuleItem) = .empty;
+                                        var items: std.ArrayList(ast.StructItem) = .empty;
                                         for (result_ct.tuple.elems[2].list.elems) |elem| {
-                                            if (ast_data.ctValueToModuleItem(self.allocator, interner_mut, elem) catch null) |mi| {
-                                                try items.append(self.allocator, patchModuleItemSpan(mi, call_span));
+                                            if (ast_data.ctValueToStructItem(self.allocator, interner_mut, elem) catch null) |mi| {
+                                                try items.append(self.allocator, patchStructItemSpan(mi, call_span));
                                             }
                                         }
                                         if (items.items.len > 0) {
@@ -1216,15 +1217,15 @@ pub const MacroEngine = struct {
                                         }
                                     } else {
                                         // Mixed content: extract each element individually.
-                                        // Function declarations → ModuleItem::function
-                                        // Expressions → ModuleItem::module_level_expr
-                                        var items: std.ArrayList(ast.ModuleItem) = .empty;
+                                        // Function declarations → StructItem::function
+                                        // Expressions → StructItem::struct_level_expr
+                                        var items: std.ArrayList(ast.StructItem) = .empty;
                                         for (result_ct.tuple.elems[2].list.elems) |elem_expr| {
-                                            if (ast_data.ctValueToModuleItem(self.allocator, interner_mut, elem_expr) catch null) |mi| {
-                                                try items.append(self.allocator, patchModuleItemSpan(mi, call_span));
+                                            if (ast_data.ctValueToStructItem(self.allocator, interner_mut, elem_expr) catch null) |mi| {
+                                                try items.append(self.allocator, patchStructItemSpan(mi, call_span));
                                             } else {
                                                 const converted = ast_data.ctValueToExpr(self.allocator, self.interner, elem_expr) catch continue;
-                                                try items.append(self.allocator, .{ .module_level_expr = converted });
+                                                try items.append(self.allocator, .{ .struct_level_expr = converted });
                                             }
                                         }
                                         if (items.items.len > 0) {
@@ -1238,13 +1239,13 @@ pub const MacroEngine = struct {
 
                     // List of module items (may be mixed with expressions)
                     if (result_ct == .list) {
-                        var items: std.ArrayList(ast.ModuleItem) = .empty;
+                        var items: std.ArrayList(ast.StructItem) = .empty;
                         for (result_ct.list.elems) |list_elem| {
-                            if (ast_data.ctValueToModuleItem(self.allocator, interner_mut, list_elem) catch null) |mi| {
-                                try items.append(self.allocator, patchModuleItemSpan(mi, call_span));
+                            if (ast_data.ctValueToStructItem(self.allocator, interner_mut, list_elem) catch null) |mi| {
+                                try items.append(self.allocator, patchStructItemSpan(mi, call_span));
                             } else {
                                 const list_expr = ast_data.ctValueToExpr(self.allocator, self.interner, list_elem) catch continue;
-                                try items.append(self.allocator, .{ .module_level_expr = list_expr });
+                                try items.append(self.allocator, .{ .struct_level_expr = list_expr });
                             }
                         }
                         if (items.items.len > 0) {
@@ -1252,14 +1253,14 @@ pub const MacroEngine = struct {
                         }
                     }
 
-                    // Not a module item — convert to expression and keep as module_level_expr
+                    // Not a struct item — convert to expression and keep as struct_level_expr
                     const result_expr = ast_data.ctValueToExpr(self.allocator, self.interner, result_ct) catch {
-                        const items = try self.allocator.alloc(ast.ModuleItem, 1);
-                        items[0] = .{ .module_level_expr = expr };
+                        const items = try self.allocator.alloc(ast.StructItem, 1);
+                        items[0] = .{ .struct_level_expr = expr };
                         return .{ .items = items, .changed = false };
                     };
-                    const items = try self.allocator.alloc(ast.ModuleItem, 1);
-                    items[0] = .{ .module_level_expr = result_expr };
+                    const items = try self.allocator.alloc(ast.StructItem, 1);
+                    items[0] = .{ .struct_level_expr = result_expr };
                     return .{ .items = items, .changed = true };
                 }
             }
@@ -1267,8 +1268,8 @@ pub const MacroEngine = struct {
 
         // Not a macro call — expand as a regular expression
         const expanded = try self.expandExpr(expr);
-        const items = try self.allocator.alloc(ast.ModuleItem, 1);
-        items[0] = .{ .module_level_expr = expanded.expr };
+        const items = try self.allocator.alloc(ast.StructItem, 1);
+        items[0] = .{ .struct_level_expr = expanded.expr };
         return .{ .items = items, .changed = expanded.changed };
     }
 
@@ -1345,9 +1346,9 @@ pub const MacroEngine = struct {
     // ============================================================
 
     /// Try to expand a declaration (fn/macro/struct) through a Kernel macro.
-    /// Returns the expanded ModuleItem if a Kernel macro exists, null otherwise.
+    /// Returns the expanded StructItem if a Kernel macro exists, null otherwise.
     /// When null, the caller should use the bootstrap fallback.
-    fn tryExpandDeclarationMacro(self: *MacroEngine, form_name: []const u8, item: ast.ModuleItem) ?ast.ModuleItem {
+    fn tryExpandDeclarationMacro(self: *MacroEngine, form_name: []const u8, item: ast.StructItem) ?ast.StructItem {
         // Look up a Kernel macro with the declaration form name (fn, module, struct, macro)
         const name_id = self.interner.intern(form_name) catch return null;
         const macro_id = self.findMacro(name_id, 1) orelse return null;
@@ -1376,7 +1377,7 @@ pub const MacroEngine = struct {
 
         // Non-identity macro — convert declaration to CtValue and evaluate
         var store = ctfe.AllocationStore{};
-        const item_ct = ast_data.moduleItemToCtValue(self.allocator, self.interner, &store, item) catch return null;
+        const item_ct = ast_data.structItemToCtValue(self.allocator, self.interner, &store, item) catch return null;
 
         if ((clause.body orelse @as([]const ast.Stmt, &.{})).len == 1 and (clause.body orelse @as([]const ast.Stmt, &.{}))[0] == .expr) {
             const body_expr = (clause.body orelse @as([]const ast.Stmt, &.{}))[0].expr;
@@ -1399,7 +1400,7 @@ pub const MacroEngine = struct {
 
                 const result_ct = if (body_vals.items.len == 1) body_vals.items[0] else return null;
                 const interner_mut: *ast.StringInterner = @constCast(self.interner);
-                return ast_data.ctValueToModuleItem(self.allocator, interner_mut, result_ct) catch return null;
+                return ast_data.ctValueToStructItem(self.allocator, interner_mut, result_ct) catch return null;
             }
         }
 
@@ -1423,14 +1424,14 @@ pub const MacroEngine = struct {
 
         if (result != .nil) {
             const interner_mut: *ast.StringInterner = @constCast(self.interner);
-            return ast_data.ctValueToModuleItem(self.allocator, interner_mut, result) catch return null;
+            return ast_data.ctValueToStructItem(self.allocator, interner_mut, result) catch return null;
         }
         return null;
     }
 
     /// Try to expand `use Module` by calling Module.__using__/1.
     /// Returns injected module items if __using__ exists, null otherwise.
-    fn tryExpandUsing(self: *MacroEngine, ud: *const ast.UseDecl) ?[]const ast.ModuleItem {
+    fn tryExpandUsing(self: *MacroEngine, ud: *const ast.UseDecl) ?[]const ast.StructItem {
         // Build the __using__ name
         const using_name = self.interner.intern("__using__") catch return null;
 
@@ -1471,10 +1472,10 @@ pub const MacroEngine = struct {
                 }
 
                 // Convert each result value to a module item
-                var items: std.ArrayList(ast.ModuleItem) = .empty;
+                var items: std.ArrayList(ast.StructItem) = .empty;
                 const interner_mut: *ast.StringInterner = @constCast(self.interner);
                 for (body_vals.items) |val| {
-                    if (ast_data.ctValueToModuleItem(self.allocator, interner_mut, val) catch null) |mi| {
+                    if (ast_data.ctValueToStructItem(self.allocator, interner_mut, val) catch null) |mi| {
                         items.append(self.allocator, mi) catch return null;
                     }
                 }
@@ -1504,17 +1505,17 @@ pub const MacroEngine = struct {
             const interner_mut: *ast.StringInterner = @constCast(self.interner);
             // Result could be a single item or a block of items
             if (result == .tuple and result.tuple.elems.len == 3) {
-                if (ast_data.ctValueToModuleItem(self.allocator, interner_mut, result) catch null) |mi| {
-                    const items = self.allocator.alloc(ast.ModuleItem, 1) catch return null;
+                if (ast_data.ctValueToStructItem(self.allocator, interner_mut, result) catch null) |mi| {
+                    const items = self.allocator.alloc(ast.StructItem, 1) catch return null;
                     items[0] = mi;
                     return items;
                 }
             }
             // Try as a list of items
             if (result == .list) {
-                var items: std.ArrayList(ast.ModuleItem) = .empty;
+                var items: std.ArrayList(ast.StructItem) = .empty;
                 for (result.list.elems) |elem| {
-                    if (ast_data.ctValueToModuleItem(self.allocator, interner_mut, elem) catch null) |mi| {
+                    if (ast_data.ctValueToStructItem(self.allocator, interner_mut, elem) catch null) |mi| {
                         items.append(self.allocator, mi) catch return null;
                     }
                 }
@@ -1816,7 +1817,7 @@ const Collector = @import("collector.zig").Collector;
 
 test "macro engine no-op on program without macros" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn add(x :: i64, y :: i64) -> i64 {
         \\    x + y
         \\  }
@@ -1840,14 +1841,14 @@ test "macro engine no-op on program without macros" {
     const expanded = try engine.expandProgram(&program);
 
     // No macros — program should be unchanged
-    try std.testing.expectEqual(@as(usize, 1), expanded.modules.len);
-    try std.testing.expect(expanded.modules[0].items[0] == .function);
+    try std.testing.expectEqual(@as(usize, 1), expanded.structs.len);
+    try std.testing.expect(expanded.structs[0].items[0] == .function);
 }
 
 test "macro engine expands simple macro" {
     // Define a macro and use it
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub macro unless(expr, body) {
         \\    quote {
         \\      if not unquote(expr) {
@@ -1879,7 +1880,7 @@ test "macro engine expands simple macro" {
     const expanded = try engine.expandProgram(&program);
 
     // Module should still exist
-    try std.testing.expectEqual(@as(usize, 1), expanded.modules.len);
+    try std.testing.expectEqual(@as(usize, 1), expanded.structs.len);
     // No errors
     try std.testing.expectEqual(@as(usize, 0), engine.errors.items.len);
 }
@@ -1917,7 +1918,7 @@ test "macro engine hygiene generates unique names" {
 
 test "macro engine reaches fixed point" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub fn foo() {
         \\    42
         \\  }
@@ -1942,12 +1943,12 @@ test "macro engine reaches fixed point" {
 
     // Should reach fixed point immediately (no macros to expand)
     try std.testing.expectEqual(@as(usize, 0), engine.errors.items.len);
-    try std.testing.expectEqual(@as(usize, 1), expanded.modules.len);
+    try std.testing.expectEqual(@as(usize, 1), expanded.structs.len);
 }
 
 test "typed macro: nil in String return position is an error" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub macro when_positive(value :: i64, result :: String) -> String {
         \\    quote {
         \\      if unquote(value) > 0 {
@@ -1987,7 +1988,7 @@ test "typed macro: nil in String return position is an error" {
 
 test "typed macro: valid types produce no errors" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub macro when_positive(value :: i64, result :: String) -> String {
         \\    quote {
         \\      if unquote(value) > 0 {
@@ -2026,7 +2027,7 @@ test "typed macro: valid types produce no errors" {
 
 test "typed macro: missing else branch is an error for non-nil return type" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub macro unless(expr :: Bool, body :: i64) -> i64 {
         \\    quote {
         \\      if not unquote(expr) {
@@ -2064,7 +2065,7 @@ test "typed macro: missing else branch is an error for non-nil return type" {
 
 test "typed macro: param type mismatch with return type" {
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub macro wrap(value :: i64) -> String {
         \\    quote {
         \\      unquote(value)
@@ -2100,7 +2101,7 @@ test "typed macro: param type mismatch with return type" {
 test "macro substitution into case_expr and block" {
     // A macro that produces a case expression with unquote inside
     const source =
-        \\pub module Test {
+        \\pub struct Test {
         \\  pub macro match_it(val :: Expr, fallback :: Expr) -> Nil {
         \\    quote {
         \\      case unquote(val) {
@@ -2135,5 +2136,5 @@ test "macro substitution into case_expr and block" {
     // No errors — case_expr substitution should work
     try std.testing.expectEqual(@as(usize, 0), engine.errors.items.len);
     // Module should still exist with expanded content
-    try std.testing.expectEqual(@as(usize, 1), expanded.modules.len);
+    try std.testing.expectEqual(@as(usize, 1), expanded.structs.len);
 }

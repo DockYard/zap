@@ -1,4 +1,4 @@
-pub module UnlessMacro.Builder {
+pub struct UnlessMacro.Builder {
   pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
     case env.target {
       :unless_macro ->

@@ -1,7 +1,7 @@
-pub module Test.AtomTest {
+pub struct Test.AtomTest {
   use Zest.Case
 
-  describe("Atom module") {
+  describe("Atom struct") {
     test("equal atoms match") {
       assert(:ok == :ok)
     }

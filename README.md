@@ -85,21 +85,21 @@ You can also specify a target explicitly: `zap build my_app`. The binary is outp
 
 ## The Language
 
-### Modules and Files
+### Structs and Files
 
-Every `.zap` file contains exactly one module. The module name maps to the file path:
+Every `.zap` file contains exactly one struct. The struct name maps to the file path:
 
-| Module name | File path |
+| Struct name | File path |
 |---|---|
 | `App` | `lib/app.zap` |
 | `Config.Parser` | `lib/config/parser.zap` |
 | `JsonParser` | `lib/json_parser.zap` |
 
-The compiler enforces this — a mismatch is a compile error. The compiler discovers files by following module references from the entry point. No glob patterns or file manifests needed.
+The compiler enforces this — a mismatch is a compile error. The compiler discovers files by following struct references from the entry point. No glob patterns or file manifests needed.
 
 ```zap
 # lib/math.zap
-pub module Math {
+pub struct Math {
   pub fn square(x :: i64) -> i64 {
     x * x
   }
@@ -113,16 +113,16 @@ pub module Math {
 ### Visibility
 
 - `pub fn` / `pub macro` — public function/macro
-- `fn` / `macro` — private to the module (file)
-- `pub module` — public module
-- `module` — private module (visible within the dep, invisible outside)
+- `fn` / `macro` — private to the struct (file)
+- `pub struct` — public struct
+- `struct` — private struct (visible within the dep, invisible outside)
 
 ### Entry Point
 
-Every program needs a `main` function inside a module. The `build.zap` manifest specifies the entry point:
+Every program needs a `main` function inside a struct. The `build.zap` manifest specifies the entry point:
 
 ```zap
-pub module MyApp {
+pub struct MyApp {
   pub fn main(_args :: [String]) {
     IO.puts("Hello!")
   }
@@ -134,7 +134,7 @@ pub module MyApp {
 Chain function calls, passing the result of each step as the first argument to the next:
 
 ```zap
-pub module Pipes {
+pub struct Pipes {
   pub fn double(x :: i64) -> i64 {
     x * 2
   }
@@ -156,7 +156,7 @@ pub module Pipes {
 Multiple function clauses with the same name form an overload group. The compiler resolves which clause to call based on argument values and types.
 
 ```zap
-pub module Factorial {
+pub struct Factorial {
   pub fn factorial(0 :: i64) -> i64 {
     1
   }
@@ -172,7 +172,7 @@ pub module Factorial {
 Function clauses can carry guard conditions that participate in dispatch:
 
 ```zap
-pub module Guards {
+pub struct Guards {
   pub fn classify(n :: i64) -> String if n > 0 {
     "positive"
   }
@@ -192,7 +192,7 @@ pub module Guards {
 Pattern matching inside function bodies:
 
 ```zap
-pub module CaseExpr {
+pub struct CaseExpr {
   pub fn check(result) -> String {
     case result {
       {:ok, v} ->
@@ -211,7 +211,7 @@ pub module CaseExpr {
 If/else is an expression — it produces a value:
 
 ```zap
-pub module Math {
+pub struct Math {
   pub fn abs(x :: i64) -> i64 {
     if x < 0 {
       -x
@@ -328,10 +328,10 @@ pub fn process(input :: String) -> String {
 
 ### Use
 
-`use Module` imports a module and calls its `__using__/1` callback if defined. This enables library DSLs:
+`use Struct` imports a struct and calls its `__using__/1` callback if defined. This enables library DSLs:
 
 ```zap
-pub module Greeter {
+pub struct Greeter {
   pub macro __using__(_opts :: Expr) -> Expr {
     quote {
       pub fn hello() -> String {
@@ -341,7 +341,7 @@ pub module Greeter {
   }
 }
 
-pub module MyApp {
+pub struct MyApp {
   use Greeter     # imports + injects hello/0 via __using__
 
   pub fn main() {
@@ -355,7 +355,7 @@ pub module MyApp {
 Zest is Zap's built-in test framework. Use `Zest.Case` for assertions and describe/test DSL:
 
 ```zap
-pub module Test.MathTest {
+pub struct Test.MathTest {
   use Zest.Case
 
   describe("math") {
@@ -399,7 +399,7 @@ countdown(100_000_000)  # runs in constant stack space
 Every Zap project has a `build.zap` that defines build targets:
 
 ```zap
-pub module MyApp.Builder {
+pub struct MyApp.Builder {
   pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
     case env.target {
       :my_app ->
@@ -416,14 +416,14 @@ pub module MyApp.Builder {
 }
 ```
 
-When `root` is specified and `paths` is omitted, the compiler uses import-driven discovery — it starts from the entry module and follows module references to find all source files automatically.
+When `root` is specified and `paths` is omitted, the compiler uses import-driven discovery — it starts from the entry struct and follows struct references to find all source files automatically.
 
 | Field | Description |
 |---|---|
 | `name` | Output binary name |
 | `version` | Project version |
 | `kind` | `:bin`, `:lib`, or `:obj` |
-| `root` | Entry point as `"Module.function/arity"` |
+| `root` | Entry point as `"Struct.function/arity"` |
 | `deps` | List of dependency tuples |
 | `optimize` | `:debug`, `:release_safe`, `:release_fast`, or `:release_small` |
 
@@ -449,7 +449,7 @@ Dependencies are declared in the manifest as tuples:
 | Path | `{:name, {:path, "dir"}}` | Local Zap library |
 | Git | `{:name, {:git, "url", "ref"}}` | Remote Zap library |
 
-Zap dependencies are first-class — their modules are available directly (`JsonParser.parse(data)`). The compiler discovers dep modules the same way it discovers project modules.
+Zap dependencies are first-class — their structs are available directly (`JsonParser.parse(data)`). The compiler discovers dep structs the same way it discovers project structs.
 
 A `zap.lock` lockfile is generated automatically on first build and records resolved versions for reproducible builds.
 
@@ -505,9 +505,9 @@ pub union Direction {
 
 ## Standard Library
 
-Zap includes a standard library of modules for working with primitive types and collections:
+Zap includes a standard library for working with primitive types and collections:
 
-| Module | Functions |
+| Struct | Functions |
 |---|---|
 | `Integer` | `to_string`, `abs`, `max`, `min`, `parse`, `remainder`, `pow`, `clamp`, `digits`, `to_float` |
 | `Float` | `to_string`, `abs`, `max`, `min`, `parse`, `round`, `floor`, `ceil`, `truncate`, `to_integer`, `clamp` |
@@ -557,15 +557,15 @@ Widening rules: `i8` -> `i16` -> `i32` -> `i64`, `u8` -> `u16` -> `u32` -> `u64`
 
 ## Native Function Bindings (`@native`)
 
-Zap library functions that need Zig runtime implementations (I/O, string operations, atom tables, etc.) use `@native` attributes instead of hardcoded compiler knowledge:
+Zap functions that need Zig runtime implementations (I/O, string operations, atom tables, etc.) use `@native` attributes instead of hardcoded compiler knowledge:
 
 ```zap
-pub module IO {
+pub struct IO {
   @native = "Prelude.println"
   pub fn puts(_message :: String) -> String
 }
 
-pub module Zest.Runtime {
+pub struct Zest.Runtime {
   @native = "ZestRuntime.reset"
   pub fn reset() -> String
 
@@ -574,28 +574,28 @@ pub module Zest.Runtime {
 }
 ```
 
-The `@native = "Module.function"` annotation tells the compiler to route calls to `@import("zap_runtime").Module.function(args)` in the generated ZIR. No function body is needed — the annotation IS the implementation binding. The compiler has zero knowledge of specific library modules; all bindings are declared in `.zap` source files.
+The `@native = "Struct.function"` annotation tells the compiler to route calls to `@import("zap_runtime").Struct.function(args)` in the generated ZIR. No function body is needed — the annotation IS the implementation binding. The compiler has zero knowledge of specific library structs; all bindings are declared in `.zap` source files.
 
 ---
 
 ## Architecture
 
-Zap uses a per-module compilation architecture with per-module ZIR emission:
+Zap uses a per-struct compilation architecture with per-struct ZIR emission:
 
-1. **Discovery** — start from the entry point, follow module references to find files
+1. **Discovery** — start from the entry point, follow struct references to find files
 2. **Pass 1** — parse all files, collect declarations into a shared scope graph
 3. **Pass 2** — compile each file: macro expand, desugar, type check, HIR
 4. **Pass 3** — monomorphize generic functions, lower to IR
 5. **Pass 4** — run analysis pipeline (escape analysis, interprocedural summaries, region solving, lambda sets, Perceus reuse)
-6. **Pass 5** — emit per-module ZIR, inject into Zig compilation, codegen
+6. **Pass 5** — emit per-struct ZIR, inject into Zig compilation, codegen
 
-Each Zap module becomes its own Zig ZIR module. Cross-module calls use `@import("Module").function(args)` chains. Namespace re-export modules are generated for hierarchical module names (e.g., `Zest` re-exports `Runtime`, `Case`, `Runner`). `@native` functions skip ZIR emission — their calls route directly to `@import("zap_runtime")`.
+Each Zap struct becomes its own Zig ZIR module. Cross-struct calls use `@import("Struct").function(args)` chains. Namespace re-export modules are generated for hierarchical struct names (e.g., `Zest` re-exports `Runtime`, `Case`, `Runner`). `@native` functions skip ZIR emission — their calls route directly to `@import("zap_runtime")`.
 
 ```
   .zap source files
       |
       v
-   Discovery -------- follow module references from entry point
+   Discovery -------- follow struct references from entry point
       |
       v
    Parse ------------ per-file ASTs
@@ -625,8 +625,8 @@ Each Zap module becomes its own Zig ZIR module. Cross-module calls use `@import(
    Analysis --------- escape, regions, lambda sets, Perceus
       |
       v
-   Per-Module ZIR --- each Zap module -> its own Zig ZIR module
-      |                cross-module calls -> @import chains
+   Per-Struct ZIR --- each Zap struct -> its own Zig ZIR module
+      |                cross-struct calls -> @import chains
       |                @native functions -> @import("zap_runtime")
       v
    Codegen ---------- native binary (via LLVM)
@@ -658,7 +658,7 @@ zig build
 # Run Zig-level unit tests
 zig build test
 
-# Run Zap test suite (323 tests across 28 modules)
+# Run Zap test suite (323 tests across 28 structs)
 zap test
 
 # Build and run an example

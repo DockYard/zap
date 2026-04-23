@@ -1645,7 +1645,7 @@ pub const Prelude = struct {
 
     pub fn file_read(path: []const u8) []const u8 {
         const path_z = std.posix.toPosixPath(path) catch return "";
-        const fd = std.posix.openat(std.posix.AT.FDCWD, &path_z, .{}, 0) catch return "";
+        const fd = std.c.open(&path_z, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0)); if (fd < 0) return "";
         defer _ = std.c.close(fd);
         var stat: std.c.Stat = undefined;
         if (std.c.fstat(fd, &stat) != 0) return "";
@@ -1665,7 +1665,7 @@ pub const Prelude = struct {
 
     pub fn file_write(path: []const u8, content: []const u8) bool {
         const path_z = std.posix.toPosixPath(path) catch return false;
-        const fd = std.posix.openat(std.posix.AT.FDCWD, &path_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644) catch return false;
+        const fd = std.c.open(&path_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644)); if (fd < 0) return false;
         defer _ = std.c.close(fd);
         var written: usize = 0;
         while (written < content.len) {

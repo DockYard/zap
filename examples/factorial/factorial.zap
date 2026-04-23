@@ -1,4 +1,4 @@
-pub module Factorial {
+pub struct Factorial {
   pub fn factorial(0 :: i64) -> i64 {
     1
   }

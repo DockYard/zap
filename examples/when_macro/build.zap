@@ -1,4 +1,4 @@
-pub module WhenMacro.Builder {
+pub struct WhenMacro.Builder {
   pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
     case env.target {
       :when_macro ->

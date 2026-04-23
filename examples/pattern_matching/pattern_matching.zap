@@ -1,4 +1,4 @@
-pub module PatternMatching {
+pub struct PatternMatching {
   pub fn main(_args :: [String]) -> String {
     PatternMatch.describe(:ok)
     |> IO.puts()

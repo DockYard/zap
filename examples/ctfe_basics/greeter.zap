@@ -1,4 +1,4 @@
-pub module Greeter {
+pub struct Greeter {
   @greeting :: String = "Hello"
   pub fn greet(name :: String) -> String {
     @greeting <> ", " <> name <> "!"

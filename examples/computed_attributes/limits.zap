@@ -1,4 +1,4 @@
-pub module Limits {
+pub struct Limits {
   @effective_timeout :: i64 = 5000
   pub fn effective_timeout() -> i64 {
     @effective_timeout
