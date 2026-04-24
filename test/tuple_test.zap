@@ -62,4 +62,21 @@ pub struct Test.TupleTest {
       {_, b} -> b + b
     }
   }
+
+  describe("tuple patterns with atom literals") {
+    test("match :ok atom in tuple") {
+      assert(extract_ok({:ok, 42}) == 42)
+    }
+
+    test("match :error atom in tuple") {
+      assert(extract_ok({:error, 0}) == -1)
+    }
+  }
+
+  fn extract_ok(t :: {Atom, i64}) -> i64 {
+    case t {
+      {:ok, v} -> v
+      {_, _} -> -1
+    }
+  }
 }
