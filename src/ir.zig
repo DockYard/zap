@@ -1074,16 +1074,6 @@ pub const IrBuilder = struct {
                 if (self.next_function_id <= func_id) {
                     self.next_function_id = func_id + 1;
                 }
-                const gn2 = self.interner.get(group.name);
-                if (std.mem.indexOf(u8, gn2, "mode") != null and std.mem.indexOf(u8, gn2, "IO") != null) {
-                    std.debug.print("DEBUG SKIP GENERIC: {s} id={d}\n", .{ gn2, group.id });
-                    if (group.clauses.len > 0) {
-                        for (group.clauses[0].params) |p| {
-                            std.debug.print("  param type_id={d} has_vars={}\n", .{ p.type_id, containsTypeVarInStore(ts, p.type_id) });
-                        }
-                        std.debug.print("  return={d} has_vars={}\n", .{ group.clauses[0].return_type, containsTypeVarInStore(ts, group.clauses[0].return_type) });
-                    }
-                }
                 return;
             }
         }
@@ -4486,6 +4476,27 @@ fn getListName(element_type: ZigType) []const u8 {
 /// Check if a HIR function group is generic (has unresolved type variables in params/return).
 fn isGenericHirGroup(store: *const types_mod.TypeStore, group: *const hir_mod.FunctionGroup) bool {
     if (group.clauses.len == 0) return false;
+
+    // Multi-clause dispatch functions (from protocol synthesis) are NOT generic.
+    // They have different param types per clause — that's dispatch, not generics.
+    if (group.clauses.len > 1) {
+        var all_same = true;
+        for (group.clauses[1..]) |clause| {
+            if (clause.params.len != group.clauses[0].params.len) {
+                all_same = false;
+                break;
+            }
+            for (clause.params, group.clauses[0].params) |a, b| {
+                if (a.type_id != b.type_id) {
+                    all_same = false;
+                    break;
+                }
+            }
+            if (!all_same) break;
+        }
+        if (!all_same) return false; // Different param types = dispatch, not generic
+    }
+
     const first_clause = &group.clauses[0];
     for (first_clause.params) |param| {
         // UNKNOWN (any) parameters are NOT generic — they compile to anytype in Zig
@@ -4530,14 +4541,14 @@ fn containsTypeVarInStore(store: *const types_mod.TypeStore, type_id: types_mod.
             return false;
         },
         .protocol_constraint => |pc| {
-            // Protocol constraints are always generic — they need dispatch resolution
+            // Protocol constraints with type variable params are generic
             if (pc.type_params.len > 0) {
                 for (pc.type_params) |tp| {
                     if (containsTypeVarInStore(store, tp)) return true;
                 }
             }
-            // Bare protocol constraint (no type params) is still generic
-            return true;
+            // Bare protocol constraint — resolved through dispatch, not monomorphization
+            return false;
         },
         else => false,
     };

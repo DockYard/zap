@@ -1099,12 +1099,35 @@ pub fn compileModuleByModule(
         // monomorphized program. Must happen after monomorphization
         // so the synthesized modules are included in Phase 4.
         {
-            var dispatch_modules: std.ArrayListUnmanaged(zap.hir.Module) = .empty;
+            // Deduplicate protocols by name (per-module HIR creates duplicates)
+            var seen_protos = std.AutoHashMap(ast.StringId, void).init(alloc);
+            defer seen_protos.deinit();
+            var unique_protos: std.ArrayListUnmanaged(zap.hir.ProtocolInfo) = .empty;
             for (combined_hir.protocols) |proto| {
+                if (seen_protos.contains(proto.name)) continue;
+                seen_protos.put(proto.name, {}) catch continue;
+                unique_protos.append(alloc, proto) catch continue;
+            }
+
+            // Deduplicate impls by protocol name string + target module string
+            var seen_impls = std.StringHashMap(void).init(alloc);
+            defer seen_impls.deinit();
+            var unique_impls: std.ArrayListUnmanaged(zap.hir.ImplInfo) = .empty;
+            for (combined_hir.impls) |impl_info| {
+                const proto_str = ctx.interner.get(impl_info.protocol_name);
+                const target_str = ctx.interner.get(impl_info.target_module);
+                const key = std.fmt.allocPrint(alloc, "{s}:{s}", .{proto_str, target_str}) catch continue;
+                if (seen_impls.contains(key)) continue;
+                seen_impls.put(key, {}) catch continue;
+                unique_impls.append(alloc, impl_info) catch continue;
+            }
+
+            var dispatch_modules: std.ArrayListUnmanaged(zap.hir.Module) = .empty;
+            for (unique_protos.items) |proto| {
                 var dispatch_groups: std.ArrayListUnmanaged(zap.hir.FunctionGroup) = .empty;
                 for (proto.function_names, proto.function_arities) |fn_name, fn_arity| {
                     var merged_clauses: std.ArrayListUnmanaged(zap.hir.Clause) = .empty;
-                    for (combined_hir.impls) |impl_info| {
+                    for (unique_impls.items) |impl_info| {
                         if (impl_info.protocol_name != proto.name) continue;
                         for (combined_hir.top_functions) |group| {
                             if (group.scope_id != impl_info.impl_scope_id) continue;
@@ -1156,9 +1179,10 @@ pub fn compileModuleByModule(
             };
             const mod_name_str = if (mod.name.parts.len > 0) ctx.interner.get(mod.name.parts[mod.name.parts.len - 1]) else "unknown";
             const mod_ir = compileHirToIr(alloc, ctx, mod_name_str, &single_mod_hir, shared_store, options) catch {
-                std.debug.print("IR failed for module: {s}\n", .{mod_name_str});
                 continue;
             };
+            if (std.mem.eql(u8, mod_name_str, "Enumerable")) {
+            }
             for (mod_ir.functions) |func| {
                 all_functions.append(alloc, func) catch return error.OutOfMemory;
             }
