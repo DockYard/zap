@@ -260,7 +260,7 @@ pub struct Kernel {
     Returns true if the value is an integer type (i8, i16, i32, i64, u8, u16, u32, u64).
     """
 
-  pub fn is_integer(value :: any) -> Bool {
+  pub fn is_integer?(value :: any) -> Bool {
     :zig.Kernel.is_integer(value)
   }
 
@@ -268,7 +268,7 @@ pub struct Kernel {
     Returns true if the value is a float type (f16, f32, f64).
     """
 
-  pub fn is_float(value :: any) -> Bool {
+  pub fn is_float?(value :: any) -> Bool {
     :zig.Kernel.is_float(value)
   }
 
@@ -276,7 +276,7 @@ pub struct Kernel {
     Returns true if the value is a number (integer or float).
     """
 
-  pub fn is_number(value :: any) -> Bool {
+  pub fn is_number?(value :: any) -> Bool {
     :zig.Kernel.is_number(value)
   }
 
@@ -284,7 +284,7 @@ pub struct Kernel {
     Returns true if the value is a boolean.
     """
 
-  pub fn is_boolean(value :: any) -> Bool {
+  pub fn is_boolean?(value :: any) -> Bool {
     :zig.Kernel.is_boolean(value)
   }
 
@@ -292,7 +292,7 @@ pub struct Kernel {
     Returns true if the value is a string.
     """
 
-  pub fn is_string(value :: any) -> Bool {
+  pub fn is_string?(value :: any) -> Bool {
     :zig.Kernel.is_string(value)
   }
 
@@ -300,7 +300,7 @@ pub struct Kernel {
     Returns true if the value is an atom.
     """
 
-  pub fn is_atom(value :: any) -> Bool {
+  pub fn is_atom?(value :: any) -> Bool {
     :zig.Kernel.is_atom(value)
   }
 
@@ -308,7 +308,7 @@ pub struct Kernel {
     Returns true if the value is nil.
     """
 
-  pub fn is_nil(value :: any) -> Bool {
+  pub fn is_nil?(value :: any) -> Bool {
     :zig.Kernel.is_nil(value)
   }
 
@@ -316,7 +316,7 @@ pub struct Kernel {
     Returns true if the value is a list.
     """
 
-  pub fn is_list(value :: any) -> Bool {
+  pub fn is_list?(value :: any) -> Bool {
     :zig.Kernel.is_list(value)
   }
 
@@ -324,7 +324,7 @@ pub struct Kernel {
     Returns true if the value is a tuple.
     """
 
-  pub fn is_tuple(value :: any) -> Bool {
+  pub fn is_tuple?(value :: any) -> Bool {
     :zig.Kernel.is_tuple(value)
   }
 
@@ -332,7 +332,7 @@ pub struct Kernel {
     Returns true if the value is a map.
     """
 
-  pub fn is_map(value :: any) -> Bool {
+  pub fn is_map?(value :: any) -> Bool {
     :zig.Kernel.is_map(value)
   }
 
@@ -340,7 +340,7 @@ pub struct Kernel {
     Returns true if the value is a struct.
     """
 
-  pub fn is_struct(value :: any) -> Bool {
+  pub fn is_struct?(value :: any) -> Bool {
     :zig.Kernel.is_struct(value)
   }
 

@@ -1,7 +1,7 @@
 pub struct Test.GuardTest {
   use Zest.Case
 
-  describe("guards") {
+  describe("basic guards") {
     test("positive number classified as positive") {
       assert(classify(5) == "positive")
     }
@@ -93,6 +93,42 @@ pub struct Test.GuardTest {
     "both small"
   }
 
+  describe("not operator in guards") {
+    test("not negates condition") {
+      assert(not_positive(-5) == "not positive")
+    }
+
+    test("not with positive falls through") {
+      assert(not_positive(5) == "positive")
+    }
+
+    test("not with and") {
+      assert(neither_big(1, 2) == "neither big")
+    }
+
+    test("not with and falls through") {
+      assert(neither_big(200, 1) == "at least one big")
+    }
+  }
+
+  fn not_positive(n :: i64) -> String if not (n > 0) {
+    "not positive"
+  }
+
+  fn not_positive(_ :: i64) -> String {
+    "positive"
+  }
+
+  fn neither_big(a :: i64, b :: i64) -> String
+    if not (a > 100)
+    and not (b > 100) {
+    "neither big"
+  }
+
+  fn neither_big(_ :: i64, _ :: i64) -> String {
+    "at least one big"
+  }
+
   describe("in operator") {
     test("value in list is true") {
       assert(is_primary(2) == true)
@@ -124,54 +160,69 @@ pub struct Test.GuardTest {
   }
 
   describe("type check functions") {
-    test("is_integer with integer") {
+    test("is_integer? with integer") {
       assert(check_is_integer(42) == true)
     }
 
-    test("is_string with string") {
-      assert(check_is_string("hello") == true)
+    test("is_float? with float") {
+      assert(check_is_float(3.14) == true)
     }
 
-    test("is_boolean with bool") {
+    test("is_number? with integer") {
+      assert(check_is_number_int(42) == true)
+    }
+
+    test("is_number? with float") {
+      assert(check_is_number_float(3.14) == true)
+    }
+
+    test("is_boolean? with bool") {
       assert(check_is_boolean(true) == true)
     }
 
-    test("is_number with integer") {
-      assert(check_is_number(42) == true)
+    test("is_string? with string") {
+      assert(check_is_string("hello") == true)
     }
 
-    test("String.length in guard") {
-      assert(classify_str("hello") == "non-empty")
+    test("is_atom? with atom") {
+      assert(check_is_atom(:hello) == true)
     }
 
-    test("String.length guard fallthrough") {
-      assert(classify_str("") == "empty")
+    test("is_nil? with nil") {
+      assert(check_is_nil(nil) == true)
     }
-
   }
 
   fn check_is_integer(value :: i64) -> Bool {
-    is_integer(value)
+    is_integer?(value)
   }
 
-  fn check_is_string(value :: String) -> Bool {
-    is_string(value)
+  fn check_is_float(value :: f64) -> Bool {
+    is_float?(value)
+  }
+
+  fn check_is_number_int(value :: i64) -> Bool {
+    is_number?(value)
+  }
+
+  fn check_is_number_float(value :: f64) -> Bool {
+    is_number?(value)
   }
 
   fn check_is_boolean(value :: Bool) -> Bool {
-    is_boolean(value)
+    is_boolean?(value)
   }
 
-  fn check_is_number(value :: i64) -> Bool {
-    is_number(value)
+  fn check_is_string(value :: String) -> Bool {
+    is_string?(value)
   }
 
-  fn classify_str(s :: String) -> String if String.length(s) > 0 {
-    "non-empty"
+  fn check_is_atom(value :: Atom) -> Bool {
+    is_atom?(value)
   }
 
-  fn classify_str(_ :: String) -> String {
-    "empty"
+  fn check_is_nil(value :: Nil) -> Bool {
+    is_nil?(value)
   }
 
   describe("function calls in guards") {
@@ -183,8 +234,16 @@ pub struct Test.GuardTest {
       assert(guard_with_local_fn(-1) == "other")
     }
 
-    test("is_integer in guard") {
+    test("is_integer? in guard") {
       assert(guard_with_is_integer(42) == "it is an integer")
+    }
+
+    test("String.length in guard") {
+      assert(classify_str("hello") == "non-empty")
+    }
+
+    test("String.length guard fallthrough") {
+      assert(classify_str("") == "empty")
     }
   }
 
@@ -200,11 +259,19 @@ pub struct Test.GuardTest {
     "other"
   }
 
-  fn guard_with_is_integer(n :: i64) -> String if is_integer(n) {
+  fn guard_with_is_integer(n :: i64) -> String if is_integer?(n) {
     "it is an integer"
   }
 
   fn guard_with_is_integer(_ :: i64) -> String {
     "unknown"
+  }
+
+  fn classify_str(s :: String) -> String if String.length(s) > 0 {
+    "non-empty"
+  }
+
+  fn classify_str(_ :: String) -> String {
+    "empty"
   }
 }
