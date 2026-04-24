@@ -809,6 +809,34 @@ pub fn panic(message: []const u8) noreturn {
     std.process.exit(1);
 }
 
+pub const Range = struct {
+    pub fn to_list(range: anytype) ?*const ListOf(i64) {
+        const start = range.start;
+        const end_val = range.end;
+        const step_mag = range.step;
+        if (step_mag == 0) return null;
+
+        const going_forward = start <= end_val;
+        const step: i64 = if (going_forward) step_mag else -step_mag;
+
+        var result: ?*const ListOf(i64) = null;
+        var current = start;
+
+        if (going_forward) {
+            while (current <= end_val) {
+                result = ListOf(i64).cons(current, result);
+                current += step;
+            }
+        } else {
+            while (current >= end_val) {
+                result = ListOf(i64).cons(current, result);
+                current += step;
+            }
+        }
+        return ListOf(i64).reverse(result);
+    }
+};
+
 pub const Kernel = struct {
     pub fn is_integer(value: anytype) bool {
         const info = @typeInfo(@TypeOf(value));
