@@ -917,11 +917,6 @@ pub const Desugarer = struct {
             return self.desugarForString(fe);
         }
 
-        // Range: counter-based iteration
-        if (fe.iterable.* == .range) {
-            return self.desugarForRange(fe);
-        }
-
         // Generate unique helper name (heap-allocated since interner stores slices)
         const name_str = try std.fmt.allocPrint(self.allocator, "__for_{d}", .{self.for_counter});
         self.for_counter += 1;
@@ -1199,120 +1194,6 @@ pub const Desugarer = struct {
                 .callee = try self.create(ast.Expr, .{ .var_ref = .{ .meta = meta, .name = helper_name } }),
                 .args = try self.allocSlice(*const ast.Expr, &.{ iterable, zero }),
             },
-        });
-    }
-
-    /// Desugar for over range: for x <- 1..10:2 { body }
-    /// Generates a counter-based recursive helper with a single clause:
-    ///   fn __for_N(__current :: i64, __end :: i64, __step :: i64) -> [i64] {
-    ///     case (__current - __end) * __step > 0 {
-    ///       true -> []
-    ///       false -> x = __current; [body | __for_N(__current + __step, __end, __step)]
-    ///     }
-    ///   }
-    fn desugarForRange(self: *Desugarer, fe: *const ast.ForExpr) !*const ast.Expr {
-        const meta = ast.NodeMeta{ .span = .{ .start = 0, .end = 0 } };
-        const re = fe.iterable.range;
-
-        const name_str = try std.fmt.allocPrint(self.allocator, "__for_{d}", .{self.for_counter});
-        self.for_counter += 1;
-        const helper_name = try self.interner.intern(name_str);
-
-        // Use the loop variable name as the current-value parameter
-        const current_name = fe.var_name;
-        const end_name = try self.interner.intern("__end");
-        const step_name = try self.interner.intern("__step");
-
-        // Refs
-        const current_ref = try self.create(ast.Expr, .{ .var_ref = .{ .meta = meta, .name = current_name } });
-        const end_ref = try self.create(ast.Expr, .{ .var_ref = .{ .meta = meta, .name = end_name } });
-        const step_ref = try self.create(ast.Expr, .{ .var_ref = .{ .meta = meta, .name = step_name } });
-
-        // Done condition: (__current - __end) * __step > 0
-        const diff = try self.create(ast.Expr, .{ .binary_op = .{ .meta = meta, .op = .sub, .lhs = current_ref, .rhs = end_ref } });
-        const product = try self.create(ast.Expr, .{ .binary_op = .{ .meta = meta, .op = .mul, .lhs = diff, .rhs = step_ref } });
-        const zero_lit = try self.create(ast.Expr, .{ .int_literal = .{ .meta = meta, .value = 0 } });
-        const done_cond = try self.create(ast.Expr, .{ .binary_op = .{ .meta = meta, .op = .greater, .lhs = product, .rhs = zero_lit } });
-
-        // Recursive call: __for_N(__current + __step, __end, __step)
-        const next_val = try self.create(ast.Expr, .{ .binary_op = .{ .meta = meta, .op = .add, .lhs = current_ref, .rhs = step_ref } });
-        const rec_call = try self.create(ast.Expr, .{
-            .call = .{ .meta = meta, .callee = try self.create(ast.Expr, .{ .var_ref = .{ .meta = meta, .name = helper_name } }), .args = try self.allocSlice(*const ast.Expr, &.{ next_val, end_ref, step_ref }) },
-        });
-
-        // Body: [body | rec_call]
-        const body_d = try self.desugarExpr(fe.body);
-        var cons_expr = try self.create(ast.Expr, .{
-            .list_cons_expr = .{ .meta = meta, .head = body_d, .tail = rec_call },
-        });
-
-        // Filter
-        if (fe.filter) |filter| {
-            const fd = try self.desugarExpr(filter);
-            cons_expr = try self.create(ast.Expr, .{
-                .case_expr = .{ .meta = meta, .scrutinee = fd, .clauses = try self.allocSlice(ast.CaseClause, &.{
-                    .{ .meta = meta, .pattern = try self.create(ast.Pattern, .{ .literal = .{ .bool_lit = .{ .meta = meta, .value = true } } }), .type_annotation = null, .guard = null, .body = try self.allocSlice(ast.Stmt, &.{.{ .expr = cons_expr }}) },
-                    .{ .meta = meta, .pattern = try self.create(ast.Pattern, .{ .literal = .{ .bool_lit = .{ .meta = meta, .value = false } } }), .type_annotation = null, .guard = null, .body = try self.allocSlice(ast.Stmt, &.{.{ .expr = rec_call }}) },
-                }) },
-            });
-        }
-
-        // case done { true -> []; false -> [body | rec] }
-        const empty_list = try self.create(ast.Expr, .{ .list = .{ .meta = meta, .elements = &.{} } });
-        const case_expr = try self.create(ast.Expr, .{
-            .case_expr = .{
-                .meta = meta,
-                .scrutinee = done_cond,
-                .clauses = try self.allocSlice(ast.CaseClause, &.{
-                    .{ .meta = meta, .pattern = try self.create(ast.Pattern, .{ .literal = .{ .bool_lit = .{ .meta = meta, .value = true } } }), .type_annotation = null, .guard = null, .body = try self.allocSlice(ast.Stmt, &.{.{ .expr = empty_list }}) },
-                    .{ .meta = meta, .pattern = try self.create(ast.Pattern, .{ .literal = .{ .bool_lit = .{ .meta = meta, .value = false } } }), .type_annotation = null, .guard = null, .body = try self.allocSlice(ast.Stmt, &.{.{ .expr = cons_expr }}) },
-                }),
-            },
-        });
-
-        // Return type: [i64]
-        const i64_name = try self.interner.intern("i64");
-        const i64_type = try self.create(ast.TypeExpr, .{ .name = .{ .meta = meta, .name = i64_name, .args = &.{} } });
-        const list_ret = try self.create(ast.TypeExpr, .{ .list = .{ .meta = meta, .element = i64_type } });
-
-        // Single clause with case body
-        const clause = ast.FunctionClause{
-            .meta = meta,
-            .params = try self.allocSlice(ast.Param, &.{
-                .{ .meta = meta, .pattern = try self.create(ast.Pattern, .{ .bind = .{ .meta = meta, .name = current_name } }), .type_annotation = null },
-                .{ .meta = meta, .pattern = try self.create(ast.Pattern, .{ .bind = .{ .meta = meta, .name = end_name } }), .type_annotation = null },
-                .{ .meta = meta, .pattern = try self.create(ast.Pattern, .{ .bind = .{ .meta = meta, .name = step_name } }), .type_annotation = null },
-            }),
-            .return_type = list_ret,
-            .refinement = null,
-            .body = try self.allocSlice(ast.Stmt, &.{.{ .expr = case_expr }}),
-        };
-
-        const func_decl = try self.create(ast.FunctionDecl, .{
-            .meta = meta,
-            .name = helper_name,
-            .clauses = try self.allocSlice(ast.FunctionClause, &.{clause}),
-            .visibility = .private,
-        });
-        try self.pending_helpers.append(self.allocator, .{ .priv_function = func_decl });
-
-        // Call: __for_N(start, end, effective_step)
-        const start_expr = try self.desugarExpr(re.start);
-        const end_expr_val = try self.desugarExpr(re.end);
-        const step_val = if (re.step) |s| try self.desugarExpr(s) else try self.create(ast.Expr, .{ .int_literal = .{ .meta = meta, .value = 1 } });
-
-        // Negate step for reverse ranges (literal start > literal end)
-        const effective_step = blk: {
-            if (re.start.* == .int_literal and re.end.* == .int_literal) {
-                if (re.start.int_literal.value > re.end.int_literal.value) {
-                    break :blk try self.create(ast.Expr, .{ .unary_op = .{ .meta = meta, .op = .negate, .operand = step_val } });
-                }
-            }
-            break :blk step_val;
-        };
-
-        return try self.create(ast.Expr, .{
-            .call = .{ .meta = fe.meta, .callee = try self.create(ast.Expr, .{ .var_ref = .{ .meta = meta, .name = helper_name } }), .args = try self.allocSlice(*const ast.Expr, &.{ start_expr, end_expr_val, effective_step }) },
         });
     }
 
