@@ -174,4 +174,27 @@ pub struct Test.GuardTest {
     "empty"
   }
 
+  describe("function calls in guards") {
+    test("local function in guard") {
+      assert(guard_with_local_fn(5) == "positive")
+    }
+
+    test("local function in guard fallthrough") {
+      assert(guard_with_local_fn(-1) == "other")
+    }
+
+  }
+
+  fn is_pos(n :: i64) -> Bool {
+    n > 0
+  }
+
+  fn guard_with_local_fn(n :: i64) -> String if is_pos(n) {
+    "positive"
+  }
+
+  fn guard_with_local_fn(_ :: i64) -> String {
+    "other"
+  }
+
 }

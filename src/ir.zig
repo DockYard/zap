@@ -3402,78 +3402,12 @@ pub const IrBuilder = struct {
                 });
                 return dest;
             },
-            .call => |call| {
-                // Handle call arguments through guard path for proper scrutinee resolution
-                var args: std.ArrayList(LocalId) = .empty;
-                var arg_modes: std.ArrayList(ValueMode) = .empty;
-                for (call.args) |arg| {
-                    const arg_local = try self.lowerGuardExpr(arg.expr, scrutinee_map);
-                    try args.append(self.allocator, arg_local);
-                    try arg_modes.append(self.allocator, arg.mode);
-                }
-                const dest = self.next_local;
-                self.next_local += 1;
-                const lowered_args = try args.toOwnedSlice(self.allocator);
-                const lowered_modes = try arg_modes.toOwnedSlice(self.allocator);
-
-                switch (call.target) {
-                    .direct => |dc| {
-                        // In guard context, emit call_named with qualified name instead
-                        // of call_direct. The dispatch function's ZIR context may not
-                        // resolve call_direct's function group IDs correctly.
-                        const func_name = self.group_id_to_name.get(dc.function_group_id) orelse "unknown";
-                        const arity: u32 = @intCast(call.args.len);
-                        const qualified = try self.resolveBareCall(func_name, arity);
-                        try self.current_instrs.append(self.allocator, .{
-                            .call_named = .{
-                                .dest = dest,
-                                .name = qualified,
-                                .args = lowered_args,
-                                .arg_modes = lowered_modes,
-                            },
-                        });
-                    },
-                    .named => |nc| {
-                        // For guard context, try resolving from the actual declared arity
-                        // rather than args count (which may include dispatch-added args).
-                        const call_arity: u32 = @intCast(call.args.len);
-                        const resolved_name = if (nc.module) |mod|
-                            try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ mod, nc.name, call_arity })
-                        else blk: {
-                            // Try decreasing arities — guard args may include dispatch overhead
-                            var try_a = call_arity;
-                            while (true) : (try_a -= 1) {
-                                const r = try self.resolveBareCall(nc.name, try_a);
-                                if (!std.mem.eql(u8, r, nc.name)) break :blk r;
-                                if (try_a == 0) break;
-                            }
-                            break :blk nc.name;
-                        };
-                        try self.current_instrs.append(self.allocator, .{
-                            .call_named = .{
-                                .dest = dest,
-                                .name = resolved_name,
-                                .args = lowered_args,
-                                .arg_modes = lowered_modes,
-                            },
-                        });
-                    },
-                    .builtin => |builtin_name| {
-                        try self.current_instrs.append(self.allocator, .{
-                            .call_builtin = .{
-                                .dest = dest,
-                                .name = builtin_name,
-                                .args = lowered_args,
-                                .arg_modes = lowered_modes,
-                            },
-                        });
-                    },
-                    else => {
-                        // Closure/dispatch — fall through to generic lowering
-                        return self.lowerExpr(expr);
-                    },
-                }
-                return dest;
+            .call => {
+                // In guard context, fall through to the generic lowerExpr which
+                // handles all call targets correctly. The guard-specific handling
+                // only needs to be in lowerGuardExpr for param_get (scrutinee
+                // resolution) and binary ops (guard-specific comparison lowering).
+                return self.lowerExpr(expr);
             },
             else => {
                 // For other expression kinds, fall through to generic lowerExpr

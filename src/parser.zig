@@ -14,6 +14,9 @@ pub const Parser = struct {
     interner: *ast.StringInterner,
     errors: std.ArrayList(Error),
     anon_function_counter: u32,
+    /// When true, `{` after a call is NOT parsed as a trailing block argument.
+    /// Set during guard expression parsing where `{` starts the function body.
+    in_guard_expr: bool = false,
 
     pub const Error = struct {
         message: []const u8,
@@ -1740,6 +1743,8 @@ pub const Parser = struct {
     /// Parse a guard expression — like a regular expression but allows
     /// newlines before `and`/`or` continuation tokens.
     fn parseGuardExpr(self: *Parser) anyerror!*const ast.Expr {
+        self.in_guard_expr = true;
+        defer self.in_guard_expr = false;
         return self.parseGuardOrExpr();
     }
 
@@ -2065,7 +2070,8 @@ pub const Parser = struct {
                 const end_tok = try self.expect(.right_paren);
 
                 // Trailing block: func(args) { body } → body becomes last argument
-                if (self.check(.left_brace)) {
+                // Disabled in guard expressions where { starts the function body.
+                if (self.check(.left_brace) and !self.in_guard_expr) {
                     const block_expr = try self.parseBlockExpr();
                     try args.append(self.allocator, block_expr);
                 }

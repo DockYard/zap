@@ -3008,7 +3008,13 @@ pub const HirBuilder = struct {
         });
 
         // Build refinement expression (guard predicate)
-        const refinement_expr = if (clause.refinement) |ref| try self.buildExpr(ref) else null;
+        const refinement_expr = if (clause.refinement) |ref| blk: {
+            const rexpr = try self.buildExpr(ref);
+            if (rexpr.kind == .call) {
+                std.debug.print("HIR refinement call args={d}\n", .{rexpr.kind.call.args.len});
+            }
+            break :blk rexpr;
+        } else null;
 
         // Build body block (empty for @native bodyless declarations)
         const body = if (clause.body) |body_stmts|
