@@ -63,6 +63,7 @@ pub const Token = struct {
         keyword_borrowed,
         keyword_protocol,
         keyword_impl,
+        keyword_in,
 
         // Operators
         plus, // +
@@ -162,6 +163,7 @@ pub const Token = struct {
         .{ "borrowed", .keyword_borrowed },
         .{ "protocol", .keyword_protocol },
         .{ "impl", .keyword_impl },
+        .{ "in", .keyword_in },
     });
 
     pub fn getKeyword(bytes: []const u8) ?Tag {

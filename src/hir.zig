@@ -3329,8 +3329,8 @@ pub const HirBuilder = struct {
                             break :blk rhs_expr.type_id;
                         break :blk types_mod.TypeStore.UNKNOWN;
                     },
-                    // Comparison/logical: Bool
-                    .equal, .not_equal, .less, .greater, .less_equal, .greater_equal, .and_op, .or_op => types_mod.TypeStore.BOOL,
+                    // Comparison/logical/membership: Bool
+                    .equal, .not_equal, .less, .greater, .less_equal, .greater_equal, .and_op, .or_op, .in_op => types_mod.TypeStore.BOOL,
                     // String concat
                     .concat => types_mod.TypeStore.STRING,
                 };

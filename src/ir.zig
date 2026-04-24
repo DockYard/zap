@@ -441,6 +441,7 @@ pub const BinaryOp = struct {
         bool_and,
         bool_or,
         concat,
+        in_list,
     };
 };
 
@@ -3388,6 +3389,7 @@ pub const IrBuilder = struct {
                     .and_op => .bool_and,
                     .or_op => .bool_or,
                     .concat => .concat,
+                    .in_op => .in_list,
                 };
                 try self.current_instrs.append(self.allocator, .{
                     .binary_op = .{ .dest = dest, .op = ir_op, .lhs = lhs, .rhs = rhs },
@@ -3692,6 +3694,7 @@ pub const IrBuilder = struct {
                     .and_op => .bool_and,
                     .or_op => .bool_or,
                     .concat => .concat,
+                    .in_op => .in_list,
                 };
                 try self.current_instrs.append(self.allocator, .{
                     .binary_op = .{ .dest = dest, .op = ir_op, .lhs = lhs, .rhs = rhs },

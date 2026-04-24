@@ -643,6 +643,7 @@ fn binopToString(op: ast.BinaryOp.Op) []const u8 {
         .and_op => "&&",
         .or_op => "||",
         .concat => "<>",
+        .in_op => "in",
     };
 }
 

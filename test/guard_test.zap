@@ -92,4 +92,34 @@ pub struct Test.GuardTest {
   fn either_big(_ :: i64, _ :: i64) -> String {
     "both small"
   }
+
+  describe("in operator") {
+    test("value in list is true") {
+      assert(is_primary(2) == true)
+    }
+
+    test("value not in list is false") {
+      assert(is_primary(4) == false)
+    }
+
+    test("in operator in guard") {
+      assert(classify_day(1) == "weekday")
+    }
+
+    test("in operator guard fallthrough") {
+      assert(classify_day(7) == "other")
+    }
+  }
+
+  fn is_primary(n :: i64) -> Bool {
+    n in [1, 2, 3]
+  }
+
+  fn classify_day(n :: i64) -> String if n in [1, 2, 3, 4, 5] {
+    "weekday"
+  }
+
+  fn classify_day(_ :: i64) -> String {
+    "other"
+  }
 }

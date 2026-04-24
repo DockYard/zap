@@ -1012,6 +1012,7 @@ pub const MacroEngine = struct {
             .and_op => "and",
             .or_op => "or",
             .concat => "<>",
+            .in_op => "in",
         };
     }
 

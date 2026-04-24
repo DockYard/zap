@@ -2215,6 +2215,20 @@ pub const Interpreter = struct {
             .bool_and => return .{ .bool_val = lhs.isTruthy() and rhs.isTruthy() },
             .bool_or => return .{ .bool_val = lhs.isTruthy() or rhs.isTruthy() },
             .concat => return self.evalConcat(lhs, rhs),
+            .in_list => {
+                switch (rhs) {
+                    .list => |list| {
+                        for (list.elems) |elem| {
+                            if (lhs.eql(elem)) return .{ .bool_val = true };
+                        }
+                        return .{ .bool_val = false };
+                    },
+                    else => {
+                        try self.emitError(.type_error, "'in' requires a list on the right-hand side");
+                        return error.CtfeFailure;
+                    },
+                }
+            },
         }
     }
 
@@ -4293,6 +4307,15 @@ fn evaluateConstBinaryOp(
                     break :blk .{ .list = .{ .alloc_id = alloc_id, .elems = result } };
                 },
                 else => error.NotComputable,
+            },
+            else => error.NotComputable,
+        },
+        .in_op => switch (rhs) {
+            .list => |list| blk: {
+                for (list.elems) |elem| {
+                    if (lhs.eql(elem)) break :blk .{ .bool_val = true };
+                }
+                break :blk .{ .bool_val = false };
             },
             else => error.NotComputable,
         },

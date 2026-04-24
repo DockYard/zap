@@ -257,7 +257,8 @@ fn mapBinopTag(op: ir.BinaryOp.Op) ?u8 {
         .bool_and => null, // handled via bool_br_and (short-circuit)
         .bool_or => null, // handled via bool_br_or (short-circuit)
         .string_eq, .string_neq => null, // handled specially via std.mem.eql
-        .concat => null, // TODO: array_cat
+        .concat => null, // handled specially via runtime call
+        .in_list => null, // handled specially via runtime call
     };
 }
 
@@ -2552,7 +2553,7 @@ pub const ZirDriver = struct {
                         if (ref == error_ref) return error.EmitFailed;
                     }
                     try self.setLocal(bo.dest, ref);
-                } else {
+                } else if (bo.op == .concat) {
                     // concat — emit @import("zap_runtime").ZapString.concatBump(lhs, rhs)
                     const lhs = self.refForLocal(bo.lhs) catch return;
                     const rhs = self.refForLocal(bo.rhs) catch return;
@@ -2566,6 +2567,25 @@ pub const ZirDriver = struct {
 
                     const args = [_]u32{ lhs, rhs };
                     const ref = zir_builder_emit_call_ref(self.handle, concat_fn, &args, 2);
+                    if (ref == error_ref) return error.EmitFailed;
+                    try self.setLocal(bo.dest, ref);
+                } else if (bo.op == .in_list) {
+                    // in — emit: lhs == list[0] or lhs == list[1] or ...
+                    // For runtime lists, call the list's contains method via generic dispatch.
+                    const lhs = self.refForLocal(bo.lhs) catch return;
+                    const rhs = self.refForLocal(bo.rhs) catch return;
+
+                    // Use the generic list contains: get the list type, then call .contains(list, value)
+                    // The list (rhs) already has the right type at runtime — call contains as a method.
+                    const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                    if (rt_import == error_ref) return error.EmitFailed;
+                    const list_mod = zir_builder_emit_field_val(self.handle, rt_import, "List", 4);
+                    if (list_mod == error_ref) return error.EmitFailed;
+                    const contains_fn = zir_builder_emit_field_val(self.handle, list_mod, "contains", 8);
+                    if (contains_fn == error_ref) return error.EmitFailed;
+
+                    const call_args = [_]u32{ rhs, lhs };
+                    const ref = zir_builder_emit_call_ref(self.handle, contains_fn, &call_args, 2);
                     if (ref == error_ref) return error.EmitFailed;
                     try self.setLocal(bo.dest, ref);
                 }

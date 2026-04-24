@@ -547,6 +547,7 @@ pub const BinaryOp = struct {
         and_op,
         or_op,
         concat, // <>
+        in_op, // in
     };
 };
 

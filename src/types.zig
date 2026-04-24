@@ -3178,6 +3178,8 @@ pub const TypeChecker = struct {
             .and_op, .or_op => TypeStore.BOOL,
             // String concat
             .concat => TypeStore.STRING,
+            // Membership test: returns Bool
+            .in_op => TypeStore.BOOL,
         };
     }
 

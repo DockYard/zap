@@ -1853,6 +1853,7 @@ pub const Parser = struct {
             .greater => .greater,
             .less_equal => .less_equal,
             .greater_equal => .greater_equal,
+            .keyword_in => .in_op,
             else => null,
         };
 
