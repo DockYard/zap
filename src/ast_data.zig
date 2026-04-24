@@ -875,6 +875,21 @@ pub fn ctValueToExpr(
     }
 
     // Special forms
+    // Range expression: {:.., meta, [start, end, step_or_nil]}
+    if (std.mem.eql(u8, form_name, "..")) {
+        if (arg_elems.len >= 2) {
+            const start = try ctValueToExpr(alloc, interner, arg_elems[0]);
+            const end_val = try ctValueToExpr(alloc, interner, arg_elems[1]);
+            const step = if (arg_elems.len >= 3 and arg_elems[2] != .nil)
+                try ctValueToExpr(alloc, interner, arg_elems[2])
+            else
+                null;
+            const expr = try alloc.create(ast.Expr);
+            expr.* = .{ .range = .{ .meta = node_meta, .start = start, .end = end_val, .step = step } };
+            return expr;
+        }
+    }
+
     if (std.mem.eql(u8, form_name, "__block__")) {
         var stmts : std.ArrayListUnmanaged(ast.Stmt) = .empty;
         for (arg_elems) |elem| {

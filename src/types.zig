@@ -3057,7 +3057,20 @@ pub const TypeChecker = struct {
             .range => |re| {
                 _ = try self.inferExpr(re.start);
                 _ = try self.inferExpr(re.end);
-                if (re.step) |s| _ = try self.inferExpr(s);
+                if (re.step) |s| {
+                    _ = try self.inferExpr(s);
+                    // Validate step is positive at compile time
+                    if (s.* == .int_literal) {
+                        if (s.int_literal.value <= 0) {
+                            try self.addHardError(
+                                "range step must be a positive integer",
+                                s.getMeta().span,
+                                "step must be > 0",
+                                "ranges use a positive step magnitude; the direction is determined by start vs end",
+                            );
+                        }
+                    }
+                }
                 return TypeStore.UNKNOWN;
             },
             .panic_expr => |pe| {

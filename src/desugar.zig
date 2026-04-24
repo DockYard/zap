@@ -413,6 +413,23 @@ pub const Desugarer = struct {
                 });
             },
 
+            .range => |re| {
+                const new_start = try self.desugarExpr(re.start);
+                const new_end = try self.desugarExpr(re.end);
+                const new_step = if (re.step) |s| try self.desugarExpr(s) else null;
+                if (new_start == re.start and new_end == re.end and
+                    (new_step == null) == (re.step == null))
+                    return expr;
+                return self.create(ast.Expr, .{
+                    .range = .{
+                        .meta = re.meta,
+                        .start = new_start,
+                        .end = new_end,
+                        .step = new_step,
+                    },
+                });
+            },
+
             // Leaf/passthrough nodes
             else => return expr,
         }
