@@ -828,6 +828,8 @@ pub const IrBuilder = struct {
     known_local_types: std.AutoHashMap(LocalId, ZigType),
     current_module_prefix: ?[]const u8,
     known_function_names: std.StringHashMap(void),
+    /// Maps function group ID → function name for guard call resolution
+    group_id_to_name: std.AutoHashMap(u32, []const u8),
     synthesized_type_defs: std.ArrayList(TypeDef),
     /// Maps function name → union dispatch info for call-site wrapping
     union_dispatch_map: std.StringHashMap(UnionDispatchInfo),
@@ -868,6 +870,7 @@ pub const IrBuilder = struct {
             .known_local_types = std.AutoHashMap(LocalId, ZigType).init(allocator),
             .current_module_prefix = null,
             .known_function_names = std.StringHashMap(void).init(allocator),
+            .group_id_to_name = std.AutoHashMap(u32, []const u8).init(allocator),
             .synthesized_type_defs = .empty,
             .union_dispatch_map = std.StringHashMap(UnionDispatchInfo).init(allocator),
             .default_arg_wrappers = std.StringHashMap([]const u8).init(allocator),
@@ -884,6 +887,7 @@ pub const IrBuilder = struct {
         self.union_dispatch_map.deinit();
         self.default_arg_wrappers.deinit();
         self.known_function_names.deinit();
+        self.group_id_to_name.deinit();
     }
 
     /// Extract the list element ZigType from an HIR expression's type_id.
@@ -916,12 +920,14 @@ pub const IrBuilder = struct {
                 const func_name = self.interner.get(func_group.name);
                 const qualified = try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ module_prefix, func_name, func_group.arity });
                 try self.known_function_names.put(qualified, {});
+                try self.group_id_to_name.put(func_group.id, func_name);
             }
         }
         for (hir_program.top_functions) |func_group| {
             const func_name = self.interner.get(func_group.name);
             const qualified = try std.fmt.allocPrint(self.allocator, "{s}__{d}", .{ func_name, func_group.arity });
             try self.known_function_names.put(qualified, {});
+            try self.group_id_to_name.put(func_group.id, func_name);
         }
 
         // Second pass: pre-scan for ~> error pipe chains to identify functions
@@ -3396,6 +3402,79 @@ pub const IrBuilder = struct {
                 });
                 return dest;
             },
+            .call => |call| {
+                // Handle call arguments through guard path for proper scrutinee resolution
+                var args: std.ArrayList(LocalId) = .empty;
+                var arg_modes: std.ArrayList(ValueMode) = .empty;
+                for (call.args) |arg| {
+                    const arg_local = try self.lowerGuardExpr(arg.expr, scrutinee_map);
+                    try args.append(self.allocator, arg_local);
+                    try arg_modes.append(self.allocator, arg.mode);
+                }
+                const dest = self.next_local;
+                self.next_local += 1;
+                const lowered_args = try args.toOwnedSlice(self.allocator);
+                const lowered_modes = try arg_modes.toOwnedSlice(self.allocator);
+
+                switch (call.target) {
+                    .direct => |dc| {
+                        // In guard context, emit call_named with qualified name instead
+                        // of call_direct. The dispatch function's ZIR context may not
+                        // resolve call_direct's function group IDs correctly.
+                        const func_name = self.group_id_to_name.get(dc.function_group_id) orelse "unknown";
+                        const arity: u32 = @intCast(call.args.len);
+                        const qualified = try self.resolveBareCall(func_name, arity);
+                        try self.current_instrs.append(self.allocator, .{
+                            .call_named = .{
+                                .dest = dest,
+                                .name = qualified,
+                                .args = lowered_args,
+                                .arg_modes = lowered_modes,
+                            },
+                        });
+                    },
+                    .named => |nc| {
+                        // For guard context, try resolving from the actual declared arity
+                        // rather than args count (which may include dispatch-added args).
+                        const call_arity: u32 = @intCast(call.args.len);
+                        const resolved_name = if (nc.module) |mod|
+                            try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ mod, nc.name, call_arity })
+                        else blk: {
+                            // Try decreasing arities — guard args may include dispatch overhead
+                            var try_a = call_arity;
+                            while (true) : (try_a -= 1) {
+                                const r = try self.resolveBareCall(nc.name, try_a);
+                                if (!std.mem.eql(u8, r, nc.name)) break :blk r;
+                                if (try_a == 0) break;
+                            }
+                            break :blk nc.name;
+                        };
+                        try self.current_instrs.append(self.allocator, .{
+                            .call_named = .{
+                                .dest = dest,
+                                .name = resolved_name,
+                                .args = lowered_args,
+                                .arg_modes = lowered_modes,
+                            },
+                        });
+                    },
+                    .builtin => |builtin_name| {
+                        try self.current_instrs.append(self.allocator, .{
+                            .call_builtin = .{
+                                .dest = dest,
+                                .name = builtin_name,
+                                .args = lowered_args,
+                                .arg_modes = lowered_modes,
+                            },
+                        });
+                    },
+                    else => {
+                        // Closure/dispatch — fall through to generic lowering
+                        return self.lowerExpr(expr);
+                    },
+                }
+                return dest;
+            },
             else => {
                 // For other expression kinds, fall through to generic lowerExpr
                 return self.lowerExpr(expr);
@@ -4295,6 +4374,11 @@ pub const IrBuilder = struct {
             {
                 const top_name = try std.fmt.allocPrint(self.allocator, "{s}__{d}", .{ name, try_arity });
                 if (self.known_function_names.contains(top_name)) return top_name;
+            }
+            // 3. Kernel function (auto-imported)
+            {
+                const kernel_name = try std.fmt.allocPrint(self.allocator, "Kernel__{s}__{d}", .{ name, try_arity });
+                if (self.known_function_names.contains(kernel_name)) return kernel_name;
             }
         }
         // 4. Keep bare name — Zig compiler will error

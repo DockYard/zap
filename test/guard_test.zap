@@ -139,6 +139,15 @@ pub struct Test.GuardTest {
     test("is_number with integer") {
       assert(check_is_number(42) == true)
     }
+
+    test("String.length in guard") {
+      assert(classify_str("hello") == "non-empty")
+    }
+
+    test("String.length guard fallthrough") {
+      assert(classify_str("") == "empty")
+    }
+
   }
 
   fn check_is_integer(value :: i64) -> Bool {
@@ -156,4 +165,13 @@ pub struct Test.GuardTest {
   fn check_is_number(value :: i64) -> Bool {
     is_number(value)
   }
+
+  fn classify_str(s :: String) -> String if String.length(s) > 0 {
+    "non-empty"
+  }
+
+  fn classify_str(_ :: String) -> String {
+    "empty"
+  }
+
 }
