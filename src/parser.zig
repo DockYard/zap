@@ -1393,8 +1393,9 @@ pub const Parser = struct {
         }
 
         var refinement: ?*const ast.Expr = null;
+        self.skipNewlinesForContinuation(.keyword_if);
         if (self.match(.keyword_if)) {
-            refinement = try self.parseExpr();
+            refinement = try self.parseGuardExpr();
         }
 
         // Bodyless declaration: @native functions have no body
@@ -1734,6 +1735,54 @@ pub const Parser = struct {
 
     pub fn parseExpr(self: *Parser) anyerror!*const ast.Expr {
         return self.parseOrExpr();
+    }
+
+    /// Parse a guard expression — like a regular expression but allows
+    /// newlines before `and`/`or` continuation tokens.
+    fn parseGuardExpr(self: *Parser) anyerror!*const ast.Expr {
+        return self.parseGuardOrExpr();
+    }
+
+    fn parseGuardOrExpr(self: *Parser) anyerror!*const ast.Expr {
+        var left = try self.parseGuardAndExpr();
+
+        while (true) {
+            self.skipNewlinesForContinuation(.keyword_or);
+            if (!self.check(.keyword_or)) break;
+            _ = self.advance();
+            const right = try self.parseGuardAndExpr();
+            left = try self.create(ast.Expr, .{
+                .binary_op = .{
+                    .meta = .{ .span = ast.SourceSpan.merge(left.getMeta().span, right.getMeta().span) },
+                    .op = .or_op,
+                    .lhs = left,
+                    .rhs = right,
+                },
+            });
+        }
+
+        return left;
+    }
+
+    fn parseGuardAndExpr(self: *Parser) anyerror!*const ast.Expr {
+        var left = try self.parseCompareExpr();
+
+        while (true) {
+            self.skipNewlinesForContinuation(.keyword_and);
+            if (!self.check(.keyword_and)) break;
+            _ = self.advance();
+            const right = try self.parseCompareExpr();
+            left = try self.create(ast.Expr, .{
+                .binary_op = .{
+                    .meta = .{ .span = ast.SourceSpan.merge(left.getMeta().span, right.getMeta().span) },
+                    .op = .and_op,
+                    .lhs = left,
+                    .rhs = right,
+                },
+            });
+        }
+
+        return left;
     }
 
     fn parseOrExpr(self: *Parser) !*const ast.Expr {
@@ -2837,7 +2886,7 @@ pub const Parser = struct {
         var guard: ?*const ast.Expr = null;
         if (self.check(.keyword_if)) {
             _ = self.advance();
-            guard = try self.parseExpr();
+            guard = try self.parseGuardExpr();
         }
 
         _ = try self.expect(.arrow);

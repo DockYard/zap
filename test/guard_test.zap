@@ -50,4 +50,46 @@ pub struct Test.GuardTest {
   fn range_check(_ :: i64) -> String {
     "large"
   }
+
+  describe("multi-line guards") {
+    test("multi-line and guard matches") {
+      assert(both_positive(3, 5) == "both positive")
+    }
+
+    test("multi-line and guard falls through") {
+      assert(both_positive(-1, 5) == "not both")
+    }
+
+    test("multi-line or guard first branch") {
+      assert(either_big(200, 1) == "at least one big")
+    }
+
+    test("multi-line or guard second branch") {
+      assert(either_big(1, 200) == "at least one big")
+    }
+
+    test("multi-line or guard falls through") {
+      assert(either_big(1, 2) == "both small")
+    }
+  }
+
+  fn both_positive(a :: i64, b :: i64) -> String
+    if a > 0
+    and b > 0 {
+    "both positive"
+  }
+
+  fn both_positive(_ :: i64, _ :: i64) -> String {
+    "not both"
+  }
+
+  fn either_big(a :: i64, b :: i64) -> String
+    if a > 100
+    or b > 100 {
+    "at least one big"
+  }
+
+  fn either_big(_ :: i64, _ :: i64) -> String {
+    "both small"
+  }
 }
