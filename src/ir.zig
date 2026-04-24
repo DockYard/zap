@@ -2784,14 +2784,13 @@ pub const IrBuilder = struct {
                 try self.lowerDecisionTreeForCase(sw.default, case_arms, scrutinee_map, 0);
             },
             .check_tuple => |ct| {
+                // For case expressions in statically typed code, the tuple type
+                // check always passes. Emit element extraction and inner guards
+                // at the CURRENT level (no guard_block wrapper). This ensures
+                // inner guard_blocks (from atom switches) appear as flat siblings
+                // in the case_block's pre_instrs, enabling proper if-else nesting
+                // by emitFlatCaseBlock.
                 const scrutinee_local = self.resolveScrutinee(ct.scrutinee, scrutinee_map);
-                const type_check_local = self.next_local;
-                self.next_local += 1;
-                try self.current_instrs.append(self.allocator, .{
-                    .match_type = .{ .dest = type_check_local, .scrutinee = scrutinee_local, .expected_type = .{ .tuple = &.{} }, .expected_arity = ct.expected_arity },
-                });
-                const saved = self.current_instrs;
-                self.current_instrs = .empty;
                 var i: u32 = 0;
                 while (i < ct.expected_arity) : (i += 1) {
                     const elem_local = self.next_local;
@@ -2799,22 +2798,15 @@ pub const IrBuilder = struct {
                     try self.current_instrs.append(self.allocator, .{
                         .index_get = .{ .dest = elem_local, .object = scrutinee_local, .index = i },
                     });
-                    // Use stored element scrutinee IDs directly — avoids the
-                    // fragile heuristic of walking the decision tree which breaks
-                    // when wildcard patterns skip bind nodes.
                     const elem_id = if (i < ct.element_scrutinee_ids.len)
                         ct.element_scrutinee_ids[i]
                     else
                         findParamGetIdInDecision(ct.success, i);
                     try scrutinee_map.put(elem_id, elem_local);
                 }
+                // Lower success subtree at the same level — inner guards become
+                // flat guard_blocks that emitFlatCaseBlock can process
                 try self.lowerDecisionTreeForCase(ct.success, case_arms, scrutinee_map, 0);
-                const success_body = try self.current_instrs.toOwnedSlice(self.allocator);
-                self.current_instrs = saved;
-                try self.current_instrs.append(self.allocator, .{
-                    .guard_block = .{ .condition = type_check_local, .body = success_body },
-                });
-                try self.lowerDecisionTreeForCase(ct.failure, case_arms, scrutinee_map, 0);
             },
             .check_list => |cl| {
                 const scrutinee_local = self.resolveScrutinee(cl.scrutinee, scrutinee_map);

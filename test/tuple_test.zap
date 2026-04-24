@@ -69,18 +69,18 @@ pub struct Test.TupleTest {
     }
 
     test("non-matching atom falls through to wildcard") {
-      assert(extract_ok({:error, 0}) == -1)
+      assert(extract_ok({:error, 0}) == 0 - 1)
     }
 
     test("unknown atom falls through to wildcard") {
-      assert(extract_ok({:unknown, 99}) == -1)
+      assert(extract_ok({:unknown, 99}) == 0 - 1)
     }
   }
 
   fn extract_ok(t :: {Atom, i64}) -> i64 {
     case t {
       {:ok, v} -> v
-      {_, _} -> -1
+      {_, _} -> 0 - 1
     }
   }
 }

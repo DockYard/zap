@@ -2406,7 +2406,12 @@ pub const ZirDriver = struct {
         switch (instr) {
             // Constants
             .const_int => |ci| {
-                const ref = zir_builder_emit_int(self.handle, ci.value);
+                // Inside case blocks, emit typed i64 to avoid comptime_int
+                // depending on runtime control flow.
+                const ref = if (self.current_case_dest != null)
+                    zir_builder_emit_int_typed(self.handle, ci.value, @intFromEnum(Zir.Inst.Ref.i64_type))
+                else
+                    zir_builder_emit_int(self.handle, ci.value);
                 if (ref == error_ref) return error.EmitFailed;
                 try self.setLocal(ci.dest, ref);
             },
