@@ -4449,9 +4449,19 @@ fn isGenericHirGroup(store: *const types_mod.TypeStore, group: *const hir_mod.Fu
     if (group.clauses.len == 0) return false;
     const first_clause = &group.clauses[0];
     for (first_clause.params) |param| {
-        if (containsTypeVarInStore(store, param.type_id)) return true;
+        // UNKNOWN (any) parameters are NOT generic — they compile to anytype in Zig
+        if (param.type_id == types_mod.TypeStore.UNKNOWN) continue;
+        if (containsTypeVarInStore(store, param.type_id)) {
+            // Check if the actual type is a type_var that was unified from UNKNOWN
+            if (param.type_id < store.types.items.len) {
+                const actual = store.types.items[param.type_id];
+                if (actual == .unknown or actual == .type_var) continue; // Not truly generic
+            }
+            return true;
+        }
     }
-    if (containsTypeVarInStore(store, first_clause.return_type)) return true;
+    const ret = first_clause.return_type;
+    if (ret != types_mod.TypeStore.UNKNOWN and containsTypeVarInStore(store, ret)) return true;
     return false;
 }
 

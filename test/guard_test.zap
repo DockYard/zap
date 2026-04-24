@@ -183,6 +183,9 @@ pub struct Test.GuardTest {
       assert(guard_with_local_fn(-1) == "other")
     }
 
+    test("is_integer in guard") {
+      assert(guard_with_is_integer(42) == "it is an integer")
+    }
   }
 
   fn is_pos(n :: i64) -> Bool {
@@ -197,4 +200,11 @@ pub struct Test.GuardTest {
     "other"
   }
 
+  fn guard_with_is_integer(n :: i64) -> String if is_integer(n) {
+    "it is an integer"
+  }
+
+  fn guard_with_is_integer(_ :: i64) -> String {
+    "unknown"
+  }
 }
