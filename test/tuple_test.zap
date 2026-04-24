@@ -67,6 +67,14 @@ pub struct Test.TupleTest {
     test("match :ok atom in tuple") {
       assert(extract_ok({:ok, 42}) == 42)
     }
+
+    test("non-matching atom falls through to wildcard") {
+      assert(extract_ok({:error, 0}) == -1)
+    }
+
+    test("unknown atom falls through to wildcard") {
+      assert(extract_ok({:unknown, 99}) == -1)
+    }
   }
 
   fn extract_ok(t :: {Atom, i64}) -> i64 {
