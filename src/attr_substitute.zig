@@ -413,6 +413,18 @@ fn substituteInExpr(
             new_expr.* = .{ .for_expr = .{ .meta = fe.meta, .var_name = fe.var_name, .iterable = new_iterable, .filter = new_filter, .body = new_body } };
             return new_expr;
         },
+        .range => |re| {
+            const new_start = try substituteInExpr(alloc, re.start, func_attrs, mod_attrs, interner, errors);
+            const new_end = try substituteInExpr(alloc, re.end, func_attrs, mod_attrs, interner, errors);
+            const new_step = if (re.step) |s|
+                try substituteInExpr(alloc, s, func_attrs, mod_attrs, interner, errors)
+            else
+                null;
+            if (new_start == re.start and new_end == re.end and new_step == re.step) return expr;
+            const new_expr = try alloc.create(ast.Expr);
+            new_expr.* = .{ .range = .{ .meta = re.meta, .start = new_start, .end = new_end, .step = new_step } };
+            return new_expr;
+        },
         .list_cons_expr => |lc| {
             const new_head = try substituteInExpr(alloc, lc.head, func_attrs, mod_attrs, interner, errors);
             const new_tail = try substituteInExpr(alloc, lc.tail, func_attrs, mod_attrs, interner, errors);

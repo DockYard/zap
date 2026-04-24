@@ -675,6 +675,32 @@ pub const MacroEngine = struct {
                 };
             },
 
+            // Range expression — recurse into start, end, and optional step
+            .range => |re| {
+                var changed = false;
+                const start = try self.expandExpr(re.start);
+                if (start.changed) changed = true;
+                const end_exp = try self.expandExpr(re.end);
+                if (end_exp.changed) changed = true;
+                const step = if (re.step) |s| blk: {
+                    const exp = try self.expandExpr(s);
+                    if (exp.changed) changed = true;
+                    break :blk exp.expr;
+                } else null;
+                if (!changed) return .{ .expr = expr, .changed = false };
+                return .{
+                    .expr = try self.create(ast.Expr, .{
+                        .range = .{
+                            .meta = re.meta,
+                            .start = start.expr,
+                            .end = end_exp.expr,
+                            .step = step,
+                        },
+                    }),
+                    .changed = true,
+                };
+            },
+
             // List cons expression — recurse into head and tail
             .list_cons_expr => |lc| {
                 var changed = false;

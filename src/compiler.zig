@@ -2426,6 +2426,22 @@ fn remapExpr(alloc: std.mem.Allocator, expr: *ast.Expr, remap: []const ast.Strin
                 me.fields = mutable_fields;
             }
         },
+        .range => |*re| {
+            const mutable_start = try alloc.create(ast.Expr);
+            mutable_start.* = re.start.*;
+            try remapExpr(alloc, mutable_start, remap);
+            re.start = mutable_start;
+            const mutable_end = try alloc.create(ast.Expr);
+            mutable_end.* = re.end.*;
+            try remapExpr(alloc, mutable_end, remap);
+            re.end = mutable_end;
+            if (re.step) |s| {
+                const mutable_step = try alloc.create(ast.Expr);
+                mutable_step.* = s.*;
+                try remapExpr(alloc, mutable_step, remap);
+                re.step = mutable_step;
+            }
+        },
         .list_cons_expr => |*lce| {
             const mutable_head = try alloc.create(ast.Expr);
             mutable_head.* = lce.head.*;

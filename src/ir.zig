@@ -445,6 +445,7 @@ pub const BinaryOp = struct {
         bool_or,
         concat,
         in_list,
+        in_range,
     };
 };
 
@@ -3406,7 +3407,20 @@ pub const IrBuilder = struct {
                     .and_op => .bool_and,
                     .or_op => .bool_or,
                     .concat => .concat,
-                    .in_op => .in_list,
+                    .in_op => blk: {
+                        if (bin.rhs.kind == .struct_init) {
+                            if (self.type_store) |ts| {
+                                if (bin.rhs.type_id < ts.types.items.len) {
+                                    const rhs_type = ts.getType(bin.rhs.type_id);
+                                    if (rhs_type == .struct_type) {
+                                        const name = self.interner.get(rhs_type.struct_type.name);
+                                        if (std.mem.eql(u8, name, "Range")) break :blk .in_range;
+                                    }
+                                }
+                            }
+                        }
+                        break :blk .in_list;
+                    },
                 };
                 try self.current_instrs.append(self.allocator, .{
                     .binary_op = .{ .dest = dest, .op = ir_op, .lhs = lhs, .rhs = rhs },
@@ -3718,7 +3732,21 @@ pub const IrBuilder = struct {
                     .and_op => .bool_and,
                     .or_op => .bool_or,
                     .concat => .concat,
-                    .in_op => .in_list,
+                    .in_op => blk: {
+                        // Detect if RHS is a Range struct
+                        if (bin.rhs.kind == .struct_init) {
+                            if (self.type_store) |ts| {
+                                if (bin.rhs.type_id < ts.types.items.len) {
+                                    const rhs_type = ts.getType(bin.rhs.type_id);
+                                    if (rhs_type == .struct_type) {
+                                        const name = self.interner.get(rhs_type.struct_type.name);
+                                        if (std.mem.eql(u8, name, "Range")) break :blk .in_range;
+                                    }
+                                }
+                            }
+                        }
+                        break :blk .in_list;
+                    },
                 };
                 try self.current_instrs.append(self.allocator, .{
                     .binary_op = .{ .dest = dest, .op = ir_op, .lhs = lhs, .rhs = rhs },

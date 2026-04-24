@@ -354,6 +354,7 @@ pub const Expr = union(enum) {
     list: ListExpr,
     map: MapExpr,
     struct_expr: StructExpr,
+    range: RangeExpr,
 
     // Operations
     binary_op: BinaryOp,
@@ -417,6 +418,7 @@ pub const Expr = union(enum) {
             .list => |v| v.meta,
             .map => |v| v.meta,
             .struct_expr => |v| v.meta,
+            .range => |v| v.meta,
             .binary_op => |v| v.meta,
             .unary_op => |v| v.meta,
             .call => |v| v.meta,
@@ -524,6 +526,13 @@ pub const StructExpr = struct {
 pub const StructField = struct {
     name: StringId,
     value: *const Expr,
+};
+
+pub const RangeExpr = struct {
+    meta: NodeMeta,
+    start: *const Expr,
+    end: *const Expr,
+    step: ?*const Expr,
 };
 
 pub const BinaryOp = struct {

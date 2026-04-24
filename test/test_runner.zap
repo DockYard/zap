@@ -37,6 +37,7 @@ pub struct Test.TestRunner {
     Test.MathTest.run()
     Test.ProtocolTest.run()
     Test.StructTest.run()
+    Test.RangeTest.run()
     Zest.Runner.run()
   }
 }

@@ -3782,6 +3782,42 @@ pub const HirBuilder = struct {
                 // Pipe should be desugared before reaching HIR
                 unreachable;
             },
+            .range => |re| {
+                // Desugar range expression to %Range{start: ..., end: ..., step: ...}
+                const start_expr = try self.buildExpr(re.start);
+                const end_expr = try self.buildExpr(re.end);
+                const step_expr = if (re.step) |s|
+                    try self.buildExpr(s)
+                else
+                    try self.create(Expr, .{
+                        .kind = .{ .int_lit = 1 },
+                        .type_id = types_mod.TypeStore.I64,
+                        .span = re.meta.span,
+                    });
+
+                // Look up Range type
+                const range_name_id = @constCast(self.interner).intern("Range") catch unreachable;
+                const range_type_id = self.type_store.name_to_type.get(range_name_id) orelse types_mod.TypeStore.UNKNOWN;
+
+                // Intern field names
+                const start_name = @constCast(self.interner).intern("start") catch unreachable;
+                const end_name = @constCast(self.interner).intern("end") catch unreachable;
+                const step_name = @constCast(self.interner).intern("step") catch unreachable;
+
+                const fields = try self.allocator.alloc(StructFieldInit, 3);
+                fields[0] = .{ .name = start_name, .value = start_expr };
+                fields[1] = .{ .name = end_name, .value = end_expr };
+                fields[2] = .{ .name = step_name, .value = step_expr };
+
+                return try self.create(Expr, .{
+                    .kind = .{ .struct_init = .{
+                        .type_id = range_type_id,
+                        .fields = fields,
+                    } },
+                    .type_id = range_type_id,
+                    .span = re.meta.span,
+                });
+            },
             .struct_expr => |se| {
                 // Resolve struct type from module name (e.g., %Point{x: 1, y: 2})
                 var struct_type_id = types_mod.TypeStore.UNKNOWN;

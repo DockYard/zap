@@ -337,6 +337,15 @@ pub fn exprToCtValue(
             return makeTuple3(alloc, store, .{ .atom = "for" }, try metaToList(alloc, store, v.meta, null), args);
         },
 
+        // Range: {:.., meta, [start, end, step_or_nil]}
+        .range => |v| {
+            const start = try exprToCtValue(alloc, interner, store, v.start);
+            const end_val = try exprToCtValue(alloc, interner, store, v.end);
+            const step_val = if (v.step) |s| try exprToCtValue(alloc, interner, store, s) else CtValue.nil;
+            const args = try makeList(alloc, store, &.{ start, end_val, step_val });
+            return makeTuple3(alloc, store, .{ .atom = ".." }, try metaToList(alloc, store, v.meta, null), args);
+        },
+
         // List cons expression: {:cons, meta, [head, tail]}
         .list_cons_expr => |v| {
             const head = try exprToCtValue(alloc, interner, store, v.head);

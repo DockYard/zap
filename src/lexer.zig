@@ -450,6 +450,10 @@ pub const Lexer = struct {
                 return self.makeToken(.colon, start, self.pos);
             },
             '.' => {
+                if (self.pos < self.source.len and self.source[self.pos] == '.') {
+                    self.pos += 1;
+                    return self.makeToken(.dot_dot, start, self.pos);
+                }
                 if (self.pos < self.source.len and self.source[self.pos] == '{') {
                     self.pos += 1;
                     if (self.interp_depth > 0) self.interp_brace_depth += 1;

@@ -2233,6 +2233,31 @@ pub const Interpreter = struct {
                     },
                 }
             },
+            .in_range => {
+                // Range membership: check value is between start/end and on step boundary
+                switch (rhs) {
+                    .struct_val => |sv| {
+                        const val = switch (lhs) {
+                            .int => |v| v,
+                            else => return .{ .bool_val = false },
+                        };
+                        var start: i64 = 0;
+                        var end_val: i64 = 0;
+                        var step: i64 = 1;
+                        for (sv.fields) |field| {
+                            if (std.mem.eql(u8, field.name, "start")) start = if (field.value == .int) field.value.int else 0;
+                            if (std.mem.eql(u8, field.name, "end")) end_val = if (field.value == .int) field.value.int else 0;
+                            if (std.mem.eql(u8, field.name, "step")) step = if (field.value == .int) field.value.int else 1;
+                        }
+                        const min_v = @min(start, end_val);
+                        const max_v = @max(start, end_val);
+                        if (val < min_v or val > max_v) return .{ .bool_val = false };
+                        if (step == 0) return .{ .bool_val = false };
+                        return .{ .bool_val = @rem(val - start, step) == 0 };
+                    },
+                    else => return .{ .bool_val = false },
+                }
+            },
         }
     }
 

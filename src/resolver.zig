@@ -322,6 +322,11 @@ pub const Resolver = struct {
                 if (se.update_source) |us| try self.resolveExpr(us);
                 for (se.fields) |field| try self.resolveExpr(field.value);
             },
+            .range => |re| {
+                try self.resolveExpr(re.start);
+                try self.resolveExpr(re.end);
+                if (re.step) |s| try self.resolveExpr(s);
+            },
             .panic_expr => |pe| try self.resolveExpr(pe.message),
             .pipe => |pipe| {
                 try self.resolveExpr(pipe.lhs);

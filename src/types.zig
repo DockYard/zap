@@ -3054,6 +3054,12 @@ pub const TypeChecker = struct {
                 }
                 return TypeStore.UNKNOWN;
             },
+            .range => |re| {
+                _ = try self.inferExpr(re.start);
+                _ = try self.inferExpr(re.end);
+                if (re.step) |s| _ = try self.inferExpr(s);
+                return TypeStore.UNKNOWN;
+            },
             .panic_expr => |pe| {
                 _ = try self.inferExpr(pe.message);
                 return TypeStore.NEVER;

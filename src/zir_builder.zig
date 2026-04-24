@@ -262,6 +262,7 @@ fn mapBinopTag(op: ir.BinaryOp.Op) ?u8 {
         .string_eq, .string_neq => null, // handled specially via std.mem.eql
         .concat => null, // handled specially via runtime call
         .in_list => null, // handled specially via runtime call
+        .in_range => null, // handled specially via runtime call
     };
 }
 
@@ -2591,6 +2592,60 @@ pub const ZirDriver = struct {
                     const ref = zir_builder_emit_call_ref(self.handle, contains_fn, &call_args, 2);
                     if (ref == error_ref) return error.EmitFailed;
                     try self.setLocal(bo.dest, ref);
+                } else if (bo.op == .in_range) {
+                    // in_range: check value >= min(start,end) and value <= max(start,end)
+                    // and rem(value - start, step) == 0
+                    const value_ref = self.refForLocal(bo.lhs) catch return;
+                    const range_ref = self.refForLocal(bo.rhs) catch return;
+
+                    // Extract range fields: start, end, step
+                    const start_ref = zir_builder_emit_field_val(self.handle, range_ref, "start", 5);
+                    if (start_ref == error_ref) return error.EmitFailed;
+                    const end_ref = zir_builder_emit_field_val(self.handle, range_ref, "end", 3);
+                    if (end_ref == error_ref) return error.EmitFailed;
+                    const step_ref = zir_builder_emit_field_val(self.handle, range_ref, "step", 4);
+                    if (step_ref == error_ref) return error.EmitFailed;
+
+                    // Compute min and max: if start <= end then min=start,max=end else min=end,max=start
+                    const start_le_end = zir_builder_emit_binop(self.handle, @intFromEnum(Zir.Inst.Tag.cmp_lte), start_ref, end_ref);
+                    if (start_le_end == error_ref) return error.EmitFailed;
+
+                    // min = if start <= end then start else end
+                    const min_ref = zir_builder_emit_if_else_inline(self.handle, start_le_end, start_ref, end_ref);
+                    if (min_ref == error_ref) return error.EmitFailed;
+                    // max = if start <= end then end else start
+                    const max_ref = zir_builder_emit_if_else_inline(self.handle, start_le_end, end_ref, start_ref);
+                    if (max_ref == error_ref) return error.EmitFailed;
+
+                    // value >= min
+                    const gte_min = zir_builder_emit_binop(self.handle, @intFromEnum(Zir.Inst.Tag.cmp_gte), value_ref, min_ref);
+                    if (gte_min == error_ref) return error.EmitFailed;
+                    // value <= max
+                    const lte_max = zir_builder_emit_binop(self.handle, @intFromEnum(Zir.Inst.Tag.cmp_lte), value_ref, max_ref);
+                    if (lte_max == error_ref) return error.EmitFailed;
+
+                    // (value - start) rem step == 0
+                    const diff = zir_builder_emit_binop(self.handle, @intFromEnum(Zir.Inst.Tag.subwrap), value_ref, start_ref);
+                    if (diff == error_ref) return error.EmitFailed;
+                    // Compute remainder manually: diff - (diff / step) * step
+                    // This handles signed integers correctly.
+                    const quotient = zir_builder_emit_binop(self.handle, @intFromEnum(Zir.Inst.Tag.div_trunc), diff, step_ref);
+                    if (quotient == error_ref) return error.EmitFailed;
+                    const product = zir_builder_emit_binop(self.handle, @intFromEnum(Zir.Inst.Tag.mulwrap), quotient, step_ref);
+                    if (product == error_ref) return error.EmitFailed;
+                    const remainder = zir_builder_emit_binop(self.handle, @intFromEnum(Zir.Inst.Tag.subwrap), diff, product);
+                    if (remainder == error_ref) return error.EmitFailed;
+                    const zero_ref = zir_builder_emit_int(self.handle, 0);
+                    if (zero_ref == error_ref) return error.EmitFailed;
+                    const on_step = zir_builder_emit_binop(self.handle, @intFromEnum(Zir.Inst.Tag.cmp_eq), remainder, zero_ref);
+                    if (on_step == error_ref) return error.EmitFailed;
+
+                    // Combine: gte_min and lte_max and on_step (short-circuit)
+                    const empty_body = [_]u32{};
+                    const in_bounds = self.emitBoolBrAnd(gte_min, &empty_body, lte_max) catch return error.EmitFailed;
+                    const result = self.emitBoolBrAnd(in_bounds, &empty_body, on_step) catch return error.EmitFailed;
+
+                    try self.setLocal(bo.dest, result);
                 }
             },
 

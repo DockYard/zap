@@ -1879,7 +1879,7 @@ pub const Parser = struct {
     }
 
     fn parsePipeExpr(self: *Parser) !*const ast.Expr {
-        var left = try self.parseAddExpr();
+        var left = try self.parseRangeExpr();
 
         while (true) {
             // Skip newlines/indentation to support multiline pipes:
@@ -1889,7 +1889,7 @@ pub const Parser = struct {
             self.skipNewlinesForContinuation(.pipe_operator);
             if (!self.check(.pipe_operator)) break;
             _ = self.advance();
-            const right = try self.parseAddExpr();
+            const right = try self.parseRangeExpr();
             left = try self.create(ast.Expr, .{
                 .pipe = .{
                     .meta = .{ .span = ast.SourceSpan.merge(left.getMeta().span, right.getMeta().span) },
@@ -1946,6 +1946,30 @@ pub const Parser = struct {
                 .meta = .{ .span = ast.SourceSpan.merge(start, func.getMeta().span) },
                 .chain = chain,
                 .handler = .{ .function = func },
+            },
+        });
+    }
+
+    fn parseRangeExpr(self: *Parser) !*const ast.Expr {
+        const left = try self.parseAddExpr();
+
+        if (!self.check(.dot_dot)) return left;
+        _ = self.advance();
+
+        const end = try self.parseAddExpr();
+
+        var step: ?*const ast.Expr = null;
+        if (self.check(.colon)) {
+            _ = self.advance();
+            step = try self.parseAddExpr();
+        }
+
+        return self.create(ast.Expr, .{
+            .range = .{
+                .meta = .{ .span = ast.SourceSpan.merge(left.getMeta().span, self.previousSpan()) },
+                .start = left,
+                .end = end,
+                .step = step,
             },
         });
     }
