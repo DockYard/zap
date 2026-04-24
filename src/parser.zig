@@ -339,11 +339,20 @@ pub const Parser = struct {
                     switch (self.peek()) {
                         .keyword_struct => {
                             self.restoreLexerState(saved); // restore so parser sees pub
-                            if (self.parseStructDecl(false)) |mod| {
-                                try structs.append(self.allocator, mod);
-                                try top_items.append(self.allocator, .{ .struct_decl = try self.create(ast.StructDecl, mod) });
-                            } else |_| {
-                                self.synchronize();
+                            if (self.isFieldOnlyStruct()) {
+                                if (self.parseTopLevelStructDecl()) |sd| {
+                                    try structs.append(self.allocator, sd.*);
+                                    try top_items.append(self.allocator, .{ .struct_decl = sd });
+                                } else |_| {
+                                    self.synchronize();
+                                }
+                            } else {
+                                if (self.parseStructDecl(false)) |mod| {
+                                    try structs.append(self.allocator, mod);
+                                    try top_items.append(self.allocator, .{ .struct_decl = try self.create(ast.StructDecl, mod) });
+                                } else |_| {
+                                    self.synchronize();
+                                }
                             }
                         },
                         .keyword_fn => {
@@ -438,11 +447,20 @@ pub const Parser = struct {
                 },
                 .keyword_struct => {
                     // bare struct = private
-                    if (self.parseStructDecl(true)) |mod| {
-                        try structs.append(self.allocator, mod);
-                        try top_items.append(self.allocator, .{ .priv_struct_decl = try self.create(ast.StructDecl, mod) });
-                    } else |_| {
-                        self.synchronize();
+                    if (self.isFieldOnlyStruct()) {
+                        if (self.parseTopLevelStructDecl()) |sd| {
+                            try structs.append(self.allocator, sd.*);
+                            try top_items.append(self.allocator, .{ .priv_struct_decl = sd });
+                        } else |_| {
+                            self.synchronize();
+                        }
+                    } else {
+                        if (self.parseStructDecl(true)) |mod| {
+                            try structs.append(self.allocator, mod);
+                            try top_items.append(self.allocator, .{ .priv_struct_decl = try self.create(ast.StructDecl, mod) });
+                        } else |_| {
+                            self.synchronize();
+                        }
                     }
                 },
                 .keyword_union => {
@@ -582,7 +600,6 @@ pub const Parser = struct {
         self.skipNewlines();
 
         var items: std.ArrayList(ast.StructItem) = .empty;
-        var fields: std.ArrayList(ast.StructFieldDecl) = .empty;
 
         while (!self.check(.right_brace) and !self.check(.eof)) {
             self.skipNewlines();
@@ -695,7 +712,7 @@ pub const Parser = struct {
                         self.synchronize();
                     }
                 },
-                // Contextual keywords: use, describe, test; also field declarations
+                // Contextual keywords: use, describe, test
                 .identifier => {
                     if (self.checkIdentifier("use")) {
                         if (self.parseUseDecl()) |ud| {
@@ -703,10 +720,6 @@ pub const Parser = struct {
                         } else |_| {
                             self.synchronize();
                         }
-                    } else if (self.isFieldDecl()) {
-                        // Field declaration: name :: Type or name :: Type = default
-                        const field = try self.parseStructField();
-                        try fields.append(self.allocator, field);
                     } else {
                         // Try parsing as a module-level expression (macro call like describe/test).
                         // These are collected into an auto-generated run/0 function.
@@ -764,39 +777,7 @@ pub const Parser = struct {
             .name = name,
             .parent = parent,
             .items = try items.toOwnedSlice(self.allocator),
-            .fields = try fields.toOwnedSlice(self.allocator),
             .is_private = is_private,
-        };
-    }
-
-    /// Check if the current position is a field declaration (identifier followed by ::)
-    fn isFieldDecl(self: *Parser) bool {
-        if (!self.check(.identifier)) return false;
-        const saved = self.saveLexerState();
-        _ = self.advance();
-        const is_field = self.check(.double_colon);
-        self.restoreLexerState(saved);
-        return is_field;
-    }
-
-    /// Parse a struct field: name :: Type or name :: Type = default
-    fn parseStructField(self: *Parser) !ast.StructFieldDecl {
-        const field_start = self.currentSpan();
-        const name_tok = try self.expect(.identifier);
-        const field_name = try self.internToken(name_tok);
-        _ = try self.expect(.double_colon);
-        const type_expr = try self.parseTypeExpr();
-
-        var default: ?*const ast.Expr = null;
-        if (self.match(.equal)) {
-            default = try self.parseExpr();
-        }
-
-        return .{
-            .meta = .{ .span = ast.SourceSpan.merge(field_start, self.previousSpan()) },
-            .name = field_name,
-            .type_expr = type_expr,
-            .default = default,
         };
     }
 
