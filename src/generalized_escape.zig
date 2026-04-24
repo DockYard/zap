@@ -627,6 +627,7 @@ pub const GeneralizedEscapeAnalyzer = struct {
             .jump => {},
             .case_break => {},
             .match_fail, .match_error_return => {},
+            .set_safety => {},
         }
     }
 

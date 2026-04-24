@@ -110,6 +110,9 @@ extern "c" fn zir_builder_set_error_union_return_type(handle: ?*ZirBuilderHandle
 extern "c" fn zir_builder_set_generic_return_type(handle: ?*ZirBuilderHandle) i32;
 extern "c" fn zir_builder_emit_cond_return(handle: ?*ZirBuilderHandle, condition: u32, value: u32) i32;
 
+// Runtime safety control (for guard error semantics)
+extern "c" fn zir_builder_emit_set_runtime_safety(handle: ?*ZirBuilderHandle, enabled: u32) u32;
+
 // Optional type support (for __try variant catch basin)
 extern "c" fn zir_builder_set_optional_return_type(handle: ?*ZirBuilderHandle) i32;
 extern "c" fn zir_builder_emit_ret_null(handle: ?*ZirBuilderHandle) i32;
@@ -3143,6 +3146,13 @@ pub const ZirDriver = struct {
                 // Body-tracked emission: chain if-else-bodies for each case
                 // so Sema only analyzes the matching branch.
                 try self.emitSwitchLiteral(sl);
+            },
+            .set_safety => |enabled| {
+                const ref = if (enabled)
+                    @intFromEnum(Zir.Inst.Ref.bool_true)
+                else
+                    @intFromEnum(Zir.Inst.Ref.bool_false);
+                _ = zir_builder_emit_set_runtime_safety(self.handle, ref);
             },
             .guard_block => |gb| {
                 // Body-tracked emission: place body instructions inside a

@@ -168,6 +168,9 @@ pub const Instruction = union(enum) {
     /// On error: dest = catch_value (handler result applied to the input that failed).
     error_catch: ErrorCatch,
 
+    // Safety control
+    set_safety: bool, // true = enable, false = disable
+
     // Control flow
     if_expr: IfExpr,
     guard_block: GuardBlock,
@@ -2741,7 +2744,9 @@ pub const IrBuilder = struct {
                 });
             },
             .guard => |guard_node| {
+                try self.current_instrs.append(self.allocator, .{ .set_safety = false });
                 const guard_local = try self.lowerGuardExpr(guard_node.condition, scrutinee_map);
+                try self.current_instrs.append(self.allocator, .{ .set_safety = true });
                 const saved = self.current_instrs;
                 self.current_instrs = .empty;
                 try self.lowerDecisionTreeForCase(guard_node.success, case_arms, scrutinee_map, 0);
@@ -3047,7 +3052,13 @@ pub const IrBuilder = struct {
                 }
             },
             .guard => |guard_node| {
+                // Disable runtime safety during guard condition evaluation.
+                // If the guard expression triggers a safety check (overflow,
+                // bounds, etc.), the result is undefined rather than a panic,
+                // causing the guard to evaluate to false and skip to the next clause.
+                try self.current_instrs.append(self.allocator, .{ .set_safety = false });
                 const guard_local = try self.lowerGuardExpr(guard_node.condition, scrutinee_map);
+                try self.current_instrs.append(self.allocator, .{ .set_safety = true });
                 const saved = self.current_instrs;
                 self.current_instrs = .empty;
                 try self.lowerDecisionTreeForDispatch(guard_node.success, clauses, scrutinee_map);

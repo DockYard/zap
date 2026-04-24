@@ -831,6 +831,7 @@ pub const UseDefInfo = struct {
 
             // Non-data instructions.
             .branch, .jump, .match_fail, .match_error_return => {},
+            .set_safety => {},
         }
     }
 

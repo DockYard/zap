@@ -1047,6 +1047,7 @@ pub const InterproceduralAnalyzer = struct {
                 },
                 .switch_tag => {},
                 .branch, .cond_branch, .jump, .case_break, .match_fail, .match_error_return => {},
+                .set_safety => {},
             }
         }
     }

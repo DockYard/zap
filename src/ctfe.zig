@@ -1104,6 +1104,7 @@ fn hashInstruction(hasher: *std.hash.Wyhash, instr: ir.Instruction) void {
                 hasher.update(std.mem.asBytes(&src.value));
             }
         },
+        .set_safety => {},
     }
 }
 
@@ -2135,6 +2136,9 @@ pub const Interpreter = struct {
                 }
                 return .continued;
             },
+
+            // === Safety (no-op at CTFE) ===
+            .set_safety => return .continued,
 
             // === Dead instructions (never emitted by IR builder) ===
             .phi,
