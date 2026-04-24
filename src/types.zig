@@ -346,6 +346,7 @@ pub const TypeStore = struct {
         if (std.mem.eql(u8, name, "usize")) return USIZE;
         if (std.mem.eql(u8, name, "isize")) return ISIZE;
         if (std.mem.eql(u8, name, "Expr")) return UNKNOWN; // Macro meta-type
+        if (std.mem.eql(u8, name, "any")) return UNKNOWN;
         return null;
     }
 

@@ -810,6 +810,88 @@ pub fn panic(message: []const u8) noreturn {
 }
 
 pub const Kernel = struct {
+    pub fn is_integer(value: anytype) bool {
+        const info = @typeInfo(@TypeOf(value));
+        return info == .int or info == .comptime_int;
+    }
+
+    pub fn is_float(value: anytype) bool {
+        const info = @typeInfo(@TypeOf(value));
+        return info == .float or info == .comptime_float;
+    }
+
+    pub fn is_number(value: anytype) bool {
+        return is_integer(value) or is_float(value);
+    }
+
+    pub fn is_boolean(value: anytype) bool {
+        return @TypeOf(value) == bool;
+    }
+
+    pub fn is_string(value: anytype) bool {
+        const T = @TypeOf(value);
+        if (T == []const u8) return true;
+        const info = @typeInfo(T);
+        if (info == .pointer) {
+            const child = std.meta.Child(T);
+            return @typeInfo(child) == .array and std.meta.Elem(child) == u8;
+        }
+        return false;
+    }
+
+    pub fn is_atom(value: anytype) bool {
+        // Atoms are represented as u32 at runtime
+        return @TypeOf(value) == u32;
+    }
+
+    pub fn is_nil(value: anytype) bool {
+        const T = @TypeOf(value);
+        if (T == @TypeOf(null)) return true;
+        const info = @typeInfo(T);
+        if (info == .optional) {
+            return value == null;
+        }
+        return false;
+    }
+
+    pub fn is_list(value: anytype) bool {
+        const info = @typeInfo(@TypeOf(value));
+        if (info == .optional) {
+            const child = @typeInfo(info.optional.child);
+            if (child == .pointer and child.pointer.size == .one) {
+                return @hasField(child.pointer.child, "head") and @hasField(child.pointer.child, "tail");
+            }
+        }
+        return false;
+    }
+
+    pub fn is_tuple(value: anytype) bool {
+        const T = @TypeOf(value);
+        const info = @typeInfo(T);
+        return info == .@"struct" and info.@"struct".is_tuple;
+    }
+
+    pub fn is_map(value: anytype) bool {
+        const info = @typeInfo(@TypeOf(value));
+        if (info == .optional) {
+            const child = @typeInfo(info.optional.child);
+            if (child == .pointer and child.pointer.size == .one) {
+                return @hasField(child.pointer.child, "entries") and @hasField(child.pointer.child, "size");
+            }
+        }
+        return false;
+    }
+
+    pub fn is_struct(value: anytype) bool {
+        const info = @typeInfo(@TypeOf(value));
+        if (info == .@"struct" and !info.@"struct".is_tuple) return true;
+        if (info == .pointer) {
+            const child = @typeInfo(std.meta.Child(@TypeOf(value)));
+            if (child == .@"struct" and !child.@"struct".is_tuple) return true;
+        }
+        return false;
+    }
+
     pub fn raise(message: []const u8) noreturn {
         posixWrite(STDERR_FD, "** (RuntimeError) ");
         posixWrite(STDERR_FD, message);

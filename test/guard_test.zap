@@ -122,4 +122,38 @@ pub struct Test.GuardTest {
   fn classify_day(_ :: i64) -> String {
     "other"
   }
+
+  describe("type check functions") {
+    test("is_integer with integer") {
+      assert(check_is_integer(42) == true)
+    }
+
+    test("is_string with string") {
+      assert(check_is_string("hello") == true)
+    }
+
+    test("is_boolean with bool") {
+      assert(check_is_boolean(true) == true)
+    }
+
+    test("is_number with integer") {
+      assert(check_is_number(42) == true)
+    }
+  }
+
+  fn check_is_integer(value :: i64) -> Bool {
+    is_integer(value)
+  }
+
+  fn check_is_string(value :: String) -> Bool {
+    is_string(value)
+  }
+
+  fn check_is_boolean(value :: Bool) -> Bool {
+    is_boolean(value)
+  }
+
+  fn check_is_number(value :: i64) -> Bool {
+    is_number(value)
+  }
 }
