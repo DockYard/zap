@@ -917,6 +917,47 @@ pub const Desugarer = struct {
             return self.desugarForString(fe);
         }
 
+        // Range with literal bounds: expand to a list literal at compile time
+        if (fe.iterable.* == .range) {
+            const re = fe.iterable.range;
+            if (re.start.* == .int_literal and re.end.* == .int_literal) {
+                const start = re.start.int_literal.value;
+                const end_val = re.end.int_literal.value;
+                const step_mag: i64 = if (re.step) |s| (if (s.* == .int_literal) s.int_literal.value else 1) else 1;
+                if (step_mag > 0) {
+                    const step: i64 = if (start <= end_val) step_mag else -step_mag;
+                    var elems: std.ArrayList(*const ast.Expr) = .empty;
+                    var current = start;
+                    if (step > 0) {
+                        while (current <= end_val) {
+                            try elems.append(self.allocator, try self.create(ast.Expr, .{
+                                .int_literal = .{ .meta = fe.meta, .value = current },
+                            }));
+                            current += step;
+                        }
+                    } else {
+                        while (current >= end_val) {
+                            try elems.append(self.allocator, try self.create(ast.Expr, .{
+                                .int_literal = .{ .meta = fe.meta, .value = current },
+                            }));
+                            current += step;
+                        }
+                    }
+                    const list_expr = try self.create(ast.Expr, .{
+                        .list = .{ .meta = fe.meta, .elements = try elems.toOwnedSlice(self.allocator) },
+                    });
+                    const new_fe = try self.create(ast.ForExpr, .{
+                        .meta = fe.meta,
+                        .var_name = fe.var_name,
+                        .iterable = list_expr,
+                        .body = fe.body,
+                        .filter = fe.filter,
+                    });
+                    return self.desugarForExpr(new_fe);
+                }
+            }
+        }
+
         // Generate unique helper name (heap-allocated since interner stores slices)
         const name_str = try std.fmt.allocPrint(self.allocator, "__for_{d}", .{self.for_counter});
         self.for_counter += 1;
