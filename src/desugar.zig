@@ -917,6 +917,100 @@ pub const Desugarer = struct {
             return self.desugarForString(fe);
         }
 
+        // Range: convert to list via :zig.Range.to_list, then use list iteration
+        if (fe.iterable.* == .range) {
+            const rmeta = ast.NodeMeta{ .span = .{ .start = 0, .end = 0 } };
+            const zig_atom = try self.interner.intern("zig");
+            const zig_ref = try self.create(ast.Expr, .{ .atom_literal = .{ .meta = rmeta, .value = zig_atom } });
+            const range_field = try self.interner.intern("Range");
+            const range_mod_ref = try self.create(ast.Expr, .{ .field_access = .{ .meta = rmeta, .object = zig_ref, .field = range_field } });
+            const to_list_field = try self.interner.intern("to_list");
+            const to_list_callee = try self.create(ast.Expr, .{ .field_access = .{ .meta = rmeta, .object = range_mod_ref, .field = to_list_field } });
+
+            const range_expr = try self.desugarExpr(fe.iterable);
+            const to_list_call = try self.create(ast.Expr, .{
+                .call = .{ .meta = rmeta, .callee = to_list_callee, .args = try self.allocSlice(*const ast.Expr, &.{range_expr}) },
+            });
+
+            // Build the list for-comprehension inline here rather than recursing,
+            // because we need to set the return type on the generated helper function
+            // (the bridge call's return type is opaque to Zig's type inference).
+            const list_meta = ast.NodeMeta{ .span = .{ .start = 0, .end = 0 } };
+
+            const for_name_str = try std.fmt.allocPrint(self.allocator, "__for_{d}", .{self.for_counter});
+            self.for_counter += 1;
+            const for_helper_name = try self.interner.intern(for_name_str);
+            const rest_name2 = try self.interner.intern("__rest");
+
+            // Return type: [i64] — ranges produce i64 lists
+            const i64_name = try self.interner.intern("i64");
+            const i64_type = try self.create(ast.TypeExpr, .{
+                .name = .{ .meta = list_meta, .name = i64_name, .args = &.{} },
+            });
+            const list_return_type = try self.create(ast.TypeExpr, .{
+                .list = .{ .meta = list_meta, .element = i64_type },
+            });
+
+            // Clause 1: base case — fn __for_N([]) -> [i64] { [] }
+            const empty_pat2 = try self.create(ast.Pattern, .{
+                .list = .{ .meta = list_meta, .elements = &.{} },
+            });
+            const base_clause2 = ast.FunctionClause{
+                .meta = list_meta,
+                .params = try self.allocSlice(ast.Param, &.{.{ .meta = list_meta, .pattern = empty_pat2, .type_annotation = null }}),
+                .return_type = list_return_type,
+                .refinement = null,
+                .body = try self.allocSlice(ast.Stmt, &.{.{ .expr = try self.create(ast.Expr, .{ .list = .{ .meta = list_meta, .elements = &.{} } }) }}),
+            };
+
+            // Clause 2: recursive case — fn __for_N([x | __rest]) -> [i64] { [body | __for_N(__rest)] }
+            const var_pat2 = try self.create(ast.Pattern, .{ .bind = .{ .meta = list_meta, .name = fe.var_name } });
+            const rest_pat2 = try self.create(ast.Pattern, .{ .bind = .{ .meta = list_meta, .name = rest_name2 } });
+            const cons_pat2 = try self.create(ast.Pattern, .{
+                .list_cons = .{ .meta = list_meta, .heads = try self.allocSlice(*const ast.Pattern, &.{var_pat2}), .tail = rest_pat2 },
+            });
+            const rest_ref2 = try self.create(ast.Expr, .{ .var_ref = .{ .meta = list_meta, .name = rest_name2 } });
+            const rec_call2 = try self.create(ast.Expr, .{
+                .call = .{ .meta = list_meta, .callee = try self.create(ast.Expr, .{ .var_ref = .{ .meta = list_meta, .name = for_helper_name } }), .args = try self.allocSlice(*const ast.Expr, &.{rest_ref2}) },
+            });
+            const body_d = try self.desugarExpr(fe.body);
+            var cons_body2 = try self.create(ast.Expr, .{
+                .list_cons_expr = .{ .meta = list_meta, .head = body_d, .tail = rec_call2 },
+            });
+
+            if (fe.filter) |filter| {
+                const fd = try self.desugarExpr(filter);
+                const tp2 = try self.create(ast.Pattern, .{ .literal = .{ .bool_lit = .{ .meta = list_meta, .value = true } } });
+                const fp2 = try self.create(ast.Pattern, .{ .literal = .{ .bool_lit = .{ .meta = list_meta, .value = false } } });
+                cons_body2 = try self.create(ast.Expr, .{
+                    .case_expr = .{ .meta = list_meta, .scrutinee = fd, .clauses = try self.allocSlice(ast.CaseClause, &.{
+                        .{ .meta = list_meta, .pattern = tp2, .type_annotation = null, .guard = null, .body = try self.allocSlice(ast.Stmt, &.{.{ .expr = cons_body2 }}) },
+                        .{ .meta = list_meta, .pattern = fp2, .type_annotation = null, .guard = null, .body = try self.allocSlice(ast.Stmt, &.{.{ .expr = rec_call2 }}) },
+                    }) },
+                });
+            }
+
+            const rec_clause2 = ast.FunctionClause{
+                .meta = list_meta,
+                .params = try self.allocSlice(ast.Param, &.{.{ .meta = list_meta, .pattern = cons_pat2, .type_annotation = null }}),
+                .return_type = list_return_type,
+                .refinement = null,
+                .body = try self.allocSlice(ast.Stmt, &.{.{ .expr = cons_body2 }}),
+            };
+
+            const func_d = try self.create(ast.FunctionDecl, .{
+                .meta = list_meta,
+                .name = for_helper_name,
+                .clauses = try self.allocSlice(ast.FunctionClause, &.{ base_clause2, rec_clause2 }),
+                .visibility = .private,
+            });
+            try self.pending_helpers.append(self.allocator, .{ .priv_function = func_d });
+
+            return try self.create(ast.Expr, .{
+                .call = .{ .meta = fe.meta, .callee = try self.create(ast.Expr, .{ .var_ref = .{ .meta = list_meta, .name = for_helper_name } }), .args = try self.allocSlice(*const ast.Expr, &.{to_list_call}) },
+            });
+        }
+
         // Generate unique helper name (heap-allocated since interner stores slices)
         const name_str = try std.fmt.allocPrint(self.allocator, "__for_{d}", .{self.for_counter});
         self.for_counter += 1;
