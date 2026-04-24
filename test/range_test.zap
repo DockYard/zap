@@ -138,4 +138,43 @@ pub struct Test.RangeTest {
     "unknown"
   }
 
+  describe("for comprehension with range") {
+    test("for over basic range") {
+      result = for_range_basic()
+      assert(List.length(result) == 5)
+      assert(List.head(result) == 2)
+    }
+
+    test("for over range with step") {
+      result = for_range_step()
+      assert(List.length(result) == 4)
+    }
+
+    test("for over reverse range") {
+      result = for_range_reverse()
+      assert(List.length(result) == 3)
+      assert(List.head(result) == 30)
+    }
+
+    test("for over range with filter") {
+      result = for_range_filter()
+      assert(List.length(result) == 5)
+    }
+  }
+
+  fn for_range_basic() -> [i64] {
+    for x <- 1..5 { x * 2 }
+  }
+
+  fn for_range_step() -> [i64] {
+    for x <- 1..10:3 { x }
+  }
+
+  fn for_range_reverse() -> [i64] {
+    for x <- 3..1 { x * 10 }
+  }
+
+  fn for_range_filter() -> [i64] {
+    for x <- 1..10, x > 5 { x }
+  }
 }

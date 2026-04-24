@@ -188,6 +188,8 @@ pub fn monomorphize(
         .program = .{
             .modules = try new_modules.toOwnedSlice(allocator),
             .top_functions = try new_top_fns.toOwnedSlice(allocator),
+            .protocols = program.protocols,
+            .impls = program.impls,
         },
         .specialization_count = @intCast(ctx.new_groups.items.len),
     };

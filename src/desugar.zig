@@ -917,6 +917,17 @@ pub const Desugarer = struct {
             return self.desugarForString(fe);
         }
 
+        // Non-list iterables: use Enumerable.next protocol dispatch.
+        // Generates: fn __for_N(state) -> [i64] {
+        //   case Enumerable.next(state) {
+        //     {:done, _, _} -> []
+        //     {:cont, x, next_state} -> [body(x) | __for_N(next_state)]
+        //   }
+        // }
+        if (fe.iterable.* == .range) {
+            return self.desugarForEnumerable(fe);
+        }
+
         // Generate unique helper name (heap-allocated since interner stores slices)
         const name_str = try std.fmt.allocPrint(self.allocator, "__for_{d}", .{self.for_counter});
         self.for_counter += 1;
@@ -1194,6 +1205,123 @@ pub const Desugarer = struct {
                 .callee = try self.create(ast.Expr, .{ .var_ref = .{ .meta = meta, .name = helper_name } }),
                 .args = try self.allocSlice(*const ast.Expr, &.{ iterable, zero }),
             },
+        });
+    }
+
+    /// Desugar for comprehension using Enumerable.next protocol dispatch.
+    /// Generates a counter-based recursive helper:
+    ///   fn __for_N(state) -> [i64] {
+    ///     case Enumerable.next(state) {
+    ///       {:done, _, _} -> []
+    ///       {:cont, x, next_state} -> [body(x) | __for_N(next_state)]
+    ///     }
+    ///   }
+    fn desugarForEnumerable(self: *Desugarer, fe: *const ast.ForExpr) !*const ast.Expr {
+        const meta = ast.NodeMeta{ .span = .{ .start = 0, .end = 0 } };
+
+        const name_str = try std.fmt.allocPrint(self.allocator, "__for_{d}", .{self.for_counter});
+        self.for_counter += 1;
+        const helper_name = try self.interner.intern(name_str);
+        const state_name = try self.interner.intern("__state");
+        const next_state_name = try self.interner.intern("__next_state");
+
+        const state_ref = try self.create(ast.Expr, .{ .var_ref = .{ .meta = meta, .name = state_name } });
+
+        // Build Enumerable.next(__state) call
+        const enum_name_id = try self.interner.intern("Enumerable");
+        const enum_parts = try self.allocator.alloc(ast.StringId, 1);
+        enum_parts[0] = enum_name_id;
+        const enum_ref = try self.create(ast.Expr, .{
+            .module_ref = .{ .meta = meta, .name = .{ .parts = enum_parts, .span = meta.span } },
+        });
+        const next_field = try self.interner.intern("next");
+        const next_callee = try self.create(ast.Expr, .{
+            .field_access = .{ .meta = meta, .object = enum_ref, .field = next_field },
+        });
+        const next_call = try self.create(ast.Expr, .{
+            .call = .{ .meta = meta, .callee = next_callee, .args = try self.allocSlice(*const ast.Expr, &.{state_ref}) },
+        });
+
+        // Recursive call: __for_N(__next_state)
+        const next_state_ref = try self.create(ast.Expr, .{ .var_ref = .{ .meta = meta, .name = next_state_name } });
+        const rec_call = try self.create(ast.Expr, .{
+            .call = .{ .meta = meta, .callee = try self.create(ast.Expr, .{ .var_ref = .{ .meta = meta, .name = helper_name } }), .args = try self.allocSlice(*const ast.Expr, &.{next_state_ref}) },
+        });
+
+        // Body: [body(x) | __for_N(__next_state)]
+        const body_d = try self.desugarExpr(fe.body);
+        var cons_expr = try self.create(ast.Expr, .{
+            .list_cons_expr = .{ .meta = meta, .head = body_d, .tail = rec_call },
+        });
+
+        // Filter
+        if (fe.filter) |filter| {
+            const fd = try self.desugarExpr(filter);
+            cons_expr = try self.create(ast.Expr, .{
+                .case_expr = .{ .meta = meta, .scrutinee = fd, .clauses = try self.allocSlice(ast.CaseClause, &.{
+                    .{ .meta = meta, .pattern = try self.create(ast.Pattern, .{ .literal = .{ .bool_lit = .{ .meta = meta, .value = true } } }), .type_annotation = null, .guard = null, .body = try self.allocSlice(ast.Stmt, &.{.{ .expr = cons_expr }}) },
+                    .{ .meta = meta, .pattern = try self.create(ast.Pattern, .{ .literal = .{ .bool_lit = .{ .meta = meta, .value = false } } }), .type_annotation = null, .guard = null, .body = try self.allocSlice(ast.Stmt, &.{.{ .expr = rec_call }}) },
+                }) },
+            });
+        }
+
+        // Case patterns for tuple result from Enumerable.next:
+        // {:done, _, _} -> []
+        const done_atom = try self.create(ast.Pattern, .{ .literal = .{ .atom = .{ .meta = meta, .value = try self.interner.intern("done") } } });
+        const wildcard1 = try self.create(ast.Pattern, .{ .wildcard = .{ .meta = meta } });
+        const wildcard2 = try self.create(ast.Pattern, .{ .wildcard = .{ .meta = meta } });
+        const done_pat = try self.create(ast.Pattern, .{
+            .tuple = .{ .meta = meta, .elements = try self.allocSlice(*const ast.Pattern, &.{ done_atom, wildcard1, wildcard2 }) },
+        });
+        const empty_list = try self.create(ast.Expr, .{ .list = .{ .meta = meta, .elements = &.{} } });
+
+        // {:cont, x, __next_state} -> [body | rec]
+        const cont_atom = try self.create(ast.Pattern, .{ .literal = .{ .atom = .{ .meta = meta, .value = try self.interner.intern("cont") } } });
+        const val_bind = try self.create(ast.Pattern, .{ .bind = .{ .meta = meta, .name = fe.var_name } });
+        const next_bind = try self.create(ast.Pattern, .{ .bind = .{ .meta = meta, .name = next_state_name } });
+        const cont_pat = try self.create(ast.Pattern, .{
+            .tuple = .{ .meta = meta, .elements = try self.allocSlice(*const ast.Pattern, &.{ cont_atom, val_bind, next_bind }) },
+        });
+
+        // case Enumerable.next(state) { done -> []; cont -> [body | rec] }
+        const case_expr = try self.create(ast.Expr, .{
+            .case_expr = .{
+                .meta = meta,
+                .scrutinee = next_call,
+                .clauses = try self.allocSlice(ast.CaseClause, &.{
+                    .{ .meta = meta, .pattern = done_pat, .type_annotation = null, .guard = null, .body = try self.allocSlice(ast.Stmt, &.{.{ .expr = empty_list }}) },
+                    .{ .meta = meta, .pattern = cont_pat, .type_annotation = null, .guard = null, .body = try self.allocSlice(ast.Stmt, &.{.{ .expr = cons_expr }}) },
+                }),
+            },
+        });
+
+        // Return type: [i64]
+        const i64_name = try self.interner.intern("i64");
+        const i64_type = try self.create(ast.TypeExpr, .{ .name = .{ .meta = meta, .name = i64_name, .args = &.{} } });
+        const list_ret = try self.create(ast.TypeExpr, .{ .list = .{ .meta = meta, .element = i64_type } });
+
+        const clause = ast.FunctionClause{
+            .meta = meta,
+            .params = try self.allocSlice(ast.Param, &.{
+                .{ .meta = meta, .pattern = try self.create(ast.Pattern, .{ .bind = .{ .meta = meta, .name = state_name } }), .type_annotation = null },
+            }),
+            .return_type = list_ret,
+            .refinement = null,
+            .body = try self.allocSlice(ast.Stmt, &.{.{ .expr = case_expr }}),
+        };
+
+        const func_decl = try self.create(ast.FunctionDecl, .{
+            .meta = meta,
+            .name = helper_name,
+            .clauses = try self.allocSlice(ast.FunctionClause, &.{clause}),
+            .visibility = .private,
+        });
+        try self.pending_helpers.append(self.allocator, .{ .priv_function = func_decl });
+
+        // Call: __for_N(iterable)
+        const iterable = try self.desugarExpr(fe.iterable);
+        return try self.create(ast.Expr, .{
+            .call = .{ .meta = fe.meta, .callee = try self.create(ast.Expr, .{ .var_ref = .{ .meta = meta, .name = helper_name } }), .args = try self.allocSlice(*const ast.Expr, &.{iterable}) },
         });
     }
 

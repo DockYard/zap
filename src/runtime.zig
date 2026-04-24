@@ -810,6 +810,28 @@ pub fn panic(message: []const u8) noreturn {
 }
 
 pub const Range = struct {
+    /// Iterator protocol for ranges.
+    /// Uses the range struct as its own state — `start` is the current position.
+    /// Returns {:cont, current, next_range} or {:done, 0, nil_range}.
+    pub fn next(range: anytype) @TypeOf(.{ .@"0" = @as(u32, 0), .@"1" = @as(i64, 0), .@"2" = range }) {
+        const start = range.start;
+        const end_val = range.end;
+        const step_mag = range.step;
+        const going_forward = start <= end_val;
+
+        // Check if done
+        const done = if (going_forward) start > end_val else start < end_val;
+        if (done) {
+            return .{ .@"0" = 7, .@"1" = 0, .@"2" = range }; // :done
+        }
+
+        // Advance: create next range with updated start
+        const step: i64 = if (going_forward) step_mag else -step_mag;
+        var next_range = range;
+        next_range.start = start + step;
+        return .{ .@"0" = 5, .@"1" = start, .@"2" = next_range }; // :cont
+    }
+
     pub fn to_list(range: anytype) ?*const ListOf(i64) {
         const start = range.start;
         const end_val = range.end;
@@ -3093,6 +3115,15 @@ pub fn ListOf(comptime T: type) type {
                 current = cell.tail;
             }
             return result;
+        }
+
+        /// Iterator protocol: returns {atom, value, next_state}.
+        /// :cont (5) with head and tail for non-empty, :done (7) for empty.
+        pub fn next(list: ?*const Self) struct { @"0": u32, @"1": T, @"2": ?*const Self } {
+            if (list) |cell| {
+                return .{ .@"0" = 5, .@"1" = cell.head, .@"2" = cell.tail };
+            }
+            return .{ .@"0" = 7, .@"1" = std.mem.zeroes(T), .@"2" = null };
         }
 
         pub fn contains(list: ?*const Self, value: T) bool {

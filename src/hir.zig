@@ -3011,7 +3011,6 @@ pub const HirBuilder = struct {
         const refinement_expr = if (clause.refinement) |ref| blk: {
             const rexpr = try self.buildExpr(ref);
             if (rexpr.kind == .call) {
-                std.debug.print("HIR refinement call args={d}\n", .{rexpr.kind.call.args.len});
             }
             break :blk rexpr;
         } else null;
@@ -3401,23 +3400,9 @@ pub const HirBuilder = struct {
                 const target: CallTarget = if (call.callee.* == .field_access) blk: {
                     const fa = call.callee.field_access;
                     if (fa.object.* == .module_ref) {
-                        // Check if the target is a protocol — direct calls on
-                        // protocols are not allowed. Protocols define interfaces;
-                        // use the implementing module (e.g., Enum) instead.
-                        if (self.graph.findProtocol(fa.object.module_ref.name)) |_| {
-                            const protocol_name = self.structNameToString(fa.object.module_ref.name);
-                            const func_name = self.interner.get(fa.field);
-                            const msg = std.fmt.allocPrint(self.allocator,
-                                "cannot call '{s}.{s}()' — '{s}' is a protocol, not a module. " ++
-                                "Protocol functions are dispatched through implementing modules.",
-                                .{ protocol_name, func_name, protocol_name },
-                            ) catch "cannot call functions directly on a protocol";
-                            try self.errors.append(self.allocator, .{
-                                .message = msg,
-                                .span = call.meta.span,
-                            });
-                            return error.CompileError;
-                        }
+                        // Protocols have synthesized dispatch modules — treat
+                        // protocol calls like module-qualified calls. The dispatch
+                        // module merges clauses from all implementations.
                         const func_name = self.interner.get(fa.field);
                         const mod_name = self.structNameToString(fa.object.module_ref.name);
                         // Module-qualified call — @native resolution happens at IR level

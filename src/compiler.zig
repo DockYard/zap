@@ -1095,6 +1095,57 @@ pub fn compileModuleByModule(
             combined_hir = mono_result.program;
         }
 
+        // Phase 3.5: synthesize protocol dispatch modules from the
+        // monomorphized program. Must happen after monomorphization
+        // so the synthesized modules are included in Phase 4.
+        {
+            var dispatch_modules: std.ArrayListUnmanaged(zap.hir.Module) = .empty;
+            for (combined_hir.protocols) |proto| {
+                var dispatch_groups: std.ArrayListUnmanaged(zap.hir.FunctionGroup) = .empty;
+                for (proto.function_names, proto.function_arities) |fn_name, fn_arity| {
+                    var merged_clauses: std.ArrayListUnmanaged(zap.hir.Clause) = .empty;
+                    for (combined_hir.impls) |impl_info| {
+                        if (impl_info.protocol_name != proto.name) continue;
+                        for (combined_hir.top_functions) |group| {
+                            if (group.scope_id != impl_info.impl_scope_id) continue;
+                            if (group.name != fn_name) continue;
+                            for (group.clauses) |clause| {
+                                merged_clauses.append(alloc, clause) catch continue;
+                            }
+                        }
+                    }
+                    if (merged_clauses.items.len > 0) {
+                        const gid = group_id_offset;
+                        group_id_offset += 1;
+                        dispatch_groups.append(alloc, .{
+                            .id = gid,
+                            .scope_id = 0,
+                            .name = fn_name,
+                            .arity = fn_arity,
+                            .clauses = merged_clauses.toOwnedSlice(alloc) catch &.{},
+                            .fallback_parent = null,
+                        }) catch continue;
+                    }
+                }
+                if (dispatch_groups.items.len > 0) {
+                    const parts = alloc.alloc(ast.StringId, 1) catch continue;
+                    parts[0] = proto.name;
+                    dispatch_modules.append(alloc, .{
+                        .name = .{ .parts = parts, .span = .{ .start = 0, .end = 0 } },
+                        .scope_id = 0,
+                        .functions = dispatch_groups.toOwnedSlice(alloc) catch &.{},
+                        .types = &.{},
+                    }) catch continue;
+                }
+            }
+            if (dispatch_modules.items.len > 0) {
+                var all_mods: std.ArrayListUnmanaged(zap.hir.Module) = .empty;
+                for (combined_hir.modules) |m| all_mods.append(alloc, m) catch continue;
+                for (dispatch_modules.items) |m| all_mods.append(alloc, m) catch continue;
+                combined_hir.modules = all_mods.toOwnedSlice(alloc) catch combined_hir.modules;
+            }
+        }
+
         // Phase 4: each module HIR → IR
         // Function IDs are already globally unique from the HIR stage (group_id_offset),
         // so no cloneWithOffset needed — just collect functions directly.
