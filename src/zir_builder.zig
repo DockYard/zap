@@ -5052,7 +5052,9 @@ pub const ZirDriver = struct {
         }
 
         if (last_guard_idx == null) {
-            // No guard_blocks — just emit everything as body instructions
+            // No guard_blocks — emit everything as body instructions.
+            // case_break instructions inside pre_instrs set cb.dest via local_refs
+            // through the current_case_dest mechanism.
             for (cb.pre_instrs) |pi| try self.emitInstruction(pi);
             for (cb.default_instrs) |di| try self.emitInstruction(di);
             if (cb.default_result) |dr| {
@@ -5060,6 +5062,8 @@ pub const ZirDriver = struct {
                     try self.local_refs.put(self.allocator, cb.dest, value_ref);
                 }
             }
+            // case_break inside pre_instrs already set cb.dest in local_refs —
+            // no additional work needed. The value is available via refForLocal(cb.dest).
             try self.emitDropSpecializationsForCurrentInstr(cb.dest, null);
             return;
         }
