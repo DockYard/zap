@@ -4477,25 +4477,9 @@ fn getListName(element_type: ZigType) []const u8 {
 fn isGenericHirGroup(store: *const types_mod.TypeStore, group: *const hir_mod.FunctionGroup) bool {
     if (group.clauses.len == 0) return false;
 
-    // Multi-clause dispatch functions (from protocol synthesis) are NOT generic.
-    // They have different param types per clause — that's dispatch, not generics.
-    if (group.clauses.len > 1) {
-        var all_same = true;
-        for (group.clauses[1..]) |clause| {
-            if (clause.params.len != group.clauses[0].params.len) {
-                all_same = false;
-                break;
-            }
-            for (clause.params, group.clauses[0].params) |a, b| {
-                if (a.type_id != b.type_id) {
-                    all_same = false;
-                    break;
-                }
-            }
-            if (!all_same) break;
-        }
-        if (!all_same) return false; // Different param types = dispatch, not generic
-    }
+    // Synthesized protocol dispatch functions (scope_id = 0) are NOT generic.
+    // They merge clauses from different impl blocks for type-based dispatch.
+    if (group.scope_id == 0 and group.clauses.len > 1) return false;
 
     const first_clause = &group.clauses[0];
     for (first_clause.params) |param| {

@@ -1095,10 +1095,12 @@ pub fn compileModuleByModule(
             combined_hir = mono_result.program;
         }
 
-        // Phase 3.5: synthesize protocol dispatch modules from the
-        // monomorphized program. Must happen after monomorphization
-        // so the synthesized modules are included in Phase 4.
-        {
+        // Phase 3.5: protocol dispatch is resolved at compile time by the
+        // desugarer, which knows the collection type and generates the
+        // appropriate iteration code for each Enumerable implementation.
+        // Synthesis of dispatch modules is not needed — static dispatch
+        // happens at the call site.
+        if (false) { // Reserved for future dynamic protocol dispatch
             // Deduplicate protocols by name (per-module HIR creates duplicates)
             var seen_protos = std.AutoHashMap(ast.StringId, void).init(alloc);
             defer seen_protos.deinit();

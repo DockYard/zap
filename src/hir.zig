@@ -3400,12 +3400,8 @@ pub const HirBuilder = struct {
                 const target: CallTarget = if (call.callee.* == .field_access) blk: {
                     const fa = call.callee.field_access;
                     if (fa.object.* == .module_ref) {
-                        // Protocols have synthesized dispatch modules — treat
-                        // protocol calls like module-qualified calls. The dispatch
-                        // module merges clauses from all implementations.
                         const func_name = self.interner.get(fa.field);
                         const mod_name = self.structNameToString(fa.object.module_ref.name);
-                        // Module-qualified call — @native resolution happens at IR level
                         break :blk .{ .named = .{ .module = mod_name, .name = func_name } };
                     }
                     // :zig.function() or :zig.Module.function() — bridge to Zig runtime
