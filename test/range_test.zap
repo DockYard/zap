@@ -137,4 +137,5 @@ pub struct Test.RangeTest {
   fn classify_score(_ :: i64) -> String {
     "unknown"
   }
+
 }
