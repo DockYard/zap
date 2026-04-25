@@ -480,22 +480,6 @@ pub const ZirDriver = struct {
 
     /// Check if a function contains tail calls to itself (via IR tail_call instructions).
     /// The IR builder already detects and marks tail-recursive calls as tail_call.
-    /// When present, the function body could be wrapped in a ZIR loop instruction
-    /// with tail calls converted to parameter updates + repeat, avoiding stack growth.
-    fn hasTailCalls(func: ir.Function) bool {
-        for (func.body) |block| {
-            for (block.instructions) |instr| {
-                switch (instr) {
-                    .tail_call => |tc| {
-                        if (std.mem.eql(u8, tc.name, func.name)) return true;
-                    },
-                    else => {},
-                }
-            }
-        }
-        return false;
-    }
-
     /// Check if ARC operations should be skipped for a value.
     /// Only skips when the value was explicitly analyzed and found stack-eligible.
     fn shouldSkipArc(self: *const ZirDriver, local: ir.LocalId) bool {
@@ -576,13 +560,8 @@ pub const ZirDriver = struct {
     /// Map Zap-facing module names to runtime struct names.
     /// Domain modules (IO, Integer, Float, etc.) route to Prelude.
     /// List, Map, String, Zest map to their runtime struct names.
-    /// Map a Zap module name to its runtime struct name for bridge calls.
-    /// Library files use the actual runtime names directly (e.g., :zig.Prelude.*),
-    /// so this is now identity for most modules. Retained only for backward
-    /// compatibility with any remaining indirect references.
-    fn mapToRuntimeModule(mod_name: []const u8) []const u8 {
-        return mod_name;
-    }
+
+
 
     fn emitAllocatorRef(self: *ZirDriver) BuildError!u32 {
         const std_import = zir_builder_emit_import(self.handle, "std", 3);
@@ -3092,7 +3071,7 @@ pub const ZirDriver = struct {
                     // Map Zap module names to runtime struct names.
                     // Domain modules route to Prelude; List/Map/String/Zest
                     // route to their renamed structs directly.
-                    const runtime_mod = mapToRuntimeModule(mod_name);
+                    const runtime_mod = mod_name;
 
                     // For generic container modules (List, Map), instantiate
                     // with default type args since the specific type isn't
@@ -4022,15 +4001,13 @@ pub const ZirDriver = struct {
                 // directly to a named function call. This handles 0-capture closures
                 // (anonymous functions and function refs) by tracking the function ID
                 // through local assignments without needing backward instruction scanning.
-                if (true) {
-                    if (self.closure_function_map.get(cc.callee)) |func_id| {
-                        if (self.findFunctionById(func_id)) |target_func| {
-                            if (target_func.captures.len == 0) {
-                                const ref = try self.emitNamedCallToTarget(func_id, &.{}, cc.args);
-                                if (ref != error_ref) {
-                                    try self.setLocal(cc.dest, ref);
-                                    return;
-                                }
+                if (self.closure_function_map.get(cc.callee)) |func_id| {
+                    if (self.findFunctionById(func_id)) |target_func| {
+                        if (target_func.captures.len == 0) {
+                            const ref = try self.emitNamedCallToTarget(func_id, &.{}, cc.args);
+                            if (ref != error_ref) {
+                                try self.setLocal(cc.dest, ref);
+                                return;
                             }
                         }
                     }

@@ -6,6 +6,12 @@ const STDOUT_FD = std.posix.STDOUT_FILENO;
 const STDERR_FD = std.posix.STDERR_FILENO;
 const STDIN_FD = std.posix.STDIN_FILENO;
 
+// Well-known atom IDs — must match the registration order in initGlobalAtomTable
+// and AtomTable.init: nil=0, true=1, false=2, ok=3, error=4, cont=5, halt=6, done=7
+pub const ATOM_CONT: u32 = 5;
+pub const ATOM_HALT: u32 = 6;
+pub const ATOM_DONE: u32 = 7;
+
 fn posixWrite(fd: std.posix.fd_t, bytes: []const u8) void {
     var written: usize = 0;
     while (written < bytes.len) {
@@ -822,14 +828,14 @@ pub const Range = struct {
         // Check if done
         const done = if (going_forward) start > end_val else start < end_val;
         if (done) {
-            return .{ .@"0" = 7, .@"1" = 0, .@"2" = range }; // :done
+            return .{ .@"0" = ATOM_DONE, .@"1" = 0, .@"2" = range };
         }
 
         // Advance: create next range with updated start
         const step: i64 = if (going_forward) step_mag else -step_mag;
         var next_range = range;
         next_range.start = start + step;
-        return .{ .@"0" = 5, .@"1" = start, .@"2" = next_range }; // :cont
+        return .{ .@"0" = ATOM_CONT, .@"1" = start, .@"2" = next_range };
     }
 
     pub fn to_list(range: anytype) ?*const List(i64) {
@@ -2974,8 +2980,6 @@ pub fn Map(comptime K: type, comptime V: type) type {
     /// field "0" is :cont(5) or :halt(6), field "1" is the new accumulator.
     pub fn reduceHaltCont(map: ?*const Self, initial: anytype, callback: anytype) struct { u64, i64 } {
         const ResultType = struct { u64, i64 };
-        const ATOM_HALT: u64 = 6;
-        const ATOM_CONT: u64 = 5;
         if (map == null) return ResultType{ ATOM_CONT, initial };
         const m = map.?;
         var acc: i64 = initial;
@@ -3103,9 +3107,9 @@ pub fn List(comptime T: type) type {
         /// :cont (5) with head and tail for non-empty, :done (7) for empty.
         pub fn next(list: ?*const Self) std.meta.Tuple(&.{ u32, T, ?*const Self }) {
             if (list) |cell| {
-                return .{ 5, cell.head, cell.tail };
+                return .{ ATOM_CONT, cell.head, cell.tail };
             }
-            return .{ 7, std.mem.zeroes(T), null };
+            return .{ ATOM_DONE, std.mem.zeroes(T), null };
         }
 
         pub fn contains(list: ?*const Self, value: T) bool {
@@ -3228,8 +3232,6 @@ pub fn List(comptime T: type) type {
         pub fn reduceHaltCont(list: ?*const Self, initial: anytype, callback: anytype) @TypeOf(callback(initial, @as(T, std.mem.zeroes(T)))) {
             const ResultType = @TypeOf(callback(initial, @as(T, std.mem.zeroes(T))));
             const AccType = @TypeOf(@field(@as(ResultType, undefined), "1"));
-            const ATOM_HALT: u64 = 6;
-            const ATOM_CONT: u64 = 5;
             var current = list;
             var acc: AccType = initial;
             while (current) |cell| {

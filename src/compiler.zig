@@ -1118,8 +1118,6 @@ pub fn compileModuleByModule(
             const mod_ir = compileHirToIr(alloc, ctx, mod_name_str, &single_mod_hir, shared_store, options) catch {
                 continue;
             };
-            if (std.mem.eql(u8, mod_name_str, "Enumerable")) {
-            }
             for (mod_ir.functions) |func| {
                 all_functions.append(alloc, func) catch return error.OutOfMemory;
             }
