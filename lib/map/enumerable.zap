@@ -1,18 +1,14 @@
 pub impl Enumerable for Map {
   @doc = """
-    Reduces a map's values using a callback with halt/cont control flow.
+    Returns the next entry from a map.
 
-    The callback receives the accumulator and current value, and
-    returns {:cont, new_acc} to continue or {:halt, new_acc} to
-    stop early.
+    Map iteration is not yet supported. This stub satisfies
+    protocol conformance but will produce a compile error
+    if used in a for comprehension until Map.next is
+    implemented in the runtime.
+    """
 
-    ## Examples
-
-        Enumerable.reduce(%{a: 1, b: 2, c: 3}, {:cont, 0}, fn(acc, val) { {:cont, acc + val} })
-        # => {:cont, 6}
-  """
-
-  pub fn reduce(map :: Map, acc :: acc, callback :: (acc, member -> {Atom, acc})) -> {Atom, acc} {
-    :zig.MapCell.reduceHaltCont(map, acc, callback)
+  pub fn next(map :: Map) -> {Atom, i64, Map} {
+    :zig.Map.next(map)
   }
 }

@@ -388,6 +388,67 @@ pub const Collector = struct {
         });
     }
 
+    /// Validate that all impl declarations conform to their protocol.
+    /// Must be called after all modules have been collected so that
+    /// protocols are available for lookup regardless of file order.
+    pub fn validateImplConformance(self: *Collector) !void {
+        for (self.graph.impls.items) |impl_entry| {
+            const impl_d = impl_entry.decl;
+            const proto_entry = self.graph.findProtocol(impl_d.protocol_name) orelse {
+                const proto_name = self.formatStructName(impl_d.protocol_name);
+                const msg = std.fmt.allocPrint(self.allocator, "protocol '{s}' is not defined", .{proto_name}) catch continue;
+                try self.addError(msg, impl_d.meta.span);
+                continue;
+            };
+
+            // Check each required protocol function is provided by the impl
+            for (proto_entry.decl.functions) |sig| {
+                var found = false;
+                for (impl_d.functions) |func| {
+                    if (func.name != sig.name) continue;
+                    found = true;
+                    // Check arity matches
+                    if (func.clauses.len > 0) {
+                        const impl_arity = func.clauses[0].params.len;
+                        if (impl_arity != sig.params.len) {
+                            const fn_name = self.interner.get(sig.name);
+                            const target_name = self.formatStructName(impl_d.target_type);
+                            const proto_name = self.formatStructName(impl_d.protocol_name);
+                            const msg = std.fmt.allocPrint(
+                                self.allocator,
+                                "impl {s} for {s}: function '{s}' has arity {d}, protocol requires {d}",
+                                .{ proto_name, target_name, fn_name, impl_arity, sig.params.len },
+                            ) catch continue;
+                            try self.addError(msg, func.meta.span);
+                        }
+                    }
+                    break;
+                }
+                if (!found) {
+                    const fn_name = self.interner.get(sig.name);
+                    const target_name = self.formatStructName(impl_d.target_type);
+                    const proto_name = self.formatStructName(impl_d.protocol_name);
+                    const msg = std.fmt.allocPrint(
+                        self.allocator,
+                        "impl {s} for {s} is missing required function '{s}/{d}'",
+                        .{ proto_name, target_name, fn_name, sig.params.len },
+                    ) catch continue;
+                    try self.addError(msg, impl_d.meta.span);
+                }
+            }
+        }
+    }
+
+    fn formatStructName(self: *const Collector, name: ast.StructName) []const u8 {
+        if (name.parts.len == 1) return self.interner.get(name.parts[0]);
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        for (name.parts, 0..) |part, i| {
+            if (i > 0) buf.appendSlice(self.allocator, ".") catch return self.interner.get(name.parts[0]);
+            buf.appendSlice(self.allocator, self.interner.get(part)) catch return self.interner.get(name.parts[0]);
+        }
+        return buf.toOwnedSlice(self.allocator) catch return self.interner.get(name.parts[0]);
+    }
+
     pub fn collectFunction(self: *Collector, func: *const ast.FunctionDecl, parent_scope: scope.ScopeId) !void {
         for (func.clauses, 0..) |clause, clause_idx| {
             const arity: u32 = @intCast(clause.params.len);

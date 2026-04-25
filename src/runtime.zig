@@ -288,7 +288,7 @@ pub const AtomTable = struct {
             .lookup = std.StringHashMap(u32).init(allocator),
         };
         // Register well-known atoms
-        const builtins = [_][]const u8{ "nil", "true", "false", "ok", "error", "cont", "halt" };
+        const builtins = [_][]const u8{ "nil", "true", "false", "ok", "error", "cont", "halt", "done" };
         for (builtins) |name| {
             table.strings.append(allocator, name) catch {};
             table.lookup.put(name, @intCast(table.strings.items.len - 1)) catch {};
@@ -337,7 +337,7 @@ var atom_table_initialized: bool = false;
 fn initAtomTable() void {
     if (atom_table_initialized) return;
     // Register well-known atoms
-    const builtins = [_][]const u8{ "nil", "true", "false", "ok", "error", "cont", "halt" };
+    const builtins = [_][]const u8{ "nil", "true", "false", "ok", "error", "cont", "halt", "done" };
     for (builtins) |name| {
         const id = atom_count;
         const len: u32 = @intCast(name.len);
@@ -3119,11 +3119,11 @@ pub fn ListOf(comptime T: type) type {
 
         /// Iterator protocol: returns {atom, value, next_state}.
         /// :cont (5) with head and tail for non-empty, :done (7) for empty.
-        pub fn next(list: ?*const Self) struct { @"0": u32, @"1": T, @"2": ?*const Self } {
+        pub fn next(list: ?*const Self) std.meta.Tuple(&.{ u32, T, ?*const Self }) {
             if (list) |cell| {
-                return .{ .@"0" = 5, .@"1" = cell.head, .@"2" = cell.tail };
+                return .{ 5, cell.head, cell.tail };
             }
-            return .{ .@"0" = 7, .@"1" = std.mem.zeroes(T), .@"2" = null };
+            return .{ 7, std.mem.zeroes(T), null };
         }
 
         pub fn contains(list: ?*const Self, value: T) bool {

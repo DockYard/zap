@@ -907,6 +907,25 @@ pub const Desugarer = struct {
     // }
     // ============================================================
 
+    /// Look up the Enumerable protocol impl for a target type via the scope graph.
+    /// Returns the runtime module name (e.g., "Range", "List") if an impl exists,
+    /// or null if no impl is registered.
+    fn resolveEnumerableModule(self: *Desugarer, target_type_name: []const u8) ?[]const u8 {
+        const graph = self.graph orelse return null;
+        const enum_id = self.interner.intern("Enumerable") catch return null;
+        const enum_parts = self.allocator.alloc(ast.StringId, 1) catch return null;
+        enum_parts[0] = enum_id;
+        const enum_name = ast.StructName{ .parts = enum_parts, .span = .{ .start = 0, .end = 0 } };
+        const target_id = self.interner.intern(target_type_name) catch return null;
+        const target_parts = self.allocator.alloc(ast.StringId, 1) catch return null;
+        target_parts[0] = target_id;
+        const target_name = ast.StructName{ .parts = target_parts, .span = .{ .start = 0, .end = 0 } };
+        if (graph.findImpl(enum_name, target_name)) |_| {
+            return target_type_name;
+        }
+        return null;
+    }
+
     fn desugarForExpr(self: *Desugarer, fe: *const ast.ForExpr) !*const ast.Expr {
         // Use zero span for generated function internals so the type checker
         // skips annotation requirements for compiler-generated code.
@@ -917,13 +936,24 @@ pub const Desugarer = struct {
             return self.desugarForString(fe);
         }
 
-        // Range: use Enumerable protocol. The protocol defines the interface;
-        // the desugarer resolves which impl to use based on the iterable type
-        // and generates a direct :zig bridge call to the impl's runtime function.
+        // Range: dispatch through Enumerable protocol registry
         if (fe.iterable.* == .range) {
-            return self.desugarForEnumerable(fe, "Range");
+            const mod = self.resolveEnumerableModule("Range") orelse "Range";
+            return self.desugarForEnumerable(fe, mod);
         }
 
+        // List literal: dispatch through Enumerable protocol registry
+        if (fe.iterable.* == .list) {
+            if (self.resolveEnumerableModule("List")) |mod| {
+                return self.desugarForEnumerable(fe, mod);
+            }
+        }
+
+        // Fallback: variables and other types
+        return self.desugarForListRecursion(fe, meta);
+    }
+
+    fn desugarForListRecursion(self: *Desugarer, fe: *const ast.ForExpr, meta: ast.NodeMeta) !*const ast.Expr {
         // Generate unique helper name (heap-allocated since interner stores slices)
         const name_str = try std.fmt.allocPrint(self.allocator, "__for_{d}", .{self.for_counter});
         self.for_counter += 1;

@@ -644,9 +644,26 @@ pub const ZirDriver = struct {
             },
             .tuple => self.mapTupleElementType(zig_type),
             .struct_ref => |name| {
-                const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
-                if (rt_import == error_ref) return error.EmitFailed;
-                const ref = zir_builder_emit_field_val(self.handle, rt_import, name.ptr, @intCast(name.len));
+                const short_name = if (std.mem.lastIndexOf(u8, name, ".")) |dot_idx|
+                    name[dot_idx + 1 ..]
+                else
+                    name;
+
+                // If the struct type is declared in the current module (top-level
+                // structs are emitted into every module by emitStructTypeDecls),
+                // use decl_val to reference it directly. This produces the same
+                // type identity as struct_init_typed(decl_val(...)), avoiding
+                // type mismatches between return types and constructed values.
+                if (self.structIsInCurrentModule(name)) {
+                    const ref = zir_builder_emit_decl_val(self.handle, short_name.ptr, @intCast(short_name.len));
+                    if (ref != error_ref) return ref;
+                }
+
+                // Cross-module struct: import from the struct's defining module.
+                const module_name = self.structToModuleName(name);
+                const import_ref = zir_builder_emit_import(self.handle, module_name.ptr, @intCast(module_name.len));
+                if (import_ref == error_ref) return error.EmitFailed;
+                const ref = zir_builder_emit_field_val(self.handle, import_ref, short_name.ptr, @intCast(short_name.len));
                 if (ref == error_ref) return error.EmitFailed;
                 return ref;
             },
@@ -870,6 +887,41 @@ pub const ZirDriver = struct {
         return null;
     }
 
+    /// Check if a struct type name is declared in the current ZIR module.
+    /// Top-level structs (no dot in name) are emitted into every module.
+    /// Dotted structs (e.g., "Zap.Env") are only emitted into their prefix module.
+    fn structIsInCurrentModule(self: *const ZirDriver, type_name: []const u8) bool {
+        if (self.findStructDef(type_name) == null) return false;
+        const current_module = self.current_emit_module orelse return false;
+        if (std.mem.lastIndexOf(u8, type_name, ".")) |dot_idx| {
+            const prefix = type_name[0..dot_idx];
+            var buf: [256]u8 = undefined;
+            if (prefix.len > buf.len) return false;
+            @memcpy(buf[0..prefix.len], prefix);
+            for (buf[0..prefix.len]) |*ch| {
+                if (ch.* == '.') ch.* = '_';
+            }
+            return std.mem.eql(u8, buf[0..prefix.len], current_module);
+        }
+        // Top-level struct — emitted into every module
+        return true;
+    }
+
+    /// Convert a struct_ref name to the ZIR module name that defines it.
+    /// "Range" → "Range", "Zap.Env" → "Zap", "IO.Mode" → "IO"
+    fn structToModuleName(self: *ZirDriver, type_name: []const u8) []const u8 {
+        if (std.mem.lastIndexOf(u8, type_name, ".")) |dot_idx| {
+            const prefix = type_name[0..dot_idx];
+            const converted = self.allocator.alloc(u8, prefix.len) catch return type_name;
+            @memcpy(converted, prefix);
+            for (converted) |*ch| {
+                if (ch.* == '.') ch.* = '_';
+            }
+            return converted;
+        }
+        return type_name;
+    }
+
     /// Map a Zig type name string to a ZIR type Ref for union variant types.
     fn mapTypeNameToRef(_: *const ZirDriver, type_name: []const u8) u32 {
         if (std.mem.eql(u8, type_name, "[]const u8")) return @intFromEnum(Zir.Inst.Ref.slice_const_u8_type);
@@ -1053,7 +1105,6 @@ pub const ZirDriver = struct {
 
     pub fn buildProgram(self: *ZirDriver, program: ir.Program) !void {
         self.program = program;
-        // Debug removed
 
         const ctx = self.compilation_ctx;
 
@@ -1679,14 +1730,24 @@ pub const ZirDriver = struct {
                     }
                     self.current_ret_type = 1;
                     self.cached_union_ret_type_ref = zir_builder_get_union_ret_type_ref(self.handle);
-                } else if (self.findStructDef(name) != null) {
-                    // Nominal struct type: reference the struct type declared
-                    // in the current module by name via decl_val.
+                } else if (self.structIsInCurrentModule(name)) {
+                    // Nominal struct type declared in the current module:
+                    // reference via decl_val.
                     const short_name = if (std.mem.lastIndexOf(u8, name, ".")) |dot_idx|
                         name[dot_idx + 1 ..]
                     else
                         name;
                     if (zir_builder_set_decl_val_return_type(self.handle, short_name.ptr, @intCast(short_name.len)) != 0)
+                        return error.EmitFailed;
+                    self.current_ret_type = 1;
+                } else if (self.findStructDef(name) != null) {
+                    // Cross-module struct: import from the defining module.
+                    const module_name = self.structToModuleName(name);
+                    const short_name = if (std.mem.lastIndexOf(u8, name, ".")) |dot_idx|
+                        name[dot_idx + 1 ..]
+                    else
+                        name;
+                    if (zir_builder_set_imported_return_type(self.handle, module_name.ptr, @intCast(module_name.len), short_name.ptr, @intCast(short_name.len)) != 0)
                         return error.EmitFailed;
                     self.current_ret_type = 1;
                 } else {
@@ -5113,6 +5174,8 @@ pub const ZirDriver = struct {
             }
         }
 
+        var index_get_pre_emitted = false;
+
         // If the default body is empty AND there's a catch-all guard (_ pattern),
         // use the last guard's body as the default instead of void.
         // The last guard has condition=true (always matches), so the empty default
@@ -5123,8 +5186,6 @@ pub const ZirDriver = struct {
             const last_gb = cb.pre_instrs[last_guard.guard_idx].guard_block;
 
             // If this is the ONLY guard (catch-all), emit body as top-level instructions
-            // instead of capturing into a nested body. This avoids ZIR scoping issues
-            // where nested bodies can't reference parent-scope operands.
             if (guards.items.len == 1) {
                 // Emit setup instructions (e.g., match_type)
                 for (cb.pre_instrs[0..last_guard.guard_idx]) |si| try self.emitInstruction(si);
@@ -5137,7 +5198,19 @@ pub const ZirDriver = struct {
                 return;
             }
 
-            // Multiple guards — capture the last one as default
+            // Multiple guards — emit shared setup (index_get for tuple element
+            // extraction) before capturing the catch-all body. Guard bodies
+            // reference these locals via local_get, so they must be defined
+            // before any body is captured. Per-guard setup (match_atom) is
+            // emitted later in the reverse loop.
+            for (guards.items) |guard| {
+                for (cb.pre_instrs[guard.setup_start..guard.guard_idx]) |si| {
+                    if (std.meta.activeTag(si) == .index_get) try self.emitInstruction(si);
+                }
+            }
+            index_get_pre_emitted = true;
+
+            // Capture the catch-all body as default
             self.beginCapture();
             for (last_gb.body) |bi| try self.emitInstruction(bi);
             var catchall_len: u32 = 0;
@@ -5153,7 +5226,7 @@ pub const ZirDriver = struct {
             _ = guards.pop();
         }
 
-        // Process guards in REVERSE order
+        // Process guards in REVERSE order to build nested if-else chain
         var gi = guards.items.len;
         while (gi > 0) {
             gi -= 1;
@@ -5161,9 +5234,12 @@ pub const ZirDriver = struct {
             const gb = cb.pre_instrs[guard.guard_idx].guard_block;
             const setup_instrs = cb.pre_instrs[guard.setup_start..guard.guard_idx];
 
-            // Emit setup instructions (match_atom comparisons etc.) as body instructions.
-            // For inner guards, these are harmless (no side effects).
-            for (setup_instrs) |si| try self.emitInstruction(si);
+            // Emit per-guard setup. Skip index_get if already pre-emitted
+            // before the catchall capture.
+            for (setup_instrs) |si| {
+                if (index_get_pre_emitted and std.meta.activeTag(si) == .index_get) continue;
+                try self.emitInstruction(si);
+            }
 
             // Get the guard condition ref
             const cond_ref = try self.refForLocal(gb.condition);

@@ -349,6 +349,17 @@ pub fn collectAllFromUnits(
                 return error.CollectFailed;
             };
         }
+        // Validate protocol conformance after all modules are collected
+        collector.validateImplConformance() catch {};
+        if (collector.errors.items.len > 0) {
+            for (collector.errors.items) |collect_err| {
+                diag_engine.err(collect_err.message, collect_err.span) catch {};
+            }
+            if (options.show_progress) std.debug.print("\r\x1b[K", .{});
+            emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
+            return error.CollectFailed;
+        }
+
         const pre_slices = try alloc.alloc(ast.Program, pre_module_programs.len);
         for (pre_module_programs, 0..) |entry, i| pre_slices[i] = entry.program;
         collector.finalizeCollectedPrograms(pre_slices) catch {
@@ -1093,82 +1104,6 @@ pub fn compileModuleByModule(
                 return error.HirFailed;
             };
             combined_hir = mono_result.program;
-        }
-
-        // Phase 3.5: protocol dispatch is resolved at compile time by the
-        // desugarer, which knows the collection type and generates the
-        // appropriate iteration code for each Enumerable implementation.
-        // Synthesis of dispatch modules is not needed — static dispatch
-        // happens at the call site.
-        if (false) { // Reserved for future dynamic protocol dispatch
-            // Deduplicate protocols by name (per-module HIR creates duplicates)
-            var seen_protos = std.AutoHashMap(ast.StringId, void).init(alloc);
-            defer seen_protos.deinit();
-            var unique_protos: std.ArrayListUnmanaged(zap.hir.ProtocolInfo) = .empty;
-            for (combined_hir.protocols) |proto| {
-                if (seen_protos.contains(proto.name)) continue;
-                seen_protos.put(proto.name, {}) catch continue;
-                unique_protos.append(alloc, proto) catch continue;
-            }
-
-            // Deduplicate impls by protocol name string + target module string
-            var seen_impls = std.StringHashMap(void).init(alloc);
-            defer seen_impls.deinit();
-            var unique_impls: std.ArrayListUnmanaged(zap.hir.ImplInfo) = .empty;
-            for (combined_hir.impls) |impl_info| {
-                const proto_str = ctx.interner.get(impl_info.protocol_name);
-                const target_str = ctx.interner.get(impl_info.target_module);
-                const key = std.fmt.allocPrint(alloc, "{s}:{s}", .{proto_str, target_str}) catch continue;
-                if (seen_impls.contains(key)) continue;
-                seen_impls.put(key, {}) catch continue;
-                unique_impls.append(alloc, impl_info) catch continue;
-            }
-
-            var dispatch_modules: std.ArrayListUnmanaged(zap.hir.Module) = .empty;
-            for (unique_protos.items) |proto| {
-                var dispatch_groups: std.ArrayListUnmanaged(zap.hir.FunctionGroup) = .empty;
-                for (proto.function_names, proto.function_arities) |fn_name, fn_arity| {
-                    var merged_clauses: std.ArrayListUnmanaged(zap.hir.Clause) = .empty;
-                    for (unique_impls.items) |impl_info| {
-                        if (impl_info.protocol_name != proto.name) continue;
-                        for (combined_hir.top_functions) |group| {
-                            if (group.scope_id != impl_info.impl_scope_id) continue;
-                            if (group.name != fn_name) continue;
-                            for (group.clauses) |clause| {
-                                merged_clauses.append(alloc, clause) catch continue;
-                            }
-                        }
-                    }
-                    if (merged_clauses.items.len > 0) {
-                        const gid = group_id_offset;
-                        group_id_offset += 1;
-                        dispatch_groups.append(alloc, .{
-                            .id = gid,
-                            .scope_id = 0,
-                            .name = fn_name,
-                            .arity = fn_arity,
-                            .clauses = merged_clauses.toOwnedSlice(alloc) catch &.{},
-                            .fallback_parent = null,
-                        }) catch continue;
-                    }
-                }
-                if (dispatch_groups.items.len > 0) {
-                    const parts = alloc.alloc(ast.StringId, 1) catch continue;
-                    parts[0] = proto.name;
-                    dispatch_modules.append(alloc, .{
-                        .name = .{ .parts = parts, .span = .{ .start = 0, .end = 0 } },
-                        .scope_id = 0,
-                        .functions = dispatch_groups.toOwnedSlice(alloc) catch &.{},
-                        .types = &.{},
-                    }) catch continue;
-                }
-            }
-            if (dispatch_modules.items.len > 0) {
-                var all_mods: std.ArrayListUnmanaged(zap.hir.Module) = .empty;
-                for (combined_hir.modules) |m| all_mods.append(alloc, m) catch continue;
-                for (dispatch_modules.items) |m| all_mods.append(alloc, m) catch continue;
-                combined_hir.modules = all_mods.toOwnedSlice(alloc) catch combined_hir.modules;
-            }
         }
 
         // Phase 4: each module HIR → IR
