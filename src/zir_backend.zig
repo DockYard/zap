@@ -46,7 +46,7 @@ extern "c" fn zir_compilation_update(ctx: *ZirContext) i32;
 
 extern "c" fn zir_compilation_destroy(ctx: *ZirContext) void;
 
-extern "c" fn zir_compilation_add_module_source(
+extern "c" fn zir_compilation_add_struct_source(
     ctx: *ZirContext,
     name: [*:0]const u8,
     source_ptr: [*]const u8,
@@ -94,7 +94,7 @@ pub const CompileOptions = struct {
     /// Name of the compilation unit (e.g., the program name).
     name: []const u8,
     /// Optional embedded runtime source. If provided, registered via
-    /// zir_compilation_add_module_source instead of file path.
+    /// zir_compilation_add_struct_source instead of file path.
     runtime_source: ?[]const u8 = null,
     /// Output mode: 0=Exe, 1=Lib, 2=Obj.
     output_mode: u8 = 0,
@@ -158,7 +158,7 @@ pub fn createContext(allocator: std.mem.Allocator, options: CompileOptions) Comp
 
     // Register embedded runtime source if provided.
     if (options.runtime_source) |source| {
-        if (zir_compilation_add_module_source(ctx, "zap_runtime", source.ptr, @intCast(source.len)) != 0) {
+        if (zir_compilation_add_struct_source(ctx, "zap_runtime", source.ptr, @intCast(source.len)) != 0) {
             zir_compilation_destroy(ctx);
             return error.CompilationFailed;
         }

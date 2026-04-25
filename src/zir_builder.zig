@@ -152,11 +152,11 @@ extern "c" fn zir_builder_pop_body_inst(handle: ?*ZirBuilderHandle) u32;
 
 // Finalize and inject
 extern "c" fn zir_builder_inject(builder_handle: ?*ZirBuilderHandle, compilation_handle: ?*ZirContext) i32;
-extern "c" fn zir_builder_inject_module(builder_handle: ?*ZirBuilderHandle, compilation_handle: ?*ZirContext, module_name: [*:0]const u8) i32;
+extern "c" fn zir_builder_inject_struct(builder_handle: ?*ZirBuilderHandle, compilation_handle: ?*ZirContext, struct_name: [*:0]const u8) i32;
 
-// Module management
-extern "c" fn zir_compilation_add_module(ctx: ?*ZirContext, name: [*:0]const u8, source_path: [*:0]const u8) i32;
-extern "c" fn zir_compilation_add_module_source(ctx: ?*ZirContext, name: [*:0]const u8, source_ptr: [*]const u8, source_len: u32) i32;
+// Struct management
+extern "c" fn zir_compilation_add_struct(ctx: ?*ZirContext, name: [*:0]const u8, source_path: [*:0]const u8) i32;
+extern "c" fn zir_compilation_add_struct_source(ctx: ?*ZirContext, name: [*:0]const u8, source_ptr: [*]const u8, source_len: u32) i32;
 
 // Pointer casting
 extern "c" fn zir_builder_emit_ptr_cast(handle: ?*ZirBuilderHandle, dest_type: u32, operand: u32) u32;
@@ -1135,7 +1135,7 @@ pub const ZirDriver = struct {
                     const mod_name_z = try self.allocator.dupeZ(u8, mod_name);
                     defer self.allocator.free(mod_name_z);
                     const stub = "comptime {}\n";
-                    _ = zir_compilation_add_module_source(c, mod_name_z, stub.ptr, @intCast(stub.len));
+                    _ = zir_compilation_add_struct_source(c, mod_name_z, stub.ptr, @intCast(stub.len));
                 }
             }
         }
@@ -1151,7 +1151,7 @@ pub const ZirDriver = struct {
                 const mod_name_z = try self.allocator.dupeZ(u8, mod_name);
                 defer self.allocator.free(mod_name_z);
                 const stub = "comptime {}\n";
-                if (zir_compilation_add_module_source(c, mod_name_z, stub.ptr, @intCast(stub.len)) != 0) {
+                if (zir_compilation_add_struct_source(c, mod_name_z, stub.ptr, @intCast(stub.len)) != 0) {
                     return error.ZirInjectionFailed;
                 }
 
@@ -1171,7 +1171,7 @@ pub const ZirDriver = struct {
                     try self.emitFunction(func);
                 }
 
-                if (zir_builder_inject_module(mod_handle, c, mod_name_z) != 0) {
+                if (zir_builder_inject_struct(mod_handle, c, mod_name_z) != 0) {
                     return error.ZirInjectionFailed;
                 }
 
@@ -1204,7 +1204,7 @@ pub const ZirDriver = struct {
                 const parent_z = try self.allocator.dupeZ(u8, parent_name);
                 defer self.allocator.free(parent_z);
                 // This will overwrite the empty stub if already registered
-                if (zir_compilation_add_module_source(c, parent_z, source.ptr, @intCast(source.len)) != 0) {
+                if (zir_compilation_add_struct_source(c, parent_z, source.ptr, @intCast(source.len)) != 0) {
                     return error.ZirInjectionFailed;
                 }
             }
@@ -5670,7 +5670,7 @@ pub fn buildAndInject(
 ) BuildError!void {
     // Register the runtime module if a path was provided.
     if (runtime_path) |rpath| {
-        if (zir_compilation_add_module(compilation_ctx, "zap_runtime", rpath) != 0) {
+        if (zir_compilation_add_struct(compilation_ctx, "zap_runtime", rpath) != 0) {
             return error.ZirInjectionFailed;
         }
     }
