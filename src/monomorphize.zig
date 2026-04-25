@@ -244,32 +244,10 @@ const MonomorphContext = struct {
         return null;
     }
 
-    /// Check if a concrete type matches an impl's target module name.
-    /// For user-defined types (structs, unions), matches by declared name.
-    /// For built-in types, matches by the language-defined module name.
-    fn typeMatchesImplTarget(self: *const MonomorphContext, type_id: TypeId, target_module: []const u8) bool {
-        if (type_id >= self.store.types.items.len) return false;
-        const typ = self.store.types.items[type_id];
-        return switch (typ) {
-            .struct_type => |s| std.mem.eql(u8, self.interner.get(s.name), target_module),
-            .tagged_union => |tu| std.mem.eql(u8, self.interner.get(tu.name), target_module),
-            .list => std.mem.eql(u8, target_module, "List"),
-            .map => std.mem.eql(u8, target_module, "Map"),
-            .string_type => std.mem.eql(u8, target_module, "String"),
-            .int => std.mem.eql(u8, target_module, "Integer"),
-            .float => std.mem.eql(u8, target_module, "Float"),
-            .bool_type => std.mem.eql(u8, target_module, "Bool"),
-            .atom_type => std.mem.eql(u8, target_module, "Atom"),
-            .tuple => std.mem.eql(u8, target_module, "Tuple"),
-            .function => std.mem.eql(u8, target_module, "Function"),
-            else => false,
-        };
-    }
-
     /// Resolve a protocol dispatch: given a protocol name, function name,
     /// and concrete argument type, find the impl's function group ID.
-    /// Iterates all impls and matches the concrete type directly against
-    /// each impl's target module, without an intermediate name lookup.
+    /// Uses TypeStore.typeToModuleName to get the type's canonical module
+    /// name, then matches against impl target modules.
     fn resolveProtocolDispatch(
         self: *const MonomorphContext,
         protocol_name: ast.StringId,
@@ -277,9 +255,11 @@ const MonomorphContext = struct {
         concrete_type: TypeId,
         arity: u32,
     ) ?u32 {
+        const type_module = self.store.typeToModuleName(concrete_type, self.interner) orelse return null;
+
         for (self.program.impls) |impl_info| {
             if (impl_info.protocol_name != protocol_name) continue;
-            if (!self.typeMatchesImplTarget(concrete_type, self.interner.get(impl_info.target_module))) continue;
+            if (!std.mem.eql(u8, self.interner.get(impl_info.target_module), type_module)) continue;
 
             // Found the impl. Search its function groups for the matching function.
             for (impl_info.function_group_ids) |gid| {

@@ -350,6 +350,30 @@ pub const TypeStore = struct {
         return null;
     }
 
+    /// Get the canonical module name for a type.
+    /// For user-defined types (structs, unions), returns the declared name.
+    /// For built-in types, returns the language-defined module name.
+    /// Returns null for types that don't have a corresponding module
+    /// (nil, never, type variables, etc.).
+    pub fn typeToModuleName(self: *const TypeStore, type_id: TypeId, interner: *const ast.StringInterner) ?[]const u8 {
+        if (type_id >= self.types.items.len) return null;
+        const typ = self.types.items[type_id];
+        return switch (typ) {
+            .struct_type => |s| interner.get(s.name),
+            .tagged_union => |tu| interner.get(tu.name),
+            .list => "List",
+            .map => "Map",
+            .string_type => "String",
+            .int => "Integer",
+            .float => "Float",
+            .bool_type => "Bool",
+            .atom_type => "Atom",
+            .tuple => "Tuple",
+            .function => "Function",
+            else => null,
+        };
+    }
+
     /// Check if two types are compatible.
     /// Returns true if `a` can be used where `b` is expected (or vice versa).
     pub fn typeEquals(self: *const TypeStore, a: TypeId, b: TypeId) bool {
