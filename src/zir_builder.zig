@@ -575,24 +575,11 @@ pub const ZirDriver = struct {
     /// Map Zap-facing module names to runtime struct names.
     /// Domain modules (IO, Integer, Float, etc.) route to Prelude.
     /// List, Map, String, Zest map to their runtime struct names.
+    /// Map a Zap module name to its runtime struct name for bridge calls.
+    /// Library files use the actual runtime names directly (e.g., :zig.Prelude.*),
+    /// so this is now identity for most modules. Retained only for backward
+    /// compatibility with any remaining indirect references.
     fn mapToRuntimeModule(mod_name: []const u8) []const u8 {
-        // These modules have their own runtime structs
-        if (std.mem.eql(u8, mod_name, "List")) return "List";
-        if (std.mem.eql(u8, mod_name, "Map")) return "MapAtomInt";
-        if (std.mem.eql(u8, mod_name, "String")) return "String";
-        if (std.mem.eql(u8, mod_name, "Zest")) return "Zest";
-        if (std.mem.eql(u8, mod_name, "Kernel")) return "Kernel";
-        // Domain modules route to Prelude (all functions live there)
-        if (std.mem.eql(u8, mod_name, "IO")) return "Prelude";
-        if (std.mem.eql(u8, mod_name, "Integer")) return "Prelude";
-        if (std.mem.eql(u8, mod_name, "Float")) return "Prelude";
-        if (std.mem.eql(u8, mod_name, "Bool")) return "Prelude";
-        if (std.mem.eql(u8, mod_name, "Atom")) return "Prelude";
-        if (std.mem.eql(u8, mod_name, "Math")) return "Prelude";
-        if (std.mem.eql(u8, mod_name, "File")) return "Prelude";
-        if (std.mem.eql(u8, mod_name, "System")) return "Prelude";
-        if (std.mem.eql(u8, mod_name, "Path")) return "Prelude";
-        // Default: use the module name as-is (Prelude, etc.)
         return mod_name;
     }
 

@@ -27,7 +27,7 @@ pub struct Atom {
     """
 
   pub fn to_string(atom :: Atom) -> String {
-    :zig.Atom.atom_name(atom)
+    :zig.Prelude.atom_name(atom)
   }
 
 }

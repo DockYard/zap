@@ -23,7 +23,7 @@ pub struct File {
     """
 
   pub fn read(path :: String) -> String {
-    :zig.File.file_read(path)
+    :zig.Prelude.file_read(path)
   }
 
   @doc = """
@@ -36,7 +36,7 @@ pub struct File {
     """
 
   pub fn write(path :: String, content :: String) -> Bool {
-    :zig.File.file_write(path, content)
+    :zig.Prelude.file_write(path, content)
   }
 
   @doc = """
@@ -49,7 +49,7 @@ pub struct File {
     """
 
   pub fn exists?(path :: String) -> Bool {
-    :zig.File.file_exists(path)
+    :zig.Prelude.file_exists(path)
   }
 
   @doc = """
@@ -78,7 +78,7 @@ pub struct File {
     """
 
   pub fn rm(path :: String) -> Bool {
-    :zig.File.file_rm(path)
+    :zig.Prelude.file_rm(path)
   }
 
   @doc = """
@@ -90,7 +90,7 @@ pub struct File {
     """
 
   pub fn mkdir(path :: String) -> Bool {
-    :zig.File.file_mkdir(path)
+    :zig.Prelude.file_mkdir(path)
   }
 
   @doc = """
@@ -102,7 +102,7 @@ pub struct File {
     """
 
   pub fn rmdir(path :: String) -> Bool {
-    :zig.File.file_rmdir(path)
+    :zig.Prelude.file_rmdir(path)
   }
 
   @doc = """
@@ -114,7 +114,7 @@ pub struct File {
     """
 
   pub fn rename(old_path :: String, new_path :: String) -> Bool {
-    :zig.File.file_rename(old_path, new_path)
+    :zig.Prelude.file_rename(old_path, new_path)
   }
 
   @doc = """
@@ -126,7 +126,7 @@ pub struct File {
     """
 
   pub fn cp(source :: String, destination :: String) -> Bool {
-    :zig.File.file_cp(source, destination)
+    :zig.Prelude.file_cp(source, destination)
   }
 
   @doc = """
@@ -139,7 +139,7 @@ pub struct File {
     """
 
   pub fn dir?(path :: String) -> Bool {
-    :zig.File.file_is_dir(path)
+    :zig.Prelude.file_is_dir(path)
   }
 
   @doc = """
@@ -152,6 +152,6 @@ pub struct File {
     """
 
   pub fn regular?(path :: String) -> Bool {
-    :zig.File.file_is_regular(path)
+    :zig.Prelude.file_is_regular(path)
   }
 }

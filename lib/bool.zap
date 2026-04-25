@@ -20,7 +20,7 @@ pub struct Bool {
     """
 
   pub fn to_string(value :: Bool) -> String {
-    :zig.Bool.bool_to_string(value)
+    :zig.Prelude.bool_to_string(value)
   }
 
   @doc = """

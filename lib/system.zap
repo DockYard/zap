@@ -18,7 +18,7 @@ pub struct System {
     """
 
   pub fn arg_count() -> i64 {
-    :zig.System.arg_count()
+    :zig.Prelude.arg_count()
   }
 
   @doc = """
@@ -36,7 +36,7 @@ pub struct System {
     """
 
   pub fn arg_at(index :: i64) -> String {
-    :zig.System.arg_at(index)
+    :zig.Prelude.arg_at(index)
   }
 
   @doc = """
@@ -52,7 +52,7 @@ pub struct System {
     """
 
   pub fn get_env(name :: String) -> String {
-    :zig.System.get_env(name)
+    :zig.Prelude.get_env(name)
   }
 
   @doc = """
@@ -68,7 +68,7 @@ pub struct System {
     """
 
   pub fn get_build_opt(name :: String) -> String {
-    :zig.System.get_build_opt(name)
+    :zig.Prelude.get_build_opt(name)
   }
 
   @doc = """
@@ -80,6 +80,6 @@ pub struct System {
     """
 
   pub fn cwd() -> String {
-    :zig.System.sys_cwd()
+    :zig.Prelude.sys_cwd()
   }
 }
