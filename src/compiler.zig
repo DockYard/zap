@@ -349,8 +349,9 @@ pub fn collectAllFromUnits(
                 return error.CollectFailed;
             };
         }
-        // Validate protocol conformance after all modules are collected
+        // Validate protocol conformance and register impl functions in target modules
         collector.validateImplConformance() catch {};
+        collector.registerImplFunctionsInTargetScopes() catch {};
         if (collector.errors.items.len > 0) {
             for (collector.errors.items) |collect_err| {
                 diag_engine.err(collect_err.message, collect_err.span) catch {};

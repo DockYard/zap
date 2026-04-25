@@ -439,6 +439,19 @@ pub const Collector = struct {
         }
     }
 
+    /// Register impl functions in their target module's scope so that
+    /// calls like Range.next(state) resolve to the impl function.
+    /// Must be called after all modules and impls are collected.
+    pub fn registerImplFunctionsInTargetScopes(self: *Collector) !void {
+        for (self.graph.impls.items) |impl_entry| {
+            const target_scope = self.graph.findStructScope(impl_entry.target_type) orelse continue;
+            for (impl_entry.decl.functions) |func| {
+                // Register each impl function in the target module's scope
+                try self.collectFunction(func, target_scope);
+            }
+        }
+    }
+
     fn formatStructName(self: *const Collector, name: ast.StructName) []const u8 {
         if (name.parts.len == 1) return self.interner.get(name.parts[0]);
         var buf: std.ArrayListUnmanaged(u8) = .empty;
