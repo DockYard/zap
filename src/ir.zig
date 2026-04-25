@@ -3927,20 +3927,20 @@ pub const IrBuilder = struct {
                                     } else false;
                                     if (is_val_enum) {
                                         // Enum values use u32 — route to MapOf(u32, u32)
-                                        break :blk try std.fmt.allocPrint(self.allocator, "MapOfU32Val.{s}", .{method});
+                                        break :blk try std.fmt.allocPrint(self.allocator, "MapU32Val.{s}", .{method});
                                     } else {
                                         const key_name = if (std.meta.activeTag(key_zig) == .atom) "u32" else if (std.meta.activeTag(key_zig) == .string) "str" else "u32";
-                                        break :blk try std.fmt.allocPrint(self.allocator, "MapOf:{s}:{s}.{s}", .{ key_name, val_zig.struct_ref, method });
+                                        break :blk try std.fmt.allocPrint(self.allocator, "Map:{s}:{s}.{s}", .{ key_name, val_zig.struct_ref, method });
                                     }
                                 }
                                 // For nested map/list value types, encode for generic dispatch
                                 if (std.meta.activeTag(val_zig) == .map or std.meta.activeTag(val_zig) == .list) {
                                     const key_name = if (std.meta.activeTag(key_zig) == .atom) "u32" else if (std.meta.activeTag(key_zig) == .string) "str" else "u32";
-                                    break :blk try std.fmt.allocPrint(self.allocator, "MapOfNested:{s}:{s}.{s}", .{ key_name, @tagName(std.meta.activeTag(val_zig)), method });
+                                    break :blk try std.fmt.allocPrint(self.allocator, "MapNested:{s}:{s}.{s}", .{ key_name, @tagName(std.meta.activeTag(val_zig)), method });
                                 }
                                 const key_name = if (std.meta.activeTag(key_zig) == .atom) "u32" else if (std.meta.activeTag(key_zig) == .string) "str" else "u32";
                                 const val_name = zigTypeToEncodedName(val_zig);
-                                break :blk try std.fmt.allocPrint(self.allocator, "MapOf:{s}:{s}.{s}", .{ key_name, val_name, method });
+                                break :blk try std.fmt.allocPrint(self.allocator, "Map:{s}:{s}.{s}", .{ key_name, val_name, method });
                             }
                             break :blk name;
                         } else name;
@@ -3965,18 +3965,18 @@ pub const IrBuilder = struct {
                                     } else false;
                                     if (is_enum) {
                                         // Enum lists use ListOf(u32) — encode for generic dispatch
-                                        break :blk try std.fmt.allocPrint(self.allocator, "ListOfU32.{s}", .{method});
+                                        break :blk try std.fmt.allocPrint(self.allocator, "ListU32.{s}", .{method});
                                     } else {
-                                        break :blk try std.fmt.allocPrint(self.allocator, "ListOf:{s}.{s}", .{ elem_zig.struct_ref, method });
+                                        break :blk try std.fmt.allocPrint(self.allocator, "List:{s}.{s}", .{ elem_zig.struct_ref, method });
                                     }
                                 }
                                 if (std.meta.activeTag(elem_zig) == .list) {
                                     // Nested list: ListOf(?*const ListOf(T))
-                                    // Use "ListOfNested:inner_type.method" encoding
-                                    break :blk try std.fmt.allocPrint(self.allocator, "ListOfNested:{s}.{s}", .{ @tagName(elem_zig.list.*), method });
+                                    // Use "ListNested:inner_type.method" encoding
+                                    break :blk try std.fmt.allocPrint(self.allocator, "ListNested:{s}.{s}", .{ @tagName(elem_zig.list.*), method });
                                 }
                                 const elem_name = zigTypeToEncodedName(elem_zig);
-                                break :blk try std.fmt.allocPrint(self.allocator, "ListOf:{s}.{s}", .{ elem_name, method });
+                                break :blk try std.fmt.allocPrint(self.allocator, "List:{s}.{s}", .{ elem_name, method });
                             }
                             break :blk map_resolved;
                         } else map_resolved;
@@ -4437,7 +4437,7 @@ fn findParamGetIdInDecision(decision: *const hir_mod.Decision, target_element: u
 }
 
 /// Map a ZigType to a canonical short name for generic container encoding.
-/// Used in call_builtin name encoding: "ListOf:i64.method", "MapOf:u32:str.method".
+/// Used in call_builtin name encoding: "List:i64.method", "Map:u32:str.method".
 fn zigTypeToEncodedName(zig_type: ZigType) []const u8 {
     return switch (std.meta.activeTag(zig_type)) {
         .i64 => "i64",

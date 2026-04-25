@@ -832,7 +832,7 @@ pub const Range = struct {
         return .{ .@"0" = 5, .@"1" = start, .@"2" = next_range }; // :cont
     }
 
-    pub fn to_list(range: anytype) ?*const ListOf(i64) {
+    pub fn to_list(range: anytype) ?*const List(i64) {
         const start = range.start;
         const end_val = range.end;
         const step_mag = range.step;
@@ -841,21 +841,21 @@ pub const Range = struct {
         const going_forward = start <= end_val;
         const step: i64 = if (going_forward) step_mag else -step_mag;
 
-        var result: ?*const ListOf(i64) = null;
+        var result: ?*const List(i64) = null;
         var current = start;
 
         if (going_forward) {
             while (current <= end_val) {
-                result = ListOf(i64).cons(current, result);
+                result = List(i64).cons(current, result);
                 current += step;
             }
         } else {
             while (current >= end_val) {
-                result = ListOf(i64).cons(current, result);
+                result = List(i64).cons(current, result);
                 current += step;
             }
         }
-        return ListOf(i64).reverse(result);
+        return List(i64).reverse(result);
     }
 };
 
@@ -1633,13 +1633,13 @@ pub const Prelude = struct {
         return result;
     }
 
-    /// Split a string by delimiter, returning a ListOf([]const u8) (linked list of strings).
-    pub fn split_to_list(s: []const u8, delimiter: []const u8) ?*const ListOf([]const u8) {
+    /// Split a string by delimiter, returning a List([]const u8) (linked list of strings).
+    pub fn split_to_list(s: []const u8, delimiter: []const u8) ?*const List([]const u8) {
         if (delimiter.len == 0) {
-            return ListOf([]const u8).cons(s, null);
+            return List([]const u8).cons(s, null);
         }
         // Build the list in reverse, then reverse it
-        var result: ?*const ListOf([]const u8) = null;
+        var result: ?*const List([]const u8) = null;
         var pos: usize = 0;
         var seg_start: usize = 0;
         while (pos < s.len) {
@@ -1647,7 +1647,7 @@ pub const Prelude = struct {
                 const seg = s[seg_start..pos];
                 const seg_copy = bumpAlloc(seg.len);
                 if (seg_copy.len > 0) @memcpy(seg_copy, seg);
-                result = ListOf([]const u8).cons(seg_copy, result);
+                result = List([]const u8).cons(seg_copy, result);
                 pos += delimiter.len;
                 seg_start = pos;
             } else {
@@ -1658,12 +1658,12 @@ pub const Prelude = struct {
         const last_seg = s[seg_start..];
         const last_copy = bumpAlloc(last_seg.len);
         if (last_copy.len > 0) @memcpy(last_copy, last_seg);
-        result = ListOf([]const u8).cons(last_copy, result);
-        return ListOf([]const u8).reverse(result);
+        result = List([]const u8).cons(last_copy, result);
+        return List([]const u8).reverse(result);
     }
 
     /// Join a list of strings with a separator.
-    pub fn string_join(list: ?*const ListOf([]const u8), separator: []const u8) []const u8 {
+    pub fn string_join(list: ?*const List([]const u8), separator: []const u8) []const u8 {
         if (list == null) return "";
         // First pass: compute total length
         var total: usize = 0;
@@ -2334,7 +2334,7 @@ pub const BinaryHelpers = struct {
 
 // ---- Callable dispatch helpers ----
 // Handle both bare function pointers and closure structs transparently.
-// Used by List, Map, and ListOf higher-order functions.
+// Used by List, Map, and List higher-order functions.
 
 inline fn call1(callback: anytype, arg0: anytype) @TypeOf(if (@typeInfo(@TypeOf(callback)) == .@"struct" and @hasField(@TypeOf(callback), "call_fn")) callback.call_fn(callback.env, arg0) else callback(arg0)) {
     const T = @TypeOf(callback);
@@ -2354,17 +2354,15 @@ inline fn call2(callback: anytype, arg0: anytype, arg1: anytype) @TypeOf(if (@ty
     }
 }
 
-pub const List = ListOf(i64);
-
 // ============================================================
 // Map — Generic HAMT-based persistent map.
 //
-// MapOf(K, V) generates a type-specific map for any key/value types.
+// Map(K, V) generates a type-specific map for any key/value types.
 // Maps use nullable pointers: null = empty, non-null = map cell.
 // Hybrid: flat array for small maps, HAMT trie for larger.
 // ============================================================
 
-pub fn MapOf(comptime K: type, comptime V: type) type {
+pub fn Map(comptime K: type, comptime V: type) type {
     return struct {
     const Self = @This();
     // Hybrid representation: flat array for small maps, HAMT trie for larger maps.
@@ -2896,16 +2894,16 @@ pub fn MapOf(comptime K: type, comptime V: type) type {
         return result;
     }
 
-    pub fn keys(map: ?*const Self) ?*const List {
+    pub fn keys(map: ?*const Self) ?*const List(K) {
         if (map == null) return null;
         const m = map.?;
 
         if (m.repr_tag == 0) {
-            var result: ?*const List = null;
+            var result: ?*const List(K) = null;
             var i: usize = m.flat_count;
             while (i > 0) {
                 i -= 1;
-                result = List.cons(@intCast(m.flat_entries[i].key), result);
+                result = List(K).cons(m.flat_entries[i].key, result);
             }
             return result;
         }
@@ -2913,25 +2911,25 @@ pub fn MapOf(comptime K: type, comptime V: type) type {
         // Trie: collect and build list
         var collected: std.ArrayListUnmanaged(MapEntry) = .empty;
         if (m.trie_root) |root| hamtCollect(root, &collected);
-        var result: ?*const List = null;
+        var result: ?*const List(K) = null;
         var i: usize = collected.items.len;
         while (i > 0) {
             i -= 1;
-            result = List.cons(@intCast(collected.items[i].key), result);
+            result = List(K).cons(collected.items[i].key, result);
         }
         return result;
     }
 
-    pub fn values(map: ?*const Self) ?*const List {
+    pub fn values(map: ?*const Self) ?*const List(V) {
         if (map == null) return null;
         const m = map.?;
 
         if (m.repr_tag == 0) {
-            var result: ?*const List = null;
+            var result: ?*const List(V) = null;
             var i: usize = m.flat_count;
             while (i > 0) {
                 i -= 1;
-                result = List.cons(m.flat_entries[i].value, result);
+                result = List(V).cons(m.flat_entries[i].value, result);
             }
             return result;
         }
@@ -2939,11 +2937,11 @@ pub fn MapOf(comptime K: type, comptime V: type) type {
         // Trie: collect and build list
         var collected: std.ArrayListUnmanaged(MapEntry) = .empty;
         if (m.trie_root) |root| hamtCollect(root, &collected);
-        var result: ?*const List = null;
+        var result: ?*const List(V) = null;
         var i: usize = collected.items.len;
         while (i > 0) {
             i -= 1;
-            result = List.cons(collected.items[i].value, result);
+            result = List(V).cons(collected.items[i].value, result);
         }
         return result;
     }
@@ -3021,14 +3019,14 @@ pub fn MapOf(comptime K: type, comptime V: type) type {
         return acc;
     }
     }; // end of returned struct
-} // end of MapOf
+} // end of Map
 
 // ============================================================
 // Generic List factory — produces monomorphic list types
 // for any element type T. Used for string lists, atom lists, etc.
 // ============================================================
 
-pub fn ListOf(comptime T: type) type {
+pub fn List(comptime T: type) type {
     return struct {
         const Self = @This();
         head: T,

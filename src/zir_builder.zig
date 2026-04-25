@@ -1347,10 +1347,7 @@ pub const ZirDriver = struct {
     /// Must be called from the main function body (not inside a capture).
     fn ensureListRef(self: *ZirDriver) BuildError!u32 {
         if (self.cached_list_cell_ref != 0) return self.cached_list_cell_ref;
-        const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
-        if (rt_import == error_ref) return error.EmitFailed;
-        const ref = zir_builder_emit_field_val(self.handle, rt_import, "List", 4);
-        if (ref == error_ref) return error.EmitFailed;
+        const ref = try self.emitListCellRef(.i64);
         self.cached_list_cell_ref = ref;
         return ref;
     }
@@ -1436,7 +1433,7 @@ pub const ZirDriver = struct {
                 const inner_ref = try self.emitContainerElementTypeRef(inner.*);
                 if (inner_ref) |iref| {
                     const type_args = [_]u32{iref};
-                    const inner_list = self.emitGenericContainerRef("ListOf", &type_args) catch return null;
+                    const inner_list = self.emitGenericContainerRef("List", &type_args) catch return null;
                     // Call .empty() to get a value of type ?*const ListOf(T)
                     const empty_fn = zir_builder_emit_field_val(self.handle, inner_list, "empty", 5);
                     if (empty_fn == error_ref) return null;
@@ -1455,7 +1452,7 @@ pub const ZirDriver = struct {
                 const val_ref = try self.emitContainerElementTypeRef(mt.value.*);
                 if (key_ref != null and val_ref != null) {
                     const type_args = [_]u32{ key_ref.?, val_ref.? };
-                    const inner_map = self.emitGenericContainerRef("MapOf", &type_args) catch return null;
+                    const inner_map = self.emitGenericContainerRef("Map", &type_args) catch return null;
                     // Call .empty() to get ?*const MapOf(K, V), then @TypeOf
                     const empty_fn = zir_builder_emit_field_val(self.handle, inner_map, "empty", 5);
                     if (empty_fn == error_ref) return null;
@@ -1506,7 +1503,7 @@ pub const ZirDriver = struct {
             zigTypeToTypeRef(element_type) orelse
             @intFromEnum(Zir.Inst.Ref.i64_type);
         const type_args = [_]u32{elem_ref};
-        return self.emitGenericContainerRef("ListOf", &type_args);
+        return self.emitGenericContainerRef("List", &type_args);
     }
 
     /// Emit a reference to a `MapOf(K, V)` type instantiation for any key/value types.
@@ -1519,7 +1516,7 @@ pub const ZirDriver = struct {
             zigTypeToTypeRef(value_type) orelse
             @intFromEnum(Zir.Inst.Ref.i64_type);
         const type_args = [_]u32{ key_ref, val_ref };
-        return self.emitGenericContainerRef("MapOf", &type_args);
+        return self.emitGenericContainerRef("Map", &type_args);
     }
 
     /// Set the return type to a generic container type.
@@ -1650,7 +1647,7 @@ pub const ZirDriver = struct {
                     zigTypeToTypeRef(getListElementType(return_type)) orelse
                     @intFromEnum(Zir.Inst.Ref.i64_type);
                 const type_args = [_]u32{elem_ref};
-                try self.setContainerReturnType("ListOf", &type_args);
+                try self.setContainerReturnType("List", &type_args);
             },
             .map => |mt| {
                 const key_ref = (try self.emitContainerElementTypeRef(mt.key.*)) orelse
@@ -1660,7 +1657,7 @@ pub const ZirDriver = struct {
                     zigTypeToTypeRef(mt.value.*) orelse
                     @intFromEnum(Zir.Inst.Ref.i64_type);
                 const type_args = [_]u32{ key_ref, val_ref };
-                try self.setContainerReturnType("MapOf", &type_args);
+                try self.setContainerReturnType("Map", &type_args);
             },
             .tuple => |elements| {
                 var tuple_type_refs: std.ArrayListUnmanaged(u32) = .empty;
@@ -2625,10 +2622,7 @@ pub const ZirDriver = struct {
 
                     // Use the generic list contains: get the list type, then call .contains(list, value)
                     // The list (rhs) already has the right type at runtime — call contains as a method.
-                    const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
-                    if (rt_import == error_ref) return error.EmitFailed;
-                    const list_mod = zir_builder_emit_field_val(self.handle, rt_import, "List", 4);
-                    if (list_mod == error_ref) return error.EmitFailed;
+                    const list_mod = try self.emitListCellRef(.i64);
                     const contains_fn = zir_builder_emit_field_val(self.handle, list_mod, "contains", 8);
                     if (contains_fn == error_ref) return error.EmitFailed;
 
@@ -2915,10 +2909,10 @@ pub const ZirDriver = struct {
                     try args.append(self.allocator, ref);
                 }
 
-                // Handle generic container calls: "ListOf:StructName.method"
+                // Handle generic container calls: "List:StructName.method"
                 // These are emitted by the IR builder for struct element lists.
-                const generic_handled = if (std.mem.startsWith(u8, cb.name, "ListOf:")) blk: {
-                    const after_prefix = cb.name["ListOf:".len..];
+                const generic_handled = if (std.mem.startsWith(u8, cb.name, "List:")) blk: {
+                    const after_prefix = cb.name["List:".len..];
                     if (std.mem.findScalar(u8, after_prefix, '.')) |dot_idx| {
                         const type_name = after_prefix[0..dot_idx];
                         const method_name = after_prefix[dot_idx + 1 ..];
@@ -2926,7 +2920,7 @@ pub const ZirDriver = struct {
                             zir_builder_emit_decl_val(self.handle, type_name.ptr, @intCast(type_name.len));
                         if (type_ref != error_ref) {
                             const type_args = [_]u32{type_ref};
-                            const list_type = self.emitGenericContainerRef("ListOf", &type_args) catch break :blk false;
+                            const list_type = self.emitGenericContainerRef("List", &type_args) catch break :blk false;
                             const fn_ref = zir_builder_emit_field_val(self.handle, list_type, method_name.ptr, @intCast(method_name.len));
                             if (fn_ref != error_ref) {
                                 const ref = zir_builder_emit_call_ref(self.handle, fn_ref, args.items.ptr, @intCast(args.items.len));
@@ -2938,9 +2932,9 @@ pub const ZirDriver = struct {
                         }
                     }
                     break :blk false;
-                } else if (std.mem.startsWith(u8, cb.name, "MapOf:")) blk2: {
-                    // Handle "MapOf:keytype:ValueStructName.method"
-                    const after_prefix = cb.name["MapOf:".len..];
+                } else if (std.mem.startsWith(u8, cb.name, "Map:")) blk2: {
+                    // Handle "Map:keytype:ValueStructName.method"
+                    const after_prefix = cb.name["Map:".len..];
                     // Parse key_type_name:value_struct_name.method
                     if (std.mem.findScalar(u8, after_prefix, ':')) |colon_idx| {
                         const key_type_name = after_prefix[0..colon_idx];
@@ -2960,7 +2954,7 @@ pub const ZirDriver = struct {
                                 zir_builder_emit_decl_val(self.handle, value_struct_name.ptr, @intCast(value_struct_name.len));
                             if (val_ref != error_ref) {
                                 const type_args = [_]u32{ key_ref, val_ref };
-                                const map_type = self.emitGenericContainerRef("MapOf", &type_args) catch break :blk2 false;
+                                const map_type = self.emitGenericContainerRef("Map", &type_args) catch break :blk2 false;
                                 const fn_ref = zir_builder_emit_field_val(self.handle, map_type, method_name.ptr, @intCast(method_name.len));
                                 if (fn_ref != error_ref) {
                                     const ref = zir_builder_emit_call_ref(self.handle, fn_ref, args.items.ptr, @intCast(args.items.len));
@@ -2973,9 +2967,9 @@ pub const ZirDriver = struct {
                         }
                     }
                     break :blk2 false;
-                } else if (std.mem.startsWith(u8, cb.name, "ListOfNested:")) blk3: {
-                    // Handle "ListOfNested:inner_type.method" for nested list dispatch
-                    const after_prefix = cb.name["ListOfNested:".len..];
+                } else if (std.mem.startsWith(u8, cb.name, "ListNested:")) blk3: {
+                    // Handle "ListNested:inner_type.method" for nested list dispatch
+                    const after_prefix = cb.name["ListNested:".len..];
                     if (std.mem.findScalar(u8, after_prefix, '.')) |dot_idx| {
                         const inner_type_name = after_prefix[0..dot_idx];
                         const method_name = after_prefix[dot_idx + 1 ..];
@@ -2992,7 +2986,7 @@ pub const ZirDriver = struct {
                             @intFromEnum(Zir.Inst.Ref.i64_type);
                         // Build ListOf(inner), call .empty(), @TypeOf for the pointer type
                         const inner_args = [_]u32{inner_type_ref};
-                        const inner_list = self.emitGenericContainerRef("ListOf", &inner_args) catch break :blk3 false;
+                        const inner_list = self.emitGenericContainerRef("List", &inner_args) catch break :blk3 false;
                         const empty_fn = zir_builder_emit_field_val(self.handle, inner_list, "empty", 5);
                         if (empty_fn == error_ref) break :blk3 false;
                         const empty_val = zir_builder_emit_call_ref(self.handle, empty_fn, &.{}, 0);
@@ -3001,7 +2995,7 @@ pub const ZirDriver = struct {
                         if (elem_type_ref == error_ref) break :blk3 false;
                         // Now call ListOf(@TypeOf(empty_val)).method
                         const outer_args = [_]u32{elem_type_ref};
-                        const outer_list = self.emitGenericContainerRef("ListOf", &outer_args) catch break :blk3 false;
+                        const outer_list = self.emitGenericContainerRef("List", &outer_args) catch break :blk3 false;
                         const fn_ref = zir_builder_emit_field_val(self.handle, outer_list, method_name.ptr, @intCast(method_name.len));
                         if (fn_ref != error_ref) {
                             const ref = zir_builder_emit_call_ref(self.handle, fn_ref, args.items.ptr, @intCast(args.items.len));
@@ -3012,9 +3006,9 @@ pub const ZirDriver = struct {
                         }
                     }
                     break :blk3 false;
-                } else if (std.mem.startsWith(u8, cb.name, "MapOfNested:")) blk4: {
-                    // Handle "MapOfNested:keytype:valtype.method" for nested map dispatch
-                    const after_prefix = cb.name["MapOfNested:".len..];
+                } else if (std.mem.startsWith(u8, cb.name, "MapNested:")) blk4: {
+                    // Handle "MapNested:keytype:valtype.method" for nested map dispatch
+                    const after_prefix = cb.name["MapNested:".len..];
                     if (std.mem.findScalar(u8, after_prefix, ':')) |colon_idx| {
                         const key_type_name = after_prefix[0..colon_idx];
                         const rest = after_prefix[colon_idx + 1 ..];
@@ -3035,7 +3029,7 @@ pub const ZirDriver = struct {
                                 const inner_key = @intFromEnum(Zir.Inst.Ref.u32_type);
                                 const inner_val = @intFromEnum(Zir.Inst.Ref.i64_type);
                                 const inner_args = [_]u32{ inner_key, inner_val };
-                                const inner_map = self.emitGenericContainerRef("MapOf", &inner_args) catch break :blk4 false;
+                                const inner_map = self.emitGenericContainerRef("Map", &inner_args) catch break :blk4 false;
                                 const empty_fn = zir_builder_emit_field_val(self.handle, inner_map, "empty", 5);
                                 if (empty_fn == error_ref) break :blk4 false;
                                 const empty_val = zir_builder_emit_call_ref(self.handle, empty_fn, &.{}, 0);
@@ -3043,7 +3037,7 @@ pub const ZirDriver = struct {
                                 const val_type = zir_builder_emit_typeof(self.handle, empty_val);
                                 if (val_type == error_ref) break :blk4 false;
                                 const outer_args = [_]u32{ key_ref, val_type };
-                                const outer_map = self.emitGenericContainerRef("MapOf", &outer_args) catch break :blk4 false;
+                                const outer_map = self.emitGenericContainerRef("Map", &outer_args) catch break :blk4 false;
                                 const fn_ref = zir_builder_emit_field_val(self.handle, outer_map, method_name.ptr, @intCast(method_name.len));
                                 if (fn_ref != error_ref) {
                                     const ref = zir_builder_emit_call_ref(self.handle, fn_ref, args.items.ptr, @intCast(args.items.len));
@@ -3056,11 +3050,11 @@ pub const ZirDriver = struct {
                         }
                     }
                     break :blk4 false;
-                } else if (std.mem.startsWith(u8, cb.name, "ListOfU32.")) blk5: {
-                    // Handle "ListOfU32.method" for enum element lists (atoms are u32)
-                    const method_name = cb.name["ListOfU32.".len..];
+                } else if (std.mem.startsWith(u8, cb.name, "ListU32.")) blk5: {
+                    // Handle "ListU32.method" for enum element lists (atoms are u32)
+                    const method_name = cb.name["ListU32.".len..];
                     const type_args = [_]u32{@intFromEnum(Zir.Inst.Ref.u32_type)};
-                    const list_type = self.emitGenericContainerRef("ListOf", &type_args) catch break :blk5 false;
+                    const list_type = self.emitGenericContainerRef("List", &type_args) catch break :blk5 false;
                     const fn_ref = zir_builder_emit_field_val(self.handle, list_type, method_name.ptr, @intCast(method_name.len));
                     if (fn_ref != error_ref) {
                         const ref = zir_builder_emit_call_ref(self.handle, fn_ref, args.items.ptr, @intCast(args.items.len));
@@ -3070,11 +3064,11 @@ pub const ZirDriver = struct {
                         }
                     }
                     break :blk5 false;
-                } else if (std.mem.startsWith(u8, cb.name, "MapOfU32Val.")) blk6: {
-                    // Handle "MapOfU32Val.method" for maps with enum values (atoms are u32)
-                    const method_name = cb.name["MapOfU32Val.".len..];
+                } else if (std.mem.startsWith(u8, cb.name, "MapU32Val.")) blk6: {
+                    // Handle "MapU32Val.method" for maps with enum values (atoms are u32)
+                    const method_name = cb.name["MapU32Val.".len..];
                     const type_args = [_]u32{ @intFromEnum(Zir.Inst.Ref.u32_type), @intFromEnum(Zir.Inst.Ref.u32_type) };
-                    const map_type = self.emitGenericContainerRef("MapOf", &type_args) catch break :blk6 false;
+                    const map_type = self.emitGenericContainerRef("Map", &type_args) catch break :blk6 false;
                     const fn_ref = zir_builder_emit_field_val(self.handle, map_type, method_name.ptr, @intCast(method_name.len));
                     if (fn_ref != error_ref) {
                         const ref = zir_builder_emit_call_ref(self.handle, fn_ref, args.items.ptr, @intCast(args.items.len));
@@ -3100,12 +3094,20 @@ pub const ZirDriver = struct {
                     // route to their renamed structs directly.
                     const runtime_mod = mapToRuntimeModule(mod_name);
 
-                    // @import("zap_runtime")
-                    const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
-                    if (rt_import == error_ref) return error.EmitFailed;
-
-                    // .RuntimeModule
-                    const mod_ref = zir_builder_emit_field_val(self.handle, rt_import, runtime_mod.ptr, @intCast(runtime_mod.len));
+                    // For generic container modules (List, Map), instantiate
+                    // with default type args since the specific type isn't
+                    // encoded in the call name.
+                    const mod_ref = if (std.mem.eql(u8, mod_name, "List"))
+                        self.emitListCellRef(.i64) catch return error.EmitFailed
+                    else if (std.mem.eql(u8, mod_name, "Map"))
+                        self.emitMapCellRef(.atom, .i64) catch return error.EmitFailed
+                    else blk: {
+                        const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                        if (rt_import == error_ref) return error.EmitFailed;
+                        const ref = zir_builder_emit_field_val(self.handle, rt_import, runtime_mod.ptr, @intCast(runtime_mod.len));
+                        if (ref == error_ref) return error.EmitFailed;
+                        break :blk ref;
+                    };
                     if (mod_ref == error_ref) return error.EmitFailed;
 
                     // .function (e.g., .println)
@@ -3456,7 +3458,7 @@ pub const ZirDriver = struct {
                 const key_type_ref = (try self.emitContainerElementTypeRef(mi.key_type)) orelse @intFromEnum(Zir.Inst.Ref.u32_type);
                 const val_type_ref = (try self.emitContainerElementTypeRef(mi.value_type)) orelse @intFromEnum(Zir.Inst.Ref.i64_type);
                 const map_type_args = [_]u32{ key_type_ref, val_type_ref };
-                const map_cell = self.emitGenericContainerRef("MapOf", &map_type_args) catch return error.EmitFailed;
+                const map_cell = self.emitGenericContainerRef("Map", &map_type_args) catch return error.EmitFailed;
 
                 if (mi.entries.len == 0) {
                     // Empty map: MapCell.empty()
