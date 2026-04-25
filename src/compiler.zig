@@ -1131,6 +1131,7 @@ pub fn compileModuleByModule(
             const top_hir = zap.hir.Program{
                 .modules = &.{},
                 .top_functions = combined_hir.top_functions,
+                .impls = combined_hir.impls,
             };
             const mod_ir = compileHirToIr(alloc, ctx, "top", &top_hir, shared_store, options) catch return error.IrFailed;
             for (mod_ir.functions) |func| {

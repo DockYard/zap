@@ -2756,8 +2756,18 @@ pub const ZirDriver = struct {
                     // then by local_name. Bare names like "begin_test" come from
                     // macro-expanded code (use/import) where the module prefix
                     // was stripped during expansion.
-                    const target_func = self.findFunctionByName(resolved_call_name) orelse
+                    var target_func = self.findFunctionByName(resolved_call_name) orelse
                         self.findFunctionByLocalName(resolved_call_name);
+                    // Try stripping module prefix for impl functions compiled
+                    // as root-level functions (e.g., "List__next__1" → "next__1")
+                    if (target_func == null) {
+                        if (std.mem.indexOf(u8, resolved_call_name, "__")) |sep| {
+                            const stripped = resolved_call_name[sep + 2 ..];
+                            if (std.mem.indexOf(u8, resolved_call_name, "next") != null) {
+                            }
+                            target_func = self.findFunctionByName(stripped);
+                        }
+                    }
                     // Debug removed
                     const target_module = if (target_func) |tf| tf.module_name else null;
                     const is_cross_module = blk: {
@@ -2773,6 +2783,30 @@ pub const ZirDriver = struct {
                             cn.name;
                         const ref = try self.emitCrossModuleCall(target_module.?, target_local, args.items);
                         try self.setLocal(cn.dest, ref);
+                    } else if (is_cross_module and target_module == null) {
+                        // Root-level impl function called from a module.
+                        // Convert the module-prefixed name to call_builtin format
+                        // and emit through the standard call_builtin handler.
+                        // "List__next__1" → "List.next" (call_builtin format)
+                        if (std.mem.indexOf(u8, resolved_call_name, "__")) |mod_sep| {
+                            const mod_prefix = resolved_call_name[0..mod_sep];
+                            const rest = resolved_call_name[mod_sep + 2 ..];
+                            const func_base = if (std.mem.lastIndexOf(u8, rest, "__")) |arity_sep|
+                                rest[0..arity_sep]
+                            else
+                                rest;
+                            const builtin_name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ mod_prefix, func_base });
+                            try self.emitInstruction(.{
+                                .call_builtin = .{ .dest = cn.dest, .name = builtin_name, .args = cn.args, .arg_modes = cn.arg_modes },
+                            });
+                            return;
+                        }
+                        // Fallback: emit as regular call
+                        const call_name = if (target_func) |tf| tf.name else resolved_call_name;
+                        const ref = zir_builder_emit_call(self.handle, call_name.ptr, @intCast(call_name.len), args.items.ptr, @intCast(args.items.len));
+                        if (ref != error_ref) {
+                            try self.setLocal(cn.dest, ref);
+                        }
                     } else {
                         const call_name = if (self.current_emit_module != null)
                             if (target_func) |tf| tf.local_name else cn.name

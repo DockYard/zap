@@ -1244,12 +1244,13 @@ pub const Desugarer = struct {
 
         const state_ref = try self.create(ast.Expr, .{ .var_ref = .{ .meta = meta, .name = state_name } });
 
-        // Build :zig.Module.next(__state) bridge call
-        const zig_atom = try self.interner.intern("zig");
-        const zig_ref = try self.create(ast.Expr, .{ .atom_literal = .{ .meta = meta, .value = zig_atom } });
+        // Build Module.next(__state) — calls the Zap impl function
+        // Uses module_ref so the HIR builder resolves it as a named module call.
         const mod_name_id = try self.interner.intern(runtime_module);
+        const mod_parts = try self.allocator.alloc(ast.StringId, 1);
+        mod_parts[0] = mod_name_id;
         const mod_ref = try self.create(ast.Expr, .{
-            .field_access = .{ .meta = meta, .object = zig_ref, .field = mod_name_id },
+            .module_ref = .{ .meta = meta, .name = .{ .parts = mod_parts, .span = .{ .start = 0, .end = 0 } } },
         });
         const next_field = try self.interner.intern("next");
         const next_callee = try self.create(ast.Expr, .{
