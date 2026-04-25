@@ -4331,11 +4331,9 @@ pub const IrBuilder = struct {
                 const top_name = try std.fmt.allocPrint(self.allocator, "{s}__{d}", .{ name, try_arity });
                 if (self.known_function_names.contains(top_name)) return top_name;
             }
-            // 3. Kernel function (auto-imported)
-            {
-                const kernel_name = try std.fmt.allocPrint(self.allocator, "Kernel__{s}__{d}", .{ name, try_arity });
-                if (self.known_function_names.contains(kernel_name)) return kernel_name;
-            }
+            // Kernel functions are resolved via auto-import in the collector —
+            // they appear as regular imports in the module scope, so steps 1-2
+            // handle them. No hardcoded Kernel fallback needed.
         }
         // 4. Keep bare name — Zig compiler will error
         return name;
