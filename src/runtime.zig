@@ -2355,7 +2355,6 @@ inline fn call2(callback: anytype, arg0: anytype, arg1: anytype) @TypeOf(if (@ty
 }
 
 pub const List = ListOf(i64);
-pub const ListType = ?*const List;
 
 // ============================================================
 // Map — Generic HAMT-based persistent map.
@@ -3024,24 +3023,6 @@ pub fn MapOf(comptime K: type, comptime V: type) type {
     }; // end of returned struct
 } // end of MapOf
 
-// Named map type aliases for common key/value combinations
-pub const MapAtomInt = MapOf(u32, i64);                  // %{Atom => i64}
-pub const MapAtomString = MapOf(u32, []const u8);        // %{Atom => String}
-pub const MapAtomBool = MapOf(u32, bool);                // %{Atom => Bool}
-pub const MapAtomFloat = MapOf(u32, f64);                // %{Atom => f64}
-pub const MapStringInt = MapOf([]const u8, i64);         // %{String => i64}
-pub const MapStringString = MapOf([]const u8, []const u8); // %{String => String}
-pub const MapStringFloat = MapOf([]const u8, f64);       // %{String => f64}
-
-// Pointer-type aliases for function return types
-pub const MapAtomIntType = ?*const MapAtomInt;
-pub const MapAtomStringType = ?*const MapAtomString;
-pub const MapAtomBoolType = ?*const MapAtomBool;
-pub const MapAtomFloatType = ?*const MapAtomFloat;
-pub const MapStringIntType = ?*const MapStringInt;
-pub const MapStringStringType = ?*const MapStringString;
-pub const MapStringFloatType = ?*const MapStringFloat;
-
 // ============================================================
 // Generic List factory — produces monomorphic list types
 // for any element type T. Used for string lists, atom lists, etc.
@@ -3406,15 +3387,6 @@ pub fn ListOf(comptime T: type) type {
 }
 
 // Concrete instantiations for known element types
-pub const StringList = ListOf([]const u8);
-pub const StringListType = ?*const StringList;
-pub const BoolList = ListOf(bool);
-pub const BoolListType = ?*const BoolList;
-pub const FloatList = ListOf(f64);
-pub const FloatListType = ?*const FloatList;
-pub const AtomList = ListOf(u64);
-pub const AtomListType = ?*const AtomList;
-
 pub const ListHelpers = struct {
     /// Check if a list is empty (void = empty, anything else = non-empty).
     pub fn isEmpty_legacy(list: anytype) bool {

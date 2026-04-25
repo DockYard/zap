@@ -91,6 +91,7 @@ extern "c" fn zir_builder_emit_optional_type(handle: ?*ZirBuilderHandle, child_t
 
 // Return type overrides
 extern "c" fn zir_builder_set_imported_return_type(handle: ?*ZirBuilderHandle, mod_ptr: [*]const u8, mod_len: u32, field_ptr: [*]const u8, field_len: u32) i32;
+extern "c" fn zir_builder_set_custom_return_type(handle: ?*ZirBuilderHandle, inst_indices_ptr: [*]const u32, inst_indices_len: u32, result_inst: u32) i32;
 
 // Imported type parameters
 extern "c" fn zir_builder_emit_param_imported_type(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32, mod_ptr: [*]const u8, mod_len: u32, field_ptr: [*]const u8, field_len: u32) u32;
@@ -615,20 +616,24 @@ pub const ZirDriver = struct {
         // Complex types: emit runtime import instructions
         return switch (zig_type) {
             .list => {
-                // List type ref for tuple elements — use named alias
-                const type_name = getListTypeName(getListElementType(zig_type));
-                const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
-                if (rt_import == error_ref) return error.EmitFailed;
-                const ref = zir_builder_emit_field_val(self.handle, rt_import, type_name.ptr, @intCast(type_name.len));
+                // Generic container type ref: ListOf(T).empty() → @TypeOf
+                const list_cell = try self.emitListCellRef(getListElementType(zig_type));
+                const empty_fn = zir_builder_emit_field_val(self.handle, list_cell, "empty", 5);
+                if (empty_fn == error_ref) return error.EmitFailed;
+                const empty_val = zir_builder_emit_call_ref(self.handle, empty_fn, &.{}, 0);
+                if (empty_val == error_ref) return error.EmitFailed;
+                const ref = zir_builder_emit_typeof(self.handle, empty_val);
                 if (ref == error_ref) return error.EmitFailed;
                 return ref;
             },
             .map => |mt| {
-                // Map type ref for tuple elements — use named alias
-                const type_name = getMapTypeName(mt.key.*, mt.value.*);
-                const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
-                if (rt_import == error_ref) return error.EmitFailed;
-                const ref = zir_builder_emit_field_val(self.handle, rt_import, type_name.ptr, @intCast(type_name.len));
+                // Generic container type ref: MapOf(K,V).empty() → @TypeOf
+                const map_cell = try self.emitMapCellRef(mt.key.*, mt.value.*);
+                const empty_fn = zir_builder_emit_field_val(self.handle, map_cell, "empty", 5);
+                if (empty_fn == error_ref) return error.EmitFailed;
+                const empty_val = zir_builder_emit_call_ref(self.handle, empty_fn, &.{}, 0);
+                if (empty_val == error_ref) return error.EmitFailed;
+                const ref = zir_builder_emit_typeof(self.handle, empty_val);
                 if (ref == error_ref) return error.EmitFailed;
                 return ref;
             },
@@ -1517,37 +1522,48 @@ pub const ZirDriver = struct {
         return self.emitGenericContainerRef("MapOf", &type_args);
     }
 
-    /// Map (key_type, value_type) to the runtime MapType pointer alias name.
-    /// Used for return type declarations where the fork API requires named types.
-    fn getMapTypeName(key_type: ir.ZigType, value_type: ir.ZigType) []const u8 {
-        if (std.meta.activeTag(key_type) == .atom) {
-            return switch (std.meta.activeTag(value_type)) {
-                .string => "MapAtomStringType",
-                .bool_type => "MapAtomBoolType",
-                .f64 => "MapAtomFloatType",
-                else => "MapAtomIntType",
-            };
-        }
-        if (std.meta.activeTag(key_type) == .string) {
-            return switch (std.meta.activeTag(value_type)) {
-                .string => "MapStringStringType",
-                .f64 => "MapStringFloatType",
-                else => "MapStringIntType",
-            };
-        }
-        return "MapAtomIntType";
-    }
+    /// Set the return type to a generic container type.
+    /// Emits instructions for the container instantiation and records them
+    /// as the return type body via the fork's custom return type API.
+    fn setContainerReturnType(self: *ZirDriver, generic_name: []const u8, type_args: []const u32) BuildError!void {
+        var inst_indices: std.ArrayListUnmanaged(u32) = .empty;
+        defer inst_indices.deinit(self.allocator);
 
-    /// Map a list element ZigType to the runtime ListType alias name.
-    /// Used for return type declarations where the fork API requires named types.
-    fn getListTypeName(element_type: ir.ZigType) []const u8 {
-        return switch (std.meta.activeTag(element_type)) {
-            .string => "StringListType",
-            .bool_type => "BoolListType",
-            .f64 => "FloatListType",
-            .atom => "AtomListType",
-            else => "ListType",
-        };
+        // 1. @import("zap_runtime")
+        const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+        if (rt_import == error_ref) return error.EmitFailed;
+        try inst_indices.append(self.allocator, zir_builder_pop_body_inst(self.handle));
+
+        // 2. field_val for generic function (ListOf or MapOf)
+        const generic_fn = zir_builder_emit_field_val(self.handle, rt_import, generic_name.ptr, @intCast(generic_name.len));
+        if (generic_fn == error_ref) return error.EmitFailed;
+        try inst_indices.append(self.allocator, zir_builder_pop_body_inst(self.handle));
+
+        // 3. call_ref to instantiate: ListOf(T) or MapOf(K, V)
+        const instantiated = zir_builder_emit_call_ref(self.handle, generic_fn, type_args.ptr, @intCast(type_args.len));
+        if (instantiated == error_ref) return error.EmitFailed;
+        try inst_indices.append(self.allocator, zir_builder_pop_body_inst(self.handle));
+
+        // 4. field_val for .empty
+        const empty_fn = zir_builder_emit_field_val(self.handle, instantiated, "empty", 5);
+        if (empty_fn == error_ref) return error.EmitFailed;
+        try inst_indices.append(self.allocator, zir_builder_pop_body_inst(self.handle));
+
+        // 5. call_ref empty() to get a typed null value
+        const empty_val = zir_builder_emit_call_ref(self.handle, empty_fn, &.{}, 0);
+        if (empty_val == error_ref) return error.EmitFailed;
+        try inst_indices.append(self.allocator, zir_builder_pop_body_inst(self.handle));
+
+        // 6. @TypeOf(empty_val) to get the optional pointer type
+        const type_ref = zir_builder_emit_typeof(self.handle, empty_val);
+        if (type_ref == error_ref) return error.EmitFailed;
+        const typeof_inst = zir_builder_pop_body_inst(self.handle);
+        try inst_indices.append(self.allocator, typeof_inst);
+
+        // Set as custom return type
+        if (zir_builder_set_custom_return_type(self.handle, inst_indices.items.ptr, @intCast(inst_indices.items.len), typeof_inst) != 0)
+            return error.EmitFailed;
+        self.current_ret_type = 1;
     }
 
     /// Resolve an encoded type name (from call_builtin encoding) to a ZIR type ref.
@@ -1630,18 +1646,21 @@ pub const ZirDriver = struct {
     fn emitComplexReturnType(self: *ZirDriver, return_type: ir.ZigType) !void {
         switch (return_type) {
             .list => {
-                // List return types still use named aliases until the fork
-                // supports setting return types from generic container refs.
-                const type_name = getListTypeName(getListElementType(return_type));
-                if (zir_builder_set_imported_return_type(self.handle, "zap_runtime", 11, type_name.ptr, @intCast(type_name.len)) != 0)
-                    return error.EmitFailed;
-                self.current_ret_type = 1;
+                const elem_ref = (try self.emitContainerElementTypeRef(getListElementType(return_type))) orelse
+                    zigTypeToTypeRef(getListElementType(return_type)) orelse
+                    @intFromEnum(Zir.Inst.Ref.i64_type);
+                const type_args = [_]u32{elem_ref};
+                try self.setContainerReturnType("ListOf", &type_args);
             },
             .map => |mt| {
-                const type_name = getMapTypeName(mt.key.*, mt.value.*);
-                if (zir_builder_set_imported_return_type(self.handle, "zap_runtime", 11, type_name.ptr, @intCast(type_name.len)) != 0)
-                    return error.EmitFailed;
-                self.current_ret_type = 1;
+                const key_ref = (try self.emitContainerElementTypeRef(mt.key.*)) orelse
+                    zigTypeToTypeRef(mt.key.*) orelse
+                    @intFromEnum(Zir.Inst.Ref.u32_type);
+                const val_ref = (try self.emitContainerElementTypeRef(mt.value.*)) orelse
+                    zigTypeToTypeRef(mt.value.*) orelse
+                    @intFromEnum(Zir.Inst.Ref.i64_type);
+                const type_args = [_]u32{ key_ref, val_ref };
+                try self.setContainerReturnType("MapOf", &type_args);
             },
             .tuple => |elements| {
                 var tuple_type_refs: std.ArrayListUnmanaged(u32) = .empty;
