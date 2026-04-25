@@ -364,4 +364,22 @@ pub struct Kernel {
     :zig.Kernel.sleep(milliseconds)
   }
 
+  @doc = """
+    Converts any value to its string representation.
+
+    Used by string interpolation to convert interpolated expressions
+    to strings. Handles all Zap types: integers, floats, booleans,
+    atoms, strings, and structs.
+
+    ## Examples
+
+        to_string(42)       # => "42"
+        to_string(true)     # => "true"
+        to_string(:hello)   # => "hello"
+    """
+
+  pub fn to_string(value :: any) -> String {
+    :zig.Kernel.to_string(value)
+  }
+
 }

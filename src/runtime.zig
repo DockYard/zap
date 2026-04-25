@@ -860,6 +860,9 @@ pub const Range = struct {
 };
 
 pub const Kernel = struct {
+    /// Generic to_string for string interpolation — delegates to Prelude.to_string.
+    pub const to_string = Prelude.to_string;
+
     pub fn is_integer(value: anytype) bool {
         const info = @typeInfo(@TypeOf(value));
         return info == .int or info == .comptime_int;
@@ -1630,13 +1633,13 @@ pub const Prelude = struct {
         return result;
     }
 
-    /// Split a string by delimiter, returning a StringList (linked list of strings).
-    pub fn split_to_list(s: []const u8, delimiter: []const u8) ?*const StringList {
+    /// Split a string by delimiter, returning a ListOf([]const u8) (linked list of strings).
+    pub fn split_to_list(s: []const u8, delimiter: []const u8) ?*const ListOf([]const u8) {
         if (delimiter.len == 0) {
-            return StringList.cons(s, null);
+            return ListOf([]const u8).cons(s, null);
         }
         // Build the list in reverse, then reverse it
-        var result: ?*const StringList = null;
+        var result: ?*const ListOf([]const u8) = null;
         var pos: usize = 0;
         var seg_start: usize = 0;
         while (pos < s.len) {
@@ -1644,7 +1647,7 @@ pub const Prelude = struct {
                 const seg = s[seg_start..pos];
                 const seg_copy = bumpAlloc(seg.len);
                 if (seg_copy.len > 0) @memcpy(seg_copy, seg);
-                result = StringList.cons(seg_copy, result);
+                result = ListOf([]const u8).cons(seg_copy, result);
                 pos += delimiter.len;
                 seg_start = pos;
             } else {
@@ -1655,12 +1658,12 @@ pub const Prelude = struct {
         const last_seg = s[seg_start..];
         const last_copy = bumpAlloc(last_seg.len);
         if (last_copy.len > 0) @memcpy(last_copy, last_seg);
-        result = StringList.cons(last_copy, result);
-        return StringList.reverse(result);
+        result = ListOf([]const u8).cons(last_copy, result);
+        return ListOf([]const u8).reverse(result);
     }
 
     /// Join a list of strings with a separator.
-    pub fn string_join(list: ?*const StringList, separator: []const u8) []const u8 {
+    pub fn string_join(list: ?*const ListOf([]const u8), separator: []const u8) []const u8 {
         if (list == null) return "";
         // First pass: compute total length
         var total: usize = 0;
