@@ -3938,8 +3938,9 @@ pub const IrBuilder = struct {
                                     const key_name = if (std.meta.activeTag(key_zig) == .atom) "u32" else if (std.meta.activeTag(key_zig) == .string) "str" else "u32";
                                     break :blk try std.fmt.allocPrint(self.allocator, "MapOfNested:{s}:{s}.{s}", .{ key_name, @tagName(std.meta.activeTag(val_zig)), method });
                                 }
-                                const map_name = getMapName(key_zig, val_zig);
-                                break :blk try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ map_name, method });
+                                const key_name = if (std.meta.activeTag(key_zig) == .atom) "u32" else if (std.meta.activeTag(key_zig) == .string) "str" else "u32";
+                                const val_name = zigTypeToEncodedName(val_zig);
+                                break :blk try std.fmt.allocPrint(self.allocator, "MapOf:{s}:{s}.{s}", .{ key_name, val_name, method });
                             }
                             break :blk name;
                         } else name;
@@ -3974,8 +3975,8 @@ pub const IrBuilder = struct {
                                     // Use "ListOfNested:inner_type.method" encoding
                                     break :blk try std.fmt.allocPrint(self.allocator, "ListOfNested:{s}.{s}", .{ @tagName(elem_zig.list.*), method });
                                 }
-                                const cell_name = getListName(elem_zig);
-                                break :blk try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ cell_name, method });
+                                const elem_name = zigTypeToEncodedName(elem_zig);
+                                break :blk try std.fmt.allocPrint(self.allocator, "ListOf:{s}.{s}", .{ elem_name, method });
                             }
                             break :blk map_resolved;
                         } else map_resolved;
@@ -4435,33 +4436,27 @@ fn findParamGetIdInDecision(decision: *const hir_mod.Decision, target_element: u
     }
 }
 
-/// Map a list element ZigType to the runtime List variant name.
-fn getMapName(key_type: ZigType, value_type: ZigType) []const u8 {
-    if (std.meta.activeTag(key_type) == .atom) {
-        return switch (std.meta.activeTag(value_type)) {
-            .string => "MapAtomString",
-            .bool_type => "MapAtomBool",
-            .f64 => "MapAtomFloat",
-            else => "MapAtomInt",
-        };
-    }
-    if (std.meta.activeTag(key_type) == .string) {
-        return switch (std.meta.activeTag(value_type)) {
-            .string => "MapStringString",
-            .f64 => "MapStringFloat",
-            else => "MapStringInt",
-        };
-    }
-    return "MapAtomInt";
-}
-
-fn getListName(element_type: ZigType) []const u8 {
-    return switch (std.meta.activeTag(element_type)) {
-        .string => "StringList",
-        .bool_type => "BoolList",
-        .f64 => "FloatList",
-        .atom => "AtomList",
-        else => "List",
+/// Map a ZigType to a canonical short name for generic container encoding.
+/// Used in call_builtin name encoding: "ListOf:i64.method", "MapOf:u32:str.method".
+fn zigTypeToEncodedName(zig_type: ZigType) []const u8 {
+    return switch (std.meta.activeTag(zig_type)) {
+        .i64 => "i64",
+        .i32 => "i32",
+        .i16 => "i16",
+        .i8 => "i8",
+        .u64 => "u64",
+        .u32 => "u32",
+        .u16 => "u16",
+        .u8 => "u8",
+        .f64 => "f64",
+        .f32 => "f32",
+        .f16 => "f16",
+        .bool_type => "bool",
+        .string => "str",
+        .atom => "u32",
+        .struct_ref => zig_type.struct_ref,
+        .tagged_union => zig_type.tagged_union,
+        else => "i64",
     };
 }
 
