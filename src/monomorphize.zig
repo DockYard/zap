@@ -244,41 +244,32 @@ const MonomorphContext = struct {
         return null;
     }
 
-    /// Infer the target module name from a concrete type.
-    /// list(T) → "List", map(K,V) → "Map", struct → struct name
-    /// Map a concrete type to the module name that implements protocols
-    /// for that type. Every type variant must have an explicit mapping —
-    /// no silent fallthrough to null.
-    /// Map a concrete type to the module name that implements protocols
-    /// for that type. Uses the type system's variant names to derive
-    /// the implementing module. New types (structs, unions) use their
-    /// declared name directly.
-    fn inferTargetStructName(self: *const MonomorphContext, type_id: TypeId) ?[]const u8 {
-        if (type_id >= self.store.types.items.len) return null;
+    /// Check if a concrete type matches an impl's target module name.
+    /// For user-defined types (structs, unions), matches by declared name.
+    /// For built-in types, matches by the language-defined module name.
+    fn typeMatchesImplTarget(self: *const MonomorphContext, type_id: TypeId, target_module: []const u8) bool {
+        if (type_id >= self.store.types.items.len) return false;
         const typ = self.store.types.items[type_id];
         return switch (typ) {
-            .list => "List",
-            .map => "Map",
-            .struct_type => |s| self.interner.get(s.name),
-            .tagged_union => |tu| self.interner.get(tu.name),
-            .union_type => null, // anonymous unions don't have module names
-            .string_type => "String",
-            .int => "Integer",
-            .float => "Float",
-            .bool_type => "Bool",
-            .atom_type => "Atom",
-            .tuple => "Tuple",
-            .function => "Function",
-            .nil_type => null,
-            .never => null,
-            .type_var, .applied, .opaque_type, .protocol_constraint,
-            .unknown, .error_type,
-            => null,
+            .struct_type => |s| std.mem.eql(u8, self.interner.get(s.name), target_module),
+            .tagged_union => |tu| std.mem.eql(u8, self.interner.get(tu.name), target_module),
+            .list => std.mem.eql(u8, target_module, "List"),
+            .map => std.mem.eql(u8, target_module, "Map"),
+            .string_type => std.mem.eql(u8, target_module, "String"),
+            .int => std.mem.eql(u8, target_module, "Integer"),
+            .float => std.mem.eql(u8, target_module, "Float"),
+            .bool_type => std.mem.eql(u8, target_module, "Bool"),
+            .atom_type => std.mem.eql(u8, target_module, "Atom"),
+            .tuple => std.mem.eql(u8, target_module, "Tuple"),
+            .function => std.mem.eql(u8, target_module, "Function"),
+            else => false,
         };
     }
 
     /// Resolve a protocol dispatch: given a protocol name, function name,
     /// and concrete argument type, find the impl's function group ID.
+    /// Iterates all impls and matches the concrete type directly against
+    /// each impl's target module, without an intermediate name lookup.
     fn resolveProtocolDispatch(
         self: *const MonomorphContext,
         protocol_name: ast.StringId,
@@ -286,15 +277,12 @@ const MonomorphContext = struct {
         concrete_type: TypeId,
         arity: u32,
     ) ?u32 {
-        const target_struct_name = self.inferTargetStructName(concrete_type) orelse return null;
-
         for (self.program.impls) |impl_info| {
             if (impl_info.protocol_name != protocol_name) continue;
-            if (!std.mem.eql(u8, self.interner.get(impl_info.target_module), target_struct_name)) continue;
+            if (!self.typeMatchesImplTarget(concrete_type, self.interner.get(impl_info.target_module))) continue;
 
             // Found the impl. Search its function groups for the matching function.
             for (impl_info.function_group_ids) |gid| {
-                // Search top-level functions for this group ID
                 for (self.program.top_functions) |*group| {
                     if (group.id == gid and
                         std.mem.eql(u8, self.interner.get(group.name), function_name) and
