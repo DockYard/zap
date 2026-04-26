@@ -802,19 +802,30 @@ fn mergeAndFinalizeWithIo(
     return .{ .ir_program = ir_program.*, .analysis_context = pipeline_result.context };
 }
 
-/// Compile a single module to HIR only (no monomorphization, no IR).
-/// Used by whole-program monomorphization pipeline.
-fn compileSingleModuleHir(
+// ============================================================
+// Per-module pipeline phases
+//
+// The post-collection pipeline for a single module flows as
+// `attribute substitution → type check → HIR build`. The two
+// public entry points (`compileSingleModuleHir` and
+// `compileSingleModuleIr`) and the per-module task share these
+// phases verbatim — each phase is extracted into a helper so the
+// entry points are simple compositions.
+// ============================================================
+
+const HirBuildResult = struct {
+    program: zap.hir.Program,
+    next_group_id: u32,
+};
+
+/// Run attribute substitution on a module's AST. Errors collected from
+/// the substitutor are routed through the context's diagnostic engine
+/// before the function returns.
+fn runAttributeSubstitution(
     alloc: std.mem.Allocator,
     ctx: *CompilationContext,
-    mod_name: []const u8,
     mod_program: *const ast.Program,
-    shared_store: *zap.types.TypeStore,
-    group_id_offset: u32,
-    options: CompileOptions,
-) CompileError!ModuleHirResult {
-    const type_severity: zap.Severity = if (options.strict_types) .@"error" else .warning;
-
+) CompileError!ast.Program {
     var subst_errors: std.ArrayListUnmanaged(zap.attr_substitute.SubstitutionError) = .empty;
     const desugared = zap.attr_substitute.substituteAttributes(
         alloc,
@@ -834,13 +845,31 @@ fn compileSingleModuleHir(
         emitContextDiagnostics(ctx, alloc);
         return error.DesugarFailed;
     }
+    return desugared;
+}
 
-    var type_checker = zap.types.TypeChecker.initWithSharedStore(alloc, shared_store, &ctx.interner, &ctx.collector.graph);
-    defer type_checker.deinit();
+/// Run the type checker against a desugared module. The TypeStore is
+/// either shared across modules (`shared_store != null`, used by the
+/// whole-program monomorphization pipeline) or owned by the type
+/// checker. The caller must `deinit` the returned TypeChecker.
+fn runTypeCheck(
+    alloc: std.mem.Allocator,
+    ctx: *CompilationContext,
+    desugared: *const ast.Program,
+    shared_store: ?*zap.types.TypeStore,
+    options: CompileOptions,
+) CompileError!zap.types.TypeChecker {
+    const type_severity: zap.Severity = if (options.strict_types) .@"error" else .warning;
 
-    shared_store.inferred_signatures.clearRetainingCapacity();
+    var type_checker = if (shared_store) |store| blk: {
+        // Per-module typecheck reuses the shared store; clear any
+        // call-site-specific inferred signatures from the previous module.
+        store.inferred_signatures.clearRetainingCapacity();
+        break :blk zap.types.TypeChecker.initWithSharedStore(alloc, store, &ctx.interner, &ctx.collector.graph);
+    } else zap.types.TypeChecker.init(alloc, &ctx.interner, &ctx.collector.graph);
+    errdefer type_checker.deinit();
 
-    type_checker.checkProgram(&desugared) catch {};
+    type_checker.checkProgram(desugared) catch {};
     for (type_checker.errors.items) |type_err| {
         ctx.diag_engine.reportDiagnostic(.{
             .severity = type_err.severity orelse type_severity,
@@ -853,13 +882,25 @@ fn compileSingleModuleHir(
     }
     if (ctx.diag_engine.hasErrors()) {
         emitContextDiagnostics(ctx, alloc);
+        type_checker.deinit();
         return error.TypeCheckFailed;
     }
+    return type_checker;
+}
 
-    var hir_builder = zap.hir.HirBuilder.init(alloc, &ctx.interner, &ctx.collector.graph, shared_store);
-    // Offset group IDs so they're globally unique across modules
+/// Run the HIR builder against a desugared module. `group_id_offset`
+/// lets the whole-program pipeline assign globally-unique function
+/// group IDs across modules; pass 0 for a per-module run.
+fn runHirBuild(
+    alloc: std.mem.Allocator,
+    ctx: *CompilationContext,
+    desugared: *const ast.Program,
+    type_store: *zap.types.TypeStore,
+    group_id_offset: u32,
+) CompileError!HirBuildResult {
+    var hir_builder = zap.hir.HirBuilder.init(alloc, &ctx.interner, &ctx.collector.graph, type_store);
     hir_builder.next_group_id = group_id_offset;
-    const hir_program = hir_builder.buildProgram(&desugared) catch {
+    const hir_program = hir_builder.buildProgram(desugared) catch {
         for (hir_builder.errors.items) |hir_err| {
             ctx.diag_engine.err(hir_err.message, hir_err.span) catch {};
         }
@@ -873,11 +914,29 @@ fn compileSingleModuleHir(
         emitContextDiagnostics(ctx, alloc);
         return error.HirFailed;
     }
+    return .{ .program = hir_program, .next_group_id = hir_builder.next_group_id };
+}
 
+/// Compile a single module to HIR only (no monomorphization, no IR).
+/// Used by whole-program monomorphization pipeline.
+fn compileSingleModuleHir(
+    alloc: std.mem.Allocator,
+    ctx: *CompilationContext,
+    mod_name: []const u8,
+    mod_program: *const ast.Program,
+    shared_store: *zap.types.TypeStore,
+    group_id_offset: u32,
+    options: CompileOptions,
+) CompileError!ModuleHirResult {
+    const desugared = try runAttributeSubstitution(alloc, ctx, mod_program);
+    var type_checker = try runTypeCheck(alloc, ctx, &desugared, shared_store, options);
+    defer type_checker.deinit();
+
+    const hir_result = try runHirBuild(alloc, ctx, &desugared, shared_store, group_id_offset);
     return .{
         .mod_name = mod_name,
-        .hir_program = hir_program,
-        .next_group_id = hir_builder.next_group_id,
+        .hir_program = hir_result.program,
+        .next_group_id = hir_result.next_group_id,
     };
 }
 
@@ -922,107 +981,34 @@ fn compileSingleModuleIr(
     mod_program: *const ast.Program,
     options: CompileOptions,
 ) CompileError!ir.Program {
-    const type_severity: zap.Severity = if (options.strict_types) .@"error" else .warning;
-
     // Macro expansion and desugaring were already run on the merged program
     // in collectAllFromUnits. The mod_program AST is fully expanded — no
     // if_expr, no pipe operators, no unexpanded macros. Proceed directly
-    // to type checking.
+    // through the per-module pipeline.
 
-    // Attribute substitution still runs per-module since @computed values
-    // are evaluated per-module via CTFE.
-    var subst_errors: std.ArrayListUnmanaged(zap.attr_substitute.SubstitutionError) = .empty;
-    const desugared = zap.attr_substitute.substituteAttributes(
-        alloc,
-        mod_program,
-        &ctx.collector.graph,
-        &ctx.interner,
-        &subst_errors,
-    ) catch {
-        ctx.diag_engine.err("Error during attribute substitution", .{ .start = 0, .end = 0 }) catch {};
-        emitContextDiagnostics(ctx, alloc);
-        return error.DesugarFailed;
-    };
-    for (subst_errors.items) |subst_err| {
-        ctx.diag_engine.err(subst_err.message, subst_err.span) catch {};
-    }
-    if (ctx.diag_engine.hasErrors()) {
-        emitContextDiagnostics(ctx, alloc);
-        return error.DesugarFailed;
-    }
+    const desugared = try runAttributeSubstitution(alloc, ctx, mod_program);
 
-    var type_checker = zap.types.TypeChecker.init(alloc, &ctx.interner, &ctx.collector.graph);
+    // Per-module typecheck owns its TypeStore (no `shared_store`).
+    // checkUnusedBindings is intentionally skipped — the type checker
+    // shares the scope graph across modules but only visits the current
+    // module's bindings, so checking all bindings here would emit false
+    // "unused" warnings for bindings declared elsewhere.
+    var type_checker = try runTypeCheck(alloc, ctx, &desugared, null, options);
     defer type_checker.deinit();
 
-    type_checker.checkProgram(&desugared) catch {};
-    // Skip checkUnusedBindings — the type checker has a shared scope graph
-    // but only visits this module's bindings. Checking all bindings here
-    // would report false "unused" warnings for bindings in other modules.
-    // Unused binding warnings are emitted during diagnostics instead.
-    for (type_checker.errors.items) |type_err| {
-        ctx.diag_engine.reportDiagnostic(.{
-            .severity = type_err.severity orelse type_severity,
-            .message = type_err.message,
-            .span = type_err.span,
-            .label = type_err.label,
-            .help = type_err.help,
-            .secondary_spans = type_err.secondary_spans,
-        }) catch {};
-    }
-    if (ctx.diag_engine.hasErrors()) {
-        emitContextDiagnostics(ctx, alloc);
-        return error.TypeCheckFailed;
-    }
-
-    var hir_builder = zap.hir.HirBuilder.init(alloc, &ctx.interner, &ctx.collector.graph, type_checker.store);
-    defer hir_builder.deinit();
-    const hir_program = hir_builder.buildProgram(&desugared) catch {
-        for (hir_builder.errors.items) |hir_err| {
-            ctx.diag_engine.err(hir_err.message, hir_err.span) catch {};
-        }
-        emitContextDiagnostics(ctx, alloc);
-        return error.HirFailed;
-    };
-    for (hir_builder.errors.items) |hir_err| {
-        ctx.diag_engine.err(hir_err.message, hir_err.span) catch {};
-    }
-    if (ctx.diag_engine.hasErrors()) {
-        emitContextDiagnostics(ctx, alloc);
-        return error.HirFailed;
-    }
+    const hir_result = try runHirBuild(alloc, ctx, &desugared, type_checker.store, 0);
+    const hir_program = hir_result.program;
 
     // Monomorphization pass
-    var mono_next_group_id2 = hir_builder.next_group_id;
-    const mono_result2 = zap.monomorphize.monomorphize(alloc, &hir_program, type_checker.store, &mono_next_group_id2, &ctx.interner) catch {
+    var mono_next_group_id = hir_result.next_group_id;
+    const mono_result = zap.monomorphize.monomorphize(alloc, &hir_program, type_checker.store, &mono_next_group_id, &ctx.interner) catch {
         ctx.diag_engine.err("Error during monomorphization", .{ .start = 0, .end = 0 }) catch {};
         emitContextDiagnostics(ctx, alloc);
         return error.HirFailed;
     };
-    const mono_program2 = mono_result2.program;
+    const mono_program = mono_result.program;
 
-    var ir_builder = zap.ir.IrBuilder.init(alloc, &ctx.interner);
-    ir_builder.type_store = type_checker.store;
-    defer ir_builder.deinit();
-    const mod_ir = ir_builder.buildProgram(&mono_program2) catch {
-        ctx.diag_engine.err("Error during IR lowering", .{ .start = 0, .end = 0 }) catch {};
-        emitContextDiagnostics(ctx, alloc);
-        return error.IrFailed;
-    };
-
-    const ctfe_result = zap.ctfe.evaluateComputedAttributesForModule(
-        alloc,
-        &mod_ir,
-        &ctx.collector.graph,
-        &ctx.interner,
-        mod_name,
-        options.cache_dir,
-        ctfeCompileOptionsHash(options),
-    ) catch null;
-    if (ctfe_result) |cr| {
-        if (cr.errors.len > 0) zap.ctfe.emitCtfeErrors(alloc, cr.errors);
-    }
-
-    return mod_ir;
+    return try compileHirToIr(alloc, ctx, mod_name, &mono_program, type_checker.store, options);
 }
 
 /// True per-module compilation: process each module independently through
