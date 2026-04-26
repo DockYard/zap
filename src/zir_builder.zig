@@ -155,6 +155,18 @@ const error_ref: u32 = 0xFFFFFFFF;
 
 const Zir = std.zig.Zir;
 
+/// Map an IR binary op to its primitive ZIR `Inst.Tag`. Reached only on
+/// the fallback path when no `Arithmetic`/`Comparator` impl matches the
+/// operand type — protocol dispatch (HIR `findImplFor`) lowers
+/// `Float + Float`, `Integer + Integer`, etc. to direct impl calls long
+/// before this function runs. The integer-shaped tags (`addwrap`,
+/// `subwrap`, `mulwrap`, `div_trunc`, `mod_rem`) are correct for that
+/// fallback because the only operand types that miss protocol dispatch
+/// are untyped/UNKNOWN values that lower as i64 in ZIR. Comparison and
+/// equality tags work for both ints and floats.
+///
+/// Returns null for operators handled outside of `emit_binop` —
+/// short-circuit booleans, string compare, concat, and membership tests.
 fn mapBinopTag(op: ir.BinaryOp.Op) ?u8 {
     return switch (op) {
         .add => @intFromEnum(Zir.Inst.Tag.addwrap),
@@ -168,12 +180,10 @@ fn mapBinopTag(op: ir.BinaryOp.Op) ?u8 {
         .gt => @intFromEnum(Zir.Inst.Tag.cmp_gt),
         .lte => @intFromEnum(Zir.Inst.Tag.cmp_lte),
         .gte => @intFromEnum(Zir.Inst.Tag.cmp_gte),
-        .bool_and => null, // handled via bool_br_and (short-circuit)
-        .bool_or => null, // handled via bool_br_or (short-circuit)
-        .string_eq, .string_neq => null, // handled specially via std.mem.eql
-        .concat => null, // handled specially via runtime call
-        .in_list => null, // handled specially via runtime call
-        .in_range => null, // handled specially via runtime call
+        .bool_and, .bool_or => null,
+        .string_eq, .string_neq => null,
+        .concat => null,
+        .in_list, .in_range => null,
     };
 }
 

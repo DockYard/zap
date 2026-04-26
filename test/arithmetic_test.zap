@@ -39,6 +39,26 @@ pub struct Test.ArithmeticTest {
     }
   }
 
+  describe("float arithmetic") {
+    test("float addition") {
+      assert(1.5 + 2.5 == 4.0)
+    }
+
+    test("float subtraction") {
+      assert(5.0 - 0.25 == 4.75)
+    }
+
+    test("float multiplication") {
+      assert(2.0 * 1.5 == 3.0)
+    }
+
+    test("float comparison") {
+      assert(1.5 < 2.0)
+      assert(2.0 > 1.5)
+      reject(2.0 < 1.0)
+    }
+  }
+
   fn add(a :: i64, b :: i64) -> i64 {
     a + b
   }
