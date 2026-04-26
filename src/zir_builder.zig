@@ -2683,12 +2683,9 @@ pub const ZirDriver = struct {
                     if (target_func == null) {
                         if (std.mem.indexOf(u8, resolved_call_name, "__")) |sep| {
                             const stripped = resolved_call_name[sep + 2 ..];
-                            if (std.mem.indexOf(u8, resolved_call_name, "next") != null) {
-                            }
                             target_func = self.findFunctionByName(stripped);
                         }
                     }
-                    // Debug removed
                     const target_module = if (target_func) |tf| tf.module_name else null;
                     const is_cross_module = blk: {
                         if (target_module == null and self.current_emit_module == null) break :blk false;
