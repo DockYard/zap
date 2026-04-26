@@ -97,7 +97,7 @@ pub fn resetAllocator() void {
 //   - Closure      — fat pointer for function values
 //   - ZapAllocator — allocator plumbing
 //   - List(T)      — persistent list
-//   - ZapMap(K,V)  — persistent map (HAMT-based)
+//   - Map(K, V)    — persistent map (HAMT-based)
 //   - String       — owned string with length
 // ============================================================
 
@@ -614,97 +614,6 @@ test "ArcRuntime.resetAny releases shared value and yields null token" {
     const token = ArcRuntime.resetAny(i64, allocator, ptr);
     try testing.expect(token == null);
     ArcRuntime.releaseAny(i64, allocator, ptr);
-}
-
-// ============================================================
-// ZapMap — Hash Array Mapped Trie (HAMT) for persistent maps
-// (spec §30.3, §31.7)
-//
-// Simplified initial implementation using a sorted array.
-// Full HAMT can be added later for performance.
-// ============================================================
-
-pub fn ZapMap(comptime K: type, comptime V: type) type {
-    return struct {
-        const Self = @This();
-
-        const Entry = struct {
-            key: K,
-            value: V,
-        };
-
-        entries: []const Entry,
-        allocator: std.mem.Allocator,
-
-        pub fn init(allocator: std.mem.Allocator) Self {
-            return .{
-                .entries = &.{},
-                .allocator = allocator,
-            };
-        }
-
-        pub fn size(self: Self) usize {
-            return self.entries.len;
-        }
-
-        pub fn get(self: Self, key: K) ?V {
-            for (self.entries) |entry| {
-                if (keysEqual(entry.key, key)) return entry.value;
-            }
-            return null;
-        }
-
-        pub fn put(self: Self, key: K, value: V) !Self {
-            // Check if key exists — update in place (immutably)
-            for (self.entries, 0..) |entry, i| {
-                if (keysEqual(entry.key, key)) {
-                    const new_entries = try self.allocator.alloc(Entry, self.entries.len);
-                    @memcpy(new_entries, self.entries);
-                    new_entries[i] = .{ .key = key, .value = value };
-                    return .{ .entries = new_entries, .allocator = self.allocator };
-                }
-            }
-
-            // Key doesn't exist — append
-            const new_entries = try self.allocator.alloc(Entry, self.entries.len + 1);
-            @memcpy(new_entries[0..self.entries.len], self.entries);
-            new_entries[self.entries.len] = .{ .key = key, .value = value };
-            return .{ .entries = new_entries, .allocator = self.allocator };
-        }
-
-        pub fn delete(self: Self, key: K) !Self {
-            for (self.entries, 0..) |entry, i| {
-                if (keysEqual(entry.key, key)) {
-                    const new_entries = try self.allocator.alloc(Entry, self.entries.len - 1);
-                    @memcpy(new_entries[0..i], self.entries[0..i]);
-                    @memcpy(new_entries[i..], self.entries[i + 1 ..]);
-                    return .{ .entries = new_entries, .allocator = self.allocator };
-                }
-            }
-            return self;
-        }
-
-        pub fn keys(self: Self, allocator: std.mem.Allocator) ![]K {
-            const result = try allocator.alloc(K, self.entries.len);
-            for (self.entries, 0..) |entry, i| {
-                result[i] = entry.key;
-            }
-            return result;
-        }
-
-        pub fn values(self: Self, allocator: std.mem.Allocator) ![]V {
-            const result = try allocator.alloc(V, self.entries.len);
-            for (self.entries, 0..) |entry, i| {
-                result[i] = entry.value;
-            }
-            return result;
-        }
-
-        fn keysEqual(a: K, b: K) bool {
-            if (K == []const u8) return std.mem.eql(u8, a, b);
-            return a == b;
-        }
-    };
 }
 
 // ============================================================
@@ -2395,10 +2304,6 @@ pub const BinaryHelpers = struct {
 };
 
 // ============================================================
-// ListHelpers — List cons (prepend) for for-comprehension results
-// ============================================================
-
-// ============================================================
 // List — Concrete cons-cell for pointer-based lists.
 //
 // Lists use nullable pointers: null = empty, non-null = cons cell.
@@ -3082,33 +2987,6 @@ pub fn Map(comptime K: type, comptime V: type) type {
         return acc;
     }
 
-    /// Reduce with halt/cont control flow for the Enumerable protocol.
-    /// The callback takes (accumulator, value) and returns a tuple where
-    /// field "0" is :cont(5) or :halt(6), field "1" is the new accumulator.
-    pub fn reduceHaltCont(map: ?*const Self, initial: anytype, callback: anytype) struct { u64, i64 } {
-        const ResultType = struct { u64, i64 };
-        if (map == null) return ResultType{ ATOM_CONT, initial };
-        const m = map.?;
-        var acc: i64 = initial;
-
-        if (m.repr_tag == 0) {
-            for (0..m.flat_count) |i| {
-                const result = callback(acc, m.flat_entries[i].value);
-                if (result.@"0" == ATOM_HALT) return ResultType{ result.@"0", result.@"1" };
-                acc = result.@"1";
-            }
-        } else if (m.trie_root) |root| {
-            var collected: std.ArrayListUnmanaged(MapEntry) = .empty;
-            hamtCollect(root, &collected);
-            for (collected.items) |entry| {
-                const result = callback(acc, entry.value);
-                if (result.@"0" == ATOM_HALT) return ResultType{ result.@"0", result.@"1" };
-                acc = result.@"1";
-            }
-        }
-        return ResultType{ ATOM_CONT, acc };
-    }
-
     /// Reduce for Enumerable: folds map values with a (acc, value) -> acc callback.
     /// Only passes the value (not the key) to match the Enumerable protocol.
     pub fn enumReduceValues(map: ?*const Self, initial: i64, callback: anytype) i64 {
@@ -3304,16 +3182,6 @@ pub fn List(comptime T: type) type {
             return reverse(result);
         }
 
-        pub fn reduceFn(list: ?*const Self, initial: anytype, callback: anytype) @TypeOf(initial) {
-            var current = list;
-            var acc = initial;
-            while (current) |cell| {
-                acc = call2(callback, acc, cell.head);
-                current = cell.tail;
-            }
-            return acc;
-        }
-
         pub fn rejectFn(list: ?*const Self, predicate: anytype) ?*const Self {
             var current = list;
             var result: ?*const Self = null;
@@ -3334,25 +3202,6 @@ pub fn List(comptime T: type) type {
                 current = cell.tail;
             }
             return acc;
-        }
-
-        pub fn reduceHaltCont(list: ?*const Self, initial: anytype, callback: anytype) @TypeOf(callback(initial, @as(T, std.mem.zeroes(T)))) {
-            const ResultType = @TypeOf(callback(initial, @as(T, std.mem.zeroes(T))));
-            const AccType = @TypeOf(@field(@as(ResultType, undefined), "1"));
-            var current = list;
-            var acc: AccType = initial;
-            while (current) |cell| {
-                const result = call2(callback, acc, cell.head);
-                if (result.@"0" == ATOM_HALT) {
-                    return result;
-                }
-                acc = result.@"1";
-                current = cell.tail;
-            }
-            var done_result: ResultType = undefined;
-            done_result.@"0" = ATOM_CONT;
-            done_result.@"1" = acc;
-            return done_result;
         }
 
         pub fn eachFn(list: ?*const Self, callback: anytype) ?*const Self {
@@ -3492,20 +3341,6 @@ pub fn List(comptime T: type) type {
         }
     };
 }
-
-// Concrete instantiations for known element types
-pub const ListHelpers = struct {
-    /// Check if a list is empty (void = empty, anything else = non-empty).
-    pub fn isEmpty_legacy(list: anytype) bool {
-        return @sizeOf(@TypeOf(list)) == 0;
-    }
-
-    /// Get the length of a cons-cell list (legacy anonymous struct version).
-    pub fn length_legacy(list: anytype) i64 {
-        if (@sizeOf(@TypeOf(list)) == 0) return 0;
-        return 1 + length_legacy(list.tail);
-    }
-};
 
 // ============================================================
 // MapHelpers — Operations on map values (anonymous structs of {key, value} entries)
@@ -3730,51 +3565,6 @@ test "List fromSlice and toSlice" {
     try std.testing.expectEqual(@as(i64, 10), slice[0]);
     try std.testing.expectEqual(@as(i64, 20), slice[1]);
     try std.testing.expectEqual(@as(i64, 30), slice[2]);
-}
-
-test "ZapMap put and get" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    var map = ZapMap(i64, i64).init(alloc);
-    map = try map.put(1, 100);
-    map = try map.put(2, 200);
-
-    try std.testing.expectEqual(@as(usize, 2), map.size());
-    try std.testing.expectEqual(@as(i64, 100), map.get(1).?);
-    try std.testing.expectEqual(@as(i64, 200), map.get(2).?);
-    try std.testing.expect(map.get(3) == null);
-}
-
-test "ZapMap update existing key" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    var map = ZapMap(i64, i64).init(alloc);
-    map = try map.put(1, 100);
-    const map2 = try map.put(1, 999);
-
-    try std.testing.expectEqual(@as(usize, 1), map2.size());
-    try std.testing.expectEqual(@as(i64, 999), map2.get(1).?);
-    // Original is unchanged
-    try std.testing.expectEqual(@as(i64, 100), map.get(1).?);
-}
-
-test "ZapMap delete" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    var map = ZapMap(i64, i64).init(alloc);
-    map = try map.put(1, 100);
-    map = try map.put(2, 200);
-    const map2 = try map.delete(1);
-
-    try std.testing.expectEqual(@as(usize, 1), map2.size());
-    try std.testing.expect(map2.get(1) == null);
-    try std.testing.expectEqual(@as(i64, 200), map2.get(2).?);
 }
 
 test "String operations" {

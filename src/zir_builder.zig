@@ -3598,9 +3598,7 @@ pub const ZirDriver = struct {
                 try self.setLocal(ig.dest, ref);
             },
             .list_len_check => |llc| {
-                // Cons cell length check via runtime helper.
-                // ListHelpers.length(list) == expected_len
-                // List-based length check: List.length(list) == expected_len
+                // Cons-cell length check: `List(T).length(list) == expected_len`.
                 const list_ref = self.refForLocal(llc.scrutinee) catch return;
                 const list_cell = try self.emitListCellRef(llc.element_type);
                 const len_fn = zir_builder_emit_field_val(self.handle, list_cell, "length", 6);
