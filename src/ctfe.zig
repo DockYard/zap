@@ -4436,15 +4436,7 @@ fn structNameToString(
     name: ast.StructName,
     interner: *const ast.StringInterner,
 ) ![]const u8 {
-    if (name.parts.len == 1) {
-        return alloc.dupe(u8, interner.get(name.parts[0]));
-    }
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
-    for (name.parts, 0..) |part, i| {
-        if (i > 0) try buf.append(alloc, '.');
-        try buf.appendSlice(alloc, interner.get(part));
-    }
-    return buf.toOwnedSlice(alloc);
+    return name.toDottedString(alloc, interner);
 }
 
 /// Find the enclosing module name for a scope, walking up the scope tree.

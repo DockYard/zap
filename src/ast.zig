@@ -114,6 +114,27 @@ pub const TopItem = union(enum) {
 pub const StructName = struct {
     parts: []const StringId,
     span: SourceSpan,
+
+    /// Render this struct name in its canonical dotted form
+    /// (`Foo.Bar.Baz`). The dotted form is the user-facing
+    /// representation used wherever modules are addressed
+    /// textually — diagnostics, the `module_programs` registry,
+    /// and the runtime bridge. Single-segment names return the
+    /// interned string directly without copying; multi-segment
+    /// names allocate a fresh slice owned by `alloc`.
+    pub fn toDottedString(
+        self: StructName,
+        alloc: std.mem.Allocator,
+        interner: *const StringInterner,
+    ) ![]const u8 {
+        if (self.parts.len == 1) return alloc.dupe(u8, interner.get(self.parts[0]));
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        for (self.parts, 0..) |part, i| {
+            if (i > 0) try buf.append(alloc, '.');
+            try buf.appendSlice(alloc, interner.get(part));
+        }
+        return buf.toOwnedSlice(alloc);
+    }
 };
 
 // ============================================================
