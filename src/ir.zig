@@ -4565,10 +4565,6 @@ fn typeIdToZigTypeWithStore(type_id: types_mod.TypeId, type_store: ?*const types
     };
 }
 
-fn typeIdToZigTypeStr(type_id: types_mod.TypeId) []const u8 {
-    return typeIdToZigTypeStrWithStore(type_id, null);
-}
-
 /// Convert a ZigType to its Zig source string representation.
 /// Used by typeIdToZigTypeStrWithStore to avoid duplicating the TypeStore lookup.
 fn zigTypeToStr(zig_type: ZigType) []const u8 {
