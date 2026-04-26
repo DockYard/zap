@@ -1014,6 +1014,95 @@ pub const TypeParenExpr = struct {
 };
 
 // ============================================================
+// AST exhaustiveness tripwires
+// ============================================================
+//
+// Adding a new variant to one of the central AST unions
+// (`Expr`, `Pattern`, `TypeExpr`, `Stmt`, `StructItem`, `TopItem`)
+// requires updating every visitor that walks the tree. The
+// compiler already catches forgotten cases in switches that omit
+// the `else =>` arm — `Expr.getMeta`, `Pattern.getMeta`, and the
+// `types.TypeResolver.resolve` switch in `types.zig` are
+// intentionally exhaustive for that reason. Visitors that DO have
+// `else =>` (most of `desugar.zig`, `macro.zig`, `attr_substitute.zig`,
+// the IR builder's expression walker, etc.) silently swallow new
+// variants, so the tests below act as tripwires: when a variant is
+// added or removed, the count assertion fires and the failure
+// message points at every visitor that needs an update.
+//
+// Update procedure when one of these tests fails:
+//   1. Bump the corresponding `expected_*_variants` constant to
+//      the new count.
+//   2. Walk the visitor checklist in the failing test's comment
+//      and confirm each one handles the new variant correctly.
+//   3. Add or update a test in the appropriate test file (see the
+//      checklist) that exercises the new variant end-to-end.
+//
+// The checklists are NOT exhaustive — they cover the high-traffic
+// visitors. Adding a variant always warrants a `git grep` for the
+// nearby variants to find any pass-specific handlers.
+
+const expected_expr_variants: usize = 37;
+const expected_pattern_variants: usize = 11;
+const expected_type_expr_variants: usize = 11;
+const expected_top_item_variants: usize = 14;
+
+test "ast.Expr variant count is locked" {
+    // When this test fails, you've added or removed an Expr
+    // variant. Visitors to verify before bumping the count:
+    //   - src/desugar.zig:desugarExpr  (transformations during desugar)
+    //   - src/macro.zig:cloneExpr      (macro AST clone for hygiene)
+    //   - src/attr_substitute.zig      (@-attribute substitution clone)
+    //   - src/types.zig:inferExpr      (expression type inference)
+    //   - src/hir.zig:buildExpr        (AST → HIR lowering)
+    //   - src/collector.zig:collectFromExpr (scope/binding discovery)
+    //   - src/ast_data.zig             (CTFE serialization, if applicable)
+    //   - Expr.getMeta in this file (exhaustive — compiler catches misses)
+    try std.testing.expectEqual(
+        expected_expr_variants,
+        std.meta.fields(Expr).len,
+    );
+}
+
+test "ast.Pattern variant count is locked" {
+    // When this test fails, walk these visitors:
+    //   - src/desugar.zig pattern paths
+    //   - src/macro.zig:clonePattern
+    //   - src/types.zig pattern type inference
+    //   - src/hir.zig:compilePattern
+    //   - src/collector.zig pattern bindings
+    //   - Pattern.getMeta in this file (exhaustive)
+    try std.testing.expectEqual(
+        expected_pattern_variants,
+        std.meta.fields(Pattern).len,
+    );
+}
+
+test "ast.TypeExpr variant count is locked" {
+    // When this test fails, walk these visitors:
+    //   - src/types.zig:TypeResolver.resolve (exhaustive — compiler catches misses)
+    //   - src/macro.zig:cloneTypeExpr
+    //   - src/attr_substitute.zig type-expression clone
+    //   - TypeExpr.getMeta in this file (exhaustive)
+    try std.testing.expectEqual(
+        expected_type_expr_variants,
+        std.meta.fields(TypeExpr).len,
+    );
+}
+
+test "ast.TopItem variant count is locked" {
+    // When this test fails, walk these visitors:
+    //   - src/collector.zig top-item collection
+    //   - src/desugar.zig top-item desugaring
+    //   - src/macro.zig top-item expansion
+    //   - src/compiler.zig:buildModulePrograms (per-module routing)
+    try std.testing.expectEqual(
+        expected_top_item_variants,
+        std.meta.fields(TopItem).len,
+    );
+}
+
+// ============================================================
 // Tests
 // ============================================================
 
