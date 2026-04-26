@@ -2134,3 +2134,21 @@ test "ZIR: String.slice cross-module call" {
     try std.testing.expectEqualStrings("hel\n", result.stdout);
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
+
+test "ZIR: pub fn with operator name parses and emits" {
+    var result = try compileAndRun(
+        \\pub struct TestProg {
+        \\  pub fn <>(left :: String, right :: String) -> String {
+        \\    :zig.String.concat(left, right)
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    IO.puts("ok")
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("ok\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}

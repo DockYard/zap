@@ -2578,7 +2578,7 @@ pub const ZirDriver = struct {
                     }
                     try self.setLocal(bo.dest, ref);
                 } else if (bo.op == .concat) {
-                    // concat — emit @import("zap_runtime").ZapString.concatBump(lhs, rhs)
+                    // concat — emit @import("zap_runtime").String.concat(lhs, rhs)
                     const lhs = self.refForLocal(bo.lhs) catch return;
                     const rhs = self.refForLocal(bo.rhs) catch return;
 
@@ -2586,7 +2586,7 @@ pub const ZirDriver = struct {
                     if (rt_import == error_ref) return error.EmitFailed;
                     const zap_string = zir_builder_emit_field_val(self.handle, rt_import, "String", 6);
                     if (zap_string == error_ref) return error.EmitFailed;
-                    const concat_fn = zir_builder_emit_field_val(self.handle, zap_string, "concatBump", 10);
+                    const concat_fn = zir_builder_emit_field_val(self.handle, zap_string, "concat", 6);
                     if (concat_fn == error_ref) return error.EmitFailed;
 
                     const args = [_]u32{ lhs, rhs };

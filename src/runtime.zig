@@ -732,15 +732,10 @@ pub const String = struct {
         return 0xFFFFFFFF;
     }
 
-    pub fn concat(allocator: std.mem.Allocator, a: []const u8, b: []const u8) ![]const u8 {
-        const result = try allocator.alloc(u8, a.len + b.len);
-        @memcpy(result[0..a.len], a);
-        @memcpy(result[a.len..], b);
-        return result;
-    }
-
-    /// Bump-allocated concat for ZIR-compiled code (avoids page_allocator).
-    pub fn concatBump(a: []const u8, b: []const u8) []const u8 {
+    /// Concatenate two strings into a fresh allocation backed by the
+    /// runtime arena. Zap-emitted code calls this directly because Zap
+    /// has no notion of allocators at the call site.
+    pub fn concat(a: []const u8, b: []const u8) []const u8 {
         const result = bumpAlloc(a.len + b.len);
         if (result.len == 0) return a; // fallback: return first string
         @memcpy(result[0..a.len], a);
@@ -956,6 +951,78 @@ pub const Kernel = struct {
         posixWrite(STDERR_FD, message);
         posixWrite(STDERR_FD, "\n");
         std.process.exit(1);
+    }
+
+    // Operator primitives backing the generic `pub fn ==`/`!=`/`<`/`>`/
+    // `<=`/`>=` in lib/kernel.zap. The Zap monomorphizer specializes the
+    // Kernel operator per concrete type pair, so each instantiation here
+    // sees a concrete `T` and Zig's comptime dispatch picks the right
+    // operation (`std.mem.eql` for slices, `==` for value types, etc.).
+
+    pub fn eq(a: anytype, b: anytype) bool {
+        const T = @TypeOf(a);
+        if (comptime T == []const u8) return std.mem.eql(u8, a, b);
+        return a == b;
+    }
+
+    pub fn neq(a: anytype, b: anytype) bool {
+        return !eq(a, b);
+    }
+
+    pub fn lt(a: anytype, b: anytype) bool {
+        const T = @TypeOf(a);
+        if (comptime T == []const u8) return std.mem.lessThan(u8, a, b);
+        return a < b;
+    }
+
+    pub fn gt(a: anytype, b: anytype) bool {
+        const T = @TypeOf(a);
+        if (comptime T == []const u8) return std.mem.lessThan(u8, b, a);
+        return a > b;
+    }
+
+    pub fn lte(a: anytype, b: anytype) bool {
+        const T = @TypeOf(a);
+        if (comptime T == []const u8) return !std.mem.lessThan(u8, b, a);
+        return a <= b;
+    }
+
+    pub fn gte(a: anytype, b: anytype) bool {
+        const T = @TypeOf(a);
+        if (comptime T == []const u8) return !std.mem.lessThan(u8, a, b);
+        return a >= b;
+    }
+
+    pub fn add(a: anytype, b: anytype) @TypeOf(a) {
+        const T = @TypeOf(a);
+        const info = @typeInfo(T);
+        if (comptime info == .int) return a +% b;
+        return a + b;
+    }
+
+    pub fn sub(a: anytype, b: anytype) @TypeOf(a) {
+        const T = @TypeOf(a);
+        const info = @typeInfo(T);
+        if (comptime info == .int) return a -% b;
+        return a - b;
+    }
+
+    pub fn mul(a: anytype, b: anytype) @TypeOf(a) {
+        const T = @TypeOf(a);
+        const info = @typeInfo(T);
+        if (comptime info == .int) return a *% b;
+        return a * b;
+    }
+
+    pub fn divide(a: anytype, b: anytype) @TypeOf(a) {
+        const T = @TypeOf(a);
+        const info = @typeInfo(T);
+        if (comptime info == .int) return @divTrunc(a, b);
+        return a / b;
+    }
+
+    pub fn remainder(a: anytype, b: anytype) @TypeOf(a) {
+        return @rem(a, b);
     }
 
     pub fn sleep(milliseconds: i64) i64 {
@@ -3680,10 +3747,7 @@ test "String operations" {
 }
 
 test "String concat" {
-    const alloc = std.testing.allocator;
-    const result = try String.concat(alloc, "hello", " world");
-    defer alloc.free(result);
-    try std.testing.expectEqualStrings("hello world", result);
+    try std.testing.expectEqualStrings("hello world", String.concat("hello", " world"));
 }
 
 test "TaggedValue equality" {

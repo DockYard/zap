@@ -948,10 +948,15 @@ fn buildTarget(
             try source_files.append(alloc, file_path);
         }
 
-        // Also scan project source roots for protocol/impl files that aren't
-        // discovered through import-driven resolution (impl files have no module
-        // declaration so they can't be found via module name → file path mapping).
-        // Only scan "project" roots, not stdlib/dependency roots.
+        // Also scan source roots for protocol/impl files that aren't
+        // discovered through import-driven resolution. Impl files have no
+        // module declaration, so they can't be found via module name → file
+        // path mapping. Walk lib/ subdirectories of every source root
+        // recursively so impls under nested directories (e.g.
+        // `lib/integer/arithmetic.zap`) are picked up. Bare project roots
+        // are still scanned at the immediate level only — recursing into
+        // them would surface unrelated `.zap` files in `examples/`,
+        // `test/`, etc.
         {
             var discovered = std.StringHashMap(void).init(alloc);
             for (source_files.items) |sf| {
@@ -959,6 +964,13 @@ fn buildTarget(
                 discovered.put(key, {}) catch {};
             }
             for (source_roots.items) |root| {
+                const is_lib_root = std.mem.endsWith(u8, root.path, "/lib") or
+                    std.mem.endsWith(u8, root.path, "/lib/") or
+                    std.mem.eql(u8, std.fs.path.basename(root.path), "lib");
+                if (is_lib_root) {
+                    try scanZapFilesRecursive(alloc, root.path, &source_files, &discovered);
+                    continue;
+                }
                 if (!std.mem.eql(u8, root.name, "project")) continue;
                 if (std.Io.Dir.cwd().openDir(global_io, root.path, .{ .iterate = true })) |dir_handle| {
                     var dir = dir_handle;
@@ -1001,13 +1013,16 @@ fn buildTarget(
         }
     }
 
-    // Deduplicate source files (explicit paths and dep paths may overlap)
+    // Deduplicate source files (explicit paths and dep paths may overlap).
+    // `std.fs.path.resolve` only collapses ./ and ../ — it doesn't promote
+    // a relative path to absolute, so `./lib/integer.zap` and the absolute
+    // form would otherwise both pass through as distinct keys. Use realpath
+    // so equivalent paths dedupe regardless of how they were discovered.
     {
         var seen = std.StringHashMap(void).init(alloc);
         var deduped: std.ArrayListUnmanaged([]const u8) = .empty;
         for (source_files.items) |sf| {
-            // Normalize: resolve to real path for comparison
-            const key = std.fs.path.resolve(alloc, &.{sf}) catch sf;
+            const key = std.Io.Dir.cwd().realPathFileAlloc(global_io, sf, alloc) catch try alloc.dupe(u8, sf);
             if (!seen.contains(key)) {
                 seen.put(key, {}) catch {};
                 deduped.append(alloc, sf) catch {};
@@ -1368,6 +1383,39 @@ fn collectWatchPaths(allocator: std.mem.Allocator, project_root: []const u8) ![]
 /// Recursively collect all .zap files under a directory using the
 /// std.Io.Dir.Walker API (Zig 0.16) for efficient selective tree traversal.
 /// Skips hidden directories (starting with '.') and non-.zap files.
+/// Recursively walk `dir_path` and append every `.zap` file (except
+/// `build.zap`) that isn't already in `discovered`. Used to surface
+/// stdlib files in nested directories — including protocol/impl files
+/// that have no module declaration and therefore aren't reachable
+/// through the import-driven file graph.
+fn scanZapFilesRecursive(
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+    results: *std.ArrayListUnmanaged([]const u8),
+    discovered: *std.StringHashMap(void),
+) !void {
+    var dir = std.Io.Dir.cwd().openDir(global_io, dir_path, .{ .iterate = true }) catch return;
+    defer dir.close(global_io);
+    var walker = std.Io.Dir.walk(dir, allocator) catch return;
+    defer walker.deinit();
+
+    while (walker.next(global_io) catch null) |entry| {
+        if (entry.basename.len > 0 and entry.basename[0] == '.') {
+            if (entry.kind == .directory) walker.leave(global_io);
+            continue;
+        }
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.basename, ".zap")) continue;
+        if (std.mem.eql(u8, entry.basename, "build.zap")) continue;
+
+        const full_path = std.fs.path.join(allocator, &.{ dir_path, entry.path }) catch continue;
+        const key = std.fs.path.resolve(allocator, &.{full_path}) catch full_path;
+        if (discovered.contains(key)) continue;
+        discovered.put(key, {}) catch {};
+        results.append(allocator, full_path) catch {};
+    }
+}
+
 fn collectZapFilesRecursive(
     allocator: std.mem.Allocator,
     dir_path: []const u8,

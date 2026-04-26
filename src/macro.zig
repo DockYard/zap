@@ -385,11 +385,16 @@ pub const MacroEngine = struct {
             .call => |call| {
                 // Check if the callee is a known macro
                 if (call.callee.* == .var_ref) {
-                    const macro_family = self.findMacro(call.callee.var_ref.name, @intCast(call.args.len));
-                    if (macro_family) |_| {
-                        // Found a macro — expand it
-                        const expanded = try self.expandMacroCall(expr);
-                        return .{ .expr = expanded, .changed = true };
+                    const callee_name = call.callee.var_ref.name;
+                    const arity: u32 = @intCast(call.args.len);
+                    // A function family with the same name+arity in scope shadows
+                    // any imported macro of the same shape. This matches normal
+                    // scope rules and lets `pub fn <op>` win over a Kernel `pub macro <op>`.
+                    if (self.findFunction(callee_name, arity) == null) {
+                        if (self.findMacro(callee_name, arity)) |_| {
+                            const expanded = try self.expandMacroCall(expr);
+                            return .{ .expr = expanded, .changed = true };
+                        }
                     }
                 }
 
@@ -475,11 +480,15 @@ pub const MacroEngine = struct {
             },
 
             .binary_op => |bo| {
-                // Try Kernel operator macro first
                 const macro_name = binopMacroName(bo.op);
-                if (self.tryExpandBinaryMacro(macro_name, bo.lhs, bo.rhs, bo.meta)) |result| {
+
+                // Try operator-named function first so a local `pub fn OP` shadows
+                // any Kernel macro of the same name (matches normal scope rules).
+                if (try self.tryDispatchToFunction(macro_name, &.{ bo.lhs, bo.rhs }, bo.meta)) |result| {
                     return .{ .expr = result, .changed = true };
                 }
+
+                // Then try Kernel/imported operator macro.
                 if (self.tryExpandBinaryMacro(macro_name, bo.lhs, bo.rhs, bo.meta)) |result| {
                     return .{ .expr = result, .changed = true };
                 }
@@ -525,6 +534,15 @@ pub const MacroEngine = struct {
             },
 
             .unary_op => |uo| {
+                const op_name = unopMacroName(uo.op);
+
+                // Try operator-named function first; a local `pub fn OP` shadows
+                // any Kernel macro of the same name. Macros (if added later)
+                // would expand here only when no function is in scope.
+                if (try self.tryDispatchToFunction(op_name, &.{uo.operand}, uo.meta)) |result| {
+                    return .{ .expr = result, .changed = true };
+                }
+
                 const operand = try self.expandExpr(uo.operand);
                 if (!operand.changed) return .{ .expr = expr, .changed = false };
                 return .{
@@ -1040,6 +1058,44 @@ pub const MacroEngine = struct {
             .concat => "<>",
             .in_op => "in",
         };
+    }
+
+    /// Map a unary operator to its Kernel macro / function name.
+    fn unopMacroName(op: ast.UnaryOp.Op) []const u8 {
+        return switch (op) {
+            .negate => "-",
+            .not_op => "not",
+        };
+    }
+
+    /// Resolve a function family by name and arity, walking the scope chain
+    /// from the current module just like `findMacro`.
+    fn findFunction(self: *MacroEngine, name: ast.StringId, arity: u32) ?scope.FunctionFamilyId {
+        const scope_id = self.current_module_scope orelse self.graph.prelude_scope;
+        return self.graph.resolveFamily(scope_id, name, arity);
+    }
+
+    /// If a `pub fn`/`fn` named `op_name` of the given arity is in scope, build
+    /// a Call expression `op_name(args...)` so the binary/unary operator
+    /// dispatches through the user-defined function. Returns null if no
+    /// matching function exists (operator falls through to its bootstrap path).
+    fn tryDispatchToFunction(
+        self: *MacroEngine,
+        op_name: []const u8,
+        args: []const *const ast.Expr,
+        meta: ast.NodeMeta,
+    ) !?*const ast.Expr {
+        const name_id = self.interner.intern(op_name) catch return null;
+        if (self.findFunction(name_id, @intCast(args.len)) == null) return null;
+
+        const callee = try self.create(ast.Expr, .{ .var_ref = .{ .meta = meta, .name = name_id } });
+        const arg_exprs = try self.allocator.alloc(*const ast.Expr, args.len);
+        for (args, 0..) |arg, i| {
+            arg_exprs[i] = (try self.expandExpr(arg)).expr;
+        }
+        return try self.create(ast.Expr, .{
+            .call = .{ .meta = meta, .callee = callee, .args = arg_exprs },
+        });
     }
 
     /// Try to expand a binary expression (operator or pipe) through a Kernel macro.

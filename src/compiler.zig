@@ -459,6 +459,12 @@ pub fn collectAllFromUnits(
             return error.CollectFailed;
         };
     }
+    // Re-register impl functions in their target module scopes. The first
+    // collector did this on its own graph, but the final_collector built a
+    // fresh graph and per-module HIR/type-check reads from THIS graph. Without
+    // re-registration, impl functions like `Integer.+` are invisible.
+    final_collector.validateImplConformance() catch {};
+    final_collector.registerImplFunctionsInTargetScopes() catch {};
     {
         const slices = try alloc.alloc(ast.Program, module_programs.len);
         for (module_programs, 0..) |entry, i| slices[i] = entry.program;
@@ -1227,12 +1233,49 @@ fn buildModulePrograms(
         const name = try structNameToOwnedString(alloc, mod.name, interner);
         const mods = try alloc.alloc(ast.StructDecl, 1);
         mods[0] = mod;
+
+        // Include impl_decls whose target_type matches this module so the
+        // module's HIR/IR emits the impl function bodies as part of the
+        // target module's namespace. registerImplFunctionsInTargetScopes
+        // makes the impl callable; this makes its body land in the right
+        // module's emitted code.
+        var module_top_items: std.ArrayList(ast.TopItem) = .empty;
+        for (program.top_items) |item| {
+            const impl = switch (item) {
+                .impl_decl => |id| id,
+                .priv_impl_decl => |id| id,
+                else => continue,
+            };
+            if (structNameMatchesString(impl.target_type, name, interner)) {
+                try module_top_items.append(alloc, item);
+            }
+        }
+
         result[i] = .{
             .name = name,
-            .program = .{ .structs = mods, .top_items = &.{} },
+            .program = .{
+                .structs = mods,
+                .top_items = try module_top_items.toOwnedSlice(alloc),
+            },
         };
     }
     return result;
+}
+
+/// Compare an AST StructName against a dotted string like "Integer" or "Foo.Bar".
+fn structNameMatchesString(name: ast.StructName, target: []const u8, interner: *const ast.StringInterner) bool {
+    var idx: usize = 0;
+    for (name.parts, 0..) |part, part_idx| {
+        const part_str = interner.get(part);
+        if (idx + part_str.len > target.len) return false;
+        if (!std.mem.eql(u8, target[idx .. idx + part_str.len], part_str)) return false;
+        idx += part_str.len;
+        if (part_idx + 1 < name.parts.len) {
+            if (idx >= target.len or target[idx] != '.') return false;
+            idx += 1;
+        }
+    }
+    return idx == target.len;
 }
 
 fn buildCompilationUnits(

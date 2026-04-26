@@ -917,19 +917,24 @@ pub const IrBuilder = struct {
     }
 
     pub fn buildProgram(self: *IrBuilder, hir_program: *const hir_mod.Program) !Program {
-        // First pass: register all qualified function names for bare call resolution
+        // First pass: register all qualified function names for bare call resolution.
+        // Mangle the raw symbol so operator-named functions (`+`, `<>`, etc.) become
+        // valid Zig identifiers; downstream lookups always go through the same mangler
+        // so call sites and declarations see the same string.
         for (hir_program.modules) |mod| {
             const module_prefix = self.structNameToPrefix(mod.name);
             for (mod.functions) |func_group| {
                 const func_name = self.interner.get(func_group.name);
-                const qualified = try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ module_prefix, func_name, func_group.arity });
+                const mangled_func_name = try mangleSymbolForZig(self.allocator, func_name);
+                const qualified = try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ module_prefix, mangled_func_name, func_group.arity });
                 try self.known_function_names.put(qualified, {});
                 try self.group_id_to_name.put(func_group.id, func_name);
             }
         }
         for (hir_program.top_functions) |func_group| {
             const func_name = self.interner.get(func_group.name);
-            const qualified = try std.fmt.allocPrint(self.allocator, "{s}__{d}", .{ func_name, func_group.arity });
+            const mangled_func_name = try mangleSymbolForZig(self.allocator, func_name);
+            const qualified = try std.fmt.allocPrint(self.allocator, "{s}__{d}", .{ mangled_func_name, func_group.arity });
             try self.known_function_names.put(qualified, {});
             try self.group_id_to_name.put(func_group.id, func_name);
         }
@@ -1340,7 +1345,8 @@ pub const IrBuilder = struct {
             self.interner.get(group.name)
         else
             "anonymous";
-        const local_name = try std.fmt.allocPrint(self.allocator, "{s}__{d}", .{ raw_name, group.arity });
+        const mangled_raw_name = try mangleSymbolForZig(self.allocator, raw_name);
+        const local_name = try std.fmt.allocPrint(self.allocator, "{s}__{d}", .{ mangled_raw_name, group.arity });
         const name_str = if (self.current_module_prefix) |prefix|
             try std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ prefix, local_name })
         else
@@ -3703,14 +3709,17 @@ pub const IrBuilder = struct {
                     .named => |nc| {
                         const call_arity = call.args.len;
                         // For module-qualified calls, try exact arity first, then higher
-                        // arities for functions with default parameters.
+                        // arities for functions with default parameters. The function
+                        // name is mangled so operator-named functions match the
+                        // declarations registered in known_function_names.
                         const resolved_name = if (nc.module) |mod| blk: {
+                            const mangled_call_name = try mangleSymbolForZig(self.allocator, nc.name);
                             var try_a: usize = call_arity;
                             while (try_a <= call_arity + 4) : (try_a += 1) {
-                                const candidate = try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ mod, nc.name, try_a });
+                                const candidate = try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ mod, mangled_call_name, try_a });
                                 if (self.known_function_names.contains(candidate)) break :blk candidate;
                             }
-                            break :blk try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ mod, nc.name, call_arity });
+                            break :blk try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ mod, mangled_call_name, call_arity });
                         } else try self.resolveBareCall(nc.name, @intCast(call_arity));
 
                         // Default params handled at ZIR call site (see zir_builder.zig call_named handler)
@@ -4201,24 +4210,28 @@ pub const IrBuilder = struct {
     /// Resolution order: current module → Kernel → top-level → bare name.
     /// Also checks higher arities for functions with default parameters.
     fn resolveBareCall(self: *IrBuilder, name: []const u8, arity: u32) ![]const u8 {
+        // Names containing operator characters are mangled before lookup so the
+        // qualified candidates match the entries registered in
+        // known_function_names (which are also mangled).
+        const mangled_name = try mangleSymbolForZig(self.allocator, name);
         // Try exact arity first, then higher arities (for default params)
         var try_arity: u32 = arity;
         while (try_arity <= arity + 4) : (try_arity += 1) {
             // 1. Current module function
             if (self.current_module_prefix) |prefix| {
-                const qualified = try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ prefix, name, try_arity });
+                const qualified = try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ prefix, mangled_name, try_arity });
                 if (self.known_function_names.contains(qualified)) return qualified;
             }
             // 2. Top-level function (bare name with arity)
             {
-                const top_name = try std.fmt.allocPrint(self.allocator, "{s}__{d}", .{ name, try_arity });
+                const top_name = try std.fmt.allocPrint(self.allocator, "{s}__{d}", .{ mangled_name, try_arity });
                 if (self.known_function_names.contains(top_name)) return top_name;
             }
             // Kernel functions are resolved via auto-import in the collector —
             // they appear as regular imports in the module scope, so steps 1-2
             // handle them. No hardcoded Kernel fallback needed.
         }
-        // 4. Keep bare name — Zig compiler will error
+        // 4. Keep bare (unmangled) name — Zig compiler will error
         return name;
     }
 
@@ -4246,6 +4259,58 @@ pub const IrBuilder = struct {
 /// Walk a Decision tree to find the param_get index used for the N-th tuple element.
 /// The decision tree's check_tuple success subtree references element scrutinee IDs
 /// via param_get nodes. This scans to find the ID associated with a given element index.
+/// Convert a Zap function name into a Zig-safe identifier.
+///
+/// Zig identifiers allow `[A-Za-z0-9_]` (plus `?`/`!` in Zap-specific
+/// positions which Zig's parser tolerates in @"..." form here). Operator
+/// chars (`+ - * / < > = ! | & ^ ~ % @ # $ . :`) are not Zig identifier
+/// chars, so any name containing them — `+`, `==`, or composite names like
+/// `Kernel_==__i64` produced by monomorphization — must be rewritten.
+///
+/// Strategy: per-char inline replacement. Each unsafe char becomes
+/// `_<spelled-out>` (e.g., `=` → `_eq`, `+` → `_plus`). Safe chars pass
+/// through verbatim. Returns the input unchanged when no mangling is needed.
+fn mangleSymbolForZig(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+    if (name.len == 0) return name;
+    var needs_mangle = false;
+    for (name) |c| {
+        switch (c) {
+            'a'...'z', 'A'...'Z', '0'...'9', '_', '?', '!' => {},
+            else => {
+                needs_mangle = true;
+                break;
+            },
+        }
+    }
+    if (!needs_mangle) return name;
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    for (name) |c| {
+        switch (c) {
+            'a'...'z', 'A'...'Z', '0'...'9', '_', '?', '!' => try buf.append(allocator, c),
+            '+' => try buf.appendSlice(allocator, "_plus"),
+            '-' => try buf.appendSlice(allocator, "_minus"),
+            '*' => try buf.appendSlice(allocator, "_star"),
+            '/' => try buf.appendSlice(allocator, "_slash"),
+            '<' => try buf.appendSlice(allocator, "_lt"),
+            '>' => try buf.appendSlice(allocator, "_gt"),
+            '=' => try buf.appendSlice(allocator, "_eq"),
+            '|' => try buf.appendSlice(allocator, "_pipe"),
+            '&' => try buf.appendSlice(allocator, "_amp"),
+            '^' => try buf.appendSlice(allocator, "_caret"),
+            '~' => try buf.appendSlice(allocator, "_tilde"),
+            '%' => try buf.appendSlice(allocator, "_pct"),
+            '@' => try buf.appendSlice(allocator, "_at"),
+            '#' => try buf.appendSlice(allocator, "_hash"),
+            '$' => try buf.appendSlice(allocator, "_dollar"),
+            '.' => try buf.appendSlice(allocator, "_dot"),
+            ':' => try buf.appendSlice(allocator, "_colon"),
+            else => try buf.appendSlice(allocator, "_x"),
+        }
+    }
+    return try buf.toOwnedSlice(allocator);
+}
+
 fn findParamGetIdInDecision(decision: *const hir_mod.Decision, target_element: u32) u32 {
     switch (decision.*) {
         .check_tuple => |ct| {

@@ -850,7 +850,7 @@ pub const Parser = struct {
         const start = self.currentSpan();
         _ = try self.expect(.keyword_fn);
 
-        const name_tok = try self.expect(.identifier);
+        const name_tok = try self.parseSymbolicName();
         const name = try self.internToken(name_tok);
 
         _ = try self.expect(.left_paren);
@@ -1318,6 +1318,26 @@ pub const Parser = struct {
     // Function declarations
     // ============================================================
 
+    /// Parse the name token of a `fn` or `macro` declaration. Accepts a regular
+    /// identifier or any operator/keyword token usable as a callable name
+    /// (so `pub fn <>(...)`, `pub macro |>(...)`, `pub fn rem(...)` all parse).
+    fn parseSymbolicName(self: *Parser) !Token {
+        if (self.check(.identifier)) return self.advance();
+        if (self.check(.keyword_if) or self.check(.keyword_cond) or
+            self.check(.keyword_and) or self.check(.keyword_or) or
+            self.check(.keyword_not) or self.check(.keyword_rem) or
+            self.check(.keyword_in) or self.check(.keyword_fn) or
+            self.check(.keyword_struct) or self.check(.keyword_union) or
+            self.check(.keyword_macro)) return self.advance();
+        if (self.check(.plus) or self.check(.minus) or self.check(.star) or
+            self.check(.slash) or self.check(.equal_equal) or
+            self.check(.not_equal) or self.check(.less) or self.check(.greater) or
+            self.check(.less_equal) or self.check(.greater_equal) or
+            self.check(.diamond) or self.check(.pipe_operator) or
+            self.check(.tilde_arrow)) return self.advance();
+        return try self.expect(.identifier); // emits the standard "expected identifier" error
+    }
+
     fn parseFunctionDecl(self: *Parser, visibility: ast.FunctionDecl.Visibility) !*const ast.FunctionDecl {
         const start = self.currentSpan();
         // consume `pub fn` or `fn`
@@ -1328,7 +1348,7 @@ pub const Parser = struct {
             return error.ParseError;
         }
 
-        const name_tok = try self.expect(.identifier);
+        const name_tok = try self.parseSymbolicName();
         const name = try self.internToken(name_tok);
 
         const clause = try self.parseFunctionClause(start);
@@ -1347,26 +1367,7 @@ pub const Parser = struct {
         if (self.check(.keyword_pub)) _ = self.advance();
         _ = try self.expect(.keyword_macro);
 
-        // Allow keywords and operators as macro names
-        // Keywords: if, cond, unless, etc.
-        // Operators: +, -, *, /, ==, !=, <, >, <=, >=, <>, |>, ~>, and, or
-        const name_tok = if (self.check(.identifier))
-            self.advance()
-        else if (self.check(.keyword_if) or self.check(.keyword_cond) or
-            self.check(.keyword_and) or
-            self.check(.keyword_or) or self.check(.keyword_not) or
-            self.check(.keyword_fn) or
-            self.check(.keyword_struct) or self.check(.keyword_union) or
-            self.check(.keyword_macro))
-            self.advance()
-        else if (self.check(.plus) or self.check(.minus) or self.check(.star) or
-            self.check(.slash) or self.check(.equal_equal) or self.check(.not_equal) or
-            self.check(.less) or self.check(.greater) or self.check(.less_equal) or
-            self.check(.greater_equal) or self.check(.diamond) or
-            self.check(.pipe_operator) or self.check(.tilde_arrow))
-            self.advance()
-        else
-            try self.expect(.identifier); // will error with expected message
+        const name_tok = try self.parseSymbolicName();
         const name = try self.internToken(name_tok);
 
         const clause = try self.parseFunctionClause(start);

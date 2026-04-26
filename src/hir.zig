@@ -1760,37 +1760,88 @@ pub const HirBuilder = struct {
                 if (first_clause.clause_index >= first_clause.decl.clauses.len) continue;
                 const clause = first_clause.decl.clauses[first_clause.clause_index];
                 if (clause.params.len != arity) continue;
-                // Resolve param AND return types in the same type var scope
-                // so that type variables like `element` and `result` are shared.
-                const self_mut: *HirBuilder = @constCast(self);
-                self_mut.hir_type_var_scope.clearRetainingCapacity();
-                var subs = types_mod.SubstitutionMap.init(self.allocator);
-                for (clause.params, 0..) |param, i| {
-                    if (i >= call_args.len) break;
-                    var arg_type = call_args[i].expr.type_id;
-                    if (arg_type == types_mod.TypeStore.UNKNOWN) {
-                        if (call_args[i].expr.kind == .list_init and call_args[i].expr.kind.list_init.len == 0) {
-                            const store_ptr2: *types_mod.TypeStore = @constCast(self.type_store);
-                            arg_type = store_ptr2.addType(.{ .list = .{ .element = types_mod.TypeStore.I64 } }) catch types_mod.TypeStore.UNKNOWN;
-                        }
-                        if (arg_type == types_mod.TypeStore.UNKNOWN) continue;
-                    }
-                    if (param.type_annotation) |ta| {
-                        const param_type = self.resolveTypeExpr(ta);
-                        const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
-                        _ = store_ptr.unify(param_type, arg_type, &subs) catch {};
-                    }
-                }
-                if (subs.bindings.count() > 0) {
-                    // Resolve return type in the SAME type var scope as params
-                    if (clause.return_type) |rt| {
-                        const resolved_return = self.resolveTypeExpr(rt);
-                        const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
-                        return subs.applyToType(store_ptr, resolved_return);
-                    }
-                }
+                return self.substituteReturnTypeFromArgs(&clause, call_args, raw_return);
             }
         }
+        return raw_return;
+    }
+
+    /// Resolve a generic function's return type for a local-scope call by
+    /// walking the scope chain to find the family. Mirrors
+    /// `resolveGenericReturnType` but uses scope-based resolution instead
+    /// of module-name-based.
+    fn resolveGenericReturnTypeLocal(
+        self: *const HirBuilder,
+        name: ast.StringId,
+        arity: u32,
+        call_args: []const CallArg,
+        raw_return: types_mod.TypeId,
+    ) types_mod.TypeId {
+        const scope_id = self.current_clause_scope orelse self.current_module_scope orelse self.graph.prelude_scope;
+        const fam_id = self.graph.resolveFamily(scope_id, name, arity) orelse return raw_return;
+        const family = self.graph.getFamily(fam_id);
+        if (family.clauses.items.len == 0) return raw_return;
+        const first_clause = family.clauses.items[0];
+        if (first_clause.clause_index >= first_clause.decl.clauses.len) return raw_return;
+        const clause = first_clause.decl.clauses[first_clause.clause_index];
+        if (clause.params.len != arity) return raw_return;
+        return self.substituteReturnTypeFromArgs(&clause, call_args, raw_return);
+    }
+
+    /// Shared inference: walk params, unify with arg types into a substitution
+    /// map, apply the substitution to the raw return type. Returns the raw
+    /// return type unchanged when no inference is possible.
+    ///
+    /// The CALLED function's type variables (e.g., `a` in `pub fn +(a, a) -> a`)
+    /// are resolved in a fresh `hir_type_var_scope` so that the surrounding
+    /// clause's existing type-var bindings (e.g., `element` in the enclosing
+    /// `fn map(list :: [element], f) -> [element]`) survive across the inference.
+    fn substituteReturnTypeFromArgs(
+        self: *const HirBuilder,
+        clause: *const ast.FunctionClause,
+        call_args: []const CallArg,
+        raw_return: types_mod.TypeId,
+    ) types_mod.TypeId {
+        const self_mut: *HirBuilder = @constCast(self);
+        const saved_scope = self_mut.hir_type_var_scope;
+        self_mut.hir_type_var_scope = std.StringHashMap(types_mod.TypeId).init(self.allocator);
+        defer {
+            self_mut.hir_type_var_scope.deinit();
+            self_mut.hir_type_var_scope = saved_scope;
+        }
+
+        var subs = types_mod.SubstitutionMap.init(self.allocator);
+        for (clause.params, 0..) |param, i| {
+            if (i >= call_args.len) break;
+            var arg_type = call_args[i].expr.type_id;
+            if (arg_type == types_mod.TypeStore.UNKNOWN) {
+                if (call_args[i].expr.kind == .list_init and call_args[i].expr.kind.list_init.len == 0) {
+                    const store_ptr2: *types_mod.TypeStore = @constCast(self.type_store);
+                    arg_type = store_ptr2.addType(.{ .list = .{ .element = types_mod.TypeStore.I64 } }) catch types_mod.TypeStore.UNKNOWN;
+                }
+                if (arg_type == types_mod.TypeStore.UNKNOWN) continue;
+            }
+            if (param.type_annotation) |ta| {
+                const param_type = self.resolveTypeExpr(ta);
+                const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
+                _ = store_ptr.unify(param_type, arg_type, &subs) catch {};
+            }
+        }
+        if (subs.bindings.count() > 0) {
+            // Resolve raw_return through the same type var scope, then substitute.
+            if (clause.return_type) |rt| {
+                const resolved_return = self.resolveTypeExpr(rt);
+                const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
+                return subs.applyToType(store_ptr, resolved_return);
+            }
+            const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
+            return subs.applyToType(store_ptr, raw_return);
+        }
+        // No inference possible (all args UNKNOWN, e.g. case-clause bindings
+        // without propagated types). Return UNKNOWN rather than an unresolved
+        // type variable so downstream UNKNOWN-tolerant checks apply.
+        const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
+        if (store_ptr.containsTypeVars(raw_return)) return types_mod.TypeStore.UNKNOWN;
         return raw_return;
     }
 
@@ -2225,27 +2276,49 @@ pub const HirBuilder = struct {
             }
         }
 
-        // Build impl function groups as top-level functions
+        // Build impl function groups and place them in the target module's
+        // functions array so cross-module calls (`Integer.+`) resolve through
+        // the normal module-qualified call path. Each module compilation
+        // pass sees the global impl set; we skip impls whose target isn't in
+        // the modules list for this pass to avoid emitting them as orphan
+        // root-level functions.
         for (self.graph.impls.items) |impl_entry| {
+            var target_module_idx: ?usize = null;
+            for (modules.items, 0..) |mod, idx| {
+                if (self.structNamesEqual(mod.name, impl_entry.target_type)) {
+                    target_module_idx = idx;
+                    break;
+                }
+            }
+            if (target_module_idx == null) continue;
+
             self.current_module_scope = impl_entry.scope_id;
+            // Group impl functions by name (multi-clause merge), local to this impl.
+            var impl_fn_order: std.ArrayList(ast.StringId) = .empty;
+            var impl_fn_groups = std.AutoHashMap(ast.StringId, std.ArrayList(*const ast.FunctionDecl)).init(self.allocator);
+            defer impl_fn_groups.deinit();
             for (impl_entry.decl.functions) |func| {
-                const entry = try fn_groups.getOrPut(func.name);
+                const entry = try impl_fn_groups.getOrPut(func.name);
                 if (!entry.found_existing) {
                     entry.value_ptr.* = .empty;
-                    try fn_order.append(self.allocator, func.name);
+                    try impl_fn_order.append(self.allocator, func.name);
                 }
                 try entry.value_ptr.append(self.allocator, func);
             }
-            // Build each impl function as a top-level function group
-            for (impl_entry.decl.functions) |func| {
-                if (fn_groups.getPtr(func.name)) |decls| {
+            var impl_groups: std.ArrayList(FunctionGroup) = .empty;
+            for (impl_fn_order.items) |name| {
+                if (impl_fn_groups.getPtr(name)) |decls| {
                     const group = try self.buildMergedFunctionGroup(decls.items, impl_entry.scope_id);
-                    try top_fns.append(self.allocator, group);
-                    // Record group ID for ImplInfo
-                    decls.clearRetainingCapacity();
+                    try impl_groups.append(self.allocator, group);
                 }
             }
             self.current_module_scope = null;
+
+            // Splice impl groups onto the target module's functions list.
+            var combined: std.ArrayList(FunctionGroup) = .empty;
+            try combined.appendSlice(self.allocator, modules.items[target_module_idx.?].functions);
+            try combined.appendSlice(self.allocator, impl_groups.items);
+            modules.items[target_module_idx.?].functions = try combined.toOwnedSlice(self.allocator);
         }
 
         // Build protocol info from scope graph
@@ -3324,7 +3397,51 @@ pub const HirBuilder = struct {
             .binary_op => |bo| {
                 const lhs_expr = try self.buildExpr(bo.lhs);
                 const rhs_expr = try self.buildExpr(bo.rhs);
-                // Derive result type from operands and operator
+
+                // Route arithmetic through the Arithmetic protocol. When
+                // either operand has a known concrete numeric type we lower
+                // `a OP b` to a call against the matching impl module
+                // (`Integer.+`, `Float.+`, ...). The mangler turns the
+                // operator name into a Zig-safe identifier downstream, and
+                // the impl body handles the type-specific runtime path.
+                // Otherwise (UNKNOWN operand types, non-numeric carriers)
+                // fall through to the primitive ZIR binary op.
+                if (bo.op == .add or bo.op == .sub or bo.op == .mul or bo.op == .div or bo.op == .rem_op) {
+                    const operand_type: types_mod.TypeId = if (lhs_expr.type_id != types_mod.TypeStore.UNKNOWN)
+                        lhs_expr.type_id
+                    else
+                        rhs_expr.type_id;
+                    if (operand_type != types_mod.TypeStore.UNKNOWN) {
+                        const module_name_opt = self.type_store.typeToModuleName(operand_type, self.interner);
+                        if (module_name_opt) |module_name| {
+                            if (std.mem.eql(u8, module_name, "Integer") or std.mem.eql(u8, module_name, "Float")) {
+                                const op_name: []const u8 = switch (bo.op) {
+                                    .add => "+",
+                                    .sub => "-",
+                                    .mul => "*",
+                                    .div => "/",
+                                    .rem_op => "rem",
+                                    else => unreachable,
+                                };
+
+                                var args: std.ArrayList(CallArg) = .empty;
+                                try args.append(self.allocator, .{ .expr = lhs_expr, .mode = .share });
+                                try args.append(self.allocator, .{ .expr = rhs_expr, .mode = .share });
+
+                                return try self.create(Expr, .{
+                                    .kind = .{ .call = .{
+                                        .target = .{ .named = .{ .module = module_name, .name = op_name } },
+                                        .args = try args.toOwnedSlice(self.allocator),
+                                    } },
+                                    .type_id = operand_type,
+                                    .span = bo.meta.span,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // Derive result type from operands and operator (primitive path).
                 const result_type = switch (bo.op) {
                     // Arithmetic: same type as operands
                     .add, .sub, .mul, .div, .rem_op => blk: {
@@ -3528,17 +3645,45 @@ pub const HirBuilder = struct {
                 const call_return_type: types_mod.TypeId = switch (target) {
                     .direct => blk: {
                         if (call.callee.* == .var_ref) {
-                            break :blk self.resolveFunctionReturnType(call.callee.var_ref.name, @intCast(call.args.len));
+                            const raw = self.resolveFunctionReturnType(call.callee.var_ref.name, @intCast(call.args.len));
+                            if (raw != types_mod.TypeStore.UNKNOWN) {
+                                const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
+                                if (store_ptr.containsTypeVars(raw)) {
+                                    break :blk self.resolveGenericReturnTypeLocal(call.callee.var_ref.name, @intCast(call.args.len), args.items, raw);
+                                }
+                            }
+                            break :blk raw;
                         }
                         break :blk types_mod.TypeStore.UNKNOWN;
                     },
                     .named => |n| blk: {
                         if (n.module == null) {
                             if (call.callee.* == .var_ref) {
-                                break :blk self.resolveFunctionReturnType(call.callee.var_ref.name, @intCast(call.args.len));
+                                const raw = self.resolveFunctionReturnType(call.callee.var_ref.name, @intCast(call.args.len));
+                                if (raw != types_mod.TypeStore.UNKNOWN) {
+                                    const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
+                                    if (store_ptr.containsTypeVars(raw)) {
+                                        break :blk self.resolveGenericReturnTypeLocal(call.callee.var_ref.name, @intCast(call.args.len), args.items, raw);
+                                    }
+                                }
+                                break :blk raw;
                             }
                         } else {
                             if (call.callee.* == .field_access) {
+                                const raw_return = self.resolveFunctionReturnTypeInModule(n.module.?, n.name, @intCast(call.args.len));
+                                if (raw_return != types_mod.TypeStore.UNKNOWN) {
+                                    const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
+                                    if (store_ptr.containsTypeVars(raw_return)) {
+                                        const resolved = self.resolveGenericReturnType(n.module.?, n.name, @intCast(call.args.len), args.items, raw_return);
+                                        break :blk resolved;
+                                    }
+                                }
+                                break :blk raw_return;
+                            }
+                            // Bare-name var_ref (`a + b` rewritten to `+(a, b)`) that
+                            // resolves to an imported module's function. Same inference
+                            // as the field_access case.
+                            if (call.callee.* == .var_ref) {
                                 const raw_return = self.resolveFunctionReturnTypeInModule(n.module.?, n.name, @intCast(call.args.len));
                                 if (raw_return != types_mod.TypeStore.UNKNOWN) {
                                     const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
