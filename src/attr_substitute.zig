@@ -410,7 +410,7 @@ fn substituteInExpr(
             const new_body = try substituteInExpr(alloc, fe.body, func_attrs, mod_attrs, interner, errors);
             if (new_iterable == fe.iterable and new_filter == fe.filter and new_body == fe.body) return expr;
             const new_expr = try alloc.create(ast.Expr);
-            new_expr.* = .{ .for_expr = .{ .meta = fe.meta, .var_name = fe.var_name, .iterable = new_iterable, .filter = new_filter, .body = new_body } };
+            new_expr.* = .{ .for_expr = .{ .meta = fe.meta, .var_pattern = fe.var_pattern, .var_type_annotation = fe.var_type_annotation, .iterable = new_iterable, .filter = new_filter, .body = new_body } };
             return new_expr;
         },
         .range => |re| {

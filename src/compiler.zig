@@ -2304,7 +2304,20 @@ fn remapExpr(alloc: std.mem.Allocator, expr: *ast.Expr, remap: []const ast.Strin
         },
         .attr_ref => |*ar| ar.name = remap[ar.name],
         .for_expr => |*fe| {
-            fe.var_name = remap[fe.var_name];
+            // Remap the loop variable's pattern through the standard
+            // pattern-remap helper so any nested binds (`{k, v}`) and
+            // tagged tuples (`{:ok, n}`) get their StringIds rewritten.
+            const mutable_pattern = try alloc.create(ast.Pattern);
+            mutable_pattern.* = fe.var_pattern.*;
+            try remapPattern(alloc, mutable_pattern, remap);
+            fe.var_pattern = mutable_pattern;
+            // Remap the optional `:: Type` annotation if present.
+            if (fe.var_type_annotation) |ta| {
+                const mutable_ta = try alloc.create(ast.TypeExpr);
+                mutable_ta.* = ta.*;
+                try remapTypeExpr(alloc, mutable_ta, remap);
+                fe.var_type_annotation = mutable_ta;
+            }
             const mutable_iter = try alloc.create(ast.Expr);
             mutable_iter.* = fe.iterable.*;
             try remapExpr(alloc, mutable_iter, remap);

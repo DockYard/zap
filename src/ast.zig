@@ -651,7 +651,17 @@ pub const CondClause = struct {
 
 pub const ForExpr = struct {
     meta: NodeMeta,
-    var_name: StringId,
+    /// Loop variable as a full pattern. A bare identifier still parses as
+    /// `Pattern.bind`, preserving the legacy `for x <- ...` form;
+    /// destructuring patterns like `{k, v}` or `{:ok, n}` flow through the
+    /// same lowering pipeline that powers function params and case arms.
+    var_pattern: *const Pattern,
+    /// Optional `:: Type` annotation on the loop variable. Mirrors the
+    /// `Param.type_annotation` field so the desugar can splice both the
+    /// pattern and the annotation into the generated helper clause's
+    /// param slot, where the type checker resolves it through the
+    /// existing param-typing path.
+    var_type_annotation: ?*const TypeExpr = null,
     iterable: *const Expr,
     filter: ?*const Expr,
     body: *const Expr,

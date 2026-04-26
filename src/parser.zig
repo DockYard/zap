@@ -2536,8 +2536,21 @@ pub const Parser = struct {
         const start = self.currentSpan();
         _ = try self.expect(.keyword_for);
 
-        const var_tok = try self.expect(.identifier);
-        const var_name = try self.internToken(var_tok);
+        // Loop variable accepts the full Pattern grammar — bare identifier,
+        // tuple destructure (`{k, v}`), tagged tuple (`{:ok, n}`), cons
+        // (`[head | tail]`), wildcards, etc. — using the same parsePattern
+        // entry point that case arms and function params call.
+        const var_pattern = try self.parsePattern();
+
+        // Optional `:: Type` annotation, mirroring function-param syntax.
+        // The annotation flows through the desugared helper's clause param
+        // and is resolved by the type checker via the standard
+        // resolveTypeExpr path.
+        var var_type_annotation: ?*const ast.TypeExpr = null;
+        if (self.match(.double_colon)) {
+            var_type_annotation = try self.parseTypeExpr();
+        }
+
         _ = try self.expect(.back_arrow); // <-
         const iterable = try self.parseExpr();
 
@@ -2557,7 +2570,8 @@ pub const Parser = struct {
         return self.create(ast.Expr, .{
             .for_expr = .{
                 .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
-                .var_name = var_name,
+                .var_pattern = var_pattern,
+                .var_type_annotation = var_type_annotation,
                 .iterable = iterable,
                 .filter = filter,
                 .body = body,
@@ -5161,6 +5175,10 @@ test "parse for comprehension" {
     try std.testing.expect(expr.for_expr.filter == null);
     try std.testing.expect(expr.for_expr.iterable.* == .var_ref);
     try std.testing.expect(expr.for_expr.body.* == .binary_op);
+    // Bare identifier still parses as a Pattern.bind, preserving the
+    // legacy single-name binding form.
+    try std.testing.expect(expr.for_expr.var_pattern.* == .bind);
+    try std.testing.expect(expr.for_expr.var_type_annotation == null);
 }
 
 test "parse for comprehension with filter" {
@@ -5174,6 +5192,94 @@ test "parse for comprehension with filter" {
     try std.testing.expect(expr.* == .for_expr);
     try std.testing.expect(expr.for_expr.filter != null);
     try std.testing.expect(expr.for_expr.filter.?.* == .binary_op);
+}
+
+test "parse for comprehension with tuple-destructure pattern" {
+    const source = "for {k, v} <- pairs { v }";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const expr = try parser.parseExpr();
+    try std.testing.expect(expr.* == .for_expr);
+    try std.testing.expect(expr.for_expr.var_pattern.* == .tuple);
+    try std.testing.expectEqual(@as(usize, 2), expr.for_expr.var_pattern.tuple.elements.len);
+    try std.testing.expect(expr.for_expr.var_pattern.tuple.elements[0].* == .bind);
+    try std.testing.expect(expr.for_expr.var_pattern.tuple.elements[1].* == .bind);
+    try std.testing.expect(expr.for_expr.var_type_annotation == null);
+}
+
+test "parse for comprehension with type annotation on bare bind" {
+    const source = "for x :: i64 <- numbers { x }";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const expr = try parser.parseExpr();
+    try std.testing.expect(expr.* == .for_expr);
+    try std.testing.expect(expr.for_expr.var_pattern.* == .bind);
+    try std.testing.expect(expr.for_expr.var_type_annotation != null);
+    try std.testing.expect(expr.for_expr.var_type_annotation.?.* == .name);
+    const name_id = expr.for_expr.var_type_annotation.?.name.name;
+    try std.testing.expectEqualStrings("i64", parser.interner.get(name_id));
+}
+
+test "parse for comprehension with destructure + type annotation" {
+    const source = "for {k, v} :: {Atom, i64} <- pairs { v }";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const expr = try parser.parseExpr();
+    try std.testing.expect(expr.* == .for_expr);
+    try std.testing.expect(expr.for_expr.var_pattern.* == .tuple);
+    try std.testing.expect(expr.for_expr.var_type_annotation != null);
+    try std.testing.expect(expr.for_expr.var_type_annotation.?.* == .tuple);
+    try std.testing.expectEqual(@as(usize, 2), expr.for_expr.var_type_annotation.?.tuple.elements.len);
+}
+
+test "parse for comprehension with cons pattern" {
+    const source = "for [head | _tail] <- nested { head }";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const expr = try parser.parseExpr();
+    try std.testing.expect(expr.* == .for_expr);
+    try std.testing.expect(expr.for_expr.var_pattern.* == .list_cons);
+}
+
+test "parse for comprehension with tagged tuple pattern" {
+    const source = "for {:ok, n} <- results { n }";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const expr = try parser.parseExpr();
+    try std.testing.expect(expr.* == .for_expr);
+    try std.testing.expect(expr.for_expr.var_pattern.* == .tuple);
+    try std.testing.expectEqual(@as(usize, 2), expr.for_expr.var_pattern.tuple.elements.len);
+    // First element is the :ok atom literal.
+    try std.testing.expect(expr.for_expr.var_pattern.tuple.elements[0].* == .literal);
+}
+
+test "parse for comprehension annotation + filter" {
+    const source = "for x :: i64 <- numbers, x > 0 { x }";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const expr = try parser.parseExpr();
+    try std.testing.expect(expr.* == .for_expr);
+    try std.testing.expect(expr.for_expr.var_pattern.* == .bind);
+    try std.testing.expect(expr.for_expr.var_type_annotation != null);
+    try std.testing.expect(expr.for_expr.filter != null);
 }
 
 test "parse list cons expression [h | t]" {

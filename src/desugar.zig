@@ -917,6 +917,62 @@ pub const Desugarer = struct {
         return null;
     }
 
+    /// Resolution shape for a for-loop's destructuring slot. When the
+    /// loop variable carries a type annotation, the destructure target
+    /// becomes an internal bind and a type-asserted rebinding is
+    /// prepended to the loop body — pushing the annotation through the
+    /// same `pattern = (value :: T)` path that any user-written
+    /// destructuring assignment uses. When no annotation is present, the
+    /// user's pattern slots in directly with no extra binding.
+    const LoopBind = struct {
+        /// Pattern that goes into the cons head, cont tuple, or string
+        /// per-byte slot.
+        pattern: *const ast.Pattern,
+        /// Statements prepended to the loop body (empty when no
+        /// annotation was given).
+        pre_body: []const ast.Stmt,
+    };
+
+    fn buildLoopBind(self: *Desugarer, fe: *const ast.ForExpr, meta: ast.NodeMeta) !LoopBind {
+        if (fe.var_type_annotation) |ta| {
+            const raw_name = try self.interner.intern("__loop_raw");
+            const raw_pat = try self.create(ast.Pattern, .{
+                .bind = .{ .meta = meta, .name = raw_name },
+            });
+            const raw_ref = try self.create(ast.Expr, .{
+                .var_ref = .{ .meta = meta, .name = raw_name },
+            });
+            const annotated = try self.create(ast.Expr, .{
+                .type_annotated = .{ .meta = meta, .expr = raw_ref, .type_expr = ta },
+            });
+            const assign = try self.create(ast.Assignment, .{
+                .meta = meta,
+                .pattern = fe.var_pattern,
+                .value = annotated,
+            });
+            return .{
+                .pattern = raw_pat,
+                .pre_body = try self.allocSlice(ast.Stmt, &.{.{ .assignment = assign }}),
+            };
+        }
+        return .{
+            .pattern = fe.var_pattern,
+            .pre_body = &.{},
+        };
+    }
+
+    /// Build the body-statement slice for a loop arm: optional
+    /// type-asserted rebinding followed by the arm's expression.
+    fn loopArmBody(self: *Desugarer, pre_body: []const ast.Stmt, body_expr: *const ast.Expr) ![]const ast.Stmt {
+        if (pre_body.len == 0) {
+            return try self.allocSlice(ast.Stmt, &.{.{ .expr = body_expr }});
+        }
+        var stmts: std.ArrayList(ast.Stmt) = .empty;
+        try stmts.appendSlice(self.allocator, pre_body);
+        try stmts.append(self.allocator, .{ .expr = body_expr });
+        return try stmts.toOwnedSlice(self.allocator);
+    }
+
     fn desugarForExpr(self: *Desugarer, fe: *const ast.ForExpr) !*const ast.Expr {
         // Use zero span for generated function internals so the type checker
         // skips annotation requirements for compiler-generated code.
@@ -981,10 +1037,13 @@ pub const Desugarer = struct {
             .body = try self.allocSlice(ast.Stmt, &.{.{ .expr = empty_list }}),
         };
 
-        // Clause 2: recursive case — fn __for_N([x | __rest]) { [body | __for_N(__rest)] }
-        const var_pat = try self.create(ast.Pattern, .{
-            .bind = .{ .meta = meta, .name = fe.var_name },
-        });
+        // Clause 2: recursive case — fn __for_N([<pat> | __rest]) { [body | __for_N(__rest)] }
+        // The user-supplied pattern slots in directly when no type
+        // annotation is present; with an annotation, the cons head
+        // binds to an internal name and the body opens with a
+        // type-asserted re-binding statement (see buildLoopBind).
+        const loop_bind = try self.buildLoopBind(fe, meta);
+        const var_pat = loop_bind.pattern;
         const rest_pat = try self.create(ast.Pattern, .{
             .bind = .{ .meta = meta, .name = rest_name },
         });
@@ -1052,7 +1111,7 @@ pub const Desugarer = struct {
             .params = try self.allocSlice(ast.Param, &.{cons_param}),
             .return_type = null,
             .refinement = null,
-            .body = try self.allocSlice(ast.Stmt, &.{.{ .expr = final_body_expr }}),
+            .body = try self.loopArmBody(loop_bind.pre_body, final_body_expr),
         };
 
         // Build function declaration with both clauses
@@ -1137,12 +1196,22 @@ pub const Desugarer = struct {
             },
         });
 
-        // Build: char = String.byte_at(__s, __i)
+        // Build: <pat> = (String.byte_at(__s, __i) :: <annotation>)?
+        // Strings yield bytes, so the user's pattern binds the byte
+        // value. When a `:: T` annotation is present the byte_at result
+        // is wrapped in a type_annotated expr — same path a user-written
+        // `x :: T = expr` statement uses elsewhere.
+        const char_value: *const ast.Expr = if (fe.var_type_annotation) |ta|
+            try self.create(ast.Expr, .{
+                .type_annotated = .{ .meta = meta, .expr = byte_at_call, .type_expr = ta },
+            })
+        else
+            byte_at_call;
         const char_assign = ast.Stmt{
             .assignment = try self.create(ast.Assignment, .{
                 .meta = meta,
-                .pattern = try self.create(ast.Pattern, .{ .bind = .{ .meta = meta, .name = fe.var_name } }),
-                .value = byte_at_call,
+                .pattern = fe.var_pattern,
+                .value = char_value,
             }),
         };
 
@@ -1302,22 +1371,28 @@ pub const Desugarer = struct {
         });
         const empty_list = try self.create(ast.Expr, .{ .list = .{ .meta = meta, .elements = &.{} } });
 
-        // Tuple pattern: {:cont, x, __next_state} -> [body | rec]
+        // Tuple pattern: {:cont, <user-pattern>, __next_state} -> [body | rec]
+        // When no annotation is present, the user's pattern slots
+        // directly into the second tuple element. With `:: T`, the slot
+        // becomes an internal bind and the cont-arm body opens with a
+        // type-asserted re-binding through the standard assignment
+        // pipeline (see buildLoopBind).
         const cont_atom = try self.create(ast.Pattern, .{ .literal = .{ .atom = .{ .meta = meta, .value = try self.interner.intern("cont") } } });
-        const val_bind = try self.create(ast.Pattern, .{ .bind = .{ .meta = meta, .name = fe.var_name } });
+        const loop_bind = try self.buildLoopBind(fe, meta);
+        const val_bind = loop_bind.pattern;
         const next_bind = try self.create(ast.Pattern, .{ .bind = .{ .meta = meta, .name = next_state_name } });
         const cont_pat = try self.create(ast.Pattern, .{
             .tuple = .{ .meta = meta, .elements = try self.allocSlice(*const ast.Pattern, &.{ cont_atom, val_bind, next_bind }) },
         });
 
-        // case :zig.Module.next(state) { {:done, _, _} -> []; {:cont, x, next} -> [body | rec] }
+        // case :zig.Module.next(state) { {:done, _, _} -> []; {:cont, x, next} -> <pre-body>; [body | rec] }
         const case_expr = try self.create(ast.Expr, .{
             .case_expr = .{
                 .meta = meta,
                 .scrutinee = next_call,
                 .clauses = try self.allocSlice(ast.CaseClause, &.{
                     .{ .meta = meta, .pattern = done_pat, .type_annotation = null, .guard = null, .body = try self.allocSlice(ast.Stmt, &.{.{ .expr = empty_list }}) },
-                    .{ .meta = meta, .pattern = cont_pat, .type_annotation = null, .guard = null, .body = try self.allocSlice(ast.Stmt, &.{.{ .expr = cons_expr }}) },
+                    .{ .meta = meta, .pattern = cont_pat, .type_annotation = null, .guard = null, .body = try self.loopArmBody(loop_bind.pre_body, cons_expr) },
                 }),
             },
         });

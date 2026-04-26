@@ -327,13 +327,17 @@ pub fn exprToCtValue(
             return makeTuple3(alloc, store, .{ .atom = "&" }, try metaToList(alloc, store, v.meta, null), args);
         },
 
-        // For comprehension: {:for, meta, [var_atom, iterable, filter_or_nil, body]}
+        // For comprehension: {:for, meta, [var_pattern, iterable, filter_or_nil, body]}
+        // var_pattern is the full Pattern serialization — supports tuple
+        // destructure (`{k, v}`), tagged tuples (`{:ok, n}`), cons heads,
+        // wildcards, etc. — going through the same patternToCtValue helper
+        // that case-arms and function params use.
         .for_expr => |v| {
-            const var_atom: CtValue = .{ .atom = interner.get(v.var_name) };
+            const var_pattern_val = try patternToCtValue(alloc, interner, store, v.var_pattern);
             const iterable = try exprToCtValue(alloc, interner, store, v.iterable);
             const filter_val = if (v.filter) |f| try exprToCtValue(alloc, interner, store, f) else CtValue.nil;
             const body = try exprToCtValue(alloc, interner, store, v.body);
-            const args = try makeList(alloc, store, &.{ var_atom, iterable, filter_val, body });
+            const args = try makeList(alloc, store, &.{ var_pattern_val, iterable, filter_val, body });
             return makeTuple3(alloc, store, .{ .atom = "for" }, try metaToList(alloc, store, v.meta, null), args);
         },
 
@@ -1128,13 +1132,18 @@ pub fn ctValueToExpr(
         }
     }
 
-    // For comprehension: {:for, meta, [var_atom, iterable, filter, body]}
+    // For comprehension: {:for, meta, [var_pattern, iterable, filter, body]}
+    // The first argument is the loop variable's pattern serialization.
+    // Legacy CTFE inputs that used a bare atom for a single-name binding
+    // are still accepted via the atom → bind-pattern fallback.
     if (std.mem.eql(u8, form_name, "for")) {
         if (arg_elems.len == 4) {
-            const var_name = if (arg_elems[0] == .atom)
-                try interner.intern(arg_elems[0].atom)
-            else
-                try interner.intern("_");
+            const var_pattern: *const ast.Pattern = if (arg_elems[0] == .atom) blk: {
+                const bind_name = try interner.intern(arg_elems[0].atom);
+                const pat = try alloc.create(ast.Pattern);
+                pat.* = .{ .bind = .{ .meta = node_meta, .name = bind_name } };
+                break :blk pat;
+            } else try ctValueToPattern(alloc, interner, arg_elems[0]);
             const iterable = try ctValueToExpr(alloc, interner, arg_elems[1]);
             const filter_expr = if (arg_elems[2] != .nil)
                 try ctValueToExpr(alloc, interner, arg_elems[2])
@@ -1144,7 +1153,8 @@ pub fn ctValueToExpr(
             const expr = try alloc.create(ast.Expr);
             expr.* = .{ .for_expr = .{
                 .meta = node_meta,
-                .var_name = var_name,
+                .var_pattern = var_pattern,
+                .var_type_annotation = null,
                 .iterable = iterable,
                 .filter = filter_expr,
                 .body = body,

@@ -251,5 +251,10 @@ pub struct Test.MapTest {
       counts = for _kv <- %{single: 42} { 1 }
       assert(List.length(counts) == 1)
     }
+
+    test("for-comp tuple destructure binds key and value") {
+      values = for {_k, v} <- %{a: 10, b: 20, c: 30} { v }
+      assert(List.length(values) == 3)
+    }
   }
 }

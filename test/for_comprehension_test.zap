@@ -46,4 +46,12 @@ pub struct Test.ForComprehensionTest {
       assert(List.head(result) == 5)
     }
   }
+
+  describe("for comprehension destructuring") {
+    test("type annotation on bare bind") {
+      result = for x :: i64 <- [1, 2, 3] { x + 100 }
+      assert(List.length(result) == 3)
+      assert(List.head(result) == 101)
+    }
+  }
 }
