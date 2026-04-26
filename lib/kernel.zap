@@ -257,52 +257,6 @@ pub struct Kernel {
   }
 
   @doc = """
-    Equality. Generic over the operand type — the monomorphizer
-    specializes per concrete type pair at each call site, and the Zig
-    helper picks the type-correct comparison (`std.mem.eql` for strings,
-    `==` for value types).
-
-    ## Examples
-
-        5 == 5         # => true
-        "a" == "b"     # => false
-    """
-
-  pub fn ==(left :: a, right :: a) -> Bool {
-    :zig.Kernel.eq(left, right)
-  }
-
-  @doc = "Inequality. Negation of `==`."
-
-  pub fn !=(left :: a, right :: a) -> Bool {
-    :zig.Kernel.neq(left, right)
-  }
-
-  @doc = "Less-than comparison. Lexicographic for strings, value-based otherwise."
-
-  pub fn <(left :: a, right :: a) -> Bool {
-    :zig.Kernel.lt(left, right)
-  }
-
-  @doc = "Greater-than comparison."
-
-  pub fn >(left :: a, right :: a) -> Bool {
-    :zig.Kernel.gt(left, right)
-  }
-
-  @doc = "Less-than-or-equal comparison."
-
-  pub fn <=(left :: a, right :: a) -> Bool {
-    :zig.Kernel.lte(left, right)
-  }
-
-  @doc = "Greater-than-or-equal comparison."
-
-  pub fn >=(left :: a, right :: a) -> Bool {
-    :zig.Kernel.gte(left, right)
-  }
-
-  @doc = """
     Raises a runtime error with the given message.
 
     This terminates the program immediately. Use in `!` functions

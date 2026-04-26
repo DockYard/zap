@@ -1603,6 +1603,51 @@ fn literalEquals(a: LiteralValue, b: LiteralValue) bool {
 }
 
 // ============================================================
+// Operator → protocol mapping
+// ============================================================
+
+/// Metadata for routing a binary operator through a protocol impl call.
+const OperatorMeta = struct {
+    /// Protocol that defines the operator (`Arithmetic`, `Comparator`).
+    protocol: []const u8,
+    /// Method name as it appears in the impl (`+`, `==`, `rem`, ...).
+    method: []const u8,
+    /// Result type derived from the operand type. Arithmetic returns
+    /// the operand type; comparison returns Bool.
+    result_type: *const fn (operand_type: types_mod.TypeId) types_mod.TypeId,
+};
+
+fn sameAsOperand(operand_type: types_mod.TypeId) types_mod.TypeId {
+    return operand_type;
+}
+
+fn alwaysBool(_: types_mod.TypeId) types_mod.TypeId {
+    return types_mod.TypeStore.BOOL;
+}
+
+/// Map a binary AST op to its protocol/method, or null when the op is
+/// handled directly by the primitive ZIR path (logical and/or, in,
+/// concat). Operators routed here lower to a call against the matching
+/// `impl PROTOCOL for OperandType` when one exists; otherwise they fall
+/// through to the primitive path.
+fn operatorProtocol(op: ast.BinaryOp.Op) ?OperatorMeta {
+    return switch (op) {
+        .add => .{ .protocol = "Arithmetic", .method = "+", .result_type = sameAsOperand },
+        .sub => .{ .protocol = "Arithmetic", .method = "-", .result_type = sameAsOperand },
+        .mul => .{ .protocol = "Arithmetic", .method = "*", .result_type = sameAsOperand },
+        .div => .{ .protocol = "Arithmetic", .method = "/", .result_type = sameAsOperand },
+        .rem_op => .{ .protocol = "Arithmetic", .method = "rem", .result_type = sameAsOperand },
+        .equal => .{ .protocol = "Comparator", .method = "==", .result_type = alwaysBool },
+        .not_equal => .{ .protocol = "Comparator", .method = "!=", .result_type = alwaysBool },
+        .less => .{ .protocol = "Comparator", .method = "<", .result_type = alwaysBool },
+        .greater => .{ .protocol = "Comparator", .method = ">", .result_type = alwaysBool },
+        .less_equal => .{ .protocol = "Comparator", .method = "<=", .result_type = alwaysBool },
+        .greater_equal => .{ .protocol = "Comparator", .method = ">=", .result_type = alwaysBool },
+        else => null,
+    };
+}
+
+// ============================================================
 // HIR builder — converts typed AST to HIR
 // ============================================================
 
@@ -3398,42 +3443,32 @@ pub const HirBuilder = struct {
                 const lhs_expr = try self.buildExpr(bo.lhs);
                 const rhs_expr = try self.buildExpr(bo.rhs);
 
-                // Route arithmetic through the Arithmetic protocol. When
-                // either operand has a known concrete numeric type we lower
-                // `a OP b` to a call against the matching impl module
-                // (`Integer.+`, `Float.+`, ...). The mangler turns the
-                // operator name into a Zig-safe identifier downstream, and
-                // the impl body handles the type-specific runtime path.
-                // Otherwise (UNKNOWN operand types, non-numeric carriers)
+                // Protocol-driven dispatch: when either operand has a known
+                // concrete type and the corresponding `impl PROTOCOL for T`
+                // exists, lower `a OP b` to a call against the impl's
+                // operator function (`Integer.+`, `Float.<`, ...). The
+                // mangler turns the operator name into a Zig-safe identifier
+                // downstream, and the impl body handles the type-specific
+                // runtime path. Otherwise (UNKNOWN operand types, no impl)
                 // fall through to the primitive ZIR binary op.
-                if (bo.op == .add or bo.op == .sub or bo.op == .mul or bo.op == .div or bo.op == .rem_op) {
+                if (operatorProtocol(bo.op)) |op_meta| {
                     const operand_type: types_mod.TypeId = if (lhs_expr.type_id != types_mod.TypeStore.UNKNOWN)
                         lhs_expr.type_id
                     else
                         rhs_expr.type_id;
                     if (operand_type != types_mod.TypeStore.UNKNOWN) {
-                        const module_name_opt = self.type_store.typeToModuleName(operand_type, self.interner);
-                        if (module_name_opt) |module_name| {
-                            if (std.mem.eql(u8, module_name, "Integer") or std.mem.eql(u8, module_name, "Float")) {
-                                const op_name: []const u8 = switch (bo.op) {
-                                    .add => "+",
-                                    .sub => "-",
-                                    .mul => "*",
-                                    .div => "/",
-                                    .rem_op => "rem",
-                                    else => unreachable,
-                                };
-
+                        if (self.type_store.typeToModuleName(operand_type, self.interner)) |module_name| {
+                            if (self.hasImpl(op_meta.protocol, module_name)) {
                                 var args: std.ArrayList(CallArg) = .empty;
                                 try args.append(self.allocator, .{ .expr = lhs_expr, .mode = .share });
                                 try args.append(self.allocator, .{ .expr = rhs_expr, .mode = .share });
 
                                 return try self.create(Expr, .{
                                     .kind = .{ .call = .{
-                                        .target = .{ .named = .{ .module = module_name, .name = op_name } },
+                                        .target = .{ .named = .{ .module = module_name, .name = op_meta.method } },
                                         .args = try args.toOwnedSlice(self.allocator),
                                     } },
-                                    .type_id = operand_type,
+                                    .type_id = op_meta.result_type(operand_type),
                                     .span = bo.meta.span,
                                 });
                             }
@@ -4508,6 +4543,21 @@ pub const HirBuilder = struct {
             buf.appendSlice(self.allocator, self.interner.get(part)) catch return self.interner.get(name.parts[0]);
         }
         return buf.toOwnedSlice(self.allocator) catch return self.interner.get(name.parts[0]);
+    }
+
+    /// True iff `impl <protocol_simple> for <target_simple>` exists in the
+    /// scope graph. Both names are matched as single-part struct names —
+    /// adequate for the current built-in protocols (`Arithmetic`,
+    /// `Comparator`, etc.) that target single-segment types like
+    /// `Integer` or `Float`.
+    fn hasImpl(self: *const HirBuilder, protocol_simple: []const u8, target_simple: []const u8) bool {
+        for (self.graph.impls.items) |entry| {
+            if (entry.protocol_name.parts.len != 1 or entry.target_type.parts.len != 1) continue;
+            const p = self.interner.get(entry.protocol_name.parts[0]);
+            const t = self.interner.get(entry.target_type.parts[0]);
+            if (std.mem.eql(u8, p, protocol_simple) and std.mem.eql(u8, t, target_simple)) return true;
+        }
+        return false;
     }
 
     /// Recursively collect bindings from tuple sub-patterns (including nested tuples).
