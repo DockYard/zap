@@ -264,6 +264,21 @@ pub struct Test.StringTest {
     }
   }
 
+  describe("Interpolation inside compound expressions") {
+    test("interpolation inside list literal") {
+      name = "world"
+      greetings = ["hello #{name}", "bye #{name}"]
+      assert(List.head(greetings) == "hello world")
+    }
+
+    test("interpolation inside nested list literal") {
+      n = 42
+      items = [["count: #{n}", "ok"]]
+      first = List.head(items)
+      assert(List.head(first) == "count: 42")
+    }
+  }
+
   describe("Word list sigils") {
     test("~w splits on space") {
       words = ~w"foo bar baz"

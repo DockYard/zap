@@ -429,8 +429,102 @@ pub const Desugarer = struct {
                 });
             },
 
-            // Leaf/passthrough nodes
-            else => return expr,
+            // ----- Compound expressions: recurse so transformations
+            //       (pipe rewriting, string interpolation, etc.) inside
+            //       compound shapes are not silently lost.
+
+            .tuple => |te| {
+                var new_elements: std.ArrayList(*const ast.Expr) = .empty;
+                for (te.elements) |elem| {
+                    try new_elements.append(self.allocator, try self.desugarExpr(elem));
+                }
+                return try self.create(ast.Expr, .{
+                    .tuple = .{
+                        .meta = te.meta,
+                        .elements = try new_elements.toOwnedSlice(self.allocator),
+                    },
+                });
+            },
+            .list => |le| {
+                var new_elements: std.ArrayList(*const ast.Expr) = .empty;
+                for (le.elements) |elem| {
+                    try new_elements.append(self.allocator, try self.desugarExpr(elem));
+                }
+                return try self.create(ast.Expr, .{
+                    .list = .{
+                        .meta = le.meta,
+                        .elements = try new_elements.toOwnedSlice(self.allocator),
+                    },
+                });
+            },
+            .field_access => |fa| {
+                return try self.create(ast.Expr, .{
+                    .field_access = .{
+                        .meta = fa.meta,
+                        .object = try self.desugarExpr(fa.object),
+                        .field = fa.field,
+                    },
+                });
+            },
+            .unwrap => |uw| {
+                return try self.desugarUnwrap(try self.desugarExpr(uw.expr), uw.meta);
+            },
+            .panic_expr => |pe| {
+                return try self.create(ast.Expr, .{
+                    .panic_expr = .{
+                        .meta = pe.meta,
+                        .message = try self.desugarExpr(pe.message),
+                    },
+                });
+            },
+            .type_annotated => |ta| {
+                return try self.create(ast.Expr, .{
+                    .type_annotated = .{
+                        .meta = ta.meta,
+                        .expr = try self.desugarExpr(ta.expr),
+                        .type_expr = ta.type_expr,
+                    },
+                });
+            },
+
+            // ----- Leaf nodes — no recursion, no transformation.
+            //       Listed explicitly so adding a new Expr variant
+            //       triggers a switch-exhaustiveness compile error here
+            //       and forces a deliberate decision instead of silently
+            //       falling through `else => return expr`.
+
+            .int_literal,
+            .float_literal,
+            .string_literal,
+            .atom_literal,
+            .bool_literal,
+            .nil_literal,
+            .var_ref,
+            .module_ref,
+            .intrinsic,
+            .attr_ref,
+            .binary_literal,
+            .function_ref,
+            => return expr,
+
+            // ----- Macro-internal AST nodes — these are placeholders
+            //       inside `quote { ... }` bodies and should NEVER be
+            //       desugared. The macro engine consumes them.
+
+            .quote_expr,
+            .unquote_expr,
+            .unquote_splicing_expr,
+            => return expr,
+
+            // ----- Control-flow forms expanded to `case` by the macro
+            //       engine before desugaring runs. Reaching this point
+            //       indicates a pipeline ordering bug, not a normal
+            //       desugaring case — keep them passthrough as a
+            //       defensive measure but flag for future tightening.
+
+            .if_expr,
+            .cond_expr,
+            => return expr,
         }
     }
 
