@@ -1058,6 +1058,13 @@ pub const TypeChecker = struct {
     /// `fn foo(x :: a) -> a` refers to the same type variable.
     type_var_scope: std.StringHashMap(TypeId),
 
+    /// Set when checking the body of an `impl Protocol for Target(K, V)`
+    /// block — the impl's declared type parameters are pre-bound into
+    /// `type_var_scope` at the start of every clause check so references
+    /// like `K` and `V` in the impl's function signatures resolve to the
+    /// impl's own type variables (consistent across params and return).
+    current_impl: ?*const ast.ImplDecl = null,
+
     // Number of stdlib lines prepended (bindings in these lines are skipped for unused checks)
     stdlib_line_count: u32 = 0,
 
@@ -2363,6 +2370,9 @@ pub const TypeChecker = struct {
             .macro, .priv_macro => {}, // Macro bodies are compile-time code — not type-checked
             .struct_decl, .priv_struct_decl => {},
             .impl_decl, .priv_impl_decl => |impl_d| {
+                const prev_impl = self.current_impl;
+                self.current_impl = impl_d;
+                defer self.current_impl = prev_impl;
                 for (impl_d.functions) |func| {
                     try self.checkFunctionDecl(func);
                 }
@@ -2453,6 +2463,22 @@ pub const TypeChecker = struct {
         // Each function clause gets its own type variable scope so that
         // `a` in `fn foo(x :: a) -> a` refers to the same type variable.
         self.type_var_scope.clearRetainingCapacity();
+
+        // Inside an impl block, pre-bind the impl's declared type
+        // parameters so subsequent param/return resolution sees them as
+        // type variables (regardless of name casing). Without this, a
+        // reference like `K` in `pub fn next(map :: Map(K, V)) -> ... K`
+        // would resolve as an unknown concrete type because the parser
+        // emits an uppercase identifier as `.name`, not `.variable`.
+        if (self.current_impl) |impl_d| {
+            for (impl_d.type_params) |tp_name_id| {
+                const tp_name = self.interner.get(tp_name_id);
+                if (!self.type_var_scope.contains(tp_name)) {
+                    const fresh = self.store.freshVar() catch continue;
+                    self.type_var_scope.put(tp_name, fresh) catch {};
+                }
+            }
+        }
 
         const is_anon = self.isAnonymousFunctionDecl(func);
 
@@ -3651,6 +3677,31 @@ pub const TypeChecker = struct {
             .name => |tn| {
                 const name = self.interner.get(tn.name);
 
+                // Names already bound as type variables in this clause's
+                // scope take precedence — covers both natural lowercase
+                // type variables (`a`, `member`) AST-classified as
+                // .variable and impl-declared parameters (e.g. `K`, `V`)
+                // that the parser routed through .name. Pre-population
+                // happens in checkFunctionClause when entering an impl.
+                if (tn.args.len == 0) {
+                    if (self.type_var_scope.get(name)) |existing| return existing;
+                }
+
+                // Built-in generic containers map onto the dedicated type
+                // variants the rest of the pipeline already understands.
+                // Mirrors the existing `[T]` and `%{K=>V}` sigils.
+                if (tn.args.len > 0) {
+                    if (std.mem.eql(u8, name, "Map") and tn.args.len == 2) {
+                        const key_t = try self.resolveTypeExpr(tn.args[0]);
+                        const value_t = try self.resolveTypeExpr(tn.args[1]);
+                        return try self.store.addType(.{ .map = .{ .key = key_t, .value = value_t } });
+                    }
+                    if (std.mem.eql(u8, name, "List") and tn.args.len == 1) {
+                        const elem_t = try self.resolveTypeExpr(tn.args[0]);
+                        return try self.store.addType(.{ .list = .{ .element = elem_t } });
+                    }
+                }
+
                 if (self.store.resolveTypeName(name)) |tid| {
                     if (tn.args.len > 0) {
                         // Generic type application
@@ -4254,6 +4305,46 @@ test "type check if condition must be Bool" {
     const err_msg = checker.errors.items[0].message;
     // New contextual message mentions the actual type and if requirement
     try std.testing.expect(std.mem.find(u8, err_msg, "but `if` requires a `Bool`") != null);
+}
+
+test "type check generic impl resolves Map(K, V) to map type" {
+    // Verify that an `impl Enumerable for Map(K, V)` block type-checks
+    // without "unknown type K/V" errors — Phase 2 plumbing only. Body
+    // references `:zig.Map.next` which is a builtin call (no type-check
+    // pass on its body); we're confirming the *signature* resolves.
+    const source =
+        \\pub protocol Enumerable {
+        \\  fn next(state) -> {Atom, i64, any}
+        \\}
+        \\
+        \\pub impl Enumerable for Map(K, V) {
+        \\  pub fn next(map :: Map(K, V)) -> Map(K, V) {
+        \\    map
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    // No "I cannot find a type named `K`" or `V` errors should fire.
+    for (checker.errors.items) |err| {
+        try std.testing.expect(std.mem.find(u8, err.message, "I cannot find a type named `K`") == null);
+        try std.testing.expect(std.mem.find(u8, err.message, "I cannot find a type named `V`") == null);
+    }
 }
 
 test "type check return type mismatch" {
