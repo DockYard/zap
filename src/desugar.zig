@@ -940,6 +940,16 @@ pub const Desugarer = struct {
             }
         }
 
+        // Map literal: dispatch through Enumerable protocol registry. Each
+        // step yields `{:cont, {key, value}, remaining_map}` so the user
+        // pattern is typically `for {k, v} <- m { ... }`. The actual
+        // signature lives in `lib/map/enumerable.zap`.
+        if (fe.iterable.* == .map) {
+            if (self.resolveEnumerableModule("Map")) |mod| {
+                return self.desugarForEnumerable(fe, mod);
+            }
+        }
+
         // Fallback: variables and other types
         return self.desugarForListRecursion(fe, meta);
     }
