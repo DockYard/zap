@@ -148,6 +148,12 @@ pub const ImplDecl = struct {
     meta: NodeMeta,
     protocol_name: StructName,
     target_type: StructName,
+    /// Type parameters declared on the impl header, e.g. `K, V` in
+    /// `impl Enumerable for Map(K, V)`. Empty when the target type is
+    /// concrete. These names are bound as type variables inside the
+    /// impl's function signatures so the same parameter symbol resolves
+    /// to the same type variable across params and return type.
+    type_params: []const StringId = &.{},
     functions: []const *const FunctionDecl,
     is_private: bool = false,
 };

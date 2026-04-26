@@ -937,6 +937,31 @@ pub const Parser = struct {
         }
         const target_type = try self.parseStructName();
 
+        // Optional type parameters: `Map(K, V)` declares K and V as type
+        // variables visible inside the impl's function signatures. Each
+        // entry must be a bare identifier — no nested type expressions
+        // and no constraints (those would belong to a future where-clause).
+        var type_params: std.ArrayList(ast.StringId) = .empty;
+        if (self.check(.left_paren)) {
+            _ = self.advance();
+            while (!self.check(.right_paren) and !self.check(.eof)) {
+                if (!self.check(.identifier) and !self.check(.module_identifier)) {
+                    try self.addRichError(
+                        "I was expecting a type-parameter name (like `K`) inside the parens",
+                        self.currentSpan(),
+                        null,
+                        "type parameters look like: `impl Enumerable for Map(K, V) { ... }`",
+                    );
+                    return error.ParseError;
+                }
+                const tok = self.advance();
+                try type_params.append(self.allocator, try self.internToken(tok));
+                if (!self.match(.comma)) break;
+                self.skipNewlines();
+            }
+            _ = try self.expect(.right_paren);
+        }
+
         _ = try self.expect(.left_brace);
         self.skipNewlines();
 
@@ -987,6 +1012,7 @@ pub const Parser = struct {
             .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
             .protocol_name = protocol_name,
             .target_type = target_type,
+            .type_params = try type_params.toOwnedSlice(self.allocator),
             .functions = try functions.toOwnedSlice(self.allocator),
             .is_private = is_private,
         };
@@ -5506,4 +5532,108 @@ test "parse private impl" {
     const impl_d = program.top_items[0].priv_impl_decl;
     try std.testing.expectEqual(true, impl_d.is_private);
     try std.testing.expectEqual(@as(usize, 1), impl_d.functions.len);
+}
+
+test "parse impl with generic type parameters" {
+    const source =
+        \\pub impl Enumerable for Map(K, V) {
+        \\  pub fn next(map :: %{K => V}) -> {Atom, {K, V}, %{K => V}} {
+        \\    :zig.Map.next(map)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const impl_d = program.top_items[0].impl_decl;
+    try std.testing.expectEqual(@as(usize, 1), impl_d.target_type.parts.len);
+    try std.testing.expectEqual(@as(usize, 2), impl_d.type_params.len);
+    // Verify the parameters are K and V in order
+    const k_name = parser.interner.get(impl_d.type_params[0]);
+    const v_name = parser.interner.get(impl_d.type_params[1]);
+    try std.testing.expectEqualStrings("K", k_name);
+    try std.testing.expectEqualStrings("V", v_name);
+    try std.testing.expectEqual(@as(usize, 1), impl_d.functions.len);
+}
+
+test "parse impl with single type parameter" {
+    const source =
+        \\pub impl Enumerable for List(T) {
+        \\  pub fn next(list :: [T]) -> {Atom, T, [T]} {
+        \\    :zig.List.next(list)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const impl_d = program.top_items[0].impl_decl;
+    try std.testing.expectEqual(@as(usize, 1), impl_d.type_params.len);
+    try std.testing.expectEqualStrings("T", parser.interner.get(impl_d.type_params[0]));
+}
+
+test "parse impl with no type parameters keeps existing shape" {
+    const source =
+        \\pub impl Enumerable for Range {
+        \\  pub fn next(range :: Range) -> {Atom, i64, Range} {
+        \\    :zig.Range.next(range)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const impl_d = program.top_items[0].impl_decl;
+    try std.testing.expectEqual(@as(usize, 0), impl_d.type_params.len);
+}
+
+test "parse impl rejects nested type expression as type parameter" {
+    const source =
+        \\pub impl Enumerable for Map(List(K), V) {
+        \\  pub fn next(map :: Map) -> Map { map }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    // Type-parameter slot must be a bare name. Nested calls like
+    // `List(K)` inside the impl header parens belong to a future
+    // where-clause / partial-application syntax — for now reject.
+    const result = parser.parseProgram();
+    try std.testing.expectError(error.ParseError, result);
+}
+
+test "less-than expression after struct call still parses as comparison" {
+    // Defensive: confirm we didn't break expression-context `<`.
+    // This file's impl-header parens are isolated from expressions.
+    const source =
+        \\pub struct Test {
+        \\  pub fn check(a :: i64, b :: i64) -> Bool {
+        \\    a < b
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    try std.testing.expectEqual(@as(usize, 1), program.structs.len);
 }
