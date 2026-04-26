@@ -1673,6 +1673,13 @@ pub const HirBuilder = struct {
     parent_assignment_bindings: std.ArrayList(AssignmentBinding),
     current_module_scope: ?scope_mod.ScopeId,
     current_clause_scope: ?scope_mod.ScopeId,
+    /// Set while building the function groups for an `impl Protocol for
+    /// Target(K, V)` block. Carries the impl's declared type parameters
+    /// so each clause's `hir_type_var_scope` can be pre-populated with
+    /// the same K, V bindings as the type checker used. Without this,
+    /// `Map(K, V)` in the impl's signatures would resolve to an UNKNOWN
+    /// type because HIR's type-var lookup wouldn't find K or V.
+    current_impl: ?*const ast.ImplDecl = null,
     current_function_root_scope: ?scope_mod.ScopeId,
     current_function_name: ?[]const u8,
     current_function_name_id: ?ast.StringId,
@@ -2338,6 +2345,9 @@ pub const HirBuilder = struct {
             if (target_module_idx == null) continue;
 
             self.current_module_scope = impl_entry.scope_id;
+            const prev_impl = self.current_impl;
+            self.current_impl = impl_entry.decl;
+            defer self.current_impl = prev_impl;
             // Group impl functions by name (multi-clause merge), local to this impl.
             var impl_fn_order: std.ArrayList(ast.StringId) = .empty;
             var impl_fn_groups = std.AutoHashMap(ast.StringId, std.ArrayList(*const ast.FunctionDecl)).init(self.allocator);
@@ -2890,6 +2900,22 @@ pub const HirBuilder = struct {
     fn buildClause(self: *HirBuilder, clause: *const ast.FunctionClause) !Clause {
         self.next_local = 0;
         self.hir_type_var_scope.clearRetainingCapacity();
+
+        // While building an impl block's clauses, pre-populate the
+        // type-var scope with the impl's declared type parameters so
+        // their occurrences in this clause's signatures resolve to the
+        // same fresh TypeVar across params and return type. Mirrors the
+        // type checker's pre-population in checkFunctionClause.
+        if (self.current_impl) |impl_d| {
+            const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
+            for (impl_d.type_params) |tp_name_id| {
+                const tp_name = self.interner.get(tp_name_id);
+                if (!self.hir_type_var_scope.contains(tp_name)) {
+                    const fresh = store_ptr.freshVar() catch continue;
+                    self.hir_type_var_scope.put(tp_name, fresh) catch {};
+                }
+            }
+        }
         const prev_clause_scope = self.current_clause_scope;
         // Look up the clause's scope from the node_scope_map using the
         // composite (source_id, span.start) key. This prevents collisions
@@ -4321,6 +4347,32 @@ pub const HirBuilder = struct {
         return switch (type_expr.*) {
             .name => |n| {
                 const name_str = self.interner.get(n.name);
+                const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
+
+                // Names already bound as type variables in the active
+                // hir_type_var_scope short-circuit to the bound TypeId.
+                // Mirrors the type checker's behaviour so impl-declared
+                // parameters like `K`, `V` resolve consistently across
+                // params and return types.
+                if (n.args.len == 0) {
+                    if (self.hir_type_var_scope.get(name_str)) |existing| return existing;
+                }
+
+                // Built-in generic containers: `Map(K, V)` and `List(T)`
+                // map onto the dedicated TypeStore variants the rest of
+                // the pipeline already understands. Same shape that the
+                // existing `[T]` and `%{K=>V}` sigils produce.
+                if (n.args.len > 0) {
+                    if (std.mem.eql(u8, name_str, "Map") and n.args.len == 2) {
+                        const key_t = self.resolveTypeExpr(n.args[0]);
+                        const value_t = self.resolveTypeExpr(n.args[1]);
+                        return store_ptr.addType(.{ .map = .{ .key = key_t, .value = value_t } }) catch types_mod.TypeStore.UNKNOWN;
+                    }
+                    if (std.mem.eql(u8, name_str, "List") and n.args.len == 1) {
+                        const elem_t = self.resolveTypeExpr(n.args[0]);
+                        return store_ptr.addType(.{ .list = .{ .element = elem_t } }) catch types_mod.TypeStore.UNKNOWN;
+                    }
+                }
 
                 // First check builtins
                 if (self.type_store.resolveTypeName(name_str)) |id| return id;
@@ -4339,7 +4391,6 @@ pub const HirBuilder = struct {
                         for (n.args) |arg| {
                             type_params.append(self.allocator, self.resolveTypeExpr(arg)) catch {};
                         }
-                        const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
                         return store_ptr.addType(.{
                             .protocol_constraint = .{
                                 .protocol_name = n.name,

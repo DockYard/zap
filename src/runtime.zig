@@ -2945,6 +2945,46 @@ pub fn Map(comptime K: type, comptime V: type) type {
         return map;
     }
 
+    /// Iterator protocol for maps.
+    /// Returns `{:cont, {key, value}, remaining_map}` on each step or
+    /// `{:done, undefined, map}` when the map is empty. Each call removes
+    /// one entry; full iteration runs in O(n log n) for a map of n
+    /// entries. Iteration order is unspecified across runs but stable
+    /// within a single iteration on a single map value.
+    pub fn next(map: ?*const Self) struct {
+        u32,
+        struct { K, V },
+        ?*const Self,
+    } {
+        if (map == null or map.?.total_count == 0) {
+            return .{ ATOM_DONE, .{ undefined, undefined }, map };
+        }
+        const m = map.?;
+
+        const first_entry: MapEntry = if (m.repr_tag == 0)
+            m.flat_entries[0]
+        else
+            firstTrieEntry(m.trie_root.?);
+
+        const remaining = delete(map, first_entry.key);
+        return .{ ATOM_CONT, .{ first_entry.key, first_entry.value }, remaining };
+    }
+
+    /// Find the first leaf entry in a HAMT subtree by depth-first
+    /// traversal. Caller must guarantee the tree is non-empty (the
+    /// root's parent map had `total_count > 0`).
+    fn firstTrieEntry(node: *const HamtNode) MapEntry {
+        const count: usize = @intCast(node.child_count);
+        for (0..count) |i| {
+            if (node.children_nodes[i]) |sub| {
+                return firstTrieEntry(sub);
+            } else {
+                return node.children_entries[i];
+            }
+        }
+        unreachable;
+    }
+
     pub fn merge(map_a: ?*const Self, map_b: ?*const Self) ?*const Self {
         if (map_a == null) return map_b;
         if (map_b == null) return map_a;

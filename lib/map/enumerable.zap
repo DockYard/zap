@@ -1,17 +1,15 @@
-pub impl Enumerable for Map {
+pub impl Enumerable for Map(K, V) {
   @doc = """
     Returns the next entry from a map.
 
-    Map iteration is not yet supported. The signature is intentionally
-    simplified to `Map -> Map` rather than the protocol's
-    `(state) -> {Atom, i64, any}` because emitting a tuple return
-    containing the bare generic `Map` type currently fails ZIR
-    materialization. Once generic-type tuple returns are wired up,
-    restore the proper signature and have the body either route to a
-    runtime iterator or `raise` on use.
+    Each step yields `{:cont, {key, value}, remaining_map}` or
+    `{:done, undef_pair, map}` when the map is empty. Iteration order
+    is unspecified across runs but stable within a single iteration.
+    Total cost is O(n log n) for a map of n entries — each step
+    removes the yielded entry and returns the persistent remainder.
     """
 
-  pub fn next(map :: Map) -> Map {
-    map
+  pub fn next(map :: Map(K, V)) -> {Atom, {K, V}, Map(K, V)} {
+    :zig.Map.next(map)
   }
 }

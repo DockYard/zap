@@ -1973,6 +1973,18 @@ fn remapImplDecl(alloc: std.mem.Allocator, impl_d: *ast.ImplDecl, remap: []const
     }
     impl_d.target_type.parts = new_type_parts;
 
+    // Remap impl-declared type parameter names. Without this, the
+    // StringIds carried by `type_params` still point into the parser's
+    // local interner — after merge they decode to whatever string lives
+    // at that ID in the global interner, garbling the type-var names.
+    if (impl_d.type_params.len > 0) {
+        const new_type_params = try alloc.alloc(ast.StringId, impl_d.type_params.len);
+        for (impl_d.type_params, 0..) |tp, i| {
+            new_type_params[i] = if (tp < remap.len) remap[tp] else tp;
+        }
+        impl_d.type_params = new_type_params;
+    }
+
     // Remap function declarations inside the impl
     const new_fns = try alloc.alloc(*const ast.FunctionDecl, impl_d.functions.len);
     for (impl_d.functions, 0..) |func, i| {
