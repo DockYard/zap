@@ -84,21 +84,50 @@ fn ctfeCompileOptionsHash(options: CompileOptions) u64 {
 /// and interner that all files compile against.
 pub const CompilationContext = struct {
     alloc: std.mem.Allocator,
-    /// The merged program AST (all files' modules combined)
+
+    // ---- Parallel views into the same compilation. Each lives at a
+    // different granularity (whole-program AST / per-module AST /
+    // per-file metadata / per-file source / per-module scope), and
+    // they're populated at different points during `collectAll`.
+    // Always call the corresponding `findX` helper instead of
+    // iterating the slice directly so the lookup convention has one
+    // home.
+
+    /// Whole-program merged AST — every `pub struct` from every source
+    /// file lives in `.structs`, and every top-level `impl` lives in
+    /// `.top_items`. Source of truth for macro expansion, scope
+    /// collection, and CTFE; downstream phases mostly read from the
+    /// per-module split below.
     merged_program: ast.Program,
-    /// Single-module AST programs keyed by module name, used by the
-    /// module-by-module pipeline so it does not need to re-extract modules
-    /// from the merged AST during later stages.
+
+    /// Per-module AST programs split out of `merged_program` after
+    /// macro expansion / desugaring. Keyed by `name` (the dotted
+    /// module path). The per-module pipeline reads from here so it
+    /// does not need to re-walk the merged tree at every stage.
     module_programs: []const ModuleProgram,
-    /// First-class per-module compilation units derived during collectAll.
+
+    /// Per-file compilation state: source path, owning module, the
+    /// raw file source, and (when produced) the per-file IR program.
+    /// `units.len == source_units.len`; one unit per file.
     units: []CompilationUnit,
-    /// Original per-file source units used to derive merged parser input.
+
+    /// Original per-file source units used to drive parsing and to
+    /// resolve span → file mappings in diagnostics.
     source_units: []const SourceUnit,
+
     /// String interner shared across all parsed source units.
     interner: ast.StringInterner,
-    /// Scope graph with all modules' declarations
+
+    /// Scope graph populated by the collector. `collector.graph.structs`
+    /// is the per-module scope view (one entry per module containing
+    /// its `ScopeId`, declared functions, and attributes); the graph
+    /// also holds bindings, function families, types, protocols, and
+    /// impls. The scope graph and `module_programs` always stay in
+    /// sync — same modules, different views.
     collector: zap.Collector,
-    /// Diagnostic engine
+
+    /// Diagnostic engine — collects errors and warnings emitted across
+    /// every phase before they're rendered to the user.
     diag_engine: zap.DiagnosticEngine,
 };
 
@@ -1052,7 +1081,7 @@ pub fn compileModuleByModule(
             if (options.show_progress) {
                 std.debug.print("\r\x1b[K  [hir {d}/{d}] {s}", .{ mod_idx + 1, module_order.len, mod_name });
             }
-            const mod_program = findModuleProgram(ctx, mod_name) orelse continue;
+            const mod_program = lookupModuleProgram(ctx, mod_name) orelse continue;
             const hir_result = compileSingleModuleHir(alloc, ctx, mod_name, mod_program, shared_store, group_id_offset, options) catch |err| {
                 std.debug.print("DEBUG: module {s} failed: {}\n", .{ mod_name, err });
                 continue;
@@ -1393,13 +1422,6 @@ fn structNameToOwnedString(
 fn lookupModuleProgram(ctx: *const CompilationContext, mod_name: []const u8) ?*const ast.Program {
     for (ctx.module_programs) |*entry| {
         if (std.mem.eql(u8, entry.name, mod_name)) return &entry.program;
-    }
-    return null;
-}
-
-fn findModuleProgram(ctx: *CompilationContext, mod_name: []const u8) ?*const ast.Program {
-    for (ctx.module_programs) |*mp| {
-        if (std.mem.eql(u8, mp.name, mod_name)) return &mp.program;
     }
     return null;
 }
