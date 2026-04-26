@@ -3818,8 +3818,8 @@ pub const IrBuilder = struct {
                                         break :val_enum false;
                                     } else false;
                                     if (is_val_enum) {
-                                        // Enum values use u32 — route to MapOf(u32, u32)
-                                        break :blk try std.fmt.allocPrint(self.allocator, "MapU32Val.{s}", .{method});
+                                        // Enum values lower to u32 atom IDs — route to Map(u32, u32) via the generic prefix.
+                                        break :blk try std.fmt.allocPrint(self.allocator, "Map:u32:u32.{s}", .{method});
                                     } else {
                                         const key_name = if (std.meta.activeTag(key_zig) == .atom) "u32" else if (std.meta.activeTag(key_zig) == .string) "str" else "u32";
                                         break :blk try std.fmt.allocPrint(self.allocator, "Map:{s}:{s}.{s}", .{ key_name, val_zig.struct_ref, method });
@@ -3856,8 +3856,8 @@ pub const IrBuilder = struct {
                                         break :blk_enum false;
                                     } else false;
                                     if (is_enum) {
-                                        // Enum lists use ListOf(u32) — encode for generic dispatch
-                                        break :blk try std.fmt.allocPrint(self.allocator, "ListU32.{s}", .{method});
+                                        // Enum lists lower to u32 atom IDs — route to List(u32) via the generic prefix.
+                                        break :blk try std.fmt.allocPrint(self.allocator, "List:u32.{s}", .{method});
                                     } else {
                                         break :blk try std.fmt.allocPrint(self.allocator, "List:{s}.{s}", .{ elem_zig.struct_ref, method });
                                     }

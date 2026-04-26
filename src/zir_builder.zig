@@ -2983,34 +2983,6 @@ pub const ZirDriver = struct {
                         }
                     }
                     break :blk4 false;
-                } else if (std.mem.startsWith(u8, cb.name, "ListU32.")) blk5: {
-                    // Handle "ListU32.method" for enum element lists (atoms are u32)
-                    const method_name = cb.name["ListU32.".len..];
-                    const type_args = [_]u32{@intFromEnum(Zir.Inst.Ref.u32_type)};
-                    const list_type = self.emitGenericContainerRef("List", &type_args) catch break :blk5 false;
-                    const fn_ref = zir_builder_emit_field_val(self.handle, list_type, method_name.ptr, @intCast(method_name.len));
-                    if (fn_ref != error_ref) {
-                        const ref = zir_builder_emit_call_ref(self.handle, fn_ref, args.items.ptr, @intCast(args.items.len));
-                        if (ref != error_ref) {
-                            try self.setLocal(cb.dest, ref);
-                            break :blk5 true;
-                        }
-                    }
-                    break :blk5 false;
-                } else if (std.mem.startsWith(u8, cb.name, "MapU32Val.")) blk6: {
-                    // Handle "MapU32Val.method" for maps with enum values (atoms are u32)
-                    const method_name = cb.name["MapU32Val.".len..];
-                    const type_args = [_]u32{ @intFromEnum(Zir.Inst.Ref.u32_type), @intFromEnum(Zir.Inst.Ref.u32_type) };
-                    const map_type = self.emitGenericContainerRef("Map", &type_args) catch break :blk6 false;
-                    const fn_ref = zir_builder_emit_field_val(self.handle, map_type, method_name.ptr, @intCast(method_name.len));
-                    if (fn_ref != error_ref) {
-                        const ref = zir_builder_emit_call_ref(self.handle, fn_ref, args.items.ptr, @intCast(args.items.len));
-                        if (ref != error_ref) {
-                            try self.setLocal(cb.dest, ref);
-                            break :blk6 true;
-                        }
-                    }
-                    break :blk6 false;
                 } else false;
 
                 if (!generic_handled) {
