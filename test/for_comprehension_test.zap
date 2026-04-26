@@ -54,4 +54,26 @@ pub struct Test.ForComprehensionTest {
       assert(List.head(result) == 101)
     }
   }
+
+  describe("variable iterables") {
+    test("list bound to variable") {
+      xs = [10, 20, 30]
+      result = for x <- xs { x + 1 }
+      assert(List.length(result) == 3)
+      assert(List.head(result) == 11)
+    }
+
+    test("range bound to variable") {
+      r = 1..4
+      result = for x <- r { x * 10 }
+      assert(List.length(result) == 3)
+      assert(List.head(result) == 10)
+    }
+
+    test("map bound to variable") {
+      m = %{a: 1, b: 2, c: 3}
+      result = for _kv <- m { 1 }
+      assert(List.length(result) == 3)
+    }
+  }
 }

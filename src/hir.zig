@@ -3579,8 +3579,19 @@ pub const HirBuilder = struct {
                     const fa = call.callee.field_access;
                     if (fa.object.* == .module_ref) {
                         const func_name = self.interner.get(fa.field);
-                        const mod_name = self.structNameToString(fa.object.module_ref.name);
-                        break :blk .{ .named = .{ .module = mod_name, .name = func_name } };
+                        const initial_mod = self.structNameToString(fa.object.module_ref.name);
+                        // Protocol-call dispatch: rewrite `Protocol.method(arg, ...)`
+                        // to `Impl.method(arg, ...)` when the first arg's type has
+                        // a matching impl. Mirrors the binary_op dispatch path so
+                        // every protocol-method invocation goes through the same
+                        // type-driven lookup. Falls through to the literal module
+                        // name when the call isn't protocol-qualified or the type
+                        // is UNKNOWN.
+                        const dispatched_mod = if (args.items.len > 0)
+                            self.protocolDispatchModule(initial_mod, args.items[0].expr.type_id) orelse initial_mod
+                        else
+                            initial_mod;
+                        break :blk .{ .named = .{ .module = dispatched_mod, .name = func_name } };
                     }
                     // :zig.function() or :zig.Module.function() — bridge to Zig runtime
                     if (fa.object.* == .atom_literal) {
@@ -4609,6 +4620,38 @@ pub const HirBuilder = struct {
             if (std.mem.eql(u8, p, protocol_simple) and std.mem.eql(u8, t, target_simple)) return true;
         }
         return false;
+    }
+
+    /// True iff `name` matches a registered single-segment protocol
+    /// (e.g., `Enumerable`, `Arithmetic`).
+    fn isProtocolName(self: *const HirBuilder, name: []const u8) bool {
+        for (self.graph.protocols.items) |entry| {
+            if (entry.name.parts.len != 1) continue;
+            if (std.mem.eql(u8, self.interner.get(entry.name.parts[0]), name)) return true;
+        }
+        return false;
+    }
+
+    /// Generic protocol-call dispatch: when a user writes `Protocol.method(arg, ...)`
+    /// and `Protocol` is a registered protocol with an `impl Protocol for T`
+    /// matching the first argument's type, returns the target type's module
+    /// name so the call lowers to `T.method(arg, ...)`.
+    ///
+    /// Returns null when:
+    ///   - `mod_name` is not a registered protocol
+    ///   - the first arg's type is UNKNOWN or has no canonical module name
+    ///   - no impl exists for the resolved target type
+    /// Callers fall through to the original module name when null is returned.
+    fn protocolDispatchModule(
+        self: *const HirBuilder,
+        mod_name: []const u8,
+        first_arg_type: types_mod.TypeId,
+    ) ?[]const u8 {
+        if (!self.isProtocolName(mod_name)) return null;
+        if (first_arg_type == types_mod.TypeStore.UNKNOWN) return null;
+        const target_module = self.type_store.typeToModuleName(first_arg_type, self.interner) orelse return null;
+        if (!self.hasImpl(mod_name, target_module)) return null;
+        return target_module;
     }
 
     /// Recursively collect bindings from tuple sub-patterns (including nested tuples).

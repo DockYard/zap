@@ -983,33 +983,25 @@ pub const Desugarer = struct {
     // ============================================================
     // For comprehension desugaring
     //
-    // for x <- list { body }
+    // for x <- iterable { body }
     // →
     // {
-    //   fn __for_N([] :: [T]) -> [T] { [] }
-    //   fn __for_N([x | __rest] :: [T]) -> [T] { [body | __for_N(__rest)] }
-    //   __for_N(list)
+    //   fn __for_N(__state) {
+    //     case Enumerable.next(__state) {
+    //       {:done, _, _} -> []
+    //       {:cont, x, __next} -> [body | __for_N(__next)]
+    //     }
+    //   }
+    //   __for_N(iterable)
     // }
+    //
+    // The `Enumerable.next/1` call is rewritten to the matching impl's
+    // `T.next(state)` at HIR build time via protocol dispatch
+    // (see `HirBuilder.protocolDispatchModule`). This is the single,
+    // type-driven dispatch path — no AST-shape special-casing here.
+    // Strings remain a separate path because they iterate by byte index
+    // rather than through Enumerable.
     // ============================================================
-
-    /// Look up the Enumerable protocol impl for a target type via the scope graph.
-    /// Returns the runtime module name (e.g., "Range", "List") if an impl exists,
-    /// or null if no impl is registered.
-    fn resolveEnumerableModule(self: *Desugarer, target_type_name: []const u8) ?[]const u8 {
-        const graph = self.graph orelse return null;
-        const enum_id = self.interner.intern("Enumerable") catch return null;
-        const enum_parts = self.allocator.alloc(ast.StringId, 1) catch return null;
-        enum_parts[0] = enum_id;
-        const enum_name = ast.StructName{ .parts = enum_parts, .span = .{ .start = 0, .end = 0 } };
-        const target_id = self.interner.intern(target_type_name) catch return null;
-        const target_parts = self.allocator.alloc(ast.StringId, 1) catch return null;
-        target_parts[0] = target_id;
-        const target_name = ast.StructName{ .parts = target_parts, .span = .{ .start = 0, .end = 0 } };
-        if (graph.findImpl(enum_name, target_name)) |_| {
-            return target_type_name;
-        }
-        return null;
-    }
 
     /// Resolution shape for a for-loop's destructuring slot. When the
     /// loop variable carries a type annotation, the destructure target
@@ -1068,168 +1060,20 @@ pub const Desugarer = struct {
     }
 
     fn desugarForExpr(self: *Desugarer, fe: *const ast.ForExpr) !*const ast.Expr {
-        // Use zero span for generated function internals so the type checker
-        // skips annotation requirements for compiler-generated code.
-        const meta = ast.NodeMeta{ .span = .{ .start = 0, .end = 0 } };
-
-        // Check if iterating over a string — use index-based iteration
+        // Strings iterate by byte index — they don't fit the
+        // `Enumerable.next` step shape and stay on a dedicated path.
         if (fe.iterable.* == .string_literal or fe.iterable.* == .string_interpolation) {
             return self.desugarForString(fe);
         }
 
-        // Range: dispatch through Enumerable protocol registry
-        if (fe.iterable.* == .range) {
-            const mod = self.resolveEnumerableModule("Range") orelse "Range";
-            return self.desugarForEnumerable(fe, mod);
-        }
-
-        // List literal: dispatch through Enumerable protocol registry
-        if (fe.iterable.* == .list) {
-            if (self.resolveEnumerableModule("List")) |mod| {
-                return self.desugarForEnumerable(fe, mod);
-            }
-        }
-
-        // Map literal: dispatch through Enumerable protocol registry. Each
-        // step yields `{:cont, {key, value}, remaining_map}` so the user
-        // pattern is typically `for {k, v} <- m { ... }`. The actual
-        // signature lives in `lib/map/enumerable.zap`.
-        if (fe.iterable.* == .map) {
-            if (self.resolveEnumerableModule("Map")) |mod| {
-                return self.desugarForEnumerable(fe, mod);
-            }
-        }
-
-        // Fallback: variables and other types
-        return self.desugarForListRecursion(fe, meta);
-    }
-
-    fn desugarForListRecursion(self: *Desugarer, fe: *const ast.ForExpr, meta: ast.NodeMeta) !*const ast.Expr {
-        // Generate unique helper name (heap-allocated since interner stores slices)
-        const name_str = try std.fmt.allocPrint(self.allocator, "__for_{d}", .{self.for_counter});
-        self.for_counter += 1;
-        const helper_name = try self.interner.intern(name_str);
-        const rest_name = try self.interner.intern("__rest");
-
-        // Clause 1: base case — fn __for_N([]) { [] }
-        const empty_pat = try self.create(ast.Pattern, .{
-            .list = .{ .meta = meta, .elements = &.{} },
-        });
-        const empty_param = ast.Param{
-            .meta = meta,
-            .pattern = empty_pat,
-            .type_annotation = null,
-        };
-        const empty_list = try self.create(ast.Expr, .{
-            .list = .{ .meta = meta, .elements = &.{} },
-        });
-        const base_clause = ast.FunctionClause{
-            .meta = meta,
-            .params = try self.allocSlice(ast.Param, &.{empty_param}),
-            .return_type = null,
-            .refinement = null,
-            .body = try self.allocSlice(ast.Stmt, &.{.{ .expr = empty_list }}),
-        };
-
-        // Clause 2: recursive case — fn __for_N([<pat> | __rest]) { [body | __for_N(__rest)] }
-        // The user-supplied pattern slots in directly when no type
-        // annotation is present; with an annotation, the cons head
-        // binds to an internal name and the body opens with a
-        // type-asserted re-binding statement (see buildLoopBind).
-        const loop_bind = try self.buildLoopBind(fe, meta);
-        const var_pat = loop_bind.pattern;
-        const rest_pat = try self.create(ast.Pattern, .{
-            .bind = .{ .meta = meta, .name = rest_name },
-        });
-        const cons_pat = try self.create(ast.Pattern, .{
-            .list_cons = .{
-                .meta = meta,
-                .heads = try self.allocSlice(*const ast.Pattern, &.{var_pat}),
-                .tail = rest_pat,
-            },
-        });
-        const cons_param = ast.Param{
-            .meta = meta,
-            .pattern = cons_pat,
-            .type_annotation = null,
-        };
-
-        // Recursive call: __for_N(__rest)
-        const rest_ref = try self.create(ast.Expr, .{
-            .var_ref = .{ .meta = meta, .name = rest_name },
-        });
-        const callee = try self.create(ast.Expr, .{
-            .var_ref = .{ .meta = meta, .name = helper_name },
-        });
-        const recursive_call = try self.create(ast.Expr, .{
-            .call = .{
-                .meta = meta,
-                .callee = callee,
-                .args = try self.allocSlice(*const ast.Expr, &.{rest_ref}),
-            },
-        });
-
-        // Body expression: [body | __for_N(__rest)]
-        const body_desugared = try self.desugarExpr(fe.body);
-        const cons_body_expr = try self.create(ast.Expr, .{
-            .list_cons_expr = .{
-                .meta = meta,
-                .head = body_desugared,
-                .tail = recursive_call,
-            },
-        });
-
-        // With filter: case filter { true -> [body | rec]; false -> rec }
-        const final_body_expr: *const ast.Expr = if (fe.filter) |filter| blk: {
-            const desugared_filter = try self.desugarExpr(filter);
-            const true_pat = try self.create(ast.Pattern, .{
-                .literal = .{ .bool_lit = .{ .meta = meta, .value = true } },
-            });
-            const false_pat = try self.create(ast.Pattern, .{
-                .literal = .{ .bool_lit = .{ .meta = meta, .value = false } },
-            });
-            break :blk try self.create(ast.Expr, .{
-                .case_expr = .{
-                    .meta = meta,
-                    .scrutinee = desugared_filter,
-                    .clauses = try self.allocSlice(ast.CaseClause, &.{
-                        .{ .meta = meta, .pattern = true_pat, .type_annotation = null, .guard = null, .body = try self.allocSlice(ast.Stmt, &.{.{ .expr = cons_body_expr }}) },
-                        .{ .meta = meta, .pattern = false_pat, .type_annotation = null, .guard = null, .body = try self.allocSlice(ast.Stmt, &.{.{ .expr = recursive_call }}) },
-                    }),
-                },
-            });
-        } else cons_body_expr;
-
-        const recursive_clause = ast.FunctionClause{
-            .meta = meta,
-            .params = try self.allocSlice(ast.Param, &.{cons_param}),
-            .return_type = null,
-            .refinement = null,
-            .body = try self.loopArmBody(loop_bind.pre_body, final_body_expr),
-        };
-
-        // Build function declaration with both clauses
-        const func_decl = try self.create(ast.FunctionDecl, .{
-            .meta = meta,
-            .name = helper_name,
-            .clauses = try self.allocSlice(ast.FunctionClause, &.{ base_clause, recursive_clause }),
-            .visibility = .private,
-        });
-
-        // Add helper function as module-level private function
-        try self.pending_helpers.append(self.allocator, .{ .priv_function = func_decl });
-
-        // Return a call to the helper: __for_N(list)
-        const iterable = try self.desugarExpr(fe.iterable);
-        return try self.create(ast.Expr, .{
-            .call = .{
-                .meta = fe.meta, // use original span for the call
-                .callee = try self.create(ast.Expr, .{
-                    .var_ref = .{ .meta = meta, .name = helper_name },
-                }),
-                .args = try self.allocSlice(*const ast.Expr, &.{iterable}),
-            },
-        });
+        // Everything else (lists, ranges, maps, struct values, variables)
+        // routes through the Enumerable protocol. The HIR builder's
+        // `protocolDispatchModule` rewrites `Enumerable.next(state)` to
+        // `T.next(state)` based on `state`'s inferred type at HIR build
+        // time. The literal-vs-variable distinction is therefore moot
+        // here — a variable bound to a Map iterates the same way as a
+        // map literal.
+        return self.desugarForEnumerable(fe);
     }
 
     /// Desugar for over string: for char <- "hello" { body }
@@ -1397,16 +1241,24 @@ pub const Desugarer = struct {
         });
     }
 
-    /// Desugar for comprehension using Enumerable.next protocol dispatch.
-    /// Generates a recursive helper that calls :zig.Module.next(state) and
-    /// pattern matches on the tuple result:
-    ///   fn __for_N(__state) -> [i64] {
-    ///     case :zig.Module.next(__state) {
-    ///       true -> []
-    ///       false -> [body | __for_N(x + __step, __end, __step)]
+    /// Desugar for comprehension via the Enumerable protocol. Generates
+    /// a recursive helper that scrutinises `Enumerable.next(state)` and
+    /// branches on the `{:done, _, _}` / `{:cont, val, next_state}`
+    /// shape:
+    ///
+    ///   fn __for_N(__state) {
+    ///     case Enumerable.next(__state) {
+    ///       {:done, _, _} -> []
+    ///       {:cont, x, __next_state} -> [body | __for_N(__next_state)]
     ///     }
     ///   }
-    fn desugarForEnumerable(self: *Desugarer, fe: *const ast.ForExpr, runtime_module: []const u8) !*const ast.Expr {
+    ///
+    /// The `Enumerable.next/1` invocation lowers to the matching impl's
+    /// `T.next/1` at HIR build time (`HirBuilder.protocolDispatchModule`),
+    /// based on `__state`'s inferred type. This keeps the desugar pass
+    /// type-agnostic — list, range, map, and user-defined Enumerables all
+    /// share the same generated shape.
+    fn desugarForEnumerable(self: *Desugarer, fe: *const ast.ForExpr) !*const ast.Expr {
         const meta = ast.NodeMeta{ .span = .{ .start = 0, .end = 0 } };
 
         const name_str = try std.fmt.allocPrint(self.allocator, "__for_{d}", .{self.for_counter});
@@ -1417,13 +1269,14 @@ pub const Desugarer = struct {
 
         const state_ref = try self.create(ast.Expr, .{ .var_ref = .{ .meta = meta, .name = state_name } });
 
-        // Build Module.next(__state) — calls the Zap impl function
-        // Uses module_ref so the HIR builder resolves it as a named module call.
-        const mod_name_id = try self.interner.intern(runtime_module);
-        const mod_parts = try self.allocator.alloc(ast.StringId, 1);
-        mod_parts[0] = mod_name_id;
+        // Build `Enumerable.next(__state)`. The HIR builder rewrites this
+        // protocol call to the concrete impl's `T.next(state)` based on
+        // `__state`'s inferred type.
+        const enum_id = try self.interner.intern("Enumerable");
+        const enum_parts = try self.allocator.alloc(ast.StringId, 1);
+        enum_parts[0] = enum_id;
         const mod_ref = try self.create(ast.Expr, .{
-            .module_ref = .{ .meta = meta, .name = .{ .parts = mod_parts, .span = .{ .start = 0, .end = 0 } } },
+            .module_ref = .{ .meta = meta, .name = .{ .parts = enum_parts, .span = .{ .start = 0, .end = 0 } } },
         });
         const next_field = try self.interner.intern("next");
         const next_callee = try self.create(ast.Expr, .{
@@ -1479,7 +1332,7 @@ pub const Desugarer = struct {
             .tuple = .{ .meta = meta, .elements = try self.allocSlice(*const ast.Pattern, &.{ cont_atom, val_bind, next_bind }) },
         });
 
-        // case :zig.Module.next(state) { {:done, _, _} -> []; {:cont, x, next} -> <pre-body>; [body | rec] }
+        // case Enumerable.next(state) { {:done, _, _} -> []; {:cont, x, next} -> [body | rec] }
         const case_expr = try self.create(ast.Expr, .{
             .case_expr = .{
                 .meta = meta,
@@ -1491,17 +1344,15 @@ pub const Desugarer = struct {
             },
         });
 
-        // Return type: [i64]
-        const i64_name = try self.interner.intern("i64");
-        const i64_type = try self.create(ast.TypeExpr, .{ .name = .{ .meta = meta, .name = i64_name, .args = &.{} } });
-        const list_ret = try self.create(ast.TypeExpr, .{ .list = .{ .meta = meta, .element = i64_type } });
-
+        // Leave return type unannotated — the type checker propagates the
+        // body's `[BodyType]` shape via inferred_signatures so the helper
+        // matches whatever element type the comprehension body produces.
         const clause = ast.FunctionClause{
             .meta = meta,
             .params = try self.allocSlice(ast.Param, &.{
                 .{ .meta = meta, .pattern = try self.create(ast.Pattern, .{ .bind = .{ .meta = meta, .name = state_name } }), .type_annotation = null },
             }),
-            .return_type = list_ret,
+            .return_type = null,
             .refinement = null,
             .body = try self.allocSlice(ast.Stmt, &.{.{ .expr = case_expr }}),
         };
