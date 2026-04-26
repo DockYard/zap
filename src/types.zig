@@ -1356,6 +1356,34 @@ pub const TypeChecker = struct {
         if (clause_ref.clause_index >= clause_ref.decl.clauses.len) return null;
         const clause = clause_ref.decl.clauses[clause_ref.clause_index];
 
+        // If the resolved family is an impl function, temporarily activate
+        // that impl's type-parameter scope so references like `K`/`V` in
+        // the impl signature resolve to the impl's type variables instead
+        // of failing as unknown types. Without this, any call site that
+        // type-checks `Map.next/1` from outside the impl block would fail
+        // because the type checker can't see the impl's K, V.
+        const prev_impl = self.current_impl;
+        defer self.current_impl = prev_impl;
+        for (self.graph.impls.items) |impl_entry| {
+            for (impl_entry.decl.functions) |func| {
+                if (func == clause_ref.decl) {
+                    self.current_impl = impl_entry.decl;
+                    break;
+                }
+            }
+            if (self.current_impl != prev_impl) break;
+        }
+        // Mirror the per-clause pre-population that buildClause does, so
+        // resolveTypeExpr below sees the impl's K, V already bound.
+        if (self.current_impl) |impl_d| {
+            self.type_var_scope.clearRetainingCapacity();
+            for (impl_d.type_params) |tp_name_id| {
+                const tp_name = self.interner.get(tp_name_id);
+                const fresh = self.store.freshVar() catch continue;
+                self.type_var_scope.put(tp_name, fresh) catch {};
+            }
+        }
+
         var param_types: std.ArrayList(TypeId) = .empty;
         var param_ownerships: std.ArrayList(Ownership) = .empty;
         for (clause.params) |param| {

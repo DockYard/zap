@@ -235,4 +235,21 @@ pub struct Test.MapTest {
       assert(Map.get(result, :admin, false))
     }
   }
+
+  describe("Map iteration") {
+    test("for-comp over map literal yields one element per entry") {
+      counts = for _kv <- %{a: 1, b: 2, c: 3} { 1 }
+      assert(List.length(counts) == 3)
+    }
+
+    test("for-comp over empty map yields empty list") {
+      counts = for _kv <- %{} { 1 }
+      assert(List.length(counts) == 0)
+    }
+
+    test("for-comp over single-entry map") {
+      counts = for _kv <- %{single: 42} { 1 }
+      assert(List.length(counts) == 1)
+    }
+  }
 }
