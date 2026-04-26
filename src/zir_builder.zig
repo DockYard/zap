@@ -51,7 +51,6 @@ extern "c" fn zir_builder_emit_import(handle: ?*ZirBuilderHandle, name_ptr: [*]c
 extern "c" fn zir_builder_emit_field_val(handle: ?*ZirBuilderHandle, object: u32, field_ptr: [*]const u8, field_len: u32) u32;
 extern "c" fn zir_builder_emit_call_ref(handle: ?*ZirBuilderHandle, callee: u32, args_ptr: [*]const u32, args_len: u32) u32;
 extern "c" fn zir_builder_emit_typeof(handle: ?*ZirBuilderHandle, operand: u32) u32;
-extern "c" fn zir_builder_emit_type_info(handle: ?*ZirBuilderHandle, operand: u32) u32;
 extern "c" fn zir_builder_emit_if_else(handle: ?*ZirBuilderHandle, condition: u32, then_value: u32, else_value: u32) u32;
 extern "c" fn zir_builder_emit_struct_init_anon(handle: ?*ZirBuilderHandle, names_ptrs: [*]const [*]const u8, names_lens: [*]const u32, values_ptr: [*]const u32, fields_len: u32) u32;
 extern "c" fn zir_builder_emit_union_init(handle: ?*ZirBuilderHandle, union_type: u32, field_name_ptr: [*]const u8, field_name_len: u32, init_value: u32) u32;
@@ -79,35 +78,21 @@ extern "c" fn zir_builder_emit_store(handle: ?*ZirBuilderHandle, ptr_ref: u32, v
 extern "c" fn zir_builder_emit_is_non_null(handle: ?*ZirBuilderHandle, operand: u32) u32;
 extern "c" fn zir_builder_emit_optional_payload(handle: ?*ZirBuilderHandle, operand: u32) u32;
 extern "c" fn zir_builder_emit_optional_payload_unsafe(handle: ?*ZirBuilderHandle, operand: u32) u32;
-extern "c" fn zir_builder_emit_orelse(handle: ?*ZirBuilderHandle, operand: u32, fallback: u32) u32;
 extern "c" fn zir_builder_set_call_modifier(handle: ?*ZirBuilderHandle, modifier: u32) void;
 extern "c" fn zir_builder_emit_if_else_inline(handle: ?*ZirBuilderHandle, condition: u32, then_value: u32, else_value: u32) u32;
 
 // Numeric widening (@as coercion)
 extern "c" fn zir_builder_emit_as(handle: ?*ZirBuilderHandle, dest_type: u32, operand: u32) u32;
 
-// Type construction
-extern "c" fn zir_builder_emit_optional_type(handle: ?*ZirBuilderHandle, child_type: u32) u32;
-
 // Return type overrides
 extern "c" fn zir_builder_set_imported_return_type(handle: ?*ZirBuilderHandle, mod_ptr: [*]const u8, mod_len: u32, field_ptr: [*]const u8, field_len: u32) i32;
 extern "c" fn zir_builder_set_custom_return_type(handle: ?*ZirBuilderHandle, inst_indices_ptr: [*]const u32, inst_indices_len: u32, result_inst: u32) i32;
-
-// Imported type parameters
-extern "c" fn zir_builder_emit_param_imported_type(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32, mod_ptr: [*]const u8, mod_len: u32, field_ptr: [*]const u8, field_len: u32) u32;
-
 
 // Tuple/array construction and element access
 extern "c" fn zir_builder_emit_array_init_anon(handle: ?*ZirBuilderHandle, values_ptr: [*]const u32, values_len: u32) u32;
 extern "c" fn zir_builder_emit_elem_val_imm(handle: ?*ZirBuilderHandle, operand: u32, index: u32) u32;
 
-// Error union unwrapping
-extern "c" fn zir_builder_emit_try(handle: ?*ZirBuilderHandle, operand: u32) u32;
-extern "c" fn zir_builder_emit_catch(handle: ?*ZirBuilderHandle, operand: u32, catch_value: u32) u32;
-extern "c" fn zir_builder_emit_is_non_err(handle: ?*ZirBuilderHandle, operand: u32) u32;
-extern "c" fn zir_builder_emit_err_union_payload_unsafe(handle: ?*ZirBuilderHandle, operand: u32) u32;
-extern "c" fn zir_builder_emit_ret_error(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32) i32;
-extern "c" fn zir_builder_set_error_union_return_type(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32) i32;
+// Generic / conditional return composition
 extern "c" fn zir_builder_set_generic_return_type(handle: ?*ZirBuilderHandle) i32;
 extern "c" fn zir_builder_emit_cond_return(handle: ?*ZirBuilderHandle, condition: u32, value: u32) i32;
 
@@ -120,16 +105,12 @@ extern "c" fn zir_builder_emit_ret_null(handle: ?*ZirBuilderHandle) i32;
 
 // Struct type declarations
 extern "c" fn zir_builder_add_struct_type(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32, field_names_ptrs: [*]const [*]const u8, field_names_lens: [*]const u32, field_type_refs: [*]const u32, field_default_refs: ?[*]const u32, fields_len: u32) i32;
-extern "c" fn zir_builder_add_enum_type(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32, variant_names_ptrs: [*]const [*]const u8, variant_names_lens: [*]const u32, variants_len: u32) i32;
-extern "c" fn zir_builder_emit_enum_from_int(handle: ?*ZirBuilderHandle, operand: u32, type_ref: u32) u32;
-extern "c" fn zir_builder_emit_int_from_enum(handle: ?*ZirBuilderHandle, operand: u32) u32;
 extern "c" fn zir_builder_set_decl_val_return_type(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32) i32;
 extern "c" fn zir_builder_emit_param_decl_val_type(handle: ?*ZirBuilderHandle, param_name_ptr: [*]const u8, param_name_len: u32, type_name_ptr: [*]const u8, type_name_len: u32) u32;
 
 // Tuple return type
 extern "c" fn zir_builder_set_tuple_return_type(handle: ?*ZirBuilderHandle, types_ptr: [*]const u32, types_len: u32) i32;
 extern "c" fn zir_builder_get_tuple_return_type(handle: ?*ZirBuilderHandle) u32;
-extern "c" fn zir_builder_get_tuple_return_type_len(handle: ?*ZirBuilderHandle) u32;
 extern "c" fn zir_builder_emit_struct_init_typed(handle: ?*ZirBuilderHandle, struct_type: u32, names_ptrs: [*]const [*]const u8, names_lens: [*]const u32, values_ptr: [*]const u32, fields_len: u32) u32;
 extern "c" fn zir_builder_emit_tuple_decl(handle: ?*ZirBuilderHandle, types_ptr: [*]const u32, types_len: u32) u32;
 extern "c" fn zir_builder_emit_tuple_decl_body(handle: ?*ZirBuilderHandle, types_ptr: [*]const u32, types_len: u32) u32;
@@ -161,77 +142,6 @@ extern "c" fn zir_compilation_add_struct_source(ctx: ?*ZirContext, name: [*:0]co
 
 // Pointer casting
 extern "c" fn zir_builder_emit_ptr_cast(handle: ?*ZirBuilderHandle, dest_type: u32, operand: u32) u32;
-extern "c" fn zir_builder_emit_ptr_cast_full(handle: ?*ZirBuilderHandle, flags_bits: u8, dest_type: u32, operand: u32) u32;
-
-// Debug and validation
-extern "c" fn zir_builder_emit_dbg_stmt(handle: ?*ZirBuilderHandle, line: u32, column: u32) i32;
-extern "c" fn zir_builder_emit_ensure_result_used(handle: ?*ZirBuilderHandle, operand: u32) i32;
-
-// Math builtins (unary float operations — Zig 0.16 @sqrt, @sin, etc.)
-extern "c" fn zir_builder_emit_sqrt(handle: ?*ZirBuilderHandle, operand: u32) u32;
-extern "c" fn zir_builder_emit_sin(handle: ?*ZirBuilderHandle, operand: u32) u32;
-extern "c" fn zir_builder_emit_cos(handle: ?*ZirBuilderHandle, operand: u32) u32;
-extern "c" fn zir_builder_emit_exp(handle: ?*ZirBuilderHandle, operand: u32) u32;
-extern "c" fn zir_builder_emit_exp2(handle: ?*ZirBuilderHandle, operand: u32) u32;
-extern "c" fn zir_builder_emit_log(handle: ?*ZirBuilderHandle, operand: u32) u32;
-extern "c" fn zir_builder_emit_log2(handle: ?*ZirBuilderHandle, operand: u32) u32;
-extern "c" fn zir_builder_emit_log10(handle: ?*ZirBuilderHandle, operand: u32) u32;
-extern "c" fn zir_builder_emit_abs(handle: ?*ZirBuilderHandle, operand: u32) u32;
-extern "c" fn zir_builder_emit_floor(handle: ?*ZirBuilderHandle, operand: u32) u32;
-extern "c" fn zir_builder_emit_ceil(handle: ?*ZirBuilderHandle, operand: u32) u32;
-extern "c" fn zir_builder_emit_round(handle: ?*ZirBuilderHandle, operand: u32) u32;
-extern "c" fn zir_builder_emit_trunc_float(handle: ?*ZirBuilderHandle, operand: u32) u32;
-
-// Saturating arithmetic (Zig 0.16 +|, -|, *|, <<|)
-extern "c" fn zir_builder_emit_add_sat(handle: ?*ZirBuilderHandle, lhs: u32, rhs: u32) u32;
-extern "c" fn zir_builder_emit_sub_sat(handle: ?*ZirBuilderHandle, lhs: u32, rhs: u32) u32;
-extern "c" fn zir_builder_emit_mul_sat(handle: ?*ZirBuilderHandle, lhs: u32, rhs: u32) u32;
-extern "c" fn zir_builder_emit_shl_sat(handle: ?*ZirBuilderHandle, lhs: u32, rhs: u32) u32;
-
-// Overflow-detecting arithmetic (returns struct {result, overflow_bit})
-extern "c" fn zir_builder_emit_add_with_overflow(handle: ?*ZirBuilderHandle, lhs: u32, rhs: u32) u32;
-extern "c" fn zir_builder_emit_sub_with_overflow(handle: ?*ZirBuilderHandle, lhs: u32, rhs: u32) u32;
-extern "c" fn zir_builder_emit_mul_with_overflow(handle: ?*ZirBuilderHandle, lhs: u32, rhs: u32) u32;
-
-// Type introspection (Zig 0.16 @sizeOf, @alignOf, etc.)
-extern "c" fn zir_builder_emit_size_of(handle: ?*ZirBuilderHandle, type_ref: u32) u32;
-extern "c" fn zir_builder_emit_align_of(handle: ?*ZirBuilderHandle, type_ref: u32) u32;
-extern "c" fn zir_builder_emit_bit_size_of(handle: ?*ZirBuilderHandle, type_ref: u32) u32;
-extern "c" fn zir_builder_emit_offset_of(handle: ?*ZirBuilderHandle, type_ref: u32, field_name: [*:0]const u8) u32;
-
-// Type naming
-extern "c" fn zir_builder_emit_tag_name(handle: ?*ZirBuilderHandle, operand: u32) u32;
-extern "c" fn zir_builder_emit_type_name(handle: ?*ZirBuilderHandle, type_ref: u32) u32;
-
-// Compile-time type checks (Zig 0.16 @hasDecl, @hasField)
-extern "c" fn zir_builder_emit_has_decl(handle: ?*ZirBuilderHandle, type_ref: u32, name: [*:0]const u8) u32;
-extern "c" fn zir_builder_emit_has_field(handle: ?*ZirBuilderHandle, type_ref: u32, name: [*:0]const u8) u32;
-
-// Pointer/integer conversions
-extern "c" fn zir_builder_emit_int_from_ptr(handle: ?*ZirBuilderHandle, operand: u32) u32;
-extern "c" fn zir_builder_emit_ptr_from_int(handle: ?*ZirBuilderHandle, operand: u32, type_ref: u32) u32;
-
-// Type reification (Zig 0.16 @Int, @Struct, @Enum, @Union, @Pointer, @Tuple replacing @Type)
-extern "c" fn zir_builder_emit_reify_int(handle: ?*ZirBuilderHandle, signedness_ref: u32, bit_count_ref: u32) u32;
-extern "c" fn zir_builder_emit_reify_struct(handle: ?*ZirBuilderHandle, layout_ref: u32, backing_ty_ref: u32, field_names_ref: u32, field_types_ref: u32, field_attrs_ref: u32) u32;
-extern "c" fn zir_builder_emit_reify_enum(handle: ?*ZirBuilderHandle, tag_ty_ref: u32, mode_ref: u32, field_names_ref: u32, field_values_ref: u32) u32;
-extern "c" fn zir_builder_emit_reify_union(handle: ?*ZirBuilderHandle, layout_ref: u32, arg_ty_ref: u32, field_names_ref: u32, field_types_ref: u32, field_attrs_ref: u32) u32;
-extern "c" fn zir_builder_emit_reify_pointer(handle: ?*ZirBuilderHandle, size_ref: u32, attrs_ref: u32, elem_ty_ref: u32, sentinel_ref: u32) u32;
-extern "c" fn zir_builder_emit_reify_tuple(handle: ?*ZirBuilderHandle, field_types_ref: u32) u32;
-
-// Vector/SIMD operations (Zig 0.16 @Vector, @splat, @shuffle, @reduce)
-extern "c" fn zir_builder_emit_vector_type(handle: ?*ZirBuilderHandle, len: u32, elem_type_ref: u32) u32;
-extern "c" fn zir_builder_emit_splat(handle: ?*ZirBuilderHandle, scalar: u32, len: u32) u32;
-extern "c" fn zir_builder_emit_shuffle(handle: ?*ZirBuilderHandle, a: u32, b: u32, mask: u32) u32;
-extern "c" fn zir_builder_emit_reduce(handle: ?*ZirBuilderHandle, operand: u32, operation: u8) u32;
-
-// Slice decomposition
-extern "c" fn zir_builder_emit_slice_start(handle: ?*ZirBuilderHandle, operand: u32, start: u32) u32;
-extern "c" fn zir_builder_emit_slice_end(handle: ?*ZirBuilderHandle, operand: u32, start: u32, end: u32) u32;
-extern "c" fn zir_builder_emit_slice_length(handle: ?*ZirBuilderHandle, operand: u32, start: u32, length: u32) u32;
-
-// Error union type construction
-extern "c" fn zir_builder_emit_error_union_type(handle: ?*ZirBuilderHandle, error_set: u32, payload: u32) u32;
 
 // ---------------------------------------------------------------------------
 // Error sentinel
