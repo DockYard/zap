@@ -191,7 +191,7 @@ pub struct Kernel {
   @doc = """
     Word list sigil with interpolation support.
 
-    Splits the string on whitespace and returns a list of strings.
+    Splits the string on a single space and returns a list of strings.
     Lowercase allows `\#{}` interpolation before splitting.
 
     ## Examples
@@ -201,13 +201,15 @@ pub struct Kernel {
     """
 
   pub macro sigil_w(content :: Expr, _opts :: Expr) -> Expr {
-    split_words(content)
+    quote {
+      String.split(unquote(content), " ")
+    }
   }
 
   @doc = """
     Word list sigil without interpolation.
 
-    Splits the string on whitespace and returns a list of strings.
+    Splits the string on a single space and returns a list of strings.
     Uppercase suppresses `\#{}` interpolation.
 
     ## Examples
@@ -216,7 +218,9 @@ pub struct Kernel {
     """
 
   pub macro sigil_W(content :: Expr, _opts :: Expr) -> Expr {
-    split_words(content)
+    quote {
+      String.split(unquote(content), " ")
+    }
   }
 
   @doc = """

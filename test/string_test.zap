@@ -263,4 +263,18 @@ pub struct Test.StringTest {
       assert(List.last(parts) == "")
     }
   }
+
+  describe("Word list sigils") {
+    test("~w splits on space") {
+      words = ~w"foo bar baz"
+      assert(List.length(words) == 3)
+      assert(List.head(words) == "foo")
+    }
+
+    test("~W splits on space without interpolation") {
+      words = ~W"alpha beta"
+      assert(List.length(words) == 2)
+      assert(List.head(words) == "alpha")
+    }
+  }
 }
