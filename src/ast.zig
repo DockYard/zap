@@ -330,6 +330,71 @@ pub const Param = struct {
 };
 
 // ============================================================
+// Macro meta-types — typed splice categories
+//
+// When a macro parameter is annotated with one of these names, the
+// macro engine validates that the bound argument matches the
+// corresponding AST shape. The default `Expr` is the most permissive
+// (any expression-shaped CtValue); narrower kinds catch mistakes at
+// macro-expansion time rather than at the splice site.
+// ============================================================
+
+pub const MacroSpliceKind = enum {
+    /// Any expression. The default; matches anything.
+    expr,
+    /// A pattern (used in `case` arms or function heads).
+    pattern,
+    /// A type expression.
+    type_expr,
+    /// A declaration: `pub fn`, `pub macro`, `import`, etc.
+    decl,
+    /// A bare identifier (variable name or atom).
+    ident,
+    /// A `__block__` of statements.
+    block,
+    /// An atom literal (`:foo`).
+    atom_lit,
+    /// An integer literal.
+    integer_lit,
+    /// A string literal.
+    string_lit,
+    /// A bare list of CtValues (used by `unquote_splicing`).
+    list_lit,
+
+    /// Map an annotation name (e.g., `Expr`, `Pat`, `Decl`) to the
+    /// corresponding kind. Returns `null` for non-meta-type names so
+    /// the caller can fall through to ordinary type resolution.
+    pub fn fromName(name: []const u8) ?MacroSpliceKind {
+        if (std.mem.eql(u8, name, "Expr")) return .expr;
+        if (std.mem.eql(u8, name, "Pat")) return .pattern;
+        if (std.mem.eql(u8, name, "Type")) return .type_expr;
+        if (std.mem.eql(u8, name, "Decl")) return .decl;
+        if (std.mem.eql(u8, name, "Ident")) return .ident;
+        if (std.mem.eql(u8, name, "Block")) return .block;
+        if (std.mem.eql(u8, name, "AtomLit")) return .atom_lit;
+        if (std.mem.eql(u8, name, "IntLit")) return .integer_lit;
+        if (std.mem.eql(u8, name, "StringLit")) return .string_lit;
+        if (std.mem.eql(u8, name, "ListLit")) return .list_lit;
+        return null;
+    }
+
+    pub fn displayName(self: MacroSpliceKind) []const u8 {
+        return switch (self) {
+            .expr => "Expr",
+            .pattern => "Pat",
+            .type_expr => "Type",
+            .decl => "Decl",
+            .ident => "Ident",
+            .block => "Block",
+            .atom_lit => "AtomLit",
+            .integer_lit => "IntLit",
+            .string_lit => "StringLit",
+            .list_lit => "ListLit",
+        };
+    }
+};
+
+// ============================================================
 // Module system directives
 // ============================================================
 

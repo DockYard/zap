@@ -198,11 +198,21 @@ pub const TypeKind = union(enum) {
 // ============================================================
 
 /// A compile-time attribute stored on a module or function.
+///
+/// Attributes are append-only at compile time. A single declared
+/// `@name = value` produces one row; macros that call
+/// `Module.put_attribute(:name, value)` append additional rows.
+/// When `accumulate` is true (set via `Module.register_attribute`),
+/// reads return the full accumulated list; otherwise reads return
+/// the latest row's value.
 pub const Attribute = struct {
     name: ast.StringId,
     type_expr: ?*const ast.TypeExpr = null,
     value: ?*const ast.Expr = null,
     computed_value: ?ctfe.ConstValue = null,
+    /// When true, multiple `put_attribute` calls accumulate; reads
+    /// see the list of values in append order.
+    accumulate: bool = false,
 };
 
 pub const StructEntry = struct {
@@ -556,6 +566,132 @@ pub const ScopeGraph = struct {
             }
         }
         return null;
+    }
+
+    /// Find the StructEntry whose scope is `scope_id`, returning a
+    /// mutable pointer so callers can append attributes. Used by macro
+    /// intrinsics that have only a ScopeId in hand (the macro engine's
+    /// `current_module_scope`).
+    pub fn findStructByScope(self: *ScopeGraph, scope_id: ScopeId) ?*StructEntry {
+        for (self.structs.items) |*entry| {
+            if (entry.scope_id == scope_id) return entry;
+        }
+        return null;
+    }
+
+    /// Find a StructEntry by name, returning a mutable pointer.
+    pub fn findStructEntryByName(self: *ScopeGraph, module_name: ast.StructName) ?*StructEntry {
+        for (self.structs.items) |*entry| {
+            if (structNamesMatch(entry.name, module_name)) return entry;
+        }
+        return null;
+    }
+
+    /// Mark `name` on `mod_entry` as an accumulating attribute. After
+    /// this call, `putModuleAttribute` appends new values rather than
+    /// overwriting; `getModuleAttribute` returns the full accumulated
+    /// list when read. Idempotent — calling twice with the same name
+    /// is a no-op.
+    pub fn registerAccumulatingAttribute(
+        self: *ScopeGraph,
+        mod_entry: *StructEntry,
+        name: ast.StringId,
+    ) !void {
+        // If a row already exists, flip its accumulate flag and ensure
+        // any later rows with the same name match.
+        var found = false;
+        for (mod_entry.attributes.items) |*attr| {
+            if (attr.name == name) {
+                attr.accumulate = true;
+                found = true;
+            }
+        }
+        if (!found) {
+            try mod_entry.attributes.append(self.allocator, .{
+                .name = name,
+                .accumulate = true,
+            });
+        }
+    }
+
+    /// Append `value` as an attribute named `name` on `mod_entry`. If
+    /// any existing row with this name has `accumulate=true`, append a
+    /// new row tagged accumulate=true. Otherwise, replace any existing
+    /// single-value row (write-once-or-overwrite semantics, matching
+    /// `@name = value` source declarations).
+    pub fn putModuleAttribute(
+        self: *ScopeGraph,
+        mod_entry: *StructEntry,
+        name: ast.StringId,
+        value: ctfe.ConstValue,
+    ) !void {
+        var is_accumulating = false;
+        for (mod_entry.attributes.items) |attr| {
+            if (attr.name == name and attr.accumulate) {
+                is_accumulating = true;
+                break;
+            }
+        }
+
+        if (is_accumulating) {
+            try mod_entry.attributes.append(self.allocator, .{
+                .name = name,
+                .computed_value = value,
+                .accumulate = true,
+            });
+            return;
+        }
+
+        // Single-value semantics: overwrite the latest row with this
+        // name, or append a new one.
+        for (mod_entry.attributes.items) |*attr| {
+            if (attr.name == name) {
+                attr.computed_value = value;
+                attr.value = null;
+                attr.type_expr = null;
+                return;
+            }
+        }
+        try mod_entry.attributes.append(self.allocator, .{
+            .name = name,
+            .computed_value = value,
+        });
+    }
+
+    /// Read the value of attribute `name` from `mod_entry`. Returns:
+    ///   - For accumulating attributes: a list of all values in
+    ///     append order (or an empty list if only a register call
+    ///     happened and no values were appended).
+    ///   - For single-value attributes: the latest value.
+    ///   - null when no row with that name exists.
+    pub fn getModuleAttribute(
+        self: *ScopeGraph,
+        mod_entry: *const StructEntry,
+        name: ast.StringId,
+    ) !?ctfe.ConstValue {
+        // Decide on shape by inspecting the rows.
+        var is_accumulating = false;
+        var match_count: usize = 0;
+        var latest_value: ?ctfe.ConstValue = null;
+        for (mod_entry.attributes.items) |attr| {
+            if (attr.name != name) continue;
+            match_count += 1;
+            if (attr.accumulate) is_accumulating = true;
+            if (attr.computed_value) |cv| latest_value = cv;
+        }
+        if (match_count == 0) return null;
+
+        if (!is_accumulating) return latest_value;
+
+        // Accumulating: collect all computed values into a list.
+        var elems: std.ArrayListUnmanaged(ctfe.ConstValue) = .empty;
+        for (mod_entry.attributes.items) |attr| {
+            if (attr.name != name) continue;
+            if (attr.computed_value) |cv| try elems.append(self.allocator, cv);
+        }
+        return ctfe.ConstValue{
+            .list = try elems.toOwnedSlice(self.allocator),
+        };
     }
 
     /// Find a protocol by name (matching all parts of StructName).

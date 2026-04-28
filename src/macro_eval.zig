@@ -22,10 +22,22 @@ pub const MacroEvalError = error{
     OutOfMemory,
 };
 
+/// Side channel for `Module.*` intrinsics: lets the evaluator reach the
+/// scope graph and the current module's `StructEntry`. The macro
+/// engine populates this before invoking `eval`; non-macro callers
+/// (legacy CTFE attribute evaluation) leave it null and the
+/// intrinsics fall back to evaluator-local behavior or no-ops.
+pub const ModuleContext = struct {
+    graph: *@import("scope.zig").ScopeGraph,
+    interner: *@import("ast.zig").StringInterner,
+    current_module_scope: ?u32 = null,
+};
+
 pub const Env = struct {
     alloc: Allocator,
     store: *AllocationStore,
     bindings: std.StringHashMap(CtValue),
+    module_ctx: ?ModuleContext = null,
 
     pub fn init(alloc: Allocator, store: *AllocationStore) Env {
         return .{
@@ -279,6 +291,26 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
                     const name_str = extractString(name_val) orelse return .nil;
                     return buildSingleTestFunction(env.alloc, env.store, name_str, body_val) catch return .nil;
                 }
+            }
+
+            // Module attribute intrinsics — callable from within macro
+            // bodies to read/write the current module's compile-time
+            // attribute table. Inert when no module context is wired
+            // through `env.module_ctx` (legacy CTFE callers).
+            //
+            // The user-facing API lives in Zap (`Module.put_attribute`,
+            // etc.) and lowers to these underscore-prefixed names via
+            // ordinary macros in lib/. The compiler stays
+            // language-agnostic about the wrappers' shape; it only
+            // implements the storage primitive.
+            if (std.mem.eql(u8, form_name, "__zap_module_put_attr__")) {
+                return moduleIntrinsicPut(env, arg_elems);
+            }
+            if (std.mem.eql(u8, form_name, "__zap_module_get_attr__")) {
+                return moduleIntrinsicGet(env, arg_elems);
+            }
+            if (std.mem.eql(u8, form_name, "__zap_module_register_attr__")) {
+                return moduleIntrinsicRegister(env, arg_elems);
             }
 
         }
@@ -574,6 +606,145 @@ fn extractString(val: CtValue) ?[]const u8 {
     return null;
 }
 
+// ============================================================
+// Module attribute intrinsics
+//
+// Implementation of `__zap_module_put_attr__`,
+// `__zap_module_get_attr__`, and `__zap_module_register_attr__`.
+// These thread through `env.module_ctx` to reach the scope graph;
+// when the context is null (legacy CTFE attribute eval) they return
+// nil so user macros wrapping them gracefully no-op.
+// ============================================================
+
+fn moduleIntrinsicPut(env: *Env, args: []const CtValue) MacroEvalError!CtValue {
+    if (args.len != 2) return .nil;
+    const name_val = try eval(env, args[0]);
+    const value_ct = try eval(env, args[1]);
+    const ctx = env.module_ctx orelse return .nil;
+    const scope_id = ctx.current_module_scope orelse return .nil;
+    const mod_entry = ctx.graph.findStructByScope(scope_id) orelse return .nil;
+
+    const name_str = extractAtomName(name_val) orelse return .nil;
+    const name_id = ctx.interner.intern(name_str) catch return .nil;
+
+    // The macro evaluator's CtValue carries AST-shape wrappers
+    // (3-tuple `{form, meta, nil}` for literals); the attribute store
+    // holds bare ConstValues that match `@attr = literal`'s storage
+    // format. Unwrap AST literal shells so consumers see the same
+    // values regardless of whether the attribute was written from
+    // source or via a macro intrinsic.
+    const unwrapped = unwrapAstLiteral(value_ct);
+    const cv = ctfe.exportValue(env.alloc, unwrapped) catch return .nil;
+    ctx.graph.putModuleAttribute(mod_entry, name_id, cv) catch return .nil;
+    return .nil;
+}
+
+/// Unwrap an AST-wrapped literal CtValue to its bare scalar form.
+/// `{ .atom ":foo", meta, nil }` → `.atom "foo"` (colon stripped to
+/// match `ConstValue.atom` semantics). `{ .int 42, meta, nil }` →
+/// `.int 42`. Tuples and lists pass through unchanged because their
+/// elements may contain mixed shapes.
+fn unwrapAstLiteral(val: CtValue) CtValue {
+    if (val != .tuple or val.tuple.elems.len != 3) return val;
+    if (val.tuple.elems[2] != .nil) return val;
+    const form = val.tuple.elems[0];
+    return switch (form) {
+        .int, .float, .string, .bool_val, .nil => form,
+        .atom => |name| blk: {
+            // Strip `:` prefix used to disambiguate atom literal vs
+            // variable reference in the AST encoding. ConstValue
+            // atoms are stored without the prefix.
+            if (name.len > 0 and name[0] == ':') {
+                break :blk CtValue{ .atom = name[1..] };
+            }
+            break :blk val; // variable refs are not literals — keep wrapper
+        },
+        else => val,
+    };
+}
+
+fn moduleIntrinsicGet(env: *Env, args: []const CtValue) MacroEvalError!CtValue {
+    if (args.len != 1) return .nil;
+    const name_val = try eval(env, args[0]);
+    const ctx = env.module_ctx orelse return .nil;
+    const scope_id = ctx.current_module_scope orelse return .nil;
+    const mod_entry = ctx.graph.findStructByScope(scope_id) orelse return .nil;
+
+    const name_str = extractAtomName(name_val) orelse return .nil;
+    const name_id = ctx.interner.intern(name_str) catch return .nil;
+    const cv_opt = ctx.graph.getModuleAttribute(mod_entry, name_id) catch return .nil;
+    const cv = cv_opt orelse return .nil;
+    return constValueToCtValue(env, cv) catch .nil;
+}
+
+fn moduleIntrinsicRegister(env: *Env, args: []const CtValue) MacroEvalError!CtValue {
+    if (args.len < 1) return .nil;
+    const name_val = try eval(env, args[0]);
+    const ctx = env.module_ctx orelse return .nil;
+    const scope_id = ctx.current_module_scope orelse return .nil;
+    const mod_entry = ctx.graph.findStructByScope(scope_id) orelse return .nil;
+
+    const name_str = extractAtomName(name_val) orelse return .nil;
+    const name_id = ctx.interner.intern(name_str) catch return .nil;
+    ctx.graph.registerAccumulatingAttribute(mod_entry, name_id) catch return .nil;
+    return .nil;
+}
+
+/// Extract an atom name from a CtValue, dropping the leading `:`
+/// that distinguishes literal atoms from identifiers in the encoded
+/// AST. Accepts:
+///   - Bare `.atom` values (with or without `:` prefix).
+///   - 3-tuple-wrapped atom literals: `{:":name", meta, nil}`.
+///   - 3-tuple-wrapped strings: `{"name", meta, nil}` (legacy).
+fn extractAtomName(val: CtValue) ?[]const u8 {
+    if (val == .atom) {
+        const raw = val.atom;
+        if (raw.len > 0 and raw[0] == ':') return raw[1..];
+        return raw;
+    }
+    if (val == .tuple and val.tuple.elems.len == 3 and val.tuple.elems[2] == .nil) {
+        const form = val.tuple.elems[0];
+        if (form == .atom) {
+            const raw = form.atom;
+            if (raw.len > 0 and raw[0] == ':') return raw[1..];
+            return raw;
+        }
+        if (form == .string) return form.string;
+    }
+    if (val == .string) return val.string;
+    return null;
+}
+
+/// Re-import a stored ConstValue back into the macro evaluator's
+/// CtValue representation. Inverse of `ctfe.exportValue` for the
+/// shapes the attribute store actually holds (no closures or
+/// runtime-only structures appear in attribute payloads).
+fn constValueToCtValue(env: *Env, cv: anytype) !CtValue {
+    const ConstValue = ctfe.ConstValue;
+    return switch (cv) {
+        ConstValue.int => |v| CtValue{ .int = v },
+        ConstValue.float => |v| CtValue{ .float = v },
+        ConstValue.string => |v| CtValue{ .string = v },
+        ConstValue.bool_val => |v| CtValue{ .bool_val = v },
+        ConstValue.atom => |v| CtValue{ .atom = v },
+        ConstValue.nil => .nil,
+        ConstValue.void => .void,
+        ConstValue.tuple => |elems| blk: {
+            var result = try env.alloc.alloc(CtValue, elems.len);
+            for (elems, 0..) |e, i| result[i] = try constValueToCtValue(env, e);
+            const id = env.store.alloc(env.alloc, .tuple, null);
+            break :blk CtValue{ .tuple = .{ .alloc_id = id, .elems = result } };
+        },
+        ConstValue.list => |elems| blk: {
+            var result = try env.alloc.alloc(CtValue, elems.len);
+            for (elems, 0..) |e, i| result[i] = try constValueToCtValue(env, e);
+            const id = env.store.alloc(env.alloc, .list, null);
+            break :blk CtValue{ .list = .{ .alloc_id = id, .elems = result } };
+        },
+        else => .nil, // map and struct_val are not used in attribute storage today
+    };
+}
+
 fn slugifyString(alloc: Allocator, input: []const u8) ![]const u8 {
     const result = try alloc.alloc(u8, input.len);
     for (input, 0..) |c, i| {
@@ -606,7 +777,11 @@ fn buildTestFnDecl(alloc: Allocator, store: *AllocationStore, name: []const u8, 
     const clause_args = try ast_data.makeList(alloc, store, &.{ head, opts });
     const clause = try ast_data.makeTuple3(alloc, store, .{ .atom = "->" }, empty, clause_args);
     const clauses = try ast_data.makeList(alloc, store, &.{clause});
-    const vis_pair = try ast_data.makeTuple2(alloc, store, .{ .atom = "visibility" }, .{ .string = "pub" });
+    // Visibility lives in metadata as an atom — must match the encoding
+    // produced by `functionDeclToCtValue` and consumed by
+    // `ctValueToStructItem` (`src/ast_data.zig:2243`). Writing it as a
+    // string would silently make the test function private.
+    const vis_pair = try ast_data.makeTuple2(alloc, store, .{ .atom = "visibility" }, .{ .atom = "pub" });
     const fn_meta = try ast_data.makeList(alloc, store, &.{vis_pair});
     return ast_data.makeTuple3(alloc, store, .{ .atom = "fn" }, fn_meta, clauses);
 }

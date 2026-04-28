@@ -345,7 +345,14 @@ pub const TypeStore = struct {
         if (std.mem.eql(u8, name, "f16")) return F16;
         if (std.mem.eql(u8, name, "usize")) return USIZE;
         if (std.mem.eql(u8, name, "isize")) return ISIZE;
-        if (std.mem.eql(u8, name, "Expr")) return UNKNOWN; // Macro meta-type
+        // Macro meta-types — see `ast.MacroSpliceKind`. The type
+        // checker treats all splice categories as UNKNOWN (no
+        // constraint) because the actual validation lives in the
+        // macro engine, where the bound CtValue's shape can be
+        // checked at expansion time. Adding a name here without a
+        // corresponding entry in `MacroSpliceKind.fromName` would
+        // silently widen the meta-type set; keep the two in sync.
+        if (ast.MacroSpliceKind.fromName(name) != null) return UNKNOWN;
         if (std.mem.eql(u8, name, "any")) return UNKNOWN;
         return null;
     }

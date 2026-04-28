@@ -823,6 +823,27 @@ pub const MacroEngine = struct {
         const clause_ref = family.clauses.items[0];
         const clause = &clause_ref.decl.clauses[clause_ref.clause_index];
 
+        // Validate typed splice categories (`:: Pat`, `:: Decl`, ...)
+        // before either expansion path runs. The conversion to CtValue
+        // is repeated by each path; the cost is negligible (expansion
+        // happens once per macro call) and the alternative (passing
+        // pre-converted CtValues into expandQuote and the evaluator
+        // path) couples both paths to the same conversion store
+        // lifecycle. Validate-first, expand-second is simpler.
+        {
+            const limit = @min(clause.params.len, call.args.len);
+            if (limit > 0) {
+                var validation_store = ctfe.AllocationStore{};
+                var arg_cts = try self.allocator.alloc(ctfe.CtValue, limit);
+                defer self.allocator.free(arg_cts);
+                for (call.args[0..limit], 0..) |arg, i| {
+                    arg_cts[i] = try ast_data.exprToCtValue(self.allocator, self.interner, &validation_store, arg);
+                }
+                const ok = try self.validateMacroArgs(clause.params, call.args, arg_cts, call.meta.span);
+                if (!ok) return expr;
+            }
+        }
+
         // Fast path: bare quote body → use Phase 2 template expansion
         if ((clause.body orelse @as([]const ast.Stmt, &.{})).len == 1 and (clause.body orelse @as([]const ast.Stmt, &.{}))[0] == .expr) {
             const body_expr = (clause.body orelse @as([]const ast.Stmt, &.{}))[0].expr;
@@ -835,10 +856,28 @@ pub const MacroEngine = struct {
         // Phase 3: evaluate macro body as a function using the macro evaluator.
         // Convert the body and args to CtValue, run the evaluator, convert back.
         {
+            // Bump the generation counter so generateHygienicName produces a
+            // fresh suffix per macro invocation. The fast path (above) does
+            // this; the eval path also returns AST that may introduce names
+            // and must share the discipline. Set-of-scopes hygiene (Phase 3
+            // of the macro maturation plan) supersedes this counter, but
+            // until then it is the only mechanism preventing collisions
+            // across nested macro calls.
+            self.generation += 1;
+
             const macro_eval = @import("macro_eval.zig");
             var store = ctfe.AllocationStore{};
             var env = macro_eval.Env.init(self.allocator, &store);
             defer env.deinit();
+            // Wire module context so `__zap_module_*` intrinsics can
+            // reach the scope graph and the current module's
+            // StructEntry. Falls back to a noop if no module is
+            // active (e.g., top-level macro calls).
+            env.module_ctx = .{
+                .graph = self.graph,
+                .interner = self.interner,
+                .current_module_scope = self.current_module_scope,
+            };
 
             // Bind macro parameters to CtValue representations of the arguments
             for (clause.params, 0..) |param, i| {
@@ -959,7 +998,20 @@ pub const MacroEngine = struct {
                 }
             }
 
-            // Recurse into 3-tuple children
+            // Recurse into all three positions: form, meta, args.
+            //
+            // Recursing into form is what makes `quote { unquote(name)() }`
+            // work — the outer call's form slot holds the unquote 3-tuple
+            // `{:unquote, [], [name_var]}`, and substituting it replaces
+            // the whole form with the bound value (typically an atom),
+            // turning the call into `name(...)`. Without this, unquote in
+            // callee position silently decays to a literal call to a
+            // function actually named `"unquote"`.
+            //
+            // For ordinary calls like `{:foo, [], [arg]}` the form is a
+            // bare atom; recursion bottoms out at the leaf-value branch
+            // below, returning the atom unchanged.
+            const new_form = try self.substituteCtValue(value.tuple.elems[0], param_map, store);
             const new_args = if (args == .list) blk: {
                 var new_elems = try self.allocator.alloc(ctfe.CtValue, args.list.elems.len);
                 for (args.list.elems, 0..) |elem, i| {
@@ -970,8 +1022,8 @@ pub const MacroEngine = struct {
             } else args;
 
             const new_tuple = try self.allocator.alloc(ctfe.CtValue, 3);
-            new_tuple[0] = value.tuple.elems[0]; // form stays
-            new_tuple[1] = value.tuple.elems[1]; // meta stays
+            new_tuple[0] = new_form;
+            new_tuple[1] = value.tuple.elems[1]; // meta stays — line/col annotations
             new_tuple[2] = new_args;
             const id = store.alloc(self.allocator, .tuple, null);
             return ctfe.CtValue{ .tuple = .{ .alloc_id = id, .elems = new_tuple } };
@@ -1034,6 +1086,162 @@ pub const MacroEngine = struct {
         const base = self.interner.get(base_name);
         const gen_name = try std.fmt.allocPrint(self.allocator, "{s}__gen{d}", .{ base, self.generation });
         return self.interner.intern(gen_name);
+    }
+
+    // ============================================================
+    // Typed splice validation
+    //
+    // When a macro parameter is annotated with a meta-type
+    // (`Expr`, `Pat`, `Decl`, `Type`, `Ident`, `Block`, etc.), the
+    // bound CtValue's shape is checked against the expected category
+    // so authors find out at the macro call site, not at the splice
+    // site, when they pass the wrong kind of AST.
+    //
+    // The default `Expr` accepts anything; narrower kinds like `Decl`
+    // require a 3-tuple whose form atom is `:fn`, `:macro`, or
+    // `:import`. A param without a type annotation also accepts any
+    // shape (preserves existing user code).
+    // ============================================================
+
+    /// Inspect a macro parameter and return its declared splice kind,
+    /// or null when no meta-type annotation is present.
+    fn paramSpliceKind(self: *const MacroEngine, param: ast.Param) ?ast.MacroSpliceKind {
+        const type_expr = param.type_annotation orelse return null;
+        if (type_expr.* != .name) return null;
+        const name = self.interner.get(type_expr.name.name);
+        return ast.MacroSpliceKind.fromName(name);
+    }
+
+    /// Check whether `value` matches the given splice kind.
+    fn matchesSpliceKind(value: ctfe.CtValue, kind: ast.MacroSpliceKind) bool {
+        return switch (kind) {
+            .expr => true, // permissive — historical default
+            .pattern => isPatternShape(value),
+            .type_expr => isTypeShape(value),
+            .decl => isDeclShape(value),
+            .ident => isIdentShape(value),
+            .block => isBlockShape(value),
+            .atom_lit => isAtomShape(value),
+            .integer_lit => value == .int,
+            .string_lit => isStringShape(value),
+            .list_lit => value == .list,
+        };
+    }
+
+    fn isDeclShape(value: ctfe.CtValue) bool {
+        if (value != .tuple or value.tuple.elems.len != 3) return false;
+        const form = value.tuple.elems[0];
+        if (form != .atom) return false;
+        return std.mem.eql(u8, form.atom, "fn") or
+            std.mem.eql(u8, form.atom, "macro") or
+            std.mem.eql(u8, form.atom, "import") or
+            std.mem.eql(u8, form.atom, "alias");
+    }
+
+    fn isBlockShape(value: ctfe.CtValue) bool {
+        if (value != .tuple or value.tuple.elems.len != 3) return false;
+        const form = value.tuple.elems[0];
+        return form == .atom and std.mem.eql(u8, form.atom, "__block__");
+    }
+
+    fn isIdentShape(value: ctfe.CtValue) bool {
+        // Variable reference: {atom-name, meta, nil}, or bare atom value.
+        if (value == .atom) {
+            const name = value.atom;
+            // Atoms prefixed with ":" are atom literals, not identifiers.
+            return name.len > 0 and name[0] != ':';
+        }
+        if (value == .tuple and value.tuple.elems.len == 3) {
+            return value.tuple.elems[0] == .atom and value.tuple.elems[2] == .nil and
+                value.tuple.elems[0].atom.len > 0 and value.tuple.elems[0].atom[0] != ':';
+        }
+        return false;
+    }
+
+    fn isAtomShape(value: ctfe.CtValue) bool {
+        // Atom literal — bare or wrapped, distinguished by ":" prefix.
+        if (value == .atom) {
+            return value.atom.len > 0 and value.atom[0] == ':';
+        }
+        if (value == .tuple and value.tuple.elems.len == 3) {
+            return value.tuple.elems[0] == .atom and value.tuple.elems[2] == .nil and
+                value.tuple.elems[0].atom.len > 0 and value.tuple.elems[0].atom[0] == ':';
+        }
+        return false;
+    }
+
+    fn isStringShape(value: ctfe.CtValue) bool {
+        if (value == .string) return true;
+        if (value == .tuple and value.tuple.elems.len == 3) {
+            return value.tuple.elems[0] == .string and value.tuple.elems[2] == .nil;
+        }
+        return false;
+    }
+
+    fn isPatternShape(value: ctfe.CtValue) bool {
+        // Patterns and exprs share the tuple shape. Most expression
+        // CtValues are also valid patterns. The compiler verifies
+        // pattern legality downstream during HIR; this validator just
+        // rejects non-AST shapes (closures, enums, structs).
+        return switch (value) {
+            .closure, .enum_val, .struct_val, .union_val => false,
+            else => true,
+        };
+    }
+
+    fn isTypeShape(value: ctfe.CtValue) bool {
+        // Type expressions show up in CtValue as `__aliases__` lists
+        // for module references, or as plain identifier atoms for
+        // built-in types. Accept either shape.
+        if (value == .atom) {
+            const name = value.atom;
+            return name.len > 0 and (std.ascii.isUpper(name[0]) or name[0] == ':');
+        }
+        if (value == .tuple and value.tuple.elems.len == 3) {
+            const form = value.tuple.elems[0];
+            if (form == .atom) {
+                const f = form.atom;
+                if (std.mem.eql(u8, f, "__aliases__")) return true;
+                if (std.mem.eql(u8, f, ".")) return true;
+                if (f.len > 0 and std.ascii.isUpper(f[0])) return true;
+            }
+        }
+        return false;
+    }
+
+    /// Validate that each macro argument's CtValue matches the
+    /// param's declared splice kind. Records structured errors on
+    /// `self.errors` and returns true when validation succeeded.
+    fn validateMacroArgs(
+        self: *MacroEngine,
+        params: []const ast.Param,
+        args: []const *const ast.Expr,
+        arg_cts: []const ctfe.CtValue,
+        call_span: ast.SourceSpan,
+    ) !bool {
+        var ok = true;
+        const limit = @min(params.len, arg_cts.len);
+        for (params[0..limit], 0..) |param, i| {
+            const kind = self.paramSpliceKind(param) orelse continue;
+            if (matchesSpliceKind(arg_cts[i], kind)) continue;
+
+            ok = false;
+            const param_name = if (param.pattern.* == .bind)
+                self.interner.get(param.pattern.bind.name)
+            else
+                "<param>";
+            const span = if (i < args.len) args[i].getMeta().span else call_span;
+            const message = try std.fmt.allocPrint(
+                self.allocator,
+                "macro argument `{s}` is not a `{s}` — expected splice kind `{s}` but got an incompatible AST shape",
+                .{ param_name, kind.displayName(), kind.displayName() },
+            );
+            try self.errors.append(self.allocator, .{
+                .message = message,
+                .span = span,
+            });
+        }
+        return ok;
     }
 
     // ============================================================
@@ -2219,4 +2427,244 @@ test "macro substitution into case_expr and block" {
     try std.testing.expectEqual(@as(usize, 0), engine.errors.items.len);
     // Module should still exist with expanded content
     try std.testing.expectEqual(@as(usize, 1), expanded.structs.len);
+}
+
+test "typed splice: AtomLit param accepts atom literals" {
+    const source =
+        \\pub struct Test {
+        \\  pub macro tag_with(label :: AtomLit, value :: Expr) -> Nil {
+        \\    quote {
+        \\      {unquote(label), unquote(value)}
+        \\    }
+        \\  }
+        \\
+        \\  pub fn check(n :: i64) -> Nil {
+        \\    tag_with(:ok, n)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    _ = try engine.expandProgram(&program);
+
+    // No splice-kind errors — `:ok` is an atom literal.
+    var splice_errs: usize = 0;
+    for (engine.errors.items) |err| {
+        if (std.mem.find(u8, err.message, "splice kind") != null) splice_errs += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), splice_errs);
+}
+
+test "typed splice: AtomLit param rejects integer literal" {
+    const source =
+        \\pub struct Test {
+        \\  pub macro tag_with(label :: AtomLit, value :: Expr) -> Nil {
+        \\    quote {
+        \\      {unquote(label), unquote(value)}
+        \\    }
+        \\  }
+        \\
+        \\  pub fn check() -> Nil {
+        \\    tag_with(42, 99)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    _ = try engine.expandProgram(&program);
+
+    // The `42` literal does not match `AtomLit`. Validation must
+    // record an error mentioning the splice kind.
+    var has_kind_error = false;
+    for (engine.errors.items) |err| {
+        if (std.mem.find(u8, err.message, "AtomLit") != null) {
+            has_kind_error = true;
+            break;
+        }
+    }
+    try std.testing.expect(has_kind_error);
+}
+
+test "module attribute intrinsics: put writes to current StructEntry" {
+    // A macro that stores its argument into the module's
+    // `:registered_tests` attribute through the put intrinsic. The
+    // side effect happens at expansion time; the macro returns nil.
+    const source =
+        \\pub struct Test {
+        \\  pub macro track(_name :: Expr) -> Nil {
+        \\    __zap_module_put_attr__(:registered_tests, _name)
+        \\    quote { nil }
+        \\  }
+        \\
+        \\  pub fn check() -> Nil {
+        \\    track(:hello)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    _ = try engine.expandProgram(&program);
+
+    // The module should now have a `:registered_tests` attribute
+    // whose value is the atom `:hello` (single-value semantics —
+    // accumulate not registered).
+    const test_struct = blk: {
+        for (collector.graph.structs.items) |*entry| {
+            if (entry.name.parts.len == 1) {
+                const part_name = parser.interner.get(entry.name.parts[0]);
+                if (std.mem.eql(u8, part_name, "Test")) break :blk entry;
+            }
+        }
+        return error.TestModuleNotFound;
+    };
+
+    var found_value: ?ctfe.ConstValue = null;
+    for (test_struct.attributes.items) |attr| {
+        const attr_name = parser.interner.get(attr.name);
+        if (std.mem.eql(u8, attr_name, "registered_tests")) {
+            found_value = attr.computed_value;
+            break;
+        }
+    }
+    try std.testing.expect(found_value != null);
+    try std.testing.expect(found_value.? == .atom);
+    try std.testing.expectEqualStrings("hello", found_value.?.atom);
+}
+
+test "module attribute intrinsics: register makes attribute accumulate" {
+    // After register_attribute, multiple put calls accumulate into a
+    // list. Without it, puts overwrite each other.
+    const source =
+        \\pub struct Test {
+        \\  pub macro setup_acc() -> Nil {
+        \\    __zap_module_register_attr__(:tests)
+        \\    quote { nil }
+        \\  }
+        \\
+        \\  pub macro track(_name :: Expr) -> Nil {
+        \\    __zap_module_put_attr__(:tests, _name)
+        \\    quote { nil }
+        \\  }
+        \\
+        \\  pub fn _setup() -> Nil { setup_acc() }
+        \\  pub fn _a() -> Nil { track(:foo) }
+        \\  pub fn _b() -> Nil { track(:bar) }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    _ = try engine.expandProgram(&program);
+
+    const test_struct = blk: {
+        for (collector.graph.structs.items) |*entry| {
+            if (entry.name.parts.len == 1) {
+                const part_name = parser.interner.get(entry.name.parts[0]);
+                if (std.mem.eql(u8, part_name, "Test")) break :blk entry;
+            }
+        }
+        return error.TestModuleNotFound;
+    };
+
+    // Two values were appended; the read should produce a list of
+    // both atoms in append order.
+    const attr_value = blk: {
+        const tests_id = try parser.interner.intern("tests");
+        const v = try collector.graph.getModuleAttribute(test_struct, tests_id);
+        break :blk v orelse return error.AttributeMissing;
+    };
+    try std.testing.expect(attr_value == .list);
+    try std.testing.expectEqual(@as(usize, 2), attr_value.list.len);
+    try std.testing.expect(attr_value.list[0] == .atom);
+    try std.testing.expect(attr_value.list[1] == .atom);
+    try std.testing.expectEqualStrings("foo", attr_value.list[0].atom);
+    try std.testing.expectEqualStrings("bar", attr_value.list[1].atom);
+}
+
+test "typed splice: untyped param accepts anything (back-compat)" {
+    const source =
+        \\pub struct Test {
+        \\  pub macro identity(x :: Expr) -> Nil {
+        \\    quote { unquote(x) }
+        \\  }
+        \\
+        \\  pub fn check() -> i64 {
+        \\    identity(42)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    _ = try engine.expandProgram(&program);
+
+    // `Expr` is the historical permissive default — any shape works.
+    var splice_errs: usize = 0;
+    for (engine.errors.items) |err| {
+        if (std.mem.find(u8, err.message, "splice kind") != null) splice_errs += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), splice_errs);
 }
