@@ -133,6 +133,18 @@ pub const MacroFamily = struct {
     clauses: std.ArrayList(FunctionClauseRef),
     /// Attributes attached to this macro (@doc, @debug, etc.)
     attributes: std.ArrayListUnmanaged(Attribute) = .empty,
+    /// Capabilities this macro is declared to require via `@requires`.
+    /// Defaults to the empty set (pure). When the body invokes an
+    /// impure intrinsic that is not in this set, expansion is rejected
+    /// with a `capability_violation` diagnostic. Caller/callee
+    /// attenuation also uses this field: a macro M1 may only call
+    /// macro M2 when `decl(M2) ⊆ decl(M1)`.
+    required_caps: ctfe.CapabilitySet = .{},
+    /// True when `@requires` was explicitly declared on the macro.
+    /// Distinguishes "author wrote `@requires = []`" from "no annotation
+    /// at all" so future inference passes can treat the unannotated
+    /// case differently from an explicit pure declaration.
+    required_caps_declared: bool = false,
 
     pub fn init(id: MacroFamilyId, scope_id: ScopeId, name: ast.StringId, arity: u32) MacroFamily {
         return .{

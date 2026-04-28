@@ -42,6 +42,23 @@ pub const Env = struct {
     /// time `dispatchComptimeCall` recurses into another function.
     /// Limits runaway evaluation of recursive functions.
     dispatch_depth: u32 = 0,
+    /// Capability set of the macro currently being evaluated. Top-level
+    /// (non-macro) callers — manifest evaluation, attribute computation,
+    /// hook fixtures — leave this at the build cap (full set) so they
+    /// retain the legacy "anything goes" behavior. Evaluation of a
+    /// macro body sets this to the family's `required_caps` before
+    /// running the body so impure intrinsics can refuse expansion when
+    /// the macro has not declared the matching capability.
+    current_macro_caps: ctfe.CapabilitySet = ctfe.CapabilitySet.build,
+    /// Name of the macro family currently expanding, for diagnostics.
+    /// Null when not inside a macro body.
+    current_macro_name: ?[]const u8 = null,
+    /// Source span of the macro call site, for diagnostics.
+    current_macro_span: ?ast.SourceSpan = null,
+    /// Last capability-violation message produced during eval. The
+    /// surface-level macro engine queries this to forward a precise
+    /// diagnostic when expansion fails. Owned by `alloc`.
+    last_capability_error: ?[]const u8 = null,
 
     pub fn init(alloc: Allocator, store: *AllocationStore) Env {
         return .{
@@ -90,10 +107,26 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
         if (form != .atom) return value;
         const form_name = form.atom;
 
-        // quote: return the body as data (don't evaluate it)
+        // quote: return the body as AST data, eagerly substituting
+        // unquote/unquote_splicing nodes against the current env.
+        //
+        // Eager substitution makes patterns like:
+        //
+        //     _expanded = for _t <- _stmts {
+        //       quote { ... unquote(_t) ... }
+        //     }
+        //
+        // capture `_t`'s value at the moment of iteration. Without it
+        // the loop variable would be cleaned up by the for-comp before
+        // the macro-end substitution pass ran, leaving the unquote
+        // node dangling.  The macro-end substitute then sees a tree
+        // with no remaining unquote nodes and is a no-op for trees
+        // produced this way. Pre-existing macros that build a single
+        // `quote` template with `unquote(arg)` (where `arg` is bound
+        // for the entire macro body) get the same result either way.
         if (std.mem.eql(u8, form_name, "quote")) {
             if (args == .list and args.list.elems.len == 1) {
-                return args.list.elems[0];
+                return substituteUnquotesEval(env, args.list.elems[0]);
             }
             return value;
         }
@@ -431,6 +464,45 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
                 return internAtomIntrinsic(env, arg_elems);
             }
 
+            // __zap_io_read_file__(path) — read a file at compile time.
+            // Gated by the `read_file` capability. The first impure
+            // intrinsic in the macro language: a macro that calls this
+            // must declare `@requires = [:read_file]`, otherwise
+            // expansion fails with a capability_violation diagnostic.
+            // Returns a `string` CtValue containing the file's bytes.
+            //
+            // Resource bound: the read is capped at 1 MiB to keep
+            // comptime evaluation deterministic — a multi-gig file
+            // would silently extend build time and explode allocator
+            // pressure. Authors who need larger inputs should chunk.
+            if (std.mem.eql(u8, form_name, "__zap_io_read_file__")) {
+                if (arg_elems.len != 1) return MacroEvalError.EvalFailed;
+                if (!env.current_macro_caps.has(.read_file)) {
+                    const caller = env.current_macro_name orelse "<top-level>";
+                    const msg = std.fmt.allocPrint(
+                        env.alloc,
+                        "macro `{s}` calls `__zap_io_read_file__` but does not declare `@requires = [:read_file]` — add the capability to allow compile-time file reads",
+                        .{caller},
+                    ) catch return MacroEvalError.EvalFailed;
+                    env.last_capability_error = msg;
+                    return MacroEvalError.EvalFailed;
+                }
+                const path_raw = try eval(env, arg_elems[0]);
+                const path_ct = unwrapAstLiteral(path_raw);
+                if (path_ct != .string) return MacroEvalError.EvalFailed;
+                const bytes = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, path_ct.string, env.alloc, .limited(1 << 20)) catch |err| {
+                    const caller = env.current_macro_name orelse "<top-level>";
+                    const msg = std.fmt.allocPrint(
+                        env.alloc,
+                        "`__zap_io_read_file__` in macro `{s}` failed to read `{s}`: {s}",
+                        .{ caller, path_ct.string, @errorName(err) },
+                    ) catch return MacroEvalError.EvalFailed;
+                    env.last_capability_error = msg;
+                    return MacroEvalError.EvalFailed;
+                };
+                return CtValue{ .string = bytes };
+            }
+
             // __zap_dbg__(label, value) — comptime debug print to stderr.
             // Returns the evaluated value so it can be wrapped around an
             // existing expression: `_x = __zap_dbg__("setup", find_setup(body))`.
@@ -735,6 +807,108 @@ test "eval: quote returns data" {
 // Helper functions
 // ============================================================
 
+/// Eagerly substitute `unquote(expr)` and `unquote_splicing(expr)`
+/// nodes within a quoted body against the macro evaluator's current
+/// `env`. Used by the `quote` arm so each quote produces a
+/// fully-resolved AST CtValue rather than relying on a deferred
+/// substitution pass at macro-body end.
+///
+/// Behavior:
+///   - `{:unquote, _, [inner]}` → `eval(env, inner)`
+///   - `{:unquote_splicing, _, [inner]}` (only at list-element
+///     positions) → splice `eval(env, inner)`'s list elements as
+///     siblings.
+///   - Nested `quote` nodes are NOT descended into; their unquotes
+///     belong to their own quote scope and remain raw until that
+///     quote is itself evaluated.
+fn substituteUnquotesEval(env: *Env, value: CtValue) MacroEvalError!CtValue {
+    if (value == .tuple and value.tuple.elems.len == 3) {
+        const form = value.tuple.elems[0];
+        const args = value.tuple.elems[2];
+
+        if (form == .atom) {
+            // Eager unquote: fully evaluate the inner expression in
+            // the current env. Mirrors the semantics the engine-level
+            // substituteCtValue achieves with `param_map`, but uses
+            // the evaluator's full eval — so `unquote(elem(_t, 2))`
+            // resolves the `elem` call instead of bottoming out on a
+            // bare `param_map.get(name)` lookup.
+            if (std.mem.eql(u8, form.atom, "unquote")) {
+                if (args == .list and args.list.elems.len == 1) {
+                    return eval(env, args.list.elems[0]);
+                }
+            }
+            // Don't descend into nested quote — its body should stay
+            // raw until that quote itself is evaluated, preserving
+            // standard quasiquote nesting semantics.
+            if (std.mem.eql(u8, form.atom, "quote")) {
+                return value;
+            }
+        }
+
+        const new_form = try substituteUnquotesEval(env, form);
+        const new_args: CtValue = if (args == .list)
+            try substituteUnquotesInList(env, args.list.elems)
+        else
+            args;
+
+        const new_tuple = try env.alloc.alloc(CtValue, 3);
+        new_tuple[0] = new_form;
+        new_tuple[1] = value.tuple.elems[1]; // meta passes through
+        new_tuple[2] = new_args;
+        const id = env.store.alloc(env.alloc, .tuple, null);
+        return CtValue{ .tuple = .{ .alloc_id = id, .elems = new_tuple } };
+    }
+
+    if (value == .tuple and value.tuple.elems.len == 2) {
+        const new_elems = try env.alloc.alloc(CtValue, 2);
+        new_elems[0] = value.tuple.elems[0];
+        new_elems[1] = try substituteUnquotesEval(env, value.tuple.elems[1]);
+        const id = env.store.alloc(env.alloc, .tuple, null);
+        return CtValue{ .tuple = .{ .alloc_id = id, .elems = new_elems } };
+    }
+
+    if (value == .list) {
+        return substituteUnquotesInList(env, value.list.elems);
+    }
+
+    return value;
+}
+
+/// Substitute unquote/unquote_splicing inside a list of CtValues,
+/// splicing unquote_splicing replacements as siblings. Used both for
+/// bare list values and the `args` slot of 3-tuples (where most
+/// stmt-shaped CtValues store their children).
+fn substituteUnquotesInList(env: *Env, elems: []const CtValue) MacroEvalError!CtValue {
+    var out: std.ArrayListUnmanaged(CtValue) = .empty;
+    for (elems) |elem| {
+        if (elem == .tuple and elem.tuple.elems.len == 3) {
+            const e_form = elem.tuple.elems[0];
+            const e_args = elem.tuple.elems[2];
+            if (e_form == .atom and std.mem.eql(u8, e_form.atom, "unquote_splicing")) {
+                if (e_args == .list and e_args.list.elems.len == 1) {
+                    const replacement = try eval(env, e_args.list.elems[0]);
+                    if (replacement == .list) {
+                        for (replacement.list.elems) |splice| {
+                            try out.append(env.alloc, splice);
+                        }
+                        continue;
+                    }
+                    // Non-list splice replacement: surface the value
+                    // as a single sibling so the caller's structural
+                    // expectations aren't silently broken.
+                    try out.append(env.alloc, replacement);
+                    continue;
+                }
+            }
+        }
+        try out.append(env.alloc, try substituteUnquotesEval(env, elem));
+    }
+    const slice = try out.toOwnedSlice(env.alloc);
+    const id = env.store.alloc(env.alloc, .list, null);
+    return CtValue{ .list = .{ .alloc_id = id, .elems = slice } };
+}
+
 /// Walk a describe block body (a __block__ or list of statements),
 /// Find a named call (like setup or teardown) in a __block__ body
 /// and return its first argument (the body expression).
@@ -1002,6 +1176,13 @@ fn dispatchComptimeCall(
     // re-discovers the inner call, but by then the outer's eval env
     // is gone, so the inner macro's args bind to raw AST var-refs
     // (`{:_stmt, [], nil}`) instead of the values those locals held.
+    // Resolved-callee capability set. Functions are treated as having
+    // the build cap (full) — function-level capability gating is out of
+    // scope for the MVP and is tracked by the type/effect system, not
+    // the macro evaluator. Macros report their `required_caps`.
+    var callee_caps: ctfe.CapabilitySet = ctfe.CapabilitySet.build;
+    var callee_is_macro = false;
+
     const clause: *const ast.FunctionClause = blk: {
         if (ctx.graph.resolveFamily(scope_id, name_id, arity)) |fid| {
             const family = &ctx.graph.families.items[fid];
@@ -1012,6 +1193,8 @@ fn dispatchComptimeCall(
         if (ctx.graph.resolveMacro(scope_id, name_id, arity)) |mid| {
             const mfamily = &ctx.graph.macro_families.items[mid];
             if (mfamily.clauses.items.len == 0) return null;
+            callee_caps = mfamily.required_caps;
+            callee_is_macro = true;
             const cref = mfamily.clauses.items[0];
             break :blk &cref.decl.clauses[cref.clause_index];
         }
@@ -1020,6 +1203,22 @@ fn dispatchComptimeCall(
         }
         return null;
     };
+
+    // Caller/callee attenuation: a macro may only invoke another macro
+    // whose declared capabilities are a subset of its own. This is the
+    // static enforcement of the boolean lattice — without it a `pure`
+    // macro could indirectly perform IO by delegating to a `read_file`
+    // macro, defeating the whole annotation system.
+    if (callee_is_macro and !callee_caps.isSubsetOf(env.current_macro_caps)) {
+        const caller_name = env.current_macro_name orelse "<top-level>";
+        const msg = std.fmt.allocPrint(
+            env.alloc,
+            "macro `{s}` requires capabilities not held by caller `{s}` — calling macro `{s}` would escalate the caller's capability set",
+            .{ form_name, caller_name, form_name },
+        ) catch return null;
+        env.last_capability_error = msg;
+        return MacroEvalError.EvalFailed;
+    }
     const body = clause.body orelse return null;
 
     // Purity check: refuse to dispatch a function whose body
@@ -1053,6 +1252,18 @@ fn dispatchComptimeCall(
     defer child_env.deinit();
     child_env.module_ctx = env.module_ctx;
     child_env.dispatch_depth = env.dispatch_depth + 1;
+    // When dispatching into a macro body, narrow the child env's
+    // capability set to the callee's declared caps so its impure-call
+    // checks are gated by the *callee's* annotation, not the caller's.
+    // For functions we keep the build cap (function-level effect
+    // tracking is out of MVP scope).
+    if (callee_is_macro) {
+        child_env.current_macro_caps = callee_caps;
+        child_env.current_macro_name = form_name;
+    } else {
+        child_env.current_macro_caps = env.current_macro_caps;
+        child_env.current_macro_name = env.current_macro_name;
+    }
 
     for (clause.params, 0..) |param, i| {
         if (i >= arg_cts.len) break;
@@ -1068,7 +1279,18 @@ fn dispatchComptimeCall(
     var result: CtValue = .nil;
     for (body) |stmt| {
         const stmt_ct = ast_data.stmtToCtValue(env.alloc, ctx.interner, env.store, stmt) catch return null;
-        result = eval(&child_env, stmt_ct) catch return null;
+        result = eval(&child_env, stmt_ct) catch |err| {
+            // Propagate a capability-violation diagnostic surfaced by
+            // an inner intrinsic or macro out to the caller's env so
+            // the outer expansion site can present it. Without this,
+            // a violation in a nested macro would surface as an
+            // opaque `EvalFailed` and the user would see no actionable
+            // hint about which capability was missing.
+            if (child_env.last_capability_error) |msg| {
+                env.last_capability_error = msg;
+            }
+            return err;
+        };
     }
 
     // The function may legitimately return nil. Return the actual

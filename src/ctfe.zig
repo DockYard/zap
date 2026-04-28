@@ -436,6 +436,25 @@ pub const CapabilitySet = struct {
         return .{ .flags = self.flags | (@as(u8, 1) << @intFromEnum(cap)) };
     }
 
+    /// True iff every capability in `self` is also in `other`. Used for
+    /// caller/callee attenuation: a callee whose declared capabilities
+    /// are a subset of the caller's may be invoked.
+    pub fn isSubsetOf(self: CapabilitySet, other: CapabilitySet) bool {
+        return (self.flags & ~other.flags) == 0;
+    }
+
+    /// Map an atom name (without the leading `:`) to its capability.
+    /// Returns null when the name is not a known capability so callers
+    /// can surface a precise diagnostic at the source location of the
+    /// offending attribute value.
+    pub fn capabilityFromAtomName(name: []const u8) ?Capability {
+        if (std.mem.eql(u8, name, "pure")) return .pure;
+        if (std.mem.eql(u8, name, "read_file")) return .read_file;
+        if (std.mem.eql(u8, name, "read_env")) return .read_env;
+        if (std.mem.eql(u8, name, "reflect_module")) return .reflect_module;
+        return null;
+    }
+
     pub const pure_only = CapabilitySet{};
     pub const build = CapabilitySet{ .flags = 0b1111 }; // pure + read_file + read_env + reflect_module
 };
