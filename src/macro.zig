@@ -3025,6 +3025,275 @@ test "@before_compile: hook fires and splices result into target module" {
     try std.testing.expect(found_injected);
 }
 
+test "Zest test/2 macro: multi-stmt quote body matches lib/zest/case.zap shape" {
+    // This is the exact shape `lib/zest/case.zap`'s test macro
+    // produces: a 6-statement quote body (fn decl + 5 tracking
+    // statements). The earlier 2-statement test passed; this version
+    // exercises the multi-statement list path in expandStructLevelExpr
+    // which is what zap-test-suite hits.
+    const source =
+        \\pub struct Test {
+        \\  pub macro tm(_name :: Expr, body :: Expr) -> Expr {
+        \\    fn_name = __zap_intern_atom__("test_" <> __zap_slugify__(_name))
+        \\    quote {
+        \\      pub fn unquote(fn_name)() -> i64 {
+        \\        unquote(body)
+        \\      }
+        \\
+        \\      1
+        \\      unquote(fn_name)()
+        \\      2
+        \\      3
+        \\      "x"
+        \\    }
+        \\  }
+        \\
+        \\  pub macro wrap(_label :: Expr, body :: Expr) -> Expr {
+        \\    body
+        \\  }
+        \\
+        \\  wrap("g") {
+        \\    tm("foo bar", 42)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    const expanded = try engine.expandProgram(&program);
+
+    var any_colon_prefixed = false;
+    var seen_test_call = false;
+    for (expanded.structs) |mod| {
+        for (mod.items) |item| {
+            if (item != .struct_level_expr) continue;
+            if (item.struct_level_expr.* != .call) continue;
+            const callee = item.struct_level_expr.call.callee;
+            if (callee.* != .var_ref) continue;
+            const name = parser.interner.get(callee.var_ref.name);
+            if (name.len > 0 and name[0] == ':') any_colon_prefixed = true;
+            if (std.mem.eql(u8, name, "test_foo_bar")) seen_test_call = true;
+        }
+    }
+    try std.testing.expect(!any_colon_prefixed);
+    try std.testing.expect(seen_test_call);
+}
+
+test "Zest test/2 macro: multiple tests with setup/teardown sibling calls" {
+    // Reproduces the actual zap-test-suite scenario more closely:
+    // tests inside a passthrough wrapper, alongside `setup` and
+    // `teardown` macro calls (whose bodies just `quote { body }`).
+    // The setup/teardown calls become struct_level_exprs after their
+    // own expansion and live alongside the test fn decls + tracking
+    // calls in the parent struct's items list.
+    const source =
+        \\pub struct Test {
+        \\  pub macro test_macro(_name :: Expr, body :: Expr) -> Expr {
+        \\    fn_name = __zap_intern_atom__("test_" <> __zap_slugify__(_name))
+        \\    quote {
+        \\      pub fn unquote(fn_name)() -> i64 {
+        \\        unquote(body)
+        \\      }
+        \\
+        \\      unquote(fn_name)()
+        \\    }
+        \\  }
+        \\
+        \\  pub macro setup_helper(body :: Expr) -> Expr {
+        \\    quote { unquote(body) }
+        \\  }
+        \\
+        \\  pub macro wrap(_label :: Expr, body :: Expr) -> Expr {
+        \\    body
+        \\  }
+        \\
+        \\  wrap("group") {
+        \\    setup_helper(7)
+        \\    test_macro("first one", 1)
+        \\    test_macro("second one", 2)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    const expanded = try engine.expandProgram(&program);
+
+    var any_colon_prefixed = false;
+    var seen_first = false;
+    var seen_second = false;
+    for (expanded.structs) |mod| {
+        for (mod.items) |item| {
+            if (item != .struct_level_expr) continue;
+            if (item.struct_level_expr.* != .call) continue;
+            const callee = item.struct_level_expr.call.callee;
+            if (callee.* != .var_ref) continue;
+            const name = parser.interner.get(callee.var_ref.name);
+            if (name.len > 0 and name[0] == ':') any_colon_prefixed = true;
+            if (std.mem.eql(u8, name, "test_first_one")) seen_first = true;
+            if (std.mem.eql(u8, name, "test_second_one")) seen_second = true;
+        }
+    }
+    try std.testing.expect(!any_colon_prefixed);
+    try std.testing.expect(seen_first);
+    try std.testing.expect(seen_second);
+}
+
+test "Zest test/2 macro: multiple tests through a passthrough wrapper" {
+    // Reproduces the multi-test case more precisely. Two tests
+    // inside a passthrough wrapper, each with a name that contains
+    // spaces (so slugify is exercised). The tracking call for both
+    // must resolve to bare identifiers.
+    const source =
+        \\pub struct Test {
+        \\  pub macro test_macro(_name :: Expr, body :: Expr) -> Expr {
+        \\    fn_name = __zap_intern_atom__("test_" <> __zap_slugify__(_name))
+        \\    quote {
+        \\      pub fn unquote(fn_name)() -> i64 {
+        \\        unquote(body)
+        \\      }
+        \\
+        \\      unquote(fn_name)()
+        \\    }
+        \\  }
+        \\
+        \\  pub macro wrap(_label :: Expr, body :: Expr) -> Expr {
+        \\    body
+        \\  }
+        \\
+        \\  wrap("group") {
+        \\    test_macro("first one", 1)
+        \\    test_macro("second one", 2)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    const expanded = try engine.expandProgram(&program);
+
+    // Collect every tracking-call callee name. Each must be a bare
+    // identifier — none should carry the `:` prefix.
+    var seen_first = false;
+    var seen_second = false;
+    var any_colon_prefixed = false;
+    for (expanded.structs) |mod| {
+        for (mod.items) |item| {
+            if (item != .struct_level_expr) continue;
+            if (item.struct_level_expr.* != .call) continue;
+            const callee = item.struct_level_expr.call.callee;
+            if (callee.* != .var_ref) continue;
+            const name = parser.interner.get(callee.var_ref.name);
+            if (name.len > 0 and name[0] == ':') any_colon_prefixed = true;
+            if (std.mem.eql(u8, name, "test_first_one")) seen_first = true;
+            if (std.mem.eql(u8, name, "test_second_one")) seen_second = true;
+        }
+    }
+    try std.testing.expect(!any_colon_prefixed);
+    try std.testing.expect(seen_first);
+    try std.testing.expect(seen_second);
+}
+
+test "Zest test/2 macro: works through a passthrough wrapper macro" {
+    // Reproduces the failure mode the describe-passthrough revealed:
+    // when a wrapper macro returns its body unchanged and the body
+    // contains a test_macro call, the test_macro expands in a later
+    // iteration and its tracking call's callee should still resolve
+    // to a bare identifier (no colon prefix). Failure mode is the
+    // tracking call having callee ':test_X' instead of 'test_X'.
+    const source =
+        \\pub struct Test {
+        \\  pub macro test_macro(_name :: Expr, body :: Expr) -> Expr {
+        \\    fn_name = __zap_intern_atom__("test_" <> __zap_slugify__(_name))
+        \\    quote {
+        \\      pub fn unquote(fn_name)() -> i64 {
+        \\        unquote(body)
+        \\      }
+        \\
+        \\      unquote(fn_name)()
+        \\    }
+        \\  }
+        \\
+        \\  pub macro wrap(body :: Expr) -> Expr {
+        \\    body
+        \\  }
+        \\
+        \\  wrap(test_macro("foo", 42))
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    const expanded = try engine.expandProgram(&program);
+
+    // The tracking call's callee must be a bare identifier
+    // (`test_foo`), never the colon-prefixed atom.
+    var tracking_callee_name: ?[]const u8 = null;
+    for (expanded.structs) |mod| {
+        if (mod.name.parts.len != 1) continue;
+        const mod_name = parser.interner.get(mod.name.parts[0]);
+        if (!std.mem.eql(u8, mod_name, "Test")) continue;
+        for (mod.items) |item| {
+            if (item != .struct_level_expr) continue;
+            if (item.struct_level_expr.* != .call) continue;
+            const callee = item.struct_level_expr.call.callee;
+            if (callee.* == .var_ref) {
+                tracking_callee_name = parser.interner.get(callee.var_ref.name);
+            }
+        }
+    }
+    try std.testing.expect(tracking_callee_name != null);
+    try std.testing.expectEqualStrings("test_foo", tracking_callee_name.?);
+}
+
 test "Zest test/2 macro: generates dynamically-named fn + tracking call" {
     // Validates the migrated `test` macro in lib/zest/case.zap works
     // end-to-end through the new comptime intrinsics + dynamic fn
