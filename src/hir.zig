@@ -2278,23 +2278,29 @@ pub const HirBuilder = struct {
 
     /// Resolve a function's return type within a specific module (for cross-module calls).
     fn resolveFunctionReturnTypeInModule(self: *const HirBuilder, mod_name: []const u8, func_name: []const u8, arity: u32) types_mod.TypeId {
-        // Find the module's scope in the scope graph, then search families by scope
+        // Find the module's scope, then look up the family via the
+        // scope's `function_families` map. The map covers both
+        // natively-declared module functions AND impl functions
+        // registered via `registerImplFunctionsInTargetScopes` —
+        // critical for protocol dispatch through `String.concat`,
+        // `List.next`, etc., where the impl-defined family lives in
+        // the impl's own scope but is reachable from the target
+        // module's scope via the registered map entry.
+        const func_name_id = self.interner.lookupExisting(func_name) orelse return types_mod.TypeStore.UNKNOWN;
+        const key = scope_mod.FamilyKey{ .name = func_name_id, .arity = arity };
         for (self.graph.structs.items) |mod_entry| {
             if (mod_entry.name.parts.len == 0) continue;
             const last_part = self.interner.get(mod_entry.name.parts[mod_entry.name.parts.len - 1]);
             if (!std.mem.eql(u8, last_part, mod_name)) continue;
-            // Search families that belong to this module's scope
-            for (self.graph.families.items) |family| {
-                if (family.scope_id != mod_entry.scope_id) continue;
-                if (family.arity != arity) continue;
-                if (!std.mem.eql(u8, self.interner.get(family.name), func_name)) continue;
-                if (family.clauses.items.len > 0) {
-                    const first_clause = family.clauses.items[0];
-                    if (first_clause.clause_index < first_clause.decl.clauses.len) {
-                        const clause = first_clause.decl.clauses[first_clause.clause_index];
-                        if (clause.return_type) |rt| {
-                            return self.resolveTypeExpr(rt);
-                        }
+            const mod_scope = self.graph.getScope(mod_entry.scope_id);
+            const fam_id = mod_scope.function_families.get(key) orelse continue;
+            const family = self.graph.getFamily(fam_id);
+            if (family.clauses.items.len > 0) {
+                const first_clause = family.clauses.items[0];
+                if (first_clause.clause_index < first_clause.decl.clauses.len) {
+                    const clause = first_clause.decl.clauses[first_clause.clause_index];
+                    if (clause.return_type) |rt| {
+                        return self.resolveTypeExpr(rt);
                     }
                 }
             }
