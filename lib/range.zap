@@ -23,6 +23,8 @@
       3 in 1..10:2      # => false (only 1, 3, 5, 7, 9)
   """
 
+@native_type = "range"
+
 pub struct Range {
   start :: i64
   end :: i64

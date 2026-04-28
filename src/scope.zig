@@ -236,6 +236,34 @@ pub const ImplEntry = struct {
 // Scope graph — the central store
 // ============================================================
 
+/// Compiler-recognised primitive runtime types. Each kind names a
+/// runtime container the compiler must lower or dispatch specially
+/// (e.g. List for cons-cell IR, Map for k/v-aware ZIR encoding,
+/// Range for `in_range` literal switching, String for the byte-string
+/// primitive). The Zap stdlib structs that back these kinds opt in
+/// by writing a `@native_type = "list"|"map"|"range"|"string"`
+/// attribute on the struct declaration; the collector scans those
+/// attributes and populates `ScopeGraph.native_type_names`. Compiler
+/// passes that previously string-compared module names against
+/// hardcoded literals consult the registry instead — that way the
+/// "is this struct the runtime List type?" question is answered by
+/// the user-visible declaration in `lib/list.zap`, not by a string
+/// literal embedded in the compiler.
+pub const NativeTypeKind = enum {
+    list,
+    map,
+    range,
+    string,
+
+    pub fn fromName(name: []const u8) ?NativeTypeKind {
+        if (std.mem.eql(u8, name, "list")) return .list;
+        if (std.mem.eql(u8, name, "map")) return .map;
+        if (std.mem.eql(u8, name, "range")) return .range;
+        if (std.mem.eql(u8, name, "string")) return .string;
+        return null;
+    }
+};
+
 pub const ScopeGraph = struct {
     allocator: std.mem.Allocator,
     scopes: std.ArrayList(Scope),
@@ -254,6 +282,11 @@ pub const ScopeGraph = struct {
     node_scope_map: std.AutoHashMap(u64, ScopeId),
     /// Maps type name (StringId) → TypeId for global type resolution
     type_name_to_id: std.AutoHashMap(ast.StringId, TypeId),
+    /// Maps each NativeTypeKind to the StringId of the user-visible
+    /// stdlib struct that opts in via `@native_type = "<kind>"`. Empty
+    /// when no struct has registered for that kind. See `NativeTypeKind`
+    /// for the design rationale.
+    native_type_names: std.EnumArray(NativeTypeKind, ?ast.StringId),
 
     /// Build the composite key for node_scope_map from a SourceSpan.
     /// Encodes source_id in the high 32 bits and span.start in the low 32 bits.
@@ -277,11 +310,51 @@ pub const ScopeGraph = struct {
             .prelude_scope = 0,
             .node_scope_map = std.AutoHashMap(u64, ScopeId).init(allocator),
             .type_name_to_id = std.AutoHashMap(ast.StringId, TypeId).init(allocator),
+            .native_type_names = std.EnumArray(NativeTypeKind, ?ast.StringId).initFill(null),
         };
         // Create prelude scope as scope 0
         const prelude = Scope.init(allocator, 0, null, .prelude);
         graph.scopes.append(allocator, prelude) catch {};
         return graph;
+    }
+
+    /// Record the user-visible stdlib struct that opts in to a native
+    /// type kind via its `@native_type` attribute. Idempotent — calling
+    /// twice with the same name is a no-op; calling twice with
+    /// different names keeps the first registration so the compiler
+    /// has a stable answer to `nativeTypeStructName`.
+    pub fn registerNativeType(self: *ScopeGraph, kind: NativeTypeKind, name: ast.StringId) void {
+        const slot = self.native_type_names.getPtr(kind);
+        if (slot.*) |_| return;
+        slot.* = name;
+    }
+
+    /// Return the StringId of the struct registered for `kind`, or
+    /// null if no struct has opted in. Used by lookup helpers like
+    /// `isNativeTypeName`.
+    pub fn nativeTypeStructName(self: *const ScopeGraph, kind: NativeTypeKind) ?ast.StringId {
+        return self.native_type_names.get(kind);
+    }
+
+    /// True iff `name` (a single-segment struct name's StringId) refers
+    /// to the struct registered for `kind`. Replaces the old pattern of
+    /// comparing the rendered name against a hardcoded literal like
+    /// `"List"`, `"Map"`, `"Range"`, `"String"`.
+    pub fn isNativeTypeName(self: *const ScopeGraph, kind: NativeTypeKind, name: ast.StringId) bool {
+        const registered = self.nativeTypeStructName(kind) orelse return false;
+        return registered == name;
+    }
+
+    /// Convenience: identify the native-type kind for a given struct
+    /// name, if any. Returns null when the name isn't a registered
+    /// native type.
+    pub fn classifyNativeType(self: *const ScopeGraph, name: ast.StringId) ?NativeTypeKind {
+        for (std.enums.values(NativeTypeKind)) |kind| {
+            if (self.native_type_names.get(kind)) |registered| {
+                if (registered == name) return kind;
+            }
+        }
+        return null;
     }
 
     pub fn deinit(self: *ScopeGraph) void {
@@ -387,6 +460,18 @@ pub const ScopeGraph = struct {
             .scope_id = scope_id,
             .decl = decl,
         });
+    }
+
+    /// Resolve a clause's owning scope. Prefers `meta.scope_id` (set
+    /// directly by the collector — unambiguous even for macro-generated
+    /// clauses with synthetic spans) over `node_scope_map` (which keys
+    /// on span and collides whenever multiple clauses share the
+    /// span 0:0 produced by macro expansion). Source-written clauses
+    /// have both consistently set, so the priority change is a no-op
+    /// for them and the fix only matters for macro-generated code.
+    pub fn resolveClauseScope(self: *const ScopeGraph, meta: ast.NodeMeta) ?ScopeId {
+        if (meta.scope_id != 0) return meta.scope_id;
+        return self.node_scope_map.get(spanKey(meta.span));
     }
 
     /// Look up a binding by name, walking up the scope chain.
@@ -624,4 +709,48 @@ test "scope graph family creation" {
     // Different arity should not match
     const wrong_arity = graph.resolveFamily(mod_scope, name_id, 3);
     try std.testing.expect(wrong_arity == null);
+}
+
+test "native type kind name parsing" {
+    try std.testing.expectEqual(@as(?NativeTypeKind, .list), NativeTypeKind.fromName("list"));
+    try std.testing.expectEqual(@as(?NativeTypeKind, .map), NativeTypeKind.fromName("map"));
+    try std.testing.expectEqual(@as(?NativeTypeKind, .range), NativeTypeKind.fromName("range"));
+    try std.testing.expectEqual(@as(?NativeTypeKind, .string), NativeTypeKind.fromName("string"));
+    try std.testing.expectEqual(@as(?NativeTypeKind, null), NativeTypeKind.fromName("List"));
+    try std.testing.expectEqual(@as(?NativeTypeKind, null), NativeTypeKind.fromName(""));
+    try std.testing.expectEqual(@as(?NativeTypeKind, null), NativeTypeKind.fromName("nope"));
+}
+
+test "scope graph native type registry" {
+    var graph = ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    const list_name: ast.StringId = 11;
+    const map_name: ast.StringId = 12;
+    const other_name: ast.StringId = 13;
+
+    // Lookup before registration returns null.
+    try std.testing.expectEqual(@as(?ast.StringId, null), graph.nativeTypeStructName(.list));
+    try std.testing.expect(!graph.isNativeTypeName(.list, list_name));
+
+    graph.registerNativeType(.list, list_name);
+    graph.registerNativeType(.map, map_name);
+
+    try std.testing.expectEqual(list_name, graph.nativeTypeStructName(.list).?);
+    try std.testing.expectEqual(map_name, graph.nativeTypeStructName(.map).?);
+
+    try std.testing.expect(graph.isNativeTypeName(.list, list_name));
+    try std.testing.expect(graph.isNativeTypeName(.map, map_name));
+    try std.testing.expect(!graph.isNativeTypeName(.list, map_name));
+    try std.testing.expect(!graph.isNativeTypeName(.list, other_name));
+
+    // Registration is first-wins so callers get a stable answer.
+    graph.registerNativeType(.list, other_name);
+    try std.testing.expectEqual(list_name, graph.nativeTypeStructName(.list).?);
+    try std.testing.expect(!graph.isNativeTypeName(.list, other_name));
+
+    // classifyNativeType reverse-lookup.
+    try std.testing.expectEqual(NativeTypeKind.list, graph.classifyNativeType(list_name).?);
+    try std.testing.expectEqual(NativeTypeKind.map, graph.classifyNativeType(map_name).?);
+    try std.testing.expectEqual(@as(?NativeTypeKind, null), graph.classifyNativeType(other_name));
 }

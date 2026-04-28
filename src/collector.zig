@@ -18,7 +18,11 @@ pub const Collector = struct {
     graph: scope.ScopeGraph,
     interner: *const ast.StringInterner,
     errors: std.ArrayList(Error),
-    /// Pre-interned StringId for "Kernel" — used to inject auto-import.
+    /// Pre-interned StringId for the auto-import module's name (see
+    /// `discovery.kernel_module_name`). Stored interned because each
+    /// per-module collect pass tests it against the module's own name
+    /// to avoid injecting a self-import. Optional so unit tests that
+    /// don't care about auto-import can pass null.
     kernel_name_id: ?ast.StringId,
 
     pub const Error = struct {
@@ -75,6 +79,13 @@ pub const Collector = struct {
 
         // Third pass: resolve module extends (copy parent function families into children)
         try self.resolveStructExtends(program);
+
+        // Fourth pass: scan struct attributes for `@native_type = "..."`
+        // declarations and populate the scope graph's native-type
+        // registry. The compiler's runtime-cell dispatch (List, Map,
+        // Range, String) reads this registry instead of comparing
+        // module names against hardcoded string literals.
+        self.registerNativeTypes();
     }
 
     pub fn collectProgramSurface(self: *Collector, program: *const ast.Program) !void {
@@ -167,6 +178,33 @@ pub const Collector = struct {
         // Third pass: resolve module extends (copy parent function families into children)
         for (programs) |program| {
             try self.resolveStructExtends(&program);
+        }
+
+        // Fourth pass: see `collectProgram` for rationale.
+        self.registerNativeTypes();
+    }
+
+    /// Scan all collected struct entries and register any that opt in
+    /// to a native type kind via `@native_type = "<kind>"`. The
+    /// attribute value must be a string literal whose contents match a
+    /// `NativeTypeKind` (`"list"`, `"map"`, `"range"`, `"string"`).
+    /// Other values are silently ignored — the user-visible diagnostic
+    /// for a misspelled native-type attribute would be that the
+    /// corresponding compiler dispatch falls back to a no-op rather
+    /// than special-casing the struct, which surfaces as a normal
+    /// "no such function" error from the affected call site.
+    fn registerNativeTypes(self: *Collector) void {
+        const native_type_attr_id = self.interner.lookupExisting("native_type") orelse return;
+        for (self.graph.structs.items) |entry| {
+            for (entry.attributes.items) |attr| {
+                if (attr.name != native_type_attr_id) continue;
+                const value = attr.value orelse continue;
+                if (value.* != .string_literal) continue;
+                const kind_name = self.interner.get(value.string_literal.value);
+                const kind = scope.NativeTypeKind.fromName(kind_name) orelse continue;
+                if (entry.name.parts.len != 1) continue;
+                self.graph.registerNativeType(kind, entry.name.parts[0]);
+            }
         }
     }
 
@@ -442,12 +480,24 @@ pub const Collector = struct {
     /// Register impl functions in their target module's scope so that
     /// calls like Range.next(state) resolve to the impl function.
     /// Must be called after all modules and impls are collected.
+    ///
+    /// We re-use the FunctionFamilyId already created by `collectImpl` (which
+    /// lives in the impl's own scope) and insert it into the target module's
+    /// `function_families` map. Calling `collectFunction` a second time would
+    /// create a *parallel* family with new function scopes, clobbering each
+    /// clause's `meta.scope_id` to point at the target-scope family — and
+    /// silently breaking the impl-scope family in the process.
     pub fn registerImplFunctionsInTargetScopes(self: *Collector) !void {
         for (self.graph.impls.items) |impl_entry| {
             const target_scope = self.graph.findStructScope(impl_entry.target_type) orelse continue;
+            const impl_scope_data = self.graph.getScope(impl_entry.scope_id);
+            const target_scope_data = self.graph.getScopeMut(target_scope);
             for (impl_entry.decl.functions) |func| {
-                // Register each impl function in the target module's scope
-                try self.collectFunction(func, target_scope);
+                const arity: u32 = if (func.clauses.len > 0) @intCast(func.clauses[0].params.len) else 0;
+                const key = scope.FamilyKey{ .name = func.name, .arity = arity };
+                const family_id = impl_scope_data.function_families.get(key) orelse continue;
+                if (target_scope_data.function_families.contains(key)) continue;
+                try target_scope_data.function_families.put(key, family_id);
             }
         }
     }
@@ -463,7 +513,12 @@ pub const Collector = struct {
     }
 
     pub fn collectFunction(self: *Collector, func: *const ast.FunctionDecl, parent_scope: scope.ScopeId) !void {
-        for (func.clauses, 0..) |clause, clause_idx| {
+        // Iterate by pointer so the `clause.meta.scope_id` write below
+        // mutates the actual slice element. With `|clause, idx|` the loop
+        // variable is a stack copy, and the mutation is silently discarded
+        // — leaving macro-generated test functions with `scope_id = 0`
+        // when their synthetic spans collide in `node_scope_map`.
+        for (func.clauses, 0..) |*clause, clause_idx| {
             const arity: u32 = @intCast(clause.params.len);
             const key = scope.FamilyKey{ .name = func.name, .arity = arity };
 
@@ -495,8 +550,8 @@ pub const Collector = struct {
                 try self.collectPatternBindings(param.pattern, fn_scope);
             }
 
-            // Collect body statements (hoisting local defs)
-            // Bodyless declarations (@native) have no body to collect.
+            // Collect body statements (hoisting local defs).
+            // Bodyless declarations (protocol sigs, forward decls) have no body to collect.
             if (clause.body) |body| {
                 try self.collectBlock(body, fn_scope);
             }
@@ -508,7 +563,7 @@ pub const Collector = struct {
     // ============================================================
 
     fn collectMacro(self: *Collector, mac: *const ast.FunctionDecl, parent_scope: scope.ScopeId) !void {
-        for (mac.clauses, 0..) |clause, clause_idx| {
+        for (mac.clauses, 0..) |*clause, clause_idx| {
             const arity: u32 = @intCast(clause.params.len);
             const key = scope.FamilyKey{ .name = mac.name, .arity = arity };
 
@@ -525,6 +580,7 @@ pub const Collector = struct {
 
             const fn_scope = try self.graph.createScope(parent_scope, .function);
             try self.graph.node_scope_map.put(scope.ScopeGraph.spanKey(clause.meta.span), fn_scope);
+            @constCast(&clause.meta).scope_id = fn_scope;
 
             for (clause.params) |param| {
                 try self.collectPatternBindings(param.pattern, fn_scope);
@@ -853,8 +909,19 @@ pub const Collector = struct {
                 }
             },
             .case_expr => |ce| {
+                try self.collectExprScopes(ce.scrutinee, parent_scope);
                 for (ce.clauses) |clause| {
                     const clause_scope = try self.graph.createScope(parent_scope, .case_clause);
+                    // Register the clause's scope so later passes (type
+                    // checker, HIR builder) can locate it via
+                    // `resolveClauseScope`. Mirrors how function clause
+                    // scopes are registered in `collectFunction`. Also
+                    // write the scope onto the clause's meta so
+                    // desugar-generated clauses with synthetic span 0:0
+                    // (which collide in `node_scope_map`) still resolve
+                    // unambiguously.
+                    try self.graph.node_scope_map.put(scope.ScopeGraph.spanKey(clause.meta.span), clause_scope);
+                    @constCast(&clause.meta).scope_id = clause_scope;
                     try self.collectPatternBindings(clause.pattern, clause_scope);
                     try self.collectBlock(clause.body, clause_scope);
                 }

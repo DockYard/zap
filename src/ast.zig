@@ -36,6 +36,17 @@ pub fn makeMeta(span: SourceSpan) NodeMeta {
     return .{ .span = span };
 }
 
+/// Whether a binding name follows the user-discard convention (Elixir-
+/// style `_name` for "intentionally unused"). Compiler-synthesised names
+/// use a double-underscore prefix (e.g. `__next_state`, `__loop_raw`,
+/// `__err`, `__state`, `__loop_raw`) and must NOT be treated as discards
+/// — they back generated bindings that downstream lowering passes
+/// reference. The bare wildcard `_` is parsed as a wildcard pattern, not
+/// a bind, so it never reaches this helper.
+pub fn isDiscardBindName(name: []const u8) bool {
+    return name.len >= 2 and name[0] == '_' and name[1] != '_';
+}
+
 // ============================================================
 // String interning
 // ============================================================
@@ -78,6 +89,17 @@ pub const StringInterner = struct {
         while (!mutex_ptr.tryLock()) std.atomic.spinLoopHint();
         defer mutex_ptr.unlock();
         return self.strings.items[id];
+    }
+
+    /// Look up a string's ID without interning a new entry. Returns null
+    /// when the string isn't already present. Lets `*const StringInterner`
+    /// holders (e.g. TypeChecker) ask "is this name registered?" without
+    /// being upgraded to a mutable pointer.
+    pub fn lookupExisting(self: *const StringInterner, str: []const u8) ?StringId {
+        const mutex_ptr = @constCast(&self.mutex);
+        while (!mutex_ptr.tryLock()) std.atomic.spinLoopHint();
+        defer mutex_ptr.unlock();
+        return self.map.get(str);
     }
 };
 
@@ -127,10 +149,25 @@ pub const StructName = struct {
         alloc: std.mem.Allocator,
         interner: *const StringInterner,
     ) ![]const u8 {
+        return self.joinedWith(alloc, interner, ".");
+    }
+
+    /// Join the segments of this struct name using `separator`. Used by
+    /// the IR/ZIR layers which need `_`-joined prefixes (e.g. `Foo_Bar` for
+    /// the function-name prefix of `Foo.Bar.add/2`) and by the type-checker
+    /// path that mangles names with `__`. Single-segment names allocate a
+    /// fresh dup so the caller can free uniformly.
+    pub fn joinedWith(
+        self: StructName,
+        alloc: std.mem.Allocator,
+        interner: *const StringInterner,
+        separator: []const u8,
+    ) ![]const u8 {
+        if (self.parts.len == 0) return alloc.alloc(u8, 0);
         if (self.parts.len == 1) return alloc.dupe(u8, interner.get(self.parts[0]));
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         for (self.parts, 0..) |part, i| {
-            if (i > 0) try buf.append(alloc, '.');
+            if (i > 0) try buf.appendSlice(alloc, separator);
             try buf.appendSlice(alloc, interner.get(part));
         }
         return buf.toOwnedSlice(alloc);

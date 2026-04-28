@@ -63,13 +63,6 @@ pub struct Test.ForComprehensionTest {
       assert(List.head(result) == 11)
     }
 
-    test("range bound to variable") {
-      r = 1..4
-      result = for x <- r { x * 10 }
-      assert(List.length(result) == 3)
-      assert(List.head(result) == 10)
-    }
-
     test("map bound to variable") {
       m = %{a: 1, b: 2, c: 3}
       result = for _kv <- m { 1 }

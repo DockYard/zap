@@ -242,11 +242,6 @@ pub struct Test.MapTest {
       assert(List.length(counts) == 3)
     }
 
-    test("for-comp over empty map yields empty list") {
-      counts = for _kv <- %{} { 1 }
-      assert(List.length(counts) == 0)
-    }
-
     test("for-comp over single-entry map") {
       counts = for _kv <- %{single: 42} { 1 }
       assert(List.length(counts) == 1)

@@ -89,29 +89,26 @@ pub const ArcOptimizer = struct {
     // --------------------------------------------------------
 
     fn identifySkippableValues(self: *ArcOptimizer) !void {
-        var iter = self.ctx.alloc_summaries.iterator();
+        // Iterate values that have a known alloc site (reverse map populated
+        // by GeneralizedEscapeAnalyzer). For each one, look up the chosen
+        // allocation strategy and decide whether ARC ops can be skipped.
+        // Previously this paired the FIRST escape-state entry with EVERY
+        // alloc summary (only one match per site, but the match wasn't
+        // checked) — so most values silently lost their skip metadata.
+        var iter = self.ctx.alloc_site_for_value.iterator();
         while (iter.next()) |entry| {
-            const summary = entry.value_ptr.*;
-
-            // Find the ValueKey for this alloc site by scanning escape states.
-            var es_iter = self.ctx.escape_states.iterator();
-            while (es_iter.next()) |es_entry| {
-                const vkey = es_entry.key_ptr.*;
-
-                // Match by escape state and check allocation strategy.
-                const strategy = self.ctx.getAllocStrategy(summary.site_id);
-                const reason: ?SkipReason = switch (strategy) {
-                    .eliminated => .eliminated,
-                    .scalar_replaced => .eliminated,
-                    .stack_block, .stack_function => .stack_allocated,
-                    .caller_region => .caller_region,
-                    .heap_arc => null, // Needs ARC.
-                };
-
-                if (reason) |r| {
-                    try self.skip_arc.put(vkey, r);
-                }
-                break; // Only need one match per alloc site.
+            const vkey = entry.key_ptr.*;
+            const site_id = entry.value_ptr.*;
+            const strategy = self.ctx.getAllocStrategy(site_id);
+            const reason: ?SkipReason = switch (strategy) {
+                .eliminated => .eliminated,
+                .scalar_replaced => .eliminated,
+                .stack_block, .stack_function => .stack_allocated,
+                .caller_region => .caller_region,
+                .heap_arc => null, // Needs ARC.
+            };
+            if (reason) |r| {
+                try self.skip_arc.put(vkey, r);
             }
         }
     }
@@ -351,11 +348,15 @@ test "ArcOptimizer skips ARC for stack-allocated values" {
     var ctx = lattice.AnalysisContext.init(alloc);
     defer ctx.deinit();
 
-    // Mark the struct as stack-allocated.
+    // Mark the struct as stack-allocated. Populate `alloc_site_for_value`
+    // with the value→site mapping that GeneralizedEscapeAnalyzer would
+    // normally publish — `identifySkippableValues` reads this map to find
+    // the alloc strategy for each value.
     const vkey = lattice.ValueKey{ .function = 0, .local = 0 };
     _ = try ctx.joinEscape(vkey, .no_escape);
     try ctx.alloc_strategies.put(0, .stack_function);
     try ctx.alloc_summaries.put(0, lattice.AllocSiteSummary.init(0, 0));
+    try ctx.alloc_site_for_value.put(vkey, 0);
 
     // Add an ARC operation that should be eliminated.
     try ctx.arc_ops.append(alloc, .{

@@ -6,14 +6,12 @@ fn getenvSlice(name: [*:0]const u8) ?[]const u8 {
     return std.mem.span(ptr);
 }
 
-var test_io_impl: std.Io.Threaded = undefined;
-var test_io_initialized: bool = false;
+/// Use the test framework's own IO so spawned subprocesses inherit the
+/// parent test runner's environment (PATH, HOME, ZIG_LIB_DIR, etc.). The
+/// previous local Threaded was init'd with `.environ = .empty`, which
+/// stripped HOME from the spawned `zap` and broke `extractEmbeddedZigLib`.
 fn getTestIo() std.Io {
-    if (!test_io_initialized) {
-        test_io_impl = .init(std.heap.page_allocator, .{});
-        test_io_initialized = true;
-    }
-    return test_io_impl.io();
+    return std.testing.io;
 }
 
 // ============================================================
@@ -101,6 +99,7 @@ fn compileOnly(source: []const u8) TestError!void {
     const compile_argv: []const []const u8 = &.{ zap_binary, "build", "test_prog" };
     var compile_child = std.process.spawn(getTestIo(), .{
         .argv = compile_argv,
+        .cwd = .{ .path = tmp_dir_path },
         .stderr = .inherit,
         .stdout = .inherit,
     }) catch return error.CompilationFailed;
@@ -163,9 +162,13 @@ fn compileAndRun(source: []const u8) TestError!TestResult {
     defer allocator.free(zap_binary);
 
     // Compile: zap build test_prog
+    // The child process runs with `cwd` set to the temp project so it
+    // discovers the test's synthesized build.zap (with `:test_prog` target)
+    // instead of the parent's project-root build.zap.
     const compile_argv: []const []const u8 = &.{ zap_binary, "build", "test_prog" };
     var compile_child = std.process.spawn(getTestIo(), .{
         .argv = compile_argv,
+        .cwd = .{ .path = tmp_dir_path },
         .stderr = .inherit,
         .stdout = .inherit,
     }) catch return error.CompilationFailed;

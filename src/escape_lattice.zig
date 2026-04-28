@@ -950,6 +950,12 @@ pub const AnalysisContext = struct {
     /// Per-allocation-site summary.
     alloc_summaries: std.AutoHashMap(AllocSiteId, AllocSiteSummary),
 
+    /// Reverse map: ValueKey of an allocating instruction → its AllocSiteId.
+    /// Populated by `GeneralizedEscapeAnalyzer`. Lets ARC and other downstream
+    /// passes resolve "what alloc site does this value come from?" without
+    /// re-walking the IR.
+    alloc_site_for_value: std.AutoHashMap(ValueKey, AllocSiteId),
+
     /// Per-function interprocedural summary.
     function_summaries: std.AutoHashMap(ir.FunctionId, FunctionSummary),
 
@@ -993,6 +999,7 @@ pub const AnalysisContext = struct {
             .region_assignments = std.AutoHashMap(ValueKey, RegionId).init(allocator),
             .ownership_states = std.AutoHashMap(ValueKey, OwnershipState).init(allocator),
             .alloc_summaries = std.AutoHashMap(AllocSiteId, AllocSiteSummary).init(allocator),
+            .alloc_site_for_value = std.AutoHashMap(ValueKey, AllocSiteId).init(allocator),
             .function_summaries = std.AutoHashMap(ir.FunctionId, FunctionSummary).init(allocator),
             .lambda_sets = std.AutoHashMap(ValueKey, LambdaSet).init(allocator),
             .virtual_objects = std.AutoHashMap(BlockVirtualKey, VirtualObject).init(allocator),
@@ -1013,6 +1020,7 @@ pub const AnalysisContext = struct {
         self.region_assignments.deinit();
         self.ownership_states.deinit();
         self.alloc_summaries.deinit();
+        self.alloc_site_for_value.deinit();
         self.function_summaries.deinit();
 
         // Clean up lambda set member slices (allocated by toLambdaSet).
@@ -1182,42 +1190,7 @@ pub const ValueKey = struct {
 };
 
 // ============================================================
-// Section 16: Backward Compatibility Bridge
-// ============================================================
-
-/// Maps from the existing closure-centric escape_analysis types
-/// to the new generalized types, enabling incremental migration.
-pub const LegacyBridge = struct {
-    /// Convert old ClosureEscape to new EscapeState.
-    pub fn fromClosureEscape(old: anytype) EscapeState {
-        // Use comptime string matching on enum field names.
-        const name = @tagName(old);
-        if (std.mem.eql(u8, name, "no_escape")) return .no_escape;
-        if (std.mem.eql(u8, name, "call_local")) return .no_escape;
-        if (std.mem.eql(u8, name, "block_local")) return .block_local;
-        if (std.mem.eql(u8, name, "stored_local")) return .function_local;
-        if (std.mem.eql(u8, name, "passed_known_safe")) return .arg_escape_safe;
-        if (std.mem.eql(u8, name, "passed_unknown")) return .global_escape;
-        if (std.mem.eql(u8, name, "returned")) return .global_escape;
-        if (std.mem.eql(u8, name, "stored_heap")) return .global_escape;
-        if (std.mem.eql(u8, name, "merged_escape")) return .global_escape;
-        if (std.mem.eql(u8, name, "unknown_escape")) return .global_escape;
-        return .global_escape;
-    }
-
-    /// Convert old AllocationStrategy to new AllocationStrategy.
-    pub fn fromOldAllocStrategy(old: anytype) AllocationStrategy {
-        const name = @tagName(old);
-        if (std.mem.eql(u8, name, "none_direct_call")) return .eliminated;
-        if (std.mem.eql(u8, name, "stack_env")) return .stack_block;
-        if (std.mem.eql(u8, name, "local_env")) return .stack_function;
-        if (std.mem.eql(u8, name, "heap_env")) return .heap_arc;
-        return .heap_arc;
-    }
-};
-
-// ============================================================
-// Section 17: Tests
+// Section 16: Tests
 // ============================================================
 
 test "EscapeState join is commutative" {

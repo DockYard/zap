@@ -13,11 +13,9 @@ const ast = @import("ast.zig");
 // ============================================================
 // Analysis Pipeline Orchestrator
 //
-// Sequences all analysis modules and produces both:
-// 1. A legacy escape_analysis.Result for backward compat with
-//    codegen.zig and types.zig
-// 2. A lattice.AnalysisContext with full analysis results for
-//    future use by the ZIR backend
+// Sequences all analysis modules and produces a `lattice.AnalysisContext`
+// with the full analysis results consumed by the ZIR backend, type
+// checker, and downstream passes.
 // ============================================================
 
 pub const PipelineResult = struct {

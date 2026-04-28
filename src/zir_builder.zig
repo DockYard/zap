@@ -97,7 +97,7 @@ extern "c" fn zir_builder_set_generic_return_type(handle: ?*ZirBuilderHandle) i3
 extern "c" fn zir_builder_emit_cond_return(handle: ?*ZirBuilderHandle, condition: u32, value: u32) i32;
 
 // Runtime safety control (for guard error semantics)
-extern "c" fn zir_builder_emit_set_runtime_safety(handle: ?*ZirBuilderHandle, enabled: u32) u32;
+extern "c" fn zir_builder_emit_set_runtime_safety(handle: ?*ZirBuilderHandle, enabled: u32) bool;
 
 // Optional type support (for __try variant catch basin)
 extern "c" fn zir_builder_set_optional_return_type(handle: ?*ZirBuilderHandle) i32;
@@ -110,6 +110,10 @@ extern "c" fn zir_builder_emit_param_decl_val_type(handle: ?*ZirBuilderHandle, p
 
 // Tuple return type
 extern "c" fn zir_builder_set_tuple_return_type(handle: ?*ZirBuilderHandle, types_ptr: [*]const u32, types_len: u32) i32;
+extern "c" fn zir_builder_set_tuple_return_type_with_body(handle: ?*ZirBuilderHandle, inst_indices_ptr: [*]const u32, inst_indices_len: u32, types_ptr: [*]const u32, types_len: u32) i32;
+extern "c" fn zir_builder_get_body_inst_count(handle: ?*ZirBuilderHandle) u32;
+extern "c" fn zir_builder_emit_tuple_decl_untracked(handle: ?*ZirBuilderHandle, types_ptr: [*]const u32, types_len: u32) u32;
+extern "c" fn zir_builder_ref_to_inst_index(handle: ?*ZirBuilderHandle, ref: u32) u32;
 extern "c" fn zir_builder_get_tuple_return_type(handle: ?*ZirBuilderHandle) u32;
 extern "c" fn zir_builder_emit_struct_init_typed(handle: ?*ZirBuilderHandle, struct_type: u32, names_ptrs: [*]const [*]const u8, names_lens: [*]const u32, values_ptr: [*]const u32, fields_len: u32) u32;
 extern "c" fn zir_builder_emit_tuple_decl(handle: ?*ZirBuilderHandle, types_ptr: [*]const u32, types_len: u32) u32;
@@ -222,6 +226,42 @@ fn indexFieldName(index: anytype) struct { ptr: [*]const u8, len: u32 } {
 // Return type mapping (ir.ZigType -> ZIR Ref u32 value)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Runtime sub-namespace registry
+//
+// Single source of truth for the names of `zap_runtime`'s internal
+// modules that the ZIR builder reaches into when lowering. Each entry
+// pairs the name string with its byte length, since the C-ABI
+// `zir_builder_emit_field_val` takes both. Use the `emitField`
+// helper to fetch a field on the runtime import without per-call-site
+// string literals — that way adding/renaming a runtime sub-module
+// touches one row here rather than 10+ call sites scattered through
+// `lowerExpr`/`lowerInstruction`.
+// ---------------------------------------------------------------------------
+
+const RuntimeNamespace = struct {
+    name: [:0]const u8,
+    len: u32,
+
+    fn make(comptime n: [:0]const u8) RuntimeNamespace {
+        return .{ .name = n, .len = @intCast(n.len) };
+    }
+};
+
+const runtime_ns = struct {
+    const arc_runtime = RuntimeNamespace.make("ArcRuntime");
+    const kernel = RuntimeNamespace.make("Kernel");
+    const builder_runtime = RuntimeNamespace.make("BuilderRuntime");
+    const binary_helpers = RuntimeNamespace.make("BinaryHelpers");
+};
+
+/// Emit `parent.<ns>` as a ZIR field-val instruction. Wraps the raw
+/// C-ABI call so callers don't have to pass the name pointer/length
+/// pair, and so renaming a runtime sub-namespace touches one place.
+fn emitRuntimeNamespaceField(handle: *ZirBuilderHandle, parent: u32, comptime ns: RuntimeNamespace) u32 {
+    return zir_builder_emit_field_val(handle, parent, ns.name.ptr, ns.len);
+}
+
 /// For main(), Zig requires void or u8 return type.
 /// Map integer types to u8 (exit code), keep void as void.
 fn mapMainReturnType(zig_type: ir.ZigType) u32 {
@@ -331,6 +371,14 @@ pub const ZirDriver = struct {
     /// When > 0, struct_init_typed can't be used because struct_init_field_type
     /// instructions (emitted via addInst) don't enter captured bodies.
     capture_depth: u32 = 0,
+    /// Raw instruction indices of nested tuple_decls emitted untracked
+    /// while constructing a tuple return type's element types. The outer
+    /// `emitComplexReturnType` `.tuple` branch drains this list into the
+    /// `support_inst_indices` it forwards to
+    /// `set_tuple_return_type_with_body`. Without this, inner tuple_decls
+    /// are emitted with no body membership and Sema can't find them when
+    /// resolving the outer tuple_decl's operand refs.
+    pending_ret_ty_untracked: std.ArrayListUnmanaged(u32) = .empty,
     /// Instruction index within the current block.
     current_instr_index: u32 = 0,
     current_block_instructions: []const ir.Instruction = &.{},
@@ -341,7 +389,6 @@ pub const ZirDriver = struct {
     reuse_backed_union_locals: std.AutoHashMapUnmanaged(ir.LocalId, ir.UnionInit) = .empty,
     reuse_backed_tuple_locals: std.AutoHashMapUnmanaged(ir.LocalId, usize) = .empty,
     type_store: ?*const @import("types.zig").TypeStore = null,
-    cached_list_type_ref: u32 = 0,
     /// Cached ZIR refs for List method functions, resolved once at function
     /// scope so they're available inside condbr bodies without re-importing.
     cached_list_cell_ref: u32 = 0,
@@ -396,6 +443,7 @@ pub const ZirDriver = struct {
         self.reuse_backed_union_locals.deinit(self.allocator);
         self.reuse_backed_tuple_locals.deinit(self.allocator);
         self.capture_param_refs.deinit(self.allocator);
+        self.pending_ret_ty_untracked.deinit(self.allocator);
     }
 
     /// Check if a function contains tail calls to itself (via IR tail_call instructions).
@@ -419,7 +467,11 @@ pub const ZirDriver = struct {
     // -- Helpers --------------------------------------------------------------
 
     /// Map an IR ZigType to a ZIR Ref, recursively emitting tuple_decl for nested tuples.
-    /// Used for declaration-body tuple_decl (param-like instructions).
+    /// Used for declaration-body tuple_decl (param-like instructions). Falls
+    /// back to the full `emitImportedTypeRef` path for complex non-tuple
+    /// types (lists, maps, struct_ref, etc.) — without that fallback,
+    /// `mapReturnType` returns 0 for complex types, leaving the outer
+    /// tuple_decl with a null operand that crashes Sema's `resolveInst`.
     fn mapTupleElementType(self: *ZirDriver, zig_type: ir.ZigType) u32 {
         if (zig_type == .tuple) {
             var inner_refs : std.ArrayListUnmanaged(u32) = .empty;
@@ -427,10 +479,25 @@ pub const ZirDriver = struct {
             for (zig_type.tuple) |inner_elem| {
                 inner_refs.append(self.allocator, self.mapTupleElementType(inner_elem)) catch return 0;
             }
-            const ref = zir_builder_emit_tuple_decl(self.handle, inner_refs.items.ptr, @intCast(inner_refs.items.len));
-            return if (ref == error_ref) 0 else ref;
+            // Emit *untracked* — `zir_builder_emit_tuple_decl` would
+            // append to `param_inst_indices`, which then makes Sema's
+            // generic-call param resolver hit `unreachable` because the
+            // param body now has a `.extended` instruction where it
+            // expects `.param*` tags. The outer call routes the resulting
+            // tuple_decl Ref into the ret_ty body via
+            // `set_tuple_return_type_with_body`. Track the raw inst index
+            // so the caller can include it in support_inst_indices.
+            const ref = zir_builder_emit_tuple_decl_untracked(self.handle, inner_refs.items.ptr, @intCast(inner_refs.items.len));
+            if (ref == error_ref) return 0;
+            const idx = zir_builder_ref_to_inst_index(self.handle, ref);
+            if (idx != 0xFFFFFFFF) {
+                self.pending_ret_ty_untracked.append(self.allocator, idx) catch return 0;
+            }
+            return ref;
         }
-        return mapReturnType(zig_type);
+        const simple = mapReturnType(zig_type);
+        if (simple != 0) return simple;
+        return self.emitImportedTypeRef(zig_type) catch 0;
     }
 
     /// Collect nested tuple types in DFS post-order (inner-first).
@@ -446,9 +513,15 @@ pub const ZirDriver = struct {
     }
 
     /// Emit a body-local tuple_decl, recursively handling nested tuples.
-    /// Returns the Ref to the emitted tuple_decl instruction.
+    /// Returns the Ref to the emitted tuple_decl instruction. Falls back to
+    /// `emitImportedTypeRef` for complex non-tuple types so list/map/struct_ref
+    /// elements get a real ZIR ref instead of `mapReturnType`'s 0 fallback.
     fn emitBodyLocalTupleType(self: *ZirDriver, zig_type: ir.ZigType) u32 {
-        if (zig_type != .tuple) return mapReturnType(zig_type);
+        if (zig_type != .tuple) {
+            const simple = mapReturnType(zig_type);
+            if (simple != 0) return simple;
+            return self.emitImportedTypeRef(zig_type) catch 0;
+        }
         var inner_refs : std.ArrayListUnmanaged(u32) = .empty;
         defer inner_refs.deinit(self.allocator);
         for (zig_type.tuple) |inner_elem| {
@@ -477,9 +550,10 @@ pub const ZirDriver = struct {
         return result;
     }
 
-    /// Map Zap-facing module names to runtime struct names.
-    /// Domain modules (IO, Integer, Float, etc.) route to Prelude.
-    /// List, Map, String, Zest map to their runtime struct names.
+    /// Map Zap-facing module names to runtime struct names. Each Zap
+    /// module (IO, Integer, Float, etc.) maps 1:1 to the runtime
+    /// struct of the same name — the call site can pass `mod_name`
+    /// straight through to `field_val`.
 
 
 
@@ -554,7 +628,8 @@ pub const ZirDriver = struct {
                 }
 
                 // Cross-module struct: import from the struct's defining module.
-                const module_name = self.structToModuleName(name);
+                var module_name_buf: [256]u8 = undefined;
+                const module_name = structToModuleName(name, &module_name_buf);
                 const import_ref = zir_builder_emit_import(self.handle, module_name.ptr, @intCast(module_name.len));
                 if (import_ref == error_ref) return error.EmitFailed;
                 const ref = zir_builder_emit_field_val(self.handle, import_ref, short_name.ptr, @intCast(short_name.len));
@@ -781,6 +856,20 @@ pub const ZirDriver = struct {
         return null;
     }
 
+    /// Convert a dotted struct prefix (e.g. "Zap.Env" → "Zap_Env",
+    /// "IO.Mode" → "IO") into the underscore-separated ZIR module name,
+    /// writing the result into the caller-provided buffer. Returns the
+    /// borrowed slice into the buffer, or null when the prefix is too
+    /// long for the buffer.
+    fn dottedPrefixToModuleName(prefix: []const u8, buf: []u8) ?[]const u8 {
+        if (prefix.len > buf.len) return null;
+        @memcpy(buf[0..prefix.len], prefix);
+        for (buf[0..prefix.len]) |*ch| {
+            if (ch.* == '.') ch.* = '_';
+        }
+        return buf[0..prefix.len];
+    }
+
     /// Check if a struct type name is declared in the current ZIR module.
     /// Top-level structs (no dot in name) are emitted into every module.
     /// Dotted structs (e.g., "Zap.Env") are only emitted into their prefix module.
@@ -788,30 +877,22 @@ pub const ZirDriver = struct {
         if (self.findStructDef(type_name) == null) return false;
         const current_module = self.current_emit_module orelse return false;
         if (std.mem.lastIndexOf(u8, type_name, ".")) |dot_idx| {
-            const prefix = type_name[0..dot_idx];
             var buf: [256]u8 = undefined;
-            if (prefix.len > buf.len) return false;
-            @memcpy(buf[0..prefix.len], prefix);
-            for (buf[0..prefix.len]) |*ch| {
-                if (ch.* == '.') ch.* = '_';
-            }
-            return std.mem.eql(u8, buf[0..prefix.len], current_module);
+            const module_name = dottedPrefixToModuleName(type_name[0..dot_idx], &buf) orelse return false;
+            return std.mem.eql(u8, module_name, current_module);
         }
         // Top-level struct — emitted into every module
         return true;
     }
 
-    /// Convert a struct_ref name to the ZIR module name that defines it.
-    /// "Range" → "Range", "Zap.Env" → "Zap", "IO.Mode" → "IO"
-    fn structToModuleName(self: *ZirDriver, type_name: []const u8) []const u8 {
+    /// Convert a struct_ref name to the ZIR module name that defines it,
+    /// writing the result into the caller-provided buffer.
+    /// "Range" → "Range", "Zap.Env" → "Zap_Env", "IO.Mode" → "IO".
+    /// Returns the borrowed slice into the buffer (or `type_name` itself
+    /// when the name is already a single segment).
+    fn structToModuleName(type_name: []const u8, buf: []u8) []const u8 {
         if (std.mem.lastIndexOf(u8, type_name, ".")) |dot_idx| {
-            const prefix = type_name[0..dot_idx];
-            const converted = self.allocator.alloc(u8, prefix.len) catch return type_name;
-            @memcpy(converted, prefix);
-            for (converted) |*ch| {
-                if (ch.* == '.') ch.* = '_';
-            }
-            return converted;
+            return dottedPrefixToModuleName(type_name[0..dot_idx], buf) orelse type_name;
         }
         return type_name;
     }
@@ -905,12 +986,12 @@ pub const ZirDriver = struct {
         return null;
     }
 
-    /// Find an IR function by its local_name (unmangled name within its module).
-    /// Used when macro-expanded code references imported functions by bare name
-    /// (e.g., `begin_test` from `use Zest.Case`).
-    /// Matches both exact local_name and base name (without arity suffix).
-    /// Find an IR function by local_name or base name, but ONLY from other modules.
-    /// Used for bare imported names like "begin_test" from `use Zest.Case`.
+    /// Find an IR function by its local_name (unmangled name within its
+    /// module). Matches both the exact arity-suffixed form and the bare
+    /// base form. Restricted to functions whose module is *not* the
+    /// current emit module so a bare reference resolves only against
+    /// imported names. Used by macro-expanded code that emits a bare
+    /// call to a function brought into scope by `use SomeModule`.
     fn findFunctionByLocalName(self: *const ZirDriver, local_name: []const u8) ?ir.Function {
         if (self.program) |prog| {
             for (prog.functions) |func| {
@@ -1006,7 +1087,9 @@ pub const ZirDriver = struct {
         // ── Step 1: Group functions by module ────────────────────────
         var module_funcs = std.StringHashMap(std.ArrayListUnmanaged(ir.Function)).init(self.allocator);
         var root_funcs: std.ArrayListUnmanaged(ir.Function) = .empty;
-        // Track ALL module names (including @native-only) for re-export generation
+        // Track every module name we see (including namespace-only modules
+        // with no functions of their own) so re-export emission below can
+        // generate parent shells for nested namespaces.
         var all_module_names = std.StringHashMap(void).init(self.allocator);
 
         // Deduplicate functions by (module, local_name), keeping the LAST
@@ -1043,8 +1126,9 @@ pub const ZirDriver = struct {
         }
 
         // ── Step 2: Detect namespace hierarchy for re-export modules ─
-        // Scan ALL module names (including @native-only) for parent_child patterns.
-        // A parent re-export is generated when a module name contains '_'.
+        // Scan every module name (function-bearing and namespace-only) for
+        // parent_child patterns. A parent re-export is generated when a module
+        // name contains '_'.
         var namespace_children = std.StringHashMap(std.ArrayListUnmanaged(NamespaceChild)).init(self.allocator);
         {
             var name_iter = all_module_names.iterator();
@@ -1070,13 +1154,15 @@ pub const ZirDriver = struct {
             }
         }
 
-        // Register empty modules for @native-only modules (so @import works)
+        // Register empty stub modules for any namespace name we've seen but
+        // that has no functions in this program (typically namespace parents
+        // whose only purpose is to host children via re-export). This lets
+        // `@import("...")` resolve them later.
         if (ctx) |c| {
             var name_iter2 = all_module_names.iterator();
             while (name_iter2.next()) |entry| {
                 const mod_name = entry.key_ptr.*;
                 if (!module_funcs.contains(mod_name)) {
-                    // @native-only module — register as empty module
                     const mod_name_z = try self.allocator.dupeZ(u8, mod_name);
                     defer self.allocator.free(mod_name_z);
                     const stub = "comptime {}\n";
@@ -1132,8 +1218,9 @@ pub const ZirDriver = struct {
                 // If parent is a leaf module with ZIR functions, skip re-export
                 // (can't overwrite its ZIR with source text)
                 if (module_funcs.contains(parent_name)) continue;
-                // If parent is already registered as @native-only, skip
-                // (already registered as empty module above)
+                // If parent is a namespace-only module already registered as
+                // an empty stub above, the re-export source below will replace
+                // it — no extra work needed here.
                 if (all_module_names.contains(parent_name) and !module_funcs.contains(parent_name)) {
                     // Replace the empty stub with the re-export source
                 }
@@ -1187,7 +1274,7 @@ pub const ZirDriver = struct {
             if (rt == error_ref) return error.EmitFailed;
 
             // Call BuilderRuntime.buildEnvFromArgv() → returns env struct
-            const builder_rt = zir_builder_emit_field_val(self.handle, rt, "BuilderRuntime", 14);
+            const builder_rt = emitRuntimeNamespaceField(self.handle, rt, runtime_ns.builder_runtime);
             if (builder_rt == error_ref) return error.EmitFailed;
             const build_env_fn = zir_builder_emit_field_val(self.handle, builder_rt, "buildEnvFromArgv", 16);
             if (build_env_fn == error_ref) return error.EmitFailed;
@@ -1559,14 +1646,56 @@ pub const ZirDriver = struct {
                 try self.setContainerReturnType("Map", &type_args);
             },
             .tuple => |elements| {
+                // Capture every body instruction emitted while constructing
+                // each tuple element's type ref. Complex elements (struct_ref,
+                // map, list, nested tuple) emit `import` / `field_val` /
+                // `call_ref` / `typeof` instructions that, if left in the
+                // declaration body, are invisible to Sema when it resolves
+                // the tuple_decl's operands inside the ret_ty body — that's
+                // the root cause of the `inst_map.get(i).?` panic for
+                // tuple-returning functions like `Map.next`.
                 var tuple_type_refs: std.ArrayListUnmanaged(u32) = .empty;
                 defer tuple_type_refs.deinit(self.allocator);
+                var support_inst_indices: std.ArrayListUnmanaged(u32) = .empty;
+                defer support_inst_indices.deinit(self.allocator);
+                // Reset the untracked-tuple-decls collector for this scope.
+                self.pending_ret_ty_untracked.clearRetainingCapacity();
+
                 for (elements) |elem_type| {
+                    const before = zir_builder_get_body_inst_count(self.handle);
+                    // Snapshot the untracked list before so nested tuple
+                    // decls collected by mapTupleElementType land in
+                    // `support_inst_indices` in emission order.
+                    const untracked_before = self.pending_ret_ty_untracked.items.len;
                     const ref = try self.emitImportedTypeRef(elem_type);
+                    if (self.pending_ret_ty_untracked.items.len > untracked_before) {
+                        for (self.pending_ret_ty_untracked.items[untracked_before..]) |idx| {
+                            try support_inst_indices.append(self.allocator, idx);
+                        }
+                    }
+                    const after = zir_builder_get_body_inst_count(self.handle);
+                    if (after > before) {
+                        const num_added = after - before;
+                        var captured: std.ArrayListUnmanaged(u32) = .empty;
+                        defer captured.deinit(self.allocator);
+                        var pop_remaining = num_added;
+                        while (pop_remaining > 0) : (pop_remaining -= 1) {
+                            const idx = zir_builder_pop_body_inst(self.handle);
+                            try captured.append(self.allocator, idx);
+                        }
+                        var rev_i: usize = captured.items.len;
+                        while (rev_i > 0) {
+                            rev_i -= 1;
+                            try support_inst_indices.append(self.allocator, captured.items[rev_i]);
+                        }
+                    }
                     try tuple_type_refs.append(self.allocator, ref);
                 }
-                if (zir_builder_set_tuple_return_type(
+
+                if (zir_builder_set_tuple_return_type_with_body(
                     self.handle,
+                    support_inst_indices.items.ptr,
+                    @intCast(support_inst_indices.items.len),
                     tuple_type_refs.items.ptr,
                     @intCast(tuple_type_refs.items.len),
                 ) != 0) {
@@ -1616,7 +1745,8 @@ pub const ZirDriver = struct {
                     self.current_ret_type = 1;
                 } else if (self.findStructDef(name) != null) {
                     // Cross-module struct: import from the defining module.
-                    const module_name = self.structToModuleName(name);
+                    var module_name_buf: [256]u8 = undefined;
+                    const module_name = structToModuleName(name, &module_name_buf);
                     const short_name = if (std.mem.lastIndexOf(u8, name, ".")) |dot_idx|
                         name[dot_idx + 1 ..]
                     else
@@ -1684,7 +1814,6 @@ pub const ZirDriver = struct {
         self.cached_list_length_ref = 0;
         self.cached_list_get_ref = 0;
         self.current_closure_env_ref = null;
-        self.cached_list_type_ref = 0;
         self.skip_next_ret_local = null;
         self.current_function_id = func.id;
         self.current_function_is_closure = func.captures.len > 0;
@@ -1753,23 +1882,7 @@ pub const ZirDriver = struct {
         // so we don't emit a real parameter. Instead, we inject code at the
         // top of the body to get OS args via std.process.argsAlloc and store
         // the result as the first param's local ref.
-        if (closure_lowering.direct_capture_params) {
-            for (func.captures) |capture| {
-                const capture_ref = zir_builder_emit_param(
-                    self.handle,
-                    capture.name.ptr,
-                    @intCast(capture.name.len),
-                    mapParamType(capture.type_expr),
-                );
-                if (capture_ref == error_ref) return error.EmitFailed;
-                try self.capture_param_refs.append(self.allocator, capture_ref);
-            }
-            for (func.params, 0..) |param, i| {
-                const param_ref = try self.emitTypedParam(param);
-                try self.param_refs.append(self.allocator, param_ref);
-                try self.setLocal(@intCast(i), param_ref);
-            }
-        } else if (closure_lowering.needs_env_param) {
+        if (closure_lowering.needs_env_param) {
             const env_param_ref = zir_builder_emit_param(self.handle, "__closure_env".ptr, 13, @intFromEnum(Zir.Inst.Ref.none));
             if (env_param_ref == error_ref) return error.EmitFailed;
             self.current_closure_env_ref = env_param_ref;
@@ -1895,7 +2008,6 @@ pub const ZirDriver = struct {
 
         tier: @import("escape_lattice.zig").ClosureEnvTier,
         needs_env_param: bool,
-        direct_capture_params: bool,
         needs_closure_object: bool,
         stack_env: bool,
         storage_scope: StorageScope,
@@ -1907,7 +2019,6 @@ pub const ZirDriver = struct {
             .lambda_lifted => .{
                 .tier = tier,
                 .needs_env_param = false,
-                .direct_capture_params = false,
                 .needs_closure_object = true,
                 .stack_env = false,
                 .storage_scope = .none,
@@ -1915,7 +2026,6 @@ pub const ZirDriver = struct {
             .immediate_invocation => .{
                 .tier = tier,
                 .needs_env_param = has_captures,
-                .direct_capture_params = false,
                 .needs_closure_object = has_captures,
                 .stack_env = false,
                 .storage_scope = if (has_captures) .stack_function else .immediate,
@@ -1923,7 +2033,6 @@ pub const ZirDriver = struct {
             .block_local => .{
                 .tier = tier,
                 .needs_env_param = has_captures,
-                .direct_capture_params = false,
                 .needs_closure_object = true,
                 .stack_env = true,
                 .storage_scope = .stack_block,
@@ -1931,7 +2040,6 @@ pub const ZirDriver = struct {
             .function_local => .{
                 .tier = tier,
                 .needs_env_param = has_captures,
-                .direct_capture_params = false,
                 .needs_closure_object = true,
                 .stack_env = true,
                 .storage_scope = .stack_function,
@@ -1939,7 +2047,6 @@ pub const ZirDriver = struct {
             .escaping => .{
                 .tier = tier,
                 .needs_env_param = has_captures,
-                .direct_capture_params = false,
                 .needs_closure_object = true,
                 .stack_env = false,
                 .storage_scope = .heap,
@@ -2021,60 +2128,76 @@ pub const ZirDriver = struct {
         return null;
     }
 
+    /// Walk aliases backwards from `local` to find the originating `make_closure`.
+    /// Cycle protection uses a visited set rather than a depth cap so deeply-
+    /// aliased code (long pipeline chains, decision-tree fan-out) still resolves
+    /// to a direct call instead of silently degrading to dynamic dispatch.
     fn findClosureTargetInInstrs(instrs: []const ir.Instruction, local: ir.LocalId) ?ClosureCallTarget {
-        return findClosureTargetInInstrsDepth(instrs, local, 0);
+        var stack_buf: [64]ir.LocalId = undefined;
+        var visited = std.heap.FixedBufferAllocator.init(std.mem.sliceAsBytes(&stack_buf));
+        var visited_list: std.ArrayListUnmanaged(ir.LocalId) = .empty;
+        defer visited_list.deinit(visited.allocator());
+        return findClosureTargetInInstrsRec(instrs, local, &visited_list, visited.allocator());
     }
 
-    fn findClosureTargetInInstrsDepth(instrs: []const ir.Instruction, local: ir.LocalId, depth: u8) ?ClosureCallTarget {
-        if (depth > 32) return null;
+    fn findClosureTargetInInstrsRec(
+        instrs: []const ir.Instruction,
+        local: ir.LocalId,
+        visited: *std.ArrayListUnmanaged(ir.LocalId),
+        visited_alloc: std.mem.Allocator,
+    ) ?ClosureCallTarget {
+        for (visited.items) |seen| {
+            if (seen == local) return null;
+        }
+        visited.append(visited_alloc, local) catch return null;
         for (instrs) |instr| {
             switch (instr) {
                 .make_closure => |mc| if (mc.dest == local) return .{ .function_id = mc.function, .captures = mc.captures },
                 .local_get => |lg| if (lg.dest == local) {
-                    if (findClosureTargetInInstrsDepth(instrs, lg.source, depth + 1)) |target| return target;
+                    if (findClosureTargetInInstrsRec(instrs, lg.source, visited, visited_alloc)) |target| return target;
                 },
                 .local_set => |ls| if (ls.dest == local) {
-                    if (findClosureTargetInInstrsDepth(instrs, ls.value, depth + 1)) |target| return target;
+                    if (findClosureTargetInInstrsRec(instrs, ls.value, visited, visited_alloc)) |target| return target;
                 },
                 .move_value => |mv| if (mv.dest == local) {
-                    if (findClosureTargetInInstrsDepth(instrs, mv.source, depth + 1)) |target| return target;
+                    if (findClosureTargetInInstrsRec(instrs, mv.source, visited, visited_alloc)) |target| return target;
                 },
                 .share_value => |sv| if (sv.dest == local) {
-                    if (findClosureTargetInInstrsDepth(instrs, sv.source, depth + 1)) |target| return target;
+                    if (findClosureTargetInInstrsRec(instrs, sv.source, visited, visited_alloc)) |target| return target;
                 },
                 .if_expr => |ie| {
-                    if (findClosureTargetInInstrsDepth(ie.then_instrs, local, depth)) |target| return target;
-                    if (findClosureTargetInInstrsDepth(ie.else_instrs, local, depth)) |target| return target;
+                    if (findClosureTargetInInstrsRec(ie.then_instrs, local, visited, visited_alloc)) |target| return target;
+                    if (findClosureTargetInInstrsRec(ie.else_instrs, local, visited, visited_alloc)) |target| return target;
                 },
                 .case_block => |cb| {
-                    if (findClosureTargetInInstrsDepth(cb.pre_instrs, local, depth)) |target| return target;
+                    if (findClosureTargetInInstrsRec(cb.pre_instrs, local, visited, visited_alloc)) |target| return target;
                     for (cb.arms) |arm| {
-                        if (findClosureTargetInInstrsDepth(arm.cond_instrs, local, depth)) |target| return target;
-                        if (findClosureTargetInInstrsDepth(arm.body_instrs, local, depth)) |target| return target;
+                        if (findClosureTargetInInstrsRec(arm.cond_instrs, local, visited, visited_alloc)) |target| return target;
+                        if (findClosureTargetInInstrsRec(arm.body_instrs, local, visited, visited_alloc)) |target| return target;
                     }
-                    if (findClosureTargetInInstrsDepth(cb.default_instrs, local, depth)) |target| return target;
+                    if (findClosureTargetInInstrsRec(cb.default_instrs, local, visited, visited_alloc)) |target| return target;
                 },
-                .guard_block => |gb| if (findClosureTargetInInstrsDepth(gb.body, local, depth)) |target| return target,
+                .guard_block => |gb| if (findClosureTargetInInstrsRec(gb.body, local, visited, visited_alloc)) |target| return target,
                 .switch_literal => |sl| {
                     for (sl.cases) |case| {
-                        if (findClosureTargetInInstrsDepth(case.body_instrs, local, depth)) |target| return target;
+                        if (findClosureTargetInInstrsRec(case.body_instrs, local, visited, visited_alloc)) |target| return target;
                     }
-                    if (findClosureTargetInInstrsDepth(sl.default_instrs, local, depth)) |target| return target;
+                    if (findClosureTargetInInstrsRec(sl.default_instrs, local, visited, visited_alloc)) |target| return target;
                 },
                 .switch_return => |sr| {
                     for (sr.cases) |case| {
-                        if (findClosureTargetInInstrsDepth(case.body_instrs, local, depth)) |target| return target;
+                        if (findClosureTargetInInstrsRec(case.body_instrs, local, visited, visited_alloc)) |target| return target;
                     }
-                    if (findClosureTargetInInstrsDepth(sr.default_instrs, local, depth)) |target| return target;
+                    if (findClosureTargetInInstrsRec(sr.default_instrs, local, visited, visited_alloc)) |target| return target;
                 },
                 .union_switch_return => |usr| {
                     for (usr.cases) |case| {
-                        if (findClosureTargetInInstrsDepth(case.body_instrs, local, depth)) |target| return target;
+                        if (findClosureTargetInInstrsRec(case.body_instrs, local, visited, visited_alloc)) |target| return target;
                     }
                 },
                 .union_switch => |us| {
                     for (us.cases) |case| {
-                        if (findClosureTargetInInstrsDepth(case.body_instrs, local, depth)) |target| return target;
+                        if (findClosureTargetInInstrsRec(case.body_instrs, local, visited, visited_alloc)) |target| return target;
                     }
                 },
                 else => {},
@@ -2083,17 +2206,10 @@ pub const ZirDriver = struct {
         return null;
     }
 
-    fn emitNamedCallToTarget(self: *ZirDriver, target_id: ir.FunctionId, captures: []const ir.LocalId, args_locals: []const ir.LocalId) !u32 {
+    fn emitNamedCallToTarget(self: *ZirDriver, target_id: ir.FunctionId, args_locals: []const ir.LocalId) !u32 {
         const target_func = self.findFunctionById(target_id) orelse return error.EmitFailed;
-        const lowering = self.getClosureLowering(target_id, captures.len);
         var args : std.ArrayListUnmanaged(u32) = .empty;
         defer args.deinit(self.allocator);
-        if (lowering.direct_capture_params) {
-            for (captures) |capture| {
-                const ref = self.refForValueLocal(capture) catch @intFromEnum(Zir.Inst.Ref.void_value);
-                try args.append(self.allocator, ref);
-            }
-        }
         for (args_locals) |arg| {
             const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
             try args.append(self.allocator, ref);
@@ -2119,8 +2235,8 @@ pub const ZirDriver = struct {
         return ref;
     }
 
-    fn emitTailNamedCallToTarget(self: *ZirDriver, target_id: ir.FunctionId, captures: []const ir.LocalId, args_locals: []const ir.LocalId) !void {
-        const ref = try self.emitNamedCallToTarget(target_id, captures, args_locals);
+    fn emitTailNamedCallToTarget(self: *ZirDriver, target_id: ir.FunctionId, args_locals: []const ir.LocalId) !void {
+        const ref = try self.emitNamedCallToTarget(target_id, args_locals);
         if (zir_builder_emit_ret(self.handle, ref) != 0) return error.EmitFailed;
     }
 
@@ -2182,7 +2298,7 @@ pub const ZirDriver = struct {
                             const val_ref = self.refForLocal(op.value) catch continue;
                             const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                             if (rt_import == error_ref) return error.EmitFailed;
-                            const arc_runtime = zir_builder_emit_field_val(self.handle, rt_import, "ArcRuntime", 10);
+                            const arc_runtime = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.arc_runtime);
                             if (arc_runtime == error_ref) return error.EmitFailed;
                             const retain_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "retainAny", 9);
                             if (retain_fn == error_ref) return error.EmitFailed;
@@ -2197,7 +2313,7 @@ pub const ZirDriver = struct {
                             const alloc_ref = try self.emitAllocatorRef();
                             const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                             if (rt_import == error_ref) return error.EmitFailed;
-                            const arc_runtime = zir_builder_emit_field_val(self.handle, rt_import, "ArcRuntime", 10);
+                            const arc_runtime = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.arc_runtime);
                             if (arc_runtime == error_ref) return error.EmitFailed;
                             const release_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "releaseAny", 10);
                             if (release_fn == error_ref) return error.EmitFailed;
@@ -2227,7 +2343,7 @@ pub const ZirDriver = struct {
                     const alloc_ref = try self.emitAllocatorRef();
                     const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                     if (rt_import == error_ref) return error.EmitFailed;
-                    const arc_runtime = zir_builder_emit_field_val(self.handle, rt_import, "ArcRuntime", 10);
+                    const arc_runtime = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.arc_runtime);
                     if (arc_runtime == error_ref) return error.EmitFailed;
                     const release_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "releaseAny", 10);
                     if (release_fn == error_ref) return error.EmitFailed;
@@ -2246,7 +2362,7 @@ pub const ZirDriver = struct {
                     const alloc_ref = try self.emitAllocatorRef();
                     const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                     if (rt_import == error_ref) return error.EmitFailed;
-                    const arc_runtime = zir_builder_emit_field_val(self.handle, rt_import, "ArcRuntime", 10);
+                    const arc_runtime = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.arc_runtime);
                     if (arc_runtime == error_ref) return error.EmitFailed;
                     const reset_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "resetAny", 8);
                     if (reset_fn == error_ref) return error.EmitFailed;
@@ -2298,7 +2414,7 @@ pub const ZirDriver = struct {
             if (cond_ref == error_ref) return error.EmitFailed;
 
             self.beginCapture();
-            const direct_ref = try self.emitNamedCallToTarget(target_id, &.{}, cc.args);
+            const direct_ref = try self.emitNamedCallToTarget(target_id, cc.args);
             try self.setLocal(cc.dest, direct_ref);
             var then_len: u32 = 0;
             const then_ptr = self.endCapture(&then_len);
@@ -2432,7 +2548,7 @@ pub const ZirDriver = struct {
                         const materialized_ref = try self.materializeValueRef(value_ref);
                         const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                         if (rt_import == error_ref) return error.EmitFailed;
-                        const arc_runtime = zir_builder_emit_field_val(self.handle, rt_import, "ArcRuntime", 10);
+                        const arc_runtime = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.arc_runtime);
                         if (arc_runtime == error_ref) return error.EmitFailed;
                         const retain_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "retainAny", 9);
                         if (retain_fn == error_ref) return error.EmitFailed;
@@ -2672,10 +2788,11 @@ pub const ZirDriver = struct {
                 }
 
                 {
-                    // Look up the target function — first by full mangled name,
-                    // then by local_name. Bare names like "begin_test" come from
-                    // macro-expanded code (use/import) where the module prefix
-                    // was stripped during expansion.
+                    // Look up the target function — first by full mangled
+                    // name, then by local_name. Bare-name calls produced by
+                    // macro-expanded code (e.g. functions imported via
+                    // `use SomeModule`) only carry the unmangled identifier;
+                    // the local_name lookup recovers the right target.
                     var target_func = self.findFunctionByName(resolved_call_name) orelse
                         self.findFunctionByLocalName(resolved_call_name);
                     // Try stripping module prefix for impl functions compiled
@@ -2984,21 +3101,21 @@ pub const ZirDriver = struct {
 
                 if (!generic_handled) {
                 // Parse "Module.function" from the builtin name.
-                // e.g., "IO.println" → import zap_runtime, field "Prelude", field "println"
-                // Module names are mapped to runtime struct names. Domain
-                // modules (IO, Integer, Float, etc.) route to Prelude.
+                // e.g., "IO.println" → import zap_runtime, field "IO",
+                // field "println". Module names map 1:1 to runtime
+                // struct names; List/Map need element-type instantiation.
                 if (std.mem.findScalar(u8, cb.name, '.')) |dot_idx| {
                     const mod_name = cb.name[0..dot_idx];
                     const func_name = cb.name[dot_idx + 1 ..];
 
-                    // Map Zap module names to runtime struct names.
-                    // Domain modules route to Prelude; List/Map/String/Zest
-                    // route to their renamed structs directly.
                     const runtime_mod = mod_name;
 
                     // For generic container modules (List, Map), instantiate
-                    // with default type args since the specific type isn't
-                    // encoded in the call name.
+                    // with default i64 type args. The specific element type
+                    // isn't currently encoded in the call_builtin name —
+                    // see TODO below about typed `List:Elem.method` encoding
+                    // (already used for some other callsites) which would
+                    // let this dispatch the right specialization.
                     const mod_ref = if (std.mem.eql(u8, mod_name, "List"))
                         self.emitListCellRef(.i64) catch return error.EmitFailed
                     else if (std.mem.eql(u8, mod_name, "Map"))
@@ -3021,12 +3138,12 @@ pub const ZirDriver = struct {
                     if (ref == error_ref) return error.EmitFailed;
                     try self.setLocal(cb.dest, ref);
                 } else {
-                    // Bare name (no module qualifier) — route through zap_runtime.Prelude
+                    // Bare name (no module qualifier) — route through Kernel.
                     const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                     if (rt_import == error_ref) return error.EmitFailed;
-                    const prelude = zir_builder_emit_field_val(self.handle, rt_import, "Prelude", 7);
-                    if (prelude == error_ref) return error.EmitFailed;
-                    const fn_ref = zir_builder_emit_field_val(self.handle, prelude, cb.name.ptr, @intCast(cb.name.len));
+                    const kernel = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.kernel);
+                    if (kernel == error_ref) return error.EmitFailed;
+                    const fn_ref = zir_builder_emit_field_val(self.handle, kernel, cb.name.ptr, @intCast(cb.name.len));
                     if (fn_ref == error_ref) return error.EmitFailed;
                     const ref = zir_builder_emit_call_ref(self.handle, fn_ref, args.items.ptr, @intCast(args.items.len));
                     if (ref == error_ref) return error.EmitFailed;
@@ -3277,7 +3394,7 @@ pub const ZirDriver = struct {
                     const alloc_ref = try self.emitAllocatorRef();
                     const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                     if (rt_import == error_ref) return error.EmitFailed;
-                    const arc_runtime = zir_builder_emit_field_val(self.handle, rt_import, "ArcRuntime", 10);
+                    const arc_runtime = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.arc_runtime);
                     if (arc_runtime == error_ref) return error.EmitFailed;
                     const reuse_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "reuseAllocByType", 16);
                     if (reuse_fn == error_ref) return error.EmitFailed;
@@ -3469,7 +3586,7 @@ pub const ZirDriver = struct {
                     const alloc_ref = try self.emitAllocatorRef();
                     const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                     if (rt_import == error_ref) return error.EmitFailed;
-                    const arc_runtime = zir_builder_emit_field_val(self.handle, rt_import, "ArcRuntime", 10);
+                    const arc_runtime = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.arc_runtime);
                     if (arc_runtime == error_ref) return error.EmitFailed;
                     const reuse_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "reuseAllocByType", 16);
                     if (reuse_fn == error_ref) return error.EmitFailed;
@@ -3680,7 +3797,7 @@ pub const ZirDriver = struct {
                     const alloc_ref = try self.emitAllocatorRef();
                     const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                     if (rt_import == error_ref) return error.EmitFailed;
-                    const arc_runtime = zir_builder_emit_field_val(self.handle, rt_import, "ArcRuntime", 10);
+                    const arc_runtime = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.arc_runtime);
                     if (arc_runtime == error_ref) return error.EmitFailed;
                     const reuse_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "reuseAllocByType", 16);
                     if (reuse_fn == error_ref) return error.EmitFailed;
@@ -3819,14 +3936,14 @@ pub const ZirDriver = struct {
                 try self.setLocal(mt.dest, ref);
             },
             .match_fail => |mf| {
-                // Emit @import("zap_runtime").Prelude.panic(message)
+                // Emit @import("zap_runtime").Kernel.panic(message)
                 const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                 if (rt_import == error_ref) return error.EmitFailed;
 
-                const prelude = zir_builder_emit_field_val(self.handle, rt_import, "Prelude", 7);
-                if (prelude == error_ref) return error.EmitFailed;
+                const kernel = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.kernel);
+                if (kernel == error_ref) return error.EmitFailed;
 
-                const panic_fn = zir_builder_emit_field_val(self.handle, prelude, "panic", 5);
+                const panic_fn = zir_builder_emit_field_val(self.handle, kernel, "panic", 5);
                 if (panic_fn == error_ref) return error.EmitFailed;
 
                 const msg_ref = zir_builder_emit_str(self.handle, mf.message.ptr, @intCast(mf.message.len));
@@ -3847,7 +3964,7 @@ pub const ZirDriver = struct {
             .call_dispatch => |cd| {
                 // Resolve the dispatch group to the actual function and call it.
                 // The group_id is a valid FunctionId created during IR building.
-                const ref = try self.emitNamedCallToTarget(cd.group_id, &.{}, cd.args);
+                const ref = try self.emitNamedCallToTarget(cd.group_id, cd.args);
                 try self.setLocal(cd.dest, ref);
             },
             .call_closure => |cc| {
@@ -3856,7 +3973,7 @@ pub const ZirDriver = struct {
 
                 // Parameter-derived closures: the callee is a function parameter.
                 // It could be either a bare function pointer or a closure struct
-                // with {call_fn, env}. Use Prelude.callCallableN for dispatch.
+                // with {call_fn, env}. Use Kernel.callCallableN for dispatch.
                 if (callee_is_param) {
                     const callee_ref = self.refForLocal(cc.callee) catch return error.EmitFailed;
                     var args: std.ArrayListUnmanaged(u32) = .empty;
@@ -3868,8 +3985,8 @@ pub const ZirDriver = struct {
 
                     const rt_ref = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                     if (rt_ref != error_ref) {
-                        const prelude_ref = zir_builder_emit_field_val(self.handle, rt_ref, "Prelude", 7);
-                        if (prelude_ref != error_ref) {
+                        const kernel_ref = emitRuntimeNamespaceField(self.handle, rt_ref, runtime_ns.kernel);
+                        if (kernel_ref != error_ref) {
                             const helper_name = switch (args.items.len) {
                                 0 => "callCallable0",
                                 1 => "callCallable1",
@@ -3887,7 +4004,7 @@ pub const ZirDriver = struct {
                                     return;
                                 },
                             };
-                            const helper_ref = zir_builder_emit_field_val(self.handle, prelude_ref, helper_name.ptr, @intCast(helper_name.len));
+                            const helper_ref = zir_builder_emit_field_val(self.handle, kernel_ref, helper_name.ptr, @intCast(helper_name.len));
                             if (helper_ref != error_ref) {
                                 var full_args: std.ArrayListUnmanaged(u32) = .empty;
                                 defer full_args.deinit(self.allocator);
@@ -3925,7 +4042,7 @@ pub const ZirDriver = struct {
                 if (self.closure_function_map.get(cc.callee)) |func_id| {
                     if (self.findFunctionById(func_id)) |target_func| {
                         if (target_func.captures.len == 0) {
-                            const ref = try self.emitNamedCallToTarget(func_id, &.{}, cc.args);
+                            const ref = try self.emitNamedCallToTarget(func_id, cc.args);
                             if (ref != error_ref) {
                                 try self.setLocal(cc.dest, ref);
                                 return;
@@ -3947,21 +4064,10 @@ pub const ZirDriver = struct {
                             if (spec.decision == .contified and self.isTailReturnOf(cc.dest) and spec.lambda_set.isSingleton()) {
                                 const target_id = spec.lambda_set.members[0];
                                 if (self.program) |prog| {
-                                    if (target_id < prog.functions.len) {
-                                        const lowering = self.getClosureLowering(target_id, prog.functions[target_id].captures.len);
-                                        if (lowering.direct_capture_params) {
-                                            if (!callee_is_param) {
-                                                if (self.findClosureCallTarget(cc.callee)) |target| {
-                                                    try self.emitTailNamedCallToTarget(target.function_id, target.captures, cc.args);
-                                                    self.skip_next_ret_local = cc.dest;
-                                                    return;
-                                                }
-                                            }
-                                        } else if (prog.functions[target_id].captures.len == 0) {
-                                            try self.emitTailNamedCallToTarget(target_id, &.{}, cc.args);
-                                            self.skip_next_ret_local = cc.dest;
-                                            return;
-                                        }
+                                    if (target_id < prog.functions.len and prog.functions[target_id].captures.len == 0) {
+                                        try self.emitTailNamedCallToTarget(target_id, cc.args);
+                                        self.skip_next_ret_local = cc.dest;
+                                        return;
                                     }
                                 }
                                 if (try self.emitTailInvokeWrapperCall(cc.callee, target_id, cc.args)) {
@@ -3972,24 +4078,11 @@ pub const ZirDriver = struct {
                             if (spec.lambda_set.isSingleton()) {
                                 if (self.program) |prog| {
                                     const target_id = spec.lambda_set.members[0];
-                                    if (target_id < prog.functions.len) {
-                                        const lowering = self.getClosureLowering(target_id, prog.functions[target_id].captures.len);
-                                        if (lowering.direct_capture_params) {
-                                            if (!callee_is_param) {
-                                                if (self.findClosureCallTarget(cc.callee)) |target| {
-                                                    const ref = try self.emitNamedCallToTarget(target.function_id, target.captures, cc.args);
-                                                    if (ref != error_ref) {
-                                                        try self.setLocal(cc.dest, ref);
-                                                        return;
-                                                    }
-                                                }
-                                            }
-                                        } else if (prog.functions[target_id].captures.len == 0) {
-                                            const ref = try self.emitNamedCallToTarget(target_id, &.{}, cc.args);
-                                            if (ref != error_ref) {
-                                                try self.setLocal(cc.dest, ref);
-                                                return;
-                                            }
+                                    if (target_id < prog.functions.len and prog.functions[target_id].captures.len == 0) {
+                                        const ref = try self.emitNamedCallToTarget(target_id, cc.args);
+                                        if (ref != error_ref) {
+                                            try self.setLocal(cc.dest, ref);
+                                            return;
                                         }
                                     }
                                 }
@@ -4007,10 +4100,6 @@ pub const ZirDriver = struct {
                 // Lambda set specialization: singleton non-capturing → direct call
                 const direct_target: ?ClosureCallTarget = blk: {
                     if (!callee_is_param) {
-                        if (self.findClosureCallTarget(cc.callee)) |target| {
-                            const lowering = self.getClosureLowering(target.function_id, target.captures.len);
-                            if (lowering.direct_capture_params) break :blk target;
-                        }
                         if (self.analysis_context) |actx| {
                             const vkey = lattice.ValueKey{
                                 .function = self.current_function_id,
@@ -4034,7 +4123,7 @@ pub const ZirDriver = struct {
                 };
 
                 if (direct_target) |target| {
-                    const ref = try self.emitNamedCallToTarget(target.function_id, target.captures, cc.args);
+                    const ref = try self.emitNamedCallToTarget(target.function_id, cc.args);
                     if (ref != error_ref) try self.setLocal(cc.dest, ref);
                 } else {
                     // Dynamic dispatch: extract call_fn and env from closure struct,
@@ -4191,10 +4280,6 @@ pub const ZirDriver = struct {
                     }
                 }
                 if (self.currentClosureLowering()) |lowering| {
-                    if (lowering.direct_capture_params and cg.index < self.capture_param_refs.items.len) {
-                        try self.setLocal(cg.dest, self.capture_param_refs.items[cg.index]);
-                        return;
-                    }
                     if (lowering.needs_env_param) {
                         const env_ref = self.current_closure_env_ref orelse {
                             const ref = zir_builder_emit_void(self.handle);
@@ -4236,9 +4321,9 @@ pub const ZirDriver = struct {
                 self.beginCapture();
                 const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                 if (rt_import == error_ref) return error.EmitFailed;
-                const prelude = zir_builder_emit_field_val(self.handle, rt_import, "Prelude", 7);
-                if (prelude == error_ref) return error.EmitFailed;
-                const panic_fn = zir_builder_emit_field_val(self.handle, prelude, "panic", 5);
+                const kernel = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.kernel);
+                if (kernel == error_ref) return error.EmitFailed;
+                const panic_fn = zir_builder_emit_field_val(self.handle, kernel, "panic", 5);
                 if (panic_fn == error_ref) return error.EmitFailed;
                 const msg = "attempted to unwrap nil value";
                 const msg_ref = zir_builder_emit_str(self.handle, msg.ptr, @intCast(msg.len));
@@ -4279,7 +4364,7 @@ pub const ZirDriver = struct {
                 // Emit: @import("zap_runtime").BinaryHelpers.<readFunc>(source, offset[, bit_offset])
                 const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                 if (rt_import == error_ref) return error.EmitFailed;
-                const helpers = zir_builder_emit_field_val(self.handle, rt_import, "BinaryHelpers", 13);
+                const helpers = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.binary_helpers);
                 if (helpers == error_ref) return error.EmitFailed;
 
                 // Choose the concrete helper based on bits, signed, endianness
@@ -4354,7 +4439,7 @@ pub const ZirDriver = struct {
                 // Emit: @import("zap_runtime").BinaryHelpers.<readFloatFunc>(source, offset)
                 const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                 if (rt_import == error_ref) return error.EmitFailed;
-                const helpers = zir_builder_emit_field_val(self.handle, rt_import, "BinaryHelpers", 13);
+                const helpers = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.binary_helpers);
                 if (helpers == error_ref) return error.EmitFailed;
 
                 const func_name: []const u8 = switch (brf.bits) {
@@ -4391,7 +4476,7 @@ pub const ZirDriver = struct {
                 // length=0 is the sentinel for "rest of data" (null length in IR)
                 const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                 if (rt_import == error_ref) return error.EmitFailed;
-                const helpers = zir_builder_emit_field_val(self.handle, rt_import, "BinaryHelpers", 13);
+                const helpers = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.binary_helpers);
                 if (helpers == error_ref) return error.EmitFailed;
                 const fn_ref = zir_builder_emit_field_val(self.handle, helpers, "slice", 5);
                 if (fn_ref == error_ref) return error.EmitFailed;
@@ -4419,7 +4504,7 @@ pub const ZirDriver = struct {
                 // Two calls: utf8ByteLen for dest_len, utf8Decode for dest_codepoint
                 const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                 if (rt_import == error_ref) return error.EmitFailed;
-                const helpers = zir_builder_emit_field_val(self.handle, rt_import, "BinaryHelpers", 13);
+                const helpers = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.binary_helpers);
                 if (helpers == error_ref) return error.EmitFailed;
 
                 const source_ref = try self.refForLocal(bru.source);
@@ -4449,7 +4534,7 @@ pub const ZirDriver = struct {
                 // Emit: @import("zap_runtime").BinaryHelpers.matchPrefix(source, expected)
                 const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                 if (rt_import == error_ref) return error.EmitFailed;
-                const helpers = zir_builder_emit_field_val(self.handle, rt_import, "BinaryHelpers", 13);
+                const helpers = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.binary_helpers);
                 if (helpers == error_ref) return error.EmitFailed;
                 const fn_ref = zir_builder_emit_field_val(self.handle, helpers, "matchPrefix", 11);
                 if (fn_ref == error_ref) return error.EmitFailed;
@@ -4472,7 +4557,7 @@ pub const ZirDriver = struct {
 
                     const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                     if (rt_import == error_ref) return error.EmitFailed;
-                    const arc_runtime = zir_builder_emit_field_val(self.handle, rt_import, "ArcRuntime", 10);
+                    const arc_runtime = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.arc_runtime);
                     if (arc_runtime == error_ref) return error.EmitFailed;
                     const retain_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "retainAny", 9);
                     if (retain_fn == error_ref) return error.EmitFailed;
@@ -4490,7 +4575,7 @@ pub const ZirDriver = struct {
 
                     const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                     if (rt_import == error_ref) return error.EmitFailed;
-                    const arc_runtime = zir_builder_emit_field_val(self.handle, rt_import, "ArcRuntime", 10);
+                    const arc_runtime = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.arc_runtime);
                     if (arc_runtime == error_ref) return error.EmitFailed;
                     const release_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "releaseAny", 10);
                     if (release_fn == error_ref) return error.EmitFailed;
@@ -4505,7 +4590,7 @@ pub const ZirDriver = struct {
 
                 const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                 if (rt_import == error_ref) return error.EmitFailed;
-                const arc_runtime = zir_builder_emit_field_val(self.handle, rt_import, "ArcRuntime", 10);
+                const arc_runtime = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.arc_runtime);
                 if (arc_runtime == error_ref) return error.EmitFailed;
                 const reset_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "resetAny", 8);
                 if (reset_fn == error_ref) return error.EmitFailed;
@@ -4526,7 +4611,7 @@ pub const ZirDriver = struct {
 
                 const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                 if (rt_import == error_ref) return error.EmitFailed;
-                const arc_runtime = zir_builder_emit_field_val(self.handle, rt_import, "ArcRuntime", 10);
+                const arc_runtime = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.arc_runtime);
                 if (arc_runtime == error_ref) return error.EmitFailed;
                 const reuse_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "reuseAllocByType", 16);
                 if (reuse_fn == error_ref) return error.EmitFailed;
@@ -5719,7 +5804,6 @@ test "closure lowering helper distinguishes immediate and stack tiers" {
 
     const immediate = ZirDriver.closure_lowering_for_tier(.immediate_invocation, 1);
     try std.testing.expectEqual(lattice.ClosureEnvTier.immediate_invocation, immediate.tier);
-    try std.testing.expect(!immediate.direct_capture_params);
     try std.testing.expect(immediate.needs_env_param);
     try std.testing.expect(immediate.needs_closure_object);
 
@@ -5756,9 +5840,7 @@ test "findClosureTargetInInstrs follows local aliases" {
     try std.testing.expectEqual(@as(ir.LocalId, 7), target.captures[0]);
 }
 
-// Runtime function routing is handled entirely via @native attributes
-// in Zap library files (lib/*.zap). The compiler's HIR builder resolves
-// @native annotations to call_builtin instructions, which the ZIR builder
-// emits as @import("zap_runtime").Module.function(args).
-//
-// No hardcoded function routing exists in the compiler.
+// Runtime function routing is handled by `:zig.Module.function(args)` calls
+// in Zap library files (lib/*.zap). The compiler's HIR builder lowers those
+// calls to `call_builtin` instructions, which the ZIR builder emits as
+// `@import("zap_runtime").Module.function(args)`.

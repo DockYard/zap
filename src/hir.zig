@@ -69,7 +69,6 @@ pub const FunctionGroup = struct {
 
 pub const Capture = struct {
     name: ast.StringId,
-    binding_id: scope_mod.BindingId,
     type_id: TypeId,
     ownership: Ownership,
 };
@@ -191,6 +190,16 @@ pub const ExprKind = union(enum) {
     unary: UnaryExpr,
     call: CallExpr,
     field_get: FieldGetExpr,
+    /// Tuple element extraction by zero-based positional index.
+    tuple_index_get: TupleIndexGetExpr,
+    /// List element extraction by zero-based positional index.
+    list_index_get: ListIndexGetExpr,
+    /// First element of a non-empty list (head).
+    list_head_get: ListHeadGetExpr,
+    /// All-but-first elements of a list (tail), preserving the list type.
+    list_tail_get: ListTailGetExpr,
+    /// Map value lookup by key expression.
+    map_value_get: MapValueGetExpr,
 
     // Control flow
     branch: BranchExpr,
@@ -222,7 +231,13 @@ pub const ErrorPipeHir = struct {
     /// Each step except the first takes the previous step's Ok value as first arg.
     steps: []const ErrorPipeStep,
     /// The error handler — called when a pipe step can't match its input.
+    /// References `err_local` for the failing input value.
     handler: *const Expr,
+    /// Local index that the IR will populate with the failing pipe value
+    /// before lowering `handler`. The HIR builder allocates this so that
+    /// `__err` references inside the handler resolve to the same local.
+    /// Zero indicates no `__err` allocation (function-style handler).
+    err_local: u32 = 0,
 };
 
 pub const ErrorPipeStep = struct {
@@ -284,6 +299,29 @@ pub const FieldGetExpr = struct {
     field: ast.StringId,
 };
 
+pub const TupleIndexGetExpr = struct {
+    object: *const Expr,
+    index: u32,
+};
+
+pub const ListIndexGetExpr = struct {
+    list: *const Expr,
+    index: u32,
+};
+
+pub const ListHeadGetExpr = struct {
+    list: *const Expr,
+};
+
+pub const ListTailGetExpr = struct {
+    list: *const Expr,
+};
+
+pub const MapValueGetExpr = struct {
+    map: *const Expr,
+    key: *const Expr,
+};
+
 pub const BranchExpr = struct {
     condition: *const Expr,
     then_block: *const Block,
@@ -311,12 +349,12 @@ pub const CaseBinding = struct {
     name: ast.StringId,
     local_index: u32,
     kind: CaseBindKind,
-    element_index: u32, // only used for tuple_element
+    element_index: u32, // only used for binary_element
 };
 
 pub const CaseBindKind = enum {
-    scrutinee, // bind the whole scrutinee value
-    tuple_element, // bind an element extracted from the scrutinee tuple
+    scrutinee, // bind the whole scrutinee value (top-level `name -> body`)
+    extracted, // bind extracted by a decision tree .bind node (tuple/list/struct/map/list_cons element)
     binary_element, // bind a segment extracted from binary data
 };
 
@@ -405,6 +443,14 @@ pub const Decision = union(enum) {
     check_binary: CheckBinaryNode,
     /// Bind a variable and continue
     bind: BindNode,
+    /// Extract named struct fields and continue. Statically-typed structs
+    /// always match the layout (the type checker rejected anything else),
+    /// so no runtime tag check is needed; this just plumbs each requested
+    /// field into the success subtree as a fresh scrutinee.
+    extract_struct: ExtractStructNode,
+    /// Extract map values for named keys and continue. Each key is verified
+    /// to exist; missing keys route to `failure`.
+    extract_map: ExtractMapNode,
 };
 
 pub const SuccessLeaf = struct {
@@ -453,6 +499,32 @@ pub const LiteralValue = union(enum) {
     atom: ast.StringId,
     bool_val: bool,
     nil,
+};
+
+pub const ExtractStructNode = struct {
+    scrutinee: *const Expr,
+    fields: []const StructFieldExtraction,
+    success: *const Decision,
+    failure: *const Decision,
+};
+
+pub const StructFieldExtraction = struct {
+    field_name: ast.StringId,
+    scrutinee_id: u32,
+};
+
+pub const ExtractMapNode = struct {
+    scrutinee: *const Expr,
+    keys: []const MapKeyExtraction,
+    success: *const Decision,
+    failure: *const Decision,
+};
+
+pub const MapKeyExtraction = struct {
+    /// Key expression (literal or computed) evaluated at runtime.
+    key: *const Expr,
+    /// Scrutinee ID assigned to the looked-up value.
+    scrutinee_id: u32,
 };
 
 pub const CheckTupleNode = struct {
@@ -816,11 +888,275 @@ fn compileConstructorColumn(
             // Pin (variable unification) -> guard with equality check
             return compilePinGuard(allocator, matrix, scrutinee_ids, scrutinee_expr, next_id, bound_scrutinees);
         },
+        .struct_match => {
+            return compileStructFields(allocator, matrix, scrutinee_ids, scrutinee_expr, next_id, bound_scrutinees);
+        },
+        .map_match => {
+            return compileMapFields(allocator, matrix, scrutinee_ids, scrutinee_expr, next_id, bound_scrutinees);
+        },
         else => {
             // Fallback: treat as variable rule
             return stripColumnAndRecurse(allocator, matrix, scrutinee_ids, next_id, bound_scrutinees);
         },
     }
+}
+
+/// Compile a column where the first pattern is `struct_match`. Collects the
+/// union of all field names referenced across rows, extracts each field into
+/// a fresh scrutinee, and rewrites each row with one column per extracted
+/// field — falling through to the generic matrix compiler so nested patterns
+/// (literals, sub-binds, nested compounds) keep being handled correctly.
+fn compileStructFields(
+    allocator: std.mem.Allocator,
+    matrix: PatternMatrix,
+    scrutinee_ids: []const u32,
+    scrutinee_expr: *const Expr,
+    next_id: *u32,
+    bound_scrutinees: *BoundScrutinees,
+) anyerror!*const Decision {
+    var field_names: std.ArrayList(ast.StringId) = .empty;
+    for (matrix.rows) |row| {
+        if (row.patterns.len == 0) continue;
+        const pat = row.patterns[0];
+        if (isWildcardPattern(pat)) continue;
+        if (pat.?.* != .struct_match) continue;
+        for (pat.?.struct_match.field_bindings) |fb| {
+            var found = false;
+            for (field_names.items) |existing| {
+                if (existing == fb.field_name) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) try field_names.append(allocator, fb.field_name);
+        }
+    }
+
+    if (field_names.items.len == 0) {
+        return stripColumnAndRecurse(allocator, matrix, scrutinee_ids, next_id, bound_scrutinees);
+    }
+
+    var extractions: std.ArrayList(StructFieldExtraction) = .empty;
+    var field_scrutinee_ids: std.ArrayList(u32) = .empty;
+    for (field_names.items) |fname| {
+        const sid = next_id.*;
+        next_id.* += 1;
+        try extractions.append(allocator, .{ .field_name = fname, .scrutinee_id = sid });
+        try field_scrutinee_ids.append(allocator, sid);
+    }
+
+    const remaining_scrutinees = if (scrutinee_ids.len > 1) scrutinee_ids[1..] else @as([]const u32, &.{});
+    var combined_ids: std.ArrayList(u32) = .empty;
+    try combined_ids.appendSlice(allocator, field_scrutinee_ids.items);
+    try combined_ids.appendSlice(allocator, remaining_scrutinees);
+
+    var success_rows: std.ArrayList(PatternRow) = .empty;
+    var failure_rows: std.ArrayList(PatternRow) = .empty;
+    for (matrix.rows) |row| {
+        if (row.patterns.len == 0) continue;
+        const head = row.patterns[0];
+        const tail = if (row.patterns.len > 1) row.patterns[1..] else @as([]const ?*const MatchPattern, &.{});
+        if (isWildcardPattern(head)) {
+            // Wildcard matches every constructor — broadcast to wildcards
+            // for each extracted field.
+            var new_pats: std.ArrayList(?*const MatchPattern) = .empty;
+            for (field_names.items) |_| {
+                try new_pats.append(allocator, null);
+            }
+            try new_pats.appendSlice(allocator, tail);
+            try success_rows.append(allocator, .{
+                .patterns = try new_pats.toOwnedSlice(allocator),
+                .body_index = row.body_index,
+                .guard = row.guard,
+            });
+            try failure_rows.append(allocator, .{
+                .patterns = tail,
+                .body_index = row.body_index,
+                .guard = row.guard,
+            });
+            continue;
+        }
+        if (head.?.* != .struct_match) continue;
+        const sm = head.?.struct_match;
+        var new_pats: std.ArrayList(?*const MatchPattern) = .empty;
+        for (field_names.items) |fname| {
+            var matched: ?*const MatchPattern = null;
+            for (sm.field_bindings) |fb| {
+                if (fb.field_name == fname) {
+                    matched = fb.pattern;
+                    break;
+                }
+            }
+            try new_pats.append(allocator, matched);
+        }
+        try new_pats.appendSlice(allocator, tail);
+        try success_rows.append(allocator, .{
+            .patterns = try new_pats.toOwnedSlice(allocator),
+            .body_index = row.body_index,
+            .guard = row.guard,
+        });
+    }
+
+    const success_decision = try compilePatternMatrixWithBindings(
+        allocator,
+        .{
+            .rows = try success_rows.toOwnedSlice(allocator),
+            .column_count = @as(u32, @intCast(field_names.items.len)) + (matrix.column_count - 1),
+        },
+        try combined_ids.toOwnedSlice(allocator),
+        next_id,
+        bound_scrutinees,
+    );
+    const failure_decision = try compilePatternMatrixWithBindings(
+        allocator,
+        .{
+            .rows = try failure_rows.toOwnedSlice(allocator),
+            .column_count = if (matrix.column_count > 0) matrix.column_count - 1 else 0,
+        },
+        remaining_scrutinees,
+        next_id,
+        bound_scrutinees,
+    );
+
+    const node = try allocator.create(Decision);
+    node.* = .{ .extract_struct = .{
+        .scrutinee = scrutinee_expr,
+        .fields = try extractions.toOwnedSlice(allocator),
+        .success = success_decision,
+        .failure = failure_decision,
+    } };
+    return node;
+}
+
+/// Compile a column where the first pattern is `map_match`. The shape mirrors
+/// `compileStructFields` but indexes by key expression rather than field name.
+fn compileMapFields(
+    allocator: std.mem.Allocator,
+    matrix: PatternMatrix,
+    scrutinee_ids: []const u32,
+    scrutinee_expr: *const Expr,
+    next_id: *u32,
+    bound_scrutinees: *BoundScrutinees,
+) anyerror!*const Decision {
+    // Collect distinct keys by AST pointer identity (parser de-duplicates
+    // literal keys — a coarser equivalence check would need an interpreter).
+    var keys: std.ArrayList(*const ast.Expr) = .empty;
+    for (matrix.rows) |row| {
+        if (row.patterns.len == 0) continue;
+        const pat = row.patterns[0];
+        if (isWildcardPattern(pat)) continue;
+        if (pat.?.* != .map_match) continue;
+        for (pat.?.map_match.field_bindings) |fb| {
+            var found = false;
+            for (keys.items) |existing| {
+                if (existing == fb.key) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) try keys.append(allocator, fb.key);
+        }
+    }
+
+    if (keys.items.len == 0) {
+        return stripColumnAndRecurse(allocator, matrix, scrutinee_ids, next_id, bound_scrutinees);
+    }
+
+    var extractions: std.ArrayList(MapKeyExtraction) = .empty;
+    var key_scrutinee_ids: std.ArrayList(u32) = .empty;
+    for (keys.items) |key_expr| {
+        const sid = next_id.*;
+        next_id.* += 1;
+        // key_expr_hir built lazily — the IR converts the AST key inline;
+        // here we just want a placeholder Expr so the Decision can
+        // reference the key for its own diagnostics.
+        const placeholder = try allocator.create(Expr);
+        placeholder.* = .{
+            .kind = .nil_lit,
+            .type_id = types_mod.TypeStore.UNKNOWN,
+            .span = key_expr.getMeta().span,
+        };
+        try extractions.append(allocator, .{ .key = placeholder, .scrutinee_id = sid });
+        try key_scrutinee_ids.append(allocator, sid);
+    }
+
+    const remaining_scrutinees = if (scrutinee_ids.len > 1) scrutinee_ids[1..] else @as([]const u32, &.{});
+    var combined_ids: std.ArrayList(u32) = .empty;
+    try combined_ids.appendSlice(allocator, key_scrutinee_ids.items);
+    try combined_ids.appendSlice(allocator, remaining_scrutinees);
+
+    var success_rows: std.ArrayList(PatternRow) = .empty;
+    var failure_rows: std.ArrayList(PatternRow) = .empty;
+    for (matrix.rows) |row| {
+        if (row.patterns.len == 0) continue;
+        const head = row.patterns[0];
+        const tail = if (row.patterns.len > 1) row.patterns[1..] else @as([]const ?*const MatchPattern, &.{});
+        if (isWildcardPattern(head)) {
+            var new_pats: std.ArrayList(?*const MatchPattern) = .empty;
+            for (keys.items) |_| try new_pats.append(allocator, null);
+            try new_pats.appendSlice(allocator, tail);
+            try success_rows.append(allocator, .{
+                .patterns = try new_pats.toOwnedSlice(allocator),
+                .body_index = row.body_index,
+                .guard = row.guard,
+            });
+            try failure_rows.append(allocator, .{
+                .patterns = tail,
+                .body_index = row.body_index,
+                .guard = row.guard,
+            });
+            continue;
+        }
+        if (head.?.* != .map_match) continue;
+        const mm = head.?.map_match;
+        var new_pats: std.ArrayList(?*const MatchPattern) = .empty;
+        for (keys.items) |k| {
+            var matched: ?*const MatchPattern = null;
+            for (mm.field_bindings) |fb| {
+                if (fb.key == k) {
+                    matched = fb.pattern;
+                    break;
+                }
+            }
+            try new_pats.append(allocator, matched);
+        }
+        try new_pats.appendSlice(allocator, tail);
+        try success_rows.append(allocator, .{
+            .patterns = try new_pats.toOwnedSlice(allocator),
+            .body_index = row.body_index,
+            .guard = row.guard,
+        });
+    }
+
+    const success_decision = try compilePatternMatrixWithBindings(
+        allocator,
+        .{
+            .rows = try success_rows.toOwnedSlice(allocator),
+            .column_count = @as(u32, @intCast(keys.items.len)) + (matrix.column_count - 1),
+        },
+        try combined_ids.toOwnedSlice(allocator),
+        next_id,
+        bound_scrutinees,
+    );
+    const failure_decision = try compilePatternMatrixWithBindings(
+        allocator,
+        .{
+            .rows = try failure_rows.toOwnedSlice(allocator),
+            .column_count = if (matrix.column_count > 0) matrix.column_count - 1 else 0,
+        },
+        remaining_scrutinees,
+        next_id,
+        bound_scrutinees,
+    );
+
+    const node = try allocator.create(Decision);
+    node.* = .{ .extract_map = .{
+        .scrutinee = scrutinee_expr,
+        .keys = try extractions.toOwnedSlice(allocator),
+        .success = success_decision,
+        .failure = failure_decision,
+    } };
+    return node;
 }
 
 fn compileLiteralSwitch(
@@ -1486,44 +1822,11 @@ fn compileBinaryCheck(
     next_id: *u32,
     bound_scrutinees: *BoundScrutinees,
 ) anyerror!*const Decision {
-    // Calculate min byte size from the first binary pattern's segments
-    // Accumulate bits for sub-byte types, then convert to bytes
-    var min_bits: u32 = 0;
-    var segments: []const BinaryMatchSegment = &.{};
-    for (matrix.rows) |row| {
-        if (row.patterns.len == 0) continue;
-        const pat = row.patterns[0];
-        if (!isWildcardPattern(pat) and pat.?.* == .binary_match) {
-            segments = pat.?.binary_match.segments;
-            for (segments) |seg| {
-                switch (seg.type_spec) {
-                    .default => min_bits += 8,
-                    .integer => |i| min_bits += i.bits,
-                    .float => |f| min_bits += f.bits,
-                    .string => {
-                        if (min_bits % 8 != 0) min_bits = (min_bits + 7) / 8 * 8;
-                        if (seg.string_literal) |sl| {
-                            _ = sl;
-                            // String literal prefix — can't easily get length here without interner
-                            // The IR emitter handles this more precisely
-                        } else if (seg.size) |sz| {
-                            switch (sz) {
-                                .literal => |n| min_bits += n * 8,
-                                .variable => {},
-                            }
-                        }
-                    },
-                    .utf8 => min_bits += 8,
-                    .utf16 => min_bits += 16,
-                    .utf32 => min_bits += 32,
-                }
-            }
-            break;
-        }
-    }
-
-    // Build wildcard-only failure base
     const remaining_scrutinees = if (scrutinee_ids.len > 1) scrutinee_ids[1..] else @as([]const u32, &.{});
+
+    // Wildcard rows form the terminal failure: when no binary pattern
+    // matches, fall through to wildcard-only matrix (which may itself
+    // contain further constructors on remaining columns).
     var wildcard_rows: std.ArrayList(PatternRow) = .empty;
     for (matrix.rows) |row| {
         if (row.patterns.len == 0) continue;
@@ -1538,54 +1841,99 @@ fn compileBinaryCheck(
         }
     }
 
-    var failure: *const Decision = undefined;
-    if (wildcard_rows.items.len > 0) {
-        failure = try compilePatternMatrixWithBindings(allocator, .{
-            .rows = try wildcard_rows.toOwnedSlice(allocator),
-            .column_count = matrix.column_count - 1,
-        }, remaining_scrutinees, next_id, bound_scrutinees);
-    } else {
+    const wildcard_failure: *const Decision = blk: {
+        if (wildcard_rows.items.len > 0) {
+            break :blk try compilePatternMatrixWithBindings(allocator, .{
+                .rows = try wildcard_rows.toOwnedSlice(allocator),
+                .column_count = if (matrix.column_count > 0) matrix.column_count - 1 else 0,
+            }, remaining_scrutinees, next_id, bound_scrutinees);
+        }
         const f = try allocator.create(Decision);
         f.* = .failure;
-        failure = f;
-    }
+        break :blk f;
+    };
 
-    // Build success rows (strip column 0, keep remaining)
-    var success_rows: std.ArrayList(PatternRow) = .empty;
-    for (matrix.rows) |row| {
+    // Build a per-row chain in REVERSE order so that the first matrix row
+    // ends up at the outermost `check_binary`. Earlier code only handled
+    // the first row's segments and silently dropped clauses 2+; chaining
+    // each row preserves clause order while letting the IR see every
+    // pattern's segment shape.
+    var chain: *const Decision = wildcard_failure;
+    var idx: usize = matrix.rows.len;
+    while (idx > 0) {
+        idx -= 1;
+        const row = matrix.rows[idx];
         if (row.patterns.len == 0) continue;
         const pat = row.patterns[0];
-        if (!isWildcardPattern(pat) and pat.?.* == .binary_match) {
-            const new_pats = if (row.patterns.len > 1) row.patterns[1..] else @as([]const ?*const MatchPattern, &.{});
+        if (isWildcardPattern(pat)) continue;
+        if (pat.?.* != .binary_match) continue;
+
+        const segments = pat.?.binary_match.segments;
+        const min_byte_size = computeBinaryMinByteSize(segments);
+
+        const new_pats = if (row.patterns.len > 1) row.patterns[1..] else @as([]const ?*const MatchPattern, &.{});
+        var success_rows: std.ArrayList(PatternRow) = .empty;
+        try success_rows.append(allocator, .{
+            .patterns = new_pats,
+            .body_index = row.body_index,
+            .guard = row.guard,
+        });
+        // Wildcards still need to be reachable from this success branch
+        // when the remaining columns demand them, so keep them in scope.
+        for (matrix.rows) |w| {
+            if (w.patterns.len == 0) continue;
+            if (!isWildcardPattern(w.patterns[0])) continue;
+            const tail = if (w.patterns.len > 1) w.patterns[1..] else @as([]const ?*const MatchPattern, &.{});
             try success_rows.append(allocator, .{
-                .patterns = new_pats,
-                .body_index = row.body_index,
-                .guard = row.guard,
-            });
-        } else if (isWildcardPattern(pat)) {
-            const new_pats = if (row.patterns.len > 1) row.patterns[1..] else @as([]const ?*const MatchPattern, &.{});
-            try success_rows.append(allocator, .{
-                .patterns = new_pats,
-                .body_index = row.body_index,
-                .guard = row.guard,
+                .patterns = tail,
+                .body_index = w.body_index,
+                .guard = w.guard,
             });
         }
+        const success = try compilePatternMatrixWithBindings(allocator, .{
+            .rows = try success_rows.toOwnedSlice(allocator),
+            .column_count = if (matrix.column_count > 0) matrix.column_count - 1 else 0,
+        }, remaining_scrutinees, next_id, bound_scrutinees);
+
+        const node = try allocator.create(Decision);
+        node.* = .{ .check_binary = .{
+            .scrutinee = scrutinee_expr,
+            .min_byte_size = min_byte_size,
+            .segments = segments,
+            .success = success,
+            .failure = chain,
+        } };
+        chain = node;
     }
 
-    const success = try compilePatternMatrixWithBindings(allocator, .{
-        .rows = try success_rows.toOwnedSlice(allocator),
-        .column_count = matrix.column_count - 1,
-    }, remaining_scrutinees, next_id, bound_scrutinees);
+    return chain;
+}
 
-    const d = try allocator.create(Decision);
-    d.* = .{ .check_binary = .{
-        .scrutinee = scrutinee_expr,
-        .min_byte_size = (min_bits + 7) / 8,
-        .segments = segments,
-        .success = success,
-        .failure = failure,
-    } };
-    return d;
+/// Compute the minimum byte size required by a binary pattern's segments.
+/// Sub-byte integer/float types accumulate bit-wise and round up; string
+/// segments with literal sizes contribute their byte length.
+fn computeBinaryMinByteSize(segments: []const BinaryMatchSegment) u32 {
+    var min_bits: u32 = 0;
+    for (segments) |seg| {
+        switch (seg.type_spec) {
+            .default => min_bits += 8,
+            .integer => |i| min_bits += i.bits,
+            .float => |f| min_bits += f.bits,
+            .string => {
+                if (min_bits % 8 != 0) min_bits = (min_bits + 7) / 8 * 8;
+                if (seg.size) |sz| {
+                    switch (sz) {
+                        .literal => |n| min_bits += n * 8,
+                        .variable => {},
+                    }
+                }
+            },
+            .utf8 => min_bits += 8,
+            .utf16 => min_bits += 16,
+            .utf32 => min_bits += 32,
+        }
+    }
+    return (min_bits + 7) / 8;
 }
 
 fn literalEquals(a: LiteralValue, b: LiteralValue) bool {
@@ -1659,6 +2007,15 @@ pub const HirBuilder = struct {
     next_group_id: u32,
     next_local: u32,
     current_param_names: []const ?ast.StringId,
+    /// Parallel to `current_param_names`. Holds each parameter's TypeId
+    /// so var_ref resolution against a parameter sees the type the type
+    /// checker (or `inferred_signatures` for synthetic helpers like
+    /// for-comp `__for_N`) assigned. The scope-graph binding entry
+    /// often doesn't have `type_id` populated for synthetic helpers,
+    /// so this in-memory copy is the source of truth during HIR build.
+    /// Critical for HIR-time protocol dispatch on
+    /// `Enumerable.next(state)` where `state` is the helper's param.
+    current_param_types: []const TypeId,
     current_tuple_bindings: std.ArrayList(TupleBinding),
     current_struct_bindings: std.ArrayList(StructBinding),
     current_list_bindings: std.ArrayList(ListBinding),
@@ -1716,6 +2073,7 @@ pub const HirBuilder = struct {
             .next_group_id = 0,
             .next_local = 0,
             .current_param_names = &.{},
+            .current_param_types = &.{},
             .current_tuple_bindings = .empty,
             .current_struct_bindings = .empty,
             .current_list_bindings = .empty,
@@ -1746,6 +2104,14 @@ pub const HirBuilder = struct {
         self.current_capture_map.deinit();
         self.current_capture_list.deinit(self.allocator);
         self.current_assignment_bindings.deinit(self.allocator);
+        self.current_tuple_bindings.deinit(self.allocator);
+        self.current_struct_bindings.deinit(self.allocator);
+        self.current_list_bindings.deinit(self.allocator);
+        self.current_cons_tail_bindings.deinit(self.allocator);
+        self.current_binary_bindings.deinit(self.allocator);
+        self.current_map_bindings.deinit(self.allocator);
+        self.current_case_bindings.deinit(self.allocator);
+        self.parent_assignment_bindings.deinit(self.allocator);
         self.hir_type_var_scope.deinit();
         self.errors.deinit(self.allocator);
     }
@@ -1760,7 +2126,10 @@ pub const HirBuilder = struct {
                 return binding.type_id;
             }
         }
-        // Fall back to scope graph binding
+        // Scope graph binding — populated by the type checker. Tests rely on
+        // mutating the type at this site after type-checking but before HIR
+        // build, so this must take precedence over the in-memory parameter
+        // copy populated below.
         const scope_id = self.current_clause_scope orelse self.current_module_scope orelse self.graph.prelude_scope;
         if (self.graph.resolveBinding(scope_id, name)) |bid| {
             const binding = self.graph.bindings.items[bid];
@@ -1768,8 +2137,6 @@ pub const HirBuilder = struct {
                 return prov.type_id;
             }
         }
-        // Also check if this is a parameter with a type annotation
-        // by looking at the current function's parameter types
         if (self.current_clause_scope) |cs| {
             const scope = self.graph.getScope(cs);
             var it = scope.bindings.iterator();
@@ -1780,6 +2147,18 @@ pub const HirBuilder = struct {
                     if (binding.type_id) |prov| {
                         return prov.type_id;
                     }
+                }
+            }
+        }
+        // Fall back to in-memory parameter types. The scope graph binding
+        // for a parameter doesn't carry an inferred type for synthetic
+        // helpers (e.g. for-comp `__for_N`), so this parallel array
+        // populated in buildClause is the source of truth in that case.
+        for (self.current_param_names, 0..) |maybe_name, idx| {
+            if (maybe_name) |pn| {
+                if (pn == name and idx < self.current_param_types.len) {
+                    const tid = self.current_param_types[idx];
+                    if (tid != types_mod.TypeStore.UNKNOWN) return tid;
                 }
             }
         }
@@ -1937,6 +2316,14 @@ pub const HirBuilder = struct {
                 }
             }
         }
+        // Synthetic helpers (`__for_N`) carry no source-level return
+        // annotation but the type checker writes a call-site-inferred
+        // return type into `inferred_signatures` once the body has been
+        // checked. Falling back to that here lets recursive calls see
+        // the right element type for cons emission, etc.
+        if (self.type_store.inferred_signatures.get(name)) |sig| {
+            return sig.return_type;
+        }
         return types_mod.TypeStore.UNKNOWN;
     }
 
@@ -2010,7 +2397,7 @@ pub const HirBuilder = struct {
         for (clause.params, 0..) |param, idx| {
             ownerships[idx] = blk: {
                 if (param.pattern.* == .bind) {
-                    const clause_scope = self.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(clause.meta.span)) orelse clause.meta.scope_id;
+                    const clause_scope = self.graph.resolveClauseScope(clause.meta) orelse clause.meta.scope_id;
                     if (self.graph.resolveBinding(clause_scope, param.pattern.bind.name)) |binding_id| {
                         if (self.graph.bindings.items[binding_id].type_id) |prov| {
                             break :blk self.resolveParamOwnership(param, prov.type_id);
@@ -2041,7 +2428,7 @@ pub const HirBuilder = struct {
         for (clause.params, 0..) |param, idx| {
             param_types[idx] = blk: {
                 if (param.pattern.* == .bind) {
-                    const clause_scope = self.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(clause.meta.span)) orelse clause.meta.scope_id;
+                    const clause_scope = self.graph.resolveClauseScope(clause.meta) orelse clause.meta.scope_id;
                     if (self.graph.resolveBinding(clause_scope, param.pattern.bind.name)) |binding_id| {
                         if (self.graph.bindings.items[binding_id].type_id) |prov| {
                             break :blk prov.type_id;
@@ -2193,7 +2580,6 @@ pub const HirBuilder = struct {
         } else Ownership.shared;
         try self.current_capture_list.append(self.allocator, .{
             .name = binding.name,
-            .binding_id = binding_id,
             .type_id = if (binding.type_id) |prov| prov.type_id else types_mod.TypeStore.UNKNOWN,
             .ownership = ownership,
         });
@@ -2238,6 +2624,11 @@ pub const HirBuilder = struct {
                 return try self.create(Expr, .{ .kind = .{ .local_get = binding.local_index }, .type_id = type_id, .span = span });
             }
         }
+        for (self.current_map_bindings.items) |binding| {
+            if (binding.name == name) {
+                return try self.create(Expr, .{ .kind = .{ .local_get = binding.local_index }, .type_id = type_id, .span = span });
+            }
+        }
         for (self.current_case_bindings.items) |binding| {
             if (binding.name == name) {
                 return try self.create(Expr, .{ .kind = .{ .local_get = binding.local_index }, .type_id = type_id, .span = span });
@@ -2259,7 +2650,6 @@ pub const HirBuilder = struct {
                 const idx: u32 = @intCast(self.current_capture_list.items.len);
                 try self.current_capture_list.append(self.allocator, .{
                     .name = binding.name,
-                    .binding_id = 0, // No scope graph binding ID — using local index
                     .type_id = capture_type,
                     .ownership = .shared,
                 });
@@ -2506,8 +2896,12 @@ pub const HirBuilder = struct {
                             stmts[idx] = .{ .expr = expr };
                         }
 
-                        // Find StringId for "String" type
-                        const string_tid: ast.StringId = st_blk: {
+                        // Find StringId for the native string type. Falls
+                        // back to scanning the interner only if the
+                        // stdlib hasn't registered a `@native_type =
+                        // "string"` struct yet (e.g. compiling the
+                        // string stdlib module itself).
+                        const string_tid: ast.StringId = self.graph.nativeTypeStructName(.string) orelse st_blk: {
                             var sid: ast.StringId = 0;
                             while (sid < self.interner.strings.items.len) : (sid += 1) {
                                 if (std.mem.eql(u8, self.interner.get(sid), "String")) break :st_blk sid;
@@ -2572,44 +2966,6 @@ pub const HirBuilder = struct {
             }
         }
 
-        // Build inherited functions from scope graph (module extends).
-        // Only include families whose clauses come from this module's own AST
-        // or from parent scopes (via __using__ injection). Skip families from
-        // sibling modules that leak into the scope during merged compilation.
-        const mod_scope_data = self.graph.getScope(mod_scope);
-        var inherited_iter = mod_scope_data.function_families.iterator();
-        while (inherited_iter.next()) |entry| {
-            const family_key = entry.key_ptr.*;
-            if (fn_groups.contains(.{ .name = family_key.name, .arity = family_key.arity })) continue;
-
-            const family_id = entry.value_ptr.*;
-            const family = self.graph.getFamily(family_id);
-            if (family.clauses.items.len == 0) continue;
-
-            // Check if any clause's decl belongs to this module's AST items
-            var belongs_to_module = false;
-            for (family.clauses.items) |clause_ref| {
-                for (mod.items) |item| {
-                    const mod_func = switch (item) {
-                        .function, .priv_function => |f| f,
-                        else => continue,
-                    };
-                    if (mod_func == clause_ref.decl) {
-                        belongs_to_module = true;
-                        break;
-                    }
-                }
-                if (belongs_to_module) break;
-            }
-            if (belongs_to_module) continue; // Already handled via fn_groups
-
-            // Skip function families from other modules. Each module's
-            // functions are compiled when that module is processed — including
-            // them here pollutes the namespace and causes anytype
-            // monomorphization to pick up wrong types from foreign functions.
-            continue;
-        }
-
         return .{
             .name = mod.name,
             .scope_id = mod_scope,
@@ -2621,51 +2977,6 @@ pub const HirBuilder = struct {
     // ============================================================
     // Function group building
     // ============================================================
-
-    /// Register a function group: assign an ID and populate family_to_group,
-    /// but do NOT build clause bodies yet. Returns a skeleton FunctionGroup
-    /// with empty clauses that will be filled in by buildGroupClauses.
-    fn registerFunctionGroup(
-        self: *HirBuilder,
-        decls: []const *const ast.FunctionDecl,
-        scope_id: scope_mod.ScopeId,
-    ) !FunctionGroup {
-        const group_id = self.next_group_id;
-        self.next_group_id += 1;
-
-        const arity: u32 = if (decls[0].clauses.len > 0) @intCast(decls[0].clauses[0].params.len) else 0;
-        if (self.graph.resolveFamily(scope_id, decls[0].name, arity)) |family_id| {
-            try self.family_to_group.put(family_id, group_id);
-        }
-
-        return .{
-            .id = group_id,
-            .scope_id = scope_id,
-            .name = decls[0].name,
-            .arity = arity,
-            .is_local = false,
-            .captures = &.{},
-            .clauses = &.{},
-            .fallback_parent = null,
-        };
-    }
-
-    /// Build clause bodies for a function group.
-    fn buildGroupClauses(
-        self: *HirBuilder,
-        decls: []const *const ast.FunctionDecl,
-    ) ![]const Clause {
-        self.current_function_name = self.interner.get(decls[0].name);
-        self.current_function_name_id = decls[0].name;
-
-        var clauses: std.ArrayList(Clause) = .empty;
-        for (decls) |func| {
-            for (func.clauses) |clause| {
-                try clauses.append(self.allocator, try self.buildClause(&clause));
-            }
-        }
-        return try clauses.toOwnedSlice(self.allocator);
-    }
 
     fn buildMergedFunctionGroup(
         self: *HirBuilder,
@@ -2736,7 +3047,7 @@ pub const HirBuilder = struct {
         const saved_root_scope = self.current_function_root_scope;
         const saved_capture_map = self.current_capture_map;
         const saved_capture_list = self.current_capture_list;
-        self.current_function_root_scope = if (func.clauses.len > 0) self.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(func.clauses[0].meta.span)) orelse func.clauses[0].meta.scope_id else null;
+        self.current_function_root_scope = if (func.clauses.len > 0) self.graph.resolveClauseScope(func.clauses[0].meta) else null;
         self.current_capture_map = std.AutoHashMap(ast.StringId, u32).init(self.allocator);
         self.current_capture_list = .empty;
 
@@ -2749,6 +3060,7 @@ pub const HirBuilder = struct {
         const saved_list_bindings = self.current_list_bindings;
         const saved_cons_tail_bindings = self.current_cons_tail_bindings;
         const saved_binary_bindings = self.current_binary_bindings;
+        const saved_map_bindings = self.current_map_bindings;
         const saved_case_bindings = self.current_case_bindings;
         // Store parent bindings for capture detection in the nested function
         const saved_parent_bindings = self.parent_assignment_bindings;
@@ -2759,6 +3071,7 @@ pub const HirBuilder = struct {
         self.current_list_bindings = .empty;
         self.current_cons_tail_bindings = .empty;
         self.current_binary_bindings = .empty;
+        self.current_map_bindings = .empty;
         self.current_case_bindings = .empty;
 
         var clauses: std.ArrayList(Clause) = .empty;
@@ -2825,6 +3138,7 @@ pub const HirBuilder = struct {
         self.current_list_bindings = saved_list_bindings;
         self.current_cons_tail_bindings = saved_cons_tail_bindings;
         self.current_binary_bindings = saved_binary_bindings;
+        self.current_map_bindings = saved_map_bindings;
         self.current_case_bindings = saved_case_bindings;
         self.parent_assignment_bindings = saved_parent_bindings;
 
@@ -2917,12 +3231,10 @@ pub const HirBuilder = struct {
             }
         }
         const prev_clause_scope = self.current_clause_scope;
-        // Look up the clause's scope from the node_scope_map using the
-        // composite (source_id, span.start) key. This prevents collisions
-        // between AST nodes at the same byte offset in different source files.
-        self.current_clause_scope = self.graph.node_scope_map.get(
-            scope_mod.ScopeGraph.spanKey(clause.meta.span),
-        ) orelse self.current_module_scope orelse clause.meta.scope_id;
+        // Resolve the clause's scope. Prefers `meta.scope_id` (set
+        // directly by the collector) over `node_scope_map` so macro-
+        // generated clauses with synthetic span 0:0 don't collide.
+        self.current_clause_scope = self.graph.resolveClauseScope(clause.meta) orelse self.current_module_scope orelse clause.meta.scope_id;
         defer self.current_clause_scope = prev_clause_scope;
 
         // Check for inferred signature from the type checker (populated for
@@ -3002,10 +3314,13 @@ pub const HirBuilder = struct {
 
         // Track param names for var_ref resolution
         var param_names: std.ArrayList(?ast.StringId) = .empty;
+        var param_types: std.ArrayList(TypeId) = .empty;
         for (params.items) |p| {
             try param_names.append(self.allocator, p.name);
+            try param_types.append(self.allocator, p.type_id);
         }
         self.current_param_names = try param_names.toOwnedSlice(self.allocator);
+        self.current_param_types = try param_types.toOwnedSlice(self.allocator);
 
         // Process tuple patterns to create bindings for destructured variables
         self.current_tuple_bindings = .empty;
@@ -3105,9 +3420,12 @@ pub const HirBuilder = struct {
                     for (pat.binary_match.segments, 0..) |seg, seg_idx| {
                         if (seg.pattern) |sub_pat| {
                             if (sub_pat.* == .bind) {
-                                // Skip _-prefixed bindings (intentionally unused)
+                                // Skip user-discard bindings (`_x`) but
+                                // keep `__synth` names — see
+                                // `ast.isDiscardBindName` for the
+                                // distinction.
                                 const name_str = self.interner.get(sub_pat.bind);
-                                if (name_str.len > 0 and name_str[0] == '_') continue;
+                                if (ast.isDiscardBindName(name_str)) continue;
                                 const local_idx = self.next_local;
                                 self.next_local += 1;
                                 try self.current_binary_bindings.append(self.allocator, .{
@@ -3159,7 +3477,7 @@ pub const HirBuilder = struct {
             break :blk rexpr;
         } else null;
 
-        // Build body block (empty for @native bodyless declarations)
+        // Build body block (empty for bodyless declarations: protocol sigs, forward decls)
         const body = if (clause.body) |body_stmts|
             try self.buildBlock(body_stmts)
         else
@@ -3188,7 +3506,11 @@ pub const HirBuilder = struct {
     fn collectBoundNames(self: *HirBuilder, pattern: *const ast.Pattern) void {
         switch (pattern.*) {
             .bind => |b| {
-                // Don't track underscore-prefixed names (discards)
+                // Don't track user-discard names (`_x`) — they should
+                // never participate in pin-style variable unification.
+                // Compiler-synthesised `__*` names are unique per
+                // generation site and likewise don't unify, so we treat
+                // them the same here.
                 const name_str = self.interner.get(b.name);
                 if (name_str.len > 0 and name_str[0] != '_') {
                     self.clause_bound_names.put(b.name, {}) catch {};
@@ -3385,27 +3707,57 @@ pub const HirBuilder = struct {
                         try hir_stmts.append(self.allocator, .{ .function_group = group_ptr });
                         break :blk try self.buildFunctionValueExpr(group.id, function_type, anon.meta.span);
                     } else try self.buildExpr(assign.value);
-                    const idx = self.next_local;
+                    const value_local = self.next_local;
                     self.next_local += 1;
+                    try hir_stmts.append(self.allocator, .{
+                        .local_set = .{ .index = value_local, .value = value },
+                    });
+
+                    // For `name = expr`, just bind the name to `value_local`.
+                    // For destructure patterns ({a,b} = pair, [h|t] = lst,
+                    // %Foo{x: x} = p, %{k => v} = m), recursively walk the
+                    // pattern and emit one `local_set` per inner bind, each
+                    // with an extractor expression that reads from a local
+                    // holding the parent compound value.
                     if (assign.pattern.* == .bind) {
                         try self.current_assignment_bindings.append(self.allocator, .{
                             .name = assign.pattern.bind.name,
-                            .local_index = idx,
+                            .local_index = value_local,
                             .type_id = value.type_id,
                         });
+                    } else {
+                        try self.lowerAssignmentDestructure(
+                            assign.pattern,
+                            value_local,
+                            value.type_id,
+                            assign.value.getMeta().span,
+                            &hir_stmts,
+                        );
                     }
-                    try hir_stmts.append(self.allocator, .{
-                        .local_set = .{ .index = idx, .value = value },
-                    });
                 },
                 .function_decl => {},
                 else => {},
             }
         }
 
+        const owned_stmts = try hir_stmts.toOwnedSlice(self.allocator);
+        // The block's result type is the last expression's type — same
+        // convention every other expression-oriented language uses,
+        // and what `case_expr`'s arm-type unifier expects to read so
+        // it can propagate a concrete container type back into
+        // structurally-empty siblings (`[]`, `%{}`).
+        var block_result_type: types_mod.TypeId = types_mod.TypeStore.UNKNOWN;
+        if (owned_stmts.len > 0) {
+            const last = owned_stmts[owned_stmts.len - 1];
+            switch (last) {
+                .expr => |expr| block_result_type = expr.type_id,
+                .local_set => |ls| block_result_type = ls.value.type_id,
+                .function_group => {},
+            }
+        }
         return try self.create(Block, .{
-            .stmts = try hir_stmts.toOwnedSlice(self.allocator),
-            .result_type = types_mod.TypeStore.UNKNOWN,
+            .stmts = owned_stmts,
+            .result_type = block_result_type,
         });
     }
 
@@ -3459,8 +3811,16 @@ pub const HirBuilder = struct {
                 if (self.resolveFunctionValueGroup(v.name)) |group_id| {
                     return try self.buildFunctionValueExpr(group_id, resolved_type, v.meta.span);
                 }
+                // Last-resort fallback when a var_ref didn't resolve to a
+                // capture, parameter, named function, or scope-graph binding.
+                // Reaching here typically means the type checker accepted a
+                // reference that the HIR build path can't ground (e.g. a
+                // synthetic helper's parameter not yet in scope). Emit a
+                // local_get of slot 0 so downstream code has *something*; the
+                // backend will surface any genuine miss as a Zig compile error
+                // rather than a silent runtime read of a wrong value.
                 return try self.create(Expr, .{
-                    .kind = .{ .local_get = 0 }, // TODO: resolve to local index
+                    .kind = .{ .local_get = 0 },
                     .type_id = resolved_type,
                     .span = v.meta.span,
                 });
@@ -3607,9 +3967,33 @@ pub const HirBuilder = struct {
                         if (inner.object.* == .atom_literal) {
                             const atom_name = self.interner.get(inner.object.atom_literal.value);
                             if (std.mem.eql(u8, atom_name, "zig")) {
-                                // Build "Module.function" qualified name
+                                // Build "Module.function" qualified name. For
+                                // generic containers (List, Map), encode the
+                                // element type from the first arg so the ZIR
+                                // backend can instantiate the right
+                                // specialization (e.g. `List:str.next` ->
+                                // `List(String).next`). Without this, every
+                                // List.* call defaulted to `List(i64)`.
                                 const mod_part = self.interner.get(inner.field);
                                 const func_part = self.interner.get(fa.field);
+                                const typed_qualified: ?[]const u8 = blk_t: {
+                                    if (args.items.len == 0) break :blk_t null;
+                                    if (!(std.mem.eql(u8, mod_part, "List") or std.mem.eql(u8, mod_part, "Map"))) break :blk_t null;
+                                    const arg_type = args.items[0].expr.type_id;
+                                    if (arg_type == types_mod.TypeStore.UNKNOWN) break :blk_t null;
+                                    const t = self.type_store.getType(arg_type);
+                                    if (std.mem.eql(u8, mod_part, "List") and t == .list) {
+                                        const enc = encodeContainerElemName(self.type_store, t.list.element);
+                                        break :blk_t std.fmt.allocPrint(self.allocator, "List:{s}.{s}", .{ enc, func_part }) catch null;
+                                    }
+                                    if (std.mem.eql(u8, mod_part, "Map") and t == .map) {
+                                        const k_enc = encodeContainerElemName(self.type_store, t.map.key);
+                                        const v_enc = encodeContainerElemName(self.type_store, t.map.value);
+                                        break :blk_t std.fmt.allocPrint(self.allocator, "Map:{s}:{s}.{s}", .{ k_enc, v_enc, func_part }) catch null;
+                                    }
+                                    break :blk_t null;
+                                };
+                                if (typed_qualified) |tq| break :blk .{ .builtin = tq };
                                 const qualified = std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ mod_part, func_part }) catch break :blk .{ .builtin = func_part };
                                 break :blk .{ .builtin = qualified };
                             }
@@ -3819,54 +4203,56 @@ pub const HirBuilder = struct {
                 var arms: std.ArrayList(CaseArm) = .empty;
 
                 for (ce.clauses) |clause| {
-                    // Save binding state for this arm
-                    const saved_case_bindings = self.current_case_bindings;
-                    self.current_case_bindings = .empty;
+                    // Append THIS clause's pattern bindings to the running
+                    // `current_case_bindings` instead of resetting it. A
+                    // nested case (e.g. the filter-case the desugarer
+                    // emits inside a for-comp's cont arm) still needs the
+                    // outer arm's bindings — the user's loop variable and
+                    // `__next_state` — visible while building its own
+                    // clause bodies. Save the start index, append this
+                    // clause's pattern bindings, build the body, snapshot
+                    // just this clause's slice for the lowered arm, then
+                    // shrink back so siblings see the outer arm's
+                    // bindings unchanged.
+                    const start_idx = self.current_case_bindings.items.len;
 
                     const pattern = try self.compilePattern(clause.pattern);
 
-                    // Process bindings from the pattern
+                    // Process bindings from the pattern. Top-level `.bind` is the
+                    // whole-scrutinee bind (kind=.scrutinee, set by the success
+                    // leaf). Anything nested inside a compound pattern is .extracted
+                    // and set by a `.bind` decision-tree node. Binary segments use
+                    // .binary_element with their segment index.
                     if (pattern) |pat| {
-                        switch (pat.*) {
-                            .bind => |name| {
-                                const local_idx = self.next_local;
-                                self.next_local += 1;
-                                try self.current_case_bindings.append(self.allocator, .{
-                                    .name = name,
-                                    .local_index = local_idx,
-                                    .kind = .scrutinee,
-                                    .element_index = 0,
-                                });
-                            },
-                            .tuple => |sub_pats| {
-                                try self.collectTuplePatternBindings(sub_pats);
-                            },
-                            .binary_match => |bm| {
-                                for (bm.segments, 0..) |seg, seg_idx| {
-                                    if (seg.pattern) |sub_pat| {
-                                        if (sub_pat.* == .bind) {
-                                            // Skip _-prefixed bindings (intentionally unused)
-                                            const name_str = self.interner.get(sub_pat.bind);
-                                            if (name_str.len > 0 and name_str[0] == '_') continue;
-                                            const local_idx = self.next_local;
-                                            self.next_local += 1;
-                                            try self.current_case_bindings.append(self.allocator, .{
-                                                .name = sub_pat.bind,
-                                                .local_index = local_idx,
-                                                .kind = .binary_element,
-                                                .element_index = @intCast(seg_idx),
-                                            });
-                                        }
-                                    }
-                                }
-                            },
-                            else => {},
-                        }
+                        try self.collectCasePatternBindings(pat, true);
+                    }
+
+                    // Switch into the clause's scope while building the
+                    // guard and body so var_refs to pattern-bound names
+                    // (e.g. `c` in `{:cont, c, _} -> c <> "!"`) pick up
+                    // the type the type checker recorded on the
+                    // case-clause binding. Without this, `resolveBindingType`
+                    // walks UP from `current_clause_scope` (the
+                    // surrounding function clause's scope) and never
+                    // visits the case-clause scope (a child), leaving
+                    // the var_ref typed as UNKNOWN — which breaks
+                    // first-arg-type-driven protocol dispatch in the
+                    // body (`Concatenable.concat`, `Arithmetic.+`, …).
+                    const saved_clause_scope = self.current_clause_scope;
+                    if (self.graph.resolveClauseScope(clause.meta)) |cs| {
+                        self.current_clause_scope = cs;
                     }
 
                     const guard_expr = if (clause.guard) |g| try self.buildExpr(g) else null;
                     const body = try self.buildBlock(clause.body);
-                    const bindings = try self.current_case_bindings.toOwnedSlice(self.allocator);
+
+                    self.current_clause_scope = saved_clause_scope;
+
+                    // Snapshot just THIS clause's bindings (those appended
+                    // at or after start_idx) so the lowered arm carries
+                    // only the bindings introduced by its own pattern.
+                    const clause_slice = self.current_case_bindings.items[start_idx..];
+                    const bindings = try self.allocator.dupe(CaseBinding, clause_slice);
 
                     try arms.append(self.allocator, .{
                         .pattern = pattern,
@@ -3875,16 +4261,59 @@ pub const HirBuilder = struct {
                         .bindings = bindings,
                     });
 
-                    // Restore binding state
-                    self.current_case_bindings = saved_case_bindings;
+                    // Drop this clause's bindings; siblings see the outer
+                    // arm's bindings as they did before this clause.
+                    self.current_case_bindings.shrinkRetainingCapacity(start_idx);
                 }
 
+                const arm_slice = try arms.toOwnedSlice(self.allocator);
+                // The case's result type is the unified type of its
+                // arms. If one arm has a concrete element type (e.g.
+                // the for-comp's cont arm produces `[String]`) and
+                // another is structurally compatible but stamped
+                // UNKNOWN (e.g. the done arm's empty literal `[]`),
+                // propagate the concrete shape so downstream cons /
+                // list_init monomorphisation doesn't default to i64.
+                // Falls back to UNKNOWN when no arm carries a concrete
+                // type or when arms disagree concretely (the latter
+                // gets caught downstream as a structural mismatch).
+                const case_type_id: types_mod.TypeId = blk: {
+                    var chosen: types_mod.TypeId = types_mod.TypeStore.UNKNOWN;
+                    for (arm_slice) |arm| {
+                        const t = arm.body.result_type;
+                        if (t == types_mod.TypeStore.UNKNOWN) continue;
+                        if (chosen == types_mod.TypeStore.UNKNOWN) {
+                            chosen = t;
+                            continue;
+                        }
+                        if (chosen != t) {
+                            chosen = types_mod.TypeStore.UNKNOWN;
+                            break;
+                        }
+                    }
+                    break :blk chosen;
+                };
+                // When a unified type is known, propagate it back into
+                // any arm whose result is structurally compatible but
+                // currently UNKNOWN — the canonical case is the done
+                // arm's `[]` empty list inside a for-comprehension's
+                // cont/done split. Without this patch the IR would
+                // emit `list_init(elem=i64)` for `[]` and `list_cons`
+                // with String for the cont arm, and Zig sema rejects
+                // the union of `?*const List(i64) | ?*const List(String)`.
+                if (case_type_id != types_mod.TypeStore.UNKNOWN) {
+                    for (arm_slice) |arm| {
+                        if (arm.body.result_type == types_mod.TypeStore.UNKNOWN) {
+                            self.patchEmptyContainerTypes(arm.body, case_type_id);
+                        }
+                    }
+                }
                 return try self.create(Expr, .{
                     .kind = .{ .case = .{
                         .scrutinee = scrutinee,
-                        .arms = try arms.toOwnedSlice(self.allocator),
+                        .arms = arm_slice,
                     } },
-                    .type_id = types_mod.TypeStore.UNKNOWN,
+                    .type_id = case_type_id,
                     .span = ce.meta.span,
                 });
             },
@@ -3940,12 +4369,30 @@ pub const HirBuilder = struct {
                 });
             },
             .list_cons_expr => |lce| {
+                const head_expr = try self.buildExpr(lce.head);
+                const tail_expr = try self.buildExpr(lce.tail);
+                // Infer the cons cell's list type from the head's type
+                // when known. Without this, downstream IR/ZIR
+                // monomorphisation defaults the element type to i64,
+                // which breaks `[String | rest]` (and any other non-i64
+                // element) emitted by the for-comp desugarer.
+                const cons_type_id: types_mod.TypeId = blk: {
+                    if (head_expr.type_id != types_mod.TypeStore.UNKNOWN) {
+                        const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
+                        break :blk store_ptr.addType(.{ .list = .{ .element = head_expr.type_id } }) catch types_mod.TypeStore.UNKNOWN;
+                    }
+                    if (tail_expr.type_id != types_mod.TypeStore.UNKNOWN) {
+                        const tail_typ = self.type_store.getType(tail_expr.type_id);
+                        if (tail_typ == .list) break :blk tail_expr.type_id;
+                    }
+                    break :blk types_mod.TypeStore.UNKNOWN;
+                };
                 return try self.create(Expr, .{
                     .kind = .{ .list_cons = .{
-                        .head = try self.buildExpr(lce.head),
-                        .tail = try self.buildExpr(lce.tail),
+                        .head = head_expr,
+                        .tail = tail_expr,
                     } },
-                    .type_id = types_mod.TypeStore.UNKNOWN,
+                    .type_id = cons_type_id,
                     .span = lce.meta.span,
                 });
             },
@@ -3980,41 +4427,12 @@ pub const HirBuilder = struct {
                 // Pipe should be desugared before reaching HIR
                 unreachable;
             },
-            .range => |re| {
-                // Desugar range expression to %Range{start: ..., end: ..., step: ...}
-                const start_expr = try self.buildExpr(re.start);
-                const end_expr = try self.buildExpr(re.end);
-                const step_expr = if (re.step) |s|
-                    try self.buildExpr(s)
-                else
-                    try self.create(Expr, .{
-                        .kind = .{ .int_lit = 1 },
-                        .type_id = types_mod.TypeStore.I64,
-                        .span = re.meta.span,
-                    });
-
-                // Look up Range type
-                const range_name_id = @constCast(self.interner).intern("Range") catch unreachable;
-                const range_type_id = self.type_store.name_to_type.get(range_name_id) orelse types_mod.TypeStore.UNKNOWN;
-
-                // Intern field names
-                const start_name = @constCast(self.interner).intern("start") catch unreachable;
-                const end_name = @constCast(self.interner).intern("end") catch unreachable;
-                const step_name = @constCast(self.interner).intern("step") catch unreachable;
-
-                const fields = try self.allocator.alloc(StructFieldInit, 3);
-                fields[0] = .{ .name = start_name, .value = start_expr };
-                fields[1] = .{ .name = end_name, .value = end_expr };
-                fields[2] = .{ .name = step_name, .value = step_expr };
-
-                return try self.create(Expr, .{
-                    .kind = .{ .struct_init = .{
-                        .type_id = range_type_id,
-                        .fields = fields,
-                    } },
-                    .type_id = range_type_id,
-                    .span = re.meta.span,
-                });
+            .range => {
+                // Range is rewritten to a struct_expr by the desugarer
+                // (see desugar.zig). Reaching HIR with a raw `.range` means
+                // a code path bypassed desugaring — surface it loudly rather
+                // than silently re-desugaring here.
+                unreachable;
             },
             .struct_expr => |se| {
                 // Resolve struct type from module name (e.g., %Point{x: 1, y: 2})
@@ -4281,7 +4699,7 @@ pub const HirBuilder = struct {
         }
 
         // Build the error handler expression
-        const handler_expr = try self.buildErrorHandlerExpr(ep.handler, ep.meta);
+        const handler_lowering = try self.buildErrorHandlerExpr(ep.handler, ep.meta);
 
         // Result type is the last step's type (the catch basin handler
         // must return the same type for the expression to be well-typed).
@@ -4293,7 +4711,8 @@ pub const HirBuilder = struct {
         return try self.create(Expr, .{
             .kind = .{ .error_pipe = .{
                 .steps = try hir_steps.toOwnedSlice(self.allocator),
-                .handler = handler_expr,
+                .handler = handler_lowering.expr,
+                .err_local = handler_lowering.err_local,
             } },
             .type_id = result_type,
             .span = ep.meta.span,
@@ -4313,39 +4732,91 @@ pub const HirBuilder = struct {
         }
     }
 
+    const HandlerLowering = struct {
+        expr: *const Expr,
+        err_local: u32, // 0 → no `__err` allocation (function-style handler)
+    };
+
     /// Build an error handler HIR expression from an AST ErrorHandler.
-    fn buildErrorHandlerExpr(self: *HirBuilder, handler: ast.ErrorHandler, meta: ast.NodeMeta) !*const Expr {
+    /// For block handlers `~> { pattern -> body, ... }`, builds a case
+    /// expression that pattern-matches on a fresh `__err` local. The IR
+    /// populates that local with the failing pipe value before lowering
+    /// the handler. For function handlers `~> handler_fn(...)` the function
+    /// expression is returned directly with no `__err` allocation; the IR
+    /// passes the failing value as the function's first argument.
+    fn buildErrorHandlerExpr(self: *HirBuilder, handler: ast.ErrorHandler, meta: ast.NodeMeta) !HandlerLowering {
         switch (handler) {
             .block => |clauses| {
-                // Build a case expression: case __err { pattern -> body, ... }
-                // The scrutinee will be substituted by the IR builder
-                const interner_mut: *ast.StringInterner = @constCast(self.interner);
-                const err_name = interner_mut.intern("__err") catch unreachable;
-                const scrutinee = try self.create(Expr, .{
-                    .kind = .{ .local_get = 0 }, // placeholder, will be substituted
-                    .type_id = types_mod.TypeStore.UNKNOWN,
-                    .span = meta.span,
-                });
-                _ = scrutinee;
-                _ = err_name;
+                // Allocate a fresh local for `__err`. The IR sets this local
+                // to the failing pipe value before lowering the handler, so
+                // both pattern bindings and the synthesized var_ref to __err
+                // resolve to the same index.
+                const err_local = self.next_local;
+                self.next_local += 1;
 
-                // For now, build the handler bodies directly
-                // The block handler has case clauses; build the first body as fallback
-                if (clauses.len > 0) {
-                    const first_body = try self.buildBlock(clauses[0].body);
-                    if (first_body.stmts.len > 0) {
-                        const last = first_body.stmts[first_body.stmts.len - 1];
-                        if (last == .expr) return last.expr;
+                const interner_mut: *ast.StringInterner = @constCast(self.interner);
+                const err_name = try interner_mut.intern("__err");
+
+                // Make `__err` resolvable as a normal binding for the
+                // duration of the case build. Restored on exit so the
+                // surrounding scope sees no leaked binding.
+                try self.current_assignment_bindings.append(self.allocator, .{
+                    .name = err_name,
+                    .local_index = err_local,
+                    .type_id = types_mod.TypeStore.UNKNOWN,
+                });
+                const saved_bindings_len = self.current_assignment_bindings.items.len;
+                defer {
+                    if (self.current_assignment_bindings.items.len == saved_bindings_len) {
+                        _ = self.current_assignment_bindings.pop();
                     }
                 }
-                return try self.create(Expr, .{
-                    .kind = .nil_lit,
+
+                const scrutinee_expr = try self.create(Expr, .{
+                    .kind = .{ .local_get = err_local },
                     .type_id = types_mod.TypeStore.UNKNOWN,
                     .span = meta.span,
                 });
+
+                // Build case arms by reusing the regular case-expr binding/
+                // pattern machinery. Each arm gets its own binding state via
+                // save/restore so cross-arm leakage cannot occur.
+                var arms: std.ArrayList(CaseArm) = .empty;
+                for (clauses) |clause| {
+                    const saved_case_bindings = self.current_case_bindings;
+                    self.current_case_bindings = .empty;
+
+                    const pattern = try self.compilePattern(clause.pattern);
+                    if (pattern) |pat| {
+                        try self.collectCasePatternBindings(pat, true);
+                    }
+
+                    const guard_expr = if (clause.guard) |g| try self.buildExpr(g) else null;
+                    const body = try self.buildBlock(clause.body);
+                    const bindings = try self.current_case_bindings.toOwnedSlice(self.allocator);
+
+                    try arms.append(self.allocator, .{
+                        .pattern = pattern,
+                        .guard = guard_expr,
+                        .body = body,
+                        .bindings = bindings,
+                    });
+
+                    self.current_case_bindings = saved_case_bindings;
+                }
+
+                const case_expr = try self.create(Expr, .{
+                    .kind = .{ .case = .{
+                        .scrutinee = scrutinee_expr,
+                        .arms = try arms.toOwnedSlice(self.allocator),
+                    } },
+                    .type_id = types_mod.TypeStore.UNKNOWN,
+                    .span = meta.span,
+                });
+                return .{ .expr = case_expr, .err_local = err_local };
             },
             .function => |func| {
-                return try self.buildExpr(func);
+                return .{ .expr = try self.buildExpr(func), .err_local = 0 };
             },
         }
     }
@@ -4372,14 +4843,18 @@ pub const HirBuilder = struct {
                 // Built-in generic containers: `Map(K, V)` and `List(T)`
                 // map onto the dedicated TypeStore variants the rest of
                 // the pipeline already understands. Same shape that the
-                // existing `[T]` and `%{K=>V}` sigils produce.
+                // existing `[T]` and `%{K=>V}` sigils produce. The native
+                // type identity comes from the `@native_type` attribute
+                // on the corresponding stdlib struct (see ScopeGraph
+                // `NativeTypeKind`), so users can shadow `List`/`Map`
+                // safely without triggering compiler-special handling.
                 if (n.args.len > 0) {
-                    if (std.mem.eql(u8, name_str, "Map") and n.args.len == 2) {
+                    if (self.graph.isNativeTypeName(.map, n.name) and n.args.len == 2) {
                         const key_t = self.resolveTypeExpr(n.args[0]);
                         const value_t = self.resolveTypeExpr(n.args[1]);
                         return store_ptr.addType(.{ .map = .{ .key = key_t, .value = value_t } }) catch types_mod.TypeStore.UNKNOWN;
                     }
-                    if (std.mem.eql(u8, name_str, "List") and n.args.len == 1) {
+                    if (self.graph.isNativeTypeName(.list, n.name) and n.args.len == 1) {
                         const elem_t = self.resolveTypeExpr(n.args[0]);
                         return store_ptr.addType(.{ .list = .{ .element = elem_t } }) catch types_mod.TypeStore.UNKNOWN;
                     }
@@ -4532,8 +5007,6 @@ pub const HirBuilder = struct {
         return null;
     }
 
-    /// Check if a function (resolved by family ID) has a @native attribute.
-    /// Returns the native binding string (e.g., "ZestRuntime.fail") if found, null otherwise.
     /// Check if an import declaration makes a specific function name/arity available.
     fn importMatchesFunction(self: *const HirBuilder, imp: scope_mod.ImportedScope, name: ast.StringId, arity: u32) bool {
         switch (imp.filter) {
@@ -4594,17 +5067,8 @@ pub const HirBuilder = struct {
     }
 
     fn structNameToString(self: *const HirBuilder, name: ast.StructName) []const u8 {
-        // For single-part module names like "IO", just return the part
-        if (name.parts.len == 1) {
-            return self.interner.get(name.parts[0]);
-        }
-        // For multi-part names like "IO.File", join with "_"
-        var buf: std.ArrayList(u8) = .empty;
-        for (name.parts, 0..) |part, i| {
-            if (i > 0) buf.appendSlice(self.allocator, "_") catch return self.interner.get(name.parts[0]);
-            buf.appendSlice(self.allocator, self.interner.get(part)) catch return self.interner.get(name.parts[0]);
-        }
-        return buf.toOwnedSlice(self.allocator) catch return self.interner.get(name.parts[0]);
+        if (name.parts.len == 1) return self.interner.get(name.parts[0]);
+        return name.joinedWith(self.allocator, self.interner, "_") catch self.interner.get(name.parts[0]);
     }
 
     /// True iff `impl <protocol_simple> for <target_simple>` exists in the
@@ -4654,26 +5118,116 @@ pub const HirBuilder = struct {
         return target_module;
     }
 
-    /// Recursively collect bindings from tuple sub-patterns (including nested tuples).
-    fn collectTuplePatternBindings(self: *HirBuilder, sub_pats: []const *const MatchPattern) !void {
-        for (sub_pats, 0..) |sub_pat, elem_idx| {
-            switch (sub_pat.*) {
-                .bind => |name| {
-                    const local_idx = self.next_local;
-                    self.next_local += 1;
-                    try self.current_case_bindings.append(self.allocator, .{
-                        .name = name,
-                        .local_index = local_idx,
-                        .kind = .tuple_element,
-                        .element_index = @intCast(elem_idx),
-                    });
-                },
-                .tuple => |nested_pats| {
-                    // Recurse into nested tuples
-                    try self.collectTuplePatternBindings(nested_pats);
-                },
-                else => {},
+    /// Walk a block and stamp `expected_type` on any UNKNOWN-typed
+    /// empty container literals (currently `list_init []` and
+    /// `map_init {}`). Used by `case_expr` to propagate a unified arm
+    /// type back into siblings whose result is an empty literal — the
+    /// for-comprehension's `{:done, _, _} -> []` arm being the canonical
+    /// example. Mutates the block's HIR in place via @constCast; the
+    /// HIR allocator owns these expressions and they're not shared
+    /// across modules.
+    fn patchEmptyContainerTypes(self: *const HirBuilder, block: *const Block, expected_type: types_mod.TypeId) void {
+        for (block.stmts) |stmt| {
+            switch (stmt) {
+                .expr => |expr| self.patchEmptyContainerTypesExpr(expr, expected_type),
+                .local_set => |ls| self.patchEmptyContainerTypesExpr(ls.value, expected_type),
+                .function_group => {},
             }
+        }
+        if (block.result_type == types_mod.TypeStore.UNKNOWN) {
+            const mut: *Block = @constCast(block);
+            mut.result_type = expected_type;
+        }
+    }
+
+    fn patchEmptyContainerTypesExpr(self: *const HirBuilder, expr: *const Expr, expected_type: types_mod.TypeId) void {
+        const expected_kind = self.type_store.getType(expected_type);
+        switch (expr.kind) {
+            .list_init => |elems| {
+                if (elems.len == 0 and expr.type_id == types_mod.TypeStore.UNKNOWN and expected_kind == .list) {
+                    const mut: *Expr = @constCast(expr);
+                    mut.type_id = expected_type;
+                }
+            },
+            .map_init => |entries| {
+                if (entries.len == 0 and expr.type_id == types_mod.TypeStore.UNKNOWN and expected_kind == .map) {
+                    const mut: *Expr = @constCast(expr);
+                    mut.type_id = expected_type;
+                }
+            },
+            else => {},
+        }
+    }
+
+    /// Recursively collect case-arm bindings from a match pattern.
+    /// `is_top_level` distinguishes a top-level `name -> body` bind (kind=.scrutinee,
+    /// emitted by the success leaf) from binds nested inside a compound pattern
+    /// (kind=.extracted, emitted by a decision-tree `.bind` node).
+    fn collectCasePatternBindings(self: *HirBuilder, pat: *const MatchPattern, is_top_level: bool) !void {
+        switch (pat.*) {
+            .bind => |name| {
+                const name_str = self.interner.get(name);
+                // Skip user-intent discards (`_x`) but keep compiler-
+                // synthesised names (`__next_state`, `__err`, …) — those
+                // back generated bindings the IR's bind-decision-tree
+                // handler must resolve to extract decomposed values
+                // (e.g. the cont-arm tail in a for-comprehension).
+                if (ast.isDiscardBindName(name_str)) return;
+                const local_idx = self.next_local;
+                self.next_local += 1;
+                try self.current_case_bindings.append(self.allocator, .{
+                    .name = name,
+                    .local_index = local_idx,
+                    .kind = if (is_top_level) .scrutinee else .extracted,
+                    .element_index = 0,
+                });
+            },
+            .tuple => |sub_pats| {
+                for (sub_pats) |sub_pat| {
+                    try self.collectCasePatternBindings(sub_pat, false);
+                }
+            },
+            .list => |sub_pats| {
+                for (sub_pats) |sub_pat| {
+                    try self.collectCasePatternBindings(sub_pat, false);
+                }
+            },
+            .list_cons => |lc| {
+                for (lc.heads) |head_pat| {
+                    try self.collectCasePatternBindings(head_pat, false);
+                }
+                try self.collectCasePatternBindings(lc.tail, false);
+            },
+            .struct_match => |sm| {
+                for (sm.field_bindings) |field| {
+                    try self.collectCasePatternBindings(field.pattern, false);
+                }
+            },
+            .map_match => |mm| {
+                for (mm.field_bindings) |field| {
+                    try self.collectCasePatternBindings(field.pattern, false);
+                }
+            },
+            .binary_match => |bm| {
+                for (bm.segments, 0..) |seg, seg_idx| {
+                    if (seg.pattern) |sub_pat| {
+                        if (sub_pat.* != .bind) continue;
+                        const name_str = self.interner.get(sub_pat.bind);
+                        // Same discard convention as the case-pattern
+                        // collector — see `ast.isDiscardBindName`.
+                        if (ast.isDiscardBindName(name_str)) continue;
+                        const local_idx = self.next_local;
+                        self.next_local += 1;
+                        try self.current_case_bindings.append(self.allocator, .{
+                            .name = sub_pat.bind,
+                            .local_index = local_idx,
+                            .kind = .binary_element,
+                            .element_index = @intCast(seg_idx),
+                        });
+                    }
+                }
+            },
+            .wildcard, .literal, .pin => {},
         }
     }
 
@@ -4682,7 +5236,191 @@ pub const HirBuilder = struct {
         ptr.* = value;
         return ptr;
     }
+
+    /// Recursively destructure an assignment LHS pattern, emitting one
+    /// `local_set` per inner `bind` and registering each as an
+    /// `AssignmentBinding` for later var_ref resolution. The parent
+    /// compound value lives in `parent_local`; nested patterns reference
+    /// it via a `local_get` extractor.
+    fn lowerAssignmentDestructure(
+        self: *HirBuilder,
+        pat: *const ast.Pattern,
+        parent_local: u32,
+        parent_type: TypeId,
+        span: ast.SourceSpan,
+        out_stmts: *std.ArrayList(Stmt),
+    ) !void {
+        switch (pat.*) {
+            .wildcard, .literal => {},
+            .pin => {},
+            .paren => |inner| try self.lowerAssignmentDestructure(inner.inner, parent_local, parent_type, span, out_stmts),
+            .bind => |b| {
+                // A bind nested in a compound: alias the parent's local (no
+                // copy, no extraction). The parent extractor already produced
+                // a fresh local; the bind just gives it a name.
+                try self.current_assignment_bindings.append(self.allocator, .{
+                    .name = b.name,
+                    .local_index = parent_local,
+                    .type_id = parent_type,
+                });
+            },
+            .tuple => |tp| {
+                const parent_typ = self.type_store.getType(parent_type);
+                for (tp.elements, 0..) |sub_pat, idx| {
+                    if (sub_pat.* == .wildcard or sub_pat.* == .literal) continue;
+                    const elem_type = if (parent_typ == .tuple and idx < parent_typ.tuple.elements.len)
+                        parent_typ.tuple.elements[idx]
+                    else
+                        types_mod.TypeStore.UNKNOWN;
+                    const elem_local = try self.emitDestructureStep(.{ .tuple = .{
+                        .object = try self.create(Expr, .{ .kind = .{ .local_get = parent_local }, .type_id = parent_type, .span = span }),
+                        .index = @intCast(idx),
+                    } }, elem_type, span, out_stmts);
+                    try self.lowerAssignmentDestructure(sub_pat, elem_local, elem_type, span, out_stmts);
+                }
+            },
+            .list => |lp| {
+                const parent_typ = self.type_store.getType(parent_type);
+                const elem_type = if (parent_typ == .list) parent_typ.list.element else types_mod.TypeStore.UNKNOWN;
+                for (lp.elements, 0..) |sub_pat, idx| {
+                    if (sub_pat.* == .wildcard or sub_pat.* == .literal) continue;
+                    const elem_local = try self.emitDestructureStep(.{ .list_at = .{
+                        .list = try self.create(Expr, .{ .kind = .{ .local_get = parent_local }, .type_id = parent_type, .span = span }),
+                        .index = @intCast(idx),
+                    } }, elem_type, span, out_stmts);
+                    try self.lowerAssignmentDestructure(sub_pat, elem_local, elem_type, span, out_stmts);
+                }
+            },
+            .list_cons => |lc| {
+                const parent_typ = self.type_store.getType(parent_type);
+                const elem_type = if (parent_typ == .list) parent_typ.list.element else types_mod.TypeStore.UNKNOWN;
+                var current_list_local = parent_local;
+                var current_list_type = parent_type;
+                for (lc.heads) |head_pat| {
+                    if (!(head_pat.* == .wildcard or head_pat.* == .literal)) {
+                        const head_local = try self.emitDestructureStep(.{ .list_head = .{
+                            .list = try self.create(Expr, .{ .kind = .{ .local_get = current_list_local }, .type_id = current_list_type, .span = span }),
+                        } }, elem_type, span, out_stmts);
+                        try self.lowerAssignmentDestructure(head_pat, head_local, elem_type, span, out_stmts);
+                    }
+                    const tail_local = try self.emitDestructureStep(.{ .list_tail = .{
+                        .list = try self.create(Expr, .{ .kind = .{ .local_get = current_list_local }, .type_id = current_list_type, .span = span }),
+                    } }, parent_type, span, out_stmts);
+                    current_list_local = tail_local;
+                    current_list_type = parent_type;
+                }
+                if (!(lc.tail.* == .wildcard or lc.tail.* == .literal)) {
+                    try self.lowerAssignmentDestructure(lc.tail, current_list_local, current_list_type, span, out_stmts);
+                }
+            },
+            .struct_pattern => |sp| {
+                for (sp.fields) |field| {
+                    if (field.pattern.* == .wildcard or field.pattern.* == .literal) continue;
+                    const field_type = self.resolveStructFieldType(parent_type, field.name);
+                    const field_local = try self.emitDestructureStep(.{ .field = .{
+                        .object = try self.create(Expr, .{ .kind = .{ .local_get = parent_local }, .type_id = parent_type, .span = span }),
+                        .field = field.name,
+                    } }, field_type, span, out_stmts);
+                    try self.lowerAssignmentDestructure(field.pattern, field_local, field_type, span, out_stmts);
+                }
+            },
+            .map => |mp| {
+                const parent_typ = self.type_store.getType(parent_type);
+                const value_type = if (parent_typ == .map) parent_typ.map.value else types_mod.TypeStore.UNKNOWN;
+                for (mp.fields) |field| {
+                    if (field.value.* == .wildcard or field.value.* == .literal) continue;
+                    const key_expr = try self.buildExpr(field.key);
+                    const value_local = try self.emitDestructureStep(.{ .map_at = .{
+                        .map = try self.create(Expr, .{ .kind = .{ .local_get = parent_local }, .type_id = parent_type, .span = span }),
+                        .key = key_expr,
+                    } }, value_type, span, out_stmts);
+                    try self.lowerAssignmentDestructure(field.value, value_local, value_type, span, out_stmts);
+                }
+            },
+            .binary => {
+                // Binary patterns on assignment LHS are uncommon. Treat as a
+                // no-op for now — when this becomes a real use case, build a
+                // case expression via the binary segment extractor.
+            },
+        }
+    }
+
+    const DestructureStep = union(enum) {
+        tuple: TupleIndexGetExpr,
+        list_at: ListIndexGetExpr,
+        list_head: ListHeadGetExpr,
+        list_tail: ListTailGetExpr,
+        field: FieldGetExpr,
+        map_at: MapValueGetExpr,
+    };
+
+    fn emitDestructureStep(
+        self: *HirBuilder,
+        step: DestructureStep,
+        elem_type: TypeId,
+        span: ast.SourceSpan,
+        out_stmts: *std.ArrayList(Stmt),
+    ) !u32 {
+        const dest_local = self.next_local;
+        self.next_local += 1;
+        const expr_kind: ExprKind = switch (step) {
+            .tuple => |s| .{ .tuple_index_get = s },
+            .list_at => |s| .{ .list_index_get = s },
+            .list_head => |s| .{ .list_head_get = s },
+            .list_tail => |s| .{ .list_tail_get = s },
+            .field => |s| .{ .field_get = s },
+            .map_at => |s| .{ .map_value_get = s },
+        };
+        const value_expr = try self.create(Expr, .{
+            .kind = expr_kind,
+            .type_id = elem_type,
+            .span = span,
+        });
+        try out_stmts.append(self.allocator, .{
+            .local_set = .{ .index = dest_local, .value = value_expr },
+        });
+        return dest_local;
+    }
+
+    fn resolveStructFieldType(self: *const HirBuilder, struct_type: TypeId, field_name: ast.StringId) TypeId {
+        const typ = self.type_store.getType(struct_type);
+        if (typ != .struct_type) return types_mod.TypeStore.UNKNOWN;
+        for (typ.struct_type.fields) |f| {
+            if (f.name == field_name) return f.type_id;
+        }
+        return types_mod.TypeStore.UNKNOWN;
+    }
 };
+
+/// Encode a TypeId into the short token used by ZIR's typed-builtin
+/// dispatch (matches `ir.zigTypeToEncodedName`). Used to materialize
+/// `:zig.List.fn` calls into `List:Elem.fn` so the runtime container
+/// instantiates with the right element type.
+fn encodeContainerElemName(store: *const types_mod.TypeStore, type_id: types_mod.TypeId) []const u8 {
+    if (type_id == types_mod.TypeStore.UNKNOWN) return "i64";
+    const t = store.getType(type_id);
+    return switch (t) {
+        .int => |i| switch (i.bits) {
+            8 => if (i.signedness == .signed) "i8" else "u8",
+            16 => if (i.signedness == .signed) "i16" else "u16",
+            32 => if (i.signedness == .signed) "i32" else "u32",
+            64 => if (i.signedness == .signed) "i64" else "u64",
+            else => "i64",
+        },
+        .float => |f| switch (f.bits) {
+            16 => "f16",
+            32 => "f32",
+            64 => "f64",
+            else => "f64",
+        },
+        .bool_type => "bool",
+        .string_type => "str",
+        .atom_type => "u32",
+        .struct_type => |s| store.interner.get(s.name),
+        .tagged_union => |tu| store.interner.get(tu.name),
+        else => "i64",
+    };
+}
 
 // Standard library resolution removed — IO, Kernel, etc. are now
 // real Zap modules defined in lib/ and compiled with the program.
@@ -4966,7 +5704,7 @@ test "HIR call args adopt function ownership modes" {
     try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
 
     const apply_clause = program.structs[0].items[0].function.clauses[0];
-    const clause_scope = collector.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(apply_clause.meta.span)) orelse apply_clause.meta.scope_id;
+    const clause_scope = collector.graph.resolveClauseScope(apply_clause.meta) orelse apply_clause.meta.scope_id;
     const f_binding = collector.graph.resolveBinding(clause_scope, apply_clause.params[0].pattern.bind.name).?;
     const f_type_id = collector.graph.bindings.items[f_binding].type_id.?.type_id;
     const original_fn_type = checker.store.types.items[f_type_id].function;
@@ -5063,7 +5801,7 @@ test "HIR closure calls adopt borrowed ownership mode" {
     try checker.checkProgram(&program);
 
     const apply_clause = program.structs[0].items[0].function.clauses[0];
-    const clause_scope = collector.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(apply_clause.meta.span)) orelse apply_clause.meta.scope_id;
+    const clause_scope = collector.graph.resolveClauseScope(apply_clause.meta) orelse apply_clause.meta.scope_id;
     const f_binding = collector.graph.resolveBinding(clause_scope, apply_clause.params[0].pattern.bind.name).?;
     const f_type_id = collector.graph.bindings.items[f_binding].type_id.?.type_id;
     const original_fn_type = checker.store.types.items[f_type_id].function;

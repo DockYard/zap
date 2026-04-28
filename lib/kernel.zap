@@ -245,19 +245,21 @@ pub struct Kernel {
   }
 
   @doc = """
-    String concatenation operator.
-
-    Lowers to the runtime bump-allocator concat. A local `pub fn <>` (or
-    `pub macro <>`) in the call-site module shadows this default, so users
-    can override `<>` for their own types.
+    Concatenation operator. Dispatches through the `Concatenable`
+    protocol — any type implementing `Concatenable.concat/2` (built-in:
+    `String`, `List`, `Map`) supports `<>`. A local `pub fn <>` (or
+    `pub macro <>`) in the call-site module still shadows this default,
+    so users can override `<>` for their own types directly.
 
     ## Examples
 
-        "hello, " <> "world"   # => "hello, world"
+        "hello, " <> "world"   # String
+        [1, 2] <> [3, 4]       # List
+        %{a: 1} <> %{b: 2}     # Map
     """
 
   pub macro <>(left :: Expr, right :: Expr) -> Expr {
-    quote { :zig.String.concat(unquote(left), unquote(right)) }
+    quote { Concatenable.concat(unquote(left), unquote(right)) }
   }
 
   @doc = """
@@ -400,6 +402,23 @@ pub struct Kernel {
 
   pub fn to_string(value :: any) -> String {
     :zig.Kernel.to_string(value)
+  }
+
+  @fndoc = """
+    Print a value's string representation to stdout, followed by a newline.
+
+    Equivalent to `IO.puts(Kernel.to_string(value))`. Useful for quick
+    debugging or examples that need a value rendered.
+
+    ## Examples
+
+        Kernel.inspect(42)       # prints "42\\n"
+        Kernel.inspect(true)     # prints "true\\n"
+        Kernel.inspect(:hello)   # prints "hello\\n"
+    """
+
+  pub fn inspect(value :: any) -> String {
+    IO.puts(to_string(value))
   }
 
 }

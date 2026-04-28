@@ -1202,8 +1202,7 @@ const testing = std.testing;
 
 // -- Test helpers --
 
-fn makeTestProgram(allocator: std.mem.Allocator, functions: []const ir.Function) !ir.Program {
-    _ = allocator;
+fn makeTestProgram(functions: []const ir.Function) !ir.Program {
     return ir.Program{
         .functions = functions,
         .type_defs = &.{},
@@ -1278,7 +1277,7 @@ test "struct deconstruction + same-type construction yields reuse pair" {
     };
     const blocks = [_]ir.Block{makeBlock(0, &block_instrs)};
     const functions = [_]ir.Function{makeFunction(0, "transform", &blocks)};
-    var program = try makeTestProgram(allocator, &functions);
+    var program = try makeTestProgram(&functions);
     _ = &program;
 
     var analyzer = PerceusAnalyzer.init(allocator, &program);
@@ -1337,7 +1336,7 @@ test "tuple deconstruction + same-arity construction yields reuse pair" {
     };
     const blocks = [_]ir.Block{makeBlock(0, &block_instrs)};
     const functions = [_]ir.Function{makeFunction(0, "transform_tuple", &blocks)};
-    var program = try makeTestProgram(allocator, &functions);
+    var program = try makeTestProgram(&functions);
     _ = &program;
 
     var analyzer = PerceusAnalyzer.init(allocator, &program);
@@ -1368,7 +1367,7 @@ test "nested case pre-instructions tuple reconstruction yields reuse pair" {
     };
     const blocks = [_]ir.Block{makeBlock(0, &block_instrs)};
     const functions = [_]ir.Function{makeFunction(0, "transform_tuple_nested", &blocks)};
-    var program = try makeTestProgram(allocator, &functions);
+    var program = try makeTestProgram(&functions);
     _ = &program;
 
     var analyzer = PerceusAnalyzer.init(allocator, &program);
@@ -1418,7 +1417,7 @@ test "source-like tuple case pre-instructions yield reuse pair" {
     };
     const blocks = [_]ir.Block{makeBlock(0, &block_instrs)};
     const functions = [_]ir.Function{makeFunction(0, "source_like_case", &blocks)};
-    var program = try makeTestProgram(allocator, &functions);
+    var program = try makeTestProgram(&functions);
     _ = &program;
 
     var analyzer = PerceusAnalyzer.init(allocator, &program);
@@ -1467,7 +1466,7 @@ test "observed source-lowered tuple case pre-instructions yield reuse pair" {
     };
     const blocks = [_]ir.Block{makeBlock(0, &block_instrs)};
     const functions = [_]ir.Function{makeFunction(0, "observed_source_case", &blocks)};
-    var program = try makeTestProgram(allocator, &functions);
+    var program = try makeTestProgram(&functions);
     _ = &program;
 
     var analyzer = PerceusAnalyzer.init(allocator, &program);
@@ -1521,7 +1520,7 @@ test "different types yield no reuse pair" {
     };
     const blocks = [_]ir.Block{makeBlock(0, &block_instrs)};
     const functions = [_]ir.Function{makeFunction(0, "mismatch", &blocks)};
-    var program = try makeTestProgram(allocator, &functions);
+    var program = try makeTestProgram(&functions);
     _ = &program;
 
     var analyzer = PerceusAnalyzer.init(allocator, &program);
@@ -1577,7 +1576,7 @@ test "unique ownership yields static_reuse" {
     };
     const blocks = [_]ir.Block{makeBlock(0, &block_instrs)};
     const functions = [_]ir.Function{makeFunction(0, "map_tree", &blocks)};
-    var program = try makeTestProgram(allocator, &functions);
+    var program = try makeTestProgram(&functions);
     _ = &program;
 
     // Set up escape analysis context marking scrutinee as local (non-escaping -> unique)
@@ -1639,7 +1638,7 @@ test "shared ownership yields dynamic_reuse" {
     };
     const blocks = [_]ir.Block{makeBlock(0, &block_instrs)};
     const functions = [_]ir.Function{makeFunction(0, "map_shared", &blocks)};
-    var program = try makeTestProgram(allocator, &functions);
+    var program = try makeTestProgram(&functions);
     _ = &program;
 
     // Mark scrutinee as escaping -> shared ownership
@@ -1710,7 +1709,7 @@ test "multiple branches with reuse in one branch" {
     };
     const blocks = [_]ir.Block{makeBlock(0, &block_instrs)};
     const functions = [_]ir.Function{makeFunction(0, "multi_branch", &blocks)};
-    var program = try makeTestProgram(allocator, &functions);
+    var program = try makeTestProgram(&functions);
     _ = &program;
 
     var analyzer = PerceusAnalyzer.init(allocator, &program);
@@ -1774,7 +1773,7 @@ test "drop specialization generates per-field drops" {
     };
     const blocks = [_]ir.Block{makeBlock(0, &block_instrs)};
     const functions = [_]ir.Function{makeFunction(0, "swap_pair", &blocks)};
-    var program = try makeTestProgram(allocator, &functions);
+    var program = try makeTestProgram(&functions);
     _ = &program;
 
     var analyzer = PerceusAnalyzer.init(allocator, &program);
@@ -1841,7 +1840,7 @@ test "no compatible construction yields no reuse pair" {
     };
     const blocks = [_]ir.Block{makeBlock(0, &block_instrs)};
     const functions = [_]ir.Function{makeFunction(0, "no_construction", &blocks)};
-    var program = try makeTestProgram(allocator, &functions);
+    var program = try makeTestProgram(&functions);
     _ = &program;
 
     var analyzer = PerceusAnalyzer.init(allocator, &program);
@@ -1924,7 +1923,7 @@ test "nested pattern matching finds inner reuse" {
     };
     const blocks = [_]ir.Block{makeBlock(0, &block_instrs)};
     const functions = [_]ir.Function{makeFunction(0, "nested_match", &blocks)};
-    var program = try makeTestProgram(allocator, &functions);
+    var program = try makeTestProgram(&functions);
     _ = &program;
 
     var analyzer = PerceusAnalyzer.init(allocator, &program);
@@ -1991,7 +1990,7 @@ test "construction with same-name struct always reuses regardless of field count
     };
     const blocks = [_]ir.Block{makeBlock(0, &block_instrs)};
     const functions = [_]ir.Function{makeFunction(0, "field_count_test", &blocks)};
-    var program = try makeTestProgram(allocator, &functions);
+    var program = try makeTestProgram(&functions);
     _ = &program;
 
     var analyzer = PerceusAnalyzer.init(allocator, &program);
@@ -2043,7 +2042,7 @@ test "list deconstruction + list construction yields reuse pair (FBIP)" {
     };
     const blocks = [_]ir.Block{makeBlock(0, &block_instrs)};
     const functions = [_]ir.Function{makeFunction(0, "map_list", &blocks)};
-    var program = try makeTestProgram(allocator, &functions);
+    var program = try makeTestProgram(&functions);
     _ = &program;
 
     var analyzer = PerceusAnalyzer.init(allocator, &program);
@@ -2151,7 +2150,7 @@ test "reuse pair generates reset and reuse_alloc ARC operations" {
     };
     const blocks = [_]ir.Block{makeBlock(0, &block_instrs)};
     const functions = [_]ir.Function{makeFunction(0, "arc_ops_test", &blocks)};
-    var program = try makeTestProgram(allocator, &functions);
+    var program = try makeTestProgram(&functions);
     _ = &program;
 
     var analyzer = PerceusAnalyzer.init(allocator, &program);
@@ -2229,7 +2228,7 @@ test "function statistics are correctly computed" {
     };
     const blocks = [_]ir.Block{makeBlock(0, &block_instrs)};
     const functions = [_]ir.Function{makeFunction(0, "stats_test", &blocks)};
-    var program = try makeTestProgram(allocator, &functions);
+    var program = try makeTestProgram(&functions);
     _ = &program;
 
     var analyzer = PerceusAnalyzer.init(allocator, &program);
@@ -2256,7 +2255,7 @@ test "empty function produces no results" {
     const allocator = testing.allocator;
 
     const functions = [_]ir.Function{makeFunction(0, "empty", &.{})};
-    var program = try makeTestProgram(allocator, &functions);
+    var program = try makeTestProgram(&functions);
     _ = &program;
 
     var analyzer = PerceusAnalyzer.init(allocator, &program);
@@ -2290,7 +2289,7 @@ test "union deconstruction + same-union construction yields reuse pair" {
     };
     const blocks = [_]ir.Block{makeBlock(0, &block_instrs)};
     const functions = [_]ir.Function{makeFunction(0, "union_match", &blocks)};
-    var program = try makeTestProgram(allocator, &functions);
+    var program = try makeTestProgram(&functions);
     _ = &program;
 
     var analyzer = PerceusAnalyzer.init(allocator, &program);

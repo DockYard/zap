@@ -433,19 +433,31 @@ const MonomorphContext = struct {
                             }
                         }
                     }
-                    // Empty list default
+                    // Empty container literal: adopt the parameter's container
+                    // type so the call specializes the right way. The previous
+                    // code defaulted to `[i64]` / `Map(Atom,i64)` regardless of
+                    // the parameter, which silently picked the wrong overload
+                    // (e.g. `[]` passed to `[String]` specialized as `[i64]`).
+                    // We only do this when the parameter is fully concrete; if
+                    // it still has type variables (generic context), let the
+                    // unifier handle it.
                     if (arg_type == types_mod.TypeStore.UNKNOWN) {
                         const param_typ = self.store.getType(param.type_id);
-                        if (std.meta.activeTag(param_typ) == .list) {
-                            if (arg.expr.kind == .list_init) {
-                                arg_type = self.store.addType(.{ .list = .{ .element = types_mod.TypeStore.I64 } }) catch types_mod.TypeStore.UNKNOWN;
-                            }
-                        }
-                        // Empty map default
-                        if (std.meta.activeTag(param_typ) == .map) {
-                            if (arg.expr.kind == .map_init) {
-                                arg_type = self.store.addType(.{ .map = .{ .key = types_mod.TypeStore.ATOM, .value = types_mod.TypeStore.I64 } }) catch types_mod.TypeStore.UNKNOWN;
-                            }
+                        switch (param_typ) {
+                            .list => |list_t| {
+                                if (arg.expr.kind == .list_init and !self.store.containsTypeVars(list_t.element)) {
+                                    arg_type = param.type_id;
+                                }
+                            },
+                            .map => |map_t| {
+                                if (arg.expr.kind == .map_init and
+                                    !self.store.containsTypeVars(map_t.key) and
+                                    !self.store.containsTypeVars(map_t.value))
+                                {
+                                    arg_type = param.type_id;
+                                }
+                            },
+                            else => {},
                         }
                     }
                     if (arg_type == types_mod.TypeStore.UNKNOWN or arg_type == types_mod.TypeStore.ERROR) continue;
@@ -560,6 +572,14 @@ const MonomorphContext = struct {
                 }
             },
             .field_get => |fg| try self.scanExpr(fg.object),
+            .tuple_index_get => |tig| try self.scanExpr(tig.object),
+            .list_index_get => |lig| try self.scanExpr(lig.list),
+            .list_head_get => |lhg| try self.scanExpr(lhg.list),
+            .list_tail_get => |ltg| try self.scanExpr(ltg.list),
+            .map_value_get => |mvg| {
+                try self.scanExpr(mvg.map);
+                try self.scanExpr(mvg.key);
+            },
             .branch => |br| {
                 try self.scanExpr(br.condition);
                 try self.scanBlock(br.then_block);
@@ -780,6 +800,24 @@ const MonomorphContext = struct {
                 .object = try self.cloneExpr(fg.object),
                 .field = fg.field,
             } },
+            .tuple_index_get => |tig| .{ .tuple_index_get = .{
+                .object = try self.cloneExpr(tig.object),
+                .index = tig.index,
+            } },
+            .list_index_get => |lig| .{ .list_index_get = .{
+                .list = try self.cloneExpr(lig.list),
+                .index = lig.index,
+            } },
+            .list_head_get => |lhg| .{ .list_head_get = .{
+                .list = try self.cloneExpr(lhg.list),
+            } },
+            .list_tail_get => |ltg| .{ .list_tail_get = .{
+                .list = try self.cloneExpr(ltg.list),
+            } },
+            .map_value_get => |mvg| .{ .map_value_get = .{
+                .map = try self.cloneExpr(mvg.map),
+                .key = try self.cloneExpr(mvg.key),
+            } },
             .branch => |br| .{ .branch = .{
                 .condition = try self.cloneExpr(br.condition),
                 .then_block = try self.cloneBlock(br.then_block),
@@ -913,6 +951,18 @@ const MonomorphContext = struct {
                 .local_index = b.local_index,
                 .source = try self.cloneExpr(b.source),
                 .next = try self.cloneDecision(b.next),
+            } },
+            .extract_struct => |es| .{ .extract_struct = .{
+                .scrutinee = try self.cloneExpr(es.scrutinee),
+                .fields = es.fields,
+                .success = try self.cloneDecision(es.success),
+                .failure = try self.cloneDecision(es.failure),
+            } },
+            .extract_map => |em| .{ .extract_map = .{
+                .scrutinee = try self.cloneExpr(em.scrutinee),
+                .keys = em.keys,
+                .success = try self.cloneDecision(em.success),
+                .failure = try self.cloneDecision(em.failure),
             } },
         };
         return result;

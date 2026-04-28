@@ -23,7 +23,7 @@ pub struct Path {
     """
 
   pub fn join(left :: String, right :: String) -> String {
-    :zig.Prelude.path_join(left, right)
+    :zig.Path.join(left, right)
   }
 
   @doc = """
@@ -36,7 +36,7 @@ pub struct Path {
     """
 
   pub fn basename(path :: String) -> String {
-    :zig.Prelude.path_basename(path)
+    :zig.Path.basename(path)
   }
 
   @doc = """
@@ -49,7 +49,7 @@ pub struct Path {
     """
 
   pub fn dirname(path :: String) -> String {
-    :zig.Prelude.path_dirname(path)
+    :zig.Path.dirname(path)
   }
 
   @doc = """
@@ -62,6 +62,6 @@ pub struct Path {
     """
 
   pub fn extname(path :: String) -> String {
-    :zig.Prelude.path_extname(path)
+    :zig.Path.extname(path)
   }
 }

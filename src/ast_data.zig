@@ -1989,7 +1989,7 @@ pub fn functionDeclToCtValue(
             try kw_elems.append(alloc, try makeKeywordPair(alloc, store, "return", try typeExprToCtValue(alloc, interner, store, rt)));
         }
 
-        // Body (optional — @native functions have no body)
+        // Body (optional — protocol signatures and forward declarations have no body)
         if (clause.body) |body_stmts| {
             var body_vals : std.ArrayListUnmanaged(CtValue) = .empty;
             for (body_stmts) |stmt| {

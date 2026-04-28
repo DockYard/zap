@@ -12,6 +12,8 @@
       String.slice("hello", 0, 3)         # => "hel"
   """
 
+@native_type = "string"
+
 pub struct String {
   @doc = """
     Returns the byte length of a string.

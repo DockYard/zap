@@ -807,221 +807,61 @@ pub const SubstitutionMap = struct {
 };
 
 // ============================================================
-// Monomorphization registry
-// ============================================================
 
-pub const InstantiationKey = struct {
-    family_id: u32, // FunctionFamilyId from scope graph
-    type_args: []const TypeId, // Concrete types substituted for type vars
-};
+/// Apply the same Zig-identifier mangling that `ir.mangleSymbolForZig` uses.
+/// Kept here (rather than imported) to avoid cyclic dep between types.zig
+/// and ir.zig — the type checker queries the analysis IR by name, so it
+/// needs to reproduce the same mangling at lookup time.
+fn mangleNameForIr(allocator: std.mem.Allocator, name: []const u8) ?[]u8 {
+    if (name.len == 0) return allocator.dupe(u8, name) catch null;
+    var needs_mangle = false;
+    for (name) |c| {
+        switch (c) {
+            'a'...'z', 'A'...'Z', '0'...'9', '_', '?', '!' => {},
+            else => {
+                needs_mangle = true;
+                break;
+            },
+        }
+    }
+    if (!needs_mangle) return allocator.dupe(u8, name) catch null;
 
-pub const MonomorphRegistry = struct {
-    allocator: std.mem.Allocator,
-    /// All recorded instantiations, in order of discovery.
-    instantiations: std.ArrayList(Instantiation),
-    /// Deduplication set: maps hash of (family_id, type_args) to index in instantiations.
-    seen: std.AutoHashMap(u64, u32),
-
-    pub const Instantiation = struct {
-        family_id: u32,
-        type_args: []const TypeId,
-        /// Substitution map for this instantiation (type var → concrete type).
-        substitutions: []const TypeVarBinding,
-        /// Mangled name suffix for the specialized function (e.g., "_i64_String").
-        name_suffix: []const u8,
-    };
-
-    pub const TypeVarBinding = struct {
-        var_id: TypeVarId,
-        concrete_type: TypeId,
-    };
-
-    pub fn init(allocator: std.mem.Allocator) MonomorphRegistry {
-        return .{
-            .allocator = allocator,
-            .instantiations = .empty,
-            .seen = std.AutoHashMap(u64, u32).init(allocator),
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+    for (name) |c| {
+        const piece: []const u8 = switch (c) {
+            'a'...'z', 'A'...'Z', '0'...'9', '_', '?', '!' => &.{c},
+            '+' => "_plus",
+            '-' => "_minus",
+            '*' => "_star",
+            '/' => "_slash",
+            '<' => "_lt",
+            '>' => "_gt",
+            '=' => "_eq",
+            '|' => "_pipe",
+            '&' => "_amp",
+            '^' => "_caret",
+            '~' => "_tilde",
+            '%' => "_pct",
+            '@' => "_at",
+            '#' => "_hash",
+            '$' => "_dollar",
+            '.' => "_dot",
+            ':' => "_colon",
+            else => "_x",
         };
+        buf.appendSlice(allocator, piece) catch return null;
     }
+    return buf.toOwnedSlice(allocator) catch null;
+}
 
-    pub fn deinit(self: *MonomorphRegistry) void {
-        // Free owned slices within each instantiation
-        for (self.instantiations.items) |inst| {
-            self.allocator.free(inst.type_args);
-            self.allocator.free(inst.substitutions);
-            self.allocator.free(inst.name_suffix);
-        }
-        self.instantiations.deinit(self.allocator);
-        self.seen.deinit();
-    }
-
-    /// Compute a combined hash from a family_id and a slice of type argument IDs.
-    /// Uses Wyhash for consistency with the rest of the codebase.
-    fn hashInstantiationKey(family_id: u32, type_args: []const TypeId) u64 {
-        var hasher = std.hash.Wyhash.init(0);
-        hasher.update(std.mem.asBytes(&family_id));
-        for (type_args) |type_arg| {
-            hasher.update(std.mem.asBytes(&type_arg));
-        }
-        return hasher.final();
-    }
-
-    /// Record a generic function instantiation. Returns the index of the
-    /// instantiation — either newly created or the existing one if these
-    /// exact type arguments were already recorded for this family.
-    pub fn recordInstantiation(
-        self: *MonomorphRegistry,
-        family_id: u32,
-        type_args: []const TypeId,
-        substitutions: []const TypeVarBinding,
-        type_store: *const TypeStore,
-    ) !u32 {
-        const key_hash = hashInstantiationKey(family_id, type_args);
-
-        // Check for existing instantiation with the same hash
-        if (self.seen.get(key_hash)) |existing_index| {
-            // Verify it is a true match (not just a hash collision)
-            const existing = self.instantiations.items[existing_index];
-            if (existing.family_id == family_id and std.mem.eql(TypeId, existing.type_args, type_args)) {
-                return existing_index;
-            }
-            // Hash collision with different key — fall through and add a new entry.
-            // In practice collisions are extremely rare with Wyhash over small keys.
-        }
-
-        // Make owned copies of the input slices so the registry owns the data
-        const owned_type_args = try self.allocator.dupe(TypeId, type_args);
-        errdefer self.allocator.free(owned_type_args);
-
-        const owned_substitutions = try self.allocator.dupe(TypeVarBinding, substitutions);
-        errdefer self.allocator.free(owned_substitutions);
-
-        const name_suffix = try self.generateNameSuffix(type_args, type_store);
-        errdefer self.allocator.free(name_suffix);
-
-        const index: u32 = @intCast(self.instantiations.items.len);
-        try self.instantiations.append(self.allocator, .{
-            .family_id = family_id,
-            .type_args = owned_type_args,
-            .substitutions = owned_substitutions,
-            .name_suffix = name_suffix,
-        });
-
-        try self.seen.put(key_hash, index);
-        return index;
-    }
-
-    /// Produce a readable mangled suffix from a slice of concrete type IDs.
-    /// For example, [I64, STRING] produces "_i64_String".
-    pub fn generateNameSuffix(
-        self: *MonomorphRegistry,
-        type_args: []const TypeId,
-        type_store: *const TypeStore,
-    ) ![]const u8 {
-        var buf: std.ArrayList(u8) = .empty;
-        errdefer buf.deinit(self.allocator);
-
-        for (type_args) |type_arg| {
-            try buf.append(self.allocator, '_');
-            const name = typeIdToMangledName(type_arg, type_store, self.allocator);
-            try buf.appendSlice(self.allocator, name);
-        }
-
-        return try buf.toOwnedSlice(self.allocator);
-    }
-
-    /// Convert a single TypeId to a short, readable name for mangling purposes.
-    fn typeIdToMangledName(type_id: TypeId, type_store: *const TypeStore, allocator: std.mem.Allocator) []const u8 {
-        // Well-known primitive types
-        if (type_id == TypeStore.BOOL) return "Bool";
-        if (type_id == TypeStore.STRING) return "String";
-        if (type_id == TypeStore.ATOM) return "Atom";
-        if (type_id == TypeStore.NIL) return "Nil";
-        if (type_id == TypeStore.NEVER) return "Never";
-        if (type_id == TypeStore.I64) return "i64";
-        if (type_id == TypeStore.I32) return "i32";
-        if (type_id == TypeStore.I16) return "i16";
-        if (type_id == TypeStore.I8) return "i8";
-        if (type_id == TypeStore.U64) return "u64";
-        if (type_id == TypeStore.U32) return "u32";
-        if (type_id == TypeStore.U16) return "u16";
-        if (type_id == TypeStore.U8) return "u8";
-        if (type_id == TypeStore.F64) return "f64";
-        if (type_id == TypeStore.F32) return "f32";
-        if (type_id == TypeStore.F16) return "f16";
-        if (type_id == TypeStore.USIZE) return "usize";
-        if (type_id == TypeStore.ISIZE) return "isize";
-        if (type_id == TypeStore.UNKNOWN) return "any";
-        if (type_id == TypeStore.ERROR) return "error";
-
-        // Compound / user-defined types
-        if (type_id < type_store.types.items.len) {
-            const typ = type_store.types.items[type_id];
-            switch (typ) {
-                .list => |list_type| {
-                    const element_name = typeIdToMangledName(list_type.element, type_store, allocator);
-                    return std.fmt.allocPrint(allocator, "list_{s}", .{element_name}) catch "list";
-                },
-                .tuple => |tuple_type| {
-                    var buf: std.ArrayList(u8) = .empty;
-                    buf.appendSlice(allocator, "tuple") catch return "tuple";
-                    for (tuple_type.elements) |element| {
-                        buf.append(allocator, '_') catch return "tuple";
-                        const element_name = typeIdToMangledName(element, type_store, allocator);
-                        buf.appendSlice(allocator, element_name) catch return "tuple";
-                    }
-                    return buf.toOwnedSlice(allocator) catch "tuple";
-                },
-                .function => |function_type| {
-                    var buf: std.ArrayList(u8) = .empty;
-                    buf.appendSlice(allocator, "fn") catch return "fn";
-                    for (function_type.params) |param| {
-                        buf.append(allocator, '_') catch return "fn";
-                        const param_name = typeIdToMangledName(param, type_store, allocator);
-                        buf.appendSlice(allocator, param_name) catch return "fn";
-                    }
-                    buf.append(allocator, '_') catch return "fn";
-                    const return_name = typeIdToMangledName(function_type.return_type, type_store, allocator);
-                    buf.appendSlice(allocator, return_name) catch return "fn";
-                    return buf.toOwnedSlice(allocator) catch "fn";
-                },
-                .map => |map_type| {
-                    const key_name = typeIdToMangledName(map_type.key, type_store, allocator);
-                    const value_name = typeIdToMangledName(map_type.value, type_store, allocator);
-                    return std.fmt.allocPrint(allocator, "map_{s}_{s}", .{ key_name, value_name }) catch "map";
-                },
-                .struct_type => |st| return type_store.interner.get(st.name),
-                .tagged_union => |tu| return type_store.interner.get(tu.name),
-                else => return "any",
-            }
-        }
-
-        return "any";
-    }
-
-    /// Get all instantiations for a given family_id.
-    /// Returns a (possibly empty) slice by scanning the instantiation list.
-    pub fn getInstantiationsForFamily(self: *const MonomorphRegistry, family_id: u32) []const Instantiation {
-        // Find the contiguous range. Because instantiations are appended in
-        // discovery order (not grouped by family), we must collect matching
-        // entries. We use the backing allocator to build a temporary slice.
-        var count: u32 = 0;
-        for (self.instantiations.items) |inst| {
-            if (inst.family_id == family_id) count += 1;
-        }
-        if (count == 0) return &.{};
-
-        const result = self.allocator.alloc(Instantiation, count) catch return &.{};
-        var write_index: u32 = 0;
-        for (self.instantiations.items) |inst| {
-            if (inst.family_id == family_id) {
-                result[write_index] = inst;
-                write_index += 1;
-            }
-        }
-        return result;
-    }
-};
+/// Join a multi-segment struct name with `_` (single underscore), matching
+/// `IrBuilder.structNameToPrefix`. Returns `null` only on allocation failure.
+fn joinStructNameWithUnderscore(allocator: std.mem.Allocator, interner: *const ast.StringInterner, name: ast.StructName) ?[]u8 {
+    if (name.parts.len == 0) return null;
+    const joined = name.joinedWith(allocator, interner, "_") catch return null;
+    return @constCast(joined);
+}
 
 // ============================================================
 // Type checker
@@ -1050,8 +890,6 @@ pub const TypeChecker = struct {
     analysis_context: ?*const escape_lattice.AnalysisContext,
     analysis_program: ?*const ir.Program,
 
-    // Monomorphization registry: collects generic function instantiations during type checking
-    morph_registry: MonomorphRegistry,
 
     /// Maps type variable names to TypeIds within the current function scope.
     /// Reset at the start of each function clause check so that `a` in
@@ -1095,7 +933,6 @@ pub const TypeChecker = struct {
             .ownership_bindings = std.AutoHashMap(scope_mod.BindingId, BindingOwnershipInfo).init(allocator),
             .analysis_context = null,
             .analysis_program = null,
-            .morph_registry = MonomorphRegistry.init(allocator),
             .type_var_scope = std.StringHashMap(TypeId).init(allocator),
         };
     }
@@ -1114,7 +951,6 @@ pub const TypeChecker = struct {
             .ownership_bindings = std.AutoHashMap(scope_mod.BindingId, BindingOwnershipInfo).init(allocator),
             .analysis_context = null,
             .analysis_program = null,
-            .morph_registry = MonomorphRegistry.init(allocator),
             .type_var_scope = std.StringHashMap(TypeId).init(allocator),
         };
     }
@@ -1128,7 +964,6 @@ pub const TypeChecker = struct {
         self.expr_types.deinit();
         self.referenced_bindings.deinit();
         self.ownership_bindings.deinit();
-        self.morph_registry.deinit();
         self.type_var_scope.deinit();
     }
 
@@ -1181,6 +1016,246 @@ pub const TypeChecker = struct {
             .source_span = source_span,
         };
         try self.recordBindingOwnership(binding_id, type_id, self.defaultOwnershipForType(type_id));
+    }
+
+    /// Walk a compound parameter pattern and record each inner bind's
+    /// type by indexing into the annotation. Wraps
+    /// `recordAssignmentBindingTypes` with a `containsTypeVars` guard
+    /// — generic function annotations like `pub fn f([h | t] :: [a])`
+    /// must NOT pin the bindings to a concrete type, otherwise the
+    /// monomorphizer specialises against the wrong shape and other
+    /// call sites mismatch.
+    fn recordParamBindingTypes(
+        self: *TypeChecker,
+        pat: *const ast.Pattern,
+        parent_type: TypeId,
+        source_span: ast.SourceSpan,
+    ) !void {
+        if (parent_type == TypeStore.UNKNOWN or parent_type == TypeStore.ERROR) return;
+        if (self.store.containsTypeVars(parent_type)) return;
+        try self.recordAssignmentBindingTypes(pat, parent_type, source_span);
+    }
+
+    /// Walk an assignment LHS pattern and record each inner bind's type
+    /// against the scope-graph binding the collector created for it. The
+    /// inferred type for each bind comes from indexing the parent type
+    /// (e.g. tuple element types, list element type, struct field types,
+    /// map value type). Mirrors `HirBuilder.lowerAssignmentDestructure`.
+    fn recordAssignmentBindingTypes(
+        self: *TypeChecker,
+        pat: *const ast.Pattern,
+        parent_type: TypeId,
+        source_span: ast.SourceSpan,
+    ) !void {
+        switch (pat.*) {
+            .wildcard, .literal, .pin => {},
+            .paren => |inner| try self.recordAssignmentBindingTypes(inner.inner, parent_type, source_span),
+            .bind => |b| {
+                if (self.current_scope) |scope_id| {
+                    if (self.graph.resolveBinding(scope_id, b.name)) |bid| {
+                        try self.recordBindingType(bid, parent_type, source_span);
+                    }
+                }
+            },
+            .tuple => |tp| {
+                const parent_typ = self.store.getType(parent_type);
+                for (tp.elements, 0..) |sub_pat, idx| {
+                    const elem_type = if (parent_typ == .tuple and idx < parent_typ.tuple.elements.len)
+                        parent_typ.tuple.elements[idx]
+                    else
+                        TypeStore.UNKNOWN;
+                    try self.recordAssignmentBindingTypes(sub_pat, elem_type, source_span);
+                }
+            },
+            .list => |lp| {
+                const parent_typ = self.store.getType(parent_type);
+                const elem_type = if (parent_typ == .list) parent_typ.list.element else TypeStore.UNKNOWN;
+                for (lp.elements) |sub_pat| {
+                    try self.recordAssignmentBindingTypes(sub_pat, elem_type, source_span);
+                }
+            },
+            .list_cons => |lc| {
+                const parent_typ = self.store.getType(parent_type);
+                const elem_type = if (parent_typ == .list) parent_typ.list.element else TypeStore.UNKNOWN;
+                for (lc.heads) |head_pat| {
+                    try self.recordAssignmentBindingTypes(head_pat, elem_type, source_span);
+                }
+                try self.recordAssignmentBindingTypes(lc.tail, parent_type, source_span);
+            },
+            .struct_pattern => |sp| {
+                const parent_typ = self.store.getType(parent_type);
+                for (sp.fields) |field| {
+                    var field_type: TypeId = TypeStore.UNKNOWN;
+                    if (parent_typ == .struct_type) {
+                        for (parent_typ.struct_type.fields) |sf| {
+                            if (sf.name == field.name) {
+                                field_type = sf.type_id;
+                                break;
+                            }
+                        }
+                    }
+                    try self.recordAssignmentBindingTypes(field.pattern, field_type, source_span);
+                }
+            },
+            .map => |mp| {
+                const parent_typ = self.store.getType(parent_type);
+                const value_type = if (parent_typ == .map) parent_typ.map.value else TypeStore.UNKNOWN;
+                for (mp.fields) |field| {
+                    try self.recordAssignmentBindingTypes(field.value, value_type, source_span);
+                }
+            },
+            .binary => {},
+        }
+    }
+
+    /// Walk a case pattern and record each inner bind's type by indexing
+    /// the scrutinee type. Mirrors `recordAssignmentBindingTypes` but
+    /// adapted for case patterns, which add literal/wildcard/atom
+    /// variants (no bindings) plus tagged-tuple destructuring where the
+    /// leading element is an atom literal but the remaining elements
+    /// still index into the scrutinee's tuple type. Skipped entirely if
+    /// `parent_type` contains type variables — pinning a generic
+    /// function's case-binding to a concrete inferred type would
+    /// poison the function's monomorphization for other call sites.
+    fn recordCasePatternBindingTypes(
+        self: *TypeChecker,
+        pat: *const ast.Pattern,
+        parent_type: TypeId,
+        source_span: ast.SourceSpan,
+    ) !void {
+        if (parent_type == TypeStore.UNKNOWN or parent_type == TypeStore.ERROR) return;
+        if (self.store.containsTypeVars(parent_type)) return;
+        switch (pat.*) {
+            .wildcard, .literal, .pin => {},
+            .paren => |inner| try self.recordCasePatternBindingTypes(inner.inner, parent_type, source_span),
+            .bind => |b| {
+                if (self.current_scope) |scope_id| {
+                    if (self.graph.resolveBinding(scope_id, b.name)) |bid| {
+                        try self.recordBindingType(bid, parent_type, source_span);
+                    }
+                }
+            },
+            .tuple => |tp| {
+                const parent_typ = self.store.getType(parent_type);
+                for (tp.elements, 0..) |sub_pat, idx| {
+                    const elem_type = if (parent_typ == .tuple and idx < parent_typ.tuple.elements.len)
+                        parent_typ.tuple.elements[idx]
+                    else
+                        TypeStore.UNKNOWN;
+                    try self.recordCasePatternBindingTypes(sub_pat, elem_type, source_span);
+                }
+            },
+            .list => |lp| {
+                const parent_typ = self.store.getType(parent_type);
+                const elem_type = if (parent_typ == .list) parent_typ.list.element else TypeStore.UNKNOWN;
+                for (lp.elements) |sub_pat| {
+                    try self.recordCasePatternBindingTypes(sub_pat, elem_type, source_span);
+                }
+            },
+            .list_cons => |lc| {
+                const parent_typ = self.store.getType(parent_type);
+                const elem_type = if (parent_typ == .list) parent_typ.list.element else TypeStore.UNKNOWN;
+                for (lc.heads) |head_pat| {
+                    try self.recordCasePatternBindingTypes(head_pat, elem_type, source_span);
+                }
+                try self.recordCasePatternBindingTypes(lc.tail, parent_type, source_span);
+            },
+            .struct_pattern => |sp| {
+                const parent_typ = self.store.getType(parent_type);
+                for (sp.fields) |field| {
+                    var field_type: TypeId = TypeStore.UNKNOWN;
+                    if (parent_typ == .struct_type) {
+                        for (parent_typ.struct_type.fields) |sf| {
+                            if (sf.name == field.name) {
+                                field_type = sf.type_id;
+                                break;
+                            }
+                        }
+                    }
+                    try self.recordCasePatternBindingTypes(field.pattern, field_type, source_span);
+                }
+            },
+            .map => |mp| {
+                const parent_typ = self.store.getType(parent_type);
+                const value_type = if (parent_typ == .map) parent_typ.map.value else TypeStore.UNKNOWN;
+                for (mp.fields) |field| {
+                    try self.recordCasePatternBindingTypes(field.value, value_type, source_span);
+                }
+            },
+            .binary => {},
+        }
+    }
+
+    /// Type-check a single case clause: switch into the clause's scope
+    /// (registered by the collector) so pattern-bound names resolve to
+    /// the case-clause's bindings, flow the scrutinee type into the
+    /// pattern, then check the body. Mirrors how `checkFunctionClause`
+    /// handles function clause scopes.
+    fn checkCaseClause(
+        self: *TypeChecker,
+        clause: ast.CaseClause,
+        scrutinee_type: TypeId,
+    ) !TypeId {
+        const prev_scope = self.current_scope;
+        defer self.current_scope = prev_scope;
+        if (self.graph.resolveClauseScope(clause.meta)) |clause_scope| {
+            self.current_scope = clause_scope;
+        }
+
+        try self.recordCasePatternBindingTypes(clause.pattern, scrutinee_type, clause.meta.span);
+
+        var clause_type: TypeId = TypeStore.NIL;
+        for (clause.body) |stmt| {
+            clause_type = try self.checkStmt(stmt);
+        }
+        return clause_type;
+    }
+
+    /// Type-checker mirror of `HirBuilder.protocolDispatchModule`. When
+    /// the call's qualifying module is a registered protocol and the
+    /// first argument's inferred type has a matching `impl Protocol for
+    /// T`, returns T's canonical name so the caller resolves the
+    /// impl's signature instead of the protocol's abstract one. This is
+    /// what makes `Enumerable.next(s :: String)` type as
+    /// `{Atom, String, String}` (the impl's return) rather than
+    /// `{Atom, i64, any}` (the protocol's hardcoded return) — without
+    /// it, downstream pattern-flow assigns the wrong types to the
+    /// cont-arm bindings, and the body's protocol calls (e.g.
+    /// `Concatenable.concat(c, "!")`) can't dispatch because their
+    /// first argument's type is wrong or UNKNOWN.
+    ///
+    /// Returns null when the module isn't a protocol or no impl
+    /// matches; callers fall back to the original module name.
+    fn protocolDispatchModule(
+        self: *TypeChecker,
+        mod_name: ast.StructName,
+        first_arg: *const ast.Expr,
+    ) ?ast.StructName {
+        if (mod_name.parts.len != 1) return null;
+        const proto_simple = self.interner.get(mod_name.parts[0]);
+        var is_proto = false;
+        for (self.graph.protocols.items) |entry| {
+            if (entry.name.parts.len != 1) continue;
+            if (std.mem.eql(u8, self.interner.get(entry.name.parts[0]), proto_simple)) {
+                is_proto = true;
+                break;
+            }
+        }
+        if (!is_proto) return null;
+
+        const arg_type = self.inferExpr(first_arg) catch return null;
+        if (arg_type == TypeStore.UNKNOWN or arg_type == TypeStore.ERROR) return null;
+        const target_simple = self.store.typeToModuleName(arg_type, self.interner) orelse return null;
+
+        for (self.graph.impls.items) |entry| {
+            if (entry.protocol_name.parts.len != 1 or entry.target_type.parts.len != 1) continue;
+            const p = self.interner.get(entry.protocol_name.parts[0]);
+            const t = self.interner.get(entry.target_type.parts[0]);
+            if (std.mem.eql(u8, p, proto_simple) and std.mem.eql(u8, t, target_simple)) {
+                return entry.target_type;
+            }
+        }
+        return null;
     }
 
     fn recordBindingQualifiedType(self: *TypeChecker, binding_id: scope_mod.BindingId, qualified_type: QualifiedType, source_span: ast.SourceSpan) !void {
@@ -1487,44 +1562,58 @@ pub const TypeChecker = struct {
         return false;
     }
 
-    fn analysisFunctionIdByName(self: *const TypeChecker, bare_name: []const u8) ?ir.FunctionId {
+    /// Resolve a Zap function `bare_name` of given `arity` to its IR FunctionId.
+    /// IR function names are `{module_prefix}__{mangled_name}__{arity}` (or
+    /// `{mangled_name}__{arity}` for top-level), so we match by the full
+    /// suffix `{name}__{arity}`. We always require an arity match — the
+    /// previous heuristic matched any `__{name}` regardless of arity, which
+    /// silently picked the wrong overload (e.g. `f/1` vs `f/2`).
+    fn analysisFunctionIdByName(self: *const TypeChecker, bare_name: []const u8, arity: u32) ?ir.FunctionId {
         const program = self.analysis_program orelse return null;
+        const mangled = mangleNameForIr(self.allocator, bare_name) orelse return null;
+        defer self.allocator.free(mangled);
+        const arity_suffix = std.fmt.allocPrint(self.allocator, "__{s}__{d}", .{ mangled, arity }) catch return null;
+        defer self.allocator.free(arity_suffix);
+
         if (self.current_scope) |scope_id| {
-            if (self.enclosingModuleQualifiedName(scope_id)) |qualified| {
-                defer self.allocator.free(qualified);
-                const full = std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ qualified, bare_name }) catch return null;
+            if (self.enclosingModuleIrPrefix(scope_id)) |prefix| {
+                defer self.allocator.free(prefix);
+                const full = std.fmt.allocPrint(self.allocator, "{s}{s}", .{ prefix, arity_suffix }) catch return null;
                 defer self.allocator.free(full);
                 for (program.functions) |func| {
                     if (std.mem.eql(u8, func.name, full)) return func.id;
                 }
             }
         }
+
+        const top_level = std.fmt.allocPrint(self.allocator, "{s}__{d}", .{ mangled, arity }) catch return null;
+        defer self.allocator.free(top_level);
         for (program.functions) |func| {
-            if (std.mem.eql(u8, func.name, bare_name)) return func.id;
+            if (std.mem.eql(u8, func.name, top_level)) return func.id;
         }
-        var best_id: ?ir.FunctionId = null;
-        var best_score: usize = 0;
-        for (program.functions) |func| {
-            if (std.mem.endsWith(u8, func.name, bare_name) and func.name.len > bare_name.len and func.name[func.name.len - bare_name.len - 1] == '_' and func.name[func.name.len - bare_name.len - 2] == '_') {
-                var score: usize = 1;
-                if (self.current_scope) |scope_id| {
-                    if (self.enclosingModuleQualifiedName(scope_id)) |qualified| {
-                        defer self.allocator.free(qualified);
-                        if (std.mem.startsWith(u8, func.name, qualified)) score += qualified.len;
-                    }
-                }
-                if (score > best_score) {
-                    best_score = score;
-                    best_id = func.id;
-                }
+        return null;
+    }
+
+    /// Build a module's IR-name prefix from a scope's enclosing struct.
+    /// Multi-segment module names join with `_` (single underscore) to match
+    /// IR's `structNameToPrefix` — distinct from `enclosingModuleQualifiedName`
+    /// which joins with `__` for type-system display.
+    fn enclosingModuleIrPrefix(self: *const TypeChecker, scope_id: scope_mod.ScopeId) ?[]u8 {
+        var current: ?scope_mod.ScopeId = scope_id;
+        while (current) |sid| {
+            for (self.graph.structs.items) |module| {
+                if (module.scope_id != sid) continue;
+                return joinStructNameWithUnderscore(self.allocator, self.interner, module.name);
             }
+            current = self.graph.getScope(sid).parent;
         }
-        return best_id;
+        return null;
     }
 
     fn analysisFunctionByDecl(self: *const TypeChecker, decl: *const ast.FunctionDecl) ?ir.Function {
         const name = self.interner.get(decl.name);
-        const function_id = self.analysisFunctionIdByName(name) orelse return null;
+        const arity = if (decl.clauses.len > 0) @as(u32, @intCast(decl.clauses[0].params.len)) else 0;
+        const function_id = self.analysisFunctionIdByName(name, arity) orelse return null;
         const program = self.analysis_program orelse return null;
         for (program.functions) |func| {
             if (func.id == function_id) return func;
@@ -1533,14 +1622,14 @@ pub const TypeChecker = struct {
     }
 
     fn closureEscapeForDecl(self: *const TypeChecker, decl: *const ast.FunctionDecl) ?escape_lattice.EscapeState {
-        const function_id = self.analysisFunctionIdByName(self.interner.get(decl.name)) orelse return null;
+        const arity = if (decl.clauses.len > 0) @as(u32, @intCast(decl.clauses[0].params.len)) else 0;
+        const function_id = self.analysisFunctionIdByName(self.interner.get(decl.name), arity) orelse return null;
         const ctx = self.analysis_context orelse return null;
         const program = self.analysis_program orelse return null;
-        return self.findClosureEscape(ctx, program, function_id);
+        return findClosureEscape(ctx, program, function_id);
     }
 
-    fn findClosureEscape(self: *const TypeChecker, ctx: *const escape_lattice.AnalysisContext, program: *const ir.Program, closure_func_id: ir.FunctionId) ?escape_lattice.EscapeState {
-        _ = self;
+    fn findClosureEscape(ctx: *const escape_lattice.AnalysisContext, program: *const ir.Program, closure_func_id: ir.FunctionId) ?escape_lattice.EscapeState {
         for (program.functions) |func| {
             for (func.body) |block| {
                 for (block.instructions) |instr| {
@@ -1609,25 +1698,8 @@ pub const TypeChecker = struct {
     }
 
     fn structNameToString(self: *const TypeChecker, name: ast.StructName) []u8 {
-        if (name.parts.len == 0) return self.allocator.alloc(u8, 0) catch return &[_]u8{};
-        var total_len: usize = 0;
-        for (name.parts, 0..) |part, idx| {
-            total_len += self.interner.get(part).len;
-            if (idx > 0) total_len += 2;
-        }
-        const buffer = self.allocator.alloc(u8, total_len) catch return &[_]u8{};
-        var offset: usize = 0;
-        for (name.parts, 0..) |part, idx| {
-            if (idx > 0) {
-                buffer[offset] = '_';
-                buffer[offset + 1] = '_';
-                offset += 2;
-            }
-            const piece = self.interner.get(part);
-            @memcpy(buffer[offset .. offset + piece.len], piece);
-            offset += piece.len;
-        }
-        return buffer;
+        const joined = name.joinedWith(self.allocator, self.interner, "__") catch return &[_]u8{};
+        return @constCast(joined);
     }
 
     fn closureDeclFromExpr(self: *TypeChecker, expr: *const ast.Expr) ?*const ast.FunctionDecl {
@@ -1649,7 +1721,7 @@ pub const TypeChecker = struct {
         }
 
         const bare_name = self.interner.get(callee_name);
-        const function_id = self.analysisFunctionIdByName(bare_name) orelse return null;
+        const function_id = self.analysisFunctionIdByName(bare_name, arity) orelse return null;
         const ctx = self.analysis_context orelse return null;
         const summary = ctx.function_summaries.get(function_id) orelse return null;
         const safe = self.allocator.alloc(bool, summary.param_summaries.len) catch return null;
@@ -1814,7 +1886,19 @@ pub const TypeChecker = struct {
                     for (clause.body) |stmt| try self.collectCapturedBindingsFromStmt(stmt, function_scope, captured);
                 }
             },
-            .anonymous_function => {},
+            .anonymous_function => |anon| {
+                // Recurse into the nested closure with the SAME outer
+                // function_scope so any binding the inner closure captures
+                // from the outer's scope is still classified as captured.
+                // Without this, a closure-of-closure that leaks a borrowed
+                // capture through its inner body bypasses borrow validation.
+                for (anon.decl.clauses) |clause| {
+                    if (clause.refinement) |r| try self.collectCapturedBindingsFromExpr(r, function_scope, captured);
+                    if (clause.body) |body| {
+                        for (body) |stmt| try self.collectCapturedBindingsFromStmt(stmt, function_scope, captured);
+                    }
+                }
+            },
             .tuple => |items| for (items.elements) |item| try self.collectCapturedBindingsFromExpr(item, function_scope, captured),
             .list => |items| for (items.elements) |item| try self.collectCapturedBindingsFromExpr(item, function_scope, captured),
             .map => |items| for (items.fields) |item| {
@@ -2249,7 +2333,7 @@ pub const TypeChecker = struct {
             // For @debug, validate that it's on a function with T -> T semantics
             // (This validation is done later when we see the function declaration)
         } else if (attr.type_expr == null and attr.value != null) {
-            // Value attribute without type (e.g., @native = "ZestRuntime.reset") — valid
+            // Value-only attribute (e.g., `@doc = "..."`) — valid
         } else {
             // Type without value — should not happen
             const attr_name = self.interner.get(attr.name);
@@ -2485,7 +2569,7 @@ pub const TypeChecker = struct {
 
     fn checkFunctionClause(self: *TypeChecker, func: *const ast.FunctionDecl, clause: *const ast.FunctionClause) !void {
         const prev_scope = self.current_scope;
-        self.current_scope = self.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(clause.meta.span)) orelse clause.meta.scope_id;
+        self.current_scope = self.graph.resolveClauseScope(clause.meta) orelse clause.meta.scope_id;
         defer self.current_scope = prev_scope;
 
         // Each function clause gets its own type variable scope so that
@@ -2510,8 +2594,15 @@ pub const TypeChecker = struct {
 
         const is_anon = self.isAnonymousFunctionDecl(func);
 
+        // Synthetic helpers (e.g. for-comp `__for_N`) have no source-level
+        // annotations, so their parameter types come from `inferred_signatures`,
+        // which the type checker populates when external call sites are
+        // processed. Looking it up once here lets the body see the right
+        // `__state` type for protocol dispatch on `Enumerable.next(__state)`.
+        const inferred_sig = self.store.inferred_signatures.get(func.name);
+
         // Resolve parameter types and populate bindings
-        for (clause.params) |param| {
+        for (clause.params, 0..) |param, param_idx| {
             if (param.type_annotation) |ta| {
                 const param_type = try self.resolveTypeExpr(ta);
                 const qualified = QualifiedType.init(param_type, self.resolveParamOwnership(param, param_type));
@@ -2522,6 +2613,35 @@ pub const TypeChecker = struct {
                         if (self.graph.resolveBinding(scope_id, bind_name)) |bid| {
                             try self.recordBindingQualifiedType(bid, qualified, ta.getMeta().span);
                         }
+                    }
+                } else {
+                    // Compound parameter pattern (cons `[h | t]`, list,
+                    // tuple, struct, map): destructure the annotated
+                    // type into its inner bindings. Without this, `h`
+                    // in `pub fn f([h | t] :: [String])` keeps an
+                    // UNKNOWN type, which breaks downstream
+                    // first-arg-driven protocol dispatch (e.g.
+                    // `h <> rest` -> `Concatenable.concat`).
+                    // `recordParamBindingTypes` no-ops on
+                    // type-variable-bearing annotations (e.g.
+                    // impl-method params with `[element]`) so generic
+                    // monomorphisation isn't pinned to a concrete
+                    // specialisation here.
+                    try self.recordParamBindingTypes(param.pattern, param_type, ta.getMeta().span);
+                }
+            } else if (inferred_sig) |sig| {
+                if (param_idx < sig.param_types.len and sig.param_types[param_idx] != TypeStore.UNKNOWN) {
+                    const param_type = sig.param_types[param_idx];
+                    const qualified = QualifiedType.init(param_type, self.resolveParamOwnership(param, param_type));
+                    if (param.pattern.* == .bind) {
+                        const bind_name = param.pattern.bind.name;
+                        if (self.current_scope) |scope_id| {
+                            if (self.graph.resolveBinding(scope_id, bind_name)) |bid| {
+                                try self.recordBindingQualifiedType(bid, qualified, param.pattern.getMeta().span);
+                            }
+                        }
+                    } else {
+                        try self.recordParamBindingTypes(param.pattern, param_type, param.pattern.getMeta().span);
                     }
                 }
             } else if (param.pattern.* == .literal) {
@@ -2595,7 +2715,7 @@ pub const TypeChecker = struct {
             }
         }
 
-        // Check body (skip for @native bodyless declarations)
+        // Check body (skip for bodyless declarations: protocol sigs, forward decls)
         var body_type: TypeId = TypeStore.NIL;
         var last_expr: ?*const ast.Expr = null;
         if (clause.body) |body| {
@@ -2628,8 +2748,26 @@ pub const TypeChecker = struct {
             }
         }
 
-        // Skip return type check for @native bodyless declarations
+        // Skip return type check for bodyless declarations (protocol sigs, forward decls).
         if (clause.body == null) return;
+
+        // Synthetic helper return-type fixpoint: when this clause has no
+        // declared return type but the type checker has a call-site-inferred
+        // signature whose return is still UNKNOWN, fold in the body's
+        // computed type. The body has been fully processed by checkStmt
+        // above, so `body_type` already reflects whatever the case
+        // expression / cons expression / etc. produced. Without this, the
+        // for-comp helper for non-list iterables (Map, Range, custom
+        // Enumerable impls) keeps an UNKNOWN return type — IR widens it to
+        // `.any` and ZIR emits a void-returning function, which then trips
+        // type errors at the call site.
+        if (clause.return_type == null and body_type != TypeStore.UNKNOWN and body_type != TypeStore.ERROR) {
+            if (self.store.inferred_signatures.getPtr(func.name)) |sig_ptr| {
+                if (sig_ptr.return_type == TypeStore.UNKNOWN) {
+                    sig_ptr.return_type = body_type;
+                }
+            }
+        }
 
         // Verify return type matches (suppress if either side is ERROR/UNKNOWN/type_var from cascading)
         const declared_is_checkable = declared_return != TypeStore.UNKNOWN and
@@ -2673,15 +2811,7 @@ pub const TypeChecker = struct {
             .assignment => |assign| {
                 try self.ensureClosureValueCanEscape(assign.value, "assignment");
                 const value_type = try self.inferExpr(assign.value);
-                // Store type on the target binding if it's a bind pattern
-                if (assign.pattern.* == .bind) {
-                    const bind_name = assign.pattern.bind.name;
-                    if (self.current_scope) |scope_id| {
-                        if (self.graph.resolveBinding(scope_id, bind_name)) |bid| {
-                            try self.recordBindingType(bid, value_type, assign.value.getMeta().span);
-                        }
-                    }
-                }
+                try self.recordAssignmentBindingTypes(assign.pattern, value_type, assign.value.getMeta().span);
                 return value_type;
             },
             .function_decl => |func| {
@@ -2827,10 +2957,8 @@ pub const TypeChecker = struct {
                     if (clause.pattern.* == .wildcard or clause.pattern.* == .bind) {
                         has_wildcard = true;
                     }
-                    var clause_type: TypeId = TypeStore.NIL;
-                    for (clause.body) |stmt| {
-                        clause_type = try self.checkStmt(stmt);
-                    }
+
+                    const clause_type = try self.checkCaseClause(clause, scrutinee_type);
                     if (result_type == TypeStore.UNKNOWN) {
                         result_type = clause_type;
                     }
@@ -2997,16 +3125,28 @@ pub const TypeChecker = struct {
                 return TypeStore.UNKNOWN;
             },
             .map => |m| {
-                // Infer key/value types from first entry
+                // Infer key/value types from first entry. Returning a real
+                // `Map(K, V)` type (instead of UNKNOWN) lets call-site type
+                // inference for synthetic helpers — like for-comp `__for_N`
+                // — propagate the iterable's type into the helper's param,
+                // which is what HIR's protocol-dispatch rewrite reads to
+                // route `Enumerable.next(state)` to `Map.next(state)`.
                 if (m.fields.len > 0) {
                     for (m.fields) |field| {
                         try self.ensureClosureValueCanEscape(field.key, "map key storage");
                         try self.ensureClosureValueCanEscape(field.value, "map value storage");
                     }
-                    _ = try self.inferExpr(m.fields[0].key);
-                    _ = try self.inferExpr(m.fields[0].value);
+                    const key_t = try self.inferExpr(m.fields[0].key);
+                    const value_t = try self.inferExpr(m.fields[0].value);
+                    return try self.store.addType(.{ .map = .{ .key = key_t, .value = value_t } });
                 }
-                return TypeStore.UNKNOWN;
+                // Empty map literal `%{}`: still a Map, just with type
+                // variables for key/value. Returning UNKNOWN here would
+                // suppress protocol dispatch on the iterable, leaving
+                // `Enumerable.next` as a dangling literal call at codegen.
+                const key_var = try self.store.freshVar();
+                const value_var = try self.store.freshVar();
+                return try self.store.addType(.{ .map = .{ .key = key_var, .value = value_var } });
             },
             .struct_expr => |se| {
                 // Resolve struct type from module name annotation
@@ -3148,6 +3288,15 @@ pub const TypeChecker = struct {
                             );
                         }
                     }
+                }
+                // Resolve to the `Range` struct type if it has been registered
+                // by the collector. Like the `.map` branch above, returning
+                // a real type (instead of UNKNOWN) lets call-site inference
+                // propagate `Range` into helper params, which HIR's protocol
+                // dispatch consults to route `Enumerable.next(state)` to
+                // `Range.next(state)`.
+                if (self.interner.lookupExisting("Range")) |range_name| {
+                    if (self.store.name_to_type.get(range_name)) |tid| return tid;
                 }
                 return TypeStore.UNKNOWN;
             },
@@ -3478,29 +3627,6 @@ pub const TypeChecker = struct {
 
                         // Record the instantiation in the monomorphization registry
                         if (!unification_failed) {
-                            // Collect the concrete type arguments from the substitution bindings
-                            var type_args_list: std.ArrayList(TypeId) = .empty;
-                            var bindings_list: std.ArrayList(MonomorphRegistry.TypeVarBinding) = .empty;
-                            var subs_iter = subs.bindings.iterator();
-                            while (subs_iter.next()) |entry| {
-                                const var_id = entry.key_ptr.*;
-                                const concrete_type = entry.value_ptr.*;
-                                try type_args_list.append(self.allocator, concrete_type);
-                                try bindings_list.append(self.allocator, .{
-                                    .var_id = var_id,
-                                    .concrete_type = concrete_type,
-                                });
-                            }
-
-                            if (type_args_list.items.len > 0) {
-                                const family_id = self.graph.resolveFamily(scope_id, vr.name, arity) orelse 0;
-                                _ = try self.morph_registry.recordInstantiation(
-                                    family_id,
-                                    type_args_list.items,
-                                    bindings_list.items,
-                                    self.store,
-                                );
-                            }
                         }
 
                         const borrowed = try self.applyCallOwnershipWithSafeParams(call.args, signature.toFunctionType(), safe_params);
@@ -3579,7 +3705,17 @@ pub const TypeChecker = struct {
                 return TypeStore.UNKNOWN;
             }
             if (fa.object.* == .module_ref) {
-                const mod_name = fa.object.module_ref.name;
+                const written_mod_name = fa.object.module_ref.name;
+                // Protocol dispatch: if the user wrote `Protocol.method(arg, …)`
+                // and `Protocol` is a registered protocol with an impl
+                // for the first argument's concrete type, redirect to the
+                // impl's module so we resolve the impl's signature
+                // (concrete return type) instead of the protocol's
+                // abstract one. Mirrors the HIR-level dispatch.
+                const mod_name = if (call.args.len > 0)
+                    self.protocolDispatchModule(written_mod_name, call.args[0]) orelse written_mod_name
+                else
+                    written_mod_name;
                 for (self.graph.structs.items) |mod_entry| {
                     if (mod_entry.name.parts.len == mod_name.parts.len) {
                         var match = true;
@@ -3627,32 +3763,6 @@ pub const TypeChecker = struct {
                                         mod_subs.applyToType(self.store, signature.return_type)
                                     else
                                         signature.return_type;
-
-                                    // Record the instantiation in the monomorphization registry
-                                    if (!mod_unification_failed) {
-                                        var mod_type_args: std.ArrayList(TypeId) = .empty;
-                                        var mod_bindings: std.ArrayList(MonomorphRegistry.TypeVarBinding) = .empty;
-                                        var mod_subs_iter = mod_subs.bindings.iterator();
-                                        while (mod_subs_iter.next()) |entry| {
-                                            const var_id = entry.key_ptr.*;
-                                            const concrete_type = entry.value_ptr.*;
-                                            try mod_type_args.append(self.allocator, concrete_type);
-                                            try mod_bindings.append(self.allocator, .{
-                                                .var_id = var_id,
-                                                .concrete_type = concrete_type,
-                                            });
-                                        }
-
-                                        if (mod_type_args.items.len > 0) {
-                                            const family_id = self.graph.resolveFamily(mod_entry.scope_id, fa.field, arity) orelse 0;
-                                            _ = try self.morph_registry.recordInstantiation(
-                                                family_id,
-                                                mod_type_args.items,
-                                                mod_bindings.items,
-                                                self.store,
-                                            );
-                                        }
-                                    }
 
                                     return mod_resolved_return;
                                 }
@@ -3717,14 +3827,18 @@ pub const TypeChecker = struct {
 
                 // Built-in generic containers map onto the dedicated type
                 // variants the rest of the pipeline already understands.
-                // Mirrors the existing `[T]` and `%{K=>V}` sigils.
+                // Mirrors the existing `[T]` and `%{K=>V}` sigils. Native
+                // type identity comes from `@native_type` on the stdlib
+                // struct (see `ScopeGraph.NativeTypeKind`); a user who
+                // shadows `Map`/`List` with their own struct doesn't get
+                // those sugar mappings.
                 if (tn.args.len > 0) {
-                    if (std.mem.eql(u8, name, "Map") and tn.args.len == 2) {
+                    if (self.graph.isNativeTypeName(.map, tn.name) and tn.args.len == 2) {
                         const key_t = try self.resolveTypeExpr(tn.args[0]);
                         const value_t = try self.resolveTypeExpr(tn.args[1]);
                         return try self.store.addType(.{ .map = .{ .key = key_t, .value = value_t } });
                     }
-                    if (std.mem.eql(u8, name, "List") and tn.args.len == 1) {
+                    if (self.graph.isNativeTypeName(.list, tn.name) and tn.args.len == 1) {
                         const elem_t = try self.resolveTypeExpr(tn.args[0]);
                         return try self.store.addType(.{ .list = .{ .element = elem_t } });
                     }
@@ -5745,7 +5859,7 @@ test "zig bridge call parameters not flagged as unused" {
     const source =
         \\pub struct Test {
         \\  pub fn get(map :: i64, key :: i64) -> i64 {
-        \\    :zig.Prelude.add(map, key)
+        \\    :zig.Integer.add(map, key)
         \\  }
         \\}
     ;

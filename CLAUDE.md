@@ -2,6 +2,18 @@
 
 **STRICTLY FORBIDDEN.** Never implement workarounds, hacks, temporary fixes, or shortcuts of any kind. Every solution must be the correct, production-grade, long-term fix — regardless of how difficult, expensive, or time-consuming it is. If a proper fix requires deep architectural changes across multiple files, that is the fix. If it requires changes to the Zig fork, make those changes. If it requires redesigning a data structure, redesign it. Cost and time are not concerns — correctness and quality are. Never choose expediency over correctness. Never paper over a root cause with a band-aid. If you find yourself writing a "temporary" fix, stop — find and implement the real solution.
 
+## Never compromise on code quality
+
+When you have an option to finish a taks faster but implementing a short cut, a hack, or some lower quality solution nerver take this option. Always pursure the highest quality solution regardless of the implementation cost or complexity of the solution.
+
+## Working with our Zig fork
+
+Zap uses a fork of Zig 0.16.0 which should be at ~/projects/zig
+
+You have full permission to make changes to this fork if necessary to unblock work in Zap. The same code quality rules apply to our Zig fork as does this project.
+
+When you need to compile our Zig fork consider the compilation guide in Zap's README as well as the README in our Zig for to understand how to build our Zig fork to compile Zap.
+
 ## Zap is a Language — Implement Features in Zap Code
 
 **THIS IS THE MOST IMPORTANT RULE. VIOLATIONS ARE UNACCEPTABLE.**

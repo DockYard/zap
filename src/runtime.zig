@@ -280,6 +280,13 @@ pub const Atom = struct {
     pub fn eql(a: Atom, b: Atom) bool {
         return a.id == b.id;
     }
+
+    pub fn to_string(id: anytype) []const u8 {
+        const T = @TypeOf(id);
+        if (T == u32) return atomToString(id);
+        if (@typeInfo(T) == .int) return atomToString(@intCast(id));
+        return "<not_an_atom>";
+    }
 };
 
 pub const AtomTable = struct {
@@ -561,26 +568,214 @@ pub const String = struct {
         return result;
     }
 
-    // Forwarding functions for string operations that live on Prelude.
-    // These provide the :zig.String.* namespace for all string ops.
-    pub const upcase = Prelude.upcase;
-    pub const downcase = Prelude.downcase;
-    pub const reverse_string = Prelude.reverse_string;
-    pub const replace_string = Prelude.replace_string;
-    pub const index_of = Prelude.index_of;
-    pub const pad_leading = Prelude.pad_leading;
-    pub const pad_trailing = Prelude.pad_trailing;
-    pub const repeat_string = Prelude.repeat_string;
-    pub const capitalize = Prelude.capitalize;
-    pub const trim_leading = Prelude.trim_leading;
-    pub const trim_trailing = Prelude.trim_trailing;
-    pub const string_count = Prelude.string_count;
-    pub const split_to_list = Prelude.split_to_list;
-    pub const string_join = Prelude.string_join;
+    /// Iterator protocol for strings. The slice itself is the iteration
+    /// state — each call returns the first byte (as a single-character
+    /// string) and the remaining slice. This lets `for ch <- "hello"`
+    /// dispatch through `Enumerable.next/1` like every other container.
+    pub fn next(s: []const u8) struct { u32, []const u8, []const u8 } {
+        if (s.len == 0) return .{ ATOM_DONE, "", s };
+        const head = bumpAlloc(1);
+        if (head.len == 0) return .{ ATOM_DONE, "", s };
+        head[0] = s[0];
+        return .{ ATOM_CONT, head, s[1..] };
+    }
+
+    pub fn upcase(s: []const u8) []const u8 {
+        const result = bumpAlloc(s.len);
+        if (result.len == 0) return s;
+        for (s, 0..) |c, i| {
+            result[i] = if (c >= 'a' and c <= 'z') c - 32 else c;
+        }
+        return result;
+    }
+
+    pub fn downcase(s: []const u8) []const u8 {
+        const result = bumpAlloc(s.len);
+        if (result.len == 0) return s;
+        for (s, 0..) |c, i| {
+            result[i] = if (c >= 'A' and c <= 'Z') c + 32 else c;
+        }
+        return result;
+    }
+
+    pub fn reverse_string(s: []const u8) []const u8 {
+        if (s.len == 0) return s;
+        const result = bumpAlloc(s.len);
+        if (result.len == 0) return s;
+        for (s, 0..) |c, i| {
+            result[s.len - 1 - i] = c;
+        }
+        return result;
+    }
+
+    pub fn replace_string(s: []const u8, pattern: []const u8, replacement: []const u8) []const u8 {
+        if (pattern.len == 0) return s;
+        var count: usize = 0;
+        var pos: usize = 0;
+        while (pos + pattern.len <= s.len) {
+            if (std.mem.eql(u8, s[pos .. pos + pattern.len], pattern)) {
+                count += 1;
+                pos += pattern.len;
+            } else {
+                pos += 1;
+            }
+        }
+        if (count == 0) return s;
+        const new_len = s.len - (count * pattern.len) + (count * replacement.len);
+        const result = bumpAlloc(new_len);
+        if (result.len == 0) return s;
+        var src: usize = 0;
+        var dst: usize = 0;
+        while (src < s.len) {
+            if (src + pattern.len <= s.len and std.mem.eql(u8, s[src .. src + pattern.len], pattern)) {
+                @memcpy(result[dst .. dst + replacement.len], replacement);
+                dst += replacement.len;
+                src += pattern.len;
+            } else {
+                result[dst] = s[src];
+                dst += 1;
+                src += 1;
+            }
+        }
+        return result;
+    }
+
+    pub fn index_of(haystack: []const u8, needle: []const u8) i64 {
+        if (needle.len == 0) return 0;
+        if (needle.len > haystack.len) return -1;
+        if (std.mem.find(u8, haystack, needle)) |idx| {
+            return @intCast(idx);
+        }
+        return -1;
+    }
+
+    pub fn pad_leading(s: []const u8, total_len: i64, pad_char: []const u8) []const u8 {
+        const target: usize = if (total_len > 0) @intCast(total_len) else return s;
+        if (s.len >= target) return s;
+        const pad_count = target - s.len;
+        const result = bumpAlloc(target);
+        if (result.len == 0) return s;
+        const fill: u8 = if (pad_char.len > 0) pad_char[0] else ' ';
+        @memset(result[0..pad_count], fill);
+        @memcpy(result[pad_count..target], s);
+        return result;
+    }
+
+    pub fn pad_trailing(s: []const u8, total_len: i64, pad_char: []const u8) []const u8 {
+        const target: usize = if (total_len > 0) @intCast(total_len) else return s;
+        if (s.len >= target) return s;
+        const result = bumpAlloc(target);
+        if (result.len == 0) return s;
+        @memcpy(result[0..s.len], s);
+        const fill: u8 = if (pad_char.len > 0) pad_char[0] else ' ';
+        @memset(result[s.len..target], fill);
+        return result;
+    }
+
+    pub fn repeat_string(s: []const u8, count: i64) []const u8 {
+        if (count <= 0 or s.len == 0) return "";
+        const n: usize = @intCast(count);
+        const result = bumpAlloc(s.len * n);
+        if (result.len == 0) return s;
+        for (0..n) |i| {
+            @memcpy(result[i * s.len .. (i + 1) * s.len], s);
+        }
+        return result;
+    }
+
+    pub fn capitalize(s: []const u8) []const u8 {
+        if (s.len == 0) return s;
+        const result = bumpAlloc(s.len);
+        if (result.len == 0) return s;
+        result[0] = if (s[0] >= 'a' and s[0] <= 'z') s[0] - 32 else s[0];
+        for (s[1..], 0..) |c, i| {
+            result[i + 1] = if (c >= 'A' and c <= 'Z') c + 32 else c;
+        }
+        return result;
+    }
+
+    pub fn trim_leading(s: []const u8) []const u8 {
+        return std.mem.trimStart(u8, s, " \t\n\r");
+    }
+
+    pub fn trim_trailing(s: []const u8) []const u8 {
+        return std.mem.trimEnd(u8, s, " \t\n\r");
+    }
+
+    pub fn string_count(haystack: []const u8, needle: []const u8) i64 {
+        if (needle.len == 0) return 0;
+        var count: i64 = 0;
+        var i: usize = 0;
+        while (i + needle.len <= haystack.len) {
+            if (std.mem.eql(u8, haystack[i..][0..needle.len], needle)) {
+                count += 1;
+                i += needle.len;
+            } else {
+                i += 1;
+            }
+        }
+        return count;
+    }
+
+    pub fn split_to_list(s: []const u8, delimiter: []const u8) ?*const List([]const u8) {
+        if (delimiter.len == 0) {
+            return List([]const u8).cons(s, null);
+        }
+        var result: ?*const List([]const u8) = null;
+        var pos: usize = 0;
+        var seg_start: usize = 0;
+        while (pos < s.len) {
+            if (pos + delimiter.len <= s.len and std.mem.eql(u8, s[pos .. pos + delimiter.len], delimiter)) {
+                const seg = s[seg_start..pos];
+                const seg_copy = bumpAlloc(seg.len);
+                if (seg_copy.len > 0) @memcpy(seg_copy, seg);
+                result = List([]const u8).cons(seg_copy, result);
+                pos += delimiter.len;
+                seg_start = pos;
+            } else {
+                pos += 1;
+            }
+        }
+        const last_seg = s[seg_start..];
+        const last_copy = bumpAlloc(last_seg.len);
+        if (last_copy.len > 0) @memcpy(last_copy, last_seg);
+        result = List([]const u8).cons(last_copy, result);
+        return List([]const u8).reverse(result);
+    }
+
+    pub fn string_join(list: ?*const List([]const u8), separator: []const u8) []const u8 {
+        if (list == null) return "";
+        var total: usize = 0;
+        var count: usize = 0;
+        var current = list;
+        while (current) |cell| {
+            total += cell.head.len;
+            count += 1;
+            current = cell.tail;
+        }
+        if (count == 0) return "";
+        total += separator.len * (count - 1);
+        const result = bumpAlloc(total);
+        if (result.len == 0) return "";
+        var dst: usize = 0;
+        var first = true;
+        current = list;
+        while (current) |cell| {
+            if (!first and separator.len > 0) {
+                @memcpy(result[dst..][0..separator.len], separator);
+                dst += separator.len;
+            }
+            @memcpy(result[dst..][0..cell.head.len], cell.head);
+            dst += cell.head.len;
+            first = false;
+            current = cell.tail;
+        }
+        return result[0..dst];
+    }
 };
 
 // ============================================================
-// Prelude / Kernel functions (spec §30.2)
+// Kernel functions (spec §30.2)
 // ============================================================
 
 pub fn panic(message: []const u8) noreturn {
@@ -613,6 +808,20 @@ pub const Range = struct {
         return .{ .@"0" = ATOM_CONT, .@"1" = start, .@"2" = next_range };
     }
 
+    /// Numeric containment for `i in r` — true when `value` falls between
+    /// `start` and `end` (inclusive). Step direction is inferred from the
+    /// `start <= end` ordering. Mirrors the `in_range` IR opcode but lives
+    /// here so `Membership.member?(range, value)` can dispatch through the
+    /// usual protocol path.
+    pub fn contains(range: anytype, value: i64) bool {
+        const start = range.start;
+        const end_val = range.end;
+        if (start <= end_val) {
+            return value >= start and value <= end_val;
+        }
+        return value <= start and value >= end_val;
+    }
+
     pub fn to_list(range: anytype) ?*const List(i64) {
         const start = range.start;
         const end_val = range.end;
@@ -641,8 +850,110 @@ pub const Range = struct {
 };
 
 pub const Kernel = struct {
-    /// Generic to_string for string interpolation — delegates to Prelude.to_string.
-    pub const to_string = Prelude.to_string;
+    /// Generic string conversion used by string interpolation. Strings
+    /// pass through untouched; numbers/bools/enums are formatted via the
+    /// runtime arena.
+    pub fn to_string(value: anytype) []const u8 {
+        const T = @TypeOf(value);
+        const info = @typeInfo(T);
+        if (T == []const u8 or (info == .pointer and @typeInfo(std.meta.Child(T)) == .array)) {
+            return value;
+        } else if (T == bool) {
+            return if (value) "true" else "false";
+        } else if (info == .int or info == .comptime_int) {
+            var buf: [32]u8 = undefined;
+            const slice = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return "?";
+            const result = bumpAlloc(slice.len);
+            if (result.len == 0) return "?";
+            @memcpy(result, slice);
+            return result;
+        } else if (info == .float or info == .comptime_float) {
+            var buf: [64]u8 = undefined;
+            const slice = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return "?";
+            const result = bumpAlloc(slice.len);
+            if (result.len == 0) return "?";
+            @memcpy(result, slice);
+            return result;
+        } else if (info == .@"enum") {
+            return @tagName(value);
+        } else {
+            return "<value>";
+        }
+    }
+
+    pub fn panic(message: []const u8) noreturn {
+        posixWrite(STDERR_FD, "panic: ");
+        posixWrite(STDERR_FD, message);
+        posixWrite(STDERR_FD, "\n");
+        std.process.exit(1);
+    }
+
+    pub fn halt(message: []const u8) noreturn {
+        posixWrite(STDERR_FD, "halt: ");
+        posixWrite(STDERR_FD, message);
+        posixWrite(STDERR_FD, "\n");
+        std.process.exit(1);
+    }
+
+    /// Call a callable value — either a bare function pointer or a
+    /// closure struct with `{call_fn, env, env_release}` fields.
+    pub inline fn callCallable0(callable: anytype) @TypeOf(callable()) {
+        const T = @TypeOf(callable);
+        if (@typeInfo(T) == .@"struct" and @hasField(T, "call_fn")) {
+            return callable.call_fn(callable.env);
+        } else {
+            return callable();
+        }
+    }
+
+    pub inline fn callCallable1(callable: anytype, arg0: anytype) CallReturnType(@TypeOf(callable)) {
+        const T = @TypeOf(callable);
+        if (@typeInfo(T) == .@"struct" and @hasField(T, "call_fn")) {
+            return callable.call_fn(callable.env, arg0);
+        } else {
+            return callable(arg0);
+        }
+    }
+
+    pub inline fn callCallable2(callable: anytype, arg0: anytype, arg1: anytype) CallReturnType(@TypeOf(callable)) {
+        const T = @TypeOf(callable);
+        if (@typeInfo(T) == .@"struct" and @hasField(T, "call_fn")) {
+            return callable.call_fn(callable.env, arg0, arg1);
+        } else {
+            return callable(arg0, arg1);
+        }
+    }
+
+    pub inline fn callCallable3(callable: anytype, arg0: anytype, arg1: anytype, arg2: anytype) CallReturnType(@TypeOf(callable)) {
+        const T = @TypeOf(callable);
+        if (@typeInfo(T) == .@"struct" and @hasField(T, "call_fn")) {
+            return callable.call_fn(callable.env, arg0, arg1, arg2);
+        } else {
+            return callable(arg0, arg1, arg2);
+        }
+    }
+
+    fn CallReturnType(comptime T: type) type {
+        if (@typeInfo(T) == .@"struct" and @hasField(T, "call_fn")) {
+            const fn_info = @typeInfo(@TypeOf(@field(@as(T, undefined), "call_fn")));
+            if (fn_info == .pointer) {
+                const child = @typeInfo(fn_info.pointer.child);
+                if (child == .@"fn") {
+                    return child.@"fn".return_type orelse i64;
+                }
+            }
+            return i64;
+        } else {
+            const info = @typeInfo(T);
+            if (info == .pointer) {
+                const child = @typeInfo(info.pointer.child);
+                if (child == .@"fn") {
+                    return child.@"fn".return_type orelse i64;
+                }
+            }
+            return i64;
+        }
+    }
 
     pub fn is_integer(value: anytype) bool {
         const info = @typeInfo(@TypeOf(value));
@@ -834,1050 +1145,6 @@ const BufWriter = struct {
     }
 };
 
-pub const Prelude = struct {
-    pub fn println(value: anytype) void {
-                const T = @TypeOf(value);
-        const info = @typeInfo(T);
-        if (T == []const u8 or (info == .pointer and @typeInfo(std.meta.Child(T)) == .array)) {
-            stdoutPrint("{s}\n", .{value});
-        } else if (info == .int or info == .comptime_int) {
-            stdoutPrint("{d}\n", .{value});
-        } else if (info == .float or info == .comptime_float) {
-            stdoutPrint("{d}\n", .{value});
-        } else if (T == bool) {
-            stdoutPrint("{}\n", .{value});
-        } else if (info == .@"enum") {
-            stdoutPrint(":{s}\n", .{@tagName(value)});
-        } else if (T == u32) {
-            // Could be an atom ID — print as atom if it looks up
-            const name = atomToString(value);
-            if (!std.mem.eql(u8, name, "<unknown_atom>")) {
-                stdoutPrint(":{s}\n", .{name});
-            } else {
-                stdoutPrint("{d}\n", .{value});
-            }
-        } else {
-            // For tuples, structs, and other compound types, use inspect formatting
-            var iw_buf: [4096]u8 = undefined;
-            var iw = BufWriter{ .buf = &iw_buf, .pos = 0 };
-            inspectWrite(&iw, value);
-            posixWrite(STDOUT_FD, iw_buf[0..iw.pos]);
-            stdoutPrint("\n", .{});
-        }
-    }
-
-    pub fn inspect(value: anytype) InspectReturn(@TypeOf(value)) {
-        var iw_buf: [4096]u8 = undefined;
-        var iw = BufWriter{ .buf = &iw_buf, .pos = 0 };
-        inspectWrite(&iw, value);
-        posixWrite(STDOUT_FD, iw_buf[0..iw.pos]);
-        stdoutPrint("\n", .{});
-        const RT = InspectReturn(@TypeOf(value));
-        if (RT == void) return;
-        return value;
-    }
-
-    /// Returns `void` for comptime-only types (enum literals, comptime_int, etc.)
-    /// so that `inspect` can be called at runtime without forcing comptime evaluation.
-    /// For all other types, returns the input type to support piping.
-    fn InspectReturn(comptime T: type) type {
-        return switch (@typeInfo(T)) {
-            .enum_literal, .comptime_int, .comptime_float, .type, .null, .undefined => void,
-            else => T,
-        };
-    }
-
-    fn inspectWrite(writer: anytype, value: anytype) void {
-        const T = @TypeOf(value);
-        const info = @typeInfo(T);
-        if (T == []const u8) {
-            writer.print("\"{s}\"", .{value}) catch {};
-        } else if (info == .pointer) {
-            const child_info = @typeInfo(info.pointer.child);
-            if (child_info == .array) {
-                if (child_info.array.child == u8) {
-                    // *const [N]u8 — string
-                    writer.print("\"{s}\"", .{value}) catch {};
-                } else {
-                    // *const [N]T — list
-                    writer.print("[", .{}) catch {};
-                    for (0..child_info.array.len) |i| {
-                        if (i > 0) writer.print(", ", .{}) catch {};
-                        inspectWrite(writer, value[i]);
-                    }
-                    writer.print("]", .{}) catch {};
-                }
-            } else {
-                writer.print("{any}", .{value}) catch {};
-            }
-        } else if (info == .int or info == .comptime_int) {
-            writer.print("{d}", .{value}) catch {};
-        } else if (info == .float or info == .comptime_float) {
-            const rounded: i64 = @trunc(value);
-            if (value == @as(@TypeOf(value), @floatFromInt(rounded))) {
-                writer.print("{d}.0", .{rounded}) catch {};
-            } else {
-                writer.print("{d}", .{value}) catch {};
-            }
-        } else if (T == bool) {
-            writer.print("{}", .{value}) catch {};
-        } else if (info == .@"struct" and info.@"struct".is_tuple) {
-            writer.print("{{", .{}) catch {};
-            inline for (info.@"struct".fields, 0..) |field, i| {
-                if (i > 0) writer.print(", ", .{}) catch {};
-                inspectWrite(writer, @field(value, field.name));
-            }
-            writer.print("}}", .{}) catch {};
-        } else if (info == .@"struct") {
-            // Detect Zap map representation: struct of .{key, value} entry structs.
-            // A map is an anonymous struct where every field is a 2-field struct with "key" and "value".
-            const is_map = comptime blk: {
-                if (info.@"struct".fields.len == 0) break :blk false;
-                for (info.@"struct".fields) |f| {
-                    const inner = @typeInfo(f.type);
-                    if (inner != .@"struct") break :blk false;
-                    if (inner.@"struct".fields.len != 2) break :blk false;
-                    const has_key = for (inner.@"struct".fields) |ef| {
-                        if (std.mem.eql(u8, ef.name, "key")) break true;
-                    } else false;
-                    const has_value = for (inner.@"struct".fields) |ef| {
-                        if (std.mem.eql(u8, ef.name, "value")) break true;
-                    } else false;
-                    if (!has_key or !has_value) break :blk false;
-                }
-                break :blk true;
-            };
-            if (is_map) {
-                // Print as %{key: value, ...}
-                writer.print("%{{", .{}) catch {};
-                inline for (info.@"struct".fields, 0..) |field, i| {
-                    if (i > 0) writer.print(", ", .{}) catch {};
-                    const entry = @field(value, field.name);
-                    inspectWrite(writer, entry.key);
-                    writer.print(": ", .{}) catch {};
-                    inspectWrite(writer, entry.value);
-                }
-                writer.print("}}", .{}) catch {};
-            } else {
-                // Named struct — print as %{field: value, ...}
-                writer.print("%{{", .{}) catch {};
-                inline for (info.@"struct".fields, 0..) |field, i| {
-                    if (i > 0) writer.print(", ", .{}) catch {};
-                    writer.print("{s}: ", .{field.name}) catch {};
-                    inspectWrite(writer, @field(value, field.name));
-                }
-                writer.print("}}", .{}) catch {};
-            }
-        } else if (info == .@"enum") {
-            writer.print(":{s}", .{@tagName(value)}) catch {};
-        } else {
-            writer.print("{any}", .{value}) catch {};
-        }
-    }
-
-    pub fn print_str(value: anytype) void {
-                const T = @TypeOf(value);
-        const info = @typeInfo(T);
-        if (T == []const u8 or (info == .pointer and @typeInfo(std.meta.Child(T)) == .array)) {
-            stdoutPrint("{s}", .{value});
-        } else {
-            stdoutPrint("{any}", .{value});
-        }
-    }
-
-    /// Read a line from stdin. Returns the line without the trailing newline.
-    /// Returns an empty string on EOF or error.
-    pub fn gets() []const u8 {
-        var buf: [4096]u8 = undefined;
-        var len: usize = 0;
-        // Read one byte at a time until newline or EOF
-        while (len < buf.len - 1) {
-            var one_buf = [_]u8{0};
-            const n = posixRead(STDIN_FD, &one_buf);
-            if (n == 0) break; // EOF
-            if (one_buf[0] == '\n') break;
-            buf[len] = one_buf[0];
-            len += 1;
-        }
-        // Strip trailing \r if present (Windows line endings)
-        if (len > 0 and buf[len - 1] == '\r') len -= 1;
-        if (len == 0) return "";
-        const result = bumpAlloc(len);
-        if (result.len == 0) return "";
-        @memcpy(result, buf[0..len]);
-        return result;
-    }
-
-    /// Write a string to stderr followed by a newline.
-    /// Switch terminal mode. Accepts u32 atom ID — checks atom name for "Raw".
-    pub fn set_terminal_mode(mode: u32) void {
-        const posix = std.posix;
-        const stdin_fd = posix.STDIN_FILENO;
-        const is_raw = std.mem.eql(u8, atomToString(mode), "Raw");
-        if (is_raw) {
-            // Raw mode: disable canonical mode and echo
-            var termios = posix.tcgetattr(stdin_fd) catch return;
-            // Save original settings on first call
-            if (!raw_mode_saved) {
-                original_termios = termios;
-                raw_mode_saved = true;
-            }
-            termios.lflag.ICANON = false;
-            termios.lflag.ECHO = false;
-            // Read returns after 1 byte
-            termios.cc[@intFromEnum(posix.V.MIN)] = 1;
-            termios.cc[@intFromEnum(posix.V.TIME)] = 0;
-            posix.tcsetattr(stdin_fd, .FLUSH, termios) catch return;
-        } else {
-            // Normal mode: restore original settings
-            if (raw_mode_saved) {
-                posix.tcsetattr(stdin_fd, .FLUSH, original_termios) catch return;
-            }
-        }
-    }
-
-    /// Non-blocking read of a single character from stdin.
-    /// Returns a 1-byte string if a key is available, or "" if not.
-    /// Must be in raw mode for meaningful use.
-    pub fn try_get_char() []const u8 {
-        const posix = std.posix;
-        const stdin_fd = posix.STDIN_FILENO;
-        const POLLIN: i16 = 0x0001;
-
-        // poll with timeout 0 = return immediately
-        var fds = [_]std.c.pollfd{.{
-            .fd = stdin_fd,
-            .events = POLLIN,
-            .revents = 0,
-        }};
-        const ready = posix.poll(&fds, 0) catch return "";
-        if (ready == 0) return "";
-
-        // Data available — read one byte
-        var one_buf = [_]u8{0};
-        const n = posixRead(STDIN_FD, &one_buf);
-        if (n == 0) return "";
-        const result_buf = bumpAlloc(1);
-        if (result_buf.len == 0) return "";
-        result_buf[0] = one_buf[0];
-        return result_buf;
-    }
-
-    /// Read a single character from stdin. Returns a 1-byte string.
-    /// In raw mode, returns immediately after one keypress.
-    /// In normal mode, blocks until Enter then returns first char.
-    pub fn get_char() []const u8 {
-        var one_buf = [_]u8{0};
-        const n = posixRead(STDIN_FD, &one_buf);
-        if (n == 0) return "";
-        const result = bumpAlloc(1);
-        if (result.len == 0) return "";
-        result[0] = one_buf[0];
-        return result;
-    }
-
-    pub fn warn(message: []const u8) void {
-        posixWrite(STDERR_FD, message);
-        posixWrite(STDERR_FD, "\n");
-    }
-
-    pub fn i64_to_string(value: i64) []const u8 {
-        var buf: [32]u8 = undefined;
-        const slice = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return "?";
-        const result = bumpAlloc(slice.len);
-        if (result.len == 0) return "?";
-        @memcpy(result, slice);
-        return result;
-    }
-
-    pub fn f64_to_string(value: f64) []const u8 {
-        var buf: [64]u8 = undefined;
-        const slice = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return "?";
-        const result = bumpAlloc(slice.len);
-        if (result.len == 0) return "?";
-        @memcpy(result, slice);
-        return result;
-    }
-
-    pub fn bool_to_string(value: bool) []const u8 {
-        return if (value) "true" else "false";
-    }
-
-    /// Generic to_string for string interpolation — handles all Zap types.
-    /// Strings pass through; other types are formatted via bump allocator.
-    pub fn to_string(value: anytype) []const u8 {
-        const T = @TypeOf(value);
-        const info = @typeInfo(T);
-        if (T == []const u8 or (info == .pointer and @typeInfo(std.meta.Child(T)) == .array)) {
-            return value;
-        } else if (T == bool) {
-            return if (value) "true" else "false";
-        } else if (info == .int or info == .comptime_int) {
-            var buf: [32]u8 = undefined;
-            const slice = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return "?";
-            const result = bumpAlloc(slice.len);
-            if (result.len == 0) return "?";
-            @memcpy(result, slice);
-            return result;
-        } else if (info == .float or info == .comptime_float) {
-            var buf: [64]u8 = undefined;
-            const slice = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return "?";
-            const result = bumpAlloc(slice.len);
-            if (result.len == 0) return "?";
-            @memcpy(result, slice);
-            return result;
-        } else if (info == .@"enum") {
-            return @tagName(value);
-        } else {
-            return "<value>";
-        }
-    }
-
-    pub fn string_to_i64(s: []const u8) ?i64 {
-        return std.fmt.parseInt(i64, s, 10) catch null;
-    }
-
-    pub fn string_to_f64(s: []const u8) ?f64 {
-        return std.fmt.parseFloat(f64, s) catch null;
-    }
-
-    /// Parse string to i64, returning 0 on failure (non-optional).
-    pub fn parse_i64(s: []const u8) i64 {
-        return std.fmt.parseInt(i64, s, 10) catch 0;
-    }
-
-    /// Parse string to f64, returning 0.0 on failure (non-optional).
-    pub fn parse_f64(s: []const u8) f64 {
-        return std.fmt.parseFloat(f64, s) catch 0.0;
-    }
-
-    pub fn div_i64(a: i64, b: i64) i64 {
-        if (b == 0) return 0;
-        return @divTrunc(a, b);
-    }
-
-    pub fn rem_i64(a: i64, b: i64) i64 {
-        if (b == 0) return 0;
-        return @rem(a, b);
-    }
-
-    pub fn abs_i64(x: i64) i64 {
-        return if (x < 0) -x else x;
-    }
-
-    pub fn abs_f64(x: f64) f64 {
-        return @abs(x);
-    }
-
-    pub fn max_i64(a: i64, b: i64) i64 {
-        return @max(a, b);
-    }
-
-    pub fn min_i64(a: i64, b: i64) i64 {
-        return @min(a, b);
-    }
-
-    pub fn max_f64(a: f64, b: f64) f64 {
-        return @max(a, b);
-    }
-
-    pub fn min_f64(a: f64, b: f64) f64 {
-        return @min(a, b);
-    }
-
-    // --- Float math ---
-    pub fn round_f64(x: f64) f64 {
-        return @round(x);
-    }
-
-    pub fn floor_f64(x: f64) f64 {
-        return @floor(x);
-    }
-
-    pub fn ceil_f64(x: f64) f64 {
-        return @ceil(x);
-    }
-
-    pub fn trunc_f64(x: f64) f64 {
-        return @trunc(x);
-    }
-
-    pub fn f64_to_i64(x: f64) i64 {
-        return @trunc(x);
-    }
-
-    pub fn i64_to_f64(x: i64) f64 {
-        return @floatFromInt(x);
-    }
-
-    // --- Math functions (Zig 0.16 float builtins) ---
-    pub fn sqrt_f64(x: f64) f64 {
-        return @sqrt(x);
-    }
-
-    pub fn sin_f64(x: f64) f64 {
-        return @sin(x);
-    }
-
-    pub fn cos_f64(x: f64) f64 {
-        return @cos(x);
-    }
-
-    pub fn tan_f64(x: f64) f64 {
-        return @tan(x);
-    }
-
-    pub fn exp_f64(x: f64) f64 {
-        return @exp(x);
-    }
-
-    pub fn exp2_f64(x: f64) f64 {
-        return @exp2(x);
-    }
-
-    pub fn log_f64(x: f64) f64 {
-        return @log(x);
-    }
-
-    pub fn log2_f64(x: f64) f64 {
-        return @log2(x);
-    }
-
-    pub fn log10_f64(x: f64) f64 {
-        return @log10(x);
-    }
-
-    // --- Float-to-integer conversions (Zig 0.16 direct builtins) ---
-    pub fn floor_to_i64(x: f64) i64 {
-        return @floor(x);
-    }
-
-    pub fn ceil_to_i64(x: f64) i64 {
-        return @ceil(x);
-    }
-
-    pub fn round_to_i64(x: f64) i64 {
-        return @round(x);
-    }
-
-    // --- Integer bit operations ---
-    pub fn clz_i64(x: i64) i64 {
-        return @intCast(@clz(x));
-    }
-
-    pub fn ctz_i64(x: i64) i64 {
-        return @intCast(@ctz(x));
-    }
-
-    pub fn popcount_i64(x: i64) i64 {
-        return @intCast(@popCount(x));
-    }
-
-    pub fn byte_swap_i64(x: i64) i64 {
-        return @byteSwap(x);
-    }
-
-    pub fn bit_reverse_i64(x: i64) i64 {
-        return @bitReverse(x);
-    }
-
-    // --- Integer predicates ---
-    pub fn sign_i64(x: i64) i64 {
-        if (x > 0) return 1;
-        if (x < 0) return -1;
-        return 0;
-    }
-
-    pub fn even_i64(x: i64) bool {
-        return @rem(x, 2) == 0;
-    }
-
-    pub fn odd_i64(x: i64) bool {
-        return @rem(x, 2) != 0;
-    }
-
-    pub fn gcd_i64(a: i64, b: i64) i64 {
-        var x = if (a < 0) -a else a;
-        var y = if (b < 0) -b else b;
-        while (y != 0) {
-            const t = y;
-            y = @rem(x, t);
-            x = t;
-        }
-        return x;
-    }
-
-    pub fn lcm_i64(a: i64, b: i64) i64 {
-        if (a == 0 and b == 0) return 0;
-        const g = gcd_i64(a, b);
-        if (g == 0) return 0;
-        const abs_a = if (a < 0) -a else a;
-        const abs_b = if (b < 0) -b else b;
-        return @divTrunc(abs_a, g) * abs_b;
-    }
-
-    // --- Saturating arithmetic ---
-    pub fn add_sat_i64(a: i64, b: i64) i64 {
-        return a +| b;
-    }
-
-    pub fn sub_sat_i64(a: i64, b: i64) i64 {
-        return a -| b;
-    }
-
-    pub fn mul_sat_i64(a: i64, b: i64) i64 {
-        return a *| b;
-    }
-
-    // --- Bitwise operations ---
-    pub fn band_i64(a: i64, b: i64) i64 {
-        return a & b;
-    }
-
-    pub fn bor_i64(a: i64, b: i64) i64 {
-        return a | b;
-    }
-
-    pub fn bxor_i64(a: i64, b: i64) i64 {
-        return a ^ b;
-    }
-
-    pub fn bnot_i64(a: i64) i64 {
-        return ~a;
-    }
-
-    pub fn bsl_i64(a: i64, b: i64) i64 {
-        if (b < 0 or b >= 64) return 0;
-        const shift: u6 = @intCast(b);
-        return a << shift;
-    }
-
-    pub fn bsr_i64(a: i64, b: i64) i64 {
-        if (b < 0 or b >= 64) return if (a < 0) -1 else 0;
-        const shift: u6 = @intCast(b);
-        return a >> shift;
-    }
-
-    // --- String operations ---
-    pub fn capitalize(s: []const u8) []const u8 {
-        if (s.len == 0) return s;
-        const result = bumpAlloc(s.len);
-        if (result.len == 0) return s;
-        result[0] = if (s[0] >= 'a' and s[0] <= 'z') s[0] - 32 else s[0];
-        for (s[1..], 0..) |c, i| {
-            result[i + 1] = if (c >= 'A' and c <= 'Z') c + 32 else c;
-        }
-        return result;
-    }
-
-    pub fn trim_leading(s: []const u8) []const u8 {
-        return std.mem.trimStart(u8, s, " \t\n\r");
-    }
-
-    pub fn trim_trailing(s: []const u8) []const u8 {
-        return std.mem.trimEnd(u8, s, " \t\n\r");
-    }
-
-    pub fn string_count(haystack: []const u8, needle: []const u8) i64 {
-        if (needle.len == 0) return 0;
-        var count: i64 = 0;
-        var i: usize = 0;
-        while (i + needle.len <= haystack.len) {
-            if (std.mem.eql(u8, haystack[i..][0..needle.len], needle)) {
-                count += 1;
-                i += needle.len;
-            } else {
-                i += 1;
-            }
-        }
-        return count;
-    }
-
-    pub fn upcase(s: []const u8) []const u8 {
-        const result = bumpAlloc(s.len);
-        if (result.len == 0) return s;
-        for (s, 0..) |c, i| {
-            result[i] = if (c >= 'a' and c <= 'z') c - 32 else c;
-        }
-        return result;
-    }
-
-    pub fn downcase(s: []const u8) []const u8 {
-        const result = bumpAlloc(s.len);
-        if (result.len == 0) return s;
-        for (s, 0..) |c, i| {
-            result[i] = if (c >= 'A' and c <= 'Z') c + 32 else c;
-        }
-        return result;
-    }
-
-    pub fn reverse_string(s: []const u8) []const u8 {
-        if (s.len == 0) return s;
-        const result = bumpAlloc(s.len);
-        if (result.len == 0) return s;
-        for (s, 0..) |c, i| {
-            result[s.len - 1 - i] = c;
-        }
-        return result;
-    }
-
-    pub fn replace_string(s: []const u8, pattern: []const u8, replacement: []const u8) []const u8 {
-        if (pattern.len == 0) return s;
-        // Count occurrences first
-        var count: usize = 0;
-        var pos: usize = 0;
-        while (pos + pattern.len <= s.len) {
-            if (std.mem.eql(u8, s[pos .. pos + pattern.len], pattern)) {
-                count += 1;
-                pos += pattern.len;
-            } else {
-                pos += 1;
-            }
-        }
-        if (count == 0) return s;
-        const new_len = s.len - (count * pattern.len) + (count * replacement.len);
-        const result = bumpAlloc(new_len);
-        if (result.len == 0) return s;
-        var src: usize = 0;
-        var dst: usize = 0;
-        while (src < s.len) {
-            if (src + pattern.len <= s.len and std.mem.eql(u8, s[src .. src + pattern.len], pattern)) {
-                @memcpy(result[dst .. dst + replacement.len], replacement);
-                dst += replacement.len;
-                src += pattern.len;
-            } else {
-                result[dst] = s[src];
-                dst += 1;
-                src += 1;
-            }
-        }
-        return result;
-    }
-
-    pub fn index_of(haystack: []const u8, needle: []const u8) i64 {
-        if (needle.len == 0) return 0;
-        if (needle.len > haystack.len) return -1;
-        if (std.mem.find(u8, haystack, needle)) |idx| {
-            return @intCast(idx);
-        }
-        return -1;
-    }
-
-    pub fn pad_leading(s: []const u8, total_len: i64, pad_char: []const u8) []const u8 {
-        const target: usize = if (total_len > 0) @intCast(total_len) else return s;
-        if (s.len >= target) return s;
-        const pad_count = target - s.len;
-        const result = bumpAlloc(target);
-        if (result.len == 0) return s;
-        const fill: u8 = if (pad_char.len > 0) pad_char[0] else ' ';
-        @memset(result[0..pad_count], fill);
-        @memcpy(result[pad_count..target], s);
-        return result;
-    }
-
-    pub fn pad_trailing(s: []const u8, total_len: i64, pad_char: []const u8) []const u8 {
-        const target: usize = if (total_len > 0) @intCast(total_len) else return s;
-        if (s.len >= target) return s;
-        const result = bumpAlloc(target);
-        if (result.len == 0) return s;
-        @memcpy(result[0..s.len], s);
-        const fill: u8 = if (pad_char.len > 0) pad_char[0] else ' ';
-        @memset(result[s.len..target], fill);
-        return result;
-    }
-
-    /// Split a string by delimiter, returning a List([]const u8) (linked list of strings).
-    pub fn split_to_list(s: []const u8, delimiter: []const u8) ?*const List([]const u8) {
-        if (delimiter.len == 0) {
-            return List([]const u8).cons(s, null);
-        }
-        // Build the list in reverse, then reverse it
-        var result: ?*const List([]const u8) = null;
-        var pos: usize = 0;
-        var seg_start: usize = 0;
-        while (pos < s.len) {
-            if (pos + delimiter.len <= s.len and std.mem.eql(u8, s[pos .. pos + delimiter.len], delimiter)) {
-                const seg = s[seg_start..pos];
-                const seg_copy = bumpAlloc(seg.len);
-                if (seg_copy.len > 0) @memcpy(seg_copy, seg);
-                result = List([]const u8).cons(seg_copy, result);
-                pos += delimiter.len;
-                seg_start = pos;
-            } else {
-                pos += 1;
-            }
-        }
-        // Last segment
-        const last_seg = s[seg_start..];
-        const last_copy = bumpAlloc(last_seg.len);
-        if (last_copy.len > 0) @memcpy(last_copy, last_seg);
-        result = List([]const u8).cons(last_copy, result);
-        return List([]const u8).reverse(result);
-    }
-
-    /// Join a list of strings with a separator.
-    pub fn string_join(list: ?*const List([]const u8), separator: []const u8) []const u8 {
-        if (list == null) return "";
-        // First pass: compute total length
-        var total: usize = 0;
-        var count: usize = 0;
-        var current = list;
-        while (current) |cell| {
-            total += cell.head.len;
-            count += 1;
-            current = cell.tail;
-        }
-        if (count == 0) return "";
-        total += separator.len * (count - 1);
-        const result = bumpAlloc(total);
-        if (result.len == 0) return "";
-        // Second pass: copy segments
-        var dst: usize = 0;
-        var first = true;
-        current = list;
-        while (current) |cell| {
-            if (!first and separator.len > 0) {
-                @memcpy(result[dst..][0..separator.len], separator);
-                dst += separator.len;
-            }
-            @memcpy(result[dst..][0..cell.head.len], cell.head);
-            dst += cell.head.len;
-            first = false;
-            current = cell.tail;
-        }
-        return result[0..dst];
-    }
-
-    pub fn split_string(s: []const u8, delimiter: []const u8) []const u8 {
-        // Returns a single bump-allocated buffer: count (as 4-byte LE) followed by
-        // length-prefixed segments.  The Zap wrapper peels segments off with slice().
-        if (delimiter.len == 0) return s;
-
-        // First pass: count segments and total size
-        var seg_count: usize = 1;
-        var total: usize = 0;
-        {
-            var pos: usize = 0;
-            while (pos < s.len) {
-                if (pos + delimiter.len <= s.len and std.mem.eql(u8, s[pos .. pos + delimiter.len], delimiter)) {
-                    seg_count += 1;
-                    pos += delimiter.len;
-                } else {
-                    total += 1;
-                    pos += 1;
-                }
-            }
-        }
-
-        // For simplicity, encode as "seg1\x00seg2\x00seg3" (null-separated).
-        // The Zap side counts nulls to split.
-        const result_len = total + seg_count - 1; // segments + null separators
-        const result = bumpAlloc(result_len);
-        if (result.len == 0) return s;
-        var dst: usize = 0;
-        var pos: usize = 0;
-        while (pos < s.len) {
-            if (pos + delimiter.len <= s.len and std.mem.eql(u8, s[pos .. pos + delimiter.len], delimiter)) {
-                if (dst < result_len) {
-                    result[dst] = 0;
-                    dst += 1;
-                }
-                pos += delimiter.len;
-            } else {
-                if (dst < result_len) {
-                    result[dst] = s[pos];
-                    dst += 1;
-                }
-                pos += 1;
-            }
-        }
-        return result[0..dst];
-    }
-
-    pub fn split_count(s: []const u8) i64 {
-        if (s.len == 0) return 1;
-        var count: i64 = 1;
-        for (s) |c| {
-            if (c == 0) count += 1;
-        }
-        return count;
-    }
-
-    pub fn split_get(s: []const u8, index: i64) []const u8 {
-        const idx: usize = if (index >= 0) @intCast(index) else return "";
-        var seg_start: usize = 0;
-        var current: usize = 0;
-        for (s, 0..) |c, i| {
-            if (c == 0) {
-                if (current == idx) return s[seg_start..i];
-                current += 1;
-                seg_start = i + 1;
-            }
-        }
-        if (current == idx) return s[seg_start..s.len];
-        return "";
-    }
-
-    pub fn repeat_string(s: []const u8, count: i64) []const u8 {
-        if (count <= 0 or s.len == 0) return "";
-        const n: usize = @intCast(count);
-        const result = bumpAlloc(s.len * n);
-        if (result.len == 0) return s;
-        for (0..n) |i| {
-            @memcpy(result[i * s.len .. (i + 1) * s.len], s);
-        }
-        return result;
-    }
-
-    // --- File I/O ---
-
-    pub fn file_read(path: []const u8) []const u8 {
-        const path_z = std.posix.toPosixPath(path) catch return "";
-        const fd = std.c.open(&path_z, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0)); if (fd < 0) return "";
-        defer _ = std.c.close(fd);
-        var stat: std.c.Stat = undefined;
-        if (std.c.fstat(fd, &stat) != 0) return "";
-        const file_size: usize = @intCast(@max(stat.size, 0));
-        if (file_size == 0) return "";
-        const read_size = @min(file_size, 1024 * 1024);
-        const result = bumpAlloc(read_size);
-        if (result.len == 0) return "";
-        var total: usize = 0;
-        while (total < read_size) {
-            const n = std.posix.read(fd, result[total..read_size]) catch break;
-            if (n == 0) break;
-            total += n;
-        }
-        return result[0..total];
-    }
-
-    pub fn file_write(path: []const u8, content: []const u8) bool {
-        const path_z = std.posix.toPosixPath(path) catch return false;
-        const fd = std.c.open(&path_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644)); if (fd < 0) return false;
-        defer _ = std.c.close(fd);
-        var written: usize = 0;
-        while (written < content.len) {
-            const rc = std.c.write(fd, content[written..].ptr, content[written..].len);
-            if (rc <= 0) return false;
-            written += @intCast(rc);
-        }
-        return true;
-    }
-
-    pub fn file_exists(path: []const u8) bool {
-        const path_z = std.posix.toPosixPath(path) catch return false;
-        return std.c.faccessat(std.posix.AT.FDCWD, &path_z, std.posix.F_OK, 0) == 0;
-    }
-
-    pub fn file_rm(path: []const u8) bool {
-        const path_z = std.posix.toPosixPath(path) catch return false;
-        return std.c.unlinkat(std.posix.AT.FDCWD, &path_z, 0) == 0;
-    }
-
-    pub fn file_mkdir(path: []const u8) bool {
-        const path_z = std.posix.toPosixPath(path) catch return false;
-        return std.c.mkdirat(std.posix.AT.FDCWD, &path_z, 0o755) == 0;
-    }
-
-    pub fn file_rmdir(path: []const u8) bool {
-        const path_z = std.posix.toPosixPath(path) catch return false;
-        const AT_REMOVEDIR: u32 = 0x80; // POSIX standard
-        return std.c.unlinkat(std.posix.AT.FDCWD, &path_z, AT_REMOVEDIR) == 0;
-    }
-
-    pub fn file_rename(old_path: []const u8, new_path: []const u8) bool {
-        const old_z = std.posix.toPosixPath(old_path) catch return false;
-        const new_z = std.posix.toPosixPath(new_path) catch return false;
-        return std.c.renameat(std.posix.AT.FDCWD, &old_z, std.posix.AT.FDCWD, &new_z) == 0;
-    }
-
-    pub fn file_cp(src: []const u8, dest: []const u8) bool {
-        const content = file_read(src);
-        if (content.len == 0) return false;
-        return file_write(dest, content);
-    }
-
-    pub fn file_is_dir(path: []const u8) bool {
-        const path_z = std.posix.toPosixPath(path) catch return false;
-        var stat: std.c.Stat = undefined;
-        if (std.c.fstatat(std.posix.AT.FDCWD, &path_z, &stat, 0) != 0) return false;
-        return stat.mode & std.posix.S.IFMT == std.posix.S.IFDIR;
-    }
-
-    pub fn file_is_regular(path: []const u8) bool {
-        const path_z = std.posix.toPosixPath(path) catch return false;
-        var stat: std.c.Stat = undefined;
-        if (std.c.fstatat(std.posix.AT.FDCWD, &path_z, &stat, 0) != 0) return false;
-        return stat.mode & std.posix.S.IFMT == std.posix.S.IFREG;
-    }
-
-    // --- System ---
-
-    pub fn sys_cwd() []const u8 {
-        var buf: [4096]u8 = undefined;
-        const cwd = std.process.getCwd(&buf) catch return "";
-        const result = bumpAlloc(cwd.len);
-        if (result.len == 0) return "";
-        @memcpy(result, cwd);
-        return result;
-    }
-
-    // --- Path operations (pure string manipulation) ---
-
-    pub fn path_join(a: []const u8, b: []const u8) []const u8 {
-        if (a.len == 0) return b;
-        if (b.len == 0) return a;
-        const need_sep = a[a.len - 1] != '/';
-        const total = a.len + b.len + @as(usize, if (need_sep) 1 else 0);
-        const result = bumpAlloc(total);
-        if (result.len == 0) return "";
-        @memcpy(result[0..a.len], a);
-        if (need_sep) {
-            result[a.len] = '/';
-            @memcpy(result[a.len + 1 ..][0..b.len], b);
-        } else {
-            @memcpy(result[a.len..][0..b.len], b);
-        }
-        return result;
-    }
-
-    pub fn path_basename(path: []const u8) []const u8 {
-        if (path.len == 0) return "";
-        var i: usize = path.len;
-        while (i > 0) {
-            i -= 1;
-            if (path[i] == '/') return path[i + 1 ..];
-        }
-        return path;
-    }
-
-    pub fn path_dirname(path: []const u8) []const u8 {
-        if (path.len == 0) return ".";
-        var i: usize = path.len;
-        while (i > 0) {
-            i -= 1;
-            if (path[i] == '/') {
-                if (i == 0) return "/";
-                return path[0..i];
-            }
-        }
-        return ".";
-    }
-
-    pub fn path_extname(path: []const u8) []const u8 {
-        const base = path_basename(path);
-        var i: usize = base.len;
-        while (i > 0) {
-            i -= 1;
-            if (base[i] == '.') return base[i..];
-        }
-        return "";
-    }
-
-    pub fn atom_name(id: anytype) []const u8 {
-        const T = @TypeOf(id);
-        if (T == u32) return atomToString(id);
-        if (@typeInfo(T) == .int) return atomToString(@intCast(id));
-        return "<not_an_atom>";
-    }
-
-    pub fn get_env(name: []const u8) []const u8 {
-        return env.getenvRuntime(name) orelse "";
-    }
-
-    pub fn panic(msg: []const u8) noreturn {
-        posixWrite(STDERR_FD, "panic: ");
-        posixWrite(STDERR_FD, msg);
-        posixWrite(STDERR_FD, "\n");
-        std.process.exit(1);
-    }
-
-    pub fn halt(msg: []const u8) noreturn {
-        posixWrite(STDERR_FD, "halt: ");
-        posixWrite(STDERR_FD, msg);
-        posixWrite(STDERR_FD, "\n");
-        std.process.exit(1);
-    }
-
-    /// Call a callable value — either a bare function pointer or a closure struct.
-    /// Closure structs have {call_fn, env, env_release} fields.
-    pub inline fn callCallable0(callable: anytype) @TypeOf(callable()) {
-        const T = @TypeOf(callable);
-        if (@typeInfo(T) == .@"struct" and @hasField(T, "call_fn")) {
-            return callable.call_fn(callable.env);
-        } else {
-            return callable();
-        }
-    }
-
-    pub inline fn callCallable1(callable: anytype, arg0: anytype) CallReturnType(@TypeOf(callable)) {
-        const T = @TypeOf(callable);
-        if (@typeInfo(T) == .@"struct" and @hasField(T, "call_fn")) {
-            return callable.call_fn(callable.env, arg0);
-        } else {
-            return callable(arg0);
-        }
-    }
-
-    pub inline fn callCallable2(callable: anytype, arg0: anytype, arg1: anytype) CallReturnType(@TypeOf(callable)) {
-        const T = @TypeOf(callable);
-        if (@typeInfo(T) == .@"struct" and @hasField(T, "call_fn")) {
-            return callable.call_fn(callable.env, arg0, arg1);
-        } else {
-            return callable(arg0, arg1);
-        }
-    }
-
-    pub inline fn callCallable3(callable: anytype, arg0: anytype, arg1: anytype, arg2: anytype) CallReturnType(@TypeOf(callable)) {
-        const T = @TypeOf(callable);
-        if (@typeInfo(T) == .@"struct" and @hasField(T, "call_fn")) {
-            return callable.call_fn(callable.env, arg0, arg1, arg2);
-        } else {
-            return callable(arg0, arg1, arg2);
-        }
-    }
-
-    fn CallReturnType(comptime T: type) type {
-        if (@typeInfo(T) == .@"struct" and @hasField(T, "call_fn")) {
-            const fn_info = @typeInfo(@TypeOf(@field(@as(T, undefined), "call_fn")));
-            if (fn_info == .pointer) {
-                const child = @typeInfo(fn_info.pointer.child);
-                if (child == .@"fn") {
-                    return child.@"fn".return_type orelse i64;
-                }
-            }
-            return i64;
-        } else {
-            const info = @typeInfo(T);
-            if (info == .pointer) {
-                const child = @typeInfo(info.pointer.child);
-                if (child == .@"fn") {
-                    return child.@"fn".return_type orelse i64;
-                }
-            }
-            return i64;
-        }
-    }
-
-
-    // CLI argument access — use getArgv() directly (no allocation)
-    pub fn arg_count() i64 {
-        const argv = getArgv();
-        return if (argv.len > 0) @as(i64, @intCast(argv.len)) - 1 else 0;
-    }
-
-    pub fn arg_at(index: anytype) []const u8 {
-        const argv = getArgv();
-        const T = @TypeOf(index);
-        const idx: usize = if (T == comptime_int or @typeInfo(T) == .int)
-            @intCast(index)
-        else
-            0;
-        // Index 0 = first user arg (skip program name)
-        if (idx + 1 < argv.len) return std.mem.sliceTo(argv[idx + 1], 0);
-        return "";
-    }
-};
 
 // ============================================================
 // TestTracker — mutable counters for test/assertion reporting
@@ -3324,6 +2591,678 @@ pub const MapHelpers = struct {
             return a == b;
         }
         return false;
+    }
+};
+
+// ============================================================
+// Type-grouped runtime namespaces
+//
+// These structs are the user-visible runtime entry points reached
+// from Zap source via `:zig.<Namespace>.<fn>(args)`. They group the
+// runtime helpers by the type they operate on (Integer, Float, Bool,
+// String, IO, File, Path, System, Math, Atom).
+// ============================================================
+
+pub const Integer = struct {
+    pub fn to_string(value: i64) []const u8 {
+        var buf: [32]u8 = undefined;
+        const slice = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return "?";
+        const result = bumpAlloc(slice.len);
+        if (result.len == 0) return "?";
+        @memcpy(result, slice);
+        return result;
+    }
+
+    /// Parse a string into i64, returning 0 on failure (non-optional).
+    pub fn parse(s: []const u8) i64 {
+        return std.fmt.parseInt(i64, s, 10) catch 0;
+    }
+
+    /// Parse a string into i64, returning null on failure.
+    pub fn parse_optional(s: []const u8) ?i64 {
+        return std.fmt.parseInt(i64, s, 10) catch null;
+    }
+
+    pub fn abs(x: i64) i64 {
+        return if (x < 0) -x else x;
+    }
+
+    pub fn max(a: i64, b: i64) i64 {
+        return @max(a, b);
+    }
+
+    pub fn min(a: i64, b: i64) i64 {
+        return @min(a, b);
+    }
+
+    pub fn div(a: i64, b: i64) i64 {
+        if (b == 0) return 0;
+        return @divTrunc(a, b);
+    }
+
+    pub fn rem(a: i64, b: i64) i64 {
+        if (b == 0) return 0;
+        return @rem(a, b);
+    }
+
+    pub fn sign(x: i64) i64 {
+        if (x > 0) return 1;
+        if (x < 0) return -1;
+        return 0;
+    }
+
+    pub fn is_even(x: i64) bool {
+        return @rem(x, 2) == 0;
+    }
+
+    pub fn is_odd(x: i64) bool {
+        return @rem(x, 2) != 0;
+    }
+
+    pub fn gcd(a: i64, b: i64) i64 {
+        var x = if (a < 0) -a else a;
+        var y = if (b < 0) -b else b;
+        while (y != 0) {
+            const t = y;
+            y = @rem(x, t);
+            x = t;
+        }
+        return x;
+    }
+
+    pub fn lcm(a: i64, b: i64) i64 {
+        if (a == 0 and b == 0) return 0;
+        const g = gcd(a, b);
+        if (g == 0) return 0;
+        const abs_a = if (a < 0) -a else a;
+        const abs_b = if (b < 0) -b else b;
+        return @divTrunc(abs_a, g) * abs_b;
+    }
+
+    pub fn add_sat(a: i64, b: i64) i64 {
+        return a +| b;
+    }
+
+    pub fn sub_sat(a: i64, b: i64) i64 {
+        return a -| b;
+    }
+
+    pub fn mul_sat(a: i64, b: i64) i64 {
+        return a *| b;
+    }
+
+    pub fn band(a: i64, b: i64) i64 {
+        return a & b;
+    }
+
+    pub fn bor(a: i64, b: i64) i64 {
+        return a | b;
+    }
+
+    pub fn bxor(a: i64, b: i64) i64 {
+        return a ^ b;
+    }
+
+    pub fn bnot(a: i64) i64 {
+        return ~a;
+    }
+
+    pub fn bsl(a: i64, b: i64) i64 {
+        if (b < 0 or b >= 64) return 0;
+        const shift: u6 = @intCast(b);
+        return a << shift;
+    }
+
+    pub fn bsr(a: i64, b: i64) i64 {
+        if (b < 0 or b >= 64) return if (a < 0) -1 else 0;
+        const shift: u6 = @intCast(b);
+        return a >> shift;
+    }
+
+    pub fn clz(x: i64) i64 {
+        return @intCast(@clz(x));
+    }
+
+    pub fn ctz(x: i64) i64 {
+        return @intCast(@ctz(x));
+    }
+
+    pub fn popcount(x: i64) i64 {
+        return @intCast(@popCount(x));
+    }
+
+    pub fn byte_swap(x: i64) i64 {
+        return @byteSwap(x);
+    }
+
+    pub fn bit_reverse(x: i64) i64 {
+        return @bitReverse(x);
+    }
+
+    pub fn to_f64(x: i64) f64 {
+        return @floatFromInt(x);
+    }
+};
+
+pub const Float = struct {
+    pub fn to_string(value: f64) []const u8 {
+        var buf: [64]u8 = undefined;
+        const slice = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return "?";
+        const result = bumpAlloc(slice.len);
+        if (result.len == 0) return "?";
+        @memcpy(result, slice);
+        return result;
+    }
+
+    /// Parse a string into f64, returning 0.0 on failure (non-optional).
+    pub fn parse(s: []const u8) f64 {
+        return std.fmt.parseFloat(f64, s) catch 0.0;
+    }
+
+    /// Parse a string into f64, returning null on failure.
+    pub fn parse_optional(s: []const u8) ?f64 {
+        return std.fmt.parseFloat(f64, s) catch null;
+    }
+
+    pub fn abs(x: f64) f64 {
+        return @abs(x);
+    }
+
+    pub fn max(a: f64, b: f64) f64 {
+        return @max(a, b);
+    }
+
+    pub fn min(a: f64, b: f64) f64 {
+        return @min(a, b);
+    }
+
+    pub fn round(x: f64) f64 {
+        return @round(x);
+    }
+
+    pub fn floor(x: f64) f64 {
+        return @floor(x);
+    }
+
+    pub fn ceil(x: f64) f64 {
+        return @ceil(x);
+    }
+
+    pub fn trunc(x: f64) f64 {
+        return @trunc(x);
+    }
+
+    pub fn to_i64(x: f64) i64 {
+        return @trunc(x);
+    }
+};
+
+pub const Math = struct {
+    pub fn sqrt(x: f64) f64 {
+        return @sqrt(x);
+    }
+
+    pub fn sin(x: f64) f64 {
+        return @sin(x);
+    }
+
+    pub fn cos(x: f64) f64 {
+        return @cos(x);
+    }
+
+    pub fn tan(x: f64) f64 {
+        return @tan(x);
+    }
+
+    pub fn exp(x: f64) f64 {
+        return @exp(x);
+    }
+
+    pub fn exp2(x: f64) f64 {
+        return @exp2(x);
+    }
+
+    pub fn log(x: f64) f64 {
+        return @log(x);
+    }
+
+    pub fn log2(x: f64) f64 {
+        return @log2(x);
+    }
+
+    pub fn log10(x: f64) f64 {
+        return @log10(x);
+    }
+
+    /// Floors a float and converts directly to an integer in one
+    /// step — more efficient than `Float.to_i64(Float.floor(x))`.
+    pub fn floor_to_i64(x: f64) i64 {
+        return @floor(x);
+    }
+
+    /// Ceils a float and converts directly to an integer in one
+    /// step — more efficient than `Float.to_i64(Float.ceil(x))`.
+    pub fn ceil_to_i64(x: f64) i64 {
+        return @ceil(x);
+    }
+
+    /// Rounds a float and converts directly to an integer in one
+    /// step — more efficient than `Float.to_i64(Float.round(x))`.
+    pub fn round_to_i64(x: f64) i64 {
+        return @round(x);
+    }
+};
+
+pub const Bool = struct {
+    pub fn to_string(value: bool) []const u8 {
+        return if (value) "true" else "false";
+    }
+};
+
+pub const IO = struct {
+    pub fn println(value: anytype) void {
+        const T = @TypeOf(value);
+        const info = @typeInfo(T);
+        if (T == []const u8 or (info == .pointer and @typeInfo(std.meta.Child(T)) == .array)) {
+            stdoutPrint("{s}\n", .{value});
+        } else if (info == .int or info == .comptime_int) {
+            stdoutPrint("{d}\n", .{value});
+        } else if (info == .float or info == .comptime_float) {
+            stdoutPrint("{d}\n", .{value});
+        } else if (T == bool) {
+            stdoutPrint("{}\n", .{value});
+        } else if (info == .@"enum") {
+            stdoutPrint(":{s}\n", .{@tagName(value)});
+        } else if (T == u32) {
+            // Could be an atom ID — print as atom if it looks up
+            const name = atomToString(value);
+            if (!std.mem.eql(u8, name, "<unknown_atom>")) {
+                stdoutPrint(":{s}\n", .{name});
+            } else {
+                stdoutPrint("{d}\n", .{value});
+            }
+        } else {
+            // For tuples, structs, and other compound types, use inspect formatting
+            var iw_buf: [4096]u8 = undefined;
+            var iw = BufWriter{ .buf = &iw_buf, .pos = 0 };
+            inspectWrite(&iw, value);
+            posixWrite(STDOUT_FD, iw_buf[0..iw.pos]);
+            stdoutPrint("\n", .{});
+        }
+    }
+
+    pub fn print_str(value: anytype) void {
+        const T = @TypeOf(value);
+        const info = @typeInfo(T);
+        if (T == []const u8 or (info == .pointer and @typeInfo(std.meta.Child(T)) == .array)) {
+            stdoutPrint("{s}", .{value});
+        } else {
+            stdoutPrint("{any}", .{value});
+        }
+    }
+
+    /// Read a line from stdin. Returns the line without the trailing
+    /// newline. Returns an empty string on EOF or error.
+    pub fn gets() []const u8 {
+        var buf: [4096]u8 = undefined;
+        var len: usize = 0;
+        // Read one byte at a time until newline or EOF
+        while (len < buf.len - 1) {
+            var one_buf = [_]u8{0};
+            const n = posixRead(STDIN_FD, &one_buf);
+            if (n == 0) break; // EOF
+            if (one_buf[0] == '\n') break;
+            buf[len] = one_buf[0];
+            len += 1;
+        }
+        // Strip trailing \r if present (Windows line endings)
+        if (len > 0 and buf[len - 1] == '\r') len -= 1;
+        if (len == 0) return "";
+        const result = bumpAlloc(len);
+        if (result.len == 0) return "";
+        @memcpy(result, buf[0..len]);
+        return result;
+    }
+
+    /// Switch terminal mode. Accepts a u32 atom ID — checks atom name
+    /// for "Raw" to enable raw mode (no canonical line buffering, no
+    /// echo); any other value restores the saved original termios.
+    pub fn set_terminal_mode(mode: u32) void {
+        const posix = std.posix;
+        const stdin_fd = posix.STDIN_FILENO;
+        const is_raw = std.mem.eql(u8, atomToString(mode), "Raw");
+        if (is_raw) {
+            var termios = posix.tcgetattr(stdin_fd) catch return;
+            if (!raw_mode_saved) {
+                original_termios = termios;
+                raw_mode_saved = true;
+            }
+            termios.lflag.ICANON = false;
+            termios.lflag.ECHO = false;
+            termios.cc[@intFromEnum(posix.V.MIN)] = 1;
+            termios.cc[@intFromEnum(posix.V.TIME)] = 0;
+            posix.tcsetattr(stdin_fd, .FLUSH, termios) catch return;
+        } else {
+            if (raw_mode_saved) {
+                posix.tcsetattr(stdin_fd, .FLUSH, original_termios) catch return;
+            }
+        }
+    }
+
+    /// Non-blocking read of a single character from stdin. Returns a
+    /// 1-byte string if a key is available, "" otherwise. Must be in
+    /// raw mode for meaningful use.
+    pub fn try_get_char() []const u8 {
+        const posix = std.posix;
+        const stdin_fd = posix.STDIN_FILENO;
+        const POLLIN: i16 = 0x0001;
+
+        var fds = [_]std.c.pollfd{.{
+            .fd = stdin_fd,
+            .events = POLLIN,
+            .revents = 0,
+        }};
+        const ready = posix.poll(&fds, 0) catch return "";
+        if (ready == 0) return "";
+
+        var one_buf = [_]u8{0};
+        const n = posixRead(STDIN_FD, &one_buf);
+        if (n == 0) return "";
+        const result_buf = bumpAlloc(1);
+        if (result_buf.len == 0) return "";
+        result_buf[0] = one_buf[0];
+        return result_buf;
+    }
+
+    /// Read a single character from stdin. Returns a 1-byte string.
+    /// In raw mode, returns immediately after one keypress; in normal
+    /// mode, blocks until Enter then returns the first character.
+    pub fn get_char() []const u8 {
+        var one_buf = [_]u8{0};
+        const n = posixRead(STDIN_FD, &one_buf);
+        if (n == 0) return "";
+        const result = bumpAlloc(1);
+        if (result.len == 0) return "";
+        result[0] = one_buf[0];
+        return result;
+    }
+
+    /// Write a string to stderr followed by a newline.
+    pub fn warn(message: []const u8) void {
+        posixWrite(STDERR_FD, message);
+        posixWrite(STDERR_FD, "\n");
+    }
+
+    pub fn inspect(value: anytype) InspectReturn(@TypeOf(value)) {
+        var iw_buf: [4096]u8 = undefined;
+        var iw = BufWriter{ .buf = &iw_buf, .pos = 0 };
+        inspectWrite(&iw, value);
+        posixWrite(STDOUT_FD, iw_buf[0..iw.pos]);
+        stdoutPrint("\n", .{});
+        const RT = InspectReturn(@TypeOf(value));
+        if (RT == void) return;
+        return value;
+    }
+};
+
+/// Returns `void` for comptime-only types (enum literals, comptime_int,
+/// etc.) so that `IO.inspect` can be called at runtime without forcing
+/// comptime evaluation. For all other types, returns the input type
+/// to support piping.
+fn InspectReturn(comptime T: type) type {
+    return switch (@typeInfo(T)) {
+        .enum_literal, .comptime_int, .comptime_float, .type, .null, .undefined => void,
+        else => T,
+    };
+}
+
+fn inspectWrite(writer: anytype, value: anytype) void {
+    const T = @TypeOf(value);
+    const info = @typeInfo(T);
+    if (T == []const u8) {
+        writer.print("\"{s}\"", .{value}) catch {};
+    } else if (info == .pointer) {
+        const child_info = @typeInfo(info.pointer.child);
+        if (child_info == .array) {
+            if (child_info.array.child == u8) {
+                writer.print("\"{s}\"", .{value}) catch {};
+            } else {
+                writer.print("[", .{}) catch {};
+                for (0..child_info.array.len) |i| {
+                    if (i > 0) writer.print(", ", .{}) catch {};
+                    inspectWrite(writer, value[i]);
+                }
+                writer.print("]", .{}) catch {};
+            }
+        } else {
+            writer.print("{any}", .{value}) catch {};
+        }
+    } else if (info == .int or info == .comptime_int) {
+        writer.print("{d}", .{value}) catch {};
+    } else if (info == .float or info == .comptime_float) {
+        const rounded: i64 = @trunc(value);
+        if (value == @as(@TypeOf(value), @floatFromInt(rounded))) {
+            writer.print("{d}.0", .{rounded}) catch {};
+        } else {
+            writer.print("{d}", .{value}) catch {};
+        }
+    } else if (T == bool) {
+        writer.print("{}", .{value}) catch {};
+    } else if (info == .@"struct" and info.@"struct".is_tuple) {
+        writer.print("{{", .{}) catch {};
+        inline for (info.@"struct".fields, 0..) |field, i| {
+            if (i > 0) writer.print(", ", .{}) catch {};
+            inspectWrite(writer, @field(value, field.name));
+        }
+        writer.print("}}", .{}) catch {};
+    } else if (info == .@"struct") {
+        // Detect Zap map representation: struct of .{key, value} entry structs.
+        const is_map = comptime blk: {
+            if (info.@"struct".fields.len == 0) break :blk false;
+            for (info.@"struct".fields) |f| {
+                const inner = @typeInfo(f.type);
+                if (inner != .@"struct") break :blk false;
+                if (inner.@"struct".fields.len != 2) break :blk false;
+                const has_key = for (inner.@"struct".fields) |ef| {
+                    if (std.mem.eql(u8, ef.name, "key")) break true;
+                } else false;
+                const has_value = for (inner.@"struct".fields) |ef| {
+                    if (std.mem.eql(u8, ef.name, "value")) break true;
+                } else false;
+                if (!has_key or !has_value) break :blk false;
+            }
+            break :blk true;
+        };
+        if (is_map) {
+            writer.print("%{{", .{}) catch {};
+            inline for (info.@"struct".fields, 0..) |field, i| {
+                if (i > 0) writer.print(", ", .{}) catch {};
+                const entry = @field(value, field.name);
+                inspectWrite(writer, entry.key);
+                writer.print(": ", .{}) catch {};
+                inspectWrite(writer, entry.value);
+            }
+            writer.print("}}", .{}) catch {};
+        } else {
+            writer.print("%{{", .{}) catch {};
+            inline for (info.@"struct".fields, 0..) |field, i| {
+                if (i > 0) writer.print(", ", .{}) catch {};
+                writer.print("{s}: ", .{field.name}) catch {};
+                inspectWrite(writer, @field(value, field.name));
+            }
+            writer.print("}}", .{}) catch {};
+        }
+    } else if (info == .@"enum") {
+        writer.print(":{s}", .{@tagName(value)}) catch {};
+    } else {
+        writer.print("{any}", .{value}) catch {};
+    }
+}
+
+pub const File = struct {
+    pub fn read(path: []const u8) []const u8 {
+        const path_z = std.posix.toPosixPath(path) catch return "";
+        const fd = std.c.open(&path_z, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+        if (fd < 0) return "";
+        defer _ = std.c.close(fd);
+        var stat: std.c.Stat = undefined;
+        if (std.c.fstat(fd, &stat) != 0) return "";
+        const file_size: usize = @intCast(@max(stat.size, 0));
+        if (file_size == 0) return "";
+        const read_size = @min(file_size, 1024 * 1024);
+        const result = bumpAlloc(read_size);
+        if (result.len == 0) return "";
+        var total: usize = 0;
+        while (total < read_size) {
+            const n = std.posix.read(fd, result[total..read_size]) catch break;
+            if (n == 0) break;
+            total += n;
+        }
+        return result[0..total];
+    }
+
+    pub fn write(path: []const u8, content: []const u8) bool {
+        const path_z = std.posix.toPosixPath(path) catch return false;
+        const fd = std.c.open(&path_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+        if (fd < 0) return false;
+        defer _ = std.c.close(fd);
+        var written: usize = 0;
+        while (written < content.len) {
+            const rc = std.c.write(fd, content[written..].ptr, content[written..].len);
+            if (rc <= 0) return false;
+            written += @intCast(rc);
+        }
+        return true;
+    }
+
+    pub fn exists(path: []const u8) bool {
+        const path_z = std.posix.toPosixPath(path) catch return false;
+        return std.c.faccessat(std.posix.AT.FDCWD, &path_z, std.posix.F_OK, 0) == 0;
+    }
+
+    pub fn rm(path: []const u8) bool {
+        const path_z = std.posix.toPosixPath(path) catch return false;
+        return std.c.unlinkat(std.posix.AT.FDCWD, &path_z, 0) == 0;
+    }
+
+    pub fn mkdir(path: []const u8) bool {
+        const path_z = std.posix.toPosixPath(path) catch return false;
+        return std.c.mkdirat(std.posix.AT.FDCWD, &path_z, 0o755) == 0;
+    }
+
+    pub fn rmdir(path: []const u8) bool {
+        const path_z = std.posix.toPosixPath(path) catch return false;
+        const AT_REMOVEDIR: u32 = 0x80; // POSIX standard
+        return std.c.unlinkat(std.posix.AT.FDCWD, &path_z, AT_REMOVEDIR) == 0;
+    }
+
+    pub fn rename(old_path: []const u8, new_path: []const u8) bool {
+        const old_z = std.posix.toPosixPath(old_path) catch return false;
+        const new_z = std.posix.toPosixPath(new_path) catch return false;
+        return std.c.renameat(std.posix.AT.FDCWD, &old_z, std.posix.AT.FDCWD, &new_z) == 0;
+    }
+
+    pub fn cp(src: []const u8, dest: []const u8) bool {
+        const content = read(src);
+        if (content.len == 0) return false;
+        return write(dest, content);
+    }
+
+    pub fn is_dir(path: []const u8) bool {
+        const path_z = std.posix.toPosixPath(path) catch return false;
+        var stat: std.c.Stat = undefined;
+        if (std.c.fstatat(std.posix.AT.FDCWD, &path_z, &stat, 0) != 0) return false;
+        return stat.mode & std.posix.S.IFMT == std.posix.S.IFDIR;
+    }
+
+    pub fn is_regular(path: []const u8) bool {
+        const path_z = std.posix.toPosixPath(path) catch return false;
+        var stat: std.c.Stat = undefined;
+        if (std.c.fstatat(std.posix.AT.FDCWD, &path_z, &stat, 0) != 0) return false;
+        return stat.mode & std.posix.S.IFMT == std.posix.S.IFREG;
+    }
+};
+
+pub const Path = struct {
+    pub fn join(a: []const u8, b: []const u8) []const u8 {
+        if (a.len == 0) return b;
+        if (b.len == 0) return a;
+        const need_sep = a[a.len - 1] != '/';
+        const total = a.len + b.len + @as(usize, if (need_sep) 1 else 0);
+        const result = bumpAlloc(total);
+        if (result.len == 0) return "";
+        @memcpy(result[0..a.len], a);
+        if (need_sep) {
+            result[a.len] = '/';
+            @memcpy(result[a.len + 1 ..][0..b.len], b);
+        } else {
+            @memcpy(result[a.len..][0..b.len], b);
+        }
+        return result;
+    }
+
+    pub fn basename(path: []const u8) []const u8 {
+        if (path.len == 0) return "";
+        var i: usize = path.len;
+        while (i > 0) {
+            i -= 1;
+            if (path[i] == '/') return path[i + 1 ..];
+        }
+        return path;
+    }
+
+    pub fn dirname(path: []const u8) []const u8 {
+        if (path.len == 0) return ".";
+        var i: usize = path.len;
+        while (i > 0) {
+            i -= 1;
+            if (path[i] == '/') {
+                if (i == 0) return "/";
+                return path[0..i];
+            }
+        }
+        return ".";
+    }
+
+    pub fn extname(path: []const u8) []const u8 {
+        const base = basename(path);
+        var i: usize = base.len;
+        while (i > 0) {
+            i -= 1;
+            if (base[i] == '.') return base[i..];
+        }
+        return "";
+    }
+};
+
+pub const System = struct {
+    pub fn cwd() []const u8 {
+        var buf: [4096]u8 = undefined;
+        const result_cwd = std.process.getCwd(&buf) catch return "";
+        const result = bumpAlloc(result_cwd.len);
+        if (result.len == 0) return "";
+        @memcpy(result, result_cwd);
+        return result;
+    }
+
+    pub fn get_env(name: []const u8) []const u8 {
+        return env.getenvRuntime(name) orelse "";
+    }
+
+    pub fn arg_count() i64 {
+        const argv = getArgv();
+        return if (argv.len > 0) @as(i64, @intCast(argv.len)) - 1 else 0;
+    }
+
+    pub fn arg_at(index: anytype) []const u8 {
+        const argv = getArgv();
+        const T = @TypeOf(index);
+        const idx: usize = if (T == comptime_int or @typeInfo(T) == .int)
+            @intCast(index)
+        else
+            0;
+        if (idx + 1 < argv.len) return std.mem.sliceTo(argv[idx + 1], 0);
+        return "";
     }
 };
 

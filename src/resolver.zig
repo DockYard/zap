@@ -193,7 +193,7 @@ pub const Resolver = struct {
                 try self.resolveExpr(ref);
             }
 
-            // Resolve body (skip for @native bodyless declarations)
+            // Resolve body (skip for bodyless declarations: protocol sigs, forward decls)
             if (clause.body) |body| {
                 try self.resolveBlock(body);
             }

@@ -1,6 +1,7 @@
 pub const Token = @import("token.zig").Token;
 pub const Lexer = @import("lexer.zig").Lexer;
 pub const ast = @import("ast.zig");
+pub const ast_visitor = @import("ast_visitor.zig");
 pub const Parser = @import("parser.zig").Parser;
 pub const scope = @import("scope.zig");
 pub const Collector = @import("collector.zig").Collector;
@@ -11,7 +12,6 @@ pub const types = @import("types.zig");
 pub const DispatchEngine = @import("dispatch.zig").DispatchEngine;
 pub const hir = @import("hir.zig");
 pub const ir = @import("ir.zig");
-pub const escape_analysis = @import("escape_analysis.zig");
 pub const ast_data = @import("ast_data.zig");
 pub const macro_eval = @import("macro_eval.zig");
 pub const zir_builder = @import("zir_builder.zig");
@@ -58,7 +58,6 @@ test {
     _ = @import("dispatch.zig");
     _ = @import("hir.zig");
     _ = @import("ir.zig");
-    _ = @import("escape_analysis.zig");
     _ = @import("escape_lattice.zig");
     _ = @import("generalized_escape.zig");
     _ = @import("interprocedural.zig");

@@ -131,7 +131,7 @@ fn substituteInFunction(
                 try new_clauses.append(alloc, clause);
             }
         } else {
-            // @native bodyless declaration — pass through unchanged
+            // Bodyless clause (protocol signature, forward decl) — pass through unchanged
             try new_clauses.append(alloc, clause);
         }
     }

@@ -1442,7 +1442,8 @@ pub const Parser = struct {
             refinement = try self.parseGuardExpr();
         }
 
-        // Bodyless declaration: @native functions have no body
+        // Bodyless declaration: protocol/impl signatures and forward
+        // declarations have no body — return early with body=null.
         if (!self.check(.left_brace)) {
             return .{
                 .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
@@ -2151,7 +2152,7 @@ pub const Parser = struct {
             } else if (self.check(.dot)) {
                 _ = self.advance();
                 // Accept both lowercase identifiers and capitalized module names
-                // (e.g., :zig.Prelude.println or map.field)
+                // (e.g., :zig.IO.println or map.field)
                 const field_tok = if (self.check(.identifier))
                     self.advance()
                 else if (self.check(.module_identifier))

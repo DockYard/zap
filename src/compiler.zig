@@ -341,8 +341,10 @@ pub fn collectAllFromUnits(
     step += 1;
     if (options.show_progress) std.debug.print("\r\x1b[K  [{d}/{d}] Collect", .{ step, total_steps });
 
-    // Intern "Kernel" before creating the collector — needed for auto-import injection
-    const kernel_name_id = try interner.intern("Kernel");
+    // Intern the auto-imported Kernel module's name once — needed for
+    // auto-import injection. The literal name lives in
+    // `discovery.kernel_module_name`.
+    const kernel_name_id = try interner.intern(zap.discovery.kernel_module_name);
     var collector = zap.Collector.init(alloc, &interner, kernel_name_id);
     {
         const pre_module_programs = try buildModulePrograms(alloc, &program, &interner);
@@ -350,13 +352,13 @@ pub fn collectAllFromUnits(
         // Collect Kernel FIRST so its scope exists when other modules'
         // auto-import resolves. This mirrors Elixir's bootstrap ordering.
         for (pre_module_programs) |entry| {
-            if (std.mem.eql(u8, entry.name, "Kernel")) {
+            if (std.mem.eql(u8, entry.name, zap.discovery.kernel_module_name)) {
                 collector.collectProgramSurface(&entry.program) catch {};
                 break;
             }
         }
         for (pre_module_programs) |entry| {
-            if (std.mem.eql(u8, entry.name, "Kernel")) continue;
+            if (std.mem.eql(u8, entry.name, zap.discovery.kernel_module_name)) continue;
             collector.collectProgramSurface(&entry.program) catch {
                 for (collector.errors.items) |collect_err| {
                     diag_engine.err(collect_err.message, collect_err.span) catch {};
@@ -463,13 +465,13 @@ pub fn collectAllFromUnits(
     var final_collector = zap.Collector.init(alloc, &interner, kernel_name_id);
     // Collect Kernel first in the second pass too
     for (module_programs) |entry| {
-        if (std.mem.eql(u8, entry.name, "Kernel")) {
+        if (std.mem.eql(u8, entry.name, zap.discovery.kernel_module_name)) {
             final_collector.collectProgramSurface(&entry.program) catch {};
             break;
         }
     }
     for (module_programs) |entry| {
-        if (std.mem.eql(u8, entry.name, "Kernel")) continue;
+        if (std.mem.eql(u8, entry.name, zap.discovery.kernel_module_name)) continue;
         final_collector.collectProgramSurface(&entry.program) catch {
             for (final_collector.errors.items) |collect_err| {
                 diag_engine.err(collect_err.message, collect_err.span) catch {};
@@ -690,6 +692,7 @@ pub fn compileForCtfe(
 
     var ir_builder = zap.ir.IrBuilder.init(alloc, &ctx.interner);
     ir_builder.type_store = type_checker.store;
+    ir_builder.scope_graph = &ctx.collector.graph;
     defer ir_builder.deinit();
     var ir_program = ir_builder.buildProgram(&mono_program) catch {
         ctx.diag_engine.err("Error during IR lowering", .{ .start = 0, .end = 0 }) catch {};
@@ -772,32 +775,6 @@ pub fn compileForCtfe(
     return .{ .ir_program = ir_program, .analysis_context = pipeline_result.context };
 }
 
-/// Compile a single file's module through macro expansion, desugaring,
-/// type checking, HIR, and IR. Stores the result in the CompilationUnit.
-///
-/// This is the per-file compilation entry point. Currently it requires the
-/// full merged program (via CompilationContext) because the type checker,
-/// HIR builder, and IR builder operate on the full program. When these
-/// phases support single-module operation, this function will process only
-/// the unit's module.
-///
-/// For now, this delegates to compileFiles for the actual work and extracts
-/// the per-module IR. The function signature is the correct API for future
-/// per-file parallelism.
-pub fn compileFile(
-    alloc: std.mem.Allocator,
-    ctx: *CompilationContext,
-    unit: *CompilationUnit,
-    options: CompileOptions,
-) CompileError!void {
-    const mod_program = lookupModuleProgram(ctx, unit.module_name) orelse {
-        ctx.diag_engine.err("Module disappeared during per-module compilation", .{ .start = 0, .end = 0 }) catch {};
-        emitDiagnostics(&ctx.diag_engine, alloc);
-        return error.CollectFailed;
-    };
-    unit.ir_program = try compileSingleModuleIr(alloc, ctx, unit.module_name, mod_program, options);
-}
-
 /// Pass 3: Finalize compilation — wrap the IR program with analysis context.
 ///
 /// Currently this is a no-op wrapper since analysis runs inside compileFiles.
@@ -812,15 +789,7 @@ pub fn mergeAndFinalize(
     alloc: std.mem.Allocator,
     ir_program: *ir.Program,
 ) CompileError!CompileResult {
-    return mergeAndFinalizeWithIo(alloc, ir_program, null);
-}
-
-fn mergeAndFinalizeWithIo(
-    alloc: std.mem.Allocator,
-    ir_program: *ir.Program,
-    pio: ?std.Io,
-) CompileError!CompileResult {
-    var pipeline_result = zap.analysis_pipeline.runAnalysisPipelineWithIo(alloc, ir_program, pio) catch {
+    var pipeline_result = zap.analysis_pipeline.runAnalysisPipelineWithIo(alloc, ir_program, null) catch {
         return error.IrFailed;
     };
     zap.contification_rewrite.rewriteContifiedContinuations(alloc, ir_program, &pipeline_result.context) catch |err| switch (err) {
@@ -911,7 +880,8 @@ fn runTypeCheck(
     }
     if (ctx.diag_engine.hasErrors()) {
         emitContextDiagnostics(ctx, alloc);
-        type_checker.deinit();
+        // The `errdefer type_checker.deinit()` above runs the cleanup —
+        // calling deinit explicitly here as well caused a double-free.
         return error.TypeCheckFailed;
     }
     return type_checker;
@@ -980,6 +950,7 @@ fn compileHirToIr(
 ) CompileError!ir.Program {
     var ir_builder = zap.ir.IrBuilder.init(alloc, &ctx.interner);
     ir_builder.type_store = type_store;
+    ir_builder.scope_graph = &ctx.collector.graph;
     defer ir_builder.deinit();
     const mod_ir = ir_builder.buildProgram(hir_program) catch {
         ctx.diag_engine.err("Error during IR lowering", .{ .start = 0, .end = 0 }) catch {};
@@ -1060,14 +1031,10 @@ pub fn compileModuleByModule(
     module_order: []const []const u8,
     options: CompileOptions,
 ) CompileError!CompileResult {
-    const pio = options.io;
-
     // Collect all IR functions and type defs across modules
     var all_functions: std.ArrayListUnmanaged(ir.Function) = .empty;
     var all_type_defs: std.ArrayListUnmanaged(ir.TypeDef) = .empty;
     var entry_id: ?ir.FunctionId = null;
-
-    _ = pio;
 
     // Shared TypeStore + globally-unique group IDs pipeline.
     {
@@ -1175,30 +1142,6 @@ pub fn compileModuleByModule(
 
     // Run analysis pipeline on merged result
     return mergeAndFinalize(alloc, &merged_ir);
-}
-
-const ModuleCompileResult = struct {
-    err: bool = false,
-};
-
-fn compileModuleTask(
-    alloc: std.mem.Allocator,
-    ctx: *CompilationContext,
-    mod_name: []const u8,
-    options: CompileOptions,
-    result: *ModuleCompileResult,
-) void {
-    const unit = lookupCompilationUnit(ctx, mod_name) orelse {
-        result.err = true;
-        return;
-    };
-    compileFile(alloc, ctx, unit, options) catch {
-        result.err = true;
-        return;
-    };
-    if (unit.ir_program == null) {
-        result.err = true;
-    }
 }
 
 /// Extract a single-module ast.Program from the merged program.
@@ -1427,119 +1370,6 @@ fn lookupModuleProgram(ctx: *const CompilationContext, mod_name: []const u8) ?*c
     return null;
 }
 
-fn lookupCompilationUnit(ctx: *CompilationContext, mod_name: []const u8) ?*CompilationUnit {
-    for (ctx.units) |*unit| {
-        if (std.mem.eql(u8, unit.module_name, mod_name)) return unit;
-    }
-    return null;
-}
-
-fn cloneFunctionWithOffset(alloc: std.mem.Allocator, func: ir.Function, function_id_offset: u32) error{OutOfMemory}!ir.Function {
-    const blocks = try alloc.alloc(ir.Block, func.body.len);
-    for (func.body, 0..) |block, i| {
-        blocks[i] = .{
-            .label = block.label,
-            .instructions = try cloneInstructionsWithOffset(alloc, block.instructions, function_id_offset),
-        };
-    }
-
-    var adjusted = func;
-    adjusted.id = function_id_offset + func.id;
-    adjusted.body = blocks;
-    return adjusted;
-}
-
-fn cloneInstructionsWithOffset(alloc: std.mem.Allocator, instrs: []const ir.Instruction, function_id_offset: u32) error{OutOfMemory}![]const ir.Instruction {
-    const cloned = try alloc.alloc(ir.Instruction, instrs.len);
-    for (instrs, 0..) |instr, i| {
-        cloned[i] = try cloneInstructionWithOffset(alloc, instr, function_id_offset);
-    }
-    return cloned;
-}
-
-fn cloneInstructionWithOffset(alloc: std.mem.Allocator, instr: ir.Instruction, function_id_offset: u32) error{OutOfMemory}!ir.Instruction {
-    var adjusted = instr;
-    switch (instr) {
-        .call_direct => |call| {
-            var next = call;
-            next.function += function_id_offset;
-            adjusted = .{ .call_direct = next };
-        },
-        .call_dispatch => |call| {
-            var next = call;
-            next.group_id += function_id_offset;
-            adjusted = .{ .call_dispatch = next };
-        },
-        .make_closure => |closure| {
-            var next = closure;
-            next.function += function_id_offset;
-            adjusted = .{ .make_closure = next };
-        },
-        .if_expr => |if_expr| {
-            var next = if_expr;
-            next.then_instrs = try cloneInstructionsWithOffset(alloc, if_expr.then_instrs, function_id_offset);
-            next.else_instrs = try cloneInstructionsWithOffset(alloc, if_expr.else_instrs, function_id_offset);
-            adjusted = .{ .if_expr = next };
-        },
-        .guard_block => |guard| {
-            var next = guard;
-            next.body = try cloneInstructionsWithOffset(alloc, guard.body, function_id_offset);
-            adjusted = .{ .guard_block = next };
-        },
-        .case_block => |case_block| {
-            var next = case_block;
-            next.pre_instrs = try cloneInstructionsWithOffset(alloc, case_block.pre_instrs, function_id_offset);
-            next.default_instrs = try cloneInstructionsWithOffset(alloc, case_block.default_instrs, function_id_offset);
-            const arms = try alloc.alloc(ir.IrCaseArm, case_block.arms.len);
-            for (case_block.arms, 0..) |arm, i| {
-                var arm_copy = arm;
-                arm_copy.cond_instrs = try cloneInstructionsWithOffset(alloc, arm.cond_instrs, function_id_offset);
-                arm_copy.body_instrs = try cloneInstructionsWithOffset(alloc, arm.body_instrs, function_id_offset);
-                arms[i] = arm_copy;
-            }
-            next.arms = arms;
-            adjusted = .{ .case_block = next };
-        },
-        .switch_literal => |switch_literal| {
-            var next = switch_literal;
-            next.default_instrs = try cloneInstructionsWithOffset(alloc, switch_literal.default_instrs, function_id_offset);
-            const cases = try alloc.alloc(ir.LitCase, switch_literal.cases.len);
-            for (switch_literal.cases, 0..) |case, i| {
-                var case_copy = case;
-                case_copy.body_instrs = try cloneInstructionsWithOffset(alloc, case.body_instrs, function_id_offset);
-                cases[i] = case_copy;
-            }
-            next.cases = cases;
-            adjusted = .{ .switch_literal = next };
-        },
-        .switch_return => |switch_return| {
-            var next = switch_return;
-            next.default_instrs = try cloneInstructionsWithOffset(alloc, switch_return.default_instrs, function_id_offset);
-            const cases = try alloc.alloc(ir.ReturnCase, switch_return.cases.len);
-            for (switch_return.cases, 0..) |case, i| {
-                var case_copy = case;
-                case_copy.body_instrs = try cloneInstructionsWithOffset(alloc, case.body_instrs, function_id_offset);
-                cases[i] = case_copy;
-            }
-            next.cases = cases;
-            adjusted = .{ .switch_return = next };
-        },
-        .union_switch_return => |switch_return| {
-            var next = switch_return;
-            const cases = try alloc.alloc(ir.UnionCase, switch_return.cases.len);
-            for (switch_return.cases, 0..) |case, i| {
-                var case_copy = case;
-                case_copy.body_instrs = try cloneInstructionsWithOffset(alloc, case.body_instrs, function_id_offset);
-                cases[i] = case_copy;
-            }
-            next.cases = cases;
-            adjusted = .{ .union_switch_return = next };
-        },
-        else => {},
-    }
-    return adjusted;
-}
-
 /// Compile a Zap source file through the frontend and ZIR backend to produce
 /// a native binary.
 fn emitDiagnostics(diag_engine: *zap.DiagnosticEngine, alloc: std.mem.Allocator) void {
@@ -1549,44 +1379,6 @@ fn emitDiagnostics(diag_engine: *zap.DiagnosticEngine, alloc: std.mem.Allocator)
 }
 
 const testing = std.testing;
-
-test "cloneFunctionWithOffset rewrites nested function references" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-    const func = ir.Function{
-        .id = 2,
-        .name = "Test__nested",
-        .scope_id = 0,
-        .arity = 0,
-        .params = &.{},
-        .return_type = .void,
-        .body = &.{ir.Block{
-            .label = 0,
-            .instructions = &.{
-                .{ .call_direct = .{ .dest = 0, .function = 1, .args = &.{}, .arg_modes = &.{} } },
-                .{ .if_expr = .{
-                    .dest = 1,
-                    .condition = 0,
-                    .then_instrs = &.{.{ .make_closure = .{ .dest = 2, .function = 3, .captures = &.{} } }},
-                    .then_result = 2,
-                    .else_instrs = &.{.{ .call_dispatch = .{ .dest = 3, .group_id = 4, .args = &.{}, .arg_modes = &.{} } }},
-                    .else_result = 3,
-                } },
-                .{ .ret = .{ .value = null } },
-            },
-        }},
-        .is_closure = false,
-        .captures = &.{},
-        .local_count = 4,
-    };
-
-    const adjusted = try cloneFunctionWithOffset(alloc, func, 10);
-    try testing.expectEqual(@as(ir.FunctionId, 12), adjusted.id);
-    try testing.expectEqual(@as(ir.FunctionId, 11), adjusted.body[0].instructions[0].call_direct.function);
-    try testing.expectEqual(@as(ir.FunctionId, 13), adjusted.body[0].instructions[1].if_expr.then_instrs[0].make_closure.function);
-    try testing.expectEqual(@as(u32, 14), adjusted.body[0].instructions[1].if_expr.else_instrs[0].call_dispatch.group_id);
-}
 
 /// Run a compiled binary by name from zap-out/bin/.
 pub fn runBinary(allocator: std.mem.Allocator, pio: std.Io, bin_path: []const u8, program_args: []const []const u8) !u8 {

@@ -29,7 +29,7 @@ pub struct IO {
     """
 
   pub fn puts(message :: String) -> String {
-    :zig.Prelude.println(message)
+    :zig.IO.println(message)
     message
   }
 
@@ -46,7 +46,7 @@ pub struct IO {
     """
 
   pub fn print_str(message :: String) -> String {
-    :zig.Prelude.print_str(message)
+    :zig.IO.print_str(message)
     message
   }
 
@@ -63,7 +63,7 @@ pub struct IO {
     """
 
   pub fn gets() -> String {
-    :zig.Prelude.gets()
+    :zig.IO.gets()
   }
 
   @doc = """
@@ -78,7 +78,7 @@ pub struct IO {
     """
 
   pub fn warn(message :: String) -> String {
-    :zig.Prelude.warn(message)
+    :zig.IO.warn(message)
     message
   }
 
@@ -93,7 +93,7 @@ pub struct IO {
     """
 
   pub fn mode(mode_value :: IO.Mode) -> IO.Mode {
-    :zig.Prelude.set_terminal_mode(mode_value)
+    :zig.IO.set_terminal_mode(mode_value)
     mode_value
   }
 
@@ -111,9 +111,9 @@ pub struct IO {
     """
 
   pub fn mode(mode_value :: IO.Mode, callback :: ( -> result)) -> result {
-    :zig.Prelude.set_terminal_mode(mode_value)
+    :zig.IO.set_terminal_mode(mode_value)
     result = callback()
-    :zig.Prelude.set_terminal_mode(IO.Mode.Normal)
+    :zig.IO.set_terminal_mode(IO.Mode.Normal)
     result
   }
 
@@ -133,7 +133,7 @@ pub struct IO {
     """
 
   pub fn get_char() -> String {
-    :zig.Prelude.get_char()
+    :zig.IO.get_char()
   }
 
   @doc = """
@@ -153,6 +153,6 @@ pub struct IO {
     """
 
   pub fn try_get_char() -> String {
-    :zig.Prelude.try_get_char()
+    :zig.IO.try_get_char()
   }
 }

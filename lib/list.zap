@@ -13,6 +13,8 @@
       List.reverse([1, 2, 3])        # => [3, 2, 1]
   """
 
+@native_type = "list"
+
 pub struct List {
   @doc = """
     Returns `true` if the list has no elements.

@@ -13,6 +13,8 @@
       Map.size(m)              # => 2
   """
 
+@native_type = "map"
+
 pub struct Map {
   @doc = """
     Returns the value for the given key, or the default if

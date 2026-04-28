@@ -791,10 +791,14 @@ pub const GeneralizedEscapeAnalyzer = struct {
             });
         }
 
-        // Copy local_alloc_sites into our own map for external queries.
+        // Copy local_alloc_sites into our own map for external queries, and
+        // mirror the same data on the AnalysisContext so downstream passes
+        // (ARC, region solver, etc.) can resolve "what alloc site does this
+        // value come from?" without re-walking the IR.
         var site_iter = self.local_alloc_sites.iterator();
         while (site_iter.next()) |entry| {
             try self.alloc_site_map.put(entry.key_ptr.*, entry.value_ptr.*);
+            try self.ctx.alloc_site_for_value.put(entry.key_ptr.*, entry.value_ptr.*);
         }
     }
 
@@ -1160,8 +1164,7 @@ pub const GeneralizedEscapeAnalyzer = struct {
 // ============================================================
 
 /// Helper to build a minimal IR program for testing.
-fn makeTestProgram(allocator: std.mem.Allocator, functions: []const ir.Function) ir.Program {
-    _ = allocator;
+fn makeTestProgram(functions: []const ir.Function) ir.Program {
     return .{
         .functions = functions,
         .type_defs = &.{},
@@ -1206,7 +1209,7 @@ test "struct that does not escape stays no_escape" {
         },
     };
 
-    const program = makeTestProgram(allocator, &functions);
+    const program = makeTestProgram(&functions);
     var analyzer = GeneralizedEscapeAnalyzer.init(allocator, program);
     defer analyzer.deinit();
 
@@ -1255,7 +1258,7 @@ test "struct returned from function escapes globally" {
         },
     };
 
-    const program = makeTestProgram(allocator, &functions);
+    const program = makeTestProgram(&functions);
     var analyzer = GeneralizedEscapeAnalyzer.init(allocator, program);
     defer analyzer.deinit();
 
@@ -1295,7 +1298,7 @@ test "tuple escape through return is global_escape" {
         },
     };
 
-    const program = makeTestProgram(allocator, &functions);
+    const program = makeTestProgram(&functions);
     var analyzer = GeneralizedEscapeAnalyzer.init(allocator, program);
     defer analyzer.deinit();
 
@@ -1344,7 +1347,7 @@ test "list element escape propagation through call" {
         },
     };
 
-    const program = makeTestProgram(allocator, &functions);
+    const program = makeTestProgram(&functions);
     var analyzer = GeneralizedEscapeAnalyzer.init(allocator, program);
     defer analyzer.deinit();
 
@@ -1412,7 +1415,7 @@ test "closure environment escape tracking" {
         },
     };
 
-    const program = makeTestProgram(allocator, &functions);
+    const program = makeTestProgram(&functions);
     var analyzer = GeneralizedEscapeAnalyzer.init(allocator, program);
     defer analyzer.deinit();
 
@@ -1477,7 +1480,7 @@ test "phi merge joins escape states correctly" {
         },
     };
 
-    const program = makeTestProgram(allocator, &functions);
+    const program = makeTestProgram(&functions);
     var analyzer = GeneralizedEscapeAnalyzer.init(allocator, program);
     defer analyzer.deinit();
 
@@ -1537,7 +1540,7 @@ test "field set propagates escape to stored value" {
         },
     };
 
-    const program = makeTestProgram(allocator, &functions);
+    const program = makeTestProgram(&functions);
     var analyzer = GeneralizedEscapeAnalyzer.init(allocator, program);
     defer analyzer.deinit();
 
@@ -1593,7 +1596,7 @@ test "borrow legality: function-local borrow is legal" {
         },
     };
 
-    const program = makeTestProgram(allocator, &functions);
+    const program = makeTestProgram(&functions);
     var analyzer = GeneralizedEscapeAnalyzer.init(allocator, program);
     defer analyzer.deinit();
 
@@ -1659,7 +1662,7 @@ test "borrow legality: global-escape borrow is illegal" {
         },
     };
 
-    const program = makeTestProgram(allocator, &functions);
+    const program = makeTestProgram(&functions);
     var analyzer = GeneralizedEscapeAnalyzer.init(allocator, program);
     defer analyzer.deinit();
 
@@ -1721,7 +1724,7 @@ test "if_expr joins both branch escape states" {
         },
     };
 
-    const program = makeTestProgram(allocator, &functions);
+    const program = makeTestProgram(&functions);
     var analyzer = GeneralizedEscapeAnalyzer.init(allocator, program);
     defer analyzer.deinit();
 
@@ -1779,7 +1782,7 @@ test "local_get propagates alloc site and escape" {
         },
     };
 
-    const program = makeTestProgram(allocator, &functions);
+    const program = makeTestProgram(&functions);
     var analyzer = GeneralizedEscapeAnalyzer.init(allocator, program);
     defer analyzer.deinit();
 
@@ -1833,7 +1836,7 @@ test "map_init tracked as alloc site" {
         },
     };
 
-    const program = makeTestProgram(allocator, &functions);
+    const program = makeTestProgram(&functions);
     var analyzer = GeneralizedEscapeAnalyzer.init(allocator, program);
     defer analyzer.deinit();
 
@@ -1884,7 +1887,7 @@ test "alloc summary strategy computed correctly" {
         },
     };
 
-    const program = makeTestProgram(allocator, &functions);
+    const program = makeTestProgram(&functions);
     var analyzer = GeneralizedEscapeAnalyzer.init(allocator, program);
     defer analyzer.deinit();
 
@@ -1963,7 +1966,7 @@ test "case_block joins all arm results" {
         },
     };
 
-    const program = makeTestProgram(allocator, &functions);
+    const program = makeTestProgram(&functions);
     var analyzer = GeneralizedEscapeAnalyzer.init(allocator, program);
     defer analyzer.deinit();
 
@@ -2041,7 +2044,7 @@ test "multi-function program analysis" {
         },
     };
 
-    const program = makeTestProgram(allocator, &functions);
+    const program = makeTestProgram(&functions);
     var analyzer = GeneralizedEscapeAnalyzer.init(allocator, program);
     defer analyzer.deinit();
 
@@ -2079,7 +2082,7 @@ test "empty function produces no alloc sites" {
         },
     };
 
-    const program = makeTestProgram(allocator, &functions);
+    const program = makeTestProgram(&functions);
     var analyzer = GeneralizedEscapeAnalyzer.init(allocator, program);
     defer analyzer.deinit();
 
@@ -2126,7 +2129,7 @@ test "field_get reads field escape from container" {
         },
     };
 
-    const program = makeTestProgram(allocator, &functions);
+    const program = makeTestProgram(&functions);
     var analyzer = GeneralizedEscapeAnalyzer.init(allocator, program);
     defer analyzer.deinit();
 
@@ -2160,7 +2163,7 @@ test "borrow: borrowed value returned from function is illegal" {
         .body = &blocks, .is_closure = false, .captures = &.{},
     }};
 
-    const program = makeTestProgram(allocator, &functions);
+    const program = makeTestProgram(&functions);
     var analyzer = GeneralizedEscapeAnalyzer.init(allocator, program);
     defer analyzer.deinit();
     var ctx = try analyzer.analyze();
@@ -2207,7 +2210,7 @@ test "borrow: loop-invariant param borrow is legal" {
         .body = &blocks, .is_closure = false, .captures = &.{},
     }};
 
-    const program = makeTestProgram(allocator, &functions);
+    const program = makeTestProgram(&functions);
     var analyzer = GeneralizedEscapeAnalyzer.init(allocator, program);
     defer analyzer.deinit();
     var ctx = try analyzer.analyze();
@@ -2242,7 +2245,7 @@ test "ownership tracking: share_value produces shared ownership" {
         .body = &blocks, .is_closure = false, .captures = &.{},
     }};
 
-    const program = makeTestProgram(allocator, &functions);
+    const program = makeTestProgram(&functions);
     var analyzer = GeneralizedEscapeAnalyzer.init(allocator, program);
     defer analyzer.deinit();
     var ctx = try analyzer.analyze();
@@ -2269,7 +2272,7 @@ test "list_init has element summarization via FieldEscapeMap" {
         .body = &blocks, .is_closure = false, .captures = &.{},
     }};
 
-    const program = makeTestProgram(allocator, &functions);
+    const program = makeTestProgram(&functions);
     var analyzer = GeneralizedEscapeAnalyzer.init(allocator, program);
     defer analyzer.deinit();
     var ctx = try analyzer.analyze();
@@ -2298,7 +2301,7 @@ test "union_init has per-variant payload tracking" {
         .body = &blocks, .is_closure = false, .captures = &.{},
     }};
 
-    const program = makeTestProgram(allocator, &functions);
+    const program = makeTestProgram(&functions);
     var analyzer = GeneralizedEscapeAnalyzer.init(allocator, program);
     defer analyzer.deinit();
     var ctx = try analyzer.analyze();
@@ -2327,7 +2330,7 @@ test "make_closure has per-capture tracking" {
         .body = &blocks, .is_closure = false, .captures = &.{},
     }};
 
-    const program = makeTestProgram(allocator, &functions);
+    const program = makeTestProgram(&functions);
     var analyzer = GeneralizedEscapeAnalyzer.init(allocator, program);
     defer analyzer.deinit();
     var ctx = try analyzer.analyze();

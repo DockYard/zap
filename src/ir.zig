@@ -820,25 +820,28 @@ pub const ZigType = union(enum) {
 pub const IrBuilder = struct {
     allocator: std.mem.Allocator,
     functions: std.ArrayList(Function),
-    next_function_id: FunctionId,
-    /// Separate ID counter for __try variants to avoid colliding with HIR group IDs.
-    next_try_id: FunctionId = 10000,
+    /// Separate ID counter for __try variants. Initialized in `buildProgram`
+    /// to `max(group.id) + 1` over the input HIR groups so the variant IDs
+    /// never collide with HIR-allocated group IDs regardless of program size.
+    next_try_id: FunctionId = 0,
     next_local: LocalId,
-    next_label: LabelId,
     current_blocks: std.ArrayList(Block),
     current_instrs: std.ArrayList(Instruction),
     interner: *const ast.StringInterner,
     type_store: ?*const types_mod.TypeStore,
+    /// Optional scope graph reference. Used to consult the native-type
+    /// registry (`isNativeTypeName`, `nativeTypeStructName`) at IR-emit
+    /// time — e.g. deciding whether `in` should lower to `in_range` or
+    /// `in_list` based on whether the rhs is the registered Range type.
+    /// The IR builder unit tests construct an IrBuilder without a
+    /// scope graph, so call sites must guard for null.
+    scope_graph: ?*const scope_mod.ScopeGraph = null,
     known_local_types: std.AutoHashMap(LocalId, ZigType),
     current_module_prefix: ?[]const u8,
     known_function_names: std.StringHashMap(void),
-    /// Maps function group ID → function name for guard call resolution
-    group_id_to_name: std.AutoHashMap(u32, []const u8),
     synthesized_type_defs: std.ArrayList(TypeDef),
     /// Maps function name → union dispatch info for call-site wrapping
     union_dispatch_map: std.StringHashMap(UnionDispatchInfo),
-    /// Maps "func_name:arity" → wrapper name for default-arg resolution
-    default_arg_wrappers: std.StringHashMap([]const u8),
     /// When true, decision tree failure nodes emit match_error_return instead of match_fail.
     /// Used when generating __try function variants for the ~> catch basin operator.
     try_mode: bool = false,
@@ -850,8 +853,6 @@ pub const IrBuilder = struct {
     try_variant_names: std.StringHashMap(void),
     /// Current function's declared param types (for param_get fallback when expr type is UNKNOWN).
     current_param_types: std.ArrayListUnmanaged(ZigType) = .empty,
-    /// Maps mangled function names → @native binding strings (e.g., "String__length" → "String.length").
-    /// Populated from @native attributes in the scope graph before building function bodies.
 
     pub const UnionDispatchInfo = struct {
         param_idx: u32,
@@ -864,9 +865,7 @@ pub const IrBuilder = struct {
         return .{
             .allocator = allocator,
             .functions = .empty,
-            .next_function_id = 0,
             .next_local = 0,
-            .next_label = 0,
             .current_blocks = .empty,
             .current_instrs = .empty,
             .interner = interner,
@@ -874,10 +873,8 @@ pub const IrBuilder = struct {
             .known_local_types = std.AutoHashMap(LocalId, ZigType).init(allocator),
             .current_module_prefix = null,
             .known_function_names = std.StringHashMap(void).init(allocator),
-            .group_id_to_name = std.AutoHashMap(u32, []const u8).init(allocator),
             .synthesized_type_defs = .empty,
             .union_dispatch_map = std.StringHashMap(UnionDispatchInfo).init(allocator),
-            .default_arg_wrappers = std.StringHashMap([]const u8).init(allocator),
             .try_variant_names = std.StringHashMap(void).init(allocator),
         };
     }
@@ -889,9 +886,7 @@ pub const IrBuilder = struct {
         self.known_local_types.deinit();
         self.synthesized_type_defs.deinit(self.allocator);
         self.union_dispatch_map.deinit();
-        self.default_arg_wrappers.deinit();
         self.known_function_names.deinit();
-        self.group_id_to_name.deinit();
     }
 
     /// Extract the list element ZigType from an HIR expression's type_id.
@@ -916,28 +911,43 @@ pub const IrBuilder = struct {
         };
     }
 
+    /// True iff `name_id` (a struct's StringId) refers to the stdlib
+    /// struct that opted in to `@native_type = "range"`. Used by `in_op`
+    /// lowering to choose between `in_range` and `in_list`. Returns
+    /// false when no scope graph is attached (IR unit-test path) — in
+    /// that case the caller falls back to `in_list`, which is the safe
+    /// default for non-Range right-hand sides.
+    fn isNativeRangeStruct(self: *const IrBuilder, name_id: ast.StringId) bool {
+        const graph = self.scope_graph orelse return false;
+        return graph.isNativeTypeName(.range, name_id);
+    }
+
     pub fn buildProgram(self: *IrBuilder, hir_program: *const hir_mod.Program) !Program {
         // First pass: register all qualified function names for bare call resolution.
         // Mangle the raw symbol so operator-named functions (`+`, `<>`, etc.) become
         // valid Zig identifiers; downstream lookups always go through the same mangler
-        // so call sites and declarations see the same string.
+        // so call sites and declarations see the same string. Also compute the upper
+        // bound on HIR group IDs so `__try` variant IDs can be assigned past the
+        // largest existing group without collision (regardless of program size).
+        var max_group_id: FunctionId = 0;
         for (hir_program.modules) |mod| {
             const module_prefix = self.structNameToPrefix(mod.name);
             for (mod.functions) |func_group| {
+                if (func_group.id > max_group_id) max_group_id = func_group.id;
                 const func_name = self.interner.get(func_group.name);
                 const mangled_func_name = try mangleSymbolForZig(self.allocator, func_name);
                 const qualified = try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ module_prefix, mangled_func_name, func_group.arity });
                 try self.known_function_names.put(qualified, {});
-                try self.group_id_to_name.put(func_group.id, func_name);
             }
         }
         for (hir_program.top_functions) |func_group| {
+            if (func_group.id > max_group_id) max_group_id = func_group.id;
             const func_name = self.interner.get(func_group.name);
             const mangled_func_name = try mangleSymbolForZig(self.allocator, func_name);
             const qualified = try std.fmt.allocPrint(self.allocator, "{s}__{d}", .{ mangled_func_name, func_group.arity });
             try self.known_function_names.put(qualified, {});
-            try self.group_id_to_name.put(func_group.id, func_name);
         }
+        self.next_try_id = max_group_id + 1;
 
         // Second pass: pre-scan for ~> error pipe chains to identify functions
         // that need __try variants. This must happen before building function bodies
@@ -1072,27 +1082,12 @@ pub const IrBuilder = struct {
         // Skip generic (unmonomorphized) functions — they contain type variables
         // that can't be lowered to concrete IR types. Only the monomorphized copies
         // (produced by the monomorphization pass) should be compiled.
-        // Emit a minimal stub to preserve function ID ordering.
         if (self.type_store) |ts| {
-            if (isGenericHirGroup(ts, group)) {
-                const func_id: FunctionId = group.id;
-                if (self.next_function_id <= func_id) {
-                    self.next_function_id = func_id + 1;
-                }
-                return;
-            }
+            if (isGenericHirGroup(ts, group)) return;
         }
-
-        // @native bodyless functions: emit a minimal stub (no body instructions).
-        // The actual call routing happens via call_builtin at call sites.
-        // We still need to emit the function to preserve function ID ordering.
 
         const func_id: FunctionId = group.id;
-        if (self.next_function_id <= func_id) {
-            self.next_function_id = func_id + 1;
-        }
         self.next_local = 0;
-        self.next_label = 0;
         self.current_instrs = .empty;
         self.known_local_types.clearRetainingCapacity();
         self.current_param_types = .empty;
@@ -1149,33 +1144,10 @@ pub const IrBuilder = struct {
             try self.current_param_types.append(self.allocator, resolved_type);
         }
 
-        // Reserve local indices used by tuple/struct bindings across all clauses.
+        // Reserve local indices used by destructure bindings across all clauses.
         // These locals are defined inside guard_blocks (separate Zig scopes),
         // so top-level code must start allocating ABOVE this range.
-        {
-            var max_binding_local: u32 = 0;
-            for (group.clauses) |clause| {
-                for (clause.tuple_bindings) |binding| {
-                    max_binding_local = @max(max_binding_local, binding.local_index + 1);
-                }
-                for (clause.struct_bindings) |binding| {
-                    max_binding_local = @max(max_binding_local, binding.local_index + 1);
-                }
-                for (clause.list_bindings) |binding| {
-                    max_binding_local = @max(max_binding_local, binding.local_index + 1);
-                }
-                for (clause.cons_tail_bindings) |binding| {
-                    max_binding_local = @max(max_binding_local, binding.local_index + 1);
-                }
-                for (clause.binary_bindings) |binding| {
-                    max_binding_local = @max(max_binding_local, binding.local_index + 1);
-                }
-                for (clause.map_bindings) |binding| {
-                    max_binding_local = @max(max_binding_local, binding.local_index + 1);
-                }
-            }
-            self.next_local = max_binding_local;
-        }
+        self.next_local = computeMaxBindingLocalForClauses(group.clauses);
 
         var uses_decision_tree = false;
 
@@ -1429,32 +1401,11 @@ pub const IrBuilder = struct {
             const try_func_id = self.next_try_id;
             self.next_try_id += 1;
             self.next_local = 0;
-            self.next_label = 0;
             self.current_instrs = .empty;
             self.known_local_types.clearRetainingCapacity();
 
             // Reserve binding locals (same as normal function)
-            {
-                var max_binding_local: u32 = 0;
-                for (group.clauses) |clause| {
-                    for (clause.tuple_bindings) |binding| {
-                        max_binding_local = @max(max_binding_local, binding.local_index + 1);
-                    }
-                    for (clause.struct_bindings) |binding| {
-                        max_binding_local = @max(max_binding_local, binding.local_index + 1);
-                    }
-                    for (clause.list_bindings) |binding| {
-                        max_binding_local = @max(max_binding_local, binding.local_index + 1);
-                    }
-                    for (clause.cons_tail_bindings) |binding| {
-                        max_binding_local = @max(max_binding_local, binding.local_index + 1);
-                    }
-                    for (clause.binary_bindings) |binding| {
-                        max_binding_local = @max(max_binding_local, binding.local_index + 1);
-                    }
-                }
-                self.next_local = max_binding_local;
-            }
+            self.next_local = computeMaxBindingLocalForClauses(group.clauses);
 
             // Re-build the decision tree with try_mode enabled
             self.try_mode = true;
@@ -1986,7 +1937,7 @@ pub const IrBuilder = struct {
                                     if (!offset_is_dynamic) byte_offset += n;
                                 },
                                 .variable => |var_name| {
-                                    const var_local = self.findBinaryVarLocal(clause, var_name);
+                                    const var_local = findBinaryVarLocal(clause, var_name);
                                     if (binding_local) |dest| {
                                         try self.current_instrs.append(self.allocator, .{
                                             .bin_slice = .{
@@ -2064,11 +2015,10 @@ pub const IrBuilder = struct {
         }
     }
 
-    fn findBinaryVarLocal(self: *IrBuilder, clause: *const hir_mod.Clause, var_name: ast.StringId) LocalId {
+    fn findBinaryVarLocal(clause: *const hir_mod.Clause, var_name: ast.StringId) LocalId {
         for (clause.binary_bindings) |binding| {
             if (binding.name == var_name) return binding.local_index;
         }
-        _ = self;
         return 0;
     }
 
@@ -2603,8 +2553,9 @@ pub const IrBuilder = struct {
             .success => |leaf| {
                 const arm = case_arms[leaf.body_index];
                 // Emit only scrutinee bindings (whole-value binds like `v -> v`).
-                // Tuple element bindings are handled by bind nodes in the
-                // decision tree path, which resolve to the correct decomposed locals.
+                // Extracted bindings (tuple/list/struct/map elements) are handled
+                // by bind nodes in the decision tree path, which resolve to the
+                // correct decomposed locals.
                 for (arm.bindings) |binding| {
                     if (binding.kind == .scrutinee) {
                         const scr_local = scrutinee_map.get(0) orelse 0;
@@ -2829,6 +2780,40 @@ pub const IrBuilder = struct {
                     }
                 }
                 try self.lowerDecisionTreeForCase(bind_node.next, case_arms, scrutinee_map, 0);
+            },
+            .extract_struct => |es| {
+                const scrutinee_local = self.resolveScrutinee(es.scrutinee, scrutinee_map);
+                for (es.fields) |fe| {
+                    const field_local = self.next_local;
+                    self.next_local += 1;
+                    try self.current_instrs.append(self.allocator, .{
+                        .field_get = .{
+                            .dest = field_local,
+                            .object = scrutinee_local,
+                            .field = self.interner.get(fe.field_name),
+                        },
+                    });
+                    try scrutinee_map.put(fe.scrutinee_id, field_local);
+                }
+                try self.lowerDecisionTreeForCase(es.success, case_arms, scrutinee_map, 0);
+            },
+            .extract_map => |em| {
+                const scrutinee_local = self.resolveScrutinee(em.scrutinee, scrutinee_map);
+                for (em.keys) |ke| {
+                    const key_local = try self.lowerExpr(ke.key);
+                    const default_local = self.next_local;
+                    self.next_local += 1;
+                    try self.current_instrs.append(self.allocator, .{
+                        .const_int = .{ .dest = default_local, .value = 0 },
+                    });
+                    const value_local = self.next_local;
+                    self.next_local += 1;
+                    try self.current_instrs.append(self.allocator, .{
+                        .map_get = .{ .dest = value_local, .map = scrutinee_local, .key = key_local, .default = default_local },
+                    });
+                    try scrutinee_map.put(ke.scrutinee_id, value_local);
+                }
+                try self.lowerDecisionTreeForCase(em.success, case_arms, scrutinee_map, 0);
             },
         }
     }
@@ -3098,26 +3083,6 @@ pub const IrBuilder = struct {
                 const saved = self.current_instrs;
                 self.current_instrs = .empty;
 
-                // For multi-clause dispatch, check if any segments have string literal
-                // prefixes that need guard blocks to differentiate clauses
-                var has_prefix_dispatch = false;
-                for (clauses) |clause| {
-                    for (clause.params) |param| {
-                        if (param.pattern) |pat| {
-                            if (pat.* == .binary_match) {
-                                for (pat.binary_match.segments) |seg| {
-                                    if (seg.string_literal != null) {
-                                        has_prefix_dispatch = true;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        if (has_prefix_dispatch) break;
-                    }
-                    if (has_prefix_dispatch) break;
-                }
-
                 if (clauses.len > 1) {
                     // Multi-clause binary dispatch: emit per-clause guarded bodies.
                     // Each clause with a binary pattern gets its own extraction + guard.
@@ -3220,6 +3185,40 @@ pub const IrBuilder = struct {
             .bind => |bind_node| {
                 try self.lowerDecisionTreeForDispatch(bind_node.next, clauses, scrutinee_map);
             },
+            .extract_struct => |es| {
+                const scrutinee_local = self.resolveScrutinee(es.scrutinee, scrutinee_map);
+                for (es.fields) |fe| {
+                    const field_local = self.next_local;
+                    self.next_local += 1;
+                    try self.current_instrs.append(self.allocator, .{
+                        .field_get = .{
+                            .dest = field_local,
+                            .object = scrutinee_local,
+                            .field = self.interner.get(fe.field_name),
+                        },
+                    });
+                    try scrutinee_map.put(fe.scrutinee_id, field_local);
+                }
+                try self.lowerDecisionTreeForDispatch(es.success, clauses, scrutinee_map);
+            },
+            .extract_map => |em| {
+                const scrutinee_local = self.resolveScrutinee(em.scrutinee, scrutinee_map);
+                for (em.keys) |ke| {
+                    const key_local = try self.lowerExpr(ke.key);
+                    const default_local = self.next_local;
+                    self.next_local += 1;
+                    try self.current_instrs.append(self.allocator, .{
+                        .const_int = .{ .dest = default_local, .value = 0 },
+                    });
+                    const value_local = self.next_local;
+                    self.next_local += 1;
+                    try self.current_instrs.append(self.allocator, .{
+                        .map_get = .{ .dest = value_local, .map = scrutinee_local, .key = key_local, .default = default_local },
+                    });
+                    try scrutinee_map.put(ke.scrutinee_id, value_local);
+                }
+                try self.lowerDecisionTreeForDispatch(em.success, clauses, scrutinee_map);
+            },
         }
     }
 
@@ -3284,8 +3283,7 @@ pub const IrBuilder = struct {
                                 if (bin.rhs.type_id < ts.types.items.len) {
                                     const rhs_type = ts.getType(bin.rhs.type_id);
                                     if (rhs_type == .struct_type) {
-                                        const name = self.interner.get(rhs_type.struct_type.name);
-                                        if (std.mem.eql(u8, name, "Range")) break :blk .in_range;
+                                        if (self.isNativeRangeStruct(rhs_type.struct_type.name)) break :blk .in_range;
                                     }
                                 }
                             }
@@ -3604,14 +3602,13 @@ pub const IrBuilder = struct {
                     .or_op => .bool_or,
                     .concat => .concat,
                     .in_op => blk: {
-                        // Detect if RHS is a Range struct
+                        // Detect if RHS is the native Range struct
                         if (bin.rhs.kind == .struct_init) {
                             if (self.type_store) |ts| {
                                 if (bin.rhs.type_id < ts.types.items.len) {
                                     const rhs_type = ts.getType(bin.rhs.type_id);
                                     if (rhs_type == .struct_type) {
-                                        const name = self.interner.get(rhs_type.struct_type.name);
-                                        if (std.mem.eql(u8, name, "Range")) break :blk .in_range;
+                                        if (self.isNativeRangeStruct(rhs_type.struct_type.name)) break :blk .in_range;
                                     }
                                 }
                             }
@@ -4059,16 +4056,19 @@ pub const IrBuilder = struct {
                             const try_name = try std.fmt.allocPrint(self.allocator, "{s}__try", .{call_name_str});
                             try self.try_variant_names.put(call_name_str, {});
 
-                            // Lower handler with pipe_val as the scrutinee (__err)
+                            // Lower handler with pipe_val as the scrutinee (__err).
+                            // Block-style handlers carry the local index they
+                            // expect to read; function-style handlers (err_local==0)
+                            // take the failing value as their first call arg
+                            // and don't need a local_set.
                             const saved = self.current_instrs;
                             self.current_instrs = .empty;
-                            // Assign __err = pipe_val (the input that failed to match)
-                            const err_local = self.next_local;
-                            self.next_local += 1;
-                            try self.current_instrs.append(self.allocator, .{
-                                .local_set = .{ .dest = err_local, .value = pipe_val },
-                            });
-                            // Lower handler expression with __err available
+                            if (ep.err_local != 0) {
+                                if (self.next_local <= ep.err_local) self.next_local = ep.err_local + 1;
+                                try self.current_instrs.append(self.allocator, .{
+                                    .local_set = .{ .dest = ep.err_local, .value = pipe_val },
+                                });
+                            }
                             const handler_result = try self.lowerExpr(handler_hir);
                             const handler_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
                             self.current_instrs = saved;
@@ -4131,6 +4131,58 @@ pub const IrBuilder = struct {
                         .object = obj,
                         .field = self.interner.get(fg.field),
                     },
+                });
+            },
+            .tuple_index_get => |tig| {
+                const obj = try self.lowerExpr(tig.object);
+                try self.current_instrs.append(self.allocator, .{
+                    .index_get = .{ .dest = dest, .object = obj, .index = tig.index },
+                });
+                if (self.type_store) |ts| {
+                    const obj_type = ts.getType(tig.object.type_id);
+                    if (obj_type == .tuple and tig.index < obj_type.tuple.elements.len) {
+                        try self.known_local_types.put(dest, typeIdToZigTypeWithStore(obj_type.tuple.elements[tig.index], self.type_store));
+                    }
+                }
+            },
+            .list_index_get => |lig| {
+                const list_local = try self.lowerExpr(lig.list);
+                const elem_type = self.listElementTypeForLocal(list_local);
+                try self.current_instrs.append(self.allocator, .{
+                    .list_get = .{ .dest = dest, .list = list_local, .index = lig.index, .element_type = elem_type },
+                });
+                try self.known_local_types.put(dest, elem_type);
+            },
+            .list_head_get => |lhg| {
+                const list_local = try self.lowerExpr(lhg.list);
+                const elem_type = self.listElementTypeForLocal(list_local);
+                try self.current_instrs.append(self.allocator, .{
+                    .list_head = .{ .dest = dest, .list = list_local, .element_type = elem_type },
+                });
+                try self.known_local_types.put(dest, elem_type);
+            },
+            .list_tail_get => |ltg| {
+                const list_local = try self.lowerExpr(ltg.list);
+                const elem_type = self.listElementTypeForLocal(list_local);
+                try self.current_instrs.append(self.allocator, .{
+                    .list_tail = .{ .dest = dest, .list = list_local, .element_type = elem_type },
+                });
+                if (self.known_local_types.get(list_local)) |list_type| {
+                    try self.known_local_types.put(dest, list_type);
+                }
+            },
+            .map_value_get => |mvg| {
+                const map_local = try self.lowerExpr(mvg.map);
+                const key_local = try self.lowerExpr(mvg.key);
+                // Use a synthesized "default" of zero (caller is responsible
+                // for confirming the key exists — destructure assumes presence).
+                const default_local = self.next_local;
+                self.next_local += 1;
+                try self.current_instrs.append(self.allocator, .{
+                    .const_int = .{ .dest = default_local, .value = 0 },
+                });
+                try self.current_instrs.append(self.allocator, .{
+                    .map_get = .{ .dest = dest, .map = map_local, .key = key_local, .default = default_local },
                 });
             },
             .map_init => |entries| {
@@ -4238,15 +4290,8 @@ pub const IrBuilder = struct {
     /// Convert an ast.StructName to a prefix string for function naming.
     /// Single-part: "IO". Multi-part: "IO_File".
     fn structNameToPrefix(self: *IrBuilder, name: ast.StructName) []const u8 {
-        if (name.parts.len == 1) {
-            return self.interner.get(name.parts[0]);
-        }
-        var buf: std.ArrayList(u8) = .empty;
-        for (name.parts, 0..) |part, i| {
-            if (i > 0) buf.appendSlice(self.allocator, "_") catch return self.interner.get(name.parts[0]);
-            buf.appendSlice(self.allocator, self.interner.get(part)) catch return self.interner.get(name.parts[0]);
-        }
-        return buf.toOwnedSlice(self.allocator) catch return self.interner.get(name.parts[0]);
+        if (name.parts.len == 1) return self.interner.get(name.parts[0]);
+        return name.joinedWith(self.allocator, self.interner, "_") catch self.interner.get(name.parts[0]);
     }
 
     fn allocSlice(self: *IrBuilder, comptime T: type, items: []const T) ![]const T {
@@ -4362,6 +4407,18 @@ fn findParamGetIdInDecision(decision: *const hir_mod.Decision, target_element: u
             }
             return findParamGetIdInDecision(cb.success, target_element);
         },
+        .extract_struct => |es| {
+            if (es.scrutinee.kind == .param_get) {
+                return es.scrutinee.kind.param_get;
+            }
+            return findParamGetIdInDecision(es.success, target_element);
+        },
+        .extract_map => |em| {
+            if (em.scrutinee.kind == .param_get) {
+                return em.scrutinee.kind.param_get;
+            }
+            return findParamGetIdInDecision(em.success, target_element);
+        },
         .guard => |g| return findParamGetIdInDecision(g.success, target_element),
         .bind => |b| {
             if (b.source.kind == .param_get) {
@@ -4404,6 +4461,38 @@ fn zigTypeToEncodedName(zig_type: ZigType) []const u8 {
         .tagged_union => zig_type.tagged_union,
         else => "i64",
     };
+}
+
+/// Walks every destructure-binding kind on every clause and returns one past
+/// the maximum local_index used. The result is the lower bound for fresh
+/// local allocation in the function body (binding locals live above this).
+/// All six binding kinds (tuple/struct/list/cons_tail/binary/map) must be
+/// covered — omitting any one silently corrupts the local layout for the
+/// affected pattern shape (this was the bug that broke `__try` variants on
+/// map-pattern functions).
+fn computeMaxBindingLocalForClauses(clauses: []const hir_mod.Clause) LocalId {
+    var max_local: LocalId = 0;
+    for (clauses) |clause| {
+        for (clause.tuple_bindings) |binding| {
+            max_local = @max(max_local, binding.local_index + 1);
+        }
+        for (clause.struct_bindings) |binding| {
+            max_local = @max(max_local, binding.local_index + 1);
+        }
+        for (clause.list_bindings) |binding| {
+            max_local = @max(max_local, binding.local_index + 1);
+        }
+        for (clause.cons_tail_bindings) |binding| {
+            max_local = @max(max_local, binding.local_index + 1);
+        }
+        for (clause.binary_bindings) |binding| {
+            max_local = @max(max_local, binding.local_index + 1);
+        }
+        for (clause.map_bindings) |binding| {
+            max_local = @max(max_local, binding.local_index + 1);
+        }
+    }
+    return max_local;
 }
 
 /// Check if a HIR function group is generic (has unresolved type variables in params/return).

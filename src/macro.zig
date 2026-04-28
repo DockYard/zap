@@ -284,7 +284,7 @@ pub const MacroEngine = struct {
                     .body = expanded.stmts,
                 });
             } else {
-                // @native bodyless declaration — pass through unchanged
+                // Bodyless clause (protocol signature, forward decl) — pass through unchanged
                 try new_clauses.append(self.allocator, clause);
             }
         }
@@ -1977,12 +1977,10 @@ test "macro engine hygiene generates unique names" {
     var interner = ast.StringInterner.init(alloc);
     defer interner.deinit();
 
-    const graph = scope.ScopeGraph.init(alloc);
-    _ = graph;
-    var graph2 = scope.ScopeGraph.init(alloc);
-    defer graph2.deinit();
+    var graph = scope.ScopeGraph.init(alloc);
+    defer graph.deinit();
 
-    var engine = MacroEngine.init(alloc, &interner, &graph2);
+    var engine = MacroEngine.init(alloc, &interner, &graph);
     defer engine.deinit();
 
     const base = try interner.intern("temp");

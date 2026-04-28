@@ -108,12 +108,28 @@ pub const ErrorInfo = struct {
 /// `entry_module` is e.g. "App" (extracted from build.zap root "App.main/0").
 /// `source_roots` are directories to search for module files, in priority order.
 /// The first root is typically the project's own lib dir.
-/// Modules that are auto-imported into every module (Elixir-style).
-/// Discovery must include these even when no source file explicitly
-/// references them, because their exports are available as bare calls
-/// via the auto-import mechanism in the collector.
+
+/// Name of the stdlib module that's auto-imported into every Zap
+/// module (Elixir-style). The collector injects an
+/// `import <kernel_module_name>` into every module's scope so the
+/// macros and helpers defined in `lib/kernel.zap` (`if`, `unless`,
+/// `|>`, `<>`, sigils, …) are reachable as bare calls without an
+/// explicit import.
+///
+/// This is the single source of truth for the name. Every site that
+/// needed to ask "is this the Kernel module?" or "what name should I
+/// inject as the auto-import?" reads it from here.
+pub const kernel_module_name = "Kernel";
+
+/// Modules that discovery must always load even when no source file
+/// references them. `kernel_module_name` is here because the collector
+/// injects auto-imports against it; `Range` is here because the `..`
+/// range-literal syntax desugars to `%Range{...}` — the user's source
+/// doesn't mention `Range` literally, so the file-discovery pass would
+/// otherwise skip it.
 pub const AUTO_IMPORTS = [_][]const u8{
-    "Kernel",
+    kernel_module_name,
+    "Range",
 };
 
 pub fn discover(

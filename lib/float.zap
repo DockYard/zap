@@ -36,7 +36,7 @@ pub struct Float {
     """
 
   pub fn to_string(value :: f64) -> String {
-    :zig.Prelude.f64_to_string(value)
+    :zig.Float.to_string(value)
   }
 
   @doc = """
@@ -50,7 +50,7 @@ pub struct Float {
     """
 
   pub fn abs(value :: f64) -> f64 {
-    :zig.Prelude.abs_f64(value)
+    :zig.Float.abs(value)
   }
 
   @doc = """
@@ -63,7 +63,7 @@ pub struct Float {
     """
 
   pub fn max(first :: f64, second :: f64) -> f64 {
-    :zig.Prelude.max_f64(first, second)
+    :zig.Float.max(first, second)
   }
 
   @doc = """
@@ -76,7 +76,7 @@ pub struct Float {
     """
 
   pub fn min(first :: f64, second :: f64) -> f64 {
-    :zig.Prelude.min_f64(first, second)
+    :zig.Float.min(first, second)
   }
 
   @doc = """
@@ -91,7 +91,7 @@ pub struct Float {
     """
 
   pub fn parse(input :: String) -> f64 {
-    :zig.Prelude.parse_f64(input)
+    :zig.Float.parse(input)
   }
 
   @doc = """
@@ -106,7 +106,7 @@ pub struct Float {
     """
 
   pub fn round(value :: f64) -> f64 {
-    :zig.Prelude.round_f64(value)
+    :zig.Float.round(value)
   }
 
   @doc = """
@@ -121,7 +121,7 @@ pub struct Float {
     """
 
   pub fn floor(value :: f64) -> f64 {
-    :zig.Prelude.floor_f64(value)
+    :zig.Float.floor(value)
   }
 
   @doc = """
@@ -136,7 +136,7 @@ pub struct Float {
     """
 
   pub fn ceil(value :: f64) -> f64 {
-    :zig.Prelude.ceil_f64(value)
+    :zig.Float.ceil(value)
   }
 
   @doc = """
@@ -151,7 +151,7 @@ pub struct Float {
     """
 
   pub fn truncate(value :: f64) -> f64 {
-    :zig.Prelude.trunc_f64(value)
+    :zig.Float.trunc(value)
   }
 
   @doc = """
@@ -165,7 +165,7 @@ pub struct Float {
     """
 
   pub fn to_integer(value :: f64) -> i64 {
-    :zig.Prelude.f64_to_i64(value)
+    :zig.Float.to_i64(value)
   }
 
   @doc = """
@@ -195,7 +195,7 @@ pub struct Float {
     """
 
   pub fn floor_to_integer(value :: f64) -> i64 {
-    :zig.Prelude.floor_to_i64(value)
+    :zig.Math.floor_to_i64(value)
   }
 
   @doc = """
@@ -211,7 +211,7 @@ pub struct Float {
     """
 
   pub fn ceil_to_integer(value :: f64) -> i64 {
-    :zig.Prelude.ceil_to_i64(value)
+    :zig.Math.ceil_to_i64(value)
   }
 
   @doc = """
@@ -227,6 +227,6 @@ pub struct Float {
     """
 
   pub fn round_to_integer(value :: f64) -> i64 {
-    :zig.Prelude.round_to_i64(value)
+    :zig.Math.round_to_i64(value)
   }
 }
