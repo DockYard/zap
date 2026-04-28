@@ -124,9 +124,33 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
         // produced this way. Pre-existing macros that build a single
         // `quote` template with `unquote(arg)` (where `arg` is bound
         // for the entire macro body) get the same result either way.
+        //
+        // Result shape mirrors `evaluateMacroBodyToCtValue`'s fast
+        // path:
+        //   - 1 stmt body → unwrap to the single CtValue
+        //   - N stmts body → wrap in `{:__block__, [], [stmts...]}`
+        //   so a macro returning `quote { stmt1; stmt2 }` produces a
+        //   block (not a list literal) that the engine knows how to
+        //   flatten into multiple struct items.
         if (std.mem.eql(u8, form_name, "quote")) {
             if (args == .list and args.list.elems.len == 1) {
-                return substituteUnquotesEval(env, args.list.elems[0]);
+                const substituted = try substituteUnquotesEval(env, args.list.elems[0]);
+                if (substituted == .list) {
+                    if (substituted.list.elems.len == 1) {
+                        return substituted.list.elems[0];
+                    }
+                    if (substituted.list.elems.len > 1) {
+                        const empty = ast_data.emptyList(env.alloc, env.store) catch return MacroEvalError.OutOfMemory;
+                        return ast_data.makeTuple3(
+                            env.alloc,
+                            env.store,
+                            .{ .atom = "__block__" },
+                            empty,
+                            substituted,
+                        ) catch return MacroEvalError.OutOfMemory;
+                    }
+                }
+                return substituted;
             }
             return value;
         }
@@ -382,44 +406,6 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
                 return CtValue{ .tuple = .{ .alloc_id = id, .elems = elems } };
             }
 
-            // find_setup(body) — find the setup() call in a block and return its body
-            if (std.mem.eql(u8, form_name, "find_setup")) {
-                if (arg_elems.len == 1) {
-                    const body = try eval(env, arg_elems[0]);
-                    return findNamedCallBody(body, "setup");
-                }
-            }
-
-            // find_teardown(body) — find the teardown() call in a block and return its body
-            if (std.mem.eql(u8, form_name, "find_teardown")) {
-                if (arg_elems.len == 1) {
-                    const body = try eval(env, arg_elems[0]);
-                    return findNamedCallBody(body, "teardown");
-                }
-            }
-
-            // build_test_fns(describe_name, body, setup_body, teardown_body)
-            if (std.mem.eql(u8, form_name, "build_test_fns")) {
-                if (arg_elems.len == 4) {
-                    const desc = try eval(env, arg_elems[0]);
-                    const body = try eval(env, arg_elems[1]);
-                    const setup = try eval(env, arg_elems[2]);
-                    const teardown = try eval(env, arg_elems[3]);
-                    const desc_str = extractString(desc) orelse return .nil;
-                    return buildTestFunctions(env.alloc, env.store, desc_str, body, setup, teardown) catch return .nil;
-                }
-            }
-
-            // build_test_fn(name, body)
-            if (std.mem.eql(u8, form_name, "build_test_fn")) {
-                if (arg_elems.len == 2) {
-                    const name_val = try eval(env, arg_elems[0]);
-                    const body_val = try eval(env, arg_elems[1]);
-                    const name_str = extractString(name_val) orelse return .nil;
-                    return buildSingleTestFunction(env.alloc, env.store, name_str, body_val) catch return .nil;
-                }
-            }
-
             // Module attribute intrinsics — callable from within macro
             // bodies to read/write the current module's compile-time
             // attribute table. Inert when no module context is wired
@@ -456,6 +442,32 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
             // entirely into Zap source.
             if (std.mem.eql(u8, form_name, "__zap_atom_name__")) {
                 return atomNameIntrinsic(env, arg_elems);
+            }
+
+            // __zap_make_call__(form_name_string, args_list) — build a
+            // 3-tuple AST node `{atom(form_name), [], args}`. The form
+            // atom is stored WITHOUT the leading `:` that disambiguates
+            // atom literals from variable refs in AST encoding, so the
+            // result round-trips as a call/operator/assignment node
+            // (e.g., `__zap_make_call__("=", [target, value])` produces
+            // the same shape as the parser emits for `target = value`).
+            //
+            // Distinct from `tuple(...)` which evaluates each argument
+            // and may wrap atom literals in 3-tuple wrappers — that
+            // shape is wrong for AST node construction. A separate
+            // primitive keeps both useful: `tuple` for data tuples,
+            // `__zap_make_call__` for AST nodes.
+            if (std.mem.eql(u8, form_name, "__zap_make_call__")) {
+                if (arg_elems.len == 2) {
+                    const name_raw = try eval(env, arg_elems[0]);
+                    const args_raw = try eval(env, arg_elems[1]);
+                    const name_str = extractString(name_raw) orelse return .nil;
+                    const dup = env.alloc.alloc(u8, name_str.len) catch return .nil;
+                    @memcpy(dup, name_str);
+                    const empty = ast_data.emptyList(env.alloc, env.store) catch return .nil;
+                    const args_list: CtValue = if (args_raw == .list) args_raw else empty;
+                    return ast_data.makeTuple3(env.alloc, env.store, .{ .atom = dup }, empty, args_list) catch return .nil;
+                }
             }
             if (std.mem.eql(u8, form_name, "__zap_slugify__")) {
                 return slugifyIntrinsic(env, arg_elems);
@@ -505,9 +517,8 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
 
             // __zap_dbg__(label, value) — comptime debug print to stderr.
             // Returns the evaluated value so it can be wrapped around an
-            // existing expression: `_x = __zap_dbg__("setup", find_setup(body))`.
-            // Useful while migrating Zig builtins into Zap macros — both
-            // paths can be wrapped and their CtValue shapes compared.
+            // existing expression: `_x = __zap_dbg__("setup", elem(body, 2))`.
+            // Useful for inspecting CtValue shapes while authoring macros.
             if (std.mem.eql(u8, form_name, "__zap_dbg__")) {
                 if (arg_elems.len == 2) {
                     const label_raw = try eval(env, arg_elems[0]);
@@ -774,7 +785,11 @@ test "eval: variable binding and lookup" {
     try std.testing.expectEqual(@as(i64, 42), result.tuple.elems[0].int);
 }
 
-test "eval: quote returns data" {
+test "eval: quote returns data (single-stmt body unwraps)" {
+    // `quote { 1 + 2 }` with a single-statement body returns the
+    // statement's CtValue directly — the per-stmt list wrapper is
+    // unwrapped so authors get the raw AST node, mirroring the fast
+    // path in `evaluateMacroBodyToCtValue`.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -782,7 +797,6 @@ test "eval: quote returns data" {
     var env = Env.init(alloc, &store);
     defer env.deinit();
 
-    // quote { 1 + 2 } → {:+, [], [{1, [], nil}, {2, [], nil}]}
     const one = try ast_data.makeTuple3(alloc, &store, .{ .int = 1 }, try ast_data.emptyList(alloc, &store), .nil);
     const two = try ast_data.makeTuple3(alloc, &store, .{ .int = 2 }, try ast_data.emptyList(alloc, &store), .nil);
     const add_args = try ast_data.makeList(alloc, &store, &.{ one, two });
@@ -794,13 +808,40 @@ test "eval: quote returns data" {
 
     const result = try eval(&env, quote_node);
 
-    // Should be a list containing the add node (not evaluated)
-    try std.testing.expect(result == .list);
-    try std.testing.expectEqual(@as(usize, 1), result.list.elems.len);
-    // The add node should be un-evaluated
-    try std.testing.expect(result.list.elems[0] == .tuple);
-    try std.testing.expect(result.list.elems[0].tuple.elems[0] == .atom);
-    try std.testing.expect(std.mem.eql(u8, result.list.elems[0].tuple.elems[0].atom, "+"));
+    // Single-stmt body is unwrapped — result is the add node tuple.
+    try std.testing.expect(result == .tuple);
+    try std.testing.expect(result.tuple.elems[0] == .atom);
+    try std.testing.expect(std.mem.eql(u8, result.tuple.elems[0].atom, "+"));
+}
+
+test "eval: quote with multi-stmt body wraps result in __block__" {
+    // Multiple statements in a quote body get wrapped in a
+    // `{:__block__, [], [stmts...]}` 3-tuple, matching the shape
+    // produced by `evaluateMacroBodyToCtValue`'s fast path. This
+    // lets the engine flatten nested blocks via
+    // `flattenNestedBlocks` and emit each stmt as a sibling
+    // struct item.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var store = AllocationStore{};
+    var env = Env.init(alloc, &store);
+    defer env.deinit();
+
+    const one = try ast_data.makeTuple3(alloc, &store, .{ .int = 1 }, try ast_data.emptyList(alloc, &store), .nil);
+    const two = try ast_data.makeTuple3(alloc, &store, .{ .int = 2 }, try ast_data.emptyList(alloc, &store), .nil);
+    const body_list = try ast_data.makeList(alloc, &store, &.{ one, two });
+    const quote_args = try ast_data.makeList(alloc, &store, &.{body_list});
+    const quote_node = try ast_data.makeTuple3(alloc, &store, .{ .atom = "quote" }, try ast_data.emptyList(alloc, &store), quote_args);
+
+    const result = try eval(&env, quote_node);
+
+    try std.testing.expect(result == .tuple);
+    try std.testing.expectEqual(@as(usize, 3), result.tuple.elems.len);
+    try std.testing.expect(result.tuple.elems[0] == .atom);
+    try std.testing.expectEqualStrings("__block__", result.tuple.elems[0].atom);
+    try std.testing.expect(result.tuple.elems[2] == .list);
+    try std.testing.expectEqual(@as(usize, 2), result.tuple.elems[2].list.elems.len);
 }
 
 // ============================================================
@@ -834,6 +875,18 @@ fn substituteUnquotesEval(env: *Env, value: CtValue) MacroEvalError!CtValue {
             // resolves the `elem` call instead of bottoming out on a
             // bare `param_map.get(name)` lookup.
             if (std.mem.eql(u8, form.atom, "unquote")) {
+                if (args == .list and args.list.elems.len == 1) {
+                    return eval(env, args.list.elems[0]);
+                }
+            }
+            // Top-level unquote_splicing inside a quote with a single
+            // stmt body: e.g. `quote { unquote_splicing(_xs) }`. The
+            // splicing is into the quote's "implicit outer list" of
+            // stmts; with only one stmt there's no surrounding list,
+            // so the natural reading is "return the list itself" so
+            // the engine sees N siblings instead of an
+            // `unquote_splicing` wrapper that survives into the AST.
+            if (std.mem.eql(u8, form.atom, "unquote_splicing")) {
                 if (args == .list and args.list.elems.len == 1) {
                     return eval(env, args.list.elems[0]);
                 }
@@ -907,34 +960,6 @@ fn substituteUnquotesInList(env: *Env, elems: []const CtValue) MacroEvalError!Ct
     const slice = try out.toOwnedSlice(env.alloc);
     const id = env.store.alloc(env.alloc, .list, null);
     return CtValue{ .list = .{ .alloc_id = id, .elems = slice } };
-}
-
-/// Walk a describe block body (a __block__ or list of statements),
-/// Find a named call (like setup or teardown) in a __block__ body
-/// and return its first argument (the body expression).
-fn findNamedCallBody(body: CtValue, name: []const u8) CtValue {
-    if (body != .tuple or body.tuple.elems.len != 3) return .nil;
-    const form = body.tuple.elems[0];
-    const args = body.tuple.elems[2];
-
-    if (form == .atom and std.mem.eql(u8, form.atom, "__block__") and args == .list) {
-        for (args.list.elems) |stmt| {
-            if (isCallNamed(stmt, name)) {
-                const call_args = stmt.tuple.elems[2];
-                if (call_args == .list and call_args.list.elems.len >= 1) {
-                    return call_args.list.elems[call_args.list.elems.len - 1]; // Last arg is the trailing block body
-                }
-            }
-        }
-    }
-    return .nil;
-}
-
-/// Check if a CtValue is a call to a specific named function/macro.
-fn isCallNamed(val: CtValue, name: []const u8) bool {
-    if (val != .tuple or val.tuple.elems.len != 3) return false;
-    if (val.tuple.elems[0] != .atom) return false;
-    return std.mem.eql(u8, val.tuple.elems[0].atom, name);
 }
 
 /// Extract string content from a CtValue, handling both bare strings
@@ -1589,108 +1614,6 @@ fn slugifyString(alloc: Allocator, input: []const u8) ![]const u8 {
     return result;
 }
 
-/// Build a plain function call: {:fn_name, [], []}
-fn buildCall0(alloc: Allocator, store: *AllocationStore, name: []const u8) !CtValue {
-    const empty = try ast_data.emptyList(alloc, store);
-    return ast_data.makeTuple3(alloc, store, .{ .atom = name }, empty, empty);
-}
-
-/// Build a test function declaration (pub, String return, given body).
-fn buildTestFnDecl(alloc: Allocator, store: *AllocationStore, name: []const u8, body: CtValue) !CtValue {
-    const empty = try ast_data.emptyList(alloc, store);
-    const head = try ast_data.makeTuple3(alloc, store, .{ .atom = name }, empty, empty);
-    const return_pair = try ast_data.makeTuple2(alloc, store, .{ .atom = "return" }, .{ .atom = "String" });
-    const do_pair = try ast_data.makeTuple2(alloc, store, .{ .atom = "do" }, body);
-    const opts = try ast_data.makeList(alloc, store, &.{ return_pair, do_pair });
-    const clause_args = try ast_data.makeList(alloc, store, &.{ head, opts });
-    const clause = try ast_data.makeTuple3(alloc, store, .{ .atom = "->" }, empty, clause_args);
-    const clauses = try ast_data.makeList(alloc, store, &.{clause});
-    // Visibility lives in metadata as an atom — must match the encoding
-    // produced by `functionDeclToCtValue` and consumed by
-    // `ctValueToStructItem` (`src/ast_data.zig:2243`). Writing it as a
-    // string would silently make the test function private.
-    const vis_pair = try ast_data.makeTuple2(alloc, store, .{ .atom = "visibility" }, .{ .atom = "pub" });
-    const fn_meta = try ast_data.makeList(alloc, store, &.{vis_pair});
-    return ast_data.makeTuple3(alloc, store, .{ .atom = "fn" }, fn_meta, clauses);
-}
-
-/// Build test functions from a describe block.
-/// Returns a __block__ containing:
-///   - function declarations (test_*)
-///   - tracking call expressions (begin_test; call; end_test; print_result; ".")
-fn buildTestFunctions(
-    alloc: Allocator,
-    store: *AllocationStore,
-    describe_name: []const u8,
-    body: CtValue,
-    setup_body: CtValue,
-    teardown_body: CtValue,
-) !CtValue {
-    if (body != .tuple or body.tuple.elems.len != 3) return .nil;
-    const form = body.tuple.elems[0];
-    const args = body.tuple.elems[2];
-    if (form != .atom or !std.mem.eql(u8, form.atom, "__block__") or args != .list) return .nil;
-
-    const desc_slug = try slugifyString(alloc, describe_name);
-    const empty = try ast_data.emptyList(alloc, store);
-    var result_items: std.ArrayListUnmanaged(CtValue) = .empty;
-
-    for (args.list.elems) |stmt| {
-        if (isCallNamed(stmt, "setup") or isCallNamed(stmt, "teardown")) continue;
-
-        if (isCallNamed(stmt, "test")) {
-            const test_args = stmt.tuple.elems[2];
-            if (test_args != .list or test_args.list.elems.len < 2) continue;
-
-            const test_name_str = extractString(test_args.list.elems[0]) orelse continue;
-            const test_slug = try slugifyString(alloc, test_name_str);
-            const fn_name = try std.fmt.allocPrint(alloc, "test_{s}_{s}", .{ desc_slug, test_slug });
-
-            // Determine test body
-            const has_context = test_args.list.elems.len == 3 and setup_body != .nil;
-            const raw_body = if (has_context) test_args.list.elems[2] else test_args.list.elems[test_args.list.elems.len - 1];
-
-            // Build function body: [setup?; body_stmts...; teardown?; "ok"]
-            var fn_body_stmts: std.ArrayListUnmanaged(CtValue) = .empty;
-            if (has_context) {
-                const ctx_var = try ast_data.makeTuple3(alloc, store, .{ .atom = "ctx" }, empty, .nil);
-                const ctx_assign = try ast_data.makeTuple3(alloc, store, .{ .atom = "=" }, empty, try ast_data.makeList(alloc, store, &.{ ctx_var, setup_body }));
-                try fn_body_stmts.append(alloc, ctx_assign);
-            }
-            // Flatten __block__ bodies
-            if (raw_body == .tuple and raw_body.tuple.elems.len == 3 and
-                raw_body.tuple.elems[0] == .atom and std.mem.eql(u8, raw_body.tuple.elems[0].atom, "__block__") and
-                raw_body.tuple.elems[2] == .list)
-            {
-                for (raw_body.tuple.elems[2].list.elems) |inner| try fn_body_stmts.append(alloc, inner);
-            } else {
-                try fn_body_stmts.append(alloc, raw_body);
-            }
-            if (teardown_body != .nil) try fn_body_stmts.append(alloc, teardown_body);
-            try fn_body_stmts.append(alloc, .{ .string = "ok" });
-
-            const fn_body = try ast_data.makeTuple3(alloc, store, .{ .atom = "__block__" }, empty, try ast_data.makeListFromSlice(alloc, store, fn_body_stmts.items));
-            const fn_decl = try buildTestFnDecl(alloc, store, fn_name, fn_body);
-            try result_items.append(alloc, fn_decl);
-
-            // Tracking call: begin_test(); test_fn(); end_test(); print_result(); "."
-            const tracking = try ast_data.makeTuple3(alloc, store, .{ .atom = "__block__" }, empty, try ast_data.makeList(alloc, store, &.{
-                try buildCall0(alloc, store, "begin_test"),
-                try buildCall0(alloc, store, fn_name),
-                try buildCall0(alloc, store, "end_test"),
-                try buildCall0(alloc, store, "print_result"),
-                .{ .string = "." },
-            }));
-            try result_items.append(alloc, tracking);
-        } else {
-            try result_items.append(alloc, stmt);
-        }
-    }
-
-    // Return as __block__ (mixed content: fn decls + tracking exprs)
-    return ast_data.makeTuple3(alloc, store, .{ .atom = "__block__" }, empty, try ast_data.makeListFromSlice(alloc, store, result_items.items));
-}
-
 test "eval: __zap_list_at__ extracts elements with normal and negative indices" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1819,37 +1742,5 @@ test "eval: __zap_list_empty__ distinguishes empty from non-empty" {
     const r_n = try eval(&env, call_n);
     try std.testing.expect(r_n == .bool_val);
     try std.testing.expectEqual(false, r_n.bool_val);
-}
-
-/// Build a standalone test function + tracking call.
-fn buildSingleTestFunction(alloc: Allocator, store: *AllocationStore, name: []const u8, body: CtValue) !CtValue {
-    const slug = try slugifyString(alloc, name);
-    const fn_name = try std.fmt.allocPrint(alloc, "test_{s}", .{slug});
-    const empty = try ast_data.emptyList(alloc, store);
-
-    var fn_body_stmts: std.ArrayListUnmanaged(CtValue) = .empty;
-    if (body == .tuple and body.tuple.elems.len == 3 and
-        body.tuple.elems[0] == .atom and std.mem.eql(u8, body.tuple.elems[0].atom, "__block__") and
-        body.tuple.elems[2] == .list)
-    {
-        for (body.tuple.elems[2].list.elems) |inner| try fn_body_stmts.append(alloc, inner);
-    } else {
-        try fn_body_stmts.append(alloc, body);
-    }
-    try fn_body_stmts.append(alloc, .{ .string = "ok" });
-
-    const fn_body = try ast_data.makeTuple3(alloc, store, .{ .atom = "__block__" }, empty, try ast_data.makeListFromSlice(alloc, store, fn_body_stmts.items));
-    const fn_decl = try buildTestFnDecl(alloc, store, fn_name, fn_body);
-
-    const tracking = try ast_data.makeTuple3(alloc, store, .{ .atom = "__block__" }, empty, try ast_data.makeList(alloc, store, &.{
-        try buildCall0(alloc, store, "begin_test"),
-        try buildCall0(alloc, store, fn_name),
-        try buildCall0(alloc, store, "end_test"),
-        try buildCall0(alloc, store, "print_result"),
-        .{ .string = "." },
-    }));
-
-    // Return as __block__ (mixed: fn decl + tracking expr)
-    return ast_data.makeTuple3(alloc, store, .{ .atom = "__block__" }, empty, try ast_data.makeList(alloc, store, &.{ fn_decl, tracking }));
 }
 

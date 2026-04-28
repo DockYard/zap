@@ -4457,3 +4457,383 @@ test "typed splice: untyped param accepts anything (back-compat)" {
     }
     try std.testing.expectEqual(@as(usize, 0), splice_errs);
 }
+
+// ============================================================
+// Zest describe migration tests (Task #5: pure-Zap describe macro)
+//
+// These tests validate the Architecture A approach: `describe`
+// directly walks its body's statements, generating per-test fn
+// declarations + tracking calls in pure Zap. No Zig builtin
+// `build_test_fns` is invoked — every transformation is expressed
+// through comptime intrinsics (`for`, `__zap_list_at__`,
+// `__zap_intern_atom__`, `__zap_slugify__`, `__zap_make_call__`,
+// list-ops) and `quote`. Setup/teardown bodies are captured as
+// macro-local CtValues and spliced into the per-test fn bodies; no
+// module-attribute side channel is used.
+//
+// The describe macro definition is inlined in each test so the
+// tests document the exact shape expected of the migrated
+// `lib/zest/case.zap` `describe` macro.
+// ============================================================
+
+const ZEST_DESCRIBE_INLINE_PRELUDE =
+    \\  pub macro setup(body :: Expr) -> Expr {
+    \\    quote { unquote(body) }
+    \\  }
+    \\
+    \\  pub macro teardown(body :: Expr) -> Expr {
+    \\    quote { unquote(body) }
+    \\  }
+    \\
+    \\  pub macro describe(_name :: Expr, body :: Expr) -> Expr {
+    \\    _stmts = elem(body, 2)
+    \\    _setup_matches = for _s <- _stmts, elem(_s, 0) == :setup { __zap_list_at__(elem(_s, 2), -1) }
+    \\    _teardown_matches = for _s <- _stmts, elem(_s, 0) == :teardown { __zap_list_at__(elem(_s, 2), -1) }
+    \\    _setup_body = __zap_list_at__(_setup_matches, 0)
+    \\    _teardown_body = __zap_list_at__(_teardown_matches, 0)
+    \\    _desc_slug = __zap_slugify__(_name)
+    \\
+    \\    _per_test = for _t <- _stmts, elem(_t, 0) == :test {
+    \\      quote {
+    \\        pub fn unquote(__zap_intern_atom__("test_" <> _desc_slug <> "_" <> __zap_slugify__(__zap_list_at__(elem(_t, 2), 0))))() -> String {
+    \\          unquote(__zap_make_call__("__block__", __zap_list_concat__(__zap_list_concat__(__zap_list_concat__(if __zap_list_len__(elem(_t, 2)) == 3 and _setup_body != nil { [__zap_make_call__("=", [ctx, _setup_body])] } else { [] }, if elem(__zap_list_at__(elem(_t, 2), -1), 0) == :__block__ { elem(__zap_list_at__(elem(_t, 2), -1), 2) } else { [__zap_list_at__(elem(_t, 2), -1)] }), if _teardown_body != nil { [_teardown_body] } else { [] }), ["ok"])))
+    \\        }
+    \\        :zig.Zest.begin_test()
+    \\        unquote(__zap_intern_atom__("test_" <> _desc_slug <> "_" <> __zap_slugify__(__zap_list_at__(elem(_t, 2), 0))))()
+    \\        :zig.Zest.end_test()
+    \\        :zig.Zest.print_result()
+    \\        "."
+    \\      }
+    \\    }
+    \\
+    \\    _passthrough = for _s <- _stmts, elem(_s, 0) != :test and elem(_s, 0) != :setup and elem(_s, 0) != :teardown { _s }
+    \\
+    \\    _all = __zap_list_concat__(_per_test, _passthrough)
+    \\
+    \\    quote { unquote_splicing(_all) }
+    \\  }
+;
+
+test "Zest describe migration T1: single test generates fn test_<group>_<test> with bare-name tracking call" {
+    const source = "pub struct Test {\n" ++ ZEST_DESCRIBE_INLINE_PRELUDE ++
+        \\
+        \\  describe("group") {
+        \\    test("t1") {
+        \\      1
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    const expanded = try engine.expandProgram(&program);
+
+    var found_fn = false;
+    var found_tracking_call = false;
+    var any_colon_prefixed = false;
+    for (expanded.structs) |mod| {
+        if (mod.name.parts.len != 1) continue;
+        if (!std.mem.eql(u8, parser.interner.get(mod.name.parts[0]), "Test")) continue;
+        for (mod.items) |item| {
+            switch (item) {
+                .function => |f| {
+                    const name = parser.interner.get(f.name);
+                    if (std.mem.eql(u8, name, "test_group_t1")) found_fn = true;
+                },
+                .struct_level_expr => |e| {
+                    if (e.* == .call and e.call.callee.* == .var_ref) {
+                        const callee_name = parser.interner.get(e.call.callee.var_ref.name);
+                        if (callee_name.len > 0 and callee_name[0] == ':') any_colon_prefixed = true;
+                        if (std.mem.eql(u8, callee_name, "test_group_t1")) found_tracking_call = true;
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+    try std.testing.expect(found_fn);
+    try std.testing.expect(found_tracking_call);
+    try std.testing.expect(!any_colon_prefixed);
+}
+
+test "Zest describe migration T2: two tests in describe produce two distinct fn names and two tracking calls" {
+    const source = "pub struct Test {\n" ++ ZEST_DESCRIBE_INLINE_PRELUDE ++
+        \\
+        \\  describe("group") {
+        \\    test("alpha") {
+        \\      1
+        \\    }
+        \\
+        \\    test("beta") {
+        \\      2
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    const expanded = try engine.expandProgram(&program);
+
+    var seen_alpha_fn = false;
+    var seen_beta_fn = false;
+    var seen_alpha_tracking = false;
+    var seen_beta_tracking = false;
+    for (expanded.structs) |mod| {
+        if (mod.name.parts.len != 1) continue;
+        if (!std.mem.eql(u8, parser.interner.get(mod.name.parts[0]), "Test")) continue;
+        for (mod.items) |item| {
+            switch (item) {
+                .function => |f| {
+                    const name = parser.interner.get(f.name);
+                    if (std.mem.eql(u8, name, "test_group_alpha")) seen_alpha_fn = true;
+                    if (std.mem.eql(u8, name, "test_group_beta")) seen_beta_fn = true;
+                },
+                .struct_level_expr => |e| {
+                    if (e.* == .call and e.call.callee.* == .var_ref) {
+                        const callee_name = parser.interner.get(e.call.callee.var_ref.name);
+                        if (std.mem.eql(u8, callee_name, "test_group_alpha")) seen_alpha_tracking = true;
+                        if (std.mem.eql(u8, callee_name, "test_group_beta")) seen_beta_tracking = true;
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+    try std.testing.expect(seen_alpha_fn);
+    try std.testing.expect(seen_beta_fn);
+    try std.testing.expect(seen_alpha_tracking);
+    try std.testing.expect(seen_beta_tracking);
+}
+
+test "Zest describe migration T3: setup body threads through ctx binding into test/3 body" {
+    // describe with `setup() { 42 }` and `test("uses ctx", ctx) { ctx }`.
+    // The generated test fn body MUST start with an assignment binding
+    // `ctx` to the setup body's value, so the `ctx` reference inside
+    // the test resolves at runtime. The migration assembles the fn
+    // body as `[ctx = setup_body, test_body_stmts..., "ok"]`.
+    const source = "pub struct Test {\n" ++ ZEST_DESCRIBE_INLINE_PRELUDE ++
+        \\
+        \\  describe("group") {
+        \\    setup() {
+        \\      42
+        \\    }
+        \\
+        \\    test("uses ctx", ctx) {
+        \\      ctx
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    const expanded = try engine.expandProgram(&program);
+
+    var test_fn: ?*const ast.FunctionDecl = null;
+    for (expanded.structs) |mod| {
+        if (mod.name.parts.len != 1) continue;
+        if (!std.mem.eql(u8, parser.interner.get(mod.name.parts[0]), "Test")) continue;
+        for (mod.items) |item| {
+            if (item == .function) {
+                const name = parser.interner.get(item.function.name);
+                if (std.mem.eql(u8, name, "test_group_uses_ctx")) test_fn = item.function;
+            }
+        }
+    }
+    try std.testing.expect(test_fn != null);
+    const decl = test_fn.?;
+    try std.testing.expect(decl.clauses.len >= 1);
+    const body = decl.clauses[0].body orelse return error.TestExpectedABody;
+    // First stmt should be the ctx assignment.
+    try std.testing.expect(body.len >= 1);
+    try std.testing.expect(body[0] == .assignment);
+    const assign = body[0].assignment;
+    try std.testing.expect(assign.pattern.* == .bind);
+    const ctx_name = parser.interner.get(assign.pattern.bind.name);
+    try std.testing.expectEqualStrings("ctx", ctx_name);
+}
+
+test "Zest describe migration T4: teardown body appended as a statement in each test fn body" {
+    // Both test fns should contain the teardown expression as a stmt
+    // before the trailing "ok". We detect by checking each fn body
+    // contains an integer literal `99` (the teardown's body).
+    const source = "pub struct Test {\n" ++ ZEST_DESCRIBE_INLINE_PRELUDE ++
+        \\
+        \\  describe("group") {
+        \\    test("a") {
+        \\      1
+        \\    }
+        \\
+        \\    test("b") {
+        \\      2
+        \\    }
+        \\
+        \\    teardown() {
+        \\      99
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    const expanded = try engine.expandProgram(&program);
+
+    var saw_99_in_a = false;
+    var saw_99_in_b = false;
+    for (expanded.structs) |mod| {
+        if (mod.name.parts.len != 1) continue;
+        if (!std.mem.eql(u8, parser.interner.get(mod.name.parts[0]), "Test")) continue;
+        for (mod.items) |item| {
+            if (item != .function) continue;
+            const name = parser.interner.get(item.function.name);
+            const is_a = std.mem.eql(u8, name, "test_group_a");
+            const is_b = std.mem.eql(u8, name, "test_group_b");
+            if (!is_a and !is_b) continue;
+            const body = item.function.clauses[0].body orelse continue;
+            for (body) |stmt| {
+                // Teardown body is appended as a `__block__` stmt; in
+                // ctValueToStmt that becomes either an int_literal
+                // (single-stmt block unwrapped) or an `Expr.block`
+                // wrapping the int. Either way the integer literal
+                // 99 is reachable in the fn body.
+                const e = if (stmt == .expr) stmt.expr else continue;
+                switch (e.*) {
+                    .int_literal => |lit| if (lit.value == 99) {
+                        if (is_a) saw_99_in_a = true;
+                        if (is_b) saw_99_in_b = true;
+                    },
+                    .block => |blk| for (blk.stmts) |inner| {
+                        if (inner == .expr and inner.expr.* == .int_literal and inner.expr.int_literal.value == 99) {
+                            if (is_a) saw_99_in_a = true;
+                            if (is_b) saw_99_in_b = true;
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+    }
+    try std.testing.expect(saw_99_in_a);
+    try std.testing.expect(saw_99_in_b);
+}
+
+test "Zest describe migration T5: bare test outside describe produces test_<slug> via test/2 macro" {
+    // The migrated `test/2` macro (sibling of describe in
+    // `lib/zest/case.zap`) handles the no-describe case and emits
+    // `test_<slug>` directly. Crucially the fn body contains ONLY
+    // the user's body + "ok"; the begin_test/end_test/print_result
+    // tracking calls live at module scope, NOT inside the fn body
+    // (matches the build_test_fn-equivalent path the deleted Zig
+    // builtin produced).
+    const source =
+        \\pub struct Test {
+        \\  pub macro test(_name :: Expr, body :: Expr) -> Expr {
+        \\    _fn_atom = __zap_intern_atom__("test_" <> __zap_slugify__(_name))
+        \\    quote {
+        \\      pub fn unquote(_fn_atom)() -> String {
+        \\        unquote(body)
+        \\        "ok"
+        \\      }
+        \\      :zig.Zest.begin_test()
+        \\      unquote(_fn_atom)()
+        \\      :zig.Zest.end_test()
+        \\      :zig.Zest.print_result()
+        \\      "."
+        \\    }
+        \\  }
+        \\
+        \\  test("solo") {
+        \\    1
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    const expanded = try engine.expandProgram(&program);
+
+    var saw_fn = false;
+    var saw_tracking = false;
+    for (expanded.structs) |mod| {
+        if (mod.name.parts.len != 1) continue;
+        if (!std.mem.eql(u8, parser.interner.get(mod.name.parts[0]), "Test")) continue;
+        for (mod.items) |item| {
+            switch (item) {
+                .function => |f| {
+                    if (std.mem.eql(u8, parser.interner.get(f.name), "test_solo")) saw_fn = true;
+                },
+                .struct_level_expr => |e| {
+                    if (e.* == .call and e.call.callee.* == .var_ref) {
+                        if (std.mem.eql(u8, parser.interner.get(e.call.callee.var_ref.name), "test_solo")) saw_tracking = true;
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+    try std.testing.expect(saw_fn);
+    try std.testing.expect(saw_tracking);
+}

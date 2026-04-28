@@ -67,11 +67,30 @@ pub struct Zest.Case {
 
   pub macro describe(_name :: Expr, body :: Expr) -> Expr {
     _stmts = elem(body, 2)
-    _setup_matches = for _stmt <- _stmts, elem(_stmt, 0) == :setup { __zap_list_at__(elem(_stmt, 2), -1) }
+    _setup_matches = for _s <- _stmts, elem(_s, 0) == :setup { __zap_list_at__(elem(_s, 2), -1) }
+    _teardown_matches = for _s <- _stmts, elem(_s, 0) == :teardown { __zap_list_at__(elem(_s, 2), -1) }
     _setup_body = __zap_list_at__(_setup_matches, 0)
-    _teardown_matches = for _stmt <- _stmts, elem(_stmt, 0) == :teardown { __zap_list_at__(elem(_stmt, 2), -1) }
     _teardown_body = __zap_list_at__(_teardown_matches, 0)
-    build_test_fns(_name, body, _setup_body, _teardown_body)
+    _desc_slug = __zap_slugify__(_name)
+
+    _per_test = for _t <- _stmts, elem(_t, 0) == :test {
+      quote {
+        pub fn unquote(__zap_intern_atom__("test_" <> _desc_slug <> "_" <> __zap_slugify__(__zap_list_at__(elem(_t, 2), 0))))() -> String {
+          unquote(__zap_make_call__("__block__", __zap_list_concat__(__zap_list_concat__(__zap_list_concat__(if __zap_list_len__(elem(_t, 2)) == 3 and _setup_body != nil { [__zap_make_call__("=", [ctx, _setup_body])] } else { [] }, if elem(__zap_list_at__(elem(_t, 2), -1), 0) == :__block__ { elem(__zap_list_at__(elem(_t, 2), -1), 2) } else { [__zap_list_at__(elem(_t, 2), -1)] }), if _teardown_body != nil { [_teardown_body] } else { [] }), ["ok"])))
+        }
+        :zig.Zest.begin_test()
+        unquote(__zap_intern_atom__("test_" <> _desc_slug <> "_" <> __zap_slugify__(__zap_list_at__(elem(_t, 2), 0))))()
+        :zig.Zest.end_test()
+        :zig.Zest.print_result()
+        "."
+      }
+    }
+
+    _passthrough = for _s <- _stmts, elem(_s, 0) != :test and elem(_s, 0) != :setup and elem(_s, 0) != :teardown { _s }
+
+    _all = __zap_list_concat__(_per_test, _passthrough)
+
+    quote { unquote_splicing(_all) }
   }
 
   @doc = """
@@ -91,10 +110,7 @@ pub struct Zest.Case {
     fn_name = __zap_intern_atom__("test_" <> __zap_slugify__(_name))
     quote {
       pub fn unquote(fn_name)() -> String {
-        :zig.Zest.begin_test()
         unquote(body)
-        :zig.Zest.end_test()
-        :zig.Zest.print_result()
         "ok"
       }
 
