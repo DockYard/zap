@@ -835,6 +835,31 @@ const Pipeline = struct {
             self.failWith("Error during IR lowering", error.IrFailed);
     }
 
+    /// Per-module IR build variant that threads a globally-unique
+    /// `__try` ID counter across module boundaries. Without this,
+    /// each per-module IR build would derive `next_try_id` from the
+    /// per-module max group ID and a `__try` variant produced for
+    /// module A's multi-clause function could share the ID of module
+    /// B's regular HIR group, causing call_direct dispatches to
+    /// resolve to the wrong function.
+    fn runIrLoweringWithTryIdSeed(
+        self: *Pipeline,
+        hir_program: *const zap.hir.Program,
+        type_store: *zap.types.TypeStore,
+        next_try_id: *u32,
+    ) CompileError!ir.Program {
+        self.progress("IR");
+        var ir_builder = zap.ir.IrBuilder.init(self.alloc, &self.ctx.interner);
+        ir_builder.type_store = type_store;
+        ir_builder.scope_graph = &self.ctx.collector.graph;
+        ir_builder.next_try_id = next_try_id.*;
+        defer ir_builder.deinit();
+        const program = ir_builder.buildProgram(hir_program) catch
+            return self.failWith("Error during IR lowering", error.IrFailed);
+        next_try_id.* = ir_builder.next_try_id;
+        return program;
+    }
+
     /// CTFE attribute evaluation across the whole IR program. When a
     /// `module_order` is supplied each module's attributes are
     /// evaluated in dependency order so each module can read its
@@ -948,9 +973,10 @@ fn compileHirToIr(
     hir_program: *const zap.hir.Program,
     type_store: *zap.types.TypeStore,
     options: CompileOptions,
+    next_try_id: *u32,
 ) CompileError!ir.Program {
     var pipeline = Pipeline.init(alloc, ctx, options, 0, 0);
-    var mod_ir = try pipeline.runIrLowering(hir_program, type_store);
+    var mod_ir = try pipeline.runIrLoweringWithTryIdSeed(hir_program, type_store, next_try_id);
     pipeline.runCtfeAttributesForModule(mod_name, &mod_ir);
     return mod_ir;
 }
@@ -1039,14 +1065,17 @@ pub fn compileModuleByModule(
     // Phase 4: each module's HIR → IR. Function IDs are already
     // globally unique from the HIR stage (group_id_offset advancement
     // in phase 1), so no cloneWithOffset is needed — collect
-    // functions directly.
+    // functions directly. `next_try_id` is threaded across modules so
+    // synthesized `__try` variants get globally unique IDs that don't
+    // collide with another module's regular HIR groups.
+    var next_try_id: u32 = mono_next;
     for (combined_hir.modules) |mod| {
         const single_mod_hir = zap.hir.Program{
             .modules = try alloc.dupe(zap.hir.Module, &.{mod}),
             .top_functions = &.{},
         };
         const mod_name_str = if (mod.name.parts.len > 0) ctx.interner.get(mod.name.parts[mod.name.parts.len - 1]) else "unknown";
-        const mod_ir = compileHirToIr(alloc, ctx, mod_name_str, &single_mod_hir, shared_store, options) catch {
+        const mod_ir = compileHirToIr(alloc, ctx, mod_name_str, &single_mod_hir, shared_store, options, &next_try_id) catch {
             continue;
         };
         for (mod_ir.functions) |func| {
@@ -1063,7 +1092,7 @@ pub fn compileModuleByModule(
             .top_functions = combined_hir.top_functions,
             .impls = combined_hir.impls,
         };
-        const mod_ir = compileHirToIr(alloc, ctx, "top", &top_hir, shared_store, options) catch return error.IrFailed;
+        const mod_ir = compileHirToIr(alloc, ctx, "top", &top_hir, shared_store, options, &next_try_id) catch return error.IrFailed;
         for (mod_ir.functions) |func| {
             all_functions.append(alloc, func) catch return error.OutOfMemory;
         }

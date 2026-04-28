@@ -947,7 +947,16 @@ pub const IrBuilder = struct {
             const qualified = try std.fmt.allocPrint(self.allocator, "{s}__{d}", .{ mangled_func_name, func_group.arity });
             try self.known_function_names.put(qualified, {});
         }
-        self.next_try_id = max_group_id + 1;
+        // The per-module IR build path computes `max_group_id` from
+        // *this module's* HIR only. To prevent `__try` IDs from
+        // colliding with regular HIR IDs in *other* modules (the IR
+        // eventually merges all modules' functions into one program),
+        // the caller may pre-seed `next_try_id` with a globally-safe
+        // offset. Only fall back to `max_group_id + 1` when the
+        // caller hasn't seeded a value.
+        if (self.next_try_id <= max_group_id) {
+            self.next_try_id = max_group_id + 1;
+        }
 
         // Second pass: pre-scan for ~> error pipe chains to identify functions
         // that need __try variants. This must happen before building function bodies
