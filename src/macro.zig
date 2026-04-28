@@ -3025,6 +3025,319 @@ test "@before_compile: hook fires and splices result into target module" {
     try std.testing.expect(found_injected);
 }
 
+test "comptime function dispatch: refuses impure function (zig interop)" {
+    // A function whose body calls `:zig.X.Y` is impure. The
+    // dispatcher must refuse and leave the call as runtime AST so
+    // the impure work happens at runtime where it belongs. The
+    // macro would otherwise see mangled output (an AST tuple in a
+    // place expecting a scalar).
+    const source =
+        \\pub struct Test {
+        \\  pub fn impure_log(value :: i64) -> i64 {
+        \\    :zig.IO.println(value)
+        \\    value
+        \\  }
+        \\
+        \\  pub macro try_log() -> Expr {
+        \\    result = impure_log(42)
+        \\    quote { unquote(result) }
+        \\  }
+        \\
+        \\  pub fn check() -> i64 {
+        \\    try_log()
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    const expanded = try engine.expandProgram(&program);
+
+    // After expansion, `check`'s body should NOT contain a bare
+    // int_literal `42` (which would mean dispatch incorrectly
+    // reduced an impure function). It should still contain the
+    // unreduced `impure_log(42)` call.
+    var body_first_expr_tag: ?[]const u8 = null;
+    for (expanded.structs) |mod| {
+        for (mod.items) |item| {
+            if (item != .function) continue;
+            const fn_name = parser.interner.get(item.function.name);
+            if (!std.mem.eql(u8, fn_name, "check")) continue;
+            for (item.function.clauses) |clause| {
+                const body = clause.body orelse continue;
+                for (body) |stmt| {
+                    if (stmt == .expr) {
+                        body_first_expr_tag = @tagName(stmt.expr.*);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    try std.testing.expect(body_first_expr_tag != null);
+    // The body should not be a bare int_literal — that would
+    // indicate dispatch reduced an impure function.
+    try std.testing.expect(!std.mem.eql(u8, body_first_expr_tag.?, "int_literal"));
+}
+
+test "comptime function dispatch: transitive — function calls function" {
+    // `quadruple(x)` calls `double(x)` calls `n + n`. The dispatcher
+    // recurses into each call, evaluates pure arithmetic, returns
+    // the final scalar. Validates that env.dispatch_depth bumps
+    // correctly and child envs inherit the module context.
+    const source =
+        \\pub struct Test {
+        \\  pub fn double(n :: i64) -> i64 {
+        \\    n + n
+        \\  }
+        \\
+        \\  pub fn quadruple(n :: i64) -> i64 {
+        \\    double(double(n))
+        \\  }
+        \\
+        \\  pub macro emit_quad() -> Expr {
+        \\    result = quadruple(7)
+        \\    quote { unquote(result) }
+        \\  }
+        \\
+        \\  pub fn check() -> i64 {
+        \\    emit_quad()
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    const expanded = try engine.expandProgram(&program);
+
+    var found_int: ?i64 = null;
+    for (expanded.structs) |mod| {
+        for (mod.items) |item| {
+            if (item != .function) continue;
+            const fn_name = parser.interner.get(item.function.name);
+            if (!std.mem.eql(u8, fn_name, "check")) continue;
+            for (item.function.clauses) |clause| {
+                const body = clause.body orelse continue;
+                for (body) |stmt| {
+                    if (stmt == .expr and stmt.expr.* == .int_literal) {
+                        found_int = stmt.expr.int_literal.value;
+                    }
+                }
+            }
+        }
+    }
+    try std.testing.expect(found_int != null);
+    // 7 doubled = 14; 14 doubled = 28
+    try std.testing.expectEqual(@as(i64, 28), found_int.?);
+}
+
+test "comptime function dispatch: macro calls pure user-defined function" {
+    // A macro body invokes `double(x)` where `double/1` is an
+    // ordinary `pub fn` defined in the same module. The comptime
+    // dispatcher resolves it through the scope graph and recursively
+    // evaluates the body, so the macro sees the function's return
+    // value as a CtValue rather than an unresolved call AST.
+    const source =
+        \\pub struct Test {
+        \\  pub fn double(n :: i64) -> i64 {
+        \\    n + n
+        \\  }
+        \\
+        \\  pub macro emit_doubled() -> Expr {
+        \\    result = double(21)
+        \\    quote { unquote(result) }
+        \\  }
+        \\
+        \\  pub fn check() -> i64 {
+        \\    emit_doubled()
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    const expanded = try engine.expandProgram(&program);
+
+    // After expansion, `check`'s body should contain the integer
+    // literal 42 (= 21 + 21). The macro's call to `double(21)` was
+    // resolved at comptime and inlined.
+    var found_int: ?i64 = null;
+    for (expanded.structs) |mod| {
+        for (mod.items) |item| {
+            if (item != .function) continue;
+            const fn_name = parser.interner.get(item.function.name);
+            if (!std.mem.eql(u8, fn_name, "check")) continue;
+            for (item.function.clauses) |clause| {
+                const body = clause.body orelse continue;
+                for (body) |stmt| {
+                    if (stmt == .expr and stmt.expr.* == .int_literal) {
+                        found_int = stmt.expr.int_literal.value;
+                    }
+                }
+            }
+        }
+    }
+    try std.testing.expect(found_int != null);
+    try std.testing.expectEqual(@as(i64, 42), found_int.?);
+}
+
+test "comptime for: iterates list and accumulates body results" {
+    // The macro evaluator runs `for x <- [1, 2, 3] { x + 10 }` at
+    // expansion time. The accumulated list of body values is
+    // returned as a CtValue.list which ctValueToExpr renders as a
+    // list literal in the expanded AST.
+    const source =
+        \\pub struct Test {
+        \\  pub macro emit_list() -> Expr {
+        \\    nums = [1, 2, 3]
+        \\    incremented = for n <- nums { n + 10 }
+        \\    quote { unquote(incremented) }
+        \\  }
+        \\
+        \\  pub fn check() -> [i64] {
+        \\    emit_list()
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    const expanded = try engine.expandProgram(&program);
+
+    // After expansion `check`'s body should contain a list literal
+    // `[11, 12, 13]`.
+    var found_list: ?*const ast.Expr = null;
+    for (expanded.structs) |mod| {
+        for (mod.items) |item| {
+            if (item != .function) continue;
+            const fn_name = parser.interner.get(item.function.name);
+            if (!std.mem.eql(u8, fn_name, "check")) continue;
+            for (item.function.clauses) |clause| {
+                const body = clause.body orelse continue;
+                for (body) |stmt| {
+                    if (stmt == .expr and stmt.expr.* == .list) {
+                        found_list = stmt.expr;
+                    }
+                }
+            }
+        }
+    }
+    try std.testing.expect(found_list != null);
+    const elems = found_list.?.list.elements;
+    try std.testing.expectEqual(@as(usize, 3), elems.len);
+    // Each element should be int_literal with the incremented value.
+    try std.testing.expect(elems[0].* == .int_literal);
+    try std.testing.expectEqual(@as(i64, 11), elems[0].int_literal.value);
+    try std.testing.expectEqual(@as(i64, 12), elems[1].int_literal.value);
+    try std.testing.expectEqual(@as(i64, 13), elems[2].int_literal.value);
+}
+
+test "comptime for: filter clause excludes elements" {
+    // `for n <- [1, 2, 3, 4, 5], n >= 3 { n + 10 }` produces
+    // [13, 14, 15] — only elements meeting the filter contribute.
+    // The comma after the iterable introduces the filter expression.
+    const source =
+        \\pub struct Test {
+        \\  pub macro emit_filtered() -> Expr {
+        \\    nums = [1, 2, 3, 4, 5]
+        \\    big = for n <- nums, n >= 3 { n + 10 }
+        \\    quote { unquote(big) }
+        \\  }
+        \\
+        \\  pub fn check() -> [i64] {
+        \\    emit_filtered()
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    const expanded = try engine.expandProgram(&program);
+
+    var found_list: ?*const ast.Expr = null;
+    for (expanded.structs) |mod| {
+        for (mod.items) |item| {
+            if (item != .function) continue;
+            const fn_name = parser.interner.get(item.function.name);
+            if (!std.mem.eql(u8, fn_name, "check")) continue;
+            for (item.function.clauses) |clause| {
+                const body = clause.body orelse continue;
+                for (body) |stmt| {
+                    if (stmt == .expr and stmt.expr.* == .list) {
+                        found_list = stmt.expr;
+                    }
+                }
+            }
+        }
+    }
+    try std.testing.expect(found_list != null);
+    const elems = found_list.?.list.elements;
+    try std.testing.expectEqual(@as(usize, 3), elems.len);
+    try std.testing.expectEqual(@as(i64, 13), elems[0].int_literal.value);
+    try std.testing.expectEqual(@as(i64, 14), elems[1].int_literal.value);
+    try std.testing.expectEqual(@as(i64, 15), elems[2].int_literal.value);
+}
+
 test "comptime intrinsics: slugify produces snake_case from string" {
     // Direct test of the slugify intrinsic via a macro that returns
     // the slug as a string literal expression. This isolates the

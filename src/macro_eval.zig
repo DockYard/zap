@@ -38,6 +38,10 @@ pub const Env = struct {
     store: *AllocationStore,
     bindings: std.StringHashMap(CtValue),
     module_ctx: ?ModuleContext = null,
+    /// Recursion depth for comptime function dispatch. Bumped each
+    /// time `dispatchComptimeCall` recurses into another function.
+    /// Limits runaway evaluation of recursive functions.
+    dispatch_depth: u32 = 0,
 
     pub fn init(alloc: Allocator, store: *AllocationStore) Env {
         return .{
@@ -313,6 +317,14 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
                 return moduleIntrinsicRegister(env, arg_elems);
             }
 
+            // For-comprehension at comptime: iterate a list/string,
+            // bind the loop pattern, optionally filter, accumulate
+            // body results into a fresh list. Encoded by `exprToCtValue`
+            // as `{:for, meta, [var_pattern, iterable, filter|nil, body]}`.
+            if (std.mem.eql(u8, form_name, "for")) {
+                return forComprehensionIntrinsic(env, arg_elems);
+            }
+
             // Comptime string/atom helpers — language primitives
             // exposed to macro bodies so library-level macros can
             // build dynamic identifiers without depending on
@@ -347,6 +359,20 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
             }
             if (std.mem.eql(u8, form_name, "not") and operand == .bool_val) {
                 return CtValue{ .bool_val = !operand.bool_val };
+            }
+        }
+
+        // Comptime function dispatch: unknown form is a function name
+        // visible in the current module's scope. Look up the function
+        // family, instantiate the first matching clause's body with
+        // the call's arg CtValues bound to the params, and recursively
+        // interpret. Pure Zap functions (no `:zig.` calls beyond
+        // comptime intrinsics) "just work"; impure functions return
+        // nil through the natural fall-through and the call survives
+        // as AST data.
+        if (args == .list) {
+            if (try dispatchComptimeCall(env, form_name, args.list.elems)) |result| {
+                return result;
             }
         }
 
@@ -663,6 +689,312 @@ fn moduleIntrinsicPut(env: *Env, args: []const CtValue) MacroEvalError!CtValue {
     const cv = ctfe.exportValue(env.alloc, unwrapped) catch return .nil;
     ctx.graph.putModuleAttribute(mod_entry, name_id, cv) catch return .nil;
     return .nil;
+}
+
+/// Walk a function's AST body and return true when none of its
+/// constructs would produce a runtime side effect when evaluated at
+/// compile time. Conservative — refuses on any construct the
+/// comptime evaluator can't safely interpret (`:zig.X` calls,
+/// `panic`, calls to functions whose bodies in turn aren't safe).
+///
+/// "Safe" here is structural: the AST shape is recognized and
+/// reducible to a value. The evaluator may still fail dynamically
+/// (e.g., division by zero) — those are handled by the caller's
+/// `catch return null` paths.
+fn isFunctionBodyComptimeSafe(body: []const ast.Stmt) bool {
+    for (body) |stmt| {
+        switch (stmt) {
+            .expr => |e| if (!isExprComptimeSafe(e)) return false,
+            .assignment => |a| {
+                if (!isExprComptimeSafe(a.value)) return false;
+            },
+            // Function/macro/import declarations inside another fn
+            // body aren't comptime-callable through dispatch (the
+            // caller would have to evaluate the whole construct).
+            .function_decl, .macro_decl, .import_decl => return false,
+        }
+    }
+    return true;
+}
+
+fn isExprComptimeSafe(expr: *const ast.Expr) bool {
+    return switch (expr.*) {
+        // Literals — always safe
+        .int_literal, .float_literal, .string_literal, .bool_literal,
+        .atom_literal, .nil_literal => true,
+        // Variable references resolve through env.bindings
+        .var_ref => true,
+        // Compound shapes — all children must be safe
+        .binary_op => |b| isExprComptimeSafe(b.lhs) and isExprComptimeSafe(b.rhs),
+        .unary_op => |u| isExprComptimeSafe(u.operand),
+        .pipe => |p| isExprComptimeSafe(p.lhs) and isExprComptimeSafe(p.rhs),
+        .list => |l| for (l.elements) |elem| {
+            if (!isExprComptimeSafe(elem)) break false;
+        } else true,
+        .tuple => |t| for (t.elements) |elem| {
+            if (!isExprComptimeSafe(elem)) break false;
+        } else true,
+        .map => |m| blk: {
+            if (m.update_source) |src| {
+                if (!isExprComptimeSafe(src)) break :blk false;
+            }
+            for (m.fields) |entry| {
+                if (!isExprComptimeSafe(entry.key)) break :blk false;
+                if (!isExprComptimeSafe(entry.value)) break :blk false;
+            }
+            break :blk true;
+        },
+        .block => |b| for (b.stmts) |stmt| {
+            switch (stmt) {
+                .expr => |e| if (!isExprComptimeSafe(e)) break false,
+                .assignment => |a| if (!isExprComptimeSafe(a.value)) break false,
+                else => break false,
+            }
+        } else true,
+        .if_expr => |ife| ifBlk: {
+            if (!isExprComptimeSafe(ife.condition)) break :ifBlk false;
+            for (ife.then_block) |s| {
+                switch (s) {
+                    .expr => |e| if (!isExprComptimeSafe(e)) break :ifBlk false,
+                    .assignment => |a| if (!isExprComptimeSafe(a.value)) break :ifBlk false,
+                    else => break :ifBlk false,
+                }
+            }
+            if (ife.else_block) |else_b| {
+                for (else_b) |s| {
+                    switch (s) {
+                        .expr => |e| if (!isExprComptimeSafe(e)) break :ifBlk false,
+                        .assignment => |a| if (!isExprComptimeSafe(a.value)) break :ifBlk false,
+                        else => break :ifBlk false,
+                    }
+                }
+            }
+            break :ifBlk true;
+        },
+        // Calls — check the callee shape. Bare-name calls go through
+        // comptime dispatch (recursive safety check at dispatch
+        // time). Field-access callees that target the `:zig.` interop
+        // namespace are NEVER comptime-safe; module-qualified Zap
+        // calls (`Foo.bar(args)`) are conservatively rejected for
+        // now since dispatch doesn't yet route through module refs.
+        .call => |c| isCallComptimeSafe(c),
+        // Range, list-cons, struct construction — pure shape
+        .range => |r| {
+            if (!isExprComptimeSafe(r.start)) return false;
+            if (!isExprComptimeSafe(r.end)) return false;
+            if (r.step) |s| if (!isExprComptimeSafe(s)) return false;
+            return true;
+        },
+        .list_cons_expr => |c| isExprComptimeSafe(c.head) and isExprComptimeSafe(c.tail),
+        // Quote/unquote — handled by macro engine, not function
+        // dispatch. Treat as not-safe so dispatch refuses.
+        .quote_expr, .unquote_expr, .unquote_splicing_expr => false,
+        // For-comp inside a function body — defer to its own safety.
+        .for_expr => |f| isExprComptimeSafe(f.iterable) and isExprComptimeSafe(f.body) and
+            (f.filter == null or isExprComptimeSafe(f.filter.?)),
+        // Anything else is unrecognized — refuse conservatively.
+        else => false,
+    };
+}
+
+fn isCallComptimeSafe(call: anytype) bool {
+    // Inspect callee shape:
+    //   - var_ref: bare-name call. Safe — dispatch will recurse.
+    //   - field_access on :zig: NEVER safe.
+    //   - field_access on a Zap module: may eventually be safe
+    //     (cross-module pure dispatch), but dispatch doesn't
+    //     currently route through module refs. Reject.
+    //   - module_ref or anything else: reject.
+    if (call.callee.* == .var_ref) {
+        // Each arg must also be safe.
+        for (call.args) |arg| {
+            if (!isExprComptimeSafe(arg)) return false;
+        }
+        return true;
+    }
+    if (call.callee.* == .field_access) {
+        // Module-qualified calls (`Foo.bar(args)`) and `:zig.X.Y(...)`
+        // interop are conservatively rejected — comptime dispatch
+        // doesn't route through field-access callees yet. When
+        // cross-module dispatch lands the safe-set widens here.
+        return false;
+    }
+    return false;
+}
+
+/// Maximum recursion depth for comptime function dispatch. Prevents
+/// runaway evaluation of recursive functions; mirrors the
+/// `max_expansions` limit on the macro engine itself. Counted across
+/// the call stack via env.dispatch_depth.
+const COMPTIME_DISPATCH_MAX_DEPTH: u32 = 64;
+
+/// Try to resolve and interpret a Zap-side function call at comptime.
+/// Returns the function body's evaluated result, or null when:
+///   - no module context is available (eval is not running for a
+///     macro expansion)
+///   - the function family isn't found in the current scope chain
+///   - the function body contains constructs the comptime evaluator
+///     can't handle (e.g., `:zig.` calls)
+///   - the depth limit is reached
+fn dispatchComptimeCall(
+    env: *Env,
+    form_name: []const u8,
+    arg_forms: []const CtValue,
+) MacroEvalError!?CtValue {
+    const ctx = env.module_ctx orelse return null;
+    if (env.dispatch_depth >= COMPTIME_DISPATCH_MAX_DEPTH) return null;
+
+    const scope_id = ctx.current_module_scope orelse ctx.graph.prelude_scope;
+    const name_id = ctx.interner.intern(form_name) catch return null;
+    const arity: u32 = @intCast(arg_forms.len);
+    const family_id = ctx.graph.resolveFamily(scope_id, name_id, arity) orelse return null;
+    const family = &ctx.graph.families.items[family_id];
+    if (family.clauses.items.len == 0) return null;
+
+    // Pick the first clause for now. Multi-clause dispatch with
+    // pattern matching at comptime is a future extension; the
+    // common case (string helpers, list helpers, formatters) uses
+    // a single clause anyway.
+    const clause_ref = family.clauses.items[0];
+    const clause = &clause_ref.decl.clauses[clause_ref.clause_index];
+    const body = clause.body orelse return null;
+
+    // Purity check: refuse to dispatch a function whose body
+    // contains `:zig.` interop calls, raw `panic`, or other
+    // side-effecting primitives. Without this guard, eval would
+    // happily process pure subtrees and leave impure subtrees as
+    // unresolved AST tuples — the macro author would silently get
+    // mangled output. The conservative refusal returns null, the
+    // caller falls through to "leave the call as AST data" which
+    // surfaces at runtime where the impure call belongs.
+    if (!isFunctionBodyComptimeSafe(body)) return null;
+
+    // Pre-evaluate each argument so the callee sees fully-evaluated
+    // values, not AST forms still containing nested calls.
+    var arg_cts = env.alloc.alloc(CtValue, arg_forms.len) catch return null;
+    defer env.alloc.free(arg_cts);
+    for (arg_forms, 0..) |form, i| {
+        arg_cts[i] = eval(env, form) catch return null;
+    }
+
+    // Spin up a child env that inherits the same store, dispatch
+    // depth (incremented), and module_ctx, but starts with a fresh
+    // bindings map populated only with the callee's parameters. The
+    // child's bindings can't leak into the caller's scope.
+    var child_env = Env.init(env.alloc, env.store);
+    defer child_env.deinit();
+    child_env.module_ctx = env.module_ctx;
+    child_env.dispatch_depth = env.dispatch_depth + 1;
+
+    for (clause.params, 0..) |param, i| {
+        if (i >= arg_cts.len) break;
+        if (param.pattern.* == .bind) {
+            const param_name = ctx.interner.get(param.pattern.bind.name);
+            child_env.bind(param_name, arg_cts[i]) catch return null;
+        }
+    }
+
+    // Convert the body statements to CtValue and evaluate them.
+    // Last statement's result is the return value, matching
+    // expression-language semantics.
+    var result: CtValue = .nil;
+    for (body) |stmt| {
+        const stmt_ct = ast_data.stmtToCtValue(env.alloc, ctx.interner, env.store, stmt) catch return null;
+        result = eval(&child_env, stmt_ct) catch return null;
+    }
+
+    // The function may legitimately return nil. Return the actual
+    // result so callers can distinguish nil-return from no-dispatch.
+    return result;
+}
+
+/// `for x <- iterable, filter, body` at comptime. Encoded as
+/// `{:for, meta, [var_pattern, iterable, filter|nil, body]}` per
+/// `exprToCtValue.for_expr`. Iterates the list-shaped iterable,
+/// binds the pattern, optionally evaluates a boolean filter, and
+/// accumulates body results into a fresh CtValue.list.
+fn forComprehensionIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtValue {
+    if (args.len != 4) return .nil;
+    const var_pattern = args[0];
+    const iterable_ct = try eval(env, args[1]);
+    const filter_form = args[2]; // unevaluated — re-evaluated per iteration
+    const body_form = args[3];
+
+    // Iterables: bare lists, AST-wrapped list literals, or strings
+    // (which iterate codepoints). Anything else returns nil — the
+    // caller can chose whether to treat that as an error.
+    const list_elems: []const CtValue = switch (iterable_ct) {
+        .list => |l| l.elems,
+        // AST-wrapped list literal would surface as a `.tuple`, but
+        // `exprToCtValue` produces bare lists for `[a, b, c]` so the
+        // tuple-shaped path doesn't arise in practice. Treat any
+        // other shape as "not iterable at comptime" — caller code
+        // can catch the nil result and surface a useful error.
+        else => return .nil,
+    };
+
+    var accumulated: std.ArrayListUnmanaged(CtValue) = .empty;
+    for (list_elems) |elem| {
+        // Bind the loop pattern. Save and restore env.bindings around
+        // each iteration so loop-bound names don't leak.
+        const had_pattern_bind = bindForPattern(env, var_pattern, elem) catch continue;
+        defer if (had_pattern_bind) |bound_name| {
+            _ = env.bindings.remove(bound_name);
+        };
+
+        // Filter check, if present.
+        if (filter_form != .nil) {
+            const filter_result = eval(env, filter_form) catch CtValue.nil;
+            const bare = unwrapAstLiteral(filter_result);
+            const passes = switch (bare) {
+                .bool_val => |b| b,
+                else => false, // truthy semantics not supported at comptime
+            };
+            if (!passes) continue;
+        }
+
+        const body_result = eval(env, body_form) catch CtValue.nil;
+        try accumulated.append(env.alloc, body_result);
+    }
+
+    const slice = try accumulated.toOwnedSlice(env.alloc);
+    const id = env.store.alloc(env.alloc, .list, null);
+    return CtValue{ .list = .{ .alloc_id = id, .elems = slice } };
+}
+
+/// Bind a for-comprehension's loop pattern to a list element. Only
+/// simple bind patterns (a bare name) are supported at comptime —
+/// destructuring patterns (`{k, v}` etc.) require running the
+/// pattern matcher, which is HIR-level work. Returns the bound name
+/// (if any) for cleanup.
+fn bindForPattern(env: *Env, pattern: CtValue, elem: CtValue) !?[]const u8 {
+    // The pattern as a CtValue is itself an AST tuple shape:
+    //   - `{:name, [], nil}`     — bare bind pattern (variable)
+    //   - `{:_, [], nil}`        — wildcard (no binding)
+    //   - other 3-tuples         — compound patterns (unsupported)
+    if (pattern == .atom) {
+        // Bare atom — happens when patternToCtValue collapses a
+        // bind pattern to the underlying name.
+        const name = pattern.atom;
+        if (std.mem.eql(u8, name, "_")) return null;
+        try env.bind(name, elem);
+        return name;
+    }
+    if (pattern == .tuple and pattern.tuple.elems.len == 3) {
+        const form = pattern.tuple.elems[0];
+        const args_v = pattern.tuple.elems[2];
+        if (form == .atom and args_v == .nil) {
+            const name = form.atom;
+            if (std.mem.eql(u8, name, "_")) return null;
+            // Skip atom literal patterns (`:foo`) — they match by
+            // equality, not by binding. The current comptime for
+            // doesn't support match semantics; that's HIR territory.
+            if (name.len > 0 and name[0] == ':') return null;
+            try env.bind(name, elem);
+            return name;
+        }
+    }
+    return null;
 }
 
 /// `__zap_atom_name__(atom_value)`: extract the bare name string
