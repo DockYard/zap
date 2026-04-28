@@ -43,9 +43,6 @@ pub const Token = struct {
         keyword_alias,
         keyword_import,
         keyword_use,
-        keyword_quote,
-        keyword_unquote,
-        keyword_unquote_splicing,
         keyword_true,
         keyword_false,
         keyword_nil,
@@ -126,6 +123,24 @@ pub const Token = struct {
         return source[self.loc.start..self.loc.end];
     }
 
+    /// True when this token is an identifier whose text is exactly `quote`.
+    /// Used by the parser to recognise the `quote { ... }` contextual
+    /// keyword without making `quote` a reserved name.
+    pub fn isQuoteIdent(self: Token, source: []const u8) bool {
+        return self.tag == .identifier and std.mem.eql(u8, self.slice(source), "quote");
+    }
+
+    /// True when this token is an identifier whose text is exactly `unquote`.
+    pub fn isUnquoteIdent(self: Token, source: []const u8) bool {
+        return self.tag == .identifier and std.mem.eql(u8, self.slice(source), "unquote");
+    }
+
+    /// True when this token is an identifier whose text is exactly
+    /// `unquote_splicing`.
+    pub fn isUnquoteSplicingIdent(self: Token, source: []const u8) bool {
+        return self.tag == .identifier and std.mem.eql(u8, self.slice(source), "unquote_splicing");
+    }
+
     pub const keywords = std.StaticStringMap(Tag).initComptime(.{
         .{ "pub", .keyword_pub },
         .{ "fn", .keyword_fn },
@@ -144,9 +159,9 @@ pub const Token = struct {
         // "use" is contextual — only recognized at module item level in the parser,
         // not as a general keyword. This allows "use" as a function/variable name.
         // .{ "use", .keyword_use },
-        .{ "quote", .keyword_quote },
-        .{ "unquote", .keyword_unquote },
-        .{ "unquote_splicing", .keyword_unquote_splicing },
+        // "quote", "unquote", and "unquote_splicing" are also contextual.
+        // The parser dispatches by literal identifier text plus lookahead so
+        // the names can still be used as ordinary functions/variables.
         .{ "true", .keyword_true },
         .{ "false", .keyword_false },
         .{ "nil", .keyword_nil },
@@ -182,6 +197,11 @@ test "keyword lookup" {
     try std.testing.expectEqual(Token.Tag.keyword_pub, Token.getKeyword("pub").?);
     try std.testing.expect(Token.getKeyword("foobar") == null);
     try std.testing.expect(Token.getKeyword("module") == null);
+    // `quote`, `unquote`, and `unquote_splicing` are contextual and
+    // must NOT be in the reserved keyword map.
+    try std.testing.expect(Token.getKeyword("quote") == null);
+    try std.testing.expect(Token.getKeyword("unquote") == null);
+    try std.testing.expect(Token.getKeyword("unquote_splicing") == null);
 }
 
 test "token slice" {
@@ -191,4 +211,49 @@ test "token slice" {
         .loc = .{ .start = 0, .end = 3 },
     };
     try std.testing.expectEqualStrings("pub", tok.slice(source));
+}
+
+test "contextual keyword identifier predicates" {
+    const source = "quote unquote unquote_splicing other";
+    const quote_tok = Token{
+        .tag = .identifier,
+        .loc = .{ .start = 0, .end = 5 },
+    };
+    const unquote_tok = Token{
+        .tag = .identifier,
+        .loc = .{ .start = 6, .end = 13 },
+    };
+    const splicing_tok = Token{
+        .tag = .identifier,
+        .loc = .{ .start = 14, .end = 30 },
+    };
+    const other_tok = Token{
+        .tag = .identifier,
+        .loc = .{ .start = 31, .end = 36 },
+    };
+
+    try std.testing.expect(quote_tok.isQuoteIdent(source));
+    try std.testing.expect(!quote_tok.isUnquoteIdent(source));
+    try std.testing.expect(!quote_tok.isUnquoteSplicingIdent(source));
+
+    try std.testing.expect(!unquote_tok.isQuoteIdent(source));
+    try std.testing.expect(unquote_tok.isUnquoteIdent(source));
+    try std.testing.expect(!unquote_tok.isUnquoteSplicingIdent(source));
+
+    try std.testing.expect(!splicing_tok.isQuoteIdent(source));
+    try std.testing.expect(!splicing_tok.isUnquoteIdent(source));
+    try std.testing.expect(splicing_tok.isUnquoteSplicingIdent(source));
+
+    try std.testing.expect(!other_tok.isQuoteIdent(source));
+    try std.testing.expect(!other_tok.isUnquoteIdent(source));
+    try std.testing.expect(!other_tok.isUnquoteSplicingIdent(source));
+
+    // A non-identifier token whose text happens to be `quote` (e.g. a
+    // string literal containing the word) must NOT trigger the
+    // contextual-keyword predicates. Tag check is the gate.
+    const non_ident = Token{
+        .tag = .string_literal,
+        .loc = .{ .start = 0, .end = 5 },
+    };
+    try std.testing.expect(!non_ident.isQuoteIdent(source));
 }

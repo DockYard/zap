@@ -1387,7 +1387,7 @@ pub const Parser = struct {
         // sees an unresolved `name_expr` outside quote context).
         var name: ast.StringId = 0;
         var name_expr: ?*const ast.Expr = null;
-        if (self.check(.keyword_unquote)) {
+        if (self.current.isUnquoteIdent(self.source) and self.peekNext() == .left_paren) {
             name_expr = try self.parseUnquoteExpr();
             // Use a placeholder name so downstream code that prints
             // diagnostics has something to render before macro
@@ -1418,7 +1418,7 @@ pub const Parser = struct {
 
         var name: ast.StringId = 0;
         var name_expr: ?*const ast.Expr = null;
-        if (self.check(.keyword_unquote)) {
+        if (self.current.isUnquoteIdent(self.source) and self.peekNext() == .left_paren) {
             name_expr = try self.parseUnquoteExpr();
             name = try self.interner.intern("__unquoted_name__");
         } else {
@@ -2250,7 +2250,23 @@ pub const Parser = struct {
             .atom_literal => return self.parseAtomLiteral(),
             .keyword_true, .keyword_false => return self.parseBoolLiteral(),
             .keyword_nil => return self.parseNilLiteral(),
-            .identifier => return self.parseVarRef(),
+            .identifier => {
+                // `quote`, `unquote`, and `unquote_splicing` are contextual
+                // keywords: recognised by literal identifier text plus a
+                // lookahead check on the immediately-following token. Only
+                // the special-form shapes (`quote {`, `unquote (`,
+                // `unquote_splicing (`) trigger dispatch.
+                if (self.current.isQuoteIdent(self.source) and self.peekNext() == .left_brace) {
+                    return self.parseQuoteExpr();
+                }
+                if (self.current.isUnquoteIdent(self.source) and self.peekNext() == .left_paren) {
+                    return self.parseUnquoteExpr();
+                }
+                if (self.current.isUnquoteSplicingIdent(self.source) and self.peekNext() == .left_paren) {
+                    return self.parseUnquoteSplicingExpr();
+                }
+                return self.parseVarRef();
+            },
             .module_identifier => return self.parseModuleRefExpr(),
             .left_paren => return self.parseParenExpr(),
             .left_brace => return self.parseTupleExpr(),
@@ -2262,9 +2278,6 @@ pub const Parser = struct {
             .keyword_case => return self.parseCaseExpr(),
             .keyword_cond => return self.parseCondExpr(),
             .keyword_for => return self.parseForExpr(),
-            .keyword_quote => return self.parseQuoteExpr(),
-            .keyword_unquote => return self.parseUnquoteExpr(),
-            .keyword_unquote_splicing => return self.parseUnquoteSplicingExpr(),
             .keyword_panic => return self.parsePanicExpr(),
             .keyword_fn => return self.parseAnonymousFunctionExpr(),
             .at_sign => return self.parseAtSignExpr(),
@@ -3117,8 +3130,12 @@ pub const Parser = struct {
     }
 
     fn parseQuoteExpr(self: *Parser) !*const ast.Expr {
+        // The contextual-keyword dispatch in `parsePrimaryExpr` has already
+        // confirmed the current token is the identifier `quote` followed by
+        // `{`. Just consume the identifier — there is no reserved keyword
+        // tag to expect.
         const start = self.currentSpan();
-        _ = try self.expect(.keyword_quote);
+        _ = self.advance();
         _ = try self.expect(.left_brace);
         self.skipNewlines();
 
@@ -3136,8 +3153,10 @@ pub const Parser = struct {
     }
 
     fn parseUnquoteExpr(self: *Parser) !*const ast.Expr {
+        // Caller has already verified the current token is the identifier
+        // `unquote` followed by `(`.
         const start = self.currentSpan();
-        _ = try self.expect(.keyword_unquote);
+        _ = self.advance();
         _ = try self.expect(.left_paren);
         const expr = try self.parseExpr();
         _ = try self.expect(.right_paren);
@@ -3151,8 +3170,10 @@ pub const Parser = struct {
     }
 
     fn parseUnquoteSplicingExpr(self: *Parser) !*const ast.Expr {
+        // Caller has already verified the current token is the identifier
+        // `unquote_splicing` followed by `(`.
         const start = self.currentSpan();
-        _ = try self.expect(.keyword_unquote_splicing);
+        _ = self.advance();
         _ = try self.expect(.left_paren);
         const expr = try self.parseExpr();
         _ = try self.expect(.right_paren);
@@ -4296,9 +4317,6 @@ fn tokenHumanName(tag: Token.Tag) []const u8 {
         .keyword_opaque => "`opaque`",
         .keyword_alias => "`alias`",
         .keyword_import => "`import`",
-        .keyword_quote => "`quote`",
-        .keyword_unquote => "`unquote`",
-        .keyword_unquote_splicing => "`unquote_splicing`",
         .keyword_true => "`true`",
         .keyword_false => "`false`",
         .keyword_nil => "`nil`",
@@ -5793,4 +5811,131 @@ test "less-than expression after struct call still parses as comparison" {
 
     const program = try parser.parseProgram();
     try std.testing.expectEqual(@as(usize, 1), program.structs.len);
+}
+
+// ============================================================
+// Contextual-keyword tests for `quote`, `unquote`, `unquote_splicing`.
+// These three names parse as ordinary identifiers everywhere except
+// the special-form shapes `quote {`, `unquote (`, `unquote_splicing (`.
+// ============================================================
+
+test "contextual-keyword: `quote` binds as a variable and is callable" {
+    const source =
+        \\pub struct Test {
+        \\  pub fn run() {
+        \\    quote = 1
+        \\    quote()
+        \\  }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+    const func = program.structs[0].items[0].function;
+    const body = func.clauses[0].body.?;
+    try std.testing.expectEqual(@as(usize, 2), body.len);
+    try std.testing.expect(body[0] == .assignment);
+    try std.testing.expect(body[1] == .expr);
+    try std.testing.expect(body[1].expr.* == .call);
+}
+
+test "contextual-keyword: a function may be literally named `quote`" {
+    const source =
+        \\pub struct Test {
+        \\  pub fn quote(x :: i64) -> i64 {
+        \\    x + 1
+        \\  }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+    try std.testing.expect(program.structs[0].items[0] == .function);
+    const func = program.structs[0].items[0].function;
+    try std.testing.expectEqualStrings("quote", parser.interner.get(func.name));
+}
+
+test "contextual-keyword: `quote { ... }` produces a quote_expr" {
+    const source =
+        \\pub struct Test {
+        \\  pub fn run() {
+        \\    quote { 1 + 1 }
+        \\  }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+    const body = program.structs[0].items[0].function.clauses[0].body.?;
+    try std.testing.expect(body[0].expr.* == .quote_expr);
+}
+
+test "contextual-keyword: `unquote(x)` inside quote produces unquote_expr" {
+    const source =
+        \\pub struct Test {
+        \\  pub fn run(x :: i64) {
+        \\    quote { unquote(x) }
+        \\  }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+    const body = program.structs[0].items[0].function.clauses[0].body.?;
+    try std.testing.expect(body[0].expr.* == .quote_expr);
+    const quote_body = body[0].expr.quote_expr.body;
+    try std.testing.expect(quote_body[0].expr.* == .unquote_expr);
+}
+
+test "contextual-keyword: identity macro with quote/unquote parses" {
+    const source =
+        \\pub struct Kernel {
+        \\  pub macro fn(decl :: Expr) -> Expr {
+        \\    quote { unquote(decl) }
+        \\  }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+    const decl = program.structs[0].items[0].macro;
+    const body = decl.clauses[0].body.?;
+    try std.testing.expect(body[0].expr.* == .quote_expr);
+}
+
+test "contextual-keyword: `pub fn unquote(name)(...)` dynamic-name form parses" {
+    const source =
+        \\pub struct Builder {
+        \\  pub macro define(name :: Expr) -> Expr {
+        \\    quote {
+        \\      pub fn unquote(name)(x :: i64) -> i64 {
+        \\        x + 1
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+    const macro_decl = program.structs[0].items[0].macro;
+    const macro_body = macro_decl.clauses[0].body.?;
+    try std.testing.expect(macro_body[0].expr.* == .quote_expr);
+    const quote_body = macro_body[0].expr.quote_expr.body;
+    try std.testing.expect(quote_body[0] == .function_decl);
+    const inner_fn = quote_body[0].function_decl;
+    try std.testing.expect(inner_fn.name_expr != null);
+    try std.testing.expect(inner_fn.name_expr.?.* == .unquote_expr);
 }
