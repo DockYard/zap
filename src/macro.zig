@@ -1226,6 +1226,29 @@ pub const MacroEngine = struct {
                 result = macro_eval.eval(&env, stmt_ct) catch .nil;
             }
 
+            // The eval path treats `quote` as a lazy form — its args
+            // are returned without recursing into them. That means
+            // unquotes inside the quote body are still raw `:unquote`
+            // 3-tuples in the result. Substitute them now using the
+            // evaluator's full binding environment (macro params and
+            // any local `=` bindings introduced during eval) so
+            // expressions like `quote { unquote(local_var) }` work
+            // alongside `quote { unquote(macro_param) }`.
+            if (result != .nil) {
+                result = try self.substituteCtValue(result, &env.bindings, &store);
+
+                // `quote { single_expr }` produces a list with one
+                // element (the body's sole statement). The fast path
+                // (`expandQuote`) unwraps single-statement bodies; the
+                // eval path must match that behavior so authors don't
+                // see a stray list literal wrapping their result.
+                // Multi-statement bodies remain a list and `__block__`
+                // wrapping is left to ctValueToExpr.
+                if (result == .list and result.list.elems.len == 1) {
+                    result = result.list.elems[0];
+                }
+            }
+
             // Convert the result back to ast.Expr
             if (result != .nil) {
                 // If the result is a function declaration form, register it in
@@ -1941,6 +1964,15 @@ pub const MacroEngine = struct {
         const macro_eval = @import("macro_eval.zig");
         var env = macro_eval.Env.init(self.allocator, &store);
         defer env.deinit();
+        // Wire module context so `__zap_module_*` and other comptime
+        // intrinsics that consult the scope graph reach the right
+        // module — same wiring as the expression-level expandMacroCall
+        // eval path.
+        env.module_ctx = .{
+            .graph = self.graph,
+            .interner = self.interner,
+            .current_module_scope = self.current_module_scope,
+        };
 
         for (clause.params, 0..) |param, i| {
             if (i < args.len) {
@@ -1956,6 +1988,24 @@ pub const MacroEngine = struct {
         for (clause_body) |stmt| {
             const stmt_ct = ast_data.stmtToCtValue(self.allocator, self.interner, &store, stmt) catch return null;
             result = macro_eval.eval(&env, stmt_ct) catch return null;
+        }
+
+        // The eval path treats `quote` as lazy: its body is returned
+        // as data without recursing into the unquote nodes. Substitute
+        // them now using the evaluator's full binding environment so
+        // local `=` bindings introduced during eval can be referenced
+        // from inside the quote body. Mirrors the pattern used by
+        // `expandMacroCall`'s eval path for expression-level macros.
+        if (result != .nil) {
+            result = self.substituteCtValue(result, &env.bindings, &store) catch return null;
+            // `quote { single_expr }` produces a list with one element
+            // (the body's sole statement). Unwrap so authors don't see
+            // a stray list literal wrapping their result. Multi-stmt
+            // bodies stay a list and ctValueToStructItems wraps in a
+            // `__block__` if needed.
+            if (result == .list and result.list.elems.len == 1) {
+                result = result.list.elems[0];
+            }
         }
 
         if (result != .nil) return result;
@@ -2973,6 +3023,132 @@ test "@before_compile: hook fires and splices result into target module" {
         }
     }
     try std.testing.expect(found_injected);
+}
+
+test "comptime intrinsics: slugify produces snake_case from string" {
+    // Direct test of the slugify intrinsic via a macro that returns
+    // the slug as a string literal expression. This isolates the
+    // intrinsic from the more complex name-splicing path.
+    const source =
+        \\pub struct Test {
+        \\  pub macro slug_of(_label :: StringLit) -> Expr {
+        \\    s = __zap_slugify__(_label)
+        \\    quote { unquote(s) }
+        \\  }
+        \\
+        \\  pub fn check() -> String {
+        \\    slug_of("My Cool Test")
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    const expanded = try engine.expandProgram(&program);
+
+    // The expanded `check` body should be just a string literal
+    // "my_cool_test" — slugify lowercased and replaced spaces with
+    // underscores.
+    var found_slug = false;
+    for (expanded.structs) |mod| {
+        for (mod.items) |item| {
+            if (item != .function) continue;
+            const name = parser.interner.get(item.function.name);
+            if (!std.mem.eql(u8, name, "check")) continue;
+            for (item.function.clauses) |clause| {
+                const body = clause.body orelse continue;
+                for (body) |stmt| {
+                    if (stmt != .expr) continue;
+                    if (stmt.expr.* == .string_literal) {
+                        const s = parser.interner.get(stmt.expr.string_literal.value);
+                        if (std.mem.eql(u8, s, "my_cool_test")) {
+                            found_slug = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    try std.testing.expect(found_slug);
+}
+
+test "comptime intrinsics: slugify + intern produces dynamic fn name" {
+    // Compose the comptime intrinsics: take a user-provided string,
+    // slugify it into an identifier, intern it as an atom, and
+    // splice it as a function name. This is the exact pattern the
+    // Zest migration needs.
+    //
+    // The macro is invoked from a function body (`check`'s inner
+    // call) rather than struct level so the expression-level
+    // expansion path (`expandMacroCall`) runs — that path is the
+    // one our intrinsics work on top of. Struct-level expansion
+    // also goes through the eval path but has additional shape-
+    // detection logic that's exercised in other tests.
+    const source =
+        \\pub struct Test {
+        \\  pub macro emit_named(_label :: StringLit) -> Expr {
+        \\    fn_name_str = "test_" <> __zap_slugify__(_label)
+        \\    quote { unquote(fn_name_str) }
+        \\  }
+        \\
+        \\  pub fn check() -> String {
+        \\    emit_named("My First Test")
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    const expanded = try engine.expandProgram(&program);
+
+    // After expansion, `check`'s body should contain a string
+    // literal "test_my_first_test" — the result of slugifying
+    // "My First Test" and prepending "test_".
+    var found = false;
+    for (expanded.structs) |mod| {
+        for (mod.items) |item| {
+            if (item != .function) continue;
+            const name = parser.interner.get(item.function.name);
+            if (!std.mem.eql(u8, name, "check")) continue;
+            for (item.function.clauses) |clause| {
+                const body = clause.body orelse continue;
+                for (body) |stmt| {
+                    if (stmt != .expr) continue;
+                    if (stmt.expr.* == .string_literal) {
+                        const s = parser.interner.get(stmt.expr.string_literal.value);
+                        if (std.mem.eql(u8, s, "test_my_first_test")) {
+                            found = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    try std.testing.expect(found);
 }
 
 test "dynamic fn name: unquote in fn-name position resolves at expansion" {

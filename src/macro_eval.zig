@@ -313,6 +313,22 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
                 return moduleIntrinsicRegister(env, arg_elems);
             }
 
+            // Comptime string/atom helpers — language primitives
+            // exposed to macro bodies so library-level macros can
+            // build dynamic identifiers without depending on
+            // test-framework-specific Zig builtins. These are the
+            // minimum needed to migrate the Zest test framework
+            // entirely into Zap source.
+            if (std.mem.eql(u8, form_name, "__zap_atom_name__")) {
+                return atomNameIntrinsic(env, arg_elems);
+            }
+            if (std.mem.eql(u8, form_name, "__zap_slugify__")) {
+                return slugifyIntrinsic(env, arg_elems);
+            }
+            if (std.mem.eql(u8, form_name, "__zap_intern_atom__")) {
+                return internAtomIntrinsic(env, arg_elems);
+            }
+
         }
 
         // Binary operators (checked AFTER built-in functions)
@@ -357,7 +373,17 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
     return value;
 }
 
-fn evalBinop(env: *Env, op: []const u8, lhs: CtValue, rhs: CtValue) MacroEvalError!CtValue {
+fn evalBinop(env: *Env, op: []const u8, lhs_raw: CtValue, rhs_raw: CtValue) MacroEvalError!CtValue {
+    // Operands arrive in their "as-evaluated" shape — eval of a
+    // literal AST node returns the wrapped 3-tuple `{value, meta, nil}`
+    // rather than the bare scalar (so AST identity is preserved for
+    // round-trips). Unwrap to bare scalars here so the per-type
+    // checks below work uniformly whether an operand came from a
+    // literal in source, a comptime computed value, or a substituted
+    // unquote.
+    const lhs = unwrapAstLiteral(lhs_raw);
+    const rhs = unwrapAstLiteral(rhs_raw);
+
     // Arithmetic
     if (lhs == .int and rhs == .int) {
         if (std.mem.eql(u8, op, "+")) return CtValue{ .int = lhs.int + rhs.int };
@@ -637,6 +663,46 @@ fn moduleIntrinsicPut(env: *Env, args: []const CtValue) MacroEvalError!CtValue {
     const cv = ctfe.exportValue(env.alloc, unwrapped) catch return .nil;
     ctx.graph.putModuleAttribute(mod_entry, name_id, cv) catch return .nil;
     return .nil;
+}
+
+/// `__zap_atom_name__(atom_value)`: extract the bare name string
+/// from an atom CtValue (or AST-wrapped atom literal). The leading
+/// `:` that distinguishes literal atoms from variable references in
+/// the AST encoding is stripped. Returns the string CtValue;
+/// returns nil if the argument isn't atom-shaped.
+fn atomNameIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtValue {
+    if (args.len != 1) return .nil;
+    const val = try eval(env, args[0]);
+    const name = extractAtomName(val) orelse return .nil;
+    // Duplicate so the lifetime survives any temporary stores.
+    const buf = env.alloc.alloc(u8, name.len) catch return .nil;
+    @memcpy(buf, name);
+    return CtValue{ .string = buf };
+}
+
+/// `__zap_slugify__(string_value)`: convert a string to a snake-
+/// case identifier suitable for use as a function name. Spaces,
+/// dashes, and other non-alphanumerics become underscores; uppercase
+/// letters become lowercase. Returns the string CtValue.
+fn slugifyIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtValue {
+    if (args.len != 1) return .nil;
+    const val = try eval(env, args[0]);
+    const input = extractString(val) orelse return .nil;
+    const out = slugifyString(env.alloc, input) catch return .nil;
+    return CtValue{ .string = out };
+}
+
+/// `__zap_intern_atom__(string_value)`: convert a string to an atom
+/// CtValue (with the `:` prefix that distinguishes literal atoms
+/// from variable refs in the AST encoding). Used by macros that
+/// build a function name as a string and need to splice it into
+/// `unquote(name)(...)` position.
+fn internAtomIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtValue {
+    if (args.len != 1) return .nil;
+    const val = try eval(env, args[0]);
+    const input = extractString(val) orelse return .nil;
+    const prefixed = std.fmt.allocPrint(env.alloc, ":{s}", .{input}) catch return .nil;
+    return CtValue{ .atom = prefixed };
 }
 
 /// Unwrap an AST-wrapped literal CtValue to its bare scalar form.
