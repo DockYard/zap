@@ -2287,18 +2287,30 @@ pub const TypeChecker = struct {
                     if (self.current_scope) |cs| try self.checkDebugAttribute(func, cs);
                 },
                 .macro, .priv_macro => |mac| {
-                    // Mark macro params as referenced — they're used in quote/unquote,
-                    // not via normal var_ref, so the unused-binding check can't see them.
-                    // Macro bodies are compile-time code and are NOT type-checked.
+                    // Macro bodies are compile-time templates that the
+                    // macro engine evaluates at expansion time, not
+                    // code the type checker analyses. Every binding
+                    // introduced inside a macro clause — parameters,
+                    // top-level let-bindings, and let-bindings inside
+                    // any nested construct (if/case/cond/for branches,
+                    // blocks, anonymous functions) — is consumed by
+                    // the macro engine and is typically referenced via
+                    // `unquote(name)` inside a `quote { ... }` template
+                    // rather than the var_ref path the unused-binding
+                    // check tracks.
+                    //
+                    // Mark every binding registered in the macro
+                    // clause's scope or any descendant scope as
+                    // referenced. We walk the scope graph rather than
+                    // the AST because not every scope-creating
+                    // construct (e.g. `if` then/else branches) is
+                    // registered in `node_scope_map`, which would make
+                    // an AST-driven walk unable to locate the right
+                    // binding scope. Bindings are far cheaper to
+                    // enumerate than to retrace through the AST.
                     for (mac.clauses) |clause| {
                         const macro_scope = self.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(clause.meta.span)) orelse clause.meta.scope_id;
-                        for (clause.params) |param| {
-                            if (param.pattern.* == .bind) {
-                                if (self.graph.resolveBinding(macro_scope, param.pattern.bind.name)) |bid| {
-                                    try self.referenced_bindings.put(bid, {});
-                                }
-                            }
-                        }
+                        try self.markBindingsInScopeSubtree(macro_scope);
                     }
                 },
                 .attribute => |attr| {
@@ -2308,6 +2320,49 @@ pub const TypeChecker = struct {
                     _ = try self.inferExpr(expr);
                 },
                 else => {},
+            }
+        }
+    }
+
+    /// Insert every binding registered in `root_scope` or any
+    /// descendant scope into `referenced_bindings`. Used when handling
+    /// macro declarations so that compile-time-only bindings inside
+    /// macro bodies aren't reported as unused (see the `.macro` /
+    /// `.priv_macro` arm in `checkStruct`).
+    ///
+    /// The scope graph stores parent links but no children list, so
+    /// descendant detection walks each scope's parent chain upward
+    /// looking for `root_scope`. Scope IDs are dense u32 indices into
+    /// `graph.scopes`, so this is a single linear pass over scopes
+    /// followed by a linear pass over bindings — cheap relative to the
+    /// surrounding type-check work.
+    fn markBindingsInScopeSubtree(self: *TypeChecker, root_scope: scope_mod.ScopeId) !void {
+        var in_subtree = std.AutoHashMap(scope_mod.ScopeId, void).init(self.allocator);
+        defer in_subtree.deinit();
+
+        try in_subtree.put(root_scope, {});
+        // Multiple sweeps so a child whose parent has not yet been
+        // marked still gets included. Scopes are appended in
+        // creation order, and a scope's parent is always created
+        // before it, so a single forward pass suffices — but we run
+        // until a sweep adds nothing to be robust to any future
+        // ordering change in the collector.
+        var changed = true;
+        while (changed) {
+            changed = false;
+            for (self.graph.scopes.items) |s| {
+                if (in_subtree.contains(s.id)) continue;
+                const parent = s.parent orelse continue;
+                if (in_subtree.contains(parent)) {
+                    try in_subtree.put(s.id, {});
+                    changed = true;
+                }
+            }
+        }
+
+        for (self.graph.bindings.items) |binding| {
+            if (in_subtree.contains(binding.scope_id)) {
+                try self.referenced_bindings.put(binding.id, {});
             }
         }
     }
@@ -5926,6 +5981,98 @@ test "nested zig bridge call parameters not flagged as unused" {
 
     for (checker.errors.items) |err| {
         if (std.mem.find(u8, err.message, "is unused") != null) {
+            std.debug.print("Unexpected unused warning: {s}\n", .{err.message});
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "macro body let-binding referenced via unquote is not unused" {
+    // Regression: a let-binding inside a macro body that is referenced
+    // only via `unquote(name)` inside a `quote { ... }` template was
+    // flagged as "variable `name` is unused". The unused-binding check
+    // never recurses into quote bodies (they're compile-time templates,
+    // not type-checked) and so cannot observe references through
+    // unquote. Macro-body bindings must be treated as referenced
+    // unconditionally because the macro engine evaluates them at
+    // compile time.
+    const source =
+        \\pub struct Test {
+        \\  pub macro define_test(name :: Expr) -> Expr {
+        \\    fn_name = __zap_intern_atom__("test_" <> __zap_slugify__(name))
+        \\    quote {
+        \\      pub fn unquote(fn_name)() -> i64 { 42 }
+        \\      unquote(fn_name)()
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+    try checker.checkUnusedBindings();
+
+    for (checker.errors.items) |err| {
+        if (std.mem.find(u8, err.message, "variable `fn_name` is unused") != null) {
+            std.debug.print("Unexpected unused warning: {s}\n", .{err.message});
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "macro body nested-block let-binding referenced via unquote is not unused" {
+    // The same rule applies to bindings introduced in nested
+    // constructs inside the macro body — `if`, `case`, `for`, and
+    // explicit blocks each create their own child scopes whose
+    // bindings are still part of the macro's compile-time evaluation.
+    const source =
+        \\pub struct Test {
+        \\  pub macro define_named(name :: Expr) -> Expr {
+        \\    if true {
+        \\      fn_name = __zap_intern_atom__("inner_" <> __zap_slugify__(name))
+        \\      quote {
+        \\        pub fn unquote(fn_name)() -> i64 { 7 }
+        \\        unquote(fn_name)()
+        \\      }
+        \\    } else {
+        \\      quote { 0 }
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+    try checker.checkUnusedBindings();
+
+    for (checker.errors.items) |err| {
+        if (std.mem.find(u8, err.message, "variable `fn_name` is unused") != null) {
             std.debug.print("Unexpected unused warning: {s}\n", .{err.message});
             return error.TestUnexpectedResult;
         }
