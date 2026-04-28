@@ -249,6 +249,49 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
                 }
             }
 
+            // __zap_list_at__(list, index) — element at zero-based index,
+            // or nil when out of range. Negative indices count from the
+            // end (`-1` = last). Lifts the bare-int conventions from Zig
+            // into macro space so library code can write `list_at(args, 0)`
+            // to take the first matching call.
+            if (std.mem.eql(u8, form_name, "__zap_list_at__")) {
+                if (arg_elems.len == 2) {
+                    const list = try eval(env, arg_elems[0]);
+                    const idx_raw = try eval(env, arg_elems[1]);
+                    const idx_val = unwrapAstLiteral(idx_raw);
+                    if (list == .list and idx_val == .int) {
+                        const len: i64 = @intCast(list.list.elems.len);
+                        const normalized: i64 = if (idx_val.int < 0) len + idx_val.int else idx_val.int;
+                        if (normalized >= 0 and normalized < len) {
+                            return list.list.elems[@intCast(normalized)];
+                        }
+                    }
+                    return .nil;
+                }
+            }
+
+            // __zap_list_len__(list) — element count as a bare int.
+            // Returns 0 for non-lists so callers can chain it through
+            // `==` / `>` without first checking shape.
+            if (std.mem.eql(u8, form_name, "__zap_list_len__")) {
+                if (arg_elems.len == 1) {
+                    const list = try eval(env, arg_elems[0]);
+                    if (list == .list) return CtValue{ .int = @intCast(list.list.elems.len) };
+                    return CtValue{ .int = 0 };
+                }
+            }
+
+            // __zap_list_empty__(list) — true iff the list has no elements.
+            // Non-list values are treated as empty so callers don't have
+            // to distinguish "empty list" from "wrong shape".
+            if (std.mem.eql(u8, form_name, "__zap_list_empty__")) {
+                if (arg_elems.len == 1) {
+                    const list = try eval(env, arg_elems[0]);
+                    if (list == .list) return CtValue{ .bool_val = list.list.elems.len == 0 };
+                    return CtValue{ .bool_val = true };
+                }
+            }
+
             // tuple(a, b, c) — construct a tuple
             if (std.mem.eql(u8, form_name, "tuple")) {
                 var elems = try env.alloc.alloc(CtValue, arg_elems.len);
@@ -1259,6 +1302,89 @@ fn buildTestFunctions(
 
     // Return as __block__ (mixed content: fn decls + tracking exprs)
     return ast_data.makeTuple3(alloc, store, .{ .atom = "__block__" }, empty, try ast_data.makeListFromSlice(alloc, store, result_items.items));
+}
+
+test "eval: __zap_list_at__ extracts elements with normal and negative indices" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var store = AllocationStore{};
+    var env = Env.init(alloc, &store);
+    defer env.deinit();
+
+    const list = try ast_data.makeList(alloc, &store, &.{
+        .{ .int = 10 },
+        .{ .int = 20 },
+        .{ .int = 30 },
+    });
+
+    // list_at(list, 0) → 10
+    const at0 = try ast_data.makeTuple3(alloc, &store, .{ .atom = "__zap_list_at__" }, try ast_data.emptyList(alloc, &store), try ast_data.makeList(alloc, &store, &.{ list, .{ .int = 0 } }));
+    const r0 = try eval(&env, at0);
+    try std.testing.expect(r0 == .int);
+    try std.testing.expectEqual(@as(i64, 10), r0.int);
+
+    // list_at(list, 2) → 30
+    const at2 = try ast_data.makeTuple3(alloc, &store, .{ .atom = "__zap_list_at__" }, try ast_data.emptyList(alloc, &store), try ast_data.makeList(alloc, &store, &.{ list, .{ .int = 2 } }));
+    const r2 = try eval(&env, at2);
+    try std.testing.expect(r2 == .int);
+    try std.testing.expectEqual(@as(i64, 30), r2.int);
+
+    // list_at(list, -1) → 30 (last)
+    const at_neg = try ast_data.makeTuple3(alloc, &store, .{ .atom = "__zap_list_at__" }, try ast_data.emptyList(alloc, &store), try ast_data.makeList(alloc, &store, &.{ list, .{ .int = -1 } }));
+    const r_neg = try eval(&env, at_neg);
+    try std.testing.expect(r_neg == .int);
+    try std.testing.expectEqual(@as(i64, 30), r_neg.int);
+
+    // list_at(list, 5) → nil (out of range)
+    const at_oor = try ast_data.makeTuple3(alloc, &store, .{ .atom = "__zap_list_at__" }, try ast_data.emptyList(alloc, &store), try ast_data.makeList(alloc, &store, &.{ list, .{ .int = 5 } }));
+    const r_oor = try eval(&env, at_oor);
+    try std.testing.expect(r_oor == .nil);
+}
+
+test "eval: __zap_list_len__ counts list elements" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var store = AllocationStore{};
+    var env = Env.init(alloc, &store);
+    defer env.deinit();
+
+    const list3 = try ast_data.makeList(alloc, &store, &.{
+        .{ .int = 1 }, .{ .int = 2 }, .{ .int = 3 },
+    });
+    const call3 = try ast_data.makeTuple3(alloc, &store, .{ .atom = "__zap_list_len__" }, try ast_data.emptyList(alloc, &store), try ast_data.makeList(alloc, &store, &.{list3}));
+    const r3 = try eval(&env, call3);
+    try std.testing.expect(r3 == .int);
+    try std.testing.expectEqual(@as(i64, 3), r3.int);
+
+    // Empty list → 0
+    const empty = try ast_data.emptyList(alloc, &store);
+    const call_empty = try ast_data.makeTuple3(alloc, &store, .{ .atom = "__zap_list_len__" }, try ast_data.emptyList(alloc, &store), try ast_data.makeList(alloc, &store, &.{empty}));
+    const r_empty = try eval(&env, call_empty);
+    try std.testing.expect(r_empty == .int);
+    try std.testing.expectEqual(@as(i64, 0), r_empty.int);
+}
+
+test "eval: __zap_list_empty__ distinguishes empty from non-empty" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var store = AllocationStore{};
+    var env = Env.init(alloc, &store);
+    defer env.deinit();
+
+    const empty = try ast_data.emptyList(alloc, &store);
+    const call_e = try ast_data.makeTuple3(alloc, &store, .{ .atom = "__zap_list_empty__" }, try ast_data.emptyList(alloc, &store), try ast_data.makeList(alloc, &store, &.{empty}));
+    const r_e = try eval(&env, call_e);
+    try std.testing.expect(r_e == .bool_val);
+    try std.testing.expectEqual(true, r_e.bool_val);
+
+    const nonempty = try ast_data.makeList(alloc, &store, &.{.{ .int = 1 }});
+    const call_n = try ast_data.makeTuple3(alloc, &store, .{ .atom = "__zap_list_empty__" }, try ast_data.emptyList(alloc, &store), try ast_data.makeList(alloc, &store, &.{nonempty}));
+    const r_n = try eval(&env, call_n);
+    try std.testing.expect(r_n == .bool_val);
+    try std.testing.expectEqual(false, r_n.bool_val);
 }
 
 /// Build a standalone test function + tracking call.
