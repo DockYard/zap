@@ -85,7 +85,22 @@ pub struct Zest.Case {
     """
 
   pub macro test(_name :: Expr, body :: Expr) -> Expr {
-    build_test_fn(_name, body)
+    fn_name = __zap_intern_atom__("test_" <> __zap_slugify__(_name))
+    quote {
+      pub fn unquote(fn_name)() -> String {
+        :zig.Zest.begin_test()
+        unquote(body)
+        :zig.Zest.end_test()
+        :zig.Zest.print_result()
+        "ok"
+      }
+
+      :zig.Zest.begin_test()
+      unquote(fn_name)()
+      :zig.Zest.end_test()
+      :zig.Zest.print_result()
+      "."
+    }
   }
 
   @doc = """

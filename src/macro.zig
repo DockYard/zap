@@ -3025,6 +3025,83 @@ test "@before_compile: hook fires and splices result into target module" {
     try std.testing.expect(found_injected);
 }
 
+test "Zest test/2 macro: generates dynamically-named fn + tracking call" {
+    // Validates the migrated `test` macro in lib/zest/case.zap works
+    // end-to-end through the new comptime intrinsics + dynamic fn
+    // name path. The macro takes a name string and a body, slugifies
+    // the name, builds an atom, splices it as a function name, and
+    // returns a __block__ containing both the fn decl and the
+    // tracking call sequence that invokes it.
+    //
+    // We bypass the actual Zest module (which depends on the runtime
+    // Zest struct) and inline the same logic as a one-off macro.
+    const source =
+        \\pub struct Test {
+        \\  pub macro test_macro(_name :: Expr, body :: Expr) -> Expr {
+        \\    fn_name = __zap_intern_atom__("test_" <> __zap_slugify__(_name))
+        \\    quote {
+        \\      pub fn unquote(fn_name)() -> i64 {
+        \\        unquote(body)
+        \\      }
+        \\
+        \\      unquote(fn_name)()
+        \\    }
+        \\  }
+        \\
+        \\  test_macro("hello world", 42)
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    const expanded = try engine.expandProgram(&program);
+
+    // Test struct should now contain (in order):
+    //   - the test_macro definition (still there)
+    //   - a fn `test_hello_world` (the generated test fn)
+    //   - a struct_level_expr calling `test_hello_world()` (tracking)
+    var found_fn = false;
+    var found_call = false;
+    for (expanded.structs) |mod| {
+        if (mod.name.parts.len != 1) continue;
+        const mod_name = parser.interner.get(mod.name.parts[0]);
+        if (!std.mem.eql(u8, mod_name, "Test")) continue;
+        for (mod.items) |item| {
+            switch (item) {
+                .function => |f| {
+                    const name = parser.interner.get(f.name);
+                    if (std.mem.eql(u8, name, "test_hello_world")) {
+                        found_fn = true;
+                    }
+                },
+                .struct_level_expr => |e| {
+                    if (e.* == .call and e.call.callee.* == .var_ref) {
+                        const callee_name = parser.interner.get(e.call.callee.var_ref.name);
+                        if (std.mem.eql(u8, callee_name, "test_hello_world")) {
+                            found_call = true;
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+    try std.testing.expect(found_fn);
+    try std.testing.expect(found_call);
+}
+
 test "comptime function dispatch: refuses impure function (zig interop)" {
     // A function whose body calls `:zig.X.Y` is impure. The
     // dispatcher must refuse and leave the call as runtime AST so

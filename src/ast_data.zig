@@ -1409,10 +1409,23 @@ pub fn ctValueToExpr(
         }
     }
 
-    // Default: treat as a function call — {:name, meta, [args...]}
+    // Default: treat as a function call — {:name, meta, [args...]}.
+    //
+    // The form atom may carry a leading `":"` when it was produced
+    // by `__zap_intern_atom__` and substituted into callee position
+    // by an `unquote(name)` in `pub fn unquote(name)()` /
+    // `unquote(name)()` patterns. The colon prefix distinguishes
+    // atom literals from variable references in the AST encoding;
+    // function names use the unprefixed form, so strip it here so
+    // the generated `var_ref` resolves correctly.
     {
+        const raw_name = form_name;
+        const callee_name = if (raw_name.len > 0 and raw_name[0] == ':')
+            raw_name[1..]
+        else
+            raw_name;
         const callee = try alloc.create(ast.Expr);
-        callee.* = .{ .var_ref = .{ .meta = node_meta, .name = try interner.intern(form_name) } };
+        callee.* = .{ .var_ref = .{ .meta = node_meta, .name = try interner.intern(callee_name) } };
 
         var call_args : std.ArrayListUnmanaged(*const ast.Expr) = .empty;
         for (arg_elems) |elem| {
