@@ -384,6 +384,24 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
                 return internAtomIntrinsic(env, arg_elems);
             }
 
+            // __zap_dbg__(label, value) — comptime debug print to stderr.
+            // Returns the evaluated value so it can be wrapped around an
+            // existing expression: `_x = __zap_dbg__("setup", find_setup(body))`.
+            // Useful while migrating Zig builtins into Zap macros — both
+            // paths can be wrapped and their CtValue shapes compared.
+            if (std.mem.eql(u8, form_name, "__zap_dbg__")) {
+                if (arg_elems.len == 2) {
+                    const label_raw = try eval(env, arg_elems[0]);
+                    const value_raw = try eval(env, arg_elems[1]);
+                    const label_unwrapped = unwrapAstLiteral(label_raw);
+                    const label_str = if (label_unwrapped == .string) label_unwrapped.string else "<dbg>";
+                    std.debug.print("[ZAP_DBG] {s}: ", .{label_str});
+                    debugPrintCtValue(value_raw, 3);
+                    std.debug.print("\n", .{});
+                    return value_raw;
+                }
+            }
+
         }
 
         // Binary operators (checked AFTER built-in functions)
@@ -394,9 +412,16 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
             if (binop_result != .nil) return binop_result;
         }
 
-        // Unary operators
+        // Unary operators. Unwrap AST-literal wrappers so a unary
+        // minus applied to a literal `-1` (encoded as `{:-, meta,
+        // [{1, [], nil}]}`) reduces to a bare `.int = -1` rather
+        // than surviving as the unevaluated tuple. Without unwrapping,
+        // downstream comparisons (`__zap_list_at__(list, -1)`) fail
+        // their `idx == .int` shape check and return nil — silently
+        // breaking step-aware indexing.
         if (args == .list and args.list.elems.len == 1) {
-            const operand = try eval(env, args.list.elems[0]);
+            const operand_raw = try eval(env, args.list.elems[0]);
+            const operand = unwrapAstLiteral(operand_raw);
             if (std.mem.eql(u8, form_name, "-") and operand == .int) {
                 return CtValue{ .int = -operand.int };
             }
@@ -1085,6 +1110,46 @@ fn internAtomIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtValue 
 /// match `ConstValue.atom` semantics). `{ .int 42, meta, nil }` →
 /// `.int 42`. Tuples and lists pass through unchanged because their
 /// elements may contain mixed shapes.
+fn debugPrintCtValue(val: CtValue, max_depth: u32) void {
+    if (max_depth == 0) {
+        std.debug.print("…", .{});
+        return;
+    }
+    switch (val) {
+        .nil => std.debug.print("nil", .{}),
+        .void => std.debug.print("void", .{}),
+        .consumed => std.debug.print("<consumed>", .{}),
+        .reuse_token => std.debug.print("<reuse>", .{}),
+        .int => |v| std.debug.print("{d}", .{v}),
+        .float => |v| std.debug.print("{d}", .{v}),
+        .string => |v| std.debug.print("\"{s}\"", .{v}),
+        .atom => |v| std.debug.print(":{s}", .{v}),
+        .bool_val => |v| std.debug.print("{s}", .{if (v) "true" else "false"}),
+        .list => |l| {
+            std.debug.print("[", .{});
+            for (l.elems, 0..) |e, i| {
+                if (i > 0) std.debug.print(", ", .{});
+                debugPrintCtValue(e, max_depth - 1);
+            }
+            std.debug.print("]", .{});
+        },
+        .tuple => |t| {
+            std.debug.print("{{", .{});
+            for (t.elems, 0..) |e, i| {
+                if (i > 0) std.debug.print(", ", .{});
+                debugPrintCtValue(e, max_depth - 1);
+            }
+            std.debug.print("}}", .{});
+        },
+        .map => std.debug.print("<map>", .{}),
+        .struct_val => std.debug.print("<struct>", .{}),
+        .union_val => std.debug.print("<union>", .{}),
+        .enum_val => std.debug.print("<enum>", .{}),
+        .optional => std.debug.print("<optional>", .{}),
+        .closure => std.debug.print("<closure>", .{}),
+    }
+}
+
 fn unwrapAstLiteral(val: CtValue) CtValue {
     if (val != .tuple or val.tuple.elems.len != 3) return val;
     if (val.tuple.elems[2] != .nil) return val;

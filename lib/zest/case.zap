@@ -66,8 +66,11 @@ pub struct Zest.Case {
     """
 
   pub macro describe(_name :: Expr, body :: Expr) -> Expr {
-    _setup_body = find_setup(body)
-    _teardown_body = find_teardown(body)
+    _stmts = elem(body, 2)
+    _setup_matches = for _stmt <- _stmts, elem(_stmt, 0) == :setup { __zap_list_at__(elem(_stmt, 2), -1) }
+    _setup_body = __zap_list_at__(_setup_matches, 0)
+    _teardown_matches = for _stmt <- _stmts, elem(_stmt, 0) == :teardown { __zap_list_at__(elem(_stmt, 2), -1) }
+    _teardown_body = __zap_list_at__(_teardown_matches, 0)
     build_test_fns(_name, body, _setup_body, _teardown_body)
   }
 
