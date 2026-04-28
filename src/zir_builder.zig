@@ -86,6 +86,12 @@ extern "c" fn zir_builder_emit_as(handle: ?*ZirBuilderHandle, dest_type: u32, op
 
 // Return type overrides
 extern "c" fn zir_builder_set_imported_return_type(handle: ?*ZirBuilderHandle, mod_ptr: [*]const u8, mod_len: u32, field_ptr: [*]const u8, field_len: u32) i32;
+// File-IS-the-struct counterparts: return type is the imported file's
+// root (`@import(name)`), or `@This()` for a self-return. Required so
+// that the import / `@This()` instructions land inside the function's
+// ret_ty body rather than in the outer scope.
+extern "c" fn zir_builder_set_imported_root_return_type(handle: ?*ZirBuilderHandle, import_name_ptr: [*]const u8, import_name_len: u32) i32;
+extern "c" fn zir_builder_set_this_return_type(handle: ?*ZirBuilderHandle) i32;
 extern "c" fn zir_builder_set_custom_return_type(handle: ?*ZirBuilderHandle, inst_indices_ptr: [*]const u32, inst_indices_len: u32, result_inst: u32) i32;
 
 // Tuple/array construction and element access
@@ -115,6 +121,23 @@ extern "c" fn zir_builder_add_struct_type(handle: ?*ZirBuilderHandle, name_ptr: 
 extern "c" fn zir_builder_set_root_fields(handle: ?*ZirBuilderHandle, name_ptrs: [*]const [*]const u8, name_lens: [*]const u32, type_refs: [*]const u32, count: u32) i32;
 extern "c" fn zir_builder_set_decl_val_return_type(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32) i32;
 extern "c" fn zir_builder_emit_param_decl_val_type(handle: ?*ZirBuilderHandle, param_name_ptr: [*]const u8, param_name_len: u32, type_name_ptr: [*]const u8, type_name_len: u32) u32;
+
+// Emit a parameter whose type is the root struct of an imported file:
+// `param_name: @import(import_name)` — file-IS-the-struct flavor with no
+// nested decl access. Required because the param's type body must contain
+// the import instruction; emitting the import in outer scope and then
+// passing the Ref to the bare `emit_param` puts the import in a different
+// body than the break that would resolve it (Sema panics in
+// `analyzeInlineBody` → `resolveInst` because the import inst isn't in
+// the param body's `inst_map`). See fork's `addParamImportedRootType`.
+extern "c" fn zir_builder_emit_param_imported_root_type(handle: ?*ZirBuilderHandle, param_name_ptr: [*]const u8, param_name_len: u32, import_name_ptr: [*]const u8, import_name_len: u32) u32;
+extern "c" fn zir_builder_emit_param_imported_type(handle: ?*ZirBuilderHandle, param_name_ptr: [*]const u8, param_name_len: u32, struct_name_ptr: [*]const u8, struct_name_len: u32, field_name_ptr: [*]const u8, field_name_len: u32) u32;
+
+// Emit a parameter whose type is `@This()` — a self-reference to the
+// current file's root struct. Required for the `.primary` classification
+// (the method's own enclosing Zap struct as a parameter type), since
+// `@import(self_name)` is rejected by Zig's build module system.
+extern "c" fn zir_builder_emit_param_this_type(handle: ?*ZirBuilderHandle, param_name_ptr: [*]const u8, param_name_len: u32) u32;
 
 // Tuple return type
 extern "c" fn zir_builder_set_tuple_return_type(handle: ?*ZirBuilderHandle, types_ptr: [*]const u32, types_len: u32) i32;
@@ -1771,21 +1794,86 @@ pub const ZirDriver = struct {
     }
 
     fn emitTypedParam(self: *ZirDriver, param: ir.Param) !u32 {
-        // Struct params: build the nominal type-ref via the
-        // file-IS-the-struct dispatcher so cross-emission types
-        // come from `@import(...)` and same-emission types come
-        // from the right local source (file root or nested decl).
+        // Struct params: dispatch to the right param-emission API
+        // based on where the type lives. The CRITICAL constraint is
+        // that any non-primitive operand the param's type body uses
+        // must be ITSELF emitted inside the param body — Sema's
+        // `analyzeInlineBody` walks only the body slice, so any Ref
+        // pointing at an instruction outside that body fails to
+        // resolve in `inst_map` and panics in `resolveInst`.
         if (std.meta.activeTag(param.type_expr) == .struct_ref) {
             const name = param.type_expr.struct_ref;
             if (self.findStructDef(name) != null) {
-                if (self.emitStructTypeRef(name) catch null) |type_ref| {
-                    const ref = zir_builder_emit_param(
-                        self.handle,
-                        param.name.ptr,
-                        @intCast(param.name.len),
-                        type_ref,
-                    );
-                    if (ref != error_ref) return ref;
+                if (self.current_emit_module) |current| {
+                    var buf: [256]u8 = undefined;
+                    const cls = classifyTypeDef(name, current, &buf);
+                    const short_name = if (std.mem.lastIndexOf(u8, name, ".")) |dot_idx|
+                        name[dot_idx + 1 ..]
+                    else
+                        name;
+                    switch (cls) {
+                        .primary => {
+                            // The file IS this struct — emit
+                            // `param: @This()`. `@import(self)` is
+                            // rejected by Zig's build module system
+                            // ("no module named X available within
+                            // module X"); `@This()` is the canonical
+                            // self-reference, and the resulting type
+                            // identity matches `Zcu.fileRootType` so
+                            // foreign emissions that import this
+                            // file get the same nominal type.
+                            const ref = zir_builder_emit_param_this_type(
+                                self.handle,
+                                param.name.ptr,
+                                @intCast(param.name.len),
+                            );
+                            if (ref != error_ref) return ref;
+                        },
+                        .nested => {
+                            // Nested inside the primary — reachable
+                            // by name in the current emission via
+                            // decl_val. The fork's
+                            // `addParamDeclValType` emits the
+                            // decl_val + break inside the param body.
+                            const ref = zir_builder_emit_param_decl_val_type(
+                                self.handle,
+                                param.name.ptr,
+                                @intCast(param.name.len),
+                                short_name.ptr,
+                                @intCast(short_name.len),
+                            );
+                            if (ref != error_ref) return ref;
+                        },
+                        .foreign => {
+                            if (std.mem.lastIndexOf(u8, name, ".")) |_| {
+                                // Foreign nested:
+                                // `@import(prefix).short_name`.
+                                var module_name_buf: [256]u8 = undefined;
+                                const module_name = structToModuleName(name, &module_name_buf);
+                                const ref = zir_builder_emit_param_imported_type(
+                                    self.handle,
+                                    param.name.ptr,
+                                    @intCast(param.name.len),
+                                    module_name.ptr,
+                                    @intCast(module_name.len),
+                                    short_name.ptr,
+                                    @intCast(short_name.len),
+                                );
+                                if (ref != error_ref) return ref;
+                            } else {
+                                // Foreign top-level — file IS the
+                                // struct: `@import(name)`.
+                                const ref = zir_builder_emit_param_imported_root_type(
+                                    self.handle,
+                                    param.name.ptr,
+                                    @intCast(param.name.len),
+                                    name.ptr,
+                                    @intCast(name.len),
+                                );
+                                if (ref != error_ref) return ref;
+                            }
+                        },
+                    }
                 }
             }
         }
@@ -1938,16 +2026,51 @@ pub const ZirDriver = struct {
                         return error.EmitFailed;
                     self.current_ret_type = 1;
                 } else if (self.findStructDef(name) != null) {
-                    // Cross-module struct: import from the defining module.
-                    var module_name_buf: [256]u8 = undefined;
-                    const module_name = structToModuleName(name, &module_name_buf);
-                    const short_name = if (std.mem.lastIndexOf(u8, name, ".")) |dot_idx|
-                        name[dot_idx + 1 ..]
-                    else
-                        name;
-                    if (zir_builder_set_imported_return_type(self.handle, module_name.ptr, @intCast(module_name.len), short_name.ptr, @intCast(short_name.len)) != 0)
-                        return error.EmitFailed;
-                    self.current_ret_type = 1;
+                    // Cross-emission struct return type — dispatch
+                    // by classification so the import / `@This()` /
+                    // field access lands inside the ret_ty body.
+                    if (self.current_emit_module) |current| {
+                        var buf: [256]u8 = undefined;
+                        const cls = classifyTypeDef(name, current, &buf);
+                        const short_name = if (std.mem.lastIndexOf(u8, name, ".")) |dot_idx|
+                            name[dot_idx + 1 ..]
+                        else
+                            name;
+                        switch (cls) {
+                            .primary => {
+                                if (zir_builder_set_this_return_type(self.handle) != 0)
+                                    return error.EmitFailed;
+                            },
+                            .nested => {
+                                if (zir_builder_set_decl_val_return_type(self.handle, short_name.ptr, @intCast(short_name.len)) != 0)
+                                    return error.EmitFailed;
+                            },
+                            .foreign => {
+                                if (std.mem.lastIndexOf(u8, name, ".")) |_| {
+                                    var module_name_buf: [256]u8 = undefined;
+                                    const module_name = structToModuleName(name, &module_name_buf);
+                                    if (zir_builder_set_imported_return_type(self.handle, module_name.ptr, @intCast(module_name.len), short_name.ptr, @intCast(short_name.len)) != 0)
+                                        return error.EmitFailed;
+                                } else {
+                                    if (zir_builder_set_imported_root_return_type(self.handle, name.ptr, @intCast(name.len)) != 0)
+                                        return error.EmitFailed;
+                                }
+                            },
+                        }
+                        self.current_ret_type = 1;
+                    } else {
+                        // No current emission — top-level / root-program
+                        // function. Fall back to the legacy path.
+                        var module_name_buf: [256]u8 = undefined;
+                        const module_name = structToModuleName(name, &module_name_buf);
+                        const short_name = if (std.mem.lastIndexOf(u8, name, ".")) |dot_idx|
+                            name[dot_idx + 1 ..]
+                        else
+                            name;
+                        if (zir_builder_set_imported_return_type(self.handle, module_name.ptr, @intCast(module_name.len), short_name.ptr, @intCast(short_name.len)) != 0)
+                            return error.EmitFailed;
+                        self.current_ret_type = 1;
+                    }
                 } else {
                     // Unknown struct_ref: use generic inference
                     if (zir_builder_set_generic_return_type(self.handle) != 0)
