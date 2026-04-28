@@ -3989,12 +3989,12 @@ pub const HirBuilder = struct {
                                     if (arg_type == types_mod.TypeStore.UNKNOWN) break :blk_t null;
                                     const t = self.type_store.getType(arg_type);
                                     if (std.mem.eql(u8, mod_part, "List") and t == .list) {
-                                        const enc = encodeContainerElemName(self.type_store, t.list.element);
+                                        const enc = encodeContainerElemName(self.type_store, t.list.element) orelse break :blk_t null;
                                         break :blk_t std.fmt.allocPrint(self.allocator, "List:{s}.{s}", .{ enc, func_part }) catch null;
                                     }
                                     if (std.mem.eql(u8, mod_part, "Map") and t == .map) {
-                                        const k_enc = encodeContainerElemName(self.type_store, t.map.key);
-                                        const v_enc = encodeContainerElemName(self.type_store, t.map.value);
+                                        const k_enc = encodeContainerElemName(self.type_store, t.map.key) orelse break :blk_t null;
+                                        const v_enc = encodeContainerElemName(self.type_store, t.map.value) orelse break :blk_t null;
                                         break :blk_t std.fmt.allocPrint(self.allocator, "Map:{s}:{s}.{s}", .{ k_enc, v_enc, func_part }) catch null;
                                     }
                                     break :blk_t null;
@@ -5402,8 +5402,17 @@ pub const HirBuilder = struct {
 /// dispatch (matches `ir.zigTypeToEncodedName`). Used to materialize
 /// `:zig.List.fn` calls into `List:Elem.fn` so the runtime container
 /// instantiates with the right element type.
-fn encodeContainerElemName(store: *const types_mod.TypeStore, type_id: types_mod.TypeId) []const u8 {
-    if (type_id == types_mod.TypeStore.UNKNOWN) return "i64";
+/// Encode a HIR type as the short name used in `:zig.List.method` /
+/// `:zig.Map.method` builtin call dispatch (e.g. `List:str.next`,
+/// `Map:u32:bool.put`). Returns null for types the encoder cannot
+/// resolve to a concrete instantiation — type variables, unknown,
+/// or container types still bound to a generic parameter — so
+/// callers fall through to the unqualified `Module.method` form.
+/// The IR's lowerCall arm then re-encodes from each call site's
+/// actual local type, which is what makes monomorphized
+/// specializations dispatch to the right runtime variant.
+fn encodeContainerElemName(store: *const types_mod.TypeStore, type_id: types_mod.TypeId) ?[]const u8 {
+    if (type_id == types_mod.TypeStore.UNKNOWN) return null;
     const t = store.getType(type_id);
     return switch (t) {
         .int => |i| switch (i.bits) {
@@ -5424,7 +5433,7 @@ fn encodeContainerElemName(store: *const types_mod.TypeStore, type_id: types_mod
         .atom_type => "u32",
         .struct_type => |s| store.interner.get(s.name),
         .tagged_union => |tu| store.interner.get(tu.name),
-        else => "i64",
+        else => null,
     };
 }
 
