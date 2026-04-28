@@ -1029,26 +1029,29 @@ pub const ZirDriver = struct {
         return null;
     }
 
-    /// Locate a monomorphized impl function compiled into the given calling
-    /// module's namespace. The IR call name is `<TargetMod>__<func>__<arity>`
-    /// (e.g. `List__member?__2`); the monomorphizer emits the specialized
-    /// copy as `<CallingMod>__<TargetMod>_<func>__<typeArg>__<arity>` with a
-    /// `local_name` of `<TargetMod>_<func>__<typeArg>__<arity>`. We rebuild
-    /// the prefix `<TargetMod>_<func>__` and the suffix `__<arity>` from the
-    /// call name and scan the program for the matching local_name in the
-    /// calling module.
-    fn findMonomorphizedImplFor(self: *const ZirDriver, calling_module: []const u8, call_name: []const u8) ?ir.Function {
+    /// Locate a monomorphized impl function compiled into the caller
+    /// struct's emitted Zig namespace. The IR call name has the shape
+    /// `<TargetStruct>__<func>__<arity>` (e.g. `List__member?__2`); the
+    /// monomorphizer emits the specialized copy with a `local_name` of
+    /// `<TargetStruct>_<func>__<typeArg>__<arity>` (one underscore
+    /// between the target struct and the function name, two as the
+    /// outer separators). We rebuild the prefix `<TargetStruct>_<func>__`
+    /// and the suffix `__<arity>` from the call name and scan the
+    /// program for a matching `local_name` whose `module_name` (the
+    /// emitted Zig namespace, which the IR field still calls a
+    /// "module") is the caller struct.
+    fn findMonomorphizedImplFor(self: *const ZirDriver, caller_struct: []const u8, call_name: []const u8) ?ir.Function {
         const sep = std.mem.indexOf(u8, call_name, "__") orelse return null;
-        const target_mod = call_name[0..sep];
+        const target_struct = call_name[0..sep];
         const rest = call_name[sep + 2 ..];
         const arity_sep = std.mem.lastIndexOf(u8, rest, "__") orelse return null;
         const func_base = rest[0..arity_sep];
         const arity_suffix = rest[arity_sep..];
         const prog = self.program orelse return null;
         for (prog.functions) |func| {
-            const fm = func.module_name orelse continue;
-            if (!std.mem.eql(u8, fm, calling_module)) continue;
-            const expected_prefix_buf = std.fmt.allocPrint(self.allocator, "{s}_{s}__", .{ target_mod, func_base }) catch continue;
+            const emit_ns = func.module_name orelse continue;
+            if (!std.mem.eql(u8, emit_ns, caller_struct)) continue;
+            const expected_prefix_buf = std.fmt.allocPrint(self.allocator, "{s}_{s}__", .{ target_struct, func_base }) catch continue;
             defer self.allocator.free(expected_prefix_buf);
             if (!std.mem.startsWith(u8, func.local_name, expected_prefix_buf)) continue;
             if (!std.mem.endsWith(u8, func.local_name, arity_suffix)) continue;
@@ -2831,18 +2834,18 @@ pub const ZirDriver = struct {
                             target_func = self.findFunctionByName(stripped);
                         }
                     }
-                    // Generic-impl monomorphization moves the specialized
-                    // function into the *calling* module's namespace and
-                    // names it `<TargetMod>_<func>__<type>__<arity>` (one
-                    // underscore between target and func, two as separators
-                    // elsewhere). Recover those entries by scanning the
-                    // current module for a local_name whose
-                    // `<TargetMod>_<func>__` prefix matches the call's
-                    // `<TargetMod>__<func>__` prefix and whose `__<arity>`
-                    // suffix matches.
+                    // Generic-impl monomorphization places the specialized
+                    // copy in the caller struct's emitted Zig namespace and
+                    // names it `<TargetStruct>_<func>__<type>__<arity>`
+                    // (one underscore between target struct and func, two
+                    // as the outer separators). Recover those entries by
+                    // scanning the caller's namespace for a `local_name`
+                    // whose `<TargetStruct>_<func>__` prefix matches the
+                    // call's `<TargetStruct>__<func>__` prefix and whose
+                    // `__<arity>` suffix matches.
                     if (target_func == null) {
-                        if (self.current_emit_module) |cem| {
-                            target_func = self.findMonomorphizedImplFor(cem, resolved_call_name);
+                        if (self.current_emit_module) |caller_struct| {
+                            target_func = self.findMonomorphizedImplFor(caller_struct, resolved_call_name);
                         }
                     }
                     const target_module = if (target_func) |tf| tf.module_name else null;

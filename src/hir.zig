@@ -2276,24 +2276,26 @@ pub const HirBuilder = struct {
         return raw_return;
     }
 
-    /// Resolve a function's return type within a specific module (for cross-module calls).
-    fn resolveFunctionReturnTypeInModule(self: *const HirBuilder, mod_name: []const u8, func_name: []const u8, arity: u32) types_mod.TypeId {
-        // Find the module's scope, then look up the family via the
-        // scope's `function_families` map. The map covers both
-        // natively-declared module functions AND impl functions
-        // registered via `registerImplFunctionsInTargetScopes` —
-        // critical for protocol dispatch through `String.concat`,
-        // `List.next`, etc., where the impl-defined family lives in
-        // the impl's own scope but is reachable from the target
-        // module's scope via the registered map entry.
+    /// Resolve a function's return type within a specific struct
+    /// (for cross-struct calls).
+    fn resolveFunctionReturnTypeInModule(self: *const HirBuilder, struct_simple: []const u8, func_name: []const u8, arity: u32) types_mod.TypeId {
+        // Find the matching struct's scope, then look up the family
+        // via the scope's `function_families` map. The map covers
+        // both functions declared inside the struct AND impl
+        // functions registered via
+        // `registerImplFunctionsInTargetScopes` — critical for
+        // protocol dispatch through `String.concat`, `List.next`,
+        // etc., where the impl-defined family lives in the impl's
+        // own scope but is reachable from the target struct's scope
+        // via the registered map entry.
         const func_name_id = self.interner.lookupExisting(func_name) orelse return types_mod.TypeStore.UNKNOWN;
         const key = scope_mod.FamilyKey{ .name = func_name_id, .arity = arity };
-        for (self.graph.structs.items) |mod_entry| {
-            if (mod_entry.name.parts.len == 0) continue;
-            const last_part = self.interner.get(mod_entry.name.parts[mod_entry.name.parts.len - 1]);
-            if (!std.mem.eql(u8, last_part, mod_name)) continue;
-            const mod_scope = self.graph.getScope(mod_entry.scope_id);
-            const fam_id = mod_scope.function_families.get(key) orelse continue;
+        for (self.graph.structs.items) |struct_entry| {
+            if (struct_entry.name.parts.len == 0) continue;
+            const last_part = self.interner.get(struct_entry.name.parts[struct_entry.name.parts.len - 1]);
+            if (!std.mem.eql(u8, last_part, struct_simple)) continue;
+            const struct_scope = self.graph.getScope(struct_entry.scope_id);
+            const fam_id = struct_scope.function_families.get(key) orelse continue;
             const family = self.graph.getFamily(fam_id);
             if (family.clauses.items.len > 0) {
                 const first_clause = family.clauses.items[0];
@@ -5407,7 +5409,7 @@ pub const HirBuilder = struct {
 /// `Map:u32:bool.put`). Returns null for types the encoder cannot
 /// resolve to a concrete instantiation — type variables, unknown,
 /// or container types still bound to a generic parameter — so
-/// callers fall through to the unqualified `Module.method` form.
+/// callers fall through to the unqualified `Struct.method` form.
 /// The IR's lowerCall arm then re-encodes from each call site's
 /// actual local type, which is what makes monomorphized
 /// specializations dispatch to the right runtime variant.
