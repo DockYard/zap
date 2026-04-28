@@ -2781,3 +2781,62 @@ test "collector can build graph from per-module programs" {
 
     try std.testing.expectEqual(@as(usize, 2), collector.graph.structs.items.len);
 }
+
+test "remapFunctionDecl rewrites name_expr through the remap table" {
+    // Regression: name_expr (used for `pub fn unquote(name)(...)`) holds
+    // a var_ref to a local-interner StringId. Before the fix, the
+    // remapping skipped name_expr entirely, so the inner var_ref kept
+    // its local id and resolved to whatever string sat at that index in
+    // the global interner — typically an unrelated identifier. The
+    // user-visible symptom in the Zest test framework was generated
+    // `pub fn unquote(fn_name)()` declarations losing the name `fn_name`
+    // and decoding to whatever happened to share the local id.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const meta: ast.NodeMeta = .{ .span = .{ .start = 0, .end = 0 } };
+
+    // Construct a remap table that swaps two ids so we can detect
+    // whether name_expr's inner var_ref gets traversed: id 0 in the
+    // local interner maps to id 5 in the global, and id 5 maps to 0.
+    // Any path that bypasses the remap surfaces id 5 unchanged.
+    const remap = try alloc.alloc(ast.StringId, 6);
+    remap[0] = 5;
+    remap[1] = 1;
+    remap[2] = 2;
+    remap[3] = 3;
+    remap[4] = 4;
+    remap[5] = 0;
+
+    // Build `pub fn unquote(<id 5>)() -> void`. The 5 simulates the
+    // local id of `fn_name`; after remap it should become 0.
+    const inner_var_ref = try alloc.create(ast.Expr);
+    inner_var_ref.* = .{ .var_ref = .{ .meta = meta, .name = 5 } };
+    const unquote = try alloc.create(ast.Expr);
+    unquote.* = .{ .unquote_expr = .{ .meta = meta, .expr = inner_var_ref } };
+
+    const clauses = try alloc.alloc(ast.FunctionClause, 1);
+    clauses[0] = .{
+        .meta = meta,
+        .params = &.{},
+        .return_type = null,
+        .refinement = null,
+        .body = null,
+    };
+    var fd: ast.FunctionDecl = .{
+        .meta = meta,
+        .name = 1, // placeholder — irrelevant for this test
+        .name_expr = unquote,
+        .clauses = clauses,
+        .visibility = .public,
+    };
+
+    try remapFunctionDecl(alloc, &fd, remap);
+
+    try std.testing.expect(fd.name_expr != null);
+    try std.testing.expect(fd.name_expr.?.* == .unquote_expr);
+    const remapped_inner = fd.name_expr.?.unquote_expr.expr;
+    try std.testing.expect(remapped_inner.* == .var_ref);
+    try std.testing.expectEqual(@as(ast.StringId, 0), remapped_inner.var_ref.name);
+}
