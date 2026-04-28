@@ -2975,6 +2975,65 @@ test "@before_compile: hook fires and splices result into target module" {
     try std.testing.expect(found_injected);
 }
 
+test "dynamic fn name: unquote in fn-name position resolves at expansion" {
+    // The pattern: a macro takes an atom argument and emits a
+    // `pub fn unquote(name)(...) -> i64 { ... }` declaration whose
+    // function name is determined at expansion time. This is the
+    // mechanism behind ExUnit's test/2 and is required for the
+    // Zest migration.
+    const source =
+        \\pub struct Test {
+        \\  pub macro define_const(_name :: AtomLit) -> Decl {
+        \\    quote {
+        \\      pub fn unquote(_name)() -> i64 {
+        \\        42
+        \\      }
+        \\    }
+        \\  }
+        \\
+        \\  define_const(:answer)
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    const expanded = try engine.expandProgram(&program);
+
+    // The Test module should now contain a function named `answer/0`
+    // injected by `define_const(:answer)`. The fn was emitted by
+    // the macro at the struct level via expandStructLevelExpr.
+    var found_answer = false;
+    for (expanded.structs) |mod| {
+        if (mod.name.parts.len != 1) continue;
+        const mod_name = parser.interner.get(mod.name.parts[0]);
+        if (!std.mem.eql(u8, mod_name, "Test")) continue;
+        for (mod.items) |item| {
+            switch (item) {
+                .function => |f| {
+                    const name = parser.interner.get(f.name);
+                    if (std.mem.eql(u8, name, "answer")) {
+                        found_answer = true;
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+    try std.testing.expect(found_answer);
+}
+
 test "@before_compile: hook reads caller's accumulated attributes" {
     // The keystone use case: macros in the target module accumulate
     // names into an attribute, then a `@before_compile` hook reads

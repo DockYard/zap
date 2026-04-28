@@ -300,6 +300,13 @@ pub const UnionVariant = struct {
 pub const FunctionDecl = struct {
     meta: NodeMeta,
     name: StringId,
+    /// When non-null the function's name is determined at macro
+    /// expansion time. The expression must evaluate at compile time
+    /// to a string or atom; the macro engine resolves it and writes
+    /// the result back into `name`. This enables
+    /// `def unquote(fn_name)(args) { ... }` inside `quote { ... }`.
+    /// Null means `name` was set directly by the parser.
+    name_expr: ?*const Expr = null,
     clauses: []const FunctionClause,
     visibility: Visibility,
 

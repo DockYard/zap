@@ -1979,9 +1979,19 @@ pub fn functionDeclToCtValue(
             try param_vals.append(alloc, try paramToCtValue(alloc, interner, store, param));
         }
 
-        // Function head: {:name, [], [params...]}
+        // Function head: {:name, [], [params...]}.
+        //
+        // When `decl.name_expr` is set, the macro author wrote
+        // `pub fn unquote(name)(...) { ... }` — the head's form is
+        // the unquote AST itself (not a literal atom). The macro
+        // engine's substituteCtValue will rewrite the form when the
+        // surrounding `quote { ... }` is expanded with bindings.
         const params_list = try makeListFromSlice(alloc, store, param_vals.items);
-        const head = try makeTuple3(alloc, store, .{ .atom = interner.get(decl.name) }, try emptyList(alloc, store), params_list);
+        const head_form: CtValue = if (decl.name_expr) |ne|
+            try exprToCtValue(alloc, interner, store, ne)
+        else
+            .{ .atom = interner.get(decl.name) };
+        const head = try makeTuple3(alloc, store, head_form, try emptyList(alloc, store), params_list);
 
         // Keyword opts: [return: type, do: body]
         var kw_elems : std.ArrayListUnmanaged(CtValue) = .empty;
@@ -2220,6 +2230,31 @@ pub fn structItemToCtValue(
 
 /// Convert a CtValue back to a StructItem.
 /// Expects {:fn, meta, clauses} or {:macro, meta, clauses} etc.
+/// Extract a function/macro name string from a CtValue used as the
+/// "form atom" position of a function-head 3-tuple. Used by
+/// `ctValueToStructItem` to support `pub fn unquote(name)(...)` —
+/// after macro substitution the form may be a bare atom, a string,
+/// or a wrapped literal.
+fn extractIdentifierName(value: CtValue) ?[]const u8 {
+    switch (value) {
+        .atom => |a| {
+            // Strip the colon prefix that distinguishes literal
+            // atoms (`":foo"`) from variable references in the AST
+            // encoding. Function names use the unprefixed form.
+            if (a.len > 0 and a[0] == ':') return a[1..];
+            return a;
+        },
+        .string => |s| return s,
+        .tuple => |t| {
+            if (t.elems.len == 3 and t.elems[2] == .nil) {
+                return extractIdentifierName(t.elems[0]);
+            }
+            return null;
+        },
+        else => return null,
+    }
+}
+
 pub fn ctValueToStructItem(
     alloc: Allocator,
     interner: *ast.StringInterner,
@@ -2266,11 +2301,22 @@ pub fn ctValueToStructItem(
             const head = clause_args.list.elems[0];
             const opts = clause_args.list.elems[1];
 
-            // Head: {:name, [], [params...]}
+            // Head: {:name, [], [params...]}.
+            //
+            // The head's form atom is the function name. When the
+            // function was written as `pub fn unquote(name)(...) {}`,
+            // the form may now be (post-macro-substitution):
+            //   - a bare atom — the resolved name
+            //   - a wrapped string literal `{"foo", _, nil}` — same
+            //     situation when the unquoted value was a string
+            //   - an unresolved unquote tuple — the substitute pass
+            //     didn't bind the param; treat as an error and skip
+            //     (the macro engine will already have logged a real
+            //     diagnostic for the surrounding macro)
             if (head != .tuple or head.tuple.elems.len != 3) continue;
-            if (head.tuple.elems[0] == .atom) {
-                func_name = try interner.intern(head.tuple.elems[0].atom);
-            }
+            if (extractIdentifierName(head.tuple.elems[0])) |name_str| {
+                func_name = try interner.intern(name_str);
+            } else continue;
 
             // Params
             var params : std.ArrayListUnmanaged(ast.Param) = .empty;

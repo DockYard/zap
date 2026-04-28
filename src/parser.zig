@@ -1374,14 +1374,31 @@ pub const Parser = struct {
             return error.ParseError;
         }
 
-        const name_tok = try self.parseSymbolicName();
-        const name = try self.internToken(name_tok);
+        // Function name: ordinary identifier OR `unquote(expr)` for
+        // macro-time-resolved names. The unquote form only makes
+        // sense inside a `quote { ... }` body (the parser doesn't
+        // enforce that here; the macro engine fails cleanly if it
+        // sees an unresolved `name_expr` outside quote context).
+        var name: ast.StringId = 0;
+        var name_expr: ?*const ast.Expr = null;
+        if (self.check(.keyword_unquote)) {
+            name_expr = try self.parseUnquoteExpr();
+            // Use a placeholder name so downstream code that prints
+            // diagnostics has something to render before macro
+            // expansion resolves it. The placeholder is overwritten
+            // when the macro engine evaluates `name_expr`.
+            name = try self.interner.intern("__unquoted_name__");
+        } else {
+            const name_tok = try self.parseSymbolicName();
+            name = try self.internToken(name_tok);
+        }
 
         const clause = try self.parseFunctionClause(start);
 
         return self.create(ast.FunctionDecl, .{
             .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
             .name = name,
+            .name_expr = name_expr,
             .clauses = try self.allocator.dupe(ast.FunctionClause, &[_]ast.FunctionClause{clause}),
             .visibility = visibility,
         });
@@ -1393,14 +1410,22 @@ pub const Parser = struct {
         if (self.check(.keyword_pub)) _ = self.advance();
         _ = try self.expect(.keyword_macro);
 
-        const name_tok = try self.parseSymbolicName();
-        const name = try self.internToken(name_tok);
+        var name: ast.StringId = 0;
+        var name_expr: ?*const ast.Expr = null;
+        if (self.check(.keyword_unquote)) {
+            name_expr = try self.parseUnquoteExpr();
+            name = try self.interner.intern("__unquoted_name__");
+        } else {
+            const name_tok = try self.parseSymbolicName();
+            name = try self.internToken(name_tok);
+        }
 
         const clause = try self.parseFunctionClause(start);
 
         return self.create(ast.FunctionDecl, .{
             .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
             .name = name,
+            .name_expr = name_expr,
             .clauses = try self.allocator.dupe(ast.FunctionClause, &[_]ast.FunctionClause{clause}),
             .visibility = visibility,
         });
