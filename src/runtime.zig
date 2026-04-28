@@ -808,48 +808,6 @@ pub const Range = struct {
         return .{ .@"0" = ATOM_CONT, .@"1" = start, .@"2" = next_range };
     }
 
-    /// Bounds-only containment primitive — true when `value` falls
-    /// between `start` and `end` (inclusive), regardless of `step`.
-    /// Direction is inferred from the `start <= end` ordering.
-    /// `Membership.member?(range, value)` layers a step-boundary
-    /// modular check on top of this primitive to deliver step-aware
-    /// semantics for `value in range`. The IR `in_range` opcode
-    /// inlines an equivalent step-aware sequence; both call sites
-    /// reuse the same bounds logic exposed here.
-    pub fn contains(range: anytype, value: i64) bool {
-        const start = range.start;
-        const end_val = range.end;
-        if (start <= end_val) {
-            return value >= start and value <= end_val;
-        }
-        return value <= start and value >= end_val;
-    }
-
-    pub fn to_list(range: anytype) ?*const List(i64) {
-        const start = range.start;
-        const end_val = range.end;
-        const step_mag = range.step;
-        if (step_mag == 0) return null;
-
-        const going_forward = start <= end_val;
-        const step: i64 = if (going_forward) step_mag else -step_mag;
-
-        var result: ?*const List(i64) = null;
-        var current = start;
-
-        if (going_forward) {
-            while (current <= end_val) {
-                result = List(i64).cons(current, result);
-                current += step;
-            }
-        } else {
-            while (current >= end_val) {
-                result = List(i64).cons(current, result);
-                current += step;
-            }
-        }
-        return List(i64).reverse(result);
-    }
 };
 
 pub const Kernel = struct {

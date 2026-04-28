@@ -23,7 +23,12 @@ pub impl Membership for Range {
     """
 
   pub fn member?(range :: Range, value :: i64) -> Bool {
-    if :zig.Range.contains(range, value) {
+    in_bounds = if range.start <= range.end {
+      value >= range.start and value <= range.end
+    } else {
+      value <= range.start and value >= range.end
+    }
+    if in_bounds {
       :zig.Kernel.remainder(value - range.start, range.step) == 0
     } else {
       false
