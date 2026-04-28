@@ -41,8 +41,11 @@ const TestResult = struct {
     stderr: []const u8,
     exit_code: u8,
     allocator: std.mem.Allocator,
-    /// Path to compiled binary for cleanup
-    output_dir: ?[]const u8,
+    /// Path to compiled binary for cleanup.
+    /// Stored as a sentinel-terminated slice because `realPathFileAlloc` returns
+    /// `[:0]u8` whose backing allocation is `len + 1` bytes; freeing through a
+    /// non-sentinel `[]const u8` would under-count and trip the testing allocator.
+    output_dir: ?[:0]const u8,
 
     pub fn deinit(self: *TestResult) void {
         self.allocator.free(self.stdout);
