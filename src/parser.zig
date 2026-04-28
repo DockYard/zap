@@ -14,9 +14,15 @@ pub const Parser = struct {
     interner: *ast.StringInterner,
     errors: std.ArrayList(Error),
     anon_function_counter: u32,
-    /// When true, `{` after a call is NOT parsed as a trailing block argument.
-    /// Set during guard expression parsing where `{` starts the function body.
-    in_guard_expr: bool = false,
+    /// When true, `{` after a call is NOT parsed as a trailing block
+    /// argument — it is reserved for the surrounding construct's body.
+    /// Set while parsing the headers of guard expressions (`{` opens
+    /// the function body), `if`/`case`/`cond` (`{` opens the
+    /// then/scrutinee/clauses block), and `for` (`{` opens the
+    /// comprehension body). Without this, `if Foo.bar(x) { ... }`
+    /// parses as `if (Foo.bar(x) { ... })` — the trailing block gets
+    /// absorbed as an argument to `bar`.
+    disable_trailing_block: bool = false,
 
     pub const Error = struct {
         message: []const u8,
@@ -1810,8 +1816,9 @@ pub const Parser = struct {
     /// Parse a guard expression — like a regular expression but allows
     /// newlines before `and`/`or` continuation tokens.
     fn parseGuardExpr(self: *Parser) anyerror!*const ast.Expr {
-        self.in_guard_expr = true;
-        defer self.in_guard_expr = false;
+        const saved = self.disable_trailing_block;
+        self.disable_trailing_block = true;
+        defer self.disable_trailing_block = saved;
         return self.parseGuardOrExpr();
     }
 
@@ -2162,7 +2169,7 @@ pub const Parser = struct {
 
                 // Trailing block: func(args) { body } → body becomes last argument
                 // Disabled in guard expressions where { starts the function body.
-                if (self.check(.left_brace) and !self.in_guard_expr) {
+                if (self.check(.left_brace) and !self.disable_trailing_block) {
                     const block_expr = try self.parseBlockExpr();
                     try args.append(self.allocator, block_expr);
                 }
@@ -2578,11 +2585,19 @@ pub const Parser = struct {
         }
 
         _ = try self.expect(.back_arrow); // <-
-        const iterable = try self.parseExpr();
+        const iterable = blk: {
+            const saved = self.disable_trailing_block;
+            self.disable_trailing_block = true;
+            defer self.disable_trailing_block = saved;
+            break :blk try self.parseExpr();
+        };
 
         // Optional filter: for x <- list, x > 0 { ... }
         var filter: ?*const ast.Expr = null;
         if (self.match(.comma)) {
+            const saved = self.disable_trailing_block;
+            self.disable_trailing_block = true;
+            defer self.disable_trailing_block = saved;
             filter = try self.parseExpr();
         }
 
@@ -2922,7 +2937,12 @@ pub const Parser = struct {
         const start = self.currentSpan();
         _ = try self.expect(.keyword_if);
 
-        const condition = try self.parseExpr();
+        const condition = blk: {
+            const saved = self.disable_trailing_block;
+            self.disable_trailing_block = true;
+            defer self.disable_trailing_block = saved;
+            break :blk try self.parseExpr();
+        };
 
         _ = try self.expect(.left_brace);
         self.skipNewlines();
@@ -2956,7 +2976,12 @@ pub const Parser = struct {
         const start = self.currentSpan();
         _ = try self.expect(.keyword_case);
 
-        const scrutinee = try self.parseExpr();
+        const scrutinee = blk: {
+            const saved = self.disable_trailing_block;
+            self.disable_trailing_block = true;
+            defer self.disable_trailing_block = saved;
+            break :blk try self.parseExpr();
+        };
 
         _ = try self.expect(.left_brace);
         self.skipNewlines();

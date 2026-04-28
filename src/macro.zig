@@ -277,8 +277,51 @@ pub const MacroEngine = struct {
                 const expanded = try self.expandFunctionDecl(mac);
                 return .{ .item = .{ .priv_macro = expanded.decl }, .changed = expanded.changed };
             },
+            .impl_decl => |impl| {
+                const expanded = try self.expandImplDecl(impl);
+                return .{ .item = .{ .impl_decl = expanded.decl }, .changed = expanded.changed };
+            },
+            .priv_impl_decl => |impl| {
+                const expanded = try self.expandImplDecl(impl);
+                return .{ .item = .{ .priv_impl_decl = expanded.decl }, .changed = expanded.changed };
+            },
             else => return .{ .item = item, .changed = false },
         }
+    }
+
+    const ExpandedImpl = struct {
+        decl: *const ast.ImplDecl,
+        changed: bool,
+    };
+
+    /// Walk each function in a protocol impl and run its body
+    /// through `expandFunctionDecl`. Without this, Kernel macros
+    /// like `if`, `and`, `or`, `unless`, `cond`, and `<>` survive
+    /// inside impl bodies as raw `if_expr`/operator AST nodes,
+    /// which the HIR builder rejects with `unreachable`.
+    /// Reuses the per-function expander so impls and module
+    /// methods follow the same rules.
+    fn expandImplDecl(self: *MacroEngine, impl: *const ast.ImplDecl) !ExpandedImpl {
+        var changed = false;
+        var new_functions: std.ArrayList(*const ast.FunctionDecl) = .empty;
+
+        for (impl.functions) |func| {
+            const expanded = try self.expandFunctionDecl(func);
+            if (expanded.changed) changed = true;
+            try new_functions.append(self.allocator, expanded.decl);
+        }
+
+        if (!changed) return .{ .decl = impl, .changed = false };
+
+        const new_impl = try self.create(ast.ImplDecl, .{
+            .meta = impl.meta,
+            .protocol_name = impl.protocol_name,
+            .target_type = impl.target_type,
+            .type_params = impl.type_params,
+            .functions = try new_functions.toOwnedSlice(self.allocator),
+            .is_private = impl.is_private,
+        });
+        return .{ .decl = new_impl, .changed = true };
     }
 
     // ============================================================
@@ -4088,3 +4131,4 @@ test "typed splice: untyped param accepts anything (back-compat)" {
     }
     try std.testing.expectEqual(@as(usize, 0), splice_errs);
 }
+
