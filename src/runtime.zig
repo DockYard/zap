@@ -808,11 +808,14 @@ pub const Range = struct {
         return .{ .@"0" = ATOM_CONT, .@"1" = start, .@"2" = next_range };
     }
 
-    /// Numeric containment for `i in r` — true when `value` falls between
-    /// `start` and `end` (inclusive). Step direction is inferred from the
-    /// `start <= end` ordering. Mirrors the `in_range` IR opcode but lives
-    /// here so `Membership.member?(range, value)` can dispatch through the
-    /// usual protocol path.
+    /// Bounds-only containment primitive — true when `value` falls
+    /// between `start` and `end` (inclusive), regardless of `step`.
+    /// Direction is inferred from the `start <= end` ordering.
+    /// `Membership.member?(range, value)` layers a step-boundary
+    /// modular check on top of this primitive to deliver step-aware
+    /// semantics for `value in range`. The IR `in_range` opcode
+    /// inlines an equivalent step-aware sequence; both call sites
+    /// reuse the same bounds logic exposed here.
     pub fn contains(range: anytype, value: i64) bool {
         const start = range.start;
         const end_val = range.end;
