@@ -1835,6 +1835,34 @@ pub const MacroEngine = struct {
         return mi;
     }
 
+    /// Recursively flatten nested `__block__` AST nodes into a flat
+    /// list of CtValues. A macro that composes other macros (e.g.
+    /// `describe` emitting a `test()` call which itself returns a
+    /// `__block__` of [fn_decl, tracking_call]) produces nested
+    /// blocks; without flattening, the inner blocks survive as
+    /// opaque expressions at module scope and the per-element
+    /// struct-item conversion never sees the underlying decls.
+    fn flattenNestedBlocks(
+        self: *MacroEngine,
+        value: ctfe.CtValue,
+        out: *std.ArrayList(ctfe.CtValue),
+    ) std.mem.Allocator.Error!void {
+        if (value != .tuple or value.tuple.elems.len != 3) {
+            try out.append(self.allocator, value);
+            return;
+        }
+        const form = value.tuple.elems[0];
+        if (form != .atom or !std.mem.eql(u8, form.atom, "__block__")) {
+            try out.append(self.allocator, value);
+            return;
+        }
+        if (value.tuple.elems[2] == .list) {
+            for (value.tuple.elems[2].list.elems) |elem| {
+                try self.flattenNestedBlocks(elem, out);
+            }
+        }
+    }
+
     fn expandStructLevelExpr(self: *MacroEngine, expr: *const ast.Expr) !ExpandedStructItems {
         // Check if this is a macro call (identifier + args)
         if (expr.* == .call and expr.call.callee.* == .var_ref) {
@@ -1873,17 +1901,27 @@ pub const MacroEngine = struct {
                         return .{ .items = items, .changed = true };
                     }
 
-                    // Block of module items (e.g., describe expanding to multiple functions)
+                    // Block of module items (e.g., describe expanding to multiple functions).
+                    // Recursively flatten nested __block__ tuples first so a macro that
+                    // composes other macros (each of which returns its own __block__)
+                    // produces a flat list of struct items instead of opaque inner blocks
+                    // surviving as struct_level_exprs.
                     if (result_ct == .tuple and result_ct.tuple.elems.len == 3) {
                         if (result_ct.tuple.elems[0] == .atom) {
                             if (std.mem.eql(u8, result_ct.tuple.elems[0].atom, "__block__")) {
                                 if (result_ct.tuple.elems[2] == .list) {
+                                    var flattened: std.ArrayList(ctfe.CtValue) = .empty;
+                                    defer flattened.deinit(self.allocator);
+                                    for (result_ct.tuple.elems[2].list.elems) |elem| {
+                                        try self.flattenNestedBlocks(elem, &flattened);
+                                    }
+
                                     // Check if ALL elements are module items. If any element
                                     // is not a module item (e.g., an assignment like ctx = 42),
                                     // keep the entire block as a single struct_level_expr to
                                     // preserve variable bindings and control flow.
                                     var all_module_items = true;
-                                    for (result_ct.tuple.elems[2].list.elems) |elem| {
+                                    for (flattened.items) |elem| {
                                         if (ast_data.ctValueToStructItem(self.allocator, interner_mut, elem) catch null) |_| {
                                             // is a module item
                                         } else {
@@ -1894,7 +1932,7 @@ pub const MacroEngine = struct {
 
                                     if (all_module_items) {
                                         var items: std.ArrayList(ast.StructItem) = .empty;
-                                        for (result_ct.tuple.elems[2].list.elems) |elem| {
+                                        for (flattened.items) |elem| {
                                             if (ast_data.ctValueToStructItem(self.allocator, interner_mut, elem) catch null) |mi| {
                                                 try items.append(self.allocator, patchStructItemSpan(mi, call_span));
                                             }
@@ -1907,7 +1945,7 @@ pub const MacroEngine = struct {
                                         // Function declarations → StructItem::function
                                         // Expressions → StructItem::struct_level_expr
                                         var items: std.ArrayList(ast.StructItem) = .empty;
-                                        for (result_ct.tuple.elems[2].list.elems) |elem_expr| {
+                                        for (flattened.items) |elem_expr| {
                                             if (ast_data.ctValueToStructItem(self.allocator, interner_mut, elem_expr) catch null) |mi| {
                                                 try items.append(self.allocator, patchStructItemSpan(mi, call_span));
                                             } else {
