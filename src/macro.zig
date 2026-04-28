@@ -26,10 +26,22 @@ pub const MacroEngine = struct {
     generation: u32,
     max_expansions: u32,
     errors: std.ArrayList(Error),
+    /// Tracks which `@before_compile` callbacks have already fired
+    /// for each module scope. The callback runs at most once per
+    /// module per `expandProgram` invocation; subsequent expansion
+    /// iterations re-check but skip already-fired hooks. Keyed by
+    /// the (module_scope, hook_module_name_id) pair so the same
+    /// module can register multiple distinct hooks.
+    before_compile_fired: std.AutoHashMap(BeforeCompileKey, void),
 
     pub const Error = struct {
         message: []const u8,
         span: ast.SourceSpan,
+    };
+
+    pub const BeforeCompileKey = struct {
+        module_scope: scope.ScopeId,
+        hook_name: ast.StringId,
     };
 
     pub fn init(allocator: std.mem.Allocator, interner: *ast.StringInterner, graph: *scope.ScopeGraph) MacroEngine {
@@ -40,11 +52,13 @@ pub const MacroEngine = struct {
             .generation = 0,
             .max_expansions = 100,
             .errors = .empty,
+            .before_compile_fired = std.AutoHashMap(BeforeCompileKey, void).init(allocator),
         };
     }
 
     pub fn deinit(self: *MacroEngine) void {
         self.errors.deinit(self.allocator);
+        self.before_compile_fired.deinit();
     }
 
     // ============================================================
@@ -80,8 +94,16 @@ pub const MacroEngine = struct {
                 try new_top_items.append(self.allocator, expanded.item);
             }
 
-            current_structs = try new_structs.toOwnedSlice(self.allocator);
+            const owned_structs = try new_structs.toOwnedSlice(self.allocator);
             current_top_items = try new_top_items.toOwnedSlice(self.allocator);
+
+            // Fire `@before_compile` hooks once per (module, hook)
+            // pair. Hooks may inject new declarations that themselves
+            // contain macro calls, so any change keeps the outer
+            // fixed-point loop alive for another iteration.
+            const hook_result = try self.fireBeforeCompileHooks(owned_structs);
+            if (hook_result.changed) changed = true;
+            current_structs = hook_result.structs;
 
             if (!changed) break;
         }
@@ -257,6 +279,313 @@ pub const MacroEngine = struct {
             },
             else => return .{ .item = item, .changed = false },
         }
+    }
+
+    // ============================================================
+    // @before_compile callback firing
+    //
+    // After per-module macro expansion, every module is checked for
+    // `@before_compile` attributes (single-value or accumulated) and
+    // each registered hook module's `__before_compile__/1` macro is
+    // invoked at most once per `expandProgram` call. The hook returns
+    // a CtValue tree of declarations which is spliced into the
+    // module's items via the same path `expandStructLevelExpr` uses
+    // for inline macro returns. New items can themselves contain
+    // macro calls; the outer fixed-point loop catches those.
+    // ============================================================
+
+    const HookFireResult = struct {
+        structs: []const ast.StructDecl,
+        changed: bool,
+    };
+
+    /// Fire all not-yet-fired `@before_compile` hooks across modules
+    /// and append their results into the corresponding module's
+    /// items. Returns either the input slice unchanged (when no hook
+    /// fired) or a freshly allocated slice with the affected modules
+    /// replaced. Either way the caller takes ownership.
+    fn fireBeforeCompileHooks(
+        self: *MacroEngine,
+        current_structs: []const ast.StructDecl,
+    ) !HookFireResult {
+        var any_fired = false;
+        const before_compile_id = try self.interner.intern("before_compile");
+
+        // Build the output slice lazily — only allocate when the
+        // first hook actually fires so the no-op path stays cheap.
+        var output: ?[]ast.StructDecl = null;
+
+        for (current_structs, 0..) |mod, mod_idx| {
+            const mod_scope = self.graph.findStructScope(mod.name) orelse continue;
+            const mod_entry = self.graph.findStructByScope(mod_scope) orelse continue;
+
+            var hook_atoms: std.ArrayListUnmanaged([]const u8) = .empty;
+            defer hook_atoms.deinit(self.allocator);
+
+            for (mod_entry.attributes.items) |attr| {
+                if (attr.name != before_compile_id) continue;
+
+                // CTFE attribute evaluation runs after macro
+                // expansion, so `computed_value` is typically null
+                // here. Fall back to the raw AST value, which for
+                // `@before_compile = :SomeModule` is an atom literal
+                // we can resolve immediately. Hook targets are
+                // expected to be plain atoms (or lists of atoms via
+                // `Module.put_attribute`), not arbitrary
+                // expressions; falling back covers the source-
+                // declared case without forcing a CTFE detour.
+                if (attr.computed_value) |cv| {
+                    try collectHookAtoms(&hook_atoms, self.allocator, cv);
+                } else if (attr.value) |expr| {
+                    try collectHookAtomsFromExpr(&hook_atoms, self.allocator, self.interner, expr);
+                }
+            }
+            if (hook_atoms.items.len == 0) continue;
+
+            var appended_items: std.ArrayListUnmanaged(ast.StructItem) = .empty;
+            defer appended_items.deinit(self.allocator);
+
+            for (hook_atoms.items) |hook_name_str| {
+                const hook_name_id = try self.interner.intern(hook_name_str);
+                const fired_key: BeforeCompileKey = .{
+                    .module_scope = mod_scope,
+                    .hook_name = hook_name_id,
+                };
+                if (self.before_compile_fired.contains(fired_key)) continue;
+
+                try self.before_compile_fired.put(fired_key, {});
+
+                const hook_items = self.invokeBeforeCompileHook(
+                    mod_scope,
+                    mod.name,
+                    hook_name_str,
+                ) catch |err| {
+                    try self.errors.append(self.allocator, .{
+                        .message = try std.fmt.allocPrint(
+                            self.allocator,
+                            "@before_compile {s}: hook invocation failed ({s})",
+                            .{ hook_name_str, @errorName(err) },
+                        ),
+                        .span = mod.meta.span,
+                    });
+                    continue;
+                };
+
+                for (hook_items) |item| {
+                    try appended_items.append(self.allocator, item);
+                }
+            }
+
+            if (appended_items.items.len == 0) continue;
+
+            // Lazily allocate the output slice on first hook fire,
+            // copying over the structs we've already passed.
+            if (output == null) {
+                output = try self.allocator.alloc(ast.StructDecl, current_structs.len);
+                @memcpy(output.?[0..mod_idx], current_structs[0..mod_idx]);
+                @memcpy(output.?[mod_idx + 1 ..], current_structs[mod_idx + 1 ..]);
+            }
+
+            const old_items = mod.items;
+            const new_items = try self.allocator.alloc(ast.StructItem, old_items.len + appended_items.items.len);
+            @memcpy(new_items[0..old_items.len], old_items);
+            @memcpy(new_items[old_items.len..], appended_items.items);
+
+            output.?[mod_idx] = .{
+                .meta = mod.meta,
+                .name = mod.name,
+                .parent = mod.parent,
+                .items = new_items,
+                .fields = mod.fields,
+                .is_private = mod.is_private,
+            };
+            any_fired = true;
+        }
+
+        return .{
+            .structs = output orelse current_structs,
+            .changed = any_fired,
+        };
+    }
+
+    /// Walk a ConstValue and collect every atom string into `out`.
+    /// Used to flatten an accumulated `@before_compile` list (which
+    /// may be a single atom or a list of atoms from `put_attribute`).
+    fn collectHookAtoms(
+        out: *std.ArrayListUnmanaged([]const u8),
+        alloc: std.mem.Allocator,
+        cv: ctfe.ConstValue,
+    ) !void {
+        switch (cv) {
+            .atom => |name| try out.append(alloc, name),
+            .list => |elems| for (elems) |e| try collectHookAtoms(out, alloc, e),
+            else => {}, // ignore other shapes — invalid hook target
+        }
+    }
+
+    /// AST-level analog of `collectHookAtoms`: walk an attribute's
+    /// raw value expression and collect atom-literal names. Handles
+    /// the same shapes (single atom, list of atoms) that the
+    /// computed-value path supports, but for source-declared
+    /// `@before_compile = :Foo` cases that have not yet been CTFE'd.
+    fn collectHookAtomsFromExpr(
+        out: *std.ArrayListUnmanaged([]const u8),
+        alloc: std.mem.Allocator,
+        interner: *const ast.StringInterner,
+        expr: *const ast.Expr,
+    ) !void {
+        switch (expr.*) {
+            .atom_literal => |a| try out.append(alloc, interner.get(a.value)),
+            .list => |l| for (l.elements) |elem| {
+                try collectHookAtomsFromExpr(out, alloc, interner, elem);
+            },
+            .module_ref => |m| {
+                // `@before_compile = SomeModule` — single-part name
+                // becomes the hook target. Multi-part names (e.g.
+                // `Foo.Bar`) are unsupported here.
+                if (m.name.parts.len == 1) {
+                    try out.append(alloc, interner.get(m.name.parts[0]));
+                }
+            },
+            else => {},
+        }
+    }
+
+    /// Invoke `<hook_name>.__before_compile__/1` and convert its
+    /// result CtValue into a slice of StructItems for splicing.
+    /// The argument passed to the hook is a CtValue describing the
+    /// caller module (currently just an atom of the module's name).
+    fn invokeBeforeCompileHook(
+        self: *MacroEngine,
+        caller_module_scope: scope.ScopeId,
+        caller_module_name: ast.StructName,
+        hook_module_name: []const u8,
+    ) ![]ast.StructItem {
+        // Resolve hook module name → scope id → __before_compile__/1
+        // macro family.
+        const hook_module_id = try self.interner.intern(hook_module_name);
+        const hook_struct_name: ast.StructName = .{
+            .parts = try self.allocator.dupe(ast.StringId, &.{hook_module_id}),
+            .span = .{ .start = 0, .end = 0 },
+        };
+        const hook_scope = self.graph.findStructScope(hook_struct_name) orelse {
+            // Hook module not found — emit error and return empty.
+            try self.errors.append(self.allocator, .{
+                .message = try std.fmt.allocPrint(
+                    self.allocator,
+                    "@before_compile target module not found: {s}",
+                    .{hook_module_name},
+                ),
+                .span = .{ .start = 0, .end = 0 },
+            });
+            return &.{};
+        };
+
+        const hook_name_id = try self.interner.intern("__before_compile__");
+        const family_id = self.graph.resolveMacro(hook_scope, hook_name_id, 1) orelse {
+            try self.errors.append(self.allocator, .{
+                .message = try std.fmt.allocPrint(
+                    self.allocator,
+                    "@before_compile {s}: __before_compile__/1 not defined",
+                    .{hook_module_name},
+                ),
+                .span = .{ .start = 0, .end = 0 },
+            });
+            return &.{};
+        };
+        const family = &self.graph.macro_families.items[family_id];
+        if (family.clauses.items.len == 0) return &.{};
+        const clause_ref = family.clauses.items[0];
+        const clause = &clause_ref.decl.clauses[clause_ref.clause_index];
+
+        // Build the env-arg CtValue: an atom of the caller's module
+        // name. A richer __ENV__ struct can come later; the atom is
+        // enough for hooks that just want to read the caller's
+        // attributes.
+        const macro_eval = @import("macro_eval.zig");
+        var store = ctfe.AllocationStore{};
+        var env = macro_eval.Env.init(self.allocator, &store);
+        defer env.deinit();
+        env.module_ctx = .{
+            .graph = self.graph,
+            .interner = self.interner,
+            // Hooks read attributes from the *caller* module, not the
+            // hook module — that's the whole point of the pattern.
+            .current_module_scope = caller_module_scope,
+        };
+
+        if (clause.params.len > 0 and clause.params[0].pattern.* == .bind) {
+            const param_name = self.interner.get(clause.params[0].pattern.bind.name);
+            // Caller module name as a colon-prefixed atom (the AST
+            // encoding for atom literals). For multi-part names we
+            // dot-join the parts so hooks see something readable.
+            const name_string = try caller_module_name.toDottedString(self.allocator, self.interner);
+            const colon_prefixed = try std.fmt.allocPrint(self.allocator, ":{s}", .{name_string});
+            const env_arg = try ast_data.makeTuple3(
+                self.allocator,
+                &store,
+                .{ .atom = colon_prefixed },
+                try ast_data.emptyList(self.allocator, &store),
+                .nil,
+            );
+            try env.bind(param_name, env_arg);
+        }
+
+        // Evaluate the hook's body.
+        var result: ctfe.CtValue = .nil;
+        for (clause.body orelse @as([]const ast.Stmt, &.{})) |stmt| {
+            const stmt_ct = try ast_data.stmtToCtValue(self.allocator, self.interner, &store, stmt);
+            result = macro_eval.eval(&env, stmt_ct) catch .nil;
+        }
+
+        // Convert the result into struct items. Same logic as
+        // expandStructLevelExpr's __block__ handling — split mixed
+        // results, dropping anything that isn't a recognized
+        // declaration shape.
+        return try self.ctValueToStructItems(result);
+    }
+
+    /// Convert a hook's CtValue result into a list of StructItems.
+    /// Handles three shapes:
+    ///   - `__block__` whose elements are decls: each becomes an item.
+    ///   - A bare list of decl-shaped CtValues.
+    ///   - A single decl-shaped CtValue.
+    /// Anything else is ignored (the hook is expected to produce
+    /// declarations only — runtime expressions are not meaningful at
+    /// the bottom of a struct's body).
+    fn ctValueToStructItems(
+        self: *MacroEngine,
+        result: ctfe.CtValue,
+    ) ![]ast.StructItem {
+        var items: std.ArrayListUnmanaged(ast.StructItem) = .empty;
+        switch (result) {
+            .tuple => |t| if (t.elems.len == 3) {
+                const form = t.elems[0];
+                if (form == .atom and std.mem.eql(u8, form.atom, "__block__")) {
+                    if (t.elems[2] == .list) {
+                        for (t.elems[2].list.elems) |elem| {
+                            if (try ast_data.ctValueToStructItem(self.allocator, self.interner, elem)) |si| {
+                                try items.append(self.allocator, si);
+                            }
+                        }
+                    }
+                } else {
+                    if (try ast_data.ctValueToStructItem(self.allocator, self.interner, result)) |si| {
+                        try items.append(self.allocator, si);
+                    }
+                }
+            },
+            .list => |l| {
+                for (l.elems) |elem| {
+                    if (try ast_data.ctValueToStructItem(self.allocator, self.interner, elem)) |si| {
+                        try items.append(self.allocator, si);
+                    }
+                }
+            },
+            .nil => {}, // hook returned nothing — fine
+            else => {},
+        }
+        return items.toOwnedSlice(self.allocator);
     }
 
     // ============================================================
@@ -2568,6 +2897,203 @@ test "module attribute intrinsics: put writes to current StructEntry" {
     try std.testing.expect(found_value != null);
     try std.testing.expect(found_value.? == .atom);
     try std.testing.expectEqualStrings("hello", found_value.?.atom);
+}
+
+test "@before_compile: hook fires and splices result into target module" {
+    // The pattern: a target module declares `@before_compile Hooks`
+    // at the END of its body (so the collector flushes the
+    // attribute onto the module entry rather than the next function),
+    // and `Hooks.__before_compile__/1` returns a function declaration
+    // that is appended to the target module's items.
+    const source =
+        \\pub struct Hooks {
+        \\  pub macro __before_compile__(_env :: Expr) -> Decl {
+        \\    quote {
+        \\      pub fn injected_marker() -> i64 {
+        \\        99
+        \\      }
+        \\    }
+        \\  }
+        \\}
+        \\
+        \\pub struct Target {
+        \\  pub fn original() -> i64 {
+        \\    1
+        \\  }
+        \\
+        \\  @before_compile = :Hooks
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    const expanded = try engine.expandProgram(&program);
+
+    // Find the Target module in the expanded program.
+    var target_struct: ?*const ast.StructDecl = null;
+    for (expanded.structs) |*mod| {
+        if (mod.name.parts.len == 1) {
+            const part_name = parser.interner.get(mod.name.parts[0]);
+            if (std.mem.eql(u8, part_name, "Target")) {
+                target_struct = mod;
+                break;
+            }
+        }
+    }
+    try std.testing.expect(target_struct != null);
+
+    // The hook should have appended `injected_marker/0`. The
+    // original `original/0` plus the injected fn = 2 functions
+    // visible in the items list (the `@before_compile = :Hooks`
+    // attribute is parsed as an AttributeDecl but it's also
+    // present as a struct item).
+    var found_injected = false;
+    for (target_struct.?.items) |item| {
+        switch (item) {
+            .function => |f| {
+                const name = parser.interner.get(f.name);
+                if (std.mem.eql(u8, name, "injected_marker")) {
+                    found_injected = true;
+                    break;
+                }
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(found_injected);
+}
+
+test "@before_compile: hook reads caller's accumulated attributes" {
+    // The keystone use case: macros in the target module accumulate
+    // names into an attribute, then a `@before_compile` hook reads
+    // that list and generates a runner. This is the pattern used by
+    // ExUnit (test names) and Mathlib (`@[simp]` lemmas) and is
+    // what unblocks the Zest migration in Phase 9.
+    //
+    // Important ordering: `track` macros expand before the hook
+    // fires (the hook runs after each per-module fixed-point), and
+    // the AST replacement at the call site means each track expands
+    // exactly once. So the track macro must itself ensure the
+    // attribute is registered as accumulating *before* it puts.
+    const source =
+        \\pub struct Hooks {
+        \\  pub macro __before_compile__(_env :: Expr) -> Decl {
+        \\    quote {
+        \\      pub fn marker_after_read() -> i64 { 42 }
+        \\    }
+        \\  }
+        \\}
+        \\
+        \\pub struct Target {
+        \\  pub macro track(_name :: AtomLit) -> Nil {
+        \\    __zap_module_register_attr__(:tests)
+        \\    __zap_module_put_attr__(:tests, _name)
+        \\    quote { nil }
+        \\  }
+        \\
+        \\  pub fn _a() -> Nil { track(:t1) }
+        \\  pub fn _b() -> Nil { track(:t2) }
+        \\
+        \\  @before_compile = :Hooks
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    _ = try engine.expandProgram(&program);
+
+    // Verify the hook fired (its marker function was injected) and
+    // the caller's :tests attribute accumulated both atoms across
+    // the two `track` calls.
+    const target_entry = blk: {
+        for (collector.graph.structs.items) |*entry| {
+            if (entry.name.parts.len == 1) {
+                const part_name = parser.interner.get(entry.name.parts[0]);
+                if (std.mem.eql(u8, part_name, "Target")) break :blk entry;
+            }
+        }
+        return error.TargetMissing;
+    };
+    const tests_id = try parser.interner.intern("tests");
+    const accumulated = (try collector.graph.getModuleAttribute(target_entry, tests_id)) orelse return error.AttributeMissing;
+    try std.testing.expect(accumulated == .list);
+    try std.testing.expectEqual(@as(usize, 2), accumulated.list.len);
+}
+
+test "@before_compile: hook fires at most once per (module, hook)" {
+    // Re-running expandProgram on the same engine should not double-
+    // fire the hook. The `before_compile_fired` set tracks every
+    // (module_scope, hook_name) pair across iterations.
+    const source =
+        \\pub struct Hooks {
+        \\  pub macro __before_compile__(_env :: Expr) -> Decl {
+        \\    quote {
+        \\      pub fn injected() -> i64 { 7 }
+        \\    }
+        \\  }
+        \\}
+        \\
+        \\pub struct Target {
+        \\  pub fn original() -> i64 { 1 }
+        \\
+        \\  @before_compile = :Hooks
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    const expanded = try engine.expandProgram(&program);
+
+    // Count `injected` functions in the Target module — must be 1.
+    var injected_count: usize = 0;
+    for (expanded.structs) |mod| {
+        if (mod.name.parts.len != 1) continue;
+        const part_name = parser.interner.get(mod.name.parts[0]);
+        if (!std.mem.eql(u8, part_name, "Target")) continue;
+        for (mod.items) |item| {
+            if (item == .function) {
+                const name = parser.interner.get(item.function.name);
+                if (std.mem.eql(u8, name, "injected")) injected_count += 1;
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), injected_count);
 }
 
 test "module attribute intrinsics: register makes attribute accumulate" {
