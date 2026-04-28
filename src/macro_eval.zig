@@ -292,6 +292,53 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
                 }
             }
 
+            // __zap_list_concat__(left, right) — concatenate two lists.
+            // Non-list operands are treated as empty: a nil setup_body
+            // can be concatenated freely without an outer guard.
+            if (std.mem.eql(u8, form_name, "__zap_list_concat__")) {
+                if (arg_elems.len == 2) {
+                    const left = try eval(env, arg_elems[0]);
+                    const right = try eval(env, arg_elems[1]);
+                    const left_elems: []const CtValue = if (left == .list) left.list.elems else &.{};
+                    const right_elems: []const CtValue = if (right == .list) right.list.elems else &.{};
+                    const total = left_elems.len + right_elems.len;
+                    var combined = try env.alloc.alloc(CtValue, total);
+                    @memcpy(combined[0..left_elems.len], left_elems);
+                    @memcpy(combined[left_elems.len..], right_elems);
+                    const id = env.store.alloc(env.alloc, .list, null);
+                    return CtValue{ .list = .{ .alloc_id = id, .elems = combined } };
+                }
+            }
+
+            // __zap_list_flatten__(list_of_lists) — flatten one level.
+            // Non-list outer is empty; non-list inner elements are
+            // appended as singletons so a mixed list `[item, [a, b]]`
+            // flattens to `[item, a, b]`. Useful for for-comp bodies
+            // that yield variable-arity lists per iteration.
+            if (std.mem.eql(u8, form_name, "__zap_list_flatten__")) {
+                if (arg_elems.len == 1) {
+                    const outer = try eval(env, arg_elems[0]);
+                    if (outer != .list) return CtValue{ .list = .{ .alloc_id = env.store.alloc(env.alloc, .list, null), .elems = &.{} } };
+                    var total: usize = 0;
+                    for (outer.list.elems) |e| {
+                        total += if (e == .list) e.list.elems.len else 1;
+                    }
+                    var combined = try env.alloc.alloc(CtValue, total);
+                    var idx: usize = 0;
+                    for (outer.list.elems) |e| {
+                        if (e == .list) {
+                            @memcpy(combined[idx .. idx + e.list.elems.len], e.list.elems);
+                            idx += e.list.elems.len;
+                        } else {
+                            combined[idx] = e;
+                            idx += 1;
+                        }
+                    }
+                    const id = env.store.alloc(env.alloc, .list, null);
+                    return CtValue{ .list = .{ .alloc_id = id, .elems = combined } };
+                }
+            }
+
             // tuple(a, b, c) — construct a tuple
             if (std.mem.eql(u8, form_name, "tuple")) {
                 var elems = try env.alloc.alloc(CtValue, arg_elems.len);
@@ -854,12 +901,37 @@ fn isExprComptimeSafe(expr: *const ast.Expr) bool {
             return true;
         },
         .list_cons_expr => |c| isExprComptimeSafe(c.head) and isExprComptimeSafe(c.tail),
-        // Quote/unquote — handled by macro engine, not function
-        // dispatch. Treat as not-safe so dispatch refuses.
-        .quote_expr, .unquote_expr, .unquote_splicing_expr => false,
+        // Quote/unquote/splicing — the macro evaluator handles all
+        // three forms directly: quote returns its body as data, and
+        // unquote/unquote_splicing only fire inside quote. Treating
+        // them as comptime-safe lets user-defined macros that
+        // construct AST (`quote { ... }`) be invoked from another
+        // macro body via comptime dispatch — without this, helper
+        // macros like `__describe_wrap_test` survive as bare AST
+        // calls instead of being expanded inline.
+        .quote_expr, .unquote_expr, .unquote_splicing_expr => true,
         // For-comp inside a function body — defer to its own safety.
         .for_expr => |f| isExprComptimeSafe(f.iterable) and isExprComptimeSafe(f.body) and
             (f.filter == null or isExprComptimeSafe(f.filter.?)),
+        // Case expression — scrutinee must be safe; each clause's
+        // body must be safe. Patterns are syntactic and don't need
+        // a separate safety check (they don't evaluate arbitrary
+        // Zap expressions). Without this, helper macros that branch
+        // on AST shape via `case elem(stmt, 0) { ... }` are rejected
+        // by comptime dispatch and survive as unevaluated calls.
+        .case_expr => |ce| caseBlk: {
+            if (!isExprComptimeSafe(ce.scrutinee)) break :caseBlk false;
+            for (ce.clauses) |clause| {
+                for (clause.body) |s| {
+                    switch (s) {
+                        .expr => |e| if (!isExprComptimeSafe(e)) break :caseBlk false,
+                        .assignment => |a| if (!isExprComptimeSafe(a.value)) break :caseBlk false,
+                        else => break :caseBlk false,
+                    }
+                }
+            }
+            break :caseBlk true;
+        },
         // Anything else is unrecognized — refuse conservatively.
         else => false,
     };
@@ -915,16 +987,39 @@ fn dispatchComptimeCall(
     const scope_id = ctx.current_module_scope orelse ctx.graph.prelude_scope;
     const name_id = ctx.interner.intern(form_name) catch return null;
     const arity: u32 = @intCast(arg_forms.len);
-    const family_id = ctx.graph.resolveFamily(scope_id, name_id, arity) orelse return null;
-    const family = &ctx.graph.families.items[family_id];
-    if (family.clauses.items.len == 0) return null;
 
-    // Pick the first clause for now. Multi-clause dispatch with
-    // pattern matching at comptime is a future extension; the
-    // common case (string helpers, list helpers, formatters) uses
-    // a single clause anyway.
-    const clause_ref = family.clauses.items[0];
-    const clause = &clause_ref.decl.clauses[clause_ref.clause_index];
+    // Resolve to a function family OR a macro family. Macros and
+    // functions live in separate scope tables (`function_families`
+    // vs `macros`), but both use `FunctionClauseRef` for their
+    // clauses, so once we have the clause body the dispatch logic
+    // is identical: pre-evaluate args in the caller's env, bind to
+    // the callee's params, and evaluate the body in a child env.
+    //
+    // Without the macro fallback, a macro-body that calls another
+    // macro would land in this function, fail the function lookup,
+    // and return null — causing the call to survive as unevaluated
+    // AST. The outer macro returns that AST, the fixed-point loop
+    // re-discovers the inner call, but by then the outer's eval env
+    // is gone, so the inner macro's args bind to raw AST var-refs
+    // (`{:_stmt, [], nil}`) instead of the values those locals held.
+    const clause: *const ast.FunctionClause = blk: {
+        if (ctx.graph.resolveFamily(scope_id, name_id, arity)) |fid| {
+            const family = &ctx.graph.families.items[fid];
+            if (family.clauses.items.len == 0) return null;
+            const cref = family.clauses.items[0];
+            break :blk &cref.decl.clauses[cref.clause_index];
+        }
+        if (ctx.graph.resolveMacro(scope_id, name_id, arity)) |mid| {
+            const mfamily = &ctx.graph.macro_families.items[mid];
+            if (mfamily.clauses.items.len == 0) return null;
+            const cref = mfamily.clauses.items[0];
+            break :blk &cref.decl.clauses[cref.clause_index];
+        }
+        if (std.mem.startsWith(u8, form_name, "__describe_")) {
+            std.debug.print("[DISP-NOTFOUND] {s}/{d} scope={d}\n", .{ form_name, arity, scope_id });
+        }
+        return null;
+    };
     const body = clause.body orelse return null;
 
     // Purity check: refuse to dispatch a function whose body
@@ -935,7 +1030,12 @@ fn dispatchComptimeCall(
     // mangled output. The conservative refusal returns null, the
     // caller falls through to "leave the call as AST data" which
     // surfaces at runtime where the impure call belongs.
-    if (!isFunctionBodyComptimeSafe(body)) return null;
+    if (!isFunctionBodyComptimeSafe(body)) {
+        if (std.mem.startsWith(u8, form_name, "__describe_")) {
+            std.debug.print("[DISP-UNSAFE] {s}/{d}\n", .{ form_name, arity });
+        }
+        return null;
+    }
 
     // Pre-evaluate each argument so the callee sees fully-evaluated
     // values, not AST forms still containing nested calls.
@@ -1429,6 +1529,53 @@ test "eval: __zap_list_len__ counts list elements" {
     const r_empty = try eval(&env, call_empty);
     try std.testing.expect(r_empty == .int);
     try std.testing.expectEqual(@as(i64, 0), r_empty.int);
+}
+
+test "eval: __zap_list_concat__ joins two lists" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var store = AllocationStore{};
+    var env = Env.init(alloc, &store);
+    defer env.deinit();
+
+    const a = try ast_data.makeList(alloc, &store, &.{ .{ .int = 1 }, .{ .int = 2 } });
+    const b = try ast_data.makeList(alloc, &store, &.{ .{ .int = 3 }, .{ .int = 4 } });
+    const call = try ast_data.makeTuple3(alloc, &store, .{ .atom = "__zap_list_concat__" }, try ast_data.emptyList(alloc, &store), try ast_data.makeList(alloc, &store, &.{ a, b }));
+    const r = try eval(&env, call);
+    try std.testing.expect(r == .list);
+    try std.testing.expectEqual(@as(usize, 4), r.list.elems.len);
+    try std.testing.expectEqual(@as(i64, 1), r.list.elems[0].int);
+    try std.testing.expectEqual(@as(i64, 4), r.list.elems[3].int);
+
+    // Concat with nil — treats nil as empty so callers can concat
+    // an optional list without an outer guard.
+    const call_with_nil = try ast_data.makeTuple3(alloc, &store, .{ .atom = "__zap_list_concat__" }, try ast_data.emptyList(alloc, &store), try ast_data.makeList(alloc, &store, &.{ a, .nil }));
+    const r2 = try eval(&env, call_with_nil);
+    try std.testing.expect(r2 == .list);
+    try std.testing.expectEqual(@as(usize, 2), r2.list.elems.len);
+}
+
+test "eval: __zap_list_flatten__ unnests one level" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var store = AllocationStore{};
+    var env = Env.init(alloc, &store);
+    defer env.deinit();
+
+    const inner_a = try ast_data.makeList(alloc, &store, &.{ .{ .int = 1 }, .{ .int = 2 } });
+    const inner_b = try ast_data.makeList(alloc, &store, &.{.{ .int = 3 }});
+    const empty = try ast_data.emptyList(alloc, &store);
+    const outer = try ast_data.makeList(alloc, &store, &.{ inner_a, empty, inner_b });
+
+    const call = try ast_data.makeTuple3(alloc, &store, .{ .atom = "__zap_list_flatten__" }, try ast_data.emptyList(alloc, &store), try ast_data.makeList(alloc, &store, &.{outer}));
+    const r = try eval(&env, call);
+    try std.testing.expect(r == .list);
+    try std.testing.expectEqual(@as(usize, 3), r.list.elems.len);
+    try std.testing.expectEqual(@as(i64, 1), r.list.elems[0].int);
+    try std.testing.expectEqual(@as(i64, 2), r.list.elems[1].int);
+    try std.testing.expectEqual(@as(i64, 3), r.list.elems[2].int);
 }
 
 test "eval: __zap_list_empty__ distinguishes empty from non-empty" {
