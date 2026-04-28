@@ -105,6 +105,14 @@ extern "c" fn zir_builder_emit_ret_null(handle: ?*ZirBuilderHandle) i32;
 
 // Struct type declarations
 extern "c" fn zir_builder_add_struct_type(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32, field_names_ptrs: [*]const [*]const u8, field_names_lens: [*]const u32, field_type_refs: [*]const u32, field_default_refs: ?[*]const u32, fields_len: u32) i32;
+
+// Set fields directly on the file's root struct_decl. Per emission, the root
+// struct_decl is fixed at instruction 0 (`main_struct_inst`) and represents
+// "this Zig file IS a struct". Calling this with the file's owning Zap
+// struct's fields makes `@import("...")` from another emission yield that
+// struct directly — same `InternPool.Index`, single canonical nominal
+// identity. count == 0 clears any prior config (no-op fallback).
+extern "c" fn zir_builder_set_root_fields(handle: ?*ZirBuilderHandle, name_ptrs: [*]const [*]const u8, name_lens: [*]const u32, type_refs: [*]const u32, count: u32) i32;
 extern "c" fn zir_builder_set_decl_val_return_type(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32) i32;
 extern "c" fn zir_builder_emit_param_decl_val_type(handle: ?*ZirBuilderHandle, param_name_ptr: [*]const u8, param_name_len: u32, type_name_ptr: [*]const u8, type_name_len: u32) u32;
 
@@ -611,31 +619,7 @@ pub const ZirDriver = struct {
                 return ref;
             },
             .tuple => self.mapTupleElementType(zig_type),
-            .struct_ref => |name| {
-                const short_name = if (std.mem.lastIndexOf(u8, name, ".")) |dot_idx|
-                    name[dot_idx + 1 ..]
-                else
-                    name;
-
-                // If the struct type is declared in the current module (top-level
-                // structs are emitted into every module by emitStructTypeDecls),
-                // use decl_val to reference it directly. This produces the same
-                // type identity as struct_init_typed(decl_val(...)), avoiding
-                // type mismatches between return types and constructed values.
-                if (self.structIsInCurrentModule(name)) {
-                    const ref = zir_builder_emit_decl_val(self.handle, short_name.ptr, @intCast(short_name.len));
-                    if (ref != error_ref) return ref;
-                }
-
-                // Cross-module struct: import from the struct's defining module.
-                var module_name_buf: [256]u8 = undefined;
-                const module_name = structToModuleName(name, &module_name_buf);
-                const import_ref = zir_builder_emit_import(self.handle, module_name.ptr, @intCast(module_name.len));
-                if (import_ref == error_ref) return error.EmitFailed;
-                const ref = zir_builder_emit_field_val(self.handle, import_ref, short_name.ptr, @intCast(short_name.len));
-                if (ref == error_ref) return error.EmitFailed;
-                return ref;
-            },
+            .struct_ref => |name| return try self.emitStructTypeRef(name),
             // void/nil/never should not appear as tuple elements
             .void, .nil, .never => return error.EmitFailed,
             // Types that don't have runtime representations as tuple elements yet
@@ -748,73 +732,150 @@ pub const ZirDriver = struct {
         // Track emitted struct names to avoid duplicates
         var emitted = std.StringHashMap(void).init(self.allocator);
         defer emitted.deinit();
+
+        // The primary struct of this emission — the Zap struct whose
+        // source produced this Zig file. Its fields go on the file's
+        // root struct_decl via `zir_builder_set_root_fields`, so
+        // `@import("X")` from another emission yields THIS canonical
+        // type with single nominal identity. Other Zap structs that
+        // happen to be in `prog.type_defs` (peer top-level structs,
+        // structs defined in other emissions) are NOT duplicated here
+        // — consumers reach them via `@import("...")` which resolves
+        // to their own canonical emission's root type.
+        var primary_def: ?ir.TypeDef = null;
+
         for (prog.type_defs) |type_def| {
-            // Only emit struct types that belong to the current module.
-            // Type names use dot notation (e.g., "Zap.Env"), module names
-            // use underscore notation (e.g., "Zap"). Match by converting
-            // the type name prefix to underscore format.
-            const belongs_to_module = blk: {
-                if (std.mem.lastIndexOf(u8, type_def.name, ".")) |dot_idx| {
-                    const prefix = type_def.name[0..dot_idx];
-                    // Convert dot-separated prefix to underscore for comparison
-                    var buf: [256]u8 = undefined;
-                    if (prefix.len > buf.len) break :blk false;
-                    @memcpy(buf[0..prefix.len], prefix);
-                    for (buf[0..prefix.len]) |*ch| {
-                        if (ch.* == '.') ch.* = '_';
-                    }
-                    break :blk std.mem.eql(u8, buf[0..prefix.len], current_module);
-                }
-                // Top-level structs have no module prefix — emit into
-                // every module that has functions. The duplicate-name
-                // issue is handled by the ZIR builder's deduplication.
-                break :blk true;
-            };
-            if (!belongs_to_module) continue;
-
-            switch (type_def.kind) {
-                .struct_def => |def| {
-                    // Use just the struct name (after the module prefix)
-                    const short_name = if (std.mem.lastIndexOf(u8, type_def.name, ".")) |dot_idx|
-                        type_def.name[dot_idx + 1 ..]
-                    else
-                        type_def.name;
-                    // Skip if already emitted (dedup across multiple type_defs)
-                    if (emitted.contains(short_name)) continue;
-                    emitted.put(short_name, {}) catch continue;
-                    var field_name_ptrs: std.ArrayListUnmanaged([*]const u8) = .empty;
-                    defer field_name_ptrs.deinit(self.allocator);
-                    var field_name_lens: std.ArrayListUnmanaged(u32) = .empty;
-                    defer field_name_lens.deinit(self.allocator);
-                    var field_type_refs: std.ArrayListUnmanaged(u32) = .empty;
-                    defer field_type_refs.deinit(self.allocator);
-
-
-                    for (def.fields) |field| {
-                        try field_name_ptrs.append(self.allocator, field.name.ptr);
-                        try field_name_lens.append(self.allocator, @intCast(field.name.len));
-                        const type_ref = self.mapTypeNameToRef(field.type_expr);
-                        try field_type_refs.append(self.allocator, type_ref);
-
-                    }
-
-                    // Don't emit defaults in struct_decl — the Zap compiler
-                    // fills in missing fields at struct_init time instead.
-                    if (zir_builder_add_struct_type(
-                        self.handle,
-                        short_name.ptr,
-                        @intCast(short_name.len),
-                        field_name_ptrs.items.ptr,
-                        field_name_lens.items.ptr,
-                        field_type_refs.items.ptr,
-                        null,
-                        @intCast(def.fields.len),
-                    ) != 0) {
-                        return error.EmitFailed;
-                    }
+            var buf: [256]u8 = undefined;
+            const cls = classifyTypeDef(type_def.name, current_module, &buf);
+            switch (cls) {
+                .primary => {
+                    if (primary_def != null) continue; // two claims; first wins
+                    primary_def = type_def;
                 },
-                else => {},
+                .nested => {
+                    // Struct/enum/union nested inside the primary —
+                    // keep emitting as a `pub const X = struct {...}`
+                    // decl inside this file's struct_decl.
+                    try self.emitNestedTypeDecl(type_def, &emitted);
+                },
+                .foreign => continue, // reached via @import elsewhere
             }
+        }
+
+        // Emit the primary struct's fields at the file's root
+        // struct_decl (instruction 0 / `main_struct_inst`). When the
+        // primary has no `struct_def` entry — e.g. a top-level Zap
+        // struct that holds only functions — we emit nothing here and
+        // the file's root remains a fields-less struct, which is
+        // exactly what we want.
+        if (primary_def) |td| switch (td.kind) {
+            .struct_def => |def| try self.emitRootFields(def),
+            else => {},
+        };
+    }
+
+    /// Whether a type_def belongs to the current emission, and how:
+    /// - `primary`  — the Zap struct that owns this emission (file IS this struct)
+    /// - `nested`   — a struct/enum/union declared *inside* the primary
+    /// - `foreign`  — owned by another emission; reached via `@import`
+    const TypeDefClass = enum { primary, nested, foreign };
+
+    /// Convert a type_def name to its emission-namespace form (dots →
+    /// underscores) and classify against the current emission. Writes
+    /// into `scratch` to avoid a heap allocation on the hot path.
+    fn classifyTypeDef(name: []const u8, current_module: []const u8, scratch: []u8) TypeDefClass {
+        if (name.len > scratch.len) return .foreign;
+        @memcpy(scratch[0..name.len], name);
+        for (scratch[0..name.len]) |*ch| {
+            if (ch.* == '.') ch.* = '_';
+        }
+        const underscore = scratch[0..name.len];
+        if (std.mem.eql(u8, underscore, current_module)) return .primary;
+        if (underscore.len > current_module.len + 1 and
+            std.mem.startsWith(u8, underscore, current_module) and
+            underscore[current_module.len] == '_')
+        {
+            return .nested;
+        }
+        return .foreign;
+    }
+
+    /// Emit one nested type-decl inside the primary struct. Mirrors
+    /// the original loop body — preserved verbatim for nested decls
+    /// only; the primary struct path goes through `emitRootFields`
+    /// instead.
+    fn emitNestedTypeDecl(self: *ZirDriver, type_def: ir.TypeDef, emitted: *std.StringHashMap(void)) !void {
+        switch (type_def.kind) {
+            .struct_def => |def| {
+                const short_name = if (std.mem.lastIndexOf(u8, type_def.name, ".")) |dot_idx|
+                    type_def.name[dot_idx + 1 ..]
+                else
+                    type_def.name;
+                if (emitted.contains(short_name)) return;
+                emitted.put(short_name, {}) catch return;
+
+                var field_name_ptrs: std.ArrayListUnmanaged([*]const u8) = .empty;
+                defer field_name_ptrs.deinit(self.allocator);
+                var field_name_lens: std.ArrayListUnmanaged(u32) = .empty;
+                defer field_name_lens.deinit(self.allocator);
+                var field_type_refs: std.ArrayListUnmanaged(u32) = .empty;
+                defer field_type_refs.deinit(self.allocator);
+
+                for (def.fields) |field| {
+                    try field_name_ptrs.append(self.allocator, field.name.ptr);
+                    try field_name_lens.append(self.allocator, @intCast(field.name.len));
+                    const type_ref = self.mapTypeNameToRef(field.type_expr);
+                    try field_type_refs.append(self.allocator, type_ref);
+                }
+
+                if (zir_builder_add_struct_type(
+                    self.handle,
+                    short_name.ptr,
+                    @intCast(short_name.len),
+                    field_name_ptrs.items.ptr,
+                    field_name_lens.items.ptr,
+                    field_type_refs.items.ptr,
+                    null,
+                    @intCast(def.fields.len),
+                ) != 0) {
+                    return error.EmitFailed;
+                }
+            },
+            else => {},
+        }
+    }
+
+    /// Emit the primary struct's fields onto the file's root
+    /// `struct_decl` via `zir_builder_set_root_fields`. The Zig fork
+    /// hard-pins this struct_decl at instruction 0, so every
+    /// `@import("...")` of this emission's file yields the same
+    /// `InternPool.Index` — a single canonical nominal identity for
+    /// the Zap struct, regardless of how many other emissions
+    /// reference it.
+    fn emitRootFields(self: *ZirDriver, def: ir.StructDef) !void {
+        if (def.fields.len == 0) return;
+
+        var name_ptrs: std.ArrayListUnmanaged([*]const u8) = .empty;
+        defer name_ptrs.deinit(self.allocator);
+        var name_lens: std.ArrayListUnmanaged(u32) = .empty;
+        defer name_lens.deinit(self.allocator);
+        var type_refs: std.ArrayListUnmanaged(u32) = .empty;
+        defer type_refs.deinit(self.allocator);
+
+        for (def.fields) |field| {
+            try name_ptrs.append(self.allocator, field.name.ptr);
+            try name_lens.append(self.allocator, @intCast(field.name.len));
+            try type_refs.append(self.allocator, self.mapTypeNameToRef(field.type_expr));
+        }
+
+        if (zir_builder_set_root_fields(
+            self.handle,
+            name_ptrs.items.ptr,
+            name_lens.items.ptr,
+            type_refs.items.ptr,
+            @intCast(def.fields.len),
+        ) != 0) {
+            return error.EmitFailed;
         }
     }
 
@@ -870,19 +931,84 @@ pub const ZirDriver = struct {
         return buf[0..prefix.len];
     }
 
-    /// Check if a struct type name is declared in the current ZIR module.
-    /// Top-level structs (no dot in name) are emitted into every module.
-    /// Dotted structs (e.g., "Zap.Env") are only emitted into their prefix module.
+    /// Check if a struct type name is declared in the current ZIR
+    /// emission. With the file-IS-the-struct architecture, this is
+    /// true iff the struct is the primary struct of the current
+    /// emission (its fields are at the file's root struct_decl) or
+    /// is nested *inside* the primary struct. Foreign structs — peer
+    /// top-level structs from other Zap source units, structs nested
+    /// inside other emissions — are NOT in this emission's
+    /// namespace; consumers reach them via `@import("...")`.
     fn structIsInCurrentModule(self: *const ZirDriver, type_name: []const u8) bool {
         if (self.findStructDef(type_name) == null) return false;
         const current_module = self.current_emit_module orelse return false;
-        if (std.mem.lastIndexOf(u8, type_name, ".")) |dot_idx| {
-            var buf: [256]u8 = undefined;
-            const module_name = dottedPrefixToModuleName(type_name[0..dot_idx], &buf) orelse return false;
-            return std.mem.eql(u8, module_name, current_module);
+        var buf: [256]u8 = undefined;
+        return classifyTypeDef(type_name, current_module, &buf) != .foreign;
+    }
+
+    /// Emit a ZIR ref to a struct type by name. Dispatches on whether
+    /// the struct is the primary of the current emission, nested
+    /// inside the primary, foreign top-level (own emission's root),
+    /// or foreign nested-in-other-emission. Each case maps to a
+    /// specific ZIR sequence:
+    ///
+    /// - **Primary** (the file IS this struct): `@import(current_emit_module)`
+    ///   — Zig's `@import` returns the canonical root struct type for
+    ///   any file, so importing one's own emission yields the same
+    ///   `InternPool.Index` as foreign imports.
+    /// - **Nested in primary**: `decl_val(short_name)` — the struct
+    ///   is emitted as a nested `pub const` decl by
+    ///   `emitNestedTypeDecl`.
+    /// - **Foreign top-level** (no dot): `@import(name)` — the
+    ///   foreign emission's file IS that struct, so its import is
+    ///   directly the type.
+    /// - **Foreign nested**: `@import(prefix_module).short_name` —
+    ///   the foreign emission's file is the prefix struct, and the
+    ///   nested decl is reached as a field on it.
+    fn emitStructTypeRef(self: *const ZirDriver, name: []const u8) BuildError!u32 {
+        const short_name = if (std.mem.lastIndexOf(u8, name, ".")) |dot_idx|
+            name[dot_idx + 1 ..]
+        else
+            name;
+
+        const current_module = self.current_emit_module orelse {
+            // No current emission context (e.g. top-level program
+            // header) — fall back to import-by-name. Same behavior
+            // as a foreign top-level reference.
+            const ref = zir_builder_emit_import(self.handle, name.ptr, @intCast(name.len));
+            if (ref == error_ref) return error.EmitFailed;
+            return ref;
+        };
+
+        var buf: [256]u8 = undefined;
+        switch (classifyTypeDef(name, current_module, &buf)) {
+            .primary => {
+                const ref = zir_builder_emit_import(self.handle, current_module.ptr, @intCast(current_module.len));
+                if (ref == error_ref) return error.EmitFailed;
+                return ref;
+            },
+            .nested => {
+                const ref = zir_builder_emit_decl_val(self.handle, short_name.ptr, @intCast(short_name.len));
+                if (ref == error_ref) return error.EmitFailed;
+                return ref;
+            },
+            .foreign => {
+                if (std.mem.lastIndexOf(u8, name, ".")) |_| {
+                    // Foreign nested: `@import(prefix).short_name`
+                    var module_name_buf: [256]u8 = undefined;
+                    const module_name = structToModuleName(name, &module_name_buf);
+                    const import_ref = zir_builder_emit_import(self.handle, module_name.ptr, @intCast(module_name.len));
+                    if (import_ref == error_ref) return error.EmitFailed;
+                    const ref = zir_builder_emit_field_val(self.handle, import_ref, short_name.ptr, @intCast(short_name.len));
+                    if (ref == error_ref) return error.EmitFailed;
+                    return ref;
+                }
+                // Foreign top-level: `@import(name)` IS the struct
+                const ref = zir_builder_emit_import(self.handle, name.ptr, @intCast(name.len));
+                if (ref == error_ref) return error.EmitFailed;
+                return ref;
+            },
         }
-        // Top-level struct — emitted into every module
-        return true;
     }
 
     /// Convert a struct_ref name to the ZIR module name that defines it,
@@ -1241,6 +1367,48 @@ pub const ZirDriver = struct {
                 self.current_emit_module = null;
             }
 
+            // ── Step 3.5: Emit fields-only top-level structs ─────────
+            // The file-IS-the-struct architecture requires every
+            // Zap struct that consumers reference via `@import("X")`
+            // to have a registered ZIR file. Step 3 covers structs
+            // with at least one function (`module_funcs.contains`),
+            // but top-level data structs (e.g. `pub struct Point {
+            // x, y }` with no methods) have empty function lists and
+            // are skipped there. Emit a fields-only ZIR file for
+            // each such struct so its `@import` resolves to a
+            // canonical type with this emission's `InternPool.Index`.
+            for (self.program.?.type_defs) |type_def| {
+                if (type_def.kind != .struct_def) continue;
+                const def = type_def.kind.struct_def;
+                if (def.fields.len == 0) continue;
+                // Skip nested types (dotted names) — they're emitted
+                // inside their parent's ZIR by `emitNestedTypeDecl`.
+                if (std.mem.indexOf(u8, type_def.name, ".") != null) continue;
+                // Skip any struct already covered by Step 3.
+                if (module_funcs.contains(type_def.name)) continue;
+
+                const struct_name_z = try self.allocator.dupeZ(u8, type_def.name);
+                defer self.allocator.free(struct_name_z);
+                const stub = "comptime {}\n";
+                if (zir_compilation_add_struct_source(c, struct_name_z, stub.ptr, @intCast(stub.len)) != 0) {
+                    return error.ZirInjectionFailed;
+                }
+
+                const struct_handle = zir_builder_create() orelse return error.ZirCreateFailed;
+                const saved_handle = self.handle;
+                self.current_emit_module = type_def.name;
+                self.handle = struct_handle;
+
+                try self.emitStructTypeDecls();
+
+                if (zir_builder_inject_struct(struct_handle, c, struct_name_z) != 0) {
+                    return error.ZirInjectionFailed;
+                }
+
+                self.handle = saved_handle;
+                self.current_emit_module = null;
+            }
+
             // ── Step 4: Generate namespace re-export modules ─────────
             // Skip parents that are also leaf modules (they already have ZIR injected).
             var ns_iter = namespace_children.iterator();
@@ -1425,14 +1593,9 @@ pub const ZirDriver = struct {
                 if (self.findEnumDef(name) or self.findEnumDef(short_name)) {
                     return @intFromEnum(Zir.Inst.Ref.u32_type);
                 }
-                // Structs: reference via decl_val
                 if (self.findStructDef(name) != null or self.findStructDef(short_name) != null) {
-                    const ref = zir_builder_emit_decl_val(
-                        self.handle,
-                        short_name.ptr,
-                        @intCast(short_name.len),
-                    );
-                    if (ref != error_ref) return ref;
+                    const ref = self.emitStructTypeRef(name) catch return null;
+                    return ref;
                 }
                 return null;
             },
@@ -1608,22 +1771,22 @@ pub const ZirDriver = struct {
     }
 
     fn emitTypedParam(self: *ZirDriver, param: ir.Param) !u32 {
-        // Struct params: use the nominal struct type via decl_val
+        // Struct params: build the nominal type-ref via the
+        // file-IS-the-struct dispatcher so cross-emission types
+        // come from `@import(...)` and same-emission types come
+        // from the right local source (file root or nested decl).
         if (std.meta.activeTag(param.type_expr) == .struct_ref) {
             const name = param.type_expr.struct_ref;
-            const short_name = if (std.mem.lastIndexOf(u8, name, ".")) |dot_idx|
-                name[dot_idx + 1 ..]
-            else
-                name;
-            if (self.findStructDef(name) != null or self.findStructDef(short_name) != null) {
-                const ref = zir_builder_emit_param_decl_val_type(
-                    self.handle,
-                    param.name.ptr,
-                    @intCast(param.name.len),
-                    short_name.ptr,
-                    @intCast(short_name.len),
-                );
-                if (ref != error_ref) return ref;
+            if (self.findStructDef(name) != null) {
+                if (self.emitStructTypeRef(name) catch null) |type_ref| {
+                    const ref = zir_builder_emit_param(
+                        self.handle,
+                        param.name.ptr,
+                        @intCast(param.name.len),
+                        type_ref,
+                    );
+                    if (ref != error_ref) return ref;
+                }
             }
         }
         // Map and list params use anytype — generic container types like
@@ -3009,7 +3172,7 @@ pub const ZirDriver = struct {
                         const type_name = after_prefix[0..dot_idx];
                         const method_name = after_prefix[dot_idx + 1 ..];
                         const type_ref = encodedNameToTypeRef(type_name) orelse
-                            zir_builder_emit_decl_val(self.handle, type_name.ptr, @intCast(type_name.len));
+                            (self.emitStructTypeRef(type_name) catch error_ref);
                         if (type_ref != error_ref) {
                             const type_args = [_]u32{type_ref};
                             const list_type = self.emitGenericContainerRef("List", &type_args) catch break :blk false;
@@ -3043,7 +3206,7 @@ pub const ZirDriver = struct {
                                 @intFromEnum(Zir.Inst.Ref.u32_type);
                             // Resolve value type — primitive or struct
                             const val_ref = encodedNameToTypeRef(value_struct_name) orelse
-                                zir_builder_emit_decl_val(self.handle, value_struct_name.ptr, @intCast(value_struct_name.len));
+                                (self.emitStructTypeRef(value_struct_name) catch error_ref);
                             if (val_ref != error_ref) {
                                 const type_args = [_]u32{ key_ref, val_ref };
                                 const map_type = self.emitGenericContainerRef("Map", &type_args) catch break :blk2 false;
@@ -3609,14 +3772,9 @@ pub const ZirDriver = struct {
                     // Use struct_init_typed for named structs to preserve type identity
                     const seed_ref = blk: {
                         if (!self.current_function_is_closure and self.capture_depth == 0) {
-                            const short_name = if (std.mem.lastIndexOf(u8, si.type_name, ".")) |dot_idx|
-                                si.type_name[dot_idx + 1 ..]
-                            else
-                                si.type_name;
-                            if (self.findStructDef(si.type_name) != null or self.findStructDef(short_name) != null) {
-                                const decl_ref = zir_builder_emit_decl_val(self.handle, short_name.ptr, @intCast(short_name.len));
-                                if (decl_ref != error_ref) {
-                                    const typed = zir_builder_emit_struct_init_typed(self.handle, decl_ref, names_ptrs.items.ptr, names_lens.items.ptr, values.items.ptr, @intCast(values.items.len));
+                            if (self.findStructDef(si.type_name) != null) {
+                                if (self.emitStructTypeRef(si.type_name) catch null) |type_ref| {
+                                    const typed = zir_builder_emit_struct_init_typed(self.handle, type_ref, names_ptrs.items.ptr, names_lens.items.ptr, values.items.ptr, @intCast(values.items.len));
                                     if (typed != error_ref) break :blk typed;
                                 }
                             }
@@ -3654,14 +3812,9 @@ pub const ZirDriver = struct {
                     // Use struct_init_typed for named structs to preserve type identity
                     const seed_ref = blk: {
                         if (!self.current_function_is_closure and self.capture_depth == 0) {
-                            const short_name = if (std.mem.lastIndexOf(u8, si.type_name, ".")) |dot_idx|
-                                si.type_name[dot_idx + 1 ..]
-                            else
-                                si.type_name;
-                            if (self.findStructDef(si.type_name) != null or self.findStructDef(short_name) != null) {
-                                const decl_ref = zir_builder_emit_decl_val(self.handle, short_name.ptr, @intCast(short_name.len));
-                                if (decl_ref != error_ref) {
-                                    const typed = zir_builder_emit_struct_init_typed(self.handle, decl_ref, names_ptrs.items.ptr, names_lens.items.ptr, values.items.ptr, @intCast(values.items.len));
+                            if (self.findStructDef(si.type_name) != null) {
+                                if (self.emitStructTypeRef(si.type_name) catch null) |type_ref| {
+                                    const typed = zir_builder_emit_struct_init_typed(self.handle, type_ref, names_ptrs.items.ptr, names_lens.items.ptr, values.items.ptr, @intCast(values.items.len));
                                     if (typed != error_ref) break :blk typed;
                                 }
                             }
@@ -3684,13 +3837,8 @@ pub const ZirDriver = struct {
                     // in non-closure functions. Closures can't resolve module-
                     // level decl_val refs, so fall back to struct_init_anon.
                     if (!self.current_function_is_closure and self.capture_depth == 0) {
-                        const short_name = if (std.mem.lastIndexOf(u8, si.type_name, ".")) |dot_idx|
-                            si.type_name[dot_idx + 1 ..]
-                        else
-                            si.type_name;
-                        if (self.findStructDef(si.type_name) != null or self.findStructDef(short_name) != null) {
-                            const type_ref = zir_builder_emit_decl_val(self.handle, short_name.ptr, @intCast(short_name.len));
-                            if (type_ref != error_ref) {
+                        if (self.findStructDef(si.type_name) != null) {
+                            if (self.emitStructTypeRef(si.type_name) catch null) |type_ref| {
                                 const typed_result = zir_builder_emit_struct_init_typed(
                                     self.handle,
                                     type_ref,
