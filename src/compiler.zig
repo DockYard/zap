@@ -1880,6 +1880,12 @@ fn remapUnionDecl(alloc: std.mem.Allocator, ud: *ast.UnionDecl, remap: []const a
 
 fn remapFunctionDecl(alloc: std.mem.Allocator, fd: *ast.FunctionDecl, remap: []const ast.StringId) error{OutOfMemory}!void {
     fd.name = remap[fd.name];
+    if (fd.name_expr) |ne| {
+        const mutable_ne = try alloc.create(ast.Expr);
+        mutable_ne.* = ne.*;
+        try remapExpr(alloc, mutable_ne, remap);
+        fd.name_expr = mutable_ne;
+    }
     if (fd.clauses.len > 0) {
         const mutable_clauses = try alloc.alloc(ast.FunctionClause, fd.clauses.len);
         for (fd.clauses, 0..) |clause, i| {

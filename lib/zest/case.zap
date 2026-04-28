@@ -66,9 +66,7 @@ pub struct Zest.Case {
     """
 
   pub macro describe(_name :: Expr, body :: Expr) -> Expr {
-    _setup_body = find_setup(body)
-    _teardown_body = find_teardown(body)
-    build_test_fns(_name, body, _setup_body, _teardown_body)
+    body
   }
 
   @doc = """
