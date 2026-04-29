@@ -823,6 +823,12 @@ pub const ZigType = union(enum) {
     string, // []const u8
     atom, // enum literal or interned string
     nil, // void or optional
+    /// `runtime.Term` — heterogeneous value wrapper. Used as the
+    /// element type of collections whose components have disagreeing
+    /// static types (e.g. `%{name: "Alice", age: 30}`). Construction
+    /// sites wrap via `Term.from(value)` and consumption sites unwrap
+    /// via `Term.to(T, term, default)`.
+    term,
     tuple: []const ZigType,
     list: *const ZigType,
     map: MapType,
@@ -869,6 +875,15 @@ pub const IrBuilder = struct {
     /// scope graph, so call sites must guard for null.
     scope_graph: ?*const scope_mod.ScopeGraph = null,
     known_local_types: std.AutoHashMap(LocalId, ZigType),
+    /// Locals whose value originated from a `param_get` instruction.
+    /// Used by the call-builtin encoder to detect bridge calls inside
+    /// generic Zap functions — those have `param: anytype` in the
+    /// emitted Zig, so any post-monomorph nominal type (e.g.
+    /// `Map(atom, string)`) cannot be safely burned into the call name
+    /// because the runtime value may carry a different generic
+    /// instantiation (e.g. `Map(atom, term)`). Locals in this set
+    /// route through the runtime's type-derived helpers instead.
+    param_backed_locals: std.AutoHashMap(LocalId, void),
     current_module_prefix: ?[]const u8,
     known_function_names: std.StringHashMap(void),
     synthesized_type_defs: std.ArrayList(TypeDef),
@@ -903,6 +918,7 @@ pub const IrBuilder = struct {
             .interner = interner,
             .type_store = null,
             .known_local_types = std.AutoHashMap(LocalId, ZigType).init(allocator),
+            .param_backed_locals = std.AutoHashMap(LocalId, void).init(allocator),
             .current_module_prefix = null,
             .known_function_names = std.StringHashMap(void).init(allocator),
             .synthesized_type_defs = .empty,
@@ -916,9 +932,14 @@ pub const IrBuilder = struct {
         self.current_blocks.deinit(self.allocator);
         self.current_instrs.deinit(self.allocator);
         self.known_local_types.deinit();
+        self.param_backed_locals.deinit();
         self.synthesized_type_defs.deinit(self.allocator);
         self.union_dispatch_map.deinit();
         self.known_function_names.deinit();
+    }
+
+    fn localBackedByParam(self: *const IrBuilder, local: LocalId) bool {
+        return self.param_backed_locals.contains(local);
     }
 
     /// Extract the list element ZigType from an HIR expression's type_id.
@@ -1131,6 +1152,7 @@ pub const IrBuilder = struct {
         self.next_local = 0;
         self.current_instrs = .empty;
         self.known_local_types.clearRetainingCapacity();
+        self.param_backed_locals.clearRetainingCapacity();
         self.current_param_types = .empty;
 
         // Use first clause for arity and return type
@@ -1346,6 +1368,7 @@ pub const IrBuilder = struct {
                 if (param_type != .any) {
                     try self.known_local_types.put(param_local, param_type);
                 }
+                try self.param_backed_locals.put(param_local, {});
                 try scrutinee_map.put(@intCast(i), param_local);
             }
 
@@ -1467,6 +1490,7 @@ pub const IrBuilder = struct {
             self.next_local = 0;
             self.current_instrs = .empty;
             self.known_local_types.clearRetainingCapacity();
+        self.param_backed_locals.clearRetainingCapacity();
 
             // Reserve binding locals (same as normal function)
             self.next_local = computeMaxBindingLocalForClauses(group.clauses);
@@ -1517,6 +1541,7 @@ pub const IrBuilder = struct {
                 if (param_type != .any) {
                     try self.known_local_types.put(param_local, param_type);
                 }
+                try self.param_backed_locals.put(param_local, {});
                 try try_scrutinee_map.put(@intCast(i), param_local);
             }
 
@@ -3850,6 +3875,9 @@ pub const IrBuilder = struct {
                 if (self.known_local_types.get(idx)) |src_type| {
                     try self.known_local_types.put(dest, src_type);
                 }
+                if (self.param_backed_locals.contains(idx)) {
+                    try self.param_backed_locals.put(dest, {});
+                }
             },
             .param_get => |idx| {
                 try self.current_instrs.append(self.allocator, .{
@@ -3867,6 +3895,10 @@ pub const IrBuilder = struct {
                 if (param_zig_type != .any) {
                     try self.known_local_types.put(dest, param_zig_type);
                 }
+                // Mark this local as param-backed so call-name encoding
+                // can detect bridge calls that thread function parameters
+                // straight into a `:zig.<Container>.<method>` site.
+                try self.param_backed_locals.put(dest, {});
             },
             .binary => |bin| {
                 const lhs = try self.lowerExpr(bin.lhs);
@@ -4096,6 +4128,33 @@ pub const IrBuilder = struct {
                                 const key_zig = first_arg_type.map.key.*;
                                 const val_zig = first_arg_type.map.value.*;
                                 const method = name["Map.".len..];
+                                // Generic-typed maps (typevars resolve to .any) cannot
+                                // be encoded to a concrete `Map:K:V.method` name.
+                                if (std.meta.activeTag(key_zig) == .any or std.meta.activeTag(val_zig) == .any) {
+                                    break :blk name;
+                                }
+                                // Bridge calls inside generic functions (where `map`
+                                // is a function parameter declared as `%{K=>V}`) are
+                                // emitted with `param: anytype` in the Zap-generated
+                                // Zig — which means the actual runtime `Map(K, V)`
+                                // type at instantiation may differ from the param's
+                                // post-monomorph nominal type (the canonical case is
+                                // `Map(atom, term)` flowing into a `Map(atom, string)`
+                                // monomorph). Detect this by checking whether the
+                                // first arg's local was loaded via a `param_get`; if
+                                // so, route through the runtime type-derived helpers
+                                // (`mapGet`, ...) instead of burning the wrong
+                                // concrete type into the call name.
+                                if (self.localBackedByParam(lowered_args[0])) {
+                                    break :blk name;
+                                }
+                                // Map(_, Term) in concrete callers (e.g. user code
+                                // `Map.X(m, ...)` where m is a local with concrete
+                                // `Map(atom, term)` storage) should also route
+                                // through the helpers so wrap/unwrap happen.
+                                if (std.meta.activeTag(val_zig) == .term or std.meta.activeTag(key_zig) == .term) {
+                                    break :blk name;
+                                }
                                 // For struct/enum value types, encode for generic MapOf dispatch
                                 if (std.meta.activeTag(val_zig) == .struct_ref) {
                                     const is_val_enum = if (self.type_store) |ts| val_enum: {
@@ -4131,6 +4190,23 @@ pub const IrBuilder = struct {
                             if (std.meta.activeTag(first_arg_type) == .list) {
                                 const elem_zig = first_arg_type.list.*;
                                 const method = map_resolved["List.".len..];
+                                // Generic-typed lists (element resolves to .any) defer
+                                // encoding so the ZIR backend routes the call through
+                                // the type-derived `listGetHead`/... helpers.
+                                if (std.meta.activeTag(elem_zig) == .any) {
+                                    break :blk map_resolved;
+                                }
+                                // Same anytype-param caveat as Map: bridge calls
+                                // inside generic functions take `list: anytype`
+                                // and the runtime element type may diverge from
+                                // the post-monomorph nominal type. Defer to the
+                                // type-derived helpers in those cases.
+                                if (self.localBackedByParam(lowered_args[0])) {
+                                    break :blk map_resolved;
+                                }
+                                if (std.meta.activeTag(elem_zig) == .term) {
+                                    break :blk map_resolved;
+                                }
                                 // For struct element types, encode for generic dispatch.
                                 // Enums (tagged_union mapped to struct_ref) use u32 atom IDs
                                 // and go through the default named alias path.
@@ -4465,12 +4541,27 @@ pub const IrBuilder = struct {
             },
             .map_init => |entries| {
                 var ir_entries: std.ArrayList(MapEntry) = .empty;
-                // Infer key/value types from the first entry's HIR type
+                // Read key/value types from the unified map type computed in
+                // HIR (which already collapses disagreeing scalars to TERM and
+                // unifies tuple shapes component-wise). Fall back to the first
+                // entry's types only when HIR couldn't fix a unified type.
                 var key_type: ZigType = .atom;
                 var value_type: ZigType = .i64;
-                if (entries.len > 0) {
-                    key_type = typeIdToZigTypeWithStore(entries[0].key.type_id, self.type_store);
-                    value_type = typeIdToZigTypeWithStore(entries[0].value.type_id, self.type_store);
+                blk: {
+                    if (self.type_store) |ts| {
+                        if (expr.type_id < ts.types.items.len) {
+                            const map_t = ts.types.items[expr.type_id];
+                            if (map_t == .map) {
+                                key_type = typeIdToZigTypeWithStore(map_t.map.key, self.type_store);
+                                value_type = typeIdToZigTypeWithStore(map_t.map.value, self.type_store);
+                                break :blk;
+                            }
+                        }
+                    }
+                    if (entries.len > 0) {
+                        key_type = typeIdToZigTypeWithStore(entries[0].key.type_id, self.type_store);
+                        value_type = typeIdToZigTypeWithStore(entries[0].value.type_id, self.type_store);
+                    }
                 }
                 for (entries) |entry| {
                     const key = try self.lowerExpr(entry.key);
@@ -4735,6 +4826,7 @@ fn zigTypeToEncodedName(zig_type: ZigType) []const u8 {
         .bool_type => "bool",
         .string => "str",
         .atom => "u32",
+        .term => "Term",
         .struct_ref => zig_type.struct_ref,
         .tagged_union => zig_type.tagged_union,
         else => "i64",
@@ -4862,6 +4954,7 @@ fn typeIdToZigTypeWithStore(type_id: types_mod.TypeId, type_store: ?*const types
         types_mod.TypeStore.ATOM => .atom,
         types_mod.TypeStore.NIL => .nil,
         types_mod.TypeStore.NEVER => .never,
+        types_mod.TypeStore.TERM => .term,
         types_mod.TypeStore.I64 => .i64,
         types_mod.TypeStore.I32 => .i32,
         types_mod.TypeStore.I16 => .i16,

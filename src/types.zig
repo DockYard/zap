@@ -64,6 +64,11 @@ pub const Type = union(enum) {
     atom_type,
     nil_type,
     never,
+    /// Heterogeneous value type. Stand-in for `runtime.Term` when a
+    /// list or map literal contains elements/values whose static types
+    /// disagree. Construction sites lower to `Term.from(value)`;
+    /// consumers unwrap via `Term.to(T, default)`.
+    term_type,
 
     // Compound types
     tuple: TupleType,
@@ -201,6 +206,7 @@ pub const TypeStore = struct {
     pub const ISIZE: TypeId = 17;
     pub const UNKNOWN: TypeId = 18;
     pub const ERROR: TypeId = 19;
+    pub const TERM: TypeId = 20;
     pub const VOID: TypeId = NIL;
 
     pub fn init(allocator: std.mem.Allocator, interner: *const ast.StringInterner) TypeStore {
@@ -244,6 +250,7 @@ pub const TypeStore = struct {
         try self.types.append(self.allocator, .{ .int = .{ .signedness = .signed, .bits = 64 } }); // 17 - isize (platform)
         try self.types.append(self.allocator, .unknown); // 18
         try self.types.append(self.allocator, .error_type); // 19
+        try self.types.append(self.allocator, .term_type); // 20
     }
 
     pub fn addType(self: *TypeStore, typ: Type) !TypeId {
@@ -266,7 +273,7 @@ pub const TypeStore = struct {
         const bt = std.meta.activeTag(b);
         if (at != bt) return false;
         return switch (a) {
-            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type => true,
+            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type, .term_type => true,
             .type_var => false,
             .list => |l| l.element == b.list.element,
             .tuple => |t| std.mem.eql(TypeId, t.elements, b.tuple.elements),
@@ -541,7 +548,7 @@ pub const TypeStore = struct {
                 return false;
             },
             // Primitives and non-compound types cannot contain type variables
-            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type => false,
+            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type, .term_type => false,
             .struct_type, .union_type, .tagged_union, .opaque_type => false,
         };
     }
@@ -590,7 +597,7 @@ pub const TypeStore = struct {
                 return false;
             },
             // Primitives and non-compound types cannot contain type variables
-            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type => false,
+            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type, .term_type => false,
             .struct_type, .union_type, .tagged_union, .opaque_type => false,
         };
     }
@@ -629,6 +636,16 @@ pub const TypeStore = struct {
 
         // UNKNOWN unifies with anything
         if (type_a == .unknown or type_b == .unknown) return true;
+
+        // `Term` unifies with any concrete type without binding the
+        // typevar — heterogeneous storage tolerates every value type
+        // via runtime wrapping, so a typevar constrained by `Term` is
+        // free to bind to a more specific concrete type later (e.g.
+        // the caller's expected default type), with the wrap/unwrap
+        // inserted at the codegen boundary. Likewise, when `Term`
+        // appears on the rhs of an already-concrete typevar the
+        // unification succeeds without altering the binding.
+        if (type_a == .term_type or type_b == .term_type) return true;
 
         // If a is a type variable, bind it to b (with occurs check)
         if (type_a == .type_var) {
@@ -807,7 +824,7 @@ pub const SubstitutionMap = struct {
                 } }) catch type_id;
             },
             // Primitives and other types pass through unchanged
-            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type => type_id,
+            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type, .term_type => type_id,
             .struct_type, .union_type, .tagged_union, .opaque_type, .applied => type_id,
         };
     }
@@ -1901,6 +1918,42 @@ pub const TypeChecker = struct {
             .case_expr, .panic_expr, .quote_expr, .unquote_expr, .intrinsic, .attr_ref, .binary_literal, .function_ref => return true,
             else => return false,
         }
+    }
+
+    /// Unify two type IDs for the purpose of typing a heterogeneous
+    /// collection. Disagreeing scalars collapse to `TERM`; tuples of
+    /// equal arity unify component-wise; lists/maps unify recursively.
+    /// Mirrors `hir.unifyForCollection`.
+    fn unifyForCollection(self: *TypeChecker, a: TypeId, b: TypeId) TypeId {
+        if (a == b) return a;
+        if (a == TypeStore.UNKNOWN) return b;
+        if (b == TypeStore.UNKNOWN) return a;
+        if (a == TypeStore.TERM or b == TypeStore.TERM) return TypeStore.TERM;
+        const ta = self.store.getType(a);
+        const tb = self.store.getType(b);
+        if (ta == .tuple and tb == .tuple and ta.tuple.elements.len == tb.tuple.elements.len) {
+            var any_changed = false;
+            const unified = self.allocator.alloc(TypeId, ta.tuple.elements.len) catch return TypeStore.TERM;
+            for (ta.tuple.elements, tb.tuple.elements, 0..) |ea, eb, i| {
+                const u = self.unifyForCollection(ea, eb);
+                if (u != ea) any_changed = true;
+                unified[i] = u;
+            }
+            if (!any_changed) return a;
+            return self.store.addType(.{ .tuple = .{ .elements = unified } }) catch TypeStore.TERM;
+        }
+        if (ta == .list and tb == .list) {
+            const u = self.unifyForCollection(ta.list.element, tb.list.element);
+            if (u == ta.list.element) return a;
+            return self.store.addType(.{ .list = .{ .element = u } }) catch TypeStore.TERM;
+        }
+        if (ta == .map and tb == .map) {
+            const uk = self.unifyForCollection(ta.map.key, tb.map.key);
+            const uv = self.unifyForCollection(ta.map.value, tb.map.value);
+            if (uk == ta.map.key and uv == ta.map.value) return a;
+            return self.store.addType(.{ .map = .{ .key = uk, .value = uv } }) catch TypeStore.TERM;
+        }
+        return TypeStore.TERM;
     }
 
     fn ensureClosureValueCanEscape(self: *TypeChecker, expr: *const ast.Expr, context: []const u8) !void {
@@ -3029,7 +3082,14 @@ pub const TypeChecker = struct {
                 for (l.elements) |elem| {
                     try self.ensureClosureValueCanEscape(elem, "list storage");
                 }
-                const elem_type = try self.inferExpr(l.elements[0]);
+                // Unify all element types so heterogeneous lists fall back
+                // to `Term` and tuple-shaped element disagreements unify
+                // component-wise. Mirrors `HirBuilder.unifyForCollection`.
+                var elem_type = try self.inferExpr(l.elements[0]);
+                for (l.elements[1..]) |e| {
+                    const t = try self.inferExpr(e);
+                    elem_type = self.unifyForCollection(elem_type, t);
+                }
                 return try self.store.addType(.{
                     .list = .{ .element = elem_type },
                 });
@@ -3239,19 +3299,25 @@ pub const TypeChecker = struct {
                 return TypeStore.UNKNOWN;
             },
             .map => |m| {
-                // Infer key/value types from first entry. Returning a real
+                // Infer key/value types from all entries. Disagreement on
+                // either axis collapses to `Term` so heterogeneous map
+                // literals get a uniform runtime type. Returning a real
                 // `Map(K, V)` type (instead of UNKNOWN) lets call-site type
                 // inference for synthetic helpers — like for-comp `__for_N`
-                // — propagate the iterable's type into the helper's param,
-                // which is what HIR's protocol-dispatch rewrite reads to
-                // route `Enumerable.next(state)` to `Map.next(state)`.
+                // — propagate the iterable's type into the helper's param.
                 if (m.fields.len > 0) {
                     for (m.fields) |field| {
                         try self.ensureClosureValueCanEscape(field.key, "map key storage");
                         try self.ensureClosureValueCanEscape(field.value, "map value storage");
                     }
-                    const key_t = try self.inferExpr(m.fields[0].key);
-                    const value_t = try self.inferExpr(m.fields[0].value);
+                    var key_t = try self.inferExpr(m.fields[0].key);
+                    var value_t = try self.inferExpr(m.fields[0].value);
+                    for (m.fields[1..]) |field| {
+                        const k = try self.inferExpr(field.key);
+                        const v = try self.inferExpr(field.value);
+                        key_t = self.unifyForCollection(key_t, k);
+                        value_t = self.unifyForCollection(value_t, v);
+                    }
                     return try self.store.addType(.{ .map = .{ .key = key_t, .value = value_t } });
                 }
                 // Empty map literal `%{}`: still a Map, just with type

@@ -1971,6 +1971,45 @@ fn sameAsOperand(operand_type: types_mod.TypeId) types_mod.TypeId {
     return operand_type;
 }
 
+/// Unify two type IDs for the purpose of typing a heterogeneous
+/// collection. Equal types unify to themselves. Disagreeing scalar
+/// types collapse to `TERM`. Tuples of identical arity unify
+/// component-wise — each disagreeing slot becomes `TERM`. Differing
+/// arities fall back to the whole element type being `TERM`.
+fn unifyForCollection(store: *types_mod.TypeStore, a: types_mod.TypeId, b: types_mod.TypeId) types_mod.TypeId {
+    if (a == b) return a;
+    if (a == types_mod.TypeStore.UNKNOWN) return b;
+    if (b == types_mod.TypeStore.UNKNOWN) return a;
+    if (a == types_mod.TypeStore.TERM or b == types_mod.TypeStore.TERM) {
+        return types_mod.TypeStore.TERM;
+    }
+    const ta = store.getType(a);
+    const tb = store.getType(b);
+    if (ta == .tuple and tb == .tuple and ta.tuple.elements.len == tb.tuple.elements.len) {
+        var any_changed = false;
+        const unified = store.allocator.alloc(types_mod.TypeId, ta.tuple.elements.len) catch return types_mod.TypeStore.TERM;
+        for (ta.tuple.elements, tb.tuple.elements, 0..) |ea, eb, i| {
+            const u = unifyForCollection(store, ea, eb);
+            if (u != ea) any_changed = true;
+            unified[i] = u;
+        }
+        if (!any_changed) return a;
+        return store.addType(.{ .tuple = .{ .elements = unified } }) catch types_mod.TypeStore.TERM;
+    }
+    if (ta == .list and tb == .list) {
+        const u = unifyForCollection(store, ta.list.element, tb.list.element);
+        if (u == ta.list.element) return a;
+        return store.addType(.{ .list = .{ .element = u } }) catch types_mod.TypeStore.TERM;
+    }
+    if (ta == .map and tb == .map) {
+        const uk = unifyForCollection(store, ta.map.key, tb.map.key);
+        const uv = unifyForCollection(store, ta.map.value, tb.map.value);
+        if (uk == ta.map.key and uv == ta.map.value) return a;
+        return store.addType(.{ .map = .{ .key = uk, .value = uv } }) catch types_mod.TypeStore.TERM;
+    }
+    return types_mod.TypeStore.TERM;
+}
+
 fn alwaysBool(_: types_mod.TypeId) types_mod.TypeId {
     return types_mod.TypeStore.BOOL;
 }
@@ -4413,9 +4452,31 @@ pub const HirBuilder = struct {
                 for (t.elements) |elem| {
                     try elems.append(self.allocator, try self.buildExpr(elem));
                 }
+                const built_elems = try elems.toOwnedSlice(self.allocator);
+                // Compute the tuple's type_id from its element types when all
+                // children have concrete types. This lets downstream list/map
+                // inference reason about tuples as proper compound types
+                // (essential for keyword lists like `[{:name, "Alice"}, ...]`
+                // where the list element is a tuple).
+                var all_known = true;
+                for (built_elems) |elem| {
+                    if (elem.type_id == types_mod.TypeStore.UNKNOWN) {
+                        all_known = false;
+                        break;
+                    }
+                }
+                const tuple_type_id: types_mod.TypeId = blk: {
+                    if (!all_known) break :blk types_mod.TypeStore.UNKNOWN;
+                    const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
+                    var elem_type_ids = self.allocator.alloc(types_mod.TypeId, built_elems.len) catch break :blk types_mod.TypeStore.UNKNOWN;
+                    for (built_elems, 0..) |elem, i| {
+                        elem_type_ids[i] = elem.type_id;
+                    }
+                    break :blk store_ptr.addType(.{ .tuple = .{ .elements = elem_type_ids } }) catch types_mod.TypeStore.UNKNOWN;
+                };
                 return try self.create(Expr, .{
-                    .kind = .{ .tuple_init = try elems.toOwnedSlice(self.allocator) },
-                    .type_id = types_mod.TypeStore.UNKNOWN,
+                    .kind = .{ .tuple_init = built_elems },
+                    .type_id = tuple_type_id,
                     .span = t.meta.span,
                 });
             },
@@ -4425,26 +4486,10 @@ pub const HirBuilder = struct {
                     try elems.append(self.allocator, try self.buildExpr(elem));
                 }
                 const built_elems = try elems.toOwnedSlice(self.allocator);
-                // Infer list type from elements — use first element with known type
-                const list_type_id = if (built_elems.len > 0) blk: {
-                    for (built_elems) |elem| {
-                        if (elem.type_id != types_mod.TypeStore.UNKNOWN) {
-                            const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
-                            break :blk store_ptr.addType(.{ .list = .{ .element = elem.type_id } }) catch types_mod.TypeStore.UNKNOWN;
-                        }
-                    }
-                    // All elements UNKNOWN — check element kinds for type inference
-                    // String literals that went through CtValue round-trip may be
-                    // encoded as call expressions to the string interpolation form.
-                    // Check if elements are string_lit directly.
-                    for (built_elems) |elem| {
-                        if (elem.kind == .string_lit) {
-                            const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
-                            break :blk store_ptr.addType(.{ .list = .{ .element = types_mod.TypeStore.STRING } }) catch types_mod.TypeStore.UNKNOWN;
-                        }
-                    }
-                    break :blk types_mod.TypeStore.UNKNOWN;
-                } else types_mod.TypeStore.UNKNOWN;
+                const list_type_id = if (built_elems.len > 0)
+                    self.inferListElementType(built_elems)
+                else
+                    types_mod.TypeStore.UNKNOWN;
                 return try self.create(Expr, .{
                     .kind = .{ .list_init = built_elems },
                     .type_id = list_type_id,
@@ -4490,12 +4535,24 @@ pub const HirBuilder = struct {
                     });
                 }
                 const built_entries = try entries.toOwnedSlice(self.allocator);
-                // Infer map type from first entry's key and value types
+                // Infer map type by unifying all entry types. If keys (or
+                // values) disagree across entries we promote the disagreeing
+                // axis to `Term`, so the runtime container instantiates as
+                // `Map(K, Term)` and individual values can be wrapped at
+                // construction sites. Tuple values are unified component-wise.
                 const map_type_id = if (built_entries.len > 0) blk: {
-                    const key_type = built_entries[0].key.type_id;
-                    const val_type = built_entries[0].value.type_id;
+                    const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
+                    var key_type = built_entries[0].key.type_id;
+                    var val_type = built_entries[0].value.type_id;
+                    for (built_entries[1..]) |entry| {
+                        if (entry.key.type_id != types_mod.TypeStore.UNKNOWN) {
+                            key_type = unifyForCollection(store_ptr, key_type, entry.key.type_id);
+                        }
+                        if (entry.value.type_id != types_mod.TypeStore.UNKNOWN) {
+                            val_type = unifyForCollection(store_ptr, val_type, entry.value.type_id);
+                        }
+                    }
                     if (key_type != types_mod.TypeStore.UNKNOWN and val_type != types_mod.TypeStore.UNKNOWN) {
-                        const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
                         break :blk store_ptr.addType(.{ .map = .{ .key = key_type, .value = val_type } }) catch types_mod.TypeStore.UNKNOWN;
                     }
                     break :blk types_mod.TypeStore.UNKNOWN;
@@ -5213,6 +5270,50 @@ pub const HirBuilder = struct {
     /// example. Mutates the block's HIR in place via @constCast; the
     /// HIR allocator owns these expressions and they're not shared
     /// across modules.
+    /// Compute the element TypeId for a list literal whose entries are
+    /// already lowered to HIR. Performs structural unification so that
+    /// disagreeing scalar elements promote to `TERM`, and disagreeing
+    /// tuple components promote position-wise to `TERM`.
+    ///
+    /// Examples:
+    ///   `[1, 2, 3]`              → `[i64]`
+    ///   `[1, "x"]`               → `[Term]`
+    ///   `[{:a, 1}, {:b, "s"}]`   → `[{Atom, Term}]` (component-wise)
+    ///   `[{:a, 1}, {:b, "s", 7}]`→ `[Term]` (different arity → fall back)
+    fn inferListElementType(self: *const HirBuilder, built_elems: []const *const Expr) types_mod.TypeId {
+        if (built_elems.len == 0) return types_mod.TypeStore.UNKNOWN;
+        const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
+
+        // First pass: pick a starting concrete type.
+        var element_type: types_mod.TypeId = types_mod.TypeStore.UNKNOWN;
+        for (built_elems) |elem| {
+            if (elem.type_id != types_mod.TypeStore.UNKNOWN) {
+                element_type = elem.type_id;
+                break;
+            }
+        }
+
+        // Fallback: detect string-literal lists when nothing carries type info.
+        if (element_type == types_mod.TypeStore.UNKNOWN) {
+            for (built_elems) |elem| {
+                if (elem.kind == .string_lit) {
+                    element_type = types_mod.TypeStore.STRING;
+                    break;
+                }
+            }
+        }
+
+        if (element_type == types_mod.TypeStore.UNKNOWN) return types_mod.TypeStore.UNKNOWN;
+
+        // Second pass: unify the chosen type with every other element.
+        for (built_elems) |elem| {
+            if (elem.type_id == types_mod.TypeStore.UNKNOWN) continue;
+            element_type = unifyForCollection(store_ptr, element_type, elem.type_id);
+        }
+
+        return store_ptr.addType(.{ .list = .{ .element = element_type } }) catch types_mod.TypeStore.UNKNOWN;
+    }
+
     fn patchEmptyContainerTypes(self: *const HirBuilder, block: *const Block, expected_type: types_mod.TypeId) void {
         for (block.stmts) |stmt| {
             switch (stmt) {
@@ -5512,6 +5613,7 @@ fn encodeContainerElemName(store: *const types_mod.TypeStore, type_id: types_mod
         .bool_type => "bool",
         .string_type => "str",
         .atom_type => "u32",
+        .term_type => "Term",
         .struct_type => |s| store.interner.get(s.name),
         .tagged_union => |tu| store.interner.get(tu.name),
         else => null,

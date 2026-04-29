@@ -1432,6 +1432,496 @@ inline fn call2(callback: anytype, arg0: anytype, arg1: anytype) @TypeOf(if (@ty
 }
 
 // ============================================================
+// Type-derived Map/List dispatch helpers.
+//
+// These free functions accept `anytype` for the collection ref and
+// reconstruct the underlying `Map(K, V)` / `List(T)` type at compile
+// time via `@TypeOf` introspection. The Zap-side `:zig.Map.get(...)`
+// and similar bridges route through these helpers so the call site's
+// runtime type — including `Map(u32, Term)` — is preserved without
+// the bridge needing to encode K/V into the call name.
+// ============================================================
+
+/// Extract the underlying `Map(K, V)` type from a `?*const Map(K, V)`
+/// (or `*const Map(K, V)`) operand. Used by the dispatch helpers to
+/// look up the right monomorph.
+fn MapTypeOf(comptime MapPtr: type) type {
+    const ti = @typeInfo(MapPtr);
+    const ptr_inner = switch (ti) {
+        .optional => |o| @typeInfo(o.child),
+        .pointer => ti,
+        else => @compileError("MapTypeOf: expected ?*const Map or *const Map, got " ++ @typeName(MapPtr)),
+    };
+    return switch (ptr_inner) {
+        .pointer => |p| p.child,
+        else => @compileError("MapTypeOf: expected ?*const Map, got " ++ @typeName(MapPtr)),
+    };
+}
+
+fn ListTypeOf(comptime ListPtr: type) type {
+    const ti = @typeInfo(ListPtr);
+    const ptr_inner = switch (ti) {
+        .optional => |o| @typeInfo(o.child),
+        .pointer => ti,
+        else => @compileError("ListTypeOf: expected ?*const List or *const List, got " ++ @typeName(ListPtr)),
+    };
+    return switch (ptr_inner) {
+        .pointer => |p| p.child,
+        else => @compileError("ListTypeOf: expected ?*const List, got " ++ @typeName(ListPtr)),
+    };
+}
+
+/// Wrap a heterogeneous-friendly `Map.get` over an `anytype` default.
+/// When the underlying Map's value type is `Term`, this wraps the
+/// default into a Term, calls `Map.get`, then unwraps the resulting
+/// Term back into the default's static type. When the value type is
+/// already a concrete (homogeneous) type, the default is forwarded
+/// unchanged. The return type matches whichever the caller passed —
+/// string literals (`*const [N:0]u8`) are surfaced as `[]const u8`.
+pub fn mapGet(map: anytype, key: anytype, default: anytype) MapGetReturnType(@TypeOf(map), @TypeOf(default)) {
+    const M = MapTypeOf(@TypeOf(map));
+    const V = @FieldType(M.MapEntry, "value");
+    if (V == Term) {
+        const wrapped = Term.from(default);
+        const result = M.get(map, key, wrapped);
+        return Term.toCoerced(result, default);
+    }
+    return M.get(map, key, default);
+}
+
+fn MapGetReturnType(comptime MapPtr: type, comptime DefaultT: type) type {
+    const M = MapTypeOf(MapPtr);
+    const V = @FieldType(M.MapEntry, "value");
+    if (V == Term) {
+        // String literals are returned as `[]const u8` slices.
+        const dti = @typeInfo(DefaultT);
+        if (dti == .pointer and dti.pointer.size == .one) {
+            const child_info = @typeInfo(dti.pointer.child);
+            if (child_info == .array and child_info.array.child == u8) {
+                return []const u8;
+            }
+        }
+        return DefaultT;
+    }
+    return V;
+}
+
+pub fn mapHasKey(map: anytype, key: anytype) bool {
+    const M = MapTypeOf(@TypeOf(map));
+    return M.hasKey(map, key);
+}
+
+pub fn mapPut(map: anytype, key: anytype, value: anytype) ?*const MapTypeOf(@TypeOf(map)) {
+    const M = MapTypeOf(@TypeOf(map));
+    const V = @FieldType(M.MapEntry, "value");
+    if (V == Term) {
+        return M.put(map, key, Term.from(value));
+    }
+    return M.put(map, key, value);
+}
+
+pub fn mapDelete(map: anytype, key: anytype) ?*const MapTypeOf(@TypeOf(map)) {
+    const M = MapTypeOf(@TypeOf(map));
+    return M.delete(map, key);
+}
+
+pub fn mapMerge(a: anytype, b: anytype) ?*const MapTypeOf(@TypeOf(a)) {
+    const M = MapTypeOf(@TypeOf(a));
+    return M.merge(a, b);
+}
+
+pub fn mapSize(map: anytype) i64 {
+    const M = MapTypeOf(@TypeOf(map));
+    return M.size(map);
+}
+
+pub fn mapIsEmpty(map: anytype) bool {
+    const M = MapTypeOf(@TypeOf(map));
+    return M.isEmpty(map);
+}
+
+pub fn mapNext(map: anytype) std.meta.Tuple(&.{
+    u32,
+    std.meta.Tuple(&.{ MapKeyOf(@TypeOf(map)), MapValueOf(@TypeOf(map)) }),
+    ?*const MapTypeOf(@TypeOf(map)),
+}) {
+    const M = MapTypeOf(@TypeOf(map));
+    return M.next(map);
+}
+
+pub fn mapKeys(map: anytype) ?*const List(MapKeyOf(@TypeOf(map))) {
+    const M = MapTypeOf(@TypeOf(map));
+    return M.keys(map);
+}
+
+pub fn mapValues(map: anytype) ?*const List(MapValueOf(@TypeOf(map))) {
+    const M = MapTypeOf(@TypeOf(map));
+    return M.values(map);
+}
+
+pub fn mapEnumReduceValues(map: anytype, initial: i64, callback: anytype) i64 {
+    const M = MapTypeOf(@TypeOf(map));
+    return M.enumReduceValues(map, initial, callback);
+}
+
+fn MapValueOf(comptime MapPtr: type) type {
+    const M = MapTypeOf(MapPtr);
+    return @FieldType(M.MapEntry, "value");
+}
+
+fn MapKeyOf(comptime MapPtr: type) type {
+    const M = MapTypeOf(MapPtr);
+    return @FieldType(M.MapEntry, "key");
+}
+
+pub fn listGetHead(list: anytype) ListElementOf(@TypeOf(list)) {
+    const L = ListTypeOf(@TypeOf(list));
+    return L.getHead(list);
+}
+
+pub fn listGetTail(list: anytype) @TypeOf(list) {
+    const L = ListTypeOf(@TypeOf(list));
+    return L.getTail(list);
+}
+
+pub fn listIsEmpty(list: anytype) bool {
+    const L = ListTypeOf(@TypeOf(list));
+    return L.isEmpty(list);
+}
+
+pub fn listLength(list: anytype) i64 {
+    const L = ListTypeOf(@TypeOf(list));
+    return L.length(list);
+}
+
+pub fn listGet(list: anytype, index: i64) ListElementOf(@TypeOf(list)) {
+    const L = ListTypeOf(@TypeOf(list));
+    return L.get(list, index);
+}
+
+pub fn listLast(list: anytype) ListElementOf(@TypeOf(list)) {
+    const L = ListTypeOf(@TypeOf(list));
+    return L.last(list);
+}
+
+pub fn listReverse(list: anytype) @TypeOf(list) {
+    const L = ListTypeOf(@TypeOf(list));
+    return L.reverse(list);
+}
+
+pub fn listConcat(a: anytype, b: anytype) @TypeOf(a) {
+    const L = ListTypeOf(@TypeOf(a));
+    return L.concat(a, b);
+}
+
+pub fn listAppend(list: anytype, value: anytype) @TypeOf(list) {
+    const L = ListTypeOf(@TypeOf(list));
+    return L.append(list, value);
+}
+
+pub fn listContains(list: anytype, value: anytype) bool {
+    const L = ListTypeOf(@TypeOf(list));
+    return L.contains(list, value);
+}
+
+pub fn listTake(list: anytype, count: i64) @TypeOf(list) {
+    const L = ListTypeOf(@TypeOf(list));
+    return L.take(list, count);
+}
+
+pub fn listNext(list: anytype) std.meta.Tuple(&.{ u32, ListElementOf(@TypeOf(list)), @TypeOf(list) }) {
+    const L = ListTypeOf(@TypeOf(list));
+    return L.next(list);
+}
+
+pub fn listCons(head: anytype, tail: anytype) @TypeOf(tail) {
+    const L = ListTypeOf(@TypeOf(tail));
+    return L.cons(head, tail);
+}
+
+pub fn listDrop(list: anytype, count: i64) @TypeOf(list) {
+    const L = ListTypeOf(@TypeOf(list));
+    return L.drop(list, count);
+}
+
+pub fn listUniq(list: anytype) @TypeOf(list) {
+    const L = ListTypeOf(@TypeOf(list));
+    return L.uniq(list);
+}
+
+pub fn listMapFn(list: anytype, callback: anytype) @TypeOf(list) {
+    const L = ListTypeOf(@TypeOf(list));
+    return L.mapFn(list, callback);
+}
+
+pub fn listFilterFn(list: anytype, predicate: anytype) @TypeOf(list) {
+    const L = ListTypeOf(@TypeOf(list));
+    return L.filterFn(list, predicate);
+}
+
+pub fn listRejectFn(list: anytype, predicate: anytype) @TypeOf(list) {
+    const L = ListTypeOf(@TypeOf(list));
+    return L.rejectFn(list, predicate);
+}
+
+pub fn listEnumReduceSimple(list: anytype, initial: ListElementOf(@TypeOf(list)), callback: anytype) ListElementOf(@TypeOf(list)) {
+    const L = ListTypeOf(@TypeOf(list));
+    return L.enumReduceSimple(list, initial, callback);
+}
+
+pub fn listEachFn(list: anytype, callback: anytype) @TypeOf(list) {
+    const L = ListTypeOf(@TypeOf(list));
+    return L.eachFn(list, callback);
+}
+
+pub fn listFindFn(list: anytype, default: anytype, predicate: anytype) ListElementOf(@TypeOf(list)) {
+    const L = ListTypeOf(@TypeOf(list));
+    return L.findFn(list, default, predicate);
+}
+
+pub fn listAnyFn(list: anytype, predicate: anytype) bool {
+    const L = ListTypeOf(@TypeOf(list));
+    return L.anyFn(list, predicate);
+}
+
+pub fn listAllFn(list: anytype, predicate: anytype) bool {
+    const L = ListTypeOf(@TypeOf(list));
+    return L.allFn(list, predicate);
+}
+
+pub fn listCountFn(list: anytype, predicate: anytype) i64 {
+    const L = ListTypeOf(@TypeOf(list));
+    return L.countFn(list, predicate);
+}
+
+pub fn listSortFn(list: anytype, comparator: anytype) @TypeOf(list) {
+    const L = ListTypeOf(@TypeOf(list));
+    return L.sortFn(list, comparator);
+}
+
+pub fn listFlatMapFn(list: anytype, callback: anytype) @TypeOf(list) {
+    const L = ListTypeOf(@TypeOf(list));
+    return L.flatMapFn(list, callback);
+}
+
+pub fn listMaxVal(list: anytype) ListElementOf(@TypeOf(list)) {
+    const L = ListTypeOf(@TypeOf(list));
+    return L.maxVal(list);
+}
+
+pub fn listMinVal(list: anytype) ListElementOf(@TypeOf(list)) {
+    const L = ListTypeOf(@TypeOf(list));
+    return L.minVal(list);
+}
+
+fn ListElementOf(comptime ListPtr: type) type {
+    const L = ListTypeOf(ListPtr);
+    return @FieldType(L, "head");
+}
+
+// ============================================================
+// Term — heterogeneous value wrapper.
+//
+// Used as the storage type for collections whose elements are not
+// homogeneously typed (e.g. `%{name: "Alice", age: 30}` where the
+// values are `String` and `i64`). The compiler picks `Term` as the
+// element type whenever the static element types disagree, then
+// inserts wrapping (`Term.from(x)`) at construction sites and
+// unwrapping (`Term.to(T, t, default)`) at consumption sites so the
+// caller still sees a concrete value of the expected type.
+//
+// Homogeneous collections continue to instantiate the underlying
+// `List(T)` / `Map(K, V)` directly with their concrete element
+// types; `Term` is engaged only for the heterogeneous case.
+// ============================================================
+
+pub const Term = union(enum) {
+    int: i64,
+    float: f64,
+    str: []const u8,
+    bool_val: bool,
+    atom: u32,
+    nil: void,
+    /// Erased ?*const List(Term). Stored as opaque pointer to avoid
+    /// the recursive type definition; callers reinterpret via the
+    /// helpers below.
+    list: ?*const anyopaque,
+    /// Erased ?*const Map(K, Term). The key type is irrelevant to
+    /// `Term` itself — collection-specific code knows the key type.
+    map: ?*const anyopaque,
+    /// Owned slice of child terms (small fixed-size aggregates).
+    tuple: []const Term,
+
+    /// Wrap a Zig value of any supported type as a `Term`. Comptime
+    /// dispatch keeps the call sites at the wrap point allocation-free
+    /// for scalars and slices.
+    pub fn from(value: anytype) Term {
+        const T = @TypeOf(value);
+        const ti = @typeInfo(T);
+        return switch (ti) {
+            .bool => .{ .bool_val = value },
+            .int => |int_info| blk: {
+                if (int_info.signedness == .signed) {
+                    break :blk .{ .int = @intCast(value) };
+                } else {
+                    // u32 atoms — emitted Zap atoms are u32. Map them
+                    // to the atom variant so equality and printing can
+                    // round-trip correctly.
+                    if (T == u32) break :blk .{ .atom = value };
+                    break :blk .{ .int = @intCast(value) };
+                }
+            },
+            .comptime_int => .{ .int = @intCast(value) },
+            .float => .{ .float = @floatCast(value) },
+            .comptime_float => .{ .float = @floatCast(value) },
+            .pointer => |ptr_info| blk: {
+                if (ptr_info.size == .slice and ptr_info.child == u8) {
+                    break :blk .{ .str = value };
+                }
+                if (ptr_info.size == .one) {
+                    const child_info = @typeInfo(ptr_info.child);
+                    if (child_info == .array and child_info.array.child == u8) {
+                        break :blk .{ .str = value[0..] };
+                    }
+                }
+                break :blk .{ .nil = {} };
+            },
+            .optional => |opt_info| blk: {
+                if (value) |v| {
+                    // Re-enter `from` with the unwrapped value.
+                    break :blk Term.from(v);
+                }
+                _ = opt_info;
+                break :blk .{ .nil = {} };
+            },
+            .void => .{ .nil = {} },
+            .null => .{ .nil = {} },
+            else => blk: {
+                if (T == Term) break :blk value;
+                break :blk .{ .nil = {} };
+            },
+        };
+    }
+
+    /// Unwrap a `Term` into a concrete Zig value of type `T`. If the
+    /// runtime variant does not match, returns the supplied default.
+    /// Accepts `[]const u8` slices and `*const [N:0]u8` string-literal
+    /// pointers transparently — both fan in to the `.str` variant.
+    pub fn to(comptime T: type, t: Term, default: T) T {
+        if (T == Term) return t;
+        const ti = @typeInfo(T);
+        return switch (ti) {
+            .bool => if (t == .bool_val) t.bool_val else default,
+            .int => |int_info| blk: {
+                if (int_info.signedness == .unsigned and T == u32) {
+                    break :blk if (t == .atom) t.atom else default;
+                }
+                if (t == .int) {
+                    break :blk @intCast(t.int);
+                }
+                break :blk default;
+            },
+            .float => if (t == .float) @floatCast(t.float) else default,
+            .pointer => |ptr_info| blk: {
+                if (ptr_info.size == .slice and ptr_info.child == u8) {
+                    break :blk if (t == .str) t.str else default;
+                }
+                break :blk default;
+            },
+            .optional => blk: {
+                if (t == .nil) break :blk null;
+                break :blk default;
+            },
+            .void => {},
+            else => default,
+        };
+    }
+
+    /// Unwrap a `Term` to a value compatible with `default`'s static
+    /// type, but always materialise the result as a `[]const u8` slice
+    /// whenever the default is a string (slice or string-literal
+    /// pointer). This sidesteps a Zig codegen quirk where parameters
+    /// declared `anytype` keep their argument's literal pointer-to-
+    /// array type instead of coercing to `[]const u8`, which would
+    /// otherwise force `Term.to` to compare incompatible target types.
+    pub fn toCoerced(t: Term, default: anytype) ToCoercedResult(@TypeOf(default)) {
+        const D = @TypeOf(default);
+        const dti = @typeInfo(D);
+        if (dti == .pointer and dti.pointer.size == .one) {
+            const child_info = @typeInfo(dti.pointer.child);
+            if (child_info == .array and child_info.array.child == u8) {
+                // String literal — return as []const u8.
+                return if (t == .str) t.str else @as([]const u8, default);
+            }
+        }
+        return Term.to(D, t, default);
+    }
+
+    fn ToCoercedResult(comptime D: type) type {
+        const dti = @typeInfo(D);
+        if (dti == .pointer and dti.pointer.size == .one) {
+            const child_info = @typeInfo(dti.pointer.child);
+            if (child_info == .array and child_info.array.child == u8) {
+                return []const u8;
+            }
+        }
+        return D;
+    }
+
+    pub fn eql(a: Term, b: Term) bool {
+        if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+        return switch (a) {
+            .int => a.int == b.int,
+            .float => a.float == b.float,
+            .str => std.mem.eql(u8, a.str, b.str),
+            .bool_val => a.bool_val == b.bool_val,
+            .atom => a.atom == b.atom,
+            .nil => true,
+            .list => a.list == b.list,
+            .map => a.map == b.map,
+            .tuple => blk: {
+                if (a.tuple.len != b.tuple.len) break :blk false;
+                for (a.tuple, b.tuple) |ea, eb| {
+                    if (!eql(ea, eb)) break :blk false;
+                }
+                break :blk true;
+            },
+        };
+    }
+
+    /// FNV-1a hash seed for Term values. Used by `Map(K, Term)` to
+    /// hash heterogeneous values when atoms-as-keys still need stable
+    /// hashing of the value type for collision resolution diagnostics.
+    pub fn hash(self: Term) u32 {
+        return switch (self) {
+            .int => |v| @truncate(@as(u64, @bitCast(v))),
+            .float => |v| @truncate(@as(u64, @bitCast(v))),
+            .str => |v| blk: {
+                var h: u32 = 2166136261;
+                for (v) |byte| {
+                    h ^= byte;
+                    h *%= 16777619;
+                }
+                break :blk h;
+            },
+            .bool_val => |v| if (v) @as(u32, 1) else @as(u32, 0),
+            .atom => |v| v,
+            .nil => 0,
+            .list => 0,
+            .map => 0,
+            .tuple => |elems| blk: {
+                var h: u32 = 2166136261;
+                for (elems) |elem| {
+                    h ^= hash(elem);
+                    h *%= 16777619;
+                }
+                break :blk h;
+            },
+        };
+    }
+};
+
+// ============================================================
 // Map — Generic HAMT-based persistent map.
 //
 // Map(K, V) generates a type-specific map for any key/value types.
@@ -1476,7 +1966,7 @@ pub fn Map(comptime K: type, comptime V: type) type {
         child_count: u5,
     };
 
-    /// Hash a key value for HAMT lookup. Supports u32 (atoms), i64, []const u8 (strings), bool.
+    /// Hash a key value for HAMT lookup. Supports u32 (atoms), i64, []const u8 (strings), bool, Term.
     fn hashKey(key: K) u32 {
         const raw: u32 = if (K == u32)
             key
@@ -1491,6 +1981,8 @@ pub fn Map(comptime K: type, comptime V: type) type {
             break :blk h;
         } else if (K == bool)
             if (key) @as(u32, 1) else @as(u32, 0)
+        else if (K == Term)
+            key.hash()
         else
             0;
         // Murmur3 finalizer
@@ -1505,6 +1997,7 @@ pub fn Map(comptime K: type, comptime V: type) type {
 
     fn keysEqual(a: K, b: K) bool {
         if (K == []const u8) return std.mem.eql(u8, a, b);
+        if (K == Term) return Term.eql(a, b);
         return a == b;
     }
 
@@ -2120,6 +2613,15 @@ pub fn List(comptime T: type) type {
         head: T,
         tail: ?*const Self,
 
+        /// Default-initialised value of `T` for empty-list returns.
+        /// Tagged unions (notably `Term`) cannot use `std.mem.zeroes`,
+        /// so we pick a representative variant: `Term.nil` for `Term`,
+        /// `std.mem.zeroes` for everything else.
+        fn defaultElement() T {
+            if (T == Term) return Term{ .nil = {} };
+            return std.mem.zeroes(T);
+        }
+
         pub fn empty() ?*const Self {
             return null;
         }
@@ -2134,7 +2636,7 @@ pub fn List(comptime T: type) type {
 
         pub fn getHead(list: ?*const Self) T {
             if (list) |cell| return cell.head;
-            return std.mem.zeroes(T);
+            return defaultElement();
         }
 
         pub fn getTail(list: ?*const Self) ?*const Self {
@@ -2164,12 +2666,12 @@ pub fn List(comptime T: type) type {
                 current = cell.tail;
                 i += 1;
             }
-            return std.mem.zeroes(T);
+            return defaultElement();
         }
 
         pub fn last(list: ?*const Self) T {
             var current = list;
-            var result: T = std.mem.zeroes(T);
+            var result: T = defaultElement();
             while (current) |cell| {
                 result = cell.head;
                 current = cell.tail;
@@ -2193,13 +2695,17 @@ pub fn List(comptime T: type) type {
             if (list) |cell| {
                 return .{ ATOM_CONT, cell.head, cell.tail };
             }
-            return .{ ATOM_DONE, std.mem.zeroes(T), null };
+            return .{ ATOM_DONE, defaultElement(), null };
         }
 
         pub fn contains(list: ?*const Self, value: T) bool {
             var current = list;
             while (current) |cell| {
-                if (std.mem.eql(u8, std.mem.asBytes(&cell.head), std.mem.asBytes(&value))) return true;
+                if (T == Term) {
+                    if (Term.eql(cell.head, value)) return true;
+                } else {
+                    if (std.mem.eql(u8, std.mem.asBytes(&cell.head), std.mem.asBytes(&value))) return true;
+                }
                 current = cell.tail;
             }
             return false;

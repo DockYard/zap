@@ -44,6 +44,22 @@ pub struct Map {
   }
 
   @doc = """
+    Returns `true` if the map contains the given key.
+    Convenience alias for `has_key?` exposed without the predicate
+    suffix so call sites that prefer the explicit identifier form
+    still resolve.
+
+    ## Examples
+
+        Map.has_key(%{a: 1, b: 2}, :a)  # => true
+        Map.has_key(%{a: 1}, :z)         # => false
+    """
+
+  pub fn has_key(map :: %{key => value}, lookup_key :: key) -> Bool {
+    :zig.Map.hasKey(map, lookup_key)
+  }
+
+  @doc = """
     Returns the number of entries in the map.
 
     ## Examples
