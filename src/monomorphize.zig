@@ -992,6 +992,7 @@ const MonomorphContext = struct {
             .check_list => |cl| .{ .check_list = .{
                 .scrutinee = try self.cloneExpr(cl.scrutinee),
                 .expected_length = cl.expected_length,
+                .element_scrutinee_ids = cl.element_scrutinee_ids,
                 .success = try self.cloneDecision(cl.success),
                 .failure = try self.cloneDecision(cl.failure),
             } },

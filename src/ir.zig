@@ -280,6 +280,12 @@ pub const ParamGet = struct {
 pub const AggregateInit = struct {
     dest: LocalId,
     elements: []const LocalId,
+    /// Static component types (one per element) when the tuple's type is
+    /// known at IR build time. Used by the ZIR backend so that components
+    /// promoted to `Term` (e.g. heterogeneous keyword-list pair values
+    /// like `{Atom, Term}`) wrap concrete element values via `Term.from`.
+    /// `null` for tuples where component types are not statically known.
+    component_types: ?[]const ZigType = null,
 };
 
 pub const MapInit = struct {
@@ -334,6 +340,14 @@ pub const IndexGet = struct {
     dest: LocalId,
     object: LocalId,
     index: u32,
+    /// When set, the extracted slot's runtime type is `zap_runtime.Term`
+    /// but the IR's static expected type is concrete (the declared slot
+    /// type from the parent's static tuple shape). The ZIR backend
+    /// inserts a `Term.toCoerced(value, default)` to recover the concrete
+    /// type. Used when patterns over heterogeneous keyword lists extract
+    /// values from `tuple{Atom, Term}` slots where the user expected a
+    /// concrete type per the declared param signature.
+    coerce_term_to: ZigType = .any,
 };
 
 pub const ListInit = struct {
@@ -354,6 +368,10 @@ pub const ListLenCheck = struct {
     scrutinee: LocalId,
     expected_len: u32,
     element_type: ZigType = .i64,
+    /// Route through `listLength(anytype)` helper instead of
+    /// `List(element_type).length(...)`. Set when `scrutinee` is
+    /// param-backed (see ListGet.via_helper for rationale).
+    via_helper: bool = false,
 };
 
 pub const ListGet = struct {
@@ -361,18 +379,35 @@ pub const ListGet = struct {
     list: LocalId,
     index: u32,
     element_type: ZigType = .i64,
+    /// When true, the ZIR backend routes through the type-derived
+    /// `listGet(anytype, index)` helper instead of
+    /// `List(element_type).get(list, index)`. Set when `list` is
+    /// param-backed: the runtime element type may diverge from the
+    /// declared type (e.g. a function declared `[{Atom, i64}]` is
+    /// passed a heterogeneous keyword list whose runtime element
+    /// type is `[{Atom, Term}]`). The helper's `anytype` signature
+    /// reads the actual element type from `@TypeOf(list)`.
+    via_helper: bool = false,
 };
 
 pub const ListIsNotEmpty = struct {
     dest: LocalId,
     list: LocalId,
     element_type: ZigType = .i64,
+    /// Route through `listIsEmpty(anytype)` helper instead of
+    /// `List(element_type).isEmpty(...)`. Set when `list` is
+    /// param-backed (see ListGet.via_helper for rationale).
+    via_helper: bool = false,
 };
 
 pub const ListHeadTail = struct {
     dest: LocalId,
     list: LocalId,
     element_type: ZigType = .i64,
+    /// Route through `listGetHead(anytype)` / `listGetTail(anytype)`
+    /// helper instead of the typed `List(element_type)` method.
+    /// Set when `list` is param-backed (see ListGet.via_helper).
+    via_helper: bool = false,
 };
 
 pub const MapHasKey = struct {
@@ -884,6 +919,12 @@ pub const IrBuilder = struct {
     /// instantiation (e.g. `Map(atom, term)`). Locals in this set
     /// route through the runtime's type-derived helpers instead.
     param_backed_locals: std.AutoHashMap(LocalId, void),
+    /// Tuple-typed locals whose components may have been Term-promoted
+    /// because they were extracted via a `via_helper` list operation
+    /// (heterogeneous keyword list flowing through `anytype`). When a
+    /// later `index_get` reads from one of these locals, the IR emits
+    /// `Term.toCoerced` to recover the declared concrete component type.
+    term_tuple_locals: std.AutoHashMap(LocalId, ZigType),
     current_module_prefix: ?[]const u8,
     known_function_names: std.StringHashMap(void),
     synthesized_type_defs: std.ArrayList(TypeDef),
@@ -919,6 +960,7 @@ pub const IrBuilder = struct {
             .type_store = null,
             .known_local_types = std.AutoHashMap(LocalId, ZigType).init(allocator),
             .param_backed_locals = std.AutoHashMap(LocalId, void).init(allocator),
+            .term_tuple_locals = std.AutoHashMap(LocalId, ZigType).init(allocator),
             .current_module_prefix = null,
             .known_function_names = std.StringHashMap(void).init(allocator),
             .synthesized_type_defs = .empty,
@@ -933,6 +975,7 @@ pub const IrBuilder = struct {
         self.current_instrs.deinit(self.allocator);
         self.known_local_types.deinit();
         self.param_backed_locals.deinit();
+        self.term_tuple_locals.deinit();
         self.synthesized_type_defs.deinit(self.allocator);
         self.union_dispatch_map.deinit();
         self.known_function_names.deinit();
@@ -1153,6 +1196,7 @@ pub const IrBuilder = struct {
         self.current_instrs = .empty;
         self.known_local_types.clearRetainingCapacity();
         self.param_backed_locals.clearRetainingCapacity();
+        self.term_tuple_locals.clearRetainingCapacity();
         self.current_param_types = .empty;
 
         // Use first clause for arity and return type
@@ -1491,6 +1535,7 @@ pub const IrBuilder = struct {
             self.current_instrs = .empty;
             self.known_local_types.clearRetainingCapacity();
         self.param_backed_locals.clearRetainingCapacity();
+        self.term_tuple_locals.clearRetainingCapacity();
 
             // Reserve binding locals (same as normal function)
             self.next_local = computeMaxBindingLocalForClauses(group.clauses);
@@ -2790,13 +2835,29 @@ pub const IrBuilder = struct {
                 // in the case_block's pre_instrs, enabling proper if-else nesting
                 // by emitFlatCaseBlock.
                 const scrutinee_local = self.resolveScrutinee(ct.scrutinee, scrutinee_map);
+                // When the scrutinee is a tuple extracted from a heterogeneous
+                // keyword list (param-backed list_get with `via_helper`), the
+                // runtime tuple's components are Term while the declared per-
+                // slot types are concrete. Tell `index_get` which concrete
+                // type to coerce each slot back to via `Term.toCoerced`.
+                const term_tuple_decl: ?ZigType = self.term_tuple_locals.get(scrutinee_local);
                 var i: u32 = 0;
                 while (i < ct.expected_arity) : (i += 1) {
                     const elem_local = self.next_local;
                     self.next_local += 1;
+                    const coerce_to: ZigType = if (term_tuple_decl) |tdecl| blk: {
+                        if (tdecl == .tuple and i < tdecl.tuple.len) {
+                            const slot_type = tdecl.tuple[i];
+                            if (slot_type != .term) break :blk slot_type;
+                        }
+                        break :blk .any;
+                    } else .any;
                     try self.current_instrs.append(self.allocator, .{
-                        .index_get = .{ .dest = elem_local, .object = scrutinee_local, .index = i },
+                        .index_get = .{ .dest = elem_local, .object = scrutinee_local, .index = i, .coerce_term_to = coerce_to },
                     });
+                    if (coerce_to != .any) {
+                        try self.known_local_types.put(elem_local, coerce_to);
+                    }
                     const elem_id = if (i < ct.element_scrutinee_ids.len)
                         ct.element_scrutinee_ids[i]
                     else
@@ -2810,10 +2871,18 @@ pub const IrBuilder = struct {
             .check_list => |cl| {
                 const scrutinee_local = self.resolveScrutinee(cl.scrutinee, scrutinee_map);
                 const elem_type = self.listElementTypeForLocal(scrutinee_local);
+                // When the scrutinee comes from a param, the runtime element
+                // type may diverge from the declared one (e.g. heterogeneous
+                // keyword list `[name: "x", age: 42]` passed to a function
+                // declared `[{Atom, i64}]`). Route through the type-derived
+                // `listLength`/`listGet` helpers so the actual element type
+                // is read from `@TypeOf(list)` instead of the stale declared
+                // element type.
+                const dispatch_via_helper = self.localBackedByParam(scrutinee_local);
                 const len_check_local = self.next_local;
                 self.next_local += 1;
                 try self.current_instrs.append(self.allocator, .{
-                    .list_len_check = .{ .dest = len_check_local, .scrutinee = scrutinee_local, .expected_len = cl.expected_length, .element_type = elem_type },
+                    .list_len_check = .{ .dest = len_check_local, .scrutinee = scrutinee_local, .expected_len = cl.expected_length, .element_type = elem_type, .via_helper = dispatch_via_helper },
                 });
                 const saved = self.current_instrs;
                 self.current_instrs = .empty;
@@ -2822,10 +2891,28 @@ pub const IrBuilder = struct {
                     const elem_local = self.next_local;
                     self.next_local += 1;
                     try self.current_instrs.append(self.allocator, .{
-                        .list_get = .{ .dest = elem_local, .list = scrutinee_local, .index = i, .element_type = elem_type },
+                        .list_get = .{ .dest = elem_local, .list = scrutinee_local, .index = i, .element_type = elem_type, .via_helper = dispatch_via_helper },
                     });
                     try self.known_local_types.put(elem_local, elem_type);
-                    try scrutinee_map.put(findParamGetIdInDecision(cl.success, i), elem_local);
+                    // When the list is param-backed AND its declared element
+                    // type is a tuple, the actual runtime element is a tuple
+                    // whose components may have been Term-promoted (the param
+                    // type `[{Atom, i64}]` accepts `[{Atom, Term}]` at runtime).
+                    // Track this so a later `index_get` from `elem_local` can
+                    // unwrap each Term slot back to the declared component
+                    // type via `Term.toCoerced(value, default)`.
+                    if (dispatch_via_helper and elem_type == .tuple) {
+                        try self.term_tuple_locals.put(elem_local, elem_type);
+                    }
+                    // Use the explicit element_scrutinee_ids when available
+                    // (always populated by the compiler), falling back to the
+                    // legacy heuristic only for older fixtures that may have
+                    // hand-constructed CheckListNodes without the field.
+                    const elem_id = if (i < cl.element_scrutinee_ids.len)
+                        cl.element_scrutinee_ids[i]
+                    else
+                        findParamGetIdInDecision(cl.success, i);
+                    try scrutinee_map.put(elem_id, elem_local);
                 }
                 try self.lowerDecisionTreeForCase(cl.success, case_arms, scrutinee_map, 0);
                 const success_body = try self.current_instrs.toOwnedSlice(self.allocator);
@@ -2839,10 +2926,14 @@ pub const IrBuilder = struct {
                 const scrutinee_local = self.resolveScrutinee(clc.scrutinee, scrutinee_map);
                 const elem_type = self.listElementTypeForLocal(scrutinee_local);
                 const scrutinee_list_type = self.known_local_types.get(scrutinee_local) orelse .any;
+                // Same param-backed dispatch shim as check_list — route
+                // through the type-derived list helpers when the scrutinee
+                // came from a param so the runtime element type is honored.
+                const dispatch_via_helper = self.localBackedByParam(scrutinee_local);
                 const not_empty_local = self.next_local;
                 self.next_local += 1;
                 try self.current_instrs.append(self.allocator, .{
-                    .list_is_not_empty = .{ .dest = not_empty_local, .list = scrutinee_local, .element_type = elem_type },
+                    .list_is_not_empty = .{ .dest = not_empty_local, .list = scrutinee_local, .element_type = elem_type, .via_helper = dispatch_via_helper },
                 });
                 const saved = self.current_instrs;
                 self.current_instrs = .empty;
@@ -2852,7 +2943,7 @@ pub const IrBuilder = struct {
                     const head_local = self.next_local;
                     self.next_local += 1;
                     try self.current_instrs.append(self.allocator, .{
-                        .list_head = .{ .dest = head_local, .list = current_list, .element_type = elem_type },
+                        .list_head = .{ .dest = head_local, .list = current_list, .element_type = elem_type, .via_helper = dispatch_via_helper },
                     });
                     try self.known_local_types.put(head_local, elem_type);
                     try scrutinee_map.put(clc.head_scrutinee_ids[i], head_local);
@@ -2860,7 +2951,7 @@ pub const IrBuilder = struct {
                         const next_list = self.next_local;
                         self.next_local += 1;
                         try self.current_instrs.append(self.allocator, .{
-                            .list_tail = .{ .dest = next_list, .list = current_list, .element_type = elem_type },
+                            .list_tail = .{ .dest = next_list, .list = current_list, .element_type = elem_type, .via_helper = dispatch_via_helper },
                         });
                         try self.known_local_types.put(next_list, scrutinee_list_type);
                         current_list = next_list;
@@ -2869,7 +2960,7 @@ pub const IrBuilder = struct {
                 const tail_local = self.next_local;
                 self.next_local += 1;
                 try self.current_instrs.append(self.allocator, .{
-                    .list_tail = .{ .dest = tail_local, .list = current_list, .element_type = elem_type },
+                    .list_tail = .{ .dest = tail_local, .list = current_list, .element_type = elem_type, .via_helper = dispatch_via_helper },
                 });
                 try self.known_local_types.put(tail_local, scrutinee_list_type);
                 try scrutinee_map.put(clc.tail_scrutinee_id, tail_local);
@@ -4264,8 +4355,30 @@ pub const IrBuilder = struct {
                     try elem_zig_types.append(self.allocator, self.known_local_types.get(local) orelse .any);
                 }
                 const elements = try locals.toOwnedSlice(self.allocator);
+
+                // Resolve the static tuple type for this expression (when
+                // the type system inferred one). When the parent context
+                // promoted some component to `Term` (heterogeneous unify),
+                // the HIR-side type id reflects that — preferring it over
+                // the per-element known_local_types means we can tell the
+                // backend to wrap concrete values via `Term.from`.
+                const inferred_tuple_type: ZigType = typeIdToZigTypeWithStore(expr.type_id, self.type_store);
+                const component_types: ?[]const ZigType = blk: {
+                    if (inferred_tuple_type == .tuple and inferred_tuple_type.tuple.len == elems.len) {
+                        // Copy the inferred component types so this slice is
+                        // owned by the IR (the type-store-derived slice is
+                        // owned elsewhere and may be aliased).
+                        var copy: std.ArrayList(ZigType) = .empty;
+                        for (inferred_tuple_type.tuple) |comp| {
+                            try copy.append(self.allocator, comp);
+                        }
+                        break :blk try copy.toOwnedSlice(self.allocator);
+                    }
+                    break :blk null;
+                };
+
                 try self.current_instrs.append(self.allocator, .{
-                    .tuple_init = .{ .dest = dest, .elements = elements },
+                    .tuple_init = .{ .dest = dest, .elements = elements, .component_types = component_types },
                 });
                 try self.known_local_types.put(dest, .{
                     .tuple = try elem_zig_types.toOwnedSlice(self.allocator),

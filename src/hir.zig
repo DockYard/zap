@@ -544,6 +544,13 @@ pub const CheckTupleNode = struct {
 pub const CheckListNode = struct {
     scrutinee: *const Expr,
     expected_length: u32,
+    /// Scrutinee IDs assigned to each list element by the pattern compiler.
+    /// `element_scrutinee_ids[i]` is the ID for element i, used to populate
+    /// the scrutinee_map in IR lowering. Stored explicitly because the
+    /// fragile `findParamGetIdInDecision` heuristic cannot distinguish list
+    /// elements from inner tuple/tag-extracted elements when patterns
+    /// decompose multiple list slots (e.g. `[{a, b}, {c, d}]`).
+    element_scrutinee_ids: []const u32,
     success: *const Decision,
     failure: *const Decision,
 };
@@ -1643,9 +1650,14 @@ fn compileListCheck(
         i -= 1;
         const length = lengths.items[i];
 
-        // Allocate new scrutinee IDs for list elements
+        // Allocate new scrutinee IDs for list elements. Save them in a
+        // separate slice that the CheckListNode owns so IR lowering can map
+        // list element positions to scrutinee locals directly without
+        // relying on `findParamGetIdInDecision` heuristics.
+        var element_ids: std.ArrayList(u32) = .empty;
         var new_scrutinee_list: std.ArrayList(u32) = .empty;
         for (0..length) |_| {
+            try element_ids.append(allocator, next_id.*);
             try new_scrutinee_list.append(allocator, next_id.*);
             next_id.* += 1;
         }
@@ -1702,6 +1714,7 @@ fn compileListCheck(
         d.* = .{ .check_list = .{
             .scrutinee = scrutinee_expr,
             .expected_length = length,
+            .element_scrutinee_ids = try element_ids.toOwnedSlice(allocator),
             .success = success_decision,
             .failure = current_failure,
         } };
@@ -2008,6 +2021,55 @@ fn unifyForCollection(store: *types_mod.TypeStore, a: types_mod.TypeId, b: types
         return store.addType(.{ .map = .{ .key = uk, .value = uv } }) catch types_mod.TypeStore.TERM;
     }
     return types_mod.TypeStore.TERM;
+}
+
+/// Propagate a unified collection element type back to a child element.
+/// Updates `elem.type_id` to `unified` when the unified form differs but
+/// is structurally compatible (same outer shape — tuple of same arity,
+/// list, map). For nested tuples, recurses into each component so a list
+/// like `[{:name, "x"}, {:age, 42}]` becomes `[{Atom, Term}]` and BOTH
+/// child tuples are re-typed to `{Atom, Term}` so the IR builder can
+/// thread the term-promoted slots into `tuple_init`'s component_types.
+fn propagateUnifiedTypeToElement(store: *types_mod.TypeStore, elem: *Expr, unified: types_mod.TypeId) void {
+    if (elem.type_id == unified) return;
+    if (unified == types_mod.TypeStore.UNKNOWN) return;
+    const elem_kind = store.getType(elem.type_id);
+    const uni_kind = store.getType(unified);
+
+    // Tuple — only re-type if both are tuples of the same arity and
+    // recurse into each child tuple element.
+    if (elem_kind == .tuple and uni_kind == .tuple and
+        elem_kind.tuple.elements.len == uni_kind.tuple.elements.len)
+    {
+        // Recurse into each child of a tuple_init expression so nested
+        // tuples carry the unified-component types as well.
+        if (elem.kind == .tuple_init) {
+            const children = elem.kind.tuple_init;
+            for (children, uni_kind.tuple.elements) |child, child_uni| {
+                propagateUnifiedTypeToElement(store, @constCast(child), child_uni);
+            }
+        }
+        elem.type_id = unified;
+        return;
+    }
+
+    // List — recurse into each child element.
+    if (elem_kind == .list and uni_kind == .list) {
+        if (elem.kind == .list_init) {
+            const children = elem.kind.list_init;
+            for (children) |child| {
+                propagateUnifiedTypeToElement(store, @constCast(child), uni_kind.list.element);
+            }
+        }
+        elem.type_id = unified;
+        return;
+    }
+
+    // Scalar promoted to Term — update so the construction site wraps via Term.from.
+    if (unified == types_mod.TypeStore.TERM) {
+        elem.type_id = unified;
+        return;
+    }
 }
 
 fn alwaysBool(_: types_mod.TypeId) types_mod.TypeId {
@@ -5309,6 +5371,16 @@ pub const HirBuilder = struct {
         for (built_elems) |elem| {
             if (elem.type_id == types_mod.TypeStore.UNKNOWN) continue;
             element_type = unifyForCollection(store_ptr, element_type, elem.type_id);
+        }
+
+        // Propagate the unified element type back to each child element so
+        // downstream IR sees the type that the list ACTUALLY expects (e.g.
+        // a heterogeneous keyword list `[name: "x", age: 42]` unifies to
+        // `[{Atom, Term}]` — each tuple element_type must reflect the
+        // promoted `Term` slot so `tuple_init` knows to emit `Term.from`).
+        for (built_elems) |elem| {
+            if (elem.type_id == types_mod.TypeStore.UNKNOWN) continue;
+            propagateUnifiedTypeToElement(store_ptr, @constCast(elem), element_type);
         }
 
         return store_ptr.addType(.{ .list = .{ .element = element_type } }) catch types_mod.TypeStore.UNKNOWN;

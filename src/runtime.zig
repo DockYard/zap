@@ -1857,7 +1857,7 @@ pub const Term = union(enum) {
         return Term.to(D, t, default);
     }
 
-    fn ToCoercedResult(comptime D: type) type {
+    pub fn ToCoercedResult(comptime D: type) type {
         const dti = @typeInfo(D);
         if (dti == .pointer and dti.pointer.size == .one) {
             const child_info = @typeInfo(dti.pointer.child);
@@ -1920,6 +1920,24 @@ pub const Term = union(enum) {
         };
     }
 };
+
+/// Coerce a value of any type back to the type produced by
+/// `Term.ToCoercedResult(@TypeOf(default))`. When the value is itself a
+/// `Term`, unwraps via `Term.toCoerced`. When the value is already
+/// compatible with `default` (the homogeneous case where the runtime
+/// collection's element type matches the declared type), returns it
+/// as-is. Used by pattern lowering for heterogeneous keyword lists:
+/// the function param's declared tuple slot may be `i64`, but the actual
+/// runtime tuple may carry `Term` values (when the caller passed a
+/// heterogeneous keyword list). One helper handles both shapes via a
+/// comptime branch on `@TypeOf(value)`.
+pub fn coerceFromMaybeTerm(value: anytype, default: anytype) Term.ToCoercedResult(@TypeOf(default)) {
+    const V = @TypeOf(value);
+    if (V == Term) {
+        return Term.toCoerced(value, default);
+    }
+    return value;
+}
 
 // ============================================================
 // Map — Generic HAMT-based persistent map.
@@ -2607,6 +2625,27 @@ pub fn Map(comptime K: type, comptime V: type) type {
 // for any element type T. Used for string lists, atom lists, etc.
 // ============================================================
 
+/// Compile-time default-value builder. Mirrors `std.mem.zeroes` but
+/// recurses through aggregates (tuples and structs) instead of bit-zeroing
+/// — so types containing `Term` (a tagged union without a zero variant)
+/// produce a valid default. Used by `List(T).defaultElement` so list
+/// fall-through paths work for heterogeneous keyword-list element types.
+fn defaultElementOf(comptime T: type) T {
+    if (T == Term) return Term{ .nil = {} };
+    const ti = @typeInfo(T);
+    switch (ti) {
+        .@"struct" => |s| {
+            var result: T = undefined;
+            inline for (s.fields) |field| {
+                @field(result, field.name) = defaultElementOf(field.type);
+            }
+            return result;
+        },
+        .optional => return null,
+        else => return std.mem.zeroes(T),
+    }
+}
+
 pub fn List(comptime T: type) type {
     return struct {
         const Self = @This();
@@ -2614,12 +2653,13 @@ pub fn List(comptime T: type) type {
         tail: ?*const Self,
 
         /// Default-initialised value of `T` for empty-list returns.
-        /// Tagged unions (notably `Term`) cannot use `std.mem.zeroes`,
-        /// so we pick a representative variant: `Term.nil` for `Term`,
-        /// `std.mem.zeroes` for everything else.
+        /// Tagged unions (notably `Term`) cannot use `std.mem.zeroes`.
+        /// Plain `Term` returns the `.nil` variant. For nested aggregates
+        /// (tuples or structs whose components include `Term`), build a
+        /// per-field default so heterogeneous keyword-list element types
+        /// like `tuple{Atom, Term}` work as `List` element types.
         fn defaultElement() T {
-            if (T == Term) return Term{ .nil = {} };
-            return std.mem.zeroes(T);
+            return defaultElementOf(T);
         }
 
         pub fn empty() ?*const Self {

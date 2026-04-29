@@ -1745,6 +1745,47 @@ pub const ZirDriver = struct {
         return ref;
     }
 
+    /// Emit a reference to a `zap_runtime.<helper_name>` function.
+    /// Used by list/map operations to dispatch through type-derived
+    /// `anytype` helpers (`listGet`, `listLength`, ...) when the
+    /// declared collection element type may differ from the runtime
+    /// element type (e.g. param-backed locals carrying heterogeneous
+    /// keyword lists).
+    fn emitRuntimeHelper(self: *ZirDriver, helper_name: []const u8) BuildError!u32 {
+        const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+        if (rt_import == error_ref) return error.EmitFailed;
+        const fn_ref = zir_builder_emit_field_val(self.handle, rt_import, helper_name.ptr, @intCast(helper_name.len));
+        if (fn_ref == error_ref) return error.EmitFailed;
+        return fn_ref;
+    }
+
+    /// Emit a zero/default value of a static type, used as the default
+    /// argument for `coerceFromMaybeTerm` so the unwrap returns the
+    /// declared concrete type. Numeric defaults use typed-int/typed-float
+    /// emission so the helper's `@TypeOf(default)` becomes a concrete
+    /// runtime type (e.g. `i64`) instead of `comptime_int` — otherwise
+    /// Sema demotes the helper call to comptime and rejects it because
+    /// the input value is runtime-known.
+    fn emitZeroDefaultForType(self: *ZirDriver, zig_type: ir.ZigType) BuildError!u32 {
+        return switch (zig_type) {
+            .i64 => zir_builder_emit_int_typed(self.handle, 0, @intFromEnum(Zir.Inst.Ref.i64_type)),
+            .i32 => zir_builder_emit_int_typed(self.handle, 0, @intFromEnum(Zir.Inst.Ref.i32_type)),
+            .i16 => zir_builder_emit_int_typed(self.handle, 0, @intFromEnum(Zir.Inst.Ref.i16_type)),
+            .i8 => zir_builder_emit_int_typed(self.handle, 0, @intFromEnum(Zir.Inst.Ref.i8_type)),
+            .u64 => zir_builder_emit_int_typed(self.handle, 0, @intFromEnum(Zir.Inst.Ref.u64_type)),
+            .u32 => zir_builder_emit_int_typed(self.handle, 0, @intFromEnum(Zir.Inst.Ref.u32_type)),
+            .u16 => zir_builder_emit_int_typed(self.handle, 0, @intFromEnum(Zir.Inst.Ref.u16_type)),
+            .u8 => zir_builder_emit_int_typed(self.handle, 0, @intFromEnum(Zir.Inst.Ref.u8_type)),
+            .usize => zir_builder_emit_int_typed(self.handle, 0, @intFromEnum(Zir.Inst.Ref.usize_type)),
+            .isize => zir_builder_emit_int_typed(self.handle, 0, @intFromEnum(Zir.Inst.Ref.isize_type)),
+            .f64, .f32, .f16 => zir_builder_emit_float(self.handle, 0.0),
+            .bool_type => @intFromEnum(Zir.Inst.Ref.bool_false),
+            .string => zir_builder_emit_str(self.handle, "".ptr, 0),
+            .atom => zir_builder_emit_int_typed(self.handle, 0, @intFromEnum(Zir.Inst.Ref.u32_type)),
+            else => @intFromEnum(Zir.Inst.Ref.void_value),
+        };
+    }
+
     /// Emit `runtime.Term.toCoerced(term_ref, default_ref)` — unwraps a
     /// `Term` back to a concrete value compatible with `default_ref`'s
     /// static Zig type. The runtime helper folds `*const [N:0]u8` ⇒
@@ -3976,7 +4017,12 @@ pub const ZirDriver = struct {
 
             // Aggregates
             .tuple_init => |ti| {
-                // Build field names ("0", "1", "2", ...) and value refs
+                // Build field names ("0", "1", "2", ...) and value refs.
+                // When the tuple's component type at index i is `.term`,
+                // wrap the value via `Term.from(value)` so heterogeneous
+                // tuple slots (e.g. `{Atom, Term}` representing a keyword
+                // pair where the value type was promoted to `Term`) accept
+                // concrete values like `comptime_int` literals.
                 var names_ptrs : std.ArrayListUnmanaged([*]const u8) = .empty;
                 defer names_ptrs.deinit(self.allocator);
                 var names_lens : std.ArrayListUnmanaged(u32) = .empty;
@@ -3985,22 +4031,23 @@ pub const ZirDriver = struct {
                 defer values.deinit(self.allocator);
 
                 for (ti.elements, 0..) |elem, i| {
-                    const ref = self.refForLocal(elem) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                    var ref = self.refForLocal(elem) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                    if (ti.component_types) |comps| {
+                        if (i < comps.len and comps[i] == .term) {
+                            ref = try self.emitTermWrap(ref);
+                        }
+                    }
                     const name = indexFieldName(i);
                     try names_ptrs.append(self.allocator, name.ptr);
                     try names_lens.append(self.allocator, name.len);
                     try values.append(self.allocator, ref);
                 }
 
-                // Map each tuple_init to its nested type using the DFS post-order stack.
-                const body_local_type = if (self.tuple_init_count < self.tuple_type_stack.items.len) blk: {
-                    const tuple_type = self.tuple_type_stack.items[self.tuple_init_count];
-                    self.tuple_init_count += 1;
-                    break :blk self.emitBodyLocalTupleType(tuple_type);
-                } else blk: {
-                    self.tuple_init_count += 1;
-                    break :blk @as(u32, 0);
-                };
+                // The body-local tuple_decl path is currently unused (no
+                // caller populates the legacy tuple_type_stack), so this
+                // always falls through to the anonymous init path.
+                self.tuple_init_count += 1;
+                const body_local_type: u32 = 0;
                 if (self.findReusePairForDest(ti.dest)) |pair| {
                     const seed_ref = if (body_local_type != 0)
                         zir_builder_emit_struct_init_typed(
@@ -4320,20 +4367,42 @@ pub const ZirDriver = struct {
                 if (zir_builder_emit_store(self.handle, ptr, val_ref) != 0) return error.EmitFailed;
             },
             .index_get => |ig| {
-                // Tuple/array element access by immediate index
+                // Tuple/array element access by immediate index. When
+                // `coerce_term_to` is set, the slot's runtime value MAY be
+                // a `Term` (heterogeneous keyword list) or already the
+                // declared concrete type (homogeneous case). The runtime
+                // helper `coerceFromMaybeTerm(value, default)` handles
+                // both via a comptime check on `@TypeOf(value)` so the
+                // emitted code stays correct under either monomorphisation.
                 const obj_ref = self.refForLocal(ig.object) catch return;
-                const ref = zir_builder_emit_elem_val_imm(self.handle, obj_ref, ig.index);
+                var ref = zir_builder_emit_elem_val_imm(self.handle, obj_ref, ig.index);
                 if (ref == error_ref) return error.EmitFailed;
+                if (ig.coerce_term_to != .any) {
+                    const default_ref = self.emitZeroDefaultForType(ig.coerce_term_to) catch ref;
+                    const helper_fn = try self.emitRuntimeHelper("coerceFromMaybeTerm");
+                    const args = [_]u32{ ref, default_ref };
+                    const coerced = zir_builder_emit_call_ref(self.handle, helper_fn, &args, 2);
+                    if (coerced == error_ref) return error.EmitFailed;
+                    ref = coerced;
+                }
                 try self.setLocal(ig.dest, ref);
             },
             .list_len_check => |llc| {
-                // Cons-cell length check: `List(T).length(list) == expected_len`.
+                // Cons-cell length check. When `via_helper` is set, dispatch
+                // through `listLength(anytype)` so the runtime element type
+                // is honored even if the declared element type differs.
                 const list_ref = self.refForLocal(llc.scrutinee) catch return;
-                const list_cell = try self.emitListCellRef(llc.element_type);
-                const len_fn = zir_builder_emit_field_val(self.handle, list_cell, "length", 6);
-                if (len_fn == error_ref) return error.EmitFailed;
-                const call_args = [_]u32{list_ref};
-                const len_ref = zir_builder_emit_call_ref(self.handle, len_fn, &call_args, 1);
+                const len_ref = if (llc.via_helper) blk: {
+                    const helper_fn = try self.emitRuntimeHelper("listLength");
+                    const call_args = [_]u32{list_ref};
+                    break :blk zir_builder_emit_call_ref(self.handle, helper_fn, &call_args, 1);
+                } else blk: {
+                    const list_cell = try self.emitListCellRef(llc.element_type);
+                    const len_fn = zir_builder_emit_field_val(self.handle, list_cell, "length", 6);
+                    if (len_fn == error_ref) return error.EmitFailed;
+                    const call_args = [_]u32{list_ref};
+                    break :blk zir_builder_emit_call_ref(self.handle, len_fn, &call_args, 1);
+                };
                 if (len_ref == error_ref) return error.EmitFailed;
                 const expected_ref = zir_builder_emit_int(self.handle, @intCast(llc.expected_len));
                 if (expected_ref == error_ref) return error.EmitFailed;
@@ -4343,15 +4412,25 @@ pub const ZirDriver = struct {
                 try self.setLocal(llc.dest, ref);
             },
             .list_get => |lg| {
-                // List-based element access: List.get(list, index)
+                // List-based element access. When the list is param-backed
+                // the runtime element type may differ from the declared one
+                // (heterogeneous keyword lists), so route through the
+                // `listGet(anytype, index)` helper which derives the actual
+                // type from `@TypeOf(list)`.
                 const list_ref = self.refForLocal(lg.list) catch return;
-                const list_cell = try self.emitListCellRef(lg.element_type);
-                const get_fn = zir_builder_emit_field_val(self.handle, list_cell, "get", 3);
-                if (get_fn == error_ref) return error.EmitFailed;
                 const index_ref = zir_builder_emit_int(self.handle, @intCast(lg.index));
                 if (index_ref == error_ref) return error.EmitFailed;
-                const call_args = [_]u32{ list_ref, index_ref };
-                const ref = zir_builder_emit_call_ref(self.handle, get_fn, &call_args, 2);
+                const ref = if (lg.via_helper) blk: {
+                    const helper_fn = try self.emitRuntimeHelper("listGet");
+                    const call_args = [_]u32{ list_ref, index_ref };
+                    break :blk zir_builder_emit_call_ref(self.handle, helper_fn, &call_args, 2);
+                } else blk: {
+                    const list_cell = try self.emitListCellRef(lg.element_type);
+                    const get_fn = zir_builder_emit_field_val(self.handle, list_cell, "get", 3);
+                    if (get_fn == error_ref) return error.EmitFailed;
+                    const call_args = [_]u32{ list_ref, index_ref };
+                    break :blk zir_builder_emit_call_ref(self.handle, get_fn, &call_args, 2);
+                };
                 if (ref == error_ref) return error.EmitFailed;
                 try self.setLocal(lg.dest, ref);
             },
@@ -4363,24 +4442,39 @@ pub const ZirDriver = struct {
                 try self.setLocal(lne.dest, ref);
             },
             .list_head => |lh| {
-                // List head extraction: List.getHead(list)
+                // List head extraction. When `via_helper` is set, dispatch
+                // through `listGetHead(anytype)` so the head's runtime type
+                // is read from `@TypeOf(list)` instead of the declared one.
                 const list_ref = self.refForValueLocal(lh.list) catch @intFromEnum(Zir.Inst.Ref.void_value);
-                const list_cell = try self.emitListCellRef(lh.element_type);
-                const fn_ref = zir_builder_emit_field_val(self.handle, list_cell, "getHead", 7);
-                if (fn_ref == error_ref) return error.EmitFailed;
-                const call_args = [_]u32{list_ref};
-                const ref = zir_builder_emit_call_ref(self.handle, fn_ref, &call_args, 1);
+                const ref = if (lh.via_helper) blk: {
+                    const helper_fn = try self.emitRuntimeHelper("listGetHead");
+                    const call_args = [_]u32{list_ref};
+                    break :blk zir_builder_emit_call_ref(self.handle, helper_fn, &call_args, 1);
+                } else blk: {
+                    const list_cell = try self.emitListCellRef(lh.element_type);
+                    const fn_ref = zir_builder_emit_field_val(self.handle, list_cell, "getHead", 7);
+                    if (fn_ref == error_ref) return error.EmitFailed;
+                    const call_args = [_]u32{list_ref};
+                    break :blk zir_builder_emit_call_ref(self.handle, fn_ref, &call_args, 1);
+                };
                 if (ref == error_ref) return error.EmitFailed;
                 try self.setLocal(lh.dest, ref);
             },
             .list_tail => |lt| {
-                // List tail extraction: List.getTail(list)
+                // List tail extraction. When `via_helper` is set, dispatch
+                // through `listGetTail(anytype)`.
                 const list_ref = self.refForValueLocal(lt.list) catch @intFromEnum(Zir.Inst.Ref.void_value);
-                const list_cell = try self.emitListCellRef(lt.element_type);
-                const fn_ref = zir_builder_emit_field_val(self.handle, list_cell, "getTail", 7);
-                if (fn_ref == error_ref) return error.EmitFailed;
-                const call_args = [_]u32{list_ref};
-                const ref = zir_builder_emit_call_ref(self.handle, fn_ref, &call_args, 1);
+                const ref = if (lt.via_helper) blk: {
+                    const helper_fn = try self.emitRuntimeHelper("listGetTail");
+                    const call_args = [_]u32{list_ref};
+                    break :blk zir_builder_emit_call_ref(self.handle, helper_fn, &call_args, 1);
+                } else blk: {
+                    const list_cell = try self.emitListCellRef(lt.element_type);
+                    const fn_ref = zir_builder_emit_field_val(self.handle, list_cell, "getTail", 7);
+                    if (fn_ref == error_ref) return error.EmitFailed;
+                    const call_args = [_]u32{list_ref};
+                    break :blk zir_builder_emit_call_ref(self.handle, fn_ref, &call_args, 1);
+                };
                 if (ref == error_ref) return error.EmitFailed;
                 try self.setLocal(lt.dest, ref);
             },
@@ -5336,15 +5430,145 @@ pub const ZirDriver = struct {
         try self.setLocal(ie.dest, ref);
     }
 
+    /// Emit a flat IR instruction sequence that may contain `guard_block`s,
+    /// reorganizing it into nested if-else-bodies so that each guard's
+    /// failure path becomes the next guard (or the trailing default ops).
+    ///
+    /// This is the same algorithm used by `emitFlatCaseBlock` for the
+    /// top-level case_block pre_instrs, factored out so it can be applied
+    /// to nested bodies (inside `guard_block` and inside captured arm/default
+    /// bodies of `emitFlatCaseBlock`). Without this, nested guard_blocks
+    /// produced by decision-tree lowering for patterns like `check_list →
+    /// switch_literal/switch_tag` would fall through into the trailing
+    /// default ops and execute both branches unconditionally.
+    ///
+    /// Recurses for both the trailing default body and each guard's own
+    /// body so that arbitrarily nested patterns (e.g. check_list →
+    /// check_tuple → switch_tag) all collapse correctly.
+    fn emitFlattenedGuardSequence(self: *ZirDriver, instrs: []const ir.Instruction) BuildError!void {
+        var has_guard = false;
+        for (instrs) |instr| {
+            if (instr == .guard_block) {
+                has_guard = true;
+                break;
+            }
+        }
+        if (!has_guard) {
+            for (instrs) |i| try self.emitInstruction(i);
+            return;
+        }
+
+        const void_ref = @intFromEnum(Zir.Inst.Ref.void_value);
+        const dest_opt = self.current_case_dest;
+
+        var last_guard_idx: usize = 0;
+        for (instrs, 0..) |instr, idx| {
+            if (instr == .guard_block) last_guard_idx = idx;
+        }
+        const default_start = last_guard_idx + 1;
+        const default_instrs = instrs[default_start..];
+
+        // Capture the trailing default body, recursing so any guard_blocks
+        // it contains are themselves flattened.
+        self.beginCapture();
+        try self.emitFlattenedGuardSequence(default_instrs);
+        var default_len: u32 = 0;
+        const default_ptr = self.endCapture(&default_len);
+        const default_result: u32 = if (dest_opt) |d|
+            if (self.local_refs.get(d)) |vr| self.materializeValueRef(vr) catch void_ref else void_ref
+        else
+            void_ref;
+
+        var current_else_insts = try self.allocator.alloc(u32, default_len);
+        @memcpy(current_else_insts, default_ptr[0..default_len]);
+        var current_else_result: u32 = default_result;
+
+        var guards = std.ArrayListUnmanaged(struct {
+            setup_start: usize,
+            guard_idx: usize,
+        }).empty;
+        defer guards.deinit(self.allocator);
+
+        var prev_end: usize = 0;
+        for (instrs, 0..) |instr, idx| {
+            if (instr == .guard_block) {
+                try guards.append(self.allocator, .{
+                    .setup_start = prev_end,
+                    .guard_idx = idx,
+                });
+                prev_end = idx + 1;
+            }
+        }
+
+        var gi = guards.items.len;
+        while (gi > 0) {
+            gi -= 1;
+            const guard = guards.items[gi];
+            const gb = instrs[guard.guard_idx].guard_block;
+            const setup_instrs = instrs[guard.setup_start..guard.guard_idx];
+
+            for (setup_instrs) |si| try self.emitInstruction(si);
+
+            const cond_ref = try self.refForLocal(gb.condition);
+
+            self.beginCapture();
+            try self.emitFlattenedGuardSequence(gb.body);
+            var body_len: u32 = 0;
+            const body_ptr = self.endCapture(&body_len);
+
+            const body_result: u32 = if (dest_opt) |d|
+                if (self.local_refs.get(d)) |vr| self.materializeValueRef(vr) catch void_ref else void_ref
+            else
+                void_ref;
+
+            const body_insts = try self.allocator.alloc(u32, body_len);
+            @memcpy(body_insts, body_ptr[0..body_len]);
+
+            const ref = zir_builder_emit_if_else_bodies(
+                self.handle,
+                cond_ref,
+                body_insts.ptr,
+                @intCast(body_insts.len),
+                body_result,
+                current_else_insts.ptr,
+                @intCast(current_else_insts.len),
+                current_else_result,
+            );
+
+            self.allocator.free(body_insts);
+            self.allocator.free(current_else_insts);
+
+            if (ref == error_ref) return error.EmitFailed;
+
+            if (gi > 0) {
+                const block_idx = zir_builder_pop_body_inst(self.handle);
+                current_else_insts = try self.allocator.alloc(u32, 1);
+                current_else_insts[0] = block_idx;
+                current_else_result = ref;
+            } else {
+                current_else_insts = try self.allocator.alloc(u32, 0);
+                current_else_result = ref;
+            }
+        }
+
+        self.allocator.free(current_else_insts);
+
+        if (dest_opt) |d| {
+            try self.setLocal(d, current_else_result);
+        }
+    }
+
     /// Emit a guard block: if (condition) { body } else { void }.
     /// Body instructions are captured and placed inside a condbr_inline's
     /// then branch so Sema only analyzes them when the condition is true.
     fn emitGuardBlock(self: *ZirDriver, gb: ir.GuardBlock) BuildError!void {
         const cond_ref = try self.refForLocal(gb.condition);
 
-        // Capture body instructions
+        // Capture body instructions, flattening any nested guard_blocks in
+        // the body into proper if-else-bodies so trailing default ops do
+        // not run unconditionally alongside the matching guard.
         self.beginCapture();
-        for (gb.body) |bi| try self.emitInstruction(bi);
+        try self.emitFlattenedGuardSequence(gb.body);
         var body_len: u32 = 0;
         const body_ptr = self.endCapture(&body_len);
 
@@ -5754,8 +5978,9 @@ pub const ZirDriver = struct {
             if (guards.items.len == 1) {
                 // Emit setup instructions (e.g., match_type)
                 for (cb.pre_instrs[0..last_guard.guard_idx]) |si| try self.emitInstruction(si);
-                // Emit body instructions at top level
-                for (last_gb.body) |bi| try self.emitInstruction(bi);
+                // Emit body instructions at top level (flatten any nested
+                // guard_blocks so trailing default ops do not run alongside).
+                try self.emitFlattenedGuardSequence(last_gb.body);
                 // The case_break in the body sets cb.dest
                 const result = if (self.local_refs.get(cb.dest)) |vr| try self.materializeValueRef(vr) else @intFromEnum(Zir.Inst.Ref.void_value);
                 try self.setLocal(cb.dest, result);
@@ -5775,9 +6000,11 @@ pub const ZirDriver = struct {
             }
             index_get_pre_emitted = true;
 
-            // Capture the catch-all body as default
+            // Capture the catch-all body as default. Flatten nested
+            // guard_blocks so that trailing default ops inside the catchall
+            // body do not execute alongside the matching inner guard.
             self.beginCapture();
-            for (last_gb.body) |bi| try self.emitInstruction(bi);
+            try self.emitFlattenedGuardSequence(last_gb.body);
             var catchall_len: u32 = 0;
             const catchall_ptr = self.endCapture(&catchall_len);
 
@@ -5809,9 +6036,12 @@ pub const ZirDriver = struct {
             // Get the guard condition ref
             const cond_ref = try self.refForLocal(gb.condition);
 
-            // Capture the guard body
+            // Capture the guard body. Flatten nested guard_blocks (e.g.
+            // those produced by inner switch_literal/switch_tag/check_list
+            // lowerings) so each inner branch is a proper if-else and
+            // trailing default ops do not run unconditionally.
             self.beginCapture();
-            for (gb.body) |bi| try self.emitInstruction(bi);
+            try self.emitFlattenedGuardSequence(gb.body);
             try self.emitDropSpecializationsForCurrentInstr(cb.dest, @intCast(gi));
             var body_len: u32 = 0;
             const body_ptr = self.endCapture(&body_len);
