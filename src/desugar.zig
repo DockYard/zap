@@ -24,6 +24,17 @@ pub const Desugarer = struct {
     pending_helpers: std.ArrayList(ast.StructItem) = .empty,
     /// Current module scope during desugaring — used for import resolution.
     current_module_scope: ?scope_mod.ScopeId = null,
+    /// Set while desugaring inside a `macro` / `priv_macro` declaration's
+    /// body. Macro bodies are compile-time templates evaluated by the
+    /// macro engine (`src/macro_eval.zig`), so constructs that would
+    /// normally be lowered to runtime helpers — `for` comprehensions in
+    /// particular — must NOT be lifted out as `__for_N` private
+    /// functions. The macro engine handles `for` directly via
+    /// `forComprehensionIntrinsic`. Lifting would emit a runtime helper
+    /// whose body still references comptime-only intrinsics (`elem`,
+    /// `__zap_list_at__`, etc.), tripping spurious "function not found"
+    /// diagnostics during type-checking.
+    in_macro_body: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, interner: *ast.StringInterner, graph: ?*const scope_mod.ScopeGraph) Desugarer {
         return .{
@@ -83,8 +94,8 @@ pub const Desugarer = struct {
         return switch (item) {
             .function => |func| .{ .function = try self.desugarFunctionDecl(func) },
             .priv_function => |func| .{ .priv_function = try self.desugarFunctionDecl(func) },
-            .macro => |mac| .{ .macro = try self.desugarFunctionDecl(mac) },
-            .priv_macro => |mac| .{ .priv_macro = try self.desugarFunctionDecl(mac) },
+            .macro => |mac| .{ .macro = try self.desugarMacroDecl(mac) },
+            .priv_macro => |mac| .{ .priv_macro = try self.desugarMacroDecl(mac) },
             else => item,
         };
     }
@@ -93,11 +104,26 @@ pub const Desugarer = struct {
         return switch (item) {
             .function => |func| .{ .function = try self.desugarFunctionDecl(func) },
             .priv_function => |func| .{ .priv_function = try self.desugarFunctionDecl(func) },
-            .macro => |mac| .{ .macro = try self.desugarFunctionDecl(mac) },
-            .priv_macro => |mac| .{ .priv_macro = try self.desugarFunctionDecl(mac) },
+            .macro => |mac| .{ .macro = try self.desugarMacroDecl(mac) },
+            .priv_macro => |mac| .{ .priv_macro = try self.desugarMacroDecl(mac) },
             .struct_level_expr => |expr| .{ .struct_level_expr = try self.desugarExpr(expr) },
             else => item,
         };
+    }
+
+    /// Desugar a macro declaration. Identical to `desugarFunctionDecl`
+    /// except for setting `in_macro_body` so that nested `for`
+    /// comprehensions are not lifted into `__for_N` private functions.
+    /// Macro bodies are compile-time templates evaluated by the macro
+    /// engine; the `for` is handled by `forComprehensionIntrinsic` in
+    /// `src/macro_eval.zig`, so a runtime helper would be both useless
+    /// and a source of spurious "function not found" diagnostics for
+    /// the comptime-only intrinsics in the body.
+    fn desugarMacroDecl(self: *Desugarer, mac: *const ast.FunctionDecl) !*const ast.FunctionDecl {
+        const prev = self.in_macro_body;
+        self.in_macro_body = true;
+        defer self.in_macro_body = prev;
+        return self.desugarFunctionDecl(mac);
     }
 
     // ============================================================
@@ -146,7 +172,7 @@ pub const Desugarer = struct {
                 }),
             },
             .function_decl => |func| .{ .function_decl = try self.desugarFunctionDecl(func) },
-            .macro_decl => |mac| .{ .macro_decl = try self.desugarFunctionDecl(mac) },
+            .macro_decl => |mac| .{ .macro_decl = try self.desugarMacroDecl(mac) },
             .import_decl => stmt,
         };
     }
@@ -911,6 +937,32 @@ pub const Desugarer = struct {
     }
 
     fn desugarForExpr(self: *Desugarer, fe: *const ast.ForExpr) !*const ast.Expr {
+        // Inside a macro body, leave the `for` expression intact: the
+        // macro engine evaluates it directly via
+        // `forComprehensionIntrinsic` in `src/macro_eval.zig`. Lifting
+        // it into a runtime `__for_N` helper would emit a private
+        // function whose body still references compile-time intrinsics
+        // (`elem`, `__zap_list_at__`, etc.), which the type checker
+        // would then flag as missing functions. We still recurse into
+        // the iterable, filter, and body so any nested non-for
+        // desugaring (string interpolation, pipes the macro engine
+        // already handled, etc.) still applies.
+        if (self.in_macro_body) {
+            const iterable = try self.desugarExpr(fe.iterable);
+            const filter = if (fe.filter) |f| try self.desugarExpr(f) else null;
+            const body = try self.desugarExpr(fe.body);
+            return try self.create(ast.Expr, .{
+                .for_expr = .{
+                    .meta = fe.meta,
+                    .var_pattern = fe.var_pattern,
+                    .var_type_annotation = fe.var_type_annotation,
+                    .iterable = iterable,
+                    .filter = filter,
+                    .body = body,
+                },
+            });
+        }
+
         // All iterables route through the Enumerable protocol. The HIR
         // builder's `protocolDispatchModule` rewrites `Enumerable.next(state)`
         // to `T.next(state)` based on `state`'s inferred type at HIR build
@@ -1161,4 +1213,92 @@ test "desugar no-op on simple expressions" {
     const func = desugared.structs[0].items[0].function;
     const body = func.clauses[0].body.?;
     try std.testing.expect(body[0].expr.* == .binary_op);
+}
+
+test "for inside macro body is not lifted into __for_N helper" {
+    // Regression: a `for` comprehension inside a macro body was being
+    // lifted out into a `__for_N` private function whose body still
+    // referenced compile-time intrinsics (`elem`, `__zap_list_at__`,
+    // etc.). The type checker would then fail to find those names and
+    // emit spurious "I cannot find a function named ..." warnings.
+    // Macro bodies are evaluated by the macro engine, which handles
+    // `for` directly via `forComprehensionIntrinsic`, so the lift is
+    // both unnecessary and harmful.
+    const source =
+        \\pub struct Test {
+        \\  pub macro do_thing(body :: Expr) -> Expr {
+        \\    _stmts = elem(body, 2)
+        \\    _xs = for _s <- _stmts, elem(_s, 0) == :setup { _s }
+        \\    quote { unquote_splicing(_xs) }
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var desugarer = Desugarer.init(alloc, parser.interner, null);
+    const desugared = try desugarer.desugarProgram(&program);
+
+    // No item should be a generated `__for_N` helper. The single item
+    // in the module must be the macro itself.
+    const items = desugared.structs[0].items;
+    try std.testing.expectEqual(@as(usize, 1), items.len);
+    try std.testing.expect(items[0] == .macro);
+
+    // The for expression should remain as a `for_expr` node inside the
+    // macro body's let-binding right-hand side, not be replaced by a
+    // call to a generated helper.
+    const macro_body = items[0].macro.clauses[0].body.?;
+    // Body shape: [_stmts = elem(...), _xs = for ..., quote { ... }]
+    try std.testing.expect(macro_body.len >= 2);
+    const xs_assign = macro_body[1].assignment;
+    try std.testing.expect(xs_assign.value.* == .for_expr);
+}
+
+test "for outside macro body is still lifted into __for_N helper" {
+    // Counterpart to the previous test: a regular function still has
+    // its `for` comprehension lifted, since the runtime needs an actual
+    // helper to drive iteration. Without this, the macro-body skip
+    // would over-fire and break runtime `for`.
+    const source =
+        \\pub struct Test {
+        \\  pub fn run(xs :: List(i64)) -> List(i64) {
+        \\    for x <- xs { x + 1 }
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var desugarer = Desugarer.init(alloc, parser.interner, null);
+    const desugared = try desugarer.desugarProgram(&program);
+
+    // The struct must contain the original `run` function plus at
+    // least one synthesised `__for_N` private helper.
+    const items = desugared.structs[0].items;
+    try std.testing.expect(items.len >= 2);
+
+    var found_helper = false;
+    for (items) |item| {
+        if (item == .priv_function) {
+            const name = parser.interner.get(item.priv_function.name);
+            if (std.mem.startsWith(u8, name, "__for_")) {
+                found_helper = true;
+                break;
+            }
+        }
+    }
+    try std.testing.expect(found_helper);
 }
