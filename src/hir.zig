@@ -236,8 +236,10 @@ pub const ErrorPipeHir = struct {
     /// Local index that the IR will populate with the failing pipe value
     /// before lowering `handler`. The HIR builder allocates this so that
     /// `__err` references inside the handler resolve to the same local.
-    /// Zero indicates no `__err` allocation (function-style handler).
-    err_local: u32 = 0,
+    /// `null` indicates no `__err` allocation (function-style handler), in
+    /// which case the failing value is passed to the handler function as
+    /// its first call argument by the IR-level lowering.
+    err_local: ?u32 = null,
 };
 
 pub const ErrorPipeStep = struct {
@@ -2335,15 +2337,47 @@ pub const HirBuilder = struct {
         return types_mod.TypeStore.UNKNOWN;
     }
 
-    /// Check if a function (by name and arity) has multiple clauses.
-    /// Multi-clause functions are the ones that get __try variants for ~> catch basins.
+    /// Check if a function (by name and arity) is dispatched: i.e., one of its
+    /// clauses can fail to match at runtime, so the call may produce a "no
+    /// matching clause" outcome that a `~>` catch basin should be able to catch.
+    ///
+    /// A function is dispatched when EITHER:
+    ///   * it has multiple clauses (the dispatcher must select one), OR
+    ///   * its single clause has a non-trivial parameter pattern or a
+    ///     refinement guard, so calling it with an unmatched argument is a
+    ///     dispatch failure rather than a sure-match.
+    ///
+    /// Pure variable-binding / wildcard clauses with no guard are always
+    /// total — they don't need a `__try` variant and would not benefit from
+    /// catch-basin handling.
     fn isFunctionMultiClause(self: *const HirBuilder, name: ast.StringId, arity: u32) bool {
         const scope_id = self.current_clause_scope orelse self.current_module_scope orelse self.graph.prelude_scope;
         if (self.graph.resolveFamily(scope_id, name, arity)) |fam_id| {
             const family = self.graph.getFamily(fam_id);
-            return family.clauses.items.len > 1;
+            if (family.clauses.items.len > 1) return true;
+            if (family.clauses.items.len == 1) {
+                const clause_ref = family.clauses.items[0];
+                const clause = clause_ref.decl.clauses[clause_ref.clause_index];
+                if (clause.refinement != null) return true;
+                for (clause.params) |param| {
+                    if (!isTotalParamPattern(param.pattern)) return true;
+                }
+            }
         }
         return false;
+    }
+
+    /// A parameter pattern is "total" when it is guaranteed to match any
+    /// runtime value of its declared type without inspecting the value.
+    /// Bare bindings, wildcards, and parenthesised total patterns qualify.
+    /// Anything that does runtime structural inspection (literals, tuples,
+    /// lists, maps, struct patterns, binaries, pins) is non-total.
+    fn isTotalParamPattern(pattern: *const ast.Pattern) bool {
+        return switch (pattern.*) {
+            .wildcard, .bind => true,
+            .paren => |p| isTotalParamPattern(p.inner),
+            else => false,
+        };
     }
 
     fn applyCallArgModes(self: *const HirBuilder, args: []CallArg, callee_type_id: types_mod.TypeId) void {
@@ -4742,7 +4776,11 @@ pub const HirBuilder = struct {
 
     const HandlerLowering = struct {
         expr: *const Expr,
-        err_local: u32, // 0 → no `__err` allocation (function-style handler)
+        /// `null` → no `__err` allocation (function-style handler).
+        /// Some(idx) → IR populates local `idx` with the failing pipe value
+        /// before lowering the handler; pattern bindings on `__err` resolve
+        /// to the same local index.
+        err_local: ?u32,
     };
 
     /// Build an error handler HIR expression from an AST ErrorHandler.
@@ -4824,7 +4862,7 @@ pub const HirBuilder = struct {
                 return .{ .expr = case_expr, .err_local = err_local };
             },
             .function => |func| {
-                return .{ .expr = try self.buildExpr(func), .err_local = 0 };
+                return .{ .expr = try self.buildExpr(func), .err_local = null };
             },
         }
     }

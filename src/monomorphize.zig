@@ -854,7 +854,11 @@ const MonomorphContext = struct {
                         .is_dispatched = step.is_dispatched,
                     };
                 }
-                break :blk .{ .error_pipe = .{ .steps = new_steps, .handler = try self.cloneExpr(ep.handler) } };
+                break :blk .{ .error_pipe = .{
+                    .steps = new_steps,
+                    .handler = try self.cloneExpr(ep.handler),
+                    .err_local = ep.err_local,
+                } };
             },
             .match => |m| .{ .match = .{
                 .scrutinee = try self.cloneExpr(m.scrutinee),

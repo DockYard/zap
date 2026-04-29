@@ -3233,23 +3233,38 @@ pub const ZirDriver = struct {
                 if (is_non_null == error_ref) return error.EmitFailed;
 
                 // Then branch (non-null = matched): unwrap optional payload
+                // and, if this step has follow-on pipe steps, run those
+                // inline so a failure in any earlier step short-circuits
+                // them. The catch-basin expression value is then the
+                // result of the deepest success path (or the handler).
                 self.beginCapture();
                 const payload = zir_builder_emit_optional_payload_unsafe(self.handle, call_ref);
                 if (payload == error_ref) return error.EmitFailed;
+                if (tcn.payload_local) |pl| {
+                    try self.setLocal(pl, payload);
+                }
+                for (tcn.success_instrs) |si| try self.emitInstruction(si);
+                const success_value_ref = if (tcn.success_result) |sr|
+                    (self.refForLocal(sr) catch payload)
+                else
+                    payload;
                 var then_len: u32 = 0;
                 const then_ptr = self.endCapture(&then_len);
                 const then_insts = try self.allocator.alloc(u32, then_len);
                 @memcpy(then_insts, then_ptr[0..then_len]);
 
-                // Else branch (null = no match): evaluate handler with input, return result
+                // Else branch (null = no match): evaluate handler with input.
+                // The handler's result becomes the value of the if-else block (and
+                // therefore the value of the catch basin expression). DO NOT emit
+                // a `ret` here: the catch basin is an expression that produces a
+                // value, not a control-flow exit from the enclosing function.
+                // Emitting `ret` from here breaks any function whose ZIR-level
+                // return type differs from the handler's value type — most
+                // notably `main`, which Zap lowers as `void`/`u8` to satisfy
+                // Zig's entry-point ABI even when the user wrote `-> String`.
                 self.beginCapture();
                 // Emit handler instructions (they reference the input local via __err)
                 for (tcn.handler_instrs) |hi| try self.emitInstruction(hi);
-                if (tcn.handler_result) |hr| {
-                    const hr_ref = try self.refForLocal(hr);
-                    if (zir_builder_emit_ret(self.handle, hr_ref) != 0)
-                        return error.EmitFailed;
-                }
                 var else_len: u32 = 0;
                 const else_ptr = self.endCapture(&else_len);
                 const handler_result_ref = if (tcn.handler_result) |hr|
@@ -3257,13 +3272,15 @@ pub const ZirDriver = struct {
                 else
                     @intFromEnum(Zir.Inst.Ref.void_value);
 
-                // Emit if-else: if (non_null) { unwrap } else { handler + return }
+                // Emit if-else: if (non_null) { unwrap; ...rest_of_pipe } else { handler_instrs }
+                // Both branches break with their respective values; the block's
+                // peer-resolved result is the catch-basin expression value.
                 const result = zir_builder_emit_if_else_bodies(
                     self.handle,
                     is_non_null,
                     then_insts.ptr,
                     @intCast(then_insts.len),
-                    payload,
+                    success_value_ref,
                     else_ptr,
                     else_len,
                     handler_result_ref,

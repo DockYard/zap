@@ -503,6 +503,19 @@ pub const CallBuiltin = struct {
 
 /// Call a __try function variant. The result is an error union:
 /// error{NoMatchingClause}!ReturnType.
+///
+/// Lowering invariant: the catch-basin pipeline is short-circuited at the
+/// FIRST failing dispatched step. To express that without forcing a
+/// `ret` (which would hijack the enclosing function's return), each
+/// `try_call_named` carries the REST of the pipe in `success_instrs` /
+/// `success_result`. The ZIR backend lowers the instruction as a single
+/// if-else block whose value is the catch-basin expression value:
+///   * then-branch: unwrap payload, run `success_instrs`, yield
+///     `success_result` (which itself may be the dest of a nested
+///     try_call_named for deeper pipelines).
+///   * else-branch: run `handler_instrs`, yield `handler_result`.
+/// When `success_instrs` is empty, the success value is simply the
+/// unwrapped payload — the simple terminal-step case.
 pub const TryCallNamed = struct {
     dest: LocalId, // holds the optional result (?ReturnType)
     name: []const u8, // the __try function name (already suffixed)
@@ -511,6 +524,17 @@ pub const TryCallNamed = struct {
     input_local: LocalId, // the pipe input — passed to handler on null
     handler_instrs: []const Instruction, // handler body instructions
     handler_result: ?LocalId, // handler result local
+    /// Instructions to run in the success branch AFTER unwrapping the
+    /// optional payload. When empty the success value is the payload itself.
+    success_instrs: []const Instruction = &.{},
+    /// Local that holds the value of the success branch after
+    /// `success_instrs` runs. When `null`, the unwrapped payload is used
+    /// directly (terminal step in the pipe).
+    success_result: ?LocalId = null,
+    /// Local that the unwrapped payload is bound to so that
+    /// `success_instrs` can reference it. When `null`, the success
+    /// branch does not need access to the payload.
+    payload_local: ?LocalId = null,
 };
 
 /// Unwrap an error union from try_call_named.
@@ -1403,8 +1427,31 @@ pub const IrBuilder = struct {
             .defaults = try defaults_list.toOwnedSlice(self.allocator),
         });
 
-        // Generate __try variant for multi-clause functions that use decision tree dispatch.
-        if (uses_decision_tree and group.clauses.len > 1 and self.try_variant_names.contains(name_str)) {
+        // Generate a `__try` variant whenever the catch-basin pipeline asked
+        // for one (i.e. the original function name is in `try_variant_names`).
+        //
+        // For multi-clause functions we go through the decision-tree dispatch
+        // path. Single-clause functions are regularly emitted without
+        // dispatch — but if the single clause has a non-trivial pattern
+        // (literal, struct, tuple, refinement, etc.) the call can still fail
+        // to match, and `~>` callers need a `__try` variant to detect that.
+        // We synthesise one here using the same decision-tree machinery used
+        // for multi-clause functions.
+        const single_clause_has_dispatch = blk: {
+            if (group.clauses.len != 1) break :blk false;
+            const c = group.clauses[0];
+            if (c.refinement != null) break :blk true;
+            for (c.params) |p| {
+                if (p.pattern) |pat| {
+                    if (!isTotalMatchPattern(pat)) break :blk true;
+                }
+            }
+            break :blk false;
+        };
+        const want_try_variant =
+            self.try_variant_names.contains(name_str) and
+            ((uses_decision_tree and group.clauses.len > 1) or single_clause_has_dispatch);
+        if (want_try_variant) {
             // Use a high ID offset for __try variants to avoid colliding with
             // normal function group IDs (which come from HIR and are sequential).
             const try_func_id = self.next_try_id;
@@ -3509,6 +3556,142 @@ pub const IrBuilder = struct {
         }
     }
 
+    /// Build the mangled name used by error-pipe call lowering:
+    /// `Mod__name__N` when there is a module prefix, `name__N` otherwise.
+    /// Mirrors what the rest of the IR uses so that the `__try` variant
+    /// resolved at the call site matches the concrete function we emit.
+    fn formatErrorPipeCallName(self: *IrBuilder, call: hir_mod.CallExpr, arity: usize) anyerror![]const u8 {
+        return switch (call.target) {
+            .named => |n| blk: {
+                if (n.module) |mod| break :blk try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ mod, n.name, arity });
+                if (self.current_module_prefix) |prefix| break :blk try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ prefix, n.name, arity });
+                break :blk try std.fmt.allocPrint(self.allocator, "{s}__{d}", .{ n.name, arity });
+            },
+            else => "unknown",
+        };
+    }
+
+    /// Lower a non-dispatched call step inside an error pipe (a
+    /// single-clause total function). The call is emitted inline at the
+    /// current `current_instrs` position. Returns the local that holds the
+    /// call's result so it can be threaded into the next pipe step.
+    fn lowerSingleErrorPipeCall(self: *IrBuilder, step: hir_mod.ErrorPipeStep, pipe_val: LocalId) anyerror!LocalId {
+        const call = step.expr.kind.call;
+        var arg_locals: std.ArrayList(LocalId) = .empty;
+        try arg_locals.append(self.allocator, pipe_val);
+        for (call.args) |arg| {
+            try arg_locals.append(self.allocator, try self.lowerExpr(arg.expr));
+        }
+        const call_dest = self.next_local;
+        self.next_local += 1;
+        const final_args = try arg_locals.toOwnedSlice(self.allocator);
+        const modes = try self.allocator.alloc(ValueMode, final_args.len);
+        @memset(modes, .share);
+        const ep_call_arity = final_args.len;
+        const call_name_str = try self.formatErrorPipeCallName(call, ep_call_arity);
+        try self.current_instrs.append(self.allocator, .{
+            .call_named = .{ .dest = call_dest, .name = call_name_str, .args = final_args, .arg_modes = modes },
+        });
+        return call_dest;
+    }
+
+    /// Lower a single dispatched error-pipe step that may fail. The rest
+    /// of the pipe (`remaining`) is lowered into the step's success
+    /// branch so that a dispatch failure jumps directly to the handler
+    /// without running the trailing steps. Returns the local that the ZIR
+    /// backend will populate with the catch-basin expression value.
+    fn lowerErrorPipeTryStep(
+        self: *IrBuilder,
+        step: hir_mod.ErrorPipeStep,
+        pipe_val: LocalId,
+        remaining: []const hir_mod.ErrorPipeStep,
+        err_local: ?u32,
+        handler_hir: *const hir_mod.Expr,
+    ) anyerror!LocalId {
+        const call = step.expr.kind.call;
+        var arg_locals: std.ArrayList(LocalId) = .empty;
+        try arg_locals.append(self.allocator, pipe_val);
+        for (call.args) |arg| {
+            try arg_locals.append(self.allocator, try self.lowerExpr(arg.expr));
+        }
+        const call_dest = self.next_local;
+        self.next_local += 1;
+        const final_args = try arg_locals.toOwnedSlice(self.allocator);
+        const modes = try self.allocator.alloc(ValueMode, final_args.len);
+        @memset(modes, .share);
+        const ep_call_arity = final_args.len;
+        const call_name_str = try self.formatErrorPipeCallName(call, ep_call_arity);
+
+        const try_name = try std.fmt.allocPrint(self.allocator, "{s}__try", .{call_name_str});
+        try self.try_variant_names.put(call_name_str, {});
+
+        // Lower the handler in a fresh instruction buffer. The handler
+        // reads the failed pipe value via `__err` (block-style handlers)
+        // or as a function argument (`err_local == 0`).
+        const saved = self.current_instrs;
+        self.current_instrs = .empty;
+        if (err_local) |el| {
+            if (self.next_local <= el) self.next_local = el + 1;
+            try self.current_instrs.append(self.allocator, .{
+                .local_set = .{ .dest = el, .value = pipe_val },
+            });
+        }
+        const handler_result = try self.lowerExpr(handler_hir);
+        const handler_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
+        self.current_instrs = saved;
+
+        // Allocate a local to hold the unwrapped payload, so the success
+        // branch can refer to it as the input of subsequent steps.
+        const payload_local = self.next_local;
+        self.next_local += 1;
+
+        // Build the success branch: emit any remaining steps with
+        // `payload_local` as the new pipe value, recursing into another
+        // try_call_named for the next dispatched step.
+        const success_saved = self.current_instrs;
+        self.current_instrs = .empty;
+        var success_pipe_val: LocalId = payload_local;
+        var rem_idx: usize = 0;
+        while (rem_idx < remaining.len) : (rem_idx += 1) {
+            const next_step = remaining[rem_idx];
+            if (next_step.expr.kind != .call) continue;
+            if (!next_step.is_dispatched) {
+                const lowered = try self.lowerSingleErrorPipeCall(next_step, success_pipe_val);
+                success_pipe_val = lowered;
+                continue;
+            }
+            const inner = try self.lowerErrorPipeTryStep(
+                next_step,
+                success_pipe_val,
+                remaining[rem_idx + 1 ..],
+                err_local,
+                handler_hir,
+            );
+            success_pipe_val = inner;
+            // After a nested try_call_named, the rest of the pipe has
+            // already been folded into its success branch.
+            break;
+        }
+        const success_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
+        self.current_instrs = success_saved;
+
+        try self.current_instrs.append(self.allocator, .{
+            .try_call_named = .{
+                .dest = call_dest,
+                .name = try_name,
+                .args = final_args,
+                .arg_modes = modes,
+                .input_local = pipe_val,
+                .handler_instrs = handler_instrs,
+                .handler_result = handler_result,
+                .success_instrs = success_instrs,
+                .success_result = success_pipe_val,
+                .payload_local = payload_local,
+            },
+        });
+        return call_dest;
+    }
+
     fn lowerExpr(self: *IrBuilder, expr: *const hir_mod.Expr) anyerror!LocalId {
         // Case expressions need binding locals reserved before dest allocation
         // to avoid shadowing conflicts in the generated Zig.
@@ -4026,84 +4209,59 @@ pub const IrBuilder = struct {
                 });
             },
             .error_pipe => |ep| {
-                // Lower error pipe as FLAT sequence.
-                // Every function call in the pipe uses its __try variant if multi-clause.
-                // If __try returns null, the unmatched input flows to the handler.
+                // Lower the error pipe so that a failure in any dispatched
+                // step short-circuits the rest of the pipeline. The catch-
+                // basin expression value is either the value of the last step
+                // (when every dispatched step matched) or the value of the
+                // handler (when one of them did not).
+                //
+                // To express the short-circuit without emitting a `ret`
+                // (which would hijack the enclosing function's return), every
+                // dispatched step is lowered as a `try_call_named` whose
+                // success branch carries the rest of the pipe inline. The
+                // ZIR backend turns this into a nested if-else block whose
+                // value flows through `setLocal(dest, ...)` here.
                 if (ep.steps.len == 0) return dest;
 
-                // Store the handler HIR expression for deferred evaluation at each step.
                 const handler_hir = ep.handler;
+
+                // Lower the base value at the top level (no try_call wraps it).
                 var pipe_val = try self.lowerExpr(ep.steps[0].expr);
 
-                // Process remaining steps at the top level
-                for (ep.steps[1..]) |step| {
-                    if (step.expr.kind == .call) {
-                        const call = step.expr.kind.call;
-                        var arg_locals: std.ArrayList(LocalId) = .empty;
-                        try arg_locals.append(self.allocator, pipe_val);
-                        for (call.args) |arg| {
-                            try arg_locals.append(self.allocator, try self.lowerExpr(arg.expr));
-                        }
-                        const call_dest = self.next_local;
-                        self.next_local += 1;
-                        const final_args = try arg_locals.toOwnedSlice(self.allocator);
-                        const modes = try self.allocator.alloc(ValueMode, final_args.len);
-                        @memset(modes, .share);
-                        const ep_call_arity = final_args.len;
-                        const call_name_str = switch (call.target) {
-                            .named => |n| blk: {
-                                if (n.module) |mod| break :blk try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ mod, n.name, ep_call_arity });
-                                if (self.current_module_prefix) |prefix| break :blk try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ prefix, n.name, ep_call_arity });
-                                break :blk try std.fmt.allocPrint(self.allocator, "{s}__{d}", .{ n.name, ep_call_arity });
-                            },
-                            else => "unknown",
-                        };
+                const remaining_steps = ep.steps[1..];
 
-                        if (step.is_dispatched) {
-                            // Multi-clause: call __try variant (returns ?ReturnType).
-                            // On null: run handler with input value, short-circuit.
-                            const try_name = try std.fmt.allocPrint(self.allocator, "{s}__try", .{call_name_str});
-                            try self.try_variant_names.put(call_name_str, {});
-
-                            // Lower handler with pipe_val as the scrutinee (__err).
-                            // Block-style handlers carry the local index they
-                            // expect to read; function-style handlers (err_local==0)
-                            // take the failing value as their first call arg
-                            // and don't need a local_set.
-                            const saved = self.current_instrs;
-                            self.current_instrs = .empty;
-                            if (ep.err_local != 0) {
-                                if (self.next_local <= ep.err_local) self.next_local = ep.err_local + 1;
-                                try self.current_instrs.append(self.allocator, .{
-                                    .local_set = .{ .dest = ep.err_local, .value = pipe_val },
-                                });
-                            }
-                            const handler_result = try self.lowerExpr(handler_hir);
-                            const handler_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
-                            self.current_instrs = saved;
-
-                            try self.current_instrs.append(self.allocator, .{
-                                .try_call_named = .{
-                                    .dest = call_dest,
-                                    .name = try_name,
-                                    .args = final_args,
-                                    .arg_modes = modes,
-                                    .input_local = pipe_val,
-                                    .handler_instrs = handler_instrs,
-                                    .handler_result = handler_result,
-                                },
-                            });
-                            pipe_val = call_dest;
-                        } else {
-                            // Single-clause function: always matches, regular call
-                            try self.current_instrs.append(self.allocator, .{
-                                .call_named = .{ .dest = call_dest, .name = call_name_str, .args = final_args, .arg_modes = modes },
-                            });
-                            pipe_val = call_dest;
-                        }
+                // Walk the remaining steps. As soon as we hit a dispatched
+                // step, the rest of the pipe must be emitted INSIDE that
+                // step's success branch (so a failure jumps over them all
+                // and yields the handler's value). Non-dispatched steps
+                // before any dispatched step can stay at the top level.
+                var idx: usize = 0;
+                while (idx < remaining_steps.len) : (idx += 1) {
+                    const step = remaining_steps[idx];
+                    if (step.expr.kind != .call) continue;
+                    if (!step.is_dispatched) {
+                        // Single-clause total step: emit a regular call
+                        // inline, then continue with the next step.
+                        const lowered = try self.lowerSingleErrorPipeCall(step, pipe_val);
+                        pipe_val = lowered;
+                        continue;
                     }
+                    // Dispatched step: emit a try_call_named whose success
+                    // branch holds the rest of the pipe (recursively built
+                    // as a nested instruction list).
+                    const try_local = try self.lowerErrorPipeTryStep(
+                        step,
+                        pipe_val,
+                        remaining_steps[idx + 1 ..],
+                        ep.err_local,
+                        handler_hir,
+                    );
+                    return try_local;
                 }
-
+                // No dispatched step appeared after the base value (or there
+                // were no dispatched calls at all). The handler is dead
+                // code, but we still must produce the pipe's value: it is
+                // the result of the last (non-dispatched) call.
                 return pipe_val;
             },
             .union_init => |ui| {
@@ -4474,6 +4632,19 @@ fn zigTypeToEncodedName(zig_type: ZigType) []const u8 {
 
 /// Walks every destructure-binding kind on every clause and returns one past
 /// the maximum local_index used. The result is the lower bound for fresh
+/// Whether a HIR `MatchPattern` is total — guaranteed to match any value of
+/// its declared parameter type without runtime inspection. Bare bindings and
+/// wildcards qualify; literals, tuples, lists, struct patterns, maps, pins,
+/// list-cons, and binary patterns all perform some structural check and so
+/// can fail to match. Used by `__try`-variant generation to decide whether a
+/// single-clause function needs a dispatch wrapper for catch-basin callers.
+fn isTotalMatchPattern(pattern: *const hir_mod.MatchPattern) bool {
+    return switch (pattern.*) {
+        .wildcard, .bind => true,
+        else => false,
+    };
+}
+
 /// local allocation in the function body (binding locals live above this).
 /// All six binding kinds (tuple/struct/list/cons_tail/binary/map) must be
 /// covered — omitting any one silently corrupts the local layout for the
