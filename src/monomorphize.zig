@@ -464,6 +464,66 @@ const MonomorphContext = struct {
                     _ = self.store.unify(param.type_id, arg_type, &subs) catch {};
                 }
 
+                // Promote typevar bindings to `Term` for typevars that
+                // need it to keep specialization consistent with the
+                // runtime helper's heterogeneous storage. The base
+                // unifier treats `Term` as a coercing supertype so a
+                // typevar paired with `Term` doesn't pin to the
+                // storage. That keeps scalar typevar uses correct
+                // (`Map.get`'s `default :: V` -> `V`, where
+                // `MapGetReturnType` unwraps the runtime `Term` back
+                // to the default's narrower type) but it leaves two
+                // problems:
+                //
+                //   1. Container-returning functions whose typevar
+                //      reappears under a container in the return type
+                //      (`Map.update`/`Map.put`'s `%{K=>V}` ->
+                //      `%{K=>V}`) materialise the value-arg's narrower
+                //      type into the return container, mismatching the
+                //      runtime's actual `Map(K, Term)` result.
+                //
+                //   2. Functions where the typevar never appears in the
+                //      return at all (`Map.has_key`'s `V` only lives
+                //      under the map param) leave `V` unbound, so the
+                //      `containsTypeVars` filter below skips
+                //      specialisation altogether — the caller then
+                //      tries to invoke a non-existent specialisation
+                //      and the build fails silently in the ZIR
+                //      injection stage.
+                //
+                // Both cases collapse into: promote `V` -> `Term`
+                // whenever `V` shows up as a container element-slot in
+                // a param AND the return type does NOT use `V` as a
+                // free scalar (i.e. the return either lacks `V` or
+                // wraps `V` in a container too). Pure-scalar return-V
+                // (Map.get-style) is the only configuration left
+                // untouched, preserving its narrow-binding behaviour.
+                {
+                    const return_uses_var_as_scalar = scalarTypeVarSet(self.store, first_clause.return_type, self.allocator) catch null;
+                    var return_scalar_set = return_uses_var_as_scalar orelse std.AutoHashMap(types_mod.TypeVarId, void).init(self.allocator);
+                    defer return_scalar_set.deinit();
+                    for (first_clause.params, call.args) |param, arg| {
+                        var arg_type = arg.expr.type_id;
+                        if (arg.expr.kind == .local_get) {
+                            if (self.local_types.get(arg.expr.kind.local_get)) |concrete| {
+                                arg_type = concrete;
+                            }
+                        }
+                        if (arg.expr.kind == .param_get and self.current_scan_params != null) {
+                            const pidx = arg.expr.kind.param_get;
+                            if (pidx < self.current_scan_params.?.len) {
+                                const scan_param_type = self.current_scan_params.?[pidx].type_id;
+                                if (!self.store.containsTypeVars(scan_param_type)) {
+                                    arg_type = scan_param_type;
+                                }
+                            }
+                        }
+                        if (arg_type == types_mod.TypeStore.UNKNOWN or arg_type == types_mod.TypeStore.ERROR) continue;
+                        promoteContainerVarsExceptScalarReturn(self.store, param.type_id, arg_type, &return_scalar_set, &subs);
+                    }
+                }
+
+
                 // Collect concrete type args sorted by type variable ID for determinism
                 var type_args: std.ArrayListUnmanaged(TypeId) = .empty;
                 defer type_args.deinit(self.allocator);
@@ -1118,6 +1178,108 @@ fn containsTypeVar(store: *const TypeStore, type_id: TypeId) bool {
         },
         else => false,
     };
+}
+
+/// Collect typevars that appear at a SCALAR (top-level, not inside a
+/// container) position within `type_id`. These are the typevars whose
+/// binding directly determines the type's identity rather than the
+/// element type of an enclosing container. Used to detect cases like
+/// `Map.get`'s `-> V` return where promoting `V` to `Term` would
+/// silently change the apparent return type at the IR level.
+fn scalarTypeVarSet(
+    store: *const TypeStore,
+    type_id: TypeId,
+    allocator: Allocator,
+) !std.AutoHashMap(types_mod.TypeVarId, void) {
+    var out = std.AutoHashMap(types_mod.TypeVarId, void).init(allocator);
+    errdefer out.deinit();
+    try collectScalarTypeVars(store, type_id, true, &out);
+    return out;
+}
+
+fn collectScalarTypeVars(
+    store: *const TypeStore,
+    type_id: TypeId,
+    is_scalar_position: bool,
+    out: *std.AutoHashMap(types_mod.TypeVarId, void),
+) error{OutOfMemory}!void {
+    const typ = store.getType(type_id);
+    switch (typ) {
+        .type_var => |var_id| {
+            if (is_scalar_position) try out.put(var_id, {});
+        },
+        .list => |lt| try collectScalarTypeVars(store, lt.element, false, out),
+        .map => |mt| {
+            try collectScalarTypeVars(store, mt.key, false, out);
+            try collectScalarTypeVars(store, mt.value, false, out);
+        },
+        .tuple => |tt| {
+            for (tt.elements) |elem| {
+                try collectScalarTypeVars(store, elem, false, out);
+            }
+        },
+        .function => |ft| {
+            for (ft.params) |p| try collectScalarTypeVars(store, p, false, out);
+            try collectScalarTypeVars(store, ft.return_type, false, out);
+        },
+        else => {},
+    }
+}
+
+/// Walk param/arg types in lock-step. For every typevar position in
+/// `param_type` whose `arg_type` counterpart is `Term`, force the
+/// typevar's binding to `Term` — UNLESS the typevar is in
+/// `scalar_return_vars` (i.e. it appears at a scalar position in the
+/// function's return type, where binding to `Term` would change the
+/// apparent return type at the IR level and break callers like
+/// `Map.get` that rely on the runtime helper unwrapping back to the
+/// default's narrower type).
+fn promoteContainerVarsExceptScalarReturn(
+    store: *const TypeStore,
+    param_type: TypeId,
+    arg_type: TypeId,
+    scalar_return_vars: *const std.AutoHashMap(types_mod.TypeVarId, void),
+    subs: *types_mod.SubstitutionMap,
+) void {
+    const param_typ = store.getType(param_type);
+    const arg_typ = store.getType(arg_type);
+    switch (param_typ) {
+        .type_var => |var_id| {
+            if (arg_typ == .term_type and !scalar_return_vars.contains(var_id)) {
+                if (subs.bindings.get(var_id)) |existing| {
+                    if (store.getType(existing) == .term_type) return;
+                }
+                subs.bind(var_id, types_mod.TypeStore.TERM);
+            }
+        },
+        .list => |pt_list| {
+            if (arg_typ == .list) {
+                promoteContainerVarsExceptScalarReturn(store, pt_list.element, arg_typ.list.element, scalar_return_vars, subs);
+            }
+        },
+        .map => |pt_map| {
+            if (arg_typ == .map) {
+                promoteContainerVarsExceptScalarReturn(store, pt_map.key, arg_typ.map.key, scalar_return_vars, subs);
+                promoteContainerVarsExceptScalarReturn(store, pt_map.value, arg_typ.map.value, scalar_return_vars, subs);
+            }
+        },
+        .tuple => |pt_tup| {
+            if (arg_typ == .tuple and pt_tup.elements.len == arg_typ.tuple.elements.len) {
+                for (pt_tup.elements, arg_typ.tuple.elements) |pe, ae| {
+                    promoteContainerVarsExceptScalarReturn(store, pe, ae, scalar_return_vars, subs);
+                }
+            }
+        },
+        .function => |pt_fn| {
+            if (arg_typ == .function and pt_fn.params.len == arg_typ.function.params.len) {
+                for (pt_fn.params, arg_typ.function.params) |pp, ap| {
+                    promoteContainerVarsExceptScalarReturn(store, pp, ap, scalar_return_vars, subs);
+                }
+                promoteContainerVarsExceptScalarReturn(store, pt_fn.return_type, arg_typ.function.return_type, scalar_return_vars, subs);
+            }
+        },
+        else => {},
+    }
 }
 
 /// Hash a (group_id, type_args) pair for deduplication.

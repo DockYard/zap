@@ -1786,6 +1786,81 @@ pub const ZirDriver = struct {
     /// Set the return type to a generic container type.
     /// Emits instructions for the container instantiation and records them
     /// as the return type body via the fork's custom return type API.
+    /// Pop every body instruction emitted since `before_count`, then push
+    /// their indices into `support` in EMISSION order. Used to capture the
+    /// instructions that materialise complex element/key/value type refs
+    /// (e.g. `@import("zap_runtime")` + `field_val Term`) so they can be
+    /// embedded into the ret_ty body instead of being orphaned in the
+    /// function body where Sema can't resolve them.
+    fn captureBodyInsts(self: *ZirDriver, before_count: u32, support: *std.ArrayListUnmanaged(u32)) BuildError!void {
+        const after = zir_builder_get_body_inst_count(self.handle);
+        if (after <= before_count) return;
+        const num_added = after - before_count;
+        var captured: std.ArrayListUnmanaged(u32) = .empty;
+        defer captured.deinit(self.allocator);
+        var pop_remaining = num_added;
+        while (pop_remaining > 0) : (pop_remaining -= 1) {
+            const idx = zir_builder_pop_body_inst(self.handle);
+            try captured.append(self.allocator, idx);
+        }
+        // captured is reverse-emission order; reverse to restore emission order
+        var rev_i: usize = captured.items.len;
+        while (rev_i > 0) {
+            rev_i -= 1;
+            try support.append(self.allocator, captured.items[rev_i]);
+        }
+    }
+
+    fn setContainerReturnTypeWithSupport(
+        self: *ZirDriver,
+        generic_name: []const u8,
+        type_args: []const u32,
+        support: []const u32,
+    ) BuildError!void {
+        var inst_indices: std.ArrayListUnmanaged(u32) = .empty;
+        defer inst_indices.deinit(self.allocator);
+        // Prepend any support instructions captured by the caller (e.g.
+        // body insts produced while building Term/struct type refs) so
+        // they live inside the ret_ty body alongside the container-type
+        // instructions emitted below.
+        for (support) |idx| try inst_indices.append(self.allocator, idx);
+
+        // 1. @import("zap_runtime")
+        const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+        if (rt_import == error_ref) return error.EmitFailed;
+        try inst_indices.append(self.allocator, zir_builder_pop_body_inst(self.handle));
+
+        // 2. field_val for generic function (ListOf or MapOf)
+        const generic_fn = zir_builder_emit_field_val(self.handle, rt_import, generic_name.ptr, @intCast(generic_name.len));
+        if (generic_fn == error_ref) return error.EmitFailed;
+        try inst_indices.append(self.allocator, zir_builder_pop_body_inst(self.handle));
+
+        // 3. call_ref to instantiate: ListOf(T) or MapOf(K, V)
+        const instantiated = zir_builder_emit_call_ref(self.handle, generic_fn, type_args.ptr, @intCast(type_args.len));
+        if (instantiated == error_ref) return error.EmitFailed;
+        try inst_indices.append(self.allocator, zir_builder_pop_body_inst(self.handle));
+
+        // 4. field_val for .empty
+        const empty_fn = zir_builder_emit_field_val(self.handle, instantiated, "empty", 5);
+        if (empty_fn == error_ref) return error.EmitFailed;
+        try inst_indices.append(self.allocator, zir_builder_pop_body_inst(self.handle));
+
+        // 5. call_ref empty() to get a typed null value
+        const empty_val = zir_builder_emit_call_ref(self.handle, empty_fn, &.{}, 0);
+        if (empty_val == error_ref) return error.EmitFailed;
+        try inst_indices.append(self.allocator, zir_builder_pop_body_inst(self.handle));
+
+        // 6. @TypeOf(empty_val) to get the optional pointer type
+        const type_ref = zir_builder_emit_typeof(self.handle, empty_val);
+        if (type_ref == error_ref) return error.EmitFailed;
+        const typeof_inst = zir_builder_pop_body_inst(self.handle);
+        try inst_indices.append(self.allocator, typeof_inst);
+
+        if (zir_builder_set_custom_return_type(self.handle, inst_indices.items.ptr, @intCast(inst_indices.items.len), typeof_inst) != 0)
+            return error.EmitFailed;
+        self.current_ret_type = 1;
+    }
+
     fn setContainerReturnType(self: *ZirDriver, generic_name: []const u8, type_args: []const u32) BuildError!void {
         var inst_indices: std.ArrayListUnmanaged(u32) = .empty;
         defer inst_indices.deinit(self.allocator);
@@ -2027,21 +2102,37 @@ pub const ZirDriver = struct {
     fn emitComplexReturnType(self: *ZirDriver, return_type: ir.ZigType) !void {
         switch (return_type) {
             .list => {
+                // emitContainerElementTypeRef may emit support instructions
+                // (e.g. `@import("zap_runtime")`, `field_val Term`) into the
+                // function body. These references must live INSIDE the
+                // ret_ty body alongside `setContainerReturnType`'s own
+                // instructions — otherwise Sema's `inst_map.get(i).?` fails
+                // when resolving the typeof break in the ret_ty body.
+                var support: std.ArrayListUnmanaged(u32) = .empty;
+                defer support.deinit(self.allocator);
+                const before = zir_builder_get_body_inst_count(self.handle);
                 const elem_ref = (try self.emitContainerElementTypeRef(getListElementType(return_type))) orelse
                     zigTypeToTypeRef(getListElementType(return_type)) orelse
                     @intFromEnum(Zir.Inst.Ref.i64_type);
+                try self.captureBodyInsts(before, &support);
                 const type_args = [_]u32{elem_ref};
-                try self.setContainerReturnType("List", &type_args);
+                try self.setContainerReturnTypeWithSupport("List", &type_args, support.items);
             },
             .map => |mt| {
+                var support: std.ArrayListUnmanaged(u32) = .empty;
+                defer support.deinit(self.allocator);
+                const before_key = zir_builder_get_body_inst_count(self.handle);
                 const key_ref = (try self.emitContainerElementTypeRef(mt.key.*)) orelse
                     zigTypeToTypeRef(mt.key.*) orelse
                     @intFromEnum(Zir.Inst.Ref.u32_type);
+                try self.captureBodyInsts(before_key, &support);
+                const before_val = zir_builder_get_body_inst_count(self.handle);
                 const val_ref = (try self.emitContainerElementTypeRef(mt.value.*)) orelse
                     zigTypeToTypeRef(mt.value.*) orelse
                     @intFromEnum(Zir.Inst.Ref.i64_type);
+                try self.captureBodyInsts(before_val, &support);
                 const type_args = [_]u32{ key_ref, val_ref };
-                try self.setContainerReturnType("Map", &type_args);
+                try self.setContainerReturnTypeWithSupport("Map", &type_args, support.items);
             },
             .tuple => |elements| {
                 // Capture every body instruction emitted while constructing
