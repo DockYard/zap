@@ -1014,16 +1014,16 @@ pub const Collector = struct {
             },
             .case_expr => |ce| {
                 try self.collectExprScopes(ce.scrutinee, parent_scope);
-                for (ce.clauses) |clause| {
+                // Iterate by pointer: `for |clause|` copies each element so
+                // any mutation through `&clause.meta` would land on the
+                // local copy and never reach the AST stored in the slice.
+                // Desugar-generated case clauses share the synthetic span
+                // 0:0, which collides in `node_scope_map`, so the only way
+                // the type checker can later resolve each clause to its
+                // unique scope is through this in-place `meta.scope_id`
+                // write.
+                for (ce.clauses) |*clause| {
                     const clause_scope = try self.graph.createScope(parent_scope, .case_clause);
-                    // Register the clause's scope so later passes (type
-                    // checker, HIR builder) can locate it via
-                    // `resolveClauseScope`. Mirrors how function clause
-                    // scopes are registered in `collectFunction`. Also
-                    // write the scope onto the clause's meta so
-                    // desugar-generated clauses with synthetic span 0:0
-                    // (which collide in `node_scope_map`) still resolve
-                    // unambiguously.
                     try self.graph.node_scope_map.put(scope.ScopeGraph.spanKey(clause.meta.span), clause_scope);
                     @constCast(&clause.meta).scope_id = clause_scope;
                     try self.collectPatternBindings(clause.pattern, clause_scope);

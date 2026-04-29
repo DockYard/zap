@@ -342,6 +342,18 @@ pub fn runAnalysisPipelineWithIo(
     // --------------------------------------------------------
     for (program.functions) |func| {
         if (func.is_closure or func.captures.len > 0) {
+            // If no `make_closure` instruction targets this function, the
+            // captures are forwarded as plain prepended arguments at every
+            // call site (HIR's direct-call lowering, see hir.zig
+            // `target == .direct` branch). Treat such a function as
+            // lambda-lifted: no `__closure_env` parameter, captures consumed
+            // as ordinary positional parameters. This keeps the call-site
+            // shape (call_direct with prepended capture args) and the
+            // callee's parameter list in agreement.
+            if (!hasMakeClosureForFunction(program, func.id)) {
+                try ctx.closure_tiers.put(func.id, .lambda_lifted);
+                continue;
+            }
             // Find the escape state for this closure's creation site.
             // Look through all functions for a make_closure that references this function.
             const escape = findClosureEscape(&ctx, program, func.id);
@@ -463,6 +475,46 @@ fn collectBorrowDiagnostics(
             },
         }
     }
+}
+
+/// Does any `make_closure` instruction in the program target the given
+/// function? If not, the function is only ever direct-called and its
+/// captures are forwarded as ordinary arguments — i.e., it should be
+/// classified as lambda-lifted regardless of its `is_closure` flag.
+fn hasMakeClosureForFunction(program: *const ir.Program, target_func_id: ir.FunctionId) bool {
+    for (program.functions) |func| {
+        for (func.body) |block| {
+            if (instrsContainMakeClosureFor(block.instructions, target_func_id)) return true;
+        }
+    }
+    return false;
+}
+
+fn instrsContainMakeClosureFor(instrs: []const ir.Instruction, target_func_id: ir.FunctionId) bool {
+    for (instrs) |instr| {
+        switch (instr) {
+            .make_closure => |mc| if (mc.function == target_func_id) return true,
+            .if_expr => |ie| {
+                if (instrsContainMakeClosureFor(ie.then_instrs, target_func_id)) return true;
+                if (instrsContainMakeClosureFor(ie.else_instrs, target_func_id)) return true;
+            },
+            .case_block => |cb| {
+                if (instrsContainMakeClosureFor(cb.pre_instrs, target_func_id)) return true;
+                for (cb.arms) |arm| {
+                    if (instrsContainMakeClosureFor(arm.cond_instrs, target_func_id)) return true;
+                    if (instrsContainMakeClosureFor(arm.body_instrs, target_func_id)) return true;
+                }
+                if (instrsContainMakeClosureFor(cb.default_instrs, target_func_id)) return true;
+            },
+            .union_switch_return => |usr| {
+                for (usr.cases) |c| {
+                    if (instrsContainMakeClosureFor(c.body_instrs, target_func_id)) return true;
+                }
+            },
+            else => {},
+        }
+    }
+    return false;
 }
 
 /// Find the escape state for a closure's creation site by searching

@@ -913,6 +913,11 @@ pub const TypeChecker = struct {
     // Number of stdlib lines prepended (bindings in these lines are skipped for unused checks)
     stdlib_line_count: u32 = 0,
 
+    /// Names of synthetic helpers whose declaration is currently being
+    /// type-checked. Guards against the recursive helper call that desugar
+    /// emits inside `__for_N` triggering an infinite eager re-check loop.
+    eager_helper_in_flight: std.AutoHashMap(ast.StringId, void) = undefined,
+
     pub const Error = struct {
         message: []const u8,
         span: ast.SourceSpan,
@@ -941,6 +946,7 @@ pub const TypeChecker = struct {
             .analysis_context = null,
             .analysis_program = null,
             .type_var_scope = std.StringHashMap(TypeId).init(allocator),
+            .eager_helper_in_flight = std.AutoHashMap(ast.StringId, void).init(allocator),
         };
     }
 
@@ -959,6 +965,7 @@ pub const TypeChecker = struct {
             .analysis_context = null,
             .analysis_program = null,
             .type_var_scope = std.StringHashMap(TypeId).init(allocator),
+            .eager_helper_in_flight = std.AutoHashMap(ast.StringId, void).init(allocator),
         };
     }
 
@@ -972,6 +979,7 @@ pub const TypeChecker = struct {
         self.referenced_bindings.deinit();
         self.ownership_bindings.deinit();
         self.type_var_scope.deinit();
+        self.eager_helper_in_flight.deinit();
     }
 
     pub fn setAnalysisContext(self: *TypeChecker, context: *const escape_lattice.AnalysisContext, program: *const ir.Program) void {
@@ -1539,6 +1547,26 @@ pub const TypeChecker = struct {
             .return_type = return_type,
             .return_ownership = self.defaultOwnershipForType(return_type),
         };
+    }
+
+    /// True when `name` denotes a compiler-generated helper whose body and
+    /// parameter list are entirely under the desugar pass's control. The
+    /// type checker may eagerly recurse into such helpers because the body
+    /// has no external dependencies that haven't already been processed.
+    fn isSyntheticHelperName(self: *const TypeChecker, name: ast.StringId) bool {
+        const text = self.interner.get(name);
+        return std.mem.startsWith(u8, text, "__for_");
+    }
+
+    /// Resolve the AST `FunctionDecl` registered for `name`/`arity` in the
+    /// scope graph, if any. Returns the same node the type checker would
+    /// recurse into via the normal struct-member walk, so calling
+    /// `checkFunctionDecl` on the result mirrors a regular pass.
+    fn lookupFunctionDecl(self: *const TypeChecker, scope_id: scope_mod.ScopeId, name: ast.StringId, arity: u32) ?*const ast.FunctionDecl {
+        const family_id = self.graph.resolveFamily(scope_id, name, arity) orelse return null;
+        const family = self.graph.getFamily(family_id);
+        if (family.clauses.items.len == 0) return null;
+        return family.clauses.items[0].decl;
     }
 
     fn resolveFunctionRefSignature(self: *TypeChecker, fr: ast.FunctionRefExpr) !?FunctionSignature {
@@ -3668,10 +3696,36 @@ pub const TypeChecker = struct {
                             });
                         }
 
+                        // Eager helper resolution: when the call's return type
+                        // is still UNKNOWN we cannot just trust that a later
+                        // pass will fix `chars`'s recorded type — the binding
+                        // is recorded against whatever type we return *now*.
+                        // For synthetic helpers (e.g. for-comp `__for_N`) the
+                        // body is fully self-contained and its parameter
+                        // types have just been pinned via
+                        // `inferred_signatures`. Type-check the helper's
+                        // declaration immediately so the body fixpoint
+                        // (see `checkFunctionClause`) runs and updates
+                        // `inferred_signatures.return_type` to the body's
+                        // type. We then read the refreshed signature back
+                        // out and propagate that to the caller.
+                        var resolved_return = inferred_return;
+                        if (has_concrete and inferred_return == TypeStore.UNKNOWN and self.isSyntheticHelperName(vr.name)) {
+                            if (!self.eager_helper_in_flight.contains(vr.name)) {
+                                if (self.lookupFunctionDecl(scope_id, vr.name, arity)) |helper_decl| {
+                                    try self.eager_helper_in_flight.put(vr.name, {});
+                                    defer _ = self.eager_helper_in_flight.remove(vr.name);
+                                    self.checkFunctionDecl(helper_decl) catch {};
+                                    if (self.store.inferred_signatures.get(vr.name)) |refreshed| {
+                                        resolved_return = refreshed.return_type;
+                                    }
+                                }
+                            }
+                        }
 
                         const borrowed = try self.applyCallOwnershipWithSafeParams(call.args, signature.toFunctionType(), safe_params);
                         defer self.endBorrowedBindings(borrowed) catch {};
-                        return inferred_return;
+                        return resolved_return;
                     }
 
                     // Check if the signature is generic (contains type variables)

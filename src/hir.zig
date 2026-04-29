@@ -3089,6 +3089,15 @@ pub const HirBuilder = struct {
         const saved_root_scope = self.current_function_root_scope;
         const saved_capture_map = self.current_capture_map;
         const saved_capture_list = self.current_capture_list;
+        // Save the enclosing function's parameter signature so that any
+        // expressions built AFTER this nested group returns (e.g., the rest
+        // of the parent body, including direct calls into this nested
+        // closure) still resolve names against the outer params. Without
+        // this, `add(10)` inside `make_adder(x)` would lower a reference
+        // to `x` against `add`'s param list and synthesise a spurious
+        // capture in the parent.
+        const saved_param_names = self.current_param_names;
+        const saved_param_types = self.current_param_types;
         self.current_function_root_scope = if (func.clauses.len > 0) self.graph.resolveClauseScope(func.clauses[0].meta) else null;
         self.current_capture_map = std.AutoHashMap(ast.StringId, u32).init(self.allocator);
         self.current_capture_list = .empty;
@@ -3174,6 +3183,8 @@ pub const HirBuilder = struct {
         self.next_local = saved_next_local;
         self.current_function_name = saved_function_name;
         self.current_function_name_id = saved_function_name_id;
+        self.current_param_names = saved_param_names;
+        self.current_param_types = saved_param_types;
         self.current_assignment_bindings = saved_assignment_bindings;
         self.current_tuple_bindings = saved_tuple_bindings;
         self.current_struct_bindings = saved_struct_bindings;

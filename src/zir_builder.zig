@@ -2222,6 +2222,21 @@ pub const ZirDriver = struct {
             try self.param_refs.append(self.allocator, args_ref);
             try self.setLocal(0, args_ref);
         } else {
+            // Lambda-lifted closures: captures are passed as prepended
+            // ordinary parameters at every call site (see HIR direct-call
+            // lowering and analysis_pipeline `hasMakeClosureForFunction`).
+            // Emit one ZIR param per capture before the declared params so
+            // the function's signature matches the call_direct argument
+            // shape, then resolve `capture_get` against `capture_param_refs`.
+            for (func.captures) |cap| {
+                const cap_param: ir.Param = .{
+                    .name = cap.name,
+                    .type_expr = cap.type_expr,
+                    .type_id = null,
+                };
+                const cap_ref = try self.emitTypedParam(cap_param);
+                try self.capture_param_refs.append(self.allocator, cap_ref);
+            }
             for (func.params, 0..) |param, i| {
                 const param_ref = try self.emitTypedParam(param);
                 try self.param_refs.append(self.allocator, param_ref);
@@ -4627,6 +4642,13 @@ pub const ZirDriver = struct {
                         try self.setLocal(cg.dest, ref);
                         return;
                     }
+                }
+
+                // Lambda-lifted closure: captures are prepended ordinary
+                // parameters; resolve via capture_param_refs.
+                if (cg.index < self.capture_param_refs.items.len) {
+                    try self.setLocal(cg.dest, self.capture_param_refs.items[cg.index]);
+                    return;
                 }
 
                 const ref = zir_builder_emit_void(self.handle);
