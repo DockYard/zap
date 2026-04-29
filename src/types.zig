@@ -1091,6 +1091,19 @@ pub const TypeChecker = struct {
             },
             .struct_pattern => |sp| {
                 const parent_typ = self.store.getType(parent_type);
+                // The parser routes the `%{key: pat, ...}` shape into
+                // `.struct_pattern` (with an empty module_name) for both
+                // struct and map destructuring — they share syntax. When
+                // the annotation says the value is a Map(K, V), each
+                // field-pattern binds to the map's value type, not a
+                // struct field type.
+                if (parent_typ == .map and sp.module_name.parts.len == 0) {
+                    const value_type = parent_typ.map.value;
+                    for (sp.fields) |field| {
+                        try self.recordAssignmentBindingTypes(field.pattern, value_type, source_span);
+                    }
+                    return;
+                }
                 for (sp.fields) |field| {
                     var field_type: TypeId = TypeStore.UNKNOWN;
                     if (parent_typ == .struct_type) {
@@ -1169,6 +1182,17 @@ pub const TypeChecker = struct {
             },
             .struct_pattern => |sp| {
                 const parent_typ = self.store.getType(parent_type);
+                // Mirror `recordAssignmentBindingTypes`: a `%{key: pat}`
+                // pattern parses as `.struct_pattern` with empty
+                // module_name; when matched against a Map(K, V), bind
+                // each inner pattern to the map's value type.
+                if (parent_typ == .map and sp.module_name.parts.len == 0) {
+                    const value_type = parent_typ.map.value;
+                    for (sp.fields) |field| {
+                        try self.recordCasePatternBindingTypes(field.pattern, value_type, source_span);
+                    }
+                    return;
+                }
                 for (sp.fields) |field| {
                     var field_type: TypeId = TypeStore.UNKNOWN;
                     if (parent_typ == .struct_type) {
@@ -4089,7 +4113,25 @@ pub const TypeChecker = struct {
                 };
             },
             .paren => |pt| self.resolveTypeExpr(pt.inner),
-            .map => TypeStore.UNKNOWN,
+            .map => |mt| {
+                // `%{K -> V, ...}` map type literal. We use the first
+                // field's key/value to determine the homogeneous K and V
+                // (the canonical convention — the parser allows multiple
+                // K -> V entries syntactically, but downstream code
+                // assumes a single Map(K, V) type). Without this
+                // resolution, parameter destructuring patterns like
+                // `pub fn f(%{name: n} :: %{Atom -> String})` lose `n`'s
+                // String type, breaking first-arg-driven protocol
+                // dispatch (`Concatenable.concat`, `Arithmetic.+`, …).
+                if (mt.fields.len == 0) {
+                    const key_var = try self.store.freshVar();
+                    const value_var = try self.store.freshVar();
+                    return try self.store.addType(.{ .map = .{ .key = key_var, .value = value_var } });
+                }
+                const key_t = try self.resolveTypeExpr(mt.fields[0].key);
+                const value_t = try self.resolveTypeExpr(mt.fields[0].value);
+                return try self.store.addType(.{ .map = .{ .key = key_t, .value = value_t } });
+            },
             .struct_type => TypeStore.UNKNOWN,
         };
     }

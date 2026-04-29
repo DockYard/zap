@@ -379,6 +379,10 @@ pub const MapHasKey = struct {
     dest: LocalId,
     map: LocalId,
     key: LocalId,
+    /// Type of map keys (used by ZIR to look up the right `Map(K, V)` cell).
+    key_type: ZigType = .atom,
+    /// Type of map values (carried for symmetry; not strictly required by `hasKey`).
+    value_type: ZigType = .i64,
 };
 
 pub const MapGet = struct {
@@ -386,6 +390,10 @@ pub const MapGet = struct {
     map: LocalId,
     key: LocalId,
     default: LocalId,
+    /// Type of map keys (used by ZIR to look up the right `Map(K, V)` cell).
+    key_type: ZigType = .atom,
+    /// Type of map values (used by ZIR to look up the right `Map(K, V)` cell).
+    value_type: ZigType = .i64,
 };
 
 pub const GuardBlock = struct {
@@ -2308,12 +2316,35 @@ pub const IrBuilder = struct {
             try self.current_instrs.append(self.allocator, .{
                 .param_get = .{ .dest = map_local, .index = binding.param_index },
             });
+            // Resolve the map's key/value types from the clause's
+            // declared parameter type so the ZIR emitter instantiates
+            // the right `Map(K, V)` cell for the runtime call. Without
+            // this the emitter would default to `.atom`/`.i64`.
+            const param_type = if (binding.param_index < clause.params.len)
+                typeIdToZigTypeWithStore(clause.params[binding.param_index].type_id, self.type_store)
+            else
+                ZigType.any;
+            const key_type: ZigType = if (param_type == .map) param_type.map.key.* else .atom;
+            const value_type: ZigType = if (param_type == .map) param_type.map.value.* else .i64;
+            // Track the binding's value type so `var_ref` lookups against
+            // the destructured local emit correctly-typed downstream
+            // instructions (e.g. string concat, arithmetic).
+            try self.known_local_types.put(binding.local_index, value_type);
+            // Track the param's map type so subsequent `map_get` locals
+            // resolved through this same param_get path see the right
+            // K/V (e.g. for `Map.get` calls in the body).
+            if (param_type != .any) {
+                try self.known_local_types.put(map_local, param_type);
+            }
             // Lower the key expression to get the key local
             const key_local = try self.lowerExpr(binding.key_expr);
-            // Create a default value (nil/0)
-            const default_local = self.next_local;
-            self.next_local += 1;
-            try self.current_instrs.append(self.allocator, .{ .const_nil = default_local });
+            // Create a default value matching the map's value type. The
+            // pattern destructure semantically assumes the key exists,
+            // so the default is unreachable at runtime — but the
+            // compiler still type-checks it against the runtime
+            // `Map(K, V).get` signature, so we must produce a value of
+            // the right Zig type or the call won't typecheck.
+            const default_local = try self.emitDefaultValueForType(value_type);
             // Extract the value via map_get
             try self.current_instrs.append(self.allocator, .{
                 .map_get = .{
@@ -2321,9 +2352,56 @@ pub const IrBuilder = struct {
                     .map = map_local,
                     .key = key_local,
                     .default = default_local,
+                    .key_type = key_type,
+                    .value_type = value_type,
                 },
             });
         }
+    }
+
+    /// Emit a default value of the given Zig type for use as `Map(K, V).get`'s
+    /// `default` parameter when destructuring assumes key presence. The
+    /// concrete runtime never observes this value (the get hits the existing
+    /// entry), but the call must still typecheck through the monomorphised
+    /// `Map(K, V).get` signature.
+    fn emitDefaultValueForType(self: *IrBuilder, value_type: ZigType) !LocalId {
+        const default_local = self.next_local;
+        self.next_local += 1;
+        switch (value_type) {
+            .string => {
+                try self.current_instrs.append(self.allocator, .{
+                    .const_string = .{ .dest = default_local, .value = "" },
+                });
+            },
+            .bool_type => {
+                try self.current_instrs.append(self.allocator, .{
+                    .const_bool = .{ .dest = default_local, .value = false },
+                });
+            },
+            .f32, .f64, .f16 => {
+                try self.current_instrs.append(self.allocator, .{
+                    .const_float = .{ .dest = default_local, .value = 0.0 },
+                });
+            },
+            .atom => {
+                try self.current_instrs.append(self.allocator, .{
+                    .const_int = .{ .dest = default_local, .value = 0 },
+                });
+            },
+            .nil => {
+                try self.current_instrs.append(self.allocator, .{
+                    .const_nil = default_local,
+                });
+            },
+            else => {
+                // Numeric or unknown — `0` works as a placeholder for
+                // any integer type the runtime cell instantiates.
+                try self.current_instrs.append(self.allocator, .{
+                    .const_int = .{ .dest = default_local, .value = 0 },
+                });
+            },
+        }
+        return default_local;
     }
 
     /// AND two boolean locals together.
@@ -2855,18 +2933,29 @@ pub const IrBuilder = struct {
             },
             .extract_map => |em| {
                 const scrutinee_local = self.resolveScrutinee(em.scrutinee, scrutinee_map);
+                // Pull the map's K/V from the scrutinee's known type
+                // so the ZIR emitter looks up the right `Map(K, V)`
+                // cell. Falls back to atom→i64 for legacy maps that
+                // don't carry concrete types.
+                const map_zig_type = self.known_local_types.get(scrutinee_local) orelse ZigType.any;
+                const key_type: ZigType = if (map_zig_type == .map) map_zig_type.map.key.* else .atom;
+                const value_type: ZigType = if (map_zig_type == .map) map_zig_type.map.value.* else .i64;
                 for (em.keys) |ke| {
                     const key_local = try self.lowerExpr(ke.key);
-                    const default_local = self.next_local;
-                    self.next_local += 1;
-                    try self.current_instrs.append(self.allocator, .{
-                        .const_int = .{ .dest = default_local, .value = 0 },
-                    });
+                    const default_local = try self.emitDefaultValueForType(value_type);
                     const value_local = self.next_local;
                     self.next_local += 1;
                     try self.current_instrs.append(self.allocator, .{
-                        .map_get = .{ .dest = value_local, .map = scrutinee_local, .key = key_local, .default = default_local },
+                        .map_get = .{
+                            .dest = value_local,
+                            .map = scrutinee_local,
+                            .key = key_local,
+                            .default = default_local,
+                            .key_type = key_type,
+                            .value_type = value_type,
+                        },
                     });
+                    try self.known_local_types.put(value_local, value_type);
                     try scrutinee_map.put(ke.scrutinee_id, value_local);
                 }
                 try self.lowerDecisionTreeForCase(em.success, case_arms, scrutinee_map, 0);
@@ -3259,18 +3348,29 @@ pub const IrBuilder = struct {
             },
             .extract_map => |em| {
                 const scrutinee_local = self.resolveScrutinee(em.scrutinee, scrutinee_map);
+                // Pull the map's K/V from the scrutinee's known type
+                // so the ZIR emitter looks up the right `Map(K, V)`
+                // cell. Falls back to atom→i64 for legacy maps that
+                // don't carry concrete types.
+                const map_zig_type = self.known_local_types.get(scrutinee_local) orelse ZigType.any;
+                const key_type: ZigType = if (map_zig_type == .map) map_zig_type.map.key.* else .atom;
+                const value_type: ZigType = if (map_zig_type == .map) map_zig_type.map.value.* else .i64;
                 for (em.keys) |ke| {
                     const key_local = try self.lowerExpr(ke.key);
-                    const default_local = self.next_local;
-                    self.next_local += 1;
-                    try self.current_instrs.append(self.allocator, .{
-                        .const_int = .{ .dest = default_local, .value = 0 },
-                    });
+                    const default_local = try self.emitDefaultValueForType(value_type);
                     const value_local = self.next_local;
                     self.next_local += 1;
                     try self.current_instrs.append(self.allocator, .{
-                        .map_get = .{ .dest = value_local, .map = scrutinee_local, .key = key_local, .default = default_local },
+                        .map_get = .{
+                            .dest = value_local,
+                            .map = scrutinee_local,
+                            .key = key_local,
+                            .default = default_local,
+                            .key_type = key_type,
+                            .value_type = value_type,
+                        },
                     });
+                    try self.known_local_types.put(value_local, value_type);
                     try scrutinee_map.put(ke.scrutinee_id, value_local);
                 }
                 try self.lowerDecisionTreeForDispatch(em.success, clauses, scrutinee_map);
@@ -4341,16 +4441,27 @@ pub const IrBuilder = struct {
             .map_value_get => |mvg| {
                 const map_local = try self.lowerExpr(mvg.map);
                 const key_local = try self.lowerExpr(mvg.key);
-                // Use a synthesized "default" of zero (caller is responsible
-                // for confirming the key exists — destructure assumes presence).
-                const default_local = self.next_local;
-                self.next_local += 1;
+                // Pull the map's K/V from the lowered map's known
+                // type so ZIR resolves the right `Map(K, V)` cell.
+                // Default to atom→i64 for legacy callers.
+                const map_zig_type = self.known_local_types.get(map_local) orelse ZigType.any;
+                const key_type: ZigType = if (map_zig_type == .map) map_zig_type.map.key.* else .atom;
+                const value_type: ZigType = if (map_zig_type == .map) map_zig_type.map.value.* else .i64;
+                // Use a synthesized default matching the value type.
+                // Destructure assumes the key exists, so the runtime
+                // never observes this — it just has to typecheck.
+                const default_local = try self.emitDefaultValueForType(value_type);
                 try self.current_instrs.append(self.allocator, .{
-                    .const_int = .{ .dest = default_local, .value = 0 },
+                    .map_get = .{
+                        .dest = dest,
+                        .map = map_local,
+                        .key = key_local,
+                        .default = default_local,
+                        .key_type = key_type,
+                        .value_type = value_type,
+                    },
                 });
-                try self.current_instrs.append(self.allocator, .{
-                    .map_get = .{ .dest = dest, .map = map_local, .key = key_local, .default = default_local },
-                });
+                try self.known_local_types.put(dest, value_type);
             },
             .map_init => |entries| {
                 var ir_entries: std.ArrayList(MapEntry) = .empty;

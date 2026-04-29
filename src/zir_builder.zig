@@ -4085,13 +4085,14 @@ pub const ZirDriver = struct {
                 try self.setLocal(lt.dest, ref);
             },
             .map_has_key => |mhk| {
-                // MapCell-based key check: MapCell.hasKey(map, key)
+                // Look up the right `Map(K, V)` cell from the IR's
+                // recorded key/value types. The compiler defaults to
+                // `.atom`/`.i64` when the IR lacks concrete types,
+                // matching pre-existing behaviour for atom-keyed
+                // integer maps emitted by older code paths.
                 const map_ref = self.refForLocal(mhk.map) catch return;
                 const key_ref = self.refForLocal(mhk.key) catch return;
-                const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
-                if (rt_import == error_ref) return error.EmitFailed;
-                const map_cell = zir_builder_emit_field_val(self.handle, rt_import, "MapAtomInt", 10);
-                if (map_cell == error_ref) return error.EmitFailed;
+                const map_cell = try self.emitMapCellRef(mhk.key_type, mhk.value_type);
                 const fn_ref = zir_builder_emit_field_val(self.handle, map_cell, "hasKey", 6);
                 if (fn_ref == error_ref) return error.EmitFailed;
                 const call_args = [_]u32{ map_ref, key_ref };
@@ -4100,14 +4101,15 @@ pub const ZirDriver = struct {
                 try self.setLocal(mhk.dest, ref);
             },
             .map_get => |mg| {
-                // MapCell-based value access: MapCell.get(map, key, default)
+                // Look up the right `Map(K, V)` cell from the IR's
+                // recorded key/value types — the ZIR runtime's `Map`
+                // generic is monomorphised per (K, V) pair, so a
+                // `Map(u32, []const u8)` cell can't be reused for an
+                // atom→int map.
                 const map_ref = self.refForLocal(mg.map) catch return;
                 const key_ref = self.refForLocal(mg.key) catch return;
                 const default_ref = self.refForLocal(mg.default) catch return;
-                const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
-                if (rt_import == error_ref) return error.EmitFailed;
-                const map_cell = zir_builder_emit_field_val(self.handle, rt_import, "MapAtomInt", 10);
-                if (map_cell == error_ref) return error.EmitFailed;
+                const map_cell = try self.emitMapCellRef(mg.key_type, mg.value_type);
                 const fn_ref = zir_builder_emit_field_val(self.handle, map_cell, "get", 3);
                 if (fn_ref == error_ref) return error.EmitFailed;
                 const call_args = [_]u32{ map_ref, key_ref, default_ref };

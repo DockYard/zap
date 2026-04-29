@@ -3327,6 +3327,36 @@ pub const HirBuilder = struct {
                                 },
                             });
                         }
+                        // The parser routes `%{key: pat, ...}` into
+                        // `.struct_pattern` with empty module_name (the
+                        // syntax is shared with struct destructure). When
+                        // the annotation is a map type (`%{K -> V}`), build
+                        // a `map_match` so the IR's map-binding extraction
+                        // path runs and the fields are looked up by key
+                        // rather than as positional struct fields.
+                        if (ann.* == .map) {
+                            var bindings: std.ArrayList(MapFieldBind) = .empty;
+                            for (sp.fields) |field| {
+                                if (try self.compilePattern(field.pattern)) |p| {
+                                    // Synthesise an atom-literal key
+                                    // expression matching the field name.
+                                    const key_ast: *ast.Expr = try self.allocator.create(ast.Expr);
+                                    key_ast.* = .{ .atom_literal = .{
+                                        .meta = .{ .span = sp.meta.span },
+                                        .value = field.name,
+                                    } };
+                                    try bindings.append(self.allocator, .{
+                                        .key = key_ast,
+                                        .pattern = p,
+                                    });
+                                }
+                            }
+                            break :blk try self.create(MatchPattern, .{
+                                .map_match = .{
+                                    .field_bindings = try bindings.toOwnedSlice(self.allocator),
+                                },
+                            });
+                        }
                     }
                 }
                 break :blk try self.compilePattern(param.pattern);
