@@ -283,6 +283,7 @@ fn compileAndRunWithFiles(source: []const u8, extra_files: []const ExtraFile) Te
     const compile_argv: []const []const u8 = &.{ zap_binary, "build", "test_prog" };
     var compile_child = std.process.spawn(getTestIo(), .{
         .argv = compile_argv,
+        .cwd = .{ .path = tmp_dir_path },
         .stderr = .inherit,
         .stdout = .inherit,
     }) catch return error.CompilationFailed;
