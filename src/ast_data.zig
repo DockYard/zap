@@ -15,6 +15,7 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 const ctfe = @import("ctfe.zig");
+const scope_mod = @import("scope.zig");
 const CtValue = ctfe.CtValue;
 const AllocId = ctfe.AllocId;
 const AllocationStore = ctfe.AllocationStore;
@@ -581,6 +582,22 @@ fn metaToList(alloc: Allocator, store: *AllocationStore, meta: ast.NodeMeta, typ
     if (meta.span.source_id) |sid| {
         try pairs.append(alloc, try makeKeywordPair(alloc, store, "source_id", .{ .int = @intCast(sid) }));
     }
+    // Encode the hygiene scope set so identifiers carry their Flatt-2016
+    // scope marks across `quote { ... unquote(...) ... }` round trips.
+    // The set is encoded as a list of int ScopeIds — the sorted-array
+    // invariant is preserved on the wire because `meta.scopes.slice()`
+    // returns the underlying sorted storage. An empty set is omitted so
+    // pre-hygiene CtValues stay byte-identical with the previous encoding.
+    if (!meta.scopes.isEmpty()) {
+        const ids = meta.scopes.slice();
+        var scope_vals = try alloc.alloc(CtValue, ids.len);
+        for (ids, 0..) |scope_id, i| {
+            scope_vals[i] = .{ .int = @intCast(scope_id) };
+        }
+        const list_id = store.alloc(alloc, .list, null);
+        const scopes_list = CtValue{ .list = .{ .alloc_id = list_id, .elems = scope_vals } };
+        try pairs.append(alloc, try makeKeywordPair(alloc, store, "scopes", scopes_list));
+    }
     if (type_name) |tn| {
         try pairs.append(alloc, try makeKeywordPair(alloc, store, "type", .{ .atom = tn }));
     }
@@ -754,8 +771,8 @@ pub fn ctValueToExpr(
     }
 
     const form = value.tuple.elems[0];
-    // metadata is value.tuple.elems[1] — we extract line/col from it
-    const node_meta = try keywordListToMeta(value.tuple.elems[1]);
+    // metadata is value.tuple.elems[1] — we extract span/scopes from it
+    const node_meta = try keywordListToMeta(alloc, value.tuple.elems[1]);
     const args = value.tuple.elems[2];
 
     // Wrapped literals: {value, meta, nil} where args is nil
@@ -1471,7 +1488,7 @@ fn ctValueToStmt(
                 const pattern = try ctValueToPattern(alloc, interner, args_val.list.elems[0]);
                 const value_expr = try ctValueToExpr(alloc, interner, args_val.list.elems[1]);
                 const assignment = try alloc.create(ast.Assignment);
-                const node_meta = try keywordListToMeta(value.tuple.elems[1]);
+                const node_meta = try keywordListToMeta(alloc, value.tuple.elems[1]);
                 assignment.* = .{
                     .meta = node_meta,
                     .pattern = pattern,
@@ -1731,12 +1748,13 @@ fn ctValueToPattern(
 }
 
 /// Extract metadata from a keyword list CtValue.
-fn keywordListToMeta(value: CtValue) !ast.NodeMeta {
+fn keywordListToMeta(alloc: Allocator, value: CtValue) !ast.NodeMeta {
     var start: u32 = 0;
     var end: u32 = 0;
     var line: u32 = 0;
     var col: u32 = 0;
     var source_id: ?u32 = null;
+    var scopes: scope_mod.ScopeSet = .empty;
     if (value == .list) {
         for (value.list.elems) |pair| {
             if (pair == .tuple and pair.tuple.elems.len == 2 and pair.tuple.elems[0] == .atom) {
@@ -1751,11 +1769,25 @@ fn keywordListToMeta(value: CtValue) !ast.NodeMeta {
                     col = @intCast(pair.tuple.elems[1].int);
                 } else if (std.mem.eql(u8, key, "source_id") and pair.tuple.elems[1] == .int) {
                     source_id = @intCast(pair.tuple.elems[1].int);
+                } else if (std.mem.eql(u8, key, "scopes") and pair.tuple.elems[1] == .list) {
+                    // Rehydrate the hygiene scope set. The encoded list is
+                    // sorted (the encoder calls `meta.scopes.slice()` which
+                    // preserves the sorted invariant), but we use `add`
+                    // here rather than appending raw so the invariant is
+                    // re-established defensively from any source.
+                    for (pair.tuple.elems[1].list.elems) |scope_val| {
+                        if (scope_val == .int) {
+                            try scopes.add(alloc, @intCast(scope_val.int));
+                        }
+                    }
                 }
             }
         }
     }
-    return .{ .span = .{ .start = start, .end = end, .line = line, .col = col, .source_id = source_id } };
+    return .{
+        .span = .{ .start = start, .end = end, .line = line, .col = col, .source_id = source_id },
+        .scopes = scopes,
+    };
 }
 
 /// Map string to binary operator.
@@ -2930,6 +2962,75 @@ test "round-trip: bool literal" {
 
     try std.testing.expect(back.* == .bool_literal);
     try std.testing.expect(back.bool_literal.value == true);
+}
+
+test "round-trip: NodeMeta.scopes survives CtValue conversion" {
+    // Hygiene scope sets must round-trip through quote substitution so
+    // identifiers preserve their Flatt-2016 marks across macro expansion.
+    // Empty sets stay empty; populated sets retain identity (member set
+    // equality, sorted invariant intact).
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    var store = AllocationStore{};
+
+    var scopes: scope_mod.ScopeSet = .empty;
+    try scopes.add(alloc, 5);
+    try scopes.add(alloc, 1);
+    try scopes.add(alloc, 3);
+    // After adds the set is {1, 3, 5} in sorted order.
+
+    const orig = try alloc.create(ast.Expr);
+    orig.* = .{ .int_literal = .{
+        .meta = .{
+            .span = .{ .start = 100, .end = 102, .line = 4, .col = 9, .source_id = null },
+            .scopes = scopes,
+        },
+        .value = 7,
+    } };
+
+    const ct = try exprToCtValue(alloc, &interner, &store, orig);
+    const back = try ctValueToExpr(alloc, &interner, ct);
+
+    try std.testing.expect(back.* == .int_literal);
+    const got = back.int_literal.meta.scopes;
+    try std.testing.expectEqual(@as(usize, 3), got.len());
+    try std.testing.expect(got.contains(1));
+    try std.testing.expect(got.contains(3));
+    try std.testing.expect(got.contains(5));
+    try std.testing.expect(!got.contains(2));
+    // Sorted invariant: slice is monotonically increasing.
+    const slice = got.slice();
+    try std.testing.expectEqual(@as(scope_mod.ScopeId, 1), slice[0]);
+    try std.testing.expectEqual(@as(scope_mod.ScopeId, 3), slice[1]);
+    try std.testing.expectEqual(@as(scope_mod.ScopeId, 5), slice[2]);
+}
+
+test "round-trip: empty NodeMeta.scopes stays empty" {
+    // The encoding must omit the `scopes` keyword pair when the set is
+    // empty so pre-hygiene CtValues stay byte-compatible (existing
+    // equality checks elsewhere in the macro engine compare meta lists
+    // structurally).
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    var store = AllocationStore{};
+
+    const orig = try alloc.create(ast.Expr);
+    orig.* = .{ .int_literal = .{
+        .meta = .{ .span = .{ .start = 0, .end = 0 } },
+        .value = 1,
+    } };
+
+    const ct = try exprToCtValue(alloc, &interner, &store, orig);
+    const back = try ctValueToExpr(alloc, &interner, ct);
+
+    try std.testing.expect(back.* == .int_literal);
+    try std.testing.expect(back.int_literal.meta.scopes.isEmpty());
 }
 
 test "round-trip: span byte offsets and source_id survive CtValue conversion" {
