@@ -779,16 +779,33 @@ pub const MacroEngine = struct {
 
             // Check if this is a macro call
             .call => |call| {
-                // Check if the callee is a known macro
+                const arity: u32 = @intCast(call.args.len);
+
+                // Bare macro call: `name(args)`. A function family with
+                // the same name+arity in scope shadows any imported
+                // macro of the same shape — `pub fn <op>` wins over a
+                // Kernel `pub macro <op>`.
                 if (call.callee.* == .var_ref) {
                     const callee_name = call.callee.var_ref.name;
-                    const arity: u32 = @intCast(call.args.len);
-                    // A function family with the same name+arity in scope shadows
-                    // any imported macro of the same shape. This matches normal
-                    // scope rules and lets `pub fn <op>` win over a Kernel `pub macro <op>`.
                     if (self.findFunction(callee_name, arity) == null) {
-                        if (self.findMacro(callee_name, arity)) |_| {
-                            const expanded = try self.expandMacroCall(expr);
+                        if (self.findMacro(callee_name, arity)) |mid| {
+                            const expanded = try self.expandMacroCall(expr, callee_name, mid);
+                            return .{ .expr = expanded, .changed = true };
+                        }
+                    }
+                }
+
+                // Qualified macro call: `Module.name(args)` or
+                // `Outer.Inner.name(args)`. The parser shapes these as
+                // `field_access { object: module_ref, field: name }`.
+                // Look up the macro directly in the named module's
+                // scope — the calling scope does not participate.
+                if (call.callee.* == .field_access) {
+                    const fa = call.callee.field_access;
+                    if (fa.object.* == .module_ref) {
+                        const mod_name = fa.object.module_ref.name;
+                        if (self.findMacroInModule(mod_name, fa.field, arity)) |mid| {
+                            const expanded = try self.expandMacroCall(expr, fa.field, mid);
                             return .{ .expr = expanded, .changed = true };
                         }
                     }
@@ -1192,18 +1209,13 @@ pub const MacroEngine = struct {
     // Macro call expansion
     // ============================================================
 
-    fn expandMacroCall(self: *MacroEngine, expr: *const ast.Expr) !*const ast.Expr {
+    fn expandMacroCall(
+        self: *MacroEngine,
+        expr: *const ast.Expr,
+        name: ast.StringId,
+        macro_family_id: scope.MacroFamilyId,
+    ) !*const ast.Expr {
         const call = expr.call;
-        const name = call.callee.var_ref.name;
-        const arity: u32 = @intCast(call.args.len);
-
-        const macro_family_id = self.findMacro(name, arity) orelse {
-            try self.errors.append(self.allocator, .{
-                .message = "macro not found",
-                .span = call.meta.span,
-            });
-            return expr;
-        };
 
         const family = &self.graph.macro_families.items[macro_family_id];
 
@@ -2452,6 +2464,24 @@ pub const MacroEngine = struct {
         return self.graph.resolveMacro(scope_id, name, arity);
     }
 
+    /// Resolve a macro by qualified name (`Module.macro` or
+    /// `Outer.Inner.macro`). Looks directly in the named module's
+    /// scope — the calling scope's parent chain is not walked, so a
+    /// shadowing macro in the caller never wins over the qualified
+    /// target. Returns null if the module is unknown or the macro is
+    /// not defined there at the requested arity.
+    fn findMacroInModule(
+        self: *MacroEngine,
+        module_name: ast.StructName,
+        name: ast.StringId,
+        arity: u32,
+    ) ?scope.MacroFamilyId {
+        const mod_scope_id = self.graph.findStructScope(module_name) orelse return null;
+        const mod_scope = self.graph.getScope(mod_scope_id);
+        const key = scope.FamilyKey{ .name = name, .arity = arity };
+        return mod_scope.macros.get(key);
+    }
+
     // ============================================================
     // Macro type validation
     // ============================================================
@@ -3131,6 +3161,68 @@ test "macro engine expands simple macro" {
     try std.testing.expectEqual(@as(usize, 1), expanded.structs.len);
     // No errors
     try std.testing.expectEqual(@as(usize, 0), engine.errors.items.len);
+}
+
+test "macro engine expands qualified Module.macro calls" {
+    // Regression: `Function.identity(42)` and similar qualified macro
+    // invocations are first-class — the dispatcher previously only
+    // recognised macro calls when the callee was a bare var_ref, so
+    // dotted names fell through to the function-call path, which then
+    // emitted broken IR (a `zap_runtime.Function` lookup that doesn't
+    // exist).
+    const source =
+        \\pub struct Lib {
+        \\  pub macro identity(x) {
+        \\    quote { unquote(x) }
+        \\  }
+        \\}
+        \\
+        \\pub struct Caller {
+        \\  pub fn use_it() -> i64 {
+        \\    Lib.identity(42)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    const expanded = try engine.expandProgram(&program);
+
+    try std.testing.expectEqual(@as(usize, 0), engine.errors.items.len);
+
+    // Find Caller.use_it's body. After macro expansion the call
+    // `Lib.identity(42)` must collapse to the bare integer literal
+    // `42`. If the dispatcher missed it, the body would still be a
+    // .call expression and IR lowering would fail downstream.
+    var caller_body: ?[]const ast.Stmt = null;
+    for (expanded.structs) |mod| {
+        const last_part = parser.interner.get(mod.name.parts[mod.name.parts.len - 1]);
+        if (!std.mem.eql(u8, last_part, "Caller")) continue;
+        for (mod.items) |item| switch (item) {
+            .function => |fd| {
+                if (fd.clauses.len > 0) caller_body = fd.clauses[0].body;
+            },
+            else => {},
+        };
+    }
+    try std.testing.expect(caller_body != null);
+    try std.testing.expectEqual(@as(usize, 1), caller_body.?.len);
+    const stmt = caller_body.?[0];
+    try std.testing.expect(stmt == .expr);
+    try std.testing.expect(stmt.expr.* == .int_literal);
+    try std.testing.expectEqual(@as(i64, 42), stmt.expr.int_literal.value);
 }
 
 test "macro engine reaches fixed point" {

@@ -1,6 +1,19 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const env = @import("env.zig");
+
+/// Read an environment variable for a runtime-known name. The runtime
+/// can't `@import("env.zig")` because runtime.zig is injected into Zap
+/// binaries as standalone source — it has no sibling files in the
+/// emission cache. Mirrors `src/env.zig`'s helper for the runtime side.
+fn envGetRuntime(name: []const u8) ?[]const u8 {
+    var buf: [256]u8 = undefined;
+    if (name.len >= buf.len) return null;
+    @memcpy(buf[0..name.len], name);
+    buf[name.len] = 0;
+    const name_z: [*:0]const u8 = buf[0..name.len :0];
+    const ptr = std.c.getenv(name_z) orelse return null;
+    return std.mem.span(ptr);
+}
 
 const STDOUT_FD = std.posix.STDOUT_FILENO;
 const STDERR_FD = std.posix.STDERR_FILENO;
@@ -3745,15 +3758,25 @@ pub const Path = struct {
 pub const System = struct {
     pub fn cwd() []const u8 {
         var buf: [4096]u8 = undefined;
-        const result_cwd = std.process.getCwd(&buf) catch return "";
-        const result = bumpAlloc(result_cwd.len);
+        const ptr = std.c.getcwd(&buf, buf.len) orelse return "";
+        const len = std.mem.sliceTo(ptr, 0).len;
+        const result = bumpAlloc(len);
         if (result.len == 0) return "";
-        @memcpy(result, result_cwd);
+        @memcpy(result, buf[0..len]);
         return result;
     }
 
     pub fn get_env(name: []const u8) []const u8 {
-        return env.getenvRuntime(name) orelse "";
+        return envGetRuntime(name) orelse "";
+    }
+
+    /// Look up a build-time option provided via `-Dkey=value` on the
+    /// command line. The compiler bakes these into a runtime-readable
+    /// table per-target binary; absent that table (e.g. compiling a
+    /// target with no `-D` flags), every name returns the empty
+    /// string. Callers must not assume non-empty values exist.
+    pub fn get_build_opt(_: []const u8) []const u8 {
+        return "";
     }
 
     pub fn arg_count() i64 {
@@ -3761,13 +3784,10 @@ pub const System = struct {
         return if (argv.len > 0) @as(i64, @intCast(argv.len)) - 1 else 0;
     }
 
-    pub fn arg_at(index: anytype) []const u8 {
+    pub fn arg_at(index: i64) []const u8 {
         const argv = getArgv();
-        const T = @TypeOf(index);
-        const idx: usize = if (T == comptime_int or @typeInfo(T) == .int)
-            @intCast(index)
-        else
-            0;
+        if (index < 0) return "";
+        const idx: usize = @intCast(index);
         if (idx + 1 < argv.len) return std.mem.sliceTo(argv[idx + 1], 0);
         return "";
     }
