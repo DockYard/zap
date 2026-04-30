@@ -562,11 +562,24 @@ fn makeKeywordPair(alloc: Allocator, store: *AllocationStore, key: []const u8, v
 /// Convert NodeMeta to a keyword list CtValue.
 fn metaToList(alloc: Allocator, store: *AllocationStore, meta: ast.NodeMeta, type_name: ?[]const u8) !CtValue {
     var pairs : std.ArrayListUnmanaged(CtValue) = .empty;
+    // Encode start/end so the original byte-offset span survives round
+    // trips through CtValue. Without this, the reverse conversion in
+    // `keywordListToMeta` zeroes the offsets and any error reported on
+    // the rehydrated AST points at line 1 col 0 instead of the source.
+    if (meta.span.start > 0) {
+        try pairs.append(alloc, try makeKeywordPair(alloc, store, "start", .{ .int = @intCast(meta.span.start) }));
+    }
+    if (meta.span.end > 0) {
+        try pairs.append(alloc, try makeKeywordPair(alloc, store, "end", .{ .int = @intCast(meta.span.end) }));
+    }
     if (meta.span.line > 0) {
         try pairs.append(alloc, try makeKeywordPair(alloc, store, "line", .{ .int = @intCast(meta.span.line) }));
     }
     if (meta.span.col > 0) {
         try pairs.append(alloc, try makeKeywordPair(alloc, store, "col", .{ .int = @intCast(meta.span.col) }));
+    }
+    if (meta.span.source_id) |sid| {
+        try pairs.append(alloc, try makeKeywordPair(alloc, store, "source_id", .{ .int = @intCast(sid) }));
     }
     if (type_name) |tn| {
         try pairs.append(alloc, try makeKeywordPair(alloc, store, "type", .{ .atom = tn }));
@@ -1719,21 +1732,30 @@ fn ctValueToPattern(
 
 /// Extract metadata from a keyword list CtValue.
 fn keywordListToMeta(value: CtValue) !ast.NodeMeta {
+    var start: u32 = 0;
+    var end: u32 = 0;
     var line: u32 = 0;
     var col: u32 = 0;
+    var source_id: ?u32 = null;
     if (value == .list) {
         for (value.list.elems) |pair| {
             if (pair == .tuple and pair.tuple.elems.len == 2 and pair.tuple.elems[0] == .atom) {
                 const key = pair.tuple.elems[0].atom;
-                if (std.mem.eql(u8, key, "line") and pair.tuple.elems[1] == .int) {
+                if (std.mem.eql(u8, key, "start") and pair.tuple.elems[1] == .int) {
+                    start = @intCast(pair.tuple.elems[1].int);
+                } else if (std.mem.eql(u8, key, "end") and pair.tuple.elems[1] == .int) {
+                    end = @intCast(pair.tuple.elems[1].int);
+                } else if (std.mem.eql(u8, key, "line") and pair.tuple.elems[1] == .int) {
                     line = @intCast(pair.tuple.elems[1].int);
                 } else if (std.mem.eql(u8, key, "col") and pair.tuple.elems[1] == .int) {
                     col = @intCast(pair.tuple.elems[1].int);
+                } else if (std.mem.eql(u8, key, "source_id") and pair.tuple.elems[1] == .int) {
+                    source_id = @intCast(pair.tuple.elems[1].int);
                 }
             }
         }
     }
-    return .{ .span = .{ .start = 0, .end = 0, .line = line, .col = col } };
+    return .{ .span = .{ .start = start, .end = end, .line = line, .col = col, .source_id = source_id } };
 }
 
 /// Map string to binary operator.
@@ -2908,6 +2930,38 @@ test "round-trip: bool literal" {
 
     try std.testing.expect(back.* == .bool_literal);
     try std.testing.expect(back.bool_literal.value == true);
+}
+
+test "round-trip: span byte offsets and source_id survive CtValue conversion" {
+    // Source spans round-trip through CtValue so error reports on
+    // macro-rehydrated AST point at the original source location, not
+    // line 1 col 0. Before this contract, `keywordListToMeta` zeroed
+    // start/end and dropped source_id — every diagnostic emitted on
+    // post-fixpoint AST collapsed to the file origin.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    var store = AllocationStore{};
+
+    const orig = try alloc.create(ast.Expr);
+    orig.* = .{ .int_literal = .{
+        .meta = .{ .span = .{ .start = 142, .end = 145, .line = 7, .col = 12, .source_id = 3 } },
+        .value = 42,
+    } };
+
+    const ct = try exprToCtValue(alloc, &interner, &store, orig);
+    const back = try ctValueToExpr(alloc, &interner, ct);
+
+    try std.testing.expect(back.* == .int_literal);
+    const span = back.int_literal.meta.span;
+    try std.testing.expectEqual(@as(u32, 142), span.start);
+    try std.testing.expectEqual(@as(u32, 145), span.end);
+    try std.testing.expectEqual(@as(u32, 7), span.line);
+    try std.testing.expectEqual(@as(u32, 12), span.col);
+    try std.testing.expect(span.source_id != null);
+    try std.testing.expectEqual(@as(u32, 3), span.source_id.?);
 }
 
 test "round-trip: atom literal" {
