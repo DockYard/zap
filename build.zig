@@ -46,7 +46,7 @@ pub fn build(b: *std.Build) void {
 
     const boundary_guard_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("test/boundary_guard_test.zig"),
+            .root_source_file = b.path("tools/boundary_guard_test.zig"),
             .target = target,
             .optimize = optimize,
         }),
