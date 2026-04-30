@@ -18,6 +18,175 @@ pub const FamilyKey = struct {
 };
 
 // ============================================================
+// ScopeSet — Flatt 2016 "Bindings as Sets of Scopes"
+//
+// Each identifier (binder or reference) carries a *set* of scopes
+// rather than a single owning scope. Macro expansion adds and flips
+// scopes asymmetrically: the macro-introduction scope tags template
+// identifiers; the macro-use scope is added to user-supplied syntax
+// on entry and flipped on exit, so identifiers from the user retain
+// their original scope set while identifiers introduced by the macro
+// pick up the macro-use scope.
+//
+// Resolution: among bindings with the same name, pick the binding
+// whose scope set is the largest subset of the reference's scope
+// set. This is what discriminates between user-supplied `tmp` and
+// macro-introduced `tmp` in the canonical swap-macro example.
+//
+// Representation: sorted ArrayListUnmanaged. Sets are tiny in
+// practice (fewer than 8 scopes for typical identifiers); a sorted
+// array gives O(n+m) union/intersect with cache-friendly access and
+// no allocator overhead per element. The sorted invariant lets `eq`
+// run in O(n) and `subsetOf` run in O(n+m).
+// ============================================================
+
+pub const ScopeSet = struct {
+    items: std.ArrayListUnmanaged(ScopeId) = .empty,
+
+    pub const empty: ScopeSet = .{};
+
+    pub fn deinit(self: *ScopeSet, allocator: std.mem.Allocator) void {
+        self.items.deinit(allocator);
+    }
+
+    pub fn isEmpty(self: ScopeSet) bool {
+        return self.items.items.len == 0;
+    }
+
+    pub fn len(self: ScopeSet) usize {
+        return self.items.items.len;
+    }
+
+    pub fn contains(self: ScopeSet, scope_id: ScopeId) bool {
+        // Binary search the sorted slice.
+        var lo: usize = 0;
+        var hi: usize = self.items.items.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const v = self.items.items[mid];
+            if (v == scope_id) return true;
+            if (v < scope_id) lo = mid + 1 else hi = mid;
+        }
+        return false;
+    }
+
+    /// Add `scope_id` to the set. Idempotent — re-adding a present
+    /// scope is a no-op. Maintains the sorted invariant.
+    pub fn add(self: *ScopeSet, allocator: std.mem.Allocator, scope_id: ScopeId) !void {
+        const idx = self.lowerBound(scope_id);
+        if (idx < self.items.items.len and self.items.items[idx] == scope_id) return;
+        try self.items.insert(allocator, idx, scope_id);
+    }
+
+    /// Remove `scope_id` from the set. No-op when absent.
+    pub fn remove(self: *ScopeSet, scope_id: ScopeId) void {
+        const idx = self.lowerBound(scope_id);
+        if (idx < self.items.items.len and self.items.items[idx] == scope_id) {
+            _ = self.items.orderedRemove(idx);
+        }
+    }
+
+    /// XOR `scope_id` into the set: present → removed, absent → added.
+    /// This is Flatt's "flip-scope" operation. Used at the macro
+    /// expansion boundary to give the asymmetric treatment of template
+    /// vs user-supplied identifiers.
+    pub fn flip(self: *ScopeSet, allocator: std.mem.Allocator, scope_id: ScopeId) !void {
+        const idx = self.lowerBound(scope_id);
+        if (idx < self.items.items.len and self.items.items[idx] == scope_id) {
+            _ = self.items.orderedRemove(idx);
+        } else {
+            try self.items.insert(allocator, idx, scope_id);
+        }
+    }
+
+    /// True iff `self ⊆ other`. Both sets are sorted, so a linear
+    /// merge-style walk is O(self.len + other.len).
+    pub fn subsetOf(self: ScopeSet, other: ScopeSet) bool {
+        var i: usize = 0;
+        var j: usize = 0;
+        const a = self.items.items;
+        const b = other.items.items;
+        while (i < a.len) {
+            if (j >= b.len) return false;
+            if (a[i] == b[j]) {
+                i += 1;
+                j += 1;
+            } else if (b[j] < a[i]) {
+                j += 1;
+            } else {
+                return false; // a[i] not in b
+            }
+        }
+        return true;
+    }
+
+    /// Set equality. Linear in length.
+    pub fn eq(self: ScopeSet, other: ScopeSet) bool {
+        const a = self.items.items;
+        const b = other.items.items;
+        if (a.len != b.len) return false;
+        for (a, b) |x, y| {
+            if (x != y) return false;
+        }
+        return true;
+    }
+
+    /// Allocate a fresh ScopeSet that is the intersection of `self`
+    /// and `other`. Used by the resolver tie-break path.
+    pub fn intersect(self: ScopeSet, other: ScopeSet, allocator: std.mem.Allocator) !ScopeSet {
+        var result: ScopeSet = .{};
+        const a = self.items.items;
+        const b = other.items.items;
+        var i: usize = 0;
+        var j: usize = 0;
+        while (i < a.len and j < b.len) {
+            if (a[i] == b[j]) {
+                try result.items.append(allocator, a[i]);
+                i += 1;
+                j += 1;
+            } else if (a[i] < b[j]) {
+                i += 1;
+            } else {
+                j += 1;
+            }
+        }
+        return result;
+    }
+
+    /// Deep-clone the scope set so the result owns its storage.
+    pub fn clone(self: ScopeSet, allocator: std.mem.Allocator) !ScopeSet {
+        var result: ScopeSet = .{};
+        try result.items.appendSlice(allocator, self.items.items);
+        return result;
+    }
+
+    /// Find the insertion point that preserves sortedness.
+    fn lowerBound(self: ScopeSet, scope_id: ScopeId) usize {
+        var lo: usize = 0;
+        var hi: usize = self.items.items.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.items.items[mid] < scope_id) lo = mid + 1 else hi = mid;
+        }
+        return lo;
+    }
+
+    /// Returns the most specific scope in the set — the largest
+    /// ScopeId, which by construction is the most recently created
+    /// (and therefore innermost) scope. Used by lowering passes that
+    /// want a single scope handle as a fallback resolution.
+    pub fn primary(self: ScopeSet) ?ScopeId {
+        const items = self.items.items;
+        if (items.len == 0) return null;
+        return items[items.len - 1];
+    }
+
+    pub fn slice(self: ScopeSet) []const ScopeId {
+        return self.items.items;
+    }
+};
+
+// ============================================================
 // Scope
 // ============================================================
 
@@ -956,6 +1125,130 @@ test "native type kind name parsing" {
     try std.testing.expectEqual(@as(?NativeTypeKind, null), NativeTypeKind.fromName("List"));
     try std.testing.expectEqual(@as(?NativeTypeKind, null), NativeTypeKind.fromName(""));
     try std.testing.expectEqual(@as(?NativeTypeKind, null), NativeTypeKind.fromName("nope"));
+}
+
+test "ScopeSet add/contains/remove preserves sorted invariant" {
+    const alloc = std.testing.allocator;
+    var set: ScopeSet = .{};
+    defer set.deinit(alloc);
+
+    try std.testing.expect(set.isEmpty());
+    try std.testing.expect(!set.contains(5));
+
+    try set.add(alloc, 5);
+    try set.add(alloc, 2);
+    try set.add(alloc, 7);
+    try set.add(alloc, 2); // idempotent
+
+    try std.testing.expectEqual(@as(usize, 3), set.len());
+    try std.testing.expect(set.contains(2));
+    try std.testing.expect(set.contains(5));
+    try std.testing.expect(set.contains(7));
+    try std.testing.expect(!set.contains(3));
+
+    // Sorted invariant: items must be in ascending order.
+    try std.testing.expectEqualSlices(ScopeId, &[_]ScopeId{ 2, 5, 7 }, set.slice());
+
+    set.remove(5);
+    try std.testing.expect(!set.contains(5));
+    try std.testing.expectEqualSlices(ScopeId, &[_]ScopeId{ 2, 7 }, set.slice());
+
+    // Remove of absent element is a no-op.
+    set.remove(99);
+    try std.testing.expectEqual(@as(usize, 2), set.len());
+}
+
+test "ScopeSet flip XORs membership" {
+    const alloc = std.testing.allocator;
+    var set: ScopeSet = .{};
+    defer set.deinit(alloc);
+
+    // Flip absent → adds.
+    try set.flip(alloc, 10);
+    try std.testing.expect(set.contains(10));
+
+    // Flip present → removes.
+    try set.flip(alloc, 10);
+    try std.testing.expect(!set.contains(10));
+
+    // Mixed: pre-populate, flip selectively.
+    try set.add(alloc, 1);
+    try set.add(alloc, 3);
+    try set.flip(alloc, 2); // adds 2
+    try set.flip(alloc, 3); // removes 3
+    try std.testing.expectEqualSlices(ScopeId, &[_]ScopeId{ 1, 2 }, set.slice());
+}
+
+test "ScopeSet subsetOf and eq" {
+    const alloc = std.testing.allocator;
+    var a: ScopeSet = .{};
+    defer a.deinit(alloc);
+    var b: ScopeSet = .{};
+    defer b.deinit(alloc);
+
+    // empty ⊆ anything
+    try std.testing.expect(a.subsetOf(b));
+    try std.testing.expect(b.subsetOf(a));
+    try std.testing.expect(a.eq(b));
+
+    try a.add(alloc, 1);
+    try a.add(alloc, 3);
+
+    try b.add(alloc, 1);
+    try b.add(alloc, 2);
+    try b.add(alloc, 3);
+
+    try std.testing.expect(a.subsetOf(b)); // {1,3} ⊆ {1,2,3}
+    try std.testing.expect(!b.subsetOf(a)); // {1,2,3} ⊄ {1,3}
+    try std.testing.expect(!a.eq(b));
+
+    var c = try a.clone(alloc);
+    defer c.deinit(alloc);
+    try std.testing.expect(c.eq(a));
+    try std.testing.expect(c.subsetOf(a));
+    try std.testing.expect(a.subsetOf(c));
+}
+
+test "ScopeSet intersect" {
+    const alloc = std.testing.allocator;
+    var a: ScopeSet = .{};
+    defer a.deinit(alloc);
+    var b: ScopeSet = .{};
+    defer b.deinit(alloc);
+
+    try a.add(alloc, 1);
+    try a.add(alloc, 3);
+    try a.add(alloc, 5);
+
+    try b.add(alloc, 2);
+    try b.add(alloc, 3);
+    try b.add(alloc, 5);
+    try b.add(alloc, 7);
+
+    var inter = try a.intersect(b, alloc);
+    defer inter.deinit(alloc);
+    try std.testing.expectEqualSlices(ScopeId, &[_]ScopeId{ 3, 5 }, inter.slice());
+
+    var disjoint: ScopeSet = .{};
+    defer disjoint.deinit(alloc);
+    try disjoint.add(alloc, 100);
+
+    var inter2 = try a.intersect(disjoint, alloc);
+    defer inter2.deinit(alloc);
+    try std.testing.expect(inter2.isEmpty());
+}
+
+test "ScopeSet primary returns innermost (largest id)" {
+    const alloc = std.testing.allocator;
+    var set: ScopeSet = .{};
+    defer set.deinit(alloc);
+
+    try std.testing.expectEqual(@as(?ScopeId, null), set.primary());
+
+    try set.add(alloc, 5);
+    try set.add(alloc, 100);
+    try set.add(alloc, 50);
+    try std.testing.expectEqual(@as(?ScopeId, 100), set.primary());
 }
 
 test "scope graph native type registry" {
