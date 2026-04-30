@@ -618,6 +618,16 @@ const Pipeline = struct {
     step: u32,
     total_steps: u32,
     progress_enabled: bool,
+    /// Diagnostic count when this pipeline was constructed. `hasNewErrors`
+    /// reports only errors added during this pipeline's lifetime, so
+    /// per-module pipelines don't trip on residual errors from earlier
+    /// modules sharing the same DiagnosticEngine.
+    error_baseline: usize,
+    /// When true, `failWith`/`failWithExisting` accumulate errors into the
+    /// engine but do not flush them to stderr. Used by the per-module
+    /// loop in `compileModuleByModule`, which renders all collected
+    /// diagnostics once at the end so each error appears exactly once.
+    defer_render: bool,
 
     fn init(
         alloc: std.mem.Allocator,
@@ -633,7 +643,17 @@ const Pipeline = struct {
             .step = starting_step,
             .total_steps = total_steps,
             .progress_enabled = options.show_progress and total_steps > 0,
+            .error_baseline = ctx.diag_engine.errorCount(),
+            .defer_render = false,
         };
+    }
+
+    /// Errors added since this pipeline was constructed. The shared
+    /// DiagnosticEngine accumulates across modules, so a raw
+    /// `hasErrors()` check would treat any prior module's failures as
+    /// our own.
+    fn hasNewErrors(self: *const Pipeline) bool {
+        return self.ctx.diag_engine.errorCount() > self.error_baseline;
     }
 
     fn progress(self: *Pipeline, name: []const u8) void {
@@ -653,7 +673,7 @@ const Pipeline = struct {
     fn failWith(self: *Pipeline, message: []const u8, err: CompileError) CompileError {
         self.ctx.diag_engine.err(message, .{ .start = 0, .end = 0 }) catch {};
         self.clearProgress();
-        emitContextDiagnostics(self.ctx, self.alloc);
+        if (!self.defer_render) emitContextDiagnostics(self.ctx, self.alloc);
         return err;
     }
 
@@ -661,7 +681,7 @@ const Pipeline = struct {
     /// errors into the diagnostic engine; flush them and bubble.
     fn failWithExisting(self: *Pipeline, err: CompileError) CompileError {
         self.clearProgress();
-        emitContextDiagnostics(self.ctx, self.alloc);
+        if (!self.defer_render) emitContextDiagnostics(self.ctx, self.alloc);
         return err;
     }
 
@@ -678,7 +698,7 @@ const Pipeline = struct {
         for (subst_errors.items) |subst_err| {
             self.ctx.diag_engine.err(subst_err.message, subst_err.span) catch {};
         }
-        if (self.ctx.diag_engine.hasErrors()) return self.failWithExisting(error.DesugarFailed);
+        if (self.hasNewErrors()) return self.failWithExisting(error.DesugarFailed);
         return substituted;
     }
 
@@ -695,7 +715,7 @@ const Pipeline = struct {
         for (macro_engine.errors.items) |macro_err| {
             self.ctx.diag_engine.err(macro_err.message, macro_err.span) catch {};
         }
-        if (self.ctx.diag_engine.hasErrors()) return self.failWithExisting(error.MacroExpansionFailed);
+        if (self.hasNewErrors()) return self.failWithExisting(error.MacroExpansionFailed);
         return expanded;
     }
 
@@ -760,7 +780,7 @@ const Pipeline = struct {
         type_checker.checkProgram(desugared) catch {};
         if (check_unused) type_checker.checkUnusedBindings() catch {};
         self.routeTypeCheckerErrors(&type_checker);
-        if (self.ctx.diag_engine.hasErrors()) return self.failWithExisting(error.TypeCheckFailed);
+        if (self.hasNewErrors()) return self.failWithExisting(error.TypeCheckFailed);
         return type_checker;
     }
 
@@ -804,7 +824,7 @@ const Pipeline = struct {
         for (hir_builder.errors.items) |hir_err| {
             self.ctx.diag_engine.err(hir_err.message, hir_err.span) catch {};
         }
-        if (self.ctx.diag_engine.hasErrors()) return self.failWithExisting(error.HirFailed);
+        if (self.hasNewErrors()) return self.failWithExisting(error.HirFailed);
         return .{ .program = hir_program, .next_group_id = hir_builder.next_group_id };
     }
 
@@ -943,6 +963,7 @@ fn compileSingleModuleHir(
     options: CompileOptions,
 ) CompileError!ModuleHirResult {
     var pipeline = Pipeline.init(alloc, ctx, options, 0, 0);
+    pipeline.defer_render = true;
     const desugared = try pipeline.runSubstitute(mod_program);
 
     // checkUnusedBindings is intentionally skipped — the type checker
@@ -974,6 +995,7 @@ fn compileHirToIr(
     next_try_id: *u32,
 ) CompileError!ir.Program {
     var pipeline = Pipeline.init(alloc, ctx, options, 0, 0);
+    pipeline.defer_render = true;
     var mod_ir = try pipeline.runIrLoweringWithTryIdSeed(hir_program, type_store, next_try_id);
     pipeline.runCtfeAttributesForModule(mod_name, &mod_ir);
     return mod_ir;
@@ -1000,6 +1022,7 @@ pub fn compileModuleByModule(
     options: CompileOptions,
 ) CompileError!CompileResult {
     var pipeline = Pipeline.init(alloc, ctx, options, 0, 0);
+    pipeline.defer_render = true;
 
     // Collect all IR functions and type defs across modules.
     var all_functions: std.ArrayListUnmanaged(ir.Function) = .empty;
@@ -1107,6 +1130,16 @@ pub fn compileModuleByModule(
         .entry = entry_id,
     };
     const analysis_result = try pipeline.runAnalysisAndContify(&merged_ir);
+
+    // Single rendering pass for all per-module diagnostics. Each
+    // sub-pipeline accumulated into the shared engine without flushing,
+    // so we emit exactly once here regardless of how many modules
+    // failed.
+    if (ctx.diag_engine.hasErrors()) {
+        pipeline.clearProgress();
+        emitContextDiagnostics(ctx, alloc);
+    }
+
     return .{ .ir_program = merged_ir, .analysis_context = analysis_result.context };
 }
 
@@ -2807,6 +2840,72 @@ test "collector can build graph from per-module programs" {
     try collector.finalizeCollectedPrograms(program_slices);
 
     try std.testing.expectEqual(@as(usize, 2), collector.graph.structs.items.len);
+}
+
+test "compileModuleByModule isolates per-module diagnostics" {
+    // Regression: errors from one module would re-fire downstream because
+    // `failWithExisting` rendered the entire diagnostic engine on every
+    // per-module failure, and `hasErrors()` checks tripped on prior
+    // modules' residual errors. The downstream symptom is that any module
+    // following a failed one would itself fail — even when its own source
+    // was perfectly clean — and the same error block would print over and
+    // over with each subsequent module's progress label.
+    //
+    // Fix verification: with one broken module followed by two clean ones,
+    // the clean modules must still produce IR functions.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source_units = [_]SourceUnit{
+        .{ .file_path = "broken.zap", .source =
+            "pub struct Broken {\n" ++
+            "  pub fn go() -> i64 {\n" ++
+            "    nonexistent_function(1)\n" ++
+            "  }\n" ++
+            "}\n",
+        },
+        .{ .file_path = "clean_a.zap", .source =
+            "pub struct CleanA {\n" ++
+            "  pub fn ok() -> i64 { 1 }\n" ++
+            "}\n",
+        },
+        .{ .file_path = "clean_b.zap", .source =
+            "pub struct CleanB {\n" ++
+            "  pub fn ok() -> i64 { 2 }\n" ++
+            "}\n",
+        },
+    };
+
+    var ctx = try collectAllFromUnits(alloc, &source_units, .{ .show_progress = false });
+
+    var names: std.ArrayListUnmanaged([]const u8) = .empty;
+    for (ctx.module_programs) |mp| {
+        names.append(alloc, mp.name) catch {};
+    }
+
+    const result = compileModuleByModule(
+        alloc,
+        &ctx,
+        names.items,
+        .{ .show_progress = false },
+    ) catch |err| {
+        std.debug.print("compileModuleByModule failed unexpectedly: {}\n", .{err});
+        return error.TestUnexpectedResult;
+    };
+
+    try std.testing.expect(ctx.diag_engine.errorCount() >= 1);
+
+    var found_clean_a = false;
+    var found_clean_b = false;
+    for (result.ir_program.functions) |func| {
+        if (func.module_name) |mod_name| {
+            if (std.mem.eql(u8, mod_name, "CleanA")) found_clean_a = true;
+            if (std.mem.eql(u8, mod_name, "CleanB")) found_clean_b = true;
+        }
+    }
+    try std.testing.expect(found_clean_a);
+    try std.testing.expect(found_clean_b);
 }
 
 test "remapFunctionDecl rewrites name_expr through the remap table" {
