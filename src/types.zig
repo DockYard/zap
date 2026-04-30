@@ -1244,7 +1244,7 @@ pub const TypeChecker = struct {
             .paren => |inner| try self.recordAssignmentBindingTypes(inner.inner, parent_type, source_span),
             .bind => |b| {
                 if (self.current_scope) |scope_id| {
-                    if (self.graph.resolveBinding(scope_id, b.name)) |bid| {
+                    if (self.graph.resolveBindingHygienic(scope_id, b.name, b.meta.scopes)) |bid| {
                         try self.recordBindingType(bid, parent_type, source_span);
                     }
                 }
@@ -1335,7 +1335,7 @@ pub const TypeChecker = struct {
             .paren => |inner| try self.recordCasePatternBindingTypes(inner.inner, parent_type, source_span),
             .bind => |b| {
                 if (self.current_scope) |scope_id| {
-                    if (self.graph.resolveBinding(scope_id, b.name)) |bid| {
+                    if (self.graph.resolveBindingHygienic(scope_id, b.name, b.meta.scopes)) |bid| {
                         try self.recordBindingType(bid, parent_type, source_span);
                     }
                 }
@@ -1576,7 +1576,7 @@ pub const TypeChecker = struct {
             }
             if (arg.* != .var_ref) continue;
             const vr = arg.var_ref;
-            const binding_id = self.graph.resolveBinding(scope_id, vr.name) orelse continue;
+            const binding_id = self.graph.resolveBindingHygienic(scope_id, vr.name, vr.meta.scopes) orelse continue;
 
             switch (ownership) {
                 .shared => {},
@@ -1619,7 +1619,7 @@ pub const TypeChecker = struct {
         if (self.current_scope == null) return null;
         return switch (expr.*) {
             .var_ref => |vr| blk: {
-                const binding_id = self.graph.resolveBinding(self.current_scope.?, vr.name) orelse break :blk null;
+                const binding_id = self.graph.resolveBindingHygienic(self.current_scope.?, vr.name, vr.meta.scopes) orelse break :blk null;
                 const info = self.ownership_bindings.get(binding_id) orelse break :blk null;
                 if (info.qualified_type.ownership == .borrowed) break :blk binding_id;
                 break :blk null;
@@ -2150,7 +2150,7 @@ pub const TypeChecker = struct {
     fn collectCapturedBindingsFromExpr(self: *TypeChecker, expr: *const ast.Expr, function_scope: scope_mod.ScopeId, captured: *std.AutoHashMap(scope_mod.BindingId, void)) anyerror!void {
         switch (expr.*) {
             .var_ref => |vr| {
-                const binding_id = self.graph.resolveBinding(function_scope, vr.name) orelse return;
+                const binding_id = self.graph.resolveBindingHygienic(function_scope, vr.name, vr.meta.scopes) orelse return;
                 const binding = self.graph.bindings.items[binding_id];
                 if (!self.isScopeWithinFunctionRoot(binding.scope_id, function_scope)) {
                     try captured.put(binding_id, {});
@@ -2862,7 +2862,7 @@ pub const TypeChecker = struct {
                     if (value_type != TypeStore.UNKNOWN and value_type != TypeStore.ERROR) {
                         if (assign.pattern.* == .bind) {
                             if (self.current_scope) |scope_id| {
-                                if (self.graph.resolveBinding(scope_id, assign.pattern.bind.name)) |bid| {
+                                if (self.graph.resolveBindingHygienic(scope_id, assign.pattern.bind.name, assign.pattern.bind.meta.scopes)) |bid| {
                                     self.recordBindingType(bid, value_type, assign.value.getMeta().span) catch {};
                                 }
                             }
@@ -2958,7 +2958,7 @@ pub const TypeChecker = struct {
                 if (param.pattern.* == .bind) {
                     const bind_name = param.pattern.bind.name;
                     if (self.current_scope) |scope_id| {
-                        if (self.graph.resolveBinding(scope_id, bind_name)) |bid| {
+                        if (self.graph.resolveBindingHygienic(scope_id, bind_name, param.pattern.bind.meta.scopes)) |bid| {
                             try self.recordBindingQualifiedType(bid, qualified, ta.getMeta().span);
                         }
                     }
@@ -2984,7 +2984,7 @@ pub const TypeChecker = struct {
                     if (param.pattern.* == .bind) {
                         const bind_name = param.pattern.bind.name;
                         if (self.current_scope) |scope_id| {
-                            if (self.graph.resolveBinding(scope_id, bind_name)) |bid| {
+                            if (self.graph.resolveBindingHygienic(scope_id, bind_name, param.pattern.bind.meta.scopes)) |bid| {
                                 try self.recordBindingQualifiedType(bid, qualified, param.pattern.getMeta().span);
                             }
                         }
@@ -3189,7 +3189,7 @@ pub const TypeChecker = struct {
             .var_ref => |vr| {
                 // Resolve type from scope binding
                 if (self.current_scope) |scope_id| {
-                    if (self.graph.resolveBinding(scope_id, vr.name)) |bid| {
+                    if (self.graph.resolveBindingHygienic(scope_id, vr.name, vr.meta.scopes)) |bid| {
                         _ = try self.ensureBindingAvailable(bid, vr.meta.span);
                         self.referenced_bindings.put(bid, {}) catch {};
                         const binding = self.graph.bindings.items[bid];
@@ -3888,7 +3888,7 @@ pub const TypeChecker = struct {
 
             if (self.current_scope) |scope_id| {
                 // First check if it's a variable holding a function
-                if (self.graph.resolveBinding(scope_id, vr.name)) |bid| {
+                if (self.graph.resolveBindingHygienic(scope_id, vr.name, vr.meta.scopes)) |bid| {
                     self.referenced_bindings.put(bid, {}) catch {};
                     const binding = self.graph.bindings.items[bid];
                     if (binding.type_id) |prov| {
@@ -4121,7 +4121,7 @@ pub const TypeChecker = struct {
                     // Mark any var_ref args as referenced directly
                     if (arg.* == .var_ref) {
                         if (self.current_scope) |scope_id| {
-                            if (self.graph.resolveBinding(scope_id, arg.var_ref.name)) |bid| {
+                            if (self.graph.resolveBindingHygienic(scope_id, arg.var_ref.name, arg.var_ref.meta.scopes)) |bid| {
                                 self.referenced_bindings.put(bid, {}) catch {};
                             }
                         }

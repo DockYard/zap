@@ -2221,7 +2221,11 @@ pub const HirBuilder = struct {
 
     /// Look up a binding's type_id from the scope graph.
     /// Returns the type_id if found, otherwise UNKNOWN.
-    fn resolveBindingType(self: *const HirBuilder, name: ast.StringId) types_mod.TypeId {
+    /// `reference_scopes` carries the Flatt-2016 hygiene marks of the
+    /// reference being resolved; pass `.empty` when the caller has no
+    /// reference node in hand (synthetic capture lookups, etc.) — that
+    /// path falls through to the lexical-chain walker.
+    fn resolveBindingType(self: *const HirBuilder, name: ast.StringId, reference_scopes: scope_mod.ScopeSet) types_mod.TypeId {
         // Check assignment bindings first — these have types from the value
         // expression and are always valid regardless of scope chain direction.
         for (self.current_assignment_bindings.items) |binding| {
@@ -2234,7 +2238,7 @@ pub const HirBuilder = struct {
         // build, so this must take precedence over the in-memory parameter
         // copy populated below.
         const scope_id = self.current_clause_scope orelse self.current_module_scope orelse self.graph.prelude_scope;
-        if (self.graph.resolveBinding(scope_id, name)) |bid| {
+        if (self.graph.resolveBindingHygienic(scope_id, name, reference_scopes)) |bid| {
             const binding = self.graph.bindings.items[bid];
             if (binding.type_id) |prov| {
                 return prov.type_id;
@@ -2549,7 +2553,7 @@ pub const HirBuilder = struct {
             ownerships[idx] = blk: {
                 if (param.pattern.* == .bind) {
                     const clause_scope = self.graph.resolveClauseScope(clause.meta) orelse clause.meta.scope_id;
-                    if (self.graph.resolveBinding(clause_scope, param.pattern.bind.name)) |binding_id| {
+                    if (self.graph.resolveBindingHygienic(clause_scope, param.pattern.bind.name, param.pattern.bind.meta.scopes)) |binding_id| {
                         if (self.graph.bindings.items[binding_id].type_id) |prov| {
                             break :blk self.resolveParamOwnership(param, prov.type_id);
                         }
@@ -2580,7 +2584,7 @@ pub const HirBuilder = struct {
             param_types[idx] = blk: {
                 if (param.pattern.* == .bind) {
                     const clause_scope = self.graph.resolveClauseScope(clause.meta) orelse clause.meta.scope_id;
-                    if (self.graph.resolveBinding(clause_scope, param.pattern.bind.name)) |binding_id| {
+                    if (self.graph.resolveBindingHygienic(clause_scope, param.pattern.bind.name, param.pattern.bind.meta.scopes)) |binding_id| {
                         if (self.graph.bindings.items[binding_id].type_id) |prov| {
                             break :blk prov.type_id;
                         }
@@ -2693,7 +2697,7 @@ pub const HirBuilder = struct {
         var capture_values: std.ArrayList(CaptureValue) = .empty;
         for (group_captures) |capture| {
             try capture_values.append(self.allocator, .{
-                .expr = (try self.buildBindingReference(capture.name, capture.type_id, span)) orelse return error.OutOfMemory,
+                .expr = (try self.buildBindingReference(capture.name, capture.type_id, span, .empty)) orelse return error.OutOfMemory,
                 .ownership = capture.ownership,
             });
         }
@@ -2738,7 +2742,20 @@ pub const HirBuilder = struct {
         return idx;
     }
 
-    fn buildBindingReference(self: *HirBuilder, name: ast.StringId, type_id: TypeId, span: ast.SourceSpan) anyerror!?*const Expr {
+    /// Build the lowered Expr for a reference to `name`. `reference_scopes`
+    /// carries the Flatt-2016 hygiene marks of the source-level identifier
+    /// when the caller has a node to extract them from; pass `.empty` for
+    /// synthetic references created during lowering (capture closures,
+    /// etc.) where there is no user-written identifier whose scope set
+    /// would matter — those fall through to the lexical-chain walker via
+    /// `resolveBindingHygienic`.
+    fn buildBindingReference(
+        self: *HirBuilder,
+        name: ast.StringId,
+        type_id: TypeId,
+        span: ast.SourceSpan,
+        reference_scopes: scope_mod.ScopeSet,
+    ) anyerror!?*const Expr {
         for (self.current_param_names, 0..) |param_name, idx| {
             if (param_name) |pn| {
                 if (pn == name) {
@@ -2814,7 +2831,7 @@ pub const HirBuilder = struct {
         }
 
         if (self.current_clause_scope) |scope_id| {
-            if (self.graph.resolveBinding(scope_id, name)) |binding_id| {
+            if (self.graph.resolveBindingHygienic(scope_id, name, reference_scopes)) |binding_id| {
                 const capture_result = try self.captureIndexForBinding(binding_id);
                 if (capture_result) |capture_idx| {
                     return try self.create(Expr, .{
@@ -3990,13 +4007,13 @@ pub const HirBuilder = struct {
                 .span = v.meta.span,
             }),
             .var_ref => |v| {
-                var resolved_type = self.resolveBindingType(v.name);
+                var resolved_type = self.resolveBindingType(v.name, v.meta.scopes);
                 if (resolved_type == types_mod.TypeStore.UNKNOWN) {
                     resolved_type = try self.resolveFunctionValueType(v.name);
                 }
 
                 if (self.current_clause_scope != null) {
-                    if (try self.buildBindingReference(v.name, resolved_type, v.meta.span)) |ref| {
+                    if (try self.buildBindingReference(v.name, resolved_type, v.meta.span, v.meta.scopes)) |ref| {
                         return ref;
                     }
                 }
@@ -4210,7 +4227,7 @@ pub const HirBuilder = struct {
                         break :blk .{ .closure = callee_expr.? };
                     }
                     if (self.current_clause_scope != null) {
-                        if (try self.buildBindingReference(vr.name, self.resolveBindingType(vr.name), vr.meta.span)) |binding_ref| {
+                        if (try self.buildBindingReference(vr.name, self.resolveBindingType(vr.name, vr.meta.scopes), vr.meta.span, vr.meta.scopes)) |binding_ref| {
                             callee_expr = binding_ref;
                             break :blk .{ .closure = callee_expr.? };
                         }
@@ -4275,7 +4292,7 @@ pub const HirBuilder = struct {
                         var full_args: std.ArrayList(CallArg) = .empty;
                         for (group_captures) |capture| {
                             try full_args.append(self.allocator, .{
-                                .expr = (try self.buildBindingReference(capture.name, capture.type_id, call.meta.span)) orelse return error.OutOfMemory,
+                                .expr = (try self.buildBindingReference(capture.name, capture.type_id, call.meta.span, .empty)) orelse return error.OutOfMemory,
                                 .mode = switch (capture.ownership) {
                                     .shared => .share,
                                     .unique => .move,

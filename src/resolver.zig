@@ -235,7 +235,7 @@ pub const Resolver = struct {
         switch (expr.*) {
             .var_ref => |vr| {
                 // Check if variable is in scope
-                if (self.graph.resolveBinding(self.current_scope, vr.name) == null) {
+                if (self.graph.resolveBindingHygienic(self.current_scope, vr.name, vr.meta.scopes) == null) {
                     // Might be a function name — check function families
                     const name_str = self.interner.get(vr.name);
                     if (!isBuiltinFunction(name_str)) {
@@ -422,7 +422,7 @@ pub const Resolver = struct {
             },
             .pin => |pin| {
                 // Pin references an existing variable
-                if (self.graph.resolveBinding(self.current_scope, pin.name) == null) {
+                if (self.graph.resolveBindingHygienic(self.current_scope, pin.name, pin.meta.scopes) == null) {
                     try self.addError("pinned variable not found in scope", pin.meta.span);
                 }
             },

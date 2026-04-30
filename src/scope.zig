@@ -757,6 +757,35 @@ pub const ScopeGraph = struct {
         return best;
     }
 
+    /// Hygiene-aware binding resolution. When the reference's scope set
+    /// is non-empty, consult `resolveBindingByScopes` first so Flatt-2016
+    /// marks discriminate macro-introduced bindings from user-supplied
+    /// identifiers; if that returns null (no binding's `scopes` is a
+    /// subset of the reference's set, or the candidates tied) fall back
+    /// to the lexical-chain walker. When the reference carries no
+    /// hygiene marks (the common case for user code untouched by a
+    /// macro), skip the scope-set query and use the lexical walker
+    /// directly. The combination preserves existing semantics for
+    /// non-hygiene callsites while enabling discrimination at hygiene-
+    /// aware sites — bindings introduced before hygiene plumbing is
+    /// fully wired (empty `Binding.scopes`) are still found by the
+    /// largest-subset rule (empty set is a subset of every set), and
+    /// the lexical fallback handles the remaining edge cases where a
+    /// binding is registered only via the scope-table chain.
+    pub fn resolveBindingHygienic(
+        self: *const ScopeGraph,
+        scope_id: ScopeId,
+        name: ast.StringId,
+        reference_scopes: ScopeSet,
+    ) ?BindingId {
+        if (!reference_scopes.isEmpty()) {
+            if (self.resolveBindingByScopes(reference_scopes, name)) |bid| {
+                return bid;
+            }
+        }
+        return self.resolveBinding(scope_id, name);
+    }
+
     /// Look up a function family by name and arity, walking up the scope chain.
     /// Also checks imported module scopes for unqualified access.
     pub fn resolveFamily(self: *const ScopeGraph, scope_id: ScopeId, name: ast.StringId, arity: u32) ?FunctionFamilyId {

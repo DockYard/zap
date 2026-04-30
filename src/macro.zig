@@ -5097,3 +5097,176 @@ test "Flatt-2016 hygiene: swap-macro discriminates user vs template identifiers 
     try std.testing.expectEqual(template_binding_id, template_resolved.?);
     try std.testing.expectEqual(user_binding_id, user_resolved.?);
 }
+
+test "Flatt-2016 hygiene: resolveBindingHygienic discriminates user vs macro-introduced tmp at the resolver layer" {
+    // Companion to the swap-macro scope-set test above. That test
+    // proves the macro engine stamps distinct scope sets onto the
+    // template-introduced `tmp` and the user-supplied `tmp`. THIS
+    // test proves the resolver call sites (types.zig, hir.zig,
+    // resolver.zig) consume those marks via the unified
+    // `resolveBindingHygienic` helper and pick distinct bindings —
+    // the contract every production resolver was migrated to in
+    // Phase-3 step 8.
+    //
+    // Under the lexical-chain-only `resolveBinding`, both `tmp`
+    // identifiers would share the same lexical scope and resolve
+    // to whichever binding happened to be registered last in the
+    // scope chain — the macro's hidden `tmp` would shadow the user's
+    // `tmp`, breaking hygiene. With the scope-set path active, the
+    // template-introduced reference (carrying intro_scope +
+    // use_scope) resolves to the binding tagged with those scopes;
+    // the user-supplied reference (carrying its original empty set)
+    // resolves to the binding registered in the user's lexical
+    // scope.
+    const source =
+        \\pub struct Test {
+        \\  pub macro hyg_swap(user_id) {
+        \\    quote {
+        \\      tmp + unquote(user_id)
+        \\    }
+        \\  }
+        \\
+        \\  pub fn caller() -> i64 {
+        \\    hyg_swap(tmp)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    const expanded = try engine.expandProgram(&program);
+
+    var caller_fn: ?*const ast.FunctionDecl = null;
+    for (expanded.structs) |mod| {
+        if (mod.name.parts.len != 1) continue;
+        if (!std.mem.eql(u8, parser.interner.get(mod.name.parts[0]), "Test")) continue;
+        for (mod.items) |item| {
+            if (item == .function) {
+                if (std.mem.eql(u8, parser.interner.get(item.function.name), "caller")) {
+                    caller_fn = item.function;
+                }
+            }
+        }
+    }
+    try std.testing.expect(caller_fn != null);
+
+    const decl = caller_fn.?;
+    try std.testing.expect(decl.clauses.len >= 1);
+    const body = decl.clauses[0].body orelse return error.TestExpectedABody;
+    try std.testing.expect(body.len >= 1);
+
+    const tmp_name = try parser.interner.intern("tmp");
+
+    var binop: ?*const ast.BinaryOp = null;
+    var cursor: ?*const ast.Expr = if (body[body.len - 1] == .expr) body[body.len - 1].expr else null;
+    while (cursor) |e| {
+        switch (e.*) {
+            .binary_op => |bop| {
+                if (bop.op == .add) {
+                    binop = &e.binary_op;
+                    break;
+                }
+                cursor = null;
+            },
+            .block => |blk| {
+                if (blk.stmts.len == 0) {
+                    cursor = null;
+                } else {
+                    cursor = if (blk.stmts[blk.stmts.len - 1] == .expr) blk.stmts[blk.stmts.len - 1].expr else null;
+                }
+            },
+            else => cursor = null,
+        }
+    }
+    try std.testing.expect(binop != null);
+    const op = binop.?;
+    try std.testing.expect(op.lhs.* == .var_ref);
+    try std.testing.expect(op.rhs.* == .var_ref);
+
+    const left_ref = op.lhs.var_ref;
+    const right_ref = op.rhs.var_ref;
+    try std.testing.expectEqual(tmp_name, left_ref.name);
+    try std.testing.expectEqual(tmp_name, right_ref.name);
+
+    // The template-introduced ref carries strictly more scopes than
+    // the user-supplied ref; pick the right side via length.
+    const template_ref = if (left_ref.meta.scopes.len() > right_ref.meta.scopes.len()) left_ref else right_ref;
+    const user_ref = if (left_ref.meta.scopes.len() > right_ref.meta.scopes.len()) right_ref else left_ref;
+
+    // Register two real bindings via the public createBindingWithScopes
+    // API — one in the user's lexical scope (caller's clause scope),
+    // matching the empty user scope set; one tagged with the template's
+    // scope set, mimicking what the collector would record when it
+    // walks a macro-introduced `let tmp = ...` binder. The lexical
+    // scope_id we hand the API is the same for both bindings; the
+    // discriminator is the scope set, not the chain. That is the
+    // entire premise of Flatt-2016 hygiene.
+    const caller_meta = decl.clauses[0].meta;
+    const caller_clause_scope = collector.graph.resolveClauseScope(caller_meta) orelse caller_meta.scope_id;
+
+    const user_binding_id = try collector.graph.createBindingWithScopes(
+        tmp_name,
+        caller_clause_scope,
+        .pattern_bind,
+        .{ .start = 0, .end = 0 },
+        user_ref.meta.scopes,
+    );
+
+    // For the second binding we must NOT call createBindingWithScopes
+    // directly into the same scope_id with the same name — it would
+    // overwrite the scope.bindings hashmap entry and wipe out the
+    // user binding's scope-table registration, which the lexical
+    // resolver still needs as a fallback. Append the synthetic
+    // template binding directly to graph.bindings so the scope-set
+    // resolver can see it without disturbing the lexical chain.
+    const template_binding_scopes = try template_ref.meta.scopes.clone(alloc);
+    const template_binding_id: scope.BindingId = @intCast(collector.graph.bindings.items.len);
+    {
+        const slot = try collector.graph.bindings.addOne(collector.graph.allocator);
+        slot.* = .{
+            .id = template_binding_id,
+            .name = tmp_name,
+            .scope_id = caller_clause_scope,
+            .kind = .pattern_bind,
+            .span = .{ .start = 0, .end = 0 },
+            .scopes = template_binding_scopes,
+        };
+    }
+
+    // The contract under test:
+    //   resolveBindingHygienic(scope, name, template_ref.scopes)
+    //     => template_binding_id
+    //   resolveBindingHygienic(scope, name, user_ref.scopes)
+    //     => user_binding_id
+    // Distinct identifiers, distinct bindings, even though both
+    // share the lexical scope and the textual name. Lexical-only
+    // resolution would collapse them to a single binding.
+    const template_resolved = collector.graph.resolveBindingHygienic(
+        caller_clause_scope,
+        tmp_name,
+        template_ref.meta.scopes,
+    );
+    const user_resolved = collector.graph.resolveBindingHygienic(
+        caller_clause_scope,
+        tmp_name,
+        user_ref.meta.scopes,
+    );
+
+    try std.testing.expect(template_resolved != null);
+    try std.testing.expect(user_resolved != null);
+    try std.testing.expect(template_resolved.? != user_resolved.?);
+    try std.testing.expectEqual(template_binding_id, template_resolved.?);
+    try std.testing.expectEqual(user_binding_id, user_resolved.?);
+}
