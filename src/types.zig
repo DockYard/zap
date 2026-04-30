@@ -1100,8 +1100,9 @@ pub const TypeChecker = struct {
         label: ?[]const u8 = null,
         help: ?[]const u8 = null,
         secondary_spans: []const @import("diagnostics.zig").SecondarySpan = &.{},
-        /// When set, overrides the pipeline's default severity (e.g. --strict-types).
-        /// Hard errors like "undefined type" are always .@"error" regardless of flags.
+        /// Optional override for the diagnostic severity. Defaults to
+        /// `.@"error"` at the pipeline. Used by checks that intentionally
+        /// emit at a different severity (e.g. lints).
         severity: ?@import("diagnostics.zig").Severity = null,
     };
 

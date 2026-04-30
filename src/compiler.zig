@@ -32,8 +32,6 @@ pub const CompileError = error{
 };
 
 pub const CompileOptions = struct {
-    /// Treat type warnings as hard errors.
-    strict_types: bool = false,
     /// Show progress output to stderr.
     show_progress: bool = true,
     /// lib mode — skip main function emission in ZIR.
@@ -767,15 +765,15 @@ const Pipeline = struct {
     }
 
     /// Forward errors collected by `type_checker` into the context's
-    /// diagnostic engine, applying the configured strict-types
-    /// severity. Pulled out as a helper because compileForCtfe also
-    /// needs to drain the checker after a second-pass `checkProgram`
-    /// once escape analysis has populated borrow diagnostics.
+    /// diagnostic engine. Type-checker errors are always hard errors —
+    /// strict types is a hard language requirement, not an opt-in.
+    /// Pulled out as a helper because compileForCtfe also needs to
+    /// drain the checker after a second-pass `checkProgram` once
+    /// escape analysis has populated borrow diagnostics.
     fn routeTypeCheckerErrors(self: *Pipeline, type_checker: *const zap.types.TypeChecker) void {
-        const type_severity: zap.Severity = if (self.options.strict_types) .@"error" else .warning;
         for (type_checker.errors.items) |type_err| {
             self.ctx.diag_engine.reportDiagnostic(.{
-                .severity = type_err.severity orelse type_severity,
+                .severity = type_err.severity orelse .@"error",
                 .message = type_err.message,
                 .span = type_err.span,
                 .label = type_err.label,
