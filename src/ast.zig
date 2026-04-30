@@ -28,7 +28,7 @@ pub const SourceSpan = struct {
     }
 };
 
-/// Per-AST-node metadata. Three channels:
+/// Per-AST-node metadata. Four channels:
 ///
 /// 1. `span` — source location for diagnostics.
 /// 2. `scope_id` — the legacy "owning lexical scope" handle. Several
@@ -42,10 +42,16 @@ pub const SourceSpan = struct {
 ///    largest subset of the reference's `scopes`. Defaults to the
 ///    empty set so existing AST construction sites that don't know
 ///    about hygiene compile unchanged.
+/// 4. `expansion` — provenance pointer for macro-expanded nodes. Null
+///    for source-level nodes (the common case). When set, points at a
+///    long-lived `ExpansionInfo` describing the macro call that
+///    produced this node. Diagnostic-only: existing semantic passes
+///    do not consult this field. See `ExpansionInfo` below.
 pub const NodeMeta = struct {
     span: SourceSpan,
     scope_id: u32 = 0,
     scopes: scope_mod.ScopeSet = .empty,
+    expansion: ?*const ExpansionInfo = null,
 
     /// Most-specific scope in the hygiene set, used by lowering passes
     /// that still want a single ScopeId handle as a fallback. Returns
@@ -54,6 +60,55 @@ pub const NodeMeta = struct {
     pub fn primaryScope(self: NodeMeta) ?scope_mod.ScopeId {
         return self.scopes.primary();
     }
+};
+
+/// Reference to a source-level binding that was substituted away by a
+/// macro. Carries enough information for an LSP server to round-trip
+/// the binding back to its source position and (optionally) its scope.
+pub const BindingRef = struct {
+    name: StringId,
+    span: SourceSpan,
+    scope_id: u32,
+};
+
+/// Provenance information attached (via `NodeMeta.expansion`) to every
+/// AST node produced by a macro expansion. The pointer is shared by all
+/// nodes in a single expansion frame so a tool can identify "everything
+/// that came from THIS macro call" by pointer-equality.
+///
+/// The `parent` chain links nested expansions: if macro `B` is invoked
+/// inside the expansion of macro `A`, `B`'s `ExpansionInfo.parent` points
+/// at `A`'s `ExpansionInfo`. Following `parent` to null walks the
+/// expansion stack back out to user source.
+///
+/// `disappeared_uses` and `disappeared_bindings` are intentionally
+/// stubbed empty for the MVP. The macro engine does not yet track which
+/// source-level identifiers were consumed by a macro without being
+/// re-emitted. Populating them precisely will be driven by a real LSP
+/// consumer; stubbing them empty now keeps the data model fixed while
+/// avoiding wrong-format churn later.
+///
+/// References:
+///   - Matthew Flatt, "Bindings as Sets of Scopes" (POPL 2016).
+///   - Racket's `'disappeared-use` / `'disappeared-binding` syntax
+///     properties — the model these fields mirror.
+pub const ExpansionInfo = struct {
+    /// Source span of the macro-call expression that triggered this
+    /// expansion. Used by Go-to-Definition to jump from a synthesized
+    /// node back to its call site.
+    call_site: SourceSpan,
+    /// Interned name of the macro that was invoked.
+    macro_name: StringId,
+    /// Source-level identifier spans the macro consumed without
+    /// re-emitting them in the expansion. Empty in the MVP — see the
+    /// type-level doc comment.
+    disappeared_uses: []const SourceSpan = &.{},
+    /// Source-level binders the macro absorbed (e.g. desugared away).
+    /// Empty in the MVP — see the type-level doc comment.
+    disappeared_bindings: []const BindingRef = &.{},
+    /// Parent expansion frame for nested macros. Null for an expansion
+    /// triggered from user source (the outermost frame).
+    parent: ?*const ExpansionInfo = null,
 };
 
 pub fn makeMeta(span: SourceSpan) NodeMeta {

@@ -1215,6 +1215,25 @@ pub const MacroEngine = struct {
             return expr;
         }
 
+        // Allocate the per-call ExpansionInfo. Lives for the lifetime
+        // of the macro engine's allocator (the compile session). Every
+        // node produced by this expansion will be stamped with this
+        // pointer so a downstream tool (LSP, diagnostic) can group them
+        // by call site and walk the parent chain back to user source.
+        //
+        // The parent frame is the call expression's *current* expansion
+        // stamp (if any). When this `expr` itself was synthesised by an
+        // outer macro expansion, the outer ExpansionInfo is already on
+        // its meta — chain to it so nested-macro provenance is
+        // preserved without needing a thread-local "current expansion"
+        // stack.
+        const expansion_info = try self.allocator.create(ast.ExpansionInfo);
+        expansion_info.* = .{
+            .call_site = call.meta.span,
+            .macro_name = name,
+            .parent = expr.getMeta().expansion,
+        };
+
         // Use the first clause for now (pattern matching on macro args is Phase 4+)
         const clause_ref = family.clauses.items[0];
         const clause = &clause_ref.decl.clauses[clause_ref.clause_index];
@@ -1258,7 +1277,9 @@ pub const MacroEngine = struct {
         if ((clause.body orelse @as([]const ast.Stmt, &.{})).len == 1 and (clause.body orelse @as([]const ast.Stmt, &.{}))[0] == .expr) {
             const body_expr = (clause.body orelse @as([]const ast.Stmt, &.{}))[0].expr;
             if (body_expr.* == .quote_expr) {
-                return try self.expandQuoteHygienic(body_expr, call.args, clause.params, use_scope, intro_scope);
+                const expanded = try self.expandQuoteHygienic(body_expr, call.args, clause.params, use_scope, intro_scope);
+                stampExpansionOnExpr(expanded, expansion_info);
+                return expanded;
             }
         }
 
@@ -1360,7 +1381,9 @@ pub const MacroEngine = struct {
             if (result != .nil) {
                 // If the result is a function declaration form, register it in
                 // the scope graph so calls to the generated function can resolve.
-                return ast_data.ctValueToExpr(self.allocator, self.interner, result) catch expr;
+                const expanded = ast_data.ctValueToExpr(self.allocator, self.interner, result) catch return expr;
+                stampExpansionOnExpr(expanded, expansion_info);
+                return expanded;
             }
         }
 
@@ -2697,6 +2720,341 @@ pub const MacroEngine = struct {
         return slice;
     }
 };
+
+// ============================================================
+// Expansion-info stamping
+//
+// After macro expansion converts the result CtValue back to AST, we
+// walk the resulting tree and write `meta.expansion = info` on every
+// node. The pointer is shared by all nodes from a single expansion so a
+// downstream tool can cluster them by expansion frame and walk
+// `info.parent` back to user source for nested macros.
+//
+// Nodes that already carry an `expansion` pointer (because they were
+// produced by an inner macro that already expanded) are left alone:
+// their existing `info.parent` chain is the truth, and overwriting
+// would lose the inner provenance. The outer call's frame is reachable
+// from the inner one via `parent`.
+//
+// The walker is exhaustive over every AST union variant — when a new
+// variant is added, the corresponding `inline else` falls through and
+// the variant-count tripwire test in `ast.zig` will catch the omission.
+// ============================================================
+
+fn stampMetaIfUnset(meta_ptr: *ast.NodeMeta, info: *const ast.ExpansionInfo) void {
+    if (meta_ptr.expansion == null) {
+        meta_ptr.expansion = info;
+    }
+}
+
+fn stampExpansionOnExpr(expr: *const ast.Expr, info: *const ast.ExpansionInfo) void {
+    const mut: *ast.Expr = @constCast(expr);
+    switch (mut.*) {
+        .int_literal => |*v| stampMetaIfUnset(&v.meta, info),
+        .float_literal => |*v| stampMetaIfUnset(&v.meta, info),
+        .string_literal => |*v| stampMetaIfUnset(&v.meta, info),
+        .string_interpolation => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            for (v.parts) |part| switch (part) {
+                .literal => {},
+                .expr => |child| stampExpansionOnExpr(child, info),
+            };
+        },
+        .atom_literal => |*v| stampMetaIfUnset(&v.meta, info),
+        .bool_literal => |*v| stampMetaIfUnset(&v.meta, info),
+        .nil_literal => |*v| stampMetaIfUnset(&v.meta, info),
+        .var_ref => |*v| stampMetaIfUnset(&v.meta, info),
+        .module_ref => |*v| stampMetaIfUnset(&v.meta, info),
+        .tuple => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            for (v.elements) |elem| stampExpansionOnExpr(elem, info);
+        },
+        .list => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            for (v.elements) |elem| stampExpansionOnExpr(elem, info);
+        },
+        .map => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            if (v.update_source) |src| stampExpansionOnExpr(src, info);
+            for (v.fields) |field| {
+                stampExpansionOnExpr(field.key, info);
+                stampExpansionOnExpr(field.value, info);
+            }
+        },
+        .struct_expr => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            if (v.update_source) |src| stampExpansionOnExpr(src, info);
+            for (v.fields) |field| stampExpansionOnExpr(field.value, info);
+        },
+        .range => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            stampExpansionOnExpr(v.start, info);
+            stampExpansionOnExpr(v.end, info);
+            if (v.step) |s| stampExpansionOnExpr(s, info);
+        },
+        .binary_op => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            stampExpansionOnExpr(v.lhs, info);
+            stampExpansionOnExpr(v.rhs, info);
+        },
+        .unary_op => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            stampExpansionOnExpr(v.operand, info);
+        },
+        .call => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            stampExpansionOnExpr(v.callee, info);
+            for (v.args) |arg| stampExpansionOnExpr(arg, info);
+        },
+        .field_access => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            stampExpansionOnExpr(v.object, info);
+        },
+        .pipe => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            stampExpansionOnExpr(v.lhs, info);
+            stampExpansionOnExpr(v.rhs, info);
+        },
+        .unwrap => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            stampExpansionOnExpr(v.expr, info);
+        },
+        .if_expr => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            stampExpansionOnExpr(v.condition, info);
+            for (v.then_block) |stmt| stampExpansionOnStmt(stmt, info);
+            if (v.else_block) |else_block| {
+                for (else_block) |stmt| stampExpansionOnStmt(stmt, info);
+            }
+        },
+        .case_expr => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            stampExpansionOnExpr(v.scrutinee, info);
+            for (v.clauses) |*clause| stampExpansionOnCaseClause(clause, info);
+        },
+        .cond_expr => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            for (v.clauses) |*clause| {
+                stampMetaIfUnset(&@as(*ast.CondClause, @constCast(clause)).meta, info);
+                stampExpansionOnExpr(clause.condition, info);
+                for (clause.body) |stmt| stampExpansionOnStmt(stmt, info);
+            }
+        },
+        .for_expr => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            stampExpansionOnPattern(v.var_pattern, info);
+            if (v.var_type_annotation) |ta| stampExpansionOnTypeExpr(ta, info);
+            stampExpansionOnExpr(v.iterable, info);
+            if (v.filter) |f| stampExpansionOnExpr(f, info);
+            stampExpansionOnExpr(v.body, info);
+        },
+        .list_cons_expr => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            stampExpansionOnExpr(v.head, info);
+            stampExpansionOnExpr(v.tail, info);
+        },
+        .quote_expr => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            for (v.body) |stmt| stampExpansionOnStmt(stmt, info);
+        },
+        .unquote_expr => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            stampExpansionOnExpr(v.expr, info);
+        },
+        .unquote_splicing_expr => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            stampExpansionOnExpr(v.expr, info);
+        },
+        .panic_expr => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            stampExpansionOnExpr(v.message, info);
+        },
+        .error_pipe => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            stampExpansionOnExpr(v.chain, info);
+            switch (v.handler) {
+                .block => |arms| for (arms) |*clause| stampExpansionOnCaseClause(clause, info),
+                .function => |fn_expr| stampExpansionOnExpr(fn_expr, info),
+            }
+        },
+        .block => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            for (v.stmts) |stmt| stampExpansionOnStmt(stmt, info);
+        },
+        .intrinsic => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            for (v.args) |arg| stampExpansionOnExpr(arg, info);
+        },
+        .attr_ref => |*v| stampMetaIfUnset(&v.meta, info),
+        .binary_literal => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            for (v.segments) |*seg| stampExpansionOnBinarySegment(seg, info);
+        },
+        .function_ref => |*v| stampMetaIfUnset(&v.meta, info),
+        .anonymous_function => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            stampExpansionOnFunctionDecl(v.decl, info);
+        },
+        .type_annotated => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            stampExpansionOnExpr(v.expr, info);
+            stampExpansionOnTypeExpr(v.type_expr, info);
+        },
+    }
+}
+
+fn stampExpansionOnStmt(stmt: ast.Stmt, info: *const ast.ExpansionInfo) void {
+    switch (stmt) {
+        .expr => |e| stampExpansionOnExpr(e, info),
+        .assignment => |a| {
+            const mut: *ast.Assignment = @constCast(a);
+            stampMetaIfUnset(&mut.meta, info);
+            stampExpansionOnPattern(a.pattern, info);
+            stampExpansionOnExpr(a.value, info);
+        },
+        .function_decl => |fd| stampExpansionOnFunctionDecl(fd, info),
+        .macro_decl => |fd| stampExpansionOnFunctionDecl(fd, info),
+        .import_decl => |id| {
+            const mut: *ast.ImportDecl = @constCast(id);
+            stampMetaIfUnset(&mut.meta, info);
+        },
+    }
+}
+
+fn stampExpansionOnPattern(pattern: *const ast.Pattern, info: *const ast.ExpansionInfo) void {
+    const mut: *ast.Pattern = @constCast(pattern);
+    switch (mut.*) {
+        .wildcard => |*v| stampMetaIfUnset(&v.meta, info),
+        .bind => |*v| stampMetaIfUnset(&v.meta, info),
+        .literal => |*lit| switch (lit.*) {
+            .int => |*v| stampMetaIfUnset(&v.meta, info),
+            .float => |*v| stampMetaIfUnset(&v.meta, info),
+            .string => |*v| stampMetaIfUnset(&v.meta, info),
+            .atom => |*v| stampMetaIfUnset(&v.meta, info),
+            .bool_lit => |*v| stampMetaIfUnset(&v.meta, info),
+            .nil => |*v| stampMetaIfUnset(&v.meta, info),
+        },
+        .tuple => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            for (v.elements) |elem| stampExpansionOnPattern(elem, info);
+        },
+        .list => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            for (v.elements) |elem| stampExpansionOnPattern(elem, info);
+        },
+        .list_cons => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            for (v.heads) |h| stampExpansionOnPattern(h, info);
+            stampExpansionOnPattern(v.tail, info);
+        },
+        .map => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            for (v.fields) |field| {
+                stampExpansionOnExpr(field.key, info);
+                stampExpansionOnPattern(field.value, info);
+            }
+        },
+        .struct_pattern => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            for (v.fields) |field| stampExpansionOnPattern(field.pattern, info);
+        },
+        .pin => |*v| stampMetaIfUnset(&v.meta, info),
+        .paren => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            stampExpansionOnPattern(v.inner, info);
+        },
+        .binary => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            for (v.segments) |*seg| stampExpansionOnBinarySegment(seg, info);
+        },
+    }
+}
+
+fn stampExpansionOnTypeExpr(type_expr: *const ast.TypeExpr, info: *const ast.ExpansionInfo) void {
+    const mut: *ast.TypeExpr = @constCast(type_expr);
+    switch (mut.*) {
+        .name => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            for (v.args) |arg| stampExpansionOnTypeExpr(arg, info);
+        },
+        .variable => |*v| stampMetaIfUnset(&v.meta, info),
+        .tuple => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            for (v.elements) |elem| stampExpansionOnTypeExpr(elem, info);
+        },
+        .list => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            stampExpansionOnTypeExpr(v.element, info);
+        },
+        .map => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            for (v.fields) |field| {
+                stampExpansionOnTypeExpr(field.key, info);
+                stampExpansionOnTypeExpr(field.value, info);
+            }
+        },
+        .struct_type => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            for (v.fields) |field| stampExpansionOnTypeExpr(field.type_expr, info);
+        },
+        .union_type => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            for (v.members) |m| stampExpansionOnTypeExpr(m, info);
+        },
+        .function => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            for (v.params) |p| stampExpansionOnTypeExpr(p, info);
+            stampExpansionOnTypeExpr(v.return_type, info);
+        },
+        .literal => |*v| stampMetaIfUnset(&v.meta, info),
+        .never => |*v| stampMetaIfUnset(&v.meta, info),
+        .paren => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            stampExpansionOnTypeExpr(v.inner, info);
+        },
+    }
+}
+
+fn stampExpansionOnCaseClause(clause: *const ast.CaseClause, info: *const ast.ExpansionInfo) void {
+    const mut: *ast.CaseClause = @constCast(clause);
+    stampMetaIfUnset(&mut.meta, info);
+    stampExpansionOnPattern(clause.pattern, info);
+    if (clause.type_annotation) |ta| stampExpansionOnTypeExpr(ta, info);
+    if (clause.guard) |g| stampExpansionOnExpr(g, info);
+    for (clause.body) |stmt| stampExpansionOnStmt(stmt, info);
+}
+
+fn stampExpansionOnFunctionDecl(decl: *const ast.FunctionDecl, info: *const ast.ExpansionInfo) void {
+    const mut: *ast.FunctionDecl = @constCast(decl);
+    stampMetaIfUnset(&mut.meta, info);
+    if (decl.name_expr) |ne| stampExpansionOnExpr(ne, info);
+    for (decl.clauses) |*clause| {
+        const cmut: *ast.FunctionClause = @constCast(clause);
+        stampMetaIfUnset(&cmut.meta, info);
+        for (clause.params) |*param| {
+            const pmut: *ast.Param = @constCast(param);
+            stampMetaIfUnset(&pmut.meta, info);
+            stampExpansionOnPattern(param.pattern, info);
+            if (param.type_annotation) |ta| stampExpansionOnTypeExpr(ta, info);
+            if (param.default) |d| stampExpansionOnExpr(d, info);
+        }
+        if (clause.return_type) |rt| stampExpansionOnTypeExpr(rt, info);
+        if (clause.refinement) |r| stampExpansionOnExpr(r, info);
+        if (clause.body) |body| {
+            for (body) |stmt| stampExpansionOnStmt(stmt, info);
+        }
+    }
+}
+
+fn stampExpansionOnBinarySegment(seg: *const ast.BinarySegment, info: *const ast.ExpansionInfo) void {
+    const mut: *ast.BinarySegment = @constCast(seg);
+    stampMetaIfUnset(&mut.meta, info);
+    switch (seg.value) {
+        .expr => |e| stampExpansionOnExpr(e, info),
+        .pattern => |p| stampExpansionOnPattern(p, info),
+        .string_literal => {},
+    }
+}
 
 // ============================================================
 // Tests
@@ -5269,4 +5627,238 @@ test "Flatt-2016 hygiene: resolveBindingHygienic discriminates user vs macro-int
     try std.testing.expect(template_resolved.? != user_resolved.?);
     try std.testing.expectEqual(template_binding_id, template_resolved.?);
     try std.testing.expectEqual(user_binding_id, user_resolved.?);
+}
+
+// ============================================================
+// Phase 10: ExpansionInfo provenance — TDD tests
+//
+// These tests lock in the contract that every node produced by a
+// macro expansion carries a NodeMeta.expansion pointer to a shared
+// ExpansionInfo describing the call site, and that nested macros
+// chain via `parent`. They run independently of any LSP consumer; the
+// goal is to prevent silent regression of the provenance plumbing.
+// ============================================================
+
+/// Walk an Expr and return the first non-null `meta.expansion`
+/// pointer encountered (preorder). Used by tests to confirm that
+/// macro output carries provenance regardless of which expansion
+/// path produced it (fast path vs eval path may wrap results
+/// differently).
+fn findFirstExpansion(expr: *const ast.Expr) ?*const ast.ExpansionInfo {
+    if (expr.getMeta().expansion) |info| return info;
+    return switch (expr.*) {
+        .if_expr => |ie| blk: {
+            if (findFirstExpansion(ie.condition)) |info| break :blk info;
+            for (ie.then_block) |stmt| switch (stmt) {
+                .expr => |e| if (findFirstExpansion(e)) |info| break :blk info,
+                else => {},
+            };
+            if (ie.else_block) |else_block| {
+                for (else_block) |stmt| switch (stmt) {
+                    .expr => |e| if (findFirstExpansion(e)) |info| break :blk info,
+                    else => {},
+                };
+            }
+            break :blk null;
+        },
+        .case_expr => |ce| blk: {
+            if (findFirstExpansion(ce.scrutinee)) |info| break :blk info;
+            for (ce.clauses) |clause| {
+                for (clause.body) |stmt| switch (stmt) {
+                    .expr => |e| if (findFirstExpansion(e)) |info| break :blk info,
+                    else => {},
+                };
+            }
+            break :blk null;
+        },
+        .block => |b| blk: {
+            for (b.stmts) |stmt| switch (stmt) {
+                .expr => |e| if (findFirstExpansion(e)) |info| break :blk info,
+                else => {},
+            };
+            break :blk null;
+        },
+        .call => |c| blk: {
+            if (findFirstExpansion(c.callee)) |info| break :blk info;
+            for (c.args) |arg| if (findFirstExpansion(arg)) |info| break :blk info;
+            break :blk null;
+        },
+        .binary_op => |b| findFirstExpansion(b.lhs) orelse findFirstExpansion(b.rhs),
+        .unary_op => |u| findFirstExpansion(u.operand),
+        else => null,
+    };
+}
+
+/// Locate the first expression in the body of a top-level function by
+/// name. Returns null if not found. Used by provenance tests to reach
+/// the macro-produced node from the expanded program.
+fn findFunctionBodyExpr(
+    program: *const ast.Program,
+    interner: *const ast.StringInterner,
+    fn_name: []const u8,
+) ?*const ast.Expr {
+    for (program.structs) |s| {
+        for (s.items) |item| switch (item) {
+            .function => |fd| {
+                if (std.mem.eql(u8, interner.get(fd.name), fn_name)) {
+                    if (fd.clauses.len == 0) return null;
+                    const body = fd.clauses[0].body orelse return null;
+                    if (body.len == 0) return null;
+                    return switch (body[0]) {
+                        .expr => |e| e,
+                        else => null,
+                    };
+                }
+            },
+            else => {},
+        };
+    }
+    return null;
+}
+
+test "expansion provenance: macro output carries call_site and macro_name" {
+    const source =
+        \\pub struct Test {
+        \\  pub macro double(value) {
+        \\    quote {
+        \\      unquote(value) + unquote(value)
+        \\    }
+        \\  }
+        \\
+        \\  pub fn foo(x :: i64) -> i64 {
+        \\    double(x)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    const expanded = try engine.expandProgram(&program);
+    try std.testing.expectEqual(@as(usize, 0), engine.errors.items.len);
+
+    const body_expr = findFunctionBodyExpr(&expanded, parser.interner, "foo") orelse {
+        try std.testing.expect(false);
+        return;
+    };
+
+    const info = findFirstExpansion(body_expr) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+
+    try std.testing.expectEqualStrings("double", parser.interner.get(info.macro_name));
+    // The call_site span must not be the zero default — it should
+    // point at the macro call inside the function body.
+    try std.testing.expect(info.call_site.end > info.call_site.start);
+    // Outermost expansion: no parent.
+    try std.testing.expect(info.parent == null);
+}
+
+test "expansion provenance: nested macro chains via parent" {
+    const source =
+        \\pub struct Test {
+        \\  pub macro inner(x) {
+        \\    quote {
+        \\      unquote(x) + 1
+        \\    }
+        \\  }
+        \\
+        \\  pub macro outer(x) {
+        \\    quote {
+        \\      inner(unquote(x))
+        \\    }
+        \\  }
+        \\
+        \\  pub fn foo(n :: i64) -> i64 {
+        \\    outer(n)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    const expanded = try engine.expandProgram(&program);
+    try std.testing.expectEqual(@as(usize, 0), engine.errors.items.len);
+
+    const body_expr = findFunctionBodyExpr(&expanded, parser.interner, "foo") orelse {
+        try std.testing.expect(false);
+        return;
+    };
+
+    const info = findFirstExpansion(body_expr) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+
+    // The body's first node was produced by the inner expansion. Its
+    // parent chain must reach up through the outer expansion to user
+    // source.
+    try std.testing.expect(info.parent != null);
+    const parent = info.parent.?;
+    try std.testing.expect(parent.parent == null);
+
+    // Macro names: leaf is `inner`, parent is `outer`.
+    try std.testing.expectEqualStrings("inner", parser.interner.get(info.macro_name));
+    try std.testing.expectEqualStrings("outer", parser.interner.get(parent.macro_name));
+}
+
+test "expansion provenance: source-level nodes have no expansion stamp" {
+    const source =
+        \\pub struct Test {
+        \\  pub fn add(x :: i64, y :: i64) -> i64 {
+        \\    x + y
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    const expanded = try engine.expandProgram(&program);
+    try std.testing.expectEqual(@as(usize, 0), engine.errors.items.len);
+
+    const body_expr = findFunctionBodyExpr(&expanded, parser.interner, "add") orelse {
+        try std.testing.expect(false);
+        return;
+    };
+
+    // No macro was invoked; nothing in this body should carry a
+    // provenance stamp.
+    try std.testing.expect(body_expr.getMeta().expansion == null);
+    try std.testing.expect(findFirstExpansion(body_expr) == null);
 }
