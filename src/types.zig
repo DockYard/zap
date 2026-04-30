@@ -2303,6 +2303,7 @@ pub const TypeChecker = struct {
         if (type_id == TypeStore.ISIZE) return "isize";
         if (type_id == TypeStore.UNKNOWN) return "{unknown}";
         if (type_id == TypeStore.ERROR) return "{error}";
+        if (type_id == TypeStore.TERM) return "Term";
         // Look up user-defined and compound types
         if (type_id < self.store.types.items.len) {
             const typ = self.store.types.items[type_id];
