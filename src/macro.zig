@@ -23,7 +23,6 @@ pub const MacroEngine = struct {
     graph: *scope.ScopeGraph,
     /// The module scope currently being expanded, for registering generated declarations.
     current_module_scope: ?scope.ScopeId = null,
-    generation: u32,
     max_expansions: u32,
     errors: std.ArrayList(Error),
     /// Tracks which `@before_compile` callbacks have already fired
@@ -49,11 +48,36 @@ pub const MacroEngine = struct {
             .allocator = allocator,
             .interner = interner,
             .graph = graph,
-            .generation = 0,
             .max_expansions = 100,
             .errors = .empty,
             .before_compile_fired = std.AutoHashMap(BeforeCompileKey, void).init(allocator),
         };
+    }
+
+    /// Lazily allocate (or look up) the macro-introduction scope for
+    /// the given macro family. The intro_scope tags every identifier
+    /// in the template body during expansion. Caching it on the
+    /// MacroFamily means every expansion of clauses in that family
+    /// shares a single intro_scope — Flatt's algorithm works equally
+    /// well with a per-call fresh scope, but per-family is cheaper and
+    /// keeps the scope-graph from growing unboundedly with expansion
+    /// iteration count.
+    fn introScopeFor(self: *MacroEngine, family_id: scope.MacroFamilyId) !scope.ScopeId {
+        const family = &self.graph.macro_families.items[family_id];
+        if (family.intro_scope) |id| return id;
+        const new_id = try self.graph.createScope(null, .macro_expansion);
+        family.intro_scope = new_id;
+        return new_id;
+    }
+
+    /// Allocate a fresh per-call macro-use scope. Called once per
+    /// macro invocation. The use_scope is *added* to user-supplied
+    /// argument identifiers on entry and *flipped* on the result on
+    /// exit — so user identifiers come back to their original scope
+    /// set while template identifiers (which never received the
+    /// use_scope on entry) acquire it via the flip.
+    fn freshUseScope(self: *MacroEngine) !scope.ScopeId {
+        return self.graph.createScope(null, .macro_expansion);
     }
 
     pub fn deinit(self: *MacroEngine) void {
@@ -1216,27 +1240,31 @@ pub const MacroEngine = struct {
             }
         }
 
+        // Allocate the Flatt-2016 hygiene scopes for this expansion:
+        //   use_scope:   fresh per call site, added to the user's arg
+        //                identifiers and flipped on the result. After
+        //                the flip, identifiers originally from the
+        //                user are unmarked while template-introduced
+        //                identifiers carry the use_scope.
+        //   intro_scope: per-family (cached on MacroFamily), added to
+        //                every identifier in the template body so
+        //                names introduced by the macro carry a
+        //                distinguishing mark independent of the call
+        //                site.
+        const use_scope = try self.freshUseScope();
+        const intro_scope = try self.introScopeFor(macro_family_id);
+
         // Fast path: bare quote body → use Phase 2 template expansion
         if ((clause.body orelse @as([]const ast.Stmt, &.{})).len == 1 and (clause.body orelse @as([]const ast.Stmt, &.{}))[0] == .expr) {
             const body_expr = (clause.body orelse @as([]const ast.Stmt, &.{}))[0].expr;
             if (body_expr.* == .quote_expr) {
-                self.generation += 1;
-                return try self.expandQuote(body_expr, call.args, clause.params);
+                return try self.expandQuoteHygienic(body_expr, call.args, clause.params, use_scope, intro_scope);
             }
         }
 
         // Phase 3: evaluate macro body as a function using the macro evaluator.
         // Convert the body and args to CtValue, run the evaluator, convert back.
         {
-            // Bump the generation counter so generateHygienicName produces a
-            // fresh suffix per macro invocation. The fast path (above) does
-            // this; the eval path also returns AST that may introduce names
-            // and must share the discipline. Set-of-scopes hygiene (Phase 3
-            // of the macro maturation plan) supersedes this counter, but
-            // until then it is the only mechanism preventing collisions
-            // across nested macro calls.
-            self.generation += 1;
-
             const macro_eval = @import("macro_eval.zig");
             var store = ctfe.AllocationStore{};
             var env = macro_eval.Env.init(self.allocator, &store);
@@ -1260,13 +1288,18 @@ pub const MacroEngine = struct {
             env.current_macro_name = self.interner.get(name);
             env.current_macro_span = call.meta.span;
 
-            // Bind macro parameters to CtValue representations of the arguments
+            // Bind macro parameters to CtValue representations of the
+            // arguments. Each argument's identifiers are tagged with
+            // the per-call use_scope so substitution embeds them into
+            // the template carrying that mark; the post-substitution
+            // flip then removes use_scope from the user identifiers.
             for (clause.params, 0..) |param, i| {
                 if (i < call.args.len) {
                     if (param.pattern.* == .bind) {
                         const param_name = self.interner.get(param.pattern.bind.name);
                         const arg_ct = try ast_data.exprToCtValue(self.allocator, self.interner, &store, call.args[i]);
-                        try env.bind(param_name, arg_ct);
+                        const marked_arg = try ast_data.addScopeToIdentifiers(self.allocator, &store, arg_ct, use_scope);
+                        try env.bind(param_name, marked_arg);
                     }
                 }
             }
@@ -1297,13 +1330,19 @@ pub const MacroEngine = struct {
             // The eval path treats `quote` as a lazy form — its args
             // are returned without recursing into them. That means
             // unquotes inside the quote body are still raw `:unquote`
-            // 3-tuples in the result. Substitute them now using the
-            // evaluator's full binding environment (macro params and
-            // any local `=` bindings introduced during eval) so
-            // expressions like `quote { unquote(local_var) }` work
-            // alongside `quote { unquote(macro_param) }`.
+            // 3-tuples in the result. Tag every identifier in the
+            // template with the macro-introduction scope BEFORE
+            // substitution (the inner var refs of `:unquote` markers
+            // pick up the mark too, but those nodes are about to be
+            // replaced wholesale by the user's value, so the
+            // marker-internal mark has no effect). Then substitute.
+            // After substitution, flip the use_scope on the result so
+            // user-supplied identifiers shed the mark they came in
+            // with while template identifiers acquire it.
             if (result != .nil) {
+                result = try ast_data.addScopeToIdentifiers(self.allocator, &store, result, intro_scope);
                 result = try self.substituteCtValue(result, &env.bindings, &store);
+                result = try ast_data.flipScopeOnIdentifiers(self.allocator, &store, result, use_scope);
 
                 // `quote { single_expr }` produces a list with one
                 // element (the body's sole statement). The fast path
@@ -1333,23 +1372,56 @@ pub const MacroEngine = struct {
     // ============================================================
 
     fn expandQuote(self: *MacroEngine, quote_expr: *const ast.Expr, args: []const *const ast.Expr, params: []const ast.Param) anyerror!*const ast.Expr {
-        const quote = quote_expr.quote_expr;
+        // Legacy entry point — used by callers that don't yet plumb
+        // use/intro scopes (declaration macros, `use`, operator macros).
+        // Allocates a one-shot pair so even the legacy paths produce
+        // hygiene-marked output. Once those callers thread their own
+        // scope ids, this wrapper can shrink to a forwarder.
+        const use_scope = try self.freshUseScope();
+        const intro_scope = try self.graph.createScope(null, .macro_expansion);
+        return self.expandQuoteHygienic(quote_expr, args, params, use_scope, intro_scope);
+    }
 
-        // Phase 2: Work through the CtValue data representation.
-        // 1. Convert quoted body to CtValue tuples
-        // 2. Build param name → CtValue arg mapping
-        // 3. Walk CtValue tree substituting :unquote nodes
-        // 4. Convert result back to ast.Expr
+    /// Hygiene-aware quote expansion. The caller supplies a fresh
+    /// `use_scope` (per-call) and an `intro_scope` (typically per
+    /// macro family). Walks the user's argument CtValues to add
+    /// `use_scope`; walks the template body to add `intro_scope`;
+    /// substitutes; then flips `use_scope` over the whole result so
+    /// user-supplied identifiers shed the use_scope while template
+    /// identifiers acquire it (Flatt-2016 set-of-scopes hygiene).
+    fn expandQuoteHygienic(
+        self: *MacroEngine,
+        quote_expr: *const ast.Expr,
+        args: []const *const ast.Expr,
+        params: []const ast.Param,
+        use_scope: scope.ScopeId,
+        intro_scope: scope.ScopeId,
+    ) anyerror!*const ast.Expr {
+        const quote = quote_expr.quote_expr;
 
         var store = ctfe.AllocationStore{};
 
-        // Convert each statement in the quote body to CtValue
+        // Convert each statement in the quote body to CtValue, then
+        // tag every identifier in the template with the macro-
+        // introduction scope. The intro_scope distinguishes
+        // template-introduced names from any same-name identifier the
+        // user passes in: after the use_scope flip on the final
+        // result, only template identifiers carry the use_scope, so
+        // resolution sees them as different bindings even when their
+        // textual names collide.
         var body_vals : std.ArrayListUnmanaged(ctfe.CtValue) = .empty;
         for (quote.body) |stmt| {
-            try body_vals.append(self.allocator, try ast_data.stmtToCtValue(self.allocator, self.interner, &store, stmt));
+            const stmt_ct = try ast_data.stmtToCtValue(self.allocator, self.interner, &store, stmt);
+            const marked = try ast_data.addScopeToIdentifiers(self.allocator, &store, stmt_ct, intro_scope);
+            try body_vals.append(self.allocator, marked);
         }
 
-        // Build parameter name (string) → CtValue argument mapping
+        // Build parameter name (string) → CtValue argument mapping.
+        // Every user-supplied identifier inside an argument picks up
+        // the use_scope here; substitution then embeds them into the
+        // template, where the final flip will *remove* the use_scope
+        // (since the user's ids already had it). Template ids never
+        // had it, so the flip *adds* it for them.
         var param_map = std.StringHashMap(ctfe.CtValue).init(self.allocator);
         defer param_map.deinit();
 
@@ -1358,25 +1430,37 @@ pub const MacroEngine = struct {
                 if (param.pattern.* == .bind) {
                     const name = self.interner.get(param.pattern.bind.name);
                     const arg_ct = try ast_data.exprToCtValue(self.allocator, self.interner, &store, args[i]);
-                    try param_map.put(name, arg_ct);
+                    const marked_arg = try ast_data.addScopeToIdentifiers(self.allocator, &store, arg_ct, use_scope);
+                    try param_map.put(name, marked_arg);
                 }
             }
         }
 
-        // Substitute :unquote nodes in the CtValue tree
+        // Substitute :unquote nodes in the CtValue tree.
         var substituted_vals : std.ArrayListUnmanaged(ctfe.CtValue) = .empty;
         for (body_vals.items) |val| {
             try substituted_vals.append(self.allocator, try self.substituteCtValue(val, &param_map, &store));
         }
 
+        // Flip the use_scope across the whole result. User-supplied
+        // identifiers (which had use_scope added) shed it; template
+        // identifiers (which didn't) acquire it. After this flip,
+        // template ids carry both intro_scope and use_scope while
+        // user ids carry their original scope set unchanged.
+        var flipped_vals : std.ArrayListUnmanaged(ctfe.CtValue) = .empty;
+        for (substituted_vals.items) |val| {
+            const flipped = try ast_data.flipScopeOnIdentifiers(self.allocator, &store, val, use_scope);
+            try flipped_vals.append(self.allocator, flipped);
+        }
+
         // Convert back to ast.Expr
-        if (substituted_vals.items.len == 1) {
-            return ast_data.ctValueToExpr(self.allocator, self.interner, substituted_vals.items[0]);
+        if (flipped_vals.items.len == 1) {
+            return ast_data.ctValueToExpr(self.allocator, self.interner, flipped_vals.items[0]);
         }
 
         // Multiple statements → wrap in block
         var stmts : std.ArrayListUnmanaged(ast.Stmt) = .empty;
-        for (substituted_vals.items) |val| {
+        for (flipped_vals.items) |val| {
             const expr = try ast_data.ctValueToExpr(self.allocator, self.interner, val);
             try stmts.append(self.allocator, .{ .expr = expr });
         }
@@ -1496,16 +1580,6 @@ pub const MacroEngine = struct {
 
         // Leaf values — no substitution
         return value;
-    }
-
-    // ============================================================
-    // Hygienic name generation
-    // ============================================================
-
-    pub fn generateHygienicName(self: *MacroEngine, base_name: ast.StringId) !ast.StringId {
-        const base = self.interner.get(base_name);
-        const gen_name = try std.fmt.allocPrint(self.allocator, "{s}__gen{d}", .{ base, self.generation });
-        return self.interner.intern(gen_name);
     }
 
     // ============================================================
@@ -1900,10 +1974,28 @@ pub const MacroEngine = struct {
                     const clause_ref = family.clauses.items[0];
                     const clause = &clause_ref.decl.clauses[clause_ref.clause_index];
 
+                    // Allocate Flatt-2016 hygiene scopes for this
+                    // expansion. See `expandMacroCall` for the full
+                    // rationale; this struct-level path mirrors it.
+                    const use_scope = self.freshUseScope() catch {
+                        const expanded = try self.expandExpr(expr);
+                        const items = try self.allocator.alloc(ast.StructItem, 1);
+                        items[0] = .{ .struct_level_expr = expanded.expr };
+                        return .{ .items = items, .changed = expanded.changed };
+                    };
+                    const intro_scope = self.introScopeFor(macro_family_id) catch {
+                        const expanded = try self.expandExpr(expr);
+                        const items = try self.allocator.alloc(ast.StructItem, 1);
+                        items[0] = .{ .struct_level_expr = expanded.expr };
+                        return .{ .items = items, .changed = expanded.changed };
+                    };
+
                     // Evaluate the macro and get the CtValue result
                     const result_ct = self.evaluateMacroBodyToCtValue(
                         clause,
                         expr.call.args,
+                        use_scope,
+                        intro_scope,
                     ) orelse {
                         // Macro evaluation failed — keep as expression
                         const expanded = try self.expandExpr(expr);
@@ -2025,10 +2117,16 @@ pub const MacroEngine = struct {
 
     /// Evaluate a macro's body given its clause and arguments, returning the
     /// raw CtValue result. Returns null if evaluation fails.
+    /// `use_scope` is a fresh per-call scope added to user-supplied
+    /// argument identifiers and flipped on the result; `intro_scope`
+    /// is the per-family macro-introduction scope added to template
+    /// identifiers. See `expandMacroCall` for the full algorithm.
     fn evaluateMacroBodyToCtValue(
         self: *MacroEngine,
         clause: *const ast.FunctionClause,
         args: []const *const ast.Expr,
+        use_scope: scope.ScopeId,
+        intro_scope: scope.ScopeId,
     ) ?ctfe.CtValue {
         var store = ctfe.AllocationStore{};
 
@@ -2044,7 +2142,12 @@ pub const MacroEngine = struct {
                         if (param.pattern.* == .bind) {
                             const pname = self.interner.get(param.pattern.bind.name);
                             const arg_ct = ast_data.exprToCtValue(self.allocator, self.interner, &store, args[i]) catch return null;
-                            param_map.put(pname, arg_ct) catch return null;
+                            // Mark user-supplied identifiers with the
+                            // per-call use_scope so the post-result
+                            // flip can shed it (template ids that
+                            // never had it then acquire it instead).
+                            const marked = ast_data.addScopeToIdentifiers(self.allocator, &store, arg_ct, use_scope) catch return null;
+                            param_map.put(pname, marked) catch return null;
                         }
                     }
                 }
@@ -2052,7 +2155,13 @@ pub const MacroEngine = struct {
                 var body_vals : std.ArrayListUnmanaged(ctfe.CtValue) = .empty;
                 for (body_expr.quote_expr.body) |stmt| {
                     const stmt_ct = ast_data.stmtToCtValue(self.allocator, self.interner, &store, stmt) catch return null;
-                    body_vals.append(self.allocator, self.substituteCtValue(stmt_ct, &param_map, &store) catch return null) catch return null;
+                    // Tag template identifiers with the per-family
+                    // intro_scope before substitution embeds the
+                    // user's args into them.
+                    const marked = ast_data.addScopeToIdentifiers(self.allocator, &store, stmt_ct, intro_scope) catch return null;
+                    const substituted = self.substituteCtValue(marked, &param_map, &store) catch return null;
+                    const flipped = ast_data.flipScopeOnIdentifiers(self.allocator, &store, substituted, use_scope) catch return null;
+                    body_vals.append(self.allocator, flipped) catch return null;
                 }
 
                 if (body_vals.items.len == 1) return body_vals.items[0];
@@ -2085,7 +2194,8 @@ pub const MacroEngine = struct {
                 if (param.pattern.* == .bind) {
                     const param_name = self.interner.get(param.pattern.bind.name);
                     const arg_ct = ast_data.exprToCtValue(self.allocator, self.interner, &store, args[i]) catch return null;
-                    env.bind(param_name, arg_ct) catch return null;
+                    const marked_arg = ast_data.addScopeToIdentifiers(self.allocator, &store, arg_ct, use_scope) catch return null;
+                    env.bind(param_name, marked_arg) catch return null;
                 }
             }
         }
@@ -2097,13 +2207,16 @@ pub const MacroEngine = struct {
         }
 
         // The eval path treats `quote` as lazy: its body is returned
-        // as data without recursing into the unquote nodes. Substitute
-        // them now using the evaluator's full binding environment so
-        // local `=` bindings introduced during eval can be referenced
-        // from inside the quote body. Mirrors the pattern used by
-        // `expandMacroCall`'s eval path for expression-level macros.
+        // as data without recursing into the unquote nodes. Tag
+        // template identifiers with the intro_scope, substitute, then
+        // flip the use_scope across the whole result so user ids shed
+        // the use_scope they came in with while template ids acquire
+        // it. Mirrors the pattern used by `expandMacroCall`'s eval
+        // path for expression-level macros.
         if (result != .nil) {
+            result = ast_data.addScopeToIdentifiers(self.allocator, &store, result, intro_scope) catch return null;
             result = self.substituteCtValue(result, &env.bindings, &store) catch return null;
+            result = ast_data.flipScopeOnIdentifiers(self.allocator, &store, result, use_scope) catch return null;
             // `quote { single_expr }` produces a list with one element
             // (the body's sole statement). Unwrap so authors don't see
             // a stray list literal wrapping their result. Multi-stmt
@@ -2660,35 +2773,6 @@ test "macro engine expands simple macro" {
     try std.testing.expectEqual(@as(usize, 1), expanded.structs.len);
     // No errors
     try std.testing.expectEqual(@as(usize, 0), engine.errors.items.len);
-}
-
-test "macro engine hygiene generates unique names" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    var interner = ast.StringInterner.init(alloc);
-    defer interner.deinit();
-
-    var graph = scope.ScopeGraph.init(alloc);
-    defer graph.deinit();
-
-    var engine = MacroEngine.init(alloc, &interner, &graph);
-    defer engine.deinit();
-
-    const base = try interner.intern("temp");
-    engine.generation = 1;
-    const hygienic1 = try engine.generateHygienicName(base);
-    engine.generation = 2;
-    const hygienic2 = try engine.generateHygienicName(base);
-
-    // Different generations should produce different names
-    try std.testing.expect(hygienic1 != hygienic2);
-
-    const name1 = interner.get(hygienic1);
-    const name2 = interner.get(hygienic2);
-    try std.testing.expectEqualStrings("temp__gen1", name1);
-    try std.testing.expectEqualStrings("temp__gen2", name2);
 }
 
 test "macro engine reaches fixed point" {
@@ -4836,4 +4920,180 @@ test "Zest describe migration T5: bare test outside describe produces test_<slug
     }
     try std.testing.expect(saw_fn);
     try std.testing.expect(saw_tracking);
+}
+
+test "Flatt-2016 hygiene: swap-macro discriminates user vs template identifiers via scope sets" {
+    // Canonical swap-macro test for set-of-scopes hygiene. The macro
+    // introduces `tmp` in its template body and references the user's
+    // identifier via `unquote(...)`. When the user passes the symbol
+    // `tmp` as the macro argument, both `tmp` occurrences in the
+    // expanded body must carry distinct `meta.scopes` so resolution
+    // can disambiguate them: the template-introduced `tmp` carries
+    // the macro-introduction scope plus the use-site scope (via the
+    // result-flip), while the user-supplied `tmp` carries its
+    // original scope set unchanged.
+    //
+    // Under the previous generation-counter mechanism, no scope
+    // marks were set and the two `tmp` references would resolve to
+    // the same binding. Under Flatt-2016, their scope sets must
+    // differ — and `ScopeGraph.resolveBindingByScopes` must be able
+    // to distinguish synthetic bindings keyed by those sets.
+    const source =
+        \\pub struct Test {
+        \\  pub macro hyg_swap(user_id) {
+        \\    quote {
+        \\      tmp + unquote(user_id)
+        \\    }
+        \\  }
+        \\
+        \\  pub fn caller() -> i64 {
+        \\    hyg_swap(tmp)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    const expanded = try engine.expandProgram(&program);
+
+    // Locate `caller`'s expanded body: it should contain a binary
+    // `+` whose left operand is the template-introduced `tmp` and
+    // whose right operand is the user-supplied `tmp`. Both refer to
+    // the same name string but must carry different scope sets.
+    var caller_fn: ?*const ast.FunctionDecl = null;
+    for (expanded.structs) |mod| {
+        if (mod.name.parts.len != 1) continue;
+        if (!std.mem.eql(u8, parser.interner.get(mod.name.parts[0]), "Test")) continue;
+        for (mod.items) |item| {
+            if (item == .function) {
+                if (std.mem.eql(u8, parser.interner.get(item.function.name), "caller")) {
+                    caller_fn = item.function;
+                }
+            }
+        }
+    }
+    try std.testing.expect(caller_fn != null);
+
+    const decl = caller_fn.?;
+    try std.testing.expect(decl.clauses.len >= 1);
+    const body = decl.clauses[0].body orelse return error.TestExpectedABody;
+    try std.testing.expect(body.len >= 1);
+
+    // Drill into the trailing expression. The macro produced a
+    // single quote-body statement (`tmp + unquote(user_id)`), so
+    // after expansion the function body's terminal stmt is the
+    // binary `+`. Iterate forward from the last stmt through any
+    // wrapper blocks until we land on the binary op.
+    const tmp_name = try parser.interner.intern("tmp");
+
+    var binop: ?*const ast.BinaryOp = null;
+    var cursor: ?*const ast.Expr = if (body[body.len - 1] == .expr) body[body.len - 1].expr else null;
+    while (cursor) |e| {
+        switch (e.*) {
+            .binary_op => |bop| {
+                if (bop.op == .add) {
+                    binop = &e.binary_op;
+                    break;
+                }
+                cursor = null;
+            },
+            .block => |blk| {
+                if (blk.stmts.len == 0) {
+                    cursor = null;
+                } else {
+                    cursor = if (blk.stmts[blk.stmts.len - 1] == .expr) blk.stmts[blk.stmts.len - 1].expr else null;
+                }
+            },
+            else => cursor = null,
+        }
+    }
+    try std.testing.expect(binop != null);
+    const op = binop.?;
+    try std.testing.expect(op.lhs.* == .var_ref);
+    try std.testing.expect(op.rhs.* == .var_ref);
+
+    const left_ref = op.lhs.var_ref;
+    const right_ref = op.rhs.var_ref;
+    try std.testing.expectEqual(tmp_name, left_ref.name);
+    try std.testing.expectEqual(tmp_name, right_ref.name);
+
+    // Both refs share the textual name `tmp` but the macro engine
+    // must have stamped distinct scope sets onto them. Empty == empty
+    // is the failure mode under the deleted generation-counter
+    // mechanism, so we explicitly assert the sets differ.
+    const left_scopes = left_ref.meta.scopes;
+    const right_scopes = right_ref.meta.scopes;
+    try std.testing.expect(!left_scopes.eq(right_scopes));
+
+    // Identify which side is which by membership: the template-
+    // introduced `tmp` must carry strictly more scopes (intro_scope
+    // + use_scope from the flip) than the user-supplied `tmp` (which
+    // came in with the empty set and the use_scope was flipped off).
+    const template_ref = if (left_scopes.len() > right_scopes.len()) left_ref else right_ref;
+    const user_ref = if (left_scopes.len() > right_scopes.len()) right_ref else left_ref;
+    try std.testing.expect(template_ref.meta.scopes.len() > 0);
+    try std.testing.expectEqual(@as(usize, 0), user_ref.meta.scopes.len());
+
+    // The discriminating property: if we register two synthetic
+    // bindings — one whose scope set matches the template ref, one
+    // whose scope set is empty — then a reference carrying each side's
+    // scope set must resolve to the correct binding. This is the
+    // contract `resolveBindingByScopes` provides; the swap-macro is
+    // the canonical case it discriminates.
+    // `addOne` returns a pointer into the bindings ArrayList; a
+    // subsequent append can reallocate that list and invalidate the
+    // earlier pointer, so we capture the assigned ids by value before
+    // adding the second binding.
+    const template_binding_scopes = try template_ref.meta.scopes.clone(alloc);
+    const template_binding_id: scope.BindingId = @intCast(collector.graph.bindings.items.len);
+    {
+        const slot = try collector.graph.bindings.addOne(collector.graph.allocator);
+        slot.* = .{
+            .id = template_binding_id,
+            .name = tmp_name,
+            .scope_id = 0,
+            .kind = .variable,
+            .span = .{ .start = 0, .end = 0 },
+            .scopes = template_binding_scopes,
+        };
+    }
+
+    const user_binding_scopes: scope.ScopeSet = .empty;
+    const user_binding_id: scope.BindingId = @intCast(collector.graph.bindings.items.len);
+    {
+        const slot = try collector.graph.bindings.addOne(collector.graph.allocator);
+        slot.* = .{
+            .id = user_binding_id,
+            .name = tmp_name,
+            .scope_id = 0,
+            .kind = .variable,
+            .span = .{ .start = 0, .end = 0 },
+            .scopes = user_binding_scopes,
+        };
+    }
+
+    // Reference scope sets:
+    //   template_ref's set must dominate template_binding.scopes
+    //   user_ref's set is empty; only the user_binding (with empty
+    //   scopes) is a subset, so it wins.
+    const template_resolved = collector.graph.resolveBindingByScopes(template_ref.meta.scopes, tmp_name);
+    const user_resolved = collector.graph.resolveBindingByScopes(user_ref.meta.scopes, tmp_name);
+
+    try std.testing.expect(template_resolved != null);
+    try std.testing.expect(user_resolved != null);
+    try std.testing.expect(template_resolved.? != user_resolved.?);
+    try std.testing.expectEqual(template_binding_id, template_resolved.?);
+    try std.testing.expectEqual(user_binding_id, user_resolved.?);
 }

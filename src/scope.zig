@@ -314,6 +314,17 @@ pub const MacroFamily = struct {
     /// at all" so future inference passes can treat the unannotated
     /// case differently from an explicit pure declaration.
     required_caps_declared: bool = false,
+    /// Per-family Flatt-2016 macro-introduction scope. Allocated lazily
+    /// the first time a macro in this family is expanded, then reused
+    /// for every subsequent expansion of any of its clauses. The
+    /// asymmetric add/flip plumbing (`MacroEngine.expandMacroCall`)
+    /// stamps this scope onto every identifier in the template body
+    /// (including identifiers introduced by `quote { ... }`). Per-call
+    /// `use_scope` lifetimes live alongside this on the engine, not
+    /// here: the use_scope is allocated fresh per macro invocation and
+    /// never cached, since two adjacent calls to the same macro must
+    /// produce distinguishable scope-set marks for resolution.
+    intro_scope: ?ScopeId = null,
 
     pub fn init(id: MacroFamilyId, scope_id: ScopeId, name: ast.StringId, arity: u32) MacroFamily {
         return .{

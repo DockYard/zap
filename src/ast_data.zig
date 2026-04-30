@@ -1790,6 +1790,150 @@ fn keywordListToMeta(alloc: Allocator, value: CtValue) !ast.NodeMeta {
     };
 }
 
+// ============================================================
+// Hygiene scope walker
+//
+// Identifiers in a CtValue tree are 3-tuples `{atom_name, meta_kw_list, nil}`
+// where `atom_name.atom` is a bare identifier — *not* prefixed with `:`
+// (atoms with `:` prefix are atom literals, not identifiers; see
+// `exprToCtValue` for atom_literal which wraps the name with a `:` prefix).
+//
+// The walkers in this section traverse a CtValue tree and rewrite the
+// `meta.scopes` field on every identifier 3-tuple they encounter,
+// returning a structurally fresh tree. Used by the macro engine at
+// expansion boundaries to implement Flatt-2016 hygiene:
+//   - addScopeToIdentifiers: extends the scope set on all identifiers
+//     so user-supplied AST entering the macro carries a use_scope, and
+//     template AST gets an intro_scope.
+//   - flipScopeOnIdentifiers: XORs a scope on every identifier; used
+//     after substitution to remove the use_scope from user-supplied
+//     identifiers (which had it added on entry) while introducing it
+//     on template identifiers (which didn't).
+//
+// The implementation decodes the meta keyword list into NodeMeta,
+// mutates `scopes`, and re-encodes via `metaToList`. This is the
+// most-obviously-correct path: it goes through the same encoding the
+// macro engine uses elsewhere, so any future field added to NodeMeta
+// is automatically preserved.
+// ============================================================
+
+/// Operation applied to an identifier's scope set during a walk.
+const ScopeOp = enum { add, flip };
+
+/// Apply `op(scope_id)` to the `meta.scopes` of every identifier-shaped
+/// 3-tuple in `value`, returning a fresh CtValue tree. Non-identifier
+/// 3-tuples (calls, operator forms, declarations, blocks, etc.) keep
+/// their meta unchanged but are recursively descended into.
+pub fn addScopeToIdentifiers(
+    alloc: Allocator,
+    store: *AllocationStore,
+    value: CtValue,
+    scope_id: scope_mod.ScopeId,
+) error{OutOfMemory}!CtValue {
+    return transformIdentifierScopes(alloc, store, value, scope_id, .add);
+}
+
+/// Same as `addScopeToIdentifiers` but XORs the scope (Flatt's "flip"
+/// operation). On identifiers that already carry the scope, this
+/// removes it; on identifiers that don't, it adds it.
+pub fn flipScopeOnIdentifiers(
+    alloc: Allocator,
+    store: *AllocationStore,
+    value: CtValue,
+    scope_id: scope_mod.ScopeId,
+) error{OutOfMemory}!CtValue {
+    return transformIdentifierScopes(alloc, store, value, scope_id, .flip);
+}
+
+fn transformIdentifierScopes(
+    alloc: Allocator,
+    store: *AllocationStore,
+    value: CtValue,
+    scope_id: scope_mod.ScopeId,
+    op: ScopeOp,
+) error{OutOfMemory}!CtValue {
+    return switch (value) {
+        .tuple => |t| transformTupleIdentifierScopes(alloc, store, t, scope_id, op),
+        .list => |l| blk: {
+            var new_elems = try alloc.alloc(CtValue, l.elems.len);
+            for (l.elems, 0..) |elem, i| {
+                new_elems[i] = try transformIdentifierScopes(alloc, store, elem, scope_id, op);
+            }
+            const id = store.alloc(alloc, .list, null);
+            break :blk CtValue{ .list = .{ .alloc_id = id, .elems = new_elems } };
+        },
+        else => value,
+    };
+}
+
+fn transformTupleIdentifierScopes(
+    alloc: Allocator,
+    store: *AllocationStore,
+    t: CtValue.CtTupleValue,
+    scope_id: scope_mod.ScopeId,
+    op: ScopeOp,
+) error{OutOfMemory}!CtValue {
+    // Identifier shape: 3-tuple `{atom_name, meta_kw_list, nil}` whose
+    // form atom is a bare identifier (not a `:`-prefixed atom literal).
+    // The args slot must be `.nil` — variable references have no args;
+    // calls (which also use a 3-tuple shape) carry their args in the
+    // third slot.
+    if (t.elems.len == 3) {
+        const form = t.elems[0];
+        const args = t.elems[2];
+        const is_identifier = form == .atom and
+            args == .nil and
+            form.atom.len > 0 and
+            form.atom[0] != ':';
+        if (is_identifier) {
+            // Decode meta, mutate scope set, re-encode. Going through
+            // NodeMeta+metaToList rather than mutating the keyword list
+            // directly means any future fields on NodeMeta are
+            // preserved automatically.
+            var meta = try keywordListToMeta(alloc, t.elems[1]);
+            switch (op) {
+                .add => try meta.scopes.add(alloc, scope_id),
+                .flip => try meta.scopes.flip(alloc, scope_id),
+            }
+            const new_meta = try metaToList(alloc, store, meta, null);
+            const new_elems = try alloc.alloc(CtValue, 3);
+            new_elems[0] = form;
+            new_elems[1] = new_meta;
+            new_elems[2] = args;
+            const id = store.alloc(alloc, .tuple, null);
+            return CtValue{ .tuple = .{ .alloc_id = id, .elems = new_elems } };
+        }
+
+        // Non-identifier 3-tuple: keep the form/meta as-is, recurse into
+        // form (the form itself may be an unquote-substituted identifier)
+        // and into the args list. Meta is NOT walked — the meta keyword
+        // list never contains identifier nodes; it carries scalar pairs
+        // for span/scopes/type only.
+        const new_form = try transformIdentifierScopes(alloc, store, form, scope_id, op);
+        const new_args = try transformIdentifierScopes(alloc, store, args, scope_id, op);
+        const new_elems = try alloc.alloc(CtValue, 3);
+        new_elems[0] = new_form;
+        new_elems[1] = t.elems[1];
+        new_elems[2] = new_args;
+        const id = store.alloc(alloc, .tuple, null);
+        return CtValue{ .tuple = .{ .alloc_id = id, .elems = new_elems } };
+    }
+
+    if (t.elems.len == 2) {
+        // 2-tuple keyword pair `{key, value}`: key stays, value recurses.
+        // The key is an atom selector (e.g. `:do`, `:else`) and never an
+        // identifier. The value can be any AST shape.
+        const new_value = try transformIdentifierScopes(alloc, store, t.elems[1], scope_id, op);
+        const new_elems = try alloc.alloc(CtValue, 2);
+        new_elems[0] = t.elems[0];
+        new_elems[1] = new_value;
+        const id = store.alloc(alloc, .tuple, null);
+        return CtValue{ .tuple = .{ .alloc_id = id, .elems = new_elems } };
+    }
+
+    return CtValue{ .tuple = t };
+}
+
 /// Map string to binary operator.
 fn stringToBinop(name: []const u8) ?ast.BinaryOp.Op {
     if (std.mem.eql(u8, name, "+")) return .add;
