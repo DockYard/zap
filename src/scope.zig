@@ -347,6 +347,13 @@ pub const Binding = struct {
     kind: BindingKind,
     span: ast.SourceSpan,
     type_id: ?TypeProvenance = null,
+    /// Flatt-2016 hygiene scope set for this binding. Populated by the
+    /// collector and macro engine when bindings are introduced; defaults
+    /// to the empty set so non-hygiene callsites see the same behaviour
+    /// as before. Resolution against this field happens through
+    /// `ScopeGraph.resolveBindingByScopes`; the legacy scope-chain
+    /// `resolveBinding` ignores it.
+    scopes: ScopeSet = .empty,
 };
 
 pub const BindingKind = enum {
@@ -676,6 +683,49 @@ pub const ScopeGraph = struct {
             current = scope.parent;
         }
         return null;
+    }
+
+    /// Flatt-2016 hygiene resolution. Among all bindings with the given
+    /// `name`, considers only those whose `scopes` field is a subset
+    /// of the reference's `scopes`. Returns the one whose set is
+    /// strictly the largest (most-specific match wins). When two or
+    /// more candidate bindings tie at the maximum size and neither
+    /// dominates the other, the result is `null` — the contract is
+    /// "no decision" rather than an error code, so the caller (the
+    /// resolver/diagnostics pass) can attach a descriptive ambiguity
+    /// diagnostic with the relevant spans. Returns `null` when no
+    /// binding's `scopes` is a subset of the reference set, including
+    /// the simple "no binding with this name" case.
+    ///
+    /// This sits alongside `resolveBinding` rather than replacing it;
+    /// non-hygiene callsites continue to use the lexical chain
+    /// resolver while hygiene-aware passes consult this one.
+    pub fn resolveBindingByScopes(
+        self: *const ScopeGraph,
+        reference_scopes: ScopeSet,
+        name: ast.StringId,
+    ) ?BindingId {
+        var best: ?BindingId = null;
+        var best_len: usize = 0;
+        var tied: bool = false;
+        for (self.bindings.items) |binding| {
+            if (binding.name != name) continue;
+            if (!binding.scopes.subsetOf(reference_scopes)) continue;
+            const candidate_len = binding.scopes.len();
+            if (best == null or candidate_len > best_len) {
+                best = binding.id;
+                best_len = candidate_len;
+                tied = false;
+            } else if (candidate_len == best_len) {
+                // Equal-sized subsets: only a tie if the existing best
+                // and this candidate cover different sets. If they're
+                // actually equal, the bindings collide on hygiene
+                // grounds — still ambiguous.
+                tied = true;
+            }
+        }
+        if (tied) return null;
+        return best;
     }
 
     /// Look up a function family by name and arity, walking up the scope chain.
@@ -1283,4 +1333,164 @@ test "scope graph native type registry" {
     try std.testing.expectEqual(NativeTypeKind.list, graph.classifyNativeType(list_name).?);
     try std.testing.expectEqual(NativeTypeKind.map, graph.classifyNativeType(map_name).?);
     try std.testing.expectEqual(@as(?NativeTypeKind, null), graph.classifyNativeType(other_name));
+}
+
+// ============================================================
+// resolveBindingByScopes — Flatt-2016 hygiene resolution
+//
+// These tests build Binding rows directly into a ScopeGraph rather
+// than going through the parser/collector, exercising the resolver
+// algebra in isolation.
+// ============================================================
+
+/// Test helper: append a Binding with an explicit scope set onto the
+/// graph's bindings list, bypassing scope-table registration. The
+/// resolver under test only consults `graph.bindings`, so this is the
+/// minimal setup that lets a test assert behaviour against synthetic
+/// binding rows.
+fn testAppendBindingWithScopes(
+    graph: *ScopeGraph,
+    name: ast.StringId,
+    scopes: ScopeSet,
+) !BindingId {
+    const id: BindingId = @intCast(graph.bindings.items.len);
+    try graph.bindings.append(graph.allocator, .{
+        .id = id,
+        .name = name,
+        .scope_id = 0,
+        .kind = .variable,
+        .span = .{ .start = 0, .end = 0 },
+        .scopes = scopes,
+    });
+    return id;
+}
+
+test "resolveBindingByScopes returns null when no binding matches name" {
+    const alloc = std.testing.allocator;
+    var graph = ScopeGraph.init(alloc);
+    defer graph.deinit();
+
+    var binding_scopes: ScopeSet = .{};
+    defer binding_scopes.deinit(alloc);
+    try binding_scopes.add(alloc, 1);
+
+    _ = try testAppendBindingWithScopes(&graph, 100, binding_scopes);
+
+    var ref_scopes: ScopeSet = .{};
+    defer ref_scopes.deinit(alloc);
+    try ref_scopes.add(alloc, 1);
+
+    // Different name → no match.
+    try std.testing.expectEqual(@as(?BindingId, null), graph.resolveBindingByScopes(ref_scopes, 999));
+}
+
+test "resolveBindingByScopes picks the binding whose scopes is the largest subset" {
+    const alloc = std.testing.allocator;
+    var graph = ScopeGraph.init(alloc);
+    defer graph.deinit();
+
+    const name: ast.StringId = 42;
+
+    // Outer binding: {1}
+    var outer_scopes: ScopeSet = .{};
+    defer outer_scopes.deinit(alloc);
+    try outer_scopes.add(alloc, 1);
+    const outer_id = try testAppendBindingWithScopes(&graph, name, outer_scopes);
+
+    // Inner binding: {1, 2} — strictly more specific.
+    var inner_scopes: ScopeSet = .{};
+    defer inner_scopes.deinit(alloc);
+    try inner_scopes.add(alloc, 1);
+    try inner_scopes.add(alloc, 2);
+    const inner_id = try testAppendBindingWithScopes(&graph, name, inner_scopes);
+
+    // Reference inside inner: {1, 2, 3} — both bindings are subsets.
+    var ref_scopes: ScopeSet = .{};
+    defer ref_scopes.deinit(alloc);
+    try ref_scopes.add(alloc, 1);
+    try ref_scopes.add(alloc, 2);
+    try ref_scopes.add(alloc, 3);
+
+    const resolved = graph.resolveBindingByScopes(ref_scopes, name);
+    try std.testing.expectEqual(@as(?BindingId, inner_id), resolved);
+
+    // Reference at outer level: {1} — only the outer binding qualifies.
+    var outer_ref: ScopeSet = .{};
+    defer outer_ref.deinit(alloc);
+    try outer_ref.add(alloc, 1);
+
+    try std.testing.expectEqual(@as(?BindingId, outer_id), graph.resolveBindingByScopes(outer_ref, name));
+}
+
+test "resolveBindingByScopes returns null on ambiguity (tied maximal subsets)" {
+    const alloc = std.testing.allocator;
+    var graph = ScopeGraph.init(alloc);
+    defer graph.deinit();
+
+    const name: ast.StringId = 7;
+
+    // Two bindings whose scope sets have the same size but cover
+    // different scopes. Both are subsets of the reference; neither
+    // dominates the other.
+    var a_scopes: ScopeSet = .{};
+    defer a_scopes.deinit(alloc);
+    try a_scopes.add(alloc, 1);
+
+    var b_scopes: ScopeSet = .{};
+    defer b_scopes.deinit(alloc);
+    try b_scopes.add(alloc, 2);
+
+    _ = try testAppendBindingWithScopes(&graph, name, a_scopes);
+    _ = try testAppendBindingWithScopes(&graph, name, b_scopes);
+
+    var ref_scopes: ScopeSet = .{};
+    defer ref_scopes.deinit(alloc);
+    try ref_scopes.add(alloc, 1);
+    try ref_scopes.add(alloc, 2);
+
+    // Ambiguity contract: returns null. Caller is expected to surface
+    // a diagnostic with the candidate spans.
+    try std.testing.expectEqual(@as(?BindingId, null), graph.resolveBindingByScopes(ref_scopes, name));
+}
+
+test "resolveBindingByScopes ignores bindings whose scopes are NOT a subset of the reference" {
+    const alloc = std.testing.allocator;
+    var graph = ScopeGraph.init(alloc);
+    defer graph.deinit();
+
+    const name: ast.StringId = 13;
+
+    // Binding tagged with a scope that the reference does not carry.
+    // This is the macro-introduced-name vs user-reference case: the
+    // user reference must not see the macro's hidden binding.
+    var hidden_scopes: ScopeSet = .{};
+    defer hidden_scopes.deinit(alloc);
+    try hidden_scopes.add(alloc, 99);
+
+    _ = try testAppendBindingWithScopes(&graph, name, hidden_scopes);
+
+    // A second binding the reference CAN see — empty set ⊆ anything.
+    var visible_scopes: ScopeSet = .{};
+    defer visible_scopes.deinit(alloc);
+    const visible_id = try testAppendBindingWithScopes(&graph, name, visible_scopes);
+
+    var ref_scopes: ScopeSet = .{};
+    defer ref_scopes.deinit(alloc);
+    try ref_scopes.add(alloc, 1);
+    try ref_scopes.add(alloc, 2);
+
+    const resolved = graph.resolveBindingByScopes(ref_scopes, name);
+    try std.testing.expectEqual(@as(?BindingId, visible_id), resolved);
+
+    // With NO visible binding, the result must be null even though the
+    // hidden binding shares the name.
+    var graph2 = ScopeGraph.init(alloc);
+    defer graph2.deinit();
+
+    var hidden2: ScopeSet = .{};
+    defer hidden2.deinit(alloc);
+    try hidden2.add(alloc, 99);
+    _ = try testAppendBindingWithScopes(&graph2, name, hidden2);
+
+    try std.testing.expectEqual(@as(?BindingId, null), graph2.resolveBindingByScopes(ref_scopes, name));
 }

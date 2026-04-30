@@ -1,5 +1,6 @@
 const std = @import("std");
 const Token = @import("token.zig").Token;
+const scope_mod = @import("scope.zig");
 
 // ============================================================
 // Source span and metadata
@@ -27,9 +28,32 @@ pub const SourceSpan = struct {
     }
 };
 
+/// Per-AST-node metadata. Three channels:
+///
+/// 1. `span` — source location for diagnostics.
+/// 2. `scope_id` — the legacy "owning lexical scope" handle. Several
+///    consumers conflate this with hygiene marking (e.g. clause-owning
+///    scope vs macro-introduction tag); splitting those is callsite
+///    work that is sequenced after the ScopeSet plumbing lands. KEEP
+///    during the transition.
+/// 3. `scopes` — Flatt-2016 set of scopes attached to identifiers and
+///    syntax fragments. Macro expansion adds, removes, and flips
+///    members; resolution picks the binding whose `scopes` is the
+///    largest subset of the reference's `scopes`. Defaults to the
+///    empty set so existing AST construction sites that don't know
+///    about hygiene compile unchanged.
 pub const NodeMeta = struct {
     span: SourceSpan,
     scope_id: u32 = 0,
+    scopes: scope_mod.ScopeSet = .empty,
+
+    /// Most-specific scope in the hygiene set, used by lowering passes
+    /// that still want a single ScopeId handle as a fallback. Returns
+    /// null when the set is empty (the common case before any macro
+    /// expansion has tagged the node).
+    pub fn primaryScope(self: NodeMeta) ?scope_mod.ScopeId {
+        return self.scopes.primary();
+    }
 };
 
 pub fn makeMeta(span: SourceSpan) NodeMeta {
