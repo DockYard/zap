@@ -21,8 +21,8 @@ fn getTestIo() std.Io {
 // by invoking the `zap` binary as a subprocess, then runs the
 // compiled binary and asserts on stdout.
 //
-// IMPORTANT: Module names must match file path. Since all test
-// sources are written to `lib/test_prog.zap`, every module must
+// IMPORTANT: Struct names must match file path. Since all test
+// sources are written to `lib/test_prog.zap`, every struct must
 // be named `TestProg`.
 // ============================================================
 
@@ -197,7 +197,8 @@ fn compileAndRun(source: []const u8) TestError!TestResult {
     // Run the compiled binary
     const run_result = std.process.run(allocator, getTestIo(), .{
         .argv = &.{compiled_binary},
-        .stdout_limit = .limited(256 * 1024), .stderr_limit = .limited(256 * 1024),
+        .stdout_limit = .limited(256 * 1024),
+        .stderr_limit = .limited(256 * 1024),
     }) catch return error.RunFailed;
 
     const run_exit = switch (run_result.term) {
@@ -306,7 +307,8 @@ fn compileAndRunWithFiles(source: []const u8, extra_files: []const ExtraFile) Te
 
     const run_result = std.process.run(allocator, getTestIo(), .{
         .argv = &.{compiled_binary},
-        .stdout_limit = .limited(256 * 1024), .stderr_limit = .limited(256 * 1024),
+        .stdout_limit = .limited(256 * 1024),
+        .stderr_limit = .limited(256 * 1024),
     }) catch return error.RunFailed;
 
     const run_exit = switch (run_result.term) {
@@ -652,7 +654,7 @@ test "ZIR: captured closure called through multiple paths" {
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
 
-test "ZIR: module function ref is first-class callable" {
+test "ZIR: struct function ref is first-class callable" {
     var result = try compileAndRun(
         \\pub struct TestProg {
         \\  pub fn double(x :: i64) -> i64 {
@@ -1725,10 +1727,10 @@ test "ZIR: tail recursive countdown (small)" {
 // ============================================================
 
 // ============================================================
-// use Module with __using__ callback
+// use Struct with __using__ callback
 // ============================================================
 
-test "ZIR: use Module imports functions" {
+test "ZIR: use Struct imports functions" {
     var result = try compileAndRunWithFiles(
         \\pub struct TestProg {
         \\  use Helper
@@ -1739,7 +1741,7 @@ test "ZIR: use Module imports functions" {
         \\  }
         \\}
     , &.{
-        .{ .path = "lib/helper.zap", .data = 
+        .{ .path = "lib/helper.zap", .data =
         \\pub struct Helper {
         \\  pub fn greet(name :: String) -> String {
         \\    "Hello, " <> name <> "!"
@@ -1752,7 +1754,7 @@ test "ZIR: use Module imports functions" {
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
 
-test "ZIR: use Module with __using__ callback injects function" {
+test "ZIR: use Struct with __using__ callback injects function" {
     var result = try compileAndRunWithFiles(
         \\pub struct TestProg {
         \\  use Greeter
@@ -1763,7 +1765,7 @@ test "ZIR: use Module with __using__ callback injects function" {
         \\  }
         \\}
     , &.{
-        .{ .path = "lib/greeter.zap", .data = 
+        .{ .path = "lib/greeter.zap", .data =
         \\pub struct Greeter {
         \\  pub macro __using__(_opts :: Expr) -> Expr {
         \\    quote {
@@ -2114,7 +2116,7 @@ test "ZIR: tail recursive countdown (large, guaranteed TCO)" {
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
 
-test "ZIR: String.length cross-module call" {
+test "ZIR: String.length cross-struct call" {
     var result = try compileAndRun(
         \\pub struct TestProg {
         \\  pub fn main() -> String {
@@ -2128,7 +2130,7 @@ test "ZIR: String.length cross-module call" {
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
 
-test "ZIR: String.slice cross-module call" {
+test "ZIR: String.slice cross-struct call" {
     var result = try compileAndRun(
         \\pub struct TestProg {
         \\  pub fn main() -> String {

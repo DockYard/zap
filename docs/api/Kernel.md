@@ -1,6 +1,6 @@
 # Kernel
 
-The default module imported into every Zap module.
+The default struct imported into every Zap struct.
 
 Kernel provides the fundamental language constructs implemented
 as macros: control flow (`if`, `unless`), boolean operators

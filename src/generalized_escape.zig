@@ -2147,20 +2147,28 @@ test "borrow: borrowed value returned from function is illegal" {
     // Function borrows a value and returns it → illegal (returned_from_function).
     const instrs = [_]ir.Instruction{
         .{ .param_get = .{ .dest = 0, .index = 0 } },
-        .{ .call_direct = .{
-            .dest = 1,
-            .function = 99, // some callee
-            .args = &[_]ir.LocalId{0},
-            .arg_modes = &[_]ir.ValueMode{.borrow},
-        } },
+        .{
+            .call_direct = .{
+                .dest = 1,
+                .function = 99, // some callee
+                .args = &[_]ir.LocalId{0},
+                .arg_modes = &[_]ir.ValueMode{.borrow},
+            },
+        },
         .{ .ret = .{ .value = 0 } }, // returning the borrowed value
     };
     const blocks = [_]ir.Block{.{ .label = 0, .instructions = &instrs }};
     const params = [_]ir.Param{.{ .name = "x", .type_expr = .i64 }};
     const functions = [_]ir.Function{.{
-        .id = 0, .name = "test_fn", .scope_id = 0, .arity = 1,
-        .params = &params, .return_type = .i64,
-        .body = &blocks, .is_closure = false, .captures = &.{},
+        .id = 0,
+        .name = "test_fn",
+        .scope_id = 0,
+        .arity = 1,
+        .params = &params,
+        .return_type = .i64,
+        .body = &blocks,
+        .is_closure = false,
+        .captures = &.{},
     }};
 
     const program = makeTestProgram(&functions);
@@ -2194,20 +2202,28 @@ test "borrow: loop-invariant param borrow is legal" {
     // The param is defined before the loop and not modified → legal.
     const instrs = [_]ir.Instruction{
         .{ .param_get = .{ .dest = 0, .index = 0 } },
-        .{ .call_direct = .{
-            .dest = 1,
-            .function = 0, // recursive call to self
-            .args = &[_]ir.LocalId{0},
-            .arg_modes = &[_]ir.ValueMode{.borrow},
-        } },
+        .{
+            .call_direct = .{
+                .dest = 1,
+                .function = 0, // recursive call to self
+                .args = &[_]ir.LocalId{0},
+                .arg_modes = &[_]ir.ValueMode{.borrow},
+            },
+        },
         .{ .ret = .{ .value = 1 } },
     };
     const blocks = [_]ir.Block{.{ .label = 0, .instructions = &instrs }};
     const params = [_]ir.Param{.{ .name = "x", .type_expr = .i64 }};
     const functions = [_]ir.Function{.{
-        .id = 0, .name = "recursive_fn", .scope_id = 0, .arity = 1,
-        .params = &params, .return_type = .i64,
-        .body = &blocks, .is_closure = false, .captures = &.{},
+        .id = 0,
+        .name = "recursive_fn",
+        .scope_id = 0,
+        .arity = 1,
+        .params = &params,
+        .return_type = .i64,
+        .body = &blocks,
+        .is_closure = false,
+        .captures = &.{},
     }};
 
     const program = makeTestProgram(&functions);
@@ -2240,9 +2256,15 @@ test "ownership tracking: share_value produces shared ownership" {
     const blocks = [_]ir.Block{.{ .label = 0, .instructions = &instrs }};
     const params = [_]ir.Param{.{ .name = "x", .type_expr = .i64 }};
     const functions = [_]ir.Function{.{
-        .id = 0, .name = "test_fn", .scope_id = 0, .arity = 1,
-        .params = &params, .return_type = .i64,
-        .body = &blocks, .is_closure = false, .captures = &.{},
+        .id = 0,
+        .name = "test_fn",
+        .scope_id = 0,
+        .arity = 1,
+        .params = &params,
+        .return_type = .i64,
+        .body = &blocks,
+        .is_closure = false,
+        .captures = &.{},
     }};
 
     const program = makeTestProgram(&functions);
@@ -2267,9 +2289,15 @@ test "list_init has element summarization via FieldEscapeMap" {
     };
     const blocks = [_]ir.Block{.{ .label = 0, .instructions = &instrs }};
     const functions = [_]ir.Function{.{
-        .id = 0, .name = "test_fn", .scope_id = 0, .arity = 0,
-        .params = &.{}, .return_type = .void,
-        .body = &blocks, .is_closure = false, .captures = &.{},
+        .id = 0,
+        .name = "test_fn",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .void,
+        .body = &blocks,
+        .is_closure = false,
+        .captures = &.{},
     }};
 
     const program = makeTestProgram(&functions);
@@ -2296,9 +2324,15 @@ test "union_init has per-variant payload tracking" {
     };
     const blocks = [_]ir.Block{.{ .label = 0, .instructions = &instrs }};
     const functions = [_]ir.Function{.{
-        .id = 0, .name = "test_fn", .scope_id = 0, .arity = 0,
-        .params = &.{}, .return_type = .void,
-        .body = &blocks, .is_closure = false, .captures = &.{},
+        .id = 0,
+        .name = "test_fn",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .void,
+        .body = &blocks,
+        .is_closure = false,
+        .captures = &.{},
     }};
 
     const program = makeTestProgram(&functions);
@@ -2325,9 +2359,15 @@ test "make_closure has per-capture tracking" {
     };
     const blocks = [_]ir.Block{.{ .label = 0, .instructions = &instrs }};
     const functions = [_]ir.Function{.{
-        .id = 0, .name = "test_fn", .scope_id = 0, .arity = 0,
-        .params = &.{}, .return_type = .void,
-        .body = &blocks, .is_closure = false, .captures = &.{},
+        .id = 0,
+        .name = "test_fn",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .void,
+        .body = &blocks,
+        .is_closure = false,
+        .captures = &.{},
     }};
 
     const program = makeTestProgram(&functions);

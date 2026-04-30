@@ -270,7 +270,7 @@ fn cmdDoc(allocator: std.mem.Allocator, args: []const []const u8) !void {
         }
     }
 
-    // Add zap lib dir as a source root so stdlib modules are discovered
+    // Add zap lib dir as a source root so stdlib structs are discovered
     if (zap_lib_dir) |zap_lib| {
         try source_roots.append(alloc, .{ .name = "zap_stdlib", .path = zap_lib });
         const zap_subdir = try std.fs.path.join(alloc, &.{ zap_lib, "zap" });
@@ -482,9 +482,9 @@ fn cmdInit(allocator: std.mem.Allocator) !void {
     const project_name = try toSnakeCase(allocator, dir_name);
     defer allocator.free(project_name);
 
-    // Convert to PascalCase module name
-    const module_name = try toPascalCase(allocator, project_name);
-    defer allocator.free(module_name);
+    // Convert to PascalCase struct name
+    const struct_name = try toPascalCase(allocator, project_name);
+    defer allocator.free(struct_name);
 
     // Generate files
     try std.Io.Dir.cwd().createDirPath(global_io, "lib");
@@ -552,7 +552,7 @@ fn cmdInit(allocator: std.mem.Allocator) !void {
         \\  }}
         \\}}
         \\
-    , .{ module_name, project_name, project_name, project_name, project_name, project_name, module_name, project_name, module_name });
+    , .{ struct_name, project_name, project_name, project_name, project_name, project_name, struct_name, project_name, struct_name });
     defer allocator.free(build_zap);
     try writeFile("build.zap", build_zap);
 
@@ -566,7 +566,7 @@ fn cmdInit(allocator: std.mem.Allocator) !void {
         \\  }}
         \\}}
         \\
-    , .{module_name});
+    , .{struct_name});
     defer allocator.free(lib_source);
     try writeFile(lib_path, lib_source);
 
@@ -580,7 +580,7 @@ fn cmdInit(allocator: std.mem.Allocator) !void {
         \\  }}
         \\}}
         \\
-    , .{module_name});
+    , .{struct_name});
     defer allocator.free(test_source);
     try writeFile(test_path, test_source);
 
@@ -675,9 +675,9 @@ fn buildTarget(
     var source_file_to_struct = std.StringHashMap([]const u8).init(alloc);
     // Source roots for import-driven discovery (populated below, used by validation)
     var source_roots: std.ArrayListUnmanaged(zap.discovery.SourceRoot) = .empty;
-    // Module names in topological order for CTFE evaluation
-    var module_order: std.ArrayListUnmanaged([]const u8) = .empty;
-    // Level boundaries from dependency-level discovery (indices into module_order
+    // Struct names in topological order for CTFE evaluation
+    var struct_order: std.ArrayListUnmanaged([]const u8) = .empty;
+    // Level boundaries from dependency-level discovery (indices into struct_order
     // where each parallel compilation level ends)
     var level_boundaries: std.ArrayListUnmanaged(u32) = .empty;
 
@@ -801,7 +801,7 @@ fn buildTarget(
                     try source_roots.append(alloc, .{ .name = dep_name, .path = dep_dir });
                 }
 
-                // Also add subdirectories that contain modules (e.g., lib/zap/ for Zap.Env)
+                // Also add subdirectories that contain structs (e.g., lib/zap/ for Zap.Env)
                 const dep_resolved = if (std.Io.Dir.cwd().access(global_io, dep_lib_dir, .{}))
                     dep_lib_dir
                 else |_|
@@ -883,7 +883,7 @@ fn buildTarget(
         };
     }
 
-    // Add zap lib dir as a source root so stdlib modules are discovered
+    // Add zap lib dir as a source root so stdlib structs are discovered
     if (zap_lib_dir) |zap_lib| {
         try source_roots.append(alloc, .{ .name = "zap_stdlib", .path = zap_lib });
         const zap_subdir = try std.fs.path.join(alloc, &.{ zap_lib, "zap" });
@@ -905,38 +905,38 @@ fn buildTarget(
         // Import-driven discovery from the entry point
         const root_spec = config.root.?;
 
-        // Extract module name from root spec: "App.main/0" → "App"
+        // Extract struct name from root spec: "App.main/0" → "App"
         const slash_pos = std.mem.findScalar(u8, root_spec, '/');
         const name_part = if (slash_pos) |pos| root_spec[0..pos] else root_spec;
         const last_dot = std.mem.findScalarLast(u8, name_part, '.');
-        const entry_module = if (last_dot) |pos| name_part[0..pos] else name_part;
+        const entry_struct = if (last_dot) |pos| name_part[0..pos] else name_part;
 
         var discovery_err_info: zap.discovery.ErrorInfo = .{};
         var file_graph = zap.discovery.discoverWithSourceFiles(
             alloc,
-            entry_module,
+            entry_struct,
             source_roots.items,
             &zap.discovery.BUILTIN_TYPE_NAMES,
             explicit_source_files.items,
             &discovery_err_info,
         ) catch |err| switch (err) {
-            error.ModuleNotFound => {
-                if (discovery_err_info.unresolved_module) |mod| {
+            error.StructNotFound => {
+                if (discovery_err_info.unresolved_struct) |mod| {
                     const expected = zap.discovery.structNameToRelPath(alloc, mod) catch "?";
-                    std.debug.print("Error: Module `{s}` not found — expected {s} in one of the source roots\n", .{ mod, expected });
-                } else if (discovery_err_info.boundary_module) |mod| {
-                    std.debug.print("Error: Module `{s}` is private (module without pub) in {s} — cannot be accessed from {s}\n", .{
+                    std.debug.print("Error: Struct `{s}` not found — expected {s} in one of the source roots\n", .{ mod, expected });
+                } else if (discovery_err_info.boundary_struct) |mod| {
+                    std.debug.print("Error: Struct `{s}` is private (struct without pub) in {s} — cannot be accessed from {s}\n", .{
                         mod,
                         discovery_err_info.boundary_dep orelse "?",
                         discovery_err_info.boundary_from orelse "?",
                     });
                 } else {
-                    std.debug.print("Error: Module not found during discovery\n", .{});
+                    std.debug.print("Error: Struct not found during discovery\n", .{});
                 }
                 std.process.exit(1);
             },
             error.CircularDependency => {
-                std.debug.print("Error: Circular module dependency detected\n", .{});
+                std.debug.print("Error: Circular struct dependency detected\n", .{});
                 std.process.exit(1);
             },
             error.ReadError => {
@@ -964,7 +964,7 @@ fn buildTarget(
 
         // Also scan source roots for protocol/impl files that aren't
         // discovered through import-driven resolution. Impl files have no
-        // module declaration, so they can't be found via module name → file
+        // struct declaration, so they can't be found via struct name → file
         // path mapping. Walk lib/ subdirectories of every source root
         // recursively so impls under nested directories (e.g.
         // `lib/integer/arithmetic.zap`) are picked up. Bare project roots
@@ -1013,7 +1013,7 @@ fn buildTarget(
             while (file_index < file_boundary) : (file_index += 1) {
                 const file_path = file_graph.topo_order.items[file_index];
                 for (file_graph.structsForFile(file_path)) |struct_name| {
-                    try module_order.append(alloc, struct_name);
+                    try struct_order.append(alloc, struct_name);
                     struct_count += 1;
                 }
             }
@@ -1057,7 +1057,7 @@ fn buildTarget(
     var mapped_files: std.ArrayListUnmanaged(compiler.MappedFile) = .empty;
     defer for (mapped_files.items) |*mf| mf.deinit(global_io);
 
-    // Validate one-module-per-file and name=path for each source file
+    // Validate one-struct-per-file and name=path for each source file
     var validation_failed = false;
     for (source_files.items) |sf| {
         // Skip build.zap — it's build configuration, not project source
@@ -1178,8 +1178,8 @@ fn buildTarget(
 
     // Compile through frontend
     // Use per-file pipeline for import-driven discovery, legacy pipeline for glob
-    const mod_order_slice: ?[]const []const u8 = if (module_order.items.len > 0)
-        module_order.items
+    const mod_order_slice: ?[]const []const u8 = if (struct_order.items.len > 0)
+        struct_order.items
     else
         null;
     const level_boundaries_slice: ?[]const u32 = if (level_boundaries.items.len > 0)
@@ -1189,7 +1189,7 @@ fn buildTarget(
 
     var result = compileProjectFrontend(alloc, source_units.items, .{
         .lib_mode = lib_mode,
-        .module_order = mod_order_slice,
+        .struct_order = mod_order_slice,
         .level_boundaries = level_boundaries_slice,
         .cache_dir = ".zap-cache/ctfe",
         .ctfe_target = target_name,
@@ -1201,7 +1201,7 @@ fn buildTarget(
 
     // Resolve the manifest root (e.g. "Test.TestHelper.main/1") to an IR function ID
     // so the ZIR backend knows which function is the entry point.
-    // IR naming: module parts joined by "_", then "__" before function name, then "__" arity.
+    // IR naming: struct parts joined by "_", then "__" before function name, then "__" arity.
     // e.g. "Test.TestHelper.main/1" -> "Test_TestHelper__main__1"
     if (config.root) |root| {
         // Extract arity suffix: "Test.TestHelper.main/1" -> arity="1"
@@ -1213,21 +1213,21 @@ fn buildTarget(
             root[0..slash]
         else
             root;
-        // Split on last dot: module prefix vs function name
-        // "Test.TestHelper.main" -> module="Test.TestHelper", func="main"
+        // Split on last dot: struct prefix vs function name
+        // "Test.TestHelper.main" -> struct="Test.TestHelper", func="main"
         var mangled: std.ArrayListUnmanaged(u8) = .empty;
         if (std.mem.findScalarLast(u8, without_arity, '.')) |last_dot| {
-            const module_part = without_arity[0..last_dot];
+            const struct_part = without_arity[0..last_dot];
             const func_part = without_arity[last_dot + 1 ..];
-            // Module parts: dots become single underscores
-            for (module_part) |c| {
+            // Struct parts: dots become single underscores
+            for (struct_part) |c| {
                 if (c == '.') {
                     mangled.append(alloc, '_') catch break;
                 } else {
                     mangled.append(alloc, c) catch break;
                 }
             }
-            // Double underscore separator between module and function
+            // Double underscore separator between struct and function
             mangled.appendSlice(alloc, "__") catch {};
             mangled.appendSlice(alloc, func_part) catch {};
             // Arity suffix
@@ -1304,17 +1304,17 @@ fn compileProjectFrontend(
     var ctx = try compiler.collectAllFromUnits(alloc, source_units, options);
 
     var names: std.ArrayListUnmanaged([]const u8) = .empty;
-    if (options.module_order) |graph_order| {
+    if (options.struct_order) |graph_order| {
         for (graph_order) |struct_name| {
             names.append(alloc, struct_name) catch {};
         }
     } else {
-        for (ctx.module_programs) |mp| {
+        for (ctx.struct_programs) |mp| {
             names.append(alloc, mp.name) catch {};
         }
     }
 
-    return try compiler.compileModuleByModule(alloc, &ctx, names.items, options);
+    return try compiler.compileStructByStruct(alloc, &ctx, names.items, options);
 }
 
 /// Compute a build cache key using SHA-256 (Zig 0.16 std.crypto) for
@@ -1374,7 +1374,7 @@ fn collectWatchPaths(allocator: std.mem.Allocator, project_root: []const u8) ![]
 /// Recursively walk `dir_path` and append every `.zap` file (except
 /// `build.zap`) that isn't already in `discovered`. Used to surface
 /// stdlib files in nested directories — including protocol/impl files
-/// that have no module declaration and therefore aren't reachable
+/// that have no struct declaration and therefore aren't reachable
 /// through the import-driven file graph.
 fn scanZapFilesRecursive(
     allocator: std.mem.Allocator,
@@ -1621,7 +1621,7 @@ const IncrementalWatchState = struct {
         // Import-driven discovery
         var source_files: std.ArrayListUnmanaged([]const u8) = .empty;
         var explicit_source_files: std.ArrayListUnmanaged([]const u8) = .empty;
-        var module_order: std.ArrayListUnmanaged([]const u8) = .empty;
+        var struct_order: std.ArrayListUnmanaged([]const u8) = .empty;
         var level_boundaries: std.ArrayListUnmanaged(u32) = .empty;
         var source_file_to_struct = std.StringHashMap([]const u8).init(alloc);
 
@@ -1633,12 +1633,12 @@ const IncrementalWatchState = struct {
             const slash_pos = std.mem.findScalar(u8, root_spec, '/');
             const name_part = if (slash_pos) |pos| root_spec[0..pos] else root_spec;
             const last_dot = std.mem.findScalarLast(u8, name_part, '.');
-            const entry_module = if (last_dot) |pos| name_part[0..pos] else name_part;
+            const entry_struct = if (last_dot) |pos| name_part[0..pos] else name_part;
 
             var discovery_err_info: zap.discovery.ErrorInfo = .{};
             var file_graph = zap.discovery.discoverWithSourceFiles(
                 alloc,
-                entry_module,
+                entry_struct,
                 source_roots.items,
                 &zap.discovery.BUILTIN_TYPE_NAMES,
                 explicit_source_files.items,
@@ -1662,7 +1662,7 @@ const IncrementalWatchState = struct {
                 while (file_index < file_boundary) : (file_index += 1) {
                     const file_path = file_graph.topo_order.items[file_index];
                     for (file_graph.structsForFile(file_path)) |struct_name| {
-                        try module_order.append(alloc, struct_name);
+                        try struct_order.append(alloc, struct_name);
                         struct_count += 1;
                     }
                 }
@@ -1694,12 +1694,12 @@ const IncrementalWatchState = struct {
         }
 
         // Frontend compile
-        const mod_order_slice: ?[]const []const u8 = if (module_order.items.len > 0) module_order.items else null;
+        const mod_order_slice: ?[]const []const u8 = if (struct_order.items.len > 0) struct_order.items else null;
         const level_boundaries_slice: ?[]const u32 = if (level_boundaries.items.len > 0) level_boundaries.items else null;
 
         var result = compileProjectFrontend(alloc, source_units.items, .{
             .lib_mode = self.lib_mode,
-            .module_order = mod_order_slice,
+            .struct_order = mod_order_slice,
             .level_boundaries = level_boundaries_slice,
             .cache_dir = ".zap-cache/ctfe",
             .ctfe_target = target_name,
@@ -1713,9 +1713,9 @@ const IncrementalWatchState = struct {
             const without_arity = if (std.mem.findScalarLast(u8, root, '/')) |slash| root[0..slash] else root;
             var mangled: std.ArrayListUnmanaged(u8) = .empty;
             if (std.mem.findScalarLast(u8, without_arity, '.')) |last_dot| {
-                const module_part = without_arity[0..last_dot];
+                const struct_part = without_arity[0..last_dot];
                 const func_part = without_arity[last_dot + 1 ..];
-                for (module_part) |c| {
+                for (struct_part) |c| {
                     mangled.append(alloc, if (c == '.') '_' else c) catch break;
                 }
                 mangled.appendSlice(alloc, "__") catch {};
@@ -1741,7 +1741,7 @@ const IncrementalWatchState = struct {
                 return error.IncrementalError;
             };
 
-            // Invalidate changed modules
+            // Invalidate changed structs
             for (changed_paths) |changed_path| {
                 if (source_file_to_struct.get(changed_path)) |struct_name| {
                     zir_backend.invalidateFile(self.zir_ctx, struct_name, alloc) catch {};

@@ -1,6 +1,6 @@
 //! ZIR Backend — calls the Zig compiler library to produce binaries from ZIR.
 //!
-//! This module provides extern declarations for the C-ABI functions exported
+//! This struct provides extern declarations for the C-ABI functions exported
 //! by libzig_compiler.a (built from the forked Zig at ~/projects/zig), and a
 //! high-level `compile` function that wires up the full pipeline:
 //!   ir.Program → ZirDriver (C-ABI calls) → inject → Zig compiler → binary
@@ -193,7 +193,7 @@ pub fn prepareUpdate(ctx: *ZirContext) CompileError!void {
     }
 }
 
-/// Mark a named module's root file as changed for incremental recompilation.
+/// Mark a named struct's root file as changed for incremental recompilation.
 pub fn invalidateFile(ctx: *ZirContext, name: []const u8, allocator: std.mem.Allocator) CompileError!void {
     const name_z = allocator.dupeZ(u8, name) catch return error.OutOfMemory;
     defer allocator.free(name_z);

@@ -1,3 +1,5 @@
+@native_type = "list"
+
 @doc = """
   Functions for working with lists.
 
@@ -12,8 +14,6 @@
       List.head([10, 20, 30])        # => 10
       List.reverse([1, 2, 3])        # => [3, 2, 1]
   """
-
-@native_type = "list"
 
 pub struct List {
   @doc = """

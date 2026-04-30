@@ -1,4 +1,4 @@
-# Module attributes and @name references
+# Struct attributes and @name references
 #
 # Demonstrates typed attributes, marker attributes, and compile-time
 # substitution of @name references in function bodies.

@@ -41,7 +41,7 @@ GPU-accelerated numerical computing is a natural extension for Zap. The goal is 
 
 Elixir's Nx uses a global default backend model and a `defn` macro that traces tensor operations into a computation graph at runtime. Zap's approach differs in three ways:
 
-1. **Per-module backend selection via `use Math, backend: Module`** — the backend is a compile-time property of the module, not a global runtime setting. This gives zero-overhead dispatch.
+1. **Per-struct backend selection via `use Math, backend: Struct`** — the backend is a compile-time property of the struct, not a global runtime setting. This gives zero-overhead dispatch.
 2. **Backends as external dependencies** — the core Zap stdlib ships only `Math`, `Math.Backend`, and `Math.CPU`. GPU backends are separate packages users opt into.
 3. **Functional trace-and-replay for autograd** — Zap's purity and immutability mean the execution trace IS the computation graph. No mutable tape, no special tracing mode.
 
@@ -59,7 +59,7 @@ Understanding how GPU support fits into Zap requires understanding Zap's compila
 
 ```
 .zap source files
-    → Discovery (follow module references from entry point)
+    → Discovery (follow struct references from entry point)
     → Parse (per-file ASTs)
     → Collect (shared scope graph + type store)
     → Macro Expansion (AST → AST transforms via Kernel macros)
@@ -69,15 +69,15 @@ Understanding how GPU support fits into Zap requires understanding Zap's compila
     → Monomorphize (specialize generics for concrete types)
     → IR Lowering (explicit control flow, locals, ARC ops)
     → Analysis (escape analysis, regions, lambda sets, Perceus)
-    → Per-Module ZIR Emission (each Zap module → Zig ZIR module)
+    → Per-Struct ZIR Emission (each Zap struct → Zig ZIR struct)
     → Codegen (Zig compiler → LLVM → native binary)
 ```
 
 Key properties:
 - **AOT compiled** — no JIT, no interpreter, no runtime compilation
-- **Per-module ZIR emission** — each Zap module becomes its own Zig ZIR module
-- **Cross-module calls** use `@import("Module").function(args)` chains in ZIR
-- **Native runtime calls** (`:zig.Module.function()`) become `@import("zap_runtime").RuntimeModule.function()` chains
+- **Per-struct ZIR emission** — each Zap struct becomes its own Zig ZIR struct
+- **Cross-struct calls** use `@import("Struct").function(args)` chains in ZIR
+- **Native runtime calls** (`:zig.Struct.function()`) become `@import("zap_runtime").RuntimeStruct.function()` chains
 
 ### The Zig Fork
 
@@ -91,16 +91,16 @@ The fork's LLVM build includes mandatory GPU-relevant targets: **NVPTX** (NVIDIA
 - **Perceus optimization** — the analysis pipeline detects when refcounts are 1 and enables in-place memory reuse. This is a key performance optimization.
 - **Persistent data structures** — `PersistentList` (cons-cell, structural sharing), `ZapMap` (copy-on-write sorted array). All immutable.
 - **Arena allocation** — bump allocator backed by page allocator.
-- **Embedded runtime** — `src/runtime.zig` is embedded via `@embedFile` and injected as an in-memory Zig module during compilation.
+- **Embedded runtime** — `src/runtime.zig` is embedded via `@embedFile` and injected as an in-memory Zig struct during compilation.
 
 ### The `use` / `__using__` Pattern
 
-When you write `use SomeModule` inside a module body:
-1. The compiler imports `SomeModule`
-2. Calls `SomeModule.__using__/1` (a macro) with any options
-3. Injects the returned AST into the calling module
+When you write `use SomeStruct` inside a struct body:
+1. The compiler imports `SomeStruct`
+2. Calls `SomeStruct.__using__/1` (a macro) with any options
+3. Injects the returned AST into the calling struct
 
-This is already used by `Zest.Case` (the test framework). It is the mechanism through which GPU backends wire themselves into user modules.
+This is already used by `Zest.Case` (the test framework). It is the mechanism through which GPU backends wire themselves into user structs.
 
 ### Protocol System
 
@@ -124,7 +124,7 @@ deps: [
 ]
 ```
 
-Dependencies that include Zig runtime code also need entries in `build.zig.zon` (Zig's package manifest). GPU backend packages are both Zap dependencies (for `.zap` module files) and Zig dependencies (for `.zig` runtime files).
+Dependencies that include Zig runtime code also need entries in `build.zig.zon` (Zig's package manifest). GPU backend packages are both Zap dependencies (for `.zap` struct files) and Zig dependencies (for `.zig` runtime files).
 
 ---
 
@@ -132,9 +132,9 @@ Dependencies that include Zig runtime code also need entries in `build.zig.zon` 
 
 These principles guided every decision in this plan:
 
-1. **Features in Zap code, not the compiler.** The compiler knows nothing about Math, tensors, GPU, or numerical computing. Everything is implemented as Zap modules, protocols, macros, and Zig runtime primitives.
+1. **Features in Zap code, not the compiler.** The compiler knows nothing about Math, tensors, GPU, or numerical computing. Everything is implemented as Zap structs, protocols, macros, and Zig runtime primitives.
 
-2. **No hardcoded module names in the compiler.** The compiler is a general-purpose tool. Backend packages are regular Zap dependencies.
+2. **No hardcoded struct names in the compiler.** The compiler is a general-purpose tool. Backend packages are regular Zap dependencies.
 
 3. **No workarounds, hacks, or shortcuts.** Every backend is the correct, production-grade implementation for its hardware. No lowest-common-denominator abstractions that sacrifice performance.
 
@@ -174,7 +174,7 @@ Eight decisions were evaluated against Zap's architecture, deep research finding
 
 **Choice:** `dfn` is a macro injected by the backend's `__using__` macro. It is not compiler syntax.
 
-**Rationale:** A device function needs to know its target — PTX for CUDA, WGSL for WebGPU, SPIR-V for Vulkan. If `dfn` were compiler syntax, the compiler would need to know which backend is active — violating "the compiler knows nothing about specific modules." Instead, each backend provides its own `dfn` macro that handles lowering to the appropriate target. `Math.CUDA`'s `dfn` compiles to PTX. `Math.WebGPU`'s `dfn` emits WGSL. No compiler changes needed.
+**Rationale:** A device function needs to know its target — PTX for CUDA, WGSL for WebGPU, SPIR-V for Vulkan. If `dfn` were compiler syntax, the compiler would need to know which backend is active — violating "the compiler knows nothing about specific structs." Instead, each backend provides its own `dfn` macro that handles lowering to the appropriate target. `Math.CUDA`'s `dfn` compiles to PTX. `Math.WebGPU`'s `dfn` emits WGSL. No compiler changes needed.
 
 **Why `dfn` and not `pub device fn` or `@device`:** The name `dfn` stands for "device function." It was chosen over `pub device fn` (which would be a decorator on `fn` requiring the compiler to know about devices) and `@device` (which would also require compiler knowledge). Since `dfn` is just a macro name provided by the backend, it needs no language-level support at all.
 
@@ -221,7 +221,7 @@ Eight decisions were evaluated against Zap's architecture, deep research finding
 
 ```
 Layer 1: Zap API (lib/*.zap — pure Zap code)
-  Math module          — public API, __using__ macro
+  Math struct          — public API, __using__ macro
   Math.Backend         — protocol contract
   Tensor type          — shape, dtype, device, data handle
   Math.CPU             — default backend, zero external dependencies
@@ -335,19 +335,19 @@ This matches PyTorch's core dtype set. `bf16` (bfloat16) is included because it 
 
 ## 7. The Math API
 
-### The `use Math, backend: Module` Pattern
+### The `use Math, backend: Struct` Pattern
 
 ```zap
-pub module Math {
-  @moduledoc """
+pub struct Math {
+  @doc """
   Numerical computing library with pluggable backends.
 
-  Use `use Math, backend: BackendModule` to configure which
+  Use `use Math, backend: BackendStruct` to configure which
   compute backend handles operations. Defaults to Math.CPU.
 
   ## Examples
 
-      pub module MyModel {
+      pub struct MyModel {
         use Math, backend: Math.WebGPU
 
         pub fn predict(weights :: Tensor, input :: Tensor) -> Tensor {
@@ -370,7 +370,7 @@ pub module Math {
 
 When a user writes `use Math, backend: Math.CUDA`:
 1. The `__using__` macro fires during macro expansion
-2. It sets `@math_backend` to `Math.CUDA` in the calling module
+2. It sets `@math_backend` to `Math.CUDA` in the calling struct
 3. Every `Math.*` call dispatches to `Math.CUDA.*` at compile time
 4. The compiler inlines the dispatch — zero runtime overhead
 
@@ -575,7 +575,7 @@ A backend that implements only Tier 1 is fully functional for data science and b
 
 ### Backend Lineup
 
-| Package | Module | Hardware | Zig Runtime Wraps | Lowering for `dfn` |
+| Package | Struct | Hardware | Zig Runtime Wraps | Lowering for `dfn` |
 |---------|--------|----------|-------------------|-------------------|
 | (core) | `Math.CPU` | All platforms | Zig SIMD, optionally OpenBLAS/Accelerate | Normal Zig function (loop) |
 | `math_webgpu` | `Math.WebGPU` | All GPUs via Dawn | `webgpu.h` C API (Dawn) | WGSL emission |
@@ -595,7 +595,7 @@ math_webgpu/
   build.zig.zon          # Zig package manifest (for Dawn dependency)
   lib/
     math/
-      webgpu.zap         # Math.WebGPU module (impl Math.Backend)
+      webgpu.zap         # Math.WebGPU struct (impl Math.Backend)
   src/
     webgpu_runtime.zig   # Zig runtime: device mgmt, buffer ops, dispatch
     shaders/
@@ -641,16 +641,16 @@ Not every GPU capability can be abstracted through the common `Math.Backend` pro
 
 Forcing these through the common protocol would mean either losing them entirely or creating a lowest-common-denominator abstraction that sacrifices the performance advantages of each platform.
 
-### The Solution: Direct Backend Module Access
+### The Solution: Direct Backend Struct Access
 
-Each backend module is just a module. The `Math.Backend` protocol defines the portable surface. But each backend can expose additional public functions beyond the protocol that provide access to hardware-specific capabilities.
+Each backend struct is just a struct. The `Math.Backend` protocol defines the portable surface. But each backend can expose additional public functions beyond the protocol that provide access to hardware-specific capabilities.
 
-Since the user already declared their backend with `use Math, backend: Math.CUDA`, they have direct access to the backend module and can call its specific functions alongside the portable `Math.*` API.
+Since the user already declared their backend with `use Math, backend: Math.CUDA`, they have direct access to the backend struct and can call its specific functions alongside the portable `Math.*` API.
 
 ### Portable Code vs Optimized Code
 
 ```zap
-pub module MyModel {
+pub struct MyModel {
   use Math, backend: Math.CUDA
 
   pub fn forward(x :: Tensor, weights :: Tensor, bias :: Tensor) -> Tensor {
@@ -676,7 +676,7 @@ end
 **CUDA — Tensor Cores and NCCL:**
 
 ```zap
-pub module DistributedTraining {
+pub struct DistributedTraining {
   use Math, backend: Math.CUDA
 
   pub fn all_reduce_gradients(gradients :: Tensor) -> Tensor {
@@ -699,7 +699,7 @@ end
 **Metal — Neural Engine and Unified Memory:**
 
 ```zap
-pub module AppleModel {
+pub struct AppleModel {
   use Math, backend: Math.Metal
 
   pub fn predict(x :: Tensor) -> Tensor {
@@ -722,7 +722,7 @@ end
 **ROCm — Wave-Level Primitives:**
 
 ```zap
-pub module AMDOptimized {
+pub struct AMDOptimized {
   use Math, backend: Math.ROCm
 
   pub fn wave_reduce(x :: Tensor) -> Tensor {
@@ -740,7 +740,7 @@ end
 **Vulkan — Push Constants and Pipeline Control:**
 
 ```zap
-pub module VulkanCompute {
+pub struct VulkanCompute {
   use Math, backend: Math.Vulkan
 
   pub fn parameterized_kernel(x :: Tensor, alpha :: f32, beta :: f32) -> Tensor {
@@ -759,9 +759,9 @@ The key design property: **the portability boundary is visible in the code.**
 - `Math.matmul(a, b)` — portable across all backends
 - `Math.CUDA.tensor_core_matmul(a, b, precision: :tf32)` — CUDA only
 
-If a user switches from `Math.CUDA` to `Math.WebGPU`, all `Math.*` calls continue to work. All `Math.CUDA.*` calls become compile errors — the module doesn't exist in the WebGPU context. This is intentional. The user sees exactly where they've tied themselves to a specific backend and can decide whether to use the portable path or the optimized path.
+If a user switches from `Math.CUDA` to `Math.WebGPU`, all `Math.*` calls continue to work. All `Math.CUDA.*` calls become compile errors — the struct doesn't exist in the WebGPU context. This is intentional. The user sees exactly where they've tied themselves to a specific backend and can decide whether to use the portable path or the optimized path.
 
-No special escape hatch API is needed. No `Math.backend_call` or `Math.raw`. The backend is just a module with its own public functions. The protocol functions are the portable subset. Everything else on the module is backend-specific.
+No special escape hatch API is needed. No `Math.backend_call` or `Math.raw`. The backend is just a struct with its own public functions. The protocol functions are the portable subset. Everything else on the struct is backend-specific.
 
 ---
 
@@ -769,14 +769,14 @@ No special escape hatch API is needed. No `Math.backend_call` or `Math.raw`. The
 
 ### Mechanism
 
-`dfn` is a macro injected by the backend's `__using__`. When a module does `use Math, backend: Math.CUDA`, the `Math.CUDA.__using__` macro injects a `dfn` macro alongside the `@math_backend` attribute. This `dfn` macro knows how to compile device code for CUDA's target (NVPTX/PTX).
+`dfn` is a macro injected by the backend's `__using__`. When a struct does `use Math, backend: Math.CUDA`, the `Math.CUDA.__using__` macro injects a `dfn` macro alongside the `@math_backend` attribute. This `dfn` macro knows how to compile device code for CUDA's target (NVPTX/PTX).
 
 No compiler changes are needed. Each backend provides its own `dfn` implementation.
 
 ### Syntax
 
 ```zap
-pub module MyKernels {
+pub struct MyKernels {
   use Math, backend: Math.CUDA
 
   # Device function — compiled to PTX by Math.CUDA's dfn macro
@@ -880,7 +880,7 @@ Inside `dfn`, only device-compatible constructs are allowed. The backend's `dfn`
 - Protocol dispatch (requires dynamic dispatch / vtable)
 - Dynamic heap allocation
 - Atoms (interned in host-side table)
-- IO, File, System, or any side-effecting module
+- IO, File, System, or any side-effecting struct
 - `raise` or exception handling
 
 ### Per-Backend Lowering
@@ -890,8 +890,8 @@ Inside `dfn`, only device-compatible constructs are allowed. The backend's `dfn`
 | `Math.CPU` | Normal Zig function body (loop over elements) | Direct call |
 | `Math.WebGPU` | WGSL compute shader source string | `wgpuDeviceCreateComputePipeline` |
 | `Math.Vulkan` | SPIR-V bytecode | `vkCreateComputePipelines` |
-| `Math.CUDA` | ZIR → LLVM NVPTX → PTX text | `cuModuleLoadData` + `cuLaunchKernel` |
-| `Math.ROCm` | ZIR → LLVM AMDGPU → HSACO binary | `hipModuleLoadData` + `hipLaunchKernel` |
+| `Math.CUDA` | ZIR → LLVM NVPTX → PTX text | `CUDA driver load API` + `cuLaunchKernel` |
+| `Math.ROCm` | ZIR → LLVM AMDGPU → HSACO binary | `HIP driver load API` + `hipLaunchKernel` |
 | `Math.Metal` | Metal Shading Language source string | `MTLDevice.makeComputePipelineState` |
 
 ---
@@ -935,7 +935,7 @@ Every entry is immutable. The inputs at trace time are the same values forever (
 ### User API
 
 ```zap
-pub module Training {
+pub struct Training {
   use Math, backend: Math.CUDA
 
   pub fn loss(params :: Tensor, input :: Tensor, target :: Tensor) -> Tensor {
@@ -965,8 +965,8 @@ pub module Training {
 Defined in Zap library code. Each primitive Math operation has a registered backward rule:
 
 ```zap
-pub module Math.VJP {
-  @moduledoc """
+pub struct Math.VJP {
+  @doc """
   Vector-Jacobian Product rules for automatic differentiation.
   Each function takes the upstream gradient and the original inputs,
   and returns the gradient with respect to each input.
@@ -1359,7 +1359,7 @@ Validate generated shader/kernel code before dispatch:
 - WGSL → Naga parser/validator
 - SPIR-V → SPIRV-Tools validator
 - PTX → CUDA driver load-and-verify
-- HSACO → HIP module load-and-verify
+- HSACO → HIP struct load-and-verify
 - MSL → Metal compiler feedback
 
 **Ring 4 — Graph Partitioning and Fallback:**
@@ -1434,7 +1434,7 @@ All backends expose:
 
 ### Core (Ships with Zap Stdlib)
 
-- `lib/math.zap` — Math module
+- `lib/math.zap` — Math struct
 - `lib/math/backend.zap` — Math.Backend protocol
 - `lib/math/cpu.zap` — Math.CPU backend
 - `lib/math/vjp.zap` — VJP rules for autograd
@@ -1485,10 +1485,10 @@ zap deps setup    # Downloads prebuilt Dawn for the host platform
 **Delivers:**
 - Tensor type in Zig runtime (shape, strides, dtype, device, ARC-managed storage)
 - `Math.Backend` protocol
-- `Math` module with `__using__` macro and ~45 Tier 1 operations
+- `Math` struct with `__using__` macro and ~45 Tier 1 operations
 - `Math.CPU` backend via Zig SIMD + optionally BLAS
 - CPU reference correctness test suite
-- `Math.VJP` module with backward rules (runs on CPU first)
+- `Math.VJP` struct with backward rules (runs on CPU first)
 
 **Effort:** Low-medium
 
@@ -1563,7 +1563,7 @@ Also delivers:
 - Restricted subset validation in each backend's macro
 - Per-backend lowering:
   - CUDA: `dfn` → ZIR → LLVM NVPTX → PTX → CUDA driver loading
-  - ROCm: `dfn` → ZIR → LLVM AMDGPU → HSACO → HIP module loading
+  - ROCm: `dfn` → ZIR → LLVM AMDGPU → HSACO → HIP struct loading
   - WebGPU: `dfn` → WGSL emission → Dawn pipeline compilation
   - Vulkan: `dfn` → SPIR-V emission → Vulkan pipeline compilation
   - Metal: `dfn` → MSL emission → Metal pipeline compilation
@@ -1628,11 +1628,11 @@ Phase 1 ────────────────────────
 
 ### "Features in Zap code, not the compiler"
 
-Math, Tensor, Math.Backend, Math.CPU, Math.VJP, autograd, `dfn`, and all backend packages are Zap modules and Zig runtime code. The Zap compiler knows nothing about numerical computing, tensors, GPU, device functions, or differentiation. Zero compiler changes across all five phases.
+Math, Tensor, Math.Backend, Math.CPU, Math.VJP, autograd, `dfn`, and all backend packages are Zap structs and Zig runtime code. The Zap compiler knows nothing about numerical computing, tensors, GPU, device functions, or differentiation. Zero compiler changes across all five phases.
 
-### No hardcoded module names
+### No hardcoded struct names
 
-The compiler has no special knowledge of Math, Tensor, or any backend. Backend packages are regular Zap dependencies discovered through normal module import resolution.
+The compiler has no special knowledge of Math, Tensor, or any backend. Backend packages are regular Zap dependencies discovered through normal struct import resolution.
 
 ### No workarounds or hacks
 
@@ -1649,4 +1649,4 @@ Immutability, purity, and the pipe operator make tensor code readable and compos
 
 ### Explicit over implicit
 
-Device placement is explicit. Data transfer is explicit. Backend selection is explicit (compile-time, per-module). Fallback diagnostics are explicit. The user always knows where their data lives, which backend is executing, and what operations are running on which device.
+Device placement is explicit. Data transfer is explicit. Backend selection is explicit (compile-time, per-struct). Fallback diagnostics are explicit. The user always knows where their data lives, which backend is executing, and what operations are running on which device.

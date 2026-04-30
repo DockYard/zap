@@ -88,8 +88,8 @@ the reverse of atom-to-string and has the same representation challenge.
 
 Existing pattern:
 1. Functions defined in `src/runtime.zig`
-2. Runtime compiled as `zap_runtime.zig`, registered as a Zig module
-3. Zap calls via `@import("zap_runtime").Module.function`
+2. Runtime compiled as `zap_runtime.zig`, registered as a Zig struct
+3. Zap calls via `@import("zap_runtime").Struct.function`
 4. ZIR builder maps Zap names to runtime names (e.g., `IO.puts` →
    `Prelude.println`)
 

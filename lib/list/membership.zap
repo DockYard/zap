@@ -1,3 +1,5 @@
+@doc = "Membership implementation for `List`."
+
 pub impl Membership for List {
   @doc = """
     Linear scan for `value` in `list`. O(n).

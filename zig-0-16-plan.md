@@ -102,10 +102,10 @@ The `zig build lib` command is unchanged. Output: `zig-out/lib/libzap_compiler.a
 This is the main C-ABI surface. It wraps Zig compiler internals. Every internal API call must be verified against 0.16.
 
 **Compilation lifecycle functions (9):**
-- `zir_compilation_create` — wraps `Compilation`, `Zcu`, `Package.Module`. Verify struct field changes.
+- `zir_compilation_create` — wraps `Compilation`, `Zcu`, `Package.Struct`. Verify struct field changes.
 - `zir_compilation_update` — wraps `Compilation.update()`. Signature likely stable but internal Sema behavior changed fundamentally (DAG-based type resolution).
-- `zir_compilation_add_module_source` — wraps `Zcu.File`, `intern_pool.createFile()`. Verify InternPool API.
-- `zir_compilation_add_module` — wraps `Package.Module.create()`, `module_roots`. Verify module registration.
+- `zir_compilation_add_struct_source` — wraps `Zcu.File`, `intern_pool.createFile()`. Verify InternPool API.
+- `zir_compilation_add_struct` — wraps `Package.Struct.create()`, `struct_roots`. Verify struct registration.
 - `zir_compilation_add_link_lib` — wraps `link.Input`. Verify linker type changes.
 - `zir_compilation_destroy` — cleanup. Should be straightforward.
 - `zir_compilation_print_errors` — wraps `ErrorBundle`. Verify error format.
@@ -135,7 +135,7 @@ Same as zir_api.zig — verify all instruction tags, refs, and data encodings.
 #### `build.zig`
 - Lines 377-456: `lib` target and `addCompilerLibStep()`. Verify `b.addLibrary()` API in 0.16.
 - Lines 652-679: Test step for zir_api. Verify test API.
-- The `aro` and `aro_translate_c` module imports may have changed.
+- The `aro` and `aro_translate_c` struct imports may have changed.
 
 #### `src/main.zig`
 - Lines 39-51: `@import("zir_api.zig")` and comptime export block. Should port cleanly — just import and force-export.
@@ -186,11 +186,11 @@ Verify these enum values haven't shifted.
 
 The 30,000-line type resolution redesign changes Sema from cyclic to DAG-based dependency resolution. Impact on Zap's injected ZIR:
 
-**Lazy field analysis:** Container types only resolve fields when size or field type is needed. Unused types serve as namespaces without triggering analysis. This benefits Zap — modules that import zap_runtime but only use some types won't force full analysis.
+**Lazy field analysis:** Container types only resolve fields when size or field type is needed. Unused types serve as namespaces without triggering analysis. This benefits Zap — structs that import zap_runtime but only use some types won't force full analysis.
 
 **Stricter dependency loops:** The compiler now detects and rejects circular dependencies that were previously tolerated. Zap must ensure:
-- zap_runtime doesn't reference Zap-generated modules
-- Injected modules don't have circular @import chains
+- zap_runtime doesn't reference Zap-generated structs
+- Injected structs don't have circular @import chains
 - Return type declarations via `@import("zap_runtime").ListType` resolve before the function body is analyzed
 
 **Detailed error messages:** Dependency loop errors now show the exact chain. This will make debugging injection issues much easier.
@@ -262,7 +262,7 @@ The CLI entry point uses many APIs that changed:
 
 ### Immediate Value
 
-**Lazy field analysis.** Reduces compile times for multi-module Zap projects where not all imported types are used.
+**Lazy field analysis.** Reduces compile times for multi-struct Zap projects where not all imported types are used.
 
 **Better error messages.** Dependency loop errors now show exact chains. Compilation errors have better source location tracking.
 

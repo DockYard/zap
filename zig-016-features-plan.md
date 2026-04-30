@@ -13,7 +13,7 @@
 6. ~~**Memory-Mapped Source Reading**~~ ✅ Done — `std.Io.File.MemoryMap` in compiler.zig
 
 ### Phase 3: Test Framework Completion
-7. **Module.functions/1** — Compile-time reflection for function discovery
+7. **Struct.functions/1** — Compile-time reflection for function discovery
 8. ~~**Seed-Based Test Ordering**~~ ✅ Done — TestTracker with Io.Timestamp seed
 
 ### Phase 4: Advanced Features
@@ -22,7 +22,7 @@
 11. **WebAssembly Target** — WASM backend support
 
 ### Phase 5: Standard Library Expansion (NEW — Zig 0.16 builtins)
-12. ~~**Math Module**~~ ✅ Done — sqrt, sin, cos, tan, exp, log via Zig 0.16 builtins
+12. ~~**Math Struct**~~ ✅ Done — sqrt, sin, cos, tan, exp, log via Zig 0.16 builtins
 13. ~~**Integer Bit Operations**~~ ✅ Done — clz, ctz, popcount, byte_swap, bit_reverse
 14. ~~**Saturating Arithmetic**~~ ✅ Done — add_sat, sub_sat, mul_sat
 15. ~~**Float-to-Integer Conversions**~~ ✅ Done — floor_to_integer, ceil_to_integer, round_to_integer
@@ -41,12 +41,12 @@
 | HAMT Maps | src/runtime.zig, lib/map.zap | No | Pending |
 | Lazy Type Emission | src/ir.zig, src/zir_builder.zig | Possibly | Pending |
 | MemoryMap Sources | src/compiler.zig | No | ✅ Done |
-| Module.functions | src/hir.zig, lib/module.zap | No | Pending |
+| Struct.functions | src/hir.zig, lib/struct.zap | No | Pending |
 | Seed Test Ordering | lib/zest/runner.zap, src/runtime.zig | No | ✅ Done |
 | @Struct/@Union/@Enum | src/zir_builder.zig (fork) | Yes | Pending |
 | Parallel Deps | src/main.zig, src/lockfile.zig | No | ✅ Done |
 | WASM Target | build.zig, src/runtime.zig | Possibly | Pending |
-| Math Module | lib/math.zap, src/runtime.zig | No | ✅ Done |
+| Math Struct | lib/math.zap, src/runtime.zig | No | ✅ Done |
 | Integer Bit Ops | lib/integer.zap, src/runtime.zig | No | ✅ Done |
 | Saturating Arithmetic | lib/integer.zap, src/runtime.zig | No | ✅ Done |
 | Float Conversions | lib/float.zap, src/runtime.zig | No | ✅ Done |

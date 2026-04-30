@@ -49,13 +49,13 @@
     var q = query.toLowerCase();
     var matches = searchData.filter(function(item) {
       return item.name.toLowerCase().indexOf(q) !== -1 ||
-             item.module.toLowerCase().indexOf(q) !== -1 ||
+             item.struct.toLowerCase().indexOf(q) !== -1 ||
              item.summary.toLowerCase().indexOf(q) !== -1;
     }).slice(0, 20);
     searchResults.innerHTML = matches.map(function(item, i) {
       return '<li data-url="' + basePath + item.url + '"' + (i === 0 ? ' class="selected"' : '') + '>' +
         '<div class="result-name">' + escapeHtml(item.name) + '</div>' +
-        '<div class="result-module">' + escapeHtml(item.module) + ' &middot; ' + item.type + '</div>' +
+        '<div class="result-struct">' + escapeHtml(item.struct) + ' &middot; ' + item.type + '</div>' +
         (item.summary ? '<div class="result-summary">' + escapeHtml(item.summary) + '</div>' : '') +
         '</li>';
     }).join('');

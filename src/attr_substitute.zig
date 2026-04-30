@@ -7,7 +7,7 @@
 //! For each function body, walks the AST looking for `attr_ref` nodes.
 //! When found, looks up the attribute by name:
 //!   1. Function-level attributes (attached to this function's family)
-//!   2. Module-level attributes (attached to the enclosing module)
+//!   2. Struct-level attributes (attached to the enclosing struct)
 //! Replaces the attr_ref with the attribute's value expression.
 //! Produces a compile error if the attribute is not found or is a marker.
 
@@ -38,7 +38,7 @@ pub fn substituteAttributes(
             continue;
         };
 
-        // Collect module-level attributes for this module
+        // Collect struct-level attributes for this struct
         var mod_attrs: std.ArrayListUnmanaged(scope.Attribute) = .empty;
         for (graph.structs.items) |mod_entry| {
             if (mod_entry.scope_id == mod_scope) {
@@ -160,7 +160,7 @@ fn substituteInExpr(
         .attr_ref => |ref| {
             const attr_name = interner.get(ref.name);
 
-            // Look up in function-level attributes first, then module-level
+            // Look up in function-level attributes first, then struct-level
             const attr = findAttribute(ref.name, func_attrs) orelse
                 findAttribute(ref.name, mod_attrs);
 
@@ -199,7 +199,7 @@ fn substituteInExpr(
                 try errors.append(alloc, .{
                     .message = std.fmt.allocPrint(
                         alloc,
-                        "undefined attribute @{s} — define it with @{s} :: Type = value in the module body",
+                        "undefined attribute @{s} — define it with @{s} :: Type = value in the struct body",
                         .{ attr_name, attr_name },
                     ) catch "undefined attribute",
                     .span = ref.meta.span,
@@ -316,7 +316,7 @@ fn substituteInExpr(
                 null;
             if (!changed and new_update == s.update_source) return expr;
             const new_expr = try alloc.create(ast.Expr);
-            new_expr.* = .{ .struct_expr = .{ .meta = s.meta, .module_name = s.module_name, .update_source = new_update, .fields = try new_fields.toOwnedSlice(alloc) } };
+            new_expr.* = .{ .struct_expr = .{ .meta = s.meta, .struct_name = s.struct_name, .update_source = new_update, .fields = try new_fields.toOwnedSlice(alloc) } };
             return new_expr;
         },
         .field_access => |f| {
@@ -442,7 +442,7 @@ fn substituteInExpr(
         .bool_literal,
         .nil_literal,
         .var_ref,
-        .module_ref,
+        .struct_ref,
         .intrinsic,
         .binary_literal,
         .function_ref,

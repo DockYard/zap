@@ -1,3 +1,5 @@
+@doc = "Comparator implementation for `Float`."
+
 pub impl Comparator for Float {
   @doc = "IEEE-754 float equality."
 

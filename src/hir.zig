@@ -26,7 +26,7 @@ pub const ValueMode = enum {
 // ============================================================
 
 pub const Program = struct {
-    modules: []const Module,
+    structs: []const Struct,
     top_functions: []const FunctionGroup,
     protocols: []const ProtocolInfo = &.{},
     impls: []const ImplInfo = &.{},
@@ -40,12 +40,12 @@ pub const ProtocolInfo = struct {
 
 pub const ImplInfo = struct {
     protocol_name: ast.StringId,
-    target_module: ast.StringId,
+    target_struct: ast.StringId,
     impl_scope_id: scope_mod.ScopeId,
     function_group_ids: []const u32,
 };
 
-pub const Module = struct {
+pub const Struct = struct {
     name: ast.StructName,
     scope_id: scope_mod.ScopeId,
     functions: []const FunctionGroup,
@@ -275,7 +275,7 @@ pub const CallArg = struct {
 };
 
 pub const NamedCall = struct {
-    module: ?[]const u8,
+    struct_name: ?[]const u8,
     name: []const u8,
 };
 
@@ -2131,7 +2131,7 @@ pub const HirBuilder = struct {
     /// When a closure references a variable from the parent function's bindings,
     /// it generates capture_get instead of local_get.
     parent_assignment_bindings: std.ArrayList(AssignmentBinding),
-    current_module_scope: ?scope_mod.ScopeId,
+    current_struct_scope: ?scope_mod.ScopeId,
     current_clause_scope: ?scope_mod.ScopeId,
     /// Set while building the function groups for an `impl Protocol for
     /// Target(K, V)` block. Carries the impl's declared type parameters
@@ -2186,7 +2186,7 @@ pub const HirBuilder = struct {
             .current_case_bindings = .empty,
             .current_assignment_bindings = .empty,
             .parent_assignment_bindings = .empty,
-            .current_module_scope = null,
+            .current_struct_scope = null,
             .current_clause_scope = null,
             .current_function_root_scope = null,
             .current_function_name = null,
@@ -2237,7 +2237,7 @@ pub const HirBuilder = struct {
         // mutating the type at this site after type-checking but before HIR
         // build, so this must take precedence over the in-memory parameter
         // copy populated below.
-        const scope_id = self.current_clause_scope orelse self.current_module_scope orelse self.graph.prelude_scope;
+        const scope_id = self.current_clause_scope orelse self.current_struct_scope orelse self.graph.prelude_scope;
         if (self.graph.resolveBindingHygienic(scope_id, name, reference_scopes)) |bid| {
             const binding = self.graph.bindings.items[bid];
             if (binding.type_id) |prov| {
@@ -2273,7 +2273,7 @@ pub const HirBuilder = struct {
     }
 
     /// Look up a function's declared return type from the scope graph.
-    /// Searches current module scope, then prelude.
+    /// Searches current struct scope, then prelude.
     /// Resolve a generic function's return type by unifying argument types with
     /// parameter types and applying the substitution to the raw return type.
     fn resolveGenericReturnType(
@@ -2284,7 +2284,7 @@ pub const HirBuilder = struct {
         call_args: []const CallArg,
         raw_return: types_mod.TypeId,
     ) types_mod.TypeId {
-        // Find the target module's scope, then resolve the family through
+        // Find the target struct's scope, then resolve the family through
         // the scope's `function_families` map. This goes through the
         // public `resolveFamily` API which honours impl-registered
         // function families — `registerImplFunctionsInTargetScopes`
@@ -2315,7 +2315,7 @@ pub const HirBuilder = struct {
     /// Resolve a generic function's return type for a local-scope call by
     /// walking the scope chain to find the family. Mirrors
     /// `resolveGenericReturnType` but uses scope-based resolution instead
-    /// of module-name-based.
+    /// of struct-name-based.
     fn resolveGenericReturnTypeLocal(
         self: *const HirBuilder,
         name: ast.StringId,
@@ -2323,7 +2323,7 @@ pub const HirBuilder = struct {
         call_args: []const CallArg,
         raw_return: types_mod.TypeId,
     ) types_mod.TypeId {
-        const scope_id = self.current_clause_scope orelse self.current_module_scope orelse self.graph.prelude_scope;
+        const scope_id = self.current_clause_scope orelse self.current_struct_scope orelse self.graph.prelude_scope;
         const fam_id = self.graph.resolveFamily(scope_id, name, arity) orelse return raw_return;
         const family = self.graph.getFamily(fam_id);
         if (family.clauses.items.len == 0) return raw_return;
@@ -2393,7 +2393,7 @@ pub const HirBuilder = struct {
 
     /// Resolve a function's return type within a specific struct
     /// (for cross-struct calls).
-    fn resolveFunctionReturnTypeInModule(self: *const HirBuilder, struct_simple: []const u8, func_name: []const u8, arity: u32) types_mod.TypeId {
+    fn resolveFunctionReturnTypeInStruct(self: *const HirBuilder, struct_simple: []const u8, func_name: []const u8, arity: u32) types_mod.TypeId {
         // Find the matching struct's scope, then look up the family
         // via the scope's `function_families` map. The map covers
         // both functions declared inside the struct AND impl
@@ -2426,7 +2426,7 @@ pub const HirBuilder = struct {
     }
 
     fn resolveFunctionReturnType(self: *const HirBuilder, name: ast.StringId, arity: u32) types_mod.TypeId {
-        const scope_id = self.current_clause_scope orelse self.current_module_scope orelse self.graph.prelude_scope;
+        const scope_id = self.current_clause_scope orelse self.current_struct_scope orelse self.graph.prelude_scope;
         if (self.graph.resolveFamily(scope_id, name, arity)) |fam_id| {
             const family = self.graph.getFamily(fam_id);
             if (family.clauses.items.len > 0) {
@@ -2464,7 +2464,7 @@ pub const HirBuilder = struct {
     /// total — they don't need a `__try` variant and would not benefit from
     /// catch-basin handling.
     fn isFunctionMultiClause(self: *const HirBuilder, name: ast.StringId, arity: u32) bool {
-        const scope_id = self.current_clause_scope orelse self.current_module_scope orelse self.graph.prelude_scope;
+        const scope_id = self.current_clause_scope orelse self.current_struct_scope orelse self.graph.prelude_scope;
         if (self.graph.resolveFamily(scope_id, name, arity)) |fam_id| {
             const family = self.graph.getFamily(fam_id);
             if (family.clauses.items.len > 1) return true;
@@ -2540,7 +2540,7 @@ pub const HirBuilder = struct {
     }
 
     fn resolveFunctionParamOwnerships(self: *HirBuilder, name: ast.StringId, arity: u32) ?[]const Ownership {
-        const scope_id = self.current_clause_scope orelse self.current_module_scope orelse self.graph.prelude_scope;
+        const scope_id = self.current_clause_scope orelse self.current_struct_scope orelse self.graph.prelude_scope;
         const family_id = self.graph.resolveFamily(scope_id, name, arity) orelse return null;
         const family = self.graph.getFamily(family_id);
         if (family.clauses.items.len == 0) return null;
@@ -2571,7 +2571,7 @@ pub const HirBuilder = struct {
     /// Resolve the declared parameter types for a function by name and arity.
     /// Used to populate CallArg.expected_type for implicit numeric widening.
     fn resolveFunctionParamTypes(self: *HirBuilder, name: ast.StringId, arity: u32) ?[]const types_mod.TypeId {
-        const scope_id = self.current_clause_scope orelse self.current_module_scope orelse self.graph.prelude_scope;
+        const scope_id = self.current_clause_scope orelse self.current_struct_scope orelse self.graph.prelude_scope;
         const family_id = self.graph.resolveFamily(scope_id, name, arity) orelse return null;
         const family = self.graph.getFamily(family_id);
         if (family.clauses.items.len == 0) return null;
@@ -2600,7 +2600,7 @@ pub const HirBuilder = struct {
     }
 
     fn resolveFunctionValueGroup(self: *const HirBuilder, name: ast.StringId) ?u32 {
-        var current: ?scope_mod.ScopeId = self.current_clause_scope orelse self.current_module_scope orelse self.graph.prelude_scope;
+        var current: ?scope_mod.ScopeId = self.current_clause_scope orelse self.current_struct_scope orelse self.graph.prelude_scope;
         var found: ?u32 = null;
         while (current) |sid| {
             var it = self.graph.getScope(sid).function_families.iterator();
@@ -2637,7 +2637,7 @@ pub const HirBuilder = struct {
     }
 
     fn resolveFunctionValueType(self: *HirBuilder, name: ast.StringId) anyerror!types_mod.TypeId {
-        const scope_id = self.current_clause_scope orelse self.current_module_scope orelse self.graph.prelude_scope;
+        const scope_id = self.current_clause_scope orelse self.current_struct_scope orelse self.graph.prelude_scope;
         var current: ?scope_mod.ScopeId = scope_id;
         var found_clause: ?ast.FunctionClause = null;
         while (current) |sid| {
@@ -2667,10 +2667,10 @@ pub const HirBuilder = struct {
     }
 
     fn resolveFunctionRefType(self: *HirBuilder, fr: ast.FunctionRefExpr) anyerror!types_mod.TypeId {
-        const scope_id = if (fr.module) |module_name|
-            self.graph.findStructScope(module_name)
+        const scope_id = if (fr.struct_name) |struct_name|
+            self.graph.findStructScope(struct_name)
         else
-            self.current_clause_scope orelse self.current_module_scope orelse self.graph.prelude_scope;
+            self.current_clause_scope orelse self.current_struct_scope orelse self.graph.prelude_scope;
 
         const resolved_scope = scope_id orelse return types_mod.TypeStore.UNKNOWN;
         const family_id = self.graph.resolveFamily(resolved_scope, fr.function, fr.arity) orelse return types_mod.TypeStore.UNKNOWN;
@@ -2682,10 +2682,10 @@ pub const HirBuilder = struct {
     }
 
     fn resolveFunctionRefGroup(self: *const HirBuilder, fr: ast.FunctionRefExpr) ?u32 {
-        const scope_id = if (fr.module) |module_name|
-            self.graph.findStructScope(module_name)
+        const scope_id = if (fr.struct_name) |struct_name|
+            self.graph.findStructScope(struct_name)
         else
-            self.current_clause_scope orelse self.current_module_scope orelse self.graph.prelude_scope;
+            self.current_clause_scope orelse self.current_struct_scope orelse self.graph.prelude_scope;
 
         const resolved_scope = scope_id orelse return null;
         const family_id = self.graph.resolveFamily(resolved_scope, fr.function, fr.arity) orelse return null;
@@ -2851,13 +2851,13 @@ pub const HirBuilder = struct {
     // ============================================================
 
     pub fn buildProgram(self: *HirBuilder, program: *const ast.Program) !Program {
-        var modules: std.ArrayList(Module) = .empty;
+        var structs: std.ArrayList(Struct) = .empty;
         for (program.structs) |*mod| {
             const mod_scope = self.graph.findStructScope(mod.name) orelse
                 self.graph.prelude_scope;
-            self.current_module_scope = mod_scope;
-            try modules.append(self.allocator, try self.buildStruct(mod, mod_scope));
-            self.current_module_scope = null;
+            self.current_struct_scope = mod_scope;
+            try structs.append(self.allocator, try self.buildStruct(mod, mod_scope));
+            self.current_struct_scope = null;
         }
 
         // Group top-level functions by name, merging clauses
@@ -2886,23 +2886,23 @@ pub const HirBuilder = struct {
             }
         }
 
-        // Build impl function groups and place them in the target module's
-        // functions array so cross-module calls (`Integer.+`) resolve through
-        // the normal module-qualified call path. Each module compilation
+        // Build impl function groups and place them in the target struct's
+        // functions array so cross-struct calls (`Integer.+`) resolve through
+        // the normal struct-qualified call path. Each struct compilation
         // pass sees the global impl set; we skip impls whose target isn't in
-        // the modules list for this pass to avoid emitting them as orphan
+        // the structs list for this pass to avoid emitting them as orphan
         // root-level functions.
         for (self.graph.impls.items) |impl_entry| {
-            var target_module_idx: ?usize = null;
-            for (modules.items, 0..) |mod, idx| {
+            var target_struct_idx: ?usize = null;
+            for (structs.items, 0..) |mod, idx| {
                 if (self.structNamesEqual(mod.name, impl_entry.target_type)) {
-                    target_module_idx = idx;
+                    target_struct_idx = idx;
                     break;
                 }
             }
-            if (target_module_idx == null) continue;
+            if (target_struct_idx == null) continue;
 
-            self.current_module_scope = impl_entry.scope_id;
+            self.current_struct_scope = impl_entry.scope_id;
             const prev_impl = self.current_impl;
             self.current_impl = impl_entry.decl;
             defer self.current_impl = prev_impl;
@@ -2925,13 +2925,13 @@ pub const HirBuilder = struct {
                     try impl_groups.append(self.allocator, group);
                 }
             }
-            self.current_module_scope = null;
+            self.current_struct_scope = null;
 
-            // Splice impl groups onto the target module's functions list.
+            // Splice impl groups onto the target struct's functions list.
             var combined: std.ArrayList(FunctionGroup) = .empty;
-            try combined.appendSlice(self.allocator, modules.items[target_module_idx.?].functions);
+            try combined.appendSlice(self.allocator, structs.items[target_struct_idx.?].functions);
             try combined.appendSlice(self.allocator, impl_groups.items);
-            modules.items[target_module_idx.?].functions = try combined.toOwnedSlice(self.allocator);
+            structs.items[target_struct_idx.?].functions = try combined.toOwnedSlice(self.allocator);
         }
 
         // Build protocol info from scope graph
@@ -2963,7 +2963,7 @@ pub const HirBuilder = struct {
             if (impl_entry.protocol_name.parts.len > 0 and impl_entry.target_type.parts.len > 0) {
                 try impl_infos.append(self.allocator, .{
                     .protocol_name = impl_entry.protocol_name.parts[impl_entry.protocol_name.parts.len - 1],
-                    .target_module = impl_entry.target_type.parts[impl_entry.target_type.parts.len - 1],
+                    .target_struct = impl_entry.target_type.parts[impl_entry.target_type.parts.len - 1],
                     .impl_scope_id = impl_entry.scope_id,
                     .function_group_ids = try group_ids.toOwnedSlice(self.allocator),
                 });
@@ -2971,15 +2971,15 @@ pub const HirBuilder = struct {
         }
 
         return .{
-            .modules = try modules.toOwnedSlice(self.allocator),
+            .structs = try structs.toOwnedSlice(self.allocator),
             .top_functions = try top_fns.toOwnedSlice(self.allocator),
             .protocols = try protocol_infos.toOwnedSlice(self.allocator),
             .impls = try impl_infos.toOwnedSlice(self.allocator),
         };
     }
 
-    fn buildStruct(self: *HirBuilder, mod: *const ast.StructDecl, mod_scope: scope_mod.ScopeId) !Module {
-        // Group module functions by {name, arity} so that same-name
+    fn buildStruct(self: *HirBuilder, mod: *const ast.StructDecl, mod_scope: scope_mod.ScopeId) !Struct {
+        // Group struct functions by {name, arity} so that same-name
         // functions with different arities become separate groups.
         const FnGroupKey = struct { name: ast.StringId, arity: u32 };
         var fn_order: std.ArrayList(FnGroupKey) = .empty;
@@ -3329,7 +3329,7 @@ pub const HirBuilder = struct {
         // Resolve the clause's scope. Prefers `meta.scope_id` (set
         // directly by the collector) over `node_scope_map` so macro-
         // generated clauses with synthetic span 0:0 don't collide.
-        self.current_clause_scope = self.graph.resolveClauseScope(clause.meta) orelse self.current_module_scope orelse clause.meta.scope_id;
+        self.current_clause_scope = self.graph.resolveClauseScope(clause.meta) orelse self.current_struct_scope orelse clause.meta.scope_id;
         defer self.current_clause_scope = prev_clause_scope;
 
         // Check for inferred signature from the type checker (populated for
@@ -3356,12 +3356,12 @@ pub const HirBuilder = struct {
                     types_mod.TypeStore.UNKNOWN;
             } else types_mod.TypeStore.UNKNOWN;
 
-            // When a struct pattern has no module_name (parsed from %{...} :: Type),
+            // When a struct pattern has no struct_name (parsed from %{...} :: Type),
             // inject the type name from the type annotation
             const match_pattern = blk: {
                 if (param.pattern.* == .struct_pattern and param.type_annotation != null) {
                     const sp = param.pattern.struct_pattern;
-                    if (sp.module_name.parts.len == 0) {
+                    if (sp.struct_name.parts.len == 0) {
                         const ann = param.type_annotation.?;
                         if (ann.* == .name) {
                             var bindings: std.ArrayList(StructFieldBind) = .empty;
@@ -3381,7 +3381,7 @@ pub const HirBuilder = struct {
                             });
                         }
                         // The parser routes `%{key: pat, ...}` into
-                        // `.struct_pattern` with empty module_name (the
+                        // `.struct_pattern` with empty struct_name (the
                         // syntax is shared with struct destructure). When
                         // the annotation is a map type (`%{K -> V}`), build
                         // a `map_match` so the IR's map-binding extraction
@@ -3719,9 +3719,9 @@ pub const HirBuilder = struct {
             .pin => |p| try self.create(MatchPattern, .{ .pin = p.name }),
             .paren => |p| self.compilePattern(p.inner),
             .struct_pattern => |sp| {
-                // Get the type name from the module_name (first part)
-                // When module_name is empty, the type comes from param annotation (handled in buildClause)
-                const type_name = if (sp.module_name.parts.len > 0) sp.module_name.parts[0] else return null;
+                // Get the type name from the struct_name (first part)
+                // When struct_name is empty, the type comes from param annotation (handled in buildClause)
+                const type_name = if (sp.struct_name.parts.len > 0) sp.struct_name.parts[0] else return null;
                 var bindings: std.ArrayList(StructFieldBind) = .empty;
                 for (sp.fields) |field| {
                     if (try self.compilePattern(field.pattern)) |p| {
@@ -3802,7 +3802,7 @@ pub const HirBuilder = struct {
         for (stmts) |stmt| {
             switch (stmt) {
                 .function_decl => |func| {
-                    const group_scope = self.current_clause_scope orelse self.current_module_scope orelse self.graph.prelude_scope;
+                    const group_scope = self.current_clause_scope orelse self.current_struct_scope orelse self.graph.prelude_scope;
                     const group = try self.buildFunctionGroup(func, group_scope, null, true);
                     const group_ptr = try self.create(FunctionGroup, group);
                     try hir_stmts.append(self.allocator, .{ .function_group = group_ptr });
@@ -3825,7 +3825,7 @@ pub const HirBuilder = struct {
                     const value = if (assign.value.* == .anonymous_function) blk: {
                         const anon = assign.value.anonymous_function;
                         const function_type = try self.resolveFunctionValueType(anon.decl.name);
-                        const group_scope = self.current_clause_scope orelse self.current_module_scope orelse self.graph.prelude_scope;
+                        const group_scope = self.current_clause_scope orelse self.current_struct_scope orelse self.graph.prelude_scope;
                         const group = try self.buildFunctionGroup(anon.decl, group_scope, null, true);
                         const group_ptr = try self.create(FunctionGroup, group);
                         try hir_stmts.append(self.allocator, .{ .function_group = group_ptr });
@@ -3967,15 +3967,15 @@ pub const HirBuilder = struct {
                     else
                         rhs_expr.type_id;
                     if (operand_type != types_mod.TypeStore.UNKNOWN) {
-                        if (self.type_store.typeToModuleName(operand_type, self.interner)) |module_name| {
-                            if (self.hasImpl(op_meta.protocol, module_name)) {
+                        if (self.type_store.typeToStructName(operand_type, self.interner)) |struct_name| {
+                            if (self.hasImpl(op_meta.protocol, struct_name)) {
                                 var args: std.ArrayList(CallArg) = .empty;
                                 try args.append(self.allocator, .{ .expr = lhs_expr, .mode = .share });
                                 try args.append(self.allocator, .{ .expr = rhs_expr, .mode = .share });
 
                                 return try self.create(Expr, .{
                                     .kind = .{ .call = .{
-                                        .target = .{ .named = .{ .module = module_name, .name = op_meta.method } },
+                                        .target = .{ .named = .{ .struct_name = struct_name, .name = op_meta.method } },
                                         .args = try args.toOwnedSlice(self.allocator),
                                     } },
                                     .type_id = op_meta.result_type(operand_type),
@@ -4021,9 +4021,9 @@ pub const HirBuilder = struct {
             }),
             .call => |call| {
                 // Check for union variant constructor: Result.Ok("hello")
-                // Parsed as call(module_ref(["Result", "Ok"]), args)
-                if (call.callee.* == .module_ref and call.args.len >= 1) {
-                    const parts = call.callee.module_ref.name.parts;
+                // Parsed as call(struct_ref(["Result", "Ok"]), args)
+                if (call.callee.* == .struct_ref and call.args.len >= 1) {
+                    const parts = call.callee.struct_ref.name.parts;
                     if (parts.len == 2) {
                         if (self.type_store.name_to_type.get(parts[0])) |tid| {
                             const typ = self.type_store.getType(tid);
@@ -4057,27 +4057,27 @@ pub const HirBuilder = struct {
 
                 var callee_expr: ?*const Expr = null;
 
-                // Check for module-qualified call: IO.puts(...), Math.square(...)
+                // Check for struct-qualified call: IO.puts(...), Math.square(...)
                 // or :zig runtime bridge: :zig.println(...)
                 const target: CallTarget = if (call.callee.* == .field_access) blk: {
                     const fa = call.callee.field_access;
-                    if (fa.object.* == .module_ref) {
+                    if (fa.object.* == .struct_ref) {
                         const func_name = self.interner.get(fa.field);
-                        const initial_mod = self.structNameToString(fa.object.module_ref.name);
+                        const initial_mod = self.structNameToString(fa.object.struct_ref.name);
                         // Protocol-call dispatch: rewrite `Protocol.method(arg, ...)`
                         // to `Impl.method(arg, ...)` when the first arg's type has
                         // a matching impl. Mirrors the binary_op dispatch path so
                         // every protocol-method invocation goes through the same
-                        // type-driven lookup. Falls through to the literal module
+                        // type-driven lookup. Falls through to the literal struct
                         // name when the call isn't protocol-qualified or the type
                         // is UNKNOWN.
                         const dispatched_mod = if (args.items.len > 0)
-                            self.protocolDispatchModule(initial_mod, args.items[0].expr.type_id) orelse initial_mod
+                            self.protocolDispatchStruct(initial_mod, args.items[0].expr.type_id) orelse initial_mod
                         else
                             initial_mod;
-                        break :blk .{ .named = .{ .module = dispatched_mod, .name = func_name } };
+                        break :blk .{ .named = .{ .struct_name = dispatched_mod, .name = func_name } };
                     }
-                    // :zig.function() or :zig.Module.function() — bridge to Zig runtime
+                    // :zig.function() or :zig.Struct.function() — bridge to Zig runtime
                     if (fa.object.* == .atom_literal) {
                         const atom_name = self.interner.get(fa.object.atom_literal.value);
                         if (std.mem.eql(u8, atom_name, "zig")) {
@@ -4085,13 +4085,13 @@ pub const HirBuilder = struct {
                             break :blk .{ .builtin = func_name };
                         }
                     }
-                    // :zig.Module.function() — chained field access
+                    // :zig.Struct.function() — chained field access
                     if (fa.object.* == .field_access) {
                         const inner = fa.object.field_access;
                         if (inner.object.* == .atom_literal) {
                             const atom_name = self.interner.get(inner.object.atom_literal.value);
                             if (std.mem.eql(u8, atom_name, "zig")) {
-                                // Build "Module.function" qualified name. For
+                                // Build "Struct.function" qualified name. For
                                 // generic containers (List, Map), encode the
                                 // element type from the first arg so the ZIR
                                 // backend can instantiate the right
@@ -4147,15 +4147,15 @@ pub const HirBuilder = struct {
                             break :blk .{ .closure = callee_expr.? };
                         }
                     }
-                    const scope_id = self.current_clause_scope orelse self.current_module_scope orelse self.graph.prelude_scope;
+                    const scope_id = self.current_clause_scope orelse self.current_struct_scope orelse self.graph.prelude_scope;
                     if (self.graph.resolveFamily(scope_id, vr.name, @intCast(call.args.len))) |family_id| {
                         if (self.family_to_group.get(family_id)) |group_id| {
                             break :blk .{ .direct = .{ .function_group_id = group_id, .clause_index = 0 } };
                         }
                     }
                     // Check if this bare call resolves to an imported function
-                    const import_module = self.resolveImport(vr.name, @intCast(call.args.len));
-                    break :blk .{ .named = .{ .module = import_module, .name = self.interner.get(vr.name) } };
+                    const import_struct = self.resolveImport(vr.name, @intCast(call.args.len));
+                    break :blk .{ .named = .{ .struct_name = import_struct, .name = self.interner.get(vr.name) } };
                 } else blk: {
                     callee_expr = try self.buildExpr(call.callee);
                     break :blk .{ .closure = callee_expr.? };
@@ -4175,7 +4175,7 @@ pub const HirBuilder = struct {
                         }
                     }
                 } else if (call.callee.* == .field_access) {
-                    // Module-qualified call: resolve via callee's function type
+                    // Struct-qualified call: resolve via callee's function type
                     if (callee_expr) |callee| {
                         const callee_type = self.type_store.getType(callee.type_id);
                         if (callee_type == .function) {
@@ -4237,7 +4237,7 @@ pub const HirBuilder = struct {
                         break :blk types_mod.TypeStore.UNKNOWN;
                     },
                     .named => |n| blk: {
-                        if (n.module == null) {
+                        if (n.struct_name == null) {
                             if (call.callee.* == .var_ref) {
                                 const raw = self.resolveFunctionReturnType(call.callee.var_ref.name, @intCast(call.args.len));
                                 if (raw != types_mod.TypeStore.UNKNOWN) {
@@ -4250,25 +4250,25 @@ pub const HirBuilder = struct {
                             }
                         } else {
                             if (call.callee.* == .field_access) {
-                                const raw_return = self.resolveFunctionReturnTypeInModule(n.module.?, n.name, @intCast(call.args.len));
+                                const raw_return = self.resolveFunctionReturnTypeInStruct(n.struct_name.?, n.name, @intCast(call.args.len));
                                 if (raw_return != types_mod.TypeStore.UNKNOWN) {
                                     const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
                                     if (store_ptr.containsTypeVars(raw_return)) {
-                                        const resolved = self.resolveGenericReturnType(n.module.?, n.name, @intCast(call.args.len), args.items, raw_return);
+                                        const resolved = self.resolveGenericReturnType(n.struct_name.?, n.name, @intCast(call.args.len), args.items, raw_return);
                                         break :blk resolved;
                                     }
                                 }
                                 break :blk raw_return;
                             }
                             // Bare-name var_ref (`a + b` rewritten to `+(a, b)`) that
-                            // resolves to an imported module's function. Same inference
+                            // resolves to an imported struct's function. Same inference
                             // as the field_access case.
                             if (call.callee.* == .var_ref) {
-                                const raw_return = self.resolveFunctionReturnTypeInModule(n.module.?, n.name, @intCast(call.args.len));
+                                const raw_return = self.resolveFunctionReturnTypeInStruct(n.struct_name.?, n.name, @intCast(call.args.len));
                                 if (raw_return != types_mod.TypeStore.UNKNOWN) {
                                     const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
                                     if (store_ptr.containsTypeVars(raw_return)) {
-                                        const resolved = self.resolveGenericReturnType(n.module.?, n.name, @intCast(call.args.len), args.items, raw_return);
+                                        const resolved = self.resolveGenericReturnType(n.struct_name.?, n.name, @intCast(call.args.len), args.items, raw_return);
                                         break :blk resolved;
                                     }
                                 }
@@ -4282,7 +4282,7 @@ pub const HirBuilder = struct {
 
                 if (target == .named and call.callee.* == .var_ref) {
                     const named = target.named;
-                    if (named.module == null) {
+                    if (named.struct_name == null) {
                         if (self.resolveFunctionParamOwnerships(call.callee.var_ref.name, @intCast(call.args.len))) |ownerships| {
                             const count = @min(args.items.len, ownerships.len);
                             for (args.items[0..count], ownerships[0..count]) |*arg, ownership| {
@@ -4577,10 +4577,10 @@ pub const HirBuilder = struct {
                 unreachable;
             },
             .struct_expr => |se| {
-                // Resolve struct type from module name (e.g., %Point{x: 1, y: 2})
+                // Resolve struct type from struct name (e.g., %Point{x: 1, y: 2})
                 var struct_type_id = types_mod.TypeStore.UNKNOWN;
-                if (se.module_name.parts.len > 0) {
-                    const type_name_id = se.module_name.parts[se.module_name.parts.len - 1];
+                if (se.struct_name.parts.len > 0) {
+                    const type_name_id = se.struct_name.parts[se.struct_name.parts.len - 1];
                     if (self.type_store.name_to_type.get(type_name_id)) |tid| {
                         struct_type_id = tid;
                     }
@@ -4604,14 +4604,14 @@ pub const HirBuilder = struct {
                 });
             },
             .field_access => |fa| {
-                // Module-qualified reference (e.g. Math.square without call parens)
-                if (fa.object.* == .module_ref) {
+                // Struct-qualified reference (e.g. Math.square without call parens)
+                if (fa.object.* == .struct_ref) {
                     const func_name = self.interner.get(fa.field);
-                    const mod_name = self.structNameToString(fa.object.module_ref.name);
+                    const mod_name = self.structNameToString(fa.object.struct_ref.name);
 
                     // Check if this is an enum variant access (e.g. Color.Red
                     // or IO.Mode.Raw for a dotted-name union)
-                    const mod_parts = fa.object.module_ref.name.parts;
+                    const mod_parts = fa.object.struct_ref.name.parts;
 
                     // Try to resolve as a union type. For dotted names like IO.Mode,
                     // build the full dotted name and look it up.
@@ -4656,7 +4656,7 @@ pub const HirBuilder = struct {
 
                     return try self.create(Expr, .{
                         .kind = .{ .call = .{
-                            .target = .{ .named = .{ .module = mod_name, .name = func_name } },
+                            .target = .{ .named = .{ .struct_name = mod_name, .name = func_name } },
                             .args = &.{},
                         } },
                         .type_id = types_mod.TypeStore.UNKNOWN,
@@ -4717,7 +4717,7 @@ pub const HirBuilder = struct {
                 if (function_type == types_mod.TypeStore.UNKNOWN and anon.decl.clauses.len > 0) {
                     function_type = try self.buildResolvedFunctionType(anon.decl.clauses[0]);
                 }
-                const group_scope = self.current_clause_scope orelse self.current_module_scope orelse self.graph.prelude_scope;
+                const group_scope = self.current_clause_scope orelse self.current_struct_scope orelse self.graph.prelude_scope;
                 const group = try self.buildFunctionGroup(anon.decl, group_scope, null, true);
                 const group_ptr = try self.create(FunctionGroup, group);
                 const closure_expr = try self.buildFunctionValueExpr(group.id, function_type, anon.meta.span);
@@ -4734,7 +4734,7 @@ pub const HirBuilder = struct {
                     .span = anon.meta.span,
                 });
             },
-            .module_ref => |mr| {
+            .struct_ref => |mr| {
                 // Check for enum variant reference:
                 //   Color.Red → parts ["Color", "Red"] (type is parts[0], variant is parts[1])
                 //   IO.Mode.Raw → parts ["IO", "Mode", "Raw"] (type is "IO.Mode", variant is "Raw")
@@ -5132,21 +5132,21 @@ pub const HirBuilder = struct {
         };
     }
 
-    /// Resolve a bare call to an imported module via the current scope's imports.
-    /// Returns the module name string if the function is imported, null otherwise.
-    /// Resolution follows Elixir semantics: local module > imports > Kernel/top-level.
+    /// Resolve a bare call to an imported struct via the current scope's imports.
+    /// Returns the struct name string if the function is imported, null otherwise.
+    /// Resolution follows Elixir semantics: local struct > imports > Kernel/top-level.
     fn resolveImport(self: *const HirBuilder, name: ast.StringId, arity: u32) ?[]const u8 {
-        const mod_scope_id = self.current_module_scope orelse return null;
+        const mod_scope_id = self.current_struct_scope orelse return null;
         const mod_scope = self.graph.getScope(mod_scope_id);
 
-        // Check if the function is defined locally in this module (local takes priority)
+        // Check if the function is defined locally in this struct (local takes priority)
         const local_key = scope_mod.FamilyKey{ .name = name, .arity = arity };
         if (mod_scope.function_families.get(local_key) != null) return null;
 
         // Check imports on this scope
         for (mod_scope.imports.items) |imp| {
             if (self.importMatchesFunction(imp, name, arity)) {
-                return self.structNameToString(imp.source_module);
+                return self.structNameToString(imp.source_struct);
             }
         }
 
@@ -5157,8 +5157,8 @@ pub const HirBuilder = struct {
     fn importMatchesFunction(self: *const HirBuilder, imp: scope_mod.ImportedScope, name: ast.StringId, arity: u32) bool {
         switch (imp.filter) {
             .all => {
-                // Import all — verify the source module actually exports this function
-                return self.sourceModuleHasFunction(imp.source_module, name, arity);
+                // Import all — verify the source struct actually exports this function
+                return self.sourceStructHasFunction(imp.source_struct, name, arity);
             },
             .only => |entries| {
                 // Only import listed functions
@@ -5175,8 +5175,8 @@ pub const HirBuilder = struct {
                 return false;
             },
             .except => |entries| {
-                // Import all except listed — first check source module exports it
-                if (!self.sourceModuleHasFunction(imp.source_module, name, arity)) return false;
+                // Import all except listed — first check source struct exports it
+                if (!self.sourceStructHasFunction(imp.source_struct, name, arity)) return false;
                 // Then check it's not excluded
                 for (entries) |entry| {
                     if (entry.name == name) {
@@ -5190,9 +5190,9 @@ pub const HirBuilder = struct {
         }
     }
 
-    /// Check if a module (by name) exports a specific function.
-    fn sourceModuleHasFunction(self: *const HirBuilder, mod_name: ast.StructName, name: ast.StringId, arity: u32) bool {
-        // Find the module in the scope graph
+    /// Check if a struct (by name) exports a specific function.
+    fn sourceStructHasFunction(self: *const HirBuilder, mod_name: ast.StructName, name: ast.StringId, arity: u32) bool {
+        // Find the struct in the scope graph
         for (self.graph.structs.items) |mod_entry| {
             if (self.structNamesEqual(mod_entry.name, mod_name)) {
                 const mod_scope = self.graph.getScope(mod_entry.scope_id);
@@ -5244,24 +5244,24 @@ pub const HirBuilder = struct {
 
     /// Generic protocol-call dispatch: when a user writes `Protocol.method(arg, ...)`
     /// and `Protocol` is a registered protocol with an `impl Protocol for T`
-    /// matching the first argument's type, returns the target type's module
+    /// matching the first argument's type, returns the target type's struct
     /// name so the call lowers to `T.method(arg, ...)`.
     ///
     /// Returns null when:
     ///   - `mod_name` is not a registered protocol
-    ///   - the first arg's type is UNKNOWN or has no canonical module name
+    ///   - the first arg's type is UNKNOWN or has no canonical struct name
     ///   - no impl exists for the resolved target type
-    /// Callers fall through to the original module name when null is returned.
-    fn protocolDispatchModule(
+    /// Callers fall through to the original struct name when null is returned.
+    fn protocolDispatchStruct(
         self: *const HirBuilder,
         mod_name: []const u8,
         first_arg_type: types_mod.TypeId,
     ) ?[]const u8 {
         if (!self.isProtocolName(mod_name)) return null;
         if (first_arg_type == types_mod.TypeStore.UNKNOWN) return null;
-        const target_module = self.type_store.typeToModuleName(first_arg_type, self.interner) orelse return null;
-        if (!self.hasImpl(mod_name, target_module)) return null;
-        return target_module;
+        const target_struct = self.type_store.typeToStructName(first_arg_type, self.interner) orelse return null;
+        if (!self.hasImpl(mod_name, target_struct)) return null;
+        return target_struct;
     }
 
     /// Walk a block and stamp `expected_type` on any UNKNOWN-typed
@@ -5271,7 +5271,7 @@ pub const HirBuilder = struct {
     /// for-comprehension's `{:done, _, _} -> []` arm being the canonical
     /// example. Mutates the block's HIR in place via @constCast; the
     /// HIR allocator owns these expressions and they're not shared
-    /// across modules.
+    /// across structs.
     /// Compute the element TypeId for a list literal whose entries are
     /// already lowered to HIR. Performs structural unification so that
     /// disagreeing scalar elements promote to `TERM`, and disagreeing
@@ -5633,7 +5633,7 @@ fn encodeContainerElemName(store: *const types_mod.TypeStore, type_id: types_mod
 }
 
 // Standard library resolution removed — IO, Kernel, etc. are now
-// real Zap modules defined in lib/ and compiled with the program.
+// real Zap structs defined in lib/ and compiled with the program.
 
 // ============================================================
 // Tests
@@ -5670,11 +5670,11 @@ test "HIR build simple function" {
     defer builder.deinit();
     const hir_program = try builder.buildProgram(&program);
 
-    try std.testing.expectEqual(@as(usize, 1), hir_program.modules.len);
-    try std.testing.expectEqual(@as(u32, 2), hir_program.modules[0].functions[0].arity);
+    try std.testing.expectEqual(@as(usize, 1), hir_program.structs.len);
+    try std.testing.expectEqual(@as(u32, 2), hir_program.structs[0].functions[0].arity);
 }
 
-test "HIR build module" {
+test "HIR build struct" {
     const source =
         \\pub struct Math {
         \\  pub fn add(x :: i64, y :: i64) -> i64 {
@@ -5702,8 +5702,8 @@ test "HIR build module" {
     defer builder.deinit();
     const hir_program = try builder.buildProgram(&program);
 
-    try std.testing.expectEqual(@as(usize, 1), hir_program.modules.len);
-    try std.testing.expectEqual(@as(usize, 1), hir_program.modules[0].functions.len);
+    try std.testing.expectEqual(@as(usize, 1), hir_program.structs.len);
+    try std.testing.expectEqual(@as(usize, 1), hir_program.structs[0].functions.len);
 }
 
 test "HIR pattern compilation" {
@@ -5738,7 +5738,7 @@ test "HIR pattern compilation" {
     const hir_program = try builder.buildProgram(&program);
 
     // Should have built the function with case expression
-    try std.testing.expectEqual(@as(usize, 1), hir_program.modules[0].functions.len);
+    try std.testing.expectEqual(@as(usize, 1), hir_program.structs[0].functions.len);
     try std.testing.expectEqual(@as(usize, 0), builder.errors.items.len);
 }
 
@@ -5770,7 +5770,7 @@ test "HIR typed params default to shared ownership" {
     defer builder.deinit();
     const hir_program = try builder.buildProgram(&program);
 
-    const params = hir_program.modules[0].functions[0].clauses[0].params;
+    const params = hir_program.structs[0].functions[0].clauses[0].params;
     try std.testing.expectEqual(@as(usize, 2), params.len);
     try std.testing.expectEqual(Ownership.shared, params[0].ownership);
     try std.testing.expectEqual(Ownership.shared, params[1].ownership);
@@ -5808,7 +5808,7 @@ test "HIR opaque typed params default to unique ownership" {
     defer builder.deinit();
     const hir_program = try builder.buildProgram(&program);
 
-    const params = hir_program.modules[0].functions[0].clauses[0].params;
+    const params = hir_program.structs[0].functions[0].clauses[0].params;
     try std.testing.expectEqual(@as(usize, 1), params.len);
     try std.testing.expectEqual(Ownership.unique, params[0].ownership);
 }
@@ -5844,7 +5844,7 @@ test "HIR respects borrowed param annotation" {
     defer builder.deinit();
     const hir_program = try builder.buildProgram(&program);
 
-    const params = hir_program.modules[0].functions[0].clauses[0].params;
+    const params = hir_program.structs[0].functions[0].clauses[0].params;
     try std.testing.expectEqual(Ownership.borrowed, params[0].ownership);
 }
 
@@ -5880,7 +5880,7 @@ test "HIR call args default to share mode" {
     defer builder.deinit();
     const hir_program = try builder.buildProgram(&program);
 
-    const bar_clause = hir_program.modules[0].functions[1].clauses[0];
+    const bar_clause = hir_program.structs[0].functions[1].clauses[0];
     const call_expr = bar_clause.body.stmts[0].expr;
     try std.testing.expect(call_expr.kind == .call);
     try std.testing.expectEqual(@as(usize, 1), call_expr.kind.call.args.len);
@@ -5936,7 +5936,7 @@ test "HIR call args adopt function ownership modes" {
     defer builder.deinit();
     const hir_program = try builder.buildProgram(&program);
 
-    const call_expr = hir_program.modules[0].functions[0].clauses[0].body.stmts[0].expr;
+    const call_expr = hir_program.structs[0].functions[0].clauses[0].body.stmts[0].expr;
     try std.testing.expect(call_expr.kind == .call);
     try std.testing.expectEqual(@as(usize, 1), call_expr.kind.call.args.len);
     try std.testing.expectEqual(ValueMode.move, call_expr.kind.call.args[0].mode);
@@ -5978,7 +5978,7 @@ test "HIR named calls use resolved parameter ownership" {
     defer builder.deinit();
     const hir_program = try builder.buildProgram(&program);
 
-    const run_clause = hir_program.modules[0].functions[1].clauses[0];
+    const run_clause = hir_program.structs[0].functions[1].clauses[0];
     const call_expr = run_clause.body.stmts[0].expr;
     try std.testing.expect(call_expr.kind == .call);
     try std.testing.expectEqual(@as(usize, 1), call_expr.kind.call.args.len);
@@ -6029,7 +6029,7 @@ test "HIR closure calls adopt borrowed ownership mode" {
     defer builder.deinit();
     const hir_program = try builder.buildProgram(&program);
 
-    const call_expr = hir_program.modules[0].functions[0].clauses[0].body.stmts[0].expr;
+    const call_expr = hir_program.structs[0].functions[0].clauses[0].body.stmts[0].expr;
     try std.testing.expect(call_expr.kind == .call);
     try std.testing.expectEqual(ValueMode.borrow, call_expr.kind.call.args[0].mode);
 }
@@ -6068,7 +6068,7 @@ test "HIR function_ref keeps concrete function type" {
     defer builder.deinit();
     const hir_program = try builder.buildProgram(&program);
 
-    const expr = hir_program.modules[0].functions[1].clauses[0].body.stmts[0].expr;
+    const expr = hir_program.structs[0].functions[1].clauses[0].body.stmts[0].expr;
     try std.testing.expect(expr.kind == .closure_create);
     try std.testing.expect(expr.type_id != types_mod.TypeStore.UNKNOWN);
 

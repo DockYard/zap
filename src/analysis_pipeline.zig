@@ -13,7 +13,7 @@ const ast = @import("ast.zig");
 // ============================================================
 // Analysis Pipeline Orchestrator
 //
-// Sequences all analysis modules and produces a `lattice.AnalysisContext`
+// Sequences all analysis structs and produces a `lattice.AnalysisContext`
 // with the full analysis results consumed by the ZIR backend, type
 // checker, and downstream passes.
 // ============================================================

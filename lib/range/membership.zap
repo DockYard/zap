@@ -1,3 +1,5 @@
+@doc = "Membership implementation for `Range`."
+
 pub impl Membership for Range {
   @doc = """
     Step-aware containment. Returns true when `value` lies

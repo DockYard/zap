@@ -73,7 +73,7 @@ pub const ManifestEval = struct {
 
 /// Extract a BuildConfig by compiling build.zap and evaluating manifest/1
 /// through the CTFE interpreter. This is the production path — it compiles
-/// the builder module to IR and runs the manifest function at compile time.
+/// the builder struct to IR and runs the manifest function at compile time.
 pub fn ctfeManifest(
     alloc: std.mem.Allocator,
     build_source: []const u8,

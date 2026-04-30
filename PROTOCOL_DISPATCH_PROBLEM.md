@@ -15,7 +15,7 @@ Zap source (.zap files)
   → Macro expand (Kernel macros: if, unless, and, or, |>)
   → Desugar (pipes, for comprehensions, string interpolation)
   → Re-collect
-  → HIR (High-level IR per module, type checking)
+  → HIR (High-level IR per struct, type checking)
   → Monomorphization (whole-program generic specialization)
   → IR (flat instruction-based representation)
   → ZIR emission (C-ABI calls to Zig fork)
@@ -31,20 +31,20 @@ Zap depends on a fork of Zig 0.16.0 at `~/projects/zig`. The fork adds two files
 
 The fork is compiled into `libzap_compiler.a` which Zap links against. Zap calls C-ABI functions like `zir_builder_begin_func`, `zir_builder_emit_call`, `zir_builder_emit_import`, `zir_builder_inject_struct`, etc.
 
-### Each Zap Struct = One Zig ZIR Module
+### Each Zap Struct = One Zig ZIR Struct
 
-This is the critical architectural fact. Each Zap struct (e.g., `Math`, `IO`, `Range`, `Test.BoolTest`) becomes its own Zig ZIR "module" — a separate compilation unit with its own namespace. The ZIR builder emits functions into each module separately via:
+This is the critical architectural fact. Each Zap struct (e.g., `Math`, `IO`, `Range`, `Test.BoolTest`) becomes its own Zig ZIR "struct" — a separate compilation unit with its own namespace. The ZIR builder emits functions into each struct separately via:
 
-1. `zir_compilation_add_struct_source(ctx, "ModuleName", stub_source)` — registers a module
+1. `zir_compilation_add_struct_source(ctx, "StructName", stub_source)` — registers a struct
 2. `zir_builder_create()` — creates a new ZIR builder handle
 3. Emit functions into it via `zir_builder_begin_func`, `zir_builder_emit_*`, etc.
-4. `zir_builder_inject_struct(builder, ctx, "ModuleName")` — injects the built ZIR into that module
+4. `zir_builder_inject_struct(builder, ctx, "StructName")` — injects the built ZIR into that struct
 
-Cross-module references use `@import("OtherModule")` in ZIR. When module `Test.BoolTest` calls `Math.square(5)`, the ZIR emits `@import("Math").square(5)`.
+Cross-struct references use `@import("OtherStruct")` in ZIR. When struct `Test.BoolTest` calls `Math.square(5)`, the ZIR emits `@import("Math").square(5)`.
 
-### Cross-Module Struct Type Identity Problem
+### Cross-Struct Struct Type Identity Problem
 
-When a struct type (e.g., `Range` with fields `start`, `end`, `step`) is defined in its own ZIR module, and another module creates an instance of that struct, the types don't match across module boundaries. Each module creates its own local anonymous struct type via `struct_init_anon`, and Zig's type system considers these to be different types even if the fields are identical. This is the **fundamental unsolved problem** blocking protocol dispatch.
+When a struct type (e.g., `Range` with fields `start`, `end`, `step`) is defined in its own ZIR struct, and another struct creates an instance of that struct, the types don't match across struct boundaries. Each struct creates its own local anonymous struct type via `struct_init_anon`, and Zig's type system considers these to be different types even if the fields are identical. This is the **fundamental unsolved problem** blocking protocol dispatch.
 
 ## What Are Protocols in Zap?
 
@@ -125,7 +125,7 @@ fn __for_N(__state) -> [i64] {
 }
 ```
 
-This is a `:zig.Range.next()` bridge call — it calls the Zig runtime function directly. It does NOT go through any protocol dispatch. The module name "Range" is hardcoded in the desugarer.
+This is a `:zig.Range.next()` bridge call — it calls the Zig runtime function directly. It does NOT go through any protocol dispatch. The struct name "Range" is hardcoded in the desugarer.
 
 For lists, it doesn't even use `desugarForEnumerable` — it uses a completely separate recursive head/tail pattern (lines 927-1005) that doesn't call `next` at all.
 
@@ -139,45 +139,45 @@ For lists, it doesn't even use `desugarForEnumerable` — it uses a completely s
 
 ## What Was Attempted (and Why It Failed)
 
-### Attempt: Synthesized Dispatch Modules
+### Attempt: Synthesized Dispatch Structs
 
 The `if (false)` block in `compiler.zig` (lines 1103-1180) contains code that tried to:
 
 1. Collect all `impl Enumerable for X` declarations
-2. For each protocol, synthesize a dispatch module that merges all impl clauses into a single multi-clause function
+2. For each protocol, synthesize a dispatch struct that merges all impl clauses into a single multi-clause function
 3. The dispatch function would use pattern matching on the argument type to route to the correct implementation
 
 **Why it failed:**
 
-1. **68 duplicate modules.** Per-module HIR compilation creates duplicates of every protocol and impl. The synthesis code tried to create 68 dispatch modules instead of the expected few. Fixed with deduplication, but this was a symptom of a deeper problem.
+1. **68 duplicate structs.** Per-struct HIR compilation creates duplicates of every protocol and impl. The synthesis code tried to create 68 dispatch structs instead of the expected few. Fixed with deduplication, but this was a symptom of a deeper problem.
 
-2. **Cross-scope clause merging produces invalid ZIR.** Each impl's `next` function is compiled in the scope of its own module. When you merge clauses from `List.Enumerable.next` and `Range.Enumerable.next` into a single synthesized `Enumerable.next` function, the clauses reference variables, types, and imports from their original modules. The merged function can't resolve these cross-module references in a single ZIR module.
+2. **Cross-scope clause merging produces invalid ZIR.** Each impl's `next` function is compiled in the scope of its own struct. When you merge clauses from `List.Enumerable.next` and `Range.Enumerable.next` into a single synthesized `Enumerable.next` function, the clauses reference variables, types, and imports from their original structs. The merged function can't resolve these cross-struct references in a single ZIR struct.
 
-3. **Cross-module struct type identity.** Even if you could merge the clauses, the struct types don't match. A `Range` struct created in the `Range` module has a different type identity than a `Range` parameter in the `Enumerable` dispatch module. Zig's type system treats anonymous structs from different modules as distinct types, so pattern matching on struct types fails.
+3. **Cross-struct struct type identity.** Even if you could merge the clauses, the struct types don't match. A `Range` struct created in the `Range` struct has a different type identity than a `Range` parameter in the `Enumerable` dispatch struct. Zig's type system treats anonymous structs from different structs as distinct types, so pattern matching on struct types fails.
 
-4. **`isGenericHirGroup` misclassified dispatch groups.** The synthesized dispatch function groups were classified as generic (because they had multiple clauses with different parameter types), causing them to be skipped during IR lowering. This produced 0 IR functions for the dispatch module.
+4. **`isGenericHirGroup` misclassified dispatch groups.** The synthesized dispatch function groups were classified as generic (because they had multiple clauses with different parameter types), causing them to be skipped during IR lowering. This produced 0 IR functions for the dispatch struct.
 
-### Why the Cross-Module Struct Type Problem Is Fundamental
+### Why the Cross-Struct Struct Type Problem Is Fundamental
 
 When Zap emits a struct initialization in ZIR:
 
 ```zig
-// In module "Range":
+// In struct "Range":
 const range = Range{ .start = 1, .end = 10, .step = 1 };
 ```
 
-This uses `struct_init_typed` with a `decl_val("Range")` type ref — the Range type declared in the current module.
+This uses `struct_init_typed` with a `decl_val("Range")` type ref — the Range type declared in the current struct.
 
-But when another module creates a Range:
+But when another struct creates a Range:
 
 ```zig
-// In module "Test.RangeTest":
+// In struct "Test.RangeTest":
 const range = Range{ .start = 1, .end = 10, .step = 1 };
 ```
 
-If `findStructDef("Range")` fails (because Range is defined in a different ZIR module), the code falls back to `struct_init_anon` — which creates an anonymous struct `struct { start: i64, end: i64, step: i64 }`. This is a DIFFERENT TYPE from `Range`. Zig's type checker considers them incompatible.
+If `findStructDef("Range")` fails (because Range is defined in a different ZIR struct), the code falls back to `struct_init_anon` — which creates an anonymous struct `struct { start: i64, end: i64, step: i64 }`. This is a DIFFERENT TYPE from `Range`. Zig's type checker considers them incompatible.
 
-An attempt was made to fix this by emitting `@import("Range").Range` to get the cross-module type, but this produced codegen crashes in Zig's aarch64 backend. That fix was reverted.
+An attempt was made to fix this by emitting `@import("Range").Range` to get the cross-struct type, but this produced codegen crashes in Zig's aarch64 backend. That fix was reverted.
 
 ## What a Correct Solution Requires
 
@@ -194,27 +194,27 @@ The desugarer currently does a crude version of this (hardcoding `:zig.Range.nex
 - Doesn't check the protocol system at all
 - Doesn't work for variables whose type is known from type inference but not from AST inspection
 
-### 3. Cross-Module Type Resolution for Dynamic Dispatch (Future)
-If Zap ever needs dynamic dispatch (runtime resolution of which impl to call), it needs a way to match struct types across ZIR module boundaries. This is the hardest problem and may require changes to the Zig fork.
+### 3. Cross-Struct Type Resolution for Dynamic Dispatch (Future)
+If Zap ever needs dynamic dispatch (runtime resolution of which impl to call), it needs a way to match struct types across ZIR struct boundaries. This is the hardest problem and may require changes to the Zig fork.
 
 ### 4. The `for` Desugarer Must Go Through the Protocol
-Instead of hardcoding runtime module names, the desugarer (or a later pass) should:
+Instead of hardcoding runtime struct names, the desugarer (or a later pass) should:
 1. Determine the iterable's type
 2. Look up which `impl Enumerable for <Type>` exists
 3. Generate a call to that impl's `next` function
 4. If no impl exists, emit a compile error
 
-This means protocol resolution must happen BEFORE or DURING IR lowering, not as a separate synthesis phase that creates new modules.
+This means protocol resolution must happen BEFORE or DURING IR lowering, not as a separate synthesis phase that creates new structs.
 
 ## Key Files
 
 | File | Role |
 |------|------|
 | `src/compiler.zig` | Pipeline orchestration. Contains disabled dispatch synthesis at line 1103. |
-| `src/desugar.zig` | Desugars `for` comprehensions. `desugarForEnumerable` hardcodes runtime module names. |
+| `src/desugar.zig` | Desugars `for` comprehensions. `desugarForEnumerable` hardcodes runtime struct names. |
 | `src/hir.zig` | HIR builder. Compiles protocol/impl declarations. Contains `ProtocolInfo` and `ImplInfo` types. |
 | `src/ir.zig` | IR builder. Lowers HIR to flat instructions. |
-| `src/zir_builder.zig` | ZIR emission. Each module gets its own ZIR. `buildProgram` groups functions by module. Cross-module calls use `@import`. |
+| `src/zir_builder.zig` | ZIR emission. Each struct gets its own ZIR. `buildProgram` groups functions by struct. Cross-struct calls use `@import`. |
 | `src/types.zig` | Type store. Type checking and resolution. |
 | `src/monomorphize.zig` | Whole-program generic specialization. Passes through protocol/impl info. |
 | `lib/enumerable.zap` | Protocol definition: `fn next(state) -> {Atom, i64, any}` |
@@ -228,7 +228,7 @@ This means protocol resolution must happen BEFORE or DURING IR lowering, not as 
 ## Constraints
 
 1. **No hacks or workarounds.** Every solution must be the correct production-grade fix.
-2. **Features belong in Zap code, not hardcoded in the compiler.** The compiler must not know about specific modules like Range, List, Map. It must use the protocol system to resolve dispatch generically.
+2. **Features belong in Zap code, not hardcoded in the compiler.** The compiler must not know about specific structs like Range, List, Map. It must use the protocol system to resolve dispatch generically.
 3. **Zap compiles to ZIR.** The only code generation path is through C-ABI calls to the Zig fork. No Zig source text generation.
-4. **Each Zap struct is a separate ZIR module.** This is fundamental to the architecture and cannot be changed without redesigning the entire emission pipeline.
+4. **Each Zap struct is a separate ZIR struct.** This is fundamental to the architecture and cannot be changed without redesigning the entire emission pipeline.
 5. **The Zig fork can be modified.** If the solution requires new C-ABI exports or changes to how the fork handles struct types, those changes are acceptable.

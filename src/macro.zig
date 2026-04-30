@@ -56,8 +56,8 @@ pub const MacroEngine = struct {
     allocator: std.mem.Allocator,
     interner: *ast.StringInterner,
     graph: *scope.ScopeGraph,
-    /// The module scope currently being expanded, for registering generated declarations.
-    current_module_scope: ?scope.ScopeId = null,
+    /// The struct scope currently being expanded, for registering generated declarations.
+    current_struct_scope: ?scope.ScopeId = null,
     max_expansions: u32,
     errors: std.ArrayList(Error),
     /// Optional CTFE-backed executor for macro families whose provider
@@ -66,11 +66,11 @@ pub const MacroEngine = struct {
     /// fall back to the tree-walking evaluator on failure.
     compiled_executor: ?*CompiledMacroExecutor = null,
     /// Tracks which `@before_compile` callbacks have already fired
-    /// for each module scope. The callback runs at most once per
-    /// module per `expandProgram` invocation; subsequent expansion
+    /// for each struct scope. The callback runs at most once per
+    /// struct per `expandProgram` invocation; subsequent expansion
     /// iterations re-check but skip already-fired hooks. Keyed by
-    /// the (module_scope, hook_module_name_id) pair so the same
-    /// module can register multiple distinct hooks.
+    /// the (struct_scope, hook_struct_name_id) pair so the same
+    /// struct can register multiple distinct hooks.
     before_compile_fired: std.AutoHashMap(BeforeCompileKey, void),
 
     pub const Error = struct {
@@ -79,7 +79,7 @@ pub const MacroEngine = struct {
     };
 
     pub const BeforeCompileKey = struct {
-        module_scope: scope.ScopeId,
+        struct_scope: scope.ScopeId,
         hook_name: ast.StringId,
     };
 
@@ -156,7 +156,7 @@ pub const MacroEngine = struct {
             for (current_structs) |mod| {
                 const expanded = try self.expandStruct(&mod);
                 if (expanded.changed) changed = true;
-                try new_structs.append(self.allocator, expanded.module);
+                try new_structs.append(self.allocator, expanded.decl);
             }
 
             // Expand top-level items
@@ -170,7 +170,7 @@ pub const MacroEngine = struct {
             const owned_structs = try new_structs.toOwnedSlice(self.allocator);
             current_top_items = try new_top_items.toOwnedSlice(self.allocator);
 
-            // Fire `@before_compile` hooks once per (module, hook)
+            // Fire `@before_compile` hooks once per (struct, hook)
             // pair. Hooks may inject new declarations that themselves
             // contain macro calls, so any change keeps the outer
             // fixed-point loop alive for another iteration.
@@ -195,23 +195,23 @@ pub const MacroEngine = struct {
     }
 
     // ============================================================
-    // Module expansion
+    // Struct expansion
     // ============================================================
 
-    const ExpandedModule = struct {
-        module: ast.StructDecl,
+    const ExpandedStruct = struct {
+        decl: ast.StructDecl,
         changed: bool,
     };
 
-    fn expandStruct(self: *MacroEngine, mod: *const ast.StructDecl) !ExpandedModule {
+    fn expandStruct(self: *MacroEngine, mod: *const ast.StructDecl) !ExpandedStruct {
         var changed = false;
         var new_items: std.ArrayList(ast.StructItem) = .empty;
 
-        // Find the module's scope by name (not pointer) so it works across
+        // Find the struct's scope by name (not pointer) so it works across
         // expansion iterations where the StructDecl is a copy.
         const mod_scope: ?scope.ScopeId = self.graph.findStructScope(mod.name);
-        self.current_module_scope = mod_scope;
-        defer self.current_module_scope = null;
+        self.current_struct_scope = mod_scope;
+        defer self.current_struct_scope = null;
 
         for (mod.items) |item| {
             switch (item) {
@@ -277,16 +277,16 @@ pub const MacroEngine = struct {
                     }
                 },
                 .use_decl => |ud| {
-                    // Step 1: Always emit `import Module` for function access
+                    // Step 1: Always emit `import Struct` for function access
                     const import_decl = try self.create(ast.ImportDecl, .{
                         .meta = ud.meta,
-                        .module_path = ud.module_path,
+                        .struct_path = ud.struct_path,
                         .filter = null,
                     });
                     try new_items.append(self.allocator, .{ .import_decl = import_decl });
                     changed = true;
 
-                    // Step 2: Look up Module.__using__/1 and inject returned items
+                    // Step 2: Look up Struct.__using__/1 and inject returned items
                     if (self.tryExpandUsing(ud)) |using_items| {
                         for (using_items) |using_item| {
                             try new_items.append(self.allocator, using_item);
@@ -307,11 +307,11 @@ pub const MacroEngine = struct {
             }
         }
 
-        // Also try expanding the module declaration itself through Kernel.module
-        // (only if a Kernel macro for "module" exists)
+        // Also try expanding the struct declaration itself through Kernel.struct
+        // (only if a Kernel macro for "struct" exists)
 
         return .{
-            .module = .{
+            .decl = .{
                 .meta = mod.meta,
                 .name = mod.name,
                 .parent = mod.parent,
@@ -372,7 +372,7 @@ pub const MacroEngine = struct {
     /// like `if`, `and`, `or`, `unless`, `cond`, and `<>` survive
     /// inside impl bodies as raw `if_expr`/operator AST nodes,
     /// which the HIR builder rejects with `unreachable`.
-    /// Reuses the per-function expander so impls and module
+    /// Reuses the per-function expander so impls and struct
     /// methods follow the same rules.
     fn expandImplDecl(self: *MacroEngine, impl: *const ast.ImplDecl) !ExpandedImpl {
         var changed = false;
@@ -400,12 +400,12 @@ pub const MacroEngine = struct {
     // ============================================================
     // @before_compile callback firing
     //
-    // After per-module macro expansion, every module is checked for
+    // After per-struct macro expansion, every struct is checked for
     // `@before_compile` attributes (single-value or accumulated) and
-    // each registered hook module's `__before_compile__/1` macro is
+    // each registered hook struct's `__before_compile__/1` macro is
     // invoked at most once per `expandProgram` call. The hook returns
     // a CtValue tree of declarations which is spliced into the
-    // module's items via the same path `expandStructLevelExpr` uses
+    // struct's items via the same path `expandStructLevelExpr` uses
     // for inline macro returns. New items can themselves contain
     // macro calls; the outer fixed-point loop catches those.
     // ============================================================
@@ -415,10 +415,10 @@ pub const MacroEngine = struct {
         changed: bool,
     };
 
-    /// Fire all not-yet-fired `@before_compile` hooks across modules
-    /// and append their results into the corresponding module's
+    /// Fire all not-yet-fired `@before_compile` hooks across structs
+    /// and append their results into the corresponding struct's
     /// items. Returns either the input slice unchanged (when no hook
-    /// fired) or a freshly allocated slice with the affected modules
+    /// fired) or a freshly allocated slice with the affected structs
     /// replaced. Either way the caller takes ownership.
     fn fireBeforeCompileHooks(
         self: *MacroEngine,
@@ -444,10 +444,10 @@ pub const MacroEngine = struct {
                 // CTFE attribute evaluation runs after macro
                 // expansion, so `computed_value` is typically null
                 // here. Fall back to the raw AST value, which for
-                // `@before_compile = :SomeModule` is an atom literal
+                // `@before_compile = :SomeStruct` is an atom literal
                 // we can resolve immediately. Hook targets are
                 // expected to be plain atoms (or lists of atoms via
-                // `Module.put_attribute`), not arbitrary
+                // `Struct.put_attribute`), not arbitrary
                 // expressions; falling back covers the source-
                 // declared case without forcing a CTFE detour.
                 if (attr.computed_value) |cv| {
@@ -464,7 +464,7 @@ pub const MacroEngine = struct {
             for (hook_atoms.items) |hook_name_str| {
                 const hook_name_id = try self.interner.intern(hook_name_str);
                 const fired_key: BeforeCompileKey = .{
-                    .module_scope = mod_scope,
+                    .struct_scope = mod_scope,
                     .hook_name = hook_name_id,
                 };
                 if (self.before_compile_fired.contains(fired_key)) continue;
@@ -555,8 +555,8 @@ pub const MacroEngine = struct {
             .list => |l| for (l.elements) |elem| {
                 try collectHookAtomsFromExpr(out, alloc, interner, elem);
             },
-            .module_ref => |m| {
-                // `@before_compile = SomeModule` — single-part name
+            .struct_ref => |m| {
+                // `@before_compile = SomeStruct` — single-part name
                 // becomes the hook target. Multi-part names (e.g.
                 // `Foo.Bar`) are unsupported here.
                 if (m.name.parts.len == 1) {
@@ -570,27 +570,27 @@ pub const MacroEngine = struct {
     /// Invoke `<hook_name>.__before_compile__/1` and convert its
     /// result CtValue into a slice of StructItems for splicing.
     /// The argument passed to the hook is a CtValue describing the
-    /// caller module (currently just an atom of the module's name).
+    /// caller struct (currently just an atom of the struct's name).
     fn invokeBeforeCompileHook(
         self: *MacroEngine,
-        caller_module_scope: scope.ScopeId,
-        caller_module_name: ast.StructName,
-        hook_module_name: []const u8,
+        caller_struct_scope: scope.ScopeId,
+        caller_struct_name: ast.StructName,
+        hook_struct_name: []const u8,
     ) ![]ast.StructItem {
-        // Resolve hook module name → scope id → __before_compile__/1
+        // Resolve hook struct name → scope id → __before_compile__/1
         // macro family.
-        const hook_module_id = try self.interner.intern(hook_module_name);
-        const hook_struct_name: ast.StructName = .{
-            .parts = try self.allocator.dupe(ast.StringId, &.{hook_module_id}),
+        const hook_struct_id = try self.interner.intern(hook_struct_name);
+        const hook_struct_path: ast.StructName = .{
+            .parts = try self.allocator.dupe(ast.StringId, &.{hook_struct_id}),
             .span = .{ .start = 0, .end = 0 },
         };
-        const hook_scope = self.graph.findStructScope(hook_struct_name) orelse {
-            // Hook module not found — emit error and return empty.
+        const hook_scope = self.graph.findStructScope(hook_struct_path) orelse {
+            // Hook struct not found — emit error and return empty.
             try self.errors.append(self.allocator, .{
                 .message = try std.fmt.allocPrint(
                     self.allocator,
-                    "@before_compile target module not found: {s}",
-                    .{hook_module_name},
+                    "@before_compile target struct not found: {s}",
+                    .{hook_struct_name},
                 ),
                 .span = .{ .start = 0, .end = 0 },
             });
@@ -603,7 +603,7 @@ pub const MacroEngine = struct {
                 .message = try std.fmt.allocPrint(
                     self.allocator,
                     "@before_compile {s}: __before_compile__/1 not defined",
-                    .{hook_module_name},
+                    .{hook_struct_name},
                 ),
                 .span = .{ .start = 0, .end = 0 },
             });
@@ -614,7 +614,7 @@ pub const MacroEngine = struct {
         const clause_ref = family.clauses.items[0];
         const clause = &clause_ref.decl.clauses[clause_ref.clause_index];
 
-        // Build the env-arg CtValue: an atom of the caller's module
+        // Build the env-arg CtValue: an atom of the caller's struct
         // name. A richer __ENV__ struct can come later; the atom is
         // enough for hooks that just want to read the caller's
         // attributes.
@@ -623,20 +623,20 @@ pub const MacroEngine = struct {
         var env = macro_eval.Env.init(self.allocator, &store);
         defer env.deinit();
         env.compiled_program = self.compiledProgram();
-        env.module_ctx = .{
+        env.struct_ctx = .{
             .graph = self.graph,
             .interner = self.interner,
-            // Hooks read attributes from the *caller* module, not the
-            // hook module — that's the whole point of the pattern.
-            .current_module_scope = caller_module_scope,
+            // Hooks read attributes from the *caller* struct, not the
+            // hook struct — that's the whole point of the pattern.
+            .current_struct_scope = caller_struct_scope,
         };
 
         if (clause.params.len > 0 and clause.params[0].pattern.* == .bind) {
             const param_name = self.interner.get(clause.params[0].pattern.bind.name);
-            // Caller module name as a colon-prefixed atom (the AST
+            // Caller struct name as a colon-prefixed atom (the AST
             // encoding for atom literals). For multi-part names we
             // dot-join the parts so hooks see something readable.
-            const name_string = try caller_module_name.toDottedString(self.allocator, self.interner);
+            const name_string = try caller_struct_name.toDottedString(self.allocator, self.interner);
             const colon_prefixed = try std.fmt.allocPrint(self.allocator, ":{s}", .{name_string});
             const env_arg = try ast_data.makeTuple3(
                 self.allocator,
@@ -858,22 +858,30 @@ pub const MacroEngine = struct {
                     const callee_name = call.callee.var_ref.name;
                     if (self.findFunction(callee_name, arity) == null) {
                         if (self.findMacro(callee_name, arity)) |mid| {
+                            if (self.isDirectUnderscoreCallName(callee_name)) {
+                                try self.rejectDirectUnderscoreCall(callee_name, arity, call.meta.span);
+                                return .{ .expr = expr, .changed = false };
+                            }
                             const expanded = try self.expandMacroCall(expr, callee_name, mid);
                             return .{ .expr = expanded, .changed = true };
                         }
                     }
                 }
 
-                // Qualified macro call: `Module.name(args)` or
+                // Qualified macro call: `Struct.name(args)` or
                 // `Outer.Inner.name(args)`. The parser shapes these as
-                // `field_access { object: module_ref, field: name }`.
-                // Look up the macro directly in the named module's
+                // `field_access { object: struct_ref, field: name }`.
+                // Look up the macro directly in the named struct's
                 // scope — the calling scope does not participate.
                 if (call.callee.* == .field_access) {
                     const fa = call.callee.field_access;
-                    if (fa.object.* == .module_ref) {
-                        const mod_name = fa.object.module_ref.name;
-                        if (self.findMacroInModule(mod_name, fa.field, arity)) |mid| {
+                    if (fa.object.* == .struct_ref) {
+                        const mod_name = fa.object.struct_ref.name;
+                        if (self.findMacroInStruct(mod_name, fa.field, arity)) |mid| {
+                            if (self.isDirectUnderscoreCallName(fa.field)) {
+                                try self.rejectDirectUnderscoreCall(fa.field, arity, call.meta.span);
+                                return .{ .expr = expr, .changed = false };
+                            }
                             const expanded = try self.expandMacroCall(expr, fa.field, mid);
                             return .{ .expr = expanded, .changed = true };
                         }
@@ -1277,7 +1285,7 @@ pub const MacroEngine = struct {
             .bool_literal,
             .nil_literal,
             .var_ref,
-            .module_ref,
+            .struct_ref,
             .tuple,
             .list,
             .map,
@@ -1347,6 +1355,22 @@ pub const MacroEngine = struct {
     // ============================================================
     // Macro call expansion
     // ============================================================
+
+    fn isDirectUnderscoreCallName(self: *const MacroEngine, name: ast.StringId) bool {
+        const text = self.interner.get(name);
+        return text.len > 0 and text[0] == '_';
+    }
+
+    fn rejectDirectUnderscoreCall(self: *MacroEngine, name: ast.StringId, arity: u32, span: ast.SourceSpan) !void {
+        try self.errors.append(self.allocator, .{
+            .message = try std.fmt.allocPrint(
+                self.allocator,
+                "cannot call underscore-prefixed function `{s}/{d}`",
+                .{ self.interner.get(name), arity },
+            ),
+            .span = span,
+        });
+    }
 
     fn expandMacroCall(
         self: *MacroEngine,
@@ -1457,14 +1481,14 @@ pub const MacroEngine = struct {
             var env = macro_eval.Env.init(self.allocator, &store);
             defer env.deinit();
             env.compiled_program = self.compiledProgram();
-            // Wire module context so `__zap_module_*` intrinsics can
-            // reach the scope graph and the current module's
-            // StructEntry. Falls back to a noop if no module is
+            // Wire struct context so struct attribute intrinsics can
+            // reach the scope graph and the current struct's
+            // StructEntry. Falls back to a noop if no struct is
             // active (e.g., top-level macro calls).
-            env.module_ctx = .{
+            env.struct_ctx = .{
                 .graph = self.graph,
                 .interner = self.interner,
-                .current_module_scope = self.current_module_scope,
+                .current_struct_scope = self.current_struct_scope,
             };
             // Narrow the evaluator's capability set to whatever the
             // macro family declared via `@requires`. The body's calls
@@ -1935,7 +1959,7 @@ pub const MacroEngine = struct {
 
     fn isTypeShape(value: ctfe.CtValue) bool {
         // Type expressions show up in CtValue as `__aliases__` lists
-        // for module references, or as plain identifier atoms for
+        // for struct references, or as plain identifier atoms for
         // built-in types. Accept either shape.
         if (value == .atom) {
             const name = value.atom;
@@ -2022,9 +2046,9 @@ pub const MacroEngine = struct {
     }
 
     /// Resolve a function family by name and arity, walking the scope chain
-    /// from the current module just like `findMacro`.
+    /// from the current struct just like `findMacro`.
     fn findFunction(self: *MacroEngine, name: ast.StringId, arity: u32) ?scope.FunctionFamilyId {
-        const scope_id = self.current_module_scope orelse self.graph.prelude_scope;
+        const scope_id = self.current_struct_scope orelse self.graph.prelude_scope;
         return self.graph.resolveFamily(scope_id, name, arity);
     }
 
@@ -2156,7 +2180,7 @@ pub const MacroEngine = struct {
     }
 
     // ============================================================
-    // Module-level expression expansion
+    // Struct-level expression expansion
     // ============================================================
 
     const ExpandedStructItems = struct {
@@ -2168,8 +2192,8 @@ pub const MacroEngine = struct {
     /// that produces a function declaration (or other struct item), convert
     /// it to the appropriate StructItem variant. Otherwise keep it as a
     /// struct_level_expr for collection into a generated run/0 function.
-    /// Patch a generated module item's source span so the scope collector
-    /// and HIR builder can associate it with the correct module scope.
+    /// Patch a generated struct item's source span so the scope collector
+    /// and HIR builder can associate it with the correct struct scope.
     fn patchStructItemSpan(mi: ast.StructItem, span: ast.SourceSpan) ast.StructItem {
         switch (mi) {
             .function, .priv_function => |func| {
@@ -2190,7 +2214,7 @@ pub const MacroEngine = struct {
     /// `describe` emitting a `test()` call which itself returns a
     /// `__block__` of [fn_decl, tracking_call]) produces nested
     /// blocks; without flattening, the inner blocks survive as
-    /// opaque expressions at module scope and the per-element
+    /// opaque expressions at struct scope and the per-element
     /// struct-item conversion never sees the underlying decls.
     fn flattenNestedBlocks(
         self: *MacroEngine,
@@ -2255,21 +2279,21 @@ pub const MacroEngine = struct {
                         return .{ .items = items, .changed = expanded.changed };
                     };
 
-                    // Try converting the result to module items.
+                    // Try converting the result to struct items.
                     // Patch source spans so generated declarations inherit the call site's
                     // position — this ensures the scope collector associates them with the
-                    // correct module scope (not the default prelude scope).
+                    // correct struct scope (not the default prelude scope).
                     const interner_mut: *ast.StringInterner = @constCast(self.interner);
                     const call_span = expr.call.meta.span;
 
-                    // Single module item (e.g., function declaration)
+                    // Single struct item (e.g., function declaration)
                     if (ast_data.ctValueToStructItem(self.allocator, interner_mut, result_ct) catch null) |mi| {
                         const items = try self.allocator.alloc(ast.StructItem, 1);
                         items[0] = patchStructItemSpan(mi, call_span);
                         return .{ .items = items, .changed = true };
                     }
 
-                    // Block of module items (e.g., describe expanding to multiple functions).
+                    // Block of struct items (e.g., describe expanding to multiple functions).
                     // Recursively flatten nested __block__ tuples first so a macro that
                     // composes other macros (each of which returns its own __block__)
                     // produces a flat list of struct items instead of opaque inner blocks
@@ -2284,21 +2308,21 @@ pub const MacroEngine = struct {
                                         try self.flattenNestedBlocks(elem, &flattened);
                                     }
 
-                                    // Check if ALL elements are module items. If any element
-                                    // is not a module item (e.g., an assignment like ctx = 42),
+                                    // Check if ALL elements are struct items. If any element
+                                    // is not a struct item (e.g., an assignment like ctx = 42),
                                     // keep the entire block as a single struct_level_expr to
                                     // preserve variable bindings and control flow.
-                                    var all_module_items = true;
+                                    var all_struct_items = true;
                                     for (flattened.items) |elem| {
                                         if (ast_data.ctValueToStructItem(self.allocator, interner_mut, elem) catch null) |_| {
-                                            // is a module item
+                                            // is a struct item
                                         } else {
-                                            all_module_items = false;
+                                            all_struct_items = false;
                                             break;
                                         }
                                     }
 
-                                    if (all_module_items) {
+                                    if (all_struct_items) {
                                         var items: std.ArrayList(ast.StructItem) = .empty;
                                         for (flattened.items) |elem| {
                                             if (ast_data.ctValueToStructItem(self.allocator, interner_mut, elem) catch null) |mi| {
@@ -2330,7 +2354,7 @@ pub const MacroEngine = struct {
                         }
                     }
 
-                    // List of module items (may be mixed with expressions)
+                    // List of struct items (may be mixed with expressions)
                     if (result_ct == .list) {
                         var items: std.ArrayList(ast.StructItem) = .empty;
                         for (result_ct.list.elems) |list_elem| {
@@ -2431,14 +2455,14 @@ pub const MacroEngine = struct {
         var env = macro_eval.Env.init(self.allocator, &store);
         defer env.deinit();
         env.compiled_program = self.compiledProgram();
-        // Wire module context so `__zap_module_*` and other comptime
+        // Wire struct context so struct attribute and other comptime
         // intrinsics that consult the scope graph reach the right
-        // module — same wiring as the expression-level expandMacroCall
+        // struct — same wiring as the expression-level expandMacroCall
         // eval path.
-        env.module_ctx = .{
+        env.struct_ctx = .{
             .graph = self.graph,
             .interner = self.interner,
-            .current_module_scope = self.current_module_scope,
+            .current_struct_scope = self.current_struct_scope,
         };
 
         for (clause.params, 0..) |param, i| {
@@ -2491,7 +2515,7 @@ pub const MacroEngine = struct {
     /// Returns the expanded StructItem if a Kernel macro exists, null otherwise.
     /// When null, the caller should use the bootstrap fallback.
     fn tryExpandDeclarationMacro(self: *MacroEngine, form_name: []const u8, item: ast.StructItem) ?ast.StructItem {
-        // Look up a Kernel macro with the declaration form name (fn, module, struct, macro)
+        // Look up a Kernel macro with the declaration form name (fn, struct, struct, macro)
         const name_id = self.interner.intern(form_name) catch return null;
         const macro_id = self.findMacro(name_id, 1) orelse return null;
 
@@ -2572,8 +2596,8 @@ pub const MacroEngine = struct {
         return null;
     }
 
-    /// Try to expand `use Module` by calling Module.__using__/1.
-    /// Returns injected module items if __using__ exists, null otherwise.
+    /// Try to expand `use Struct` by calling Struct.__using__/1.
+    /// Returns injected struct items if __using__ exists, null otherwise.
     fn tryExpandUsing(self: *MacroEngine, ud: *const ast.UseDecl) ?[]const ast.StructItem {
         // Build the __using__ name
         const using_name = self.interner.intern("__using__") catch return null;
@@ -2614,7 +2638,7 @@ pub const MacroEngine = struct {
                     body_vals.append(self.allocator, self.substituteCtValue(stmt_ct, &param_map, &store) catch return null) catch return null;
                 }
 
-                // Convert each result value to a module item
+                // Convert each result value to a struct item
                 var items: std.ArrayList(ast.StructItem) = .empty;
                 const interner_mut: *ast.StringInterner = @constCast(self.interner);
                 for (body_vals.items) |val| {
@@ -2631,10 +2655,10 @@ pub const MacroEngine = struct {
         var env = macro_eval.Env.init(self.allocator, &store);
         defer env.deinit();
         env.compiled_program = self.compiledProgram();
-        env.module_ctx = .{
+        env.struct_ctx = .{
             .graph = self.graph,
             .interner = self.interner,
-            .current_module_scope = family.scope_id,
+            .current_struct_scope = family.scope_id,
         };
         env.current_macro_caps = family.required_caps;
         env.current_macro_name = self.interner.get(family.name);
@@ -2667,33 +2691,33 @@ pub const MacroEngine = struct {
         return null;
     }
 
-    /// Find a macro by walking the scope chain from the current module scope.
-    /// Checks local macros first (module-local shadows Kernel), then imports
+    /// Find a macro by walking the scope chain from the current struct scope.
+    /// Checks local macros first (struct-local shadows Kernel), then imports
     /// (finds Kernel macros via auto-import), then parent scopes.
-    /// Find a macro by walking the scope chain from the current module scope.
-    /// Checks local macros first (module-local shadows Kernel), then imports
+    /// Find a macro by walking the scope chain from the current struct scope.
+    /// Checks local macros first (struct-local shadows Kernel), then imports
     /// (finds Kernel macros via auto-import), then parent scopes.
-    /// Find a macro by walking the scope chain from the current module scope.
-    /// Checks local macros first (module-local shadows Kernel), then imports
+    /// Find a macro by walking the scope chain from the current struct scope.
+    /// Checks local macros first (struct-local shadows Kernel), then imports
     /// (finds Kernel macros via auto-import), then parent scopes.
     fn findMacro(self: *MacroEngine, name: ast.StringId, arity: u32) ?scope.MacroFamilyId {
-        const scope_id = self.current_module_scope orelse self.graph.prelude_scope;
+        const scope_id = self.current_struct_scope orelse self.graph.prelude_scope;
         return self.graph.resolveMacro(scope_id, name, arity);
     }
 
-    /// Resolve a macro by qualified name (`Module.macro` or
-    /// `Outer.Inner.macro`). Looks directly in the named module's
+    /// Resolve a macro by qualified name (`Struct.macro` or
+    /// `Outer.Inner.macro`). Looks directly in the named struct's
     /// scope — the calling scope's parent chain is not walked, so a
     /// shadowing macro in the caller never wins over the qualified
-    /// target. Returns null if the module is unknown or the macro is
+    /// target. Returns null if the struct is unknown or the macro is
     /// not defined there at the requested arity.
-    fn findMacroInModule(
+    fn findMacroInStruct(
         self: *MacroEngine,
-        module_name: ast.StructName,
+        struct_name: ast.StructName,
         name: ast.StringId,
         arity: u32,
     ) ?scope.MacroFamilyId {
-        const mod_scope_id = self.graph.findStructScope(module_name) orelse return null;
+        const mod_scope_id = self.graph.findStructScope(struct_name) orelse return null;
         const mod_scope = self.graph.getScope(mod_scope_id);
         const key = scope.FamilyKey{ .name = name, .arity = arity };
         return mod_scope.macros.get(key);
@@ -3011,7 +3035,7 @@ fn stampExpansionOnExpr(expr: *const ast.Expr, info: *const ast.ExpansionInfo) v
         .bool_literal => |*v| stampMetaIfUnset(&v.meta, info),
         .nil_literal => |*v| stampMetaIfUnset(&v.meta, info),
         .var_ref => |*v| stampMetaIfUnset(&v.meta, info),
-        .module_ref => |*v| stampMetaIfUnset(&v.meta, info),
+        .struct_ref => |*v| stampMetaIfUnset(&v.meta, info),
         .tuple => |*v| {
             stampMetaIfUnset(&v.meta, info);
             for (v.elements) |elem| stampExpansionOnExpr(elem, info);
@@ -3379,13 +3403,13 @@ test "macro engine expands simple macro" {
     defer engine.deinit();
     const expanded = try engine.expandProgram(&program);
 
-    // Module should still exist
+    // Struct should still exist
     try std.testing.expectEqual(@as(usize, 1), expanded.structs.len);
     // No errors
     try std.testing.expectEqual(@as(usize, 0), engine.errors.items.len);
 }
 
-test "macro engine expands qualified Module.macro calls" {
+test "macro engine expands qualified Struct.macro calls" {
     // Regression: `Function.identity(42)` and similar qualified macro
     // invocations are first-class — the dispatcher previously only
     // recognised macro calls when the callee was a bare var_ref, so
@@ -3491,7 +3515,7 @@ test "macro engine invokes registered compiled macro through CTFE" {
         .{
             .id = 0,
             .name = "Provider__answer__0",
-            .module_name = "Provider",
+            .struct_name = "Provider",
             .local_name = "answer__0",
             .scope_id = provider_scope,
             .arity = 0,
@@ -3758,7 +3782,7 @@ test "macro substitution into case_expr and block" {
 
     // No errors — case_expr substitution should work
     try std.testing.expectEqual(@as(usize, 0), engine.errors.items.len);
-    // Module should still exist with expanded content
+    // Struct should still exist with expanded content
     try std.testing.expectEqual(@as(usize, 1), expanded.structs.len);
 }
 
@@ -3844,14 +3868,14 @@ test "typed splice: AtomLit param rejects integer literal" {
     try std.testing.expect(has_kind_error);
 }
 
-test "module attribute intrinsics: put writes to current StructEntry" {
-    // A macro that stores its argument into the module's
+test "struct attribute intrinsics: put writes to current StructEntry" {
+    // A macro that stores its argument into the struct's
     // `:registered_tests` attribute through the put intrinsic. The
     // side effect happens at expansion time; the macro returns nil.
     const source =
         \\pub struct Test {
         \\  pub macro track(_name :: Expr) -> Nil {
-        \\    __zap_module_put_attr__(:registered_tests, _name)
+        \\    struct_put_attribute(:registered_tests, _name)
         \\    quote { nil }
         \\  }
         \\
@@ -3877,7 +3901,7 @@ test "module attribute intrinsics: put writes to current StructEntry" {
     defer engine.deinit();
     _ = try engine.expandProgram(&program);
 
-    // The module should now have a `:registered_tests` attribute
+    // The struct should now have a `:registered_tests` attribute
     // whose value is the atom `:hello` (single-value semantics —
     // accumulate not registered).
     const test_struct = blk: {
@@ -3887,7 +3911,7 @@ test "module attribute intrinsics: put writes to current StructEntry" {
                 if (std.mem.eql(u8, part_name, "Test")) break :blk entry;
             }
         }
-        return error.TestModuleNotFound;
+        return error.TestStructNotFound;
     };
 
     var found_value: ?ctfe.ConstValue = null;
@@ -3903,12 +3927,12 @@ test "module attribute intrinsics: put writes to current StructEntry" {
     try std.testing.expectEqualStrings("hello", found_value.?.atom);
 }
 
-test "@before_compile: hook fires and splices result into target module" {
-    // The pattern: a target module declares `@before_compile Hooks`
+test "@before_compile: hook fires and splices result into target struct" {
+    // The pattern: a target struct declares `@before_compile Hooks`
     // at the END of its body (so the collector flushes the
-    // attribute onto the module entry rather than the next function),
+    // attribute onto the struct entry rather than the next function),
     // and `Hooks.__before_compile__/1` returns a function declaration
-    // that is appended to the target module's items.
+    // that is appended to the target struct's items.
     const source =
         \\pub struct Hooks {
         \\  pub macro __before_compile__(_env :: Expr) -> Decl {
@@ -3945,7 +3969,7 @@ test "@before_compile: hook fires and splices result into target module" {
     defer engine.deinit();
     const expanded = try engine.expandProgram(&program);
 
-    // Find the Target module in the expanded program.
+    // Find the Target struct in the expanded program.
     var target_struct: ?*const ast.StructDecl = null;
     for (expanded.structs) |*mod| {
         if (mod.name.parts.len == 1) {
@@ -3988,7 +4012,7 @@ test "Zest test/2 macro: multi-stmt quote body matches lib/zest/case.zap shape" 
     const source =
         \\pub struct Test {
         \\  pub macro tm(_name :: Expr, body :: Expr) -> Expr {
-        \\    fn_name = __zap_intern_atom__("test_" <> __zap_slugify__(_name))
+        \\    fn_name = intern_atom("test_" <> slugify(_name))
         \\    quote {
         \\      pub fn unquote(fn_name)() -> i64 {
         \\        unquote(body)
@@ -4055,7 +4079,7 @@ test "Zest test/2 macro: multiple tests with setup/teardown sibling calls" {
     const source =
         \\pub struct Test {
         \\  pub macro test_macro(_name :: Expr, body :: Expr) -> Expr {
-        \\    fn_name = __zap_intern_atom__("test_" <> __zap_slugify__(_name))
+        \\    fn_name = intern_atom("test_" <> slugify(_name))
         \\    quote {
         \\      pub fn unquote(fn_name)() -> i64 {
         \\        unquote(body)
@@ -4125,7 +4149,7 @@ test "Zest test/2 macro: multiple tests through a passthrough wrapper" {
     const source =
         \\pub struct Test {
         \\  pub macro test_macro(_name :: Expr, body :: Expr) -> Expr {
-        \\    fn_name = __zap_intern_atom__("test_" <> __zap_slugify__(_name))
+        \\    fn_name = intern_atom("test_" <> slugify(_name))
         \\    quote {
         \\      pub fn unquote(fn_name)() -> i64 {
         \\        unquote(body)
@@ -4194,7 +4218,7 @@ test "Zest test/2 macro: works through a passthrough wrapper macro" {
     const source =
         \\pub struct Test {
         \\  pub macro test_macro(_name :: Expr, body :: Expr) -> Expr {
-        \\    fn_name = __zap_intern_atom__("test_" <> __zap_slugify__(_name))
+        \\    fn_name = intern_atom("test_" <> slugify(_name))
         \\    quote {
         \\      pub fn unquote(fn_name)() -> i64 {
         \\        unquote(body)
@@ -4256,12 +4280,12 @@ test "Zest test/2 macro: generates dynamically-named fn + tracking call" {
     // returns a __block__ containing both the fn decl and the
     // tracking call sequence that invokes it.
     //
-    // We bypass the actual Zest module (which depends on the runtime
+    // We bypass the actual Zest struct (which depends on the runtime
     // Zest struct) and inline the same logic as a one-off macro.
     const source =
         \\pub struct Test {
         \\  pub macro test_macro(_name :: Expr, body :: Expr) -> Expr {
-        \\    fn_name = __zap_intern_atom__("test_" <> __zap_slugify__(_name))
+        \\    fn_name = intern_atom("test_" <> slugify(_name))
         \\    quote {
         \\      pub fn unquote(fn_name)() -> i64 {
         \\        unquote(body)
@@ -4396,7 +4420,7 @@ test "comptime function dispatch: transitive — function calls function" {
     // `quadruple(x)` calls `double(x)` calls `n + n`. The dispatcher
     // recurses into each call, evaluates pure arithmetic, returns
     // the final scalar. Validates that env.dispatch_depth bumps
-    // correctly and child envs inherit the module context.
+    // correctly and child envs inherit the struct context.
     const source =
         \\pub struct Test {
         \\  pub fn double(n :: i64) -> i64 {
@@ -4457,7 +4481,7 @@ test "comptime function dispatch: transitive — function calls function" {
 
 test "comptime function dispatch: macro calls pure user-defined function" {
     // A macro body invokes `double(x)` where `double/1` is an
-    // ordinary `pub fn` defined in the same module. The comptime
+    // ordinary `pub fn` defined in the same struct. The comptime
     // dispatcher resolves it through the scope graph and recursively
     // evaluates the body, so the macro sees the function's return
     // value as a CtValue rather than an unresolved call AST.
@@ -4645,7 +4669,7 @@ test "comptime intrinsics: slugify produces snake_case from string" {
     const source =
         \\pub struct Test {
         \\  pub macro slug_of(_label :: StringLit) -> Expr {
-        \\    s = __zap_slugify__(_label)
+        \\    s = slugify(_label)
         \\    quote { unquote(s) }
         \\  }
         \\
@@ -4712,7 +4736,7 @@ test "comptime intrinsics: slugify + intern produces dynamic fn name" {
     const source =
         \\pub struct Test {
         \\  pub macro emit_named(_label :: StringLit) -> Expr {
-        \\    fn_name_str = "test_" <> __zap_slugify__(_label)
+        \\    fn_name_str = "test_" <> slugify(_label)
         \\    quote { unquote(fn_name_str) }
         \\  }
         \\
@@ -4800,7 +4824,7 @@ test "dynamic fn name: unquote in fn-name position resolves at expansion" {
     defer engine.deinit();
     const expanded = try engine.expandProgram(&program);
 
-    // The Test module should now contain a function named `answer/0`
+    // The Test struct should now contain a function named `answer/0`
     // injected by `define_const(:answer)`. The fn was emitted by
     // the macro at the struct level via expandStructLevelExpr.
     var found_answer = false;
@@ -4824,14 +4848,14 @@ test "dynamic fn name: unquote in fn-name position resolves at expansion" {
 }
 
 test "@before_compile: hook reads caller's accumulated attributes" {
-    // The keystone use case: macros in the target module accumulate
+    // The keystone use case: macros in the target struct accumulate
     // names into an attribute, then a `@before_compile` hook reads
     // that list and generates a runner. This is the pattern used by
     // ExUnit (test names) and Mathlib (`@[simp]` lemmas) and is
     // what unblocks the Zest migration in Phase 9.
     //
     // Important ordering: `track` macros expand before the hook
-    // fires (the hook runs after each per-module fixed-point), and
+    // fires (the hook runs after each per-struct fixed-point), and
     // the AST replacement at the call site means each track expands
     // exactly once. So the track macro must itself ensure the
     // attribute is registered as accumulating *before* it puts.
@@ -4846,8 +4870,8 @@ test "@before_compile: hook reads caller's accumulated attributes" {
         \\
         \\pub struct Target {
         \\  pub macro track(_name :: AtomLit) -> Nil {
-        \\    __zap_module_register_attr__(:tests)
-        \\    __zap_module_put_attr__(:tests, _name)
+        \\    struct_register_attribute(:tests)
+        \\    struct_put_attribute(:tests, _name)
         \\    quote { nil }
         \\  }
         \\
@@ -4887,15 +4911,15 @@ test "@before_compile: hook reads caller's accumulated attributes" {
         return error.TargetMissing;
     };
     const tests_id = try parser.interner.intern("tests");
-    const accumulated = (try collector.graph.getModuleAttribute(target_entry, tests_id)) orelse return error.AttributeMissing;
+    const accumulated = (try collector.graph.getStructAttribute(target_entry, tests_id)) orelse return error.AttributeMissing;
     try std.testing.expect(accumulated == .list);
     try std.testing.expectEqual(@as(usize, 2), accumulated.list.len);
 }
 
-test "@before_compile: hook fires at most once per (module, hook)" {
+test "@before_compile: hook fires at most once per (struct, hook)" {
     // Re-running expandProgram on the same engine should not double-
     // fire the hook. The `before_compile_fired` set tracks every
-    // (module_scope, hook_name) pair across iterations.
+    // (struct_scope, hook_name) pair across iterations.
     const source =
         \\pub struct Hooks {
         \\  pub macro __before_compile__(_env :: Expr) -> Decl {
@@ -4928,7 +4952,7 @@ test "@before_compile: hook fires at most once per (module, hook)" {
     defer engine.deinit();
     const expanded = try engine.expandProgram(&program);
 
-    // Count `injected` functions in the Target module — must be 1.
+    // Count `injected` functions in the Target struct — must be 1.
     var injected_count: usize = 0;
     for (expanded.structs) |mod| {
         if (mod.name.parts.len != 1) continue;
@@ -4944,18 +4968,18 @@ test "@before_compile: hook fires at most once per (module, hook)" {
     try std.testing.expectEqual(@as(usize, 1), injected_count);
 }
 
-test "module attribute intrinsics: register makes attribute accumulate" {
+test "struct attribute intrinsics: register makes attribute accumulate" {
     // After register_attribute, multiple put calls accumulate into a
     // list. Without it, puts overwrite each other.
     const source =
         \\pub struct Test {
         \\  pub macro setup_acc() -> Nil {
-        \\    __zap_module_register_attr__(:tests)
+        \\    struct_register_attribute(:tests)
         \\    quote { nil }
         \\  }
         \\
         \\  pub macro track(_name :: Expr) -> Nil {
-        \\    __zap_module_put_attr__(:tests, _name)
+        \\    struct_put_attribute(:tests, _name)
         \\    quote { nil }
         \\  }
         \\
@@ -4988,14 +5012,14 @@ test "module attribute intrinsics: register makes attribute accumulate" {
                 if (std.mem.eql(u8, part_name, "Test")) break :blk entry;
             }
         }
-        return error.TestModuleNotFound;
+        return error.TestStructNotFound;
     };
 
     // Two values were appended; the read should produce a list of
     // both atoms in append order.
     const attr_value = blk: {
         const tests_id = try parser.interner.intern("tests");
-        const v = try collector.graph.getModuleAttribute(test_struct, tests_id);
+        const v = try collector.graph.getStructAttribute(test_struct, tests_id);
         break :blk v orelse return error.AttributeMissing;
     };
     try std.testing.expect(attr_value == .list);
@@ -5009,7 +5033,7 @@ test "module attribute intrinsics: register makes attribute accumulate" {
 // ============================================================
 // Capability tests (Task #15)
 //
-// Exercise the `@requires` annotation, the `__zap_io_read_file__`
+// Exercise the `@requires` annotation, the `read_file`
 // intrinsic, and the caller/callee attenuation rule. Each test
 // stages a small Zap program through the full
 // parse → collect → expand pipeline so the surface diagnostics
@@ -5092,7 +5116,7 @@ fn buildCapTestSource(
     , .{ macros_decls, entry_macro_call });
 }
 
-test "capability T1: macro with @requires=[:read_file] can call __zap_io_read_file__" {
+test "capability T1: macro with @requires=[:read_file] can call read_file" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -5108,7 +5132,7 @@ test "capability T1: macro with @requires=[:read_file] can call __zap_io_read_fi
     const macros_decl = try std.fmt.allocPrint(alloc,
         \\  @requires = [:read_file]
         \\  pub macro embed_fixture() {{
-        \\    __zap_io_read_file__("{s}")
+        \\    read_file("{s}")
         \\  }}
     , .{tmp_path});
     const source = try buildCapTestSource(alloc, macros_decl, "embed_fixture()");
@@ -5131,7 +5155,7 @@ test "capability T1: macro with @requires=[:read_file] can call __zap_io_read_fi
     }
 }
 
-test "capability T2: macro WITHOUT @requires calling __zap_io_read_file__ is a compile error" {
+test "capability T2: macro WITHOUT @requires calling read_file is a compile error" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -5146,7 +5170,7 @@ test "capability T2: macro WITHOUT @requires calling __zap_io_read_file__ is a c
 
     const macros_decl = try std.fmt.allocPrint(alloc,
         \\  pub macro embed_no_caps() {{
-        \\    __zap_io_read_file__("{s}")
+        \\    read_file("{s}")
         \\  }}
     , .{tmp_path});
     const source = try buildCapTestSource(alloc, macros_decl, "embed_no_caps()");
@@ -5166,7 +5190,7 @@ test "capability T2: macro WITHOUT @requires calling __zap_io_read_file__ is a c
     var saw_read_file_error = false;
     for (engine.errors.items) |err| {
         if (std.mem.find(u8, err.message, "read_file") != null and
-            std.mem.find(u8, err.message, "__zap_io_read_file__") != null)
+            std.mem.find(u8, err.message, "read_file") != null)
         {
             saw_read_file_error = true;
             break;
@@ -5191,7 +5215,7 @@ test "capability T3: pure caller cannot invoke a @requires=[:read_file] macro" {
     const macros_decl = try std.fmt.allocPrint(alloc,
         \\  @requires = [:read_file]
         \\  pub macro inner_io() {{
-        \\    __zap_io_read_file__("{s}")
+        \\    read_file("{s}")
         \\  }}
         \\
         \\  pub macro outer_pure() {{
@@ -5224,6 +5248,172 @@ test "capability T3: pure caller cannot invoke a @requires=[:read_file] macro" {
     try std.testing.expect(saw_attenuation);
 }
 
+test "macro eval rejects bare underscore-prefixed call in macro body" {
+    const source =
+        \\pub struct Test {
+        \\  pub macro bad() -> Expr {
+        \\    _helper()
+        \\  }
+        \\
+        \\  pub fn run() -> i64 {
+        \\    bad()
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    _ = try engine.expandProgram(&program);
+
+    var found_error = false;
+    for (engine.errors.items) |err| {
+        if (std.mem.find(u8, err.message, "cannot call underscore-prefixed function `_helper` from macro code") != null) {
+            found_error = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_error);
+}
+
+test "macro eval rejects qualified underscore-prefixed call in macro body" {
+    const source =
+        \\pub struct Helper {
+        \\  pub macro _hidden() -> Expr {
+        \\    quote { 1 }
+        \\  }
+        \\}
+        \\
+        \\pub struct Test {
+        \\  pub macro bad() -> Expr {
+        \\    Helper._hidden()
+        \\  }
+        \\
+        \\  pub fn run() -> i64 {
+        \\    bad()
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    _ = try engine.expandProgram(&program);
+
+    var found_error = false;
+    for (engine.errors.items) |err| {
+        if (std.mem.find(u8, err.message, "cannot call underscore-prefixed function `_hidden` from macro code") != null) {
+            found_error = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_error);
+}
+
+test "macro engine rejects direct bare underscore-prefixed macro call" {
+    const source =
+        \\pub struct Test {
+        \\  pub macro _hidden() -> Expr {
+        \\    quote { 1 }
+        \\  }
+        \\
+        \\  pub fn run() -> i64 {
+        \\    _hidden()
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    _ = try engine.expandProgram(&program);
+
+    var found_error = false;
+    for (engine.errors.items) |err| {
+        if (std.mem.find(u8, err.message, "cannot call underscore-prefixed function `_hidden/0`") != null) {
+            found_error = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_error);
+}
+
+test "macro engine rejects direct qualified __using__ macro call" {
+    const source =
+        \\pub struct Provider {
+        \\  pub macro __using__(_opts :: Expr) -> Expr {
+        \\    quote {
+        \\      pub fn injected() -> i64 { 1 }
+        \\    }
+        \\  }
+        \\}
+        \\
+        \\pub struct Test {
+        \\  pub fn run() -> i64 {
+        \\    Provider.__using__([])
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    _ = try engine.expandProgram(&program);
+
+    var found_error = false;
+    for (engine.errors.items) |err| {
+        if (std.mem.find(u8, err.message, "cannot call underscore-prefixed function `__using__/1`") != null) {
+            found_error = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_error);
+}
+
 test "capability T4: matching capabilities pass attenuation" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -5240,7 +5430,7 @@ test "capability T4: matching capabilities pass attenuation" {
     const macros_decl = try std.fmt.allocPrint(alloc,
         \\  @requires = [:read_file]
         \\  pub macro inner_io() {{
-        \\    __zap_io_read_file__("{s}")
+        \\    read_file("{s}")
         \\  }}
         \\
         \\  @requires = [:read_file]
@@ -5313,11 +5503,11 @@ test "typed splice: untyped param accepts anything (back-compat)" {
 // directly walks its body's statements, generating per-test fn
 // declarations + tracking calls in pure Zap. No Zig builtin
 // `build_test_fns` is invoked — every transformation is expressed
-// through comptime intrinsics (`for`, `__zap_list_at__`,
-// `__zap_intern_atom__`, `__zap_slugify__`, `__zap_make_call__`,
+// through comptime intrinsics (`for`, `list_at`,
+// `intern_atom`, `slugify`, `make_call`,
 // list-ops) and `quote`. Setup/teardown bodies are captured as
 // macro-local CtValues and spliced into the per-test fn bodies; no
-// module-attribute side channel is used.
+// struct-attribute side channel is used.
 //
 // The describe macro definition is inlined in each test so the
 // tests document the exact shape expected of the migrated
@@ -5335,19 +5525,19 @@ const ZEST_DESCRIBE_INLINE_PRELUDE =
     \\
     \\  pub macro describe(_name :: Expr, body :: Expr) -> Expr {
     \\    _stmts = elem(body, 2)
-    \\    _setup_matches = for _s <- _stmts, elem(_s, 0) == :setup { __zap_list_at__(elem(_s, 2), -1) }
-    \\    _teardown_matches = for _s <- _stmts, elem(_s, 0) == :teardown { __zap_list_at__(elem(_s, 2), -1) }
-    \\    _setup_body = __zap_list_at__(_setup_matches, 0)
-    \\    _teardown_body = __zap_list_at__(_teardown_matches, 0)
-    \\    _desc_slug = __zap_slugify__(_name)
+    \\    _setup_matches = for _s <- _stmts, elem(_s, 0) == :setup { list_at(elem(_s, 2), -1) }
+    \\    _teardown_matches = for _s <- _stmts, elem(_s, 0) == :teardown { list_at(elem(_s, 2), -1) }
+    \\    _setup_body = list_at(_setup_matches, 0)
+    \\    _teardown_body = list_at(_teardown_matches, 0)
+    \\    _desc_slug = slugify(_name)
     \\
     \\    _per_test = for _t <- _stmts, elem(_t, 0) == :test {
     \\      quote {
-    \\        pub fn unquote(__zap_intern_atom__("test_" <> _desc_slug <> "_" <> __zap_slugify__(__zap_list_at__(elem(_t, 2), 0))))() -> String {
-    \\          unquote(__zap_make_call__("__block__", __zap_list_concat__(__zap_list_concat__(__zap_list_concat__(if __zap_list_len__(elem(_t, 2)) == 3 and _setup_body != nil { [__zap_make_call__("=", [ctx, _setup_body])] } else { [] }, if elem(__zap_list_at__(elem(_t, 2), -1), 0) == :__block__ { elem(__zap_list_at__(elem(_t, 2), -1), 2) } else { [__zap_list_at__(elem(_t, 2), -1)] }), if _teardown_body != nil { [_teardown_body] } else { [] }), ["ok"])))
+    \\        pub fn unquote(intern_atom("test_" <> _desc_slug <> "_" <> slugify(list_at(elem(_t, 2), 0))))() -> String {
+    \\          unquote(make_call("__block__", list_concat(list_concat(list_concat(if list_length(elem(_t, 2)) == 3 and _setup_body != nil { [make_call("=", [ctx, _setup_body])] } else { [] }, if elem(list_at(elem(_t, 2), -1), 0) == :__block__ { elem(list_at(elem(_t, 2), -1), 2) } else { [list_at(elem(_t, 2), -1)] }), if _teardown_body != nil { [_teardown_body] } else { [] }), ["ok"])))
     \\        }
     \\        :zig.Zest.begin_test()
-    \\        unquote(__zap_intern_atom__("test_" <> _desc_slug <> "_" <> __zap_slugify__(__zap_list_at__(elem(_t, 2), 0))))()
+    \\        unquote(intern_atom("test_" <> _desc_slug <> "_" <> slugify(list_at(elem(_t, 2), 0))))()
     \\        :zig.Zest.end_test()
     \\        :zig.Zest.print_result()
     \\        "."
@@ -5356,7 +5546,7 @@ const ZEST_DESCRIBE_INLINE_PRELUDE =
     \\
     \\    _passthrough = for _s <- _stmts, elem(_s, 0) != :test and elem(_s, 0) != :setup and elem(_s, 0) != :teardown { _s }
     \\
-    \\    _all = __zap_list_concat__(_per_test, _passthrough)
+    \\    _all = list_concat(_per_test, _passthrough)
     \\
     \\    quote { unquote_splicing(_all) }
     \\  }
@@ -5621,13 +5811,13 @@ test "Zest describe migration T5: bare test outside describe produces test_<slug
     // `lib/zest/case.zap`) handles the no-describe case and emits
     // `test_<slug>` directly. Crucially the fn body contains ONLY
     // the user's body + "ok"; the begin_test/end_test/print_result
-    // tracking calls live at module scope, NOT inside the fn body
+    // tracking calls live at struct scope, NOT inside the fn body
     // (matches the build_test_fn-equivalent path the deleted Zig
     // builtin produced).
     const source =
         \\pub struct Test {
         \\  pub macro test(_name :: Expr, body :: Expr) -> Expr {
-        \\    _fn_atom = __zap_intern_atom__("test_" <> __zap_slugify__(_name))
+        \\    _fn_atom = intern_atom("test_" <> slugify(_name))
         \\    quote {
         \\      pub fn unquote(_fn_atom)() -> String {
         \\        unquote(body)

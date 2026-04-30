@@ -171,6 +171,13 @@ pub struct Integer {
     count_digits(Integer.abs(value))
   }
 
+  @doc = """
+    Counts decimal digits in a non-negative integer.
+
+    This helper assumes the value is already non-negative. Use
+    `Integer.digits/1` when sign handling is needed.
+    """
+
   pub fn count_digits(value :: i64) -> i64 {
     case value < 10 {
       true -> 1

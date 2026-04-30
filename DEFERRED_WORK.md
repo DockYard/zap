@@ -55,7 +55,7 @@ for-comp integration test now exercises the real bug.
 **What's been ruled out.**
 
 - Not a parser issue (the desugarer constructs the AST directly).
-- Not a problem with `protocolDispatchModule` itself — for the inline
+- Not a problem with `protocolDispatchStruct` itself — for the inline
   scrutinee it correctly resolves `Enumerable` → `List` based on the
   state's inferred type.
 - Adding an intermediate `__next_call = Enumerable.next(state)`
@@ -97,7 +97,7 @@ would isolate where they diverge.
 ### A1. Two-track pipeline unification
 
 **Files.** `src/compiler.zig` (`compileForCtfe` lines ~525–785,
-`compileModuleByModule` lines ~1023–1141, `collectAllFromUnits` lines
+`compileStructByStruct` lines ~1023–1141, `collectAllFromUnits` lines
 ~410–520).
 
 **What's duplicated.** Both paths share the same conceptual frontend —
@@ -105,20 +105,20 @@ attribute substitution → macro expansion → desugar → re-collect —
 implemented inline in two places with subtly different diagnostic
 plumbing (one uses `diag_engine`, one uses `ctx.diag_engine`). Per-step
 helper functions exist (`runAttributeSubstitution`, `runTypeCheck`,
-`runHirBuild`, `compileSingleModuleHir`) but the *orchestration* of
+`runHirBuild`, `compileSingleStructHir`) but the *orchestration* of
 those steps is duplicated.
 
 **What's intentionally divergent.**
 
 - `compileForCtfe` runs a *second* type-check pass after CTFE
-  evaluation (lines 738–742); the per-module path doesn't.
-- `compileModuleByModule` *intentionally* skips `checkUnusedBindings`
+  evaluation (lines 738–742); the per-struct path doesn't.
+- `compileStructByStruct` *intentionally* skips `checkUnusedBindings`
   (compiler.zig:1018–1024) due to false positives in shared-scope-graph
   mode.
 - Three CTFE evaluator entry points exist
-  (`evaluateModuleAttributesInOrder`,
+  (`evaluateStructAttributesInOrder`,
   `evaluateComputedAttributes`,
-  `evaluateComputedAttributesForModule`) that each duplicate ~50 lines
+  `evaluateComputedAttributesForStruct`) that each duplicate ~50 lines
   of interpreter setup.
 
 **What the fix looks like.**

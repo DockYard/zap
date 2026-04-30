@@ -1,3 +1,5 @@
+@doc = "Stringable implementation for `Atom`."
+
 pub impl Stringable for Atom {
   @doc = """
     Render an atom as the bare name string. `:hello` becomes

@@ -364,12 +364,12 @@ pub const TypeStore = struct {
         return null;
     }
 
-    /// Get the canonical module name for a type.
+    /// Get the canonical struct name for a type.
     /// For user-defined types (structs, unions), returns the declared name.
-    /// For built-in types, returns the language-defined module name.
-    /// Returns null for types that don't have a corresponding module
+    /// For built-in types, returns the language-defined struct name.
+    /// Returns null for types that don't have a corresponding struct
     /// (nil, never, type variables, etc.).
-    pub fn typeToModuleName(self: *const TypeStore, type_id: TypeId, interner: *const ast.StringInterner) ?[]const u8 {
+    pub fn typeToStructName(self: *const TypeStore, type_id: TypeId, interner: *const ast.StringInterner) ?[]const u8 {
         if (type_id >= self.types.items.len) return null;
         const typ = self.types.items[type_id];
         return switch (typ) {
@@ -1276,12 +1276,12 @@ pub const TypeChecker = struct {
             .struct_pattern => |sp| {
                 const parent_typ = self.store.getType(parent_type);
                 // The parser routes the `%{key: pat, ...}` shape into
-                // `.struct_pattern` (with an empty module_name) for both
+                // `.struct_pattern` (with an empty struct_name) for both
                 // struct and map destructuring — they share syntax. When
                 // the annotation says the value is a Map(K, V), each
                 // field-pattern binds to the map's value type, not a
                 // struct field type.
-                if (parent_typ == .map and sp.module_name.parts.len == 0) {
+                if (parent_typ == .map and sp.struct_name.parts.len == 0) {
                     const value_type = parent_typ.map.value;
                     for (sp.fields) |field| {
                         try self.recordAssignmentBindingTypes(field.pattern, value_type, source_span);
@@ -1368,9 +1368,9 @@ pub const TypeChecker = struct {
                 const parent_typ = self.store.getType(parent_type);
                 // Mirror `recordAssignmentBindingTypes`: a `%{key: pat}`
                 // pattern parses as `.struct_pattern` with empty
-                // module_name; when matched against a Map(K, V), bind
+                // struct_name; when matched against a Map(K, V), bind
                 // each inner pattern to the map's value type.
-                if (parent_typ == .map and sp.module_name.parts.len == 0) {
+                if (parent_typ == .map and sp.struct_name.parts.len == 0) {
                     const value_type = parent_typ.map.value;
                     for (sp.fields) |field| {
                         try self.recordCasePatternBindingTypes(field.pattern, value_type, source_span);
@@ -1426,8 +1426,8 @@ pub const TypeChecker = struct {
         return clause_type;
     }
 
-    /// Type-checker mirror of `HirBuilder.protocolDispatchModule`. When
-    /// the call's qualifying module is a registered protocol and the
+    /// Type-checker mirror of `HirBuilder.protocolDispatchStruct`. When
+    /// the call's qualifying struct is a registered protocol and the
     /// first argument's inferred type has a matching `impl Protocol for
     /// T`, returns T's canonical name so the caller resolves the
     /// impl's signature instead of the protocol's abstract one. This is
@@ -1439,9 +1439,9 @@ pub const TypeChecker = struct {
     /// `Concatenable.concat(c, "!")`) can't dispatch because their
     /// first argument's type is wrong or UNKNOWN.
     ///
-    /// Returns null when the module isn't a protocol or no impl
-    /// matches; callers fall back to the original module name.
-    fn protocolDispatchModule(
+    /// Returns null when the struct isn't a protocol or no impl
+    /// matches; callers fall back to the original struct name.
+    fn protocolDispatchStruct(
         self: *TypeChecker,
         mod_name: ast.StructName,
         first_arg: *const ast.Expr,
@@ -1460,7 +1460,7 @@ pub const TypeChecker = struct {
 
         const arg_type = self.inferExpr(first_arg) catch return null;
         if (arg_type == TypeStore.UNKNOWN or arg_type == TypeStore.ERROR) return null;
-        const target_simple = self.store.typeToModuleName(arg_type, self.interner) orelse return null;
+        const target_simple = self.store.typeToStructName(arg_type, self.interner) orelse return null;
 
         for (self.graph.impls.items) |entry| {
             if (entry.protocol_name.parts.len != 1 or entry.target_type.parts.len != 1) continue;
@@ -1766,9 +1766,9 @@ pub const TypeChecker = struct {
     }
 
     fn resolveFunctionRefSignature(self: *TypeChecker, fr: ast.FunctionRefExpr) !?FunctionSignature {
-        if (fr.module) |module_name| {
-            const module_scope = self.graph.findStructScope(module_name) orelse return null;
-            return try self.resolveFamilySignature(module_scope, fr.function, fr.arity);
+        if (fr.struct_name) |struct_name| {
+            const struct_scope = self.graph.findStructScope(struct_name) orelse return null;
+            return try self.resolveFamilySignature(struct_scope, fr.function, fr.arity);
         }
 
         if (self.current_scope) |scope_id| {
@@ -1818,7 +1818,7 @@ pub const TypeChecker = struct {
     }
 
     /// Resolve a Zap function `bare_name` of given `arity` to its IR FunctionId.
-    /// IR function names are `{module_prefix}__{mangled_name}__{arity}` (or
+    /// IR function names are `{struct_prefix}__{mangled_name}__{arity}` (or
     /// `{mangled_name}__{arity}` for top-level), so we match by the full
     /// suffix `{name}__{arity}`. We always require an arity match — the
     /// previous heuristic matched any `__{name}` regardless of arity, which
@@ -1831,7 +1831,7 @@ pub const TypeChecker = struct {
         defer self.allocator.free(arity_suffix);
 
         if (self.current_scope) |scope_id| {
-            if (self.enclosingModuleIrPrefix(scope_id)) |prefix| {
+            if (self.enclosingStructIrPrefix(scope_id)) |prefix| {
                 defer self.allocator.free(prefix);
                 const full = std.fmt.allocPrint(self.allocator, "{s}{s}", .{ prefix, arity_suffix }) catch return null;
                 defer self.allocator.free(full);
@@ -1849,16 +1849,16 @@ pub const TypeChecker = struct {
         return null;
     }
 
-    /// Build a module's IR-name prefix from a scope's enclosing struct.
-    /// Multi-segment module names join with `_` (single underscore) to match
-    /// IR's `structNameToPrefix` — distinct from `enclosingModuleQualifiedName`
+    /// Build a struct's IR-name prefix from a scope's enclosing struct.
+    /// Multi-segment struct names join with `_` (single underscore) to match
+    /// IR's `structNameToPrefix` — distinct from `enclosingStructQualifiedName`
     /// which joins with `__` for type-system display.
-    fn enclosingModuleIrPrefix(self: *const TypeChecker, scope_id: scope_mod.ScopeId) ?[]u8 {
+    fn enclosingStructIrPrefix(self: *const TypeChecker, scope_id: scope_mod.ScopeId) ?[]u8 {
         var current: ?scope_mod.ScopeId = scope_id;
         while (current) |sid| {
-            for (self.graph.structs.items) |module| {
-                if (module.scope_id != sid) continue;
-                return joinStructNameWithUnderscore(self.allocator, self.interner, module.name);
+            for (self.graph.structs.items) |struct_decl| {
+                if (struct_decl.scope_id != sid) continue;
+                return joinStructNameWithUnderscore(self.allocator, self.interner, struct_decl.name);
             }
             current = self.graph.getScope(sid).parent;
         }
@@ -1940,12 +1940,12 @@ pub const TypeChecker = struct {
         return null;
     }
 
-    fn enclosingModuleQualifiedName(self: *const TypeChecker, scope_id: scope_mod.ScopeId) ?[]u8 {
+    fn enclosingStructQualifiedName(self: *const TypeChecker, scope_id: scope_mod.ScopeId) ?[]u8 {
         var current: ?scope_mod.ScopeId = scope_id;
         while (current) |sid| {
-            for (self.graph.structs.items) |module| {
-                if (module.scope_id != sid) continue;
-                return self.structNameToString(module.name);
+            for (self.graph.structs.items) |struct_decl| {
+                if (struct_decl.scope_id != sid) continue;
+                return self.structNameToString(struct_decl.name);
             }
             current = self.graph.getScope(sid).parent;
         }
@@ -2340,44 +2340,44 @@ pub const TypeChecker = struct {
             try self.checkStruct(mod);
         }
         for (program.top_items) |item| {
-            // Only `def main()` is allowed at the top level — all other functions must be inside a module
+            // Only `def main()` is allowed at the top level — all other functions must be inside a struct
             switch (item) {
                 .function => |func| {
                     const name = self.interner.get(func.name);
                     if (!std.mem.eql(u8, name, "main")) {
                         try self.addHardError(
-                            try std.fmt.allocPrint(self.allocator, "top-level function `{s}` is not allowed — only `def main()` can be defined outside a module", .{name}),
+                            try std.fmt.allocPrint(self.allocator, "top-level function `{s}` is not allowed — only `def main()` can be defined outside a struct", .{name}),
                             func.meta.span,
-                            "move this function into a `module` block",
-                            "all functions except `main` must be defined inside a `module { ... }` block",
+                            "move this function into a `struct` block",
+                            "all functions except `main` must be defined inside a `struct { ... }` block",
                         );
                     }
                 },
                 .priv_function => |func| {
                     const name = self.interner.get(func.name);
                     try self.addHardError(
-                        try std.fmt.allocPrint(self.allocator, "top-level private function `{s}` is not allowed — functions must be inside a module", .{name}),
+                        try std.fmt.allocPrint(self.allocator, "top-level private function `{s}` is not allowed — functions must be inside a struct", .{name}),
                         func.meta.span,
-                        "move this function into a `module` block",
-                        "all functions must be defined inside a `module { ... }` block",
+                        "move this function into a `struct` block",
+                        "all functions must be defined inside a `struct { ... }` block",
                     );
                 },
                 .macro => |mac| {
                     const name = self.interner.get(mac.name);
                     try self.addHardError(
-                        try std.fmt.allocPrint(self.allocator, "top-level macro `{s}` is not allowed — macros must be inside a module", .{name}),
+                        try std.fmt.allocPrint(self.allocator, "top-level macro `{s}` is not allowed — macros must be inside a struct", .{name}),
                         mac.meta.span,
-                        "move this macro into a `module` block",
-                        "all macros must be defined inside a `module { ... }` block",
+                        "move this macro into a `struct` block",
+                        "all macros must be defined inside a `struct { ... }` block",
                     );
                 },
                 .priv_macro => |mac| {
                     const name = self.interner.get(mac.name);
                     try self.addHardError(
-                        try std.fmt.allocPrint(self.allocator, "top-level private macro `{s}` is not allowed — macros must be inside a module", .{name}),
+                        try std.fmt.allocPrint(self.allocator, "top-level private macro `{s}` is not allowed — macros must be inside a struct", .{name}),
                         mac.meta.span,
-                        "move this macro into a `module` block",
-                        "all macros must be defined inside a `module { ... }` block",
+                        "move this macro into a `struct` block",
+                        "all macros must be defined inside a `struct { ... }` block",
                     );
                 },
                 else => {},
@@ -2525,6 +2525,207 @@ pub const TypeChecker = struct {
         return false;
     }
 
+    fn isSyntheticSpan(span: ast.SourceSpan) bool {
+        return span.start == 0 and span.end == 0 and span.line == 0;
+    }
+
+    fn isDisallowedUnderscoreFunctionCall(self: *const TypeChecker, name: ast.StringId, meta: ast.NodeMeta) bool {
+        const text = self.interner.get(name);
+        if (text.len == 0 or text[0] != '_') return false;
+        return !(self.isSyntheticHelperName(name) and isSyntheticSpan(meta.span));
+    }
+
+    fn rejectUnderscoreCall(self: *TypeChecker, name: []const u8, arity: u32, span: ast.SourceSpan) !void {
+        try self.addRichError(
+            try std.fmt.allocPrint(self.allocator, "cannot call underscore-prefixed function `{s}/{d}`", .{ name, arity }),
+            span,
+            "underscore-prefixed function names are reserved for unused-warning suppression",
+            "rename the function to a callable name before calling it directly",
+        );
+    }
+
+    fn validateMacroBodyDoesNotCallUnderscoreFunctions(self: *TypeChecker, mac: *const ast.FunctionDecl) anyerror!void {
+        for (mac.clauses) |clause| {
+            if (clause.body) |body| {
+                for (body) |stmt| {
+                    try self.validateStmtDoesNotCallUnderscoreFunctions(stmt);
+                }
+            }
+        }
+    }
+
+    fn validateStmtDoesNotCallUnderscoreFunctions(self: *TypeChecker, stmt: ast.Stmt) anyerror!void {
+        switch (stmt) {
+            .expr => |expr| try self.validateExprDoesNotCallUnderscoreFunctions(expr),
+            .assignment => |assignment| try self.validateExprDoesNotCallUnderscoreFunctions(assignment.value),
+            .function_decl => |func| try self.validateFunctionBodyDoesNotCallUnderscoreFunctions(func),
+            .macro_decl => |mac| try self.validateMacroBodyDoesNotCallUnderscoreFunctions(mac),
+            .attribute => |attr| if (attr.value) |value| try self.validateExprDoesNotCallUnderscoreFunctions(value),
+            .import_decl => {},
+        }
+    }
+
+    fn validateFunctionBodyDoesNotCallUnderscoreFunctions(self: *TypeChecker, func: *const ast.FunctionDecl) anyerror!void {
+        for (func.clauses) |clause| {
+            if (clause.body) |body| {
+                for (body) |stmt| {
+                    try self.validateStmtDoesNotCallUnderscoreFunctions(stmt);
+                }
+            }
+        }
+    }
+
+    fn validateExprDoesNotCallUnderscoreFunctions(self: *TypeChecker, expr: *const ast.Expr) anyerror!void {
+        switch (expr.*) {
+            .call => |call| {
+                const arity: u32 = @intCast(call.args.len);
+                if (call.callee.* == .var_ref) {
+                    const name_id = call.callee.var_ref.name;
+                    if (self.isDisallowedUnderscoreFunctionCall(name_id, call.callee.var_ref.meta)) {
+                        try self.rejectUnderscoreCall(self.interner.get(name_id), arity, call.meta.span);
+                    }
+                } else if (call.callee.* == .field_access) {
+                    const field_id = call.callee.field_access.field;
+                    if (self.isDisallowedUnderscoreFunctionCall(field_id, call.callee.field_access.meta)) {
+                        try self.rejectUnderscoreCall(self.interner.get(field_id), arity, call.meta.span);
+                    }
+                }
+                try self.validateExprDoesNotCallUnderscoreFunctions(call.callee);
+                for (call.args) |arg| try self.validateExprDoesNotCallUnderscoreFunctions(arg);
+            },
+            .binary_op => |op| {
+                try self.validateExprDoesNotCallUnderscoreFunctions(op.lhs);
+                try self.validateExprDoesNotCallUnderscoreFunctions(op.rhs);
+            },
+            .unary_op => |op| try self.validateExprDoesNotCallUnderscoreFunctions(op.operand),
+            .pipe => |pipe| {
+                try self.validateExprDoesNotCallUnderscoreFunctions(pipe.lhs);
+                try self.validateExprDoesNotCallUnderscoreFunctions(pipe.rhs);
+            },
+            .unwrap => |unwrap| try self.validateExprDoesNotCallUnderscoreFunctions(unwrap.expr),
+            .tuple => |tuple| for (tuple.elements) |element| try self.validateExprDoesNotCallUnderscoreFunctions(element),
+            .list => |list| for (list.elements) |element| try self.validateExprDoesNotCallUnderscoreFunctions(element),
+            .map => |map| {
+                if (map.update_source) |source| try self.validateExprDoesNotCallUnderscoreFunctions(source);
+                for (map.fields) |field| {
+                    try self.validateExprDoesNotCallUnderscoreFunctions(field.key);
+                    try self.validateExprDoesNotCallUnderscoreFunctions(field.value);
+                }
+            },
+            .struct_expr => |struct_expr| {
+                if (struct_expr.update_source) |source| try self.validateExprDoesNotCallUnderscoreFunctions(source);
+                for (struct_expr.fields) |field| try self.validateExprDoesNotCallUnderscoreFunctions(field.value);
+            },
+            .range => |range| {
+                try self.validateExprDoesNotCallUnderscoreFunctions(range.start);
+                try self.validateExprDoesNotCallUnderscoreFunctions(range.end);
+                if (range.step) |step| try self.validateExprDoesNotCallUnderscoreFunctions(step);
+            },
+            .field_access => |field_access| try self.validateExprDoesNotCallUnderscoreFunctions(field_access.object),
+            .if_expr => |if_expr| {
+                try self.validateExprDoesNotCallUnderscoreFunctions(if_expr.condition);
+                for (if_expr.then_block) |stmt| try self.validateStmtDoesNotCallUnderscoreFunctions(stmt);
+                if (if_expr.else_block) |else_block| {
+                    for (else_block) |stmt| try self.validateStmtDoesNotCallUnderscoreFunctions(stmt);
+                }
+            },
+            .case_expr => |case_expr| {
+                try self.validateExprDoesNotCallUnderscoreFunctions(case_expr.scrutinee);
+                for (case_expr.clauses) |clause| {
+                    if (clause.guard) |guard| try self.validateExprDoesNotCallUnderscoreFunctions(guard);
+                    try self.validatePatternExpressionsDoNotCallUnderscoreFunctions(clause.pattern);
+                    for (clause.body) |stmt| try self.validateStmtDoesNotCallUnderscoreFunctions(stmt);
+                }
+            },
+            .cond_expr => |cond_expr| {
+                for (cond_expr.clauses) |clause| {
+                    try self.validateExprDoesNotCallUnderscoreFunctions(clause.condition);
+                    for (clause.body) |stmt| try self.validateStmtDoesNotCallUnderscoreFunctions(stmt);
+                }
+            },
+            .for_expr => |for_expr| {
+                try self.validatePatternExpressionsDoNotCallUnderscoreFunctions(for_expr.var_pattern);
+                try self.validateExprDoesNotCallUnderscoreFunctions(for_expr.iterable);
+                if (for_expr.filter) |filter| try self.validateExprDoesNotCallUnderscoreFunctions(filter);
+                try self.validateExprDoesNotCallUnderscoreFunctions(for_expr.body);
+            },
+            .list_cons_expr => |list_cons| {
+                try self.validateExprDoesNotCallUnderscoreFunctions(list_cons.head);
+                try self.validateExprDoesNotCallUnderscoreFunctions(list_cons.tail);
+            },
+            .quote_expr => |quote_expr| {
+                for (quote_expr.body) |stmt| try self.validateStmtDoesNotCallUnderscoreFunctions(stmt);
+            },
+            .unquote_expr => |unquote| try self.validateExprDoesNotCallUnderscoreFunctions(unquote.expr),
+            .unquote_splicing_expr => |unquote_splicing| try self.validateExprDoesNotCallUnderscoreFunctions(unquote_splicing.expr),
+            .panic_expr => |panic_expr| try self.validateExprDoesNotCallUnderscoreFunctions(panic_expr.message),
+            .error_pipe => |error_pipe| {
+                try self.validateExprDoesNotCallUnderscoreFunctions(error_pipe.chain);
+                switch (error_pipe.handler) {
+                    .block => |clauses| for (clauses) |clause| {
+                        if (clause.guard) |guard| try self.validateExprDoesNotCallUnderscoreFunctions(guard);
+                        try self.validatePatternExpressionsDoNotCallUnderscoreFunctions(clause.pattern);
+                        for (clause.body) |stmt| try self.validateStmtDoesNotCallUnderscoreFunctions(stmt);
+                    },
+                    .function => |function| try self.validateExprDoesNotCallUnderscoreFunctions(function),
+                }
+            },
+            .block => |block| for (block.stmts) |stmt| try self.validateStmtDoesNotCallUnderscoreFunctions(stmt),
+            .intrinsic => |intrinsic| for (intrinsic.args) |arg| try self.validateExprDoesNotCallUnderscoreFunctions(arg),
+            .binary_literal => |binary_literal| for (binary_literal.segments) |segment| try self.validateBinarySegmentDoesNotCallUnderscoreFunctions(segment),
+            .anonymous_function => |anonymous_function| try self.validateFunctionBodyDoesNotCallUnderscoreFunctions(anonymous_function.decl),
+            .type_annotated => |type_annotated| try self.validateExprDoesNotCallUnderscoreFunctions(type_annotated.expr),
+            .string_interpolation => |interpolation| for (interpolation.parts) |part| {
+                switch (part) {
+                    .expr => |part_expr| try self.validateExprDoesNotCallUnderscoreFunctions(part_expr),
+                    .literal => {},
+                }
+            },
+            .int_literal,
+            .float_literal,
+            .string_literal,
+            .atom_literal,
+            .bool_literal,
+            .nil_literal,
+            .var_ref,
+            .struct_ref,
+            .attr_ref,
+            .function_ref,
+            => {},
+        }
+    }
+
+    fn validatePatternExpressionsDoNotCallUnderscoreFunctions(self: *TypeChecker, pattern: *const ast.Pattern) anyerror!void {
+        switch (pattern.*) {
+            .tuple => |tuple| for (tuple.elements) |element| try self.validatePatternExpressionsDoNotCallUnderscoreFunctions(element),
+            .list => |list| for (list.elements) |element| try self.validatePatternExpressionsDoNotCallUnderscoreFunctions(element),
+            .list_cons => |list_cons| {
+                for (list_cons.heads) |head| try self.validatePatternExpressionsDoNotCallUnderscoreFunctions(head);
+                try self.validatePatternExpressionsDoNotCallUnderscoreFunctions(list_cons.tail);
+            },
+            .map => |map| for (map.fields) |field| {
+                try self.validateExprDoesNotCallUnderscoreFunctions(field.key);
+                try self.validatePatternExpressionsDoNotCallUnderscoreFunctions(field.value);
+            },
+            .struct_pattern => |struct_pattern| for (struct_pattern.fields) |field| try self.validatePatternExpressionsDoNotCallUnderscoreFunctions(field.pattern),
+            .pin => {},
+            .paren => |paren| try self.validatePatternExpressionsDoNotCallUnderscoreFunctions(paren.inner),
+            .binary => |binary| for (binary.segments) |segment| try self.validateBinarySegmentDoesNotCallUnderscoreFunctions(segment),
+            .wildcard,
+            .bind,
+            .literal,
+            => {},
+        }
+    }
+
+    fn validateBinarySegmentDoesNotCallUnderscoreFunctions(self: *TypeChecker, segment: ast.BinarySegment) anyerror!void {
+        switch (segment.value) {
+            .expr => |expr| try self.validateExprDoesNotCallUnderscoreFunctions(expr),
+            .pattern => |pattern| try self.validatePatternExpressionsDoNotCallUnderscoreFunctions(pattern),
+            .string_literal => {},
+        }
+    }
+
     pub fn checkUnusedBindings(self: *TypeChecker) !void {
         for (self.graph.bindings.items, 0..) |binding, i| {
             const bid: scope_mod.BindingId = @intCast(i);
@@ -2561,7 +2762,7 @@ pub const TypeChecker = struct {
         self.current_scope = self.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(mod.meta.span)) orelse mod.meta.scope_id;
         defer self.current_scope = prev_scope;
 
-        // Check module extends: validate overridden function return types match parent
+        // Check struct extends: validate overridden function return types match parent
         if (mod.parent) |parent_name| {
             try self.checkStructExtendsSignatures(mod, parent_name);
         }
@@ -2577,6 +2778,7 @@ pub const TypeChecker = struct {
                     if (self.current_scope) |cs| try self.checkDebugAttribute(func, cs);
                 },
                 .macro, .priv_macro => |mac| {
+                    try self.validateMacroBodyDoesNotCallUnderscoreFunctions(mac);
                     // Macro bodies are compile-time templates that the
                     // macro engine evaluates at expansion time, not
                     // code the type checker analyses. Every binding
@@ -2770,7 +2972,7 @@ pub const TypeChecker = struct {
     }
 
     fn checkStructExtendsSignatures(self: *TypeChecker, mod: *const ast.StructDecl, parent_name: ast.StringId) !void {
-        // Find parent module
+        // Find parent struct
         var parent_mod: ?*const ast.StructDecl = null;
         for (self.graph.structs.items) |mod_entry| {
             if (mod_entry.name.parts.len == 1 and mod_entry.name.parts[0] == parent_name) {
@@ -2831,7 +3033,7 @@ pub const TypeChecker = struct {
         switch (item) {
             .function => |func| try self.checkFunctionDecl(func),
             .priv_function => |func| try self.checkFunctionDecl(func),
-            .macro, .priv_macro => {}, // Macro bodies are compile-time code — not type-checked
+            .macro, .priv_macro => |mac| try self.validateMacroBodyDoesNotCallUnderscoreFunctions(mac),
             .struct_decl, .priv_struct_decl => {},
             .impl_decl, .priv_impl_decl => |impl_d| {
                 const prev_impl = self.current_impl;
@@ -3336,8 +3538,8 @@ pub const TypeChecker = struct {
                         for (tu.variants) |variant| {
                             var variant_matched = false;
                             for (ce.clauses) |clause| {
-                                // Check for module_ref pattern matching enum variant
-                                // e.g. Color.Red → literal atom pattern or module_ref pattern
+                                // Check for struct_ref pattern matching enum variant
+                                // e.g. Color.Red → literal atom pattern or struct_ref pattern
                                 if (clause.pattern.* == .literal) {
                                     if (clause.pattern.literal == .atom) {
                                         if (clause.pattern.literal.atom.value == variant.name) {
@@ -3444,8 +3646,8 @@ pub const TypeChecker = struct {
             },
             .field_access => |fa| {
                 // Check for enum variant access (e.g. Color.Red)
-                if (fa.object.* == .module_ref) {
-                    const parts = fa.object.module_ref.name.parts;
+                if (fa.object.* == .struct_ref) {
+                    const parts = fa.object.struct_ref.name.parts;
                     if (parts.len == 1) {
                         if (self.store.name_to_type.get(parts[0])) |tid| {
                             const t = self.store.getType(tid);
@@ -3518,9 +3720,9 @@ pub const TypeChecker = struct {
                 return try self.store.addType(.{ .map = .{ .key = key_var, .value = value_var } });
             },
             .struct_expr => |se| {
-                // Resolve struct type from module name annotation
-                if (se.module_name.parts.len > 0) {
-                    const type_name_id = se.module_name.parts[se.module_name.parts.len - 1];
+                // Resolve struct type from struct name annotation
+                if (se.struct_name.parts.len > 0) {
+                    const type_name_id = se.struct_name.parts[se.struct_name.parts.len - 1];
                     if (self.store.name_to_type.get(type_name_id)) |tid| {
                         const typ = self.store.getType(tid);
                         if (typ == .struct_type) {
@@ -3715,8 +3917,8 @@ pub const TypeChecker = struct {
                 _ = try self.inferExpr(pipe.rhs);
                 return TypeStore.UNKNOWN;
             },
-            .module_ref => |mr| {
-                // Check for enum variant access (e.g. Color.Red parsed as module_ref ["Color", "Red"])
+            .struct_ref => |mr| {
+                // Check for enum variant access (e.g. Color.Red parsed as struct_ref ["Color", "Red"])
                 if (mr.name.parts.len == 2) {
                     if (self.store.name_to_type.get(mr.name.parts[0])) |tid| {
                         const t = self.store.getType(tid);
@@ -3875,7 +4077,7 @@ pub const TypeChecker = struct {
     }
 
     /// Check if a field_access chain roots at an atom_literal (`:zig` bridge call).
-    /// Handles nested chains like :zig.Module.func by traversing to the root.
+    /// Handles nested chains like :zig.Struct.func by traversing to the root.
     fn isZigBridgeCall(fa: ast.FieldAccess) bool {
         var obj = fa.object;
         while (true) {
@@ -3893,6 +4095,13 @@ pub const TypeChecker = struct {
         // Special handling for direct function calls (callee is var_ref)
         if (call.callee.* == .var_ref) {
             const vr = call.callee.var_ref;
+            const func_name = self.interner.get(vr.name);
+
+            if (self.isDisallowedUnderscoreFunctionCall(vr.name, vr.meta)) {
+                try self.rejectUnderscoreCall(func_name, arity, call.meta.span);
+                for (call.args) |arg| _ = try self.inferExpr(arg);
+                return TypeStore.UNKNOWN;
+            }
 
             if (self.current_scope) |scope_id| {
                 // First check if it's a variable holding a function
@@ -4082,7 +4291,6 @@ pub const TypeChecker = struct {
                 }
 
                 // Function not found — suggest alternatives
-                const func_name = self.interner.get(vr.name);
                 const visible = self.graph.collectVisibleFunctionNames(
                     scope_id,
                     self.allocator,
@@ -4116,10 +4324,17 @@ pub const TypeChecker = struct {
             }
         }
 
-        // Module-qualified call: IO.puts(...) is a call with field_access callee
+        // Struct-qualified call: IO.puts(...) is a call with field_access callee
         if (call.callee.* == .field_access) {
             const fa = call.callee.field_access;
-            // :zig.func(args) or :zig.Module.func(args) — bridge call;
+            const field_name = self.interner.get(fa.field);
+            if (self.isDisallowedUnderscoreFunctionCall(fa.field, fa.meta)) {
+                try self.rejectUnderscoreCall(field_name, arity, call.meta.span);
+                for (call.args) |arg| _ = try self.inferExpr(arg);
+                return TypeStore.UNKNOWN;
+            }
+
+            // :zig.func(args) or :zig.Struct.func(args) — bridge call;
             // infer args to mark bindings as used. Traverse field access chain
             // to find the root object (handles :zig.A.B.func nested chains).
             if (isZigBridgeCall(fa)) {
@@ -4136,16 +4351,16 @@ pub const TypeChecker = struct {
                 }
                 return TypeStore.UNKNOWN;
             }
-            if (fa.object.* == .module_ref) {
-                const written_mod_name = fa.object.module_ref.name;
+            if (fa.object.* == .struct_ref) {
+                const written_mod_name = fa.object.struct_ref.name;
                 // Protocol dispatch: if the user wrote `Protocol.method(arg, …)`
                 // and `Protocol` is a registered protocol with an impl
                 // for the first argument's concrete type, redirect to the
-                // impl's module so we resolve the impl's signature
+                // impl's struct so we resolve the impl's signature
                 // (concrete return type) instead of the protocol's
                 // abstract one. Mirrors the HIR-level dispatch.
                 const mod_name = if (call.args.len > 0)
-                    self.protocolDispatchModule(written_mod_name, call.args[0]) orelse written_mod_name
+                    self.protocolDispatchStruct(written_mod_name, call.args[0]) orelse written_mod_name
                 else
                     written_mod_name;
                 for (self.graph.structs.items) |mod_entry| {
@@ -4307,9 +4522,9 @@ pub const TypeChecker = struct {
                     }
                 }
 
-                // Check if this is a module name — modules can be used as
+                // Check if this is a struct name — structs can be used as
                 // types in impl declarations and type annotations. Any
-                // module name is accepted as a valid type reference. The
+                // struct name is accepted as a valid type reference. The
                 // monomorphizer resolves the concrete type at specialization.
                 for (self.graph.structs.items) |mod| {
                     if (mod.name.parts.len > 0) {
@@ -6169,6 +6384,190 @@ test "underscore-prefixed variable no unused warning" {
     }
 }
 
+test "direct call to underscore-prefixed bare function is rejected" {
+    const source =
+        \\pub struct Test {
+        \\  pub fn caller() -> i64 {
+        \\    _helper()
+        \\  }
+        \\
+        \\  fn _helper() -> i64 {
+        \\    42
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var found_error = false;
+    for (checker.errors.items) |err| {
+        if (std.mem.find(u8, err.message, "cannot call underscore-prefixed function `_helper/0`") != null) {
+            found_error = true;
+        }
+    }
+    try std.testing.expect(found_error);
+}
+
+test "direct source call to compiler helper-shaped underscore function is rejected" {
+    const source =
+        \\pub struct Test {
+        \\  pub fn caller() -> i64 {
+        \\    __for_0()
+        \\  }
+        \\
+        \\  fn __for_0() -> i64 {
+        \\    42
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var found_error = false;
+    for (checker.errors.items) |err| {
+        if (std.mem.find(u8, err.message, "cannot call underscore-prefixed function `__for_0/0`") != null) {
+            found_error = true;
+        }
+    }
+    try std.testing.expect(found_error);
+}
+
+test "direct call to underscore-prefixed qualified function is rejected" {
+    const source =
+        \\pub struct Helper {
+        \\  pub fn _hidden() -> i64 {
+        \\    42
+        \\  }
+        \\}
+        \\
+        \\pub struct Test {
+        \\  pub fn caller() -> i64 {
+        \\    Helper._hidden()
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var found_error = false;
+    for (checker.errors.items) |err| {
+        if (std.mem.find(u8, err.message, "cannot call underscore-prefixed function `_hidden/0`") != null) {
+            found_error = true;
+        }
+    }
+    try std.testing.expect(found_error);
+}
+
+test "direct call to underscore-prefixed function inside macro body is rejected" {
+    const source =
+        \\pub struct Test {
+        \\  pub macro emit() -> Expr {
+        \\    _helper()
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var found_error = false;
+    for (checker.errors.items) |err| {
+        if (std.mem.find(u8, err.message, "cannot call underscore-prefixed function `_helper/0`") != null) {
+            found_error = true;
+        }
+    }
+    try std.testing.expect(found_error);
+}
+
+test "direct call to underscore-prefixed qualified function inside macro body is rejected" {
+    const source =
+        \\pub struct Test {
+        \\  pub macro emit() -> Expr {
+        \\    Helper._hidden()
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var found_error = false;
+    for (checker.errors.items) |err| {
+        if (std.mem.find(u8, err.message, "cannot call underscore-prefixed function `_hidden/0`") != null) {
+            found_error = true;
+        }
+    }
+    try std.testing.expect(found_error);
+}
+
 test "used variable no unused warning" {
     const source =
         \\pub struct Test {
@@ -6305,7 +6704,7 @@ test "unused function parameter produces warning" {
 }
 
 test "zig bridge call parameters not flagged as unused" {
-    // Regression: :zig.Module.func(param) calls should mark parameters as used.
+    // Regression: :zig.Struct.func(param) calls should mark parameters as used.
     // Previously, the scope collector created duplicate binding IDs for function
     // parameters, and the :zig bridge call resolved to the duplicate — leaving
     // the original parameter binding appearing unused.
@@ -6390,7 +6789,7 @@ test "macro body let-binding referenced via unquote is not unused" {
     const source =
         \\pub struct Test {
         \\  pub macro define_test(name :: Expr) -> Expr {
-        \\    fn_name = __zap_intern_atom__("test_" <> __zap_slugify__(name))
+        \\    fn_name = intern_atom("test_" <> slugify(name))
         \\    quote {
         \\      pub fn unquote(fn_name)() -> i64 { 42 }
         \\      unquote(fn_name)()
@@ -6433,7 +6832,7 @@ test "macro body nested-block let-binding referenced via unquote is not unused" 
         \\pub struct Test {
         \\  pub macro define_named(name :: Expr) -> Expr {
         \\    if true {
-        \\      fn_name = __zap_intern_atom__("inner_" <> __zap_slugify__(name))
+        \\      fn_name = intern_atom("inner_" <> slugify(name))
         \\      quote {
         \\        pub fn unquote(fn_name)() -> i64 { 7 }
         \\        unquote(fn_name)()

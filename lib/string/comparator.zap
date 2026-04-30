@@ -1,3 +1,5 @@
+@doc = "Comparator implementation for `String`."
+
 pub impl Comparator for String {
   @doc = "Byte-equal string equality."
 

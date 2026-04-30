@@ -1,3 +1,5 @@
+@doc = "Comparator implementation for `Integer`."
+
 pub impl Comparator for Integer {
   @doc = "Integer equality."
 

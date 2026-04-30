@@ -2,7 +2,7 @@
 
 ## Problem Statement
 
-Zap is a functional programming language that compiles to native code via Zig's compiler backend. Functions are first-class values — they can be passed as arguments, returned from functions, and stored in data structures. This works at the language level but breaks during code generation: **function-typed values become `void` when crossing module boundaries in the generated ZIR**, causing 21 compilation errors in the test suite.
+Zap is a functional programming language that compiles to native code via Zig's compiler backend. Functions are first-class values — they can be passed as arguments, returned from functions, and stored in data structures. This works at the language level but breaks during code generation: **function-typed values become `void` when crossing struct boundaries in the generated ZIR**, causing 21 compilation errors in the test suite.
 
 ## Architecture Overview
 
@@ -16,17 +16,17 @@ The critical handoff is **IR → ZIR**. The IR (intermediate representation) is 
 
 Zap uses a **forked Zig compiler** (`~/projects/zig`) that exposes ZIR construction via a C-ABI surface (`zir_api.zig`). The Zap compiler builds ZIR by calling C functions like `zir_builder_emit_call`, `zir_builder_emit_param`, `zir_builder_emit_decl_ref`, etc.
 
-### Per-Module Compilation
+### Per-Struct Compilation
 
-Each Zap module (one per `.zap` file) is compiled independently through the pipeline, producing its own ZIR module. Cross-module references use `@import("ModuleName").function_name`. The Zig compiler links all modules together.
+Each Zap struct (one per `.zap` file) is compiled independently through the pipeline, producing its own ZIR struct. Cross-struct references use `@import("StructName").function_name`. The Zig compiler links all structs together.
 
-Example: `Enum.map([1,2,3], doubler)` in a test module becomes:
+Example: `Enum.map([1,2,3], doubler)` in a test struct becomes:
 ```zig
 // In Test_MyTest.zig (ZIR)
 @import("Enum").map__2(list_ref, doubler_ref)
 ```
 
-And inside the Enum module:
+And inside the Enum struct:
 ```zig
 // In Enum.zig (ZIR)
 pub fn map__2(list: ListType, callback: anytype) ListType {
@@ -66,12 +66,12 @@ The lookup fails because function-typed values flow through the IR as opaque loc
 
 ### Scenarios Where It Fails
 
-**1. Cross-module function references in Enum callbacks:**
+**1. Cross-struct function references in Enum callbacks:**
 ```zap
 # test/for_comprehension_test.zap
 doubled = for x <- [1, 2, 3] { x * 2 }
 ```
-Desugars to a call to `Enum.map` with an anonymous callback. The callback is a `make_closure` with 0 captures. The ZIR builder emits `decl_ref("__for_0")` for the anonymous function. But when this ref crosses into the Enum module via `@import`, Zig can't resolve it because `__for_0` is private to the test module.
+Desugars to a call to `Enum.map` with an anonymous callback. The callback is a `make_closure` with 0 captures. The ZIR builder emits `decl_ref("__for_0")` for the anonymous function. But when this ref crosses into the Enum struct via `@import`, Zig can't resolve it because `__for_0` is private to the test struct.
 
 **2. Function references passed as callback parameters:**
 ```zap
@@ -81,15 +81,15 @@ fn apply(value :: i64, callback :: (i64 -> i64)) -> i64 {
 }
 assert(apply(41, add_one) == 42)
 ```
-`add_one` is passed to `apply`. In the IR, this is `make_closure(dest=L5, function=add_one_id, captures=[])`. The ZIR builder emits `decl_ref("add_one__1")` and stores it in `local_refs[L5]`. Then `apply`'s body has `call_closure(callee=L1, args=[L0])` where L1 is the `callback` parameter. The parameter IS registered via `setLocal(1, param_ref)`, so L1 resolves. But the actual function pointer type is lost — Zig sees it as `anytype` and needs the callsite to provide the concrete type. When the concrete type comes from a cross-module `@import`, the indirection loses the function-ness.
+`add_one` is passed to `apply`. In the IR, this is `make_closure(dest=L5, function=add_one_id, captures=[])`. The ZIR builder emits `decl_ref("add_one__1")` and stores it in `local_refs[L5]`. Then `apply`'s body has `call_closure(callee=L1, args=[L0])` where L1 is the `callback` parameter. The parameter IS registered via `setLocal(1, param_ref)`, so L1 resolves. But the actual function pointer type is lost — Zig sees it as `anytype` and needs the callsite to provide the concrete type. When the concrete type comes from a cross-struct `@import`, the indirection loses the function-ness.
 
 **3. Imported function identifiers:**
 ```zap
 # test/import_test.zap
-import Test.MultiModuleHelper
+import Test.MultiStructHelper
 assert(double(3) == 6)
 ```
-`double` is used as a bare identifier. The ZIR builder emits `decl_ref("double")` but `double` isn't declared in `Test_ImportTest.zig` — it's in `Test_MultiModuleHelper.zig`. The ZIR builder should emit `@import("Test_MultiModuleHelper").double__1` instead.
+`double` is used as a bare identifier. The ZIR builder emits `decl_ref("double")` but `double` isn't declared in `Test_ImportTest.zig` — it's in `Test_MultiStructHelper.zig`. The ZIR builder should emit `@import("Test_MultiStructHelper").double__1` instead.
 
 ## Current Type Representation
 
@@ -124,7 +124,7 @@ Function values flow through these IR instructions:
 - `make_closure { dest: LocalId, function: FunctionId, captures: []LocalId }` — creates a function reference
 - `call_closure { dest: LocalId, callee: LocalId, args: []LocalId }` — calls a function value
 - `call { dest: LocalId, target: FunctionId, args: []LocalId }` — direct named call
-- `call_builtin { dest: LocalId, name: []const u8, args: []LocalId }` — runtime function call (`:zig.Module.function`)
+- `call_builtin { dest: LocalId, name: []const u8, args: []LocalId }` — runtime function call (`:zig.Struct.function`)
 - `local_set { dest: LocalId, source: LocalId }` — copy a local
 - `local_get { dest: LocalId, source: LocalId }` — read a local
 
@@ -204,13 +204,13 @@ In `src/ir.zig`'s `IrBuilder`, when lowering a HIR expression with a function ty
 In `src/zir_builder.zig`, when encountering a `ZigType.function`:
 - For parameters: emit `*const fn(param_types...) return_type` instead of `anytype`
 - For `make_closure` with 0 captures: emit a typed `decl_ref` 
-- For cross-module calls: ensure the function ref type survives the `@import` boundary
+- For cross-struct calls: ensure the function ref type survives the `@import` boundary
 
-### 4. Fix Cross-Module Import Resolution
+### 4. Fix Cross-Struct Import Resolution
 
-When a local's value comes from another module (via `import` or cross-module function call), the ZIR builder should emit `@import("SourceModule").function_name` instead of `decl_ref("function_name")`.
+When a local's value comes from another struct (via `import` or cross-struct function call), the ZIR builder should emit `@import("SourceStruct").function_name` instead of `decl_ref("function_name")`.
 
-The `import` resolution logic exists for function CALLS (see `emitCrossModuleCall` in zir_builder.zig) but not for function VALUES passed as arguments.
+The `import` resolution logic exists for function CALLS (see `emitCrossStructCall` in zir_builder.zig) but not for function VALUES passed as arguments.
 
 ## Key Files
 
@@ -219,19 +219,19 @@ The `import` resolution logic exists for function CALLS (see `emitCrossModuleCal
 | `src/types.zig` | Type checker with full function type support (TypeStore, Type union) |
 | `src/hir.zig` | HIR with TypeId annotations on every expression |
 | `src/ir.zig` | IR with ZigType (missing function variant), IrBuilder |
-| `src/zir_builder.zig` | ZIR emission, local_refs tracking, cross-module routing |
-| `src/compiler.zig` | Pipeline orchestration, per-module compilation |
+| `src/zir_builder.zig` | ZIR emission, local_refs tracking, cross-struct routing |
+| `src/compiler.zig` | Pipeline orchestration, per-struct compilation |
 | `src/runtime.zig` | Runtime with ListCell.mapFn etc. (where the errors manifest) |
-| `lib/enum.zap` | Enum.map etc. — intermediate module between caller and runtime |
+| `lib/enum.zap` | Enum.map etc. — intermediate struct between caller and runtime |
 | `test/closure_test.zap` | Tests for function-as-value patterns |
 | `test/for_comprehension_test.zap` | Tests for desugared for loops with callbacks |
-| `test/import_test.zap` | Tests for cross-module bare identifier imports |
+| `test/import_test.zap` | Tests for cross-struct bare identifier imports |
 
 ## Current Error Manifest
 
 21 errors when running `zap test`:
 
-| Count | Module | Error | Root Cause |
+| Count | Struct | Error | Root Cause |
 |-------|--------|-------|------------|
 | 2 | Test_ClosureTest | `type 'void' not a function` | Function ref passed to `apply()` becomes void |
 | 8 | Test_ForComprehensionTest | `expected ListCell, found void` | For loop callback becomes void |
@@ -240,17 +240,17 @@ The `import` resolution logic exists for function CALLS (see `emitCrossModuleCal
 
 ## Relevant Zig Concepts
 
-- **ZIR (Zig IR)**: Zig's intermediate representation before semantic analysis. Instruction-based, SSA-like. Each module produces its own ZIR.
+- **ZIR (Zig IR)**: Zig's intermediate representation before semantic analysis. Instruction-based, SSA-like. Each struct produces its own ZIR.
 - **Sema**: Zig's semantic analyzer that type-checks ZIR and produces AIR (Analysis IR). This is where the `void not a function` errors occur.
 - **`anytype`**: Zig's comptime-polymorphic parameter type. Functions with `anytype` params are monomorphized at each call site. The runtime's `mapFn(list, callback: anytype)` relies on this.
-- **`@import`**: Zig's module system. Each Zap module becomes a Zig module. Cross-module references use `@import("ModuleName").symbol`.
-- **`decl_ref`**: ZIR instruction that references a declaration by name within the current module's namespace.
+- **`@import`**: Zig's struct system. Each Zap struct becomes a Zig struct. Cross-struct references use `@import("StructName").symbol`.
+- **`decl_ref`**: ZIR instruction that references a declaration by name within the current struct's namespace.
 - **Function pointers**: In Zig, `*const fn(i64) i64` is a concrete type. Function values in Zap should compile to this.
 
 ## Constraints
 
 - The Zig fork's C-ABI surface (`zir_api.zig`) already supports emitting function types via `zir_builder_emit_param` with type refs, `zir_builder_emit_decl_ref` for function references, and `zir_builder_emit_call_ref` for indirect calls.
-- The fix must work for both same-module and cross-module function references.
+- The fix must work for both same-struct and cross-struct function references.
 - Anonymous functions (lambdas) with 0 captures should work the same as named function references.
 - Closures with captures use a different mechanism (environment struct) and are partially working — the 0-capture case is the broken one.
 - All changes must be in the Zap compiler (`~/projects/zap/src/`), not in the Zig fork.

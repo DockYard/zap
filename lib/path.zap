@@ -1,21 +1,21 @@
+@doc = """
+  Functions for manipulating file system paths.
+
+  Most functions are pure string manipulation. `Path.glob/1` reads
+  the file system and returns matching paths in deterministic sorted
+  order.
+
+  ## Examples
+
+      Path.join("src", "main.zap")  # => "src/main.zap"
+      Path.basename("/usr/bin/zap")  # => "zap"
+      Path.dirname("/usr/bin/zap")   # => "/usr/bin"
+      Path.extname("main.zap")       # => ".zap"
+      Path.glob("lib/**/*.zap")      # => ["lib/path.zap", ...]
+  """
+
 pub struct Path {
-  @structdoc = """
-    Functions for manipulating file system paths.
-
-    Most functions are pure string manipulation. `Path.glob/1` reads
-    the file system and returns matching paths in deterministic sorted
-    order.
-
-    ## Examples
-
-        Path.join("src", "main.zap")  # => "src/main.zap"
-        Path.basename("/usr/bin/zap")  # => "zap"
-        Path.dirname("/usr/bin/zap")   # => "/usr/bin"
-        Path.extname("main.zap")       # => ".zap"
-        Path.glob("lib/**/*.zap")      # => ["lib/path.zap", ...]
-    """
-
-  @fndoc = """
+  @doc = """
     Joins two path segments with a separator.
 
     ## Examples
@@ -28,7 +28,7 @@ pub struct Path {
     :zig.Path.join(left, right)
   }
 
-  @fndoc = """
+  @doc = """
     Returns the last component of a path.
 
     ## Examples
@@ -41,7 +41,7 @@ pub struct Path {
     :zig.Path.basename(path)
   }
 
-  @fndoc = """
+  @doc = """
     Returns the directory component of a path.
 
     ## Examples
@@ -54,7 +54,7 @@ pub struct Path {
     :zig.Path.dirname(path)
   }
 
-  @fndoc = """
+  @doc = """
     Returns the file extension including the dot.
 
     ## Examples
@@ -67,7 +67,7 @@ pub struct Path {
     :zig.Path.extname(path)
   }
 
-  @fndoc = """
+  @doc = """
     Returns paths matching a glob pattern as a sorted list of strings.
 
     Supports `*`, `?`, and recursive `**` wildcards. Relative patterns

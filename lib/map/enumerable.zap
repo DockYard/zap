@@ -1,3 +1,5 @@
+@doc = "Enumerable implementation for `Map`."
+
 pub impl Enumerable for Map(K, V) {
   @doc = """
     Returns the next entry from a map.

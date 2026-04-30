@@ -1,3 +1,5 @@
+@native_type = "string"
+
 @doc = """
   Functions for working with UTF-8 encoded strings.
 
@@ -11,8 +13,6 @@
       String.contains?("hello world", "o") # => true
       String.slice("hello", 0, 3)         # => "hel"
   """
-
-@native_type = "string"
 
 pub struct String {
   @doc = """

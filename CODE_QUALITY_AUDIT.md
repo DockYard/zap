@@ -13,8 +13,8 @@
 The compiler is functionally working (586/585 tests passing) but has accumulated significant architectural debt across its lifetime. The audit identified five systemic patterns that account for the majority of issues:
 
 1. **Hardcoded Zap library names in Zig source** — direct violation of CLAUDE.md's most-emphasized rule. Found in 11 files with hundreds of literal string occurrences (`"List"`, `"Map"`, `"Range"`, `"Kernel"`, `"Zest"`, `"Prelude"`, `"ArcRuntime"`, `"to_string"`, `"begin_test"`, etc.).
-2. **`@native` mechanism is documented but functionally dead** — README claims it's the canonical bridge to runtime functions; in reality `:zig.Module.fn(args)` is the only working mechanism. Five parallel runtime-call paths coexist.
-3. **Two-track pipeline architecture** — `compileForCtfe` and `compileModuleByModule` have drifted into largely-duplicate ~250-line pipelines with subtly different invariants. Two-collector-pass and re-registration loops paper over stale-AST-pointer fragility.
+2. **`@native` mechanism is documented but functionally dead** — README claims it's the canonical bridge to runtime functions; in reality `:zig.Struct.fn(args)` is the only working mechanism. Five parallel runtime-call paths coexist.
+3. **Two-track pipeline architecture** — `compileForCtfe` and `compileStructByStruct` have drifted into largely-duplicate ~250-line pipelines with subtly different invariants. Two-collector-pass and re-registration loops paper over stale-AST-pointer fragility.
 4. **Parallel implementations of the same concept** — many fundamental operations have 3-5 implementations: capture detection (4 paths), call dispatch (3 paths), tuple emission (3 paths), return-type setters (7 variants), AST walkers (8+ implementations), name lookup (3 different scope-walk semantics).
 5. **Dead/abandoned code masquerading as live infrastructure** — `escape_analysis.zig` (1100 lines, zero callers), 70 of 159 fork C-ABI exports unused (44%), 8 of 13 macro_eval builtins unreferenced, dead `MonomorphRegistry` (write-only), dead `ReuseAlloc`/`Phi`/`Reset` IR instructions, dead `compileFile`/`cloneFunctionWithOffset` machinery.
 
@@ -52,7 +52,7 @@ These are issues where the current code can produce wrong output, leak memory, o
 
 ### Tier 2: Major architectural issues (CLAUDE.md rule violations)
 
-Every item here violates one or more of the explicit project rules: "no hardcoded Zap module names in compiler", "no shortcuts/hacks", "Zap features must be implemented in Zap".
+Every item here violates one or more of the explicit project rules: "no hardcoded Zap struct names in compiler", "no shortcuts/hacks", "Zap features must be implemented in Zap".
 
 #### Hardcoded Zap library names in compiler
 
@@ -65,7 +65,7 @@ Every item here violates one or more of the explicit project rules: "no hardcode
 | `"String"` | parser.zig:3780, types.zig:330+, desugar.zig:1099+, hir.zig:2531-5162, macro.zig:1824, macro_eval.zig:826/877, zir_builder.zig:2587 | Type primitive plus runtime `String.concat`/`length`/`byte_at` |
 | `"Enumerable"` | desugar.zig:1275 | Single literal — protocol name in macro expansion |
 | `"Zest"` | runtime.zig:1886-2020, macro_eval.zig (entire `build_test_*` family), zir_builder.zig:951/964 | Test framework name in 3 places |
-| `"Zap.Env/Manifest/Dep/Builder"` | zir_builder.zig:716+, doc_generator.zig:80-83 | Build system module names |
+| `"Zap.Env/Manifest/Dep/Builder"` | zir_builder.zig:716+, doc_generator.zig:80-83 | Build system struct names |
 | `"Inspect"` / `"to_string"` | desugar.zig:34/949, resolver.zig:488 | String interpolation hardcodes `Kernel.to_string` |
 | `"Ok"` / variant names | types.zig:3283, zir_builder.zig:5504 | `~>` operator hardcodes Result variant name |
 | `"Prelude"` | zir_builder.zig (8+ sites) | Runtime sub-namespace |
@@ -75,11 +75,11 @@ Every item here violates one or more of the explicit project rules: "no hardcode
 
 #### `@native` is documented but dead
 
-- README documents `@native = "Module.function"` as the canonical mechanism (README.md:558-577).
-- **Zero `.zap` files in `lib/` use `@native`.** All bindings use `:zig.Module.function(args)` calls.
+- README documents `@native = "Struct.function"` as the canonical mechanism (README.md:558-577).
+- **Zero `.zap` files in `lib/` use `@native`.** All bindings use `:zig.Struct.function(args)` calls.
 - **No code in `src/*.zig` reads, registers, or routes via the `@native` attribute.** Only vestigial comments exist.
 - Five parallel runtime-call mechanisms coexist:
-  1. `:zig.X.Y(args)` → HIR `CallTarget.builtin` → IR `call_builtin` → ZIR via `Module.function` parsing
+  1. `:zig.X.Y(args)` → HIR `CallTarget.builtin` → IR `call_builtin` → ZIR via `Struct.function` parsing
   2. `@native = "X.Y"` (documented, non-functional)
   3. Direct `zir_builder_emit_import("zap_runtime", 11)` + `field_val` chains (37+ sites)
   4. Raw ZIR primitive emission (`addwrap`/`subwrap`/`cmp_*` for primitive arithmetic — bypasses `Arithmetic` impl entirely)
@@ -89,10 +89,10 @@ The `Arithmetic for Integer` and `Comparator for Integer` impls in `lib/integer/
 
 #### Two-track pipeline architecture
 
-- `compileForCtfe` (compiler.zig:525-773) and `compileModuleByModule` (compiler.zig:1057-1178) duplicate the entire post-collect pipeline.
-- The CTFE path has a *second* type-check pass (compiler.zig:738-742) the per-module path doesn't.
-- Per-module path *intentionally skips* `checkUnusedBindings` (1018-1024) due to false positives in shared-scope-graph mode.
-- Three CTFE evaluator entry points exist: `evaluateModuleAttributesInOrder`, `evaluateComputedAttributes`, `evaluateComputedAttributesForModule` — each duplicating ~50 lines of interpreter setup; the ordered variant ends with a fallback whole-program pass.
+- `compileForCtfe` (compiler.zig:525-773) and `compileStructByStruct` (compiler.zig:1057-1178) duplicate the entire post-collect pipeline.
+- The CTFE path has a *second* type-check pass (compiler.zig:738-742) the per-struct path doesn't.
+- Per-struct path *intentionally skips* `checkUnusedBindings` (1018-1024) due to false positives in shared-scope-graph mode.
+- Three CTFE evaluator entry points exist: `evaluateStructAttributesInOrder`, `evaluateComputedAttributes`, `evaluateComputedAttributesForStruct` — each duplicating ~50 lines of interpreter setup; the ordered variant ends with a fallback whole-program pass.
 - Two-collector-pass pattern (lines 346-403, 463-506) workarounds stale AST-node pointers after macro expansion. Re-registration loops at 584-604 and 618-639 cover the same ground at the project level.
 - `@constCast` of immutable slices in 4+ places to back-patch analysis results.
 
@@ -102,7 +102,7 @@ The `Arithmetic for Integer` and `Comparator for Integer` impls in `lib/integer/
 |---------|----------------------|-------|
 | "Is this a closure?" detection | 3 booleans + 1 helper | ir.zig (`is_closure`), zir_builder.zig (`current_function_is_closure`), analysis_pipeline.zig (defensive `or`) |
 | Capture computation | 4 algorithms | hir.zig (canonical + parent-assignment), types.zig (`collectCapturedBindings*`, `capturedBindingsForFunctionDecl`), escape_analysis.zig (`summarizeClosure`, dead) |
-| Generic call dispatch | 3 parallel pipelines | types.zig:3501-3568 (bare-name) and 3653-3717 (module-qualified) and monomorphize.zig:389-453 — all do the same `containsTypeVars + unify + applyToType` dance |
+| Generic call dispatch | 3 parallel pipelines | types.zig:3501-3568 (bare-name) and 3653-3717 (struct-qualified) and monomorphize.zig:389-453 — all do the same `containsTypeVars + unify + applyToType` dance |
 | Tuple-decl emission | 3 + 1 = 4 paths | fork zir_api: `emit_tuple_decl`, `_body`, `_untracked`, plus `_with_body` (the new one); plus internal `mapTupleElementType`/`emitBodyLocalTupleType`/`emitTypeRef` cluster |
 | Return-type setters on FuncBody | 7 variants + 8 mutually-exclusive state fields | fork zir_builder.zig — `setTupleReturnType`, `_with_body`, `setUnionReturnType`, `setErrorUnionReturnType`, `setOptionalReturnType`, `setImportedReturnType`, `setDeclValReturnType`, `setCustomReturnType` |
 | `containsTypeVar(s)` | 2 implementations with contradicting protocol_constraint semantics | monomorphize.zig:1033-1067 vs types.zig:502-540 |
@@ -130,8 +130,8 @@ The `Arithmetic for Integer` and `Comparator for Integer` impls in `lib/integer/
 | Fork zir_api type-reification wrappers (`reify_int` etc. ×6) | ~80 | Zero externs in Zap |
 | `desugarErrorPipe`/`flattenPipeChain`/`buildErrorHandler`/`wrapInErrorCheck`/`replacePlaceholder` | ~200 | Calls undefined `desugarPipe`; never invoked |
 | `compileFile` in compiler.zig | 13 | Doc claims to delegate to nonexistent `compileFiles` |
-| `cloneFunctionWithOffset` + helpers | ~110 | Comment in `compileModuleByModule` says "no cloneWithOffset needed"; only test consumes it |
-| `compileModuleTask` + `Io.Group` parallel infrastructure | ~50 | `_ = pio;` discard at line 1070 confirms unused |
+| `cloneFunctionWithOffset` + helpers | ~110 | Comment in `compileStructByStruct` says "no cloneWithOffset needed"; only test consumes it |
+| `compileStructTask` + `Io.Group` parallel infrastructure | ~50 | `_ = pio;` discard at line 1070 confirms unused |
 | `MonomorphRegistry` in types.zig | ~200 | Recorded twice but never read; `getInstantiationsForFamily` has no callers |
 | 8 of 13 macro_eval builtins | ~400 | `make_fn_decl`, `find_setup`, `find_teardown`, `inject_setup`, `defstruct`, `defenum`, `defunion`, `split_words`, `slugify`, `string_concat`, `is_tuple`, `is_list`, `is_atom` — all have no `.zap` callers |
 | Dead IR instructions (`cond_branch`, `if_expr`, `branch`, `phi`, `reset`, `reuse_alloc`, `jump`) | ~80 | Defined but never produced |
@@ -139,7 +139,7 @@ The `Arithmetic for Integer` and `Comparator for Integer` impls in `lib/integer/
 | Dead ZIR builder fields (`cached_list_type_ref`) | ~5 | Field reset to 0 but never assigned non-zero |
 | Dead `direct_capture_params` / `tier` / `stack_env` / `storage_scope` / `needs_closure_object` | ~20 (× 5 branches that read them) | All `closure_lowering_for_tier` paths set `direct_capture_params = false` |
 | `registerFunctionGroup` + `buildGroupClauses` in HIR | ~40 | Cog reports zero callers |
-| `inherited_iter` loop in `buildModule` | ~30 | Always `continue`s — entire body dead |
+| `inherited_iter` loop in `buildStruct` | ~30 | Always `continue`s — entire body dead |
 | `setErrorUnionReturnType` C-ABI export and Zap-side declaration | ~25 | Zero externs |
 | Stale `// Fourth pass` comment | 1 | There are only 2 passes |
 
@@ -151,20 +151,20 @@ The `Arithmetic for Integer` and `Comparator for Integer` impls in `lib/integer/
 | `__for_` prefix detection (synthetic helper marker) | desugar.zig:1089/1264, types.zig:2655-2670 |
 | `__try` suffix detection | zir_builder.zig:1808 |
 | `__main__` substring sniffing for entry detection | zir_builder.zig:1750-1751 |
-| `__Module__` prefix demangling | ir.zig:4262, zir_builder.zig:2723 (different rules in each) |
+| `__Struct__` prefix demangling | ir.zig:4262, zir_builder.zig:2723 (different rules in each) |
 | Hardcoded `?` and `!` suffix validation in `buildFunctionGroup` | hir.zig:2799-2834 |
 | `ctx` variable name hardcoded in test setup expansion | macro_eval.zig:739, 927 |
 | `test_` prefix and slugify rules in macro_eval | macro_eval.zig:851-865 |
 | Hardcoded `"ok"` and `"."` test-tracking literals | macro_eval.zig:941, 953, 980, 990 |
-| `Test.` module prefix enforcement | main.zig:1110-1138 |
+| `Test.` struct prefix enforcement | main.zig:1110-1138 |
 | `lib/zest/` directory probe | main.zig:280-283 |
 | `manifest`/`__manifest__1` name patterns in builder | builder.zig:184-194 |
 | Magic number `next_try_id = 10000` | ir.zig:825 (will collide silently if program has ≥10000 functions) |
 | Magic depth limit 32 in alias chasing | analysis_pipeline.zig:648, contification_rewrite.zig:136 |
 | Magic safety limit `transitive_iterations > 10` in monomorphizer | monomorphize.zig:99-126 |
 | `0xFFFFFFFF` literal used 349 times in fork zir_api | (file-level constant should exist) |
-| Magic "module name = `top`" used as synthetic top-level marker | compiler.zig:1152-1166 (CTFE silently no-ops for top-level functions) |
-| Substring-match `unit.source` against module name to map module→file | compiler.zig:1316 |
+| Magic "struct name = `top`" used as synthetic top-level marker | compiler.zig:1152-1166 (CTFE silently no-ops for top-level functions) |
+| Substring-match `unit.source` against struct name to map struct→file | compiler.zig:1316 |
 | `interner.lookupExisting("run") and ("String")` to decide whether to synthesize `run()` | hir.zig:2511-2538 (depends on coincidental interner state) |
 
 ---
@@ -172,7 +172,7 @@ The `Arithmetic for Integer` and `Comparator for Integer` impls in `lib/integer/
 ## Findings by file (per-agent reports)
 
 ### Zap-side: `src/types.zig` — 23 findings
-**Most critical:** `inferCall` has two parallel ~340-line dispatch pipelines (bare-name vs module-qualified), each independently rebuilding `SubstitutionMap` + unify + applyToType. Same for monomorphic call paths.
+**Most critical:** `inferCall` has two parallel ~340-line dispatch pipelines (bare-name vs struct-qualified), each independently rebuilding `SubstitutionMap` + unify + applyToType. Same for monomorphic call paths.
 
 Other top issues:
 - `analysisFunctionByDecl` re-walks `program.functions` after `analysisFunctionIdByName` already did
@@ -192,13 +192,13 @@ Other top issues:
 - `current_param_names` linear scan duplicated 5× for "is parameter?" check
 - 4 near-identical `resolveFunction*ReturnType*` functions
 - `resolveFunctionParamOwnerships` and `resolveFunctionParamTypes` are 95% identical
-- `current_clause_scope orelse current_module_scope orelse prelude_scope` repeated 13×
+- `current_clause_scope orelse current_struct_scope orelse prelude_scope` repeated 13×
 - Hardcoded Range field desugaring (`"start"`, `"end"`, `"step"`) in HIR
 - Hardcoded `"Map"`, `"List"`, `:zig` atom, `"Arithmetic"`/`"Comparator"`, `"raise"`, `"!"`/`"?"` suffix detection
-- `"run"`/`"String"` interner-scan hack for module-level expression synthesis
+- `"run"`/`"String"` interner-scan hack for struct-level expression synthesis
 - `buildErrorHandlerExpr` discards all but first case clause (`_ = scrutinee; _ = err_name;` placeholder)
 - 3 different `StructName.toString` formats with different separators
-- 2 protocol-call dispatch paths (binary op vs module call) duplicate lookup logic
+- 2 protocol-call dispatch paths (binary op vs struct call) duplicate lookup logic
 
 ### Zap-side: `src/desugar.zig` — 21 findings
 **Most critical:** ~200 lines of dead `desugarErrorPipe`/`flattenPipeChain`/`buildErrorHandler` chain that calls a `desugarPipe` function which doesn't exist (would be a compile error if reachable).
@@ -212,19 +212,19 @@ Other top issues:
 - Synthesized AST nodes lose source spans (everything zero-spanned)
 - Visibility encoded twice on for-comp helpers
 - `collectAllStructFields` swallows OOM and returns wrong data
-- Inconsistent `var_ref` vs `module_ref` for module names
+- Inconsistent `var_ref` vs `struct_ref` for struct names
 
 ### Zap-side: `src/zir_builder.zig` — 19 findings
-**Most critical:** Four parallel "ZigType → ZIR Ref" resolvers with different incomplete coverage and different return conventions. Three tuple-type emission paths. Three `struct_init` paths copying same `decl_val + struct_init_typed` fallback logic. Cross-module call routing duplicated 6+ times. Closure call dispatch has 5 overlapping fast paths in 240 lines.
+**Most critical:** Four parallel "ZigType → ZIR Ref" resolvers with different incomplete coverage and different return conventions. Three tuple-type emission paths. Three `struct_init` paths copying same `decl_val + struct_init_typed` fallback logic. Cross-struct call routing duplicated 6+ times. Closure call dispatch has 5 overlapping fast paths in 240 lines.
 
 Other top issues:
-- "zap_runtime" string literal in 25+ places (hardcoded module name)
+- "zap_runtime" string literal in 25+ places (hardcoded struct name)
 - "Prelude", "ArcRuntime", "BinaryHelpers", "MapAtomInt", "BuilderRuntime" hardcoded as runtime struct names
 - The colon-encoded "List:Type.method" / "MapNested:str:list" call_builtin parsing scheme
 - Hardcoded `"List"` cached refs (6 of them) without equivalent for Map/String/Atom
 - `emitUnionSwitch` has admitted broken implementation behind a placeholder comment ("For now, accept that the Ok prong returns void. This means the ~> expression evaluates to void for success. That's wrong for production but let's see if it at least doesn't crash")
 - Unused `emitAllocMut`, `emitLoop`, `emitRepeat`
-- `structToModuleName` leaks per call (allocator.alloc never freed)
+- `structToStructName` leaks per call (allocator.alloc never freed)
 - main-name detection by string heuristics instead of `program.entry`
 - Dead state field `cached_list_type_ref`
 
@@ -232,7 +232,7 @@ Other top issues:
 **Most critical:** `lowerDecisionTreeForCase` and `lowerDecisionTreeForDispatch` are 95% duplicates (~600 lines, leaves diverge). `__try` variant generation duplicates ~120 lines of `buildFunctionGroup` body and silently omits `map_bindings`. `next_local; param_get; .empty; toOwnedSlice` boilerplate appears 20+ times.
 
 Other top issues:
-- 3 independent call-name resolution paths formatting `"{module}__{name}__{arity}"` differently
+- 3 independent call-name resolution paths formatting `"{struct}__{name}__{arity}"` differently
 - 4 places computing `max_binding_local` with inconsistent coverage
 - Hardcoded `"Range"`/`"List."`/`"Map."` string prefixes for opcode dispatch
 - Encoded type names (`"u32"`, `"str"`) duplicated in `zigTypeToEncodedName` AND inline at call sites with `else => "i64"` silent fallback
@@ -258,32 +258,32 @@ Other top issues:
 - `makeList` and `makeListFromSlice` are byte-identical
 
 ### Zap-side: `src/compiler.zig` — 15 findings
-**Most critical:** `compileForCtfe` is a fully duplicated whole-program pipeline (~250 lines) running side-by-side with `compileModuleByModule`. Two-collector-pass pattern. Type-checker constructed and run twice on the same desugared program in CTFE path.
+**Most critical:** `compileForCtfe` is a fully duplicated whole-program pipeline (~250 lines) running side-by-side with `compileStructByStruct`. Two-collector-pass pattern. Type-checker constructed and run twice on the same desugared program in CTFE path.
 
 Other top issues:
 - `compileFile` shim contradicts its own doc comment
 - `mergeAndFinalize` and `mergeAndFinalizeWithIo` split despite no caller passing non-null `pio`
-- `compileModuleTask` exists for parallel execution that's never invoked (`_ = pio;` confirms)
+- `compileStructTask` exists for parallel execution that's never invoked (`_ = pio;` confirms)
 - `runTypeCheck`'s "shared store" branch silently mutates caller's store via `clearRetainingCapacity`
 - 3 CTFE evaluator entry points doing essentially the same job; one redundantly runs whole-program after running ordered
 - Diagnostic emission's "show_progress clear + emit + return error" pattern copy-pasted 17×
 - `validateImplConformance` + `registerImplFunctionsInTargetScopes` called twice in same pipeline
-- `buildModulePrograms` re-attaches impls into modules at AST-split time (3rd impl-registration pass)
-- Magic `"top"` string as module name for synthesizing top-level functions (CTFE silently doesn't run for top-level)
+- `buildStructPrograms` re-attaches impls into structs at AST-split time (3rd impl-registration pass)
+- Magic `"top"` string as struct name for synthesizing top-level functions (CTFE silently doesn't run for top-level)
 - `cloneFunctionWithOffset` machinery (~110 lines) is dead — only test consumes it
-- `buildCompilationUnits` does `std.mem.find(unit.source, entry.name)` (substring match against raw source text) to map module→file
+- `buildCompilationUnits` does `std.mem.find(unit.source, entry.name)` (substring match against raw source text) to map struct→file
 
 ### Zap-side: `src/collector.zig` + `src/scope.zig` — 14 findings
 **Most critical:** `registerImplFunctionsInTargetScopes` calls `collectFunction` a second time on the same impls, clobbering `clause.meta.scope_id` and creating duplicate `FunctionFamily` entries. Direct `node_scope_map.get(spanKey(...)) orelse meta.scope_id` calls in 7+ files use *reversed priority* from the canonical `resolveClauseScope` — re-introducing the synthetic-span collision bug just fixed.
 
 Other top issues:
 - `use Foo` silently rewritten to `import Foo`, dropping `__using__/1` semantics and `opts`
-- Top-level vs module-item dispatch are parallel switches that must be kept in sync
+- Top-level vs struct-item dispatch are parallel switches that must be kept in sync
 - `findStructScope` linear-scan reinvented as `findStructScopeByName` (×2) plus 14+ inline loops in types.zig and ctfe.zig
 - `findProtocol`/`findImpl`/`findImplsForProtocol` use linear scans
 - `resolveTypeByName` is a global flat lookup while `resolveBinding`/`resolveFamily` walk scope chain — three different lookup semantics for the same concept
-- `resolveFamily`/`resolveMacro` re-resolve `findStructScope(imp.source_module)` per scope per import (hot path)
-- `node_scope_map` writes for module/protocol/impl/clause/macro/block all use same span-keyed map (collision risk for synthetic code)
+- `resolveFamily`/`resolveMacro` re-resolve `findStructScope(imp.source_struct)` per scope per import (hot path)
+- `node_scope_map` writes for struct/protocol/impl/clause/macro/block all use same span-keyed map (collision risk for synthetic code)
 - `@constCast` mutation of `*const` fields (`clause.meta.scope_id`, `interner`)
 - "Pending attribute" state threaded as in-place mutable accumulator
 - `"Kernel"` hardcoded in 3 files (collector, compiler, discovery)
@@ -296,10 +296,10 @@ Other top issues:
 **Most critical:** `MonomorphRegistry` in types.zig is dead write-only state. Three call-site dispatch implementations re-do unification. Two `containsTypeVar` implementations with **contradicting protocol_constraint semantics**. Two name-mangling implementations producing different output for the same input.
 
 Other top issues:
-- Per-module re-monomorphization via `module_salt` produces N copies of identical specialized function
+- Per-struct re-monomorphization via `struct_salt` produces N copies of identical specialized function
 - Magic `> 10` cap on transitive iteration loop (silently produces wrong binary if exceeded)
 - Local function groups inside specialized clones not specialized — share generic captures with all parents
-- Source-module prefix lookup is O(modules × functions) per specialization
+- Source-struct prefix lookup is O(structs × functions) per specialization
 - Pointer-identity-based `call_rewrites` map (heap address as key) — fragile
 - Empty-list/map default to `[i64]` / `Map(Atom, i64)`
 - `local_types` side-table is workaround for stale `Expr.type_id` after call rewrites
@@ -340,7 +340,7 @@ Other top issues:
 **Most critical:** Entire Zest test DSL implemented in `macro_eval.zig` instead of Zap macros. `find_setup`/`find_teardown`/`build_test_fns`/`build_test_fn` are Zig functions. Test framework knowledge baked in 5+ places.
 
 Other top issues:
-- Hardcoded `Test.` module prefix validation in `main.zig:1110-1138`
+- Hardcoded `Test.` struct prefix validation in `main.zig:1110-1138`
 - `lib/zest/` directory probe in `main.zig:280-283` (special-cased)
 - HIR synthesizes `pub fn run() -> String` only when interner happens to contain "run" (depends on coincidental interner state — fragile)
 - Runtime struct named `Zest` in `runtime.zig:1886-2020` (framework name in runtime)
@@ -401,11 +401,11 @@ Other top issues:
 - 16 sites manually check `pattern.* == .bind` — should be `Pattern.asBindName() ?StringId` helper
 - `next_id: *u32` thread-local mutable counter passed through 11 functions (matrix-compiler should be a struct)
 
-### Cross-cutting: hardcoded module names search — Categorized
-- **Module names hardcoded** (Kernel, String, List, Map, Range, Enumerable, Zest, Zap.*, Inspect, etc.): **~15 hotspots across 11 files** — HIGH severity
+### Cross-cutting: hardcoded struct names search — Categorized
+- **Struct names hardcoded** (Kernel, String, List, Map, Range, Enumerable, Zest, Zap.*, Inspect, etc.): **~15 hotspots across 11 files** — HIGH severity
 - **Library API function names hardcoded** (`getHead`, `getTail`, `cons`, `length`, `concat`, `to_string`, `setup`, `teardown`, `begin_test`, `end_test`, `print_result`): **~25 hotspots, concentrated in zir_builder.zig and macro_eval.zig** — HIGH
 - **Runtime ABI helpers hardcoded** (`zap_runtime`, `Prelude`, `getArgv`, `atomIntern`, `ArcRuntime`, `callCallableN`, `MapAtomInt`): **~30 occurrences** — MEDIUM (runtime ABI is shared by definition but should flow through Zap-side annotations)
-- **Internal naming conventions** (`__anon_fn_`, `__for_`, `__main__`, `__using__`, `__try`, `__Module__*`, `:zig.*`): ~12 occurrences — MEDIUM
+- **Internal naming conventions** (`__anon_fn_`, `__for_`, `__main__`, `__using__`, `__try`, `__Struct__*`, `:zig.*`): ~12 occurrences — MEDIUM
 - **Variant names** (`Ok`, `Result`, `Some`, etc.): ~3 production hits — MEDIUM (couple to language-item attributes)
 - **Duplicated primitive-type lists**: 6 separate copies of the same builtin-type-name array — LOW
 
@@ -417,7 +417,7 @@ Other top issues:
 - `in` operator for ranges is hardcoded inline arithmetic chain
 - `BinaryHelpers.readInt{...}` switch table (~85 lines) exhaustively hardcodes endianness/sign/width permutations
 - Atom interning calls `atomIntern` directly via `field_val` instead of through ABI helper
-- Function-name mangling format `Module__function__arity` is parsed and re-parsed at multiple layers, with operator names having extra prefixing — round-trip fragility
+- Function-name mangling format `Struct__function__arity` is parsed and re-parsed at multiple layers, with operator names having extra prefixing — round-trip fragility
 
 ---
 
@@ -469,9 +469,9 @@ When a primitive needed to do almost-the-same thing, the consistent answer was t
 ### Pattern E: "Run it twice for safety"
 - Two-collector-pass pattern (compiler.zig)
 - Two type-check passes in compileForCtfe
-- Three impl-registration passes (collectImpl, registerImplFunctionsInTargetScopes, buildModulePrograms)
+- Three impl-registration passes (collectImpl, registerImplFunctionsInTargetScopes, buildStructPrograms)
 - Phase 3 of analysis pipeline reruns Phase 1 from scratch
-- `evaluateModuleAttributesInOrder` falls back to whole-program walk after ordered walk
+- `evaluateStructAttributesInOrder` falls back to whole-program walk after ordered walk
 
 **Fix posture:** Each "run again" is paying for an information-flow gap. Find what's stale on the first run and fix it (e.g., scope_id on AST nodes via pointer identity instead of span keys).
 
@@ -500,9 +500,9 @@ Each item below is "delete code with no consumers"; if test suite passes, the cl
 5. Dead IR instructions (`cond_branch`, `if_expr`, `branch`, `phi`, `reset`, `reuse_alloc`, `jump`)
 6. Dead IR-builder fields (`default_arg_wrappers`, `group_id_to_name`, `next_label`, `next_function_id`, `cached_list_type_ref`)
 7. Dead `MonomorphRegistry` in types.zig
-8. Dead `compileFile`, `compileModuleTask`, `cloneFunctionWithOffset` machinery
+8. Dead `compileFile`, `compileStructTask`, `cloneFunctionWithOffset` machinery
 9. Dead `direct_capture_params` field and 5 branches reading it; collapse `ClosureLowering` to `needs_env_param`
-10. `inherited_iter` no-op loop in HIR `buildModule`
+10. `inherited_iter` no-op loop in HIR `buildStruct`
 11. `registerFunctionGroup`/`buildGroupClauses` orphaned helpers
 12. `setErrorUnionReturnType` C ABI export (zero externs)
 
@@ -532,7 +532,7 @@ Each item below is "delete code with no consumers"; if test suite passes, the cl
 ### Wave 4: Refactor parallel implementations
 1. **Single AST visitor** (`src/ir_traversal.zig` proposal in analysis-pipeline audit). Replaces 8+ duplicate walkers across analysis files. Estimated ~1000 line savings.
 2. **Single binding-resolver** combining `resolveBindingType` + `buildBindingReference` + map_bindings.
-3. **Single call-dispatch path** in types.zig replacing the bare-name + module-qualified parallel pipelines.
+3. **Single call-dispatch path** in types.zig replacing the bare-name + struct-qualified parallel pipelines.
 4. **`RetTypeSpec` tagged union** in fork zir_builder, replacing the 7 setter variants and 8 state fields. `endFunction`'s triple if/else chain collapses.
 5. **Single decision-tree lowerer** in IR builder with `LeafEmitter` strategy parameter — eliminates ~600 lines duplication between Case and Dispatch lowering.
 6. **Unified worklist abstraction** in `src/worklist.zig` — replaces 4 inconsistent fixpoint engines.

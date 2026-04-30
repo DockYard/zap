@@ -1,3 +1,5 @@
+@doc = "Concatenable implementation for `String`."
+
 pub impl Concatenable for String {
   @doc = """
     String concatenation. Allocates a fresh string in the runtime

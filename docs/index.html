@@ -24,7 +24,7 @@
 <circle cx="7" cy="7" r="5" stroke="var(--fg-muted)" stroke-width="1.3"/>
 <line x1="10.6" y1="10.6" x2="14" y2="14" stroke="var(--fg-muted)" stroke-width="1.3" stroke-linecap="round"/>
 </svg>
-<span>Search modules, functions, guides...</span>
+<span>Search structs, functions, guides...</span>
 <kbd>⌘</kbd><kbd>K</kbd>
 </button>
 </div>
@@ -46,35 +46,35 @@
 <div class="sidebar-header"><a href="index.html" class="sidebar-title">zap_stdlib</a> <span class="sidebar-version">v0.1.0</span></div>
 <div class="sidebar-search"><input type="text" id="search-input" placeholder="Search (Cmd+K)" aria-label="Search documentation"></div>
 <div class="sidebar-group">
-<h4>Modules</h4>
+<h4>Structs</h4>
 <ul>
-<li><a href="modules/Atom.html">Atom</a></li>
-<li><a href="modules/Bool.html">Bool</a></li>
-<li><a href="modules/Enum.html">Enum</a></li>
-<li><a href="modules/File.html">File</a></li>
-<li><a href="modules/Float.html">Float</a></li>
-<li><a href="modules/Function.html">Function</a></li>
-<li><a href="modules/IO.html">IO</a></li>
-<li><a href="modules/Integer.html">Integer</a></li>
-<li><a href="modules/Kernel.html">Kernel</a></li>
-<li><a href="modules/List.html">List</a></li>
-<li><a href="modules/Map.html">Map</a></li>
-<li><a href="modules/Math.html">Math</a></li>
-<li><a href="modules/String.html">String</a></li>
-<li><a href="modules/System.html">System</a></li>
-<li><a href="modules/Zest.html">Zest</a></li>
+<li><a href="structs/Atom.html">Atom</a></li>
+<li><a href="structs/Bool.html">Bool</a></li>
+<li><a href="structs/Enum.html">Enum</a></li>
+<li><a href="structs/File.html">File</a></li>
+<li><a href="structs/Float.html">Float</a></li>
+<li><a href="structs/Function.html">Function</a></li>
+<li><a href="structs/IO.html">IO</a></li>
+<li><a href="structs/Integer.html">Integer</a></li>
+<li><a href="structs/Kernel.html">Kernel</a></li>
+<li><a href="structs/List.html">List</a></li>
+<li><a href="structs/Map.html">Map</a></li>
+<li><a href="structs/Math.html">Math</a></li>
+<li><a href="structs/String.html">String</a></li>
+<li><a href="structs/System.html">System</a></li>
+<li><a href="structs/Zest.html">Zest</a></li>
 </ul>
 </div>
 <div class="sidebar-group">
 <h4>Zest</h4>
 <ul>
-<li><a href="modules/Zest.Case.html">Zest.Case</a></li>
-<li><a href="modules/Zest.Runner.html">Zest.Runner</a></li>
+<li><a href="structs/Zest.Case.html">Zest.Case</a></li>
+<li><a href="structs/Zest.Runner.html">Zest.Runner</a></li>
 </ul>
 </div>
 </nav>
 <main class="content">
-<div class="moduledoc">
+<div class="struct_doc">
 <p align="center">
   <br>
   <br>
@@ -127,16 +127,16 @@ zap run test        # Compile and run test target</code></pre>
 <p>You can also specify a target explicitly: <code>zap build my_app</code>. The binary is output to <code>zap-out/bin/my_app</code>.</p>
 <hr>
 <h2>The Language</h2>
-<h3>Modules and Files</h3>
-<p>Every <code>.zap</code> file contains exactly one module. The module name maps to the file path:</p>
-<p>| Module name | File path |
+<h3>Structs and Files</h3>
+<p>Every <code>.zap</code> file contains exactly one struct. The struct name maps to the file path:</p>
+<p>| Struct name | File path |
 |---|---|
 | <code>App</code> | <code>lib/app.zap</code> |
 | <code>Config.Parser</code> | <code>lib/config/parser.zap</code> |
 | <code>JsonParser</code> | <code>lib/json_parser.zap</code> |</p>
-<p>The compiler enforces this — a mismatch is a compile error. The compiler discovers files by following module references from the entry point. No glob patterns or file manifests needed.</p>
+<p>The compiler enforces this — a mismatch is a compile error. The compiler discovers files by following struct references from the entry point. No glob patterns or file manifests needed.</p>
 <pre><code class="language-zap"><span class="hl-comment"># lib/math.zap</span>
-<span class="hl-keyword">pub</span> <span class="hl-keyword">module</span> Math {
+<span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> Math {
   <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> square(x <span class="hl-op">::</span> <span class="hl-type">i64</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">i64</span> {
     x <span class="hl-op">*</span> x
   }
@@ -148,20 +148,20 @@ zap run test        # Compile and run test target</code></pre>
 <h3>Visibility</h3>
 <ul>
 <li><code>pub fn</code> / <code>pub macro</code> — public function/macro</li>
-<li><code>fn</code> / <code>macro</code> — private to the module (file)</li>
-<li><code>pub module</code> — public module</li>
-<li><code>module</code> — private module (visible within the dep, invisible outside)</li>
+<li><code>fn</code> / <code>macro</code> — private to the struct (file)</li>
+<li><code>pub struct</code> — public struct</li>
+<li><code>struct</code> — private struct (visible within the dep, invisible outside)</li>
 </ul>
 <h3>Entry Point</h3>
-<p>Every program needs a <code>main</code> function inside a module. The <code>build.zap</code> manifest specifies the entry point:</p>
-<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">module</span> MyApp {
+<p>Every program needs a <code>main</code> function inside a struct. The <code>build.zap</code> manifest specifies the entry point:</p>
+<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> MyApp {
   <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> main(_args <span class="hl-op">::</span> [<span class="hl-type">String</span>]) {
     IO.puts(<span class="hl-string">"Hello!"</span>)
   }
 }</code></pre>
 <h3>Pipe Operator</h3>
 <p>Chain function calls, passing the result of each step as the first argument to the next:</p>
-<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">module</span> Pipes {
+<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> Pipes {
   <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> double(x <span class="hl-op">::</span> <span class="hl-type">i64</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">i64</span> {
     x <span class="hl-op">*</span> <span class="hl-number">2</span>
   }
@@ -178,7 +178,7 @@ zap run test        # Compile and run test target</code></pre>
 }</code></pre>
 <h3>Pattern Matching</h3>
 <p>Multiple function clauses with the same name form an overload group. The compiler resolves which clause to call based on argument values and types.</p>
-<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">module</span> Factorial {
+<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> Factorial {
   <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> factorial(<span class="hl-number">0</span> <span class="hl-op">::</span> <span class="hl-type">i64</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">i64</span> {
     <span class="hl-number">1</span>
   }
@@ -189,7 +189,7 @@ zap run test        # Compile and run test target</code></pre>
 }</code></pre>
 <h3>Guards</h3>
 <p>Function clauses can carry guard conditions that participate in dispatch:</p>
-<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">module</span> Guards {
+<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> Guards {
   <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> classify(n <span class="hl-op">::</span> <span class="hl-type">i64</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">String</span> <span class="hl-keyword">if</span> n <span class="hl-op">&gt;</span> <span class="hl-number">0</span> {
     <span class="hl-string">"positive"</span>
   }
@@ -204,7 +204,7 @@ zap run test        # Compile and run test target</code></pre>
 }</code></pre>
 <h3>Case Expressions</h3>
 <p>Pattern matching inside function bodies:</p>
-<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">module</span> CaseExpr {
+<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> CaseExpr {
   <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> check(result) <span class="hl-op">-&gt;</span> <span class="hl-type">String</span> {
     <span class="hl-keyword">case</span> result {
       {<span class="hl-atom">:ok</span>, v} <span class="hl-op">-&gt;</span>
@@ -218,7 +218,7 @@ zap run test        # Compile and run test target</code></pre>
 }</code></pre>
 <h3>If / Else</h3>
 <p>If/else is an expression — it produces a value:</p>
-<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">module</span> Math {
+<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> Math {
   <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> abs(x <span class="hl-op">::</span> <span class="hl-type">i64</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">i64</span> {
     <span class="hl-keyword">if</span> x <span class="hl-op">&lt;</span> <span class="hl-number">0</span> {
       -x
@@ -293,8 +293,8 @@ evens <span class="hl-op">=</span> <span class="hl-keyword">for</span> x <span c
   }
 }</code></pre>
 <h3>Use</h3>
-<p><code>use Module</code> imports a module and calls its <code>__using__/1</code> callback if defined. This enables library DSLs:</p>
-<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">module</span> Greeter {
+<p><code>use Struct</code> imports a struct and calls its <code>__using__/1</code> callback if defined. This enables library DSLs:</p>
+<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> Greeter {
   <span class="hl-keyword">pub</span> <span class="hl-keyword">macro</span> __using__(_opts <span class="hl-op">::</span> <span class="hl-type">Expr</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">Expr</span> {
     <span class="hl-keyword">quote</span> {
       <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> hello() <span class="hl-op">-&gt;</span> <span class="hl-type">String</span> {
@@ -304,7 +304,7 @@ evens <span class="hl-op">=</span> <span class="hl-keyword">for</span> x <span c
   }
 }
 
-<span class="hl-keyword">pub</span> <span class="hl-keyword">module</span> MyApp {
+<span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> MyApp {
   <span class="hl-keyword">use</span> Greeter     <span class="hl-comment"># imports + injects hello/0 via __using__</span>
 
   <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> main() {
@@ -313,7 +313,7 @@ evens <span class="hl-op">=</span> <span class="hl-keyword">for</span> x <span c
 }</code></pre>
 <h3>Testing with Zest</h3>
 <p>Zest is Zap's built-in test framework. Use <code>Zest.Case</code> for assertions and describe/test DSL:</p>
-<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">module</span> Test.MathTest {
+<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> Test.MathTest {
   <span class="hl-keyword">use</span> Zest.Case
 
   <span class="hl-keyword">describe</span>(<span class="hl-string">"math"</span>) {
@@ -341,7 +341,7 @@ countdown(<span class="hl-number">100_000_000</span>)  <span class="hl-comment">
 <hr>
 <h2>Build Manifest</h2>
 <p>Every Zap project has a <code>build.zap</code> that defines build targets:</p>
-<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">module</span> MyApp.Builder {
+<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> MyApp.Builder {
   <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> manifest(env <span class="hl-op">::</span> Zap.Env) <span class="hl-op">-&gt;</span> Zap.Manifest {
     <span class="hl-keyword">case</span> env.target {
       <span class="hl-atom">:my_app</span> <span class="hl-op">-&gt;</span>
@@ -356,13 +356,13 @@ countdown(<span class="hl-number">100_000_000</span>)  <span class="hl-comment">
     }
   }
 }</code></pre>
-<p>When <code>root</code> is specified and <code>paths</code> is omitted, the compiler uses import-driven discovery — it starts from the entry module and follows module references to find all source files automatically.</p>
+<p>When <code>root</code> is specified and <code>paths</code> is omitted, the compiler uses import-driven discovery — it starts from the entry struct and follows struct references to find all source files automatically.</p>
 <p>| Field | Description |
 |---|---|
 | <code>name</code> | Output binary name |
 | <code>version</code> | Project version |
 | <code>kind</code> | <code>:bin</code>, <code>:lib</code>, or <code>:obj</code> |
-| <code>root</code> | Entry point as <code>&quot;Module.function/arity&quot;</code> |
+| <code>root</code> | Entry point as <code>&quot;Struct.function/arity&quot;</code> |
 | <code>deps</code> | List of dependency tuples |
 | <code>optimize</code> | <code>:debug</code>, <code>:release_safe</code>, <code>:release_fast</code>, or <code>:release_small</code> |</p>
 <h3>Dependencies</h3>
@@ -381,7 +381,7 @@ countdown(<span class="hl-number">100_000_000</span>)  <span class="hl-comment">
 |---|---|---|
 | Path | <code>{:name, {:path, &quot;dir&quot;}}</code> | Local Zap library |
 | Git | <code>{:name, {:git, &quot;url&quot;, &quot;ref&quot;}}</code> | Remote Zap library |</p>
-<p>Zap dependencies are first-class — their modules are available directly (<code>JsonParser.parse(data)</code>). The compiler discovers dep modules the same way it discovers project modules.</p>
+<p>Zap dependencies are first-class — their structs are available directly (<code>JsonParser.parse(data)</code>). The compiler discovers dep structs the same way it discovers project structs.</p>
 <p>A <code>zap.lock</code> lockfile is generated automatically on first build and records resolved versions for reproducible builds.</p>
 <pre><code class="language-sh">zap deps update         # Re-resolve all dependencies
 zap deps update &lt;name&gt;  # Re-resolve a single dependency</code></pre>
@@ -417,8 +417,8 @@ zap deps update &lt;name&gt;  # Re-resolve a single dependency</code></pre>
 }</code></pre>
 <hr>
 <h2>Standard Library</h2>
-<p>Zap includes a standard library of modules for working with primitive types and collections:</p>
-<p>| Module | Functions |
+<p>Zap includes a standard library of structs for working with primitive types and collections:</p>
+<p>| Struct | Functions |
 |---|---|
 | <code>Integer</code> | <code>to_string</code>, <code>abs</code>, <code>max</code>, <code>min</code>, <code>parse</code>, <code>remainder</code>, <code>pow</code>, <code>clamp</code>, <code>digits</code>, <code>to_float</code> |
 | <code>Float</code> | <code>to_string</code>, <code>abs</code>, <code>max</code>, <code>min</code>, <code>parse</code>, <code>round</code>, <code>floor</code>, <code>ceil</code>, <code>truncate</code>, <code>to_integer</code>, <code>clamp</code> |
@@ -454,33 +454,33 @@ process(small)  <span class="hl-comment"># i8 automatically widened to i64</span
 <hr>
 <h2>Native Function Bindings (<code>@native</code>)</h2>
 <p>Zap library functions that need Zig runtime implementations (I/O, string operations, atom tables, etc.) use <code>@native</code> attributes instead of hardcoded compiler knowledge:</p>
-<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">module</span> IO {
+<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> IO {
   @native <span class="hl-op">=</span> <span class="hl-string">"Prelude.println"</span>
   <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> puts(_message <span class="hl-op">::</span> <span class="hl-type">String</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">String</span>
 }
 
-<span class="hl-keyword">pub</span> <span class="hl-keyword">module</span> Zest.Runtime {
+<span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> Zest.Runtime {
   @native <span class="hl-op">=</span> <span class="hl-string">"ZestRuntime.reset"</span>
   <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> reset() <span class="hl-op">-&gt;</span> <span class="hl-type">String</span>
 
   @native <span class="hl-op">=</span> <span class="hl-string">"ZestRuntime.fail"</span>
   <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> fail(_message <span class="hl-op">::</span> <span class="hl-type">String</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">String</span>
 }</code></pre>
-<p>The <code>@native = &quot;Module.function&quot;</code> annotation tells the compiler to route calls to <code>@import(&quot;zap_runtime&quot;).Module.function(args)</code> in the generated ZIR. No function body is needed — the annotation IS the implementation binding. The compiler has zero knowledge of specific library modules; all bindings are declared in <code>.zap</code> source files.</p>
+<p>The <code>@native = &quot;Struct.function&quot;</code> annotation tells the compiler to route calls to <code>@import(&quot;zap_runtime&quot;).Struct.function(args)</code> in the generated ZIR. No function body is needed — the annotation IS the implementation binding. The compiler has zero knowledge of specific library structs; all bindings are declared in <code>.zap</code> source files.</p>
 <hr>
 <h2>Architecture</h2>
-<p>Zap uses a per-module compilation architecture with per-module ZIR emission:</p>
-<p>1. <strong>Discovery</strong> — start from the entry point, follow module references to find files
+<p>Zap uses a per-struct compilation architecture with per-struct ZIR emission:</p>
+<p>1. <strong>Discovery</strong> — start from the entry point, follow struct references to find files
 2. <strong>Pass 1</strong> — parse all files, collect declarations into a shared scope graph
 3. <strong>Pass 2</strong> — compile each file: macro expand, desugar, type check, HIR
 4. <strong>Pass 3</strong> — monomorphize generic functions, lower to IR
 5. <strong>Pass 4</strong> — run analysis pipeline (escape analysis, interprocedural summaries, region solving, lambda sets, Perceus reuse)
-6. <strong>Pass 5</strong> — emit per-module ZIR, inject into Zig compilation, codegen</p>
-<p>Each Zap module becomes its own Zig ZIR module. Cross-module calls use <code>@import(&quot;Module&quot;).function(args)</code> chains. Namespace re-export modules are generated for hierarchical module names (e.g., <code>Zest</code> re-exports <code>Runtime</code>, <code>Case</code>, <code>Runner</code>). <code>@native</code> functions skip ZIR emission — their calls route directly to <code>@import(&quot;zap_runtime&quot;)</code>.</p>
+6. <strong>Pass 5</strong> — emit per-struct ZIR, inject into Zig compilation, codegen</p>
+<p>Each Zap struct becomes its own Zig ZIR struct. Cross-struct calls use <code>@import(&quot;Struct&quot;).function(args)</code> chains. Namespace re-export structs are generated for hierarchical struct names (e.g., <code>Zest</code> re-exports <code>Runtime</code>, <code>Case</code>, <code>Runner</code>). <code>@native</code> functions skip ZIR emission — their calls route directly to <code>@import(&quot;zap_runtime&quot;)</code>.</p>
 <pre><code class="language-zap">  .zap source files
       <span class="hl-op">|</span>
       v
-   Discovery -------- follow <span class="hl-keyword">module</span> references from entry point
+   Discovery -------- follow <span class="hl-keyword">struct</span> references from entry point
       <span class="hl-op">|</span>
       v
    Parse ------------ per-file ASTs
@@ -510,8 +510,8 @@ process(small)  <span class="hl-comment"># i8 automatically widened to i64</span
    Analysis --------- escape, regions, lambda sets, Perceus
       <span class="hl-op">|</span>
       v
-   Per-Module ZIR --- each Zap <span class="hl-keyword">module</span> <span class="hl-op">-&gt;</span> its own Zig ZIR <span class="hl-keyword">module</span>
-      <span class="hl-op">|</span>                cross-<span class="hl-keyword">module</span> calls <span class="hl-op">-&gt;</span> @<span class="hl-keyword">import</span> chains
+   Per-Struct ZIR --- each Zap <span class="hl-keyword">struct</span> <span class="hl-op">-&gt;</span> its own Zig ZIR <span class="hl-keyword">struct</span>
+      <span class="hl-op">|</span>                cross-<span class="hl-keyword">struct</span> calls <span class="hl-op">-&gt;</span> @<span class="hl-keyword">import</span> chains
       <span class="hl-op">|</span>                @native functions <span class="hl-op">-&gt;</span> @<span class="hl-keyword">import</span>(<span class="hl-string">"zap_runtime"</span>)
       v
    Codegen ---------- native binary (via LLVM)</code></pre>
@@ -533,7 +533,7 @@ zig build
 # Run Zig-level unit tests
 zig build test
 
-# Run Zap test suite (323 tests across 28 modules)
+# Run Zap test suite (323 tests across 28 structs)
 zap test
 
 # Build and run an example

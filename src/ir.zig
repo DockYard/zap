@@ -65,9 +65,9 @@ pub const Program = struct {
 pub const Function = struct {
     id: FunctionId,
     name: []const u8,
-    /// Module this function belongs to (e.g., "IO", "Zest_Runtime"). Null for top-level.
-    module_name: ?[]const u8 = null,
-    /// Function name within its module, with arity suffix (e.g., "puts__1"). Used for per-module ZIR emission.
+    /// Struct this function belongs to (e.g., "IO", "Zest_Runtime"). Null for top-level.
+    struct_name: ?[]const u8 = null,
+    /// Function name within its struct, with arity suffix (e.g., "puts__1"). Used for per-struct ZIR emission.
     local_name: []const u8 = "",
     scope_id: scope_mod.ScopeId,
     arity: u32,
@@ -925,7 +925,7 @@ pub const IrBuilder = struct {
     /// later `index_get` reads from one of these locals, the IR emits
     /// `Term.toCoerced` to recover the declared concrete component type.
     term_tuple_locals: std.AutoHashMap(LocalId, ZigType),
-    current_module_prefix: ?[]const u8,
+    current_struct_prefix: ?[]const u8,
     known_function_names: std.StringHashMap(void),
     synthesized_type_defs: std.ArrayList(TypeDef),
     /// Maps function name → union dispatch info for call-site wrapping
@@ -961,7 +961,7 @@ pub const IrBuilder = struct {
             .known_local_types = std.AutoHashMap(LocalId, ZigType).init(allocator),
             .param_backed_locals = std.AutoHashMap(LocalId, void).init(allocator),
             .term_tuple_locals = std.AutoHashMap(LocalId, ZigType).init(allocator),
-            .current_module_prefix = null,
+            .current_struct_prefix = null,
             .known_function_names = std.StringHashMap(void).init(allocator),
             .synthesized_type_defs = .empty,
             .union_dispatch_map = std.StringHashMap(UnionDispatchInfo).init(allocator),
@@ -1026,13 +1026,13 @@ pub const IrBuilder = struct {
         // bound on HIR group IDs so `__try` variant IDs can be assigned past the
         // largest existing group without collision (regardless of program size).
         var max_group_id: FunctionId = 0;
-        for (hir_program.modules) |mod| {
-            const module_prefix = self.structNameToPrefix(mod.name);
+        for (hir_program.structs) |mod| {
+            const struct_prefix = self.structNameToPrefix(mod.name);
             for (mod.functions) |func_group| {
                 if (func_group.id > max_group_id) max_group_id = func_group.id;
                 const func_name = self.interner.get(func_group.name);
                 const mangled_func_name = try mangleSymbolForZig(self.allocator, func_name);
-                const qualified = try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ module_prefix, mangled_func_name, func_group.arity });
+                const qualified = try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ struct_prefix, mangled_func_name, func_group.arity });
                 try self.known_function_names.put(qualified, {});
             }
         }
@@ -1043,10 +1043,10 @@ pub const IrBuilder = struct {
             const qualified = try std.fmt.allocPrint(self.allocator, "{s}__{d}", .{ mangled_func_name, func_group.arity });
             try self.known_function_names.put(qualified, {});
         }
-        // The per-module IR build path computes `max_group_id` from
-        // *this module's* HIR only. To prevent `__try` IDs from
-        // colliding with regular HIR IDs in *other* modules (the IR
-        // eventually merges all modules' functions into one program),
+        // The per-struct IR build path computes `max_group_id` from
+        // *this struct's* HIR only. To prevent `__try` IDs from
+        // colliding with regular HIR IDs in *other* structs (the IR
+        // eventually merges all structs' functions into one program),
         // the caller may pre-seed `next_try_id` with a globally-safe
         // offset. Only fall back to `max_group_id + 1` when the
         // caller hasn't seeded a value.
@@ -1057,11 +1057,11 @@ pub const IrBuilder = struct {
         // Second pass: pre-scan for ~> error pipe chains to identify functions
         // that need __try variants. This must happen before building function bodies
         // so that __try variants are generated during buildFunctionGroup.
-        for (hir_program.modules) |mod| {
-            const module_prefix = self.structNameToPrefix(mod.name);
+        for (hir_program.structs) |mod| {
+            const struct_prefix = self.structNameToPrefix(mod.name);
             for (mod.functions) |func_group| {
                 for (func_group.clauses) |clause| {
-                    try self.scanForTryVariantNames(clause.body, module_prefix);
+                    try self.scanForTryVariantNames(clause.body, struct_prefix);
                 }
             }
         }
@@ -1072,14 +1072,14 @@ pub const IrBuilder = struct {
         }
 
         // Fourth pass: build function bodies
-        for (hir_program.modules) |mod| {
-            const module_prefix = self.structNameToPrefix(mod.name);
-            self.current_module_prefix = module_prefix;
+        for (hir_program.structs) |mod| {
+            const struct_prefix = self.structNameToPrefix(mod.name);
+            self.current_struct_prefix = struct_prefix;
             for (mod.functions) |func_group| {
                 try self.buildFunctionGroup(&func_group);
             }
         }
-        self.current_module_prefix = null;
+        self.current_struct_prefix = null;
         for (hir_program.top_functions) |func_group| {
             try self.buildFunctionGroup(&func_group);
         }
@@ -1424,7 +1424,7 @@ pub const IrBuilder = struct {
             "anonymous";
         const mangled_raw_name = try mangleSymbolForZig(self.allocator, raw_name);
         const local_name = try std.fmt.allocPrint(self.allocator, "{s}__{d}", .{ mangled_raw_name, group.arity });
-        const name_str = if (self.current_module_prefix) |prefix|
+        const name_str = if (self.current_struct_prefix) |prefix|
             try std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ prefix, local_name })
         else
             local_name;
@@ -1485,7 +1485,7 @@ pub const IrBuilder = struct {
         try self.functions.append(self.allocator, .{
             .id = func_id,
             .name = name_str,
-            .module_name = self.current_module_prefix,
+            .struct_name = self.current_struct_prefix,
             .local_name = local_name,
             .scope_id = group.scope_id,
             .arity = group.arity,
@@ -1615,7 +1615,7 @@ pub const IrBuilder = struct {
             try self.functions.append(self.allocator, .{
                 .id = try_func_id,
                 .name = try_name,
-                .module_name = self.current_module_prefix,
+                .struct_name = self.current_struct_prefix,
                 .local_name = try_local_name,
                 .scope_id = group.scope_id,
                 .arity = group.arity,
@@ -1857,7 +1857,7 @@ pub const IrBuilder = struct {
             self.interner.get(group.name)
         else
             "anonymous";
-        const func_name = if (self.current_module_prefix) |prefix|
+        const func_name = if (self.current_struct_prefix) |prefix|
             try std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ prefix, raw_name })
         else
             raw_name;
@@ -3684,21 +3684,21 @@ pub const IrBuilder = struct {
     /// Pre-scan HIR block to find error_pipe expressions with
     /// is_dispatched steps, registering their function names in try_variant_names.
     /// This runs before function bodies are built so __try variants are generated.
-    fn scanForTryVariantNames(self: *IrBuilder, block: *const hir_mod.Block, module_prefix: ?[]const u8) error{OutOfMemory}!void {
+    fn scanForTryVariantNames(self: *IrBuilder, block: *const hir_mod.Block, struct_prefix: ?[]const u8) error{OutOfMemory}!void {
         for (block.stmts) |stmt| {
             switch (stmt) {
-                .expr => |expr| try self.scanExprForTryVariants(expr, module_prefix),
-                .local_set => |ls| try self.scanExprForTryVariants(ls.value, module_prefix),
+                .expr => |expr| try self.scanExprForTryVariants(expr, struct_prefix),
+                .local_set => |ls| try self.scanExprForTryVariants(ls.value, struct_prefix),
                 .function_group => |fg| {
                     for (fg.clauses) |clause| {
-                        try self.scanForTryVariantNames(clause.body, module_prefix);
+                        try self.scanForTryVariantNames(clause.body, struct_prefix);
                     }
                 },
             }
         }
     }
 
-    fn scanExprForTryVariants(self: *IrBuilder, expr: *const hir_mod.Expr, module_prefix: ?[]const u8) error{OutOfMemory}!void {
+    fn scanExprForTryVariants(self: *IrBuilder, expr: *const hir_mod.Expr, struct_prefix: ?[]const u8) error{OutOfMemory}!void {
         switch (expr.kind) {
             .error_pipe => |ep| {
                 for (ep.steps) |step| {
@@ -3708,8 +3708,8 @@ pub const IrBuilder = struct {
                         const call_arity = call.args.len + 1;
                         const call_name_str = switch (call.target) {
                             .named => |n| blk: {
-                                if (n.module) |mod| break :blk try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ mod, n.name, call_arity });
-                                if (module_prefix) |prefix| break :blk try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ prefix, n.name, call_arity });
+                                if (n.struct_name) |mod| break :blk try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ mod, n.name, call_arity });
+                                if (struct_prefix) |prefix| break :blk try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ prefix, n.name, call_arity });
                                 break :blk try std.fmt.allocPrint(self.allocator, "{s}__{d}", .{ n.name, call_arity });
                             },
                             else => continue,
@@ -3717,52 +3717,52 @@ pub const IrBuilder = struct {
                         try self.try_variant_names.put(call_name_str, {});
                     }
                     // Recurse into step expressions
-                    try self.scanExprForTryVariants(step.expr, module_prefix);
+                    try self.scanExprForTryVariants(step.expr, struct_prefix);
                 }
                 // Recurse into handler
-                try self.scanExprForTryVariants(ep.handler, module_prefix);
+                try self.scanExprForTryVariants(ep.handler, struct_prefix);
             },
             .call => |c| {
                 for (c.args) |arg| {
-                    try self.scanExprForTryVariants(arg.expr, module_prefix);
+                    try self.scanExprForTryVariants(arg.expr, struct_prefix);
                 }
             },
             .branch => |br| {
-                try self.scanExprForTryVariants(br.condition, module_prefix);
-                try self.scanBlockForTryVariants(br.then_block, module_prefix);
-                if (br.else_block) |eb| try self.scanBlockForTryVariants(eb, module_prefix);
+                try self.scanExprForTryVariants(br.condition, struct_prefix);
+                try self.scanBlockForTryVariants(br.then_block, struct_prefix);
+                if (br.else_block) |eb| try self.scanBlockForTryVariants(eb, struct_prefix);
             },
             .case => |ce| {
-                try self.scanExprForTryVariants(ce.scrutinee, module_prefix);
+                try self.scanExprForTryVariants(ce.scrutinee, struct_prefix);
                 for (ce.arms) |arm| {
-                    try self.scanBlockForTryVariants(arm.body, module_prefix);
+                    try self.scanBlockForTryVariants(arm.body, struct_prefix);
                 }
             },
             .binary => |b| {
-                try self.scanExprForTryVariants(b.lhs, module_prefix);
-                try self.scanExprForTryVariants(b.rhs, module_prefix);
+                try self.scanExprForTryVariants(b.lhs, struct_prefix);
+                try self.scanExprForTryVariants(b.rhs, struct_prefix);
             },
             .unary => |u| {
-                try self.scanExprForTryVariants(u.operand, module_prefix);
+                try self.scanExprForTryVariants(u.operand, struct_prefix);
             },
             .union_init => |ui| {
-                try self.scanExprForTryVariants(ui.value, module_prefix);
+                try self.scanExprForTryVariants(ui.value, struct_prefix);
             },
             .block => |blk| {
-                try self.scanBlockForTryVariants(&blk, module_prefix);
+                try self.scanBlockForTryVariants(&blk, struct_prefix);
             },
             else => {},
         }
     }
 
-    fn scanBlockForTryVariants(self: *IrBuilder, block: *const hir_mod.Block, module_prefix: ?[]const u8) error{OutOfMemory}!void {
+    fn scanBlockForTryVariants(self: *IrBuilder, block: *const hir_mod.Block, struct_prefix: ?[]const u8) error{OutOfMemory}!void {
         for (block.stmts) |stmt| {
             switch (stmt) {
-                .expr => |expr| try self.scanExprForTryVariants(expr, module_prefix),
-                .local_set => |ls| try self.scanExprForTryVariants(ls.value, module_prefix),
+                .expr => |expr| try self.scanExprForTryVariants(expr, struct_prefix),
+                .local_set => |ls| try self.scanExprForTryVariants(ls.value, struct_prefix),
                 .function_group => |fg| {
                     for (fg.clauses) |clause| {
-                        try self.scanForTryVariantNames(clause.body, module_prefix);
+                        try self.scanForTryVariantNames(clause.body, struct_prefix);
                     }
                 },
             }
@@ -3770,14 +3770,14 @@ pub const IrBuilder = struct {
     }
 
     /// Build the mangled name used by error-pipe call lowering:
-    /// `Mod__name__N` when there is a module prefix, `name__N` otherwise.
+    /// `Mod__name__N` when there is a struct prefix, `name__N` otherwise.
     /// Mirrors what the rest of the IR uses so that the `__try` variant
     /// resolved at the call site matches the concrete function we emit.
     fn formatErrorPipeCallName(self: *IrBuilder, call: hir_mod.CallExpr, arity: usize) anyerror![]const u8 {
         return switch (call.target) {
             .named => |n| blk: {
-                if (n.module) |mod| break :blk try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ mod, n.name, arity });
-                if (self.current_module_prefix) |prefix| break :blk try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ prefix, n.name, arity });
+                if (n.struct_name) |mod| break :blk try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ mod, n.name, arity });
+                if (self.current_struct_prefix) |prefix| break :blk try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ prefix, n.name, arity });
                 break :blk try std.fmt.allocPrint(self.allocator, "{s}__{d}", .{ n.name, arity });
             },
             else => "unknown",
@@ -4115,11 +4115,11 @@ pub const IrBuilder = struct {
                     },
                     .named => |nc| {
                         const call_arity = call.args.len;
-                        // For module-qualified calls, try exact arity first, then higher
+                        // For struct-qualified calls, try exact arity first, then higher
                         // arities for functions with default parameters. The function
                         // name is mangled so operator-named functions match the
                         // declarations registered in known_function_names.
-                        const resolved_name = if (nc.module) |mod| blk: {
+                        const resolved_name = if (nc.struct_name) |mod| blk: {
                             const mangled_call_name = try mangleSymbolForZig(self.allocator, nc.name);
                             var try_a: usize = call_arity;
                             while (try_a <= call_arity + 4) : (try_a += 1) {
@@ -4736,7 +4736,7 @@ pub const IrBuilder = struct {
     }
 
     /// Resolve a bare function call to a qualified name with arity.
-    /// Resolution order: current module → Kernel → top-level → bare name.
+    /// Resolution order: current struct → Kernel → top-level → bare name.
     /// Also checks higher arities for functions with default parameters.
     fn resolveBareCall(self: *IrBuilder, name: []const u8, arity: u32) ![]const u8 {
         // Names containing operator characters are mangled before lookup so the
@@ -4746,8 +4746,8 @@ pub const IrBuilder = struct {
         // Try exact arity first, then higher arities (for default params)
         var try_arity: u32 = arity;
         while (try_arity <= arity + 4) : (try_arity += 1) {
-            // 1. Current module function
-            if (self.current_module_prefix) |prefix| {
+            // 1. Current struct function
+            if (self.current_struct_prefix) |prefix| {
                 const qualified = try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ prefix, mangled_name, try_arity });
                 if (self.known_function_names.contains(qualified)) return qualified;
             }
@@ -4757,7 +4757,7 @@ pub const IrBuilder = struct {
                 if (self.known_function_names.contains(top_name)) return top_name;
             }
             // Kernel functions are resolved via auto-import in the collector —
-            // they appear as regular imports in the module scope, so steps 1-2
+            // they appear as regular imports in the struct scope, so steps 1-2
             // handle them. No hardcoded Kernel fallback needed.
         }
         // 4. Keep bare (unmangled) name — Zig compiler will error

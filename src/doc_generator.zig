@@ -1,6 +1,6 @@
 //! Documentation Generator
 //!
-//! Extracts @doc and @moduledoc attributes from the scope graph and generates
+//! Extracts @doc and @structdoc attributes from the scope graph and generates
 //! static HTML documentation and Markdown files. Used by `zap doc`.
 
 const std = @import("std");
@@ -66,27 +66,27 @@ pub fn generate(
     const interner = &ctx.interner;
 
     // Extract documentation data from the scope graph
-    var modules: std.ArrayListUnmanaged(DocModule) = .empty;
-    var seen_modules = std.StringHashMap(void).init(alloc);
+    var structs: std.ArrayListUnmanaged(DocStruct) = .empty;
+    var seen_structs = std.StringHashMap(void).init(alloc);
 
     for (graph.structs.items) |mod_entry| {
         const mod_name = resolveStructName(alloc, mod_entry.name, interner) catch continue;
 
-        // Skip duplicate modules (same module discovered from multiple source roots)
-        if (seen_modules.contains(mod_name)) continue;
-        seen_modules.put(mod_name, {}) catch {};
+        // Skip duplicate structs (same struct discovered from multiple source roots)
+        if (seen_structs.contains(mod_name)) continue;
+        seen_structs.put(mod_name, {}) catch {};
 
-        // Skip internal/build modules
+        // Skip internal/build structs
         if (std.mem.eql(u8, mod_name, "Zap.Builder")) continue;
         if (std.mem.eql(u8, mod_name, "Zap.Manifest")) continue;
         if (std.mem.eql(u8, mod_name, "Zap.Env")) continue;
         if (std.mem.eql(u8, mod_name, "Zap.Dep")) continue;
 
-        // Find the source file for this module
-        const source_file = findModuleSourceFile(mod_name, options.source_units) orelse "";
+        // Find the source file for this struct
+        const source_file = findStructSourceFile(mod_name, options.source_units) orelse "";
 
         // Extract @doc for the struct
-        const moduledoc = extractDocAttribute(alloc, mod_entry.attributes, "doc", interner) orelse "";
+        const structdoc = extractDocAttribute(alloc, mod_entry.attributes, "doc", interner) orelse "";
 
         // Collect public functions and macros
         var functions: std.ArrayListUnmanaged(DocFunction) = .empty;
@@ -134,18 +134,18 @@ pub fn generate(
             }) catch {};
         }
 
-        modules.append(alloc, .{
+        structs.append(alloc, .{
             .name = mod_name,
-            .moduledoc = moduledoc,
+            .structdoc = structdoc,
             .source_file = source_file,
             .functions = functions.toOwnedSlice(alloc) catch &.{},
         }) catch {};
     }
 
-    // Sort modules alphabetically
-    const mod_slice = modules.toOwnedSlice(alloc) catch &.{};
-    std.mem.sort(DocModule, @constCast(mod_slice), {}, struct {
-        fn lessThan(_: void, a: DocModule, b: DocModule) bool {
+    // Sort structs alphabetically
+    const mod_slice = structs.toOwnedSlice(alloc) catch &.{};
+    std.mem.sort(DocStruct, @constCast(mod_slice), {}, struct {
+        fn lessThan(_: void, a: DocStruct, b: DocStruct) bool {
             return std.mem.order(u8, a.name, b.name) == .lt;
         }
     }.lessThan);
@@ -154,24 +154,24 @@ pub fn generate(
         .name = options.project_name,
         .version = options.project_version,
         .source_url = options.source_url,
-        .modules = mod_slice,
+        .structs = mod_slice,
     };
 
     // Create output directories
     const io = std.Options.debug_io;
     std.Io.Dir.cwd().createDirPath(io, options.output_dir) catch {};
-    const modules_dir = try std.fmt.allocPrint(alloc, "{s}/modules", .{options.output_dir});
-    std.Io.Dir.cwd().createDirPath(io, modules_dir) catch {};
+    const structs_dir = try std.fmt.allocPrint(alloc, "{s}/structs", .{options.output_dir});
+    std.Io.Dir.cwd().createDirPath(io, structs_dir) catch {};
     const api_dir = try std.fmt.allocPrint(alloc, "{s}/api", .{options.output_dir});
     std.Io.Dir.cwd().createDirPath(io, api_dir) catch {};
 
     // Generate landing page
     try generateLandingPage(alloc, project, options);
 
-    // Generate module pages (HTML + Markdown)
-    for (project.modules) |mod| {
-        try generateModulePage(alloc, mod, project, options);
-        try generateModuleMarkdown(alloc, mod, project, options);
+    // Generate struct pages (HTML + Markdown)
+    for (project.structs) |mod| {
+        try generateStructPage(alloc, mod, project, options);
+        try generateStructMarkdown(alloc, mod, project, options);
     }
 
     // Generate search index
@@ -190,8 +190,8 @@ pub fn generate(
         }
     }
 
-    std.debug.print("  {d} modules, {d} functions documented\n", .{
-        project.modules.len,
+    std.debug.print("  {d} structs, {d} functions documented\n", .{
+        project.structs.len,
         countFunctions(project),
     });
 }
@@ -204,12 +204,12 @@ const DocProject = struct {
     name: []const u8,
     version: []const u8,
     source_url: ?[]const u8,
-    modules: []const DocModule,
+    structs: []const DocStruct,
 };
 
-const DocModule = struct {
+const DocStruct = struct {
     name: []const u8,
-    moduledoc: []const u8,
+    structdoc: []const u8,
     source_file: []const u8,
     functions: []const DocFunction,
 };
@@ -472,7 +472,7 @@ fn computeLineNumber(meta: ast.NodeMeta, source_units: []const compiler.SourceUn
     return line;
 }
 
-fn findModuleSourceFile(mod_name: []const u8, source_units: []const compiler.SourceUnit) ?[]const u8 {
+fn findStructSourceFile(mod_name: []const u8, source_units: []const compiler.SourceUnit) ?[]const u8 {
     for (source_units) |unit| {
         if (std.mem.indexOf(u8, unit.source, "pub struct ")) |idx| {
             const rest = unit.source[idx + 11 ..];
@@ -491,7 +491,7 @@ fn findModuleSourceFile(mod_name: []const u8, source_units: []const compiler.Sou
 
 fn countFunctions(project: DocProject) usize {
     var count: usize = 0;
-    for (project.modules) |mod| {
+    for (project.structs) |mod| {
         count += mod.functions.len;
     }
     return count;
@@ -511,7 +511,7 @@ fn generateLandingPage(alloc: std.mem.Allocator, project: DocProject, options: D
     if (options.landing_page) |landing_page_path| {
         const full_path = try std.fs.path.join(alloc, &.{ options.project_root, landing_page_path });
         if (std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, full_path, alloc, .limited(1024 * 1024))) |content| {
-            h.str("<div class=\"moduledoc\">\n");
+            h.str("<div class=\"structdoc\">\n");
             appendMarkdownAsHtml(&h, content);
             h.str("</div>\n");
         } else |_| {
@@ -539,16 +539,16 @@ fn appendDefaultLanding(h: *StringBuffer, project: DocProject) void {
         h.str("</p>\n");
     }
 
-    h.str("<h2>Modules</h2>\n<div class=\"module-list\">\n");
-    for (project.modules) |mod| {
-        h.str("<div class=\"module-card\">\n<h3><a href=\"modules/");
+    h.str("<h2>Structs</h2>\n<div class=\"struct-list\">\n");
+    for (project.structs) |mod| {
+        h.str("<div class=\"struct-card\">\n<h3><a href=\"structs/");
         h.str(mod.name);
         h.str(".html\">");
         appendHtmlEscaped(h, mod.name);
         h.str("</a></h3>\n");
 
-        if (mod.moduledoc.len > 0) {
-            const summary = extractFirstSentence(h.alloc, mod.moduledoc);
+        if (mod.structdoc.len > 0) {
+            const summary = extractFirstSentence(h.alloc, mod.structdoc);
             if (summary.len > 0) {
                 h.str("<p>");
                 appendHtmlEscaped(h, summary);
@@ -560,20 +560,20 @@ fn appendDefaultLanding(h: *StringBuffer, project: DocProject) void {
     h.str("</div>\n");
 }
 
-fn generateModulePage(alloc: std.mem.Allocator, mod: DocModule, project: DocProject, options: DocOptions) !void {
+fn generateStructPage(alloc: std.mem.Allocator, mod: DocStruct, project: DocProject, options: DocOptions) !void {
     var h = StringBuffer.init(alloc);
     appendPageHeader(&h, mod.name, project, "../");
     h.str("<div class=\"layout\">\n");
     appendSidebar(&h, project, mod.name, options, "../");
     h.str("<main class=\"content\">\n");
 
-    // Module header — title row with name left, pub struct pill + source right
+    // Struct header — title row with name left, pub struct pill + source right
     h.str("<div class=\"title-row\">\n");
     h.str("<h1>");
     appendHtmlEscaped(&h, mod.name);
     h.str("</h1>\n");
     h.str("<div class=\"title-meta\">\n");
-    h.str("<span class=\"pub-module-pill\">pub struct</span>\n");
+    h.str("<span class=\"pub-struct-pill\">pub struct</span>\n");
     if (mod.source_file.len > 0) {
         if (options.source_url) |base_url| {
             h.str("<a href=\"");
@@ -594,9 +594,9 @@ fn generateModulePage(alloc: std.mem.Allocator, mod: DocModule, project: DocProj
     h.str("</div>\n");
     h.str("</div>\n");
 
-    // Tagline — extract first sentence of moduledoc
-    if (mod.moduledoc.len > 0) {
-        const tagline = extractFirstSentence(alloc, mod.moduledoc);
+    // Tagline — extract first sentence of structdoc
+    if (mod.structdoc.len > 0) {
+        const tagline = extractFirstSentence(alloc, mod.structdoc);
         if (tagline.len > 0) {
             h.str("<p class=\"tagline\">");
             appendHtmlEscaped(&h, tagline);
@@ -604,9 +604,9 @@ fn generateModulePage(alloc: std.mem.Allocator, mod: DocModule, project: DocProj
         }
     }
 
-    if (mod.moduledoc.len > 0) {
-        h.str("<div class=\"moduledoc\">\n");
-        appendMarkdownAsHtml(&h, mod.moduledoc);
+    if (mod.structdoc.len > 0) {
+        h.str("<div class=\"structdoc\">\n");
+        appendMarkdownAsHtml(&h, mod.structdoc);
         h.str("</div>\n");
     }
 
@@ -693,11 +693,11 @@ fn generateModulePage(alloc: std.mem.Allocator, mod: DocModule, project: DocProj
     h.str("</ul>\n</aside>\n</div>\n");
     appendPageFooter(&h, "../");
 
-    const path = try std.fmt.allocPrint(alloc, "{s}/modules/{s}.html", .{ options.output_dir, mod.name });
+    const path = try std.fmt.allocPrint(alloc, "{s}/structs/{s}.html", .{ options.output_dir, mod.name });
     try writeFile(path, h.toSlice());
 }
 
-fn appendFunctionDetail(h: *StringBuffer, func: DocFunction, _: DocModule, _: DocProject, _: DocOptions) void {
+fn appendFunctionDetail(h: *StringBuffer, func: DocFunction, _: DocStruct, _: DocProject, _: DocOptions) void {
     h.str("<div class=\"function-detail\" id=\"");
     appendAnchorId(h, func);
     h.str("\">\n<div class=\"function-header\">\n<h3>");
@@ -824,13 +824,19 @@ const ParamSplitter = struct {
 
         while (self.pos < self.source.len) {
             const c = self.source[self.pos];
-            if (c == '(' ) { depth_paren += 1; }
-            else if (c == ')') { if (depth_paren > 0) depth_paren -= 1; }
-            else if (c == '[') { depth_bracket += 1; }
-            else if (c == ']') { if (depth_bracket > 0) depth_bracket -= 1; }
-            else if (c == '{') { depth_brace += 1; }
-            else if (c == '}') { if (depth_brace > 0) depth_brace -= 1; }
-            else if (c == ',' and depth_paren == 0 and depth_bracket == 0 and depth_brace == 0) {
+            if (c == '(') {
+                depth_paren += 1;
+            } else if (c == ')') {
+                if (depth_paren > 0) depth_paren -= 1;
+            } else if (c == '[') {
+                depth_bracket += 1;
+            } else if (c == ']') {
+                if (depth_bracket > 0) depth_bracket -= 1;
+            } else if (c == '{') {
+                depth_brace += 1;
+            } else if (c == '}') {
+                if (depth_brace > 0) depth_brace -= 1;
+            } else if (c == ',' and depth_paren == 0 and depth_bracket == 0 and depth_brace == 0) {
                 const result = self.source[start..self.pos];
                 self.pos += 1; // skip the comma
                 return result;
@@ -849,15 +855,15 @@ fn splitParams(params: []const u8) ParamSplitter {
 // Markdown output
 // ============================================================
 
-fn generateModuleMarkdown(alloc: std.mem.Allocator, mod: DocModule, project: DocProject, options: DocOptions) !void {
+fn generateStructMarkdown(alloc: std.mem.Allocator, mod: DocStruct, project: DocProject, options: DocOptions) !void {
     var h = StringBuffer.init(alloc);
 
     h.str("# ");
     h.str(mod.name);
     h.str("\n\n");
 
-    if (mod.moduledoc.len > 0) {
-        h.str(mod.moduledoc);
+    if (mod.structdoc.len > 0) {
+        h.str(mod.structdoc);
         h.str("\n\n");
     }
 
@@ -888,7 +894,7 @@ fn generateModuleMarkdown(alloc: std.mem.Allocator, mod: DocModule, project: Doc
     try writeFile(path, h.toSlice());
 }
 
-fn appendFunctionMarkdown(h: *StringBuffer, func: DocFunction, mod: DocModule, project: DocProject, options: DocOptions) void {
+fn appendFunctionMarkdown(h: *StringBuffer, func: DocFunction, mod: DocStruct, project: DocProject, options: DocOptions) void {
     h.str("### ");
     h.str(func.name);
     h.fmt("/{d}\n\n", .{func.arity});
@@ -926,7 +932,7 @@ fn appendFunctionMarkdown(h: *StringBuffer, func: DocFunction, mod: DocModule, p
 // Sidebar
 // ============================================================
 
-fn appendSidebar(h: *StringBuffer, project: DocProject, current_module: ?[]const u8, options: DocOptions, base: []const u8) void {
+fn appendSidebar(h: *StringBuffer, project: DocProject, current_struct: ?[]const u8, options: DocOptions, base: []const u8) void {
     h.str("<nav class=\"sidebar\">\n");
     h.str("<div class=\"sidebar-header\"><a href=\"");
     h.str(base);
@@ -956,39 +962,39 @@ fn appendSidebar(h: *StringBuffer, project: DocProject, current_module: ?[]const
         h.str("</ul>\n</div>\n");
     }
 
-    // Auto-group modules by prefix
-    var ungrouped: std.ArrayListUnmanaged(DocModule) = .empty;
+    // Auto-group structs by prefix
+    var ungrouped: std.ArrayListUnmanaged(DocStruct) = .empty;
     var grouped_prefixes: std.ArrayListUnmanaged([]const u8) = .empty;
-    var grouped_modules: std.ArrayListUnmanaged(std.ArrayListUnmanaged(DocModule)) = .empty;
+    var grouped_structs: std.ArrayListUnmanaged(std.ArrayListUnmanaged(DocStruct)) = .empty;
 
-    for (project.modules) |mod| {
+    for (project.structs) |mod| {
         if (std.mem.indexOf(u8, mod.name, ".")) |dot_pos| {
             const prefix = mod.name[0..dot_pos];
             // Find or create group
             var found = false;
             for (grouped_prefixes.items, 0..) |existing, idx| {
                 if (std.mem.eql(u8, existing, prefix)) {
-                    grouped_modules.items[idx].append(h.alloc, mod) catch {};
+                    grouped_structs.items[idx].append(h.alloc, mod) catch {};
                     found = true;
                     break;
                 }
             }
             if (!found) {
                 grouped_prefixes.append(h.alloc, prefix) catch {};
-                var list: std.ArrayListUnmanaged(DocModule) = .empty;
+                var list: std.ArrayListUnmanaged(DocStruct) = .empty;
                 list.append(h.alloc, mod) catch {};
-                grouped_modules.append(h.alloc, list) catch {};
+                grouped_structs.append(h.alloc, list) catch {};
             }
         } else {
             ungrouped.append(h.alloc, mod) catch {};
         }
     }
 
-    // Render ungrouped modules
+    // Render ungrouped structs
     if (ungrouped.items.len > 0) {
-        h.str("<div class=\"sidebar-group\">\n<h4>Modules</h4>\n<ul>\n");
+        h.str("<div class=\"sidebar-group\">\n<h4>Structs</h4>\n<ul>\n");
         for (ungrouped.items) |mod| {
-            const is_current = if (current_module) |cm| std.mem.eql(u8, cm, mod.name) else false;
+            const is_current = if (current_struct) |cm| std.mem.eql(u8, cm, mod.name) else false;
             if (is_current) {
                 h.str("<li class=\"active\">");
             } else {
@@ -996,7 +1002,7 @@ fn appendSidebar(h: *StringBuffer, project: DocProject, current_module: ?[]const
             }
             h.str("<a href=\"");
             h.str(base);
-            h.str("modules/");
+            h.str("structs/");
             h.str(mod.name);
             h.str(".html\">");
             appendHtmlEscaped(h, mod.name);
@@ -1005,13 +1011,13 @@ fn appendSidebar(h: *StringBuffer, project: DocProject, current_module: ?[]const
         h.str("</ul>\n</div>\n");
     }
 
-    // Render grouped modules
+    // Render grouped structs
     for (grouped_prefixes.items, 0..) |prefix, idx| {
         h.str("<div class=\"sidebar-group\">\n<h4>");
         appendHtmlEscaped(h, prefix);
         h.str("</h4>\n<ul>\n");
-        for (grouped_modules.items[idx].items) |mod| {
-            const is_current = if (current_module) |cm| std.mem.eql(u8, cm, mod.name) else false;
+        for (grouped_structs.items[idx].items) |mod| {
+            const is_current = if (current_struct) |cm| std.mem.eql(u8, cm, mod.name) else false;
             if (is_current) {
                 h.str("<li class=\"active\">");
             } else {
@@ -1019,7 +1025,7 @@ fn appendSidebar(h: *StringBuffer, project: DocProject, current_module: ?[]const
             }
             h.str("<a href=\"");
             h.str(base);
-            h.str("modules/");
+            h.str("structs/");
             h.str(mod.name);
             h.str(".html\">");
             appendHtmlEscaped(h, mod.name);
@@ -1040,23 +1046,23 @@ fn generateSearchIndex(alloc: std.mem.Allocator, project: DocProject, options: D
     h.str("[\n");
 
     var first = true;
-    for (project.modules) |mod| {
+    for (project.structs) |mod| {
         if (!first) h.str(",\n");
         first = false;
 
-        h.str("  {\"module\":\"");
+        h.str("  {\"struct\":\"");
         appendJsonEscaped(&h, mod.name);
-        h.str("\",\"type\":\"module\",\"name\":\"");
+        h.str("\",\"type\":\"struct\",\"name\":\"");
         appendJsonEscaped(&h, mod.name);
         h.str("\",\"summary\":\"");
-        const mod_summary = extractFirstSentence(alloc, mod.moduledoc);
+        const mod_summary = extractFirstSentence(alloc, mod.structdoc);
         appendJsonEscaped(&h, mod_summary);
-        h.str("\",\"url\":\"modules/");
+        h.str("\",\"url\":\"structs/");
         appendJsonEscaped(&h, mod.name);
         h.str(".html\"}");
 
         for (mod.functions) |func| {
-            h.str(",\n  {\"module\":\"");
+            h.str(",\n  {\"struct\":\"");
             appendJsonEscaped(&h, mod.name);
             h.str("\",\"type\":\"");
             if (func.is_macro) h.str("macro") else h.str("function");
@@ -1065,7 +1071,7 @@ fn generateSearchIndex(alloc: std.mem.Allocator, project: DocProject, options: D
             h.fmt("/{d}", .{func.arity});
             h.str("\",\"summary\":\"");
             appendJsonEscaped(&h, func.summary);
-            h.str("\",\"url\":\"modules/");
+            h.str("\",\"url\":\"structs/");
             appendJsonEscaped(&h, mod.name);
             h.str(".html#");
             appendJsonEscaped(&h, func.name);
@@ -1095,7 +1101,7 @@ fn generateDocGroupPage(alloc: std.mem.Allocator, page_path: []const u8, project
     appendPageHeader(&h, stem, project, "../");
     h.str("<div class=\"layout\">\n");
     appendSidebar(&h, project, null, options, "../");
-    h.str("<main class=\"content\"><div class=\"moduledoc\">\n");
+    h.str("<main class=\"content\"><div class=\"structdoc\">\n");
     appendMarkdownAsHtml(&h, content);
     h.str("</div></main>\n</div>\n");
     appendPageFooter(&h, "../");
@@ -1142,7 +1148,7 @@ fn appendPageHeader(h: *StringBuffer, title: []const u8, project: DocProject, ba
     h.str("<circle cx=\"7\" cy=\"7\" r=\"5\" stroke=\"var(--fg-muted)\" stroke-width=\"1.3\"/>\n");
     h.str("<line x1=\"10.6\" y1=\"10.6\" x2=\"14\" y2=\"14\" stroke=\"var(--fg-muted)\" stroke-width=\"1.3\" stroke-linecap=\"round\"/>\n");
     h.str("</svg>\n");
-    h.str("<span>Search modules, functions, guides...</span>\n");
+    h.str("<span>Search structs, functions, guides...</span>\n");
     h.str("<kbd>\u{2318}</kbd><kbd>K</kbd>\n");
     h.str("</button>\n");
     h.str("</div>\n");
@@ -1211,8 +1217,14 @@ fn appendMarkdownAsHtml(h: *StringBuffer, markdown: []const u8) void {
                 in_code_block = false;
                 code_block_buf.list.clearRetainingCapacity();
             } else {
-                if (in_paragraph) { h.str("</p>\n"); in_paragraph = false; }
-                if (in_list) { h.str("</ul>\n"); in_list = false; }
+                if (in_paragraph) {
+                    h.str("</p>\n");
+                    in_paragraph = false;
+                }
+                if (in_list) {
+                    h.str("</ul>\n");
+                    in_list = false;
+                }
                 code_block_lang = std.mem.trimStart(u8, trimmed[3..], " ");
                 in_code_block = true;
                 code_block_buf.list.clearRetainingCapacity();
@@ -1227,59 +1239,107 @@ fn appendMarkdownAsHtml(h: *StringBuffer, markdown: []const u8) void {
         }
 
         if (trimmed.len == 0) {
-            if (in_paragraph) { h.str("</p>\n"); in_paragraph = false; }
-            if (in_list) { h.str("</ul>\n"); in_list = false; }
+            if (in_paragraph) {
+                h.str("</p>\n");
+                in_paragraph = false;
+            }
+            if (in_list) {
+                h.str("</ul>\n");
+                in_list = false;
+            }
             continue;
         }
 
         // Headings
         if (std.mem.startsWith(u8, trimmed, "#### ")) {
-            if (in_paragraph) { h.str("</p>\n"); in_paragraph = false; }
-            h.str("<h4>"); appendInlineMarkdown(h, trimmed[5..]); h.str("</h4>\n");
+            if (in_paragraph) {
+                h.str("</p>\n");
+                in_paragraph = false;
+            }
+            h.str("<h4>");
+            appendInlineMarkdown(h, trimmed[5..]);
+            h.str("</h4>\n");
             continue;
         }
         if (std.mem.startsWith(u8, trimmed, "### ")) {
-            if (in_paragraph) { h.str("</p>\n"); in_paragraph = false; }
-            h.str("<h3>"); appendInlineMarkdown(h, trimmed[4..]); h.str("</h3>\n");
+            if (in_paragraph) {
+                h.str("</p>\n");
+                in_paragraph = false;
+            }
+            h.str("<h3>");
+            appendInlineMarkdown(h, trimmed[4..]);
+            h.str("</h3>\n");
             continue;
         }
         if (std.mem.startsWith(u8, trimmed, "## ")) {
-            if (in_paragraph) { h.str("</p>\n"); in_paragraph = false; }
-            h.str("<h2>"); appendInlineMarkdown(h, trimmed[3..]); h.str("</h2>\n");
+            if (in_paragraph) {
+                h.str("</p>\n");
+                in_paragraph = false;
+            }
+            h.str("<h2>");
+            appendInlineMarkdown(h, trimmed[3..]);
+            h.str("</h2>\n");
             continue;
         }
         if (std.mem.startsWith(u8, trimmed, "# ")) {
-            if (in_paragraph) { h.str("</p>\n"); in_paragraph = false; }
-            h.str("<h1>"); appendInlineMarkdown(h, trimmed[2..]); h.str("</h1>\n");
+            if (in_paragraph) {
+                h.str("</p>\n");
+                in_paragraph = false;
+            }
+            h.str("<h1>");
+            appendInlineMarkdown(h, trimmed[2..]);
+            h.str("</h1>\n");
             continue;
         }
 
         // Horizontal rule
         if (std.mem.eql(u8, trimmed, "---") or std.mem.eql(u8, trimmed, "***")) {
-            if (in_paragraph) { h.str("</p>\n"); in_paragraph = false; }
+            if (in_paragraph) {
+                h.str("</p>\n");
+                in_paragraph = false;
+            }
             h.str("<hr>\n");
             continue;
         }
 
         // Unordered list
         if (trimmed.len > 2 and (trimmed[0] == '-' or trimmed[0] == '*') and trimmed[1] == ' ') {
-            if (in_paragraph) { h.str("</p>\n"); in_paragraph = false; }
-            if (!in_list) { h.str("<ul>\n"); in_list = true; }
-            h.str("<li>"); appendInlineMarkdown(h, trimmed[2..]); h.str("</li>\n");
+            if (in_paragraph) {
+                h.str("</p>\n");
+                in_paragraph = false;
+            }
+            if (!in_list) {
+                h.str("<ul>\n");
+                in_list = true;
+            }
+            h.str("<li>");
+            appendInlineMarkdown(h, trimmed[2..]);
+            h.str("</li>\n");
             continue;
         }
 
         // Blockquote
         if (std.mem.startsWith(u8, trimmed, "> ")) {
-            if (in_paragraph) { h.str("</p>\n"); in_paragraph = false; }
-            h.str("<blockquote><p>"); appendInlineMarkdown(h, trimmed[2..]); h.str("</p></blockquote>\n");
+            if (in_paragraph) {
+                h.str("</p>\n");
+                in_paragraph = false;
+            }
+            h.str("<blockquote><p>");
+            appendInlineMarkdown(h, trimmed[2..]);
+            h.str("</p></blockquote>\n");
             continue;
         }
 
         // Raw HTML passthrough — lines starting with < are passed through verbatim
         if (trimmed.len > 0 and trimmed[0] == '<') {
-            if (in_paragraph) { h.str("</p>\n"); in_paragraph = false; }
-            if (in_list) { h.str("</ul>\n"); in_list = false; }
+            if (in_paragraph) {
+                h.str("</p>\n");
+                in_paragraph = false;
+            }
+            if (in_list) {
+                h.str("</ul>\n");
+                in_list = false;
+            }
             h.str(line);
             h.char('\n');
             continue;
@@ -1307,7 +1367,12 @@ fn appendMarkdownAsHtml(h: *StringBuffer, markdown: []const u8) void {
         }
 
         // Paragraph text
-        if (!in_paragraph) { h.str("<p>"); in_paragraph = true; } else { h.char('\n'); }
+        if (!in_paragraph) {
+            h.str("<p>");
+            in_paragraph = true;
+        } else {
+            h.char('\n');
+        }
         appendInlineMarkdown(h, trimmed);
     }
 
@@ -1322,34 +1387,67 @@ fn appendInlineMarkdown(h: *StringBuffer, text: []const u8) void {
         const c = text[i];
 
         if (c == '`') {
-            const end = std.mem.indexOfPos(u8, text, i + 1, "`") orelse { h.char('`'); i += 1; continue; };
-            h.str("<code>"); appendHtmlEscaped(h, text[i + 1 .. end]); h.str("</code>");
+            const end = std.mem.indexOfPos(u8, text, i + 1, "`") orelse {
+                h.char('`');
+                i += 1;
+                continue;
+            };
+            h.str("<code>");
+            appendHtmlEscaped(h, text[i + 1 .. end]);
+            h.str("</code>");
             i = end + 1;
             continue;
         }
         if (c == '*' and i + 1 < text.len and text[i + 1] == '*') {
-            const end = std.mem.indexOfPos(u8, text, i + 2, "**") orelse { h.str("**"); i += 2; continue; };
-            h.str("<strong>"); appendHtmlEscaped(h, text[i + 2 .. end]); h.str("</strong>");
+            const end = std.mem.indexOfPos(u8, text, i + 2, "**") orelse {
+                h.str("**");
+                i += 2;
+                continue;
+            };
+            h.str("<strong>");
+            appendHtmlEscaped(h, text[i + 2 .. end]);
+            h.str("</strong>");
             i = end + 2;
             continue;
         }
         if (c == '*') {
-            const end = std.mem.indexOfPos(u8, text, i + 1, "*") orelse { h.char('*'); i += 1; continue; };
-            h.str("<em>"); appendHtmlEscaped(h, text[i + 1 .. end]); h.str("</em>");
+            const end = std.mem.indexOfPos(u8, text, i + 1, "*") orelse {
+                h.char('*');
+                i += 1;
+                continue;
+            };
+            h.str("<em>");
+            appendHtmlEscaped(h, text[i + 1 .. end]);
+            h.str("</em>");
             i = end + 1;
             continue;
         }
         if (c == '[') {
-            const cb = std.mem.indexOfPos(u8, text, i + 1, "]") orelse { appendHtmlEscapedByte(h, c); i += 1; continue; };
+            const cb = std.mem.indexOfPos(u8, text, i + 1, "]") orelse {
+                appendHtmlEscapedByte(h, c);
+                i += 1;
+                continue;
+            };
             if (cb + 1 < text.len and text[cb + 1] == '(') {
-                const cp = std.mem.indexOfPos(u8, text, cb + 2, ")") orelse { appendHtmlEscapedByte(h, c); i += 1; continue; };
-                h.str("<a href=\""); appendHtmlEscaped(h, text[cb + 2 .. cp]); h.str("\">");
-                appendHtmlEscaped(h, text[i + 1 .. cb]); h.str("</a>");
+                const cp = std.mem.indexOfPos(u8, text, cb + 2, ")") orelse {
+                    appendHtmlEscapedByte(h, c);
+                    i += 1;
+                    continue;
+                };
+                h.str("<a href=\"");
+                appendHtmlEscaped(h, text[cb + 2 .. cp]);
+                h.str("\">");
+                appendHtmlEscaped(h, text[i + 1 .. cb]);
+                h.str("</a>");
                 i = cp + 1;
                 continue;
             }
         }
-        if (c == '\\' and i + 1 < text.len) { appendHtmlEscapedByte(h, text[i + 1]); i += 2; continue; }
+        if (c == '\\' and i + 1 < text.len) {
+            appendHtmlEscapedByte(h, text[i + 1]);
+            i += 2;
+            continue;
+        }
 
         // HTML entities — pass through &...; verbatim
         if (c == '&') {
@@ -1526,12 +1624,12 @@ fn isZapLang(lang: []const u8) bool {
 
 fn isKeyword(word: []const u8) bool {
     const keywords = [_][]const u8{
-        "pub",       "fn",        "macro",     "module",    "case",
-        "if",        "else",      "use",       "struct",    "union",
-        "when",      "for",       "in",        "cond",      "do",
-        "end",       "unless",    "and",       "or",        "not",
-        "import",    "alias",     "quote",     "unquote",   "panic",
-        "defmodule", "extends",   "describe",  "test",      "assert",
+        "pub",    "fn",      "macro",    "struct",  "case",
+        "if",     "else",    "use",      "struct",  "union",
+        "when",   "for",     "in",       "cond",    "do",
+        "end",    "unless",  "and",      "or",      "not",
+        "import", "alias",   "quote",    "unquote", "panic",
+        "struct", "extends", "describe", "test",    "assert",
         "reject",
     };
     for (&keywords) |kw| {
@@ -1542,8 +1640,8 @@ fn isKeyword(word: []const u8) bool {
 
 fn isBuiltin(word: []const u8) bool {
     const builtins = [_][]const u8{
-        "true",   "false",  "nil",
-        "setup",  "teardown",
+        "true",  "false",    "nil",
+        "setup", "teardown",
     };
     for (&builtins) |b| {
         if (std.mem.eql(u8, word, b)) return true;
@@ -1553,11 +1651,11 @@ fn isBuiltin(word: []const u8) bool {
 
 fn isPrimitiveType(word: []const u8) bool {
     const types = [_][]const u8{
-        "i8",    "i16",   "i32",   "i64",
-        "u8",    "u16",   "u32",   "u64",
-        "f16",   "f32",   "f64",
-        "usize", "isize",
-        "Bool",  "String", "Atom", "Nil", "Never", "Expr",
+        "i8",    "i16",   "i32",    "i64",
+        "u8",    "u16",   "u32",    "u64",
+        "f16",   "f32",   "f64",    "usize",
+        "isize", "Bool",  "String", "Atom",
+        "Nil",   "Never", "Expr",
     };
     for (&types) |t| {
         if (std.mem.eql(u8, word, t)) return true;
@@ -1647,23 +1745,23 @@ fn generateScriptWithIndex(alloc: std.mem.Allocator, project: DocProject, option
 fn appendSearchIndexJson(h: *StringBuffer, project: DocProject, alloc: std.mem.Allocator) void {
     h.str("[\n");
     var first = true;
-    for (project.modules) |mod| {
+    for (project.structs) |mod| {
         if (!first) h.str(",\n");
         first = false;
 
-        h.str("{\"module\":\"");
+        h.str("{\"struct\":\"");
         appendJsonEscaped(h, mod.name);
-        h.str("\",\"type\":\"module\",\"name\":\"");
+        h.str("\",\"type\":\"struct\",\"name\":\"");
         appendJsonEscaped(h, mod.name);
         h.str("\",\"summary\":\"");
-        const mod_summary = extractFirstSentence(alloc, mod.moduledoc);
+        const mod_summary = extractFirstSentence(alloc, mod.structdoc);
         appendJsonEscaped(h, mod_summary);
-        h.str("\",\"url\":\"modules/");
+        h.str("\",\"url\":\"structs/");
         appendJsonEscaped(h, mod.name);
         h.str(".html\"}");
 
         for (mod.functions) |func| {
-            h.str(",\n{\"module\":\"");
+            h.str(",\n{\"struct\":\"");
             appendJsonEscaped(h, mod.name);
             h.str("\",\"type\":\"");
             if (func.is_macro) h.str("macro") else h.str("function");
@@ -1672,7 +1770,7 @@ fn appendSearchIndexJson(h: *StringBuffer, project: DocProject, alloc: std.mem.A
             h.fmt("/{d}", .{func.arity});
             h.str("\",\"summary\":\"");
             appendJsonEscaped(h, func.summary);
-            h.str("\",\"url\":\"modules/");
+            h.str("\",\"url\":\"structs/");
             appendJsonEscaped(h, mod.name);
             h.str(".html#");
             appendJsonEscaped(h, func.name);

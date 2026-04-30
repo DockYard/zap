@@ -1,6 +1,6 @@
 # Deferred: Stdlib Build Types (Phase 2)
 
-## Status: Blocked by module-imports.md
+## Status: Blocked by struct-imports.md
 
 ## What It Is
 
@@ -24,7 +24,7 @@ for compiled execution.
 ### Zap.Env
 
 ```zap
-defmodule Zap do
+struct Zap do
   defstruct Env do
     target :: Atom
     os :: Atom
@@ -37,7 +37,7 @@ end
 ### Zap.Manifest
 
 ```zap
-defmodule Zap do
+struct Zap do
   defstruct Manifest do
     name :: String
     version :: String
@@ -53,7 +53,7 @@ end
 ### Zap.BuildOpts
 
 ```zap
-defmodule Zap.BuildOpts do
+struct Zap.BuildOpts do
   def get_string(opts :: %{Atom => String}, key :: Atom, default :: String) :: String do
     # lookup key in opts map, return default if not found
   end
@@ -76,14 +76,14 @@ Planned location: embedded in the compiler binary, similar to how
 1. **Embed as Zap source text** — `@embedFile("lib/zap/env.zap")` etc.,
    prepended during builder compilation (like stdlib)
 2. **Ship as files** — installed alongside the compiler, found via search path
-3. **Register via C-ABI** — `zir_compilation_add_module_source` with the
+3. **Register via C-ABI** — `zir_compilation_add_struct_source` with the
    Zap source text for each type
 
 Option 1 is simplest for v1 — embed the source and prepend it during
 builder compilation. This avoids needing file-based import resolution
 for the build types specifically.
 
-Option 2 requires the full import system from `module-imports.md`.
+Option 2 requires the full import system from `struct-imports.md`.
 
 ## Current State
 
@@ -115,7 +115,7 @@ So if these types were available, struct construction would compile.
 ## Dependencies
 
 - **Without imports**: None — can be done by embedding source text
-- **With imports**: Requires `module-imports.md`
+- **With imports**: Requires `struct-imports.md`
 
 ## Blocks
 

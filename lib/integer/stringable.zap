@@ -1,3 +1,5 @@
+@doc = "Stringable implementation for `Integer`."
+
 pub impl Stringable for Integer {
   @doc = """
     Render an i64 as its decimal representation. Calls the runtime

@@ -1,3 +1,5 @@
+@doc = "Stringable implementation for `Bool`."
+
 pub impl Stringable for Bool {
   @doc = """
     Render a boolean as `"true"` or `"false"`. Calls the runtime

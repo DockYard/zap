@@ -19,10 +19,10 @@ Deep analysis of Zig 0.16 features against the entire Zap codebase (compiler + f
 **Change:** Spawn parse tasks via `Io.Group` — each parser operates on isolated source with shared `StringInterner`.
 **Impact:** 2-8x speedup for multi-file projects. Parsing is embarrassingly parallel.
 
-### 4. Parallel module compilation via `Io.Group` (compiler.zig:837-861)
-**Current:** Sequential `for (module_order)` compiling each module one at a time.
-**Change:** Build dependency graph, compile independent modules in parallel via `Io.Group`, synchronize at dependency boundaries.
-**Impact:** 2-4x speedup for projects with many independent modules.
+### 4. Parallel struct compilation via `Io.Group` (compiler.zig:837-861)
+**Current:** Sequential `for (struct_order)` compiling each struct one at a time.
+**Change:** Build dependency graph, compile independent structs in parallel via `Io.Group`, synchronize at dependency boundaries.
+**Impact:** 2-4x speedup for projects with many independent structs.
 
 ### 5. Atomic cache writes (main.zig:987-991)
 **Current:** Direct `createFile` + `writeStreamingAll` for `.zap-cache/{target}.hash` — crash between create and close corrupts cache.
@@ -58,10 +58,10 @@ Deep analysis of Zig 0.16 features against the entire Zap codebase (compiler + f
 **Change:** Run build in cancelable `Io.Group` task, cancel on new file change detection.
 **Impact:** Instant feedback in `--watch` mode when files change during compilation.
 
-### 11. `Queue(T)` for ZIR module batching (zir_api.zig:142-149)
+### 11. `Queue(T)` for ZIR struct batching (zir_api.zig:142-149)
 **Current:** `zir_compilation_add_zir()` and `zir_compilation_update()` are synchronous.
-**Change:** Queue ZIR injections, then run single Sema pass on all queued modules.
-**Impact:** Reduces N Sema passes to 1 for N modules.
+**Change:** Queue ZIR injections, then run single Sema pass on all queued structs.
+**Impact:** Reduces N Sema passes to 1 for N structs.
 
 ### 12. ArenaAllocator `resetRetainingCapacity()` (runtime.zig:69-74)
 **Current:** `resetAllocator()` calls `a.deinit()` then sets to `null`, forcing full reallocation.
@@ -84,8 +84,8 @@ Deep analysis of Zig 0.16 features against the entire Zap codebase (compiler + f
 
 ### 15. `Io.Group` for parallel Sema in fork (zir_api.zig:153-157)
 **Current:** `zir_compilation_update()` runs Sema sequentially.
-**Change:** Use `Io.Group` to parallelize Sema analysis across multiple ZIR modules.
-**Impact:** 2-4x speedup for multi-module compilations.
+**Change:** Use `Io.Group` to parallelize Sema analysis across multiple ZIR structs.
+**Impact:** 2-4x speedup for multi-struct compilations.
 
 ### 16. `@Struct()/@Union()/@Enum()` for ZIR type emission (zir_builder.zig:1070-1114)
 **Current:** Manual field-by-field marshaling via C-ABI arrays for union/struct return types.
@@ -108,9 +108,9 @@ Deep analysis of Zig 0.16 features against the entire Zap codebase (compiler + f
 **Impact:** Smaller cache directory, especially for large projects.
 
 ### 20. `Io.Batch` for discovery file reads (discovery.zig:144)
-**Current:** Sequential `readFileAlloc` in module discovery loop.
-**Change:** Batch all file reads for discovered modules simultaneously.
-**Impact:** 2-4x speedup for module discovery phase.
+**Current:** Sequential `readFileAlloc` in struct discovery loop.
+**Change:** Batch all file reads for discovered structs simultaneously.
+**Impact:** 2-4x speedup for struct discovery phase.
 
 ---
 
@@ -131,6 +131,6 @@ Deep analysis of Zig 0.16 features against the entire Zap codebase (compiler + f
 | Phase | Items | Files | Estimated Impact |
 |-------|-------|-------|-----------------|
 | **Phase 1: Foundation** | #1 Process.Init, #5 Atomic writes, #6 std.time, #12 Arena reset, #13 Test timeouts | main.zig, runtime.zig, build.zig | Code quality + correctness |
-| **Phase 2: Parallelism** | #2 Io.Group deps, #3 Parallel parsing, #4 Parallel modules, #9 Batch file reads | lockfile.zig, compiler.zig, main.zig | 2-8x compilation speedup |
+| **Phase 2: Parallelism** | #2 Io.Group deps, #3 Parallel parsing, #4 Parallel structs, #9 Batch file reads | lockfile.zig, compiler.zig, main.zig | 2-8x compilation speedup |
 | **Phase 3: Fork** | #7 Incremental compilation, #8 In-memory stubs, #11 Queue batching, #14 Io passthrough | zir_api.zig | 5-50x iterative speedup |
 | **Phase 4: Advanced** | #10 Build cancelation, #15 Parallel Sema, #16 @Struct builtins, #20 Batch discovery | main.zig, zir_api.zig, zir_builder.zig | Architecture improvements |

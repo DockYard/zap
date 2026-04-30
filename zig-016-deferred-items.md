@@ -18,32 +18,32 @@ The `StringInterner` is a `StringHashMap` + `ArrayList` that every parser writes
 - `buildInternerRemap()` — O(total unique strings)
 - `remapProgram()` — walks AST nodes replacing StringId fields
 
-**Risk:** The AST remap must cover every node type containing StringId (ModuleName.parts, FunctionDecl.name, VarRef, StringLiteral, AtomLiteral, Attribute, etc.). This is mechanical but must be thorough.
+**Risk:** The AST remap must cover every node type containing StringId (StructName.parts, FunctionDecl.name, VarRef, StringLiteral, AtomLiteral, Attribute, etc.). This is mechanical but must be thorough.
 
 **Files:** `src/compiler.zig` lines 267-288
 
 ---
 
-## 2. Parallel Module Compilation (Io.Group + Dependency Levels)
+## 2. Parallel Struct Compilation (Io.Group + Dependency Levels)
 
 **Approach: Level-by-level parallel compilation using topological sort depth.**
 
-The current `compileModuleByModule` iterates modules sequentially. Modules at the same dependency depth are independent and can compile in parallel.
+The current `compileStructByStruct` iterates structs sequentially. Structs at the same dependency depth are independent and can compile in parallel.
 
 **Shared state hazards identified:**
-- `TypeChecker` writes `graph.bindings.items[id].type_id` (types.zig:1002,1011) — each module writes to non-overlapping indices, but needs isolation for safety
-- `DiagnosticEngine` — not thread-safe, needs per-module collection
+- `TypeChecker` writes `graph.bindings.items[id].type_id` (types.zig:1002,1011) — each struct writes to non-overlapping indices, but needs isolation for safety
+- `DiagnosticEngine` — not thread-safe, needs per-struct collection
 - `ctx.interner` and `ctx.collector.graph` — read-only during compilation, safe for concurrent access
 - CTFE may write computed values — safe within a dependency level (no cross-deps)
 
 **Implementation:**
 1. Modify `discovery.zig` topologicalSort to output `level_boundaries` (where each depth level starts)
-2. Create `PerModuleResult` struct with per-module IR, diagnostics, errors
-3. Process level-by-level: `Io.Group` for modules at same depth, sequential between levels
+2. Create `PerStructResult` struct with per-struct IR, diagnostics, errors
+3. Process level-by-level: `Io.Group` for structs at same depth, sequential between levels
 4. Merge IR results after each level completes
 5. Thread `Io` through the compilation pipeline (main.zig → compiler.zig)
 
-**Expected speedup:** For N modules across M levels, time reduces from O(N) to O(M). A 20-module project with 4 levels → ~4-5x speedup.
+**Expected speedup:** For N structs across M levels, time reduces from O(N) to O(M). A 20-struct project with 4 levels → ~4-5x speedup.
 
 **Files:** `src/compiler.zig` lines 822-872, `src/discovery.zig` lines 372-436
 
@@ -108,18 +108,18 @@ Then update `begin_capture`/`end_capture` in `zir_api.zig` to use `b.capture_buf
 - `CacheMode.incremental` enables persistent artifact dirs and linker patching
 - ZIR re-injection works — `addZirImpl` frees old ZIR before injecting new (line 858)
 - InternPool persists across updates (only freed in `Zcu.deinit()`)
-- Module registrations are idempotent (`import_table.getOrPut`)
+- Struct registrations are idempotent (`import_table.getOrPut`)
 
 **Critical gap: `prev_zir` for injected files.** Normal files save `file.zir` → `file.prev_zir` during AstGen, enabling `updateZirRefs` to diff old vs new ZIR. For `zir_injected` files, this never happens (AstGen is skipped at PerThread.zig:371). Without `prev_zir`, the compiler can't determine what changed.
 
 **Proposed new C-ABI functions:**
 1. `zir_compilation_create_incremental(...)` — creates context with `.cache_mode = .incremental`
 2. `zir_compilation_prepare_update(ctx)` — saves `file.zir` → `file.prev_zir` for all injected files
-3. `zir_compilation_invalidate_file(ctx, name)` — marks a module for re-analysis
+3. `zir_compilation_invalidate_file(ctx, name)` — marks a struct for re-analysis
 
 **Proposed watch mode flow:**
 ```
-Initial:  create_incremental → add_modules → build_zir → inject → update → run
+Initial:  create_incremental → add_structs → build_zir → inject → update → run
 On change: prepare_update → re-parse changed files → re-inject ZIR → update → run
 Shutdown: destroy
 ```
@@ -140,5 +140,5 @@ Shutdown: destroy
 | Move capture state to Builder | Low | Correctness | None |
 | File.MemoryMap replacement | Low | Code quality | None |
 | Parallel file parsing | Medium | 2-8x parse speedup | AST remap function |
-| Parallel module compilation | High | 2-5x compile speedup | Discovery level boundaries, Io threading |
+| Parallel struct compilation | High | 2-5x compile speedup | Discovery level boundaries, Io threading |
 | Incremental ZirContext | High | 10-50x watch speedup | Fork changes + rebuild |

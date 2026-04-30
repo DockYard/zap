@@ -192,7 +192,7 @@ pub const ScopeSet = struct {
 
 pub const ScopeKind = enum {
     prelude,
-    module,
+    struct_scope,
     function,
     block,
     case_clause,
@@ -237,7 +237,7 @@ pub const Scope = struct {
 // ============================================================
 
 pub const ImportedScope = struct {
-    source_module: ast.StructName,
+    source_struct: ast.StructName,
     filter: ImportFilter,
     imported_families: std.AutoHashMap(FamilyKey, FunctionFamilyId),
     imported_types: std.AutoHashMap(ast.StringId, TypeId),
@@ -393,15 +393,15 @@ pub const TypeKind = union(enum) {
 };
 
 // ============================================================
-// Module registration
+// Struct registration
 // ============================================================
 
-/// A compile-time attribute stored on a module or function.
+/// A compile-time attribute stored on a struct or function.
 ///
 /// Attributes are append-only at compile time. A single declared
 /// `@name = value` produces one row; macros that call
-/// `Module.put_attribute(:name, value)` append additional rows.
-/// When `accumulate` is true (set via `Module.register_attribute`),
+/// `Struct.put_attribute(:name, value)` append additional rows.
+/// When `accumulate` is true (set via `Struct.register_attribute`),
 /// reads return the full accumulated list; otherwise reads return
 /// the latest row's value.
 pub const Attribute = struct {
@@ -458,7 +458,7 @@ pub const ImplEntry = struct {
 /// by writing a `@native_type = "list"|"map"|"range"|"string"`
 /// attribute on the struct declaration; the collector scans those
 /// attributes and populates `ScopeGraph.native_type_names`. Compiler
-/// passes that previously string-compared module names against
+/// passes that previously string-compared struct names against
 /// hardcoded literals consult the registry instead — that way the
 /// "is this struct the runtime List type?" question is answered by
 /// the user-visible declaration in `lib/list.zap`, not by a string
@@ -491,7 +491,7 @@ pub const ScopeGraph = struct {
     impls: std.ArrayList(ImplEntry),
     prelude_scope: ScopeId,
     /// Maps (source_id, span.start) → scope_id, so the type checker can
-    /// find the scope for function clauses and modules without mutating
+    /// find the scope for function clauses and structs without mutating
     /// the AST. Uses a composite key to prevent collisions between
     /// AST nodes at the same byte offset in different source files.
     node_scope_map: std.AutoHashMap(u64, ScopeId),
@@ -677,7 +677,7 @@ pub const ScopeGraph = struct {
             .kind = kind,
             .params = params,
         });
-        // Register named types for global lookup (skip sentinel 0 for module-scoped unnamed structs)
+        // Register named types for global lookup (skip sentinel 0 for struct-scoped unnamed structs)
         if (name != 0) {
             try self.type_name_to_id.put(name, id);
         }
@@ -818,7 +818,7 @@ pub const ScopeGraph = struct {
     }
 
     /// Look up a function family by name and arity, walking up the scope chain.
-    /// Also checks imported module scopes for unqualified access.
+    /// Also checks imported struct scopes for unqualified access.
     pub fn resolveFamily(self: *const ScopeGraph, scope_id: ScopeId, name: ast.StringId, arity: u32) ?FunctionFamilyId {
         const key = FamilyKey{ .name = name, .arity = arity };
         var current: ?ScopeId = scope_id;
@@ -827,14 +827,14 @@ pub const ScopeGraph = struct {
             if (s.function_families.get(key)) |fid| {
                 return fid;
             }
-            // Check imported module scopes
+            // Check imported struct scopes
             for (s.imports.items) |imp| {
                 // Check pre-populated imported_families
                 if (imp.imported_families.get(key)) |fid| {
                     return fid;
                 }
-                // Also search the source module's scope directly
-                if (self.findStructScope(imp.source_module)) |mod_scope_id| {
+                // Also search the source struct's scope directly
+                if (self.findStructScope(imp.source_struct)) |mod_scope_id| {
                     const mod_scope = self.getScope(mod_scope_id);
                     if (mod_scope.function_families.get(key)) |fid| {
                         // Check import filter
@@ -885,7 +885,7 @@ pub const ScopeGraph = struct {
                 return hit;
             }
             for (s.imports.items) |imp| {
-                if (self.findStructScope(imp.source_module)) |mod_scope_id| {
+                if (self.findStructScope(imp.source_struct)) |mod_scope_id| {
                     const mod_scope = self.getScope(mod_scope_id);
                     if (self.matchFamilyWithDefaults(mod_scope, name, call_arity)) |hit| {
                         const filter_key = FamilyKey{ .name = name, .arity = hit.declared_arity };
@@ -937,7 +937,7 @@ pub const ScopeGraph = struct {
     }
 
     /// Look up a macro family by name and arity, walking up the scope chain.
-    /// Also checks imported module scopes.
+    /// Also checks imported struct scopes.
     pub fn resolveMacro(self: *const ScopeGraph, scope_id: ScopeId, name: ast.StringId, arity: u32) ?MacroFamilyId {
         const key = FamilyKey{ .name = name, .arity = arity };
         var current: ?ScopeId = scope_id;
@@ -947,7 +947,7 @@ pub const ScopeGraph = struct {
                 return mid;
             }
             for (s.imports.items) |imp| {
-                if (self.findStructScope(imp.source_module)) |mod_scope_id| {
+                if (self.findStructScope(imp.source_struct)) |mod_scope_id| {
                     const mod_scope = self.getScope(mod_scope_id);
                     if (mod_scope.macros.get(key)) |mid| {
                         if (self.passesImportFilter(imp.filter, key)) return mid;
@@ -959,13 +959,13 @@ pub const ScopeGraph = struct {
         return null;
     }
 
-    /// Find a module's scope by its name.
-    pub fn findStructScope(self: *const ScopeGraph, module_name: ast.StructName) ?ScopeId {
+    /// Find a struct's scope by its name.
+    pub fn findStructScope(self: *const ScopeGraph, struct_name: ast.StructName) ?ScopeId {
         for (self.structs.items) |mod_entry| {
             // Use stored name (not decl.name) for consistency after remapping
-            if (mod_entry.name.parts.len == module_name.parts.len) {
+            if (mod_entry.name.parts.len == struct_name.parts.len) {
                 var match = true;
-                for (mod_entry.name.parts, module_name.parts) |a, b| {
+                for (mod_entry.name.parts, struct_name.parts) |a, b| {
                     if (a != b) {
                         match = false;
                         break;
@@ -980,7 +980,7 @@ pub const ScopeGraph = struct {
     /// Find the StructEntry whose scope is `scope_id`, returning a
     /// mutable pointer so callers can append attributes. Used by macro
     /// intrinsics that have only a ScopeId in hand (the macro engine's
-    /// `current_module_scope`).
+    /// `current_struct_scope`).
     pub fn findStructByScope(self: *ScopeGraph, scope_id: ScopeId) ?*StructEntry {
         for (self.structs.items) |*entry| {
             if (entry.scope_id == scope_id) return entry;
@@ -989,16 +989,16 @@ pub const ScopeGraph = struct {
     }
 
     /// Find a StructEntry by name, returning a mutable pointer.
-    pub fn findStructEntryByName(self: *ScopeGraph, module_name: ast.StructName) ?*StructEntry {
+    pub fn findStructEntryByName(self: *ScopeGraph, struct_name: ast.StructName) ?*StructEntry {
         for (self.structs.items) |*entry| {
-            if (structNamesMatch(entry.name, module_name)) return entry;
+            if (structNamesMatch(entry.name, struct_name)) return entry;
         }
         return null;
     }
 
     /// Mark `name` on `mod_entry` as an accumulating attribute. After
-    /// this call, `putModuleAttribute` appends new values rather than
-    /// overwriting; `getModuleAttribute` returns the full accumulated
+    /// this call, `putStructAttribute` appends new values rather than
+    /// overwriting; `getStructAttribute` returns the full accumulated
     /// list when read. Idempotent — calling twice with the same name
     /// is a no-op.
     pub fn registerAccumulatingAttribute(
@@ -1028,7 +1028,7 @@ pub const ScopeGraph = struct {
     /// new row tagged accumulate=true. Otherwise, replace any existing
     /// single-value row (write-once-or-overwrite semantics, matching
     /// `@name = value` source declarations).
-    pub fn putModuleAttribute(
+    pub fn putStructAttribute(
         self: *ScopeGraph,
         mod_entry: *StructEntry,
         name: ast.StringId,
@@ -1073,7 +1073,7 @@ pub const ScopeGraph = struct {
     ///     happened and no values were appended).
     ///   - For single-value attributes: the latest value.
     ///   - null when no row with that name exists.
-    pub fn getModuleAttribute(
+    pub fn getStructAttribute(
         self: *ScopeGraph,
         mod_entry: *const StructEntry,
         name: ast.StringId,
@@ -1207,8 +1207,8 @@ test "scope graph basic operations" {
     try std.testing.expectEqual(@as(usize, 1), graph.scopes.items.len);
     try std.testing.expectEqual(ScopeKind.prelude, graph.getScope(0).kind);
 
-    // Create a module scope
-    const mod_scope = try graph.createScope(0, .module);
+    // Create a struct scope
+    const mod_scope = try graph.createScope(0, .struct_scope);
     try std.testing.expectEqual(@as(ScopeId, 1), mod_scope);
     try std.testing.expectEqual(@as(?ScopeId, 0), graph.getScope(mod_scope).parent);
 
@@ -1221,7 +1221,7 @@ test "scope graph binding resolution" {
     var graph = ScopeGraph.init(std.testing.allocator);
     defer graph.deinit();
 
-    const mod_scope = try graph.createScope(0, .module);
+    const mod_scope = try graph.createScope(0, .struct_scope);
     const fn_scope = try graph.createScope(mod_scope, .function);
 
     const span = ast.SourceSpan{ .start = 0, .end = 1 };
@@ -1229,7 +1229,7 @@ test "scope graph binding resolution" {
 
     _ = try graph.createBinding(name_id, mod_scope, .variable, span);
 
-    // Resolve from function scope should find binding in module scope
+    // Resolve from function scope should find binding in struct scope
     const found = graph.resolveBinding(fn_scope, name_id);
     try std.testing.expect(found != null);
 
@@ -1242,7 +1242,7 @@ test "scope graph family creation" {
     var graph = ScopeGraph.init(std.testing.allocator);
     defer graph.deinit();
 
-    const mod_scope = try graph.createScope(0, .module);
+    const mod_scope = try graph.createScope(0, .struct_scope);
     const name_id: ast.StringId = 10;
 
     const fam_id = try graph.createFamily(mod_scope, name_id, 2, .public);

@@ -26,7 +26,7 @@ Zap is a general-purpose functional programming language that compiles to native
 
 **Core philosophy:**
 
-- **Features are implemented in Zap code**, not hardcoded in the compiler. The compiler is a general-purpose tool that knows nothing about specific Zap modules (IO, String, Math, etc.). Standard library functions, macros, test frameworks, and DSLs are all written in `.zap` source files.
+- **Features are implemented in Zap code**, not hardcoded in the compiler. The compiler is a general-purpose tool that knows nothing about specific Zap structs (IO, String, Math, etc.). Standard library functions, macros, test frameworks, and DSLs are all written in `.zap` source files.
 - **The compiler only handles language primitives**: parsing, type system, ZIR emission, and a small set of runtime primitives that physically cannot be expressed in Zap (stdout, memory allocation, OS argv).
 - **No workarounds or hacks.** Every solution must be the correct, production-grade, long-term fix.
 
@@ -47,11 +47,11 @@ Zap is a general-purpose functional programming language that compiles to native
 
 ## 2. Language Syntax and Semantics
 
-### Modules and Files
+### Structs and Files
 
-Every `.zap` file contains exactly one module. The module name maps to the file path:
+Every `.zap` file contains exactly one struct. The struct name maps to the file path:
 
-| Module name      | File path              |
+| Struct name      | File path              |
 |------------------|------------------------|
 | `App`            | `lib/app.zap`          |
 | `Config.Parser`  | `lib/config/parser.zap`|
@@ -59,7 +59,7 @@ Every `.zap` file contains exactly one module. The module name maps to the file 
 
 ```zap
 # lib/math.zap
-pub module Math {
+pub struct Math {
   pub fn square(x :: i64) -> i64 {
     x * x
   }
@@ -186,9 +186,9 @@ evens = for x <- [1, 2, 3, 4, 5, 6], x rem 2 == 0 { x }
 Multi-line strings use triple-quote `"""`:
 
 ```zap
-@moduledoc = """
+@doc = """
   This is a multi-line documentation string.
-  Used for module and function documentation.
+  Used for struct and function documentation.
   """
 ```
 
@@ -202,7 +202,7 @@ Zap uses a multi-pass compilation architecture:
   .zap source files
       |
       v
-   Discovery -------- follow module references from entry point
+   Discovery -------- follow struct references from entry point
       |
       v
    Parse ------------ per-file ASTs
@@ -232,8 +232,8 @@ Zap uses a multi-pass compilation architecture:
    Analysis --------- escape analysis, regions, lambda sets, Perceus
       |
       v
-   Per-Module ZIR --- each Zap module -> its own Zig ZIR module
-      |                cross-module calls -> @import chains
+   Per-Struct ZIR --- each Zap struct -> its own Zig ZIR struct
+      |                cross-struct calls -> @import chains
       |                :zig. functions -> @import("zap_runtime")
       v
    Codegen ---------- native binary (via Zig compiler -> LLVM)
@@ -243,15 +243,15 @@ Zap uses a multi-pass compilation architecture:
 
 **Pass 1 (`collectAll`):** Parse all files, collect declarations into a shared scope graph and type store. Returns a `CompilationContext`.
 
-**Pass 2 (`compileFile`, per-module):** Macro expand → desugar → type check → HIR → IR. Each module is compiled against the shared context.
+**Pass 2 (`compileFile`, per-struct):** Macro expand → desugar → type check → HIR → IR. Each struct is compiled against the shared context.
 
-**Pass 3 (`mergeAndFinalize`):** Merge IR programs from all modules, run the full analysis pipeline (escape analysis, interprocedural summaries, region inference, lambda sets, Perceus/ARC optimization).
+**Pass 3 (`mergeAndFinalize`):** Merge IR programs from all structs, run the full analysis pipeline (escape analysis, interprocedural summaries, region inference, lambda sets, Perceus/ARC optimization).
 
 ### ZIR Emission
 
-After analysis, each Zap module is emitted as its own Zig ZIR module. The ZIR builder (`src/zir_builder.zig`) translates Zap IR instructions into ZIR instruction sequences by calling C-ABI functions exported by the Zig fork.
+After analysis, each Zap struct is emitted as its own Zig ZIR struct. The ZIR builder (`src/zir_builder.zig`) translates Zap IR instructions into ZIR instruction sequences by calling C-ABI functions exported by the Zig fork.
 
-Cross-module calls become `@import("Module").function(args)` chains in ZIR. Native runtime calls (`:zig.Module.function()`) become `@import("zap_runtime").RuntimeModule.function()` chains.
+Cross-struct calls become `@import("Struct").function(args)` chains in ZIR. Native runtime calls (`:zig.Struct.function()`) become `@import("zap_runtime").RuntimeStruct.function()` chains.
 
 ### Key Property: AOT Compilation
 
@@ -280,7 +280,7 @@ The Zig fork exports C-ABI functions that the Zap compiler calls to build ZIR pr
 - `zir_builder_destroy(handle)` → cleanup
 - `zir_compilation_create(zig_lib_dir, cache_dirs, output_path, root_name, output_mode, optimize_mode, ...)` → compilation context
 - `zir_compilation_update(ctx)` → run Sema + codegen
-- `zir_compilation_add_module_source(ctx, name, source_ptr, source_len)` → inject Zig source as a module
+- `zir_compilation_add_struct_source(ctx, name, source_ptr, source_len)` → inject Zig source as a struct
 - `zir_builder_inject(builder, compilation)` → finalize and inject ZIR into compilation
 
 **Constants and Primitives:**
@@ -355,10 +355,10 @@ All instruction-emitting functions return a `u32` reference (ZIR instruction ind
 
 ### How Native Calls Are Routed
 
-When Zap code calls `:zig.Module.function(args)`, the ZIR builder:
+When Zap code calls `:zig.Struct.function(args)`, the ZIR builder:
 
-1. Emits `@import("zap_runtime")` → gets the runtime module reference
-2. Maps the Zap module name to a runtime struct name (e.g., `IO` → `Prelude`, `Math` → `Prelude`, `List` → `List`)
+1. Emits `@import("zap_runtime")` → gets the runtime struct reference
+2. Maps the Zap struct name to a runtime struct name (e.g., `IO` → `Prelude`, `Math` → `Prelude`, `List` → `List`)
 3. Emits `.RuntimeStruct` field access → gets the struct reference
 4. Emits `.function` field access → gets the function reference
 5. Emits a call with the resolved function and argument references
@@ -381,7 +381,7 @@ The fork links mandatory LLVM targets including: AArch64, **AMDGPU**, ARM, **NVP
 
 ### Embedded Runtime
 
-`src/runtime.zig` is embedded into the compiler via `@embedFile("runtime.zig")` and injected as an in-memory Zig module during compilation via `zir_compilation_add_module_source()`. This means runtime functions are compiled alongside user code — no separate runtime library.
+`src/runtime.zig` is embedded into the compiler via `@embedFile("runtime.zig")` and injected as an in-memory Zig struct during compilation via `zir_compilation_add_struct_source()`. This means runtime functions are compiled alongside user code — no separate runtime library.
 
 ### Core Runtime Types
 
@@ -449,15 +449,15 @@ pub const TaggedValue = union(enum) {
 
 ## 6. The `use` / `__using__` Pattern
 
-This is a central mechanism in Zap, directly inspired by Elixir's `use` macro. It enables module composition and DSL creation.
+This is a central mechanism in Zap, directly inspired by Elixir's `use` macro. It enables struct composition and DSL creation.
 
 ### How It Works
 
-When you write `use SomeModule` inside a module body, the compiler:
+When you write `use SomeStruct` inside a struct body, the compiler:
 
-1. Imports `SomeModule`
-2. Calls `SomeModule.__using__/1` (a macro) with any options provided
-3. Injects the returned AST into the calling module
+1. Imports `SomeStruct`
+2. Calls `SomeStruct.__using__/1` (a macro) with any options provided
+3. Injects the returned AST into the calling struct
 
 ### Existing Example: Zest Test Framework
 
@@ -465,7 +465,7 @@ The test framework uses this pattern:
 
 ```zap
 # lib/zest/case.zap
-pub module Zest.Case {
+pub struct Zest.Case {
   pub macro __using__(_opts :: Expr) -> Expr {
     quote {
       import Zest.Case
@@ -487,11 +487,11 @@ pub module Zest.Case {
 }
 ```
 
-Used in test modules:
+Used in test structs:
 
 ```zap
 # test/closure_test.zap
-pub module Test.ClosureTest {
+pub struct Test.ClosureTest {
   use Zest.Case
 
   describe("closures") {
@@ -506,9 +506,9 @@ pub module Test.ClosureTest {
 
 - `__using__` is a **macro** — it runs at compile time during macro expansion
 - It receives options as an AST expression (e.g., `backend: Math.CUDA`)
-- It returns an AST expression that gets injected into the calling module
+- It returns an AST expression that gets injected into the calling struct
 - This is all Zap code — the compiler has no special knowledge of `__using__` beyond knowing to call it during `use` expansion
-- `__using__` can inject imports, function definitions, module attributes, or any other valid AST
+- `__using__` can inject imports, function definitions, struct attributes, or any other valid AST
 
 ### How Options Work
 
@@ -557,21 +557,21 @@ Protocols and implementations are first-class AST nodes:
 // src/ast.zig
 pub const ProtocolDecl = struct {
     meta: NodeMeta,
-    name: ModuleName,
+    name: StructName,
     functions: []const ProtocolFunctionSig,
     is_private: bool,
 };
 
 pub const ImplDecl = struct {
     meta: NodeMeta,
-    protocol_name: ModuleName,
-    target_type: ModuleName,
+    protocol_name: StructName,
+    target_type: StructName,
     functions: []const *const FunctionDecl,
     is_private: bool,
 };
 ```
 
-Both `protocol` and `impl` are variants in the `TopItem` union, meaning they're first-class module-level declarations.
+Both `protocol` and `impl` are variants in the `TopItem` union, meaning they're first-class struct-level declarations.
 
 ---
 
@@ -582,7 +582,7 @@ Both `protocol` and `impl` are variants in the `TopItem` union, meaning they're 
 Every Zap project has a `build.zap` that defines build targets:
 
 ```zap
-pub module MyApp.Builder {
+pub struct MyApp.Builder {
   pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
     case env.target {
       :my_app ->
@@ -607,13 +607,13 @@ pub module MyApp.Builder {
 | Path       | `{:name, {:path, "dir"}}`          | Local Zap library      |
 | Git        | `{:name, {:git, "url", "ref"}}`    | Remote Zap library     |
 
-Dependencies are first-class — their modules are available directly. The compiler discovers dependency modules the same way it discovers project modules (by following imports from the entry point).
+Dependencies are first-class — their structs are available directly. The compiler discovers dependency structs the same way it discovers project structs (by following imports from the entry point).
 
 A `zap.lock` lockfile records resolved versions for reproducible builds.
 
 ### Zig-Level Dependencies
 
-Since Zap compiles through Zig, backend packages that include Zig runtime code also need entries in `build.zig.zon` (Zig's package manifest). This means GPU backend packages are both Zap dependencies (for the `.zap` module files) and Zig dependencies (for the `.zig` runtime files).
+Since Zap compiles through Zig, backend packages that include Zig runtime code also need entries in `build.zig.zon` (Zig's package manifest). This means GPU backend packages are both Zap dependencies (for the `.zap` struct files) and Zig dependencies (for the `.zig` runtime files).
 
 Current `build.zig.zon` has no dependencies — it's a blank slate:
 
@@ -630,14 +630,14 @@ Current `build.zig.zon` has no dependencies — it's a blank slate:
 
 ## 9. Existing Standard Library
 
-### Current Math Module
+### Current Math Struct
 
-The existing `Math` module is a thin wrapper around Zig's hardware-accelerated builtins:
+The existing `Math` struct is a thin wrapper around Zig's hardware-accelerated builtins:
 
 ```zap
 # lib/math.zap
-pub module Math {
-  @moduledoc = """
+pub struct Math {
+  @doc = """
     Mathematical functions for floating-point computation.
     Provides trigonometric, exponential, logarithmic, and other
     mathematical operations on f64 values.
@@ -659,9 +659,9 @@ pub module Math {
 
 Every function delegates to `:zig.Math.*` which routes to `@import("zap_runtime").Prelude.*` at the ZIR level. The `Prelude` struct in `runtime.zig` provides the actual Zig implementations calling `@sqrt`, `@sin`, `@cos`, etc.
 
-### Other Standard Library Modules
+### Other Standard Library Structs
 
-| Module     | Purpose                                                    |
+| Struct     | Purpose                                                    |
 |------------|------------------------------------------------------------|
 | `Kernel`   | Core macros: `if`, `unless`, `and`, `or`, `\|>`, sigils, `fn`, `struct`, `union`, `raise`, `sleep` |
 | `IO`       | Console I/O: `puts`, `gets`, `write`, `mode`               |
@@ -684,7 +684,7 @@ Every function delegates to `:zig.Math.*` which routes to `@import("zap_runtime"
 
 ### How Library Functions Call Into Zig
 
-Every standard library function that needs hardware access uses the `:zig.Module.function()` pattern:
+Every standard library function that needs hardware access uses the `:zig.Struct.function()` pattern:
 
 ```zap
 # In Zap code:
@@ -694,7 +694,7 @@ Every standard library function that needs hardware access uses the `:zig.Module
 @import("zap_runtime").Prelude.println(message)
 ```
 
-The ZIR builder maps module names to runtime struct names:
+The ZIR builder maps struct names to runtime struct names:
 - `IO`, `Math`, `Integer`, `Float`, `Bool`, `Atom`, `File`, `System`, `Path` → all map to `Prelude`
 - `List` → `List`
 - `Map` → `MapAtomInt` (or variant-specific based on key/value types)
@@ -709,7 +709,7 @@ The ZIR builder maps module names to runtime struct names:
 ### Design Goals
 
 1. **Numerical library with the same depth as Nx and PyTorch** — tensor operations, linear algebra, neural network primitives, autograd, FFT, sparse operations (~150-200 operations total)
-2. **Backend adapter pattern via `use Math, backend: Module`** — the `Math` module defines the API, backends provide the implementation
+2. **Backend adapter pattern via `use Math, backend: Struct`** — the `Math` struct defines the API, backends provide the implementation
 3. **Backends are external dependencies, not built into the core** — the core ships `Math` + `Math.Backend` protocol + `Math.CPU` default; GPU backends are separate packages users opt into
 4. **Everything possible is Zap code** — the compiler knows nothing about tensors, GPU, or numerical computing
 
@@ -729,11 +729,11 @@ Separate packages (user opts in via deps):
   math_metal     — Math.Metal backend for Apple Silicon
 ```
 
-### The `use Math, backend: Module` Pattern
+### The `use Math, backend: Struct` Pattern
 
 ```zap
-pub module Math {
-  @moduledoc """
+pub struct Math {
+  @doc """
   Numerical computing library with pluggable backends.
   """
 
@@ -815,7 +815,7 @@ pub protocol Math.Backend {
 
 ```zap
 # In the math_webgpu package:
-pub module Math.WebGPU {
+pub struct Math.WebGPU {
   impl Math.Backend {
     pub fn add(left :: Tensor, right :: Tensor) -> Tensor {
       :zig.WebGPU.elementwise_add(left, right)
@@ -838,7 +838,7 @@ pub module Math.WebGPU {
 ### User Experience
 
 ```zap
-pub module ImageClassifier {
+pub struct ImageClassifier {
   use Math, backend: Math.WebGPU
 
   pub fn forward(params, image :: Tensor) -> Tensor {
@@ -873,7 +873,7 @@ Convolution (1d/2d/3d), pooling, normalization (batch/layer/group), attention, a
 
 ### The Zig Runtime Layer
 
-Each backend package includes Zig runtime code that handles the actual hardware interface. The `:zig.` calls in the Zap backend module land in these Zig functions.
+Each backend package includes Zig runtime code that handles the actual hardware interface. The `:zig.` calls in the Zap backend struct land in these Zig functions.
 
 | Backend        | Zig runtime wraps                        |
 |----------------|------------------------------------------|
@@ -942,7 +942,7 @@ The following questions need deep investigation:
 
 13. **How should data transfer between CPU and GPU work?** Explicit (user calls `to_device`/`to_host`), implicit (backend handles it), or tracked in the type system (separate `GPUTensor` vs `Tensor` types)?
 
-14. **How should device selection work?** Per-module via `use Math, backend: Math.WebGPU`? Per-call? Global default with override? What about multi-GPU?
+14. **How should device selection work?** Per-struct via `use Math, backend: Math.WebGPU`? Per-call? Global default with override? What about multi-GPU?
 
 15. **Is kernel fusion possible at the Zap compiler level?** Since Zap sees the entire function at compile time (AOT), could the compiler detect chains of tensor operations and fuse them into a single GPU kernel? This is what makes XLA and TVM competitive. Could Zap do this without an external runtime?
 
@@ -956,7 +956,7 @@ The following questions need deep investigation:
 
 19. **What does Elixir Nx's operation coverage look like in detail?** Full operation list, signatures, and behavior. This is the depth we want to match.
 
-20. **What does PyTorch's `torch` module cover that Nx doesn't?** Sparse operations, quantization, distributed, custom autograd functions. Which of these matter for Zap?
+20. **What does PyTorch's `torch` struct cover that Nx doesn't?** Sparse operations, quantization, distributed, custom autograd functions. Which of these matter for Zap?
 
 21. **How do Mojo and Julia approach the same problem?** Both are LLVM-based languages with GPU support. What can we learn from their architecture without copying their design?
 

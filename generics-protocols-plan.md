@@ -190,7 +190,7 @@ The `MonomorphRegistry` already tracks instantiations. The monomorphization pass
 
 The existing `monomorphize.zig` has scaffolding for this but needs to be completed for function-level generics (currently it looks for type_var in params but doesn't do full AST cloning with substitution).
 
-#### 1.5 Update Enum module with generic signatures
+#### 1.5 Update Enum struct with generic signatures
 
 **File: `lib/enum.zap`**
 
@@ -208,7 +208,7 @@ Do this for all Enum functions: `map`, `filter`, `reject`, `reduce`, `each`, `fi
 
 Some functions have natural constraints (e.g., `sum` only works on numeric types) — these can initially keep `i64` signatures and be generalized later when numeric protocols exist.
 
-#### 1.6 Update List module
+#### 1.6 Update List struct
 
 **File: `lib/list.zap`**
 
@@ -268,7 +268,7 @@ pub const ImplDecl = struct {
 };
 ```
 
-Add to `ModuleItem`:
+Add to `StructItem`:
 ```zig
 protocol: *const ProtocolDecl,
 impl_block: *const ImplDecl,
@@ -307,7 +307,7 @@ pub const ImplEntry = struct {
 };
 ```
 
-The collector walks `ModuleItem.protocol` and `ModuleItem.impl_block`, registers them in the scope graph.
+The collector walks `StructItem.protocol` and `StructItem.impl_block`, registers them in the scope graph.
 
 #### 2.3 Type Checker — resolve protocol constraints
 
@@ -531,9 +531,9 @@ Working:
 - IR builtin rewriting (ListCell → StringListCell when element type is String)
 - End-to-end: `fn identity(x :: element) -> element { x }` works with i64, Bool, String
 
-**Blocking issue: cross-module monomorphization.** The per-module compilation pipeline runs monomorphization independently per module. When `Test.EnumTest` calls `Enum.map([1,2,3], fn...)`, the monomorphization in the `Enum` module doesn't see call sites from `Test.EnumTest`. This means generic stdlib functions (List, Enum) can't be monomorphized for callers in other modules.
+**Blocking issue: cross-struct monomorphization.** The per-struct compilation pipeline runs monomorphization independently per struct. When `Test.EnumTest` calls `Enum.map([1,2,3], fn...)`, the monomorphization in the `Enum` struct doesn't see call sites from `Test.EnumTest`. This means generic stdlib functions (List, Enum) can't be monomorphized for callers in other structs.
 
-**Fix required:** Move monomorphization to a whole-program pass that runs after all modules are compiled to HIR, or implement cross-module specialization requests where each module records which specializations it needs from imported modules.
+**Fix required:** Move monomorphization to a whole-program pass that runs after all structs are compiled to HIR, or implement cross-struct specialization requests where each struct records which specializations it needs from imported structs.
 
 ## Non-Goals
 

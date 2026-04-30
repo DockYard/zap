@@ -25,7 +25,7 @@ pub const Token = struct {
 
         // Identifiers
         identifier,
-        module_identifier, // capitalized identifier
+        type_identifier, // capitalized identifier
 
         // Keywords
         keyword_pub,
@@ -156,7 +156,7 @@ pub const Token = struct {
         .{ "opaque", .keyword_opaque },
         .{ "alias", .keyword_alias },
         .{ "import", .keyword_import },
-        // "use" is contextual — only recognized at module item level in the parser,
+        // "use" is contextual — only recognized at struct item level in the parser,
         // not as a general keyword. This allows "use" as a function/variable name.
         // .{ "use", .keyword_use },
         // "quote", "unquote", and "unquote_splicing" are also contextual.
@@ -196,7 +196,6 @@ test "keyword lookup" {
     try std.testing.expectEqual(Token.Tag.keyword_struct, Token.getKeyword("struct").?);
     try std.testing.expectEqual(Token.Tag.keyword_pub, Token.getKeyword("pub").?);
     try std.testing.expect(Token.getKeyword("foobar") == null);
-    try std.testing.expect(Token.getKeyword("module") == null);
     // `quote`, `unquote`, and `unquote_splicing` are contextual and
     // must NOT be in the reserved keyword map.
     try std.testing.expect(Token.getKeyword("quote") == null);

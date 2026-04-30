@@ -80,7 +80,7 @@ fn rewriteBlock(
         var next_local = maxLocalInFunction(block.instructions, target_func.body[0].instructions);
         var local_map = std.AutoHashMap(ir.LocalId, ir.LocalId).init(allocator);
         defer local_map.deinit();
-        var cloned : std.ArrayListUnmanaged(ir.Instruction) = .empty;
+        var cloned: std.ArrayListUnmanaged(ir.Instruction) = .empty;
         defer cloned.deinit(allocator);
 
         try cloned.appendSlice(allocator, block.instructions[0..instr_index]);

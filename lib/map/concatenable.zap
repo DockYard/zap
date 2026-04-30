@@ -1,3 +1,5 @@
+@doc = "Concatenable implementation for `Map`."
+
 pub impl Concatenable for Map(K, V) {
   @doc = """
     Map concatenation, equivalent to `Map.merge/2`. Entries from

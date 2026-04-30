@@ -112,7 +112,7 @@ Each phase catches errors and continues to the next -- produce as much analysis 
 - `compiler.zig`: Pattern for `compileFrontend` pipeline orchestration
 - `diagnostics.zig`: `DiagnosticEngine`, `Diagnostic`, `Severity`, `Suggestion`
 - `stdlib.zig`: `prependStdlib()` for source preparation
-- All frontend modules via `root.zig` re-exports
+- All frontend structs via `root.zig` re-exports
 
 ---
 
@@ -144,17 +144,17 @@ Recursive AST descent checking `span.start <= offset <= span.end`, returning the
 1. Find AST node at cursor
 2. If `var_ref`: `resolveBinding()` -> return `binding.span`
 3. If `call`: `resolveFamily()` -> return `family.clauses[0].decl.meta.span`
-4. If `module_ref`: look up in `scope_graph.modules` -> return module decl span
+4. If `struct_ref`: look up in `scope_graph.structs` -> return struct decl span
 5. If definition is in stdlib (line <= stdlib_line_count): return null
 
 ### Completion
 1. Find scope at cursor via `node_scope_map` (ScopeGraph maps `span.start -> ScopeId`)
 2. `ScopeGraph.collectVisibleBindingNames(scope_id)` -> variable completions (kind: 6)
 3. `ScopeGraph.collectVisibleFunctionNames(scope_id)` -> function completions (kind: 3)
-4. Module names from `scope_graph.modules` -> module completions (kind: 9)
+4. Struct names from `scope_graph.structs` -> struct completions (kind: 9)
 5. Type names from `scope_graph.types` -> type completions (kind: 7)
-6. Keyword completions based on context (inside module: `def`, `defp`, `defstruct`, etc.)
-7. Trigger character: `.` (for module-qualified access)
+6. Keyword completions based on context (inside struct: `def`, `defp`, `defstruct`, etc.)
+7. Trigger character: `.` (for struct-qualified access)
 
 ### Updated Capabilities
 ```json
@@ -171,7 +171,7 @@ Recursive AST descent checking `span.start <= offset <= span.end`, returning the
 Parser produces partial ASTs for incomplete/broken code, enabling diagnostics and navigation while typing.
 
 ### Current State
-Parser already has `synchronize()` (parser.zig:162-190) that skips to `def`/`defp`/`defmodule`/`end` boundaries. `parseProgram()` catches errors per top-level item and calls `synchronize()`. This is a foundation to extend.
+Parser already has `synchronize()` (parser.zig:162-190) that skips to `def`/`defp`/`struct`/`end` boundaries. `parseProgram()` catches errors per top-level item and calls `synchronize()`. This is a foundation to extend.
 
 ### AST Change
 Add `error_expr: NodeMeta` variant to `ast.Expr` union (ast.zig:266). Add matching case in `Expr.getMeta()`. This represents a parse failure at a specific source location.
@@ -215,8 +215,8 @@ Enable `textDocument/didChange` with analysis (still `Full` sync, kind 1). Add s
 | `src/lsp/references.zig` | `ReferenceIndex`, `buildReferenceIndex()` from AST walk | 300 |
 
 ### Document Symbols
-Walk `program.modules` and `program.top_items` producing hierarchy:
-- `ModuleDecl` -> Module (2)
+Walk `program.structs` and `program.top_items` producing hierarchy:
+- `StructDecl` -> Struct (2)
   - `FunctionDecl` -> Function (12), name includes arity
   - `StructDecl` -> Struct (23), with Field children
   - `EnumDecl` -> Enum (10), with EnumMember children
@@ -251,7 +251,7 @@ Trigger on `(` and `,`. Detect enclosing call expression, look up function famil
 ProjectState
   ├── project_root, manifest (from build.zap)
   ├── files: HashMap(path -> FileState)
-  ├── module_index: HashMap(module_name -> {file, scope_id})
+  ├── struct_index: HashMap(struct_name -> {file, scope_id})
   └── stdlib_state (parsed once, shared)
 ```
 
@@ -260,7 +260,7 @@ ProjectState
 2. **Per-file analysis**: Each file parsed independently. Collector starts with pre-populated stdlib scopes.
 3. **Dependency tracking**: Record import relationships. Re-analyze dependents when a file changes.
 4. **Project discovery**: On `initialize`, find `build.zap`, extract source paths, watch for changes.
-5. **Cross-file go-to-definition**: Look up module in `module_index`, navigate to its file.
+5. **Cross-file go-to-definition**: Look up struct in `struct_index`, navigate to its file.
 
 ### New LSP Methods
 - `workspace/didChangeWatchedFiles` (file creation/deletion)
@@ -300,7 +300,7 @@ Phase 2 depends on Phase 1. Phase 3 is independent of Phase 2 (can parallelize).
 | File | Phase | Change |
 |------|-------|--------|
 | `src/main.zig` | 1 | Add `lsp` command |
-| `src/root.zig` | 1 | Re-export lsp module |
+| `src/root.zig` | 1 | Re-export lsp struct |
 | `src/ast.zig` | 3 | Add `error_expr` variant |
 | `src/parser.zig` | 3 | `error_tolerant` mode, improved recovery |
 | `src/collector.zig` | 3 | Skip `error_expr` |
@@ -327,10 +327,10 @@ Phase 2 depends on Phase 1. Phase 3 is independent of Phase 2 (can parallelize).
 2. Other functions in the same file still show diagnostics correctly
 
 ### Phase 4
-1. Outline view shows module/function/type hierarchy
+1. Outline view shows struct/function/type hierarchy
 2. Find References on a variable -> all usages highlighted
 3. Rename a variable -> all references updated
 
 ### Phase 5
 1. Cross-file go-to-definition works
-2. Edit a module in one file -> diagnostics update in files that import it
+2. Edit a struct in one file -> diagnostics update in files that import it

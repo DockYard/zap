@@ -218,8 +218,8 @@ pub const StructName = struct {
 
     /// Render this struct name in its canonical dotted form
     /// (`Foo.Bar.Baz`). The dotted form is the user-facing
-    /// representation used wherever modules are addressed
-    /// textually — diagnostics, the `module_programs` registry,
+    /// representation used wherever structs are addressed
+    /// textually — diagnostics, the `struct_programs` registry,
     /// and the runtime bridge. Single-segment names return the
     /// interned string directly without copying; multi-segment
     /// names allocate a fresh slice owned by `alloc`.
@@ -481,24 +481,24 @@ pub const MacroSpliceKind = enum {
 };
 
 // ============================================================
-// Module system directives
+// Struct system directives
 // ============================================================
 
 pub const AliasDecl = struct {
     meta: NodeMeta,
-    module_path: StructName,
+    struct_path: StructName,
     as_name: ?StructName,
 };
 
 pub const ImportDecl = struct {
     meta: NodeMeta,
-    module_path: StructName,
+    struct_path: StructName,
     filter: ?ImportFilter,
 };
 
 pub const UseDecl = struct {
     meta: NodeMeta,
-    module_path: StructName,
+    struct_path: StructName,
     opts: ?*const Expr,
 };
 
@@ -516,7 +516,7 @@ pub const ImportEntry = union(enum) {
 };
 
 // ============================================================
-// Module attributes
+// Struct attributes
 // ============================================================
 
 pub const AttributeDecl = struct {
@@ -563,7 +563,7 @@ pub const Expr = union(enum) {
 
     // References
     var_ref: VarRef,
-    module_ref: ModuleRef,
+    struct_ref: StructRef,
 
     // Compound literals
     tuple: TupleExpr,
@@ -610,7 +610,7 @@ pub const Expr = union(enum) {
     // Binary literal: <<1, 2, 3>>
     binary_literal: BinaryLiteral,
 
-    // Function reference: Module.func/arity
+    // Function reference: Struct.func/arity
     function_ref: FunctionRefExpr,
 
     // Anonymous function expression
@@ -629,7 +629,7 @@ pub const Expr = union(enum) {
             .bool_literal => |v| v.meta,
             .nil_literal => |v| v.meta,
             .var_ref => |v| v.meta,
-            .module_ref => |v| v.meta,
+            .struct_ref => |v| v.meta,
             .tuple => |v| v.meta,
             .list => |v| v.meta,
             .map => |v| v.meta,
@@ -706,7 +706,7 @@ pub const VarRef = struct {
     name: StringId,
 };
 
-pub const ModuleRef = struct {
+pub const StructRef = struct {
     meta: NodeMeta,
     name: StructName,
 };
@@ -734,7 +734,7 @@ pub const MapField = struct {
 
 pub const StructExpr = struct {
     meta: NodeMeta,
-    module_name: StructName,
+    struct_name: StructName,
     update_source: ?*const Expr,
     fields: []const StructField,
 };
@@ -1010,7 +1010,7 @@ pub const MapPatternField = struct {
 
 pub const StructPattern = struct {
     meta: NodeMeta,
-    module_name: StructName,
+    struct_name: StructName,
     fields: []const StructPatternField,
 };
 
@@ -1080,7 +1080,7 @@ pub const BinaryPattern = struct {
 
 pub const FunctionRefExpr = struct {
     meta: NodeMeta,
-    module: ?StructName, // null for local function references
+    struct_name: ?StructName, // null for local function references
     function: StringId,
     arity: u32,
 };
@@ -1157,7 +1157,7 @@ pub const TypeMapField = struct {
 
 pub const TypeStructExpr = struct {
     meta: NodeMeta,
-    module_name: StructName,
+    struct_name: StructName,
     fields: []const TypeStructField,
 };
 
@@ -1284,7 +1284,7 @@ test "ast.TopItem variant count is locked" {
     //   - src/collector.zig top-item collection
     //   - src/desugar.zig top-item desugaring
     //   - src/macro.zig top-item expansion
-    //   - src/compiler.zig:buildModulePrograms (per-module routing)
+    //   - src/compiler.zig:buildStructPrograms (per-struct routing)
     try std.testing.expectEqual(
         expected_top_item_variants,
         std.meta.fields(TopItem).len,

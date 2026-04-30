@@ -1,3 +1,5 @@
+@doc = "Stringable implementation for `Float`."
+
 pub impl Stringable for Float {
   @doc = """
     Render a 64-bit float using the runtime's default formatting.

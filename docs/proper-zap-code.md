@@ -24,9 +24,9 @@ If the README, tests, and compiler disagree, trust the compiler and existing pas
 
 ## Top-Level Structure
 
-### One File, One Module
+### One File, One Struct
 
-Every `.zap` file should define one module whose name matches its path.
+Every `.zap` file should define one struct whose name matches its path.
 
 Examples:
 
@@ -34,9 +34,9 @@ Examples:
 - `lib/zest/case.zap` -> `pub struct Zest.Case { ... }`
 - `test/function_test.zap` -> `pub struct Test.FunctionTest { ... }`
 
-### Put Functions Inside Modules
+### Put Functions Inside Structs
 
-Do not write top-level functions outside a module.
+Do not write top-level functions outside a struct.
 
 Write:
 
@@ -108,7 +108,7 @@ pub fn process(n :: String, g :: String) -> String {
 ### Struct And Function Naming
 
 - Structs use `PascalCase`
-- Namespaced modules use dotted `PascalCase`: `Zest.Case`, `Test.FunctionTest`
+- Namespaced structs use dotted `PascalCase`: `Zest.Case`, `Test.FunctionTest`
 - Functions use `snake_case`
 
 Examples from the repo:
@@ -514,24 +514,24 @@ Single-character sigils are reserved for the language. Multi-character sigils ca
 
 ### import
 
-Use `import ModuleName` when you want unqualified access to functions or macros.
+Use `import StructName` when you want unqualified access to functions or macros.
 
 ```zap
-import Test.MultiModuleHelper
+import Test.MultiStructHelper
 
 double(3)
 ```
 
 ### use
 
-Use `use ModuleName` for DSL-style modules that define a `__using__` macro.
+Use `use StructName` for DSL-style structs that define a `__using__` macro.
 
 Examples in the repo:
 
 - `use Zest.Case`
 - `use Zest.Runner`
 
-If a module does not provide a `__using__` macro, prefer `import` or qualified calls instead.
+If a struct does not provide a `__using__` macro, prefer `import` or qualified calls instead.
 
 ## Closures And Function References
 
@@ -541,7 +541,7 @@ When you want a named callable value, prefer:
 
 ```zap
 &local_function/1
-&ModuleName.function_name/2
+&StructName.function_name/2
 ```
 
 This is clearer and more reliable than relying on bare function names as values.
@@ -702,7 +702,7 @@ pub struct Test.MyFeatureTest {
 
 Rules:
 
-- test modules live under `Test.*`
+- test structs live under `Test.*`
 - use `Zest.Case`
 - expose `run() -> String`
 - group checks with `describe`
@@ -748,8 +748,8 @@ Prefer simple, source-backed callable patterns that already exist in tests and c
 
 Before finalizing new Zap code, check all of these:
 
-1. Is everything inside a module?
-2. Do file path and module name match?
+1. Is everything inside a struct?
+2. Do file path and struct name match?
 3. Are all parameter types annotated?
 4. Are return types explicit?
 5. Are names descriptive (or scope is trivially small)?

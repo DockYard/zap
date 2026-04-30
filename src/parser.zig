@@ -524,7 +524,7 @@ pub const Parser = struct {
     }
 
     // ============================================================
-    // Module declarations
+    // Struct declarations
     // ============================================================
 
     fn parseStructDecl(self: *Parser, is_private: bool) !ast.StructDecl {
@@ -542,7 +542,7 @@ pub const Parser = struct {
             return error.ParseError;
         }
 
-        if (!self.check(.module_identifier)) {
+        if (!self.check(.type_identifier)) {
             try self.addRichError(
                 "I was expecting a struct name (like `MyStruct`) after the struct keyword",
                 start,
@@ -556,7 +556,7 @@ pub const Parser = struct {
         // Parse optional extends
         var parent: ?ast.StringId = null;
         if (self.match(.keyword_extends)) {
-            const parent_tok = try self.expect(.module_identifier);
+            const parent_tok = try self.expect(.type_identifier);
             parent = try self.internToken(parent_tok);
         }
 
@@ -713,7 +713,7 @@ pub const Parser = struct {
                         const field = try self.parseStructField();
                         try fields.append(self.allocator, field);
                     } else {
-                        // Try parsing as a module-level expression (macro call like describe/test).
+                        // Try parsing as a struct-level expression (macro call like describe/test).
                         // These are collected into an auto-generated run/0 function.
                         const expr = try self.parseExpr();
                         try items.append(self.allocator, .{ .struct_level_expr = expr });
@@ -806,7 +806,7 @@ pub const Parser = struct {
         if (self.check(.keyword_pub)) _ = self.advance();
         _ = try self.expect(.keyword_protocol);
 
-        if (!self.check(.module_identifier)) {
+        if (!self.check(.type_identifier)) {
             try self.addRichError(
                 "I was expecting a protocol name (like `Enumerable`) after `protocol`",
                 start,
@@ -911,7 +911,7 @@ pub const Parser = struct {
         if (self.check(.keyword_pub)) _ = self.advance();
         _ = try self.expect(.keyword_impl);
 
-        if (!self.check(.module_identifier)) {
+        if (!self.check(.type_identifier)) {
             try self.addRichError(
                 "I was expecting a protocol name (like `Enumerable`) after `impl`",
                 start,
@@ -932,7 +932,7 @@ pub const Parser = struct {
             return error.ParseError;
         }
 
-        if (!self.check(.module_identifier)) {
+        if (!self.check(.type_identifier)) {
             try self.addRichError(
                 "I was expecting a type name (like `List`) after `for`",
                 self.currentSpan(),
@@ -951,7 +951,7 @@ pub const Parser = struct {
         if (self.check(.left_paren)) {
             _ = self.advance();
             while (!self.check(.right_paren) and !self.check(.eof)) {
-                if (!self.check(.identifier) and !self.check(.module_identifier)) {
+                if (!self.check(.identifier) and !self.check(.type_identifier)) {
                     try self.addRichError(
                         "I was expecting a type-parameter name (like `K`) inside the parens",
                         self.currentSpan(),
@@ -1028,20 +1028,20 @@ pub const Parser = struct {
         const start = self.currentSpan();
         var parts: std.ArrayList(ast.StringId) = .empty;
 
-        const first = try self.expect(.module_identifier);
+        const first = try self.expect(.type_identifier);
         try parts.append(self.allocator, try self.internToken(first));
 
         while (self.check(.dot)) {
-            // Peek past the dot — only consume if followed by another module_identifier
+            // Peek past the dot — only consume if followed by another type_identifier
             const saved_lexer = self.lexer;
             const saved_current = self.current;
             const saved_previous = self.previous;
             _ = self.advance(); // consume dot
-            if (self.check(.module_identifier)) {
+            if (self.check(.type_identifier)) {
                 const part = self.advance();
                 try parts.append(self.allocator, try self.internToken(part));
             } else {
-                // Not a module name continuation — restore the dot
+                // Not a struct name continuation — restore the dot
                 self.lexer = saved_lexer;
                 self.current = saved_current;
                 self.previous = saved_previous;
@@ -1056,7 +1056,7 @@ pub const Parser = struct {
     }
 
     /// Peek ahead to determine if a struct declaration is field-only (data struct)
-    /// versus a module-like struct with items (functions, macros, etc.).
+    /// versus a struct-like struct with items (functions, macros, etc.).
     /// Returns true if the struct body starts with `identifier ::` (field declaration).
     fn isFieldOnlyStruct(self: *Parser) bool {
         const saved = self.saveLexerState();
@@ -1067,11 +1067,11 @@ pub const Parser = struct {
         if (self.check(.keyword_struct)) _ = self.advance();
 
         // Skip dotted name (e.g., Foo.Bar)
-        if (self.check(.module_identifier)) {
+        if (self.check(.type_identifier)) {
             _ = self.advance();
             while (self.check(.dot)) {
                 _ = self.advance();
-                if (self.check(.module_identifier) or self.check(.identifier)) {
+                if (self.check(.type_identifier) or self.check(.identifier)) {
                     _ = self.advance();
                 } else break;
             }
@@ -1080,7 +1080,7 @@ pub const Parser = struct {
         // Skip optional extends
         if (self.check(.keyword_extends)) {
             _ = self.advance();
-            if (self.check(.module_identifier)) _ = self.advance();
+            if (self.check(.type_identifier)) _ = self.advance();
         }
 
         // Now we should be at `{`
@@ -1110,7 +1110,7 @@ pub const Parser = struct {
         const start = self.currentSpan();
         _ = try self.expect(.keyword_type);
 
-        const name_tok = try self.expectIdentifierOrModule();
+        const name_tok = try self.expectIdentifierOrType();
         const name = try self.internToken(name_tok);
 
         const params = try self.parseOptionalTypeParams();
@@ -1131,7 +1131,7 @@ pub const Parser = struct {
         const start = self.currentSpan();
         _ = try self.expect(.keyword_opaque);
 
-        const name_tok = try self.expectIdentifierOrModule();
+        const name_tok = try self.expectIdentifierOrType();
         const name = try self.internToken(name_tok);
 
         const params = try self.parseOptionalTypeParams();
@@ -1155,7 +1155,7 @@ pub const Parser = struct {
         var params: std.ArrayList(ast.TypeParam) = .empty;
 
         while (!self.check(.right_paren) and !self.check(.eof)) {
-            const param_tok = try self.expectIdentifierOrModule();
+            const param_tok = try self.expectIdentifierOrType();
             try params.append(self.allocator, .{
                 .meta = .{ .span = ast.SourceSpan.from(param_tok.loc) },
                 .name = try self.internToken(param_tok),
@@ -1177,7 +1177,7 @@ pub const Parser = struct {
         _ = try self.expect(.keyword_struct);
 
         // Parse optional struct name (anonymous structs have no name)
-        const name: ast.StructName = if (self.check(.module_identifier))
+        const name: ast.StructName = if (self.check(.type_identifier))
             try self.parseStructName()
         else
             .{ .parts = &.{}, .span = self.currentSpan() };
@@ -1239,7 +1239,7 @@ pub const Parser = struct {
         // Parse optional extends
         var parent: ?ast.StringId = null;
         if (self.match(.keyword_extends)) {
-            const parent_tok = try self.expect(.module_identifier);
+            const parent_tok = try self.expect(.type_identifier);
             parent = try self.internToken(parent_tok);
         }
 
@@ -1317,7 +1317,7 @@ pub const Parser = struct {
             self.skipNewlines();
             if (self.check(.right_brace)) break;
 
-            const variant_tok = try self.expect(.module_identifier);
+            const variant_tok = try self.expect(.type_identifier);
             const variant_name = try self.internToken(variant_tok);
 
             var type_expr: ?*const ast.TypeExpr = null;
@@ -1568,7 +1568,7 @@ pub const Parser = struct {
         const start = self.currentSpan();
         _ = try self.expect(.keyword_alias);
 
-        const module_path = try self.parseStructName();
+        const struct_path = try self.parseStructName();
 
         var as_name: ?ast.StructName = null;
         if (self.match(.comma)) {
@@ -1581,7 +1581,7 @@ pub const Parser = struct {
 
         return self.create(ast.AliasDecl, .{
             .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
-            .module_path = module_path,
+            .struct_path = struct_path,
             .as_name = as_name,
         });
     }
@@ -1590,7 +1590,7 @@ pub const Parser = struct {
         const start = self.currentSpan();
         _ = try self.expect(.keyword_import);
 
-        const module_path = try self.parseStructName();
+        const struct_path = try self.parseStructName();
 
         var filter: ?ast.ImportFilter = null;
         if (self.match(.comma)) {
@@ -1599,7 +1599,7 @@ pub const Parser = struct {
 
         return self.create(ast.ImportDecl, .{
             .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
-            .module_path = module_path,
+            .struct_path = struct_path,
             .filter = filter,
         });
     }
@@ -1609,9 +1609,9 @@ pub const Parser = struct {
         // "use" is a contextual keyword — consume it as an identifier
         _ = self.advance();
 
-        const module_path = try self.parseStructName();
+        const struct_path = try self.parseStructName();
 
-        // Optional opts after comma: use Module, key: value
+        // Optional opts after comma: use Struct, key: value
         var opts: ?*const ast.Expr = null;
         if (self.match(.comma)) {
             opts = if (self.isBareKeywordOptionStart())
@@ -1622,7 +1622,7 @@ pub const Parser = struct {
 
         return self.create(ast.UseDecl, .{
             .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
-            .module_path = module_path,
+            .struct_path = struct_path,
             .opts = opts,
         });
     }
@@ -1761,7 +1761,7 @@ pub const Parser = struct {
             if (self.check(.keyword_type)) {
                 _ = self.advance();
                 _ = try self.expect(.colon);
-                const type_tok = try self.expectIdentifierOrModule();
+                const type_tok = try self.expectIdentifierOrType();
                 try entries.append(self.allocator, .{ .type_import = try self.internToken(type_tok) });
             } else {
                 const name_tok = try self.expect(.identifier);
@@ -2247,17 +2247,17 @@ pub const Parser = struct {
                 });
             } else if (self.check(.dot)) {
                 _ = self.advance();
-                // Accept both lowercase identifiers and capitalized module names
+                // Accept both lowercase identifiers and capitalized struct names
                 // (e.g., :zig.IO.println or map.field)
                 const field_tok = if (self.check(.identifier))
                     self.advance()
-                else if (self.check(.module_identifier))
+                else if (self.check(.type_identifier))
                     self.advance()
                 else
                     try self.expect(.identifier); // error if neither
                 const field_name = try self.internToken(field_tok);
 
-                // Check for function reference: Module.func/arity
+                // Check for function reference: Struct.func/arity
                 if (self.check(.slash)) {
                     const saved_lexer = self.lexer;
                     const saved_current = self.current;
@@ -2268,16 +2268,16 @@ pub const Parser = struct {
                         const arity_text = arity_tok.slice(self.source);
                         const arity = std.fmt.parseInt(u32, arity_text, 10) catch 0;
 
-                        // Extract module name from the object expression
+                        // Extract struct name from the object expression
                         const mod_name: ?ast.StructName = switch (expr.*) {
-                            .module_ref => |mr| mr.name,
+                            .struct_ref => |mr| mr.name,
                             else => null,
                         };
 
                         expr = try self.create(ast.Expr, .{
                             .function_ref = .{
                                 .meta = .{ .span = ast.SourceSpan.merge(expr.getMeta().span, ast.SourceSpan.from(arity_tok.loc)) },
-                                .module = mod_name,
+                                .struct_name = mod_name,
                                 .function = field_name,
                                 .arity = arity,
                             },
@@ -2331,7 +2331,7 @@ pub const Parser = struct {
                 }
                 return self.parseVarRef();
             },
-            .module_identifier => return self.parseModuleRefExpr(),
+            .type_identifier => return self.parseStructRefExpr(),
             .left_paren => return self.parseParenExpr(),
             .left_brace => return self.parseTupleExpr(),
             .left_bracket => return self.parseListExpr(),
@@ -2392,11 +2392,11 @@ pub const Parser = struct {
         const start = self.currentSpan();
         _ = try self.expect(.ampersand);
 
-        var module_name: ?ast.StructName = null;
+        var struct_name: ?ast.StructName = null;
         var function_name: ast.StringId = undefined;
 
-        if (self.check(.module_identifier)) {
-            module_name = try self.parseStructName();
+        if (self.check(.type_identifier)) {
+            struct_name = try self.parseStructName();
             _ = try self.expect(.dot);
             const function_tok = try self.expect(.identifier);
             function_name = try self.internToken(function_tok);
@@ -2413,7 +2413,7 @@ pub const Parser = struct {
         return self.create(ast.Expr, .{
             .function_ref = .{
                 .meta = .{ .span = ast.SourceSpan.merge(start, ast.SourceSpan.from(arity_tok.loc)) },
-                .module = module_name,
+                .struct_name = struct_name,
                 .function = function_name,
                 .arity = arity,
             },
@@ -2697,10 +2697,10 @@ pub const Parser = struct {
         });
     }
 
-    fn parseModuleRefExpr(self: *Parser) !*const ast.Expr {
+    fn parseStructRefExpr(self: *Parser) !*const ast.Expr {
         const name = try self.parseStructName();
         return self.create(ast.Expr, .{
-            .module_ref = .{ .meta = .{ .span = name.span }, .name = name },
+            .struct_ref = .{ .meta = .{ .span = name.span }, .name = name },
         });
     }
 
@@ -2917,7 +2917,7 @@ pub const Parser = struct {
             return self.create(ast.Expr, .{
                 .struct_expr = .{
                     .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
-                    .module_name = type_name,
+                    .struct_name = type_name,
                     .update_source = null,
                     .fields = try struct_fields.toOwnedSlice(self.allocator),
                 },
@@ -2958,7 +2958,7 @@ pub const Parser = struct {
         const start = self.currentSpan();
         _ = try self.expect(.percent);
 
-        const module_name = try self.parseStructName();
+        const struct_name = try self.parseStructName();
         _ = try self.expect(.left_brace);
 
         // Support multiline: %Name{\n  field: val,\n  ...\n}
@@ -2999,7 +2999,7 @@ pub const Parser = struct {
         return self.create(ast.Expr, .{
             .struct_expr = .{
                 .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
-                .module_name = module_name,
+                .struct_name = struct_name,
                 .update_source = update_source,
                 .fields = try fields.toOwnedSlice(self.allocator),
             },
@@ -3392,10 +3392,10 @@ pub const Parser = struct {
                         .wildcard = .{ .meta = .{ .span = ast.SourceSpan.from(tok.loc) } },
                     });
                 }
-                // Check for module-qualified enum pattern: Color.Red
+                // Check for struct-qualified enum pattern: Color.Red
                 if (self.check(.dot)) {
                     _ = self.advance(); // consume '.'
-                    if (self.check(.identifier) or self.check(.module_identifier)) {
+                    if (self.check(.identifier) or self.check(.type_identifier)) {
                         const variant_tok = self.advance();
                         const variant_text = variant_tok.slice(self.source);
                         return self.create(ast.Pattern, .{
@@ -3413,12 +3413,12 @@ pub const Parser = struct {
                     },
                 });
             },
-            .module_identifier => {
+            .type_identifier => {
                 const tok = self.advance();
-                // Module-qualified enum pattern: Color.Red
+                // Struct-qualified enum pattern: Color.Red
                 if (self.check(.dot)) {
                     _ = self.advance(); // consume '.'
-                    if (self.check(.identifier) or self.check(.module_identifier)) {
+                    if (self.check(.identifier) or self.check(.type_identifier)) {
                         const variant_tok = self.advance();
                         const variant_text = variant_tok.slice(self.source);
                         return self.create(ast.Pattern, .{
@@ -3429,7 +3429,7 @@ pub const Parser = struct {
                         });
                     }
                 }
-                // Bare module identifier in pattern — treat as bind
+                // Bare struct identifier in pattern — treat as bind
                 return self.create(ast.Pattern, .{
                     .bind = .{
                         .meta = .{ .span = ast.SourceSpan.from(tok.loc) },
@@ -3682,7 +3682,7 @@ pub const Parser = struct {
             return self.create(ast.Pattern, .{
                 .struct_pattern = .{
                     .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
-                    .module_name = .{ .parts = &.{}, .span = start },
+                    .struct_name = .{ .parts = &.{}, .span = start },
                     .fields = try struct_fields.toOwnedSlice(self.allocator),
                 },
             });
@@ -3712,7 +3712,7 @@ pub const Parser = struct {
         const start = self.currentSpan();
         _ = try self.expect(.percent);
 
-        const module_name = try self.parseStructName();
+        const struct_name = try self.parseStructName();
 
         _ = try self.expect(.left_brace);
 
@@ -3732,7 +3732,7 @@ pub const Parser = struct {
         return self.create(ast.Pattern, .{
             .struct_pattern = .{
                 .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
-                .module_name = module_name,
+                .struct_name = struct_name,
                 .fields = try fields.toOwnedSlice(self.allocator),
             },
         });
@@ -3845,7 +3845,7 @@ pub const Parser = struct {
             _ = self.advance(); // consume ::
 
             // Parse type specifier from identifier
-            if (self.check(.identifier) or self.check(.module_identifier)) {
+            if (self.check(.identifier) or self.check(.type_identifier)) {
                 const type_tok = self.advance();
                 const type_text = type_tok.slice(self.source);
                 type_spec = parseBinaryTypeSpec(type_text);
@@ -3971,7 +3971,7 @@ pub const Parser = struct {
             .percent => return self.parseStructType(),
             .atom_literal => return self.parseAtomType(),
             .int_literal, .string_literal, .keyword_true, .keyword_false, .keyword_nil => return self.parseLiteralType(),
-            .identifier, .module_identifier => return self.parseNamedType(),
+            .identifier, .type_identifier => return self.parseNamedType(),
             else => {
                 try self.addRichError(
                     std.fmt.allocPrint(self.allocator, "I was not expecting {s} in this type annotation", .{
@@ -4143,7 +4143,7 @@ pub const Parser = struct {
         const start = self.currentSpan();
         _ = try self.expect(.percent);
 
-        const module_name = try self.parseStructName();
+        const struct_name = try self.parseStructName();
 
         _ = try self.expect(.left_brace);
 
@@ -4163,7 +4163,7 @@ pub const Parser = struct {
         return self.create(ast.TypeExpr, .{
             .struct_type = .{
                 .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
-                .module_name = module_name,
+                .struct_name = struct_name,
                 .fields = try fields.toOwnedSlice(self.allocator),
             },
         });
@@ -4235,13 +4235,13 @@ pub const Parser = struct {
         }
 
         // Handle dot-separated type names (e.g., Zap.Project)
-        if (tok.tag == .module_identifier) {
+        if (tok.tag == .type_identifier) {
             while (self.check(.dot)) {
                 const saved_lexer = self.lexer;
                 const saved_current = self.current;
                 const saved_previous = self.previous;
                 _ = self.advance(); // consume dot
-                if (self.check(.module_identifier) or self.check(.identifier)) {
+                if (self.check(.type_identifier) or self.check(.identifier)) {
                     const part = self.advance();
                     const part_text = part.slice(self.source);
                     text = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ text, part_text });
@@ -4362,8 +4362,8 @@ pub const Parser = struct {
         }
     }
 
-    fn expectIdentifierOrModule(self: *Parser) !Token {
-        if (self.check(.identifier) or self.check(.module_identifier)) {
+    fn expectIdentifierOrType(self: *Parser) !Token {
+        if (self.check(.identifier) or self.check(.type_identifier)) {
             return self.advance();
         }
         try self.addError("I was expecting an identifier", self.currentSpan());
@@ -4430,7 +4430,7 @@ fn tokenHumanName(tag: Token.Tag) []const u8 {
         .caret => "`^`",
         .at_sign => "`@`",
         .identifier => "an identifier",
-        .module_identifier => "a module name",
+        .type_identifier => "a struct name",
         .int_literal => "a number",
         .float_literal => "a number",
         .string_literal => "a string",
@@ -4559,7 +4559,7 @@ test "parse function type ownership annotations" {
     try std.testing.expectEqual(ast.Ownership.unique, fn_type.return_ownership);
 }
 
-test "parse module" {
+test "parse struct" {
     const source =
         \\pub struct Foo {
         \\  pub fn bar() -> i64 {
@@ -4832,7 +4832,7 @@ test "parse local function" {
     try std.testing.expect(body[0] == .function_decl);
 }
 
-test "parse module with types and functions" {
+test "parse struct with types and functions" {
     const source =
         \\pub struct Foo {
         \\  type Result(a, e) = {:ok, a} | {:error, e}
@@ -4923,7 +4923,7 @@ test "parse union declaration" {
     try std.testing.expectEqual(@as(usize, 3), ed.variants.len);
 }
 
-test "parse defmodule extends" {
+test "parse struct extends" {
     const source =
         \\pub struct Animal {
         \\  pub fn breathe() -> String {
@@ -4968,10 +4968,10 @@ test "parse struct init with type annotation" {
     defer parser.deinit();
 
     const program = try parser.parseProgram();
-    // Should have Point (field-only) + Test (module-like)
+    // Should have Point (field-only) + Test (struct-like)
     try std.testing.expectEqual(@as(usize, 2), program.top_items.len);
     try std.testing.expectEqual(@as(usize, 2), program.structs.len);
-    // Test is the second struct (module-like), Point is first (field-only)
+    // Test is the second struct (struct-like), Point is first (field-only)
     const func = program.structs[1].items[0].function;
     const body = func.clauses[0].body.?;
     try std.testing.expect(body[0].expr.* == .struct_expr);
@@ -4998,7 +4998,7 @@ test "parse private struct" {
     try std.testing.expect(program.top_items[0] == .priv_struct_decl);
 }
 
-test "parse defmacrop inside module" {
+test "parse defmacrop inside struct" {
     const source =
         \\pub struct Foo {
         \\  macro helper(x) {
@@ -5019,7 +5019,7 @@ test "parse defmacrop inside module" {
     try std.testing.expectEqual(ast.FunctionDecl.Visibility.private, program.structs[0].items[0].priv_macro.visibility);
 }
 
-test "parse defmodule is_private false by default" {
+test "parse struct is_private false by default" {
     const source =
         \\pub struct Foo {
         \\  pub fn bar() -> i64 {
@@ -5038,7 +5038,7 @@ test "parse defmodule is_private false by default" {
     try std.testing.expect(!program.structs[0].is_private);
 }
 
-test "parse typed module attribute" {
+test "parse typed struct attribute" {
     const source =
         \\pub struct Foo {
         \\  @doc :: String = "hello world"
@@ -5121,10 +5121,10 @@ test "parse multiple attributes on same function" {
     try std.testing.expectEqualStrings("deprecated", parser.interner.get(dep.name));
 }
 
-test "parse module-level attribute" {
+test "parse struct-level attribute" {
     const source =
         \\pub struct Foo {
-        \\  @moduledoc :: String = "A module"
+        \\  @structdoc :: String = "A struct"
         \\  @version :: String = "1.0.0"
         \\}
     ;
@@ -5140,8 +5140,8 @@ test "parse module-level attribute" {
     try std.testing.expect(program.structs[0].items[0] == .attribute);
     try std.testing.expect(program.structs[0].items[1] == .attribute);
 
-    const moduledoc = program.structs[0].items[0].attribute;
-    try std.testing.expectEqualStrings("moduledoc", parser.interner.get(moduledoc.name));
+    const structdoc = program.structs[0].items[0].attribute;
+    try std.testing.expectEqualStrings("structdoc", parser.interner.get(structdoc.name));
 
     const version = program.structs[0].items[1].attribute;
     try std.testing.expectEqualStrings("version", parser.interner.get(version.name));
@@ -5611,7 +5611,7 @@ test "parse ~w sigil desugars to sigil_w call" {
     try std.testing.expectEqualStrings("sigil_w", parser.interner.get(expr.call.callee.var_ref.name));
 }
 
-test "parse &Module.function/arity as function_ref" {
+test "parse &Struct.function/arity as function_ref" {
     const source =
         \\pub struct Test {
         \\  pub fn run() {
@@ -5631,8 +5631,8 @@ test "parse &Module.function/arity as function_ref" {
     const expr = body[0].expr;
 
     try std.testing.expect(expr.* == .function_ref);
-    try std.testing.expect(expr.function_ref.module != null);
-    try std.testing.expectEqualStrings("Math", parser.interner.get(expr.function_ref.module.?.parts[0]));
+    try std.testing.expect(expr.function_ref.struct_name != null);
+    try std.testing.expectEqualStrings("Math", parser.interner.get(expr.function_ref.struct_name.?.parts[0]));
     try std.testing.expectEqualStrings("double", parser.interner.get(expr.function_ref.function));
     try std.testing.expectEqual(@as(u32, 1), expr.function_ref.arity);
 }
@@ -5657,7 +5657,7 @@ test "parse &function/arity as local function_ref" {
     const expr = body[0].expr;
 
     try std.testing.expect(expr.* == .function_ref);
-    try std.testing.expect(expr.function_ref.module == null);
+    try std.testing.expect(expr.function_ref.struct_name == null);
     try std.testing.expectEqualStrings("double", parser.interner.get(expr.function_ref.function));
     try std.testing.expectEqual(@as(u32, 1), expr.function_ref.arity);
 }

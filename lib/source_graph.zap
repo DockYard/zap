@@ -1,14 +1,14 @@
+@doc = """
+  Compile-time access to source-level declarations.
+
+  Source graph functions are intended for macros and other compile-time
+  code that need to inspect declarations from known source paths.
+  """
+
 pub struct SourceGraph {
-  @structdoc = """
-    Compile-time access to source-level declarations.
-
-    Source graph functions are intended for macros and other compile-time
-    code that need to inspect declarations from known source paths.
-    """
-
   @requires = [:reflect_source]
 
-  @fndoc = """
+  @doc = """
     Returns struct references declared in the exact source paths provided.
 
     Each returned reference can be unquoted into generated code as a
@@ -17,7 +17,7 @@ pub struct SourceGraph {
 
   pub macro structs(paths :: Expr) -> Expr {
     quote {
-      __zap_source_graph_structs__(unquote(paths))
+      source_graph_structs(unquote(paths))
     }
   }
 }

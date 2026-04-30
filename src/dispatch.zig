@@ -12,7 +12,7 @@ const types_mod = @import("types.zig");
 //   3. Ambiguous overload → compilation error
 //   4. Applicable overload → attempt clause matching
 //   5. No clause match → continue outward
-//   6. Walk: local → module → import → prelude
+//   6. Walk: local → struct → import → prelude
 //
 // Also handles:
 //   - Overload applicability (spec §9)
@@ -98,11 +98,11 @@ pub const DispatchEngine = struct {
                 }
             }
 
-            // Check imports at module scope
-            if (s.kind == .module) {
+            // Check imports at struct scope
+            if (s.kind == .struct_scope) {
                 for (s.imports.items) |imported| {
                     _ = imported;
-                    // TODO: check imported families when cross-module resolution is implemented
+                    // TODO: check imported families when cross-struct resolution is implemented
                 }
             }
 
@@ -117,16 +117,16 @@ pub const DispatchEngine = struct {
         return null;
     }
 
-    /// Resolve a qualified call `Module.f(args...)` — no fallback (spec §10.1 qualified).
+    /// Resolve a qualified call `Struct.f(args...)` — no fallback (spec §10.1 qualified).
     pub fn resolveQualified(
         self: *DispatchEngine,
-        module_scope: scope_mod.ScopeId,
+        struct_scope: scope_mod.ScopeId,
         name: ast.StringId,
         arity: u32,
         arg_types: []const types_mod.TypeId,
         span: ast.SourceSpan,
     ) !?DispatchResult {
-        const s = self.graph.getScope(module_scope);
+        const s = self.graph.getScope(struct_scope);
         const key = scope_mod.FamilyKey{ .name = name, .arity = arity };
 
         if (s.function_families.get(key)) |fam_id| {
@@ -139,7 +139,7 @@ pub const DispatchEngine = struct {
                 });
                 return null;
             }
-            const result = try self.resolveInFamily(fam_id, module_scope, arg_types, span);
+            const result = try self.resolveInFamily(fam_id, struct_scope, arg_types, span);
             switch (result) {
                 .resolved => |r| return r,
                 .ambiguous => {
@@ -160,7 +160,7 @@ pub const DispatchEngine = struct {
         }
 
         try self.errors.append(self.allocator, .{
-            .message = "function not found in module",
+            .message = "function not found in struct",
             .span = span,
         });
         return null;
@@ -385,18 +385,18 @@ test "dispatch resolve simple function" {
     var engine = DispatchEngine.init(alloc, &collector.graph, &type_store, parser.interner);
     defer engine.deinit();
 
-    // Find the module scope
-    var module_scope: scope_mod.ScopeId = 0;
+    // Find the struct scope
+    var struct_scope: scope_mod.ScopeId = 0;
     for (collector.graph.scopes.items, 0..) |s, idx| {
-        if (s.kind == .module) {
-            module_scope = @intCast(idx);
+        if (s.kind == .struct_scope) {
+            struct_scope = @intCast(idx);
         }
     }
 
     const add_name = try parser.interner.intern("add");
     const arg_types = [_]types_mod.TypeId{ types_mod.TypeStore.I64, types_mod.TypeStore.I64 };
     const result = try engine.resolve(
-        module_scope,
+        struct_scope,
         add_name,
         2,
         &arg_types,
@@ -441,8 +441,8 @@ test "dispatch scope fallback" {
     var engine = DispatchEngine.init(alloc, &collector.graph, &type_store, parser.interner);
     defer engine.deinit();
 
-    // Both module and local b exist — find b from the function scope of a
-    // Walk scopes to find a function scope (should be inside module)
+    // Both struct and local b exist — find b from the function scope of a
+    // Walk scopes to find a function scope (should be inside struct)
     const b_name = try parser.interner.intern("b");
     var search_scope: scope_mod.ScopeId = 0;
     for (collector.graph.scopes.items, 0..) |s, idx| {
@@ -488,17 +488,17 @@ test "dispatch no match" {
     var engine = DispatchEngine.init(alloc, &collector.graph, &type_store, parser.interner);
     defer engine.deinit();
 
-    // Find the module scope
-    var module_scope: scope_mod.ScopeId = 0;
+    // Find the struct scope
+    var struct_scope: scope_mod.ScopeId = 0;
     for (collector.graph.scopes.items, 0..) |s, idx| {
-        if (s.kind == .module) {
-            module_scope = @intCast(idx);
+        if (s.kind == .struct_scope) {
+            struct_scope = @intCast(idx);
         }
     }
 
     const nonexistent = try parser.interner.intern("nonexistent");
     const result = try engine.resolve(
-        module_scope,
+        struct_scope,
         nonexistent,
         1,
         &.{types_mod.TypeStore.I64},
@@ -540,17 +540,17 @@ test "dispatch specificity — literal pattern beats bind" {
     var engine = DispatchEngine.init(alloc, &collector.graph, &type_store, parser.interner);
     defer engine.deinit();
 
-    // Find the module scope
-    var module_scope: scope_mod.ScopeId = 0;
+    // Find the struct scope
+    var struct_scope: scope_mod.ScopeId = 0;
     for (collector.graph.scopes.items, 0..) |s, idx| {
-        if (s.kind == .module) {
-            module_scope = @intCast(idx);
+        if (s.kind == .struct_scope) {
+            struct_scope = @intCast(idx);
         }
     }
 
     const factorial_name = try parser.interner.intern("factorial");
     const result = try engine.resolve(
-        module_scope,
+        struct_scope,
         factorial_name,
         1,
         &.{types_mod.TypeStore.I64},

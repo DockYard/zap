@@ -103,12 +103,12 @@ The `zap` CLI needs to generate Zap source code for a synthetic `main/1`
 function that:
 1. Parses `args :: [String]` into target name, OS, arch, and `-D` flags
 2. Constructs `%Zap.Env{target: ..., os: ..., arch: ..., build_opts: ...}`
-3. Calls `<BuilderModule>.manifest(env)`
+3. Calls `<BuilderStruct>.manifest(env)`
 4. Serializes the returned `%Zap.Manifest{...}` to stdout
 
 **Approach**: Generate Zap source text and prepend it to `build.zap` before
 compilation (same mechanism as `stdlib.prependStdlib`). The generated source
-references the discovered builder module name (from AST scanning in
+references the discovered builder struct name (from AST scanning in
 `builder.zig`).
 
 **Example generated wrapper** (conceptual):

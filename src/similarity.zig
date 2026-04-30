@@ -171,8 +171,8 @@ test "jaro-winkler dissimilar strings" {
 
 test "jaro-winkler prefix boost" {
     // Strings with common prefix should score higher
-    const with_prefix = jaroWinkler("defmodule", "defmodul");
-    const without = jaroWinkler("xefmodule", "defmodul");
+    const with_prefix = jaroWinkler("struct", "strcut");
+    const without = jaroWinkler("xtruct", "strcut");
     try std.testing.expect(with_prefix > without);
 }
 

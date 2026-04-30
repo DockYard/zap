@@ -18,7 +18,7 @@ Three properties make code auditable:
 1. **Strict types** — function signatures are machine-checkable contracts
 2. **Explicit effects** — what a function *does* (IO, failure, state) is visible
    at the boundary, not hidden in the body
-3. **Clean dependency graphs** — modules declare what they depend on; no global
+3. **Clean dependency graphs** — structs declare what they depend on; no global
    state, no implicit imports, no action-at-a-distance
 
 Zap delivers (1) and (3). This plan adds (2) through compiler-derived effect
@@ -43,21 +43,21 @@ live in the artifact.
 Return type inference was removed. Every function boundary is a
 machine-checkable contract. No silent numeric widening, no coercion.
 
-### One module per file, name equals path
+### One struct per file, name equals path
 
-Every `.zap` file contains exactly one `defmodule`. The module name maps
+Every `.zap` file contains exactly one `struct`. The struct name maps
 directly to the file path: `Config.Parser` lives in `lib/config/parser.zap`.
 The compiler enforces this — a mismatch is a compile error.
 
 This means:
-- The file system IS the module dependency graph
-- `ls -R lib/` shows every module in the project
-- An agent can navigate the codebase by module name without any tooling
-- Cross-module references are explicit and traceable to a specific file
+- The file system IS the struct dependency graph
+- `ls -R lib/` shows every struct in the project
+- An agent can navigate the codebase by struct name without any tooling
+- Cross-struct references are explicit and traceable to a specific file
 
 ### Import-driven compilation
 
-The compiler starts from the entry point and follows module references to
+The compiler starts from the entry point and follows struct references to
 discover which files to compile. No globs, no manifests listing source files.
 If a file isn't reachable from the entry point, it isn't compiled.
 
@@ -65,10 +65,10 @@ This gives the compiler a precise dependency graph — it knows exactly which
 files depend on which, enabling incremental recompilation and parallel
 compilation of independent branches.
 
-### Mandatory module scoping
+### Mandatory struct scoping
 
-The `defmodule` requirement means no ambient global namespace. Every function
-has a module home. Cross-module references are explicit (`Module.function()`).
+The `struct` requirement means no ambient global namespace. Every function
+has a struct home. Cross-struct references are explicit (`Struct.function()`).
 
 ### Immutable-by-default semantics
 
@@ -147,8 +147,8 @@ This was reconsidered for several reasons:
    analysis already tells you what every function does. Adding syntax just makes
    the programmer manually write what the compiler can derive.
 
-2. **Per-file compilation makes it natural.** With one-module-per-file and
-   import-driven compilation, the compiler builds a precise module dependency
+2. **Per-file compilation makes it natural.** With one-struct-per-file and
+   import-driven compilation, the compiler builds a precise struct dependency
    graph. Effect propagation is a straightforward extension of this graph.
 
 3. **The MCP server is the right interface.** The goal is auditability — knowing
@@ -199,7 +199,7 @@ Debug/diagnostic functions are annotated with `@debug`. The compiler:
 
 ```zap
 # lib/kernel.zap
-defmodule Kernel do
+struct Kernel do
   @debug
   def inspect(value :: T) :: T do
     :zig.inspect(value)
@@ -313,8 +313,8 @@ When this plan is complete, a Zap function's full behavior is knowable from:
 - **What it owns** — ownership qualifiers (in the source)
 - **What it returns** — return type (in the source)
 - **What it does** — derived effects (queryable via MCP)
-- **Where it lives** — file path = module name (in the file system)
-- **What it depends on** — module references (in the import graph)
+- **Where it lives** — file path = struct name (in the file system)
+- **What it depends on** — struct references (in the import graph)
 
 The source code tells you types, ownership, and structure. The compiler tells
 you effects, memory behavior, and dependencies. Together, the artifact is the

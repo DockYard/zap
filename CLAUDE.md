@@ -20,7 +20,7 @@ When you need to compile our Zig fork consider the compilation guide in Zap's RE
 
 Zap is a general-purpose programming language. Features, behaviors, library functions, and language constructs MUST be implemented in Zap source code (`lib/*.zap`), NOT hardcoded in the Zig compiler (`src/*.zig`).
 
-**NEVER hardcode Zap module names, function names, or library behavior in the compiler.** The compiler is a general-purpose tool. It does not know about IO, String, Kernel, Map, Zest, or any other Zap module. If you find yourself writing a Zap module name as a string literal in Zig source, you are doing it wrong. Stop. Think. Find the Zap-level solution.
+**NEVER hardcode Zap struct names, function names, or library behavior in the compiler.** The compiler is a general-purpose tool. It does not know about IO, String, Kernel, Map, Zest, or any other Zap struct. If you find yourself writing a Zap struct name as a string literal in Zig source, you are doing it wrong. Stop. Think. Find the Zap-level solution.
 
 **ALWAYS attempt the Zap solution first.** Before touching any Zig compiler code, ask: "Can this be done in Zap?" If the answer is "yes" or "maybe," do it in Zap. If you think it can't be done in Zap, think harder. Research how Elixir solves it. Research how other languages solve it. Only touch the compiler as a last resort for genuine language primitives (parsing, type system, ZIR emission).
 
@@ -128,7 +128,7 @@ For any request to explore, analyze, understand, map, or explain code, use `cog_
 Do NOT use Grep, Glob, or shell search commands like `grep`, `rg`, `find`, or `git grep` for code exploration when the Cog index is available.
 
 - `cog_code_explore` — find symbols by name, return full definition bodies, file TOC, and optional architecture summaries. ALWAYS put all symbols into a single `queries` array — never split across multiple calls.
-- `cog_code_query` — `find` (locate definitions), `refs` (find references), `symbols` (list file symbols), `imports` (module/file dependencies), `contains` (parent-child containment), `calls`/`callers` (approximate call graph), `overview` (symbol/file/repo architecture summary). ALWAYS use the `queries` array to combine multiple queries into one call — never make sequential code_query calls that could be batched.
+- `cog_code_query` — `find` (locate definitions), `refs` (find references), `symbols` (list file symbols), `imports` (struct/file dependencies), `contains` (parent-child containment), `calls`/`callers` (approximate call graph), `overview` (symbol/file/repo architecture summary). ALWAYS use the `queries` array to combine multiple queries into one call — never make sequential code_query calls that could be batched.
 - Include synonyms with `|`: `banner|header|splash`
 - Wildcard symbol patterns: `*init*`, `get*`, `Handle?`
 

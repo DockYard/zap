@@ -49,7 +49,7 @@ pub fn monomorphize(
     defer ctx.local_types.deinit();
 
     // Phase A: Identify generic function groups (those with type_var params)
-    for (program.modules) |mod| {
+    for (program.structs) |mod| {
         for (mod.functions) |*group| {
             if (isGenericGroup(store, group)) {
                 try ctx.generic_groups.put(group.id, group);
@@ -70,8 +70,8 @@ pub fn monomorphize(
     // Phase B: Scan all call sites, collect instantiations, create specializations.
     // After the initial scan, rescan newly created specializations until no more
     // are produced (transitive closure — e.g. Enum.take calls List.take internally).
-    for (program.modules, 0..) |mod, mod_idx| {
-        ctx.current_scan_module_idx = mod_idx;
+    for (program.structs, 0..) |mod, mod_idx| {
+        ctx.current_scan_struct_idx = mod_idx;
         for (mod.functions) |*group| {
             for (group.clauses) |clause| {
                 ctx.local_types.clearRetainingCapacity();
@@ -79,7 +79,7 @@ pub fn monomorphize(
             }
         }
     }
-    ctx.current_scan_module_idx = null;
+    ctx.current_scan_struct_idx = null;
     for (program.top_functions) |*group| {
         for (group.clauses) |clause| {
             ctx.local_types.clearRetainingCapacity();
@@ -111,7 +111,7 @@ pub fn monomorphize(
                 }
             }
             for (entries_to_scan.items) |entry| {
-                ctx.current_scan_module_idx = entry.target_module_idx;
+                ctx.current_scan_struct_idx = entry.target_struct_idx;
                 for (entry.group.clauses) |clause| {
                     ctx.current_scan_params = clause.params;
                     ctx.local_types.clearRetainingCapacity();
@@ -122,26 +122,26 @@ pub fn monomorphize(
             entries_to_scan.deinit(allocator);
             scan_start = scan_end;
         }
-        ctx.current_scan_module_idx = null;
+        ctx.current_scan_struct_idx = null;
     }
     // Phase C: Build new program with specialized groups added.
-    // Specializations are placed in the CALLING module (target_module_idx)
-    // so that cross-module direct calls resolve within the same module's IR.
-    // If target_module_idx is null, fall back to placing in the defining module.
-    var new_modules: std.ArrayListUnmanaged(hir.Module) = .empty;
-    for (program.modules, 0..) |mod, mod_idx| {
+    // Specializations are placed in the CALLING struct (target_struct_idx)
+    // so that cross-struct direct calls resolve within the same struct's IR.
+    // If target_struct_idx is null, fall back to placing in the defining struct.
+    var new_structs: std.ArrayListUnmanaged(hir.Struct) = .empty;
+    for (program.structs, 0..) |mod, mod_idx| {
         var new_fns: std.ArrayListUnmanaged(hir.FunctionGroup) = .empty;
         for (mod.functions) |group| {
             try new_fns.append(allocator, group);
         }
         for (ctx.new_groups.items) |entry| {
-            if (entry.target_module_idx) |target_idx| {
-                // Cross-module: place in calling module
+            if (entry.target_struct_idx) |target_idx| {
+                // Cross-struct: place in calling struct
                 if (target_idx == mod_idx) {
                     try new_fns.append(allocator, entry.group);
                 }
             } else {
-                // Intra-module: place in defining module
+                // Intra-struct: place in defining struct
                 for (mod.functions) |orig_group| {
                     if (entry.source_group_id == orig_group.id) {
                         try new_fns.append(allocator, entry.group);
@@ -149,7 +149,7 @@ pub fn monomorphize(
                 }
             }
         }
-        try new_modules.append(allocator, .{
+        try new_structs.append(allocator, .{
             .name = mod.name,
             .scope_id = mod.scope_id,
             .functions = try new_fns.toOwnedSlice(allocator),
@@ -170,8 +170,8 @@ pub fn monomorphize(
         }
     }
 
-    // Phase D: Rewrite call sites in all expressions (modules + top functions)
-    for (new_modules.items) |*mod| {
+    // Phase D: Rewrite call sites in all expressions (structs + top functions)
+    for (new_structs.items) |*mod| {
         for (mod.functions) |*group| {
             for (group.clauses) |clause| {
                 ctx.rewriteBlock(clause.body);
@@ -186,7 +186,7 @@ pub fn monomorphize(
 
     return .{
         .program = .{
-            .modules = try new_modules.toOwnedSlice(allocator),
+            .structs = try new_structs.toOwnedSlice(allocator),
             .top_functions = try new_top_fns.toOwnedSlice(allocator),
             .protocols = program.protocols,
             .impls = program.impls,
@@ -198,9 +198,9 @@ pub fn monomorphize(
 const NewGroupEntry = struct {
     group: hir.FunctionGroup,
     source_group_id: u32,
-    /// Module index where this specialization should be placed.
-    /// For cross-module calls, this is the CALLING module, not the defining module.
-    target_module_idx: ?usize = null,
+    /// Struct index where this specialization should be placed.
+    /// For cross-struct calls, this is the CALLING struct, not the defining struct.
+    target_struct_idx: ?usize = null,
 };
 
 const MonomorphContext = struct {
@@ -208,10 +208,10 @@ const MonomorphContext = struct {
     store: *TypeStore,
     next_group_id: *u32,
     interner: *ast.StringInterner,
-    /// Reference to the whole HIR program for resolving named cross-module calls
+    /// Reference to the whole HIR program for resolving named cross-struct calls
     program: *const hir.Program,
-    /// Current module index being scanned (for placing specializations)
-    current_scan_module_idx: ?usize = null,
+    /// Current struct index being scanned (for placing specializations)
+    current_scan_struct_idx: ?usize = null,
     /// Current function params during scan — used to resolve param_get types
     /// in specialized copies where cloneExpr may not have fully substituted types.
     current_scan_params: ?[]const hir.TypedParam = null,
@@ -234,10 +234,10 @@ const MonomorphContext = struct {
     /// Check if a named call targets a protocol (e.g., Enumerable.each).
     /// Returns the protocol name StringId if it matches a registered protocol.
     fn isProtocolCall(self: *const MonomorphContext, nc: hir.NamedCall) ?ast.StringId {
-        const target_module = nc.module orelse return null;
+        const target_struct = nc.struct_name orelse return null;
         for (self.program.protocols) |proto| {
             const proto_str = self.interner.get(proto.name);
-            if (std.mem.eql(u8, proto_str, target_module)) {
+            if (std.mem.eql(u8, proto_str, target_struct)) {
                 return proto.name;
             }
         }
@@ -246,8 +246,8 @@ const MonomorphContext = struct {
 
     /// Resolve a protocol dispatch: given a protocol name, function name,
     /// and concrete argument type, find the impl's function group ID.
-    /// Uses TypeStore.typeToModuleName to get the type's canonical module
-    /// name, then matches against impl target modules.
+    /// Uses TypeStore.typeToStructName to get the type's canonical struct
+    /// name, then matches against impl target structs.
     fn resolveProtocolDispatch(
         self: *const MonomorphContext,
         protocol_name: ast.StringId,
@@ -255,11 +255,11 @@ const MonomorphContext = struct {
         concrete_type: TypeId,
         arity: u32,
     ) ?u32 {
-        const type_module = self.store.typeToModuleName(concrete_type, self.interner) orelse return null;
+        const type_struct = self.store.typeToStructName(concrete_type, self.interner) orelse return null;
 
         for (self.program.impls) |impl_info| {
             if (impl_info.protocol_name != protocol_name) continue;
-            if (!std.mem.eql(u8, self.interner.get(impl_info.target_module), type_module)) continue;
+            if (!std.mem.eql(u8, self.interner.get(impl_info.target_struct), type_struct)) continue;
 
             // Found the impl. Search its function groups for the matching function.
             for (impl_info.function_group_ids) |gid| {
@@ -276,15 +276,15 @@ const MonomorphContext = struct {
         return null;
     }
 
-    /// Resolve a named cross-module call (e.g., List.head) to a function group ID
-    /// by searching all modules in the HIR program.
+    /// Resolve a named cross-struct call (e.g., List.head) to a function group ID
+    /// by searching all structs in the HIR program.
     fn resolveNamedCall(self: *const MonomorphContext, nc: hir.NamedCall, arity: u32) ?u32 {
-        const target_module = nc.module orelse return null;
-        for (self.program.modules) |mod| {
-            // Check if this module's name matches the target
+        const target_struct = nc.struct_name orelse return null;
+        for (self.program.structs) |mod| {
+            // Check if this struct's name matches the target
             if (mod.name.parts.len == 0) continue;
             const last_part = self.interner.get(mod.name.parts[mod.name.parts.len - 1]);
-            if (!std.mem.eql(u8, last_part, target_module)) continue;
+            if (!std.mem.eql(u8, last_part, target_struct)) continue;
             // Search for the function by name and arity
             for (mod.functions) |*group| {
                 const group_name = self.interner.get(group.name);
@@ -523,7 +523,6 @@ const MonomorphContext = struct {
                     }
                 }
 
-
                 // Collect concrete type args sorted by type variable ID for determinism
                 var type_args: std.ArrayListUnmanaged(TypeId) = .empty;
                 defer type_args.deinit(self.allocator);
@@ -556,14 +555,14 @@ const MonomorphContext = struct {
                     if (has_vars) return;
                 }
 
-                // Check if this instantiation already exists for THIS module.
-                // Each calling module needs its own copy of the specialization
-                // so that call_direct resolves within the module's own IR.
-                const module_salt: u32 = if (self.current_scan_module_idx) |idx| @intCast(idx) else 0;
+                // Check if this instantiation already exists for THIS struct.
+                // Each calling struct needs its own copy of the specialization
+                // so that call_direct resolves within the struct's own IR.
+                const struct_salt: u32 = if (self.current_scan_struct_idx) |idx| @intCast(idx) else 0;
                 const base_key = hashInstantiation(target_id, type_args.items);
-                const key = base_key +% @as(u64, module_salt) *% 0x9E3779B97F4A7C15;
+                const key = base_key +% @as(u64, struct_salt) *% 0x9E3779B97F4A7C15;
                 if (self.specializations.get(key)) |existing_id| {
-                    // Already have a specialization for this module — just record the rewrite
+                    // Already have a specialization for this struct — just record the rewrite
                     try self.call_rewrites.put(@intFromPtr(expr), existing_id);
                     // Update type_id for nested call resolution.
                     // Apply subs to the GENERIC GROUP's return type (which uses the
@@ -586,7 +585,7 @@ const MonomorphContext = struct {
                 try self.new_groups.append(self.allocator, .{
                     .group = specialized,
                     .source_group_id = target_id,
-                    .target_module_idx = self.current_scan_module_idx,
+                    .target_struct_idx = self.current_scan_struct_idx,
                 });
                 try self.specializations.put(key, new_id);
                 // Record this specific call expression for rewriting
@@ -712,13 +711,13 @@ const MonomorphContext = struct {
             });
         }
 
-        // Include source module name in the mangled specialization name to prevent
+        // Include source struct name in the mangled specialization name to prevent
         // name collisions. Without this, List.empty?__i64 and Enum.empty?__i64
-        // produce the same local_name in the calling module, causing the ZIR builder's
+        // produce the same local_name in the calling struct, causing the ZIR builder's
         // deduplication to remove one — the surviving function then calls itself.
         const base_name = self.interner.get(group.name);
-        const source_module_prefix = blk: {
-            for (self.program.modules) |mod| {
+        const source_struct_prefix = blk: {
+            for (self.program.structs) |mod| {
                 for (mod.functions) |*g| {
                     if (g.id == group.id) {
                         if (mod.name.parts.len > 0) {
@@ -729,8 +728,8 @@ const MonomorphContext = struct {
             }
             break :blk "";
         };
-        const qualified_base = if (source_module_prefix.len > 0)
-            std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ source_module_prefix, base_name }) catch base_name
+        const qualified_base = if (source_struct_prefix.len > 0)
+            std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ source_struct_prefix, base_name }) catch base_name
         else
             base_name;
         const mangled_str = mangleName(self.allocator, qualified_base, self.store, subs) catch qualified_base;
@@ -1062,7 +1061,7 @@ const MonomorphContext = struct {
                                 .direct => |*dc| dc.function_group_id = new_id,
                                 .dispatch => |*dp| dp.function_group_id = new_id,
                                 .named => {
-                                    // Rewrite named cross-module call to direct call
+                                    // Rewrite named cross-struct call to direct call
                                     c.target = .{ .direct = .{
                                         .function_group_id = new_id,
                                         .clause_index = 0,

@@ -1,3 +1,5 @@
+@doc = "Membership implementation for `Map`."
+
 pub impl Membership for Map(K, V) {
   @doc = """
     Key membership — true when `key` exists in `map`. Mirrors

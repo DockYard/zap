@@ -6,7 +6,7 @@
 Zap is a functional programming language that compiles to native code via LLVM. Source files (`.zap`) compile through this pipeline:
 
 1. **Parse** → AST
-2. **Collect** → scope graph (functions, types, modules, protocol impls)
+2. **Collect** → scope graph (functions, types, structs, protocol impls)
 3. **Macro expand** → AST→AST transformations
 4. **Re-collect** → register macro-expanded functions in the scope graph
 5. **Desugar** → simplify syntax (e.g., `for x <- xs { body }` → recursive helper)
@@ -14,10 +14,10 @@ Zap is a functional programming language that compiles to native code via LLVM. 
 7. **HIR lower** → typed intermediate representation
 8. **Monomorphize** → specialize generic functions
 9. **IR lower** → low-level IR
-10. **Per-struct ZIR emit** → each Zap struct becomes a Zig ZIR module
+10. **Per-struct ZIR emit** → each Zap struct becomes a Zig ZIR struct
 11. **Codegen via LLVM** → native binary
 
-Each Zap struct compiles to a separate Zig ZIR module. Cross-struct calls become `@import("Struct").function(args)` chains.
+Each Zap struct compiles to a separate Zig ZIR struct. Cross-struct calls become `@import("Struct").function(args)` chains.
 
 **Source layout:**
 - `/Users/bcardarella/projects/zap/src/*.zig` — Zap compiler (Zig source)
@@ -75,7 +75,7 @@ The current branch is `for-comp-dispatch`. It cherry-picks commit `9ff3863` ("Ty
 
 ### Before the cherry-pick (main branch baseline: 585/585 tests passing)
 `for x <- xs { body }` desugared based on the AST shape of `xs`:
-- List literal → emit a recursive helper that calls `List.next(state)` directly (hardcoded module name)
+- List literal → emit a recursive helper that calls `List.next(state)` directly (hardcoded struct name)
 - Range literal → call `Range.next(state)`
 - Map literal → call `Map.next(state)`
 - Variable → fell back to a list-only `[h | t]` recursion (silently broken for maps/ranges held in variables)
@@ -92,7 +92,7 @@ fn __for_N(__state) {
 __for_N(iterable)
 ```
 
-The HIR builder rewrites `Enumerable.next(state)` → `Impl.next(state)` based on `state`'s inferred type (protocol dispatch at HIR build time, via `HirBuilder.protocolDispatchModule`).
+The HIR builder rewrites `Enumerable.next(state)` → `Impl.next(state)` based on `state`'s inferred type (protocol dispatch at HIR build time, via `HirBuilder.protocolDispatchStruct`).
 
 ### Goal
 Make all 585+ existing tests pass AND get the 3 new variable-iterable tests passing (list, range, map bound to variable), with no `[i64]`-style hacks.
@@ -126,9 +126,9 @@ test("for-comp over map literal yields one element per entry") {
 
 We get this Zig type error from Sema:
 ```
-.zap-cache/zap_modules/Test_MapTest.zig:1:1: error: expected type
+.zap-cache/zap_structs/Test_MapTest.zig:1:1: error: expected type
   '?*const zap_runtime.List(i64)', found 'void'
-.zap-cache/zap_modules/zap_runtime.zig:2899:36: note: parameter type declared here
+.zap-cache/zap_structs/zap_runtime.zig:2899:36: note: parameter type declared here
 ```
 
 This points at the `List.cons(head: T, tail: ?*const Self)` function — line 2899 in the runtime-emitted `zap_runtime.zig`. So somewhere the for-comp helper is calling `List.cons` (cons is the `[head | tail]` list constructor) but passing `void` for `tail` instead of a `?*const List(i64)`.
@@ -189,7 +189,7 @@ Has a separate, pre-existing issue:
 error: expected type 'Range.Range', found 'Test_ForComprehensionTest.Range'
 ```
 
-`Range` is a top-level Zap struct. The `structIsInCurrentModule` check in `zir_builder.zig:801` returns `true` for top-level structs ("emitted into every module"), so each module emits its own `Range` decl, and these decls are NOT type-equal across modules. This is a deeper design issue that probably also affects other cross-module struct usage.
+`Range` is a top-level Zap struct. The `structIsInCurrentEmitStruct` check in `zir_builder.zig:801` returns `true` for top-level structs ("emitted into every struct"), so each struct emits its own `Range` decl, and these decls are NOT type-equal across structs. This is a deeper design issue that probably also affects other cross-struct struct usage.
 
 ---
 
@@ -213,7 +213,7 @@ With value iteration this mutated a local copy. With pointer iteration it now mu
 #### `src/types.zig`
 1. **Map literal type inference.** `inferExpr` for `.map` now returns `Map(K, V)` instead of UNKNOWN.
 2. **Range literal type inference.** `inferExpr` for `.range` looks up `Range` in `name_to_type` (registered by collector) and returns it.
-3. **Protocol dispatch in `inferCall`.** When the callee is `Protocol.method(arg, ...)` and `Protocol` is a registered protocol, look up the matching impl based on first arg's type. Mirrors `HirBuilder.protocolDispatchModule` so the type checker sees the same concrete impl signature that HIR will route to.
+3. **Protocol dispatch in `inferCall`.** When the callee is `Protocol.method(arg, ...)` and `Protocol` is a registered protocol, look up the matching impl based on first arg's type. Mirrors `HirBuilder.protocolDispatchStruct` so the type checker sees the same concrete impl signature that HIR will route to.
 4. **Param-from-`inferred_signatures`.** In `checkFunctionClause`, when a parameter has no annotation but `inferred_signatures.get(func.name)` exists, use the inferred type. Without this, synthetic helpers' bodies see `__state` as having no type.
 
 #### `src/hir.zig`
@@ -309,7 +309,7 @@ After THAT fix, the current state: panic is gone, but type error appears (the vo
 - `src/hir.zig:1655-1741` — HirBuilder fields including `current_param_types`
 - `src/hir.zig:2900-3060` — `buildClause` (where current_param_types is populated)
 - `src/hir.zig:3603-3620` — protocol dispatch in HIR
-- `src/hir.zig:4645+` — `protocolDispatchModule` and helpers
+- `src/hir.zig:4645+` — `protocolDispatchStruct` and helpers
 - `src/zir_builder.zig:1542-1610` — `emitComplexReturnType` (where tuple-return logic lives)
 - `src/zir_builder.zig:421-450` — `mapTupleElementType` and `emitBodyLocalTupleType`
 - `src/collector.zig:465-504` — `collectFunction`
@@ -360,9 +360,9 @@ Less ambitious. In `src/types.zig:3425`, if first param is not a list, do a part
 - Type-check the cont arm's body to get its type T.
 - Set inferred_return = `[T]`.
 
-### Approach C: Fix `structIsInCurrentModule` for the Range issue (independent)
+### Approach C: Fix `structIsInCurrentEmitStruct` for the Range issue (independent)
 
-Don't emit top-level struct decls into every module. Instead, ALWAYS use `import + field_val` for cross-module structs. This is a deeper change that requires understanding why the "emit into every module" pattern was used in the first place.
+Don't emit top-level struct decls into every struct. Instead, ALWAYS use `import + field_val` for cross-struct structs. This is a deeper change that requires understanding why the "emit into every struct" pattern was used in the first place.
 
 ---
 

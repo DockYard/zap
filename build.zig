@@ -11,7 +11,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Library module — no native deps needed
+    // Library import unit — no native deps needed
     const mod = b.addModule("zap", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,

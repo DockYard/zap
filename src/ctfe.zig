@@ -423,7 +423,7 @@ pub const Capability = enum(u3) {
     pure = 0,
     read_file = 1,
     read_env = 2,
-    reflect_module = 3,
+    reflect_struct = 3,
     reflect_source = 4,
 };
 
@@ -453,7 +453,7 @@ pub const CapabilitySet = struct {
         if (std.mem.eql(u8, name, "pure")) return .pure;
         if (std.mem.eql(u8, name, "read_file")) return .read_file;
         if (std.mem.eql(u8, name, "read_env")) return .read_env;
-        if (std.mem.eql(u8, name, "reflect_module")) return .reflect_module;
+        if (std.mem.eql(u8, name, "reflect_struct")) return .reflect_struct;
         if (std.mem.eql(u8, name, "reflect_source")) return .reflect_source;
         return null;
     }
@@ -480,8 +480,8 @@ pub const CtDependency = union(enum) {
         pattern: []const u8,
         result_hash: u64,
     },
-    reflected_module: struct {
-        module_name: []const u8,
+    reflected_struct: struct {
+        struct_name: []const u8,
         interface_hash: u64,
     },
     reflected_source: struct {
@@ -511,8 +511,8 @@ fn cloneDependency(alloc: std.mem.Allocator, dep: CtDependency) !CtDependency {
             .pattern = try alloc.dupe(u8, g.pattern),
             .result_hash = g.result_hash,
         } },
-        .reflected_module => |rm| .{ .reflected_module = .{
-            .module_name = try alloc.dupe(u8, rm.module_name),
+        .reflected_struct => |rm| .{ .reflected_struct = .{
+            .struct_name = try alloc.dupe(u8, rm.struct_name),
             .interface_hash = rm.interface_hash,
         } },
         .reflected_source => |rs| blk: {
@@ -579,7 +579,7 @@ pub const CtfeError = struct {
 
     pub const AttributeContext = struct {
         attr_name: []const u8,
-        module_name: []const u8,
+        struct_name: []const u8,
     };
 };
 
@@ -591,7 +591,7 @@ fn cloneCtfeError(alloc: std.mem.Allocator, err: CtfeError) !CtfeError {
         .call_stack = cloned_stack,
         .attribute_context = if (err.attribute_context) |ctx| .{
             .attr_name = try alloc.dupe(u8, ctx.attr_name),
-            .module_name = try alloc.dupe(u8, ctx.module_name),
+            .struct_name = try alloc.dupe(u8, ctx.struct_name),
         } else null,
     };
 }
@@ -657,7 +657,7 @@ pub fn formatCtfeError(alloc: std.mem.Allocator, err: CtfeError) ![]const u8 {
 
     // Attribute context
     if (err.attribute_context) |ctx| {
-        try w.print("  for attribute `@{s}` in `{s}`\n", .{ ctx.attr_name, ctx.module_name });
+        try w.print("  for attribute `@{s}` in `{s}`\n", .{ ctx.attr_name, ctx.struct_name });
     }
 
     // Help text based on error kind
@@ -665,7 +665,7 @@ pub fn formatCtfeError(alloc: std.mem.Allocator, err: CtfeError) ![]const u8 {
         .step_limit_exceeded => try w.writeAll("  help: possible infinite recursion or unexpectedly large compile-time loop\n"),
         .recursion_limit_exceeded => try w.writeAll("  help: recursion depth exceeded — simplify the compile-time computation or increase the limit\n"),
         .capability_violation => try w.print("  help: declare the required capability or remove the compile-time {s}\n", .{
-            if (std.mem.find(u8, err.message, "read_file")) |_| "file access" else if (std.mem.find(u8, err.message, "read_env")) |_| "env access" else if (std.mem.find(u8, err.message, "reflect_module")) |_| "reflection" else "effect",
+            if (std.mem.find(u8, err.message, "read_file")) |_| "file access" else if (std.mem.find(u8, err.message, "read_env")) |_| "env access" else if (std.mem.find(u8, err.message, "reflect_struct")) |_| "reflection" else "effect",
         }),
         .use_after_consume => try w.writeAll("  help: a moved or released value was read again during compile-time evaluation\n"),
         .division_by_zero => try w.writeAll("  help: ensure the divisor is non-zero at compile time\n"),
@@ -1240,7 +1240,7 @@ pub const Interpreter = struct {
         for (self.errors.items) |err| {
             if (err.attribute_context) |ctx| {
                 self.allocator.free(ctx.attr_name);
-                self.allocator.free(ctx.module_name);
+                self.allocator.free(ctx.struct_name);
             }
         }
         self.errors.deinit(self.allocator);
@@ -2827,28 +2827,13 @@ pub const Interpreter = struct {
         const args = try self.collectLocals(cb.args, frame);
 
         // Reflection intrinsics
-        if (std.mem.eql(u8, cb.name, "Module__functions") or
-            std.mem.endsWith(u8, cb.name, "__Module__functions"))
-        {
-            return self.builtinModuleFunctions(args);
-        }
-        if (std.mem.eql(u8, cb.name, "Module__attributes") or
-            std.mem.endsWith(u8, cb.name, "__Module__attributes"))
-        {
-            return self.builtinModuleAttributes(args);
-        }
-        if (std.mem.eql(u8, cb.name, "Module__types") or
-            std.mem.endsWith(u8, cb.name, "__Module__types"))
-        {
-            return self.builtinModuleTypes(args);
-        }
-        if (std.mem.eql(u8, cb.name, "__zap_source_graph_structs__")) {
+        if (std.mem.eql(u8, cb.name, "source_graph_structs")) {
             return self.builtinSourceGraphStructs(args);
         }
-        if (std.mem.eql(u8, cb.name, "__zap_struct_functions__")) {
-            return self.builtinStructFunctions(args);
+        if (std.mem.eql(u8, cb.name, "struct_functions")) {
+            return self.builtinReflectedStructFunctions(args);
         }
-        if (std.mem.eql(u8, cb.name, "__zap_map_get__")) {
+        if (std.mem.eql(u8, cb.name, "map_get")) {
             return self.builtinMapGet(args);
         }
 
@@ -2984,7 +2969,7 @@ pub const Interpreter = struct {
 
     fn builtinMapGet(self: *Interpreter, args: []const CtValue) CtfeInterpretError!CtValue {
         if (args.len != 3) {
-            try self.emitError(.type_error, "__zap_map_get__ expects 3 arguments");
+            try self.emitError(.type_error, "map_get expects 3 arguments");
             return error.CtfeFailure;
         }
 
@@ -3139,16 +3124,16 @@ pub const Interpreter = struct {
     // --------------------------------------------------------
 
     fn hasReflectionCapability(self: *const Interpreter) bool {
-        return self.capabilities.has(.reflect_source) or self.capabilities.has(.reflect_module);
+        return self.capabilities.has(.reflect_source) or self.capabilities.has(.reflect_struct);
     }
 
     fn builtinSourceGraphStructs(self: *Interpreter, args: []const CtValue) CtfeInterpretError!CtValue {
         if (!self.hasReflectionCapability()) {
-            try self.emitError(.capability_violation, "__zap_source_graph_structs__ requires reflect_source capability");
+            try self.emitError(.capability_violation, "source_graph_structs requires reflect_source capability");
             return error.CtfeFailure;
         }
         if (args.len != 1) {
-            try self.emitError(.type_error, "__zap_source_graph_structs__ expects 1 argument");
+            try self.emitError(.type_error, "source_graph_structs expects 1 argument");
             return error.CtfeFailure;
         }
 
@@ -3182,13 +3167,13 @@ pub const Interpreter = struct {
         return .{ .list = .{ .alloc_id = alloc_id, .elems = result_list.items } };
     }
 
-    fn builtinStructFunctions(self: *Interpreter, args: []const CtValue) CtfeInterpretError!CtValue {
+    fn builtinReflectedStructFunctions(self: *Interpreter, args: []const CtValue) CtfeInterpretError!CtValue {
         if (!self.hasReflectionCapability()) {
-            try self.emitError(.capability_violation, "__zap_struct_functions__ requires reflect_source capability");
+            try self.emitError(.capability_violation, "struct_functions requires reflect_source capability");
             return error.CtfeFailure;
         }
         if (args.len != 1) {
-            try self.emitError(.type_error, "__zap_struct_functions__ expects 1 argument");
+            try self.emitError(.type_error, "struct_functions expects 1 argument");
             return error.CtfeFailure;
         }
 
@@ -3202,7 +3187,7 @@ pub const Interpreter = struct {
         };
 
         const struct_name = (try self.extractStructRefName(args[0])) orelse {
-            try self.emitError(.type_error, "__zap_struct_functions__ expects a reflected struct, atom, or string");
+            try self.emitError(.type_error, "struct_functions expects a reflected struct, atom, or string");
             return error.CtfeFailure;
         };
         const struct_scope_id = self.findStructScopeByName(graph, struct_name) orelse {
@@ -3210,9 +3195,9 @@ pub const Interpreter = struct {
             return error.CtfeFailure;
         };
 
-        const iface_hash = computeModuleInterfaceHash(graph, struct_scope_id, self.interner, struct_name);
+        const iface_hash = computeStructInterfaceHash(graph, struct_scope_id, self.interner, struct_name);
         try self.dependencies.append(self.allocator, .{
-            .reflected_module = .{ .module_name = struct_name, .interface_hash = iface_hash },
+            .reflected_struct = .{ .struct_name = struct_name, .interface_hash = iface_hash },
         });
 
         var result_list: std.ArrayListUnmanaged(CtValue) = .empty;
@@ -3248,7 +3233,7 @@ pub const Interpreter = struct {
                         .string => |path| path,
                         .atom => |path| path,
                         else => {
-                            try self.emitError(.type_error, "__zap_source_graph_structs__ path list must contain strings");
+                            try self.emitError(.type_error, "source_graph_structs path list must contain strings");
                             return error.CtfeFailure;
                         },
                     };
@@ -3256,7 +3241,7 @@ pub const Interpreter = struct {
                 break :blk paths;
             },
             else => {
-                try self.emitError(.type_error, "__zap_source_graph_structs__ expects a string path or list of string paths");
+                try self.emitError(.type_error, "source_graph_structs expects a string path or list of string paths");
                 return error.CtfeFailure;
             },
         };
@@ -3330,13 +3315,13 @@ pub const Interpreter = struct {
         return .{ .map = .{ .alloc_id = alloc_id, .entries = entries } };
     }
 
-    fn builtinModuleFunctions(self: *Interpreter, args: []const CtValue) CtfeInterpretError!CtValue {
-        if (!self.capabilities.has(.reflect_module)) {
-            try self.emitError(.capability_violation, "Module.functions requires reflect_module capability");
+    fn builtinStructFunctions(self: *Interpreter, args: []const CtValue) CtfeInterpretError!CtValue {
+        if (!self.capabilities.has(.reflect_struct)) {
+            try self.emitError(.capability_violation, "struct function reflection requires reflect_struct capability");
             return error.CtfeFailure;
         }
         if (args.len != 1) {
-            try self.emitError(.type_error, "Module.functions expects 1 argument");
+            try self.emitError(.type_error, "struct function reflection expects 1 argument");
             return error.CtfeFailure;
         }
 
@@ -3344,7 +3329,7 @@ pub const Interpreter = struct {
             .atom => |a| a,
             .string => |s| s,
             else => {
-                try self.emitError(.type_error, "Module.functions expects atom or string argument");
+                try self.emitError(.type_error, "struct function reflection expects atom or string argument");
                 return error.CtfeFailure;
             },
         };
@@ -3354,19 +3339,19 @@ pub const Interpreter = struct {
             return error.CtfeFailure;
         };
 
-        // Find module scope
+        // Find struct scope
         const mod_scope_id = self.findStructScopeByName(graph, mod_name_str) orelse {
-            try self.emitError(.undefined_function, "module not found for reflection");
+            try self.emitError(.undefined_function, "struct not found for reflection");
             return error.CtfeFailure;
         };
 
         // Record dependency with interface hash
-        const iface_hash = computeModuleInterfaceHash(graph, mod_scope_id, self.interner, mod_name_str);
+        const iface_hash = computeStructInterfaceHash(graph, mod_scope_id, self.interner, mod_name_str);
         try self.dependencies.append(self.allocator, .{
-            .reflected_module = .{ .module_name = mod_name_str, .interface_hash = iface_hash },
+            .reflected_struct = .{ .struct_name = mod_name_str, .interface_hash = iface_hash },
         });
 
-        // Collect public functions from this module's scope
+        // Collect public functions from this struct's scope
         const mod_scope = graph.getScope(mod_scope_id);
         var result_list: std.ArrayListUnmanaged(CtValue) = .empty;
 
@@ -3387,13 +3372,13 @@ pub const Interpreter = struct {
         return .{ .list = .{ .alloc_id = alloc_id, .elems = result_list.items } };
     }
 
-    fn builtinModuleAttributes(self: *Interpreter, args: []const CtValue) CtfeInterpretError!CtValue {
-        if (!self.capabilities.has(.reflect_module)) {
-            try self.emitError(.capability_violation, "Module.attributes requires reflect_module capability");
+    fn builtinStructAttributes(self: *Interpreter, args: []const CtValue) CtfeInterpretError!CtValue {
+        if (!self.capabilities.has(.reflect_struct)) {
+            try self.emitError(.capability_violation, "struct attribute reflection requires reflect_struct capability");
             return error.CtfeFailure;
         }
         if (args.len != 1) {
-            try self.emitError(.type_error, "Module.attributes expects 1 argument");
+            try self.emitError(.type_error, "struct attribute reflection expects 1 argument");
             return error.CtfeFailure;
         }
 
@@ -3401,7 +3386,7 @@ pub const Interpreter = struct {
             .atom => |a| a,
             .string => |s| s,
             else => {
-                try self.emitError(.type_error, "Module.attributes expects atom or string argument");
+                try self.emitError(.type_error, "struct attribute reflection expects atom or string argument");
                 return error.CtfeFailure;
             },
         };
@@ -3413,12 +3398,12 @@ pub const Interpreter = struct {
 
         // Record dependency with interface hash
         const mod_scope_id = self.findStructScopeByName(graph, mod_name_str);
-        const iface_hash = if (mod_scope_id) |sid| computeModuleInterfaceHash(graph, sid, self.interner, mod_name_str) else 0;
+        const iface_hash = if (mod_scope_id) |sid| computeStructInterfaceHash(graph, sid, self.interner, mod_name_str) else 0;
         try self.dependencies.append(self.allocator, .{
-            .reflected_module = .{ .module_name = mod_name_str, .interface_hash = iface_hash },
+            .reflected_struct = .{ .struct_name = mod_name_str, .interface_hash = iface_hash },
         });
 
-        // Find module entry and collect its attributes
+        // Find struct entry and collect its attributes
         var result_list: std.ArrayListUnmanaged(CtValue) = .empty;
         for (graph.structs.items) |mod_entry| {
             if (self.structNameMatches(mod_entry.name, mod_name_str)) {
@@ -3443,13 +3428,13 @@ pub const Interpreter = struct {
         return .{ .list = .{ .alloc_id = alloc_id, .elems = result_list.items } };
     }
 
-    fn builtinModuleTypes(self: *Interpreter, args: []const CtValue) CtfeInterpretError!CtValue {
-        if (!self.capabilities.has(.reflect_module)) {
-            try self.emitError(.capability_violation, "Module.types requires reflect_module capability");
+    fn builtinStructTypes(self: *Interpreter, args: []const CtValue) CtfeInterpretError!CtValue {
+        if (!self.capabilities.has(.reflect_struct)) {
+            try self.emitError(.capability_violation, "struct type reflection requires reflect_struct capability");
             return error.CtfeFailure;
         }
         if (args.len != 1) {
-            try self.emitError(.type_error, "Module.types expects 1 argument");
+            try self.emitError(.type_error, "struct type reflection expects 1 argument");
             return error.CtfeFailure;
         }
 
@@ -3457,7 +3442,7 @@ pub const Interpreter = struct {
             .atom => |a| a,
             .string => |s| s,
             else => {
-                try self.emitError(.type_error, "Module.types expects atom or string argument");
+                try self.emitError(.type_error, "struct type reflection expects atom or string argument");
                 return error.CtfeFailure;
             },
         };
@@ -3470,18 +3455,18 @@ pub const Interpreter = struct {
         // Record dependency with interface hash
         const mod_scope_id = self.findStructScopeByName(graph, mod_name_str) orelse {
             try self.dependencies.append(self.allocator, .{
-                .reflected_module = .{ .module_name = mod_name_str, .interface_hash = 0 },
+                .reflected_struct = .{ .struct_name = mod_name_str, .interface_hash = 0 },
             });
             return .{ .list = .{ .alloc_id = 0, .elems = &.{} } };
         };
-        const iface_hash = computeModuleInterfaceHash(graph, mod_scope_id, self.interner, mod_name_str);
+        const iface_hash = computeStructInterfaceHash(graph, mod_scope_id, self.interner, mod_name_str);
         try self.dependencies.append(self.allocator, .{
-            .reflected_module = .{ .module_name = mod_name_str, .interface_hash = iface_hash },
+            .reflected_struct = .{ .struct_name = mod_name_str, .interface_hash = iface_hash },
         });
 
         var result_list: std.ArrayListUnmanaged(CtValue) = .empty;
         for (graph.types.items) |type_entry| {
-            // Check if type belongs to this module by matching scope
+            // Check if type belongs to this struct by matching scope
             if (self.structNameMatchesByScope(graph, type_entry.scope_id, mod_name_str)) {
                 const name_str = if (self.interner) |int| int.get(type_entry.name) else "?";
                 result_list.append(self.allocator, .{ .atom = name_str }) catch return error.OutOfMemory;
@@ -3526,7 +3511,7 @@ pub const Interpreter = struct {
     }
 
     fn structNameMatchesByScope(self: *Interpreter, graph: *const scope.ScopeGraph, type_scope_id: scope.ScopeId, mod_name_str: []const u8) bool {
-        // Walk up from type's scope to find the module
+        // Walk up from type's scope to find the struct
         var sid = type_scope_id;
         while (true) {
             for (graph.structs.items) |mod_entry| {
@@ -3662,7 +3647,7 @@ pub const Interpreter = struct {
 
         const attribute_context = if (self.current_attribute_context) |ctx| CtfeError.AttributeContext{
             .attr_name = try self.allocator.dupe(u8, ctx.attr_name),
-            .module_name = try self.allocator.dupe(u8, ctx.module_name),
+            .struct_name = try self.allocator.dupe(u8, ctx.struct_name),
         } else null;
 
         try self.errors.append(self.allocator, .{
@@ -3822,9 +3807,9 @@ pub const Interpreter = struct {
     }
 };
 
-/// Compute a deterministic hash of a module's public interface.
-/// Hashes public function families (sorted by name+arity) and module attribute names/values.
-fn computeModuleInterfaceHash(
+/// Compute a deterministic hash of a struct's public interface.
+/// Hashes public function families (sorted by name+arity) and struct attribute names/values.
+fn computeStructInterfaceHash(
     graph: *const scope.ScopeGraph,
     mod_scope_id: scope.ScopeId,
     interner: ?*const ast.StringInterner,
@@ -3832,10 +3817,10 @@ fn computeModuleInterfaceHash(
 ) u64 {
     var hasher = std.hash.Wyhash.init(0);
 
-    // Hash module name for disambiguation
+    // Hash struct name for disambiguation
     hasher.update(mod_name_str);
 
-    // Hash public function families from this module's scope
+    // Hash public function families from this struct's scope
     const mod_scope = graph.getScope(mod_scope_id);
     var family_iter = mod_scope.function_families.iterator();
     // Collect and hash family entries (order-independent via commutative accumulation)
@@ -3852,7 +3837,7 @@ fn computeModuleInterfaceHash(
     }
     hasher.update(std.mem.asBytes(&family_hash));
 
-    // Hash module attributes
+    // Hash struct attributes
     var attr_hash: u64 = 0;
     for (graph.structs.items) |mod_entry| {
         if (mod_entry.scope_id == mod_scope_id) {
@@ -4177,7 +4162,7 @@ pub fn constValueToExpr(
             name_parts[0] = try interner.intern(sv.type_name);
             break :blk .{ .struct_expr = .{
                 .meta = meta,
-                .module_name = .{ .parts = name_parts, .span = .{ .start = 0, .end = 0 } },
+                .struct_name = .{ .parts = name_parts, .span = .{ .start = 0, .end = 0 } },
                 .update_source = null,
                 .fields = converted,
             } };
@@ -4192,9 +4177,9 @@ pub fn constValueToExpr(
 
 const scope = @import("scope.zig");
 
-/// Evaluate computed attributes across all modules.
+/// Evaluate computed attributes across all structs.
 ///
-/// Walks module and function attributes looking for those whose values
+/// Walks struct and function attributes looking for those whose values
 /// are function calls (zero-argument). For each, resolves the callee to
 /// an IR function, evaluates it via CTFE, and stores the result as
 /// `computed_value` on the attribute.
@@ -4221,7 +4206,7 @@ pub fn evaluateComputedAttributes(
     var evaluated: u32 = 0;
     var failed: u32 = 0;
 
-    // Walk module-level attributes
+    // Walk struct-level attributes
     for (graph.structs.items) |*mod_entry| {
         for (mod_entry.attributes.items) |*attr| {
             if (attr.computed_value != null) continue; // already computed
@@ -4235,7 +4220,7 @@ pub fn evaluateComputedAttributes(
 
     // Walk function-level attributes
     for (graph.families.items) |*family| {
-        // Find the enclosing module for name mangling
+        // Find the enclosing struct for name mangling
         const mod_name = findStructForScope(graph, family.scope_id);
         for (family.attributes.items) |*attr| {
             if (attr.computed_value != null) continue;
@@ -4266,16 +4251,16 @@ pub const EvalAttrError = error{
 
 /// Evaluate computed attributes in dependency order.
 ///
-/// Like `evaluateComputedAttributes`, but processes modules in the given
-/// topological order. Results from earlier modules are stored before
-/// later modules are evaluated, ensuring that cross-module attribute
+/// Like `evaluateComputedAttributes`, but processes structs in the given
+/// topological order. Results from earlier structs are stored before
+/// later structs are evaluated, ensuring that cross-struct attribute
 /// references resolve correctly.
-pub fn evaluateModuleAttributesInOrder(
+pub fn evaluateStructAttributesInOrder(
     alloc: std.mem.Allocator,
     program: *const ir.Program,
     graph: *scope.ScopeGraph,
     interner: *const ast.StringInterner,
-    module_order: []const []const u8,
+    struct_order: []const []const u8,
     cache_dir: ?[]const u8,
     compile_options_hash: u64,
 ) EvalAttrError!EvalAttrResult {
@@ -4292,12 +4277,12 @@ pub fn evaluateModuleAttributesInOrder(
     var evaluated: u32 = 0;
     var failed: u32 = 0;
 
-    // Process modules in dependency order
-    for (module_order) |mod_name| {
-        // Find the module entry matching this name
+    // Process structs in dependency order
+    for (struct_order) |mod_name| {
+        // Find the struct entry matching this name
         for (graph.structs.items) |*mod_entry| {
             if (structNameMatchesStr(mod_entry.name, mod_name, interner)) {
-                // Evaluate module-level attributes
+                // Evaluate struct-level attributes
                 for (mod_entry.attributes.items) |*attr| {
                     if (attr.computed_value != null) continue;
                     if (tryEvalAttribute(alloc, &interp, attr, mod_entry.name, interner)) {
@@ -4307,7 +4292,7 @@ pub fn evaluateModuleAttributesInOrder(
                     }
                 }
 
-                // Evaluate function-level attributes in this module
+                // Evaluate function-level attributes in this struct
                 for (graph.families.items) |*family| {
                     if (family.scope_id == mod_entry.scope_id) {
                         for (family.attributes.items) |*attr| {
@@ -4325,7 +4310,7 @@ pub fn evaluateModuleAttributesInOrder(
         }
     }
 
-    // Also process any modules not in the order list (stdlib, etc.)
+    // Also process any structs not in the order list (stdlib, etc.)
     for (graph.structs.items) |*mod_entry| {
         for (mod_entry.attributes.items) |*attr| {
             if (attr.computed_value != null) continue;
@@ -4344,16 +4329,16 @@ pub fn evaluateModuleAttributesInOrder(
     };
 }
 
-/// Evaluate computed attributes for a single module against the module IR that
-/// has just been lowered. This is used by the true module-by-module compiler
-/// loop so later modules can observe earlier computed values without trying to
-/// evaluate modules whose IR does not exist yet.
-pub fn evaluateComputedAttributesForModule(
+/// Evaluate computed attributes for a single struct against the struct IR that
+/// has just been lowered. This is used by the true struct-by-struct compiler
+/// loop so later structs can observe earlier computed values without trying to
+/// evaluate structs whose IR does not exist yet.
+pub fn evaluateComputedAttributesForStruct(
     alloc: std.mem.Allocator,
     program: *const ir.Program,
     graph: *scope.ScopeGraph,
     interner: *const ast.StringInterner,
-    module_name: []const u8,
+    struct_name: []const u8,
     cache_dir: ?[]const u8,
     compile_options_hash: u64,
 ) EvalAttrError!EvalAttrResult {
@@ -4371,7 +4356,7 @@ pub fn evaluateComputedAttributesForModule(
     var failed: u32 = 0;
 
     for (graph.structs.items) |*mod_entry| {
-        if (!structNameMatchesStr(mod_entry.name, module_name, interner)) continue;
+        if (!structNameMatchesStr(mod_entry.name, struct_name, interner)) continue;
 
         for (mod_entry.attributes.items) |*attr| {
             if (attr.computed_value != null) continue;
@@ -4437,18 +4422,18 @@ fn tryEvalAttribute(
 
     const prev_context = interp.current_attribute_context;
     defer interp.current_attribute_context = prev_context;
-    const module_name_str = if (mod_name) |mn| try structNameToString(alloc, mn, interner) else null;
-    defer if (module_name_str) |name| alloc.free(name);
+    const struct_name_str = if (mod_name) |mn| try structNameToString(alloc, mn, interner) else null;
+    defer if (struct_name_str) |name| alloc.free(name);
     if (mod_name) |mn| {
         _ = mn;
         interp.current_attribute_context = .{
             .attr_name = interner.get(attr.name),
-            .module_name = module_name_str.?,
+            .struct_name = struct_name_str.?,
         };
     } else {
         interp.current_attribute_context = .{
             .attr_name = interner.get(attr.name),
-            .module_name = "<unknown>",
+            .struct_name = "<unknown>",
         };
     }
 
@@ -4556,7 +4541,7 @@ fn evaluateConstExpr(
         .struct_expr => |s| blk: {
             if (s.update_source != null) return error.NotComputable;
             const fields = alloc.alloc(CtValue.CtFieldValue, s.fields.len) catch return error.OutOfMemory;
-            const type_name = try structNameToString(alloc, s.module_name, interner);
+            const type_name = try structNameToString(alloc, s.struct_name, interner);
             for (s.fields, 0..) |field, i| {
                 fields[i] = .{
                     .name = interner.get(field.name),
@@ -4568,9 +4553,9 @@ fn evaluateConstExpr(
         },
         .attr_ref => |ar| blk: {
             const graph = interp.scope_graph orelse return error.NotComputable;
-            const current_module = mod_name orelse return error.NotComputable;
+            const current_struct = mod_name orelse return error.NotComputable;
             for (graph.structs.items) |mod_entry| {
-                if (!std.meta.eql(mod_entry.name, current_module)) continue;
+                if (!std.meta.eql(mod_entry.name, current_struct)) continue;
                 for (mod_entry.attributes.items) |attr| {
                     if (attr.name != ar.name) continue;
                     if (attr.computed_value) |cv| {
@@ -4753,7 +4738,7 @@ const AttrEvalInternalError = error{
 };
 
 /// Resolve a callee AST expression to a mangled IR function name.
-/// Handles: bare `func()` and `Module.func()` forms.
+/// Handles: bare `func()` and `Struct.func()` forms.
 fn resolveCalleeName(
     alloc: std.mem.Allocator,
     callee: *const ast.Expr,
@@ -4761,7 +4746,7 @@ fn resolveCalleeName(
     interner: *const ast.StringInterner,
 ) ?[]const u8 {
     switch (callee.*) {
-        // Bare call: func() → Module__func
+        // Bare call: func() → Struct__func
         .var_ref => |vr| {
             const func_name = interner.get(vr.name);
             if (mod_name) |mn| {
@@ -4770,12 +4755,12 @@ fn resolveCalleeName(
             }
             return func_name;
         },
-        // Qualified call: Module.func() → Module__func
+        // Qualified call: Struct.func() → Struct__func
         .field_access => |fa| {
-            // object should be a module_ref or var_ref
+            // object should be a struct_ref or var_ref
             const field_name = interner.get(fa.field);
             switch (fa.object.*) {
-                .module_ref => |mr| {
+                .struct_ref => |mr| {
                     const prefix = structNameToPrefix(alloc, mr.name, interner) catch return null;
                     return std.fmt.allocPrint(alloc, "{s}__{s}", .{ prefix, field_name }) catch null;
                 },
@@ -4809,9 +4794,9 @@ fn structNameToString(
     return name.toDottedString(alloc, interner);
 }
 
-/// Find the enclosing module name for a scope, walking up the scope tree.
+/// Find the enclosing struct name for a scope, walking up the scope tree.
 fn findStructForScope(graph: *const scope.ScopeGraph, scope_id: scope.ScopeId) ?ast.StructName {
-    // Check if this scope directly belongs to a module
+    // Check if this scope directly belongs to a struct
     for (graph.structs.items) |mod_entry| {
         if (mod_entry.scope_id == scope_id) return mod_entry.name;
     }
@@ -4826,10 +4811,10 @@ fn findStructForScope(graph: *const scope.ScopeGraph, scope_id: scope.ScopeId) ?
 fn findStructScopeByNameForCache(
     graph: *const scope.ScopeGraph,
     interner: *const ast.StringInterner,
-    module_name: []const u8,
+    struct_name: []const u8,
 ) ?scope.ScopeId {
     for (graph.structs.items) |mod_entry| {
-        if (structNameMatchesStr(mod_entry.name, module_name, interner)) {
+        if (structNameMatchesStr(mod_entry.name, struct_name, interner)) {
             return mod_entry.scope_id;
         }
     }
@@ -4934,11 +4919,11 @@ pub const PersistentCache = struct {
                     const current_hash = hashGlobMatches(matches);
                     if (current_hash != g.result_hash) return false;
                 },
-                .reflected_module => |rm| {
+                .reflected_struct => |rm| {
                     const current_graph = graph orelse return false;
                     const current_interner = interner orelse return false;
-                    const mod_scope_id = findStructScopeByNameForCache(current_graph, current_interner, rm.module_name) orelse return false;
-                    const current_hash = computeModuleInterfaceHash(current_graph, mod_scope_id, current_interner, rm.module_name);
+                    const mod_scope_id = findStructScopeByNameForCache(current_graph, current_interner, rm.struct_name) orelse return false;
+                    const current_hash = computeStructInterfaceHash(current_graph, mod_scope_id, current_interner, rm.struct_name);
                     if (current_hash != rm.interface_hash) return false;
                 },
                 .reflected_source => |rs| {
@@ -4969,7 +4954,7 @@ const CONST_TAG_STRUCT: u8 = 11;
 // Dependency serialization tags
 const DEP_TAG_FILE: u8 = 1;
 const DEP_TAG_ENV_VAR: u8 = 2;
-const DEP_TAG_REFLECTED_MODULE: u8 = 3;
+const DEP_TAG_REFLECTED_STRUCT: u8 = 3;
 const DEP_TAG_REFLECTED_SOURCE: u8 = 4;
 const DEP_TAG_GLOB: u8 = 5;
 
@@ -4997,11 +4982,11 @@ fn serializeDependencyInto(alloc: std.mem.Allocator, buf: *std.ArrayListUnmanage
             try buf.appendSlice(alloc, g.pattern);
             try buf.appendSlice(alloc, std.mem.asBytes(&g.result_hash));
         },
-        .reflected_module => |rm| {
-            try buf.append(alloc, DEP_TAG_REFLECTED_MODULE);
-            const name_len: u32 = @intCast(rm.module_name.len);
+        .reflected_struct => |rm| {
+            try buf.append(alloc, DEP_TAG_REFLECTED_STRUCT);
+            const name_len: u32 = @intCast(rm.struct_name.len);
             try buf.appendSlice(alloc, std.mem.asBytes(&name_len));
-            try buf.appendSlice(alloc, rm.module_name);
+            try buf.appendSlice(alloc, rm.struct_name);
             try buf.appendSlice(alloc, std.mem.asBytes(&rm.interface_hash));
         },
         .reflected_source => |rs| {
@@ -5062,17 +5047,17 @@ fn deserializeDependency(alloc: std.mem.Allocator, data: []const u8, pos: *usize
             pos.* += 8;
             return .{ .glob = .{ .pattern = pattern, .result_hash = result_hash } };
         },
-        DEP_TAG_REFLECTED_MODULE => {
+        DEP_TAG_REFLECTED_STRUCT => {
             if (pos.* + 4 > data.len) return error.UnexpectedEndOfData;
             const name_len = std.mem.readInt(u32, data[pos.*..][0..4], .little);
             pos.* += 4;
             if (pos.* + name_len > data.len) return error.UnexpectedEndOfData;
-            const module_name = try alloc.dupe(u8, data[pos.*..][0..name_len]);
+            const struct_name = try alloc.dupe(u8, data[pos.*..][0..name_len]);
             pos.* += name_len;
             if (pos.* + 8 > data.len) return error.UnexpectedEndOfData;
             const interface_hash = std.mem.readInt(u64, data[pos.*..][0..8], .little);
             pos.* += 8;
-            return .{ .reflected_module = .{ .module_name = module_name, .interface_hash = interface_hash } };
+            return .{ .reflected_struct = .{ .struct_name = struct_name, .interface_hash = interface_hash } };
         },
         DEP_TAG_REFLECTED_SOURCE => {
             if (pos.* + 4 > data.len) return error.UnexpectedEndOfData;
@@ -6180,7 +6165,7 @@ test "interpreter: error captures function source span provenance" {
     var graph = scope.ScopeGraph.init(alloc);
     defer graph.deinit();
 
-    const mod_scope = try graph.createScope(0, .module);
+    const mod_scope = try graph.createScope(0, .struct_scope);
     const family_id = try graph.createFamily(mod_scope, fn_name, 0, .public);
 
     const clause_span = ast.SourceSpan{ .start = 10, .end = 20, .line = 7, .col = 3 };
@@ -6312,10 +6297,10 @@ test "CapabilitySet" {
     try testing.expect(build.has(.pure));
     try testing.expect(build.has(.read_file));
     try testing.expect(build.has(.read_env));
-    try testing.expect(build.has(.reflect_module));
+    try testing.expect(build.has(.reflect_struct));
 
-    const with_reflect = pure.with(.reflect_module);
-    try testing.expect(with_reflect.has(.reflect_module));
+    const with_reflect = pure.with(.reflect_struct);
+    try testing.expect(with_reflect.has(.reflect_struct));
     try testing.expect(!with_reflect.has(.read_file));
 
     const with_source_reflect = pure.with(.reflect_source);
@@ -6333,7 +6318,7 @@ test "reflection: SourceGraph.structs filters by source path" {
 
     var graph = scope.ScopeGraph.init(alloc);
     try graph.registerSourceFile(0, "./app.zap");
-    const app_scope = try graph.createScope(0, .module);
+    const app_scope = try graph.createScope(0, .struct_scope);
 
     const app_decl = try alloc.create(ast.StructDecl);
     app_decl.* = .{
@@ -6354,7 +6339,7 @@ test "reflection: SourceGraph.structs filters by source path" {
             .label = 0,
             .instructions = &.{
                 .{ .const_string = .{ .dest = 0, .value = "app.zap" } },
-                .{ .call_builtin = .{ .dest = 1, .name = "__zap_source_graph_structs__", .args = &.{0}, .arg_modes = &.{.share} } },
+                .{ .call_builtin = .{ .dest = 1, .name = "source_graph_structs", .args = &.{0}, .arg_modes = &.{.share} } },
                 .{ .ret = .{ .value = 1 } },
             },
         }},
@@ -6396,7 +6381,7 @@ test "reflection: Struct.functions returns public function refs" {
     const main_id = try interner.intern("main");
 
     var graph = scope.ScopeGraph.init(alloc);
-    const app_scope = try graph.createScope(0, .module);
+    const app_scope = try graph.createScope(0, .struct_scope);
     const app_decl = try alloc.create(ast.StructDecl);
     app_decl.* = .{
         .meta = .{ .span = .{ .start = 0, .end = 3, .source_id = 0 } },
@@ -6417,7 +6402,7 @@ test "reflection: Struct.functions returns public function refs" {
             .label = 0,
             .instructions = &.{
                 .{ .const_string = .{ .dest = 0, .value = "App" } },
-                .{ .call_builtin = .{ .dest = 1, .name = "__zap_struct_functions__", .args = &.{0}, .arg_modes = &.{.share} } },
+                .{ .call_builtin = .{ .dest = 1, .name = "struct_functions", .args = &.{0}, .arg_modes = &.{.share} } },
                 .{ .ret = .{ .value = 1 } },
             },
         }},
@@ -6546,11 +6531,11 @@ test "evaluateComputedAttributes: call expression" {
     const functions = [_]ir.Function{compute_fn};
     const program = makeTestProgram(&functions);
 
-    // Build a scope graph with a module "Foo" and an attribute @config = compute()
+    // Build a scope graph with a struct "Foo" and an attribute @config = compute()
     var graph = scope.ScopeGraph.init(alloc);
 
-    // Create module scope (child of prelude)
-    const mod_scope = try graph.createScope(0, .module);
+    // Create struct scope (child of prelude)
+    const mod_scope = try graph.createScope(0, .struct_scope);
 
     // Intern strings
     var interner = ast.StringInterner.init(alloc);
@@ -6571,7 +6556,7 @@ test "evaluateComputedAttributes: call expression" {
         .args = &.{},
     } };
 
-    // Create a stub module decl (needed for StructEntry)
+    // Create a stub struct decl (needed for StructEntry)
     const mod_decl = try alloc.create(ast.StructDecl);
     mod_decl.* = .{
         .meta = .{ .span = .{ .start = 0, .end = 0 } },
@@ -6579,7 +6564,7 @@ test "evaluateComputedAttributes: call expression" {
         .items = &.{},
     };
 
-    // Register the module with the attribute
+    // Register the struct with the attribute
     try graph.structs.append(alloc, .{
         .name = .{ .parts = &.{foo_id}, .span = .{ .start = 0, .end = 0 } },
         .scope_id = mod_scope,
@@ -6632,7 +6617,7 @@ test "evaluateComputedAttributes: failing attribute records attribute context" {
     const program = makeTestProgram(&functions);
 
     var graph = scope.ScopeGraph.init(alloc);
-    const mod_scope = try graph.createScope(0, .module);
+    const mod_scope = try graph.createScope(0, .struct_scope);
 
     var interner = ast.StringInterner.init(alloc);
     const foo_id = try interner.intern("Foo");
@@ -6674,7 +6659,7 @@ test "evaluateComputedAttributes: failing attribute records attribute context" {
     try testing.expectEqual(@as(usize, 1), result.errors.len);
     try testing.expect(result.errors[0].attribute_context != null);
     try testing.expectEqualStrings("config", result.errors[0].attribute_context.?.attr_name);
-    try testing.expectEqualStrings("Foo", result.errors[0].attribute_context.?.module_name);
+    try testing.expectEqualStrings("Foo", result.errors[0].attribute_context.?.struct_name);
 }
 
 test "evaluateComputedAttributes: binary expression value" {
@@ -6686,7 +6671,7 @@ test "evaluateComputedAttributes: binary expression value" {
     const program = makeTestProgram(&functions);
 
     var graph = scope.ScopeGraph.init(alloc);
-    const mod_scope = try graph.createScope(0, .module);
+    const mod_scope = try graph.createScope(0, .struct_scope);
 
     var interner = ast.StringInterner.init(alloc);
     const foo_id = try interner.intern("Foo");
@@ -6754,7 +6739,7 @@ test "evaluateComputedAttributes: call expression with computed args" {
     const program = makeTestProgram(&functions);
 
     var graph = scope.ScopeGraph.init(alloc);
-    const mod_scope = try graph.createScope(0, .module);
+    const mod_scope = try graph.createScope(0, .struct_scope);
 
     var interner = ast.StringInterner.init(alloc);
     const foo_id = try interner.intern("Foo");
@@ -6817,7 +6802,7 @@ test "evaluateComputedAttributes: attr_ref can use earlier computed attribute" {
     const program = makeTestProgram(&functions);
 
     var graph = scope.ScopeGraph.init(alloc);
-    const mod_scope = try graph.createScope(0, .module);
+    const mod_scope = try graph.createScope(0, .struct_scope);
 
     var interner = ast.StringInterner.init(alloc);
     const foo_id = try interner.intern("Foo");
@@ -6872,7 +6857,7 @@ test "tryEvalAttribute: literal int value" {
     const program = makeTestProgram(&functions);
 
     var graph = scope.ScopeGraph.init(alloc);
-    const mod_scope = try graph.createScope(0, .module);
+    const mod_scope = try graph.createScope(0, .struct_scope);
 
     var interner = ast.StringInterner.init(alloc);
     const foo_id = try interner.intern("Foo");
@@ -6916,7 +6901,7 @@ test "tryEvalAttribute: literal string value" {
     const program = makeTestProgram(&functions);
 
     var graph = scope.ScopeGraph.init(alloc);
-    const mod_scope = try graph.createScope(0, .module);
+    const mod_scope = try graph.createScope(0, .struct_scope);
 
     var interner = ast.StringInterner.init(alloc);
     const foo_id = try interner.intern("Foo");
@@ -7754,7 +7739,7 @@ test "rich diagnostics: formatCtfeError" {
         .call_stack = &.{
             .{ .function_name = "Config__generate", .function_id = 0, .instruction_index = 0, .source_span = .{ .start = 10, .end = 20, .line = 12, .col = 4 } },
         },
-        .attribute_context = .{ .attr_name = "config", .module_name = "App" },
+        .attribute_context = .{ .attr_name = "config", .struct_name = "App" },
     };
     const formatted = try formatCtfeError(alloc, err);
     defer alloc.free(formatted);
@@ -7791,21 +7776,21 @@ test "validateDependencies: env_var absent stays absent" {
     try testing.expect(PersistentCache.validateDependencies(alloc, &deps, null, null));
 }
 
-test "validateDependencies: reflected_module invalidates without graph" {
+test "validateDependencies: reflected_struct invalidates without graph" {
     const alloc = testing.allocator;
     const deps = [_]CtDependency{
-        .{ .reflected_module = .{ .module_name = "Test", .interface_hash = 0 } },
+        .{ .reflected_struct = .{ .struct_name = "Test", .interface_hash = 0 } },
     };
     try testing.expect(!PersistentCache.validateDependencies(alloc, &deps, null, null));
 }
 
-test "validateDependencies: reflected_module validates against matching graph" {
+test "validateDependencies: reflected_struct validates against matching graph" {
     var arena = testArena();
     defer arena.deinit();
     const alloc = arena.allocator();
 
     var graph = scope.ScopeGraph.init(alloc);
-    const mod_scope = try graph.createScope(0, .module);
+    const mod_scope = try graph.createScope(0, .struct_scope);
     var interner = ast.StringInterner.init(alloc);
     const test_id = try interner.intern("Test");
 
@@ -7821,20 +7806,20 @@ test "validateDependencies: reflected_module validates against matching graph" {
         .decl = mod_decl,
     });
 
-    const iface_hash = computeModuleInterfaceHash(&graph, mod_scope, &interner, "Test");
+    const iface_hash = computeStructInterfaceHash(&graph, mod_scope, &interner, "Test");
     const deps = [_]CtDependency{
-        .{ .reflected_module = .{ .module_name = "Test", .interface_hash = iface_hash } },
+        .{ .reflected_struct = .{ .struct_name = "Test", .interface_hash = iface_hash } },
     };
     try testing.expect(PersistentCache.validateDependencies(alloc, &deps, &graph, &interner));
 }
 
-test "validateDependencies: reflected_module invalidates on interface change" {
+test "validateDependencies: reflected_struct invalidates on interface change" {
     var arena = testArena();
     defer arena.deinit();
     const alloc = arena.allocator();
 
     var graph = scope.ScopeGraph.init(alloc);
-    const mod_scope = try graph.createScope(0, .module);
+    const mod_scope = try graph.createScope(0, .struct_scope);
     var interner = ast.StringInterner.init(alloc);
     const test_id = try interner.intern("Test");
     const config_id = try interner.intern("config");
@@ -7855,9 +7840,9 @@ test "validateDependencies: reflected_module invalidates on interface change" {
         .computed_value = .{ .int = 1 },
     }) catch {};
 
-    const iface_hash = computeModuleInterfaceHash(&graph, mod_scope, &interner, "Test");
+    const iface_hash = computeStructInterfaceHash(&graph, mod_scope, &interner, "Test");
     const deps = [_]CtDependency{
-        .{ .reflected_module = .{ .module_name = "Test", .interface_hash = iface_hash } },
+        .{ .reflected_struct = .{ .struct_name = "Test", .interface_hash = iface_hash } },
     };
 
     graph.structs.items[0].attributes.items[0].computed_value = .{ .int = 2 };
@@ -8211,13 +8196,13 @@ test "dependency serialization: env_var dep round-trip" {
     try testing.expect(restored.dependencies[0].env_var.present);
 }
 
-test "dependency serialization: reflected_module dep round-trip" {
+test "dependency serialization: reflected_struct dep round-trip" {
     var arena = testArena();
     defer arena.deinit();
     const alloc = arena.allocator();
 
     const deps = [_]CtDependency{
-        .{ .reflected_module = .{ .module_name = "Config", .interface_hash = 0xABCD } },
+        .{ .reflected_struct = .{ .struct_name = "Config", .interface_hash = 0xABCD } },
     };
     const eval_result = CtEvalResult{
         .value = .{ .bool_val = true },
@@ -8227,9 +8212,9 @@ test "dependency serialization: reflected_module dep round-trip" {
     const data = try serializeResult(alloc, eval_result);
     const restored = try deserializeResult(alloc, data);
     try testing.expectEqual(@as(usize, 1), restored.dependencies.len);
-    try testing.expect(restored.dependencies[0] == .reflected_module);
-    try testing.expectEqualStrings("Config", restored.dependencies[0].reflected_module.module_name);
-    try testing.expectEqual(@as(u64, 0xABCD), restored.dependencies[0].reflected_module.interface_hash);
+    try testing.expect(restored.dependencies[0] == .reflected_struct);
+    try testing.expectEqualStrings("Config", restored.dependencies[0].reflected_struct.struct_name);
+    try testing.expectEqual(@as(u64, 0xABCD), restored.dependencies[0].reflected_struct.interface_hash);
 }
 
 test "dependency serialization: multiple mixed deps" {
@@ -8240,7 +8225,7 @@ test "dependency serialization: multiple mixed deps" {
     const deps = [_]CtDependency{
         .{ .file = .{ .path = "build.zap", .content_hash = 111 } },
         .{ .env_var = .{ .name = "MIX_ENV", .value_hash = 222, .present = false } },
-        .{ .reflected_module = .{ .module_name = "App.Config", .interface_hash = 333 } },
+        .{ .reflected_struct = .{ .struct_name = "App.Config", .interface_hash = 333 } },
     };
     const eval_result = CtEvalResult{
         .value = .{ .string = "ok" },
@@ -8258,10 +8243,10 @@ test "dependency serialization: multiple mixed deps" {
     try testing.expect(restored.dependencies[1] == .env_var);
     try testing.expectEqualStrings("MIX_ENV", restored.dependencies[1].env_var.name);
     try testing.expect(!restored.dependencies[1].env_var.present);
-    // reflected_module
-    try testing.expect(restored.dependencies[2] == .reflected_module);
-    try testing.expectEqualStrings("App.Config", restored.dependencies[2].reflected_module.module_name);
-    try testing.expectEqual(@as(u64, 333), restored.dependencies[2].reflected_module.interface_hash);
+    // reflected_struct
+    try testing.expect(restored.dependencies[2] == .reflected_struct);
+    try testing.expectEqualStrings("App.Config", restored.dependencies[2].reflected_struct.struct_name);
+    try testing.expectEqual(@as(u64, 333), restored.dependencies[2].reflected_struct.interface_hash);
 }
 
 test "builtin: get_build_opt returns value" {

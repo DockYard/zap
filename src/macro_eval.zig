@@ -24,22 +24,22 @@ pub const MacroEvalError = error{
     OutOfMemory,
 };
 
-/// Side channel for `Module.*` intrinsics: lets the evaluator reach the
-/// scope graph and the current module's `StructEntry`. The macro
+/// Side channel for `Struct.*` intrinsics: lets the evaluator reach the
+/// scope graph and the current struct's `StructEntry`. The macro
 /// engine populates this before invoking `eval`; non-macro callers
 /// (legacy CTFE attribute evaluation) leave it null and the
 /// intrinsics fall back to evaluator-local behavior or no-ops.
-pub const ModuleContext = struct {
+pub const StructContext = struct {
     graph: *@import("scope.zig").ScopeGraph,
     interner: *@import("ast.zig").StringInterner,
-    current_module_scope: ?u32 = null,
+    current_struct_scope: ?u32 = null,
 };
 
 pub const Env = struct {
     alloc: Allocator,
     store: *AllocationStore,
     bindings: std.StringHashMap(CtValue),
-    module_ctx: ?ModuleContext = null,
+    struct_ctx: ?StructContext = null,
     /// IR program containing Zap functions compiled before the
     /// current macro expansion. Qualified Zap function calls are
     /// executed through this program when available.
@@ -279,6 +279,15 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
             }
         }
 
+        if (isDisallowedUnderscoreComptimeCallName(form_name)) {
+            env.last_capability_error = std.fmt.allocPrint(
+                env.alloc,
+                "cannot call underscore-prefixed function `{s}` from macro code",
+                .{form_name},
+            ) catch return MacroEvalError.EvalFailed;
+            return MacroEvalError.EvalFailed;
+        }
+
         // Built-in compile-time functions for AST manipulation
         // Must be checked BEFORE binary/unary operator fallbacks since
         // built-in functions like elem(x, 0) also have 2 args.
@@ -319,12 +328,12 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
                 }
             }
 
-            // __zap_list_at__(list, index) — element at zero-based index,
+            // list_at(list, index) — element at zero-based index,
             // or nil when out of range. Negative indices count from the
             // end (`-1` = last). Lifts the bare-int conventions from Zig
             // into macro space so library code can write `list_at(args, 0)`
             // to take the first matching call.
-            if (std.mem.eql(u8, form_name, "__zap_list_at__")) {
+            if (std.mem.eql(u8, form_name, "list_at")) {
                 if (arg_elems.len == 2) {
                     const list = try eval(env, arg_elems[0]);
                     const idx_raw = try eval(env, arg_elems[1]);
@@ -340,10 +349,10 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
                 }
             }
 
-            // __zap_list_len__(list) — element count as a bare int.
+            // list_length(list) — element count as a bare int.
             // Returns 0 for non-lists so callers can chain it through
             // `==` / `>` without first checking shape.
-            if (std.mem.eql(u8, form_name, "__zap_list_len__")) {
+            if (std.mem.eql(u8, form_name, "list_length")) {
                 if (arg_elems.len == 1) {
                     const list = try eval(env, arg_elems[0]);
                     if (list == .list) return CtValue{ .int = @intCast(list.list.elems.len) };
@@ -351,10 +360,10 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
                 }
             }
 
-            // __zap_list_empty__(list) — true iff the list has no elements.
+            // list_empty?(list) — true iff the list has no elements.
             // Non-list values are treated as empty so callers don't have
             // to distinguish "empty list" from "wrong shape".
-            if (std.mem.eql(u8, form_name, "__zap_list_empty__")) {
+            if (std.mem.eql(u8, form_name, "list_empty?")) {
                 if (arg_elems.len == 1) {
                     const list = try eval(env, arg_elems[0]);
                     if (list == .list) return CtValue{ .bool_val = list.list.elems.len == 0 };
@@ -362,10 +371,10 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
                 }
             }
 
-            // __zap_list_concat__(left, right) — concatenate two lists.
+            // list_concat(left, right) — concatenate two lists.
             // Non-list operands are treated as empty: a nil setup_body
             // can be concatenated freely without an outer guard.
-            if (std.mem.eql(u8, form_name, "__zap_list_concat__")) {
+            if (std.mem.eql(u8, form_name, "list_concat")) {
                 if (arg_elems.len == 2) {
                     const left = try eval(env, arg_elems[0]);
                     const right = try eval(env, arg_elems[1]);
@@ -380,12 +389,12 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
                 }
             }
 
-            // __zap_list_flatten__(list_of_lists) — flatten one level.
+            // list_flatten(list_of_lists) — flatten one level.
             // Non-list outer is empty; non-list inner elements are
             // appended as singletons so a mixed list `[item, [a, b]]`
             // flattens to `[item, a, b]`. Useful for for-comp bodies
             // that yield variable-arity lists per iteration.
-            if (std.mem.eql(u8, form_name, "__zap_list_flatten__")) {
+            if (std.mem.eql(u8, form_name, "list_flatten")) {
                 if (arg_elems.len == 1) {
                     const outer = try eval(env, arg_elems[0]);
                     if (outer != .list) return CtValue{ .list = .{ .alloc_id = env.store.alloc(env.alloc, .list, null), .elems = &.{} } };
@@ -409,10 +418,10 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
                 }
             }
 
-            // __zap_map_get__(map, key, default) — fetch a compile-time
+            // map_get(map, key, default) — fetch a compile-time
             // map entry by key, returning the caller-provided default
             // when the value is absent or the first argument is not a map.
-            if (std.mem.eql(u8, form_name, "__zap_map_get__")) {
+            if (std.mem.eql(u8, form_name, "map_get")) {
                 if (arg_elems.len == 3) {
                     const map_value = try eval(env, arg_elems[0]);
                     const lookup_key = unwrapAstLiteral(try eval(env, arg_elems[1]));
@@ -438,29 +447,29 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
                 return CtValue{ .tuple = .{ .alloc_id = id, .elems = elems } };
             }
 
-            // Module attribute intrinsics — callable from within macro
-            // bodies to read/write the current module's compile-time
-            // attribute table. Inert when no module context is wired
-            // through `env.module_ctx` (legacy CTFE callers).
+            // Struct attribute intrinsics — callable from within macro
+            // bodies to read/write the current struct's compile-time
+            // attribute table. Inert when no struct context is wired
+            // through `env.struct_ctx` (legacy CTFE callers).
             //
-            // The user-facing API lives in Zap (`Module.put_attribute`,
+            // The user-facing API lives in Zap (`Struct.put_attribute`,
             // etc.) and lowers to these underscore-prefixed names via
             // ordinary macros in lib/. The compiler stays
             // language-agnostic about the wrappers' shape; it only
             // implements the storage primitive.
-            if (std.mem.eql(u8, form_name, "__zap_module_put_attr__")) {
-                return moduleIntrinsicPut(env, arg_elems);
+            if (std.mem.eql(u8, form_name, "struct_put_attribute")) {
+                return structIntrinsicPut(env, arg_elems);
             }
-            if (std.mem.eql(u8, form_name, "__zap_module_get_attr__")) {
-                return moduleIntrinsicGet(env, arg_elems);
+            if (std.mem.eql(u8, form_name, "struct_get_attribute")) {
+                return structIntrinsicGet(env, arg_elems);
             }
-            if (std.mem.eql(u8, form_name, "__zap_module_register_attr__")) {
-                return moduleIntrinsicRegister(env, arg_elems);
+            if (std.mem.eql(u8, form_name, "struct_register_attribute")) {
+                return structIntrinsicRegister(env, arg_elems);
             }
-            if (std.mem.eql(u8, form_name, "__zap_source_graph_structs__")) {
+            if (std.mem.eql(u8, form_name, "source_graph_structs")) {
                 return sourceGraphStructsIntrinsic(env, arg_elems);
             }
-            if (std.mem.eql(u8, form_name, "__zap_struct_functions__")) {
+            if (std.mem.eql(u8, form_name, "struct_functions")) {
                 return structFunctionsIntrinsic(env, arg_elems);
             }
 
@@ -478,24 +487,24 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
             // test-framework-specific Zig builtins. These are the
             // minimum needed to migrate the Zest test framework
             // entirely into Zap source.
-            if (std.mem.eql(u8, form_name, "__zap_atom_name__")) {
+            if (std.mem.eql(u8, form_name, "atom_name")) {
                 return atomNameIntrinsic(env, arg_elems);
             }
 
-            // __zap_make_call__(form_name_string, args_list) — build a
+            // make_call(form_name_string, args_list) — build a
             // 3-tuple AST node `{atom(form_name), [], args}`. The form
             // atom is stored WITHOUT the leading `:` that disambiguates
             // atom literals from variable refs in AST encoding, so the
             // result round-trips as a call/operator/assignment node
-            // (e.g., `__zap_make_call__("=", [target, value])` produces
+            // (e.g., `make_call("=", [target, value])` produces
             // the same shape as the parser emits for `target = value`).
             //
             // Distinct from `tuple(...)` which evaluates each argument
             // and may wrap atom literals in 3-tuple wrappers — that
             // shape is wrong for AST node construction. A separate
             // primitive keeps both useful: `tuple` for data tuples,
-            // `__zap_make_call__` for AST nodes.
-            if (std.mem.eql(u8, form_name, "__zap_make_call__")) {
+            // `make_call` for AST nodes.
+            if (std.mem.eql(u8, form_name, "make_call")) {
                 if (arg_elems.len == 2) {
                     const name_raw = try eval(env, arg_elems[0]);
                     const args_raw = try eval(env, arg_elems[1]);
@@ -507,14 +516,14 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
                     return ast_data.makeTuple3(env.alloc, env.store, .{ .atom = dup }, empty, args_list) catch return .nil;
                 }
             }
-            if (std.mem.eql(u8, form_name, "__zap_slugify__")) {
+            if (std.mem.eql(u8, form_name, "slugify")) {
                 return slugifyIntrinsic(env, arg_elems);
             }
-            if (std.mem.eql(u8, form_name, "__zap_intern_atom__")) {
+            if (std.mem.eql(u8, form_name, "intern_atom")) {
                 return internAtomIntrinsic(env, arg_elems);
             }
 
-            // __zap_io_read_file__(path) — read a file at compile time.
+            // read_file(path) — read a file at compile time.
             // Gated by the `read_file` capability. The first impure
             // intrinsic in the macro language: a macro that calls this
             // must declare `@requires = [:read_file]`, otherwise
@@ -525,13 +534,13 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
             // comptime evaluation deterministic — a multi-gig file
             // would silently extend build time and explode allocator
             // pressure. Authors who need larger inputs should chunk.
-            if (std.mem.eql(u8, form_name, "__zap_io_read_file__")) {
+            if (std.mem.eql(u8, form_name, "read_file")) {
                 if (arg_elems.len != 1) return MacroEvalError.EvalFailed;
                 if (!env.current_macro_caps.has(.read_file)) {
                     const caller = env.current_macro_name orelse "<top-level>";
                     const msg = std.fmt.allocPrint(
                         env.alloc,
-                        "macro `{s}` calls `__zap_io_read_file__` but does not declare `@requires = [:read_file]` — add the capability to allow compile-time file reads",
+                        "macro `{s}` calls `read_file` but does not declare `@requires = [:read_file]` — add the capability to allow compile-time file reads",
                         .{caller},
                     ) catch return MacroEvalError.EvalFailed;
                     env.last_capability_error = msg;
@@ -544,7 +553,7 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
                     const caller = env.current_macro_name orelse "<top-level>";
                     const msg = std.fmt.allocPrint(
                         env.alloc,
-                        "`__zap_io_read_file__` in macro `{s}` failed to read `{s}`: {s}",
+                        "`read_file` in macro `{s}` failed to read `{s}`: {s}",
                         .{ caller, path_ct.string, @errorName(err) },
                     ) catch return MacroEvalError.EvalFailed;
                     env.last_capability_error = msg;
@@ -553,11 +562,11 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
                 return CtValue{ .string = bytes };
             }
 
-            // __zap_dbg__(label, value) — comptime debug print to stderr.
+            // debug_value(label, value) — comptime debug print to stderr.
             // Returns the evaluated value so it can be wrapped around an
-            // existing expression: `_x = __zap_dbg__("setup", elem(body, 2))`.
+            // existing expression: `_x = debug_value("setup", elem(body, 2))`.
             // Useful for inspecting CtValue shapes while authoring macros.
-            if (std.mem.eql(u8, form_name, "__zap_dbg__")) {
+            if (std.mem.eql(u8, form_name, "debug_value")) {
                 if (arg_elems.len == 2) {
                     const label_raw = try eval(env, arg_elems[0]);
                     const value_raw = try eval(env, arg_elems[1]);
@@ -583,7 +592,7 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
         // minus applied to a literal `-1` (encoded as `{:-, meta,
         // [{1, [], nil}]}`) reduces to a bare `.int = -1` rather
         // than surviving as the unevaluated tuple. Without unwrapping,
-        // downstream comparisons (`__zap_list_at__(list, -1)`) fail
+        // downstream comparisons (`list_at(list, -1)`) fail
         // their `idx == .int` shape check and return nil — silently
         // breaking step-aware indexing.
         if (args == .list and args.list.elems.len == 1) {
@@ -598,7 +607,7 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
         }
 
         // Comptime function dispatch: unknown form is a function name
-        // visible in the current module's scope. Look up the function
+        // visible in the current struct's scope. Look up the function
         // family, instantiate the first matching clause's body with
         // the call's arg CtValues bound to the params, and recursively
         // interpret. Pure Zap functions (no `:zig.` calls beyond
@@ -632,6 +641,13 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
         }
     }
     return value;
+}
+
+fn isDisallowedUnderscoreComptimeCallName(name: []const u8) bool {
+    if (name.len == 0 or name[0] != '_') return false;
+    if (std.mem.eql(u8, name, "__block__")) return false;
+    if (std.mem.eql(u8, name, "__aliases__")) return false;
+    return true;
 }
 
 fn evalBinop(env: *Env, op: []const u8, lhs_raw: CtValue, rhs_raw: CtValue) MacroEvalError!CtValue {
@@ -1010,21 +1026,21 @@ fn extractString(val: CtValue) ?[]const u8 {
 }
 
 // ============================================================
-// Module attribute intrinsics
+// Struct attribute intrinsics
 //
-// Implementation of `__zap_module_put_attr__`,
-// `__zap_module_get_attr__`, and `__zap_module_register_attr__`.
-// These thread through `env.module_ctx` to reach the scope graph;
+// Implementation of `struct_put_attribute`,
+// `struct_get_attribute`, and `struct_register_attribute`.
+// These thread through `env.struct_ctx` to reach the scope graph;
 // when the context is null (legacy CTFE attribute eval) they return
 // nil so user macros wrapping them gracefully no-op.
 // ============================================================
 
-fn moduleIntrinsicPut(env: *Env, args: []const CtValue) MacroEvalError!CtValue {
+fn structIntrinsicPut(env: *Env, args: []const CtValue) MacroEvalError!CtValue {
     if (args.len != 2) return .nil;
     const name_val = try eval(env, args[0]);
     const value_ct = try eval(env, args[1]);
-    const ctx = env.module_ctx orelse return .nil;
-    const scope_id = ctx.current_module_scope orelse return .nil;
+    const ctx = env.struct_ctx orelse return .nil;
+    const scope_id = ctx.current_struct_scope orelse return .nil;
     const mod_entry = ctx.graph.findStructByScope(scope_id) orelse return .nil;
 
     const name_str = extractAtomName(name_val) orelse return .nil;
@@ -1038,7 +1054,7 @@ fn moduleIntrinsicPut(env: *Env, args: []const CtValue) MacroEvalError!CtValue {
     // source or via a macro intrinsic.
     const unwrapped = unwrapAstLiteral(value_ct);
     const cv = ctfe.exportValue(env.alloc, unwrapped) catch return .nil;
-    ctx.graph.putModuleAttribute(mod_entry, name_id, cv) catch return .nil;
+    ctx.graph.putStructAttribute(mod_entry, name_id, cv) catch return .nil;
     return .nil;
 }
 
@@ -1124,9 +1140,9 @@ fn isExprComptimeSafe(expr: *const ast.Expr) bool {
         // Calls — check the callee shape. Bare-name calls go through
         // comptime dispatch (recursive safety check at dispatch
         // time). Field-access callees that target the `:zig.` interop
-        // namespace are NEVER comptime-safe; module-qualified Zap
+        // namespace are NEVER comptime-safe; struct-qualified Zap
         // calls (`Foo.bar(args)`) are conservatively rejected for
-        // now since dispatch doesn't yet route through module refs.
+        // now since dispatch doesn't yet route through struct refs.
         .call => |c| isCallComptimeSafe(c),
         // Range, list-cons, struct construction — pure shape
         .range => |r| {
@@ -1176,10 +1192,10 @@ fn isCallComptimeSafe(call: anytype) bool {
     // Inspect callee shape:
     //   - var_ref: bare-name call. Safe — dispatch will recurse.
     //   - field_access on :zig: NEVER safe.
-    //   - field_access on a Zap module: may eventually be safe
-    //     (cross-module pure dispatch), but dispatch doesn't
-    //     currently route through module refs. Reject.
-    //   - module_ref or anything else: reject.
+    //   - field_access on a Zap struct: may eventually be safe
+    //     (cross-struct pure dispatch), but dispatch doesn't
+    //     currently route through struct refs. Reject.
+    //   - struct_ref or anything else: reject.
     if (call.callee.* == .var_ref) {
         // Each arg must also be safe.
         for (call.args) |arg| {
@@ -1188,10 +1204,10 @@ fn isCallComptimeSafe(call: anytype) bool {
         return true;
     }
     if (call.callee.* == .field_access) {
-        // Module-qualified calls (`Foo.bar(args)`) and `:zig.X.Y(...)`
+        // Struct-qualified calls (`Foo.bar(args)`) and `:zig.X.Y(...)`
         // interop are conservatively rejected — comptime dispatch
         // doesn't route through field-access callees yet. When
-        // cross-module dispatch lands the safe-set widens here.
+        // cross-struct dispatch lands the safe-set widens here.
         return false;
     }
     return false;
@@ -1202,7 +1218,7 @@ fn dispatchQualifiedComptimeCall(
     form: CtValue,
     arg_forms: []const CtValue,
 ) MacroEvalError!?CtValue {
-    const ctx = env.module_ctx orelse return null;
+    const ctx = env.struct_ctx orelse return null;
     if (env.dispatch_depth >= COMPTIME_DISPATCH_MAX_DEPTH) return null;
 
     var segments: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -1212,6 +1228,14 @@ fn dispatchQualifiedComptimeCall(
     if (std.mem.eql(u8, segments.items[0], "zig")) return null;
 
     const function_name = segments.items[segments.items.len - 1];
+    if (isDisallowedUnderscoreComptimeCallName(function_name)) {
+        env.last_capability_error = std.fmt.allocPrint(
+            env.alloc,
+            "cannot call underscore-prefixed function `{s}` from macro code",
+            .{function_name},
+        ) catch return MacroEvalError.EvalFailed;
+        return MacroEvalError.EvalFailed;
+    }
     const struct_scope = findStructScopeBySegments(ctx.graph, ctx.interner, segments.items[0 .. segments.items.len - 1]) orelse return null;
     const name_id = ctx.interner.intern(function_name) catch return null;
     const arity: u32 = @intCast(arg_forms.len);
@@ -1220,7 +1244,7 @@ fn dispatchQualifiedComptimeCall(
 
     if (struct_scope_value.function_families.get(key)) |family_id| {
         const family = &ctx.graph.families.items[family_id];
-        if (family.visibility != .public and ctx.current_module_scope != struct_scope) return null;
+        if (family.visibility != .public and ctx.current_struct_scope != struct_scope) return null;
         if (try evalCompiledQualifiedFunction(env, segments.items, arg_forms)) |compiled_result| {
             return compiled_result;
         }
@@ -1263,7 +1287,7 @@ fn evalCompiledQualifiedFunction(
     const compiled_name = try compiledFunctionName(env.alloc, segments, arg_forms.len);
     var interpreter = ctfe.Interpreter.init(env.alloc, program);
     defer interpreter.deinit();
-    if (env.module_ctx) |ctx| {
+    if (env.struct_ctx) |ctx| {
         interpreter.scope_graph = ctx.graph;
         interpreter.interner = ctx.interner;
     }
@@ -1293,10 +1317,10 @@ fn compiledFunctionName(
     segments: []const []const u8,
     arity: usize,
 ) MacroEvalError![]const u8 {
-    var module_prefix: std.ArrayListUnmanaged(u8) = .empty;
+    var struct_prefix: std.ArrayListUnmanaged(u8) = .empty;
     for (segments[0 .. segments.len - 1], 0..) |segment, index| {
-        if (index > 0) try module_prefix.append(allocator, '_');
-        try module_prefix.appendSlice(allocator, segment);
+        if (index > 0) try struct_prefix.append(allocator, '_');
+        try struct_prefix.appendSlice(allocator, segment);
     }
 
     const raw_function_name = segments[segments.len - 1];
@@ -1305,7 +1329,7 @@ fn compiledFunctionName(
     return std.fmt.allocPrint(
         allocator,
         "{s}__{s}__{d}",
-        .{ module_prefix.items, mangled_function_name, arity },
+        .{ struct_prefix.items, mangled_function_name, arity },
     ) catch return MacroEvalError.OutOfMemory;
 }
 
@@ -1313,8 +1337,8 @@ fn isCompileTimeIntrinsicExpansion(value: CtValue) bool {
     if (value != .tuple or value.tuple.elems.len != 3) return false;
     const form = value.tuple.elems[0];
     if (form != .atom) return false;
-    return std.mem.eql(u8, form.atom, "__zap_source_graph_structs__") or
-        std.mem.eql(u8, form.atom, "__zap_struct_functions__");
+    return std.mem.eql(u8, form.atom, "source_graph_structs") or
+        std.mem.eql(u8, form.atom, "struct_functions");
 }
 
 fn evalDispatchedClause(
@@ -1326,7 +1350,7 @@ fn evalDispatchedClause(
     callee_caps: ctfe.CapabilitySet,
     callee_name: []const u8,
 ) MacroEvalError!?CtValue {
-    const ctx = env.module_ctx orelse return null;
+    const ctx = env.struct_ctx orelse return null;
     const body = clause.body orelse return null;
     if (!isFunctionBodyComptimeSafe(body)) return null;
 
@@ -1338,10 +1362,10 @@ fn evalDispatchedClause(
 
     var child_env = Env.init(env.alloc, env.store);
     defer child_env.deinit();
-    child_env.module_ctx = .{
+    child_env.struct_ctx = .{
         .graph = ctx.graph,
         .interner = ctx.interner,
-        .current_module_scope = callee_scope,
+        .current_struct_scope = callee_scope,
     };
     child_env.compiled_program = env.compiled_program;
     child_env.dispatch_depth = env.dispatch_depth + 1;
@@ -1444,7 +1468,7 @@ const COMPTIME_DISPATCH_MAX_DEPTH: u32 = 64;
 
 /// Try to resolve and interpret a Zap-side function call at comptime.
 /// Returns the function body's evaluated result, or null when:
-///   - no module context is available (eval is not running for a
+///   - no struct context is available (eval is not running for a
 ///     macro expansion)
 ///   - the function family isn't found in the current scope chain
 ///   - the function body contains constructs the comptime evaluator
@@ -1455,10 +1479,10 @@ fn dispatchComptimeCall(
     form_name: []const u8,
     arg_forms: []const CtValue,
 ) MacroEvalError!?CtValue {
-    const ctx = env.module_ctx orelse return null;
+    const ctx = env.struct_ctx orelse return null;
     if (env.dispatch_depth >= COMPTIME_DISPATCH_MAX_DEPTH) return null;
 
-    const scope_id = ctx.current_module_scope orelse ctx.graph.prelude_scope;
+    const scope_id = ctx.current_struct_scope orelse ctx.graph.prelude_scope;
     const name_id = ctx.interner.intern(form_name) catch return null;
     const arity: u32 = @intCast(arg_forms.len);
 
@@ -1539,12 +1563,12 @@ fn dispatchComptimeCall(
     }
 
     // Spin up a child env that inherits the same store, dispatch
-    // depth (incremented), and module_ctx, but starts with a fresh
+    // depth (incremented), and struct_ctx, but starts with a fresh
     // bindings map populated only with the callee's parameters. The
     // child's bindings can't leak into the caller's scope.
     var child_env = Env.init(env.alloc, env.store);
     defer child_env.deinit();
-    child_env.module_ctx = env.module_ctx;
+    child_env.struct_ctx = env.struct_ctx;
     child_env.compiled_program = env.compiled_program;
     child_env.dispatch_depth = env.dispatch_depth + 1;
     // When dispatching into a macro body, narrow the child env's
@@ -1682,7 +1706,7 @@ fn bindForPattern(env: *Env, pattern: CtValue, elem: CtValue) !?[]const u8 {
     return null;
 }
 
-/// `__zap_atom_name__(atom_value)`: extract the bare name string
+/// `atom_name(atom_value)`: extract the bare name string
 /// from an atom CtValue (or AST-wrapped atom literal). The leading
 /// `:` that distinguishes literal atoms from variable references in
 /// the AST encoding is stripped. Returns the string CtValue;
@@ -1697,7 +1721,7 @@ fn atomNameIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtValue {
     return CtValue{ .string = buf };
 }
 
-/// `__zap_slugify__(string_value)`: convert a string to a snake-
+/// `slugify(string_value)`: convert a string to a snake-
 /// case identifier suitable for use as a function name. Spaces,
 /// dashes, and other non-alphanumerics become underscores; uppercase
 /// letters become lowercase. Returns the string CtValue.
@@ -1709,7 +1733,7 @@ fn slugifyIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtValue {
     return CtValue{ .string = out };
 }
 
-/// `__zap_intern_atom__(string_value)`: convert a string to an atom
+/// `intern_atom(string_value)`: convert a string to an atom
 /// CtValue (with the `:` prefix that distinguishes literal atoms
 /// from variable refs in the AST encoding). Used by macros that
 /// build a function name as a string and need to splice it into
@@ -1792,25 +1816,25 @@ fn ctMapKeyEql(left_raw: CtValue, right_raw: CtValue) bool {
     return left.eql(right);
 }
 
-fn moduleIntrinsicGet(env: *Env, args: []const CtValue) MacroEvalError!CtValue {
+fn structIntrinsicGet(env: *Env, args: []const CtValue) MacroEvalError!CtValue {
     if (args.len != 1) return .nil;
     const name_val = try eval(env, args[0]);
-    const ctx = env.module_ctx orelse return .nil;
-    const scope_id = ctx.current_module_scope orelse return .nil;
+    const ctx = env.struct_ctx orelse return .nil;
+    const scope_id = ctx.current_struct_scope orelse return .nil;
     const mod_entry = ctx.graph.findStructByScope(scope_id) orelse return .nil;
 
     const name_str = extractAtomName(name_val) orelse return .nil;
     const name_id = ctx.interner.intern(name_str) catch return .nil;
-    const cv_opt = ctx.graph.getModuleAttribute(mod_entry, name_id) catch return .nil;
+    const cv_opt = ctx.graph.getStructAttribute(mod_entry, name_id) catch return .nil;
     const cv = cv_opt orelse return .nil;
     return constValueToCtValue(env, cv) catch .nil;
 }
 
-fn moduleIntrinsicRegister(env: *Env, args: []const CtValue) MacroEvalError!CtValue {
+fn structIntrinsicRegister(env: *Env, args: []const CtValue) MacroEvalError!CtValue {
     if (args.len < 1) return .nil;
     const name_val = try eval(env, args[0]);
-    const ctx = env.module_ctx orelse return .nil;
-    const scope_id = ctx.current_module_scope orelse return .nil;
+    const ctx = env.struct_ctx orelse return .nil;
+    const scope_id = ctx.current_struct_scope orelse return .nil;
     const mod_entry = ctx.graph.findStructByScope(scope_id) orelse return .nil;
 
     const name_str = extractAtomName(name_val) orelse return .nil;
@@ -1824,7 +1848,7 @@ fn sourceGraphStructsIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!
     if (!hasReflectionCapability(env)) {
         env.last_capability_error = std.fmt.allocPrint(
             env.alloc,
-            "macro `{s}` calls `__zap_source_graph_structs__` but does not declare `@requires = [:reflect_source]`",
+            "macro `{s}` calls `source_graph_structs` but does not declare `@requires = [:reflect_source]`",
             .{env.current_macro_name orelse "<top-level>"},
         ) catch return MacroEvalError.EvalFailed;
         return MacroEvalError.EvalFailed;
@@ -1832,7 +1856,7 @@ fn sourceGraphStructsIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!
 
     const paths_raw = try eval(env, args[0]);
     const paths = extractPathFilter(env, paths_raw) catch return .nil;
-    const ctx = env.module_ctx orelse return .nil;
+    const ctx = env.struct_ctx orelse return .nil;
 
     var result_list: std.ArrayListUnmanaged(CtValue) = .empty;
     for (ctx.graph.structs.items) |struct_entry| {
@@ -1851,13 +1875,13 @@ fn structFunctionsIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtV
     if (!hasReflectionCapability(env)) {
         env.last_capability_error = std.fmt.allocPrint(
             env.alloc,
-            "macro `{s}` calls `__zap_struct_functions__` but does not declare `@requires = [:reflect_source]`",
+            "macro `{s}` calls `struct_functions` but does not declare `@requires = [:reflect_source]`",
             .{env.current_macro_name orelse "<top-level>"},
         ) catch return MacroEvalError.EvalFailed;
         return MacroEvalError.EvalFailed;
     }
 
-    const ctx = env.module_ctx orelse return .nil;
+    const ctx = env.struct_ctx orelse return .nil;
     const ref_value = try eval(env, args[0]);
     const struct_name = (try extractStructRefName(env.alloc, ref_value)) orelse return .nil;
     const struct_scope_id = findStructScopeByName(ctx.graph, ctx.interner, struct_name) orelse return .nil;
@@ -1877,7 +1901,7 @@ fn structFunctionsIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtV
 }
 
 fn hasReflectionCapability(env: *const Env) bool {
-    return env.current_macro_caps.has(.reflect_source) or env.current_macro_caps.has(.reflect_module);
+    return env.current_macro_caps.has(.reflect_source) or env.current_macro_caps.has(.reflect_struct);
 }
 
 fn extractPathFilter(env: *Env, value: CtValue) ![]const []const u8 {
@@ -2090,7 +2114,7 @@ fn slugifyString(alloc: Allocator, input: []const u8) ![]const u8 {
     return result;
 }
 
-test "eval: __zap_list_at__ extracts elements with normal and negative indices" {
+test "eval: list_at extracts elements with normal and negative indices" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -2105,30 +2129,30 @@ test "eval: __zap_list_at__ extracts elements with normal and negative indices" 
     });
 
     // list_at(list, 0) → 10
-    const at0 = try ast_data.makeTuple3(alloc, &store, .{ .atom = "__zap_list_at__" }, try ast_data.emptyList(alloc, &store), try ast_data.makeList(alloc, &store, &.{ list, .{ .int = 0 } }));
+    const at0 = try ast_data.makeTuple3(alloc, &store, .{ .atom = "list_at" }, try ast_data.emptyList(alloc, &store), try ast_data.makeList(alloc, &store, &.{ list, .{ .int = 0 } }));
     const r0 = try eval(&env, at0);
     try std.testing.expect(r0 == .int);
     try std.testing.expectEqual(@as(i64, 10), r0.int);
 
     // list_at(list, 2) → 30
-    const at2 = try ast_data.makeTuple3(alloc, &store, .{ .atom = "__zap_list_at__" }, try ast_data.emptyList(alloc, &store), try ast_data.makeList(alloc, &store, &.{ list, .{ .int = 2 } }));
+    const at2 = try ast_data.makeTuple3(alloc, &store, .{ .atom = "list_at" }, try ast_data.emptyList(alloc, &store), try ast_data.makeList(alloc, &store, &.{ list, .{ .int = 2 } }));
     const r2 = try eval(&env, at2);
     try std.testing.expect(r2 == .int);
     try std.testing.expectEqual(@as(i64, 30), r2.int);
 
     // list_at(list, -1) → 30 (last)
-    const at_neg = try ast_data.makeTuple3(alloc, &store, .{ .atom = "__zap_list_at__" }, try ast_data.emptyList(alloc, &store), try ast_data.makeList(alloc, &store, &.{ list, .{ .int = -1 } }));
+    const at_neg = try ast_data.makeTuple3(alloc, &store, .{ .atom = "list_at" }, try ast_data.emptyList(alloc, &store), try ast_data.makeList(alloc, &store, &.{ list, .{ .int = -1 } }));
     const r_neg = try eval(&env, at_neg);
     try std.testing.expect(r_neg == .int);
     try std.testing.expectEqual(@as(i64, 30), r_neg.int);
 
     // list_at(list, 5) → nil (out of range)
-    const at_oor = try ast_data.makeTuple3(alloc, &store, .{ .atom = "__zap_list_at__" }, try ast_data.emptyList(alloc, &store), try ast_data.makeList(alloc, &store, &.{ list, .{ .int = 5 } }));
+    const at_oor = try ast_data.makeTuple3(alloc, &store, .{ .atom = "list_at" }, try ast_data.emptyList(alloc, &store), try ast_data.makeList(alloc, &store, &.{ list, .{ .int = 5 } }));
     const r_oor = try eval(&env, at_oor);
     try std.testing.expect(r_oor == .nil);
 }
 
-test "eval: __zap_list_len__ counts list elements" {
+test "eval: list_length counts list elements" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -2139,20 +2163,20 @@ test "eval: __zap_list_len__ counts list elements" {
     const list3 = try ast_data.makeList(alloc, &store, &.{
         .{ .int = 1 }, .{ .int = 2 }, .{ .int = 3 },
     });
-    const call3 = try ast_data.makeTuple3(alloc, &store, .{ .atom = "__zap_list_len__" }, try ast_data.emptyList(alloc, &store), try ast_data.makeList(alloc, &store, &.{list3}));
+    const call3 = try ast_data.makeTuple3(alloc, &store, .{ .atom = "list_length" }, try ast_data.emptyList(alloc, &store), try ast_data.makeList(alloc, &store, &.{list3}));
     const r3 = try eval(&env, call3);
     try std.testing.expect(r3 == .int);
     try std.testing.expectEqual(@as(i64, 3), r3.int);
 
     // Empty list → 0
     const empty = try ast_data.emptyList(alloc, &store);
-    const call_empty = try ast_data.makeTuple3(alloc, &store, .{ .atom = "__zap_list_len__" }, try ast_data.emptyList(alloc, &store), try ast_data.makeList(alloc, &store, &.{empty}));
+    const call_empty = try ast_data.makeTuple3(alloc, &store, .{ .atom = "list_length" }, try ast_data.emptyList(alloc, &store), try ast_data.makeList(alloc, &store, &.{empty}));
     const r_empty = try eval(&env, call_empty);
     try std.testing.expect(r_empty == .int);
     try std.testing.expectEqual(@as(i64, 0), r_empty.int);
 }
 
-test "eval: __zap_list_concat__ joins two lists" {
+test "eval: list_concat joins two lists" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -2162,7 +2186,7 @@ test "eval: __zap_list_concat__ joins two lists" {
 
     const a = try ast_data.makeList(alloc, &store, &.{ .{ .int = 1 }, .{ .int = 2 } });
     const b = try ast_data.makeList(alloc, &store, &.{ .{ .int = 3 }, .{ .int = 4 } });
-    const call = try ast_data.makeTuple3(alloc, &store, .{ .atom = "__zap_list_concat__" }, try ast_data.emptyList(alloc, &store), try ast_data.makeList(alloc, &store, &.{ a, b }));
+    const call = try ast_data.makeTuple3(alloc, &store, .{ .atom = "list_concat" }, try ast_data.emptyList(alloc, &store), try ast_data.makeList(alloc, &store, &.{ a, b }));
     const r = try eval(&env, call);
     try std.testing.expect(r == .list);
     try std.testing.expectEqual(@as(usize, 4), r.list.elems.len);
@@ -2171,13 +2195,13 @@ test "eval: __zap_list_concat__ joins two lists" {
 
     // Concat with nil — treats nil as empty so callers can concat
     // an optional list without an outer guard.
-    const call_with_nil = try ast_data.makeTuple3(alloc, &store, .{ .atom = "__zap_list_concat__" }, try ast_data.emptyList(alloc, &store), try ast_data.makeList(alloc, &store, &.{ a, .nil }));
+    const call_with_nil = try ast_data.makeTuple3(alloc, &store, .{ .atom = "list_concat" }, try ast_data.emptyList(alloc, &store), try ast_data.makeList(alloc, &store, &.{ a, .nil }));
     const r2 = try eval(&env, call_with_nil);
     try std.testing.expect(r2 == .list);
     try std.testing.expectEqual(@as(usize, 2), r2.list.elems.len);
 }
 
-test "eval: __zap_list_flatten__ unnests one level" {
+test "eval: list_flatten unnests one level" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -2190,7 +2214,7 @@ test "eval: __zap_list_flatten__ unnests one level" {
     const empty = try ast_data.emptyList(alloc, &store);
     const outer = try ast_data.makeList(alloc, &store, &.{ inner_a, empty, inner_b });
 
-    const call = try ast_data.makeTuple3(alloc, &store, .{ .atom = "__zap_list_flatten__" }, try ast_data.emptyList(alloc, &store), try ast_data.makeList(alloc, &store, &.{outer}));
+    const call = try ast_data.makeTuple3(alloc, &store, .{ .atom = "list_flatten" }, try ast_data.emptyList(alloc, &store), try ast_data.makeList(alloc, &store, &.{outer}));
     const r = try eval(&env, call);
     try std.testing.expect(r == .list);
     try std.testing.expectEqual(@as(usize, 3), r.list.elems.len);
@@ -2199,7 +2223,7 @@ test "eval: __zap_list_flatten__ unnests one level" {
     try std.testing.expectEqual(@as(i64, 3), r.list.elems[2].int);
 }
 
-test "eval: __zap_list_empty__ distinguishes empty from non-empty" {
+test "eval: list_empty? distinguishes empty from non-empty" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -2208,19 +2232,19 @@ test "eval: __zap_list_empty__ distinguishes empty from non-empty" {
     defer env.deinit();
 
     const empty = try ast_data.emptyList(alloc, &store);
-    const call_e = try ast_data.makeTuple3(alloc, &store, .{ .atom = "__zap_list_empty__" }, try ast_data.emptyList(alloc, &store), try ast_data.makeList(alloc, &store, &.{empty}));
+    const call_e = try ast_data.makeTuple3(alloc, &store, .{ .atom = "list_empty?" }, try ast_data.emptyList(alloc, &store), try ast_data.makeList(alloc, &store, &.{empty}));
     const r_e = try eval(&env, call_e);
     try std.testing.expect(r_e == .bool_val);
     try std.testing.expectEqual(true, r_e.bool_val);
 
     const nonempty = try ast_data.makeList(alloc, &store, &.{.{ .int = 1 }});
-    const call_n = try ast_data.makeTuple3(alloc, &store, .{ .atom = "__zap_list_empty__" }, try ast_data.emptyList(alloc, &store), try ast_data.makeList(alloc, &store, &.{nonempty}));
+    const call_n = try ast_data.makeTuple3(alloc, &store, .{ .atom = "list_empty?" }, try ast_data.emptyList(alloc, &store), try ast_data.makeList(alloc, &store, &.{nonempty}));
     const r_n = try eval(&env, call_n);
     try std.testing.expect(r_n == .bool_val);
     try std.testing.expectEqual(false, r_n.bool_val);
 }
 
-test "eval: __zap_map_get__ returns matching value or default" {
+test "eval: map_get returns matching value or default" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -2234,13 +2258,13 @@ test "eval: __zap_map_get__ returns matching value or default" {
     const map_value = CtValue{ .map = .{ .alloc_id = store.alloc(alloc, .map, null), .entries = entries } };
 
     const name_key = try ast_data.makeTuple3(alloc, &store, .{ .atom = ":name" }, try ast_data.emptyList(alloc, &store), .nil);
-    const name_call = try ast_data.makeTuple3(alloc, &store, .{ .atom = "__zap_map_get__" }, try ast_data.emptyList(alloc, &store), try ast_data.makeList(alloc, &store, &.{ map_value, name_key, .{ .string = "" } }));
+    const name_call = try ast_data.makeTuple3(alloc, &store, .{ .atom = "map_get" }, try ast_data.emptyList(alloc, &store), try ast_data.makeList(alloc, &store, &.{ map_value, name_key, .{ .string = "" } }));
     const name_result = try eval(&env, name_call);
     try std.testing.expect(name_result == .string);
     try std.testing.expectEqualStrings("run", name_result.string);
 
     const missing_key = try ast_data.makeTuple3(alloc, &store, .{ .atom = ":missing" }, try ast_data.emptyList(alloc, &store), .nil);
-    const missing_call = try ast_data.makeTuple3(alloc, &store, .{ .atom = "__zap_map_get__" }, try ast_data.emptyList(alloc, &store), try ast_data.makeList(alloc, &store, &.{ map_value, missing_key, .{ .int = -1 } }));
+    const missing_call = try ast_data.makeTuple3(alloc, &store, .{ .atom = "map_get" }, try ast_data.emptyList(alloc, &store), try ast_data.makeList(alloc, &store, &.{ map_value, missing_key, .{ .int = -1 } }));
     const missing_result = try eval(&env, missing_call);
     try std.testing.expect(missing_result == .int);
     try std.testing.expectEqual(@as(i64, -1), missing_result.int);

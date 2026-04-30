@@ -1,3 +1,5 @@
+@native_type = "map"
+
 @doc = """
   Functions for working with maps.
 
@@ -12,8 +14,6 @@
       Map.has_key?(m, :name)   # => true
       Map.size(m)              # => 2
   """
-
-@native_type = "map"
 
 pub struct Map {
   @doc = """

@@ -340,7 +340,7 @@ pub const Lexer = struct {
         }
 
         if (first_char >= 'A' and first_char <= 'Z') {
-            return self.makeToken(.module_identifier, start, self.pos);
+            return self.makeToken(.type_identifier, start, self.pos);
         }
 
         return self.makeToken(.identifier, start, self.pos);
@@ -622,20 +622,20 @@ test "lex string" {
     try std.testing.expectEqualStrings("\"hello world\"", t1.slice(source));
 }
 
-test "lex module identifier" {
-    const source = "Foo Bar MyModule";
+test "lex struct identifier" {
+    const source = "Foo Bar MyStruct";
     var lexer = Lexer.init(source);
 
     const t1 = lexer.next();
-    try std.testing.expectEqual(Token.Tag.module_identifier, t1.tag);
+    try std.testing.expectEqual(Token.Tag.type_identifier, t1.tag);
     try std.testing.expectEqualStrings("Foo", t1.slice(source));
 
     const t2 = lexer.next();
-    try std.testing.expectEqual(Token.Tag.module_identifier, t2.tag);
+    try std.testing.expectEqual(Token.Tag.type_identifier, t2.tag);
 
     const t3 = lexer.next();
-    try std.testing.expectEqual(Token.Tag.module_identifier, t3.tag);
-    try std.testing.expectEqualStrings("MyModule", t3.slice(source));
+    try std.testing.expectEqual(Token.Tag.type_identifier, t3.tag);
+    try std.testing.expectEqualStrings("MyStruct", t3.slice(source));
 }
 
 test "lex braces" {

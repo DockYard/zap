@@ -1,7 +1,7 @@
 //! ZIR Builder — thin driver that calls C-ABI builder functions.
 //!
 //! The actual ZIR encoding logic lives in the Zig fork (~/projects/zig).
-//! This module maps Zap IR instructions to C-ABI calls exported by
+//! This struct maps Zap IR instructions to C-ABI calls exported by
 //! zir_api.zig in that fork.
 
 const std = @import("std");
@@ -136,7 +136,7 @@ extern "c" fn zir_builder_emit_param_imported_type(handle: ?*ZirBuilderHandle, p
 // Emit a parameter whose type is `@This()` — a self-reference to the
 // current file's root struct. Required for the `.primary` classification
 // (the method's own enclosing Zap struct as a parameter type), since
-// `@import(self_name)` is rejected by Zig's build module system.
+// `@import(self_name)` is rejected by Zig's build struct system.
 extern "c" fn zir_builder_emit_param_this_type(handle: ?*ZirBuilderHandle, param_name_ptr: [*]const u8, param_name_len: u32) u32;
 
 // Tuple return type
@@ -261,11 +261,11 @@ fn indexFieldName(index: anytype) struct { ptr: [*]const u8, len: u32 } {
 // Runtime sub-namespace registry
 //
 // Single source of truth for the names of `zap_runtime`'s internal
-// modules that the ZIR builder reaches into when lowering. Each entry
+// structs that the ZIR builder reaches into when lowering. Each entry
 // pairs the name string with its byte length, since the C-ABI
 // `zir_builder_emit_field_val` takes both. Use the `emitField`
 // helper to fetch a field on the runtime import without per-call-site
-// string literals — that way adding/renaming a runtime sub-module
+// string literals — that way adding/renaming a runtime sub-struct
 // touches one row here rather than 10+ call sites scattered through
 // `lowerExpr`/`lowerInstruction`.
 // ---------------------------------------------------------------------------
@@ -445,17 +445,17 @@ pub const ZirDriver = struct {
     /// When a closure captures another closure value, this allows the inner function's
     /// capture_get to propagate the closure_function_map across function boundaries.
     capture_closure_function_map: std.AutoHashMapUnmanaged(u64, ir.FunctionId) = .empty,
-    /// Compilation context for per-module ZIR injection.
+    /// Compilation context for per-struct ZIR injection.
     compilation_ctx: ?*ZirContext = null,
-    /// Module currently being emitted (e.g., "IO", "Zest_Case"). Null when emitting root.
-    current_emit_module: ?[]const u8 = null,
+    /// Struct currently being emitted (e.g., "IO", "Zest_Case"). Null when emitting root.
+    current_emit_struct: ?[]const u8 = null,
 
     const ValueRef = union(enum) {
         /// Already-materialized ZIR instruction ref
         inst: u32,
         /// Declaration reference (materialized lazily via decl_ref or @import)
         decl: struct {
-            module_name: ?[]const u8, // null => current module
+            struct_name: ?[]const u8, // null => current struct
             decl_name: []const u8,
         },
     };
@@ -513,7 +513,7 @@ pub const ZirDriver = struct {
     /// tuple_decl with a null operand that crashes Sema's `resolveInst`.
     fn mapTupleElementType(self: *ZirDriver, zig_type: ir.ZigType) u32 {
         if (zig_type == .tuple) {
-            var inner_refs : std.ArrayListUnmanaged(u32) = .empty;
+            var inner_refs: std.ArrayListUnmanaged(u32) = .empty;
             defer inner_refs.deinit(self.allocator);
             for (zig_type.tuple) |inner_elem| {
                 inner_refs.append(self.allocator, self.mapTupleElementType(inner_elem)) catch return 0;
@@ -561,7 +561,7 @@ pub const ZirDriver = struct {
             if (simple != 0) return simple;
             return self.emitImportedTypeRef(zig_type) catch 0;
         }
-        var inner_refs : std.ArrayListUnmanaged(u32) = .empty;
+        var inner_refs: std.ArrayListUnmanaged(u32) = .empty;
         defer inner_refs.deinit(self.allocator);
         for (zig_type.tuple) |inner_elem| {
             inner_refs.append(self.allocator, self.emitBodyLocalTupleType(inner_elem)) catch return 0;
@@ -574,8 +574,8 @@ pub const ZirDriver = struct {
         try self.local_refs.put(self.allocator, local, .{ .inst = ref });
     }
 
-    fn setLocalDecl(self: *ZirDriver, local: ir.LocalId, module_name: ?[]const u8, decl_name: []const u8) !void {
-        try self.local_refs.put(self.allocator, local, .{ .decl = .{ .module_name = module_name, .decl_name = decl_name } });
+    fn setLocalDecl(self: *ZirDriver, local: ir.LocalId, struct_name: ?[]const u8, decl_name: []const u8) !void {
+        try self.local_refs.put(self.allocator, local, .{ .decl = .{ .struct_name = struct_name, .decl_name = decl_name } });
     }
 
     fn beginCapture(self: *ZirDriver) void {
@@ -589,13 +589,10 @@ pub const ZirDriver = struct {
         return result;
     }
 
-    /// Map Zap-facing module names to runtime struct names. Each Zap
-    /// module (IO, Integer, Float, etc.) maps 1:1 to the runtime
+    /// Map Zap-facing struct names to runtime struct names. Each Zap
+    /// struct (IO, Integer, Float, etc.) maps 1:1 to the runtime
     /// struct of the same name — the call site can pass `mod_name`
     /// straight through to `field_val`.
-
-
-
     fn emitAllocatorRef(self: *ZirDriver) BuildError!u32 {
         const std_import = zir_builder_emit_import(self.handle, "std", 3);
         if (std_import == error_ref) return error.EmitFailed;
@@ -658,11 +655,21 @@ pub const ZirDriver = struct {
             .function, .tagged_union, .ptr, .optional, .any => return error.EmitFailed,
             // Primitives are handled above by mapReturnType — they never reach here
             .bool_type,
-            .i8, .i16, .i32, .i64,
-            .u8, .u16, .u32, .u64,
-            .usize, .isize,
-            .f16, .f32, .f64,
-            .string, .atom,
+            .i8,
+            .i16,
+            .i32,
+            .i64,
+            .u8,
+            .u16,
+            .u32,
+            .u64,
+            .usize,
+            .isize,
+            .f16,
+            .f32,
+            .f64,
+            .string,
+            .atom,
             => unreachable,
         };
     }
@@ -676,8 +683,8 @@ pub const ZirDriver = struct {
         return switch (value) {
             .inst => |r| r,
             .decl => |d| {
-                if (d.module_name) |mod| {
-                    return self.emitCrossModuleRef(mod, d.decl_name);
+                if (d.struct_name) |mod| {
+                    return self.emitCrossStructRef(mod, d.decl_name);
                 }
                 const ref = zir_builder_emit_decl_ref(self.handle, d.decl_name.ptr, @intCast(d.decl_name.len));
                 if (ref == error_ref) return error.EmitFailed;
@@ -725,24 +732,24 @@ pub const ZirDriver = struct {
     }
 
     /// Emit struct type declarations for all struct type_defs in the IR program.
-    /// These become named constants in the module's ZIR (e.g., `const Point = struct { x: i64, y: i64 };`).
-    /// Check if any function in the given module references a struct type by name.
-    fn moduleUsesStruct(self: *const ZirDriver, module_name: []const u8, struct_name: []const u8) bool {
+    /// These become named constants in the struct's ZIR (e.g., `const Point = struct { x: i64, y: i64 };`).
+    /// Check if any function in the given struct references a struct type by name.
+    fn structUsesStruct(self: *const ZirDriver, owner_struct: []const u8, struct_name: []const u8) bool {
         const prog = self.program orelse return false;
         for (prog.functions) |func| {
-            // Check if the function belongs to this module
-            const func_module = if (std.mem.lastIndexOf(u8, func.name, "__")) |sep|
+            // Check if the function belongs to this struct
+            const func_struct = if (std.mem.lastIndexOf(u8, func.name, "__")) |sep|
                 func.name[0..sep]
             else
                 func.name;
             // Convert dots to underscores for comparison
             var buf: [256]u8 = undefined;
-            if (func_module.len > buf.len) continue;
-            @memcpy(buf[0..func_module.len], func_module);
-            for (buf[0..func_module.len]) |*ch| {
+            if (func_struct.len > buf.len) continue;
+            @memcpy(buf[0..func_struct.len], func_struct);
+            for (buf[0..func_struct.len]) |*ch| {
                 if (ch.* == '.') ch.* = '_';
             }
-            if (!std.mem.eql(u8, buf[0..func_module.len], module_name)) continue;
+            if (!std.mem.eql(u8, buf[0..func_struct.len], owner_struct)) continue;
 
             // Check if return type references this struct
             if (std.meta.activeTag(func.return_type) == .struct_ref) {
@@ -760,7 +767,7 @@ pub const ZirDriver = struct {
 
     fn emitStructTypeDecls(self: *ZirDriver) !void {
         const prog = self.program orelse return;
-        const current_module = self.current_emit_module orelse return;
+        const current_struct = self.current_emit_struct orelse return;
         // Track emitted struct names to avoid duplicates
         var emitted = std.StringHashMap(void).init(self.allocator);
         defer emitted.deinit();
@@ -778,7 +785,7 @@ pub const ZirDriver = struct {
 
         for (prog.type_defs) |type_def| {
             var buf: [256]u8 = undefined;
-            const cls = classifyTypeDef(type_def.name, current_module, &buf);
+            const cls = classifyTypeDef(type_def.name, current_struct, &buf);
             switch (cls) {
                 .primary => {
                     if (primary_def != null) continue; // two claims; first wins
@@ -815,17 +822,17 @@ pub const ZirDriver = struct {
     /// Convert a type_def name to its emission-namespace form (dots →
     /// underscores) and classify against the current emission. Writes
     /// into `scratch` to avoid a heap allocation on the hot path.
-    fn classifyTypeDef(name: []const u8, current_module: []const u8, scratch: []u8) TypeDefClass {
+    fn classifyTypeDef(name: []const u8, current_struct: []const u8, scratch: []u8) TypeDefClass {
         if (name.len > scratch.len) return .foreign;
         @memcpy(scratch[0..name.len], name);
         for (scratch[0..name.len]) |*ch| {
             if (ch.* == '.') ch.* = '_';
         }
         const underscore = scratch[0..name.len];
-        if (std.mem.eql(u8, underscore, current_module)) return .primary;
-        if (underscore.len > current_module.len + 1 and
-            std.mem.startsWith(u8, underscore, current_module) and
-            underscore[current_module.len] == '_')
+        if (std.mem.eql(u8, underscore, current_struct)) return .primary;
+        if (underscore.len > current_struct.len + 1 and
+            std.mem.startsWith(u8, underscore, current_struct) and
+            underscore[current_struct.len] == '_')
         {
             return .nested;
         }
@@ -950,11 +957,11 @@ pub const ZirDriver = struct {
     }
 
     /// Convert a dotted struct prefix (e.g. "Zap.Env" → "Zap_Env",
-    /// "IO.Mode" → "IO") into the underscore-separated ZIR module name,
+    /// "IO.Mode" → "IO") into the underscore-separated ZIR struct name,
     /// writing the result into the caller-provided buffer. Returns the
     /// borrowed slice into the buffer, or null when the prefix is too
     /// long for the buffer.
-    fn dottedPrefixToModuleName(prefix: []const u8, buf: []u8) ?[]const u8 {
+    fn dottedPrefixToImportName(prefix: []const u8, buf: []u8) ?[]const u8 {
         if (prefix.len > buf.len) return null;
         @memcpy(buf[0..prefix.len], prefix);
         for (buf[0..prefix.len]) |*ch| {
@@ -971,11 +978,11 @@ pub const ZirDriver = struct {
     /// top-level structs from other Zap source units, structs nested
     /// inside other emissions — are NOT in this emission's
     /// namespace; consumers reach them via `@import("...")`.
-    fn structIsInCurrentModule(self: *const ZirDriver, type_name: []const u8) bool {
+    fn structIsInCurrentEmitStruct(self: *const ZirDriver, type_name: []const u8) bool {
         if (self.findStructDef(type_name) == null) return false;
-        const current_module = self.current_emit_module orelse return false;
+        const current_struct = self.current_emit_struct orelse return false;
         var buf: [256]u8 = undefined;
-        return classifyTypeDef(type_name, current_module, &buf) != .foreign;
+        return classifyTypeDef(type_name, current_struct, &buf) != .foreign;
     }
 
     /// Emit a ZIR ref to a struct type by name. Dispatches on whether
@@ -984,7 +991,7 @@ pub const ZirDriver = struct {
     /// or foreign nested-in-other-emission. Each case maps to a
     /// specific ZIR sequence:
     ///
-    /// - **Primary** (the file IS this struct): `@import(current_emit_module)`
+    /// - **Primary** (the file IS this struct): `@import(current_emit_struct)`
     ///   — Zig's `@import` returns the canonical root struct type for
     ///   any file, so importing one's own emission yields the same
     ///   `InternPool.Index` as foreign imports.
@@ -994,7 +1001,7 @@ pub const ZirDriver = struct {
     /// - **Foreign top-level** (no dot): `@import(name)` — the
     ///   foreign emission's file IS that struct, so its import is
     ///   directly the type.
-    /// - **Foreign nested**: `@import(prefix_module).short_name` —
+    /// - **Foreign nested**: `@import(prefix_struct).short_name` —
     ///   the foreign emission's file is the prefix struct, and the
     ///   nested decl is reached as a field on it.
     fn emitStructTypeRef(self: *const ZirDriver, name: []const u8) BuildError!u32 {
@@ -1003,7 +1010,7 @@ pub const ZirDriver = struct {
         else
             name;
 
-        const current_module = self.current_emit_module orelse {
+        const current_struct = self.current_emit_struct orelse {
             // No current emission context (e.g. top-level program
             // header) — fall back to import-by-name. Same behavior
             // as a foreign top-level reference.
@@ -1013,9 +1020,9 @@ pub const ZirDriver = struct {
         };
 
         var buf: [256]u8 = undefined;
-        switch (classifyTypeDef(name, current_module, &buf)) {
+        switch (classifyTypeDef(name, current_struct, &buf)) {
             .primary => {
-                const ref = zir_builder_emit_import(self.handle, current_module.ptr, @intCast(current_module.len));
+                const ref = zir_builder_emit_import(self.handle, current_struct.ptr, @intCast(current_struct.len));
                 if (ref == error_ref) return error.EmitFailed;
                 return ref;
             },
@@ -1027,9 +1034,9 @@ pub const ZirDriver = struct {
             .foreign => {
                 if (std.mem.lastIndexOf(u8, name, ".")) |_| {
                     // Foreign nested: `@import(prefix).short_name`
-                    var module_name_buf: [256]u8 = undefined;
-                    const module_name = structToModuleName(name, &module_name_buf);
-                    const import_ref = zir_builder_emit_import(self.handle, module_name.ptr, @intCast(module_name.len));
+                    var struct_name_buf: [256]u8 = undefined;
+                    const struct_name = structToImportName(name, &struct_name_buf);
+                    const import_ref = zir_builder_emit_import(self.handle, struct_name.ptr, @intCast(struct_name.len));
                     if (import_ref == error_ref) return error.EmitFailed;
                     const ref = zir_builder_emit_field_val(self.handle, import_ref, short_name.ptr, @intCast(short_name.len));
                     if (ref == error_ref) return error.EmitFailed;
@@ -1043,14 +1050,14 @@ pub const ZirDriver = struct {
         }
     }
 
-    /// Convert a struct_ref name to the ZIR module name that defines it,
+    /// Convert a struct_ref name to the ZIR struct name that defines it,
     /// writing the result into the caller-provided buffer.
     /// "Range" → "Range", "Zap.Env" → "Zap_Env", "IO.Mode" → "IO".
     /// Returns the borrowed slice into the buffer (or `type_name` itself
     /// when the name is already a single segment).
-    fn structToModuleName(type_name: []const u8, buf: []u8) []const u8 {
+    fn structToImportName(type_name: []const u8, buf: []u8) []const u8 {
         if (std.mem.lastIndexOf(u8, type_name, ".")) |dot_idx| {
-            return dottedPrefixToModuleName(type_name[0..dot_idx], buf) orelse type_name;
+            return dottedPrefixToImportName(type_name[0..dot_idx], buf) orelse type_name;
         }
         return type_name;
     }
@@ -1073,11 +1080,11 @@ pub const ZirDriver = struct {
     fn refForValueLocal(self: *ZirDriver, local: ir.LocalId) BuildError!u32 {
         if (self.reuse_backed_tuple_locals.get(local)) |arity| {
             const ptr_ref = try self.refForLocal(local);
-            var names_ptrs : std.ArrayListUnmanaged([*]const u8) = .empty;
+            var names_ptrs: std.ArrayListUnmanaged([*]const u8) = .empty;
             defer names_ptrs.deinit(self.allocator);
-            var names_lens : std.ArrayListUnmanaged(u32) = .empty;
+            var names_lens: std.ArrayListUnmanaged(u32) = .empty;
             defer names_lens.deinit(self.allocator);
-            var values : std.ArrayListUnmanaged(u32) = .empty;
+            var values: std.ArrayListUnmanaged(u32) = .empty;
             defer values.deinit(self.allocator);
             for (0..arity) |i| {
                 const name = indexFieldName(i);
@@ -1106,11 +1113,11 @@ pub const ZirDriver = struct {
             const ptr_ref = try self.refForLocal(local);
             const struct_def = self.findStructDef(type_name) orelse return error.EmitFailed;
 
-            var names_ptrs : std.ArrayListUnmanaged([*]const u8) = .empty;
+            var names_ptrs: std.ArrayListUnmanaged([*]const u8) = .empty;
             defer names_ptrs.deinit(self.allocator);
-            var names_lens : std.ArrayListUnmanaged(u32) = .empty;
+            var names_lens: std.ArrayListUnmanaged(u32) = .empty;
             defer names_lens.deinit(self.allocator);
-            var values : std.ArrayListUnmanaged(u32) = .empty;
+            var values: std.ArrayListUnmanaged(u32) = .empty;
             defer values.deinit(self.allocator);
 
             for (struct_def.fields) |field| {
@@ -1145,18 +1152,18 @@ pub const ZirDriver = struct {
     }
 
     /// Find an IR function by its local_name (unmangled name within its
-    /// module). Matches both the exact arity-suffixed form and the bare
-    /// base form. Restricted to functions whose module is *not* the
-    /// current emit module so a bare reference resolves only against
+    /// struct). Matches both the exact arity-suffixed form and the bare
+    /// base form. Restricted to functions whose struct is *not* the
+    /// current emit struct so a bare reference resolves only against
     /// imported names. Used by macro-expanded code that emits a bare
-    /// call to a function brought into scope by `use SomeModule`.
+    /// call to a function brought into scope by `use SomeStruct`.
     fn findFunctionByLocalName(self: *const ZirDriver, local_name: []const u8) ?ir.Function {
         if (self.program) |prog| {
             for (prog.functions) |func| {
-                // Only match functions from OTHER modules
-                if (func.module_name == null) continue;
-                if (self.current_emit_module) |cem| {
-                    if (std.mem.eql(u8, func.module_name.?, cem)) continue;
+                // Only match functions from OTHER structs
+                if (func.struct_name == null) continue;
+                if (self.current_emit_struct) |cem| {
+                    if (std.mem.eql(u8, func.struct_name.?, cem)) continue;
                 }
                 // Exact match on local_name
                 if (func.local_name.len > 0 and std.mem.eql(u8, func.local_name, local_name)) {
@@ -1195,9 +1202,9 @@ pub const ZirDriver = struct {
     /// between the target struct and the function name, two as the
     /// outer separators). We rebuild the prefix `<TargetStruct>_<func>__`
     /// and the suffix `__<arity>` from the call name and scan the
-    /// program for a matching `local_name` whose `module_name` (the
+    /// program for a matching `local_name` whose `struct_name` (the
     /// emitted Zig namespace, which the IR field still calls a
-    /// "module") is the caller struct.
+    /// "struct") is the caller struct.
     fn findMonomorphizedImplFor(self: *const ZirDriver, caller_struct: []const u8, call_name: []const u8) ?ir.Function {
         const sep = std.mem.indexOf(u8, call_name, "__") orelse return null;
         const target_struct = call_name[0..sep];
@@ -1207,7 +1214,7 @@ pub const ZirDriver = struct {
         const arity_suffix = rest[arity_sep..];
         const prog = self.program orelse return null;
         for (prog.functions) |func| {
-            const emit_ns = func.module_name orelse continue;
+            const emit_ns = func.struct_name orelse continue;
             if (!std.mem.eql(u8, emit_ns, caller_struct)) continue;
             const expected_prefix_buf = std.fmt.allocPrint(self.allocator, "{s}_{s}__", .{ target_struct, func_base }) catch continue;
             defer self.allocator.free(expected_prefix_buf);
@@ -1218,18 +1225,18 @@ pub const ZirDriver = struct {
         return null;
     }
 
-    /// Emit a cross-module function reference: @import("TargetModule").local_name
-    fn emitCrossModuleRef(self: *ZirDriver, target_module: []const u8, local_name: []const u8) BuildError!u32 {
-        const import_ref = zir_builder_emit_import(self.handle, target_module.ptr, @intCast(target_module.len));
+    /// Emit a cross-struct function reference: @import("TargetStruct").local_name
+    fn emitCrossStructRef(self: *ZirDriver, target_struct: []const u8, local_name: []const u8) BuildError!u32 {
+        const import_ref = zir_builder_emit_import(self.handle, target_struct.ptr, @intCast(target_struct.len));
         if (import_ref == error_ref) return error.EmitFailed;
         const fn_ref = zir_builder_emit_field_val(self.handle, import_ref, local_name.ptr, @intCast(local_name.len));
         if (fn_ref == error_ref) return error.EmitFailed;
         return fn_ref;
     }
 
-    /// Emit a cross-module function call: @import("TargetModule").local_name(args)
-    fn emitCrossModuleCall(self: *ZirDriver, target_module: []const u8, local_name: []const u8, arg_refs: []const u32) BuildError!u32 {
-        const import_ref = zir_builder_emit_import(self.handle, target_module.ptr, @intCast(target_module.len));
+    /// Emit a cross-struct function call: @import("TargetStruct").local_name(args)
+    fn emitCrossStructCall(self: *ZirDriver, target_struct: []const u8, local_name: []const u8, arg_refs: []const u32) BuildError!u32 {
+        const import_ref = zir_builder_emit_import(self.handle, target_struct.ptr, @intCast(target_struct.len));
         if (import_ref == error_ref) return error.EmitFailed;
         const fn_ref = zir_builder_emit_field_val(self.handle, import_ref, local_name.ptr, @intCast(local_name.len));
         if (fn_ref == error_ref) return error.EmitFailed;
@@ -1240,7 +1247,7 @@ pub const ZirDriver = struct {
 
     const NamespaceChild = struct {
         name: []const u8, // "Runtime" (short name for re-export)
-        full_module: []const u8, // "Zest_Runtime" (full module name for @import)
+        full_struct: []const u8, // "Zest_Runtime" (full struct name for @import)
     };
 
     /// Deduplicate a function list by local_name, keeping the last occurrence.
@@ -1272,34 +1279,33 @@ pub const ZirDriver = struct {
 
         const ctx = self.compilation_ctx;
 
-
-        // ── Step 1: Group functions by module ────────────────────────
-        var module_funcs = std.StringHashMap(std.ArrayListUnmanaged(ir.Function)).init(self.allocator);
+        // ── Step 1: Group functions by struct ────────────────────────
+        var struct_funcs = std.StringHashMap(std.ArrayListUnmanaged(ir.Function)).init(self.allocator);
         var root_funcs: std.ArrayListUnmanaged(ir.Function) = .empty;
-        // Track every module name we see (including namespace-only modules
+        // Track every struct name we see (including namespace-only structs
         // with no functions of their own) so re-export emission below can
         // generate parent shells for nested namespaces.
-        var all_module_names = std.StringHashMap(void).init(self.allocator);
+        var all_struct_names = std.StringHashMap(void).init(self.allocator);
 
-        // Deduplicate functions by (module, local_name), keeping the LAST
+        // Deduplicate functions by (struct, local_name), keeping the LAST
         // occurrence. The IR may contain duplicate entries from monomorphization;
         // duplicates cause putNoClobber assertion failures in Zig 0.16's scanNamespace.
         // We keep the last occurrence because decl_ref/decl_val resolve to the final
         // declaration in the namespace.
         {
-            // First pass: collect all functions per module, allowing duplicates.
+            // First pass: collect all functions per struct, allowing duplicates.
             var raw_root_funcs: std.ArrayListUnmanaged(ir.Function) = .empty;
-            var raw_module_funcs = std.StringHashMap(std.ArrayListUnmanaged(ir.Function)).init(self.allocator);
+            var raw_struct_funcs = std.StringHashMap(std.ArrayListUnmanaged(ir.Function)).init(self.allocator);
             for (program.functions) |func| {
-                if (func.module_name) |mod| {
-                    try all_module_names.put(mod, {});
+                if (func.struct_name) |mod| {
+                    try all_struct_names.put(mod, {});
                 }
                 const is_entry = if (program.entry) |eid| func.id == eid else false;
-                if (is_entry or func.module_name == null) {
+                if (is_entry or func.struct_name == null) {
                     try raw_root_funcs.append(self.allocator, func);
                 } else {
-                    const mod = func.module_name.?;
-                    const gop = try raw_module_funcs.getOrPut(mod);
+                    const mod = func.struct_name.?;
+                    const gop = try raw_struct_funcs.getOrPut(mod);
                     if (!gop.found_existing) gop.value_ptr.* = .empty;
                     try gop.value_ptr.append(self.allocator, func);
                 }
@@ -1307,20 +1313,20 @@ pub const ZirDriver = struct {
 
             // Second pass: deduplicate by local_name within each group, keeping last.
             root_funcs = try deduplicateFunctions(self.allocator, raw_root_funcs.items);
-            var raw_iter = raw_module_funcs.iterator();
+            var raw_iter = raw_struct_funcs.iterator();
             while (raw_iter.next()) |entry| {
                 const deduped = try deduplicateFunctions(self.allocator, entry.value_ptr.items);
-                try module_funcs.put(entry.key_ptr.*, deduped);
+                try struct_funcs.put(entry.key_ptr.*, deduped);
             }
         }
 
-        // ── Step 2: Detect namespace hierarchy for re-export modules ─
-        // Scan every module name (function-bearing and namespace-only) for
-        // parent_child patterns. A parent re-export is generated when a module
+        // ── Step 2: Detect namespace hierarchy for re-export structs ─
+        // Scan every struct name (function-bearing and namespace-only) for
+        // parent_child patterns. A parent re-export is generated when a struct
         // name contains '_'.
         var namespace_children = std.StringHashMap(std.ArrayListUnmanaged(NamespaceChild)).init(self.allocator);
         {
-            var name_iter = all_module_names.iterator();
+            var name_iter = all_struct_names.iterator();
             while (name_iter.next()) |entry| {
                 const mod_name = entry.key_ptr.*;
                 if (std.mem.findScalarLast(u8, mod_name, '_')) |sep| {
@@ -1331,27 +1337,27 @@ pub const ZirDriver = struct {
                     // Avoid duplicate children
                     var already = false;
                     for (gop.value_ptr.items) |existing| {
-                        if (std.mem.eql(u8, existing.full_module, mod_name)) {
+                        if (std.mem.eql(u8, existing.full_struct, mod_name)) {
                             already = true;
                             break;
                         }
                     }
                     if (!already) {
-                        try gop.value_ptr.append(self.allocator, .{ .name = child, .full_module = mod_name });
+                        try gop.value_ptr.append(self.allocator, .{ .name = child, .full_struct = mod_name });
                     }
                 }
             }
         }
 
-        // Register empty stub modules for any namespace name we've seen but
+        // Register empty stub structs for any namespace name we've seen but
         // that has no functions in this program (typically namespace parents
         // whose only purpose is to host children via re-export). This lets
         // `@import("...")` resolve them later.
         if (ctx) |c| {
-            var name_iter2 = all_module_names.iterator();
+            var name_iter2 = all_struct_names.iterator();
             while (name_iter2.next()) |entry| {
                 const mod_name = entry.key_ptr.*;
-                if (!module_funcs.contains(mod_name)) {
+                if (!struct_funcs.contains(mod_name)) {
                     const mod_name_z = try self.allocator.dupeZ(u8, mod_name);
                     defer self.allocator.free(mod_name_z);
                     const stub = "comptime {}\n";
@@ -1360,9 +1366,9 @@ pub const ZirDriver = struct {
             }
         }
 
-        // ── Step 3: Emit each leaf module as its own ZIR module ──────
+        // ── Step 3: Emit each leaf struct as its own ZIR struct ──────
         if (ctx) |c| {
-            var leaf_iter = module_funcs.iterator();
+            var leaf_iter = struct_funcs.iterator();
             while (leaf_iter.next()) |entry| {
                 const mod_name = entry.key_ptr.*;
                 const funcs = entry.value_ptr.items;
@@ -1377,7 +1383,7 @@ pub const ZirDriver = struct {
 
                 const mod_handle = zir_builder_create() orelse return error.ZirCreateFailed;
                 const saved_handle = self.handle;
-                self.current_emit_module = mod_name;
+                self.current_emit_struct = mod_name;
                 self.handle = mod_handle;
 
                 // Emit struct type declarations before functions so they
@@ -1396,14 +1402,14 @@ pub const ZirDriver = struct {
                 }
 
                 self.handle = saved_handle;
-                self.current_emit_module = null;
+                self.current_emit_struct = null;
             }
 
             // ── Step 3.5: Emit fields-only top-level structs ─────────
             // The file-IS-the-struct architecture requires every
             // Zap struct that consumers reference via `@import("X")`
             // to have a registered ZIR file. Step 3 covers structs
-            // with at least one function (`module_funcs.contains`),
+            // with at least one function (`struct_funcs.contains`),
             // but top-level data structs (e.g. `pub struct Point {
             // x, y }` with no methods) have empty function lists and
             // are skipped there. Emit a fields-only ZIR file for
@@ -1417,7 +1423,7 @@ pub const ZirDriver = struct {
                 // inside their parent's ZIR by `emitNestedTypeDecl`.
                 if (std.mem.indexOf(u8, type_def.name, ".") != null) continue;
                 // Skip any struct already covered by Step 3.
-                if (module_funcs.contains(type_def.name)) continue;
+                if (struct_funcs.contains(type_def.name)) continue;
 
                 const struct_name_z = try self.allocator.dupeZ(u8, type_def.name);
                 defer self.allocator.free(struct_name_z);
@@ -1428,7 +1434,7 @@ pub const ZirDriver = struct {
 
                 const struct_handle = zir_builder_create() orelse return error.ZirCreateFailed;
                 const saved_handle = self.handle;
-                self.current_emit_module = type_def.name;
+                self.current_emit_struct = type_def.name;
                 self.handle = struct_handle;
 
                 try self.emitStructTypeDecls();
@@ -1438,28 +1444,28 @@ pub const ZirDriver = struct {
                 }
 
                 self.handle = saved_handle;
-                self.current_emit_module = null;
+                self.current_emit_struct = null;
             }
 
-            // ── Step 4: Generate namespace re-export modules ─────────
-            // Skip parents that are also leaf modules (they already have ZIR injected).
+            // ── Step 4: Generate namespace re-export structs ─────────
+            // Skip parents that are also leaf structs (they already have ZIR injected).
             var ns_iter = namespace_children.iterator();
             while (ns_iter.next()) |entry| {
                 const parent_name = entry.key_ptr.*;
-                // If parent is a leaf module with ZIR functions, skip re-export
+                // If parent is a leaf struct with ZIR functions, skip re-export
                 // (can't overwrite its ZIR with source text)
-                if (module_funcs.contains(parent_name)) continue;
-                // If parent is a namespace-only module already registered as
+                if (struct_funcs.contains(parent_name)) continue;
+                // If parent is a namespace-only struct already registered as
                 // an empty stub above, the re-export source below will replace
                 // it — no extra work needed here.
-                if (all_module_names.contains(parent_name) and !module_funcs.contains(parent_name)) {
+                if (all_struct_names.contains(parent_name) and !struct_funcs.contains(parent_name)) {
                     // Replace the empty stub with the re-export source
                 }
 
                 const children = entry.value_ptr.items;
                 var source_buf: std.ArrayListUnmanaged(u8) = .empty;
                 for (children) |child| {
-                    const line = try std.fmt.allocPrint(self.allocator, "pub const {s} = @import(\"{s}\");\n", .{ child.name, child.full_module });
+                    const line = try std.fmt.allocPrint(self.allocator, "pub const {s} = @import(\"{s}\");\n", .{ child.name, child.full_struct });
                     try source_buf.appendSlice(self.allocator, line);
                 }
                 const source = try source_buf.toOwnedSlice(self.allocator);
@@ -1473,8 +1479,8 @@ pub const ZirDriver = struct {
             }
         }
 
-        // ── Step 5: Emit root module functions ───────────────────────
-        self.current_emit_module = null;
+        // ── Step 5: Emit root struct functions ───────────────────────
+        self.current_emit_struct = null;
         for (root_funcs.items) |func| {
             self.reuse_backed_struct_locals.clearRetainingCapacity();
             self.reuse_backed_union_locals.clearRetainingCapacity();
@@ -2036,7 +2042,7 @@ pub const ZirDriver = struct {
         if (std.meta.activeTag(param.type_expr) == .struct_ref) {
             const name = param.type_expr.struct_ref;
             if (self.findStructDef(name) != null) {
-                if (self.current_emit_module) |current| {
+                if (self.current_emit_struct) |current| {
                     var buf: [256]u8 = undefined;
                     const cls = classifyTypeDef(name, current, &buf);
                     const short_name = if (std.mem.lastIndexOf(u8, name, ".")) |dot_idx|
@@ -2047,9 +2053,9 @@ pub const ZirDriver = struct {
                         .primary => {
                             // The file IS this struct — emit
                             // `param: @This()`. `@import(self)` is
-                            // rejected by Zig's build module system
-                            // ("no module named X available within
-                            // module X"); `@This()` is the canonical
+                            // rejected by Zig's build struct system
+                            // ("no struct named X available within
+                            // struct X"); `@This()` is the canonical
                             // self-reference, and the resulting type
                             // identity matches `Zcu.fileRootType` so
                             // foreign emissions that import this
@@ -2080,14 +2086,14 @@ pub const ZirDriver = struct {
                             if (std.mem.lastIndexOf(u8, name, ".")) |_| {
                                 // Foreign nested:
                                 // `@import(prefix).short_name`.
-                                var module_name_buf: [256]u8 = undefined;
-                                const module_name = structToModuleName(name, &module_name_buf);
+                                var struct_name_buf: [256]u8 = undefined;
+                                const struct_name = structToImportName(name, &struct_name_buf);
                                 const ref = zir_builder_emit_param_imported_type(
                                     self.handle,
                                     param.name.ptr,
                                     @intCast(param.name.len),
-                                    module_name.ptr,
-                                    @intCast(module_name.len),
+                                    struct_name.ptr,
+                                    @intCast(struct_name.len),
                                     short_name.ptr,
                                     @intCast(short_name.len),
                                 );
@@ -2263,8 +2269,8 @@ pub const ZirDriver = struct {
                     }
                     self.current_ret_type = 1;
                     self.cached_union_ret_type_ref = zir_builder_get_union_ret_type_ref(self.handle);
-                } else if (self.structIsInCurrentModule(name)) {
-                    // Nominal struct type declared in the current module:
+                } else if (self.structIsInCurrentEmitStruct(name)) {
+                    // Nominal struct type declared in the current struct:
                     // reference via decl_val.
                     const short_name = if (std.mem.lastIndexOf(u8, name, ".")) |dot_idx|
                         name[dot_idx + 1 ..]
@@ -2277,7 +2283,7 @@ pub const ZirDriver = struct {
                     // Cross-emission struct return type — dispatch
                     // by classification so the import / `@This()` /
                     // field access lands inside the ret_ty body.
-                    if (self.current_emit_module) |current| {
+                    if (self.current_emit_struct) |current| {
                         var buf: [256]u8 = undefined;
                         const cls = classifyTypeDef(name, current, &buf);
                         const short_name = if (std.mem.lastIndexOf(u8, name, ".")) |dot_idx|
@@ -2295,9 +2301,9 @@ pub const ZirDriver = struct {
                             },
                             .foreign => {
                                 if (std.mem.lastIndexOf(u8, name, ".")) |_| {
-                                    var module_name_buf: [256]u8 = undefined;
-                                    const module_name = structToModuleName(name, &module_name_buf);
-                                    if (zir_builder_set_imported_return_type(self.handle, module_name.ptr, @intCast(module_name.len), short_name.ptr, @intCast(short_name.len)) != 0)
+                                    var struct_name_buf: [256]u8 = undefined;
+                                    const struct_name = structToImportName(name, &struct_name_buf);
+                                    if (zir_builder_set_imported_return_type(self.handle, struct_name.ptr, @intCast(struct_name.len), short_name.ptr, @intCast(short_name.len)) != 0)
                                         return error.EmitFailed;
                                 } else {
                                     if (zir_builder_set_imported_root_return_type(self.handle, name.ptr, @intCast(name.len)) != 0)
@@ -2309,13 +2315,13 @@ pub const ZirDriver = struct {
                     } else {
                         // No current emission — top-level / root-program
                         // function. Fall back to the legacy path.
-                        var module_name_buf: [256]u8 = undefined;
-                        const module_name = structToModuleName(name, &module_name_buf);
+                        var struct_name_buf: [256]u8 = undefined;
+                        const struct_name = structToImportName(name, &struct_name_buf);
                         const short_name = if (std.mem.lastIndexOf(u8, name, ".")) |dot_idx|
                             name[dot_idx + 1 ..]
                         else
                             name;
-                        if (zir_builder_set_imported_return_type(self.handle, module_name.ptr, @intCast(module_name.len), short_name.ptr, @intCast(short_name.len)) != 0)
+                        if (zir_builder_set_imported_return_type(self.handle, struct_name.ptr, @intCast(struct_name.len), short_name.ptr, @intCast(short_name.len)) != 0)
                             return error.EmitFailed;
                         self.current_ret_type = 1;
                     }
@@ -2348,19 +2354,32 @@ pub const ZirDriver = struct {
             },
             // Primitives are handled by mapReturnType — they never reach here.
             // void/nil have ret_type=0 intentionally — they never reach here.
-            .void, .nil, .never, .bool_type,
-            .i8, .i16, .i32, .i64,
-            .u8, .u16, .u32, .u64,
-            .usize, .isize,
-            .f16, .f32, .f64,
-            .string, .atom,
+            .void,
+            .nil,
+            .never,
+            .bool_type,
+            .i8,
+            .i16,
+            .i32,
+            .i64,
+            .u8,
+            .u16,
+            .u32,
+            .u64,
+            .usize,
+            .isize,
+            .f16,
+            .f32,
+            .f64,
+            .string,
+            .atom,
             => unreachable, // handled by mapReturnType
         }
     }
 
     fn emitFunction(self: *ZirDriver, func: ir.Function) !void {
         // Detect the entry point using the program's entry function ID.
-        // When multiple modules define main, only the one matching the
+        // When multiple structs define main, only the one matching the
         // manifest root is emitted as "main" in ZIR.
         const is_main = if (self.program) |prog|
             if (prog.entry) |entry_id| func.id == entry_id else false
@@ -2413,7 +2432,7 @@ pub const ZirDriver = struct {
 
         const emit_name = if (is_main)
             @as([]const u8, "main")
-        else if (self.current_emit_module != null and func.local_name.len > 0)
+        else if (self.current_emit_struct != null and func.local_name.len > 0)
             func.local_name
         else
             func.name;
@@ -2792,25 +2811,25 @@ pub const ZirDriver = struct {
 
     fn emitNamedCallToTarget(self: *ZirDriver, target_id: ir.FunctionId, args_locals: []const ir.LocalId) !u32 {
         const target_func = self.findFunctionById(target_id) orelse return error.EmitFailed;
-        var args : std.ArrayListUnmanaged(u32) = .empty;
+        var args: std.ArrayListUnmanaged(u32) = .empty;
         defer args.deinit(self.allocator);
         for (args_locals) |arg| {
             const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
             try args.append(self.allocator, ref);
         }
 
-        // Cross-module routing
-        const target_module = target_func.module_name;
+        // Cross-struct routing
+        const target_struct = target_func.struct_name;
         const is_cross = blk: {
-            if (target_module == null and self.current_emit_module == null) break :blk false;
-            if (target_module == null or self.current_emit_module == null) break :blk true;
-            break :blk !std.mem.eql(u8, target_module.?, self.current_emit_module.?);
+            if (target_struct == null and self.current_emit_struct == null) break :blk false;
+            if (target_struct == null or self.current_emit_struct == null) break :blk true;
+            break :blk !std.mem.eql(u8, target_struct.?, self.current_emit_struct.?);
         };
-        if (is_cross and target_module != null) {
-            return try self.emitCrossModuleCall(target_module.?, target_func.local_name, args.items);
+        if (is_cross and target_struct != null) {
+            return try self.emitCrossStructCall(target_struct.?, target_func.local_name, args.items);
         }
 
-        const call_name = if (self.current_emit_module != null and target_func.local_name.len > 0)
+        const call_name = if (self.current_emit_struct != null and target_func.local_name.len > 0)
             target_func.local_name
         else
             target_func.name;
@@ -2965,7 +2984,7 @@ pub const ZirDriver = struct {
         const call_fn_ref = zir_builder_emit_field_val(self.handle, callee_ref, "call_fn", 7);
         if (call_fn_ref == error_ref) return false;
 
-        var fallback_args : std.ArrayListUnmanaged(u32) = .empty;
+        var fallback_args: std.ArrayListUnmanaged(u32) = .empty;
         defer fallback_args.deinit(self.allocator);
         for (cc.args) |arg| {
             const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
@@ -3326,7 +3345,7 @@ pub const ZirDriver = struct {
 
             // Named calls
             .call_named => |cn| {
-                var args : std.ArrayListUnmanaged(u32) = .empty;
+                var args: std.ArrayListUnmanaged(u32) = .empty;
                 defer args.deinit(self.allocator);
                 for (cn.args) |arg| {
                     const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
@@ -3375,11 +3394,11 @@ pub const ZirDriver = struct {
                     // Look up the target function — first by full mangled
                     // name, then by local_name. Bare-name calls produced by
                     // macro-expanded code (e.g. functions imported via
-                    // `use SomeModule`) only carry the unmangled identifier;
+                    // `use SomeStruct`) only carry the unmangled identifier;
                     // the local_name lookup recovers the right target.
                     var target_func = self.findFunctionByName(resolved_call_name) orelse
                         self.findFunctionByLocalName(resolved_call_name);
-                    // Try stripping module prefix for impl functions compiled
+                    // Try stripping struct prefix for impl functions compiled
                     // as root-level functions (e.g., "List__next__1" → "next__1")
                     if (target_func == null) {
                         if (std.mem.indexOf(u8, resolved_call_name, "__")) |sep| {
@@ -3397,27 +3416,27 @@ pub const ZirDriver = struct {
                     // call's `<TargetStruct>__<func>__` prefix and whose
                     // `__<arity>` suffix matches.
                     if (target_func == null) {
-                        if (self.current_emit_module) |caller_struct| {
+                        if (self.current_emit_struct) |caller_struct| {
                             target_func = self.findMonomorphizedImplFor(caller_struct, resolved_call_name);
                         }
                     }
-                    const target_module = if (target_func) |tf| tf.module_name else null;
-                    const is_cross_module = blk: {
-                        if (target_module == null and self.current_emit_module == null) break :blk false;
-                        if (target_module == null or self.current_emit_module == null) break :blk true;
-                        break :blk !std.mem.eql(u8, target_module.?, self.current_emit_module.?);
+                    const target_struct = if (target_func) |tf| tf.struct_name else null;
+                    const is_cross_struct = blk: {
+                        if (target_struct == null and self.current_emit_struct == null) break :blk false;
+                        if (target_struct == null or self.current_emit_struct == null) break :blk true;
+                        break :blk !std.mem.eql(u8, target_struct.?, self.current_emit_struct.?);
                     };
 
-                    if (is_cross_module and target_module != null) {
+                    if (is_cross_struct and target_struct != null) {
                         const target_local = if (target_func) |tf|
                             (if (tf.local_name.len > 0) tf.local_name else cn.name)
                         else
                             cn.name;
-                        const ref = try self.emitCrossModuleCall(target_module.?, target_local, args.items);
+                        const ref = try self.emitCrossStructCall(target_struct.?, target_local, args.items);
                         try self.setLocal(cn.dest, ref);
-                    } else if (is_cross_module and target_module == null) {
-                        // Root-level impl function called from a module.
-                        // Convert the module-prefixed name to call_builtin format
+                    } else if (is_cross_struct and target_struct == null) {
+                        // Root-level impl function called from a struct.
+                        // Convert the struct-prefixed name to call_builtin format
                         // and emit through the standard call_builtin handler.
                         // "List__next__1" → "List.next" (call_builtin format)
                         if (std.mem.indexOf(u8, resolved_call_name, "__")) |mod_sep| {
@@ -3440,7 +3459,7 @@ pub const ZirDriver = struct {
                             try self.setLocal(cn.dest, ref);
                         }
                     } else {
-                        const call_name = if (self.current_emit_module != null)
+                        const call_name = if (self.current_emit_struct != null)
                             if (target_func) |tf| tf.local_name else cn.name
                         else
                             cn.name;
@@ -3458,7 +3477,7 @@ pub const ZirDriver = struct {
             },
 
             .try_call_named => |tcn| {
-                var args : std.ArrayListUnmanaged(u32) = .empty;
+                var args: std.ArrayListUnmanaged(u32) = .empty;
                 defer args.deinit(self.allocator);
                 for (tcn.args) |arg| {
                     const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
@@ -3466,21 +3485,21 @@ pub const ZirDriver = struct {
                 }
                 zir_builder_set_call_modifier(self.handle, 3); // no_optimizations
 
-                // Resolve name for per-module emission
+                // Resolve name for per-struct emission
                 const try_target = self.findFunctionByName(tcn.name) orelse
                     self.findFunctionByLocalName(tcn.name);
-                const try_target_module = if (try_target) |tf| tf.module_name else null;
+                const try_target_struct = if (try_target) |tf| tf.struct_name else null;
                 const try_is_cross = blk: {
-                    if (try_target_module == null and self.current_emit_module == null) break :blk false;
-                    if (try_target_module == null or self.current_emit_module == null) break :blk true;
-                    break :blk !std.mem.eql(u8, try_target_module.?, self.current_emit_module.?);
+                    if (try_target_struct == null and self.current_emit_struct == null) break :blk false;
+                    if (try_target_struct == null or self.current_emit_struct == null) break :blk true;
+                    break :blk !std.mem.eql(u8, try_target_struct.?, self.current_emit_struct.?);
                 };
 
-                const call_ref = if (try_is_cross and try_target_module != null) blk: {
+                const call_ref = if (try_is_cross and try_target_struct != null) blk: {
                     const target_local = if (try_target) |tf| tf.local_name else tcn.name;
-                    break :blk try self.emitCrossModuleCall(try_target_module.?, target_local, args.items);
+                    break :blk try self.emitCrossStructCall(try_target_struct.?, target_local, args.items);
                 } else blk: {
-                    const try_call_name = if (self.current_emit_module != null)
+                    const try_call_name = if (self.current_emit_struct != null)
                         if (try_target) |tf| tf.local_name else tcn.name
                     else
                         tcn.name;
@@ -3562,9 +3581,9 @@ pub const ZirDriver = struct {
                 try self.setLocal(ec.dest, source_ref);
             },
 
-            // Builtin calls — emit @import("zap_runtime").Module.function(args)
+            // Builtin calls — emit @import("zap_runtime").Struct.function(args)
             .call_builtin => |cb| {
-                var args : std.ArrayListUnmanaged(u32) = .empty;
+                var args: std.ArrayListUnmanaged(u32) = .empty;
                 defer args.deinit(self.allocator);
                 for (cb.args) |arg| {
                     const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
@@ -3755,74 +3774,74 @@ pub const ZirDriver = struct {
                 } else false;
 
                 if (!generic_handled) {
-                // Parse "Module.function" from the builtin name.
-                // e.g., "IO.println" → import zap_runtime, field "IO",
-                // field "println". Module names map 1:1 to runtime
-                // struct names; List/Map need element-type instantiation.
-                if (std.mem.findScalar(u8, cb.name, '.')) |dot_idx| {
-                    const mod_name = cb.name[0..dot_idx];
-                    const func_name = cb.name[dot_idx + 1 ..];
+                    // Parse "Struct.function" from the builtin name.
+                    // e.g., "IO.println" → import zap_runtime, field "IO",
+                    // field "println". Struct names map 1:1 to runtime
+                    // struct names; List/Map need element-type instantiation.
+                    if (std.mem.findScalar(u8, cb.name, '.')) |dot_idx| {
+                        const mod_name = cb.name[0..dot_idx];
+                        const func_name = cb.name[dot_idx + 1 ..];
 
-                    const runtime_mod = mod_name;
+                        const runtime_mod = mod_name;
 
-                    // Generic container modules (List, Map): when the call
-                    // name carries no concrete element-type encoding (which
-                    // is the case for the bridge `:zig.Map.get(map, ...)`
-                    // body inside `lib/map.zap` — `map` has parametric
-                    // `%{K=>V}`), route through the runtime's type-derived
-                    // dispatch helpers (`mapGet`, `listGetHead`, etc).
-                    // These take `anytype` collections and reconstruct the
-                    // monomorphic `Map(K, V)` / `List(T)` type via
-                    // `@TypeOf`, so the actual runtime type — including
-                    // `Map(u32, Term)` — is preserved.
-                    const is_generic_container = std.mem.eql(u8, mod_name, "List") or std.mem.eql(u8, mod_name, "Map");
-                    if (is_generic_container) {
-                        const helper_name = mapBridgeMethodToHelper(mod_name, func_name) orelse {
-                            // Fall back to the old default (Map(atom,i64) /
-                            // List(i64)) for methods without a type-derived
-                            // helper — these are typically methods that do
-                            // not depend on the element type (e.g. legacy
-                            // utility functions). The set covered by
-                            // `mapBridgeMethodToHelper` includes every
-                            // method exposed via `lib/map.zap` and
-                            // `lib/list.zap`, so reaching this branch means
-                            // a new Zap-side bridge was added without a
-                            // matching helper — surface the omission rather
-                            // than silently miscompiling.
-                            return error.EmitFailed;
-                        };
-                        const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
-                        if (rt_import == error_ref) return error.EmitFailed;
-                        const fn_ref = zir_builder_emit_field_val(self.handle, rt_import, helper_name.ptr, @intCast(helper_name.len));
-                        if (fn_ref == error_ref) return error.EmitFailed;
-                        const ref = zir_builder_emit_call_ref(self.handle, fn_ref, args.items.ptr, @intCast(args.items.len));
-                        if (ref == error_ref) return error.EmitFailed;
-                        try self.setLocal(cb.dest, ref);
+                        // Generic container structs (List, Map): when the call
+                        // name carries no concrete element-type encoding (which
+                        // is the case for the bridge `:zig.Map.get(map, ...)`
+                        // body inside `lib/map.zap` — `map` has parametric
+                        // `%{K=>V}`), route through the runtime's type-derived
+                        // dispatch helpers (`mapGet`, `listGetHead`, etc).
+                        // These take `anytype` collections and reconstruct the
+                        // monomorphic `Map(K, V)` / `List(T)` type via
+                        // `@TypeOf`, so the actual runtime type — including
+                        // `Map(u32, Term)` — is preserved.
+                        const is_generic_container = std.mem.eql(u8, mod_name, "List") or std.mem.eql(u8, mod_name, "Map");
+                        if (is_generic_container) {
+                            const helper_name = mapBridgeMethodToHelper(mod_name, func_name) orelse {
+                                // Fall back to the old default (Map(atom,i64) /
+                                // List(i64)) for methods without a type-derived
+                                // helper — these are typically methods that do
+                                // not depend on the element type (e.g. legacy
+                                // utility functions). The set covered by
+                                // `mapBridgeMethodToHelper` includes every
+                                // method exposed via `lib/map.zap` and
+                                // `lib/list.zap`, so reaching this branch means
+                                // a new Zap-side bridge was added without a
+                                // matching helper — surface the omission rather
+                                // than silently miscompiling.
+                                return error.EmitFailed;
+                            };
+                            const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                            if (rt_import == error_ref) return error.EmitFailed;
+                            const fn_ref = zir_builder_emit_field_val(self.handle, rt_import, helper_name.ptr, @intCast(helper_name.len));
+                            if (fn_ref == error_ref) return error.EmitFailed;
+                            const ref = zir_builder_emit_call_ref(self.handle, fn_ref, args.items.ptr, @intCast(args.items.len));
+                            if (ref == error_ref) return error.EmitFailed;
+                            try self.setLocal(cb.dest, ref);
+                        } else {
+                            const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                            if (rt_import == error_ref) return error.EmitFailed;
+                            const mod_ref = zir_builder_emit_field_val(self.handle, rt_import, runtime_mod.ptr, @intCast(runtime_mod.len));
+                            if (mod_ref == error_ref) return error.EmitFailed;
+
+                            const fn_ref = zir_builder_emit_field_val(self.handle, mod_ref, func_name.ptr, @intCast(func_name.len));
+                            if (fn_ref == error_ref) return error.EmitFailed;
+
+                            const ref = zir_builder_emit_call_ref(self.handle, fn_ref, args.items.ptr, @intCast(args.items.len));
+                            if (ref == error_ref) return error.EmitFailed;
+                            try self.setLocal(cb.dest, ref);
+                        }
                     } else {
+                        // Bare name (no struct qualifier) — route through Kernel.
                         const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                         if (rt_import == error_ref) return error.EmitFailed;
-                        const mod_ref = zir_builder_emit_field_val(self.handle, rt_import, runtime_mod.ptr, @intCast(runtime_mod.len));
-                        if (mod_ref == error_ref) return error.EmitFailed;
-
-                        const fn_ref = zir_builder_emit_field_val(self.handle, mod_ref, func_name.ptr, @intCast(func_name.len));
+                        const kernel = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.kernel);
+                        if (kernel == error_ref) return error.EmitFailed;
+                        const fn_ref = zir_builder_emit_field_val(self.handle, kernel, cb.name.ptr, @intCast(cb.name.len));
                         if (fn_ref == error_ref) return error.EmitFailed;
-
                         const ref = zir_builder_emit_call_ref(self.handle, fn_ref, args.items.ptr, @intCast(args.items.len));
                         if (ref == error_ref) return error.EmitFailed;
                         try self.setLocal(cb.dest, ref);
                     }
-                } else {
-                    // Bare name (no module qualifier) — route through Kernel.
-                    const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
-                    if (rt_import == error_ref) return error.EmitFailed;
-                    const kernel = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.kernel);
-                    if (kernel == error_ref) return error.EmitFailed;
-                    const fn_ref = zir_builder_emit_field_val(self.handle, kernel, cb.name.ptr, @intCast(cb.name.len));
-                    if (fn_ref == error_ref) return error.EmitFailed;
-                    const ref = zir_builder_emit_call_ref(self.handle, fn_ref, args.items.ptr, @intCast(args.items.len));
-                    if (ref == error_ref) return error.EmitFailed;
-                    try self.setLocal(cb.dest, ref);
-                }
                 } // end if (!generic_handled)
             },
 
@@ -3830,15 +3849,15 @@ pub const ZirDriver = struct {
             .tail_call => |tc| {
                 // Guaranteed tail call: set always_tail modifier (4) so LLVM
                 // emits a tail call that reuses the current stack frame.
-                // Tail calls are always intra-module (self-recursion).
+                // Tail calls are always intra-struct (self-recursion).
                 zir_builder_set_call_modifier(self.handle, 4); // always_tail
-                var args : std.ArrayListUnmanaged(u32) = .empty;
+                var args: std.ArrayListUnmanaged(u32) = .empty;
                 defer args.deinit(self.allocator);
                 for (tc.args) |arg| {
                     const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
                     try args.append(self.allocator, ref);
                 }
-                const tail_name = if (self.current_emit_module != null)
+                const tail_name = if (self.current_emit_struct != null)
                     if (self.findFunctionByName(tc.name)) |tf| tf.local_name else tc.name
                 else
                     tc.name;
@@ -3886,7 +3905,7 @@ pub const ZirDriver = struct {
                         break :blk @as(?[]const u8, null);
                     };
                     if (func_name) |fname| {
-                        var args : std.ArrayListUnmanaged(u32) = .empty;
+                        var args: std.ArrayListUnmanaged(u32) = .empty;
                         defer args.deinit(self.allocator);
                         for (cd.args) |arg| {
                             const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
@@ -3895,19 +3914,19 @@ pub const ZirDriver = struct {
 
                         {
                             const target_func = self.findFunctionById(cd.function);
-                            const target_module = if (target_func) |tf| tf.module_name else null;
+                            const target_struct = if (target_func) |tf| tf.struct_name else null;
                             const is_cross = xmod: {
-                                if (target_module == null and self.current_emit_module == null) break :xmod false;
-                                if (target_module == null or self.current_emit_module == null) break :xmod true;
-                                break :xmod !std.mem.eql(u8, target_module.?, self.current_emit_module.?);
+                                if (target_struct == null and self.current_emit_struct == null) break :xmod false;
+                                if (target_struct == null or self.current_emit_struct == null) break :xmod true;
+                                break :xmod !std.mem.eql(u8, target_struct.?, self.current_emit_struct.?);
                             };
 
-                            if (is_cross and target_module != null) {
+                            if (is_cross and target_struct != null) {
                                 const target_local = if (target_func) |tf| tf.local_name else fname;
-                                const ref = try self.emitCrossModuleCall(target_module.?, target_local, args.items);
+                                const ref = try self.emitCrossStructCall(target_struct.?, target_local, args.items);
                                 try self.setLocal(cd.dest, ref);
                             } else {
-                                const call_name = if (self.current_emit_module != null)
+                                const call_name = if (self.current_emit_struct != null)
                                     if (target_func) |tf| tf.local_name else fname
                                 else
                                     fname;
@@ -4023,11 +4042,11 @@ pub const ZirDriver = struct {
                 // tuple slots (e.g. `{Atom, Term}` representing a keyword
                 // pair where the value type was promoted to `Term`) accept
                 // concrete values like `comptime_int` literals.
-                var names_ptrs : std.ArrayListUnmanaged([*]const u8) = .empty;
+                var names_ptrs: std.ArrayListUnmanaged([*]const u8) = .empty;
                 defer names_ptrs.deinit(self.allocator);
-                var names_lens : std.ArrayListUnmanaged(u32) = .empty;
+                var names_lens: std.ArrayListUnmanaged(u32) = .empty;
                 defer names_lens.deinit(self.allocator);
-                var values : std.ArrayListUnmanaged(u32) = .empty;
+                var values: std.ArrayListUnmanaged(u32) = .empty;
                 defer values.deinit(self.allocator);
 
                 for (ti.elements, 0..) |elem, i| {
@@ -4202,11 +4221,11 @@ pub const ZirDriver = struct {
                 }
             },
             .struct_init => |si| {
-                var names_ptrs : std.ArrayListUnmanaged([*]const u8) = .empty;
+                var names_ptrs: std.ArrayListUnmanaged([*]const u8) = .empty;
                 defer names_ptrs.deinit(self.allocator);
-                var names_lens : std.ArrayListUnmanaged(u32) = .empty;
+                var names_lens: std.ArrayListUnmanaged(u32) = .empty;
                 defer names_lens.deinit(self.allocator);
-                var values : std.ArrayListUnmanaged(u32) = .empty;
+                var values: std.ArrayListUnmanaged(u32) = .empty;
                 defer values.deinit(self.allocator);
 
                 for (si.fields) |field| {
@@ -4321,7 +4340,7 @@ pub const ZirDriver = struct {
                     _ = self.reuse_backed_struct_locals.remove(si.dest);
 
                     // Use struct_init_typed with decl_val for nominal types
-                    // in non-closure functions. Closures can't resolve module-
+                    // in non-closure functions. Closures can't resolve struct-
                     // level decl_val refs, so fall back to struct_init_anon.
                     if (!self.current_function_is_closure and self.capture_depth == 0) {
                         if (self.findStructDef(si.type_name) != null) {
@@ -4786,7 +4805,7 @@ pub const ZirDriver = struct {
                             // Fall through to dynamic dispatch. The unreachable
                             // classification may be wrong when function IDs shift
                             // (e.g., anonymous closures inserted in the IR), or
-                            // when cross-module callers pass closures the local
+                            // when cross-struct callers pass closures the local
                             // escape analysis didn't see.
                         },
                         .direct_call, .contified => {
@@ -4863,7 +4882,7 @@ pub const ZirDriver = struct {
                     // (from a 0-capture make_closure), emit a direct call_ref without
                     // trying to destructure a closure struct.
                     if (callee_is_param or self.isBareFunctionRef(cc.callee)) {
-                        var args : std.ArrayListUnmanaged(u32) = .empty;
+                        var args: std.ArrayListUnmanaged(u32) = .empty;
                         defer args.deinit(self.allocator);
                         for (cc.args) |arg| {
                             const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
@@ -4879,7 +4898,7 @@ pub const ZirDriver = struct {
                     const call_fn_ref = zir_builder_emit_field_val(self.handle, callee_ref, "call_fn", 7);
                     if (call_fn_ref == error_ref) {
                         // Fallback: callee might be a bare function ref, not a closure struct
-                        var args : std.ArrayListUnmanaged(u32) = .empty;
+                        var args: std.ArrayListUnmanaged(u32) = .empty;
                         defer args.deinit(self.allocator);
                         for (cc.args) |arg| {
                             const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
@@ -4895,7 +4914,7 @@ pub const ZirDriver = struct {
                     if (env_ref == error_ref) return error.EmitFailed;
 
                     // Build args: env as first argument, then user args
-                    var full_args : std.ArrayListUnmanaged(u32) = .empty;
+                    var full_args: std.ArrayListUnmanaged(u32) = .empty;
                     defer full_args.deinit(self.allocator);
                     try full_args.append(self.allocator, env_ref);
                     for (cc.args) |arg| {
@@ -4923,28 +4942,28 @@ pub const ZirDriver = struct {
                     }
                 }
 
-                // Resolve the correct name for the current module context.
-                // In per-module emission, functions are emitted with local_name,
-                // so references must also use local_name (or @import for cross-module).
-                const emit_name = if (self.current_emit_module != null and target_func.local_name.len > 0)
+                // Resolve the correct name for the current struct context.
+                // In per-struct emission, functions are emitted with local_name,
+                // so references must also use local_name (or @import for cross-struct).
+                const emit_name = if (self.current_emit_struct != null and target_func.local_name.len > 0)
                     target_func.local_name
                 else
                     target_func.name;
 
-                // Determine if this is a cross-module reference
-                const target_module = target_func.module_name;
-                const is_cross_module = blk: {
-                    if (target_module == null and self.current_emit_module == null) break :blk false;
-                    if (target_module == null or self.current_emit_module == null) break :blk true;
-                    break :blk !std.mem.eql(u8, target_module.?, self.current_emit_module.?);
+                // Determine if this is a cross-struct reference
+                const target_struct = target_func.struct_name;
+                const is_cross_struct = blk: {
+                    if (target_struct == null and self.current_emit_struct == null) break :blk false;
+                    if (target_struct == null or self.current_emit_struct == null) break :blk true;
+                    break :blk !std.mem.eql(u8, target_struct.?, self.current_emit_struct.?);
                 };
 
                 // 0-capture closures: emit a bare function pointer via decl_ref.
                 // This produces *const fn(args...) ret which is the uniform type
                 // for all function references passed as callback parameters.
                 if (mc.captures.len == 0) {
-                    if (is_cross_module and target_module != null) {
-                        try self.setLocalDecl(mc.dest, target_module.?, target_func.local_name);
+                    if (is_cross_struct and target_struct != null) {
+                        try self.setLocalDecl(mc.dest, target_struct.?, target_func.local_name);
                     } else {
                         try self.setLocalDecl(mc.dest, null, emit_name);
                     }
@@ -4952,11 +4971,11 @@ pub const ZirDriver = struct {
                 }
 
                 // Build the environment tuple: .{ capture0, capture1, ... }
-                var env_names_ptrs : std.ArrayListUnmanaged([*]const u8) = .empty;
+                var env_names_ptrs: std.ArrayListUnmanaged([*]const u8) = .empty;
                 defer env_names_ptrs.deinit(self.allocator);
-                var env_names_lens : std.ArrayListUnmanaged(u32) = .empty;
+                var env_names_lens: std.ArrayListUnmanaged(u32) = .empty;
                 defer env_names_lens.deinit(self.allocator);
-                var env_values : std.ArrayListUnmanaged(u32) = .empty;
+                var env_values: std.ArrayListUnmanaged(u32) = .empty;
                 defer env_values.deinit(self.allocator);
 
                 for (mc.captures, 0..) |cap, i| {
@@ -4977,9 +4996,9 @@ pub const ZirDriver = struct {
                 if (env_ref == error_ref) return error.EmitFailed;
 
                 // Build the closure struct: .{ .call_fn = func_ref, .env = env_ref }
-                // Use module-aware resolution: decl_ref for same-module, @import for cross-module.
-                const fn_name_ref = if (is_cross_module and target_module != null)
-                    self.emitCrossModuleRef(target_module.?, target_func.local_name) catch @intFromEnum(Zir.Inst.Ref.void_value)
+                // Use struct-aware resolution: decl_ref for same-struct, @import for cross-struct.
+                const fn_name_ref = if (is_cross_struct and target_struct != null)
+                    self.emitCrossStructRef(target_struct.?, target_func.local_name) catch @intFromEnum(Zir.Inst.Ref.void_value)
                 else blk: {
                     const ref = zir_builder_emit_decl_ref(self.handle, emit_name.ptr, @intCast(emit_name.len));
                     break :blk if (ref != error_ref) ref else zir_builder_emit_str(self.handle, emit_name.ptr, @intCast(emit_name.len));
@@ -6330,17 +6349,17 @@ pub const ZirDriver = struct {
 
         // Pre-emit all body instructions with body_tracking OFF.
         // Collect instruction indices and result Refs for each prong.
-        var names_ptrs : std.ArrayListUnmanaged([*]const u8) = .empty;
+        var names_ptrs: std.ArrayListUnmanaged([*]const u8) = .empty;
         defer names_ptrs.deinit(self.allocator);
-        var names_lens : std.ArrayListUnmanaged(u32) = .empty;
+        var names_lens: std.ArrayListUnmanaged(u32) = .empty;
         defer names_lens.deinit(self.allocator);
-        var captures : std.ArrayListUnmanaged(u32) = .empty;
+        var captures: std.ArrayListUnmanaged(u32) = .empty;
         defer captures.deinit(self.allocator);
-        var body_lens : std.ArrayListUnmanaged(u32) = .empty;
+        var body_lens: std.ArrayListUnmanaged(u32) = .empty;
         defer body_lens.deinit(self.allocator);
-        var body_results : std.ArrayListUnmanaged(u32) = .empty;
+        var body_results: std.ArrayListUnmanaged(u32) = .empty;
         defer body_results.deinit(self.allocator);
-        var all_body_insts : std.ArrayListUnmanaged(u32) = .empty;
+        var all_body_insts: std.ArrayListUnmanaged(u32) = .empty;
         defer all_body_insts.deinit(self.allocator);
 
         // We need the future switch_block Ref for payload capture binding.
@@ -6396,7 +6415,7 @@ pub const ZirDriver = struct {
                 if (bi == .call_named) {
                     const cn = bi.call_named;
                     if (pre_resolved_fns.get(cn.name)) |fn_ref| {
-                        var call_args : std.ArrayListUnmanaged(u32) = .empty;
+                        var call_args: std.ArrayListUnmanaged(u32) = .empty;
                         defer call_args.deinit(self.allocator);
                         for (cn.args) |arg| {
                             const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
@@ -6488,25 +6507,25 @@ pub const ZirDriver = struct {
     /// Must be called with body_tracking ON (before entering prong bodies).
     /// Returns the function Ref, or error if not resolvable.
     fn resolveCallNamedToRef(self: *ZirDriver, name: []const u8) BuildError!u32 {
-        // Check if this is a cross-module call — resolve via @import
+        // Check if this is a cross-struct call — resolve via @import
         const target_func = self.findFunctionByName(name);
-        const target_module = if (target_func) |tf| tf.module_name else null;
+        const target_struct = if (target_func) |tf| tf.struct_name else null;
         const is_cross = blk: {
-            if (target_module == null and self.current_emit_module == null) break :blk false;
-            if (target_module == null or self.current_emit_module == null) break :blk true;
-            break :blk !std.mem.eql(u8, target_module.?, self.current_emit_module.?);
+            if (target_struct == null and self.current_emit_struct == null) break :blk false;
+            if (target_struct == null or self.current_emit_struct == null) break :blk true;
+            break :blk !std.mem.eql(u8, target_struct.?, self.current_emit_struct.?);
         };
-        if (is_cross and target_module != null) {
+        if (is_cross and target_struct != null) {
             const target_local = if (target_func) |tf| tf.local_name else name;
-            const import_ref = zir_builder_emit_import(self.handle, target_module.?.ptr, @intCast(target_module.?.len));
+            const import_ref = zir_builder_emit_import(self.handle, target_struct.?.ptr, @intCast(target_struct.?.len));
             if (import_ref == error_ref) return error.EmitFailed;
             const fn_ref = zir_builder_emit_field_val(self.handle, import_ref, target_local.ptr, @intCast(target_local.len));
             if (fn_ref == error_ref) return error.EmitFailed;
             return fn_ref;
         }
 
-        // Intra-module: use local name for decl_ref
-        const resolve_name = if (self.current_emit_module != null)
+        // Intra-struct: use local name for decl_ref
+        const resolve_name = if (self.current_emit_struct != null)
             if (target_func) |tf| tf.local_name else name
         else
             name;
@@ -6539,7 +6558,7 @@ pub fn buildAndInject(
     builder_entry: ?[]const u8,
     analysis_context: ?*const @import("escape_lattice.zig").AnalysisContext,
 ) BuildError!void {
-    // Register the runtime module if a path was provided.
+    // Register the runtime struct if a path was provided.
     if (runtime_path) |rpath| {
         if (zir_compilation_add_struct(compilation_ctx, "zap_runtime", rpath) != 0) {
             return error.ZirInjectionFailed;
@@ -6712,7 +6731,7 @@ test "findClosureTargetInInstrs follows local aliases" {
     try std.testing.expectEqual(@as(ir.LocalId, 7), target.captures[0]);
 }
 
-// Runtime function routing is handled by `:zig.Module.function(args)` calls
+// Runtime function routing is handled by `:zig.Struct.function(args)` calls
 // in Zap library files (lib/*.zap). The compiler's HIR builder lowers those
 // calls to `call_builtin` instructions, which the ZIR builder emits as
-// `@import("zap_runtime").Module.function(args)`.
+// `@import("zap_runtime").Struct.function(args)`.

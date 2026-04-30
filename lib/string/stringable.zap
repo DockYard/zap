@@ -1,3 +1,5 @@
+@doc = "Stringable implementation for `String`."
+
 pub impl Stringable for String {
   @doc = """
     Identity: a string is already a string. Provided so generic code

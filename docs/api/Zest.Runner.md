@@ -14,7 +14,7 @@ generated from the system clock.
 
 ## Examples
 
-    pub module Test.TestRunner {
+    pub struct Test.TestRunner {
       use Zest.Runner
 
       pub fn main(_args :: [String]) -> String {

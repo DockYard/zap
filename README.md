@@ -557,7 +557,7 @@ Widening rules: `i8` -> `i16` -> `i32` -> `i64`, `u8` -> `u16` -> `u32` -> `u64`
 
 ## Native Function Bindings (`:zig`)
 
-Zap functions that need Zig runtime implementations (I/O, string operations, atom tables, etc.) call into Zig directly via the `:zig.Module.function(args)` form:
+Zap functions that need Zig runtime implementations (I/O, string operations, atom tables, etc.) call into Zig directly via the `:zig.Struct.function(args)` form:
 
 ```zap
 pub struct IO {
@@ -577,7 +577,7 @@ pub struct Zest.Runtime {
 }
 ```
 
-The `:zig.Module.function(args)` call tells the compiler to lower this expression to `@import("zap_runtime").Module.function(args)` in the generated ZIR. The compiler has zero knowledge of specific library structs; every runtime binding lives in a `.zap` source file.
+The `:zig.Struct.function(args)` call tells the compiler to lower this expression to `@import("zap_runtime").Struct.function(args)` in the generated ZIR. The compiler has zero knowledge of specific library structs; every runtime binding lives in a `.zap` source file.
 
 ---
 
@@ -592,7 +592,7 @@ Zap uses a per-struct compilation architecture with per-struct ZIR emission:
 5. **Pass 4** — run analysis pipeline (escape analysis, interprocedural summaries, region solving, lambda sets, Perceus reuse)
 6. **Pass 5** — emit per-struct ZIR, inject into Zig compilation, codegen
 
-Each Zap struct becomes its own Zig ZIR module. Cross-struct calls use `@import("Struct").function(args)` chains. Namespace re-export modules are generated for hierarchical struct names (e.g., `Zest` re-exports `Runtime`, `Case`, `Runner`). Direct `:zig.Module.fn(...)` calls bypass cross-module routing and emit `@import("zap_runtime").Module.fn(...)` directly.
+Each Zap struct becomes its own Zig ZIR struct. Cross-struct calls use `@import("Struct").function(args)` chains. Namespace re-export structs are generated for hierarchical struct names (e.g., `Zest` re-exports `Runtime`, `Case`, `Runner`). Direct `:zig.Struct.fn(...)` calls bypass cross-struct routing and emit `@import("zap_runtime").Struct.fn(...)` directly.
 
 ```
   .zap source files
@@ -628,7 +628,7 @@ Each Zap struct becomes its own Zig ZIR module. Cross-struct calls use `@import(
    Analysis --------- escape, regions, lambda sets, Perceus
       |
       v
-   Per-Struct ZIR --- each Zap struct -> its own Zig ZIR module
+   Per-Struct ZIR --- each Zap struct -> its own Zig ZIR struct
       |                cross-struct calls -> @import chains
       |                :zig.X.Y(args) calls -> @import("zap_runtime")
       v

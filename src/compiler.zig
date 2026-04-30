@@ -36,11 +36,11 @@ pub const CompileOptions = struct {
     show_progress: bool = true,
     /// lib mode — skip main function emission in ZIR.
     lib_mode: bool = false,
-    /// Module names in dependency order for CTFE evaluation.
-    /// When set, computed attributes are evaluated per-module in this order.
-    module_order: ?[]const []const u8 = null,
-    /// Indices into module_order marking where each dependency level ends.
-    /// Modules within the same level have no dependencies on each other
+    /// Struct names in dependency order for CTFE evaluation.
+    /// When set, computed attributes are evaluated per-struct in this order.
+    struct_order: ?[]const []const u8 = null,
+    /// Indices into struct_order marking where each dependency level ends.
+    /// Structs within the same level have no dependencies on each other
     /// and can be compiled in parallel. Populated by import-driven discovery.
     level_boundaries: ?[]const u32 = null,
     /// Directory for persistent CTFE cache. When set, computed attribute
@@ -51,7 +51,7 @@ pub const CompileOptions = struct {
     /// Optimize mode used when hashing CTFE cache keys.
     ctfe_optimize: ?[]const u8 = null,
     /// Io instance for parallel compilation. When set with level_boundaries,
-    /// modules within the same dependency level are compiled concurrently
+    /// structs within the same dependency level are compiled concurrently
     /// using Io.Group.
     io: ?std.Io = null,
 };
@@ -75,14 +75,14 @@ fn ctfeCompileOptionsHash(options: CompileOptions) u64 {
 // Three-pass pipeline:
 //   Pass 1 (collectAll): Parse all files, collect declarations into a
 //     shared CompilationContext.
-//   Pass 2 (compileForCtfe / compileModuleByModule): Run the
+//   Pass 2 (compileForCtfe / compileStructByStruct): Run the
 //     post-collect pipeline. The phase methods on `Pipeline` handle
 //     the shared front-end (substitute → macro → desugar →
 //     re-collect → type check → HIR → mono → IR), and each entry
 //     point composes the phases it needs and adds its own divergent
 //     steps (build-time CTFE re-checks types after analysis; per-
-//     module compilation runs whole-program monomorphization once
-//     across all modules).
+//     struct compilation runs whole-program monomorphization once
+//     across all structs).
 //   Pass 3 (analysis + contify): Last phase of pass 2 — escape /
 //     alias analysis, contification rewrite, and (for compileForCtfe)
 //     a borrow re-check.
@@ -94,8 +94,8 @@ pub const CompilationContext = struct {
     alloc: std.mem.Allocator,
 
     // ---- Parallel views into the same compilation. Each lives at a
-    // different granularity (whole-program AST / per-module AST /
-    // per-file metadata / per-file source / per-module scope), and
+    // different granularity (whole-program AST / per-struct AST /
+    // per-file metadata / per-file source / per-struct scope), and
     // they're populated at different points during `collectAll`.
     // Always call the corresponding `findX` helper instead of
     // iterating the slice directly so the lookup convention has one
@@ -105,16 +105,16 @@ pub const CompilationContext = struct {
     /// file lives in `.structs`, and every top-level `impl` lives in
     /// `.top_items`. Source of truth for macro expansion, scope
     /// collection, and CTFE; downstream phases mostly read from the
-    /// per-module split below.
+    /// per-struct split below.
     merged_program: ast.Program,
 
-    /// Per-module AST programs split out of `merged_program` after
+    /// Per-struct AST programs split out of `merged_program` after
     /// macro expansion / desugaring. Keyed by `name` (the dotted
-    /// module path). The per-module pipeline reads from here so it
+    /// struct path). The per-struct pipeline reads from here so it
     /// does not need to re-walk the merged tree at every stage.
-    module_programs: []const ModuleProgram,
+    struct_programs: []const StructProgram,
 
-    /// Per-file compilation state: source path, owning module, the
+    /// Per-file compilation state: source path, owning struct, the
     /// raw file source, and (when produced) the per-file IR program.
     /// `units.len == source_units.len`; one unit per file.
     units: []CompilationUnit,
@@ -127,11 +127,11 @@ pub const CompilationContext = struct {
     interner: ast.StringInterner,
 
     /// Scope graph populated by the collector. `collector.graph.structs`
-    /// is the per-module scope view (one entry per module containing
+    /// is the per-struct scope view (one entry per struct containing
     /// its `ScopeId`, declared functions, and attributes); the graph
     /// also holds bindings, function families, types, protocols, and
-    /// impls. The scope graph and `module_programs` always stay in
-    /// sync — same modules, different views.
+    /// impls. The scope graph and `struct_programs` always stay in
+    /// sync — same structs, different views.
     collector: zap.Collector,
 
     /// Diagnostic engine — collects errors and warnings emitted across
@@ -139,7 +139,7 @@ pub const CompilationContext = struct {
     diag_engine: zap.DiagnosticEngine,
 };
 
-pub const ModuleProgram = struct {
+pub const StructProgram = struct {
     name: []const u8,
     program: ast.Program,
 };
@@ -147,20 +147,20 @@ pub const ModuleProgram = struct {
 /// Per-file compilation state.
 pub const CompilationUnit = struct {
     file_path: []const u8,
-    module_name: []const u8,
+    struct_name: []const u8,
     source: []const u8,
-    /// Index of this file's module in the merged program's modules array
-    module_index: ?u32 = null,
+    /// Index of this file's struct in the merged program's structs array
+    struct_index: ?u32 = null,
     /// Per-file IR program, populated by compileFile
     ir_program: ?ir.Program = null,
     /// Which dep this file belongs to (null for project files)
     dep: ?[]const u8 = null,
 };
 
-/// Result of compiling a single module to HIR (before monomorphization).
-/// Used by whole-program monomorphization to collect all module HIRs,
-/// then monomorphize across module boundaries.
-pub const ModuleHirResult = struct {
+/// Result of compiling a single struct to HIR (before monomorphization).
+/// Used by whole-program monomorphization to collect all struct HIRs,
+/// then monomorphize across struct boundaries.
+pub const StructHirResult = struct {
     mod_name: []const u8,
     hir_program: zap.hir.Program,
     next_group_id: u32,
@@ -356,25 +356,25 @@ pub fn collectAllFromUnits(
     step += 1;
     if (options.show_progress) std.debug.print("\r\x1b[K  [{d}/{d}] Collect", .{ step, total_steps });
 
-    // Intern the auto-imported Kernel module's name once — needed for
+    // Intern the auto-imported Kernel struct's name once — needed for
     // auto-import injection. The literal name lives in
-    // `discovery.kernel_module_name`.
-    const kernel_name_id = try interner.intern(zap.discovery.kernel_module_name);
+    // `discovery.kernel_struct_name`.
+    const kernel_name_id = try interner.intern(zap.discovery.kernel_struct_name);
     var collector = zap.Collector.init(alloc, &interner, kernel_name_id);
     try registerSourceUnits(&collector.graph, all_source_units);
     {
-        const pre_module_programs = try buildModulePrograms(alloc, &program, &interner);
+        const pre_struct_programs = try buildStructPrograms(alloc, &program, &interner);
 
-        // Collect Kernel FIRST so its scope exists when other modules'
+        // Collect Kernel FIRST so its scope exists when other structs'
         // auto-import resolves. This mirrors Elixir's bootstrap ordering.
-        for (pre_module_programs) |entry| {
-            if (std.mem.eql(u8, entry.name, zap.discovery.kernel_module_name)) {
+        for (pre_struct_programs) |entry| {
+            if (std.mem.eql(u8, entry.name, zap.discovery.kernel_struct_name)) {
                 collector.collectProgramSurface(&entry.program) catch {};
                 break;
             }
         }
-        for (pre_module_programs) |entry| {
-            if (std.mem.eql(u8, entry.name, zap.discovery.kernel_module_name)) continue;
+        for (pre_struct_programs) |entry| {
+            if (std.mem.eql(u8, entry.name, zap.discovery.kernel_struct_name)) continue;
             collector.collectProgramSurface(&entry.program) catch {
                 for (collector.errors.items) |collect_err| {
                     diag_engine.err(collect_err.message, collect_err.span) catch {};
@@ -396,7 +396,7 @@ pub fn collectAllFromUnits(
                 return error.CollectFailed;
             };
         }
-        // Validate protocol conformance and register impl functions in target modules
+        // Validate protocol conformance and register impl functions in target structs
         collector.validateImplConformance() catch {};
         collector.registerImplFunctionsInTargetScopes() catch {};
         if (collector.errors.items.len > 0) {
@@ -408,8 +408,8 @@ pub fn collectAllFromUnits(
             return error.CollectFailed;
         }
 
-        const pre_slices = try alloc.alloc(ast.Program, pre_module_programs.len);
-        for (pre_module_programs, 0..) |entry, i| pre_slices[i] = entry.program;
+        const pre_slices = try alloc.alloc(ast.Program, pre_struct_programs.len);
+        for (pre_struct_programs, 0..) |entry, i| pre_slices[i] = entry.program;
         collector.finalizeCollectedPrograms(pre_slices) catch {
             for (collector.errors.items) |collect_err| {
                 diag_engine.err(collect_err.message, collect_err.span) catch {};
@@ -430,18 +430,18 @@ pub fn collectAllFromUnits(
     }
 
     // Run macro expansion and desugaring. When the discovery graph supplies a
-    // module order, expand one module at a time and compile each completed
+    // struct order, expand one struct at a time and compile each completed
     // dependency level to IR so later macros can call already compiled Zap
     // functions through CTFE. Without a graph order, keep the legacy merged
     // expansion path.
     step += 1;
     if (options.show_progress) std.debug.print("\r\x1b[K  [{d}/{d}] Macro expand", .{ step, total_steps });
 
-    const desugared_program = if (options.module_order) |module_order|
+    const desugared_program = if (options.struct_order) |struct_order|
         stagedMacroExpandAndDesugar(
             alloc,
             &program,
-            module_order,
+            struct_order,
             &interner,
             &collector,
             &diag_engine,
@@ -466,29 +466,29 @@ pub fn collectAllFromUnits(
     step += 1;
     if (options.show_progress) std.debug.print("\r\x1b[K  [{d}/{d}] Desugar", .{ step, total_steps });
 
-    // NOW split into per-module programs from the expanded/desugared AST.
+    // NOW split into per-struct programs from the expanded/desugared AST.
     // All if_expr nodes are gone, all pipes desugared, all macros expanded.
-    const module_programs = try buildModulePrograms(alloc, &desugared_program, &interner);
+    const struct_programs = try buildStructPrograms(alloc, &desugared_program, &interner);
 
     // Rebuild the scope graph from the desugared AST. The original collector
     // was built from pre-expansion AST, so its function declaration pointers
     // are stale. The HIR builder compares AST node pointers to determine
-    // which functions belong to the current module, so the scope graph must
-    // reference the same AST nodes as the desugared module programs.
+    // which functions belong to the current struct, so the scope graph must
+    // reference the same AST nodes as the desugared struct programs.
     step += 1;
     if (options.show_progress) std.debug.print("\r\x1b[K  [{d}/{d}] Re-collect", .{ step, total_steps });
 
     var final_collector = zap.Collector.init(alloc, &interner, kernel_name_id);
     try registerSourceUnits(&final_collector.graph, all_source_units);
     // Collect Kernel first in the second pass too
-    for (module_programs) |entry| {
-        if (std.mem.eql(u8, entry.name, zap.discovery.kernel_module_name)) {
+    for (struct_programs) |entry| {
+        if (std.mem.eql(u8, entry.name, zap.discovery.kernel_struct_name)) {
             final_collector.collectProgramSurface(&entry.program) catch {};
             break;
         }
     }
-    for (module_programs) |entry| {
-        if (std.mem.eql(u8, entry.name, zap.discovery.kernel_module_name)) continue;
+    for (struct_programs) |entry| {
+        if (std.mem.eql(u8, entry.name, zap.discovery.kernel_struct_name)) continue;
         final_collector.collectProgramSurface(&entry.program) catch {
             for (final_collector.errors.items) |collect_err| {
                 diag_engine.err(collect_err.message, collect_err.span) catch {};
@@ -507,15 +507,15 @@ pub fn collectAllFromUnits(
             return error.CollectFailed;
         };
     }
-    // Re-register impl functions in their target module scopes. The first
+    // Re-register impl functions in their target struct scopes. The first
     // collector did this on its own graph, but the final_collector built a
-    // fresh graph and per-module HIR/type-check reads from THIS graph. Without
+    // fresh graph and per-struct HIR/type-check reads from THIS graph. Without
     // re-registration, impl functions like `Integer.+` are invisible.
     final_collector.validateImplConformance() catch {};
     final_collector.registerImplFunctionsInTargetScopes() catch {};
     {
-        const slices = try alloc.alloc(ast.Program, module_programs.len);
-        for (module_programs, 0..) |entry, i| slices[i] = entry.program;
+        const slices = try alloc.alloc(ast.Program, struct_programs.len);
+        for (struct_programs, 0..) |entry, i| slices[i] = entry.program;
         final_collector.finalizeCollectedPrograms(slices) catch {
             for (final_collector.errors.items) |collect_err| {
                 diag_engine.err(collect_err.message, collect_err.span) catch {};
@@ -524,12 +524,12 @@ pub fn collectAllFromUnits(
         };
     }
 
-    const units = try buildCompilationUnits(alloc, module_programs, all_source_units);
+    const units = try buildCompilationUnits(alloc, struct_programs, all_source_units);
 
     return .{
         .alloc = alloc,
         .merged_program = desugared_program,
-        .module_programs = module_programs,
+        .struct_programs = struct_programs,
         .units = units,
         .source_units = all_source_units,
         .interner = interner,
@@ -540,7 +540,7 @@ pub fn collectAllFromUnits(
 
 /// Compile the build.zap manifest through the full pipeline.
 /// This is ONLY used by the builder for CTFE manifest evaluation —
-/// NOT for project compilation. Project compilation uses compileModuleByModule.
+/// NOT for project compilation. Project compilation uses compileStructByStruct.
 pub fn compileForCtfe(
     alloc: std.mem.Allocator,
     ctx: *CompilationContext,
@@ -570,7 +570,7 @@ pub fn compileForCtfe(
     const mono_program = try pipeline.runMonomorphize(&hir_result.program, type_checker.store, &mono_next);
     var ir_program = try pipeline.runIrLowering(&mono_program, type_checker.store);
 
-    pipeline.runCtfeAttributes(&ir_program, options.module_order);
+    pipeline.runCtfeAttributes(&ir_program, options.struct_order);
 
     var analysis_result = try pipeline.runAnalysisAndContify(&ir_program);
 
@@ -605,13 +605,13 @@ pub fn compileForCtfe(
 // `Pipeline` holds the shared state every phase needs (allocator,
 // CompilationContext, options, progress counter) and exposes one
 // method per phase. Each entry point — `compileForCtfe` for the
-// build-time manifest pass, `compileModuleByModule` for project
+// build-time manifest pass, `compileStructByStruct` for project
 // compilation — composes the phases it needs in the order it needs
 // them, including divergent steps. The intentional differences
 // (compileForCtfe re-checks types after escape analysis to catch
-// borrow diagnostics; the per-module path skips
+// borrow diagnostics; the per-struct path skips
 // `checkUnusedBindings` because the shared scope graph would
-// produce false positives across modules) live at the call site,
+// produce false positives across structs) live at the call site,
 // not inside the phase methods.
 // ============================================================
 
@@ -629,12 +629,12 @@ const Pipeline = struct {
     progress_enabled: bool,
     /// Diagnostic count when this pipeline was constructed. `hasNewErrors`
     /// reports only errors added during this pipeline's lifetime, so
-    /// per-module pipelines don't trip on residual errors from earlier
-    /// modules sharing the same DiagnosticEngine.
+    /// per-struct pipelines don't trip on residual errors from earlier
+    /// structs sharing the same DiagnosticEngine.
     error_baseline: usize,
     /// When true, `failWith`/`failWithExisting` accumulate errors into the
-    /// engine but do not flush them to stderr. Used by the per-module
-    /// loop in `compileModuleByModule`, which renders all collected
+    /// engine but do not flush them to stderr. Used by the per-struct
+    /// loop in `compileStructByStruct`, which renders all collected
     /// diagnostics once at the end so each error appears exactly once.
     defer_render: bool,
 
@@ -658,8 +658,8 @@ const Pipeline = struct {
     }
 
     /// Errors added since this pipeline was constructed. The shared
-    /// DiagnosticEngine accumulates across modules, so a raw
-    /// `hasErrors()` check would treat any prior module's failures as
+    /// DiagnosticEngine accumulates across structs, so a raw
+    /// `hasErrors()` check would treat any prior struct's failures as
     /// our own.
     fn hasNewErrors(self: *const Pipeline) bool {
         return self.ctx.diag_engine.errorCount() > self.error_baseline;
@@ -737,11 +737,11 @@ const Pipeline = struct {
 
     /// Walk `program` and register every function declaration that
     /// the scope graph hasn't already recorded under its parent
-    /// module. Used after macro expansion or desugaring introduces
+    /// struct. Used after macro expansion or desugaring introduces
     /// helpers (e.g., `__for_N` from for-comprehensions) that need a
     /// scope before HIR lowering can resolve their callsites — the
     /// HIR builder compares AST node pointers to determine which
-    /// functions belong to the current module, so the scope graph
+    /// functions belong to the current struct, so the scope graph
     /// entries must reference these new AST nodes.
     fn runReCollectFunctions(self: *Pipeline, program: *const ast.Program) void {
         for (program.structs) |*mod| {
@@ -763,9 +763,9 @@ const Pipeline = struct {
     }
 
     /// Run the type checker against a desugared program. The TypeStore
-    /// is either shared across modules (`shared_store != null`, used
+    /// is either shared across structs (`shared_store != null`, used
     /// by the whole-program monomorphization path so call-site
-    /// inferred signatures travel between modules) or owned by the
+    /// inferred signatures travel between structs) or owned by the
     /// returned checker. The caller must `deinit` the returned
     /// TypeChecker — the function returns it so the caller can keep
     /// it alive across later phases (e.g., compileForCtfe re-runs
@@ -778,9 +778,9 @@ const Pipeline = struct {
     ) CompileError!zap.types.TypeChecker {
         self.progress("Type check");
         var type_checker = if (shared_store) |store| blk: {
-            // Per-module typecheck reuses the shared store; clear
+            // Per-struct typecheck reuses the shared store; clear
             // call-site-specific inferred signatures from the previous
-            // module so they don't leak between modules.
+            // struct so they don't leak between structs.
             store.inferred_signatures.clearRetainingCapacity();
             break :blk zap.types.TypeChecker.initWithSharedStore(self.alloc, store, &self.ctx.interner, &self.ctx.collector.graph);
         } else zap.types.TypeChecker.init(self.alloc, &self.ctx.interner, &self.ctx.collector.graph);
@@ -814,7 +814,7 @@ const Pipeline = struct {
 
     /// Build HIR from a desugared program. `group_id_offset` lets the
     /// whole-program pipeline assign globally-unique function group
-    /// IDs across modules; pass 0 for a single-module run.
+    /// IDs across structs; pass 0 for a single-struct run.
     fn runHirBuild(
         self: *Pipeline,
         desugared: *const ast.Program,
@@ -862,11 +862,11 @@ const Pipeline = struct {
             self.failWith("Error during IR lowering", error.IrFailed);
     }
 
-    /// Per-module IR build variant that threads a globally-unique
-    /// `__try` ID counter across module boundaries. Without this,
-    /// each per-module IR build would derive `next_try_id` from the
-    /// per-module max group ID and a `__try` variant produced for
-    /// module A's multi-clause function could share the ID of module
+    /// Per-struct IR build variant that threads a globally-unique
+    /// `__try` ID counter across struct boundaries. Without this,
+    /// each per-struct IR build would derive `next_try_id` from the
+    /// per-struct max group ID and a `__try` variant produced for
+    /// struct A's multi-clause function could share the ID of struct
     /// B's regular HIR group, causing call_direct dispatches to
     /// resolve to the wrong function.
     fn runIrLoweringWithTryIdSeed(
@@ -888,20 +888,20 @@ const Pipeline = struct {
     }
 
     /// CTFE attribute evaluation across the whole IR program. When a
-    /// `module_order` is supplied each module's attributes are
-    /// evaluated in dependency order so each module can read its
+    /// `struct_order` is supplied each struct's attributes are
+    /// evaluated in dependency order so each struct can read its
     /// dependencies' resolved values; otherwise the legacy
     /// whole-program evaluator runs. CTFE errors are emitted through
-    /// the CTFE module's own path, so the return is best-effort.
+    /// the CTFE struct's own path, so the return is best-effort.
     fn runCtfeAttributes(
         self: *Pipeline,
         ir_program: *ir.Program,
-        module_order: ?[]const []const u8,
+        struct_order: ?[]const []const u8,
     ) void {
         const cache_dir = self.options.cache_dir;
         const opts_hash = ctfeCompileOptionsHash(self.options);
-        if (module_order) |order| {
-            _ = zap.ctfe.evaluateModuleAttributesInOrder(
+        if (struct_order) |order| {
+            _ = zap.ctfe.evaluateStructAttributesInOrder(
                 self.alloc,
                 ir_program,
                 &self.ctx.collector.graph,
@@ -922,15 +922,15 @@ const Pipeline = struct {
         }
     }
 
-    /// Per-module CTFE used when each module's IR is built in
+    /// Per-struct CTFE used when each struct's IR is built in
     /// isolation. Surfaces any errors directly through the CTFE
     /// emit path.
-    fn runCtfeAttributesForModule(
+    fn runCtfeAttributesForStruct(
         self: *Pipeline,
         mod_name: []const u8,
         mod_ir: *ir.Program,
     ) void {
-        const ctfe_result = zap.ctfe.evaluateComputedAttributesForModule(
+        const ctfe_result = zap.ctfe.evaluateComputedAttributesForStruct(
             self.alloc,
             mod_ir,
             &self.ctx.collector.graph,
@@ -959,10 +959,10 @@ const Pipeline = struct {
     }
 };
 
-/// Compile a single module's AST through attribute substitution → type
-/// check → HIR build. Used by `compileModuleByModule`'s phase-1 loop
-/// to gather every module's HIR before whole-program monomorphization.
-fn compileSingleModuleHir(
+/// Compile a single struct's AST through attribute substitution → type
+/// check → HIR build. Used by `compileStructByStruct`'s phase-1 loop
+/// to gather every struct's HIR before whole-program monomorphization.
+fn compileSingleStructHir(
     alloc: std.mem.Allocator,
     ctx: *CompilationContext,
     mod_name: []const u8,
@@ -970,14 +970,14 @@ fn compileSingleModuleHir(
     shared_store: *zap.types.TypeStore,
     group_id_offset: u32,
     options: CompileOptions,
-) CompileError!ModuleHirResult {
+) CompileError!StructHirResult {
     var pipeline = Pipeline.init(alloc, ctx, options, 0, 0);
     pipeline.defer_render = true;
     const desugared = try pipeline.runSubstitute(mod_program);
 
     // checkUnusedBindings is intentionally skipped — the type checker
-    // shares the scope graph across modules but only visits the
-    // current module's bindings, so checking all bindings here would
+    // shares the scope graph across structs but only visits the
+    // current struct's bindings, so checking all bindings here would
     // emit false "unused" warnings for bindings declared elsewhere.
     var type_checker = try pipeline.runTypeCheck(&desugared, shared_store, false);
     defer type_checker.deinit();
@@ -991,9 +991,9 @@ fn compileSingleModuleHir(
 }
 
 /// Lower a monomorphized HIR program to IR, then evaluate computed
-/// attributes for the module so downstream modules can read the
-/// resolved values. Per-module half of the IR-lowering loop in
-/// `compileModuleByModule`.
+/// attributes for the struct so downstream structs can read the
+/// resolved values. Per-struct half of the IR-lowering loop in
+/// `compileStructByStruct`.
 fn compileHirToIr(
     alloc: std.mem.Allocator,
     ctx: *CompilationContext,
@@ -1006,7 +1006,7 @@ fn compileHirToIr(
     var pipeline = Pipeline.init(alloc, ctx, options, 0, 0);
     pipeline.defer_render = true;
     var mod_ir = try pipeline.runIrLoweringWithTryIdSeed(hir_program, type_store, next_try_id);
-    pipeline.runCtfeAttributesForModule(mod_name, &mod_ir);
+    pipeline.runCtfeAttributesForStruct(mod_name, &mod_ir);
     return mod_ir;
 }
 
@@ -1040,14 +1040,14 @@ fn legacyMacroExpandAndDesugar(
 fn stagedMacroExpandAndDesugar(
     alloc: std.mem.Allocator,
     program: *const ast.Program,
-    module_order: []const []const u8,
+    struct_order: []const []const u8,
     interner: *ast.StringInterner,
     collector: *zap.Collector,
     diag_engine: *zap.DiagnosticEngine,
 ) CompileError!ast.Program {
-    const original_modules = buildModulePrograms(alloc, program, interner) catch return error.OutOfMemory;
-    var expanded_modules: std.ArrayListUnmanaged(ModuleProgram) = .empty;
-    var seen_modules = std.StringHashMap(void).init(alloc);
+    const original_structs = buildStructPrograms(alloc, program, interner) catch return error.OutOfMemory;
+    var expanded_structs: std.ArrayListUnmanaged(StructProgram) = .empty;
+    var seen_structs = std.StringHashMap(void).init(alloc);
 
     var cumulative_ir = ir.Program{
         .functions = &.{},
@@ -1060,12 +1060,12 @@ fn stagedMacroExpandAndDesugar(
     const shared_store = alloc.create(zap.types.TypeStore) catch return error.OutOfMemory;
     shared_store.* = zap.types.TypeStore.init(alloc, interner);
 
-    var hir_results: std.ArrayListUnmanaged(ModuleHirResult) = .empty;
+    var hir_results: std.ArrayListUnmanaged(StructHirResult) = .empty;
     var group_id_offset: u32 = 0;
 
-    for (module_order) |module_name| {
-        const original = lookupModuleProgramInSlice(original_modules, module_name) orelse continue;
-        const desugared = try expandAndDesugarStagedModule(
+    for (struct_order) |struct_name| {
+        const original = lookupStructProgramInSlice(original_structs, struct_name) orelse continue;
+        const desugared = try expandAndDesugarStagedStruct(
             alloc,
             original,
             interner,
@@ -1073,10 +1073,10 @@ fn stagedMacroExpandAndDesugar(
             diag_engine,
             &compiled_executor,
         );
-        try expanded_modules.append(alloc, .{ .name = original.name, .program = desugared });
-        try seen_modules.put(original.name, {});
+        try expanded_structs.append(alloc, .{ .name = original.name, .program = desugared });
+        try seen_structs.put(original.name, {});
 
-        const hir_result = try compileStagedModuleHir(
+        const hir_result = try compileStagedStructHir(
             alloc,
             &desugared,
             original.name,
@@ -1099,9 +1099,9 @@ fn stagedMacroExpandAndDesugar(
         );
     }
 
-    for (original_modules) |original| {
-        if (seen_modules.contains(original.name)) continue;
-        const desugared = try expandAndDesugarStagedModule(
+    for (original_structs) |original| {
+        if (seen_structs.contains(original.name)) continue;
+        const desugared = try expandAndDesugarStagedStruct(
             alloc,
             &original,
             interner,
@@ -1109,7 +1109,7 @@ fn stagedMacroExpandAndDesugar(
             diag_engine,
             &compiled_executor,
         );
-        try expanded_modules.append(alloc, .{ .name = original.name, .program = desugared });
+        try expanded_structs.append(alloc, .{ .name = original.name, .program = desugared });
     }
 
     const top_level_items = try collectUnassignedTopLevelItems(alloc, program);
@@ -1126,12 +1126,12 @@ fn stagedMacroExpandAndDesugar(
     } else null;
 
     const extra_top_level_count: usize = if (top_level_program != null) 1 else 0;
-    const slices = try alloc.alloc(ast.Program, expanded_modules.items.len + extra_top_level_count);
-    for (expanded_modules.items, 0..) |entry, index| {
+    const slices = try alloc.alloc(ast.Program, expanded_structs.items.len + extra_top_level_count);
+    for (expanded_structs.items, 0..) |entry, index| {
         slices[index] = entry.program;
     }
     if (top_level_program) |top_program| {
-        slices[expanded_modules.items.len] = top_program;
+        slices[expanded_structs.items.len] = top_program;
     }
     return mergePrograms(alloc, slices) catch return error.OutOfMemory;
 }
@@ -1192,9 +1192,9 @@ fn expandAndDesugarTopLevelProgram(
     };
 }
 
-fn expandAndDesugarStagedModule(
+fn expandAndDesugarStagedStruct(
     alloc: std.mem.Allocator,
-    module_program: *const ModuleProgram,
+    struct_program: *const StructProgram,
     interner: *ast.StringInterner,
     collector: *zap.Collector,
     diag_engine: *zap.DiagnosticEngine,
@@ -1205,7 +1205,7 @@ fn expandAndDesugarStagedModule(
     var macro_engine = zap.MacroEngine.init(alloc, interner, &collector.graph);
     defer macro_engine.deinit();
     macro_engine.setCompiledExecutor(compiled_executor);
-    const expanded = macro_engine.expandProgram(&module_program.program) catch {
+    const expanded = macro_engine.expandProgram(&struct_program.program) catch {
         for (macro_engine.errors.items) |macro_err| {
             diag_engine.err(macro_err.message, macro_err.span) catch {};
         }
@@ -1240,8 +1240,8 @@ fn expandGraphImplsForProgram(
 ) CompileError!void {
     for (collector.graph.impls.items) |*entry| {
         var target_in_program = false;
-        for (program.structs) |module| {
-            if (structNamesEqual(module.name, entry.target_type)) {
+        for (program.structs) |struct_decl| {
+            if (structNamesEqual(struct_decl.name, entry.target_type)) {
                 target_in_program = true;
                 break;
             }
@@ -1284,23 +1284,23 @@ fn expandGraphImplsForProgram(
     }
 }
 
-fn compileStagedModuleHir(
+fn compileStagedStructHir(
     alloc: std.mem.Allocator,
     desugared: *const ast.Program,
-    module_name: []const u8,
+    struct_name: []const u8,
     interner: *ast.StringInterner,
     collector: *zap.Collector,
     diag_engine: *zap.DiagnosticEngine,
     shared_store: *zap.types.TypeStore,
     group_id_offset: u32,
-) CompileError!ModuleHirResult {
+) CompileError!StructHirResult {
     const error_baseline = diag_engine.errorCount();
     if (findUndesugaredMacroForm(desugared) orelse findUndesugaredMacroFormInGraphImpls(&collector.graph, desugared)) |form| {
         diag_engine.err(
             std.fmt.allocPrint(
                 alloc,
                 "staged macro expansion left raw `{s}` before HIR in `{s}`",
-                .{ form.name, module_name },
+                .{ form.name, struct_name },
             ) catch "staged macro expansion left raw macro form before HIR",
             form.span,
         ) catch {};
@@ -1337,7 +1337,7 @@ fn compileStagedModuleHir(
     if (diag_engine.errorCount() > error_baseline) return error.HirFailed;
 
     return .{
-        .mod_name = module_name,
+        .mod_name = struct_name,
         .hir_program = hir_program,
         .next_group_id = hir_builder.next_group_id,
     };
@@ -1349,8 +1349,8 @@ const UndesugaredMacroForm = struct {
 };
 
 fn findUndesugaredMacroForm(program: *const ast.Program) ?UndesugaredMacroForm {
-    for (program.structs) |module| {
-        for (module.items) |item| {
+    for (program.structs) |struct_decl| {
+        for (struct_decl.items) |item| {
             if (findUndesugaredMacroFormInStructItem(item)) |form| return form;
         }
     }
@@ -1363,8 +1363,8 @@ fn findUndesugaredMacroForm(program: *const ast.Program) ?UndesugaredMacroForm {
 fn findUndesugaredMacroFormInGraphImpls(graph: *const zap.scope.ScopeGraph, program: *const ast.Program) ?UndesugaredMacroForm {
     for (graph.impls.items) |impl_entry| {
         var target_in_program = false;
-        for (program.structs) |module| {
-            if (structNamesEqual(module.name, impl_entry.target_type)) {
+        for (program.structs) |struct_decl| {
+            if (structNamesEqual(struct_decl.name, impl_entry.target_type)) {
                 target_in_program = true;
                 break;
             }
@@ -1513,19 +1513,19 @@ fn findUndesugaredMacroFormInErrorHandler(handler: ast.ErrorHandler) ?Undesugare
 
 fn rebuildStagedIr(
     alloc: std.mem.Allocator,
-    hir_results: []const ModuleHirResult,
+    hir_results: []const StructHirResult,
     interner: *ast.StringInterner,
     collector: *zap.Collector,
     shared_store: *zap.types.TypeStore,
     group_id_offset: u32,
 ) CompileError!ir.Program {
-    var all_hir_modules: std.ArrayListUnmanaged(zap.hir.Module) = .empty;
+    var all_hir_structs: std.ArrayListUnmanaged(zap.hir.Struct) = .empty;
     var all_hir_top_fns: std.ArrayListUnmanaged(zap.hir.FunctionGroup) = .empty;
     var all_hir_protocols: std.ArrayListUnmanaged(zap.hir.ProtocolInfo) = .empty;
     var all_hir_impls: std.ArrayListUnmanaged(zap.hir.ImplInfo) = .empty;
     for (hir_results) |*result| {
-        for (result.hir_program.modules) |mod| {
-            all_hir_modules.append(alloc, mod) catch return error.OutOfMemory;
+        for (result.hir_program.structs) |mod| {
+            all_hir_structs.append(alloc, mod) catch return error.OutOfMemory;
         }
         for (result.hir_program.top_functions) |top_function| {
             all_hir_top_fns.append(alloc, top_function) catch return error.OutOfMemory;
@@ -1539,7 +1539,7 @@ fn rebuildStagedIr(
     }
 
     var combined_hir = zap.hir.Program{
-        .modules = all_hir_modules.toOwnedSlice(alloc) catch return error.OutOfMemory,
+        .structs = all_hir_structs.toOwnedSlice(alloc) catch return error.OutOfMemory,
         .top_functions = all_hir_top_fns.toOwnedSlice(alloc) catch return error.OutOfMemory,
         .protocols = all_hir_protocols.toOwnedSlice(alloc) catch return error.OutOfMemory,
         .impls = all_hir_impls.toOwnedSlice(alloc) catch return error.OutOfMemory,
@@ -1557,9 +1557,9 @@ fn rebuildStagedIr(
     return ir_builder.buildProgram(&combined_hir) catch return error.IrFailed;
 }
 
-fn lookupModuleProgramInSlice(module_programs: []const ModuleProgram, module_name: []const u8) ?*const ModuleProgram {
-    for (module_programs) |*entry| {
-        if (std.mem.eql(u8, entry.name, module_name)) return entry;
+fn lookupStructProgramInSlice(struct_programs: []const StructProgram, struct_name: []const u8) ?*const StructProgram {
+    for (struct_programs) |*entry| {
+        if (std.mem.eql(u8, entry.name, struct_name)) return entry;
     }
     return null;
 }
@@ -1607,30 +1607,30 @@ fn structNamesEqual(left: ast.StructName, right: ast.StructName) bool {
     return true;
 }
 
-/// True per-module compilation: process each module independently through
+/// True per-struct compilation: process each struct independently through
 /// macro → desugar → typecheck → HIR → IR, in dependency order.
 ///
-/// After each module's IR is built, runs CTFE on its computed attributes
-/// and registers the results for downstream modules to reference.
+/// After each struct's IR is built, runs CTFE on its computed attributes
+/// and registers the results for downstream structs to reference.
 ///
 /// This is the architecture described in ir-interpreter-plan.md Phase 5:
 /// "split macro expansion, desugaring, typechecking, HIR, and IR lowering
-/// into real per-module units."
+/// into real per-struct units."
 ///
 /// Requires that collectAll has already populated the shared scope graph
-/// with all modules' declarations. Each module compiles against the full
-/// scope graph (for cross-module type resolution) but only processes its
+/// with all structs' declarations. Each struct compiles against the full
+/// scope graph (for cross-struct type resolution) but only processes its
 /// own AST through the pipeline.
-pub fn compileModuleByModule(
+pub fn compileStructByStruct(
     alloc: std.mem.Allocator,
     ctx: *CompilationContext,
-    module_order: []const []const u8,
+    struct_order: []const []const u8,
     options: CompileOptions,
 ) CompileError!CompileResult {
     var pipeline = Pipeline.init(alloc, ctx, options, 0, 0);
     pipeline.defer_render = true;
 
-    // Collect all IR functions and type defs across modules.
+    // Collect all IR functions and type defs across structs.
     var all_functions: std.ArrayListUnmanaged(ir.Function) = .empty;
     var all_type_defs: std.ArrayListUnmanaged(ir.TypeDef) = .empty;
     var entry_id: ?ir.FunctionId = null;
@@ -1639,33 +1639,33 @@ pub fn compileModuleByModule(
     const shared_store = alloc.create(zap.types.TypeStore) catch return error.OutOfMemory;
     shared_store.* = zap.types.TypeStore.init(alloc, &ctx.interner);
 
-    // Phase 1: every module → HIR. Shared TypeStore and globally-
-    // unique group IDs let later phases monomorphize across module
+    // Phase 1: every struct → HIR. Shared TypeStore and globally-
+    // unique group IDs let later phases monomorphize across struct
     // boundaries.
-    var hir_results: std.ArrayListUnmanaged(ModuleHirResult) = .empty;
+    var hir_results: std.ArrayListUnmanaged(StructHirResult) = .empty;
     var group_id_offset: u32 = 0;
-    for (module_order, 0..) |mod_name, mod_idx| {
+    for (struct_order, 0..) |mod_name, mod_idx| {
         if (options.show_progress) {
-            std.debug.print("\r\x1b[K  [hir {d}/{d}] {s}", .{ mod_idx + 1, module_order.len, mod_name });
+            std.debug.print("\r\x1b[K  [hir {d}/{d}] {s}", .{ mod_idx + 1, struct_order.len, mod_name });
         }
-        const mod_program = lookupModuleProgram(ctx, mod_name) orelse continue;
-        // Per-module failures are routed through the diagnostic
+        const mod_program = lookupStructProgram(ctx, mod_name) orelse continue;
+        // Per-struct failures are routed through the diagnostic
         // engine inside the helper; the loop continues so other
-        // modules still compile and the user sees as many errors as
+        // structs still compile and the user sees as many errors as
         // possible in one run.
-        const hir_result = compileSingleModuleHir(alloc, ctx, mod_name, mod_program, shared_store, group_id_offset, options) catch continue;
+        const hir_result = compileSingleStructHir(alloc, ctx, mod_name, mod_program, shared_store, group_id_offset, options) catch continue;
         group_id_offset = hir_result.next_group_id;
         hir_results.append(alloc, hir_result) catch return error.OutOfMemory;
     }
 
-    // Phase 2: merge per-module HIR programs.
-    var all_hir_modules: std.ArrayListUnmanaged(zap.hir.Module) = .empty;
+    // Phase 2: merge per-struct HIR programs.
+    var all_hir_structs: std.ArrayListUnmanaged(zap.hir.Struct) = .empty;
     var all_hir_top_fns: std.ArrayListUnmanaged(zap.hir.FunctionGroup) = .empty;
     var all_hir_protocols: std.ArrayListUnmanaged(zap.hir.ProtocolInfo) = .empty;
     var all_hir_impls: std.ArrayListUnmanaged(zap.hir.ImplInfo) = .empty;
     for (hir_results.items) |*result| {
-        for (result.hir_program.modules) |mod| {
-            all_hir_modules.append(alloc, mod) catch return error.OutOfMemory;
+        for (result.hir_program.structs) |mod| {
+            all_hir_structs.append(alloc, mod) catch return error.OutOfMemory;
         }
         for (result.hir_program.top_functions) |tf| {
             all_hir_top_fns.append(alloc, tf) catch return error.OutOfMemory;
@@ -1679,7 +1679,7 @@ pub fn compileModuleByModule(
     }
 
     var combined_hir = zap.hir.Program{
-        .modules = all_hir_modules.toOwnedSlice(alloc) catch return error.OutOfMemory,
+        .structs = all_hir_structs.toOwnedSlice(alloc) catch return error.OutOfMemory,
         .top_functions = all_hir_top_fns.toOwnedSlice(alloc) catch return error.OutOfMemory,
         .protocols = all_hir_protocols.toOwnedSlice(alloc) catch return error.OutOfMemory,
         .impls = all_hir_impls.toOwnedSlice(alloc) catch return error.OutOfMemory,
@@ -1689,16 +1689,16 @@ pub fn compileModuleByModule(
     var mono_next = group_id_offset;
     combined_hir = try pipeline.runMonomorphize(&combined_hir, shared_store, &mono_next);
 
-    // Phase 4: each module's HIR → IR. Function IDs are already
+    // Phase 4: each struct's HIR → IR. Function IDs are already
     // globally unique from the HIR stage (group_id_offset advancement
     // in phase 1), so no cloneWithOffset is needed — collect
-    // functions directly. `next_try_id` is threaded across modules so
+    // functions directly. `next_try_id` is threaded across structs so
     // synthesized `__try` variants get globally unique IDs that don't
-    // collide with another module's regular HIR groups.
+    // collide with another struct's regular HIR groups.
     var next_try_id: u32 = mono_next;
-    for (combined_hir.modules) |mod| {
+    for (combined_hir.structs) |mod| {
         const single_mod_hir = zap.hir.Program{
-            .modules = try alloc.dupe(zap.hir.Module, &.{mod}),
+            .structs = try alloc.dupe(zap.hir.Struct, &.{mod}),
             .top_functions = &.{},
         };
         const mod_name_str = if (mod.name.parts.len > 0) ctx.interner.get(mod.name.parts[mod.name.parts.len - 1]) else "unknown";
@@ -1715,7 +1715,7 @@ pub fn compileModuleByModule(
     }
     if (combined_hir.top_functions.len > 0) {
         const top_hir = zap.hir.Program{
-            .modules = &.{},
+            .structs = &.{},
             .top_functions = combined_hir.top_functions,
             .impls = combined_hir.impls,
         };
@@ -1737,9 +1737,9 @@ pub fn compileModuleByModule(
     };
     const analysis_result = try pipeline.runAnalysisAndContify(&merged_ir);
 
-    // Single rendering pass for all per-module diagnostics. Each
+    // Single rendering pass for all per-struct diagnostics. Each
     // sub-pipeline accumulated into the shared engine without flushing,
-    // so we emit exactly once here regardless of how many modules
+    // so we emit exactly once here regardless of how many structs
     // failed.
     if (ctx.diag_engine.hasErrors()) {
         pipeline.clearProgress();
@@ -1749,15 +1749,15 @@ pub fn compileModuleByModule(
     return .{ .ir_program = merged_ir, .analysis_context = analysis_result.context };
 }
 
-/// Extract a single-module ast.Program from the merged program.
-fn extractModuleProgram(
+/// Extract a single-struct ast.Program from the merged program.
+fn extractStructProgram(
     alloc: std.mem.Allocator,
     merged: *const ast.Program,
     mod_name: []const u8,
     interner: *const ast.StringInterner,
 ) ?ast.Program {
     for (merged.structs) |mod| {
-        // Build module name string from parts
+        // Build struct name string from parts
         if (mod.name.parts.len == 1) {
             if (std.mem.eql(u8, interner.get(mod.name.parts[0]), mod_name)) {
                 const mods = alloc.alloc(ast.StructDecl, 1) catch return null;
@@ -1787,23 +1787,23 @@ fn extractModuleProgram(
     return null;
 }
 
-fn buildModulePrograms(
+fn buildStructPrograms(
     alloc: std.mem.Allocator,
     program: *const ast.Program,
     interner: *const ast.StringInterner,
-) ![]const ModuleProgram {
-    const result = try alloc.alloc(ModuleProgram, program.structs.len);
+) ![]const StructProgram {
+    const result = try alloc.alloc(StructProgram, program.structs.len);
     for (program.structs, 0..) |mod, i| {
         const name = try structNameToOwnedString(alloc, mod.name, interner);
         const mods = try alloc.alloc(ast.StructDecl, 1);
         mods[0] = mod;
 
-        // Include impl_decls whose target_type matches this module so the
-        // module's HIR/IR emits the impl function bodies as part of the
-        // target module's namespace. registerImplFunctionsInTargetScopes
+        // Include impl_decls whose target_type matches this struct so the
+        // struct's HIR/IR emits the impl function bodies as part of the
+        // target struct's namespace. registerImplFunctionsInTargetScopes
         // makes the impl callable; this makes its body land in the right
-        // module's emitted code.
-        var module_top_items: std.ArrayList(ast.TopItem) = .empty;
+        // struct's emitted code.
+        var struct_top_items: std.ArrayList(ast.TopItem) = .empty;
         for (program.top_items) |item| {
             const impl = switch (item) {
                 .impl_decl => |id| id,
@@ -1811,7 +1811,7 @@ fn buildModulePrograms(
                 else => continue,
             };
             if (structNameMatchesString(impl.target_type, name, interner)) {
-                try module_top_items.append(alloc, item);
+                try struct_top_items.append(alloc, item);
             }
         }
 
@@ -1819,7 +1819,7 @@ fn buildModulePrograms(
             .name = name,
             .program = .{
                 .structs = mods,
-                .top_items = try module_top_items.toOwnedSlice(alloc),
+                .top_items = try struct_top_items.toOwnedSlice(alloc),
             },
         };
     }
@@ -1844,21 +1844,21 @@ fn structNameMatchesString(name: ast.StructName, target: []const u8, interner: *
 
 fn buildCompilationUnits(
     alloc: std.mem.Allocator,
-    module_programs: []const ModuleProgram,
+    struct_programs: []const StructProgram,
     source_units: []const SourceUnit,
 ) ![]CompilationUnit {
     // Build a unit for each struct by using parser source_id metadata first.
     // This stays correct when source_units also contains protocol/impl-only
     // files gathered from manifest globs.
     var units_list: std.ArrayListUnmanaged(CompilationUnit) = .empty;
-    for (module_programs, 0..) |entry, mod_idx| {
-        const source_idx = findSourceUnitIndex(entry, mod_idx, module_programs.len, source_units);
+    for (struct_programs, 0..) |entry, mod_idx| {
+        const source_idx = findSourceUnitIndex(entry, mod_idx, struct_programs.len, source_units);
         const su = source_units[source_idx];
         try units_list.append(alloc, .{
             .file_path = su.file_path,
-            .module_name = entry.name,
+            .struct_name = entry.name,
             .source = su.source,
-            .module_index = @intCast(mod_idx),
+            .struct_index = @intCast(mod_idx),
             .ir_program = null,
             .dep = null,
         });
@@ -1867,9 +1867,9 @@ fn buildCompilationUnits(
 }
 
 fn findSourceUnitIndex(
-    entry: ModuleProgram,
-    module_index: usize,
-    module_count: usize,
+    entry: StructProgram,
+    struct_index: usize,
+    struct_count: usize,
     source_units: []const SourceUnit,
 ) usize {
     if (entry.program.structs.len > 0) {
@@ -1884,7 +1884,7 @@ fn findSourceUnitIndex(
         }
     }
 
-    if (module_count == source_units.len) return module_index;
+    if (struct_count == source_units.len) return struct_index;
 
     for (source_units, 0..) |unit, source_index| {
         if (std.mem.find(u8, unit.source, entry.name)) |_| {
@@ -1892,7 +1892,7 @@ fn findSourceUnitIndex(
         }
     }
 
-    return @min(module_index, if (source_units.len > 0) source_units.len - 1 else 0);
+    return @min(struct_index, if (source_units.len > 0) source_units.len - 1 else 0);
 }
 
 fn mergePrograms(alloc: std.mem.Allocator, programs: []const ast.Program) !ast.Program {
@@ -1982,8 +1982,8 @@ fn structNameToOwnedString(
     return name.toDottedString(alloc, interner);
 }
 
-fn lookupModuleProgram(ctx: *const CompilationContext, mod_name: []const u8) ?*const ast.Program {
-    for (ctx.module_programs) |*entry| {
+fn lookupStructProgram(ctx: *const CompilationContext, mod_name: []const u8) ?*const ast.Program {
+    for (ctx.struct_programs) |*entry| {
         if (std.mem.eql(u8, entry.name, mod_name)) return &entry.program;
     }
     return null;
@@ -2022,12 +2022,12 @@ pub fn runBinary(allocator: std.mem.Allocator, pio: std.Io, bin_path: []const u8
     };
 }
 
-/// Validate that a source file contains exactly one module declaration and that the
-/// module name matches the file path. Returns an error message if validation
+/// Validate that a source file contains exactly one struct declaration and that the
+/// struct name matches the file path. Returns an error message if validation
 /// fails, or null if the file is valid.
 ///
 /// `file_path` is relative to the lib root (e.g., "config/parser.zap").
-/// The expected module name is derived from the path: "config/parser.zap" → "Config.Parser".
+/// The expected struct name is derived from the path: "config/parser.zap" → "Config.Parser".
 pub fn validateOneStructPerFile(
     alloc: std.mem.Allocator,
     source: []const u8,
@@ -2039,7 +2039,7 @@ pub fn validateOneStructPerFile(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // Parse without stdlib — we only need to count module declarations
+    // Parse without stdlib — we only need to count struct declarations
     var parser = zap.Parser.init(arena, source);
 
     const program = parser.parseProgram() catch {
@@ -2048,22 +2048,22 @@ pub fn validateOneStructPerFile(
     };
 
     // Count top-level declarations (struct, protocol, or impl)
-    var module_count: u32 = 0;
-    var module_name_parts: ?[]const ast.StringId = null;
+    var struct_count: u32 = 0;
+    var struct_name_parts: ?[]const ast.StringId = null;
     var has_protocol_or_impl = false;
     for (program.top_items) |item| {
         switch (item) {
             .struct_decl => |mod| {
-                // Only count module-like structs (with items), not field-only data structs
+                // Only count struct-like structs (with items), not field-only data structs
                 if (mod.items.len > 0) {
-                    module_count += 1;
-                    module_name_parts = mod.name.parts;
+                    struct_count += 1;
+                    struct_name_parts = mod.name.parts;
                 }
             },
             .priv_struct_decl => |mod| {
                 if (mod.items.len > 0) {
-                    module_count += 1;
-                    module_name_parts = mod.name.parts;
+                    struct_count += 1;
+                    struct_name_parts = mod.name.parts;
                 }
             },
             .protocol, .priv_protocol => {
@@ -2076,37 +2076,37 @@ pub fn validateOneStructPerFile(
         }
     }
     // Also count from program.structs (the parser populates both)
-    if (module_count == 0) {
+    if (struct_count == 0) {
         for (program.structs) |mod| {
             if (mod.items.len > 0) {
-                module_count += 1;
-                module_name_parts = mod.name.parts;
+                struct_count += 1;
+                struct_name_parts = mod.name.parts;
             }
         }
     }
 
-    // Protocol and impl files don't need a module declaration
-    if (has_protocol_or_impl and module_count == 0) {
+    // Protocol and impl files don't need a struct declaration
+    if (has_protocol_or_impl and struct_count == 0) {
         return null;
     }
 
-    if (module_count == 0) {
-        return std.fmt.allocPrint(alloc, "File `{s}` must contain exactly one module declaration, found none", .{file_path}) catch "file has no module";
+    if (struct_count == 0) {
+        return std.fmt.allocPrint(alloc, "File `{s}` must contain exactly one struct declaration, found none", .{file_path}) catch "file has no struct";
     }
 
-    if (module_count > 1) {
-        return std.fmt.allocPrint(alloc, "File `{s}` must contain exactly one module declaration, found {d}", .{ file_path, module_count }) catch "file has multiple modules";
+    if (struct_count > 1) {
+        return std.fmt.allocPrint(alloc, "File `{s}` must contain exactly one struct declaration, found {d}", .{ file_path, struct_count }) catch "file has multiple structs";
     }
 
-    // Build the actual module name from the AST
-    const parts = module_name_parts orelse return null;
+    // Build the actual struct name from the AST
+    const parts = struct_name_parts orelse return null;
     var actual_name: std.ArrayListUnmanaged(u8) = .empty;
     for (parts, 0..) |part, i| {
         if (i > 0) actual_name.append(arena, '.') catch return null;
         actual_name.appendSlice(arena, parser.interner.get(part)) catch return null;
     }
 
-    // Build the expected module name from the file path
+    // Build the expected struct name from the file path
     // "config/parser.zap" → "Config.Parser"
     var expected_name: std.ArrayListUnmanaged(u8) = .empty;
 
@@ -2145,9 +2145,9 @@ pub fn validateOneStructPerFile(
         // Allocate the error message with the caller's allocator so it outlives the arena
         return std.fmt.allocPrint(
             alloc,
-            "Module name `{s}` does not match file path `{s}` — expected `{s}`",
+            "Struct name `{s}` does not match file path `{s}` — expected `{s}`",
             .{ actual_name.items, file_path, expected_name.items },
-        ) catch "module name does not match file path";
+        ) catch "struct name does not match file path";
     }
 
     return null;
@@ -2451,7 +2451,7 @@ fn remapStructItem(alloc: std.mem.Allocator, item: *ast.StructItem, remap: []con
         .alias_decl => |ad| {
             const mutable = try alloc.create(ast.AliasDecl);
             mutable.* = ad.*;
-            try remapStructName(alloc, &mutable.module_path, remap);
+            try remapStructName(alloc, &mutable.struct_path, remap);
             if (mutable.as_name) |*as_name| try remapStructName(alloc, as_name, remap);
             item.* = .{ .alias_decl = mutable };
         },
@@ -2464,7 +2464,7 @@ fn remapStructItem(alloc: std.mem.Allocator, item: *ast.StructItem, remap: []con
         .use_decl => |ud| {
             const mutable = try alloc.create(ast.UseDecl);
             mutable.* = ud.*;
-            try remapStructName(alloc, &mutable.module_path, remap);
+            try remapStructName(alloc, &mutable.struct_path, remap);
             if (mutable.opts) |opts| {
                 const mutable_opts = try alloc.create(ast.Expr);
                 mutable_opts.* = opts.*;
@@ -2686,7 +2686,7 @@ fn remapStmt(alloc: std.mem.Allocator, stmt: *ast.Stmt, remap: []const ast.Strin
 }
 
 fn remapImportDecl(alloc: std.mem.Allocator, id: *ast.ImportDecl, remap: []const ast.StringId) error{OutOfMemory}!void {
-    try remapStructName(alloc, &id.module_path, remap);
+    try remapStructName(alloc, &id.struct_path, remap);
     if (id.filter) |*filter| {
         switch (filter.*) {
             .only => |entries| {
@@ -2718,7 +2718,7 @@ fn remapExpr(alloc: std.mem.Allocator, expr: *ast.Expr, remap: []const ast.Strin
         .string_literal => |*sl| sl.value = remap[sl.value],
         .atom_literal => |*al| al.value = remap[al.value],
         .var_ref => |*vr| vr.name = remap[vr.name],
-        .module_ref => |*mr| try remapStructName(alloc, &mr.name, remap),
+        .struct_ref => |*mr| try remapStructName(alloc, &mr.name, remap),
         .field_access => |*fa| {
             const mutable_obj = try alloc.create(ast.Expr);
             mutable_obj.* = fa.object.*;
@@ -2788,7 +2788,7 @@ fn remapExpr(alloc: std.mem.Allocator, expr: *ast.Expr, remap: []const ast.Strin
             }
         },
         .struct_expr => |*se| {
-            try remapStructName(alloc, &se.module_name, remap);
+            try remapStructName(alloc, &se.struct_name, remap);
             if (se.update_source) |us| {
                 const mutable = try alloc.create(ast.Expr);
                 mutable.* = us.*;
@@ -2809,7 +2809,7 @@ fn remapExpr(alloc: std.mem.Allocator, expr: *ast.Expr, remap: []const ast.Strin
             }
         },
         .function_ref => |*fr| {
-            if (fr.module) |*m| try remapStructName(alloc, m, remap);
+            if (fr.struct_name) |*m| try remapStructName(alloc, m, remap);
             fr.function = remap[fr.function];
         },
         .binary_op => |*bo| {
@@ -3174,7 +3174,7 @@ fn remapPattern(alloc: std.mem.Allocator, pattern: *ast.Pattern, remap: []const 
             }
         },
         .struct_pattern => |*sp| {
-            try remapStructName(alloc, &sp.module_name, remap);
+            try remapStructName(alloc, &sp.struct_name, remap);
             if (sp.fields.len > 0) {
                 const mutable_fields = try alloc.alloc(ast.StructPatternField, sp.fields.len);
                 for (sp.fields, 0..) |f, i| {
@@ -3258,7 +3258,7 @@ fn remapTypeExpr(alloc: std.mem.Allocator, te: *ast.TypeExpr, remap: []const ast
             }
         },
         .struct_type => |*tse| {
-            try remapStructName(alloc, &tse.module_name, remap);
+            try remapStructName(alloc, &tse.struct_name, remap);
             if (tse.fields.len > 0) {
                 const mutable_fields = try alloc.alloc(ast.TypeStructField, tse.fields.len);
                 for (tse.fields, 0..) |f, i| {
@@ -3320,14 +3320,14 @@ fn remapTypeExpr(alloc: std.mem.Allocator, te: *ast.TypeExpr, remap: []const ast
 // Tests
 // ============================================================
 
-test "validateOneStructPerFile: valid single module" {
+test "validateOneStructPerFile: valid single struct" {
     const alloc = std.testing.allocator;
     const source = "pub struct Config {\n  pub fn load() -> String {\n    \"ok\"\n  }\n}\n";
     const result = validateOneStructPerFile(alloc, source, "config.zap");
     try std.testing.expectEqual(null, result);
 }
 
-test "validateOneStructPerFile: valid nested module name" {
+test "validateOneStructPerFile: valid nested struct name" {
     const alloc = std.testing.allocator;
     const source = "pub struct Config.Parser {\n  pub fn parse() -> String {\n    \"ok\"\n  }\n}\n";
     const result = validateOneStructPerFile(alloc, source, "config/parser.zap");
@@ -3353,17 +3353,17 @@ test "validateOneStructPerFile: valid private struct" {
     try std.testing.expectEqual(null, result);
 }
 
-test "validateOneStructPerFile: field-only struct does not count as module" {
+test "validateOneStructPerFile: field-only struct does not count as struct" {
     const alloc = std.testing.allocator;
     const source = "pub struct Point {\n  x :: i64\n}\n";
     const result = validateOneStructPerFile(alloc, source, "point.zap");
-    // Field-only structs don't count as module declarations
-    // An empty file or one with only data structs has no module
+    // Field-only structs don't count as struct declarations
+    // An empty file or one with only data structs has no struct
     try std.testing.expect(result != null);
     alloc.free(result.?);
 }
 
-test "validateOneStructPerFile: multiple modules is error" {
+test "validateOneStructPerFile: multiple structs is error" {
     const alloc = std.testing.allocator;
     const source = "pub struct Foo {\n  pub fn foo() -> i64 {\n    1\n  }\n}\npub struct Bar {\n  pub fn bar() -> i64 {\n    2\n  }\n}\n";
     const result = validateOneStructPerFile(alloc, source, "foo.zap");
@@ -3388,7 +3388,7 @@ test "validateOneStructPerFile: snake_case path to PascalCase" {
     try std.testing.expectEqual(null, result);
 }
 
-test "buildModulePrograms stores per-module AST programs" {
+test "buildStructPrograms stores per-struct AST programs" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -3403,15 +3403,15 @@ test "buildModulePrograms stores per-module AST programs" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    const module_programs = try buildModulePrograms(alloc, &program, parser.interner);
-    try std.testing.expectEqual(@as(usize, 2), module_programs.len);
-    try std.testing.expectEqualStrings("Foo", module_programs[0].name);
-    try std.testing.expectEqual(@as(usize, 1), module_programs[0].program.structs.len);
-    try std.testing.expectEqualStrings("Bar.Baz", module_programs[1].name);
-    try std.testing.expectEqual(@as(usize, 1), module_programs[1].program.structs.len);
+    const struct_programs = try buildStructPrograms(alloc, &program, parser.interner);
+    try std.testing.expectEqual(@as(usize, 2), struct_programs.len);
+    try std.testing.expectEqualStrings("Foo", struct_programs[0].name);
+    try std.testing.expectEqual(@as(usize, 1), struct_programs[0].program.structs.len);
+    try std.testing.expectEqualStrings("Bar.Baz", struct_programs[1].name);
+    try std.testing.expectEqual(@as(usize, 1), struct_programs[1].program.structs.len);
 }
 
-test "buildCompilationUnits derives units from module programs" {
+test "buildCompilationUnits derives units from struct programs" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -3424,19 +3424,19 @@ test "buildCompilationUnits derives units from module programs" {
     var parser = zap.Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
-    const module_programs = try buildModulePrograms(alloc, &program, parser.interner);
+    const struct_programs = try buildStructPrograms(alloc, &program, parser.interner);
     const source_units = [_]SourceUnit{
         .{ .file_path = "fixture.zap", .source = "pub struct Foo {\n}\n" },
         .{ .file_path = "fixture.zap", .source = "pub struct Bar.Baz {\n}\n" },
     };
-    const units = try buildCompilationUnits(alloc, module_programs, &source_units);
+    const units = try buildCompilationUnits(alloc, struct_programs, &source_units);
 
     try std.testing.expectEqual(@as(usize, 2), units.len);
-    try std.testing.expectEqualStrings("Foo", units[0].module_name);
+    try std.testing.expectEqualStrings("Foo", units[0].struct_name);
     try std.testing.expectEqualStrings("fixture.zap", units[0].file_path);
-    try std.testing.expectEqual(@as(u32, 0), units[0].module_index.?);
-    try std.testing.expectEqualStrings("Bar.Baz", units[1].module_name);
-    try std.testing.expectEqual(@as(u32, 1), units[1].module_index.?);
+    try std.testing.expectEqual(@as(u32, 0), units[0].struct_index.?);
+    try std.testing.expectEqualStrings("Bar.Baz", units[1].struct_name);
+    try std.testing.expectEqual(@as(u32, 1), units[1].struct_index.?);
 }
 
 test "buildCompilationUnits uses source ids when globbed files have no struct" {
@@ -3468,16 +3468,16 @@ test "buildCompilationUnits uses source ids when globbed files have no struct" {
         try foo_parser.parseProgram(),
     };
     const merged = try mergePrograms(alloc, &programs);
-    const module_programs = try buildModulePrograms(alloc, &merged, &interner);
+    const struct_programs = try buildStructPrograms(alloc, &merged, &interner);
     const source_units = [_]SourceUnit{
         .{ .file_path = "display_impl.zap", .source = impl_source },
         .{ .file_path = "foo.zap", .source = foo_source, .primary_struct_name = "Foo" },
     };
 
-    const units = try buildCompilationUnits(alloc, module_programs, &source_units);
+    const units = try buildCompilationUnits(alloc, struct_programs, &source_units);
 
     try std.testing.expectEqual(@as(usize, 1), units.len);
-    try std.testing.expectEqualStrings("Foo", units[0].module_name);
+    try std.testing.expectEqualStrings("Foo", units[0].struct_name);
     try std.testing.expectEqualStrings("foo.zap", units[0].file_path);
 }
 
@@ -3500,7 +3500,7 @@ test "per-unit parser assigns source_id and file-local spans" {
     try std.testing.expectEqual(@as(?u32, 7), parser.errors.items[0].span.source_id);
 }
 
-test "collector can build graph from per-module programs" {
+test "collector can build graph from per-struct programs" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -3519,13 +3519,13 @@ test "collector can build graph from per-module programs" {
     var parser = zap.Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
-    const module_programs = try buildModulePrograms(alloc, &program, parser.interner);
-    const program_slices = try alloc.alloc(ast.Program, module_programs.len);
-    for (module_programs, 0..) |entry, i| program_slices[i] = entry.program;
+    const struct_programs = try buildStructPrograms(alloc, &program, parser.interner);
+    const program_slices = try alloc.alloc(ast.Program, struct_programs.len);
+    for (struct_programs, 0..) |entry, i| program_slices[i] = entry.program;
 
     var collector = zap.Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
-    for (module_programs) |entry| {
+    for (struct_programs) |entry| {
         try collector.collectProgramSurface(&entry.program);
     }
     try collector.finalizeCollectedPrograms(program_slices);
@@ -3533,17 +3533,17 @@ test "collector can build graph from per-module programs" {
     try std.testing.expectEqual(@as(usize, 2), collector.graph.structs.items.len);
 }
 
-test "compileModuleByModule isolates per-module diagnostics" {
-    // Regression: errors from one module would re-fire downstream because
+test "compileStructByStruct isolates per-struct diagnostics" {
+    // Regression: errors from one struct would re-fire downstream because
     // `failWithExisting` rendered the entire diagnostic engine on every
-    // per-module failure, and `hasErrors()` checks tripped on prior
-    // modules' residual errors. The downstream symptom is that any module
+    // per-struct failure, and `hasErrors()` checks tripped on prior
+    // structs' residual errors. The downstream symptom is that any struct
     // following a failed one would itself fail — even when its own source
     // was perfectly clean — and the same error block would print over and
-    // over with each subsequent module's progress label.
+    // over with each subsequent struct's progress label.
     //
-    // Fix verification: with one broken module followed by two clean ones,
-    // the clean modules must still produce IR functions.
+    // Fix verification: with one broken struct followed by two clean ones,
+    // the clean structs must still produce IR functions.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -3574,17 +3574,17 @@ test "compileModuleByModule isolates per-module diagnostics" {
     var ctx = try collectAllFromUnits(alloc, &source_units, .{ .show_progress = false });
 
     var names: std.ArrayListUnmanaged([]const u8) = .empty;
-    for (ctx.module_programs) |mp| {
+    for (ctx.struct_programs) |mp| {
         names.append(alloc, mp.name) catch {};
     }
 
-    const result = compileModuleByModule(
+    const result = compileStructByStruct(
         alloc,
         &ctx,
         names.items,
         .{ .show_progress = false },
     ) catch |err| {
-        std.debug.print("compileModuleByModule failed unexpectedly: {}\n", .{err});
+        std.debug.print("compileStructByStruct failed unexpectedly: {}\n", .{err});
         return error.TestUnexpectedResult;
     };
 
@@ -3593,7 +3593,7 @@ test "compileModuleByModule isolates per-module diagnostics" {
     var found_clean_a = false;
     var found_clean_b = false;
     for (result.ir_program.functions) |func| {
-        if (func.module_name) |mod_name| {
+        if (func.struct_name) |mod_name| {
             if (std.mem.eql(u8, mod_name, "CleanA")) found_clean_a = true;
             if (std.mem.eql(u8, mod_name, "CleanB")) found_clean_b = true;
         }
@@ -3661,7 +3661,7 @@ test "remapFunctionDecl rewrites name_expr through the remap table" {
     try std.testing.expectEqual(@as(ast.StringId, 0), remapped_inner.var_ref.name);
 }
 
-test "SourceGraph structs exposes modules collected from source units" {
+test "SourceGraph structs exposes structs collected from source units" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -3743,13 +3743,13 @@ test "staged macro expansion can call previously compiled Zap functions" {
                 "}\n",
         },
     };
-    const module_order = [_][]const u8{ "Lib", "MacroProvider", "Caller" };
+    const struct_order = [_][]const u8{ "Lib", "MacroProvider", "Caller" };
 
     var ctx = try collectAllFromUnits(alloc, &source_units, .{
         .show_progress = false,
-        .module_order = &module_order,
+        .struct_order = &struct_order,
     });
-    var result = try compileModuleByModule(alloc, &ctx, &module_order, .{ .show_progress = false });
+    var result = try compileStructByStruct(alloc, &ctx, &struct_order, .{ .show_progress = false });
 
     var interpreter = zap.ctfe.Interpreter.init(alloc, &result.ir_program);
     defer interpreter.deinit();
@@ -3777,7 +3777,7 @@ test "staged macro expansion can call compiled Zap functions that use allowed CT
                 "  @requires = [:read_file]\n" ++
                 "  pub macro build() -> Expr {\n" ++
                 "    paths = Globber.files()\n" ++
-                "    count = __zap_list_len__(paths)\n" ++
+                "    count = list_length(paths)\n" ++
                 "    quote { unquote(count) }\n" ++
                 "  }\n" ++
                 "}\n",
@@ -3791,13 +3791,13 @@ test "staged macro expansion can call compiled Zap functions that use allowed CT
                 "}\n",
         },
     };
-    const module_order = [_][]const u8{ "Globber", "MacroProvider", "Caller" };
+    const struct_order = [_][]const u8{ "Globber", "MacroProvider", "Caller" };
 
     var ctx = try collectAllFromUnits(alloc, &source_units, .{
         .show_progress = false,
-        .module_order = &module_order,
+        .struct_order = &struct_order,
     });
-    var result = try compileModuleByModule(alloc, &ctx, &module_order, .{ .show_progress = false });
+    var result = try compileStructByStruct(alloc, &ctx, &struct_order, .{ .show_progress = false });
 
     var interpreter = zap.ctfe.Interpreter.init(alloc, &result.ir_program);
     defer interpreter.deinit();
@@ -3825,7 +3825,7 @@ test "staged use macro expansion can call previously compiled Zap functions" {
                 "  @requires = [:read_file]\n" ++
                 "  pub macro __using__(_opts :: Expr) -> Expr {\n" ++
                 "    paths = Globber.files()\n" ++
-                "    count = __zap_list_len__(paths)\n" ++
+                "    count = list_length(paths)\n" ++
                 "    quote { pub fn main() -> i64 { unquote(count) } }\n" ++
                 "  }\n" ++
                 "}\n",
@@ -3837,13 +3837,13 @@ test "staged use macro expansion can call previously compiled Zap functions" {
                 "}\n",
         },
     };
-    const module_order = [_][]const u8{ "Globber", "MacroProvider", "Caller" };
+    const struct_order = [_][]const u8{ "Globber", "MacroProvider", "Caller" };
 
     var ctx = try collectAllFromUnits(alloc, &source_units, .{
         .show_progress = false,
-        .module_order = &module_order,
+        .struct_order = &struct_order,
     });
-    var result = try compileModuleByModule(alloc, &ctx, &module_order, .{ .show_progress = false });
+    var result = try compileStructByStruct(alloc, &ctx, &struct_order, .{ .show_progress = false });
 
     var interpreter = zap.ctfe.Interpreter.init(alloc, &result.ir_program);
     defer interpreter.deinit();
@@ -3851,4 +3851,30 @@ test "staged use macro expansion can call previously compiled Zap functions" {
 
     try std.testing.expect(value == .int);
     try std.testing.expectEqual(@as(i64, 1), value.int);
+}
+
+test "staged macro provider rejects direct underscore-prefixed call before compilation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source_units = [_]SourceUnit{
+        .{
+            .file_path = "lib/macro_provider.zap",
+            .source = "pub struct MacroProvider {\n" ++
+                "  pub macro build() -> Expr {\n" ++
+                "    _helper()\n" ++
+                "  }\n" ++
+                "}\n",
+        },
+    };
+    const struct_order = [_][]const u8{"MacroProvider"};
+
+    try std.testing.expectError(
+        error.TypeCheckFailed,
+        collectAllFromUnits(alloc, &source_units, .{
+            .show_progress = false,
+            .struct_order = &struct_order,
+        }),
+    );
 }

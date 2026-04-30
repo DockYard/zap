@@ -1,3 +1,5 @@
+@doc = "Updatable implementation for `Map`."
+
 pub impl Updatable for Map(K, V) {
   @doc = """
     Map functional update — equivalent to `Map.put/3`. Returns a new map

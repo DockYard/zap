@@ -5,8 +5,8 @@ Functions for working with boolean values.
 Zap has two boolean values: `true` and `false`. Booleans are
 used in conditionals, guards, and logical expressions.
 
-The Kernel module provides `and`, `or`, and `not` macros for
-use in expressions. This module provides functional equivalents
+The Kernel struct provides `and`, `or`, and `not` macros for
+use in expressions. This struct provides functional equivalents
 that can be passed as values or used in pipes.
 
 ## Functions

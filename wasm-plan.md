@@ -55,7 +55,7 @@ Every file access point in the compiler must go through the adapter. Current dir
 
 **Discovery (discovery.zig):**
 - `std.Io.Dir.cwd().readFileAlloc` for scanning source files
-- `std.Io.Dir.cwd().access` for module resolution
+- `std.Io.Dir.cwd().access` for struct resolution
 
 **Cache (main.zig):**
 - `.zap-cache/` directory: hash files, compilation artifacts
@@ -115,7 +115,7 @@ The resulting `.wasm` can run in:
 
 ### Implementation Order
 
-1. **Define the FileSystem adapter interface** in a new `src/fs.zig` module
+1. **Define the FileSystem adapter interface** in a new `src/fs.zig` struct
 2. **Implement NativeFS** — thin wrapper around `std.Io.Dir` operations
 3. **Migrate all direct filesystem calls** in main.zig, discovery.zig, lockfile.zig, zir_backend.zig, and runtime.zig to use the adapter
 4. **Implement VirtualFS** — in-memory tree with comptime-populated data

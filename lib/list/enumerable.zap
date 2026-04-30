@@ -1,3 +1,5 @@
+@doc = "Enumerable implementation for `List`."
+
 pub impl Enumerable for List {
   @doc = """
     Returns the next element from a list.

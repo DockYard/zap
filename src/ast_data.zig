@@ -162,8 +162,8 @@ pub fn exprToCtValue(
             return makeTuple3(alloc, store, .{ .atom = "case" }, try metaToList(alloc, store, v.meta, null), args);
         },
 
-        // Module ref: {:__aliases__, meta, [:Part1, :Part2, ...]}
-        .module_ref => |v| {
+        // Struct ref: {:__aliases__, meta, [:Part1, :Part2, ...]}
+        .struct_ref => |v| {
             var parts: std.ArrayListUnmanaged(CtValue) = .empty;
             for (v.name.parts) |part| {
                 try parts.append(alloc, CtValue{ .atom = interner.get(part) });
@@ -244,7 +244,7 @@ pub fn exprToCtValue(
             const fields_list = try makeListFromSlice(alloc, store, field_vals.items);
             const map_node = try makeTuple3(alloc, store, .{ .atom = "%{}" }, try emptyList(alloc, store), fields_list);
             var name_parts: std.ArrayListUnmanaged(CtValue) = .empty;
-            for (v.module_name.parts) |part| {
+            for (v.struct_name.parts) |part| {
                 try name_parts.append(alloc, CtValue{ .atom = interner.get(part) });
             }
             const name_val = try makeListFromSlice(alloc, store, name_parts.items);
@@ -391,7 +391,7 @@ pub fn stmtToCtValue(
         },
         .import_decl => |id| {
             var parts: std.ArrayListUnmanaged(CtValue) = .empty;
-            for (id.module_path.parts) |part| {
+            for (id.struct_path.parts) |part| {
                 try parts.append(alloc, CtValue{ .atom = interner.get(part) });
             }
             const aliases = try makeTuple3(alloc, store, .{ .atom = "__aliases__" }, try emptyList(alloc, store), try makeListFromSlice(alloc, store, parts.items));
@@ -485,9 +485,9 @@ pub fn patternToCtValue(
             return makeTuple3(alloc, store, .{ .atom = "|" }, try metaToList(alloc, store, v.meta, null), args);
         },
         .struct_pattern => |v| {
-            // {:%, meta, [module_name, {:%{}, [], [field_pairs...]}]}
+            // {:%, meta, [struct_name, {:%{}, [], [field_pairs...]}]}
             var parts: std.ArrayListUnmanaged(CtValue) = .empty;
-            for (v.module_name.parts) |part| {
+            for (v.struct_name.parts) |part| {
                 try parts.append(alloc, CtValue{ .atom = interner.get(part) });
             }
             const name_val = try makeTuple3(alloc, store, .{ .atom = "__aliases__" }, try emptyList(alloc, store), try makeListFromSlice(alloc, store, parts.items));
@@ -674,7 +674,7 @@ fn calleeToCtValue(
             const args = try makeList(alloc, store, &.{ obj, field });
             return makeTuple3(alloc, store, .{ .atom = "." }, try metaToList(alloc, store, v.meta, null), args);
         },
-        .module_ref => |v| {
+        .struct_ref => |v| {
             var parts: std.ArrayListUnmanaged(CtValue) = .empty;
             for (v.name.parts) |part| {
                 try parts.append(alloc, CtValue{ .atom = interner.get(part) });
@@ -848,7 +848,7 @@ pub fn ctValueToExpr(
     // Node with args: {form_atom, meta, args_list}
     if (form != .atom) {
         // Non-atom form — check for dot-call: {:., meta, [object, :field]}
-        // This represents a qualified function call like Module.func(args)
+        // This represents a qualified function call like Struct.func(args)
         if (form == .tuple and form.tuple.elems.len == 3) {
             const dot_form = form.tuple.elems[0];
             const dot_args = form.tuple.elems[2];
@@ -978,7 +978,7 @@ pub fn ctValueToExpr(
     // Struct expression: {:%, meta, [name_list, {:%{}, [], [field_pairs...]}, update_or_nil]}
     if (std.mem.eql(u8, form_name, "%")) {
         if (arg_elems.len >= 2) {
-            // arg_elems[0] = module name parts (list of atoms)
+            // arg_elems[0] = struct name parts (list of atoms)
             // arg_elems[1] = {:%{}, [], [field_pairs...]} (map node with fields)
             var name_parts: std.ArrayListUnmanaged(ast.StringId) = .empty;
             if (arg_elems[0] == .list) {
@@ -1019,7 +1019,7 @@ pub fn ctValueToExpr(
             const expr = try alloc.create(ast.Expr);
             expr.* = .{ .struct_expr = .{
                 .meta = node_meta,
-                .module_name = .{ .parts = try name_parts.toOwnedSlice(alloc), .span = node_meta.span },
+                .struct_name = .{ .parts = try name_parts.toOwnedSlice(alloc), .span = node_meta.span },
                 .update_source = update_source,
                 .fields = try fields.toOwnedSlice(alloc),
             } };
@@ -1058,7 +1058,7 @@ pub fn ctValueToExpr(
             }
         }
         const expr = try alloc.create(ast.Expr);
-        expr.* = .{ .module_ref = .{
+        expr.* = .{ .struct_ref = .{
             .meta = node_meta,
             .name = .{ .parts = try parts.toOwnedSlice(alloc), .span = node_meta.span },
         } };
@@ -1277,7 +1277,7 @@ pub fn ctValueToExpr(
             const expr = try alloc.create(ast.Expr);
             expr.* = .{ .function_ref = .{
                 .meta = node_meta,
-                .module = null,
+                .struct_name = null,
                 .function = try interner.intern(arg_elems[0].atom),
                 .arity = @intCast(arg_elems[1].int),
             } };
@@ -1459,7 +1459,7 @@ pub fn ctValueToExpr(
     // Default: treat as a function call — {:name, meta, [args...]}.
     //
     // The form atom may carry a leading `":"` when it was produced
-    // by `__zap_intern_atom__` and substituted into callee position
+    // by `intern_atom` and substituted into callee position
     // by an `unquote(name)` in `pub fn unquote(name)()` /
     // `unquote(name)()` patterns. The colon prefix distinguishes
     // atom literals from variable references in the AST encoding;
@@ -1702,7 +1702,7 @@ fn ctValueToPattern(
             if (pat_args == .list and pat_args.list.elems.len == 2) {
                 const aliases_ct = pat_args.list.elems[0];
                 const map_ct = pat_args.list.elems[1];
-                // Extract module name
+                // Extract struct name
                 var parts: std.ArrayListUnmanaged(ast.StringId) = .empty;
                 if (aliases_ct == .tuple and aliases_ct.tuple.elems.len == 3 and aliases_ct.tuple.elems[2] == .list) {
                     for (aliases_ct.tuple.elems[2].list.elems) |part| {
@@ -1724,7 +1724,7 @@ fn ctValueToPattern(
                 const pat = try alloc.create(ast.Pattern);
                 pat.* = .{ .struct_pattern = .{
                     .meta = meta,
-                    .module_name = .{ .parts = try parts.toOwnedSlice(alloc), .span = meta.span },
+                    .struct_name = .{ .parts = try parts.toOwnedSlice(alloc), .span = meta.span },
                     .fields = try fields.toOwnedSlice(alloc),
                 } };
                 return pat;
@@ -2054,7 +2054,7 @@ pub fn typeExprToCtValue(
         .paren => |p| typeExprToCtValue(alloc, interner, store, p.inner),
         .struct_type => |s| {
             var parts: std.ArrayListUnmanaged(CtValue) = .empty;
-            for (s.module_name.parts) |part| {
+            for (s.struct_name.parts) |part| {
                 try parts.append(alloc, CtValue{ .atom = interner.get(part) });
             }
             return makeTuple3(alloc, store, .{ .atom = "__aliases__" }, try emptyList(alloc, store), try makeListFromSlice(alloc, store, parts.items));
@@ -2179,7 +2179,7 @@ pub fn ctValueToTypeExpr(
                 const te = try alloc.create(ast.TypeExpr);
                 te.* = .{ .struct_type = .{
                     .meta = meta,
-                    .module_name = .{ .parts = try parts.toOwnedSlice(alloc), .span = meta.span },
+                    .struct_name = .{ .parts = try parts.toOwnedSlice(alloc), .span = meta.span },
                     .fields = &.{},
                 } };
                 return te;
@@ -2303,14 +2303,14 @@ fn paramToCtValue(
 }
 
 /// Convert a StructDecl to CtValue:
-/// {:module, [visibility: :pub], [:Name, [do: [items...]]]}
-pub fn moduleDeclToCtValue(
+/// {:struct, [visibility: :pub], [:Name, [do: [items...]]]}
+pub fn functionBearingStructDeclToCtValue(
     alloc: Allocator,
     interner: *const ast.StringInterner,
     store: *AllocationStore,
     decl: *const ast.StructDecl,
 ) error{OutOfMemory}!CtValue {
-    // Module name as atom
+    // Struct name as atom
     var name_parts: std.ArrayListUnmanaged(CtValue) = .empty;
     for (decl.name.parts) |part| {
         try name_parts.append(alloc, CtValue{ .atom = interner.get(part) });
@@ -2334,7 +2334,7 @@ pub fn moduleDeclToCtValue(
     const meta = try makeListFromSlice(alloc, store, meta_elems.items);
 
     const args = try makeList(alloc, store, &.{ name_val, opts });
-    return makeTuple3(alloc, store, .{ .atom = "module" }, meta, args);
+    return makeTuple3(alloc, store, .{ .atom = "struct" }, meta, args);
 }
 
 /// Convert a StructDecl to CtValue:
@@ -2403,7 +2403,7 @@ pub fn structItemToCtValue(
         },
         .import_decl => |id| {
             var parts: std.ArrayListUnmanaged(CtValue) = .empty;
-            for (id.module_path.parts) |part| {
+            for (id.struct_path.parts) |part| {
                 try parts.append(alloc, CtValue{ .atom = interner.get(part) });
             }
             const aliases = try makeTuple3(alloc, store, .{ .atom = "__aliases__" }, try emptyList(alloc, store), try makeListFromSlice(alloc, store, parts.items));
@@ -2412,7 +2412,7 @@ pub fn structItemToCtValue(
         },
         .use_decl => |ud| {
             var parts: std.ArrayListUnmanaged(CtValue) = .empty;
-            for (ud.module_path.parts) |part| {
+            for (ud.struct_path.parts) |part| {
                 try parts.append(alloc, CtValue{ .atom = interner.get(part) });
             }
             const aliases = try makeTuple3(alloc, store, .{ .atom = "__aliases__" }, try emptyList(alloc, store), try makeListFromSlice(alloc, store, parts.items));
@@ -2420,9 +2420,9 @@ pub fn structItemToCtValue(
             return makeTuple3(alloc, store, .{ .atom = "use" }, try emptyList(alloc, store), args);
         },
         .alias_decl => |ad| {
-            // {:alias, [], [module_path, as_name]}
+            // {:alias, [], [struct_path, as_name]}
             var parts: std.ArrayListUnmanaged(CtValue) = .empty;
-            for (ad.module_path.parts) |part| {
+            for (ad.struct_path.parts) |part| {
                 try parts.append(alloc, CtValue{ .atom = interner.get(part) });
             }
             const mod_val = try makeTuple3(alloc, store, .{ .atom = "__aliases__" }, try emptyList(alloc, store), try makeListFromSlice(alloc, store, parts.items));
@@ -2618,7 +2618,7 @@ pub fn ctValueToStructItem(
                         const decl = try alloc.create(ast.ImportDecl);
                         decl.* = .{
                             .meta = .{ .span = .{ .start = 0, .end = 0 } },
-                            .module_path = .{ .parts = try parts.toOwnedSlice(alloc), .span = .{ .start = 0, .end = 0 } },
+                            .struct_path = .{ .parts = try parts.toOwnedSlice(alloc), .span = .{ .start = 0, .end = 0 } },
                             .filter = null,
                         };
                         return .{ .import_decl = decl };
@@ -2675,7 +2675,7 @@ pub fn ctValueToStructItem(
                         const decl = try alloc.create(ast.UseDecl);
                         decl.* = .{
                             .meta = .{ .span = .{ .start = 0, .end = 0 } },
-                            .module_path = .{ .parts = try parts.toOwnedSlice(alloc), .span = .{ .start = 0, .end = 0 } },
+                            .struct_path = .{ .parts = try parts.toOwnedSlice(alloc), .span = .{ .start = 0, .end = 0 } },
                             .opts = null,
                         };
                         return .{ .use_decl = decl };
@@ -2734,7 +2734,7 @@ pub fn ctValueToStructItem(
         }
     }
 
-    // Alias: {:alias, meta, [module_path, ?as_name]}
+    // Alias: {:alias, meta, [struct_path, ?as_name]}
     if (std.mem.eql(u8, form_name, "alias")) {
         if (args == .list and args.list.elems.len >= 1) {
             const mod_aliases = args.list.elems[0];
@@ -2758,7 +2758,7 @@ pub fn ctValueToStructItem(
             const decl = try alloc.create(ast.AliasDecl);
             decl.* = .{
                 .meta = .{ .span = .{ .start = 0, .end = 0 } },
-                .module_path = .{ .parts = try mod_parts.toOwnedSlice(alloc), .span = .{ .start = 0, .end = 0 } },
+                .struct_path = .{ .parts = try mod_parts.toOwnedSlice(alloc), .span = .{ .start = 0, .end = 0 } },
                 .as_name = as_name,
             };
             return .{ .alias_decl = decl };
@@ -2793,8 +2793,8 @@ pub fn ctValueToStructItem(
         }
     }
 
-    // Module: {:module, meta, [name, [do: [items...]]]}
-    if (std.mem.eql(u8, form_name, "module")) {
+    // Struct: {:struct, meta, [name, [do: [items...]]]}
+    if (std.mem.eql(u8, form_name, "struct")) {
         if (args == .list and args.list.elems.len >= 2) {
             const name_ct = args.list.elems[0];
             var name_parts: std.ArrayListUnmanaged(ast.StringId) = .empty;
@@ -2804,7 +2804,7 @@ pub fn ctValueToStructItem(
                 }
             }
             // Extract items from [do: [items...]]
-            // For now, return an empty module — full item reconstruction is complex
+            // For now, return an empty struct — full item reconstruction is complex
             const decl = try alloc.create(ast.StructDecl);
             decl.* = .{
                 .meta = .{ .span = .{ .start = 0, .end = 0 } },

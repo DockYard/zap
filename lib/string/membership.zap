@@ -1,3 +1,5 @@
+@doc = "Membership implementation for `String`."
+
 pub impl Membership for String {
   @doc = """
     Substring check — true when `needle` appears anywhere in `haystack`.

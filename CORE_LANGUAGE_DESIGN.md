@@ -17,7 +17,7 @@ This document is intentionally about:
 This document is intentionally not about:
 
 - growing the standard library
-- adding more built-in modules
+- adding more built-in structs
 - package ecosystem work
 - formatter/LSP/IDE tooling
 
@@ -27,7 +27,7 @@ Those matter, but they are downstream of the core language.
 
 Zap already has a meaningful language core:
 
-- modules and visibility
+- structs and visibility
 - pattern matching and multi-clause function dispatch
 - guards
 - `if`, `case`, `cond`, `for`
@@ -210,7 +210,7 @@ The two strongest candidates are:
 Today Zap has:
 
 - functions
-- modules
+- structs
 - pattern matching
 - macros
 
@@ -631,7 +631,7 @@ Rust's `Fn`, `FnMut`, and `FnOnce` distinctions are elegant, but they are only w
 
 ### 4. Inheritance-Centric OO Features
 
-Zap already has better foundations: pattern matching, modules, macros, and likely future protocols. It should not drift toward class hierarchies as a primary abstraction mechanism.
+Zap already has better foundations: pattern matching, structs, macros, and likely future protocols. It should not drift toward class hierarchies as a primary abstraction mechanism.
 
 ## Suggested Implementation Sequence
 

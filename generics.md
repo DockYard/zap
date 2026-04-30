@@ -2,24 +2,24 @@
 
 ## What is Zap
 
-Zap is a statically-typed functional programming language that compiles to native code. It has Elixir-like syntax (pattern matching, pipes, modules) but compiles through Zig's compiler backend. The compilation pipeline is:
+Zap is a statically-typed functional programming language that compiles to native code. It has Elixir-like syntax (pattern matching, pipes, structs) but compiles through Zig's compiler backend. The compilation pipeline is:
 
 ```
 Parse → Collect → Macro Expand → Desugar → Type Check → HIR → Monomorphize → IR → ZIR → Zig Sema → LLVM → Native
 ```
 
 Key architectural facts:
-- Source files are `.zap` files, each containing one module
-- All modules share one **scope graph** (symbol table) built during collection
-- The compiler has a **StringInterner** shared across all modules
-- Modules are compiled in dependency order
+- Source files are `.zap` files, each containing one struct
+- All structs share one **scope graph** (symbol table) built during collection
+- The compiler has a **StringInterner** shared across all structs
+- Structs are compiled in dependency order
 - The test framework uses macros (`describe`, `test`) that expand into function declarations
 
 ## What We're Building
 
 Parametric polymorphism (generics) so that collection functions like `List.head`, `Enum.map`, etc. work with any element type, not just `i64`.
 
-### Example of what works today (intra-module generics)
+### Example of what works today (intra-struct generics)
 
 ```zap
 pub struct Test.FunctionTest {
@@ -37,7 +37,7 @@ pub struct Test.FunctionTest {
 
 This works end-to-end: 446 tests pass, 478 assertions.
 
-### What we're trying to make work (cross-module generics)
+### What we're trying to make work (cross-struct generics)
 
 ```zap
 # In lib/list.zap
@@ -51,7 +51,7 @@ pub struct List {
 pub struct Test.EnumTest {
   test("map doubles values") {
     result = Enum.map([1, 2, 3], double)
-    assert(List.head(result) == 2)    # ← This call needs cross-module monomorphization
+    assert(List.head(result) == 2)    # ← This call needs cross-struct monomorphization
   }
 }
 ```
@@ -68,25 +68,25 @@ The following pieces are implemented and working:
 
 4. **IR generic skip** (`src/ir.zig`): Generic functions (containing type_var in params/return) are skipped during IR building (emit empty stub to preserve ID ordering). Only monomorphized copies are compiled.
 
-5. **Shared TypeStore** (`src/types.zig`, `src/compiler.zig`): All modules share one TypeStore (InternPool pattern). TypeIds are globally consistent. Structural deduplication in `addType` prevents identical types from getting different IDs.
+5. **Shared TypeStore** (`src/types.zig`, `src/compiler.zig`): All structs share one TypeStore (InternPool pattern). TypeIds are globally consistent. Structural deduplication in `addType` prevents identical types from getting different IDs.
 
-6. **Globally-unique function group IDs** (`src/compiler.zig`): Each module's HIR builder starts group IDs at an offset, so group IDs don't collide when modules are merged for whole-program monomorphization.
+6. **Globally-unique function group IDs** (`src/compiler.zig`): Each struct's HIR builder starts group IDs at an offset, so group IDs don't collide when structs are merged for whole-program monomorphization.
 
 7. **Whole-program monomorphization** (`src/compiler.zig`): The compilation pipeline does:
-   - Phase 1: Compile all modules to HIR (shared TypeStore)
-   - Phase 2: Merge all HIR modules
-   - Phase 3: Run monomorphization across all modules
-   - Phase 4: Compile each module's HIR to IR
+   - Phase 1: Compile all structs to HIR (shared TypeStore)
+   - Phase 2: Merge all HIR structs
+   - Phase 3: Run monomorphization across all structs
+   - Phase 4: Compile each struct's HIR to IR
 
-8. **Cross-module named call resolution** (`src/monomorphize.zig`): The monomorphizer resolves `.named` cross-module calls (e.g., `List.head` called from `Test.ListTest`) by searching the merged HIR for the target module/function. Creates specializations and rewrites `.named` → `.direct`.
+8. **Cross-struct named call resolution** (`src/monomorphize.zig`): The monomorphizer resolves `.named` cross-struct calls (e.g., `List.head` called from `Test.ListTest`) by searching the merged HIR for the target struct/function. Creates specializations and rewrites `.named` → `.direct`.
 
-9. **Per-module specialization placement**: Each calling module gets its own copy of the specialization (keyed by module index in dedup hash) so `call_direct` resolves within the module's own IR.
+9. **Per-struct specialization placement**: Each calling struct gets its own copy of the specialization (keyed by struct index in dedup hash) so `call_direct` resolves within the struct's own IR.
 
 10. **ListCell type variants** (`src/runtime.zig`): `ListCellOf(T)` generic runtime exists. `StringListCell`, `BoolListCell`, `FloatListCell`, `AtomListCell` pre-instantiated. IR builder rewrites `:zig.ListCell.*` → correct variant based on element type.
 
 11. **HIR list literal type inference** (`src/hir.zig`): List literals like `[1, 2, 3]` now have `type_id = list(i64)` instead of UNKNOWN.
 
-12. **Cross-module return type resolution** (`src/hir.zig`): `resolveFunctionReturnTypeInModule` resolves return types for module-qualified calls by searching the scope graph.
+12. **Cross-struct return type resolution** (`src/hir.zig`): `resolveFunctionReturnTypeInStruct` resolves return types for struct-qualified calls by searching the scope graph.
 
 13. **Function body type checking** (`src/types.zig`): TypeChecker now traverses function bodies (not just signatures) to set binding types on assignment variables.
 
@@ -100,18 +100,18 @@ The monomorphization pass needs to know the concrete type of each argument to a 
 
 The `type_id` on a variable reference expression comes from the variable's **binding** in the scope graph. The binding's type is set by the **TypeChecker** when it processes the assignment `result = Enum.map([1, 2, 3], double)`. The TypeChecker infers `Enum.map(...)` returns `list(i64)` and stores this on the `result` binding.
 
-**The problem**: The TypeChecker's `inferCall` for module-qualified calls like `Enum.map(...)` works correctly for SOME modules but returns `UNKNOWN` for others — specifically Test.EnumTest. The issue is in the TypeChecker's function body traversal.
+**The problem**: The TypeChecker's `inferCall` for struct-qualified calls like `Enum.map(...)` works correctly for SOME structs but returns `UNKNOWN` for others — specifically Test.EnumTest. The issue is in the TypeChecker's function body traversal.
 
 ### Detailed trace
 
-1. `compileSingleModuleHir` creates a TypeChecker with the shared TypeStore
-2. TypeChecker calls `checkProgram(desugared)` for the module's AST
-3. `checkProgram` → `checkModule` → `checkFunctionDecl` for each function
+1. `compileSingleStructHir` creates a TypeChecker with the shared TypeStore
+2. TypeChecker calls `checkProgram(desugared)` for the struct's AST
+3. `checkProgram` → `checkStruct` → `checkFunctionDecl` for each function
 4. `checkFunctionDecl` calls `checkFunctionClause` (checks param/return type annotations)
 5. Then traverses the function body: `for (body) |stmt| { _ = self.checkStmt(stmt) catch {}; }`
 6. `checkStmt(.assignment)` calls `inferExpr(assign.value)` on `Enum.map([1,2,3], double)`
-7. `inferExpr` → `inferCall` → `field_access → module_ref` path
-8. The module search finds the Enum module (confirmed by debug traces)
+7. `inferExpr` → `inferCall` → `field_access → struct_ref` path
+8. The struct search finds the Enum struct (confirmed by debug traces)
 9. `resolveFamilySignature(Enum.scope_id, "map", 2)` finds the `map/2` signature (confirmed)
 10. For Test.ForComprehensionTest: returns `list(i64)` (type 21) ✓
 11. For Test.EnumTest: returns `UNKNOWN` (type 18) ✗
@@ -120,20 +120,20 @@ The `type_id` on a variable reference expression comes from the variable's **bin
 
 Inside the `if (fam_sig) |signature|` block, the code iterates call arguments and calls `try self.inferExpr(arg)` for each. For `Enum.map([1,2,3], double)`:
 - Arg 1: `[1, 2, 3]` — a list literal, `inferExpr` returns `list(i64)` ✓
-- Arg 2: `double` — a function reference (bare var_ref to a module-level function)
+- Arg 2: `double` — a function reference (bare var_ref to a struct-level function)
 
 If `inferExpr(double)` throws an error (because `double` can't be resolved in the current scope during body traversal), the `try` propagates the error out of the for loop. The caller has `catch {}` which swallows the error. The binding type is never set.
 
 ### Why `double` might fail
 
-`double` is a function defined at the module level of Test.EnumTest:
+`double` is a function defined at the struct level of Test.EnumTest:
 ```zap
 fn double(x :: i64) -> i64 { x * 2 }
 ```
 
-During the body traversal in `checkFunctionDecl`, `self.current_scope` is set to the function clause's scope (e.g., the scope of `test_enum_module_map_doubles_values/0`). The `double` function is defined in the module scope, which is the PARENT of the clause scope. The scope chain should connect clause → module → prelude, so `double` should be resolvable.
+During the body traversal in `checkFunctionDecl`, `self.current_scope` is set to the function clause's scope (e.g., the scope of `test_enum_struct_map_doubles_values/0`). The `double` function is defined in the struct scope, which is the PARENT of the clause scope. The scope chain should connect clause → struct → prelude, so `double` should be resolvable.
 
-But for MACRO-GENERATED functions (the `test` macro generates `pub fn test_xxx`), the scope chain might be broken. The macro-generated function's clause scope might not properly chain to the module scope, making module-level functions like `double` invisible.
+But for MACRO-GENERATED functions (the `test` macro generates `pub fn test_xxx`), the scope chain might be broken. The macro-generated function's clause scope might not properly chain to the struct scope, making struct-level functions like `double` invisible.
 
 ### Why Test.ForComprehensionTest works but Test.EnumTest doesn't
 
@@ -150,11 +150,11 @@ Test.EnumTest uses named function references: `Enum.map([1,2,3], double)`. This 
 | `src/monomorphize.zig` | Monomorphization pass — specializes generic functions |
 | `src/ir.zig` | IR builder — lowers HIR to IR, skips generic stubs |
 | `src/compiler.zig` | Pipeline orchestration, shared TypeStore, whole-program mono |
-| `src/scope.zig` | Scope graph — shared symbol table across all modules |
+| `src/scope.zig` | Scope graph — shared symbol table across all structs |
 | `src/zir_builder.zig` | ZIR emission — lowers IR to Zig's ZIR for final compilation |
-| `lib/list.zap` | List module (target for generic signatures) |
-| `lib/enum.zap` | Enum module (higher-order functions over lists) |
-| `test/enum_test.zap` | Test module that exercises Enum functions |
+| `lib/list.zap` | List struct (target for generic signatures) |
+| `lib/enum.zap` | Enum struct (higher-order functions over lists) |
+| `test/enum_test.zap` | Test struct that exercises Enum functions |
 
 ## Key Data Structures
 
@@ -185,8 +185,8 @@ clauses: []Clause             # Function clauses with typed params
 
 ### HIR CallTarget (`src/hir.zig:250`)
 ```
-direct: { function_group_id }   # Intra-module call by group ID
-named: { module, name }         # Cross-module call by string names
+direct: { function_group_id }   # Intra-struct call by group ID
+named: { struct, name }         # Cross-struct call by string names
 dispatch: { function_group_id } # Pattern-match dispatch
 builtin: []const u8             # :zig. bridge call
 ```
@@ -196,14 +196,14 @@ builtin: []const u8             # :zig. bridge call
 generic_groups: HashMap(u32, *FunctionGroup)  # Group ID → generic function
 specializations: HashMap(u64, u32)            # Dedup key → specialized group ID
 call_rewrites: HashMap(u64, u32)              # Expr pointer → new group ID
-current_scan_module_idx: ?usize               # Which module is being scanned
+current_scan_struct_idx: ?usize               # Which struct is being scanned
 ```
 
 ## What Needs to Happen
 
 The `inferExpr` call for the function reference `double` (a bare `var_ref`) must NOT throw an error during body traversal. Either:
 
-1. **Fix the scope chain** for macro-generated function scopes so module-level functions are visible during body traversal
+1. **Fix the scope chain** for macro-generated function scopes so struct-level functions are visible during body traversal
 2. **Make body traversal error-tolerant** for individual expressions (currently `try self.inferExpr(arg)` propagates errors that abort the entire call inference)
 3. **Skip argument inference errors** and still return the function's declared return type
 

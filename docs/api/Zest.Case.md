@@ -10,11 +10,11 @@ Teardown runs after each test. Assertions are non-fatal.
 
 The `describe` and `test` macros expand into function declarations
 so that each test becomes a named pub function (test_*) that is
-called at module level.
+called at struct level.
 
 ## Examples
 
-    pub module Test.MyTest {
+    pub struct Test.MyTest {
       use Zest.Case
 
       describe("my feature") {

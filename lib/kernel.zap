@@ -1,5 +1,5 @@
 @doc = """
-  The default module imported into every Zap module.
+  The default struct imported into every Zap struct.
 
   Kernel provides the fundamental language constructs implemented
   as macros: control flow (`if`, `unless`), boolean operators
@@ -248,7 +248,7 @@ pub struct Kernel {
     Concatenation operator. Dispatches through the `Concatenable`
     protocol — any type implementing `Concatenable.concat/2` (built-in:
     `String`, `List`, `Map`) supports `<>`. A local `pub fn <>` (or
-    `pub macro <>`) in the call-site module still shadows this default,
+    `pub macro <>`) in the call-site struct still shadows this default,
     so users can override `<>` for their own types directly.
 
     ## Examples
@@ -261,22 +261,6 @@ pub struct Kernel {
   pub macro <>(left :: Expr, right :: Expr) -> Expr {
     quote { Concatenable.concat(unquote(left), unquote(right)) }
   }
-
-  @doc = """
-    Raises a runtime error with the given message.
-
-    This terminates the program immediately. Use in `!` functions
-    to signal unrecoverable errors.
-
-    ## Examples
-
-        raise("something went wrong")
-
-        case File.read(path) {
-          {:ok, contents} -> contents
-          {:error, reason} -> raise("File.read! failed: " <> reason)
-        }
-    """
 
   @doc = """
     Returns true if the value is an integer type (i8, i16, i32, i64, u8, u16, u32, u64).
@@ -366,6 +350,10 @@ pub struct Kernel {
     :zig.Kernel.is_struct(value)
   }
 
+  @doc = """
+    Raises a runtime error with the provided message.
+    """
+
   pub fn raise(message :: String) -> Never {
     :zig.Kernel.raise(message)
   }
@@ -404,7 +392,7 @@ pub struct Kernel {
     :zig.Kernel.to_string(value)
   }
 
-  @fndoc = """
+  @doc = """
     Print a value's string representation to stdout, followed by a newline.
 
     Equivalent to `IO.puts(Kernel.to_string(value))`. Useful for quick

@@ -1,3 +1,10 @@
+@doc = """
+  Project manifest returned by `Zap.Builder.manifest/1`.
+
+  The manifest controls build output, entry points, source paths,
+  dependencies, build options, and documentation settings.
+  """
+
 pub struct Zap.Manifest {
   name :: String
   version :: String

@@ -1,3 +1,5 @@
+@doc = "Concatenable implementation for `List`."
+
 pub impl Concatenable for List {
   @doc = """
     List concatenation. The result reuses the tail's spine; the head

@@ -371,17 +371,17 @@ code, pre, .signature { font-family: var(--ff-mono); font-size: 13px; }
 }
 
 /* ── Prose — serif for documentation text ── */
-.moduledoc, .function-doc {
+.struct_doc, .function-doc {
   font-family: var(--ff-serif);
   font-size: 16px;
   line-height: 1.7;
   color: var(--fg);
 }
-.moduledoc { margin-bottom: 40px; }
-.moduledoc p, .function-doc p { margin-bottom: 14px; }
+.struct_doc { margin-bottom: 40px; }
+.struct_doc p, .function-doc p { margin-bottom: 14px; }
 .function-doc p { margin-bottom: 10px; font-size: 15.5px; }
 
-.moduledoc pre,
+.struct_doc pre,
 .function-doc pre {
   background: var(--bg-elev);
   border: 1px solid var(--border);
@@ -395,7 +395,7 @@ code, pre, .signature { font-family: var(--ff-mono); font-size: 13px; }
   position: relative;
 }
 
-.moduledoc code,
+.struct_doc code,
 .function-doc code {
   font-family: var(--ff-mono);
   font-size: 0.88em;
@@ -405,21 +405,21 @@ code, pre, .signature { font-family: var(--ff-mono); font-size: 13px; }
   border-radius: 3px;
   white-space: nowrap;
 }
-.moduledoc pre code,
+.struct_doc pre code,
 .function-doc pre code {
   background: none; padding: 0; color: var(--fg); white-space: pre;
 }
 
-.moduledoc h2 { margin-top: 28px; }
-.moduledoc h3 {
+.struct_doc h2 { margin-top: 28px; }
+.struct_doc h3 {
   font-family: var(--ff-serif);
   font-size: 18px;
   font-weight: 600;
   text-transform: none;
   letter-spacing: 0;
 }
-.moduledoc ul, .function-doc ul { padding-left: 1.25rem; margin-bottom: 14px; }
-.moduledoc li, .function-doc li { margin-bottom: 4px; }
+.struct_doc ul, .function-doc ul { padding-left: 1.25rem; margin-bottom: 14px; }
+.struct_doc li, .function-doc li { margin-bottom: 4px; }
 
 /* ── Summary Table ── */
 .summary {
@@ -555,8 +555,8 @@ code, pre, .signature { font-family: var(--ff-mono); font-size: 13px; }
   border-color: rgba(3, 105, 161, 0.4);
 }
 
-/* ── Module Title ── */
-.pub-module-pill {
+/* ── Struct Title ── */
+.pub-struct-pill {
   font-family: var(--ff-mono);
   font-size: 11px;
   color: var(--fg-dim);
@@ -641,29 +641,29 @@ code, pre, .signature { font-family: var(--ff-mono); font-size: 13px; }
 }
 
 /* ══════════════════════════════════════
-   Module Cards
+   Struct Cards
    ══════════════════════════════════════ */
-.module-list {
+.struct-list {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
   gap: 8px;
   margin-top: 16px;
 }
-.module-card {
+.struct-card {
   background: var(--bg-elev);
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 14px 16px;
   transition: all .12s;
 }
-.module-card:hover {
+.struct-card:hover {
   border-color: var(--border-strong);
   box-shadow: 0 2px 8px rgba(0,0,0,0.06);
 }
-[data-theme="dark"] .module-card:hover {
+[data-theme="dark"] .struct-card:hover {
   box-shadow: 0 2px 8px rgba(0,0,0,0.3);
 }
-.module-card h3 {
+.struct-card h3 {
   font-family: var(--ff-mono);
   font-size: 13px;
   font-weight: 500;
@@ -671,9 +671,9 @@ code, pre, .signature { font-family: var(--ff-mono); font-size: 13px; }
   text-transform: none;
   letter-spacing: 0;
 }
-.module-card h3 a { color: var(--fg); }
-.module-card h3 a:hover { color: var(--accent); text-decoration: none; }
-.module-card p {
+.struct-card h3 a { color: var(--fg); }
+.struct-card h3 a:hover { color: var(--accent); text-decoration: none; }
+.struct-card p {
   font-family: var(--ff-serif);
   color: var(--fg-muted);
   font-size: 13px;
@@ -781,7 +781,7 @@ code, pre, .signature { font-family: var(--ff-mono); font-size: 13px; }
   font-weight: 500;
   color: var(--fg);
 }
-.result-module {
+.result-struct {
   font-family: var(--ff-mono);
   font-size: 10px;
   text-transform: uppercase;

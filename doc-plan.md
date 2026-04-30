@@ -69,19 +69,19 @@ zap doc
   ├── 2. Discover build.zap, evaluate manifest with target :doc (CTFE)
   ├── 3. Discover source files (reuse import-driven discovery)
   ├── 4. Parse all .zap files (reuse parser)
-  ├── 5. Collect modules/functions/attributes (reuse collector)
+  ├── 5. Collect structs/functions/attributes (reuse collector)
   │
   ├── 6. Extract documentation data from scope graph:
-  │      ├── ModuleEntry → @structdoc, module name
+  │      ├── StructEntry → @structdoc, struct name
   │      ├── FunctionFamily → @fndoc, name, arity, params, types, visibility
   │      ├── MacroFamily → @fndoc, name, arity, params
   │      └── TypeEntry → struct/union definitions
   │
-  ├── 7. Build DocModule tree (intermediate representation)
+  ├── 7. Build DocStruct tree (intermediate representation)
   │
   ├── 8. Render outputs:
-  │      ├── HTML: static site with index, module pages, search, dark mode
-  │      └── Markdown: one .md file per module
+  │      ├── HTML: static site with index, struct pages, search, dark mode
+  │      └── Markdown: one .md file per struct
   │
   └── 9. Write to docs/ directory
 ```
@@ -91,7 +91,7 @@ zap doc
 The existing pipeline (parser → collector → scope graph) already:
 - Parses `@fndoc` and `@structdoc` as `AttributeDecl` AST nodes
 - Associates `@fndoc` with the next `FunctionFamily` or `MacroFamily`
-- Associates `@structdoc` with the `ModuleEntry`
+- Associates `@structdoc` with the `StructEntry`
 - Stores attribute values (string heredocs) accessible via `Attribute.value`
 - Tracks function signatures with parameter names, types, and return types
 
@@ -128,7 +128,7 @@ DocProject
   source_url: String
   landing_page_html: String          # rendered from landing_page markdown
   groups: []DocGroup                  # additional doc pages
-  modules: []DocModule
+  structs: []DocStruct
 
 DocGroup
   name: String
@@ -139,9 +139,9 @@ DocPage
   path: String
   html: String                        # rendered from markdown file
 
-DocModule
+DocStruct
   name: String                        # e.g., "String", "Zest.Case"
-  moduledoc: String                   # rendered HTML from @structdoc
+  doc: String                   # rendered HTML from @structdoc
   source_file: String                 # e.g., "lib/string.zap"
   functions: []DocFunction
   macros: []DocFunction               # same shape as functions
@@ -176,7 +176,7 @@ docs/
   search-index.json          # client-side search data
   style.css                  # all styles
   app.js                     # search + dark mode toggle
-  modules/
+  structs/
     String.html
     Integer.html
     Enum.html
@@ -200,13 +200,13 @@ docs/
 Three-panel layout (left sidebar, content, right TOC):
 
 - **Top bar**: Project name, version, search (Cmd+K), dark/light toggle
-- **Left sidebar**: Doc group pages (if any), then all modules listed alphabetically. Current page highlighted. On mobile: hamburger drawer.
-- **Content area**: Module page content (max-width 768px)
+- **Left sidebar**: Doc group pages (if any), then all structs listed alphabetically. Current page highlighted. On mobile: hamburger drawer.
+- **Content area**: Struct page content (max-width 768px)
 - **Right sidebar**: "On this page" TOC from h2/h3 headings with scroll-spy. Hidden on mobile.
 
-### Module Page Sections
+### Struct Page Sections
 
-1. **Module name** as h1
+1. **Struct name** as h1
 2. **Source file** link (e.g., "lib/string.zap")
 3. **@structdoc** rendered as HTML
 4. **Summary table** — compact list: `name/arity` | first sentence of `@fndoc`
@@ -245,18 +245,18 @@ Generated at build time as `search-index.json`:
 ```json
 [
   {
-    "module": "String",
-    "type": "module",
+    "struct": "String",
+    "type": "struct",
     "name": "String",
     "summary": "Functions for working with UTF-8 encoded strings.",
-    "url": "modules/String.html"
+    "url": "structs/String.html"
   },
   {
-    "module": "String",
+    "struct": "String",
     "type": "function",
     "name": "length/1",
     "summary": "Returns the number of bytes in the given string.",
-    "url": "modules/String.html#length/1"
+    "url": "structs/String.html#length/1"
   }
 ]
 ```
@@ -265,9 +265,9 @@ Generated at build time as `search-index.json`:
 
 In rendered `@fndoc` and `@structdoc` Markdown, backtick references to known symbols are auto-linked:
 
-- `` `String.length/1` `` → `<a href="modules/String.html#length/1">String.length/1</a>`
-- `` `Enum` `` → `<a href="modules/Enum.html">Enum</a>`
-- `` `Map.get/3` `` → `<a href="modules/Map.html#get/3">Map.get/3</a>`
+- `` `String.length/1` `` → `<a href="structs/String.html#length/1">String.length/1</a>`
+- `` `Enum` `` → `<a href="structs/Enum.html">Enum</a>`
+- `` `Map.get/3` `` → `<a href="structs/Map.html#get/3">Map.get/3</a>`
 
 Resolution happens after Markdown rendering, as a post-processing pass over the HTML.
 
@@ -300,7 +300,7 @@ Integration:
 
 For code blocks tagged as `zap` or with no language tag, apply basic syntax highlighting:
 
-- Keywords: `pub`, `fn`, `macro`, `module`, `case`, `if`, `else`, `use`, `struct`, `true`, `false`, `nil`
+- Keywords: `pub`, `fn`, `macro`, `struct`, `case`, `if`, `else`, `use`, `struct`, `true`, `false`, `nil`
 - Strings: `"..."`, `"""..."""`
 - Comments: `#`
 - Atoms: `:name`
@@ -311,7 +311,7 @@ Implemented as a post-processing pass over `<code class="language-zap">` blocks,
 
 ## Markdown Output
 
-One `.md` file per module in `docs/api/`:
+One `.md` file per struct in `docs/api/`:
 
 ```markdown
 # String
@@ -349,9 +349,9 @@ Returns the number of bytes in the given string.
 
 ### Phase 2: Doc Extraction (medium)
 5. Create `src/doc_generator.zig`
-6. Implement scope graph walking: iterate modules, function families, macro families
+6. Implement scope graph walking: iterate structs, function families, macro families
 7. Extract @fndoc/@structdoc string values from attributes
-8. Build `DocProject` / `DocModule` / `DocFunction` data model
+8. Build `DocProject` / `DocStruct` / `DocFunction` data model
 9. Extract function signatures from AST (param names, types, return type)
 
 ### Phase 3: Markdown Rendering (small)
@@ -361,7 +361,7 @@ Returns the number of bytes in the given string.
 
 ### Phase 4: HTML Generation (large)
 13. HTML templates as comptime strings in `doc_generator.zig`
-14. Module page rendering
+14. Struct page rendering
 15. Index/landing page rendering
 16. Summary table generation
 17. Source link generation
@@ -375,11 +375,11 @@ Returns the number of bytes in the given string.
 
 ### Phase 6: Extras (small)
 23. Doc group page rendering (additional markdown files)
-24. Markdown output (`.md` files per module)
+24. Markdown output (`.md` files per struct)
 25. `--no-deps` flag
 
 ### Phase 7: Polish
-26. Module auto-grouping in sidebar (by prefix)
+26. Struct auto-grouping in sidebar (by prefix)
 27. Mobile responsive testing
 28. Accessibility (ARIA labels, keyboard nav, skip links)
 

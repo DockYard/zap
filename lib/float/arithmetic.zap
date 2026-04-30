@@ -1,3 +1,5 @@
+@doc = "Arithmetic implementation for `Float`."
+
 pub impl Arithmetic for Float {
   @doc = "IEEE-754 float addition."
 

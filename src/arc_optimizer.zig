@@ -334,9 +334,15 @@ test "ArcOptimizer skips ARC for stack-allocated values" {
     };
     const functions = [_]ir.Function{
         .{
-            .id = 0, .name = "test_fn", .scope_id = 0, .arity = 0,
-            .params = &.{}, .return_type = .void,
-            .body = &blocks, .is_closure = false, .captures = &.{},
+            .id = 0,
+            .name = "test_fn",
+            .scope_id = 0,
+            .arity = 0,
+            .params = &.{},
+            .return_type = .void,
+            .body = &blocks,
+            .is_closure = false,
+            .captures = &.{},
         },
     };
     const program = ir.Program{
@@ -389,9 +395,15 @@ test "ArcOptimizer marks borrowed params as skippable" {
     };
     const functions = [_]ir.Function{
         .{
-            .id = 0, .name = "test_fn", .scope_id = 0, .arity = 1,
-            .params = &params, .return_type = .i64,
-            .body = &blocks, .is_closure = false, .captures = &.{},
+            .id = 0,
+            .name = "test_fn",
+            .scope_id = 0,
+            .arity = 1,
+            .params = &params,
+            .return_type = .i64,
+            .body = &blocks,
+            .is_closure = false,
+            .captures = &.{},
         },
     };
     const program = ir.Program{
@@ -439,9 +451,15 @@ test "ArcOptimizer keeps ARC for heap-allocated values" {
     };
     const functions = [_]ir.Function{
         .{
-            .id = 0, .name = "test_fn", .scope_id = 0, .arity = 0,
-            .params = &.{}, .return_type = .void,
-            .body = &blocks, .is_closure = false, .captures = &.{},
+            .id = 0,
+            .name = "test_fn",
+            .scope_id = 0,
+            .arity = 0,
+            .params = &.{},
+            .return_type = .void,
+            .body = &blocks,
+            .is_closure = false,
+            .captures = &.{},
         },
     };
     const program = ir.Program{

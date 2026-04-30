@@ -102,7 +102,7 @@ pub fn resetAllocator() void {
 }
 
 // ============================================================
-// Zap Runtime Support Module (spec §21, §31.7)
+// Zap Runtime Support Struct (spec §21, §31.7)
 //
 // Provides runtime types for generated Zig code:
 //   - Arc(T)       — generic ARC wrapper with atomic refcount

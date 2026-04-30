@@ -23,8 +23,8 @@ The first half is **architecture and orientation**. The second half is
 > 2. `case_expr` HIR builder rewritten to append-then-shrink instead of
 >    save-reset-restore, so nested case clauses see the outer arm's
 >    bindings (the desugarer's filter-case sits inside the cont arm).
-> 3. Type-checker mirror of `protocolDispatchModule` — when the call's
->    qualifying module is a registered protocol and the first arg has
+> 3. Type-checker mirror of `protocolDispatchStruct` — when the call's
+>    qualifying struct is a registered protocol and the first arg has
 >    a matching impl, redirect to the impl's signature so the call's
 >    inferred return type uses the impl's concrete shape rather than
 >    the protocol's abstract one.
@@ -111,7 +111,7 @@ pipeline. The Zap compiler itself is built by linking against
     arc_optimizer.zig, perceus.zig, escape_lattice.zig, ...   # late passes
     zir_builder.zig     # IR → ZIR (calls into the Zig fork's C-ABI)
     runtime.zig         # zap_runtime.zig source (Zig runtime functions Zap programs link against)
-    compiler.zig        # Pipeline orchestration (CTFE / per-module / full)
+    compiler.zig        # Pipeline orchestration (CTFE / per-struct / full)
     zir_integration_tests.zig  # End-to-end tests: compile a Zap program with `zap build`, run it, check stdout
   lib/                  # Zap stdlib (Zap source — NOT Zig)
     kernel.zap          # Macros (if, |>, sigils, <>); auto-imported
@@ -132,7 +132,7 @@ pipeline. The Zap compiler itself is built by linking against
 .zap files
   → discovery   (follow struct refs from entry to find all files)
   → parse       (per file, produce AST)
-  → collect     (scope graph: scopes per module/function/case-clause/block)
+  → collect     (scope graph: scopes per struct/function/case-clause/block)
   → macro-expand (Kernel macros run here; e.g. `<>` expands)
   → desugar     (`for x <- it { body }` becomes a __for_N helper fn + a call)
   → re-collect  (refresh scope graph for desugar-generated AST)
@@ -189,7 +189,7 @@ result = __for_N(iterable)
 ```
 
 The helper is registered via `Desugarer.pending_helpers` and emitted as
-a `priv_function` in the same module. Its parameter has no type
+a `priv_function` in the same struct. Its parameter has no type
 annotation; the type checker fills it in via `inferred_signatures`
 populated when the call site `__for_N(iterable)` is processed.
 
@@ -198,7 +198,7 @@ abstract signature, and concrete impls live at `lib/list/enumerable.zap`,
 `lib/map/enumerable.zap`, `lib/range/enumerable.zap`,
 `lib/string/enumerable.zap`. The HIR builder rewrites
 `Enumerable.next(state)` to `T.next(state)` based on `state`'s inferred
-type via `protocolDispatchModule` (`src/hir.zig:4987`).
+type via `protocolDispatchStruct` (`src/hir.zig:4987`).
 
 ### Decision-tree pattern compiler (relevant for B1)
 
@@ -424,9 +424,9 @@ Failures the speculative work was chasing:
 
 The `Concatenable` error means `<>` (which expands to
 `Concatenable.concat(a, b)`) didn't dispatch to `String.concat` at HIR
-time, so the ZIR emit references a non-existent runtime module. That
+time, so the ZIR emit references a non-existent runtime struct. That
 happens when the HIR call's first arg has UNKNOWN type at dispatch
-time. (`src/hir.zig:3917`: `protocolDispatchModule` returns null when
+time. (`src/hir.zig:3917`: `protocolDispatchStruct` returns null when
 `first_arg_type == TypeStore.UNKNOWN`.)
 
 The List(i64) vs List(String) error suggests that for `c <- "abc"`,
@@ -464,15 +464,15 @@ also caused regressions when stacked):
    this, `resolveBindingType` walks from the function clause scope and
    never enters the case_clause scope.
 
-4. **Type-checker protocol dispatch in `inferCall` for module-qualified
+4. **Type-checker protocol dispatch in `inferCall` for struct-qualified
    calls**. `src/types.zig:~3658` — Mirror of HIR's
-   `protocolDispatchModule`. When `Enumerable.next(s :: String)` is
+   `protocolDispatchStruct`. When `Enumerable.next(s :: String)` is
    type-checked, the type checker was using the protocol's signature
    (`fn next(state) -> {Atom, i64, any}`) to infer the call's return
    type. That's wrong: it should use `String.next`'s signature
-   (`{Atom, String, String}`). I added a `protocolDispatchModule`
+   (`{Atom, String, String}`). I added a `protocolDispatchStruct`
    helper that walks `graph.protocols` and `graph.impls` to redirect
-   the resolution to the impl's module before resolving the family
+   the resolution to the impl's struct before resolving the family
    signature.
 
 5. **Function-param compound-pattern type recursion**. `src/types.zig:~2584`
@@ -556,9 +556,9 @@ I would:
 
 Specifically, the speculative changes to revert are:
 - `src/types.zig`: remove `checkCaseClause`, `recordCasePatternBindingTypes`,
-  `protocolDispatchModule` helpers; revert `case_expr` handler in
+  `protocolDispatchStruct` helpers; revert `case_expr` handler in
   `inferExpr` to call `checkStmt` directly; revert `inferCall`'s
-  `field_access` path to not call `protocolDispatchModule`; revert the
+  `field_access` path to not call `protocolDispatchStruct`; revert the
   function-param compound-pattern recursion in `checkFunctionClause`.
 - `src/collector.zig`: revert the case_clause `node_scope_map.put`
   and `@constCast(&clause.meta).scope_id` lines.
@@ -573,7 +573,7 @@ Specifically, the speculative changes to revert are:
   UNKNOWN because the type checker doesn't flow scrutinee types into
   case pattern bindings (the very problem fix #1's recordCasePattern...
   was trying to address). When the protocol dispatch runs with UNKNOWN
-  arg type, it falls through to the literal `Concatenable` module name,
+  arg type, it falls through to the literal `Concatenable` struct name,
   which doesn't exist in the runtime.
 
 - ZIR test count: 54/78 with verified fixes. Pre-existing failures (24
@@ -663,7 +663,7 @@ Additional investigation directions:
   UNKNOWN`. For `__for_N` over String, `body_type` should become
   `[String]` after a full body check. Confirm by debug print.
 
-- The HIR `protocolDispatchModule` (`src/hir.zig:4987`) requires
+- The HIR `protocolDispatchStruct` (`src/hir.zig:4987`) requires
   `first_arg_type` to be a non-UNKNOWN type with a registered impl.
   Register a debug print in `case` builder:
 
@@ -694,7 +694,7 @@ Per `DEFERRED_WORK.md`, after B1 the recommended order is:
    Range, String hardcoded names → attribute-driven).
 2. A2 (generic AstVisitor — replace per-pass exhaustive AST switches).
 3. A1 (pipeline unification — the two compileForCtfe /
-   compileModuleByModule paths).
+   compileStructByStruct paths).
 4. A3 (move Zest into Zap macros — gated on a macro-system feature for
    constructing function decls, design discussion required).
 
@@ -711,9 +711,9 @@ src/hir.zig:660..1500       # decision tree compiler (compilePatternMatrix, comp
 src/hir.zig:2121..2155      # resolveBindingType (HIR var_ref type lookup)
 src/hir.zig:2582..2670      # buildBindingReference (HIR var_ref scope walk)
 src/hir.zig:3766..3793      # var_ref expression builder
-src/hir.zig:3895..4162      # call expression builder (protocolDispatchModule call site at 3917)
+src/hir.zig:3895..4162      # call expression builder (protocolDispatchStruct call site at 3917)
 src/hir.zig:4167..4220      # case_expr builder (B1 case-bindings stack edit site)
-src/hir.zig:4957..5000      # hasImpl, isProtocolName, protocolDispatchModule
+src/hir.zig:4957..5000      # hasImpl, isProtocolName, protocolDispatchStruct
 src/hir.zig:4994..5053      # collectCasePatternBindings (verified bug here)
 src/ir.zig:2526..2800       # lowerDecisionTreeForCase (.bind handler at 2750)
 src/ir.zig:3208..3217       # resolveScrutinee
@@ -802,7 +802,7 @@ EOF
 - **AIR**: Zig's analysed intermediate (post-sema). Zap doesn't directly
   see AIR — the fork handles ZIR → AIR → LLVM.
 - **scope_graph**: A flat array of scopes (function/block/case_clause/
-  module/etc.) with parent links and a `bindings` map per scope.
+  struct/etc.) with parent links and a `bindings` map per scope.
   `resolveBinding(scope_id, name)` walks UP from `scope_id`.
 - **scrutinee_id / scrutinee_map**: In the decision-tree pattern
   compiler, every position in the pattern matrix is identified by a
@@ -825,7 +825,7 @@ EOF
 - **No workarounds, hacks, or shortcuts** — the project's CLAUDE.md is
   emphatic. The fix has to be the real fix.
 - **Zap features go in `lib/*.zap`, not in `src/*.zig`** — never
-  hardcode Zap module names as string literals in the compiler. The
+  hardcode Zap struct names as string literals in the compiler. The
   exception is type primitives, dispatch decisions, and the runtime
   bridge layer, where some hardcoded names exist today (and are
   themselves an open audit item, A4 in `DEFERRED_WORK.md`).

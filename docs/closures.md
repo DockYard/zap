@@ -4,7 +4,7 @@ Zap supports first-class callable values through both explicit function referenc
 
 ## Function References
 
-You can reference an existing function value with `&name/arity` or `&Module.name/arity`.
+You can reference an existing function value with `&name/arity` or `&Struct.name/arity`.
 
 Local function reference:
 
@@ -21,7 +21,7 @@ pub struct Demo {
 }
 ```
 
-Module-qualified function reference:
+Struct-qualified function reference:
 
 ```zap
 pub struct Demo {

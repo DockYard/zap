@@ -1,3 +1,5 @@
+@doc = "Enumerable implementation for `String`."
+
 pub impl Enumerable for String {
   @doc = """
     Iterate a string byte-by-byte.

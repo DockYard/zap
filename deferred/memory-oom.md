@@ -219,7 +219,7 @@ Key files:
 1. Zap frontend produces `ir.Program` (list of functions with instructions)
 2. `zir_builder.zig` walks each function and emits ZIR instructions via
    C-ABI calls to the forked Zig's builder
-3. `zir_builder_inject` replaces the root module's ZIR with the emitted
+3. `zir_builder_inject` replaces the root struct's ZIR with the emitted
    instructions
 4. `zir_compilation_update` runs Zig's Sema on the injected ZIR, then
    LLVM codegen, then MachO linking
@@ -227,7 +227,7 @@ Key files:
 
 The ZIR injection replaces a "stub" source file (`"pub fn main() void {}"`)
 with Zap's generated functions. The stub exists so the Zig compilation has
-a valid root module before injection.
+a valid root struct before injection.
 
 ## Specific Findings from Research
 

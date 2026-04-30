@@ -1,3 +1,5 @@
+@doc = "Arithmetic implementation for `Integer`."
+
 pub impl Arithmetic for Integer {
   @doc = "Integer addition. Wrapping on overflow."
 

@@ -90,7 +90,7 @@ tool descriptions and agent prompts.
 Zap uses per-file compilation with a two-pass architecture:
 
 **Pass 1: Global collection** (fast, all files)
-- Start from the entry point, follow module references to discover files
+- Start from the entry point, follow struct references to discover files
 - Parse each file independently
 - Collect all declarations into a shared scope graph and type store
 
@@ -105,10 +105,10 @@ Zap uses per-file compilation with a two-pass architecture:
 - Effect derivation from the interprocedural call graph
 - ZIR backend produces native binary
 
-Module discovery is import-driven: the compiler starts from the entry point and
-follows `Module.function()` references to find files. Each module name maps to
+Struct discovery is import-driven: the compiler starts from the entry point and
+follows `Struct.function()` references to find files. Each struct name maps to
 a file path by convention (`Config.Parser` -> `lib/config/parser.zap`). One
-module per file, enforced by the compiler.
+struct per file, enforced by the compiler.
 
 ### State management
 
@@ -116,7 +116,7 @@ The server holds these artifacts in memory after compilation:
 
 | Artifact | Source | Granularity | Contents |
 |---|---|---|---|
-| `file_graph` | Discovery | Global | Module dependency graph (which files import which) |
+| `file_graph` | Discovery | Global | Struct dependency graph (which files import which) |
 | `compilation_context` | Pass 1 | Global | Shared scope graph, type store, string interner |
 | `file_asts` | Pass 1 | Per-file | AST with spans for each source file |
 | `file_irs` | Pass 2 | Per-file | IR program for each source file |
@@ -177,7 +177,7 @@ directly to the existing `diagnostics.Diagnostic` struct.
 
 ### Pagination
 
-Tools that return lists (`function_list`, `modules`, `escape`, `regions`,
+Tools that return lists (`function_list`, `structs`, `escape`, `regions`,
 `reuse`) support pagination:
 
 **Parameters** (on applicable tools):
@@ -215,7 +215,7 @@ Every tool declares MCP annotations:
 | `types` | true | false | true | false |
 | `type_at` | true | false | true | false |
 | `scope` | true | false | true | false |
-| `modules` | true | false | true | false |
+| `structs` | true | false | true | false |
 | `function_list` | true | false | true | false |
 | `deps` | true | false | true | false |
 | `call_graph` | true | false | true | false |
@@ -251,7 +251,7 @@ Compile the project through the per-file compilation pipeline.
 - `files_compiled` — number of files compiled (less than total on incremental)
 - `files_total` — total files in the project
 - `diagnostics[]` — all errors and warnings from all phases
-- `functions[]` — list of compiled functions with name, arity, module
+- `functions[]` — list of compiled functions with name, arity, struct
 - `types[]` — list of type definitions (structs, enums, unions)
 - `entry` — the entry point function, if any
 
@@ -338,11 +338,11 @@ the agent wants to re-read errors without triggering a recompilation.
 #### `source`
 
 Read a project source file, optionally annotated with type information.
-Accepts either a file path or a module name.
+Accepts either a file path or a struct name.
 
 **Parameters:**
 - `file` (optional, string) — source file path relative to project root
-- `module` (optional, string) — module name (resolved to file path via
+- `struct` (optional, string) — struct name (resolved to file path via
   convention: `Config.Parser` -> `lib/config/parser.zap`)
 - `annotated` (optional, bool) — include inline type annotations, default false
 
@@ -350,8 +350,8 @@ Accepts either a file path or a module name.
 ```json
 {
   "file": "lib/config.zap",
-  "module": "Config",
-  "content": "defmodule Config do\n  ...\nend",
+  "struct": "Config",
+  "content": "struct Config do\n  ...\nend",
   "lines": 42,
   "annotations": [
     { "line": 3, "column": 5, "type": "String", "ownership": "shared" }
@@ -360,18 +360,18 @@ Accepts either a file path or a module name.
 ```
 
 **Behavior:**
-Reads the source file from disk. Module names are resolved to file paths via
+Reads the source file from disk. Struct names are resolved to file paths via
 the naming convention. When `annotated: true`, overlays the TypeChecker's
 resolved types at binding sites.
 
-### Module dependency queries
+### Struct dependency queries
 
 #### `deps`
 
-Get the module dependency graph.
+Get the struct dependency graph.
 
 **Parameters:**
-- `module` (optional, string) — show deps for a specific module. If omitted,
+- `struct` (optional, string) — show deps for a specific struct. If omitted,
   returns the full project dependency graph.
 - `direction` (optional, enum) — `imports` (default), `imported_by`, or `both`
 - `depth` (optional, int) — transitive depth, default 1, max 10
@@ -379,27 +379,27 @@ Get the module dependency graph.
 **Returns:**
 ```json
 {
-  "module": "App",
+  "struct": "App",
   "file": "lib/app.zap",
   "imports": [
-    { "module": "Config", "file": "lib/config.zap" },
-    { "module": "IO", "file": "lib/io.zap" }
+    { "struct": "Config", "file": "lib/config.zap" },
+    { "struct": "IO", "file": "lib/io.zap" }
   ],
   "imported_by": []
 }
 ```
 
-When no module is specified, returns the full graph:
+When no struct is specified, returns the full graph:
 ```json
 {
-  "modules": [
+  "structs": [
     {
-      "module": "App",
+      "struct": "App",
       "file": "lib/app.zap",
       "imports": ["Config", "IO"]
     },
     {
-      "module": "Config",
+      "struct": "Config",
       "file": "lib/config.zap",
       "imports": ["Config.Parser"]
     }
@@ -409,16 +409,16 @@ When no module is specified, returns the full graph:
 
 **Behavior:**
 Reads from the file dependency graph built during import-driven discovery.
-The agent can see the entire module structure of the project and understand
+The agent can see the entire struct structure of the project and understand
 what depends on what — without reading any source files.
 
-#### `modules`
+#### `structs`
 
-List all modules in the compiled program.
+List all structs in the compiled program.
 
 **Parameters:**
-- `limit` (optional, int) — max modules to return, default 50
-- `offset` (optional, int) — modules to skip, default 0
+- `limit` (optional, int) — max structs to return, default 50
+- `offset` (optional, int) — structs to skip, default 0
 
 **Returns:**
 ```json
@@ -427,7 +427,7 @@ List all modules in the compiled program.
   "count": 5,
   "offset": 0,
   "has_more": false,
-  "modules": [
+  "structs": [
     {
       "name": "Config",
       "functions": ["load/1", "parse/1", "validate/2"],
@@ -440,7 +440,7 @@ List all modules in the compiled program.
 ```
 
 **Behavior:**
-With one-module-per-file and name=path convention, the module list can be
+With one-struct-per-file and name=path convention, the struct list can be
 derived from the file system (`lib/` tree) for discovery, enriched with type
 information from the compilation state.
 
@@ -457,7 +457,7 @@ Get type information for a function.
 ```json
 {
   "name": "Config.load",
-  "module": "Config",
+  "struct": "Config",
   "file": "lib/config.zap",
   "arity": 1,
   "params": [
@@ -500,8 +500,8 @@ expression text.
 Get what's visible in a given scope.
 
 **Parameters:**
-- `module` (string) — module name
-- `function` (optional, string) — function name within the module
+- `struct` (string) — struct name
+- `function` (optional, string) — function name within the struct
 
 **Returns:**
 ```json
@@ -520,9 +520,9 @@ Get what's visible in a given scope.
 ```
 
 **Behavior:**
-Reads from the scope graph. If only `module` is given, returns the module-level
+Reads from the scope graph. If only `struct` is given, returns the struct-level
 scope. If `function` is also given, returns the function's scope (parameters,
-locals, captures) plus everything visible from the enclosing module scope.
+locals, captures) plus everything visible from the enclosing struct scope.
 
 ### Call graph and effect queries
 
@@ -543,13 +543,13 @@ Get the call graph for a function.
   "callees": [
     {
       "name": "IO.read_file",
-      "module": "IO",
+      "struct": "IO",
       "file": "lib/io.zap",
       "call_sites": [{ "line": 3, "column": 9 }]
     },
     {
       "name": "Config.parse",
-      "module": "Config",
+      "struct": "Config",
       "file": "lib/config.zap",
       "call_sites": [{ "line": 4, "column": 3 }]
     }
@@ -823,7 +823,7 @@ List all functions matching a pattern.
 
 **Parameters:**
 - `pattern` (optional, string) — glob pattern on function name
-- `module` (optional, string) — restrict to a module
+- `struct` (optional, string) — restrict to a struct
 - `limit` (optional, int) — max functions to return, default 50
 - `offset` (optional, int) — functions to skip, default 0
 
@@ -900,14 +900,14 @@ sends a notification when diagnostics change after recompilation.
 
 Source file content. Example: `zap://source/lib/config.zap`.
 
-#### `zap://module/{name}`
+#### `zap://struct/{name}`
 
-Source file for a module, resolved via the naming convention.
-Example: `zap://module/Config.Parser` resolves to `lib/config/parser.zap`.
+Source file for a struct, resolved via the naming convention.
+Example: `zap://struct/Config.Parser` resolves to `lib/config/parser.zap`.
 
 #### `zap://deps`
 
-The full module dependency graph. Subscribable — updated on recompilation.
+The full struct dependency graph. Subscribable — updated on recompilation.
 
 Resources complement tools: the agent uses tools for parameterized queries
 (`escape("Config.load")`) and resources for ambient state it wants to
@@ -976,7 +976,7 @@ The canonical agent workflow with `zap mcp`:
    and doesn't escape, return value is a fresh allocation
 4. Agent calls `effects("Config.load")` — learns it performs
    `FileSystem.read` with the full call chain
-5. Agent calls `deps(module: "Config")` — sees it imports `Config.Parser`
+5. Agent calls `deps(struct: "Config")` — sees it imports `Config.Parser`
    and `IO`
 6. Agent has a complete understanding of the function's contract,
    dependencies, and side effects from four MCP calls, zero source reads
@@ -999,7 +999,7 @@ Build the MCP server infrastructure and the core compilation tools.
 - `run` tool — executes binary, captures output
 - `test` tool — builds and runs tests, returns structured results
 - `diagnostics` tool — returns cached diagnostics, filterable by file
-- `source` tool — reads source files by path or module name, with optional
+- `source` tool — reads source files by path or struct name, with optional
   type annotations
 - `zap://diagnostics` resource
 
@@ -1014,29 +1014,29 @@ Build the MCP server infrastructure and the core compilation tools.
 - Diagnostics are per-file, stored keyed by file path
 - Log to stderr, never stdout (stdio transport requirement)
 
-### Phase 2: Module dependency and type queries
+### Phase 2: Struct dependency and type queries
 
 Expose the file dependency graph, type checker, and scope graph.
 
 **Deliverables:**
 - `deps` tool
-- `modules` tool (with pagination)
+- `structs` tool (with pagination)
 - `types` tool
 - `type_at` tool
 - `scope` tool
 - `function_list` tool (with pagination)
-- `zap://module/{name}` resource
+- `zap://struct/{name}` resource
 - `zap://deps` resource
 
 **Implementation notes:**
 - `deps` reads from the file dependency graph built during import-driven
-  discovery. Module names resolve to files via the naming convention.
-- `modules` can be derived from the file system (`lib/` tree) for discovery,
+  discovery. Struct names resolve to files via the naming convention.
+- `structs` can be derived from the file system (`lib/` tree) for discovery,
   enriched with type information from compilation state
 - `types` reads function signatures from the per-file IR programs and enriches
   with ownership from the scope graph
 - `type_at` requires a span-to-type lookup per file
-- `source` resolves module names to file paths via the naming convention
+- `source` resolves struct names to file paths via the naming convention
 
 ### Phase 3: Call graph, effects, and interprocedural queries
 
@@ -1053,7 +1053,7 @@ Expose the call graph, function summaries, and derived effects.
   global (assigned during pass 3 merge).
 - `effects` reads from the effect derivation results in the interprocedural
   analysis. Effects propagate upward from `:zig.*` intrinsic leaf calls.
-- All responses include `file` fields since module names map to files
+- All responses include `file` fields since struct names map to files
 
 ### Phase 4: Escape analysis and memory queries
 
@@ -1152,7 +1152,7 @@ modeled as either. We chose tools because:
 
 Resources are used for state that changes on recompilation and benefits from
 push notifications: `zap://diagnostics`, `zap://deps`,
-`zap://module/{name}`, `zap://source/{file}`.
+`zap://struct/{name}`, `zap://source/{file}`.
 
 ---
 

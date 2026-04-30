@@ -9,7 +9,7 @@ const scope_mod = @import("scope.zig");
 //   - Variable references to bindings in scope
 //   - Type names to registered types
 //   - Function calls to function families
-//   - Module references via aliases
+//   - Struct references via aliases
 //
 // Annotates AST nodes with scope_id information.
 // ============================================================
@@ -49,9 +49,9 @@ pub const Resolver = struct {
     // ============================================================
 
     pub fn resolveProgram(self: *Resolver, program: *const ast.Program) !void {
-        // Resolve modules
+        // Resolve structs
         for (program.structs, 0..) |*mod, i| {
-            // Find the module scope
+            // Find the struct scope
             if (i < self.graph.structs.items.len) {
                 const mod_entry = &self.graph.structs.items[i];
                 const saved = self.current_scope;
@@ -350,7 +350,7 @@ pub const Resolver = struct {
                     }
                 }
             },
-            // Literals and module refs — no resolution needed
+            // Literals and struct refs — no resolution needed
             .int_literal,
             .float_literal,
             .string_literal,
@@ -358,7 +358,7 @@ pub const Resolver = struct {
             .atom_literal,
             .bool_literal,
             .nil_literal,
-            .module_ref,
+            .struct_ref,
             .function_ref,
             .intrinsic,
             .attr_ref,
@@ -534,7 +534,7 @@ test "resolve simple function" {
     try std.testing.expectEqual(@as(usize, 0), resolver.errors.items.len);
 }
 
-test "resolve module with function" {
+test "resolve struct with function" {
     const source =
         \\pub struct Math {
         \\  pub fn add(x :: i64, y :: i64) -> i64 {

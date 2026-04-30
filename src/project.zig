@@ -13,10 +13,10 @@ pub const FileUnit = struct {
     stem: []const u8,
     source: []const u8,
     defines_types: []const []const u8,
-    defines_modules: []const []const u8,
+    defines_structs: []const []const u8,
     defines_functions: []const []const u8 = &.{},
     references_types: []const []const u8,
-    references_modules: []const []const u8,
+    references_structs: []const []const u8,
     has_main: bool,
 };
 
@@ -51,10 +51,10 @@ pub const DependencyGraph = struct {
                     }
                 }
             }
-            for (file.references_modules) |ref_mod| {
+            for (file.references_structs) |ref_mod| {
                 for (files, 0..) |other, j| {
                     if (i == j) continue;
-                    for (other.defines_modules) |def_mod| {
+                    for (other.defines_structs) |def_mod| {
                         if (std.mem.eql(u8, ref_mod, def_mod)) {
                             var found = false;
                             for (deps.items) |d| {
@@ -209,7 +209,7 @@ pub const DependencyGraph = struct {
 
 /// Discover all .zap files in the same directory as the given file.
 /// Only returns multiple files if they form a project (at least one file
-/// references a type or module defined in another file). Standalone files
+/// references a type or struct defined in another file). Standalone files
 /// in a directory of unrelated .zap files stay in single-file mode.
 pub fn discoverZapFiles(allocator: std.mem.Allocator, path: []const u8) ![]const []const u8 {
     const dir_path = std.fs.path.dirname(path) orelse ".";
@@ -252,9 +252,9 @@ pub fn discoverZapFiles(allocator: std.mem.Allocator, path: []const u8) ![]const
         const program = parser.parseProgram() catch continue;
         const analysis = analyzeProgram(allocator, &program, parser.interner) catch continue;
         for (analysis.defines_types) |dt| try all_defined.append(allocator, dt);
-        for (analysis.defines_modules) |dm| try all_defined.append(allocator, dm);
+        for (analysis.defines_structs) |dm| try all_defined.append(allocator, dm);
         for (analysis.references_types) |rt| try all_referenced.append(allocator, rt);
-        for (analysis.references_modules) |rm| try all_referenced.append(allocator, rm);
+        for (analysis.references_structs) |rm| try all_referenced.append(allocator, rm);
     }
 
     // If any referenced name matches a name defined in another file, it's a project
@@ -279,24 +279,24 @@ pub fn discoverZapFiles(allocator: std.mem.Allocator, path: []const u8) ![]const
     return try candidate_paths.toOwnedSlice(allocator);
 }
 
-/// Analyze a parsed program to determine what types and modules it defines and references.
+/// Analyze a parsed program to determine what types and structs it defines and references.
 pub fn analyzeProgram(
     allocator: std.mem.Allocator,
     program: *const ast.Program,
     interner: *const ast.StringInterner,
 ) !struct {
     defines_types: []const []const u8,
-    defines_modules: []const []const u8,
+    defines_structs: []const []const u8,
     defines_functions: []const []const u8,
     references_types: []const []const u8,
-    references_modules: []const []const u8,
+    references_structs: []const []const u8,
     has_main: bool,
 } {
     var def_types: std.ArrayList([]const u8) = .empty;
-    var def_modules: std.ArrayList([]const u8) = .empty;
+    var def_structs: std.ArrayList([]const u8) = .empty;
     var def_functions: std.ArrayList([]const u8) = .empty;
     var ref_types: std.ArrayList([]const u8) = .empty;
-    var ref_modules: std.ArrayList([]const u8) = .empty;
+    var ref_structs: std.ArrayList([]const u8) = .empty;
     var has_main = false;
 
     for (program.top_items) |item| {
@@ -304,11 +304,11 @@ pub fn analyzeProgram(
             .struct_decl, .priv_struct_decl => |sd| {
                 if (sd.name.parts.len > 0) {
                     const struct_name = interner.get(sd.name.parts[0]);
-                    try def_modules.append(allocator, struct_name);
+                    try def_structs.append(allocator, struct_name);
                 }
                 // Check for extends (references parent struct)
                 if (sd.parent) |parent| {
-                    try ref_modules.append(allocator, interner.get(parent));
+                    try ref_structs.append(allocator, interner.get(parent));
                 }
                 // Scan struct functions for type references and main
                 for (sd.items) |struct_item| {
@@ -366,26 +366,26 @@ pub fn analyzeProgram(
         }
     }
 
-    var filtered_ref_modules: std.ArrayList([]const u8) = .empty;
-    for (ref_modules.items) |rm| {
+    var filtered_ref_structs: std.ArrayList([]const u8) = .empty;
+    for (ref_structs.items) |rm| {
         var is_self = false;
-        for (def_modules.items) |dm| {
+        for (def_structs.items) |dm| {
             if (std.mem.eql(u8, rm, dm)) {
                 is_self = true;
                 break;
             }
         }
         if (!is_self) {
-            try filtered_ref_modules.append(allocator, rm);
+            try filtered_ref_structs.append(allocator, rm);
         }
     }
 
     return .{
         .defines_types = try def_types.toOwnedSlice(allocator),
-        .defines_modules = try def_modules.toOwnedSlice(allocator),
+        .defines_structs = try def_structs.toOwnedSlice(allocator),
         .defines_functions = try def_functions.toOwnedSlice(allocator),
         .references_types = try filtered_ref_types.toOwnedSlice(allocator),
-        .references_modules = try filtered_ref_modules.toOwnedSlice(allocator),
+        .references_structs = try filtered_ref_structs.toOwnedSlice(allocator),
         .has_main = has_main,
     };
 }
@@ -431,8 +431,8 @@ fn collectTypeRefsFromExpr(
 ) anyerror!void {
     switch (expr.*) {
         .struct_expr => |se| {
-            if (se.module_name.parts.len > 0) {
-                const name = interner.get(se.module_name.parts[0]);
+            if (se.struct_name.parts.len > 0) {
+                const name = interner.get(se.struct_name.parts[0]);
                 if (!isBuiltinTypeName(name)) {
                     try ref_types.append(allocator, name);
                 }
@@ -514,9 +514,9 @@ test "DependencyGraph cycle diagnostic lists cycle edges and help" {
             .stem = "cycle_a",
             .source = "",
             .defines_types = &.{},
-            .defines_modules = &.{"CycleA"},
+            .defines_structs = &.{"CycleA"},
             .references_types = &.{},
-            .references_modules = &.{"CycleB"},
+            .references_structs = &.{"CycleB"},
             .has_main = false,
         },
         .{
@@ -524,9 +524,9 @@ test "DependencyGraph cycle diagnostic lists cycle edges and help" {
             .stem = "cycle_b",
             .source = "",
             .defines_types = &.{},
-            .defines_modules = &.{"CycleB"},
+            .defines_structs = &.{"CycleB"},
             .references_types = &.{},
-            .references_modules = &.{"CycleA"},
+            .references_structs = &.{"CycleA"},
             .has_main = false,
         },
     };

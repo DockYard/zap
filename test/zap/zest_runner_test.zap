@@ -26,7 +26,7 @@ pub struct Zap.ZestRunnerTest {
 
   pub macro normalized_option_count(opts :: Expr) -> Expr {
     normalized = options(opts)
-    count = __zap_list_len__(normalized)
+    count = list_length(normalized)
 
     quote { unquote(count) }
   }

@@ -1,15 +1,15 @@
+@doc = """
+  Discovers and runs Zest test structs.
+
+  `use Zest.Runner` expands into a test runner `main/1` that discovers
+  Zap source files from configured glob patterns, reflects their structs,
+  invokes each discovered struct's `run/0`, and then prints the summary.
+  """
+
 pub struct Zest.Runner {
-  @structdoc = """
-    Discovers and runs Zest test structs.
-
-    `use Zest.Runner` expands into a test runner `main/1` that discovers
-    Zap source files from configured glob patterns, reflects their structs,
-    invokes each discovered struct's `run/0`, and then prints the summary.
-    """
-
   @requires = [:read_file, :reflect_source]
 
-  @fndoc = """
+  @doc = """
     Imports `Zest.Runner` and generates a `main/1` test entry point.
 
     Options are normalized through `Zest.Runner.options/1`. The supported
@@ -21,13 +21,13 @@ pub struct Zest.Runner {
   pub macro __using__(_opts :: Expr) -> Expr {
     _options = options(_opts)
     _patterns = patterns(_options)
-    _source_paths = __zap_list_flatten__(for _pattern <- _patterns {
+    _source_paths = list_flatten(for _pattern <- _patterns {
       Path.glob(_pattern)
     })
-    _source_structs = __zap_list_flatten__(for _source_path <- _source_paths {
-      __zap_source_graph_structs__(_source_path)
+    _source_structs = list_flatten(for _source_path <- _source_paths {
+      SourceGraph.structs(_source_path)
     })
-    _test_structs = for _struct <- _source_structs, has_run?(_struct) {
+    _test_structs = for _struct <- _source_structs, Struct.has_function?(_struct, "run", 0) {
       _struct
     }
     _run_calls = for _struct <- _test_structs {
@@ -39,6 +39,8 @@ pub struct Zest.Runner {
     quote {
       import Zest.Runner
 
+      @doc = "Generated Zest test runner entry point."
+
       pub fn main(_args :: [String]) -> String {
         Zest.Runner.configure()
         unquote_splicing(_run_calls)
@@ -47,7 +49,7 @@ pub struct Zest.Runner {
     }
   }
 
-  @fndoc = """
+  @doc = """
     Normalizes runner options to a list.
 
     `nil` and `[]` become an empty list, an existing option list is returned
@@ -61,7 +63,7 @@ pub struct Zest.Runner {
       if opts == [] {
         []
       } else {
-        if __zap_list_len__(opts) == 0 {
+        if list_length(opts) == 0 {
           [opts]
         } else {
           opts
@@ -70,7 +72,7 @@ pub struct Zest.Runner {
     }
   }
 
-  @fndoc = """
+  @doc = """
     Parses `--seed` and `--timeout` from CLI arguments and applies
     them to the test tracker. If `--seed <integer>` is present,
     sets the seed explicitly for reproducible ordering. Otherwise
@@ -88,7 +90,7 @@ pub struct Zest.Runner {
     parse_cli_args(0, System.arg_count())
   }
 
-  @fndoc = """
+  @doc = """
     Prints the test summary with counts and exits with a
     failure code if any tests failed.
 
@@ -111,7 +113,7 @@ pub struct Zest.Runner {
     "done"
   }
 
-  @fndoc = """
+  @doc = """
     Recursively scans CLI arguments for `--seed <value>` and
     `--timeout <milliseconds>`, applying each to the test tracker.
     """
@@ -146,7 +148,7 @@ pub struct Zest.Runner {
     _pattern_groups = for _option <- options {
       option_patterns(_option)
     }
-    _patterns = __zap_list_flatten__(_pattern_groups)
+    _patterns = list_flatten(_pattern_groups)
 
     if _patterns == [] {
       ["test/**/*_test.zap"]
@@ -171,21 +173,12 @@ pub struct Zest.Runner {
     if value == [] {
       []
     } else {
-      if __zap_list_len__(value) == 0 {
+      if list_length(value) == 0 {
         [value]
       } else {
         value
       }
     }
-  }
-
-  @requires = [:reflect_source]
-  macro has_run?(struct_ref :: Expr) -> Expr {
-    _matches = for _function <- __zap_struct_functions__(struct_ref), __zap_map_get__(_function, :name, "") == "run" and __zap_map_get__(_function, :arity, -1) == 0 {
-      _function
-    }
-
-    __zap_list_len__(_matches) > 0
   }
 
 }

@@ -219,7 +219,7 @@ pub fn AstVisitor(comptime Context: type) type {
 
         pub fn walkExpr(ctx: *Context, expr: *const ast.Expr) anyerror!void {
             switch (expr.*) {
-                .int_literal, .float_literal, .string_literal, .atom_literal, .bool_literal, .nil_literal, .var_ref, .module_ref, .attr_ref, .function_ref, .intrinsic => {},
+                .int_literal, .float_literal, .string_literal, .atom_literal, .bool_literal, .nil_literal, .var_ref, .struct_ref, .attr_ref, .function_ref, .intrinsic => {},
                 .string_interpolation => |si| {
                     for (si.parts) |part| {
                         switch (part) {
