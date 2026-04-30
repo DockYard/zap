@@ -955,7 +955,20 @@ pub const Collector = struct {
     fn collectPatternBindings(self: *Collector, pattern: *const ast.Pattern, scope_id: scope.ScopeId) !void {
         switch (pattern.*) {
             .bind => |bind| {
-                _ = try self.graph.createBinding(bind.name, scope_id, .pattern_bind, bind.meta.span);
+                // Copy the binder's hygiene scope set into the Binding row
+                // so `resolveBindingByScopes` can pick this binding when a
+                // reference's scope set is a superset (Flatt 2016 largest-
+                // subset rule). For pre-hygiene code paths the set is
+                // empty, which makes the binding visible to any reference
+                // (the empty set is a subset of every set) — preserves the
+                // lexical-chain fallback semantics.
+                _ = try self.graph.createBindingWithScopes(
+                    bind.name,
+                    scope_id,
+                    .pattern_bind,
+                    bind.meta.span,
+                    bind.meta.scopes,
+                );
             },
             .tuple => |tup| {
                 for (tup.elements) |elem| {

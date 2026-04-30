@@ -604,13 +604,31 @@ pub const ScopeGraph = struct {
     }
 
     pub fn createBinding(self: *ScopeGraph, name: ast.StringId, scope_id: ScopeId, kind: BindingKind, span: ast.SourceSpan) !BindingId {
+        return self.createBindingWithScopes(name, scope_id, kind, span, .empty);
+    }
+
+    /// Create a binding with an explicit hygiene scope set (Flatt 2016).
+    /// The set is cloned so callers can free their input. The lexical
+    /// `scope_id` is preserved separately for the lexical-chain resolver
+    /// (`resolveBinding`); the new `resolveBindingByScopes` consults the
+    /// scope set instead.
+    pub fn createBindingWithScopes(
+        self: *ScopeGraph,
+        name: ast.StringId,
+        scope_id: ScopeId,
+        kind: BindingKind,
+        span: ast.SourceSpan,
+        scopes: ScopeSet,
+    ) !BindingId {
         const id: BindingId = @intCast(self.bindings.items.len);
+        const cloned = try scopes.clone(self.allocator);
         try self.bindings.append(self.allocator, .{
             .id = id,
             .name = name,
             .scope_id = scope_id,
             .kind = kind,
             .span = span,
+            .scopes = cloned,
         });
         try self.getScopeMut(scope_id).bindings.put(name, id);
         return id;
