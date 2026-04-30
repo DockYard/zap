@@ -539,6 +539,95 @@ pub const ScopeGraph = struct {
         return null;
     }
 
+    /// Result of `resolveFamilyAllowingDefaults` — the resolved family plus the
+    /// declared arity so callers can detect when defaults were used to bridge
+    /// a shorter call-site arity.
+    pub const ResolvedFamilyWithDefaults = struct {
+        family_id: FunctionFamilyId,
+        declared_arity: u32,
+    };
+
+    /// Look up a function family that can be invoked with `call_arity`
+    /// arguments. If no exact-arity family exists, search for a family with
+    /// declared_arity > call_arity whose tail parameters (positions
+    /// `call_arity..declared_arity-1`) all have default values, in every
+    /// clause. The call site is allowed to omit those trailing arguments
+    /// because the codegen layer (zir_builder) inlines the constant defaults
+    /// when emitting the call.
+    ///
+    /// Mirrors the resolution path of `resolveFamily` so the same scope
+    /// chain (including imports) is searched.
+    pub fn resolveFamilyAllowingDefaults(
+        self: *const ScopeGraph,
+        scope_id: ScopeId,
+        name: ast.StringId,
+        call_arity: u32,
+    ) ?ResolvedFamilyWithDefaults {
+        // Exact arity wins — never reinterpret a present family with a
+        // different arity even if a longer declared family also has
+        // defaults that would technically permit the call.
+        if (self.resolveFamily(scope_id, name, call_arity)) |fid| {
+            return .{ .family_id = fid, .declared_arity = call_arity };
+        }
+
+        var current: ?ScopeId = scope_id;
+        while (current) |sid| {
+            const s = self.getScope(sid);
+            if (self.matchFamilyWithDefaults(s, name, call_arity)) |hit| {
+                return hit;
+            }
+            for (s.imports.items) |imp| {
+                if (self.findStructScope(imp.source_module)) |mod_scope_id| {
+                    const mod_scope = self.getScope(mod_scope_id);
+                    if (self.matchFamilyWithDefaults(mod_scope, name, call_arity)) |hit| {
+                        const filter_key = FamilyKey{ .name = name, .arity = hit.declared_arity };
+                        if (self.passesImportFilter(imp.filter, filter_key)) return hit;
+                    }
+                }
+            }
+            current = s.parent;
+        }
+        return null;
+    }
+
+    /// Inspect every family registered in `scope` whose name matches
+    /// `name` and whose declared arity is greater than `call_arity`,
+    /// returning the first family in which every clause's tail
+    /// parameters (`call_arity..declared_arity-1`) have default values.
+    fn matchFamilyWithDefaults(
+        self: *const ScopeGraph,
+        scope: *const Scope,
+        name: ast.StringId,
+        call_arity: u32,
+    ) ?ResolvedFamilyWithDefaults {
+        var it = scope.function_families.iterator();
+        while (it.next()) |entry| {
+            const key = entry.key_ptr.*;
+            if (key.name != name) continue;
+            if (key.arity <= call_arity) continue;
+            const family = self.getFamily(entry.value_ptr.*);
+            if (allClausesAcceptDefaults(family, call_arity)) {
+                return .{ .family_id = entry.value_ptr.*, .declared_arity = key.arity };
+            }
+        }
+        return null;
+    }
+
+    fn allClausesAcceptDefaults(family: *const FunctionFamily, call_arity: u32) bool {
+        if (family.clauses.items.len == 0) return false;
+        for (family.clauses.items) |clause_ref| {
+            if (clause_ref.clause_index >= clause_ref.decl.clauses.len) return false;
+            const clause = clause_ref.decl.clauses[clause_ref.clause_index];
+            if (clause.params.len != family.arity) return false;
+            if (call_arity > clause.params.len) return false;
+            var idx: usize = call_arity;
+            while (idx < clause.params.len) : (idx += 1) {
+                if (clause.params[idx].default == null) return false;
+            }
+        }
+        return true;
+    }
+
     /// Look up a macro family by name and arity, walking up the scope chain.
     /// Also checks imported module scopes.
     pub fn resolveMacro(self: *const ScopeGraph, scope_id: ScopeId, name: ast.StringId, arity: u32) ?MacroFamilyId {

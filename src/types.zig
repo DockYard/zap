@@ -399,6 +399,18 @@ pub const TypeStore = struct {
         if (ta == .never or tb == .never) return true;
         // Unknown matches anything (for inference)
         if (ta == .unknown or tb == .unknown) return true;
+        // `Term` accepts any concrete type — heterogeneous-storage
+        // values wrap/unwrap at the codegen boundary, so a position
+        // expecting `Term` is satisfied by every concrete type and a
+        // position expecting a concrete type is satisfied by `Term`
+        // (the runtime helper handles the unwrap with a default).
+        // Without this the monomorphic-call check at `inferCall`
+        // flags every heterogeneous tuple/list literal — e.g. the
+        // keyword list `[name: "Brian", age: 42]` whose element type
+        // collapses to `{Atom, Term}` — as a type mismatch against a
+        // declared `[{Atom, i64}]` parameter, even though unify (the
+        // generic path) already accepts the call.
+        if (ta == .term_type or tb == .term_type) return true;
         // Generic signatures compare structurally even when fresh type-variable
         // IDs differ across separate resolution passes.
         if (ta == .type_var and tb == .type_var) return true;
@@ -645,7 +657,21 @@ pub const TypeStore = struct {
         // inserted at the codegen boundary. Likewise, when `Term`
         // appears on the rhs of an already-concrete typevar the
         // unification succeeds without altering the binding.
-        if (type_a == .term_type or type_b == .term_type) return true;
+        //
+        // Record the Term constraint on any typevar side so that
+        // `applyToReturnType` can later promote container-position
+        // occurrences of the typevar back to `Term`. Without this,
+        // a heterogeneous-map argument to `Map.update(map :: %{K=>V},
+        // key :: K, value :: V) -> %{K=>V}` would "lose" the `Term`
+        // constraint on `V` once a subsequent scalar argument like
+        // `value="Bob"` (String) bound `V → String`, and the call's
+        // return type would collapse to `%{Atom=>String}` instead of
+        // remaining `%{Atom=>Term}`.
+        if (type_a == .term_type or type_b == .term_type) {
+            if (type_a == .type_var) subs.markTermConstrained(type_a.type_var);
+            if (type_b == .type_var) subs.markTermConstrained(type_b.type_var);
+            return true;
+        }
 
         // If a is a type variable, bind it to b (with occurs check)
         if (type_a == .type_var) {
@@ -719,22 +745,52 @@ pub const TypeStore = struct {
 
 pub const SubstitutionMap = struct {
     bindings: std.AutoHashMap(TypeVarId, TypeId),
+    /// Type variables that were unified against `Term` at some point
+    /// during the call's argument check. These are *not* bound in
+    /// `bindings` because the existing unify rule treats `Term` as a
+    /// universal acceptor without binding the typevar (so that a
+    /// later argument supplying a more specific concrete type can
+    /// still bind the var, e.g. the scalar default of `Map.get`).
+    /// We track the constraint separately so the *return-type*
+    /// resolver can decide, position-by-position, whether the
+    /// typevar should resolve to its concrete binding (scalar
+    /// positions, e.g. `default :: V` flowing into `-> V`) or stay
+    /// as `Term` (container positions, e.g. `-> %{K=>V}` for
+    /// `Map.update` against a heterogeneous map). Mirrors the
+    /// monomorphizer's `promoteContainerVarsExceptScalarReturn`
+    /// logic at the type-checker layer.
+    term_constrained: std.AutoHashMap(TypeVarId, void),
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) SubstitutionMap {
         return .{
             .bindings = std.AutoHashMap(TypeVarId, TypeId).init(allocator),
+            .term_constrained = std.AutoHashMap(TypeVarId, void).init(allocator),
             .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *SubstitutionMap) void {
         self.bindings.deinit();
+        self.term_constrained.deinit();
     }
 
     /// Bind a type variable to a concrete type.
     pub fn bind(self: *SubstitutionMap, var_id: TypeVarId, type_id: TypeId) void {
         self.bindings.put(var_id, type_id) catch {};
+    }
+
+    /// Mark a type variable as Term-constrained — i.e. it appeared at
+    /// a position where the argument type was `Term`. Recorded so
+    /// `applyToReturnType` can promote container-position
+    /// occurrences back to `Term` even when the var also acquired a
+    /// concrete binding from a scalar argument.
+    pub fn markTermConstrained(self: *SubstitutionMap, var_id: TypeVarId) void {
+        self.term_constrained.put(var_id, {}) catch {};
+    }
+
+    pub fn isTermConstrained(self: *const SubstitutionMap, var_id: TypeVarId) bool {
+        return self.term_constrained.contains(var_id);
     }
 
     /// Look up the binding for a type variable.
@@ -824,6 +880,109 @@ pub const SubstitutionMap = struct {
                 } }) catch type_id;
             },
             // Primitives and other types pass through unchanged
+            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type, .term_type => type_id,
+            .struct_type, .union_type, .tagged_union, .opaque_type, .applied => type_id,
+        };
+    }
+
+    /// Apply substitutions to a return-type, distinguishing scalar
+    /// from container positions. Type variables that were
+    /// `Term`-constrained during argument unification are promoted
+    /// to `Term` at container positions; at scalar positions they
+    /// fall back to whatever concrete binding the substitution map
+    /// recorded (so `Map.get(map :: %{K=>V}, key :: K, default :: V)
+    /// -> V` still types as the default's concrete type, while
+    /// `Map.update(... ) -> %{K=>V}` types as `%{K=>Term}` when the
+    /// map was heterogeneous).
+    ///
+    /// Mirrors `monomorphize.promoteContainerVarsExceptScalarReturn`
+    /// at the type-checker layer so call-site argument validation
+    /// agrees with the eventual specialised signature.
+    pub fn applyToReturnType(self: *const SubstitutionMap, store: *TypeStore, type_id: TypeId) TypeId {
+        return self.applyToReturnTypeImpl(store, type_id, true);
+    }
+
+    fn applyToReturnTypeImpl(self: *const SubstitutionMap, store: *TypeStore, type_id: TypeId, scalar_position: bool) TypeId {
+        const typ = store.getType(type_id);
+        return switch (typ) {
+            .type_var => |var_id| {
+                // At container positions, a Term-constrained typevar
+                // resolves to `Term` regardless of any concrete
+                // binding it picked up from a scalar argument.
+                if (!scalar_position and self.isTermConstrained(var_id)) {
+                    return TypeStore.TERM;
+                }
+                if (self.resolve(var_id)) |bound_type| {
+                    return self.applyToReturnTypeImpl(store, bound_type, scalar_position);
+                }
+                return type_id;
+            },
+            .list => |list_type| {
+                const new_element = self.applyToReturnTypeImpl(store, list_type.element, false);
+                if (new_element == list_type.element) return type_id;
+                return store.addType(.{ .list = .{ .element = new_element } }) catch type_id;
+            },
+            .tuple => |tuple_type| {
+                var changed = false;
+                const new_elements = store.allocator.alloc(TypeId, tuple_type.elements.len) catch return type_id;
+                for (tuple_type.elements, 0..) |element, index| {
+                    const new_element = self.applyToReturnTypeImpl(store, element, false);
+                    new_elements[index] = new_element;
+                    if (new_element != element) changed = true;
+                }
+                if (!changed) {
+                    store.allocator.free(new_elements);
+                    return type_id;
+                }
+                return store.addType(.{ .tuple = .{ .elements = new_elements } }) catch type_id;
+            },
+            .function => |function_type| {
+                var changed = false;
+                const new_params = store.allocator.alloc(TypeId, function_type.params.len) catch return type_id;
+                for (function_type.params, 0..) |param, index| {
+                    const new_param = self.applyToReturnTypeImpl(store, param, false);
+                    new_params[index] = new_param;
+                    if (new_param != param) changed = true;
+                }
+                const new_return = self.applyToReturnTypeImpl(store, function_type.return_type, scalar_position);
+                if (new_return != function_type.return_type) changed = true;
+                if (!changed) {
+                    store.allocator.free(new_params);
+                    return type_id;
+                }
+                return store.addType(.{ .function = .{
+                    .params = new_params,
+                    .return_type = new_return,
+                    .param_ownerships = function_type.param_ownerships,
+                    .return_ownership = function_type.return_ownership,
+                } }) catch type_id;
+            },
+            .map => |map_type| {
+                const new_key = self.applyToReturnTypeImpl(store, map_type.key, false);
+                const new_value = self.applyToReturnTypeImpl(store, map_type.value, false);
+                if (new_key == map_type.key and new_value == map_type.value) return type_id;
+                return store.addType(.{ .map = .{
+                    .key = new_key,
+                    .value = new_value,
+                } }) catch type_id;
+            },
+            .protocol_constraint => |pc| {
+                var changed = false;
+                const new_params = store.allocator.alloc(TypeId, pc.type_params.len) catch return type_id;
+                for (pc.type_params, 0..) |tp, index| {
+                    const new_tp = self.applyToReturnTypeImpl(store, tp, false);
+                    new_params[index] = new_tp;
+                    if (new_tp != tp) changed = true;
+                }
+                if (!changed) {
+                    store.allocator.free(new_params);
+                    return type_id;
+                }
+                return store.addType(.{ .protocol_constraint = .{
+                    .protocol_name = pc.protocol_name,
+                    .type_params = new_params,
+                } }) catch type_id;
+            },
             .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type, .term_type => type_id,
             .struct_type, .union_type, .tagged_union, .opaque_type, .applied => type_id,
         };
@@ -1480,12 +1639,18 @@ pub const TypeChecker = struct {
     }
 
     fn resolveFamilySignature(self: *TypeChecker, scope_id: scope_mod.ScopeId, name: ast.StringId, arity: u32) !?FunctionSignature {
-        const family_id = self.graph.resolveFamily(scope_id, name, arity) orelse return null;
-        const family = self.graph.getFamily(family_id);
+        // Allow calls with fewer arguments than the declared arity when
+        // every trailing parameter has a default value. The codegen
+        // backend inlines the defaults at the call site, so the type
+        // checker only needs to validate the supplied arguments and
+        // return a signature truncated to the call-site arity.
+        const resolved = self.graph.resolveFamilyAllowingDefaults(scope_id, name, arity) orelse return null;
+        const family = self.graph.getFamily(resolved.family_id);
         if (family.clauses.items.len == 0) return null;
         const clause_ref = family.clauses.items[0];
         if (clause_ref.clause_index >= clause_ref.decl.clauses.len) return null;
         const clause = clause_ref.decl.clauses[clause_ref.clause_index];
+        const truncate_to_call_arity = resolved.declared_arity != arity;
 
         // If the resolved family is an impl function, temporarily activate
         // that impl's type-parameter scope so references like `K`/`V` in
@@ -1557,6 +1722,20 @@ pub const TypeChecker = struct {
             try self.resolveTypeExpr(rt)
         else
             TypeStore.UNKNOWN;
+
+        // When the call site supplied fewer arguments than the
+        // declared arity, the caller is relying on default values for
+        // the trailing parameters. Truncate the signature to the
+        // call-site arity so the per-argument check runs only over
+        // actually-supplied arguments (the defaults are inlined by
+        // the codegen backend, not by the type checker). Without
+        // truncation, the bare-call resolver in `inferCall` would
+        // already have rejected the call as `name/N` not found.
+        if (truncate_to_call_arity) {
+            const call_arity = arity;
+            param_types.shrinkRetainingCapacity(call_arity);
+            param_ownerships.shrinkRetainingCapacity(call_arity);
+        }
 
         return .{
             .params = try param_types.toOwnedSlice(self.allocator),
@@ -3858,9 +4037,14 @@ pub const TypeChecker = struct {
                             }
                         }
 
-                        // Apply substitutions to resolve the return type
+                        // Apply substitutions to resolve the return type.
+                        // Use the position-aware variant so type variables
+                        // that were Term-constrained at container positions
+                        // surface as `Term` in the return type even when
+                        // they also picked up a concrete binding from a
+                        // scalar argument (see `applyToReturnType` doc).
                         const resolved_return = if (!unification_failed)
-                            subs.applyToType(self.store, signature.return_type)
+                            subs.applyToReturnType(self.store, signature.return_type)
                         else
                             signature.return_type;
 
@@ -3997,9 +4181,12 @@ pub const TypeChecker = struct {
                                         }
                                     }
 
-                                    // Apply substitutions to resolve the return type
+                                    // Apply substitutions to resolve the return type.
+                                    // See `applyToReturnType` for why we use
+                                    // the position-aware variant rather than
+                                    // plain `applyToType`.
                                     const mod_resolved_return = if (!mod_unification_failed)
-                                        mod_subs.applyToType(self.store, signature.return_type)
+                                        mod_subs.applyToReturnType(self.store, signature.return_type)
                                     else
                                         signature.return_type;
 
@@ -6744,6 +6931,200 @@ test "applyToType leaves primitives unchanged" {
     try std.testing.expectEqual(TypeStore.STRING, subs.applyToType(&store, TypeStore.STRING));
     try std.testing.expectEqual(TypeStore.BOOL, subs.applyToType(&store, TypeStore.BOOL));
     try std.testing.expectEqual(TypeStore.NIL, subs.applyToType(&store, TypeStore.NIL));
+}
+
+test "unify records Term constraint when typevar meets Term without binding" {
+    // Locks in the fix for the heterogeneous-map update-syntax false
+    // positive: when a typevar is unified against `Term` the binding
+    // is skipped (Term tolerates any concrete type at runtime), but
+    // the substitution map MUST remember the constraint so the
+    // return-type resolver can promote container occurrences of the
+    // typevar back to `Term`. Without this record, a later scalar
+    // argument supplying `String` would silently shadow the `Term`
+    // constraint and the call's return type would collapse to a
+    // concrete scalar instead of preserving the heterogeneous shape.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var store = TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    var subs = SubstitutionMap.init(alloc);
+    defer subs.deinit();
+
+    const value_var = try store.freshVar();
+    const value_var_id = store.getType(value_var).type_var;
+
+    // First: unify(V, Term) — typevar is left unbound, but the constraint is recorded.
+    try std.testing.expect(try store.unify(value_var, TypeStore.TERM, &subs));
+    try std.testing.expect(subs.resolve(value_var_id) == null);
+    try std.testing.expect(subs.isTermConstrained(value_var_id));
+
+    // Then: unify(V, String) — typevar binds to String for scalar uses.
+    try std.testing.expect(try store.unify(value_var, TypeStore.STRING, &subs));
+    try std.testing.expectEqual(TypeStore.STRING, subs.resolve(value_var_id).?);
+    try std.testing.expect(subs.isTermConstrained(value_var_id));
+}
+
+test "applyToReturnType promotes Term-constrained var at container position to Term" {
+    // Mirrors the post-unification step the type checker runs for
+    // `Map.update(map :: %{K=>V}, key :: K, value :: V) -> %{K=>V}`
+    // when the map argument is heterogeneous (`%{Atom=>Term}`) and
+    // the value argument is a concrete type like `String`. Container
+    // positions in the return must surface as `Term`, even though
+    // the substitution map records the scalar binding picked up
+    // along the way.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var store = TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    var subs = SubstitutionMap.init(alloc);
+    defer subs.deinit();
+
+    const key_var = try store.freshVar();
+    const value_var = try store.freshVar();
+    const generic_map = try store.addType(.{ .map = .{ .key = key_var, .value = value_var } });
+    const heterogeneous_map = try store.addType(.{ .map = .{ .key = TypeStore.ATOM, .value = TypeStore.TERM } });
+
+    try std.testing.expect(try store.unify(generic_map, heterogeneous_map, &subs));
+    // Subsequent argument unifies the typevar against a concrete scalar.
+    try std.testing.expect(try store.unify(value_var, TypeStore.STRING, &subs));
+
+    // Plain applyToType resolves V to its scalar binding (String) — used for scalar return positions.
+    const scalar_apply = subs.applyToType(&store, value_var);
+    try std.testing.expectEqual(TypeStore.STRING, scalar_apply);
+
+    // applyToReturnType against `%{K=>V}` keeps V at container position → Term.
+    const return_resolved = subs.applyToReturnType(&store, generic_map);
+    const return_typ = store.getType(return_resolved);
+    try std.testing.expect(return_typ == .map);
+    try std.testing.expectEqual(TypeStore.ATOM, return_typ.map.key);
+    try std.testing.expectEqual(TypeStore.TERM, return_typ.map.value);
+
+    // applyToReturnType for a bare `V` (scalar position) keeps the concrete binding.
+    try std.testing.expectEqual(TypeStore.STRING, subs.applyToReturnType(&store, value_var));
+}
+
+test "typeEquals accepts Term against any concrete type" {
+    // Regression test for the keyword-list false positive: when a
+    // heterogeneous tuple/list literal collapses an element type to
+    // `Term`, the monomorphic-call check (which uses `typeEquals`,
+    // not `unify`) must still treat the literal as compatible with a
+    // concrete declared parameter. Without this, a call like
+    // `get_age([name: \"Brian\", age: 42])` against a parameter of
+    // type `[{Atom, i64}]` is rejected even though the runtime can
+    // wrap/unwrap each element through the Term boundary.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var store = TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    // Term unifies with concrete primitive types in either order.
+    try std.testing.expect(store.typeEquals(TypeStore.TERM, TypeStore.I64));
+    try std.testing.expect(store.typeEquals(TypeStore.STRING, TypeStore.TERM));
+
+    // Term inside a tuple satisfies a concrete tuple shape.
+    const expected_tuple = try store.addType(.{ .tuple = .{
+        .elements = try alloc.dupe(TypeId, &[_]TypeId{ TypeStore.ATOM, TypeStore.I64 }),
+    } });
+    const term_tuple = try store.addType(.{ .tuple = .{
+        .elements = try alloc.dupe(TypeId, &[_]TypeId{ TypeStore.ATOM, TypeStore.TERM }),
+    } });
+    try std.testing.expect(store.typeEquals(expected_tuple, term_tuple));
+
+    // And inside a list of tuples — the literal shape produced by
+    // a heterogeneous keyword list desugar.
+    const expected_list = try store.addType(.{ .list = .{ .element = expected_tuple } });
+    const term_list = try store.addType(.{ .list = .{ .element = term_tuple } });
+    try std.testing.expect(store.typeEquals(expected_list, term_list));
+}
+
+test "resolveFamilyAllowingDefaults accepts shorter call when tail params have defaults" {
+    // Regression test for the default-parameter false positive: when
+    // a function is declared with trailing defaults (e.g.
+    // `pub fn add(a :: i64, b :: i64 = 10)`) a bare call supplying
+    // fewer arguments must still resolve to that family. The
+    // codegen backend inlines the constants — the type checker only
+    // needs to confirm the supplied arguments are well-typed.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var graph = scope_mod.ScopeGraph.init(alloc);
+    defer graph.deinit();
+
+    const root_scope = graph.prelude_scope;
+    const fn_name = try interner.intern("add");
+
+    // Build a synthetic `pub fn add(a :: i64, b :: i64 = 10)` clause
+    // whose second parameter has a default. We only need the
+    // structural shape — the type checker doesn't read into the
+    // bodies during family resolution.
+    const param_meta = ast.NodeMeta{ .span = .{ .start = 0, .end = 0 } };
+    const a_pat = try alloc.create(ast.Pattern);
+    a_pat.* = .{ .bind = .{ .meta = param_meta, .name = try interner.intern("a") } };
+    const b_pat = try alloc.create(ast.Pattern);
+    b_pat.* = .{ .bind = .{ .meta = param_meta, .name = try interner.intern("b") } };
+
+    const default_expr = try alloc.create(ast.Expr);
+    default_expr.* = .{ .int_literal = .{ .meta = param_meta, .value = 10 } };
+
+    const params = try alloc.alloc(ast.Param, 2);
+    params[0] = .{ .meta = param_meta, .pattern = a_pat, .type_annotation = null };
+    params[1] = .{ .meta = param_meta, .pattern = b_pat, .type_annotation = null, .default = default_expr };
+
+    const clauses = try alloc.alloc(ast.FunctionClause, 1);
+    clauses[0] = .{
+        .meta = param_meta,
+        .params = params,
+        .return_type = null,
+        .refinement = null,
+        .body = null,
+    };
+
+    const decl = try alloc.create(ast.FunctionDecl);
+    decl.* = .{
+        .meta = param_meta,
+        .name = fn_name,
+        .name_expr = null,
+        .clauses = clauses,
+        .visibility = .public,
+    };
+
+    // Register the family at full declared arity (2). The fix path
+    // must recognise this as the correct target for a 1-arg call.
+    const family_id = try graph.createFamily(root_scope, fn_name, 2, .public);
+    try graph.getFamilyMut(family_id).clauses.append(alloc, .{ .decl = decl, .clause_index = 0 });
+    try graph.getScopeMut(root_scope).function_families.put(.{ .name = fn_name, .arity = 2 }, family_id);
+
+    // Exact-arity lookup at arity 2 still works.
+    const exact = graph.resolveFamilyAllowingDefaults(root_scope, fn_name, 2);
+    try std.testing.expect(exact != null);
+    try std.testing.expectEqual(@as(u32, 2), exact.?.declared_arity);
+    try std.testing.expectEqual(family_id, exact.?.family_id);
+
+    // Default-bridged lookup at arity 1 surfaces the same family with declared_arity=2.
+    const bridged = graph.resolveFamilyAllowingDefaults(root_scope, fn_name, 1);
+    try std.testing.expect(bridged != null);
+    try std.testing.expectEqual(@as(u32, 2), bridged.?.declared_arity);
+    try std.testing.expectEqual(family_id, bridged.?.family_id);
+
+    // Arity 0 does NOT resolve — the first param has no default.
+    try std.testing.expect(graph.resolveFamilyAllowingDefaults(root_scope, fn_name, 0) == null);
 }
 
 test "pipe inside error_pipe resolves rhs at the piped arity" {
