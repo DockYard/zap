@@ -1,4 +1,4 @@
-pub struct Test.MultiArityTest {
+pub struct MultiArityTest {
   use Zest.Case
 
   describe("multi arity") {

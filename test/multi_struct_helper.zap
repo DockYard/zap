@@ -1,4 +1,4 @@
-pub struct Test.MultiStructHelper {
+pub struct MultiStructHelper {
   pub fn double(x :: i64) -> i64 {
     x + x
   }

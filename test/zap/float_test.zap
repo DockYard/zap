@@ -1,4 +1,4 @@
-pub struct Test.FloatTest {
+pub struct Zap.FloatTest {
   use Zest.Case
 
   describe("Float struct") {

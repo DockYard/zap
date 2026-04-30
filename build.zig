@@ -44,6 +44,16 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
 
+    const boundary_guard_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/boundary_guard_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_boundary_guard_tests = b.addRunArtifact(boundary_guard_tests);
+    test_step.dependOn(&run_boundary_guard_tests.step);
+
     // -----------------------------------------------------------------------
     // Dependency paths
     // -----------------------------------------------------------------------
@@ -116,7 +126,6 @@ pub fn build(b: *std.Build) void {
 
     exe.root_module.addObjectFile(.{ .cwd_relative = zig_compiler_lib_path });
 
-
     if (llvm_lib_path) |lib_path| {
         exe.root_module.addLibraryPath(.{ .cwd_relative = lib_path });
 
@@ -127,10 +136,10 @@ pub fn build(b: *std.Build) void {
             "clangStaticAnalyzerFrontend", "clangStaticAnalyzerCheckers", "clangStaticAnalyzerCore",
             "clangAnalysis",               "clangASTMatchers",            "clangAST",
             "clangParse",                  "clangAPINotes",               "clangBasic",
-            "clangEdit",                   "clangLex",
-            "clangRewriteFrontend",        "clangRewrite",                "clangCrossTU",
-            "clangIndex",                  "clangToolingCore",            "clangExtractAPI",
-            "clangSupport",                "clangInstallAPI",
+            "clangEdit",                   "clangLex",                    "clangRewriteFrontend",
+            "clangRewrite",                "clangCrossTU",                "clangIndex",
+            "clangToolingCore",            "clangExtractAPI",             "clangSupport",
+            "clangInstallAPI",
         };
         for (clang_libs) |lib_name| {
             exe.root_module.linkSystemLibrary(lib_name, .{ .preferred_link_mode = .static });

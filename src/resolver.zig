@@ -224,6 +224,9 @@ pub const Resolver = struct {
             .function_decl => |func| try self.resolveFunctionDecl(func),
             .macro_decl => |mac| try self.resolveFunctionDecl(mac),
             .import_decl => {},
+            .attribute => |attr| {
+                if (attr.value) |value| try self.resolveExpr(value);
+            },
         }
     }
 

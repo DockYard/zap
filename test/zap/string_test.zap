@@ -1,4 +1,4 @@
-pub struct Test.StringTest {
+pub struct Zap.StringTest {
   use Zest.Case
 
   describe("String struct") {

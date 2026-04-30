@@ -6,6 +6,9 @@ args = ["mcp"]
 [mcp_servers.cog.tools.code_query]
 approval_mode = "approve"
 
+[mcp_servers.cog.tools.code_explore]
+approval_mode = "approve"
+
 [agents.cog-code-query]
 description = "Explore code structure using the Cog SCIP index"
 developer_instructions = """

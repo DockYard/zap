@@ -1,4 +1,4 @@
-pub struct Test.BooleanTest {
+pub struct BooleanTest {
   use Zest.Case
 
   describe("booleans") {

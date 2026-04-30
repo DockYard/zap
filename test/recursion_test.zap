@@ -1,4 +1,4 @@
-pub struct Test.RecursionTest {
+pub struct RecursionTest {
   use Zest.Case
 
   describe("recursion") {

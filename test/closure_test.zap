@@ -1,4 +1,4 @@
-pub struct Test.ClosureTest {
+pub struct ClosureTest {
   use Zest.Case
 
   describe("closures") {

@@ -1,4 +1,4 @@
-pub struct Test.OperatorNameTest {
+pub struct OperatorNameTest {
   use Zest.Case
 
   describe("operator-named functions") {

@@ -1,4 +1,4 @@
-pub struct Test.ZestFeaturesTest {
+pub struct Zap.ZestFeaturesTest {
   use Zest.Case
 
   describe("multiple assertions per test") {

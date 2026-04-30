@@ -1,4 +1,4 @@
-pub struct Test.GuardTest {
+pub struct GuardTest {
   use Zest.Case
 
   describe("basic guards") {

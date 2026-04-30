@@ -1,4 +1,4 @@
-pub struct Test.MacroTest {
+pub struct MacroTest {
   use Zest.Case
 
   describe("macros") {

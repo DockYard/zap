@@ -1,6 +1,6 @@
-pub struct Test.ImportTest {
+pub struct ImportTest {
   use Zest.Case
-  import Test.MultiStructHelper
+  import MultiStructHelper
 
   describe("imports") {
     test("imported double function works") {

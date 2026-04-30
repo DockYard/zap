@@ -1,4 +1,4 @@
-pub struct Test.UnionTest {
+pub struct UnionTest {
   use Zest.Case
 
   pub union Color {

@@ -27,6 +27,16 @@ pub const FileGraph = struct {
     /// Module name → file path (absolute)
     module_to_file: std.StringHashMap([]const u8),
 
+    /// File path → primary struct name declared by that file.
+    file_to_struct: std.StringHashMap([]const u8),
+
+    /// File path → all struct names declared by that file.
+    file_to_structs: std.StringHashMap(std.ArrayListUnmanaged([]const u8)),
+
+    /// Every source file known to the graph, including files without a
+    /// top-level struct such as protocol/impl-only files.
+    known_files: std.StringHashMap(void),
+
     /// File path → list of module names it references
     file_imports: std.StringHashMap(std.ArrayListUnmanaged([]const u8)),
 
@@ -51,11 +61,13 @@ pub const FileGraph = struct {
     /// Module name → true if declared with defmodulep (private to dep)
     module_is_private: std.StringHashMap(bool),
 
-
     pub fn init(allocator: std.mem.Allocator) FileGraph {
         return .{
             .allocator = allocator,
             .module_to_file = std.StringHashMap([]const u8).init(allocator),
+            .file_to_struct = std.StringHashMap([]const u8).init(allocator),
+            .file_to_structs = std.StringHashMap(std.ArrayListUnmanaged([]const u8)).init(allocator),
+            .known_files = std.StringHashMap(void).init(allocator),
             .file_imports = std.StringHashMap(std.ArrayListUnmanaged([]const u8)).init(allocator),
             .file_imported_by = std.StringHashMap(std.ArrayListUnmanaged([]const u8)).init(allocator),
             .topo_order = .empty,
@@ -68,6 +80,13 @@ pub const FileGraph = struct {
 
     pub fn deinit(self: *FileGraph) void {
         self.module_to_file.deinit();
+        self.file_to_struct.deinit();
+        {
+            var it = self.file_to_structs.iterator();
+            while (it.next()) |entry| entry.value_ptr.deinit(self.allocator);
+        }
+        self.file_to_structs.deinit();
+        self.known_files.deinit();
         {
             var it = self.file_imports.iterator();
             while (it.next()) |entry| entry.value_ptr.deinit(self.allocator);
@@ -83,6 +102,17 @@ pub const FileGraph = struct {
         self.stdlib_modules.deinit();
         self.file_source_root.deinit();
         self.module_is_private.deinit();
+    }
+
+    pub fn structForFile(self: *const FileGraph, file_path: []const u8) ?[]const u8 {
+        return self.file_to_struct.get(file_path);
+    }
+
+    pub fn structsForFile(self: *const FileGraph, file_path: []const u8) []const []const u8 {
+        if (self.file_to_structs.get(file_path)) |structs| {
+            return structs.items;
+        }
+        return &.{};
     }
 };
 
@@ -108,7 +138,6 @@ pub const ErrorInfo = struct {
 /// `entry_module` is e.g. "App" (extracted from build.zap root "App.main/0").
 /// `source_roots` are directories to search for module files, in priority order.
 /// The first root is typically the project's own lib dir.
-
 /// Name of the stdlib module that's auto-imported into every Zap
 /// module (Elixir-style). The collector injects an
 /// `import <kernel_module_name>` into every module's scope so the
@@ -139,6 +168,17 @@ pub fn discover(
     stdlib_module_names: []const []const u8,
     err_info: ?*ErrorInfo,
 ) DiscoveryError!FileGraph {
+    return discoverWithSourceFiles(alloc, entry_module, source_roots, stdlib_module_names, &.{}, err_info);
+}
+
+pub fn discoverWithSourceFiles(
+    alloc: std.mem.Allocator,
+    entry_module: []const u8,
+    source_roots: []const SourceRoot,
+    stdlib_module_names: []const []const u8,
+    explicit_source_files: []const []const u8,
+    err_info: ?*ErrorInfo,
+) DiscoveryError!FileGraph {
     var graph = FileGraph.init(alloc);
     errdefer graph.deinit();
 
@@ -160,48 +200,17 @@ pub fn discover(
         queue.append(alloc, auto_mod) catch return error.OutOfMemory;
     }
 
-    while (queue.items.len > 0) {
-        const module_name = queue.orderedRemove(0);
+    try drainDiscoveryQueue(alloc, &graph, &queue, source_roots);
 
-        // Skip if already discovered or is a stdlib module
-        if (graph.module_to_file.contains(module_name)) continue;
-        if (graph.stdlib_modules.contains(module_name)) continue;
+    for (explicit_source_files) |file_path| {
+        if (graph.known_files.contains(file_path)) continue;
 
-        // Resolve module name to file path.
-        // If the name can't be resolved, it may be a union variant, struct
-        // name, or other non-module uppercase identifier — skip it silently.
-        // The compiler will catch genuinely missing modules during compilation.
-        const resolved = resolveModuleToFile(alloc, module_name, source_roots) orelse continue;
-        const file_path = resolved.path;
-
-        graph.module_to_file.put(module_name, file_path) catch return error.OutOfMemory;
-        graph.file_source_root.put(file_path, resolved.source_root_name) catch return error.OutOfMemory;
-
-        // Read and scan the file for module references
+        const source_root_name = sourceRootNameForFile(alloc, file_path, source_roots) orelse "project";
         const source = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, file_path, alloc, .limited(10 * 1024 * 1024)) catch
             return error.ReadError;
-
-        // Track whether this module is private (defmodulep)
-        graph.module_is_private.put(module_name, isPrivateStruct(source)) catch return error.OutOfMemory;
-
-        const refs = extractModuleReferences(alloc, source, module_name) catch
-            return error.OutOfMemory;
-
-        // Record imports for this file
-        var imports_list: std.ArrayListUnmanaged([]const u8) = .empty;
-        for (refs) |ref| {
-            // Skip self-references, stdlib modules, and already-queued modules
-            if (std.mem.eql(u8, ref, module_name)) continue;
-            if (graph.stdlib_modules.contains(ref)) continue;
-
-            imports_list.append(alloc, ref) catch return error.OutOfMemory;
-
-            // Add to queue if not yet discovered
-            if (!graph.module_to_file.contains(ref)) {
-                queue.append(alloc, ref) catch return error.OutOfMemory;
-            }
-        }
-        graph.file_imports.put(file_path, imports_list) catch return error.OutOfMemory;
+        const primary_struct = primaryStructName(alloc, source) catch return error.OutOfMemory;
+        try recordSourceFile(alloc, &graph, file_path, source_root_name, source, primary_struct, &queue);
+        try drainDiscoveryQueue(alloc, &graph, &queue, source_roots);
     }
 
     // Build imported_by (reverse index)
@@ -211,6 +220,7 @@ pub fn discover(
             const importer_file = entry.key_ptr.*;
             for (entry.value_ptr.items) |imported_module| {
                 if (graph.module_to_file.get(imported_module)) |imported_file| {
+                    if (std.mem.eql(u8, imported_file, importer_file)) continue;
                     const by_entry = graph.file_imported_by.getOrPut(imported_file) catch
                         return error.OutOfMemory;
                     if (!by_entry.found_existing) {
@@ -230,6 +240,78 @@ pub fn discover(
     try enforceDepBoundaries(alloc, &graph, err_info);
 
     return graph;
+}
+
+fn drainDiscoveryQueue(
+    alloc: std.mem.Allocator,
+    graph: *FileGraph,
+    queue: *std.ArrayListUnmanaged([]const u8),
+    source_roots: []const SourceRoot,
+) DiscoveryError!void {
+    while (queue.items.len > 0) {
+        const struct_name = queue.orderedRemove(0);
+
+        if (graph.module_to_file.contains(struct_name)) continue;
+        if (graph.stdlib_modules.contains(struct_name)) continue;
+
+        const resolved = resolveModuleToFile(alloc, struct_name, source_roots) orelse continue;
+        const file_path = resolved.path;
+        const source = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, file_path, alloc, .limited(10 * 1024 * 1024)) catch
+            return error.ReadError;
+
+        try recordSourceFile(alloc, graph, file_path, resolved.source_root_name, source, struct_name, queue);
+    }
+}
+
+fn recordSourceFile(
+    alloc: std.mem.Allocator,
+    graph: *FileGraph,
+    file_path: []const u8,
+    source_root_name: []const u8,
+    source: []const u8,
+    primary_struct: ?[]const u8,
+    queue: *std.ArrayListUnmanaged([]const u8),
+) DiscoveryError!void {
+    graph.known_files.put(file_path, {}) catch return error.OutOfMemory;
+    graph.file_source_root.put(file_path, source_root_name) catch return error.OutOfMemory;
+
+    const declared_structs = structNamesInSource(alloc, source) catch return error.OutOfMemory;
+    if (declared_structs.len > 0) {
+        var structs_for_file: std.ArrayListUnmanaged([]const u8) = .empty;
+        for (declared_structs) |struct_name| {
+            graph.module_to_file.put(struct_name, file_path) catch return error.OutOfMemory;
+            graph.module_is_private.put(struct_name, false) catch return error.OutOfMemory;
+            structs_for_file.append(alloc, struct_name) catch return error.OutOfMemory;
+        }
+        graph.file_to_structs.put(file_path, structs_for_file) catch return error.OutOfMemory;
+    }
+
+    if (primary_struct) |struct_name| {
+        graph.module_to_file.put(struct_name, file_path) catch return error.OutOfMemory;
+        graph.file_to_struct.put(file_path, struct_name) catch return error.OutOfMemory;
+        graph.module_is_private.put(struct_name, isPrivateStruct(source)) catch return error.OutOfMemory;
+    } else if (declared_structs.len > 0) {
+        graph.file_to_struct.put(file_path, declared_structs[0]) catch return error.OutOfMemory;
+    }
+
+    const refs = extractModuleReferences(alloc, source, primary_struct orelse "") catch
+        return error.OutOfMemory;
+
+    var imports_list: std.ArrayListUnmanaged([]const u8) = .empty;
+    for (refs) |ref| {
+        if (primary_struct) |struct_name| {
+            if (std.mem.eql(u8, ref, struct_name)) continue;
+        }
+        if (structNameDeclaredInFile(declared_structs, ref)) continue;
+        if (graph.stdlib_modules.contains(ref)) continue;
+
+        imports_list.append(alloc, ref) catch return error.OutOfMemory;
+
+        if (!graph.module_to_file.contains(ref)) {
+            queue.append(alloc, ref) catch return error.OutOfMemory;
+        }
+    }
+    graph.file_imports.put(file_path, imports_list) catch return error.OutOfMemory;
 }
 
 /// Enforce that defmodulep modules are not referenced across dep boundaries.
@@ -335,6 +417,65 @@ fn resolveModuleToFile(
     }
 
     return null;
+}
+
+fn sourceRootNameForFile(
+    alloc: std.mem.Allocator,
+    file_path: []const u8,
+    source_roots: []const SourceRoot,
+) ?[]const u8 {
+    const normalized_file = if (std.mem.startsWith(u8, file_path, "./")) file_path[2..] else file_path;
+    for (source_roots) |root| {
+        const normalized_root = if (std.mem.startsWith(u8, root.path, "./")) root.path[2..] else root.path;
+        if (std.mem.eql(u8, normalized_file, normalized_root)) return root.name;
+        const root_slash = std.fmt.allocPrint(alloc, "{s}/", .{normalized_root}) catch continue;
+        if (std.mem.startsWith(u8, normalized_file, root_slash)) return root.name;
+    }
+    return null;
+}
+
+fn primaryStructName(alloc: std.mem.Allocator, source: []const u8) error{OutOfMemory}!?[]const u8 {
+    const declared_structs = try structNamesInSource(alloc, source);
+    if (declared_structs.len == 0) return null;
+    return declared_structs[0];
+}
+
+fn structNamesInSource(alloc: std.mem.Allocator, source: []const u8) error{OutOfMemory}![]const []const u8 {
+    var names: std.ArrayListUnmanaged([]const u8) = .empty;
+    var lexer = zap.Lexer.init(source);
+    while (true) {
+        const tok = lexer.next();
+        if (tok.tag == .eof) break;
+        if (tok.tag != .keyword_struct) continue;
+
+        const name_tok = lexer.next();
+        if (name_tok.tag != .module_identifier) continue;
+
+        var name_buf: std.ArrayListUnmanaged(u8) = .empty;
+        try name_buf.appendSlice(alloc, name_tok.slice(source));
+
+        var peek = lexer;
+        while (true) {
+            const dot_tok = peek.next();
+            if (dot_tok.tag != .dot) break;
+            const next_tok = peek.next();
+            if (next_tok.tag != .module_identifier) break;
+            try name_buf.append(alloc, '.');
+            try name_buf.appendSlice(alloc, next_tok.slice(source));
+            lexer = peek;
+        }
+
+        try names.append(alloc, try name_buf.toOwnedSlice(alloc));
+    }
+
+    return try names.toOwnedSlice(alloc);
+}
+
+fn structNameDeclaredInFile(declared_structs: []const []const u8, ref: []const u8) bool {
+    for (declared_structs) |struct_name| {
+        if (std.mem.eql(u8, struct_name, ref)) return true;
+    }
+    return false;
 }
 
 /// Check if a source file declares its module without `pub` (private).
@@ -499,10 +640,12 @@ fn topologicalSort(alloc: std.mem.Allocator, graph: *FileGraph) DiscoveryError!v
     var in_degree = std.StringHashMap(u32).init(alloc);
     defer in_degree.deinit();
 
-    // Initialize all files with in-degree 0
-    var mod_it = graph.module_to_file.iterator();
-    while (mod_it.next()) |entry| {
-        in_degree.put(entry.value_ptr.*, 0) catch return error.OutOfMemory;
+    // Initialize all known files with in-degree 0. Some source files
+    // intentionally have no primary struct, such as protocol/impl-only
+    // files collected from manifest globs.
+    var file_it = graph.known_files.iterator();
+    while (file_it.next()) |entry| {
+        in_degree.put(entry.key_ptr.*, 0) catch return error.OutOfMemory;
     }
 
     // Count dependencies: for each file, count how many of its imports resolve to files in the graph
@@ -511,7 +654,8 @@ fn topologicalSort(alloc: std.mem.Allocator, graph: *FileGraph) DiscoveryError!v
         const importing_file = entry.key_ptr.*;
         var dep_count: u32 = 0;
         for (entry.value_ptr.items) |imported_module| {
-            if (graph.module_to_file.get(imported_module)) |_| {
+            if (graph.module_to_file.get(imported_module)) |imported_file| {
+                if (std.mem.eql(u8, imported_file, importing_file)) continue;
                 dep_count += 1;
             }
         }
@@ -730,6 +874,104 @@ test "discover: transitive references" {
     const topo = graph.topo_order.items;
     const util_path = graph.module_to_file.get("Util").?;
     try std.testing.expectEqualStrings(util_path, topo[0]);
+}
+
+test "discoverWithSourceFiles indexes globbed source file struct" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "app.zap",
+        .data = "pub struct App {\n  pub fn main() -> i64 {\n    1\n  }\n}\n",
+    });
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "extra_test.zap",
+        .data = "pub struct Test.ExtraTest {\n  pub fn run() -> i64 {\n    Helper.value()\n  }\n}\n",
+    });
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "helper.zap",
+        .data = "pub struct Helper {\n  pub fn value() -> i64 {\n    2\n  }\n}\n",
+    });
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
+    const extra_path = try std.fs.path.join(alloc, &.{ tmp_path, "extra_test.zap" });
+    const roots = &[_]SourceRoot{.{ .name = "project", .path = tmp_path }};
+
+    var graph = try discoverWithSourceFiles(alloc, "App", roots, &BUILTIN_TYPE_NAMES, &.{extra_path}, null);
+    defer graph.deinit();
+
+    try std.testing.expect(graph.module_to_file.contains("App"));
+    try std.testing.expect(graph.module_to_file.contains("Test.ExtraTest"));
+    try std.testing.expect(graph.module_to_file.contains("Helper"));
+    try std.testing.expectEqualStrings("Test.ExtraTest", graph.structForFile(extra_path).?);
+}
+
+test "discoverWithSourceFiles tracks multiple structs in one source file without self-cycle" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "app.zap",
+        .data = "pub struct App {\n  pub fn main() -> i64 {\n    1\n  }\n}\n",
+    });
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "multi_test.zap",
+        .data = "pub struct Point {\n  x :: i64\n}\n\n" ++
+            "pub struct Test.MultiTest {\n" ++
+            "  pub fn run() -> Point {\n" ++
+            "    %Point{x: 1}\n" ++
+            "  }\n" ++
+            "}\n",
+    });
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
+    const multi_path = try std.fs.path.join(alloc, &.{ tmp_path, "multi_test.zap" });
+    const roots = &[_]SourceRoot{.{ .name = "project", .path = tmp_path }};
+
+    var graph = try discoverWithSourceFiles(alloc, "App", roots, &BUILTIN_TYPE_NAMES, &.{multi_path}, null);
+    defer graph.deinit();
+
+    try std.testing.expect(graph.module_to_file.contains("Point"));
+    try std.testing.expect(graph.module_to_file.contains("Test.MultiTest"));
+    try std.testing.expectEqual(@as(usize, 2), graph.structsForFile(multi_path).len);
+    try std.testing.expectEqual(@as(usize, 2), graph.topo_order.items.len);
+}
+
+test "discoverWithSourceFiles keeps structless source files in graph" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "app.zap",
+        .data = "pub struct App {\n  pub fn main() -> i64 {\n    1\n  }\n}\n",
+    });
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "integer_display.zap",
+        .data = "impl Display for Integer {\n  pub fn show(_value :: Integer) -> String {\n    \"1\"\n  }\n}\n",
+    });
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
+    const impl_path = try std.fs.path.join(alloc, &.{ tmp_path, "integer_display.zap" });
+    const roots = &[_]SourceRoot{.{ .name = "project", .path = tmp_path }};
+
+    var graph = try discoverWithSourceFiles(alloc, "App", roots, &BUILTIN_TYPE_NAMES, &.{impl_path}, null);
+    defer graph.deinit();
+
+    try std.testing.expect(graph.known_files.contains(impl_path));
+    try std.testing.expect(graph.structForFile(impl_path) == null);
+    try std.testing.expectEqual(@as(usize, 2), graph.topo_order.items.len);
 }
 
 test "discover: circular dependency detected" {

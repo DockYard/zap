@@ -1,4 +1,4 @@
-pub struct Test.EnumTest {
+pub struct Zap.EnumTest {
   use Zest.Case
 
   describe("Enum struct") {

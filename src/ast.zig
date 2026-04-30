@@ -309,7 +309,7 @@ pub const StructItem = union(enum) {
     use_decl: *const UseDecl,
     attribute: *const AttributeDecl,
     /// Expression at struct level (e.g., macro calls like describe/test).
-    /// Collected into an auto-generated run/0 function by the HIR builder.
+    /// Collected into an auto-generated run/0 function by desugaring.
     struct_level_expr: *const Expr,
 };
 
@@ -538,6 +538,7 @@ pub const Stmt = union(enum) {
     function_decl: *const FunctionDecl,
     macro_decl: *const FunctionDecl,
     import_decl: *const ImportDecl,
+    attribute: *const AttributeDecl,
 };
 
 pub const Assignment = struct {

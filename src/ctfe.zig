@@ -11,6 +11,7 @@ const std = @import("std");
 const ir = @import("ir.zig");
 const ast = @import("ast.zig");
 const env = @import("env.zig");
+const glob = @import("glob.zig");
 
 // ============================================================
 // Symbolic Memory Model
@@ -423,6 +424,7 @@ pub const Capability = enum(u3) {
     read_file = 1,
     read_env = 2,
     reflect_module = 3,
+    reflect_source = 4,
 };
 
 pub const CapabilitySet = struct {
@@ -452,11 +454,12 @@ pub const CapabilitySet = struct {
         if (std.mem.eql(u8, name, "read_file")) return .read_file;
         if (std.mem.eql(u8, name, "read_env")) return .read_env;
         if (std.mem.eql(u8, name, "reflect_module")) return .reflect_module;
+        if (std.mem.eql(u8, name, "reflect_source")) return .reflect_source;
         return null;
     }
 
     pub const pure_only = CapabilitySet{};
-    pub const build = CapabilitySet{ .flags = 0b1111 }; // pure + read_file + read_env + reflect_module
+    pub const build = CapabilitySet{ .flags = 0b1_1111 }; // pure + read_file + read_env + reflection
 };
 
 // ============================================================
@@ -473,9 +476,17 @@ pub const CtDependency = union(enum) {
         value_hash: u64,
         present: bool,
     },
+    glob: struct {
+        pattern: []const u8,
+        result_hash: u64,
+    },
     reflected_module: struct {
         module_name: []const u8,
         interface_hash: u64,
+    },
+    reflected_source: struct {
+        paths: []const []const u8,
+        graph_hash: u64,
     },
 };
 
@@ -496,10 +507,24 @@ fn cloneDependency(alloc: std.mem.Allocator, dep: CtDependency) !CtDependency {
             .value_hash = ev.value_hash,
             .present = ev.present,
         } },
+        .glob => |g| .{ .glob = .{
+            .pattern = try alloc.dupe(u8, g.pattern),
+            .result_hash = g.result_hash,
+        } },
         .reflected_module => |rm| .{ .reflected_module = .{
             .module_name = try alloc.dupe(u8, rm.module_name),
             .interface_hash = rm.interface_hash,
         } },
+        .reflected_source => |rs| blk: {
+            const paths = try alloc.alloc([]const u8, rs.paths.len);
+            for (rs.paths, 0..) |path, i| {
+                paths[i] = try alloc.dupe(u8, path);
+            }
+            break :blk .{ .reflected_source = .{
+                .paths = paths,
+                .graph_hash = rs.graph_hash,
+            } };
+        },
     };
 }
 
@@ -509,6 +534,16 @@ fn cloneDependencies(alloc: std.mem.Allocator, deps: []const CtDependency) ![]co
         cloned[i] = try cloneDependency(alloc, dep);
     }
     return cloned;
+}
+
+fn hashGlobMatches(matches: []const []const u8) u64 {
+    var hasher = std.hash.Wyhash.init(0);
+    for (matches) |matched_path| {
+        const path_len: u64 = @intCast(matched_path.len);
+        hasher.update(std.mem.asBytes(&path_len));
+        hasher.update(matched_path);
+    }
+    return hasher.final();
 }
 
 // ============================================================
@@ -2807,6 +2842,15 @@ pub const Interpreter = struct {
         {
             return self.builtinModuleTypes(args);
         }
+        if (std.mem.eql(u8, cb.name, "__zap_source_graph_structs__")) {
+            return self.builtinSourceGraphStructs(args);
+        }
+        if (std.mem.eql(u8, cb.name, "__zap_struct_functions__")) {
+            return self.builtinStructFunctions(args);
+        }
+        if (std.mem.eql(u8, cb.name, "__zap_map_get__")) {
+            return self.builtinMapGet(args);
+        }
 
         // File read intrinsic
         if (std.mem.eql(u8, cb.name, "File.read") or
@@ -2814,6 +2858,11 @@ pub const Interpreter = struct {
             std.mem.eql(u8, cb.name, ":zig.file_read"))
         {
             return self.builtinFileRead(args);
+        }
+
+        // Filesystem glob primitive. Zap stdlib APIs wrap this in Zap code.
+        if (std.mem.eql(u8, cb.name, "Prim.glob")) {
+            return self.builtinPrimitiveGlob(args);
         }
 
         // Env read intrinsic
@@ -2933,6 +2982,23 @@ pub const Interpreter = struct {
         return .{ .string = s };
     }
 
+    fn builtinMapGet(self: *Interpreter, args: []const CtValue) CtfeInterpretError!CtValue {
+        if (args.len != 3) {
+            try self.emitError(.type_error, "__zap_map_get__ expects 3 arguments");
+            return error.CtfeFailure;
+        }
+
+        const default_value = args[2];
+        if (args[0] != .map) return default_value;
+
+        for (args[0].map.entries) |entry| {
+            if (entry.key.eql(args[1])) {
+                return entry.value;
+            }
+        }
+        return default_value;
+    }
+
     // --------------------------------------------------------
     // File/env intrinsics
     // --------------------------------------------------------
@@ -2971,6 +3037,42 @@ pub const Interpreter = struct {
         }) catch {};
 
         return .{ .string = content };
+    }
+
+    fn builtinPrimitiveGlob(self: *Interpreter, args: []const CtValue) CtfeInterpretError!CtValue {
+        if (!self.capabilities.has(.read_file)) {
+            try self.emitError(.capability_violation, ":zig.Prim.glob requires read_file capability");
+            return error.CtfeFailure;
+        }
+        if (args.len != 1) {
+            try self.emitError(.type_error, ":zig.Prim.glob expects 1 argument (pattern)");
+            return error.CtfeFailure;
+        }
+
+        const pattern_value = unwrapCtAstLiteral(args[0]);
+        const pattern = switch (pattern_value) {
+            .string => |s| s,
+            else => {
+                try self.emitError(.type_error, ":zig.Prim.glob expects a string pattern");
+                return error.CtfeFailure;
+            },
+        };
+
+        const matches = glob.collect(self.allocator, std.Options.debug_io, pattern, .{}) catch return error.OutOfMemory;
+        const result_items = self.allocator.alloc(CtValue, matches.len) catch return error.OutOfMemory;
+        for (matches, 0..) |matched_path, index| {
+            result_items[index] = .{ .string = matched_path };
+        }
+
+        self.dependencies.append(self.allocator, .{
+            .glob = .{
+                .pattern = pattern,
+                .result_hash = hashGlobMatches(matches),
+            },
+        }) catch {};
+
+        const alloc_id = self.allocation_store.alloc(self.allocator, .list, self.currentFunctionId());
+        return .{ .list = .{ .alloc_id = alloc_id, .elems = result_items } };
     }
 
     fn builtinGetEnv(self: *Interpreter, args: []const CtValue) CtfeInterpretError!CtValue {
@@ -3035,6 +3137,198 @@ pub const Interpreter = struct {
     // --------------------------------------------------------
     // Reflection intrinsics
     // --------------------------------------------------------
+
+    fn hasReflectionCapability(self: *const Interpreter) bool {
+        return self.capabilities.has(.reflect_source) or self.capabilities.has(.reflect_module);
+    }
+
+    fn builtinSourceGraphStructs(self: *Interpreter, args: []const CtValue) CtfeInterpretError!CtValue {
+        if (!self.hasReflectionCapability()) {
+            try self.emitError(.capability_violation, "__zap_source_graph_structs__ requires reflect_source capability");
+            return error.CtfeFailure;
+        }
+        if (args.len != 1) {
+            try self.emitError(.type_error, "__zap_source_graph_structs__ expects 1 argument");
+            return error.CtfeFailure;
+        }
+
+        const graph = self.scope_graph orelse {
+            try self.emitError(.unsupported_instruction, "no scope graph available for reflection");
+            return error.CtfeFailure;
+        };
+        const interner = self.interner orelse {
+            try self.emitError(.unsupported_instruction, "no string interner available for reflection");
+            return error.CtfeFailure;
+        };
+
+        const path_filter = try self.extractPathFilter(args[0]);
+        const graph_hash = computeSourceReflectionHash(graph, interner, path_filter);
+        try self.dependencies.append(self.allocator, .{
+            .reflected_source = .{
+                .paths = path_filter,
+                .graph_hash = graph_hash,
+            },
+        });
+
+        var result_list: std.ArrayListUnmanaged(CtValue) = .empty;
+        for (graph.structs.items) |struct_entry| {
+            const source_id = struct_entry.decl.meta.span.source_id orelse continue;
+            const path = graph.sourcePathById(source_id) orelse continue;
+            if (!pathFilterContains(path_filter, path)) continue;
+            try result_list.append(self.allocator, try self.makeStructRef(struct_entry, path, source_id));
+        }
+
+        const alloc_id = self.allocation_store.alloc(self.allocator, .list, self.currentFunctionId());
+        return .{ .list = .{ .alloc_id = alloc_id, .elems = result_list.items } };
+    }
+
+    fn builtinStructFunctions(self: *Interpreter, args: []const CtValue) CtfeInterpretError!CtValue {
+        if (!self.hasReflectionCapability()) {
+            try self.emitError(.capability_violation, "__zap_struct_functions__ requires reflect_source capability");
+            return error.CtfeFailure;
+        }
+        if (args.len != 1) {
+            try self.emitError(.type_error, "__zap_struct_functions__ expects 1 argument");
+            return error.CtfeFailure;
+        }
+
+        const graph = self.scope_graph orelse {
+            try self.emitError(.unsupported_instruction, "no scope graph available for reflection");
+            return error.CtfeFailure;
+        };
+        const interner = self.interner orelse {
+            try self.emitError(.unsupported_instruction, "no string interner available for reflection");
+            return error.CtfeFailure;
+        };
+
+        const struct_name = (try self.extractStructRefName(args[0])) orelse {
+            try self.emitError(.type_error, "__zap_struct_functions__ expects a reflected struct, atom, or string");
+            return error.CtfeFailure;
+        };
+        const struct_scope_id = self.findStructScopeByName(graph, struct_name) orelse {
+            try self.emitError(.undefined_function, "struct not found for reflection");
+            return error.CtfeFailure;
+        };
+
+        const iface_hash = computeModuleInterfaceHash(graph, struct_scope_id, self.interner, struct_name);
+        try self.dependencies.append(self.allocator, .{
+            .reflected_module = .{ .module_name = struct_name, .interface_hash = iface_hash },
+        });
+
+        var result_list: std.ArrayListUnmanaged(CtValue) = .empty;
+        const struct_scope = graph.getScope(struct_scope_id);
+        var family_iter = struct_scope.function_families.iterator();
+        while (family_iter.next()) |entry| {
+            const family = &graph.families.items[entry.value_ptr.*];
+            if (family.visibility != .public) continue;
+            const name_str = interner.get(family.name);
+            try result_list.append(self.allocator, try self.makeFunctionRef(name_str, family.arity, family.visibility));
+        }
+
+        const alloc_id = self.allocation_store.alloc(self.allocator, .list, self.currentFunctionId());
+        return .{ .list = .{ .alloc_id = alloc_id, .elems = result_list.items } };
+    }
+
+    fn extractPathFilter(self: *Interpreter, value: CtValue) CtfeInterpretError![]const []const u8 {
+        return switch (value) {
+            .string => |path| blk: {
+                const paths = try self.allocator.alloc([]const u8, 1);
+                paths[0] = path;
+                break :blk paths;
+            },
+            .atom => |path| blk: {
+                const paths = try self.allocator.alloc([]const u8, 1);
+                paths[0] = path;
+                break :blk paths;
+            },
+            .list => |list| blk: {
+                const paths = try self.allocator.alloc([]const u8, list.elems.len);
+                for (list.elems, 0..) |elem, i| {
+                    paths[i] = switch (elem) {
+                        .string => |path| path,
+                        .atom => |path| path,
+                        else => {
+                            try self.emitError(.type_error, "__zap_source_graph_structs__ path list must contain strings");
+                            return error.CtfeFailure;
+                        },
+                    };
+                }
+                break :blk paths;
+            },
+            else => {
+                try self.emitError(.type_error, "__zap_source_graph_structs__ expects a string path or list of string paths");
+                return error.CtfeFailure;
+            },
+        };
+    }
+
+    fn extractStructRefName(self: *Interpreter, value: CtValue) CtfeInterpretError!?[]const u8 {
+        return switch (value) {
+            .string => |name| name,
+            .atom => |name| name,
+            .tuple => |tuple| blk: {
+                if (tuple.elems.len != 3) break :blk null;
+                if (tuple.elems[0] != .atom or !std.mem.eql(u8, tuple.elems[0].atom, "__aliases__")) break :blk null;
+                if (tuple.elems[2] != .list) break :blk null;
+                var buffer: std.ArrayListUnmanaged(u8) = .empty;
+                for (tuple.elems[2].list.elems, 0..) |part, index| {
+                    if (part != .atom) break :blk null;
+                    if (index > 0) try buffer.append(self.allocator, '.');
+                    try buffer.appendSlice(self.allocator, part.atom);
+                }
+                break :blk try buffer.toOwnedSlice(self.allocator);
+            },
+            .map => |map| blk: {
+                for (map.entries) |entry| {
+                    if (entry.key == .atom and std.mem.eql(u8, entry.key.atom, "name")) {
+                        if (entry.value == .string) break :blk entry.value.string;
+                        if (entry.value == .atom) break :blk entry.value.atom;
+                    }
+                }
+                break :blk null;
+            },
+            else => null,
+        };
+    }
+
+    fn makeStructRef(
+        self: *Interpreter,
+        struct_entry: scope.StructEntry,
+        path: []const u8,
+        source_id: u32,
+    ) CtfeInterpretError!CtValue {
+        _ = path;
+        _ = source_id;
+
+        const tuple_elems = try self.allocator.alloc(CtValue, 3);
+        const parts = try self.allocator.alloc(CtValue, struct_entry.name.parts.len);
+        for (struct_entry.name.parts, 0..) |part, index| {
+            parts[index] = .{ .atom = self.interner.?.get(part) };
+        }
+
+        const empty_list_id = self.allocation_store.alloc(self.allocator, .list, self.currentFunctionId());
+        const parts_list_id = self.allocation_store.alloc(self.allocator, .list, self.currentFunctionId());
+        tuple_elems[0] = .{ .atom = "__aliases__" };
+        tuple_elems[1] = .{ .list = .{ .alloc_id = empty_list_id, .elems = &.{} } };
+        tuple_elems[2] = .{ .list = .{ .alloc_id = parts_list_id, .elems = parts } };
+
+        const tuple_id = self.allocation_store.alloc(self.allocator, .tuple, self.currentFunctionId());
+        return .{ .tuple = .{ .alloc_id = tuple_id, .elems = tuple_elems } };
+    }
+
+    fn makeFunctionRef(
+        self: *Interpreter,
+        name: []const u8,
+        arity: u32,
+        visibility: ast.FunctionDecl.Visibility,
+    ) CtfeInterpretError!CtValue {
+        const entries = try self.allocator.alloc(CtValue.CtMapEntry, 3);
+        entries[0] = .{ .key = .{ .atom = "name" }, .value = .{ .string = name } };
+        entries[1] = .{ .key = .{ .atom = "arity" }, .value = .{ .int = @intCast(arity) } };
+        entries[2] = .{ .key = .{ .atom = "visibility" }, .value = .{ .atom = @tagName(visibility) } };
+        const alloc_id = self.allocation_store.alloc(self.allocator, .map, self.currentFunctionId());
+        return .{ .map = .{ .alloc_id = alloc_id, .entries = entries } };
+    }
 
     fn builtinModuleFunctions(self: *Interpreter, args: []const CtValue) CtfeInterpretError!CtValue {
         if (!self.capabilities.has(.reflect_module)) {
@@ -3578,6 +3872,70 @@ fn computeModuleInterfaceHash(
     hasher.update(std.mem.asBytes(&attr_hash));
 
     return hasher.final();
+}
+
+fn computeSourceReflectionHash(
+    graph: *const scope.ScopeGraph,
+    interner: *const ast.StringInterner,
+    paths: []const []const u8,
+) u64 {
+    var aggregate_hash: u64 = 0;
+    var matched_count: u64 = 0;
+
+    for (graph.structs.items) |struct_entry| {
+        const source_id = struct_entry.decl.meta.span.source_id orelse continue;
+        const path = graph.sourcePathById(source_id) orelse continue;
+        if (!pathFilterContains(paths, path)) continue;
+
+        var struct_hasher = std.hash.Wyhash.init(0);
+        struct_hasher.update(normalizeSourcePath(path));
+        for (struct_entry.name.parts) |part| {
+            struct_hasher.update(interner.get(part));
+            struct_hasher.update(".");
+        }
+        aggregate_hash ^= struct_hasher.final();
+        matched_count += 1;
+    }
+
+    var final_hasher = std.hash.Wyhash.init(0);
+    final_hasher.update(std.mem.asBytes(&matched_count));
+    final_hasher.update(std.mem.asBytes(&aggregate_hash));
+    return final_hasher.final();
+}
+
+fn pathFilterContains(paths: []const []const u8, path: []const u8) bool {
+    for (paths) |candidate| {
+        if (sourcePathsEqual(candidate, path)) return true;
+    }
+    return false;
+}
+
+fn sourcePathsEqual(left: []const u8, right: []const u8) bool {
+    return std.mem.eql(u8, normalizeSourcePath(left), normalizeSourcePath(right));
+}
+
+fn normalizeSourcePath(path: []const u8) []const u8 {
+    var normalized = path;
+    while (std.mem.startsWith(u8, normalized, "./")) {
+        normalized = normalized[2..];
+    }
+    return normalized;
+}
+
+fn unwrapCtAstLiteral(value: CtValue) CtValue {
+    if (value != .tuple or value.tuple.elems.len != 3) return value;
+    if (value.tuple.elems[2] != .nil) return value;
+    const form = value.tuple.elems[0];
+    return switch (form) {
+        .int, .float, .string, .bool_val, .nil => form,
+        .atom => |name| blk: {
+            if (name.len > 0 and name[0] == ':') {
+                break :blk CtValue{ .atom = name[1..] };
+            }
+            break :blk value;
+        },
+        else => value,
+    };
 }
 
 fn baseFunctionName(function_name: []const u8) []const u8 {
@@ -4233,7 +4591,7 @@ fn evaluateConstExpr(
             const func_id = interp.function_by_name.get(callee_name) orelse
                 return error.NotComputable;
 
-            var ct_args : std.ArrayListUnmanaged(CtValue) = .empty;
+            var ct_args: std.ArrayListUnmanaged(CtValue) = .empty;
             for (call.args) |arg| {
                 ct_args.append(alloc, try evaluateConstExpr(alloc, interp, arg, mod_name, interner)) catch return error.OutOfMemory;
             }
@@ -4570,12 +4928,24 @@ pub const PersistentCache = struct {
                         if (current_hash != ev.value_hash) return false;
                     }
                 },
+                .glob => |g| {
+                    const matches = glob.collect(alloc, std.Options.debug_io, g.pattern, .{}) catch return false;
+                    defer glob.freeMatches(alloc, matches);
+                    const current_hash = hashGlobMatches(matches);
+                    if (current_hash != g.result_hash) return false;
+                },
                 .reflected_module => |rm| {
                     const current_graph = graph orelse return false;
                     const current_interner = interner orelse return false;
                     const mod_scope_id = findStructScopeByNameForCache(current_graph, current_interner, rm.module_name) orelse return false;
                     const current_hash = computeModuleInterfaceHash(current_graph, mod_scope_id, current_interner, rm.module_name);
                     if (current_hash != rm.interface_hash) return false;
+                },
+                .reflected_source => |rs| {
+                    const current_graph = graph orelse return false;
+                    const current_interner = interner orelse return false;
+                    const current_hash = computeSourceReflectionHash(current_graph, current_interner, rs.paths);
+                    if (current_hash != rs.graph_hash) return false;
                 },
             }
         }
@@ -4600,6 +4970,8 @@ const CONST_TAG_STRUCT: u8 = 11;
 const DEP_TAG_FILE: u8 = 1;
 const DEP_TAG_ENV_VAR: u8 = 2;
 const DEP_TAG_REFLECTED_MODULE: u8 = 3;
+const DEP_TAG_REFLECTED_SOURCE: u8 = 4;
+const DEP_TAG_GLOB: u8 = 5;
 
 fn serializeDependencyInto(alloc: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), dep: CtDependency) !void {
     switch (dep) {
@@ -4618,12 +4990,30 @@ fn serializeDependencyInto(alloc: std.mem.Allocator, buf: *std.ArrayListUnmanage
             try buf.appendSlice(alloc, std.mem.asBytes(&ev.value_hash));
             try buf.append(alloc, @intFromBool(ev.present));
         },
+        .glob => |g| {
+            try buf.append(alloc, DEP_TAG_GLOB);
+            const pattern_len: u32 = @intCast(g.pattern.len);
+            try buf.appendSlice(alloc, std.mem.asBytes(&pattern_len));
+            try buf.appendSlice(alloc, g.pattern);
+            try buf.appendSlice(alloc, std.mem.asBytes(&g.result_hash));
+        },
         .reflected_module => |rm| {
             try buf.append(alloc, DEP_TAG_REFLECTED_MODULE);
             const name_len: u32 = @intCast(rm.module_name.len);
             try buf.appendSlice(alloc, std.mem.asBytes(&name_len));
             try buf.appendSlice(alloc, rm.module_name);
             try buf.appendSlice(alloc, std.mem.asBytes(&rm.interface_hash));
+        },
+        .reflected_source => |rs| {
+            try buf.append(alloc, DEP_TAG_REFLECTED_SOURCE);
+            const path_count: u32 = @intCast(rs.paths.len);
+            try buf.appendSlice(alloc, std.mem.asBytes(&path_count));
+            for (rs.paths) |path| {
+                const path_len: u32 = @intCast(path.len);
+                try buf.appendSlice(alloc, std.mem.asBytes(&path_len));
+                try buf.appendSlice(alloc, path);
+            }
+            try buf.appendSlice(alloc, std.mem.asBytes(&rs.graph_hash));
         },
     }
 }
@@ -4660,6 +5050,18 @@ fn deserializeDependency(alloc: std.mem.Allocator, data: []const u8, pos: *usize
             pos.* += 1;
             return .{ .env_var = .{ .name = name, .value_hash = value_hash, .present = present } };
         },
+        DEP_TAG_GLOB => {
+            if (pos.* + 4 > data.len) return error.UnexpectedEndOfData;
+            const pattern_len = std.mem.readInt(u32, data[pos.*..][0..4], .little);
+            pos.* += 4;
+            if (pos.* + pattern_len > data.len) return error.UnexpectedEndOfData;
+            const pattern = try alloc.dupe(u8, data[pos.*..][0..pattern_len]);
+            pos.* += pattern_len;
+            if (pos.* + 8 > data.len) return error.UnexpectedEndOfData;
+            const result_hash = std.mem.readInt(u64, data[pos.*..][0..8], .little);
+            pos.* += 8;
+            return .{ .glob = .{ .pattern = pattern, .result_hash = result_hash } };
+        },
         DEP_TAG_REFLECTED_MODULE => {
             if (pos.* + 4 > data.len) return error.UnexpectedEndOfData;
             const name_len = std.mem.readInt(u32, data[pos.*..][0..4], .little);
@@ -4671,6 +5073,24 @@ fn deserializeDependency(alloc: std.mem.Allocator, data: []const u8, pos: *usize
             const interface_hash = std.mem.readInt(u64, data[pos.*..][0..8], .little);
             pos.* += 8;
             return .{ .reflected_module = .{ .module_name = module_name, .interface_hash = interface_hash } };
+        },
+        DEP_TAG_REFLECTED_SOURCE => {
+            if (pos.* + 4 > data.len) return error.UnexpectedEndOfData;
+            const path_count = std.mem.readInt(u32, data[pos.*..][0..4], .little);
+            pos.* += 4;
+            const paths = try alloc.alloc([]const u8, path_count);
+            for (paths) |*path_slot| {
+                if (pos.* + 4 > data.len) return error.UnexpectedEndOfData;
+                const path_len = std.mem.readInt(u32, data[pos.*..][0..4], .little);
+                pos.* += 4;
+                if (pos.* + path_len > data.len) return error.UnexpectedEndOfData;
+                path_slot.* = try alloc.dupe(u8, data[pos.*..][0..path_len]);
+                pos.* += path_len;
+            }
+            if (pos.* + 8 > data.len) return error.UnexpectedEndOfData;
+            const graph_hash = std.mem.readInt(u64, data[pos.*..][0..8], .little);
+            pos.* += 8;
+            return .{ .reflected_source = .{ .paths = paths, .graph_hash = graph_hash } };
         },
         else => return error.UnexpectedEndOfData,
     };
@@ -5897,6 +6317,143 @@ test "CapabilitySet" {
     const with_reflect = pure.with(.reflect_module);
     try testing.expect(with_reflect.has(.reflect_module));
     try testing.expect(!with_reflect.has(.read_file));
+
+    const with_source_reflect = pure.with(.reflect_source);
+    try testing.expect(with_source_reflect.has(.reflect_source));
+    try testing.expect(!with_source_reflect.has(.read_file));
+}
+
+test "reflection: SourceGraph.structs filters by source path" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    const app_id = try interner.intern("App");
+
+    var graph = scope.ScopeGraph.init(alloc);
+    try graph.registerSourceFile(0, "./app.zap");
+    const app_scope = try graph.createScope(0, .module);
+
+    const app_decl = try alloc.create(ast.StructDecl);
+    app_decl.* = .{
+        .meta = .{ .span = .{ .start = 0, .end = 3, .source_id = 0 } },
+        .name = .{ .parts = &.{app_id}, .span = .{ .start = 0, .end = 3, .source_id = 0 } },
+        .items = &.{},
+    };
+    try graph.registerStruct(app_decl.name, app_scope, app_decl);
+
+    const func = ir.Function{
+        .id = 0,
+        .name = "reflect_structs",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .any,
+        .body = &.{ir.Block{
+            .label = 0,
+            .instructions = &.{
+                .{ .const_string = .{ .dest = 0, .value = "app.zap" } },
+                .{ .call_builtin = .{ .dest = 1, .name = "__zap_source_graph_structs__", .args = &.{0}, .arg_modes = &.{.share} } },
+                .{ .ret = .{ .value = 1 } },
+            },
+        }},
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 2,
+    };
+    const functions = [_]ir.Function{func};
+    const program = makeTestProgram(&functions);
+    var interp = Interpreter.init(alloc, &program);
+    defer interp.deinit();
+    interp.capabilities = CapabilitySet.pure_only.with(.reflect_source);
+    interp.scope_graph = &graph;
+    interp.interner = &interner;
+
+    const result = try interp.evalFunction(0, &.{});
+    try testing.expect(result == .list);
+    try testing.expectEqual(@as(usize, 1), result.list.elems.len);
+    try testing.expect(result.list.elems[0] == .tuple);
+    const struct_ref = result.list.elems[0].tuple;
+    try testing.expectEqual(@as(usize, 3), struct_ref.elems.len);
+    try testing.expect(struct_ref.elems[0] == .atom);
+    try testing.expectEqualStrings("__aliases__", struct_ref.elems[0].atom);
+    try testing.expect(struct_ref.elems[2] == .list);
+    try testing.expectEqual(@as(usize, 1), struct_ref.elems[2].list.elems.len);
+    try testing.expect(struct_ref.elems[2].list.elems[0] == .atom);
+    try testing.expectEqualStrings("App", struct_ref.elems[2].list.elems[0].atom);
+    try testing.expectEqual(@as(usize, 1), interp.dependencies.items.len);
+    try testing.expect(interp.dependencies.items[0] == .reflected_source);
+}
+
+test "reflection: Struct.functions returns public function refs" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    const app_id = try interner.intern("App");
+    const main_id = try interner.intern("main");
+
+    var graph = scope.ScopeGraph.init(alloc);
+    const app_scope = try graph.createScope(0, .module);
+    const app_decl = try alloc.create(ast.StructDecl);
+    app_decl.* = .{
+        .meta = .{ .span = .{ .start = 0, .end = 3, .source_id = 0 } },
+        .name = .{ .parts = &.{app_id}, .span = .{ .start = 0, .end = 3, .source_id = 0 } },
+        .items = &.{},
+    };
+    try graph.registerStruct(app_decl.name, app_scope, app_decl);
+    _ = try graph.createFamily(app_scope, main_id, 1, .public);
+
+    const func = ir.Function{
+        .id = 0,
+        .name = "reflect_functions",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .any,
+        .body = &.{ir.Block{
+            .label = 0,
+            .instructions = &.{
+                .{ .const_string = .{ .dest = 0, .value = "App" } },
+                .{ .call_builtin = .{ .dest = 1, .name = "__zap_struct_functions__", .args = &.{0}, .arg_modes = &.{.share} } },
+                .{ .ret = .{ .value = 1 } },
+            },
+        }},
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 2,
+    };
+    const functions = [_]ir.Function{func};
+    const program = makeTestProgram(&functions);
+    var interp = Interpreter.init(alloc, &program);
+    defer interp.deinit();
+    interp.capabilities = CapabilitySet.pure_only.with(.reflect_source);
+    interp.scope_graph = &graph;
+    interp.interner = &interner;
+
+    const result = try interp.evalFunction(0, &.{});
+    try testing.expect(result == .list);
+    try testing.expectEqual(@as(usize, 1), result.list.elems.len);
+    try testing.expect(result.list.elems[0] == .map);
+
+    var found_name = false;
+    var found_arity = false;
+    for (result.list.elems[0].map.entries) |entry| {
+        if (entry.key == .atom and std.mem.eql(u8, entry.key.atom, "name")) {
+            try testing.expect(entry.value == .string);
+            try testing.expectEqualStrings("main", entry.value.string);
+            found_name = true;
+        }
+        if (entry.key == .atom and std.mem.eql(u8, entry.key.atom, "arity")) {
+            try testing.expect(entry.value == .int);
+            try testing.expectEqual(@as(i64, 1), entry.value.int);
+            found_arity = true;
+        }
+    }
+    try testing.expect(found_name);
+    try testing.expect(found_arity);
 }
 
 test "interpreter: make_closure and call_closure" {

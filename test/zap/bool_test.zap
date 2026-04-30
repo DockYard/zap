@@ -1,4 +1,4 @@
-pub struct Test.BoolTest {
+pub struct Zap.BoolTest {
   use Zest.Case
 
   describe("Bool struct") {

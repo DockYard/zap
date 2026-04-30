@@ -1,4 +1,4 @@
-pub struct Test.AtomTest {
+pub struct Zap.AtomTest {
   use Zest.Case
 
   describe("Atom struct") {

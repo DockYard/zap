@@ -1,4 +1,4 @@
-pub struct Test.ListTest {
+pub struct Zap.ListTest {
   use Zest.Case
 
   describe("Integer lists") {

@@ -1073,7 +1073,6 @@ pub const TypeChecker = struct {
     analysis_context: ?*const escape_lattice.AnalysisContext,
     analysis_program: ?*const ir.Program,
 
-
     /// Maps type variable names to TypeIds within the current function scope.
     /// Reset at the start of each function clause check so that `a` in
     /// `fn foo(x :: a) -> a` refers to the same type variable.
@@ -2029,6 +2028,11 @@ pub const TypeChecker = struct {
                 },
                 .assignment => |assign| {
                     if (self.exprUsesClosureParamUnsafely(assign.value, param_name, false)) return false;
+                },
+                .attribute => |attr| {
+                    if (attr.value) |value| {
+                        if (self.exprUsesClosureParamUnsafely(value, param_name, false)) return false;
+                    }
                 },
                 .function_decl, .macro_decl, .import_decl => {},
             }
@@ -3171,6 +3175,10 @@ pub const TypeChecker = struct {
                 return TypeStore.NIL;
             },
             .import_decl => TypeStore.NIL,
+            .attribute => |attr| {
+                if (attr.value) |value| _ = try self.inferExpr(value);
+                return TypeStore.NIL;
+            },
         };
     }
 
@@ -4051,8 +4059,7 @@ pub const TypeChecker = struct {
                             signature.return_type;
 
                         // Record the instantiation in the monomorphization registry
-                        if (!unification_failed) {
-                        }
+                        if (!unification_failed) {}
 
                         const borrowed = try self.applyCallOwnershipWithSafeParams(call.args, signature.toFunctionType(), safe_params);
                         defer self.endBorrowedBindings(borrowed) catch {};

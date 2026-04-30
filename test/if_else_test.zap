@@ -1,4 +1,4 @@
-pub struct Test.IfElseTest {
+pub struct IfElseTest {
   use Zest.Case
 
   describe("if else") {

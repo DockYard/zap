@@ -3,6 +3,7 @@ const ast = @import("ast.zig");
 const scope = @import("scope.zig");
 const ast_data = @import("ast_data.zig");
 const ctfe = @import("ctfe.zig");
+const ir = @import("ir.zig");
 
 // ============================================================
 // Macro engine
@@ -17,6 +18,40 @@ const ctfe = @import("ctfe.zig");
 //     to avoid accidental capture
 // ============================================================
 
+pub const CompiledMacroExecutor = struct {
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    family_functions: std.AutoHashMap(scope.MacroFamilyId, ir.FunctionId),
+
+    pub fn init(allocator: std.mem.Allocator, program: *const ir.Program) CompiledMacroExecutor {
+        return .{
+            .allocator = allocator,
+            .program = program,
+            .family_functions = std.AutoHashMap(scope.MacroFamilyId, ir.FunctionId).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *CompiledMacroExecutor) void {
+        self.family_functions.deinit();
+    }
+
+    pub fn registerMacroFunction(
+        self: *CompiledMacroExecutor,
+        family_id: scope.MacroFamilyId,
+        function_id: ir.FunctionId,
+    ) !void {
+        try self.family_functions.put(family_id, function_id);
+    }
+
+    pub fn hasMacro(self: *const CompiledMacroExecutor, family_id: scope.MacroFamilyId) bool {
+        return self.family_functions.contains(family_id);
+    }
+
+    pub fn functionIdFor(self: *const CompiledMacroExecutor, family_id: scope.MacroFamilyId) ?ir.FunctionId {
+        return self.family_functions.get(family_id);
+    }
+};
+
 pub const MacroEngine = struct {
     allocator: std.mem.Allocator,
     interner: *ast.StringInterner,
@@ -25,6 +60,11 @@ pub const MacroEngine = struct {
     current_module_scope: ?scope.ScopeId = null,
     max_expansions: u32,
     errors: std.ArrayList(Error),
+    /// Optional CTFE-backed executor for macro families whose provider
+    /// structs have already been compiled to IR. When a family is
+    /// registered here, expansion must use compiled CTFE and must not
+    /// fall back to the tree-walking evaluator on failure.
+    compiled_executor: ?*CompiledMacroExecutor = null,
     /// Tracks which `@before_compile` callbacks have already fired
     /// for each module scope. The callback runs at most once per
     /// module per `expandProgram` invocation; subsequent expansion
@@ -50,8 +90,17 @@ pub const MacroEngine = struct {
             .graph = graph,
             .max_expansions = 100,
             .errors = .empty,
+            .compiled_executor = null,
             .before_compile_fired = std.AutoHashMap(BeforeCompileKey, void).init(allocator),
         };
+    }
+
+    pub fn setCompiledExecutor(self: *MacroEngine, executor: *CompiledMacroExecutor) void {
+        self.compiled_executor = executor;
+    }
+
+    fn compiledProgram(self: *const MacroEngine) ?*const ir.Program {
+        return if (self.compiled_executor) |executor| executor.program else null;
     }
 
     /// Lazily allocate (or look up) the macro-introduction scope for
@@ -573,6 +622,7 @@ pub const MacroEngine = struct {
         var store = ctfe.AllocationStore{};
         var env = macro_eval.Env.init(self.allocator, &store);
         defer env.deinit();
+        env.compiled_program = self.compiledProgram();
         env.module_ctx = .{
             .graph = self.graph,
             .interner = self.interner,
@@ -743,6 +793,25 @@ pub const MacroEngine = struct {
                 },
                 .import_decl => {
                     try new_stmts.append(self.allocator, stmt);
+                },
+                .attribute => |attr| {
+                    if (attr.value) |value| {
+                        const expanded = try self.expandExpr(value);
+                        if (expanded.changed) {
+                            changed = true;
+                            const new_attr = try self.create(ast.AttributeDecl, .{
+                                .meta = attr.meta,
+                                .name = attr.name,
+                                .type_expr = attr.type_expr,
+                                .value = expanded.expr,
+                            });
+                            try new_stmts.append(self.allocator, .{ .attribute = new_attr });
+                        } else {
+                            try new_stmts.append(self.allocator, stmt);
+                        }
+                    } else {
+                        try new_stmts.append(self.allocator, stmt);
+                    }
                 },
             }
         }
@@ -1153,6 +1222,52 @@ pub const MacroEngine = struct {
                 };
             },
 
+            .error_pipe => |ep| {
+                var changed = false;
+                const chain = try self.expandErrorPipeChain(ep.chain);
+                if (chain.changed) changed = true;
+
+                const handler: ast.ErrorHandler = switch (ep.handler) {
+                    .function => |function| blk: {
+                        const expanded = try self.expandExpr(function);
+                        if (expanded.changed) changed = true;
+                        break :blk .{ .function = expanded.expr };
+                    },
+                    .block => |clauses| blk: {
+                        var new_clauses: std.ArrayList(ast.CaseClause) = .empty;
+                        for (clauses) |clause| {
+                            const guard = if (clause.guard) |guard_expr| guard_blk: {
+                                const expanded = try self.expandExpr(guard_expr);
+                                if (expanded.changed) changed = true;
+                                break :guard_blk expanded.expr;
+                            } else null;
+                            const body = try self.expandBlock(clause.body);
+                            if (body.changed) changed = true;
+                            try new_clauses.append(self.allocator, .{
+                                .meta = clause.meta,
+                                .pattern = clause.pattern,
+                                .type_annotation = clause.type_annotation,
+                                .guard = guard,
+                                .body = body.stmts,
+                            });
+                        }
+                        break :blk .{ .block = try new_clauses.toOwnedSlice(self.allocator) };
+                    },
+                };
+
+                if (!changed) return .{ .expr = expr, .changed = false };
+                return .{
+                    .expr = try self.create(ast.Expr, .{
+                        .error_pipe = .{
+                            .meta = ep.meta,
+                            .chain = chain.expr,
+                            .handler = handler,
+                        },
+                    }),
+                    .changed = true,
+                };
+            },
+
             // Leaf nodes — no expansion needed
             .int_literal,
             .float_literal,
@@ -1173,9 +1288,33 @@ pub const MacroEngine = struct {
             .intrinsic,
             .attr_ref,
             .binary_literal,
-            .error_pipe,
             => return .{ .expr = expr, .changed = false },
         }
+    }
+
+    fn expandErrorPipeChain(self: *MacroEngine, expr: *const ast.Expr) anyerror!ExpandedExpr {
+        if (expr.* != .pipe) {
+            return self.expandExpr(expr);
+        }
+
+        const pipe = expr.pipe;
+        var changed = false;
+        const lhs = try self.expandErrorPipeChain(pipe.lhs);
+        if (lhs.changed) changed = true;
+        const rhs = try self.expandErrorPipeChain(pipe.rhs);
+        if (rhs.changed) changed = true;
+
+        if (!changed) return .{ .expr = expr, .changed = false };
+        return .{
+            .expr = try self.create(ast.Expr, .{
+                .pipe = .{
+                    .meta = pipe.meta,
+                    .lhs = lhs.expr,
+                    .rhs = rhs.expr,
+                },
+            }),
+            .changed = true,
+        };
     }
 
     fn expandCallExpr(self: *MacroEngine, expr: *const ast.Expr) !ExpandedExpr {
@@ -1297,11 +1436,27 @@ pub const MacroEngine = struct {
 
         // Phase 3: evaluate macro body as a function using the macro evaluator.
         // Convert the body and args to CtValue, run the evaluator, convert back.
+        if (self.compiled_executor) |executor| {
+            if (executor.hasMacro(macro_family_id)) {
+                return try self.expandCompiledMacroCall(
+                    expr,
+                    macro_family_id,
+                    use_scope,
+                    intro_scope,
+                    expansion_info,
+                );
+            }
+        }
+
+        // Phase 3 fallback: evaluate macro body as a function using the
+        // legacy macro evaluator. This path remains for macro families
+        // whose provider structs have not yet been staged and compiled.
         {
             const macro_eval = @import("macro_eval.zig");
             var store = ctfe.AllocationStore{};
             var env = macro_eval.Env.init(self.allocator, &store);
             defer env.deinit();
+            env.compiled_program = self.compiledProgram();
             // Wire module context so `__zap_module_*` intrinsics can
             // reach the scope graph and the current module's
             // StructEntry. Falls back to a noop if no module is
@@ -1402,6 +1557,66 @@ pub const MacroEngine = struct {
         return expr;
     }
 
+    fn expandCompiledMacroCall(
+        self: *MacroEngine,
+        expr: *const ast.Expr,
+        macro_family_id: scope.MacroFamilyId,
+        use_scope: scope.ScopeId,
+        intro_scope: scope.ScopeId,
+        expansion_info: *ast.ExpansionInfo,
+    ) !*const ast.Expr {
+        const executor = self.compiled_executor orelse return expr;
+        const function_id = executor.functionIdFor(macro_family_id) orelse return expr;
+        const call = expr.call;
+        const family = &self.graph.macro_families.items[macro_family_id];
+
+        var store = ctfe.AllocationStore{};
+        const compiled_args = try self.allocator.alloc(ctfe.CtValue, call.args.len);
+        for (call.args, 0..) |arg, index| {
+            const arg_ct = try ast_data.exprToCtValue(self.allocator, self.interner, &store, arg);
+            compiled_args[index] = try ast_data.addScopeToIdentifiers(self.allocator, &store, arg_ct, use_scope);
+        }
+
+        var interpreter = ctfe.Interpreter.init(self.allocator, executor.program);
+        defer interpreter.deinit();
+        interpreter.scope_graph = self.graph;
+        interpreter.interner = self.interner;
+        interpreter.capabilities = family.required_caps;
+        interpreter.steps_remaining = interpreter.step_budget;
+
+        var result = interpreter.evalFunction(function_id, compiled_args) catch |err| {
+            if (interpreter.errors.items.len > 0) {
+                for (interpreter.errors.items) |ctfe_err| {
+                    const formatted = ctfe.formatCtfeError(self.allocator, ctfe_err) catch
+                        try std.fmt.allocPrint(self.allocator, "compiled macro CTFE failed: {s}", .{ctfe_err.message});
+                    try self.errors.append(self.allocator, .{
+                        .message = formatted,
+                        .span = call.meta.span,
+                    });
+                }
+            } else {
+                try self.errors.append(self.allocator, .{
+                    .message = try std.fmt.allocPrint(
+                        self.allocator,
+                        "compiled macro CTFE failed for `{s}`: {s}",
+                        .{ self.interner.get(family.name), @errorName(err) },
+                    ),
+                    .span = call.meta.span,
+                });
+            }
+            return expr;
+        };
+
+        if (result == .nil) return expr;
+
+        result = try ast_data.addScopeToIdentifiers(self.allocator, &store, result, intro_scope);
+        result = try ast_data.flipScopeOnIdentifiers(self.allocator, &store, result, use_scope);
+
+        const expanded = ast_data.ctValueToExpr(self.allocator, self.interner, result) catch return expr;
+        stampExpansionOnExpr(expanded, expansion_info);
+        return expanded;
+    }
+
     // ============================================================
     // Quote expansion with unquote substitution
     // ============================================================
@@ -1444,7 +1659,7 @@ pub const MacroEngine = struct {
         // result, only template identifiers carry the use_scope, so
         // resolution sees them as different bindings even when their
         // textual names collide.
-        var body_vals : std.ArrayListUnmanaged(ctfe.CtValue) = .empty;
+        var body_vals: std.ArrayListUnmanaged(ctfe.CtValue) = .empty;
         for (quote.body) |stmt| {
             const stmt_ct = try ast_data.stmtToCtValue(self.allocator, self.interner, &store, stmt);
             const marked = try ast_data.addScopeToIdentifiers(self.allocator, &store, stmt_ct, intro_scope);
@@ -1472,7 +1687,7 @@ pub const MacroEngine = struct {
         }
 
         // Substitute :unquote nodes in the CtValue tree.
-        var substituted_vals : std.ArrayListUnmanaged(ctfe.CtValue) = .empty;
+        var substituted_vals: std.ArrayListUnmanaged(ctfe.CtValue) = .empty;
         for (body_vals.items) |val| {
             try substituted_vals.append(self.allocator, try self.substituteCtValue(val, &param_map, &store));
         }
@@ -1482,7 +1697,7 @@ pub const MacroEngine = struct {
         // identifiers (which didn't) acquire it. After this flip,
         // template ids carry both intro_scope and use_scope while
         // user ids carry their original scope set unchanged.
-        var flipped_vals : std.ArrayListUnmanaged(ctfe.CtValue) = .empty;
+        var flipped_vals: std.ArrayListUnmanaged(ctfe.CtValue) = .empty;
         for (substituted_vals.items) |val| {
             const flipped = try ast_data.flipScopeOnIdentifiers(self.allocator, &store, val, use_scope);
             try flipped_vals.append(self.allocator, flipped);
@@ -1494,7 +1709,7 @@ pub const MacroEngine = struct {
         }
 
         // Multiple statements → wrap in block
-        var stmts : std.ArrayListUnmanaged(ast.Stmt) = .empty;
+        var stmts: std.ArrayListUnmanaged(ast.Stmt) = .empty;
         for (flipped_vals.items) |val| {
             const expr = try ast_data.ctValueToExpr(self.allocator, self.interner, val);
             try stmts.append(self.allocator, .{ .expr = expr });
@@ -1579,7 +1794,7 @@ pub const MacroEngine = struct {
 
         // Recurse into bare lists — with unquote_splicing support
         if (value == .list) {
-            var result_elems : std.ArrayListUnmanaged(ctfe.CtValue) = .empty;
+            var result_elems: std.ArrayListUnmanaged(ctfe.CtValue) = .empty;
             var changed = false;
             for (value.list.elems) |elem| {
                 // Check for unquote_splicing: {:unquote_splicing, _, [list_expr]}
@@ -1896,7 +2111,7 @@ pub const MacroEngine = struct {
                     param_map.put(self.interner.get(clause.params[1].pattern.bind.name), rhs_ct) catch return null;
                 }
 
-                var body_vals : std.ArrayListUnmanaged(ctfe.CtValue) = .empty;
+                var body_vals: std.ArrayListUnmanaged(ctfe.CtValue) = .empty;
                 for (body_expr.quote_expr.body) |stmt| {
                     const stmt_ct = ast_data.stmtToCtValue(self.allocator, self.interner, &store, stmt) catch return null;
                     body_vals.append(self.allocator, self.substituteCtValue(stmt_ct, &param_map, &store) catch return null) catch return null;
@@ -1914,6 +2129,7 @@ pub const MacroEngine = struct {
             const macro_eval = @import("macro_eval.zig");
             var env = macro_eval.Env.init(self.allocator, &store);
             defer env.deinit();
+            env.compiled_program = self.compiledProgram();
 
             // Bind params to CtValue arg representations
             if (clause.params.len >= 1 and clause.params[0].pattern.* == .bind) {
@@ -2187,7 +2403,7 @@ pub const MacroEngine = struct {
                     }
                 }
 
-                var body_vals : std.ArrayListUnmanaged(ctfe.CtValue) = .empty;
+                var body_vals: std.ArrayListUnmanaged(ctfe.CtValue) = .empty;
                 for (body_expr.quote_expr.body) |stmt| {
                     const stmt_ct = ast_data.stmtToCtValue(self.allocator, self.interner, &store, stmt) catch return null;
                     // Tag template identifiers with the per-family
@@ -2214,6 +2430,7 @@ pub const MacroEngine = struct {
         const macro_eval = @import("macro_eval.zig");
         var env = macro_eval.Env.init(self.allocator, &store);
         defer env.deinit();
+        env.compiled_program = self.compiledProgram();
         // Wire module context so `__zap_module_*` and other comptime
         // intrinsics that consult the scope graph reach the right
         // module — same wiring as the expression-level expandMacroCall
@@ -2317,7 +2534,7 @@ pub const MacroEngine = struct {
                     }
                 }
 
-                var body_vals : std.ArrayListUnmanaged(ctfe.CtValue) = .empty;
+                var body_vals: std.ArrayListUnmanaged(ctfe.CtValue) = .empty;
                 for (body_expr.quote_expr.body) |stmt| {
                     const stmt_ct = ast_data.stmtToCtValue(self.allocator, self.interner, &store, stmt) catch return null;
                     body_vals.append(self.allocator, self.substituteCtValue(stmt_ct, &decl_param_map, &store) catch return null) catch return null;
@@ -2333,6 +2550,7 @@ pub const MacroEngine = struct {
         const macro_eval = @import("macro_eval.zig");
         var env = macro_eval.Env.init(self.allocator, &store);
         defer env.deinit();
+        env.compiled_program = self.compiledProgram();
 
         for (clause.params) |param| {
             if (param.pattern.* == .bind) {
@@ -2390,7 +2608,7 @@ pub const MacroEngine = struct {
                     }
                 }
 
-                var body_vals : std.ArrayListUnmanaged(ctfe.CtValue) = .empty;
+                var body_vals: std.ArrayListUnmanaged(ctfe.CtValue) = .empty;
                 for (body_expr.quote_expr.body) |stmt| {
                     const stmt_ct = ast_data.stmtToCtValue(self.allocator, self.interner, &store, stmt) catch return null;
                     body_vals.append(self.allocator, self.substituteCtValue(stmt_ct, &param_map, &store) catch return null) catch return null;
@@ -2412,6 +2630,15 @@ pub const MacroEngine = struct {
         const macro_eval = @import("macro_eval.zig");
         var env = macro_eval.Env.init(self.allocator, &store);
         defer env.deinit();
+        env.compiled_program = self.compiledProgram();
+        env.module_ctx = .{
+            .graph = self.graph,
+            .interner = self.interner,
+            .current_module_scope = family.scope_id,
+        };
+        env.current_macro_caps = family.required_caps;
+        env.current_macro_name = self.interner.get(family.name);
+        env.current_macro_span = ud.meta.span;
 
         for (clause.params) |param| {
             if (param.pattern.* == .bind) {
@@ -2423,29 +2650,19 @@ pub const MacroEngine = struct {
         var result: ctfe.CtValue = .nil;
         for (clause.body orelse @as([]const ast.Stmt, &.{})) |stmt| {
             const stmt_ct = ast_data.stmtToCtValue(self.allocator, self.interner, &store, stmt) catch return null;
-            result = macro_eval.eval(&env, stmt_ct) catch return null;
+            result = macro_eval.eval(&env, stmt_ct) catch {
+                if (env.last_capability_error) |msg| {
+                    self.errors.append(self.allocator, .{
+                        .message = msg,
+                        .span = ud.meta.span,
+                    }) catch return null;
+                }
+                return null;
+            };
         }
 
         if (result != .nil) {
-            const interner_mut: *ast.StringInterner = @constCast(self.interner);
-            // Result could be a single item or a block of items
-            if (result == .tuple and result.tuple.elems.len == 3) {
-                if (ast_data.ctValueToStructItem(self.allocator, interner_mut, result) catch null) |mi| {
-                    const items = self.allocator.alloc(ast.StructItem, 1) catch return null;
-                    items[0] = mi;
-                    return items;
-                }
-            }
-            // Try as a list of items
-            if (result == .list) {
-                var items: std.ArrayList(ast.StructItem) = .empty;
-                for (result.list.elems) |elem| {
-                    if (ast_data.ctValueToStructItem(self.allocator, interner_mut, elem) catch null) |mi| {
-                        items.append(self.allocator, mi) catch return null;
-                    }
-                }
-                return items.toOwnedSlice(self.allocator) catch return null;
-            }
+            return self.ctValueToStructItems(result) catch return null;
         }
         return null;
     }
@@ -2948,6 +3165,11 @@ fn stampExpansionOnStmt(stmt: ast.Stmt, info: *const ast.ExpansionInfo) void {
             const mut: *ast.ImportDecl = @constCast(id);
             stampMetaIfUnset(&mut.meta, info);
         },
+        .attribute => |attr| {
+            const mut: *ast.AttributeDecl = @constCast(attr);
+            stampMetaIfUnset(&mut.meta, info);
+            if (attr.value) |value| stampExpansionOnExpr(value, info);
+        },
     }
 }
 
@@ -3223,6 +3445,98 @@ test "macro engine expands qualified Module.macro calls" {
     try std.testing.expect(stmt == .expr);
     try std.testing.expect(stmt.expr.* == .int_literal);
     try std.testing.expectEqual(@as(i64, 42), stmt.expr.int_literal.value);
+}
+
+test "macro engine invokes registered compiled macro through CTFE" {
+    const source =
+        \\pub struct Provider {
+        \\  pub macro answer() -> Expr {
+        \\    0
+        \\  }
+        \\}
+        \\
+        \\pub struct Consumer {
+        \\  import Provider
+        \\
+        \\  pub fn use_it() -> i64 {
+        \\    answer()
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    const provider_scope = collector.graph.findStructScope(program.structs[0].name).?;
+    const answer_name = try parser.interner.intern("answer");
+    const macro_family_id = collector.graph.resolveMacro(provider_scope, answer_name, 0).?;
+
+    const compiled_body = [_]ir.Instruction{
+        .{ .const_int = .{ .dest = 0, .value = 42 } },
+        .{ .ret = .{ .value = 0 } },
+    };
+    const compiled_blocks = [_]ir.Block{
+        .{ .label = 0, .instructions = &compiled_body },
+    };
+    const compiled_functions = [_]ir.Function{
+        .{
+            .id = 0,
+            .name = "Provider__answer__0",
+            .module_name = "Provider",
+            .local_name = "answer__0",
+            .scope_id = provider_scope,
+            .arity = 0,
+            .params = &.{},
+            .return_type = .any,
+            .body = &compiled_blocks,
+            .is_closure = false,
+            .captures = &.{},
+            .local_count = 1,
+        },
+    };
+    const compiled_program = ir.Program{
+        .functions = &compiled_functions,
+        .type_defs = &.{},
+        .entry = null,
+    };
+
+    var executor = CompiledMacroExecutor.init(alloc, &compiled_program);
+    defer executor.deinit();
+    try executor.registerMacroFunction(macro_family_id, 0);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    engine.setCompiledExecutor(&executor);
+    const expanded = try engine.expandProgram(&program);
+
+    try std.testing.expectEqual(@as(usize, 0), engine.errors.items.len);
+
+    var consumer_body: ?[]const ast.Stmt = null;
+    for (expanded.structs) |mod| {
+        const last_part = parser.interner.get(mod.name.parts[mod.name.parts.len - 1]);
+        if (!std.mem.eql(u8, last_part, "Consumer")) continue;
+        for (mod.items) |item| switch (item) {
+            .function => |fd| {
+                if (fd.clauses.len > 0) consumer_body = fd.clauses[0].body;
+            },
+            else => {},
+        };
+    }
+
+    try std.testing.expect(consumer_body != null);
+    try std.testing.expectEqual(@as(usize, 1), consumer_body.?.len);
+    try std.testing.expect(consumer_body.?[0] == .expr);
+    try std.testing.expect(consumer_body.?[0].expr.* == .int_literal);
+    try std.testing.expectEqual(@as(i64, 42), consumer_body.?[0].expr.int_literal.value);
 }
 
 test "macro engine reaches fixed point" {
@@ -5953,4 +6267,110 @@ test "expansion provenance: source-level nodes have no expansion stamp" {
     // provenance stamp.
     try std.testing.expect(body_expr.getMeta().expansion == null);
     try std.testing.expect(findFirstExpansion(body_expr) == null);
+}
+
+test "use macro receives explicit empty option list" {
+    const source =
+        \\pub struct Provider {
+        \\  pub macro __using__(_opts :: Expr) -> Expr {
+        \\    quote {
+        \\      @received_opts = unquote(_opts)
+        \\    }
+        \\  }
+        \\}
+        \\
+        \\pub struct Consumer {
+        \\  use Provider, []
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    const expanded = try engine.expandProgram(&program);
+
+    var found_received_opts = false;
+    for (expanded.structs) |mod| {
+        if (mod.name.parts.len != 1) continue;
+        if (!std.mem.eql(u8, parser.interner.get(mod.name.parts[0]), "Consumer")) continue;
+        for (mod.items) |item| {
+            if (item != .attribute) continue;
+            const attr = item.attribute;
+            if (!std.mem.eql(u8, parser.interner.get(attr.name), "received_opts")) continue;
+            found_received_opts = true;
+            const value = attr.value orelse return error.MissingReceivedOptionsValue;
+            try std.testing.expect(value.* == .list);
+            try std.testing.expectEqual(@as(usize, 0), value.list.elements.len);
+        }
+    }
+
+    try std.testing.expect(found_received_opts);
+}
+
+test "use macro receives bare pattern keyword option list" {
+    const source =
+        \\pub struct Provider {
+        \\  pub macro __using__(_opts :: Expr) -> Expr {
+        \\    quote {
+        \\      @received_opts = unquote(_opts)
+        \\    }
+        \\  }
+        \\}
+        \\
+        \\pub struct Consumer {
+        \\  use Provider, pattern: "test/**/*_test.zap"
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    const expanded = try engine.expandProgram(&program);
+
+    var found_received_opts = false;
+    for (expanded.structs) |mod| {
+        if (mod.name.parts.len != 1) continue;
+        if (!std.mem.eql(u8, parser.interner.get(mod.name.parts[0]), "Consumer")) continue;
+        for (mod.items) |item| {
+            if (item != .attribute) continue;
+            const attr = item.attribute;
+            if (!std.mem.eql(u8, parser.interner.get(attr.name), "received_opts")) continue;
+            found_received_opts = true;
+            const value = attr.value orelse return error.MissingReceivedOptionsValue;
+            try std.testing.expect(value.* == .list);
+            try std.testing.expectEqual(@as(usize, 1), value.list.elements.len);
+
+            const option = value.list.elements[0];
+            try std.testing.expect(option.* == .tuple);
+            try std.testing.expectEqual(@as(usize, 2), option.tuple.elements.len);
+            try std.testing.expect(option.tuple.elements[0].* == .atom_literal);
+            try std.testing.expectEqualStrings("pattern", parser.interner.get(option.tuple.elements[0].atom_literal.value));
+            try std.testing.expect(option.tuple.elements[1].* == .string_literal);
+            try std.testing.expectEqualStrings("test/**/*_test.zap", parser.interner.get(option.tuple.elements[1].string_literal.value));
+        }
+    }
+
+    try std.testing.expect(found_received_opts);
 }

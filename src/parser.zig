@@ -1614,13 +1614,58 @@ pub const Parser = struct {
         // Optional opts after comma: use Module, key: value
         var opts: ?*const ast.Expr = null;
         if (self.match(.comma)) {
-            opts = try self.parseExpr();
+            opts = if (self.isBareKeywordOptionStart())
+                try self.parseBareKeywordOptionList()
+            else
+                try self.parseExpr();
         }
 
         return self.create(ast.UseDecl, .{
             .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
             .module_path = module_path,
             .opts = opts,
+        });
+    }
+
+    fn isBareKeywordOptionStart(self: *Parser) bool {
+        if (!self.check(.identifier)) return false;
+        const saved = self.saveLexerState();
+        _ = self.advance();
+        const result = self.check(.colon);
+        self.restoreLexerState(saved);
+        return result;
+    }
+
+    fn parseBareKeywordOptionList(self: *Parser) !*const ast.Expr {
+        const start = self.currentSpan();
+        var elements: std.ArrayList(*const ast.Expr) = .empty;
+
+        while (!self.check(.newline) and !self.check(.right_brace) and !self.check(.eof)) {
+            const key_tok = try self.expect(.identifier);
+            _ = try self.expect(.colon);
+            const key_name = try self.internToken(key_tok);
+            const value = try self.parseExpr();
+
+            const atom_key = try self.create(ast.Expr, .{
+                .atom_literal = .{ .meta = .{ .span = ast.SourceSpan.from(key_tok.loc) }, .value = key_name },
+            });
+            const tuple = try self.create(ast.Expr, .{
+                .tuple = .{
+                    .meta = .{ .span = ast.SourceSpan.merge(ast.SourceSpan.from(key_tok.loc), self.previousSpan()) },
+                    .elements = try self.allocator.dupe(*const ast.Expr, &.{ atom_key, value }),
+                },
+            });
+            try elements.append(self.allocator, tuple);
+
+            if (!self.match(.comma)) break;
+            if (!self.isBareKeywordOptionStart()) break;
+        }
+
+        return self.create(ast.Expr, .{
+            .list = .{
+                .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
+                .elements = try elements.toOwnedSlice(self.allocator),
+            },
         });
     }
 
@@ -1786,6 +1831,10 @@ pub const Parser = struct {
             const imp = try self.parseImportDecl();
             return .{ .import_decl = imp };
         }
+        if (self.isAttributeStatementStart()) {
+            const attr = try self.parseAttributeDecl();
+            return .{ .attribute = attr };
+        }
 
         const expr = try self.parseExpr();
 
@@ -1803,6 +1852,21 @@ pub const Parser = struct {
         }
 
         return .{ .expr = expr };
+    }
+
+    fn isAttributeStatementStart(self: *Parser) bool {
+        if (!self.check(.at_sign)) return false;
+
+        const saved = self.saveLexerState();
+        _ = self.advance();
+        if (!self.check(.identifier)) {
+            self.restoreLexerState(saved);
+            return false;
+        }
+        _ = self.advance();
+        const result = !self.check(.left_paren);
+        self.restoreLexerState(saved);
+        return result;
     }
 
     // ============================================================
@@ -3390,8 +3454,14 @@ pub const Parser = struct {
                 const text = tok.slice(self.source);
                 const value: i64 = if (text.len >= 3 and text[1] == '\\') blk: {
                     break :blk switch (text[2]) {
-                        'n' => 10, 't' => 9, 'r' => 13, 's' => 32,
-                        '\\' => 92, '0' => 0, 'a' => 7, 'e' => 27,
+                        'n' => 10,
+                        't' => 9,
+                        'r' => 13,
+                        's' => 32,
+                        '\\' => 92,
+                        '0' => 0,
+                        'a' => 7,
+                        'e' => 27,
                         'x', 'X' => if (text.len > 3)
                             std.fmt.parseInt(i64, text[3..], 16) catch 0
                         else
@@ -5196,6 +5266,52 @@ test "parse keyword list expression desugars to tuples" {
     try std.testing.expect(second.tuple.elements[0].* == .atom_literal);
     try std.testing.expect(second.tuple.elements[1].* == .int_literal);
     try std.testing.expectEqual(@as(i64, 42), second.tuple.elements[1].int_literal.value);
+}
+
+test "parse use declaration with bare keyword options" {
+    const source =
+        \\pub struct TestProg {
+        \\  use Zest.Runner, pattern: "test/**/*_test.zap"
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const use_decl = program.structs[0].items[0].use_decl;
+    const opts = use_decl.opts orelse return error.MissingUseOptions;
+
+    try std.testing.expect(opts.* == .list);
+    try std.testing.expectEqual(@as(usize, 1), opts.list.elements.len);
+
+    const option = opts.list.elements[0];
+    try std.testing.expect(option.* == .tuple);
+    try std.testing.expectEqual(@as(usize, 2), option.tuple.elements.len);
+    try std.testing.expect(option.tuple.elements[0].* == .atom_literal);
+    try std.testing.expectEqualStrings("pattern", parser.interner.get(option.tuple.elements[0].atom_literal.value));
+    try std.testing.expect(option.tuple.elements[1].* == .string_literal);
+    try std.testing.expectEqualStrings("test/**/*_test.zap", parser.interner.get(option.tuple.elements[1].string_literal.value));
+}
+
+test "parse use declaration with explicit empty option list" {
+    const source =
+        \\pub struct TestProg {
+        \\  use Zest.Runner, []
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    const use_decl = program.structs[0].items[0].use_decl;
+    const opts = use_decl.opts orelse return error.MissingUseOptions;
+
+    try std.testing.expect(opts.* == .list);
+    try std.testing.expectEqual(@as(usize, 0), opts.list.elements.len);
 }
 
 test "parse keyword list pattern desugars to tuple patterns" {

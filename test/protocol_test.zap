@@ -3,7 +3,7 @@ pub struct Point {
   y :: i64
 }
 
-pub struct Test.ProtocolTest {
+pub struct ProtocolTest {
   use Zest.Case
 
   describe("Map enumeration") {

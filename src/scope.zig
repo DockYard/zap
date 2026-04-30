@@ -422,6 +422,11 @@ pub const StructEntry = struct {
     attributes: std.ArrayListUnmanaged(Attribute) = .empty,
 };
 
+pub const SourceFileEntry = struct {
+    id: u32,
+    path: []const u8,
+};
+
 // ============================================================
 // Protocol and Impl entries
 // ============================================================
@@ -481,6 +486,7 @@ pub const ScopeGraph = struct {
     macro_families: std.ArrayList(MacroFamily),
     types: std.ArrayList(TypeEntry),
     structs: std.ArrayList(StructEntry),
+    source_files: std.ArrayList(SourceFileEntry),
     protocols: std.ArrayList(ProtocolEntry),
     impls: std.ArrayList(ImplEntry),
     prelude_scope: ScopeId,
@@ -514,6 +520,7 @@ pub const ScopeGraph = struct {
             .macro_families = .empty,
             .types = .empty,
             .structs = .empty,
+            .source_files = .empty,
             .protocols = .empty,
             .impls = .empty,
             .prelude_scope = 0,
@@ -582,6 +589,7 @@ pub const ScopeGraph = struct {
         self.macro_families.deinit(self.allocator);
         self.types.deinit(self.allocator);
         self.structs.deinit(self.allocator);
+        self.source_files.deinit(self.allocator);
         self.protocols.deinit(self.allocator);
         self.impls.deinit(self.allocator);
         self.node_scope_map.deinit();
@@ -687,6 +695,29 @@ pub const ScopeGraph = struct {
             .scope_id = scope_id,
             .decl = decl,
         });
+    }
+
+    /// Record the source path assigned to a parser source id. Reflection
+    /// APIs use this to answer path-scoped source graph queries without
+    /// guessing from struct names.
+    pub fn registerSourceFile(self: *ScopeGraph, source_id: u32, path: []const u8) !void {
+        for (self.source_files.items) |*entry| {
+            if (entry.id == source_id) {
+                entry.path = path;
+                return;
+            }
+        }
+        try self.source_files.append(self.allocator, .{
+            .id = source_id,
+            .path = path,
+        });
+    }
+
+    pub fn sourcePathById(self: *const ScopeGraph, source_id: u32) ?[]const u8 {
+        for (self.source_files.items) |entry| {
+            if (entry.id == source_id) return entry.path;
+        }
+        return null;
     }
 
     /// Resolve a clause's owning scope. Prefers `meta.scope_id` (set

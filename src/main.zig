@@ -671,6 +671,8 @@ fn buildTarget(
     // Discover source files — either via import-driven discovery from the
     // entry point (when paths is empty) or via glob patterns (legacy).
     var source_files: std.ArrayListUnmanaged([]const u8) = .empty;
+    var explicit_source_files: std.ArrayListUnmanaged([]const u8) = .empty;
+    var source_file_to_struct = std.StringHashMap([]const u8).init(alloc);
     // Source roots for import-driven discovery (populated below, used by validation)
     var source_roots: std.ArrayListUnmanaged(zap.discovery.SourceRoot) = .empty;
     // Module names in topological order for CTFE evaluation
@@ -787,92 +789,92 @@ fn buildTarget(
         }
 
         switch (dep.source) {
-                .path => |dep_path| {
-                    // Resolve dep path relative to the project root
-                    const dep_dir = try std.fs.path.join(alloc, &.{ project_root, dep_path });
+            .path => |dep_path| {
+                // Resolve dep path relative to the project root
+                const dep_dir = try std.fs.path.join(alloc, &.{ project_root, dep_path });
 
-                    // Try dep_dir/lib/ first (standard layout), fall back to dep_dir/
-                    const dep_lib_dir = try std.fs.path.join(alloc, &.{ dep_dir, "lib" });
+                // Try dep_dir/lib/ first (standard layout), fall back to dep_dir/
+                const dep_lib_dir = try std.fs.path.join(alloc, &.{ dep_dir, "lib" });
+                if (std.Io.Dir.cwd().access(global_io, dep_lib_dir, .{})) |_| {
+                    try source_roots.append(alloc, .{ .name = dep_name, .path = dep_lib_dir });
+                } else |_| {
+                    try source_roots.append(alloc, .{ .name = dep_name, .path = dep_dir });
+                }
+
+                // Also add subdirectories that contain modules (e.g., lib/zap/ for Zap.Env)
+                const dep_resolved = if (std.Io.Dir.cwd().access(global_io, dep_lib_dir, .{}))
+                    dep_lib_dir
+                else |_|
+                    dep_dir;
+                // Scan for subdirectories containing .zap files
+                if (std.Io.Dir.cwd().openDir(global_io, dep_resolved, .{ .iterate = true })) |dir_handle| {
+                    var dir = dir_handle;
+                    defer dir.close(global_io);
+                    var it = dir.iterate();
+                    while (it.next(global_io) catch null) |entry| {
+                        if (entry.kind == .directory) {
+                            const subdir = try std.fs.path.join(alloc, &.{ dep_resolved, entry.name });
+                            try source_roots.append(alloc, .{ .name = dep_name, .path = subdir });
+                        }
+                    }
+                } else |_| {}
+
+                // Path deps are recorded in lockfile but not locked
+                try new_lock_entries.append(alloc, .{
+                    .name = dep.name,
+                    .source_type = "path",
+                    .url = dep_path,
+                    .resolved_ref = "-",
+                    .commit = "-",
+                    .integrity = "-",
+                });
+            },
+            .git => |git| {
+                // Use pre-fetched parallel result
+                if (git_result_idx < git_results.len) {
+                    const result = git_results[git_result_idx];
+                    git_result_idx += 1;
+
+                    if (result.fetch_error) {
+                        std.debug.print("Error: failed to fetch dep `{s}`\n", .{dep.name});
+                        std.process.exit(1);
+                    }
+
+                    // Add dep's lib dir as source root
+                    const dep_lib_dir = try std.fs.path.join(alloc, &.{ result.path, "lib" });
                     if (std.Io.Dir.cwd().access(global_io, dep_lib_dir, .{})) |_| {
                         try source_roots.append(alloc, .{ .name = dep_name, .path = dep_lib_dir });
                     } else |_| {
-                        try source_roots.append(alloc, .{ .name = dep_name, .path = dep_dir });
+                        try source_roots.append(alloc, .{ .name = dep_name, .path = result.path });
                     }
 
-                    // Also add subdirectories that contain modules (e.g., lib/zap/ for Zap.Env)
-                    const dep_resolved = if (std.Io.Dir.cwd().access(global_io, dep_lib_dir, .{}))
-                        dep_lib_dir
-                    else |_|
-                        dep_dir;
-                    // Scan for subdirectories containing .zap files
-                    if (std.Io.Dir.cwd().openDir(global_io, dep_resolved, .{ .iterate = true })) |dir_handle| {
-                        var dir = dir_handle;
-                        defer dir.close(global_io);
-                        var it = dir.iterate();
-                        while (it.next(global_io) catch null) |entry| {
-                            if (entry.kind == .directory) {
-                                const subdir = try std.fs.path.join(alloc, &.{ dep_resolved, entry.name });
-                                try source_roots.append(alloc, .{ .name = dep_name, .path = subdir });
-                            }
-                        }
-                    } else |_| {}
-
-                    // Path deps are recorded in lockfile but not locked
+                    const ref = git.tag orelse git.branch orelse git.rev;
+                    // Record in lockfile
                     try new_lock_entries.append(alloc, .{
                         .name = dep.name,
-                        .source_type = "path",
-                        .url = dep_path,
-                        .resolved_ref = "-",
-                        .commit = "-",
-                        .integrity = "-",
+                        .source_type = "git",
+                        .url = git.url,
+                        .resolved_ref = ref orelse "-",
+                        .commit = result.commit,
+                        .integrity = result.integrity,
                     });
-                },
-                .git => |git| {
-                    // Use pre-fetched parallel result
-                    if (git_result_idx < git_results.len) {
-                        const result = git_results[git_result_idx];
-                        git_result_idx += 1;
 
-                        if (result.fetch_error) {
-                            std.debug.print("Error: failed to fetch dep `{s}`\n", .{dep.name});
-                            std.process.exit(1);
-                        }
-
-                        // Add dep's lib dir as source root
-                        const dep_lib_dir = try std.fs.path.join(alloc, &.{ result.path, "lib" });
-                        if (std.Io.Dir.cwd().access(global_io, dep_lib_dir, .{})) |_| {
-                            try source_roots.append(alloc, .{ .name = dep_name, .path = dep_lib_dir });
-                        } else |_| {
-                            try source_roots.append(alloc, .{ .name = dep_name, .path = result.path });
-                        }
-
-                        const ref = git.tag orelse git.branch orelse git.rev;
-                        // Record in lockfile
-                        try new_lock_entries.append(alloc, .{
-                            .name = dep.name,
-                            .source_type = "git",
-                            .url = git.url,
-                            .resolved_ref = ref orelse "-",
-                            .commit = result.commit,
-                            .integrity = result.integrity,
-                        });
-
-                        // Check if lockfile needs updating
-                        const locked = if (lock_entries) |entries|
-                            zap.lockfile.findEntry(entries, dep.name)
-                        else
-                            null;
-                        const locked_commit: ?[]const u8 = if (locked) |l|
-                            (if (std.mem.eql(u8, l.commit, "-")) null else l.commit)
-                        else
-                            null;
-                        if (locked_commit == null or !std.mem.eql(u8, locked_commit.?, result.commit)) {
-                            lockfile_changed = true;
-                        }
+                    // Check if lockfile needs updating
+                    const locked = if (lock_entries) |entries|
+                        zap.lockfile.findEntry(entries, dep.name)
+                    else
+                        null;
+                    const locked_commit: ?[]const u8 = if (locked) |l|
+                        (if (std.mem.eql(u8, l.commit, "-")) null else l.commit)
+                    else
+                        null;
+                    if (locked_commit == null or !std.mem.eql(u8, locked_commit.?, result.commit)) {
+                        lockfile_changed = true;
                     }
-                },
-            }
+                }
+            },
         }
+    }
 
     // Write lockfile if it changed or doesn't exist
     if (lock_entries == null or lockfile_changed) {
@@ -895,6 +897,10 @@ fn buildTarget(
         std.process.exit(1);
     }
 
+    for (config.paths) |pattern| {
+        try globCollectFiles(alloc, project_root, pattern, &explicit_source_files);
+    }
+
     {
         // Import-driven discovery from the entry point
         const root_spec = config.root.?;
@@ -906,11 +912,12 @@ fn buildTarget(
         const entry_module = if (last_dot) |pos| name_part[0..pos] else name_part;
 
         var discovery_err_info: zap.discovery.ErrorInfo = .{};
-        var file_graph = zap.discovery.discover(
+        var file_graph = zap.discovery.discoverWithSourceFiles(
             alloc,
             entry_module,
             source_roots.items,
             &zap.discovery.BUILTIN_TYPE_NAMES,
+            explicit_source_files.items,
             &discovery_err_info,
         ) catch |err| switch (err) {
             error.ModuleNotFound => {
@@ -942,6 +949,13 @@ fn buildTarget(
             },
         };
         defer file_graph.deinit();
+
+        {
+            var iter = file_graph.file_to_struct.iterator();
+            while (iter.next()) |entry| {
+                try source_file_to_struct.put(entry.key_ptr.*, entry.value_ptr.*);
+            }
+        }
 
         // Collect discovered files in topological order
         for (file_graph.topo_order.items) |file_path| {
@@ -991,25 +1005,23 @@ fn buildTarget(
             }
         }
 
-        // Build module order for CTFE: reverse-map file paths to module names
-        var file_to_module = std.StringHashMap([]const u8).init(alloc);
-        {
-            var iter = file_graph.module_to_file.iterator();
-            while (iter.next()) |entry| {
-                try file_to_module.put(entry.value_ptr.*, entry.key_ptr.*);
+        // Build CTFE order from the source graph, filtering out files that
+        // intentionally have no primary struct.
+        var file_index: usize = 0;
+        var struct_count: u32 = 0;
+        for (file_graph.level_boundaries.items) |file_boundary| {
+            while (file_index < file_boundary) : (file_index += 1) {
+                const file_path = file_graph.topo_order.items[file_index];
+                for (file_graph.structsForFile(file_path)) |struct_name| {
+                    try module_order.append(alloc, struct_name);
+                    struct_count += 1;
+                }
             }
-        }
-        for (file_graph.topo_order.items) |file_path| {
-            if (file_to_module.get(file_path)) |mod_name| {
-                try module_order.append(alloc, mod_name);
+            if (struct_count > 0 and
+                (level_boundaries.items.len == 0 or level_boundaries.items[level_boundaries.items.len - 1] != struct_count))
+            {
+                try level_boundaries.append(alloc, struct_count);
             }
-        }
-
-        // Copy level boundaries from the file graph. These mark where each
-        // dependency level ends in module_order — modules within the same
-        // level have no inter-dependencies and can be compiled in parallel.
-        for (file_graph.level_boundaries.items) |boundary| {
-            try level_boundaries.append(alloc, boundary);
         }
     }
 
@@ -1053,7 +1065,11 @@ fn buildTarget(
 
         const mapped = try compiler.mmapSourceFile(global_io, sf, alloc);
         try mapped_files.append(alloc, mapped);
-        try source_units.append(alloc, .{ .file_path = sf, .source = mapped.bytes() });
+        try source_units.append(alloc, .{
+            .file_path = sf,
+            .source = mapped.bytes(),
+            .primary_struct_name = source_file_to_struct.get(sf),
+        });
 
         // Skip validation for dep/stdlib source files — they're external code
         const is_dep_file = blk: {
@@ -1107,37 +1123,7 @@ fn buildTarget(
             break :blk rel_path;
         };
 
-        // Determine if this file is under a named source root (like `test/`)
-        // that adds a module name prefix. Files in `test/` directory use `Test.`
-        // prefix convention: `test/string_test.zap` → `Test.StringTest`.
-        const source_root_dir_name: ?[]const u8 = blk: {
-            const norm_sf = if (std.mem.startsWith(u8, sf, "./")) sf[2..] else sf;
-            for (source_roots.items) |root| {
-                if (std.mem.eql(u8, root.name, "project")) {
-                    const norm_root = if (std.mem.startsWith(u8, root.path, "./"))
-                        root.path[2..]
-                    else
-                        root.path;
-                    const root_slash = try std.fmt.allocPrint(alloc, "{s}/", .{norm_root});
-                    if (std.mem.startsWith(u8, norm_sf, root_slash)) {
-                        // Return the directory basename (e.g., "test" from "./test/")
-                        break :blk std.fs.path.basename(norm_root);
-                    }
-                }
-            }
-            break :blk null;
-        };
-
-        // For files under `test/`, prepend "test/" to the relative path so
-        // validation expects `Test.StructName` to match `test/module_name.zap`.
-        const validation_path = if (source_root_dir_name) |dir_name| blk: {
-            if (!std.mem.eql(u8, dir_name, "lib")) {
-                break :blk try std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir_name, lib_rel });
-            }
-            break :blk lib_rel;
-        } else lib_rel;
-
-        if (compiler.validateOneStructPerFile(alloc, mapped.bytes(), validation_path)) |err_msg| {
+        if (compiler.validateOneStructPerFile(alloc, mapped.bytes(), lib_rel)) |err_msg| {
             std.debug.print("Error: {s}\n", .{err_msg});
             validation_failed = true;
         }
@@ -1213,7 +1199,6 @@ fn buildTarget(
         std.process.exit(1);
     };
 
-
     // Resolve the manifest root (e.g. "Test.TestHelper.main/1") to an IR function ID
     // so the ZIR backend knows which function is the entry point.
     // IR naming: module parts joined by "_", then "__" before function name, then "__" arity.
@@ -1262,7 +1247,6 @@ fn buildTarget(
             }
         }
     }
-
 
     // Map optimize mode from manifest
     const optimize_mode: u8 = switch (config.optimize) {
@@ -1319,11 +1303,15 @@ fn compileProjectFrontend(
 ) !compiler.CompileResult {
     var ctx = try compiler.collectAllFromUnits(alloc, source_units, options);
 
-    // Derive module_order from the parsed module programs and compile
-    // each module independently through the per-module pipeline.
     var names: std.ArrayListUnmanaged([]const u8) = .empty;
-    for (ctx.module_programs) |mp| {
-        names.append(alloc, mp.name) catch {};
+    if (options.module_order) |graph_order| {
+        for (graph_order) |struct_name| {
+            names.append(alloc, struct_name) catch {};
+        }
+    } else {
+        for (ctx.module_programs) |mp| {
+            names.append(alloc, mp.name) catch {};
+        }
     }
 
     return try compiler.compileModuleByModule(alloc, &ctx, names.items, options);
@@ -1632,9 +1620,14 @@ const IncrementalWatchState = struct {
 
         // Import-driven discovery
         var source_files: std.ArrayListUnmanaged([]const u8) = .empty;
+        var explicit_source_files: std.ArrayListUnmanaged([]const u8) = .empty;
         var module_order: std.ArrayListUnmanaged([]const u8) = .empty;
         var level_boundaries: std.ArrayListUnmanaged(u32) = .empty;
-        var file_to_module = std.StringHashMap([]const u8).init(alloc);
+        var source_file_to_struct = std.StringHashMap([]const u8).init(alloc);
+
+        for (config.paths) |pattern| {
+            try globCollectFiles(alloc, project_root, pattern, &explicit_source_files);
+        }
 
         if (config.root) |root_spec| {
             const slash_pos = std.mem.findScalar(u8, root_spec, '/');
@@ -1643,29 +1636,41 @@ const IncrementalWatchState = struct {
             const entry_module = if (last_dot) |pos| name_part[0..pos] else name_part;
 
             var discovery_err_info: zap.discovery.ErrorInfo = .{};
-            var file_graph = zap.discovery.discover(
-                alloc, entry_module, source_roots.items,
-                &zap.discovery.BUILTIN_TYPE_NAMES, &discovery_err_info,
+            var file_graph = zap.discovery.discoverWithSourceFiles(
+                alloc,
+                entry_module,
+                source_roots.items,
+                &zap.discovery.BUILTIN_TYPE_NAMES,
+                explicit_source_files.items,
+                &discovery_err_info,
             ) catch return error.DiscoveryError;
             defer file_graph.deinit();
 
             for (file_graph.topo_order.items) |file_path| {
                 try source_files.append(alloc, file_path);
             }
-            // Build file→module mapping
+            // Build file→struct mapping
             {
-                var iter = file_graph.module_to_file.iterator();
+                var iter = file_graph.file_to_struct.iterator();
                 while (iter.next()) |entry| {
-                    try file_to_module.put(entry.value_ptr.*, entry.key_ptr.*);
+                    try source_file_to_struct.put(entry.key_ptr.*, entry.value_ptr.*);
                 }
             }
-            for (file_graph.topo_order.items) |file_path| {
-                if (file_to_module.get(file_path)) |mod_name| {
-                    try module_order.append(alloc, mod_name);
+            var file_index: usize = 0;
+            var struct_count: u32 = 0;
+            for (file_graph.level_boundaries.items) |file_boundary| {
+                while (file_index < file_boundary) : (file_index += 1) {
+                    const file_path = file_graph.topo_order.items[file_index];
+                    for (file_graph.structsForFile(file_path)) |struct_name| {
+                        try module_order.append(alloc, struct_name);
+                        struct_count += 1;
+                    }
                 }
-            }
-            for (file_graph.level_boundaries.items) |boundary| {
-                try level_boundaries.append(alloc, boundary);
+                if (struct_count > 0 and
+                    (level_boundaries.items.len == 0 or level_boundaries.items[level_boundaries.items.len - 1] != struct_count))
+                {
+                    try level_boundaries.append(alloc, struct_count);
+                }
             }
         } else {
             std.debug.print("Error: build.zap must specify a root entry point\n", .{});
@@ -1681,7 +1686,11 @@ const IncrementalWatchState = struct {
             if (std.mem.eql(u8, std.fs.path.basename(sf), "build.zap")) continue;
             const mapped = try compiler.mmapSourceFile(global_io, sf, alloc);
             try mapped_files.append(alloc, mapped);
-            try source_units.append(alloc, .{ .file_path = sf, .source = mapped.bytes() });
+            try source_units.append(alloc, .{
+                .file_path = sf,
+                .source = mapped.bytes(),
+                .primary_struct_name = source_file_to_struct.get(sf),
+            });
         }
 
         // Frontend compile
@@ -1734,8 +1743,8 @@ const IncrementalWatchState = struct {
 
             // Invalidate changed modules
             for (changed_paths) |changed_path| {
-                if (file_to_module.get(changed_path)) |mod_name| {
-                    zir_backend.invalidateFile(self.zir_ctx, mod_name, alloc) catch {};
+                if (source_file_to_struct.get(changed_path)) |struct_name| {
+                    zir_backend.invalidateFile(self.zir_ctx, struct_name, alloc) catch {};
                 }
             }
         }
@@ -2045,59 +2054,7 @@ fn discoverBuildFile(allocator: std.mem.Allocator, override: ?[]const u8) ![]con
 /// Match a file path against a simple glob pattern.
 /// Supports: `*` (any non-/ chars), `**` (any path depth), literal chars.
 fn globMatch(pattern: []const u8, path: []const u8) bool {
-    var pi: usize = 0; // pattern index
-    var si: usize = 0; // string (path) index
-    var star_pi: ?usize = null; // pattern index after last `*`
-    var star_si: usize = 0; // string index at last `*` match
-
-    while (si < path.len) {
-        if (pi < pattern.len and pattern[pi] == '*') {
-            // Check for `**`
-            if (pi + 1 < pattern.len and pattern[pi + 1] == '*') {
-                // `**` — skip the `**` and optional following `/`
-                pi += 2;
-                if (pi < pattern.len and pattern[pi] == '/') pi += 1;
-                // `**` can match everything remaining — try greedy with backtrack
-                star_pi = pi;
-                star_si = si;
-                continue;
-            }
-            // Single `*` — matches non-/ characters
-            star_pi = pi + 1;
-            star_si = si;
-            pi += 1;
-            continue;
-        }
-
-        if (pi < pattern.len and (pattern[pi] == path[si] or pattern[pi] == '?')) {
-            pi += 1;
-            si += 1;
-            continue;
-        }
-
-        // Mismatch — backtrack to last star
-        if (star_pi) |sp| {
-            pi = sp;
-            star_si += 1;
-            si = star_si;
-            // For single `*`, skip over '/' in path (don't match across dirs)
-            // Check if this was a `**` by looking back
-            if (sp >= 2 and pattern[sp - 2] == '*' and pattern[sp - 1] == '*') {
-                // `**` — can cross directory boundaries
-                continue;
-            }
-            // Single `*` — cannot cross `/`
-            if (si > 0 and path[si - 1] == '/') return false;
-            continue;
-        }
-
-        return false;
-    }
-
-    // Consume trailing stars/wildcards in pattern
-    while (pi < pattern.len and pattern[pi] == '*') : (pi += 1) {}
-
-    return pi == pattern.len;
+    return zap.glob.match(pattern, path);
 }
 
 /// Collect .zap files matching a glob pattern, relative to project_root.

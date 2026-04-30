@@ -1,4 +1,4 @@
-pub struct Test.PipesTest {
+pub struct PipesTest {
   use Zest.Case
 
   describe("pipes") {

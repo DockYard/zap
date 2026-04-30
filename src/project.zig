@@ -492,13 +492,52 @@ fn collectTypeRefsFromTypeExpr(
 
 fn isBuiltinTypeName(name: []const u8) bool {
     const builtins = [_][]const u8{
-        "Bool", "String", "Atom", "Nil", "Never",
-        "i64",  "i32",    "i16",  "i8",  "u64",
-        "u32",  "u16",    "u8",   "f64", "f32",
+        "Bool", "String", "Atom",  "Nil", "Never",
+        "i64",  "i32",    "i16",   "i8",  "u64",
+        "u32",  "u16",    "u8",    "f64", "f32",
         "f16",  "usize",  "isize",
     };
     for (builtins) |b| {
         if (std.mem.eql(u8, name, b)) return true;
     }
     return false;
+}
+
+test "DependencyGraph cycle diagnostic lists cycle edges and help" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const files = [_]FileUnit{
+        .{
+            .path = "lib/cycle_a.zap",
+            .stem = "cycle_a",
+            .source = "",
+            .defines_types = &.{},
+            .defines_modules = &.{"CycleA"},
+            .references_types = &.{},
+            .references_modules = &.{"CycleB"},
+            .has_main = false,
+        },
+        .{
+            .path = "lib/cycle_b.zap",
+            .stem = "cycle_b",
+            .source = "",
+            .defines_types = &.{},
+            .defines_modules = &.{"CycleB"},
+            .references_types = &.{},
+            .references_modules = &.{"CycleA"},
+            .has_main = false,
+        },
+    };
+
+    var graph = try DependencyGraph.init(alloc, &files);
+    const topo_result = graph.topologicalSort(alloc);
+    try std.testing.expectError(error.CircularDependency, topo_result);
+
+    const message = try graph.formatCycleError(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, message, "error: circular dependency between files") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "lib/cycle_a.zap depends on lib/cycle_b.zap") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "lib/cycle_b.zap depends on lib/cycle_a.zap") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "break the cycle") != null);
 }

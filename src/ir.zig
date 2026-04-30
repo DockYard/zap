@@ -1071,8 +1071,6 @@ pub const IrBuilder = struct {
             }
         }
 
-
-
         // Fourth pass: build function bodies
         for (hir_program.modules) |mod| {
             const module_prefix = self.structNameToPrefix(mod.name);
@@ -1125,8 +1123,7 @@ pub const IrBuilder = struct {
                                     // Use ZIR-correct type names (atoms are u32 IDs in ZIR)
                                     if (tid == types_mod.TypeStore.ATOM) break :blk @as([]const u8, "u32");
                                     break :blk typeIdToZigTypeStrWithStore(tid, self.type_store);
-                                } else
-                                    "void";
+                                } else "void";
                                 try union_variants.append(self.allocator, .{
                                     .name = self.interner.get(v.name),
                                     .type_name = type_str,
@@ -1534,8 +1531,8 @@ pub const IrBuilder = struct {
             self.next_local = 0;
             self.current_instrs = .empty;
             self.known_local_types.clearRetainingCapacity();
-        self.param_backed_locals.clearRetainingCapacity();
-        self.term_tuple_locals.clearRetainingCapacity();
+            self.param_backed_locals.clearRetainingCapacity();
+            self.term_tuple_locals.clearRetainingCapacity();
 
             // Reserve binding locals (same as normal function)
             self.next_local = computeMaxBindingLocalForClauses(group.clauses);
@@ -3995,10 +3992,8 @@ pub const IrBuilder = struct {
                 const lhs = try self.lowerExpr(bin.lhs);
                 const rhs = try self.lowerExpr(bin.rhs);
                 // Detect string comparison — Zig needs std.mem.eql, not ==
-                const lhs_is_string = if (self.known_local_types.get(lhs)) |t| t == .string else
-                    (bin.lhs.type_id == types_mod.TypeStore.STRING);
-                const rhs_is_string = if (self.known_local_types.get(rhs)) |t| t == .string else
-                    (bin.rhs.type_id == types_mod.TypeStore.STRING);
+                const lhs_is_string = if (self.known_local_types.get(lhs)) |t| t == .string else (bin.lhs.type_id == types_mod.TypeStore.STRING);
+                const rhs_is_string = if (self.known_local_types.get(rhs)) |t| t == .string else (bin.rhs.type_id == types_mod.TypeStore.STRING);
                 const is_string_cmp = lhs_is_string or rhs_is_string;
 
                 const ir_op: BinaryOp.Op = switch (bin.op) {
@@ -4797,7 +4792,7 @@ pub const IrBuilder = struct {
 /// Strategy: per-char inline replacement. Each unsafe char becomes
 /// `_<spelled-out>` (e.g., `=` → `_eq`, `+` → `_plus`). Safe chars pass
 /// through verbatim. Returns the input unchanged when no mangling is needed.
-fn mangleSymbolForZig(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+pub fn mangleSymbolForZig(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
     if (name.len == 0) return name;
     var needs_mangle = false;
     for (name) |c| {

@@ -169,7 +169,14 @@ pub const ModuleHirResult = struct {
 pub const SourceUnit = struct {
     file_path: []const u8,
     source: []const u8,
+    primary_struct_name: ?[]const u8 = null,
 };
+
+fn registerSourceUnits(graph: *zap.scope.ScopeGraph, source_units: []const SourceUnit) !void {
+    for (source_units, 0..) |unit, source_index| {
+        try graph.registerSourceFile(@intCast(source_index), unit.file_path);
+    }
+}
 
 /// A memory-mapped file that provides zero-copy read access to source contents.
 /// Uses Zig 0.16's std.Io.File.MemoryMap for cross-platform memory mapping.
@@ -354,6 +361,7 @@ pub fn collectAllFromUnits(
     // `discovery.kernel_module_name`.
     const kernel_name_id = try interner.intern(zap.discovery.kernel_module_name);
     var collector = zap.Collector.init(alloc, &interner, kernel_name_id);
+    try registerSourceUnits(&collector.graph, all_source_units);
     {
         const pre_module_programs = try buildModulePrograms(alloc, &program, &interner);
 
@@ -421,42 +429,42 @@ pub fn collectAllFromUnits(
         return error.CollectFailed;
     }
 
-    // Run macro expansion and desugaring on the MERGED program — all modules
-    // together. This ensures every if_expr is expanded to case_expr, every
-    // pipe is desugared, etc., before the AST is split into per-module programs.
-    // The scope graph (collector) is already populated, so macros can resolve.
+    // Run macro expansion and desugaring. When the discovery graph supplies a
+    // module order, expand one module at a time and compile each completed
+    // dependency level to IR so later macros can call already compiled Zap
+    // functions through CTFE. Without a graph order, keep the legacy merged
+    // expansion path.
     step += 1;
     if (options.show_progress) std.debug.print("\r\x1b[K  [{d}/{d}] Macro expand", .{ step, total_steps });
 
-    var macro_engine = zap.MacroEngine.init(alloc, &interner, &collector.graph);
-    defer macro_engine.deinit();
-    const expanded_program = macro_engine.expandProgram(&program) catch {
-        for (macro_engine.errors.items) |macro_err| {
-            diag_engine.err(macro_err.message, macro_err.span) catch {};
+    const desugared_program = if (options.module_order) |module_order|
+        stagedMacroExpandAndDesugar(
+            alloc,
+            &program,
+            module_order,
+            &interner,
+            &collector,
+            &diag_engine,
+        ) catch |err| {
+            if (options.show_progress) std.debug.print("\r\x1b[K", .{});
+            emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
+            return err;
         }
-        if (options.show_progress) std.debug.print("\r\x1b[K", .{});
-        emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
-        return error.MacroExpansionFailed;
-    };
-    for (macro_engine.errors.items) |macro_err| {
-        diag_engine.err(macro_err.message, macro_err.span) catch {};
-    }
-    if (diag_engine.hasErrors()) {
-        if (options.show_progress) std.debug.print("\r\x1b[K", .{});
-        emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
-        return error.MacroExpansionFailed;
-    }
+    else
+        legacyMacroExpandAndDesugar(
+            alloc,
+            &program,
+            &interner,
+            &collector,
+            &diag_engine,
+        ) catch |err| {
+            if (options.show_progress) std.debug.print("\r\x1b[K", .{});
+            emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
+            return err;
+        };
 
     step += 1;
     if (options.show_progress) std.debug.print("\r\x1b[K  [{d}/{d}] Desugar", .{ step, total_steps });
-
-    var desugarer = zap.Desugarer.init(alloc, &interner, &collector.graph);
-    const desugared_program = desugarer.desugarProgram(&expanded_program) catch {
-        diag_engine.err("Error during desugaring", .{ .start = 0, .end = 0 }) catch {};
-        if (options.show_progress) std.debug.print("\r\x1b[K", .{});
-        emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
-        return error.DesugarFailed;
-    };
 
     // NOW split into per-module programs from the expanded/desugared AST.
     // All if_expr nodes are gone, all pipes desugared, all macros expanded.
@@ -471,6 +479,7 @@ pub fn collectAllFromUnits(
     if (options.show_progress) std.debug.print("\r\x1b[K  [{d}/{d}] Re-collect", .{ step, total_steps });
 
     var final_collector = zap.Collector.init(alloc, &interner, kernel_name_id);
+    try registerSourceUnits(&final_collector.graph, all_source_units);
     // Collect Kernel first in the second pass too
     for (module_programs) |entry| {
         if (std.mem.eql(u8, entry.name, zap.discovery.kernel_module_name)) {
@@ -1001,6 +1010,603 @@ fn compileHirToIr(
     return mod_ir;
 }
 
+fn legacyMacroExpandAndDesugar(
+    alloc: std.mem.Allocator,
+    program: *const ast.Program,
+    interner: *ast.StringInterner,
+    collector: *zap.Collector,
+    diag_engine: *zap.DiagnosticEngine,
+) CompileError!ast.Program {
+    var macro_engine = zap.MacroEngine.init(alloc, interner, &collector.graph);
+    defer macro_engine.deinit();
+    const expanded_program = macro_engine.expandProgram(program) catch {
+        for (macro_engine.errors.items) |macro_err| {
+            diag_engine.err(macro_err.message, macro_err.span) catch {};
+        }
+        return error.MacroExpansionFailed;
+    };
+    for (macro_engine.errors.items) |macro_err| {
+        diag_engine.err(macro_err.message, macro_err.span) catch {};
+    }
+    if (diag_engine.hasErrors()) return error.MacroExpansionFailed;
+
+    var desugarer = zap.Desugarer.init(alloc, interner, &collector.graph);
+    return desugarer.desugarProgram(&expanded_program) catch {
+        diag_engine.err("Error during desugaring", .{ .start = 0, .end = 0 }) catch {};
+        return error.DesugarFailed;
+    };
+}
+
+fn stagedMacroExpandAndDesugar(
+    alloc: std.mem.Allocator,
+    program: *const ast.Program,
+    module_order: []const []const u8,
+    interner: *ast.StringInterner,
+    collector: *zap.Collector,
+    diag_engine: *zap.DiagnosticEngine,
+) CompileError!ast.Program {
+    const original_modules = buildModulePrograms(alloc, program, interner) catch return error.OutOfMemory;
+    var expanded_modules: std.ArrayListUnmanaged(ModuleProgram) = .empty;
+    var seen_modules = std.StringHashMap(void).init(alloc);
+
+    var cumulative_ir = ir.Program{
+        .functions = &.{},
+        .type_defs = &.{},
+        .entry = null,
+    };
+    var compiled_executor = @import("macro.zig").CompiledMacroExecutor.init(alloc, &cumulative_ir);
+    defer compiled_executor.deinit();
+
+    const shared_store = alloc.create(zap.types.TypeStore) catch return error.OutOfMemory;
+    shared_store.* = zap.types.TypeStore.init(alloc, interner);
+
+    var hir_results: std.ArrayListUnmanaged(ModuleHirResult) = .empty;
+    var group_id_offset: u32 = 0;
+
+    for (module_order) |module_name| {
+        const original = lookupModuleProgramInSlice(original_modules, module_name) orelse continue;
+        const desugared = try expandAndDesugarStagedModule(
+            alloc,
+            original,
+            interner,
+            collector,
+            diag_engine,
+            &compiled_executor,
+        );
+        try expanded_modules.append(alloc, .{ .name = original.name, .program = desugared });
+        try seen_modules.put(original.name, {});
+
+        const hir_result = try compileStagedModuleHir(
+            alloc,
+            &desugared,
+            original.name,
+            interner,
+            collector,
+            diag_engine,
+            shared_store,
+            group_id_offset,
+        );
+        group_id_offset = hir_result.next_group_id;
+        try hir_results.append(alloc, hir_result);
+
+        cumulative_ir = try rebuildStagedIr(
+            alloc,
+            hir_results.items,
+            interner,
+            collector,
+            shared_store,
+            group_id_offset,
+        );
+    }
+
+    for (original_modules) |original| {
+        if (seen_modules.contains(original.name)) continue;
+        const desugared = try expandAndDesugarStagedModule(
+            alloc,
+            &original,
+            interner,
+            collector,
+            diag_engine,
+            &compiled_executor,
+        );
+        try expanded_modules.append(alloc, .{ .name = original.name, .program = desugared });
+    }
+
+    const top_level_items = try collectUnassignedTopLevelItems(alloc, program);
+    const top_level_program: ?ast.Program = if (top_level_items.len > 0) blk: {
+        const expanded = try expandAndDesugarTopLevelProgram(
+            alloc,
+            top_level_items,
+            interner,
+            collector,
+            diag_engine,
+            &compiled_executor,
+        );
+        break :blk expanded;
+    } else null;
+
+    const extra_top_level_count: usize = if (top_level_program != null) 1 else 0;
+    const slices = try alloc.alloc(ast.Program, expanded_modules.items.len + extra_top_level_count);
+    for (expanded_modules.items, 0..) |entry, index| {
+        slices[index] = entry.program;
+    }
+    if (top_level_program) |top_program| {
+        slices[expanded_modules.items.len] = top_program;
+    }
+    return mergePrograms(alloc, slices) catch return error.OutOfMemory;
+}
+
+fn collectUnassignedTopLevelItems(
+    alloc: std.mem.Allocator,
+    program: *const ast.Program,
+) ![]const ast.TopItem {
+    var items: std.ArrayListUnmanaged(ast.TopItem) = .empty;
+    for (program.top_items) |item| {
+        if (topItemIsAssignedToStruct(item, program.structs)) continue;
+        try items.append(alloc, item);
+    }
+    return try items.toOwnedSlice(alloc);
+}
+
+fn topItemIsAssignedToStruct(item: ast.TopItem, structs: []const ast.StructDecl) bool {
+    const target_type = switch (item) {
+        .impl_decl => |impl| impl.target_type,
+        .priv_impl_decl => |impl| impl.target_type,
+        else => return false,
+    };
+    for (structs) |structure| {
+        if (structNamesEqual(structure.name, target_type)) return true;
+    }
+    return false;
+}
+
+fn expandAndDesugarTopLevelProgram(
+    alloc: std.mem.Allocator,
+    top_items: []const ast.TopItem,
+    interner: *ast.StringInterner,
+    collector: *zap.Collector,
+    diag_engine: *zap.DiagnosticEngine,
+    compiled_executor: *@import("macro.zig").CompiledMacroExecutor,
+) CompileError!ast.Program {
+    const top_program = ast.Program{ .structs = &.{}, .top_items = top_items };
+    const error_baseline = diag_engine.errorCount();
+
+    var macro_engine = zap.MacroEngine.init(alloc, interner, &collector.graph);
+    defer macro_engine.deinit();
+    macro_engine.setCompiledExecutor(compiled_executor);
+    const expanded = macro_engine.expandProgram(&top_program) catch {
+        for (macro_engine.errors.items) |macro_err| {
+            diag_engine.err(macro_err.message, macro_err.span) catch {};
+        }
+        return error.MacroExpansionFailed;
+    };
+    for (macro_engine.errors.items) |macro_err| {
+        diag_engine.err(macro_err.message, macro_err.span) catch {};
+    }
+    if (diag_engine.errorCount() > error_baseline) return error.MacroExpansionFailed;
+
+    var desugarer = zap.Desugarer.init(alloc, interner, &collector.graph);
+    return desugarer.desugarProgram(&expanded) catch {
+        diag_engine.err("Error during top-level desugaring", .{ .start = 0, .end = 0 }) catch {};
+        return error.DesugarFailed;
+    };
+}
+
+fn expandAndDesugarStagedModule(
+    alloc: std.mem.Allocator,
+    module_program: *const ModuleProgram,
+    interner: *ast.StringInterner,
+    collector: *zap.Collector,
+    diag_engine: *zap.DiagnosticEngine,
+    compiled_executor: *@import("macro.zig").CompiledMacroExecutor,
+) CompileError!ast.Program {
+    const error_baseline = diag_engine.errorCount();
+
+    var macro_engine = zap.MacroEngine.init(alloc, interner, &collector.graph);
+    defer macro_engine.deinit();
+    macro_engine.setCompiledExecutor(compiled_executor);
+    const expanded = macro_engine.expandProgram(&module_program.program) catch {
+        for (macro_engine.errors.items) |macro_err| {
+            diag_engine.err(macro_err.message, macro_err.span) catch {};
+        }
+        return error.MacroExpansionFailed;
+    };
+    for (macro_engine.errors.items) |macro_err| {
+        diag_engine.err(macro_err.message, macro_err.span) catch {};
+    }
+    if (diag_engine.errorCount() > error_baseline) return error.MacroExpansionFailed;
+
+    reCollectFunctionsInProgram(collector, &expanded);
+    updateImplDeclsInProgram(collector, &expanded);
+
+    var desugarer = zap.Desugarer.init(alloc, interner, &collector.graph);
+    const desugared = desugarer.desugarProgram(&expanded) catch {
+        diag_engine.err("Error during desugaring", .{ .start = 0, .end = 0 }) catch {};
+        return error.DesugarFailed;
+    };
+    reCollectFunctionsInProgram(collector, &desugared);
+    updateImplDeclsInProgram(collector, &desugared);
+    try expandGraphImplsForProgram(alloc, &desugared, interner, collector, diag_engine, compiled_executor);
+    return desugared;
+}
+
+fn expandGraphImplsForProgram(
+    alloc: std.mem.Allocator,
+    program: *const ast.Program,
+    interner: *ast.StringInterner,
+    collector: *zap.Collector,
+    diag_engine: *zap.DiagnosticEngine,
+    compiled_executor: *@import("macro.zig").CompiledMacroExecutor,
+) CompileError!void {
+    for (collector.graph.impls.items) |*entry| {
+        var target_in_program = false;
+        for (program.structs) |module| {
+            if (structNamesEqual(module.name, entry.target_type)) {
+                target_in_program = true;
+                break;
+            }
+        }
+        if (!target_in_program) continue;
+
+        const top_item: ast.TopItem = if (entry.is_private)
+            .{ .priv_impl_decl = entry.decl }
+        else
+            .{ .impl_decl = entry.decl };
+        const top_items = alloc.alloc(ast.TopItem, 1) catch return error.OutOfMemory;
+        top_items[0] = top_item;
+        const impl_program = ast.Program{ .structs = &.{}, .top_items = top_items };
+
+        var macro_engine = zap.MacroEngine.init(alloc, interner, &collector.graph);
+        defer macro_engine.deinit();
+        macro_engine.setCompiledExecutor(compiled_executor);
+        const expanded = macro_engine.expandProgram(&impl_program) catch {
+            for (macro_engine.errors.items) |macro_err| {
+                diag_engine.err(macro_err.message, macro_err.span) catch {};
+            }
+            return error.MacroExpansionFailed;
+        };
+        for (macro_engine.errors.items) |macro_err| {
+            diag_engine.err(macro_err.message, macro_err.span) catch {};
+        }
+
+        var desugarer = zap.Desugarer.init(alloc, interner, &collector.graph);
+        const desugared_impl_program = desugarer.desugarProgram(&expanded) catch {
+            diag_engine.err("Error during impl desugaring", .{ .start = 0, .end = 0 }) catch {};
+            return error.DesugarFailed;
+        };
+        if (desugared_impl_program.top_items.len > 0) {
+            entry.decl = switch (desugared_impl_program.top_items[0]) {
+                .impl_decl => |decl| decl,
+                .priv_impl_decl => |decl| decl,
+                else => entry.decl,
+            };
+        }
+    }
+}
+
+fn compileStagedModuleHir(
+    alloc: std.mem.Allocator,
+    desugared: *const ast.Program,
+    module_name: []const u8,
+    interner: *ast.StringInterner,
+    collector: *zap.Collector,
+    diag_engine: *zap.DiagnosticEngine,
+    shared_store: *zap.types.TypeStore,
+    group_id_offset: u32,
+) CompileError!ModuleHirResult {
+    const error_baseline = diag_engine.errorCount();
+    if (findUndesugaredMacroForm(desugared) orelse findUndesugaredMacroFormInGraphImpls(&collector.graph, desugared)) |form| {
+        diag_engine.err(
+            std.fmt.allocPrint(
+                alloc,
+                "staged macro expansion left raw `{s}` before HIR in `{s}`",
+                .{ form.name, module_name },
+            ) catch "staged macro expansion left raw macro form before HIR",
+            form.span,
+        ) catch {};
+        return error.MacroExpansionFailed;
+    }
+    shared_store.inferred_signatures.clearRetainingCapacity();
+
+    var type_checker = zap.types.TypeChecker.initWithSharedStore(alloc, shared_store, interner, &collector.graph);
+    defer type_checker.deinit();
+    type_checker.checkProgram(desugared) catch {};
+    for (type_checker.errors.items) |type_err| {
+        diag_engine.reportDiagnostic(.{
+            .severity = type_err.severity orelse .@"error",
+            .message = type_err.message,
+            .span = type_err.span,
+            .label = type_err.label,
+            .help = type_err.help,
+            .secondary_spans = type_err.secondary_spans,
+        }) catch {};
+    }
+    if (diag_engine.errorCount() > error_baseline) return error.TypeCheckFailed;
+
+    var hir_builder = zap.hir.HirBuilder.init(alloc, interner, &collector.graph, shared_store);
+    hir_builder.next_group_id = group_id_offset;
+    const hir_program = hir_builder.buildProgram(desugared) catch {
+        for (hir_builder.errors.items) |hir_err| {
+            diag_engine.err(hir_err.message, hir_err.span) catch {};
+        }
+        return error.HirFailed;
+    };
+    for (hir_builder.errors.items) |hir_err| {
+        diag_engine.err(hir_err.message, hir_err.span) catch {};
+    }
+    if (diag_engine.errorCount() > error_baseline) return error.HirFailed;
+
+    return .{
+        .mod_name = module_name,
+        .hir_program = hir_program,
+        .next_group_id = hir_builder.next_group_id,
+    };
+}
+
+const UndesugaredMacroForm = struct {
+    name: []const u8,
+    span: ast.SourceSpan,
+};
+
+fn findUndesugaredMacroForm(program: *const ast.Program) ?UndesugaredMacroForm {
+    for (program.structs) |module| {
+        for (module.items) |item| {
+            if (findUndesugaredMacroFormInStructItem(item)) |form| return form;
+        }
+    }
+    for (program.top_items) |item| {
+        if (findUndesugaredMacroFormInTopItem(item)) |form| return form;
+    }
+    return null;
+}
+
+fn findUndesugaredMacroFormInGraphImpls(graph: *const zap.scope.ScopeGraph, program: *const ast.Program) ?UndesugaredMacroForm {
+    for (graph.impls.items) |impl_entry| {
+        var target_in_program = false;
+        for (program.structs) |module| {
+            if (structNamesEqual(module.name, impl_entry.target_type)) {
+                target_in_program = true;
+                break;
+            }
+        }
+        if (!target_in_program) continue;
+        if (findUndesugaredMacroFormInImpl(impl_entry.decl)) |form| return form;
+    }
+    return null;
+}
+
+fn findUndesugaredMacroFormInTopItem(item: ast.TopItem) ?UndesugaredMacroForm {
+    return switch (item) {
+        .function, .priv_function => |function| findUndesugaredMacroFormInFunction(function),
+        .impl_decl => |impl| findUndesugaredMacroFormInImpl(impl),
+        .priv_impl_decl => |impl| findUndesugaredMacroFormInImpl(impl),
+        else => null,
+    };
+}
+
+fn findUndesugaredMacroFormInStructItem(item: ast.StructItem) ?UndesugaredMacroForm {
+    return switch (item) {
+        .function, .priv_function => |function| findUndesugaredMacroFormInFunction(function),
+        .struct_level_expr => |expr| findUndesugaredMacroFormInExpr(expr),
+        else => null,
+    };
+}
+
+fn findUndesugaredMacroFormInImpl(impl: *const ast.ImplDecl) ?UndesugaredMacroForm {
+    for (impl.functions) |function| {
+        if (findUndesugaredMacroFormInFunction(function)) |form| return form;
+    }
+    return null;
+}
+
+fn findUndesugaredMacroFormInFunction(function: *const ast.FunctionDecl) ?UndesugaredMacroForm {
+    for (function.clauses) |clause| {
+        if (clause.body) |body| {
+            for (body) |stmt| {
+                if (findUndesugaredMacroFormInStmt(stmt)) |form| return form;
+            }
+        }
+    }
+    return null;
+}
+
+fn findUndesugaredMacroFormInStmt(stmt: ast.Stmt) ?UndesugaredMacroForm {
+    return switch (stmt) {
+        .expr => |expr| findUndesugaredMacroFormInExpr(expr),
+        .assignment => |assignment| findUndesugaredMacroFormInExpr(assignment.value),
+        .function_decl => |function| findUndesugaredMacroFormInFunction(function),
+        else => null,
+    };
+}
+
+fn findUndesugaredMacroFormInExpr(expr: *const ast.Expr) ?UndesugaredMacroForm {
+    return switch (expr.*) {
+        .if_expr => |if_expr| .{ .name = "if", .span = if_expr.meta.span },
+        .cond_expr => |cond_expr| .{ .name = "cond", .span = cond_expr.meta.span },
+        .pipe => |pipe| .{ .name = "|>", .span = pipe.meta.span },
+        .binary_op => |binary| findUndesugaredMacroFormInExpr(binary.lhs) orelse findUndesugaredMacroFormInExpr(binary.rhs),
+        .unary_op => |unary| findUndesugaredMacroFormInExpr(unary.operand),
+        .call => |call| blk: {
+            if (findUndesugaredMacroFormInExpr(call.callee)) |form| break :blk form;
+            for (call.args) |arg| {
+                if (findUndesugaredMacroFormInExpr(arg)) |form| break :blk form;
+            }
+            break :blk null;
+        },
+        .field_access => |field| findUndesugaredMacroFormInExpr(field.object),
+        .case_expr => |case_expr| blk: {
+            if (findUndesugaredMacroFormInExpr(case_expr.scrutinee)) |form| break :blk form;
+            for (case_expr.clauses) |clause| {
+                if (clause.guard) |guard| {
+                    if (findUndesugaredMacroFormInExpr(guard)) |form| break :blk form;
+                }
+                for (clause.body) |stmt| {
+                    if (findUndesugaredMacroFormInStmt(stmt)) |form| break :blk form;
+                }
+            }
+            break :blk null;
+        },
+        .tuple => |tuple| blk: {
+            for (tuple.elements) |element| {
+                if (findUndesugaredMacroFormInExpr(element)) |form| break :blk form;
+            }
+            break :blk null;
+        },
+        .list => |list| blk: {
+            for (list.elements) |element| {
+                if (findUndesugaredMacroFormInExpr(element)) |form| break :blk form;
+            }
+            break :blk null;
+        },
+        .map => |map| blk: {
+            for (map.fields) |field| {
+                if (findUndesugaredMacroFormInExpr(field.key)) |form| break :blk form;
+                if (findUndesugaredMacroFormInExpr(field.value)) |form| break :blk form;
+            }
+            break :blk null;
+        },
+        .struct_expr => |struct_expr| blk: {
+            for (struct_expr.fields) |field| {
+                if (findUndesugaredMacroFormInExpr(field.value)) |form| break :blk form;
+            }
+            break :blk null;
+        },
+        .block => |block| blk: {
+            for (block.stmts) |stmt| {
+                if (findUndesugaredMacroFormInStmt(stmt)) |form| break :blk form;
+            }
+            break :blk null;
+        },
+        .panic_expr => |panic_expr| findUndesugaredMacroFormInExpr(panic_expr.message),
+        .unwrap => |unwrap| findUndesugaredMacroFormInExpr(unwrap.expr),
+        .type_annotated => |type_annotated| findUndesugaredMacroFormInExpr(type_annotated.expr),
+        .anonymous_function => |anonymous| findUndesugaredMacroFormInFunction(anonymous.decl),
+        .list_cons_expr => |list_cons| findUndesugaredMacroFormInExpr(list_cons.head) orelse findUndesugaredMacroFormInExpr(list_cons.tail),
+        .error_pipe => |error_pipe| findUndesugaredMacroFormInErrorPipeChain(error_pipe.chain) orelse findUndesugaredMacroFormInErrorHandler(error_pipe.handler),
+        else => null,
+    };
+}
+
+fn findUndesugaredMacroFormInErrorPipeChain(expr: *const ast.Expr) ?UndesugaredMacroForm {
+    return switch (expr.*) {
+        .pipe => |pipe| findUndesugaredMacroFormInErrorPipeChain(pipe.lhs) orelse findUndesugaredMacroFormInErrorPipeChain(pipe.rhs),
+        else => findUndesugaredMacroFormInExpr(expr),
+    };
+}
+
+fn findUndesugaredMacroFormInErrorHandler(handler: ast.ErrorHandler) ?UndesugaredMacroForm {
+    return switch (handler) {
+        .function => |function| findUndesugaredMacroFormInExpr(function),
+        .block => |clauses| blk: {
+            for (clauses) |clause| {
+                if (clause.guard) |guard| {
+                    if (findUndesugaredMacroFormInExpr(guard)) |form| break :blk form;
+                }
+                for (clause.body) |stmt| {
+                    if (findUndesugaredMacroFormInStmt(stmt)) |form| break :blk form;
+                }
+            }
+            break :blk null;
+        },
+    };
+}
+
+fn rebuildStagedIr(
+    alloc: std.mem.Allocator,
+    hir_results: []const ModuleHirResult,
+    interner: *ast.StringInterner,
+    collector: *zap.Collector,
+    shared_store: *zap.types.TypeStore,
+    group_id_offset: u32,
+) CompileError!ir.Program {
+    var all_hir_modules: std.ArrayListUnmanaged(zap.hir.Module) = .empty;
+    var all_hir_top_fns: std.ArrayListUnmanaged(zap.hir.FunctionGroup) = .empty;
+    var all_hir_protocols: std.ArrayListUnmanaged(zap.hir.ProtocolInfo) = .empty;
+    var all_hir_impls: std.ArrayListUnmanaged(zap.hir.ImplInfo) = .empty;
+    for (hir_results) |*result| {
+        for (result.hir_program.modules) |mod| {
+            all_hir_modules.append(alloc, mod) catch return error.OutOfMemory;
+        }
+        for (result.hir_program.top_functions) |top_function| {
+            all_hir_top_fns.append(alloc, top_function) catch return error.OutOfMemory;
+        }
+        for (result.hir_program.protocols) |protocol| {
+            all_hir_protocols.append(alloc, protocol) catch return error.OutOfMemory;
+        }
+        for (result.hir_program.impls) |impl_info| {
+            all_hir_impls.append(alloc, impl_info) catch return error.OutOfMemory;
+        }
+    }
+
+    var combined_hir = zap.hir.Program{
+        .modules = all_hir_modules.toOwnedSlice(alloc) catch return error.OutOfMemory,
+        .top_functions = all_hir_top_fns.toOwnedSlice(alloc) catch return error.OutOfMemory,
+        .protocols = all_hir_protocols.toOwnedSlice(alloc) catch return error.OutOfMemory,
+        .impls = all_hir_impls.toOwnedSlice(alloc) catch return error.OutOfMemory,
+    };
+
+    var mono_next = group_id_offset;
+    const mono_result = zap.monomorphize.monomorphize(alloc, &combined_hir, shared_store, &mono_next, interner) catch
+        return error.HirFailed;
+    combined_hir = mono_result.program;
+
+    var ir_builder = zap.ir.IrBuilder.init(alloc, interner);
+    ir_builder.type_store = shared_store;
+    ir_builder.scope_graph = &collector.graph;
+    defer ir_builder.deinit();
+    return ir_builder.buildProgram(&combined_hir) catch return error.IrFailed;
+}
+
+fn lookupModuleProgramInSlice(module_programs: []const ModuleProgram, module_name: []const u8) ?*const ModuleProgram {
+    for (module_programs) |*entry| {
+        if (std.mem.eql(u8, entry.name, module_name)) return entry;
+    }
+    return null;
+}
+
+fn reCollectFunctionsInProgram(collector: *zap.Collector, program: *const ast.Program) void {
+    for (program.structs) |*mod| {
+        const mod_scope = collector.graph.findStructScope(mod.name) orelse continue;
+        for (mod.items) |item| {
+            switch (item) {
+                .function, .priv_function => |func| {
+                    const arity: u8 = if (func.clauses.len > 0) @intCast(func.clauses[0].params.len) else 0;
+                    const key = zap.scope.FamilyKey{ .name = func.name, .arity = arity };
+                    const scope_data = collector.graph.getScope(mod_scope);
+                    if (scope_data.function_families.get(key) == null) {
+                        collector.collectFunction(func, mod_scope) catch {};
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+}
+
+fn updateImplDeclsInProgram(collector: *zap.Collector, program: *const ast.Program) void {
+    for (program.top_items) |item| {
+        const impl = switch (item) {
+            .impl_decl => |decl| decl,
+            .priv_impl_decl => |decl| decl,
+            else => continue,
+        };
+        for (collector.graph.impls.items) |*entry| {
+            if (!structNamesEqual(entry.protocol_name, impl.protocol_name)) continue;
+            if (!structNamesEqual(entry.target_type, impl.target_type)) continue;
+            entry.decl = impl;
+            break;
+        }
+    }
+}
+
+fn structNamesEqual(left: ast.StructName, right: ast.StructName) bool {
+    if (left.parts.len != right.parts.len) return false;
+    for (left.parts, right.parts) |left_part, right_part| {
+        if (left_part != right_part) return false;
+    }
+    return true;
+}
+
 /// True per-module compilation: process each module independently through
 /// macro → desugar → typecheck → HIR → IR, in dependency order.
 ///
@@ -1241,27 +1847,12 @@ fn buildCompilationUnits(
     module_programs: []const ModuleProgram,
     source_units: []const SourceUnit,
 ) ![]CompilationUnit {
-    // Build a unit for each module by matching module names to source files.
-    // Source files that contain only top-level items (e.g., Zap.zap with pub struct)
-    // won't have a matching module_program and are skipped.
+    // Build a unit for each struct by using parser source_id metadata first.
+    // This stays correct when source_units also contains protocol/impl-only
+    // files gathered from manifest globs.
     var units_list: std.ArrayListUnmanaged(CompilationUnit) = .empty;
     for (module_programs, 0..) |entry, mod_idx| {
-        // Find the source unit whose file path best matches this module name.
-        // For 1:1 cases (same count), use index mapping. Otherwise, try to
-        // match by checking if the source file contains the module definition.
-        const source_idx: usize = if (module_programs.len == source_units.len)
-            mod_idx
-        else blk: {
-            // Convert module name to expected file basename: "Foo.Bar" -> "bar.zap"
-            // Check each source unit for a match.
-            for (source_units, 0..) |unit, si| {
-                if (std.mem.find(u8, unit.source, entry.name)) |_| {
-                    break :blk si;
-                }
-            }
-            // Fallback: use mod_idx clamped to source_units range
-            break :blk @min(mod_idx, if (source_units.len > 0) source_units.len - 1 else 0);
-        };
+        const source_idx = findSourceUnitIndex(entry, mod_idx, module_programs.len, source_units);
         const su = source_units[source_idx];
         try units_list.append(alloc, .{
             .file_path = su.file_path,
@@ -1273,6 +1864,35 @@ fn buildCompilationUnits(
         });
     }
     return try units_list.toOwnedSlice(alloc);
+}
+
+fn findSourceUnitIndex(
+    entry: ModuleProgram,
+    module_index: usize,
+    module_count: usize,
+    source_units: []const SourceUnit,
+) usize {
+    if (entry.program.structs.len > 0) {
+        if (entry.program.structs[0].meta.span.source_id) |source_id| {
+            if (source_id < source_units.len) return source_id;
+        }
+    }
+
+    for (source_units, 0..) |unit, source_index| {
+        if (unit.primary_struct_name) |struct_name| {
+            if (std.mem.eql(u8, struct_name, entry.name)) return source_index;
+        }
+    }
+
+    if (module_count == source_units.len) return module_index;
+
+    for (source_units, 0..) |unit, source_index| {
+        if (std.mem.find(u8, unit.source, entry.name)) |_| {
+            return source_index;
+        }
+    }
+
+    return @min(module_index, if (source_units.len > 0) source_units.len - 1 else 0);
 }
 
 fn mergePrograms(alloc: std.mem.Allocator, programs: []const ast.Program) !ast.Program {
@@ -2045,6 +2665,23 @@ fn remapStmt(alloc: std.mem.Allocator, stmt: *ast.Stmt, remap: []const ast.Strin
             try remapImportDecl(alloc, mutable, remap);
             stmt.* = .{ .import_decl = mutable };
         },
+        .attribute => |attr| {
+            const mutable = try alloc.create(ast.AttributeDecl);
+            mutable.* = attr.*;
+            if (attr.type_expr) |type_expr| {
+                const mutable_type = try alloc.create(ast.TypeExpr);
+                mutable_type.* = type_expr.*;
+                try remapTypeExpr(alloc, mutable_type, remap);
+                mutable.type_expr = mutable_type;
+            }
+            if (attr.value) |value| {
+                const mutable_value = try alloc.create(ast.Expr);
+                mutable_value.* = value.*;
+                try remapExpr(alloc, mutable_value, remap);
+                mutable.value = mutable_value;
+            }
+            stmt.* = .{ .attribute = mutable };
+        },
     }
 }
 
@@ -2697,6 +3334,18 @@ test "validateOneStructPerFile: valid nested module name" {
     try std.testing.expectEqual(null, result);
 }
 
+test "validateOneStructPerFile: valid source-root relative test struct names" {
+    const alloc = std.testing.allocator;
+
+    const root_source = "pub struct PatternMatchingTest {\n  pub fn run() -> String {\n    \"ok\"\n  }\n}\n";
+    const root_result = validateOneStructPerFile(alloc, root_source, "pattern_matching_test.zap");
+    try std.testing.expectEqual(null, root_result);
+
+    const nested_source = "pub struct Zap.ListTest {\n  pub fn run() -> String {\n    \"ok\"\n  }\n}\n";
+    const nested_result = validateOneStructPerFile(alloc, nested_source, "zap/list_test.zap");
+    try std.testing.expectEqual(null, nested_result);
+}
+
 test "validateOneStructPerFile: valid private struct" {
     const alloc = std.testing.allocator;
     const source = "struct Config.Helpers {\n  pub fn help() -> String {\n    \"ok\"\n  }\n}\n";
@@ -2790,6 +3439,48 @@ test "buildCompilationUnits derives units from module programs" {
     try std.testing.expectEqual(@as(u32, 1), units[1].module_index.?);
 }
 
+test "buildCompilationUnits uses source ids when globbed files have no struct" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    const impl_source =
+        "impl Display for Foo {\n" ++
+        "  pub fn show(_value :: Foo) -> String {\n" ++
+        "    \"foo\"\n" ++
+        "  }\n" ++
+        "}\n";
+    const foo_source =
+        "pub struct Foo {\n" ++
+        "  pub fn value() -> i64 {\n" ++
+        "    1\n" ++
+        "  }\n" ++
+        "}\n";
+
+    var impl_parser = zap.Parser.initWithSharedInterner(alloc, impl_source, &interner, 0);
+    defer impl_parser.deinit();
+    var foo_parser = zap.Parser.initWithSharedInterner(alloc, foo_source, &interner, 1);
+    defer foo_parser.deinit();
+
+    const programs = [_]ast.Program{
+        try impl_parser.parseProgram(),
+        try foo_parser.parseProgram(),
+    };
+    const merged = try mergePrograms(alloc, &programs);
+    const module_programs = try buildModulePrograms(alloc, &merged, &interner);
+    const source_units = [_]SourceUnit{
+        .{ .file_path = "display_impl.zap", .source = impl_source },
+        .{ .file_path = "foo.zap", .source = foo_source, .primary_struct_name = "Foo" },
+    };
+
+    const units = try buildCompilationUnits(alloc, module_programs, &source_units);
+
+    try std.testing.expectEqual(@as(usize, 1), units.len);
+    try std.testing.expectEqualStrings("Foo", units[0].module_name);
+    try std.testing.expectEqualStrings("foo.zap", units[0].file_path);
+}
+
 test "per-unit parser assigns source_id and file-local spans" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2858,22 +3549,25 @@ test "compileModuleByModule isolates per-module diagnostics" {
     const alloc = arena.allocator();
 
     const source_units = [_]SourceUnit{
-        .{ .file_path = "broken.zap", .source =
-            "pub struct Broken {\n" ++
-            "  pub fn go() -> i64 {\n" ++
-            "    nonexistent_function(1)\n" ++
-            "  }\n" ++
-            "}\n",
+        .{
+            .file_path = "broken.zap",
+            .source = "pub struct Broken {\n" ++
+                "  pub fn go() -> i64 {\n" ++
+                "    nonexistent_function(1)\n" ++
+                "  }\n" ++
+                "}\n",
         },
-        .{ .file_path = "clean_a.zap", .source =
-            "pub struct CleanA {\n" ++
-            "  pub fn ok() -> i64 { 1 }\n" ++
-            "}\n",
+        .{
+            .file_path = "clean_a.zap",
+            .source = "pub struct CleanA {\n" ++
+                "  pub fn ok() -> i64 { 1 }\n" ++
+                "}\n",
         },
-        .{ .file_path = "clean_b.zap", .source =
-            "pub struct CleanB {\n" ++
-            "  pub fn ok() -> i64 { 2 }\n" ++
-            "}\n",
+        .{
+            .file_path = "clean_b.zap",
+            .source = "pub struct CleanB {\n" ++
+                "  pub fn ok() -> i64 { 2 }\n" ++
+                "}\n",
         },
     };
 
@@ -2965,4 +3659,196 @@ test "remapFunctionDecl rewrites name_expr through the remap table" {
     const remapped_inner = fd.name_expr.?.unquote_expr.expr;
     try std.testing.expect(remapped_inner.* == .var_ref);
     try std.testing.expectEqual(@as(ast.StringId, 0), remapped_inner.var_ref.name);
+}
+
+test "SourceGraph structs exposes modules collected from source units" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source_units = [_]SourceUnit{
+        .{
+            .file_path = "lib/app.zap",
+            .source = "pub struct App {\n" ++
+                "  pub fn main() -> i64 { Helper.value() }\n" ++
+                "}\n",
+        },
+        .{
+            .file_path = "lib/helper.zap",
+            .source = "pub struct Helper {\n" ++
+                "  pub fn value() -> i64 { 42 }\n" ++
+                "}\n",
+        },
+        .{
+            .file_path = "test/app_test.zap",
+            .source = "pub struct Test.AppTest {\n" ++
+                "  pub fn run() -> String { \"ok\" }\n" ++
+                "}\n",
+        },
+    };
+
+    var ctx = try collectAllFromUnits(alloc, &source_units, .{ .show_progress = false });
+
+    try std.testing.expectEqual(@as(usize, 3), ctx.collector.graph.structs.items.len);
+
+    var found_app = false;
+    var found_helper = false;
+    var found_test_app_test = false;
+    for (ctx.collector.graph.structs.items) |entry| {
+        if (entry.name.parts.len == 1) {
+            const name = ctx.interner.get(entry.name.parts[0]);
+            if (std.mem.eql(u8, name, "App")) found_app = true;
+            if (std.mem.eql(u8, name, "Helper")) found_helper = true;
+        } else if (entry.name.parts.len == 2) {
+            const first = ctx.interner.get(entry.name.parts[0]);
+            const second = ctx.interner.get(entry.name.parts[1]);
+            if (std.mem.eql(u8, first, "Test") and std.mem.eql(u8, second, "AppTest")) {
+                found_test_app_test = true;
+            }
+        }
+    }
+
+    try std.testing.expect(found_app);
+    try std.testing.expect(found_helper);
+    try std.testing.expect(found_test_app_test);
+}
+
+test "staged macro expansion can call previously compiled Zap functions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source_units = [_]SourceUnit{
+        .{
+            .file_path = "lib/lib.zap",
+            .source = "pub struct Lib {\n" ++
+                "  pub fn value() -> String { \"ok\" }\n" ++
+                "}\n",
+        },
+        .{
+            .file_path = "lib/macro_provider.zap",
+            .source = "pub struct MacroProvider {\n" ++
+                "  pub macro build() -> Expr {\n" ++
+                "    value = Lib.value()\n" ++
+                "    quote { unquote(value) }\n" ++
+                "  }\n" ++
+                "}\n",
+        },
+        .{
+            .file_path = "lib/caller.zap",
+            .source = "pub struct Caller {\n" ++
+                "  pub fn main() -> String {\n" ++
+                "    MacroProvider.build()\n" ++
+                "  }\n" ++
+                "}\n",
+        },
+    };
+    const module_order = [_][]const u8{ "Lib", "MacroProvider", "Caller" };
+
+    var ctx = try collectAllFromUnits(alloc, &source_units, .{
+        .show_progress = false,
+        .module_order = &module_order,
+    });
+    var result = try compileModuleByModule(alloc, &ctx, &module_order, .{ .show_progress = false });
+
+    var interpreter = zap.ctfe.Interpreter.init(alloc, &result.ir_program);
+    defer interpreter.deinit();
+    const value = try interpreter.evalByName("Caller__main__0", &.{});
+
+    try std.testing.expect(value == .string);
+    try std.testing.expectEqualStrings("ok", value.string);
+}
+
+test "staged macro expansion can call compiled Zap functions that use allowed CTFE primitives" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source_units = [_]SourceUnit{
+        .{
+            .file_path = "lib/globber.zap",
+            .source = "pub struct Globber {\n" ++
+                "  pub fn files() -> [String] { :zig.Prim.glob(\"test/zap/zest_runner_test.zap\") }\n" ++
+                "}\n",
+        },
+        .{
+            .file_path = "lib/macro_provider.zap",
+            .source = "pub struct MacroProvider {\n" ++
+                "  @requires = [:read_file]\n" ++
+                "  pub macro build() -> Expr {\n" ++
+                "    paths = Globber.files()\n" ++
+                "    count = __zap_list_len__(paths)\n" ++
+                "    quote { unquote(count) }\n" ++
+                "  }\n" ++
+                "}\n",
+        },
+        .{
+            .file_path = "lib/caller.zap",
+            .source = "pub struct Caller {\n" ++
+                "  pub fn main() -> i64 {\n" ++
+                "    MacroProvider.build()\n" ++
+                "  }\n" ++
+                "}\n",
+        },
+    };
+    const module_order = [_][]const u8{ "Globber", "MacroProvider", "Caller" };
+
+    var ctx = try collectAllFromUnits(alloc, &source_units, .{
+        .show_progress = false,
+        .module_order = &module_order,
+    });
+    var result = try compileModuleByModule(alloc, &ctx, &module_order, .{ .show_progress = false });
+
+    var interpreter = zap.ctfe.Interpreter.init(alloc, &result.ir_program);
+    defer interpreter.deinit();
+    const value = try interpreter.evalByName("Caller__main__0", &.{});
+
+    try std.testing.expect(value == .int);
+    try std.testing.expectEqual(@as(i64, 1), value.int);
+}
+
+test "staged use macro expansion can call previously compiled Zap functions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source_units = [_]SourceUnit{
+        .{
+            .file_path = "lib/globber.zap",
+            .source = "pub struct Globber {\n" ++
+                "  pub fn files() -> [String] { :zig.Prim.glob(\"test/zap/zest_runner_test.zap\") }\n" ++
+                "}\n",
+        },
+        .{
+            .file_path = "lib/macro_provider.zap",
+            .source = "pub struct MacroProvider {\n" ++
+                "  @requires = [:read_file]\n" ++
+                "  pub macro __using__(_opts :: Expr) -> Expr {\n" ++
+                "    paths = Globber.files()\n" ++
+                "    count = __zap_list_len__(paths)\n" ++
+                "    quote { pub fn main() -> i64 { unquote(count) } }\n" ++
+                "  }\n" ++
+                "}\n",
+        },
+        .{
+            .file_path = "lib/caller.zap",
+            .source = "pub struct Caller {\n" ++
+                "  use MacroProvider\n" ++
+                "}\n",
+        },
+    };
+    const module_order = [_][]const u8{ "Globber", "MacroProvider", "Caller" };
+
+    var ctx = try collectAllFromUnits(alloc, &source_units, .{
+        .show_progress = false,
+        .module_order = &module_order,
+    });
+    var result = try compileModuleByModule(alloc, &ctx, &module_order, .{ .show_progress = false });
+
+    var interpreter = zap.ctfe.Interpreter.init(alloc, &result.ir_program);
+    defer interpreter.deinit();
+    const value = try interpreter.evalByName("Caller__main__0", &.{});
+
+    try std.testing.expect(value == .int);
+    try std.testing.expectEqual(@as(i64, 1), value.int);
 }

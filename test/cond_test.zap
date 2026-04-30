@@ -1,4 +1,4 @@
-pub struct Test.CondTest {
+pub struct CondTest {
   use Zest.Case
 
   describe("cond") {

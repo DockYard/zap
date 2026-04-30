@@ -80,6 +80,7 @@ pub const Desugarer = struct {
         for (self.pending_helpers.items) |helper| {
             try new_items.append(self.allocator, helper);
         }
+        try self.appendSynthesizedRunIfNeeded(mod, &new_items);
         return .{
             .meta = mod.meta,
             .name = mod.name,
@@ -88,6 +89,78 @@ pub const Desugarer = struct {
             .fields = mod.fields,
             .is_private = mod.is_private,
         };
+    }
+
+    fn appendSynthesizedRunIfNeeded(
+        self: *Desugarer,
+        mod: *const ast.StructDecl,
+        items: *std.ArrayList(ast.StructItem),
+    ) !void {
+        const run_name = try self.interner.intern("run");
+        var struct_level_exprs: std.ArrayList(*const ast.Expr) = .empty;
+
+        for (items.items) |item| {
+            switch (item) {
+                .function => |func| {
+                    if (self.functionHasArity(func, run_name, 0)) return;
+                },
+                .priv_function => |func| {
+                    if (self.functionHasArity(func, run_name, 0)) return;
+                },
+                .struct_level_expr => |expr| try struct_level_exprs.append(self.allocator, expr),
+                else => {},
+            }
+        }
+
+        if (struct_level_exprs.items.len == 0) return;
+
+        const statements = try self.allocator.alloc(ast.Stmt, struct_level_exprs.items.len);
+        for (struct_level_exprs.items, 0..) |expr, index| {
+            statements[index] = .{ .expr = expr };
+        }
+
+        const string_type_name = try self.nativeStringTypeName();
+        const return_type = try self.create(ast.TypeExpr, .{
+            .name = .{
+                .meta = mod.meta,
+                .name = string_type_name,
+                .args = &.{},
+            },
+        });
+
+        const clauses = try self.allocator.alloc(ast.FunctionClause, 1);
+        clauses[0] = .{
+            .meta = mod.meta,
+            .params = &.{},
+            .return_type = return_type,
+            .refinement = null,
+            .body = statements,
+        };
+
+        const run_decl = try self.create(ast.FunctionDecl, .{
+            .meta = mod.meta,
+            .name = run_name,
+            .name_expr = null,
+            .clauses = clauses,
+            .visibility = .public,
+        });
+        try items.append(self.allocator, .{ .function = run_decl });
+    }
+
+    fn functionHasArity(self: *const Desugarer, func: *const ast.FunctionDecl, name: ast.StringId, arity: usize) bool {
+        _ = self;
+        if (func.name != name) return false;
+        for (func.clauses) |clause| {
+            if (clause.params.len == arity) return true;
+        }
+        return false;
+    }
+
+    fn nativeStringTypeName(self: *Desugarer) !ast.StringId {
+        if (self.graph) |graph| {
+            if (graph.nativeTypeStructName(.string)) |name| return name;
+        }
+        return self.interner.intern("String");
     }
 
     fn desugarTopItem(self: *Desugarer, item: ast.TopItem) !ast.TopItem {
@@ -174,6 +247,14 @@ pub const Desugarer = struct {
             .function_decl => |func| .{ .function_decl = try self.desugarFunctionDecl(func) },
             .macro_decl => |mac| .{ .macro_decl = try self.desugarMacroDecl(mac) },
             .import_decl => stmt,
+            .attribute => |attr| .{
+                .attribute = try self.create(ast.AttributeDecl, .{
+                    .meta = attr.meta,
+                    .name = attr.name,
+                    .type_expr = attr.type_expr,
+                    .value = if (attr.value) |value| try self.desugarExpr(value) else null,
+                }),
+            },
         };
     }
 
@@ -335,18 +416,20 @@ pub const Desugarer = struct {
             // Error pipe: pass through to HIR builder. Transform function handlers
             // into block handlers so the handler call is a top-level expression.
             .error_pipe => |ep| {
+                const chain = try self.desugarExpr(ep.chain);
                 const handler: ast.ErrorHandler = switch (ep.handler) {
                     .function => |func| blk: {
                         // ~> handle_error() → ~> { __err -> handle_error(__err) }
                         // The unmatched value is injected as the first argument.
+                        const desugared_func = try self.desugarExpr(func);
                         const err_name = try self.interner.intern("__err");
                         const err_ref = try self.create(ast.Expr, .{
                             .var_ref = .{ .meta = ep.meta, .name = err_name },
                         });
 
                         // Inject __err as first argument into the handler call
-                        const call_expr = if (func.* == .call) ce: {
-                            const call = func.call;
+                        const call_expr = if (desugared_func.* == .call) ce: {
+                            const call = desugared_func.call;
                             var new_args: std.ArrayList(*const ast.Expr) = .empty;
                             try new_args.append(self.allocator, err_ref);
                             for (call.args) |arg| {
@@ -364,7 +447,7 @@ pub const Desugarer = struct {
                             try self.create(ast.Expr, .{
                                 .call = .{
                                     .meta = ep.meta,
-                                    .callee = func,
+                                    .callee = desugared_func,
                                     .args = try self.allocSlice(*const ast.Expr, &.{err_ref}),
                                 },
                             });
@@ -378,12 +461,24 @@ pub const Desugarer = struct {
                         });
                         break :blk .{ .block = clauses };
                     },
-                    .block => ep.handler,
+                    .block => |clauses| blk: {
+                        var new_clauses: std.ArrayList(ast.CaseClause) = .empty;
+                        for (clauses) |clause| {
+                            try new_clauses.append(self.allocator, .{
+                                .meta = clause.meta,
+                                .pattern = clause.pattern,
+                                .type_annotation = clause.type_annotation,
+                                .guard = if (clause.guard) |guard| try self.desugarExpr(guard) else null,
+                                .body = try self.desugarBlock(clause.body),
+                            });
+                        }
+                        break :blk .{ .block = try new_clauses.toOwnedSlice(self.allocator) };
+                    },
                 };
                 return try self.create(ast.Expr, .{
                     .error_pipe = .{
                         .meta = ep.meta,
-                        .chain = ep.chain,
+                        .chain = chain,
                         .handler = handler,
                     },
                 });
@@ -972,7 +1067,6 @@ pub const Desugarer = struct {
         return self.desugarForEnumerable(fe);
     }
 
-
     /// Desugar for comprehension via the Enumerable protocol. Generates
     /// a recursive helper that scrutinises `Enumerable.next(state)` and
     /// branches on the `{:done, _, _}` / `{:cont, val, next_state}`
@@ -1301,4 +1395,73 @@ test "for outside macro body is still lifted into __for_N helper" {
         }
     }
     try std.testing.expect(found_helper);
+}
+
+test "struct-level expressions synthesize public run function during desugar" {
+    const source =
+        \\pub struct Test {
+        \\  marker()
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var desugarer = Desugarer.init(alloc, parser.interner, null);
+    const desugared = try desugarer.desugarProgram(&program);
+
+    const run_name = parser.interner.lookupExisting("run").?;
+    const string_name = parser.interner.lookupExisting("String").?;
+    var found_run = false;
+    for (desugared.structs[0].items) |item| {
+        if (item == .function and item.function.name == run_name) {
+            found_run = true;
+            try std.testing.expectEqual(ast.FunctionDecl.Visibility.public, item.function.visibility);
+            try std.testing.expectEqual(@as(usize, 1), item.function.clauses.len);
+            const clause = item.function.clauses[0];
+            try std.testing.expectEqual(@as(usize, 0), clause.params.len);
+            try std.testing.expect(clause.return_type.?.* == .name);
+            try std.testing.expectEqual(string_name, clause.return_type.?.name.name);
+            try std.testing.expectEqual(@as(usize, 1), clause.body.?.len);
+            try std.testing.expect(clause.body.?[0].expr.* == .call);
+        }
+    }
+    try std.testing.expect(found_run);
+}
+
+test "struct-level expressions do not duplicate existing run function" {
+    const source =
+        \\pub struct Test {
+        \\  marker()
+        \\
+        \\  pub fn run() -> String {
+        \\    "existing"
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var desugarer = Desugarer.init(alloc, parser.interner, null);
+    const desugared = try desugarer.desugarProgram(&program);
+
+    const run_name = parser.interner.lookupExisting("run").?;
+    var run_count: usize = 0;
+    for (desugared.structs[0].items) |item| {
+        if (item == .function and item.function.name == run_name) {
+            run_count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), run_count);
 }

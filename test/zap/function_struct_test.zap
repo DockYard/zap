@@ -1,4 +1,4 @@
-pub struct Test.FunctionStructTest {
+pub struct Zap.FunctionStructTest {
   use Zest.Case
 
   describe("Function struct") {

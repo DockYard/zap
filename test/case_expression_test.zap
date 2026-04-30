@@ -1,4 +1,4 @@
-pub struct Test.CaseExpressionTest {
+pub struct CaseExpressionTest {
   use Zest.Case
 
   describe("case expressions") {

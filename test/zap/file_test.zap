@@ -1,4 +1,4 @@
-pub struct Test.FileTest {
+pub struct Zap.FileTest {
   use Zest.Case
 
   describe("File struct") {

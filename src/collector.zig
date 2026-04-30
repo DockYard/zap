@@ -457,7 +457,7 @@ pub const Collector = struct {
                 }
                 const msg = try std.fmt.allocPrint(
                     self.allocator,
-                    "unknown capability `:{s}` — expected one of :pure, :read_file, :read_env, :reflect_module",
+                    "unknown capability `:{s}` — expected one of :pure, :read_file, :read_env, :reflect_module, :reflect_source",
                     .{name},
                 );
                 try self.errors.append(self.allocator, .{ .message = msg, .span = atom.meta.span });
@@ -482,7 +482,7 @@ pub const Collector = struct {
                     } else {
                         const msg = try std.fmt.allocPrint(
                             self.allocator,
-                            "unknown capability `:{s}` — expected one of :pure, :read_file, :read_env, :reflect_module",
+                            "unknown capability `:{s}` — expected one of :pure, :read_file, :read_env, :reflect_module, :reflect_source",
                             .{name},
                         );
                         try self.errors.append(self.allocator, .{ .message = msg, .span = atom.meta.span });
@@ -942,6 +942,9 @@ pub const Collector = struct {
                 },
                 .import_decl => |id_decl| {
                     try self.collectImport(id_decl, parent_scope);
+                },
+                .attribute => |attr| {
+                    if (attr.value) |value| try self.collectExprScopes(value, parent_scope);
                 },
                 .function_decl, .macro_decl => {},
             }

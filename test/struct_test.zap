@@ -21,7 +21,7 @@ pub struct Rectangle extends Shape {
 
 
 
-pub struct Test.StructTest {
+pub struct StructTest {
   use Zest.Case
 
   describe("Struct creation") {
@@ -182,11 +182,6 @@ pub struct Test.StructTest {
 
   fn make_rectangle(num_sides :: i64, rect_width :: i64, rect_height :: i64) -> Rectangle {
     %Rectangle{sides: num_sides, width: rect_width, height: rect_height}
-  }
-
-  fn get_x_from_inline() -> i64 {
-    point = %Point{x: 42, y: 99}
-    point.x
   }
 
   fn get_x_from_inline() -> i64 {

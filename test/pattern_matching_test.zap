@@ -1,4 +1,4 @@
-pub struct Test.PatternMatchingTest {
+pub struct PatternMatchingTest {
   use Zest.Case
 
   describe("pattern matching") {

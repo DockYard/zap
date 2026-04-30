@@ -6,7 +6,8 @@ pub struct Zap.Builder {
           name: "zap_test",
           version: "0.1.0",
           kind: :bin,
-          root: "Test.TestRunner.main/1",
+          root: "TestRunner.main/1",
+          paths: ["test/**/*_test.zap"],
           deps: [{:zap_stdlib, {:path, "lib"}}]
         }
       :doc ->

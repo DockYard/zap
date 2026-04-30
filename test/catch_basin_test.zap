@@ -1,4 +1,4 @@
-pub struct Test.CatchBasinTest {
+pub struct CatchBasinTest {
   use Zest.Case
 
   describe("catch basins") {

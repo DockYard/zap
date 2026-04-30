@@ -1,4 +1,4 @@
-pub struct Test.ArithmeticTest {
+pub struct Zap.ArithmeticTest {
   use Zest.Case
 
   describe("arithmetic") {

@@ -13,6 +13,8 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const ctfe = @import("ctfe.zig");
 const ast_data = @import("ast_data.zig");
+const scope = @import("scope.zig");
+const ir = @import("ir.zig");
 const CtValue = ctfe.CtValue;
 const AllocationStore = ctfe.AllocationStore;
 const Allocator = std.mem.Allocator;
@@ -38,6 +40,10 @@ pub const Env = struct {
     store: *AllocationStore,
     bindings: std.StringHashMap(CtValue),
     module_ctx: ?ModuleContext = null,
+    /// IR program containing Zap functions compiled before the
+    /// current macro expansion. Qualified Zap function calls are
+    /// executed through this program when available.
+    compiled_program: ?*const ir.Program = null,
     /// Recursion depth for comptime function dispatch. Bumped each
     /// time `dispatchComptimeCall` recurses into another function.
     /// Limits runaway evaluation of recursive functions.
@@ -104,7 +110,14 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
             };
         }
 
-        if (form != .atom) return value;
+        if (form != .atom) {
+            if (args == .list) {
+                if (try dispatchQualifiedComptimeCall(env, form, args.list.elems)) |result| {
+                    return result;
+                }
+            }
+            return value;
+        }
         const form_name = form.atom;
 
         // quote: return the body as AST data, eagerly substituting
@@ -396,6 +409,25 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
                 }
             }
 
+            // __zap_map_get__(map, key, default) — fetch a compile-time
+            // map entry by key, returning the caller-provided default
+            // when the value is absent or the first argument is not a map.
+            if (std.mem.eql(u8, form_name, "__zap_map_get__")) {
+                if (arg_elems.len == 3) {
+                    const map_value = try eval(env, arg_elems[0]);
+                    const lookup_key = unwrapAstLiteral(try eval(env, arg_elems[1]));
+                    const default_value = try eval(env, arg_elems[2]);
+                    if (map_value == .map) {
+                        for (map_value.map.entries) |entry| {
+                            if (ctMapKeyEql(entry.key, lookup_key)) {
+                                return entry.value;
+                            }
+                        }
+                    }
+                    return default_value;
+                }
+            }
+
             // tuple(a, b, c) — construct a tuple
             if (std.mem.eql(u8, form_name, "tuple")) {
                 var elems = try env.alloc.alloc(CtValue, arg_elems.len);
@@ -424,6 +456,12 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
             }
             if (std.mem.eql(u8, form_name, "__zap_module_register_attr__")) {
                 return moduleIntrinsicRegister(env, arg_elems);
+            }
+            if (std.mem.eql(u8, form_name, "__zap_source_graph_structs__")) {
+                return sourceGraphStructsIntrinsic(env, arg_elems);
+            }
+            if (std.mem.eql(u8, form_name, "__zap_struct_functions__")) {
+                return structFunctionsIntrinsic(env, arg_elems);
             }
 
             // For-comprehension at comptime: iterate a list/string,
@@ -531,7 +569,6 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
                     return value_raw;
                 }
             }
-
         }
 
         // Binary operators (checked AFTER built-in functions)
@@ -1025,7 +1062,7 @@ fn isFunctionBodyComptimeSafe(body: []const ast.Stmt) bool {
             // Function/macro/import declarations inside another fn
             // body aren't comptime-callable through dispatch (the
             // caller would have to evaluate the whole construct).
-            .function_decl, .macro_decl, .import_decl => return false,
+            .function_decl, .macro_decl, .import_decl, .attribute => return false,
         }
     }
     return true;
@@ -1034,8 +1071,7 @@ fn isFunctionBodyComptimeSafe(body: []const ast.Stmt) bool {
 fn isExprComptimeSafe(expr: *const ast.Expr) bool {
     return switch (expr.*) {
         // Literals — always safe
-        .int_literal, .float_literal, .string_literal, .bool_literal,
-        .atom_literal, .nil_literal => true,
+        .int_literal, .float_literal, .string_literal, .bool_literal, .atom_literal, .nil_literal => true,
         // Variable references resolve through env.bindings
         .var_ref => true,
         // Compound shapes — all children must be safe
@@ -1161,6 +1197,245 @@ fn isCallComptimeSafe(call: anytype) bool {
     return false;
 }
 
+fn dispatchQualifiedComptimeCall(
+    env: *Env,
+    form: CtValue,
+    arg_forms: []const CtValue,
+) MacroEvalError!?CtValue {
+    const ctx = env.module_ctx orelse return null;
+    if (env.dispatch_depth >= COMPTIME_DISPATCH_MAX_DEPTH) return null;
+
+    var segments: std.ArrayListUnmanaged([]const u8) = .empty;
+    if (!try collectQualifiedSegments(env, form, &segments)) return null;
+    if (segments.items.len < 2) return null;
+
+    if (std.mem.eql(u8, segments.items[0], "zig")) return null;
+
+    const function_name = segments.items[segments.items.len - 1];
+    const struct_scope = findStructScopeBySegments(ctx.graph, ctx.interner, segments.items[0 .. segments.items.len - 1]) orelse return null;
+    const name_id = ctx.interner.intern(function_name) catch return null;
+    const arity: u32 = @intCast(arg_forms.len);
+    const key = scope.FamilyKey{ .name = name_id, .arity = arity };
+    const struct_scope_value = ctx.graph.getScope(struct_scope);
+
+    if (struct_scope_value.function_families.get(key)) |family_id| {
+        const family = &ctx.graph.families.items[family_id];
+        if (family.visibility != .public and ctx.current_module_scope != struct_scope) return null;
+        if (try evalCompiledQualifiedFunction(env, segments.items, arg_forms)) |compiled_result| {
+            return compiled_result;
+        }
+        if (family.clauses.items.len == 0) return null;
+        const clause_ref = family.clauses.items[0];
+        return evalDispatchedClause(env, &clause_ref.decl.clauses[clause_ref.clause_index], arg_forms, struct_scope, false, ctfe.CapabilitySet.build, function_name);
+    }
+
+    if (struct_scope_value.macros.get(key)) |macro_id| {
+        const family = &ctx.graph.macro_families.items[macro_id];
+        if (!family.required_caps.isSubsetOf(env.current_macro_caps)) {
+            const caller_name = env.current_macro_name orelse "<top-level>";
+            env.last_capability_error = std.fmt.allocPrint(
+                env.alloc,
+                "macro `{s}` requires capabilities not held by caller `{s}` — calling macro `{s}` would escalate the caller's capability set",
+                .{ function_name, caller_name, function_name },
+            ) catch return MacroEvalError.EvalFailed;
+            return MacroEvalError.EvalFailed;
+        }
+        if (family.clauses.items.len == 0) return null;
+        const clause_ref = family.clauses.items[0];
+        const result = (try evalDispatchedClause(env, &clause_ref.decl.clauses[clause_ref.clause_index], arg_forms, struct_scope, true, family.required_caps, function_name)) orelse return null;
+        if (isCompileTimeIntrinsicExpansion(result)) {
+            return try eval(env, result);
+        }
+        return result;
+    }
+
+    return null;
+}
+
+fn evalCompiledQualifiedFunction(
+    env: *Env,
+    segments: []const []const u8,
+    arg_forms: []const CtValue,
+) MacroEvalError!?CtValue {
+    const program = env.compiled_program orelse return null;
+    if (segments.len < 2) return null;
+
+    const compiled_name = try compiledFunctionName(env.alloc, segments, arg_forms.len);
+    var interpreter = ctfe.Interpreter.init(env.alloc, program);
+    defer interpreter.deinit();
+    if (env.module_ctx) |ctx| {
+        interpreter.scope_graph = ctx.graph;
+        interpreter.interner = ctx.interner;
+    }
+    interpreter.capabilities = env.current_macro_caps;
+    interpreter.steps_remaining = interpreter.step_budget;
+    if (!interpreter.function_by_name.contains(compiled_name)) return null;
+
+    var arg_values = env.alloc.alloc(CtValue, arg_forms.len) catch return MacroEvalError.OutOfMemory;
+    defer env.alloc.free(arg_values);
+    for (arg_forms, 0..) |form, index| {
+        arg_values[index] = try eval(env, form);
+    }
+
+    return interpreter.evalByName(compiled_name, arg_values) catch |err| {
+        if (interpreter.errors.items.len > 0) {
+            env.last_capability_error = ctfe.formatCtfeError(env.alloc, interpreter.errors.items[0]) catch
+                std.fmt.allocPrint(env.alloc, "compiled Zap function CTFE failed: {s}", .{@errorName(err)}) catch
+                return MacroEvalError.EvalFailed;
+            return MacroEvalError.EvalFailed;
+        }
+        return null;
+    };
+}
+
+fn compiledFunctionName(
+    allocator: Allocator,
+    segments: []const []const u8,
+    arity: usize,
+) MacroEvalError![]const u8 {
+    var module_prefix: std.ArrayListUnmanaged(u8) = .empty;
+    for (segments[0 .. segments.len - 1], 0..) |segment, index| {
+        if (index > 0) try module_prefix.append(allocator, '_');
+        try module_prefix.appendSlice(allocator, segment);
+    }
+
+    const raw_function_name = segments[segments.len - 1];
+    const mangled_function_name = ir.mangleSymbolForZig(allocator, raw_function_name) catch
+        return MacroEvalError.OutOfMemory;
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}__{s}__{d}",
+        .{ module_prefix.items, mangled_function_name, arity },
+    ) catch return MacroEvalError.OutOfMemory;
+}
+
+fn isCompileTimeIntrinsicExpansion(value: CtValue) bool {
+    if (value != .tuple or value.tuple.elems.len != 3) return false;
+    const form = value.tuple.elems[0];
+    if (form != .atom) return false;
+    return std.mem.eql(u8, form.atom, "__zap_source_graph_structs__") or
+        std.mem.eql(u8, form.atom, "__zap_struct_functions__");
+}
+
+fn evalDispatchedClause(
+    env: *Env,
+    clause: *const ast.FunctionClause,
+    arg_forms: []const CtValue,
+    callee_scope: scope.ScopeId,
+    callee_is_macro: bool,
+    callee_caps: ctfe.CapabilitySet,
+    callee_name: []const u8,
+) MacroEvalError!?CtValue {
+    const ctx = env.module_ctx orelse return null;
+    const body = clause.body orelse return null;
+    if (!isFunctionBodyComptimeSafe(body)) return null;
+
+    var arg_cts = env.alloc.alloc(CtValue, arg_forms.len) catch return null;
+    defer env.alloc.free(arg_cts);
+    for (arg_forms, 0..) |form, index| {
+        arg_cts[index] = eval(env, form) catch return null;
+    }
+
+    var child_env = Env.init(env.alloc, env.store);
+    defer child_env.deinit();
+    child_env.module_ctx = .{
+        .graph = ctx.graph,
+        .interner = ctx.interner,
+        .current_module_scope = callee_scope,
+    };
+    child_env.compiled_program = env.compiled_program;
+    child_env.dispatch_depth = env.dispatch_depth + 1;
+    if (callee_is_macro) {
+        child_env.current_macro_caps = callee_caps;
+        child_env.current_macro_name = callee_name;
+    } else {
+        child_env.current_macro_caps = env.current_macro_caps;
+        child_env.current_macro_name = env.current_macro_name;
+    }
+
+    for (clause.params, 0..) |param, index| {
+        if (index >= arg_cts.len) break;
+        if (param.pattern.* == .bind) {
+            const param_name = ctx.interner.get(param.pattern.bind.name);
+            child_env.bind(param_name, arg_cts[index]) catch return null;
+        }
+    }
+
+    var result: CtValue = .nil;
+    for (body) |stmt| {
+        const stmt_ct = ast_data.stmtToCtValue(env.alloc, ctx.interner, env.store, stmt) catch return null;
+        result = eval(&child_env, stmt_ct) catch |err| {
+            if (child_env.last_capability_error) |message| {
+                env.last_capability_error = message;
+            }
+            return err;
+        };
+    }
+    return result;
+}
+
+fn collectQualifiedSegments(
+    env: *Env,
+    value: CtValue,
+    segments: *std.ArrayListUnmanaged([]const u8),
+) MacroEvalError!bool {
+    if (value == .tuple and value.tuple.elems.len == 3) {
+        const form = value.tuple.elems[0];
+        const args = value.tuple.elems[2];
+
+        if (form == .atom and std.mem.eql(u8, form.atom, ".")) {
+            if (args != .list or args.list.elems.len != 2) return false;
+            if (!try collectQualifiedSegments(env, args.list.elems[0], segments)) return false;
+            const field = args.list.elems[1];
+            if (field != .atom) return false;
+            try segments.append(env.alloc, stripAtomLiteralPrefix(field.atom));
+            return true;
+        }
+
+        if (form == .atom and std.mem.eql(u8, form.atom, "__aliases__")) {
+            if (args != .list) return false;
+            for (args.list.elems) |part| {
+                if (part != .atom) return false;
+                try segments.append(env.alloc, stripAtomLiteralPrefix(part.atom));
+            }
+            return true;
+        }
+
+        if (args == .nil and form == .atom and form.atom.len > 0 and form.atom[0] == ':') {
+            try segments.append(env.alloc, form.atom[1..]);
+            return true;
+        }
+    }
+
+    if (value == .atom) {
+        try segments.append(env.alloc, stripAtomLiteralPrefix(value.atom));
+        return true;
+    }
+
+    return false;
+}
+
+fn stripAtomLiteralPrefix(value: []const u8) []const u8 {
+    if (value.len > 0 and value[0] == ':') return value[1..];
+    return value;
+}
+
+fn findStructScopeBySegments(
+    graph: *const scope.ScopeGraph,
+    interner: *const ast.StringInterner,
+    segments: []const []const u8,
+) ?scope.ScopeId {
+    for (graph.structs.items) |struct_entry| {
+        if (struct_entry.name.parts.len != segments.len) continue;
+        for (struct_entry.name.parts, segments) |part_id, segment| {
+            if (!std.mem.eql(u8, interner.get(part_id), segment)) break;
+        } else {
+            return struct_entry.scope_id;
+        }
+    }
+    return null;
+}
+
 /// Maximum recursion depth for comptime function dispatch. Prevents
 /// runaway evaluation of recursive functions; mirrors the
 /// `max_expansions` limit on the macro engine itself. Counted across
@@ -1223,9 +1498,6 @@ fn dispatchComptimeCall(
             const cref = mfamily.clauses.items[0];
             break :blk &cref.decl.clauses[cref.clause_index];
         }
-        if (std.mem.startsWith(u8, form_name, "__describe_")) {
-            std.debug.print("[DISP-NOTFOUND] {s}/{d} scope={d}\n", .{ form_name, arity, scope_id });
-        }
         return null;
     };
 
@@ -1255,9 +1527,6 @@ fn dispatchComptimeCall(
     // caller falls through to "leave the call as AST data" which
     // surfaces at runtime where the impure call belongs.
     if (!isFunctionBodyComptimeSafe(body)) {
-        if (std.mem.startsWith(u8, form_name, "__describe_")) {
-            std.debug.print("[DISP-UNSAFE] {s}/{d}\n", .{ form_name, arity });
-        }
         return null;
     }
 
@@ -1276,6 +1545,7 @@ fn dispatchComptimeCall(
     var child_env = Env.init(env.alloc, env.store);
     defer child_env.deinit();
     child_env.module_ctx = env.module_ctx;
+    child_env.compiled_program = env.compiled_program;
     child_env.dispatch_depth = env.dispatch_depth + 1;
     // When dispatching into a macro body, narrow the child env's
     // capability set to the callee's declared caps so its impure-call
@@ -1516,6 +1786,12 @@ fn unwrapAstLiteral(val: CtValue) CtValue {
     };
 }
 
+fn ctMapKeyEql(left_raw: CtValue, right_raw: CtValue) bool {
+    const left = unwrapAstLiteral(left_raw);
+    const right = unwrapAstLiteral(right_raw);
+    return left.eql(right);
+}
+
 fn moduleIntrinsicGet(env: *Env, args: []const CtValue) MacroEvalError!CtValue {
     if (args.len != 1) return .nil;
     const name_val = try eval(env, args[0]);
@@ -1541,6 +1817,206 @@ fn moduleIntrinsicRegister(env: *Env, args: []const CtValue) MacroEvalError!CtVa
     const name_id = ctx.interner.intern(name_str) catch return .nil;
     ctx.graph.registerAccumulatingAttribute(mod_entry, name_id) catch return .nil;
     return .nil;
+}
+
+fn sourceGraphStructsIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtValue {
+    if (args.len != 1) return .nil;
+    if (!hasReflectionCapability(env)) {
+        env.last_capability_error = std.fmt.allocPrint(
+            env.alloc,
+            "macro `{s}` calls `__zap_source_graph_structs__` but does not declare `@requires = [:reflect_source]`",
+            .{env.current_macro_name orelse "<top-level>"},
+        ) catch return MacroEvalError.EvalFailed;
+        return MacroEvalError.EvalFailed;
+    }
+
+    const paths_raw = try eval(env, args[0]);
+    const paths = extractPathFilter(env, paths_raw) catch return .nil;
+    const ctx = env.module_ctx orelse return .nil;
+
+    var result_list: std.ArrayListUnmanaged(CtValue) = .empty;
+    for (ctx.graph.structs.items) |struct_entry| {
+        const source_id = struct_entry.decl.meta.span.source_id orelse continue;
+        const path = ctx.graph.sourcePathById(source_id) orelse continue;
+        if (!pathFilterContains(paths, path)) continue;
+        try result_list.append(env.alloc, try makeStructRef(env, ctx.interner, struct_entry, path, source_id));
+    }
+
+    const id = env.store.alloc(env.alloc, .list, null);
+    return CtValue{ .list = .{ .alloc_id = id, .elems = result_list.items } };
+}
+
+fn structFunctionsIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtValue {
+    if (args.len != 1) return .nil;
+    if (!hasReflectionCapability(env)) {
+        env.last_capability_error = std.fmt.allocPrint(
+            env.alloc,
+            "macro `{s}` calls `__zap_struct_functions__` but does not declare `@requires = [:reflect_source]`",
+            .{env.current_macro_name orelse "<top-level>"},
+        ) catch return MacroEvalError.EvalFailed;
+        return MacroEvalError.EvalFailed;
+    }
+
+    const ctx = env.module_ctx orelse return .nil;
+    const ref_value = try eval(env, args[0]);
+    const struct_name = (try extractStructRefName(env.alloc, ref_value)) orelse return .nil;
+    const struct_scope_id = findStructScopeByName(ctx.graph, ctx.interner, struct_name) orelse return .nil;
+    const struct_scope = ctx.graph.getScope(struct_scope_id);
+
+    var result_list: std.ArrayListUnmanaged(CtValue) = .empty;
+    var family_iter = struct_scope.function_families.iterator();
+    while (family_iter.next()) |entry| {
+        const family = &ctx.graph.families.items[entry.value_ptr.*];
+        if (family.visibility != .public) continue;
+        const name = ctx.interner.get(family.name);
+        try result_list.append(env.alloc, try makeFunctionRef(env, name, family.arity, family.visibility));
+    }
+
+    const id = env.store.alloc(env.alloc, .list, null);
+    return CtValue{ .list = .{ .alloc_id = id, .elems = result_list.items } };
+}
+
+fn hasReflectionCapability(env: *const Env) bool {
+    return env.current_macro_caps.has(.reflect_source) or env.current_macro_caps.has(.reflect_module);
+}
+
+fn extractPathFilter(env: *Env, value: CtValue) ![]const []const u8 {
+    const unwrapped = unwrapAstLiteral(value);
+    return switch (unwrapped) {
+        .string => |path| blk: {
+            const paths = try env.alloc.alloc([]const u8, 1);
+            paths[0] = path;
+            break :blk paths;
+        },
+        .atom => |path| blk: {
+            const paths = try env.alloc.alloc([]const u8, 1);
+            paths[0] = path;
+            break :blk paths;
+        },
+        .list => |list| blk: {
+            const paths = try env.alloc.alloc([]const u8, list.elems.len);
+            for (list.elems, 0..) |elem, i| {
+                const bare = unwrapAstLiteral(elem);
+                paths[i] = switch (bare) {
+                    .string => |path| path,
+                    .atom => |path| path,
+                    else => return error.InvalidPathFilter,
+                };
+            }
+            break :blk paths;
+        },
+        else => return error.InvalidPathFilter,
+    };
+}
+
+fn extractStructRefName(alloc: Allocator, value: CtValue) !?[]const u8 {
+    const unwrapped = unwrapAstLiteral(value);
+    return switch (unwrapped) {
+        .string => |name| name,
+        .atom => |name| name,
+        .tuple => |tuple| blk: {
+            if (tuple.elems.len != 3) break :blk null;
+            if (tuple.elems[0] != .atom or !std.mem.eql(u8, tuple.elems[0].atom, "__aliases__")) break :blk null;
+            if (tuple.elems[2] != .list) break :blk null;
+            var buffer: std.ArrayListUnmanaged(u8) = .empty;
+            for (tuple.elems[2].list.elems, 0..) |part, index| {
+                if (part != .atom) break :blk null;
+                if (index > 0) try buffer.append(alloc, '.');
+                try buffer.appendSlice(alloc, stripAtomLiteralPrefix(part.atom));
+            }
+            break :blk try buffer.toOwnedSlice(alloc);
+        },
+        .map => |map| blk: {
+            for (map.entries) |entry| {
+                const key = unwrapAstLiteral(entry.key);
+                if (key == .atom and std.mem.eql(u8, key.atom, "name")) {
+                    const val = unwrapAstLiteral(entry.value);
+                    if (val == .string) break :blk val.string;
+                    if (val == .atom) break :blk val.atom;
+                }
+            }
+            break :blk null;
+        },
+        else => null,
+    };
+}
+
+fn makeStructRef(
+    env: *Env,
+    interner: *ast.StringInterner,
+    struct_entry: scope.StructEntry,
+    path: []const u8,
+    source_id: u32,
+) !CtValue {
+    _ = path;
+    _ = source_id;
+
+    var parts: std.ArrayListUnmanaged(CtValue) = .empty;
+    for (struct_entry.name.parts) |part| {
+        try parts.append(env.alloc, .{ .atom = interner.get(part) });
+    }
+    return ast_data.makeTuple3(
+        env.alloc,
+        env.store,
+        .{ .atom = "__aliases__" },
+        try ast_data.emptyList(env.alloc, env.store),
+        try ast_data.makeListFromSlice(env.alloc, env.store, parts.items),
+    );
+}
+
+fn makeFunctionRef(
+    env: *Env,
+    name: []const u8,
+    arity: u32,
+    visibility: ast.FunctionDecl.Visibility,
+) !CtValue {
+    const entries = try env.alloc.alloc(CtValue.CtMapEntry, 3);
+    entries[0] = .{ .key = .{ .atom = "name" }, .value = .{ .string = name } };
+    entries[1] = .{ .key = .{ .atom = "arity" }, .value = .{ .int = @intCast(arity) } };
+    entries[2] = .{ .key = .{ .atom = "visibility" }, .value = .{ .atom = @tagName(visibility) } };
+    const id = env.store.alloc(env.alloc, .map, null);
+    return CtValue{ .map = .{ .alloc_id = id, .entries = entries } };
+}
+
+fn findStructScopeByName(graph: *const scope.ScopeGraph, interner: *const ast.StringInterner, name: []const u8) ?scope.ScopeId {
+    for (graph.structs.items) |struct_entry| {
+        if (structNameMatches(interner, struct_entry.name, name)) return struct_entry.scope_id;
+    }
+    return null;
+}
+
+fn structNameMatches(interner: *const ast.StringInterner, name: ast.StructName, target: []const u8) bool {
+    var index: usize = 0;
+    for (name.parts, 0..) |part, part_index| {
+        const part_name = interner.get(part);
+        if (index + part_name.len > target.len) return false;
+        if (!std.mem.eql(u8, target[index .. index + part_name.len], part_name)) return false;
+        index += part_name.len;
+        if (part_index + 1 < name.parts.len) {
+            if (index >= target.len or target[index] != '.') return false;
+            index += 1;
+        }
+    }
+    return index == target.len;
+}
+
+fn pathFilterContains(paths: []const []const u8, path: []const u8) bool {
+    for (paths) |candidate| {
+        if (sourcePathsEqual(candidate, path)) return true;
+    }
+    return false;
+}
+
+fn sourcePathsEqual(left: []const u8, right: []const u8) bool {
+    return std.mem.eql(u8, normalizeSourcePath(left), normalizeSourcePath(right));
+}
+
+fn normalizeSourcePath(path: []const u8) []const u8 {
+    var normalized = path;
+    while (std.mem.startsWith(u8, normalized, "./")) {
+        normalized = normalized[2..];
+    }
+    return normalized;
 }
 
 /// Extract an atom name from a CtValue, dropping the leading `:`
@@ -1744,3 +2220,38 @@ test "eval: __zap_list_empty__ distinguishes empty from non-empty" {
     try std.testing.expectEqual(false, r_n.bool_val);
 }
 
+test "eval: __zap_map_get__ returns matching value or default" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var store = AllocationStore{};
+    var env = Env.init(alloc, &store);
+    defer env.deinit();
+
+    const entries = try alloc.alloc(CtValue.CtMapEntry, 2);
+    entries[0] = .{ .key = .{ .atom = "name" }, .value = .{ .string = "run" } };
+    entries[1] = .{ .key = .{ .atom = "arity" }, .value = .{ .int = 0 } };
+    const map_value = CtValue{ .map = .{ .alloc_id = store.alloc(alloc, .map, null), .entries = entries } };
+
+    const name_key = try ast_data.makeTuple3(alloc, &store, .{ .atom = ":name" }, try ast_data.emptyList(alloc, &store), .nil);
+    const name_call = try ast_data.makeTuple3(alloc, &store, .{ .atom = "__zap_map_get__" }, try ast_data.emptyList(alloc, &store), try ast_data.makeList(alloc, &store, &.{ map_value, name_key, .{ .string = "" } }));
+    const name_result = try eval(&env, name_call);
+    try std.testing.expect(name_result == .string);
+    try std.testing.expectEqualStrings("run", name_result.string);
+
+    const missing_key = try ast_data.makeTuple3(alloc, &store, .{ .atom = ":missing" }, try ast_data.emptyList(alloc, &store), .nil);
+    const missing_call = try ast_data.makeTuple3(alloc, &store, .{ .atom = "__zap_map_get__" }, try ast_data.emptyList(alloc, &store), try ast_data.makeList(alloc, &store, &.{ map_value, missing_key, .{ .int = -1 } }));
+    const missing_result = try eval(&env, missing_call);
+    try std.testing.expect(missing_result == .int);
+    try std.testing.expectEqual(@as(i64, -1), missing_result.int);
+}
+
+test "source path filters treat leading dot slash as equivalent" {
+    const exact_paths = [_][]const u8{"test/zap/zest_runner_test.zap"};
+    try std.testing.expect(pathFilterContains(&exact_paths, "test/zap/zest_runner_test.zap"));
+    try std.testing.expect(pathFilterContains(&exact_paths, "./test/zap/zest_runner_test.zap"));
+
+    const dot_slash_paths = [_][]const u8{"./test/zap/zest_runner_test.zap"};
+    try std.testing.expect(pathFilterContains(&dot_slash_paths, "test/zap/zest_runner_test.zap"));
+    try std.testing.expect(!pathFilterContains(&exact_paths, "test/other_test.zap"));
+}

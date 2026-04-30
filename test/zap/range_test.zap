@@ -1,4 +1,4 @@
-pub struct Test.RangeTest {
+pub struct Zap.RangeTest {
   use Zest.Case
 
   describe("Range creation") {

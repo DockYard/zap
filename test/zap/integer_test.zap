@@ -1,4 +1,4 @@
-pub struct Test.IntegerTest {
+pub struct Zap.IntegerTest {
   use Zest.Case
 
   describe("Integer struct") {
