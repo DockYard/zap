@@ -2280,22 +2280,30 @@ pub const HirBuilder = struct {
         call_args: []const CallArg,
         raw_return: types_mod.TypeId,
     ) types_mod.TypeId {
-        // Find the function's parameter types
+        // Find the target module's scope, then resolve the family through
+        // the scope's `function_families` map. This goes through the
+        // public `resolveFamily` API which honours impl-registered
+        // function families — `registerImplFunctionsInTargetScopes`
+        // (`src/collector.zig:594`) installs impl-defined functions
+        // into their target scope's lookup map without rewriting the
+        // family's own `scope_id`. A linear `family.scope_id ==
+        // mod_entry.scope_id` filter would have missed them and
+        // returned `raw_return` (typevars un-substituted), leaving
+        // call sites with `Map(K_v, V_v)` propagated as `local_types`
+        // — masked downstream by monomorphize but still wrong.
         for (self.graph.structs.items) |mod_entry| {
             if (mod_entry.name.parts.len == 0) continue;
             const last_part = self.interner.get(mod_entry.name.parts[mod_entry.name.parts.len - 1]);
             if (!std.mem.eql(u8, last_part, mod_name)) continue;
-            for (self.graph.families.items) |family| {
-                if (family.scope_id != mod_entry.scope_id) continue;
-                if (family.arity != arity) continue;
-                if (!std.mem.eql(u8, self.interner.get(family.name), func_name)) continue;
-                if (family.clauses.items.len == 0) continue;
-                const first_clause = family.clauses.items[0];
-                if (first_clause.clause_index >= first_clause.decl.clauses.len) continue;
-                const clause = first_clause.decl.clauses[first_clause.clause_index];
-                if (clause.params.len != arity) continue;
-                return self.substituteReturnTypeFromArgs(&clause, call_args, raw_return);
-            }
+            const name_id = self.interner.lookupExisting(func_name) orelse continue;
+            const fam_id = self.graph.resolveFamily(mod_entry.scope_id, name_id, arity) orelse continue;
+            const family = self.graph.getFamily(fam_id);
+            if (family.clauses.items.len == 0) continue;
+            const first_clause = family.clauses.items[0];
+            if (first_clause.clause_index >= first_clause.decl.clauses.len) continue;
+            const clause = first_clause.decl.clauses[first_clause.clause_index];
+            if (clause.params.len != arity) continue;
+            return self.substituteReturnTypeFromArgs(&clause, call_args, raw_return);
         }
         return raw_return;
     }
