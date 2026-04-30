@@ -3486,9 +3486,42 @@ pub const TypeChecker = struct {
             },
             .unwrap => TypeStore.UNKNOWN,
             .pipe => |pipe| {
-                // Pipes are desugared before type checking, but we still need
-                // to walk into children so var_refs get marked as referenced
-                // (e.g., for unused binding detection in error_pipe chains).
+                // Most pipes are rewritten to plain calls during macro
+                // expansion, but pipes nested inside an `error_pipe` chain
+                // are intentionally preserved up to HIR build time so
+                // `flattenAstPipeChain` can identify each step. The type
+                // checker still has to reason about them: `lhs |> rhs` is
+                // semantically `f(lhs, args...)` when `rhs` is `f(args...)`.
+                //
+                // Treating the pipe as a synthetic call with the lhs
+                // prepended routes resolution through `inferCall`, which
+                // resolves the family at the correct arity (rhs.args.len + 1)
+                // instead of mis-reporting the rhs as a zero-arg call.
+                // For non-call rhs forms we fall back to walking children
+                // so var_refs are still marked as referenced.
+                if (pipe.rhs.* == .call) {
+                    const inner = pipe.rhs.call;
+                    var new_args = try self.allocator.alloc(*const ast.Expr, inner.args.len + 1);
+                    new_args[0] = pipe.lhs;
+                    for (inner.args, 0..) |arg, idx| new_args[idx + 1] = arg;
+                    const synthetic = ast.CallExpr{
+                        .meta = pipe.meta,
+                        .callee = inner.callee,
+                        .args = new_args,
+                    };
+                    return try self.inferCall(&synthetic);
+                }
+                if (pipe.rhs.* == .var_ref) {
+                    // Bare `lhs |> f` — equivalent to `f(lhs)`.
+                    const args = try self.allocator.alloc(*const ast.Expr, 1);
+                    args[0] = pipe.lhs;
+                    const synthetic = ast.CallExpr{
+                        .meta = pipe.meta,
+                        .callee = pipe.rhs,
+                        .args = args,
+                    };
+                    return try self.inferCall(&synthetic);
+                }
                 _ = try self.inferExpr(pipe.lhs);
                 _ = try self.inferExpr(pipe.rhs);
                 return TypeStore.UNKNOWN;
@@ -6711,4 +6744,166 @@ test "applyToType leaves primitives unchanged" {
     try std.testing.expectEqual(TypeStore.STRING, subs.applyToType(&store, TypeStore.STRING));
     try std.testing.expectEqual(TypeStore.BOOL, subs.applyToType(&store, TypeStore.BOOL));
     try std.testing.expectEqual(TypeStore.NIL, subs.applyToType(&store, TypeStore.NIL));
+}
+
+test "pipe inside error_pipe resolves rhs at the piped arity" {
+    // Regression test for the type-checker treating `lhs |> rhs` as a
+    // bare zero-argument call to `rhs`. Pipes are normally rewritten to
+    // calls during macro expansion, but pipes inside an `error_pipe`
+    // chain are intentionally preserved up to HIR build time so
+    // `flattenAstPipeChain` can identify each step. The type checker
+    // must therefore recognise that `lhs |> f()` has arity 1 (one piped
+    // argument) and resolve `f/1`, not `f/0`.
+    //
+    // This test skips macro expansion so the inner pipe stays raw —
+    // exactly the shape the type-checker sees inside an error_pipe
+    // chain — and asserts no `cannot find a function named parse/0`
+    // diagnostic fires.
+    const source =
+        \\pub struct Test {
+        \\  pub fn parse(s :: String) -> String {
+        \\    s
+        \\  }
+        \\
+        \\  pub fn run() -> String {
+        \\    "x"
+        \\    |> parse()
+        \\    ~> {
+        \\      val -> val
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    // Deliberately skip macro expansion: the parser produces an
+    // `error_pipe { chain = pipe { ... }, handler = ... }` shape and
+    // the macro engine treats `error_pipe` as a leaf, leaving the
+    // inner pipe intact even when expansion runs. Skipping macros
+    // keeps the test self-contained while reproducing the same AST
+    // the type checker sees in production.
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    for (checker.errors.items) |type_err| {
+        // No diagnostic should mention `parse/0` — the pipe must be
+        // resolved as `parse/1`.
+        try std.testing.expect(std.mem.indexOf(u8, type_err.message, "parse/0") == null);
+        try std.testing.expect(std.mem.indexOf(u8, type_err.message, "parse`/`0") == null);
+    }
+}
+
+test "bare pipe lhs |> f() resolves rhs at arity 1" {
+    // Companion to the error_pipe regression: when a raw pipe reaches
+    // the type checker (e.g. inside a context where the macro engine
+    // hasn't rewritten it), `lhs |> f()` must still be resolved as
+    // `f/1`, not `f/0`. We inject a raw pipe AST node directly into a
+    // function body so we exercise `inferExpr`'s `.pipe` branch
+    // without depending on the macro expansion order for any specific
+    // surface form.
+    const source =
+        \\pub struct Test {
+        \\  pub fn double(x :: i64) -> i64 {
+        \\    x + x
+        \\  }
+        \\
+        \\  pub fn run() -> i64 {
+        \\    double(1)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    var program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    // Replace `run`'s body with a raw pipe AST: `1 |> double()`.
+    // This is the post-parse, pre-macro shape — exactly what the
+    // type checker would see if the macro engine hadn't rewritten
+    // the pipe (which is what happens inside an error_pipe chain).
+    const test_struct = &program.structs[0];
+    const run_func = test_struct.items[1].function;
+    const meta = ast.NodeMeta{ .span = .{ .start = 0, .end = 0 } };
+
+    const lhs = try alloc.create(ast.Expr);
+    lhs.* = .{ .int_literal = .{ .meta = meta, .value = 1 } };
+
+    const callee = try alloc.create(ast.Expr);
+    callee.* = .{ .var_ref = .{ .meta = meta, .name = run_func.clauses[0].body.?[0].expr.call.callee.var_ref.name } };
+    // Reuse the `double` name from the existing call in the body.
+
+    const rhs = try alloc.create(ast.Expr);
+    rhs.* = .{ .call = .{ .meta = meta, .callee = callee, .args = &.{} } };
+
+    const pipe_expr = try alloc.create(ast.Expr);
+    pipe_expr.* = .{ .pipe = .{ .meta = meta, .lhs = lhs, .rhs = rhs } };
+
+    const new_body = try alloc.alloc(ast.Stmt, 1);
+    new_body[0] = .{ .expr = pipe_expr };
+
+    const new_clause = ast.FunctionClause{
+        .meta = run_func.clauses[0].meta,
+        .params = run_func.clauses[0].params,
+        .return_type = run_func.clauses[0].return_type,
+        .refinement = run_func.clauses[0].refinement,
+        .body = new_body,
+    };
+    const new_clauses = try alloc.alloc(ast.FunctionClause, 1);
+    new_clauses[0] = new_clause;
+
+    const new_func = try alloc.create(ast.FunctionDecl);
+    new_func.* = .{
+        .meta = run_func.meta,
+        .name = run_func.name,
+        .clauses = new_clauses,
+        .visibility = run_func.visibility,
+    };
+
+    const new_items = try alloc.alloc(ast.StructItem, test_struct.items.len);
+    @memcpy(new_items, test_struct.items);
+    new_items[1] = .{ .function = new_func };
+
+    const new_struct = ast.StructDecl{
+        .meta = test_struct.meta,
+        .name = test_struct.name,
+        .parent = test_struct.parent,
+        .items = new_items,
+        .fields = test_struct.fields,
+        .is_private = test_struct.is_private,
+    };
+    const new_structs = try alloc.alloc(ast.StructDecl, 1);
+    new_structs[0] = new_struct;
+
+    const new_program = ast.Program{
+        .structs = new_structs,
+        .top_items = program.top_items,
+    };
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&new_program);
+
+    for (checker.errors.items) |type_err| {
+        try std.testing.expect(std.mem.indexOf(u8, type_err.message, "double/0") == null);
+    }
 }
