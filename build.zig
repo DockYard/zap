@@ -277,6 +277,7 @@ pub fn build(b: *std.Build) void {
     });
     const run_zir_tests = b.addRunArtifact(zir_tests);
     run_zir_tests.setEnvironmentVariable("ZAP_BINARY", b.getInstallPath(.bin, "zap"));
+    run_zir_tests.step.dependOn(b.getInstallStep());
     const zir_test_step = b.step("zir-test", "Run ZIR integration tests");
     zir_test_step.dependOn(&run_zir_tests.step);
     zir_test_step.dependOn(b.getInstallStep());

@@ -56,6 +56,8 @@ Any Zig-compatible integer type. Signedness and size are encoded in the type nam
 | `i32` | 32 | Yes | Signed 32-bit |
 | `u64` | 64 | No | Unsigned 64-bit |
 | `i64` | 64 | Yes | Signed 64-bit |
+| `u128` | 128 | No | Unsigned 128-bit |
+| `i128` | 128 | Yes | Signed 128-bit |
 | `u1` | 1 | No | Single bit |
 | `u4` | 4 | No | Nibble |
 
@@ -68,6 +70,8 @@ Zig supports arbitrary bit-width integers, so `u3`, `u13`, `i24` etc. are all va
 | `f16` | 16 | Half precision |
 | `f32` | 32 | Single precision |
 | `f64` | 64 | Double precision |
+| `f80` | 80 | Extended precision |
+| `f128` | 128 | Quad precision |
 
 #### String Type
 

@@ -834,7 +834,7 @@ pub const Kernel = struct {
         } else if (T == bool) {
             return if (value) "true" else "false";
         } else if (info == .int or info == .comptime_int) {
-            var buf: [32]u8 = undefined;
+            var buf: [64]u8 = undefined;
             const slice = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return "?";
             const result = bumpAlloc(slice.len);
             if (result.len == 0) return "?";
@@ -1101,6 +1101,9 @@ pub const Kernel = struct {
     pub fn eq_i64(a: i64, b: i64) bool {
         return a == b;
     }
+    pub fn eq_i128(a: i128, b: i128) bool {
+        return a == b;
+    }
     pub fn eq_u8(a: u8, b: u8) bool {
         return a == b;
     }
@@ -1113,6 +1116,9 @@ pub const Kernel = struct {
     pub fn eq_u64(a: u64, b: u64) bool {
         return a == b;
     }
+    pub fn eq_u128(a: u128, b: u128) bool {
+        return a == b;
+    }
     pub fn eq_f16(a: f16, b: f16) bool {
         return a == b;
     }
@@ -1120,6 +1126,12 @@ pub const Kernel = struct {
         return a == b;
     }
     pub fn eq_f64(a: f64, b: f64) bool {
+        return a == b;
+    }
+    pub fn eq_f80(a: f80, b: f80) bool {
+        return a == b;
+    }
+    pub fn eq_f128(a: f128, b: f128) bool {
         return a == b;
     }
 
@@ -1135,6 +1147,9 @@ pub const Kernel = struct {
     pub fn neq_i64(a: i64, b: i64) bool {
         return a != b;
     }
+    pub fn neq_i128(a: i128, b: i128) bool {
+        return a != b;
+    }
     pub fn neq_u8(a: u8, b: u8) bool {
         return a != b;
     }
@@ -1147,6 +1162,9 @@ pub const Kernel = struct {
     pub fn neq_u64(a: u64, b: u64) bool {
         return a != b;
     }
+    pub fn neq_u128(a: u128, b: u128) bool {
+        return a != b;
+    }
     pub fn neq_f16(a: f16, b: f16) bool {
         return a != b;
     }
@@ -1154,6 +1172,12 @@ pub const Kernel = struct {
         return a != b;
     }
     pub fn neq_f64(a: f64, b: f64) bool {
+        return a != b;
+    }
+    pub fn neq_f80(a: f80, b: f80) bool {
+        return a != b;
+    }
+    pub fn neq_f128(a: f128, b: f128) bool {
         return a != b;
     }
 
@@ -1169,6 +1193,9 @@ pub const Kernel = struct {
     pub fn lt_i64(a: i64, b: i64) bool {
         return a < b;
     }
+    pub fn lt_i128(a: i128, b: i128) bool {
+        return a < b;
+    }
     pub fn lt_u8(a: u8, b: u8) bool {
         return a < b;
     }
@@ -1181,6 +1208,9 @@ pub const Kernel = struct {
     pub fn lt_u64(a: u64, b: u64) bool {
         return a < b;
     }
+    pub fn lt_u128(a: u128, b: u128) bool {
+        return a < b;
+    }
     pub fn lt_f16(a: f16, b: f16) bool {
         return a < b;
     }
@@ -1188,6 +1218,12 @@ pub const Kernel = struct {
         return a < b;
     }
     pub fn lt_f64(a: f64, b: f64) bool {
+        return a < b;
+    }
+    pub fn lt_f80(a: f80, b: f80) bool {
+        return a < b;
+    }
+    pub fn lt_f128(a: f128, b: f128) bool {
         return a < b;
     }
 
@@ -1203,6 +1239,9 @@ pub const Kernel = struct {
     pub fn gt_i64(a: i64, b: i64) bool {
         return a > b;
     }
+    pub fn gt_i128(a: i128, b: i128) bool {
+        return a > b;
+    }
     pub fn gt_u8(a: u8, b: u8) bool {
         return a > b;
     }
@@ -1215,6 +1254,9 @@ pub const Kernel = struct {
     pub fn gt_u64(a: u64, b: u64) bool {
         return a > b;
     }
+    pub fn gt_u128(a: u128, b: u128) bool {
+        return a > b;
+    }
     pub fn gt_f16(a: f16, b: f16) bool {
         return a > b;
     }
@@ -1222,6 +1264,12 @@ pub const Kernel = struct {
         return a > b;
     }
     pub fn gt_f64(a: f64, b: f64) bool {
+        return a > b;
+    }
+    pub fn gt_f80(a: f80, b: f80) bool {
+        return a > b;
+    }
+    pub fn gt_f128(a: f128, b: f128) bool {
         return a > b;
     }
 
@@ -1237,6 +1285,9 @@ pub const Kernel = struct {
     pub fn lte_i64(a: i64, b: i64) bool {
         return a <= b;
     }
+    pub fn lte_i128(a: i128, b: i128) bool {
+        return a <= b;
+    }
     pub fn lte_u8(a: u8, b: u8) bool {
         return a <= b;
     }
@@ -1249,6 +1300,9 @@ pub const Kernel = struct {
     pub fn lte_u64(a: u64, b: u64) bool {
         return a <= b;
     }
+    pub fn lte_u128(a: u128, b: u128) bool {
+        return a <= b;
+    }
     pub fn lte_f16(a: f16, b: f16) bool {
         return a <= b;
     }
@@ -1256,6 +1310,12 @@ pub const Kernel = struct {
         return a <= b;
     }
     pub fn lte_f64(a: f64, b: f64) bool {
+        return a <= b;
+    }
+    pub fn lte_f80(a: f80, b: f80) bool {
+        return a <= b;
+    }
+    pub fn lte_f128(a: f128, b: f128) bool {
         return a <= b;
     }
 
@@ -1271,6 +1331,9 @@ pub const Kernel = struct {
     pub fn gte_i64(a: i64, b: i64) bool {
         return a >= b;
     }
+    pub fn gte_i128(a: i128, b: i128) bool {
+        return a >= b;
+    }
     pub fn gte_u8(a: u8, b: u8) bool {
         return a >= b;
     }
@@ -1283,6 +1346,9 @@ pub const Kernel = struct {
     pub fn gte_u64(a: u64, b: u64) bool {
         return a >= b;
     }
+    pub fn gte_u128(a: u128, b: u128) bool {
+        return a >= b;
+    }
     pub fn gte_f16(a: f16, b: f16) bool {
         return a >= b;
     }
@@ -1290,6 +1356,12 @@ pub const Kernel = struct {
         return a >= b;
     }
     pub fn gte_f64(a: f64, b: f64) bool {
+        return a >= b;
+    }
+    pub fn gte_f80(a: f80, b: f80) bool {
+        return a >= b;
+    }
+    pub fn gte_f128(a: f128, b: f128) bool {
         return a >= b;
     }
 
@@ -1305,6 +1377,9 @@ pub const Kernel = struct {
     pub fn add_i64(a: i64, b: i64) i64 {
         return a +% b;
     }
+    pub fn add_i128(a: i128, b: i128) i128 {
+        return a +% b;
+    }
     pub fn add_u8(a: u8, b: u8) u8 {
         return a +% b;
     }
@@ -1317,6 +1392,9 @@ pub const Kernel = struct {
     pub fn add_u64(a: u64, b: u64) u64 {
         return a +% b;
     }
+    pub fn add_u128(a: u128, b: u128) u128 {
+        return a +% b;
+    }
     pub fn add_f16(a: f16, b: f16) f16 {
         return a + b;
     }
@@ -1324,6 +1402,12 @@ pub const Kernel = struct {
         return a + b;
     }
     pub fn add_f64(a: f64, b: f64) f64 {
+        return a + b;
+    }
+    pub fn add_f80(a: f80, b: f80) f80 {
+        return a + b;
+    }
+    pub fn add_f128(a: f128, b: f128) f128 {
         return a + b;
     }
 
@@ -1339,6 +1423,9 @@ pub const Kernel = struct {
     pub fn sub_i64(a: i64, b: i64) i64 {
         return a -% b;
     }
+    pub fn sub_i128(a: i128, b: i128) i128 {
+        return a -% b;
+    }
     pub fn sub_u8(a: u8, b: u8) u8 {
         return a -% b;
     }
@@ -1351,6 +1438,9 @@ pub const Kernel = struct {
     pub fn sub_u64(a: u64, b: u64) u64 {
         return a -% b;
     }
+    pub fn sub_u128(a: u128, b: u128) u128 {
+        return a -% b;
+    }
     pub fn sub_f16(a: f16, b: f16) f16 {
         return a - b;
     }
@@ -1358,6 +1448,12 @@ pub const Kernel = struct {
         return a - b;
     }
     pub fn sub_f64(a: f64, b: f64) f64 {
+        return a - b;
+    }
+    pub fn sub_f80(a: f80, b: f80) f80 {
+        return a - b;
+    }
+    pub fn sub_f128(a: f128, b: f128) f128 {
         return a - b;
     }
 
@@ -1373,6 +1469,9 @@ pub const Kernel = struct {
     pub fn mul_i64(a: i64, b: i64) i64 {
         return a *% b;
     }
+    pub fn mul_i128(a: i128, b: i128) i128 {
+        return a *% b;
+    }
     pub fn mul_u8(a: u8, b: u8) u8 {
         return a *% b;
     }
@@ -1385,6 +1484,9 @@ pub const Kernel = struct {
     pub fn mul_u64(a: u64, b: u64) u64 {
         return a *% b;
     }
+    pub fn mul_u128(a: u128, b: u128) u128 {
+        return a *% b;
+    }
     pub fn mul_f16(a: f16, b: f16) f16 {
         return a * b;
     }
@@ -1392,6 +1494,12 @@ pub const Kernel = struct {
         return a * b;
     }
     pub fn mul_f64(a: f64, b: f64) f64 {
+        return a * b;
+    }
+    pub fn mul_f80(a: f80, b: f80) f80 {
+        return a * b;
+    }
+    pub fn mul_f128(a: f128, b: f128) f128 {
         return a * b;
     }
 
@@ -1407,6 +1515,9 @@ pub const Kernel = struct {
     pub fn divide_i64(a: i64, b: i64) i64 {
         return @divTrunc(a, b);
     }
+    pub fn divide_i128(a: i128, b: i128) i128 {
+        return @divTrunc(a, b);
+    }
     pub fn divide_u8(a: u8, b: u8) u8 {
         return @divTrunc(a, b);
     }
@@ -1419,6 +1530,9 @@ pub const Kernel = struct {
     pub fn divide_u64(a: u64, b: u64) u64 {
         return @divTrunc(a, b);
     }
+    pub fn divide_u128(a: u128, b: u128) u128 {
+        return @divTrunc(a, b);
+    }
     pub fn divide_f16(a: f16, b: f16) f16 {
         return a / b;
     }
@@ -1426,6 +1540,12 @@ pub const Kernel = struct {
         return a / b;
     }
     pub fn divide_f64(a: f64, b: f64) f64 {
+        return a / b;
+    }
+    pub fn divide_f80(a: f80, b: f80) f80 {
+        return a / b;
+    }
+    pub fn divide_f128(a: f128, b: f128) f128 {
         return a / b;
     }
 
@@ -1441,6 +1561,9 @@ pub const Kernel = struct {
     pub fn remainder_i64(a: i64, b: i64) i64 {
         return @rem(a, b);
     }
+    pub fn remainder_i128(a: i128, b: i128) i128 {
+        return @rem(a, b);
+    }
     pub fn remainder_u8(a: u8, b: u8) u8 {
         return @rem(a, b);
     }
@@ -1453,6 +1576,9 @@ pub const Kernel = struct {
     pub fn remainder_u64(a: u64, b: u64) u64 {
         return @rem(a, b);
     }
+    pub fn remainder_u128(a: u128, b: u128) u128 {
+        return @rem(a, b);
+    }
     pub fn remainder_f16(a: f16, b: f16) f16 {
         return @rem(a, b);
     }
@@ -1460,6 +1586,12 @@ pub const Kernel = struct {
         return @rem(a, b);
     }
     pub fn remainder_f64(a: f64, b: f64) f64 {
+        return @rem(a, b);
+    }
+    pub fn remainder_f80(a: f80, b: f80) f80 {
+        return @rem(a, b);
+    }
+    pub fn remainder_f128(a: f128, b: f128) f128 {
         return @rem(a, b);
     }
 
@@ -3496,8 +3628,8 @@ pub const MapHelpers = struct {
 // ============================================================
 
 pub const Integer = struct {
-    fn formatSignedDecimal(value: i64) []const u8 {
-        var buf: [64]u8 = undefined;
+    fn formatSignedDecimal(value: i128) []const u8 {
+        var buf: [128]u8 = undefined;
         const slice = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return "?";
         const result = bumpAlloc(slice.len);
         if (result.len == 0) return "?";
@@ -3505,8 +3637,8 @@ pub const Integer = struct {
         return result;
     }
 
-    fn formatUnsignedDecimal(value: u64) []const u8 {
-        var buf: [64]u8 = undefined;
+    fn formatUnsignedDecimal(value: u128) []const u8 {
+        var buf: [128]u8 = undefined;
         const slice = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return "?";
         const result = bumpAlloc(slice.len);
         if (result.len == 0) return "?";
@@ -3514,7 +3646,7 @@ pub const Integer = struct {
         return result;
     }
 
-    fn digitCountUnsigned(value: u64) i64 {
+    fn digitCountUnsigned(value: u128) i64 {
         var remaining = value;
         var count: i64 = 1;
         while (remaining >= 10) {
@@ -3542,6 +3674,11 @@ pub const Integer = struct {
     fn absMagnitudeI64(value: i64) u64 {
         if (value >= 0) return @intCast(value);
         return @as(u64, @intCast(-(value + 1))) + 1;
+    }
+
+    fn absMagnitudeI128(value: i128) u128 {
+        if (value >= 0) return @intCast(value);
+        return @as(u128, @intCast(-(value + 1))) + 1;
     }
 
     /// Parse a string into i64, returning 0 on failure (non-optional).
@@ -4777,6 +4914,286 @@ pub const Integer = struct {
         if (divisor == 0) return 0;
         return @divTrunc(value, divisor) *% other;
     }
+
+    pub fn to_string_i128(value: i128) []const u8 {
+        return formatSignedDecimal(value);
+    }
+
+    pub fn to_string_u128(value: u128) []const u8 {
+        return formatUnsignedDecimal(value);
+    }
+
+    pub fn abs_i128(value: i128) i128 {
+        return if (value < 0) 0 -% value else value;
+    }
+
+    pub fn abs_u128(value: u128) u128 {
+        return value;
+    }
+
+    pub fn max_i128(value: i128, other: i128) i128 {
+        return @max(value, other);
+    }
+
+    pub fn max_u128(value: u128, other: u128) u128 {
+        return @max(value, other);
+    }
+
+    pub fn min_i128(value: i128, other: i128) i128 {
+        return @min(value, other);
+    }
+
+    pub fn min_u128(value: u128, other: u128) u128 {
+        return @min(value, other);
+    }
+
+    pub fn div_i128(value: i128, divisor: i128) i128 {
+        if (divisor == 0) return 0;
+        return @divTrunc(value, divisor);
+    }
+
+    pub fn div_u128(value: u128, divisor: u128) u128 {
+        if (divisor == 0) return 0;
+        return @divTrunc(value, divisor);
+    }
+
+    pub fn rem_i128(value: i128, divisor: i128) i128 {
+        if (divisor == 0) return 0;
+        return @rem(value, divisor);
+    }
+
+    pub fn rem_u128(value: u128, divisor: u128) u128 {
+        if (divisor == 0) return 0;
+        return @rem(value, divisor);
+    }
+
+    pub fn pow_i128(base: i128, exponent: i128) i128 {
+        var result: i128 = 1;
+        var remaining = exponent;
+        while (remaining > 0) : (remaining -= 1) result *%= base;
+        return result;
+    }
+
+    pub fn pow_u128(base: u128, exponent: u128) u128 {
+        var result: u128 = 1;
+        var remaining = exponent;
+        while (remaining > 0) : (remaining -= 1) result *%= base;
+        return result;
+    }
+
+    pub fn clamp_i128(value: i128, lower: i128, upper: i128) i128 {
+        return min_i128(max_i128(value, lower), upper);
+    }
+
+    pub fn clamp_u128(value: u128, lower: u128, upper: u128) u128 {
+        return min_u128(max_u128(value, lower), upper);
+    }
+
+    pub fn digits_i128(value: i128) i64 {
+        return digitCountUnsigned(absMagnitudeI128(value));
+    }
+
+    pub fn digits_u128(value: u128) i64 {
+        return digitCountUnsigned(value);
+    }
+
+    pub fn count_digits_i128(value: i128) i64 {
+        return digitCountUnsigned(absMagnitudeI128(value));
+    }
+
+    pub fn count_digits_u128(value: u128) i64 {
+        return digitCountUnsigned(value);
+    }
+
+    pub fn to_f64_i128(value: i128) f64 {
+        return @floatFromInt(value);
+    }
+
+    pub fn to_f64_u128(value: u128) f64 {
+        return @floatFromInt(value);
+    }
+
+    pub fn clz_i128(value: i128) i64 {
+        return @intCast(@clz(value));
+    }
+
+    pub fn clz_u128(value: u128) i64 {
+        return @intCast(@clz(value));
+    }
+
+    pub fn ctz_i128(value: i128) i64 {
+        return @intCast(@ctz(value));
+    }
+
+    pub fn ctz_u128(value: u128) i64 {
+        return @intCast(@ctz(value));
+    }
+
+    pub fn popcount_i128(value: i128) i64 {
+        return @intCast(@popCount(value));
+    }
+
+    pub fn popcount_u128(value: u128) i64 {
+        return @intCast(@popCount(value));
+    }
+
+    pub fn byte_swap_i128(value: i128) i128 {
+        return @byteSwap(value);
+    }
+
+    pub fn byte_swap_u128(value: u128) u128 {
+        return @byteSwap(value);
+    }
+
+    pub fn bit_reverse_i128(value: i128) i128 {
+        return @bitReverse(value);
+    }
+
+    pub fn bit_reverse_u128(value: u128) u128 {
+        return @bitReverse(value);
+    }
+
+    pub fn add_sat_i128(value: i128, other: i128) i128 {
+        return value +| other;
+    }
+
+    pub fn add_sat_u128(value: u128, other: u128) u128 {
+        return value +| other;
+    }
+
+    pub fn sub_sat_i128(value: i128, other: i128) i128 {
+        return value -| other;
+    }
+
+    pub fn sub_sat_u128(value: u128, other: u128) u128 {
+        return value -| other;
+    }
+
+    pub fn mul_sat_i128(value: i128, other: i128) i128 {
+        return value *| other;
+    }
+
+    pub fn mul_sat_u128(value: u128, other: u128) u128 {
+        return value *| other;
+    }
+
+    pub fn band_i128(value: i128, other: i128) i128 {
+        return value & other;
+    }
+
+    pub fn band_u128(value: u128, other: u128) u128 {
+        return value & other;
+    }
+
+    pub fn bor_i128(value: i128, other: i128) i128 {
+        return value | other;
+    }
+
+    pub fn bor_u128(value: u128, other: u128) u128 {
+        return value | other;
+    }
+
+    pub fn bxor_i128(value: i128, other: i128) i128 {
+        return value ^ other;
+    }
+
+    pub fn bxor_u128(value: u128, other: u128) u128 {
+        return value ^ other;
+    }
+
+    pub fn bnot_i128(value: i128) i128 {
+        return ~value;
+    }
+
+    pub fn bnot_u128(value: u128) u128 {
+        return ~value;
+    }
+
+    pub fn bsl_i128(value: i128, amount: i128) i128 {
+        if (amount < 0 or amount >= 128) return 0;
+        const shift: u7 = @intCast(amount);
+        return value << shift;
+    }
+
+    pub fn bsl_u128(value: u128, amount: u128) u128 {
+        if (amount >= 128) return 0;
+        const shift: u7 = @intCast(amount);
+        return value << shift;
+    }
+
+    pub fn bsr_i128(value: i128, amount: i128) i128 {
+        if (amount < 0 or amount >= 128) return if (value < 0) -1 else 0;
+        const shift: u7 = @intCast(amount);
+        return value >> shift;
+    }
+
+    pub fn bsr_u128(value: u128, amount: u128) u128 {
+        if (amount >= 128) return 0;
+        const shift: u7 = @intCast(amount);
+        return value >> shift;
+    }
+
+    pub fn sign_i128(value: i128) i128 {
+        if (value > 0) return 1;
+        if (value < 0) return -1;
+        return 0;
+    }
+
+    pub fn sign_u128(value: u128) u128 {
+        return if (value > 0) 1 else 0;
+    }
+
+    pub fn is_even_i128(value: i128) bool {
+        return @rem(value, 2) == 0;
+    }
+
+    pub fn is_even_u128(value: u128) bool {
+        return @rem(value, 2) == 0;
+    }
+
+    pub fn is_odd_i128(value: i128) bool {
+        return @rem(value, 2) != 0;
+    }
+
+    pub fn is_odd_u128(value: u128) bool {
+        return @rem(value, 2) != 0;
+    }
+
+    pub fn gcd_i128(value: i128, other: i128) i128 {
+        var x = abs_i128(value);
+        var y = abs_i128(other);
+        while (y != 0) {
+            const next = @rem(x, y);
+            x = y;
+            y = next;
+        }
+        return x;
+    }
+
+    pub fn gcd_u128(value: u128, other: u128) u128 {
+        var x = value;
+        var y = other;
+        while (y != 0) {
+            const next = @rem(x, y);
+            x = y;
+            y = next;
+        }
+        return x;
+    }
+
+    pub fn lcm_i128(value: i128, other: i128) i128 {
+        if (value == 0 and other == 0) return 0;
+        const divisor = gcd_i128(value, other);
+        if (divisor == 0) return 0;
+        return @divTrunc(abs_i128(value), divisor) *% abs_i128(other);
+    }
+
+    pub fn lcm_u128(value: u128, other: u128) u128 {
+        if (value == 0 and other == 0) return 0;
+        const divisor = gcd_u128(value, other);
+        if (divisor == 0) return 0;
+        return @divTrunc(value, divisor) *% other;
+    }
 };
 
 pub const Float = struct {
@@ -4960,6 +5377,96 @@ pub const Float = struct {
     pub fn to_i64_f64(value: f64) i64 {
         return @intFromFloat(@trunc(value));
     }
+
+    pub fn to_string_f80(value: f80) []const u8 {
+        var buf: [128]u8 = undefined;
+        const slice = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return "?";
+        const result = bumpAlloc(slice.len);
+        if (result.len == 0) return "?";
+        @memcpy(result, slice);
+        return result;
+    }
+
+    pub fn to_string_f128(value: f128) []const u8 {
+        var buf: [128]u8 = undefined;
+        const slice = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return "?";
+        const result = bumpAlloc(slice.len);
+        if (result.len == 0) return "?";
+        @memcpy(result, slice);
+        return result;
+    }
+
+    pub fn abs_f80(value: f80) f80 {
+        return @abs(value);
+    }
+
+    pub fn abs_f128(value: f128) f128 {
+        return @abs(value);
+    }
+
+    pub fn max_f80(value: f80, other: f80) f80 {
+        return @max(value, other);
+    }
+
+    pub fn max_f128(value: f128, other: f128) f128 {
+        return @max(value, other);
+    }
+
+    pub fn min_f80(value: f80, other: f80) f80 {
+        return @min(value, other);
+    }
+
+    pub fn min_f128(value: f128, other: f128) f128 {
+        return @min(value, other);
+    }
+
+    pub fn round_f80(value: f80) f80 {
+        return @round(value);
+    }
+
+    pub fn round_f128(value: f128) f128 {
+        return @round(value);
+    }
+
+    pub fn floor_f80(value: f80) f80 {
+        return @floor(value);
+    }
+
+    pub fn floor_f128(value: f128) f128 {
+        return @floor(value);
+    }
+
+    pub fn ceil_f80(value: f80) f80 {
+        return @ceil(value);
+    }
+
+    pub fn ceil_f128(value: f128) f128 {
+        return @ceil(value);
+    }
+
+    pub fn trunc_f80(value: f80) f80 {
+        return @trunc(value);
+    }
+
+    pub fn trunc_f128(value: f128) f128 {
+        return @trunc(value);
+    }
+
+    pub fn clamp_f80(value: f80, lower: f80, upper: f80) f80 {
+        return min_f80(max_f80(value, lower), upper);
+    }
+
+    pub fn clamp_f128(value: f128, lower: f128, upper: f128) f128 {
+        return min_f128(max_f128(value, lower), upper);
+    }
+
+    pub fn to_i64_f80(value: f80) i64 {
+        return @intFromFloat(@trunc(value));
+    }
+
+    pub fn to_i64_f128(value: f128) i64 {
+        return @intFromFloat(@trunc(value));
+    }
 };
 
 pub const Math = struct {
@@ -5002,19 +5509,79 @@ pub const Math = struct {
     /// Floors a float and converts directly to an integer in one
     /// step — more efficient than `Float.to_i64(Float.floor(x))`.
     pub fn floor_to_i64(x: f64) i64 {
-        return @floor(x);
+        return floor_to_i64_f64(x);
+    }
+
+    pub fn floor_to_i64_f16(x: f16) i64 {
+        return @intFromFloat(@floor(x));
+    }
+
+    pub fn floor_to_i64_f32(x: f32) i64 {
+        return @intFromFloat(@floor(x));
+    }
+
+    pub fn floor_to_i64_f64(x: f64) i64 {
+        return @intFromFloat(@floor(x));
+    }
+
+    pub fn floor_to_i64_f80(x: f80) i64 {
+        return @intFromFloat(@floor(x));
+    }
+
+    pub fn floor_to_i64_f128(x: f128) i64 {
+        return @intFromFloat(@floor(x));
     }
 
     /// Ceils a float and converts directly to an integer in one
     /// step — more efficient than `Float.to_i64(Float.ceil(x))`.
     pub fn ceil_to_i64(x: f64) i64 {
-        return @ceil(x);
+        return ceil_to_i64_f64(x);
+    }
+
+    pub fn ceil_to_i64_f16(x: f16) i64 {
+        return @intFromFloat(@ceil(x));
+    }
+
+    pub fn ceil_to_i64_f32(x: f32) i64 {
+        return @intFromFloat(@ceil(x));
+    }
+
+    pub fn ceil_to_i64_f64(x: f64) i64 {
+        return @intFromFloat(@ceil(x));
+    }
+
+    pub fn ceil_to_i64_f80(x: f80) i64 {
+        return @intFromFloat(@ceil(x));
+    }
+
+    pub fn ceil_to_i64_f128(x: f128) i64 {
+        return @intFromFloat(@ceil(x));
     }
 
     /// Rounds a float and converts directly to an integer in one
     /// step — more efficient than `Float.to_i64(Float.round(x))`.
     pub fn round_to_i64(x: f64) i64 {
-        return @round(x);
+        return round_to_i64_f64(x);
+    }
+
+    pub fn round_to_i64_f16(x: f16) i64 {
+        return @intFromFloat(@round(x));
+    }
+
+    pub fn round_to_i64_f32(x: f32) i64 {
+        return @intFromFloat(@round(x));
+    }
+
+    pub fn round_to_i64_f64(x: f64) i64 {
+        return @intFromFloat(@round(x));
+    }
+
+    pub fn round_to_i64_f80(x: f80) i64 {
+        return @intFromFloat(@round(x));
+    }
+
+    pub fn round_to_i64_f128(x: f128) i64 {
+        return @intFromFloat(@round(x));
     }
 };
 

@@ -8,7 +8,7 @@
 pub fn is_integer?(value :: any) -> Bool
 ```
 
-Returns true if the value is an integer type (i8, i16, i32, i64, u8, u16, u32, u64).
+Returns true if the value is an integer type (i8, i16, i32, i64, i128, u8, u16, u32, u64, u128).
 
 [Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/kernel.zap#L269)
 
@@ -20,7 +20,7 @@ Returns true if the value is an integer type (i8, i16, i32, i64, u8, u16, u32, u
 pub fn is_float?(value :: any) -> Bool
 ```
 
-Returns true if the value is a float type (f16, f32, f64).
+Returns true if the value is a float type (f16, f32, f64, f80, f128).
 
 [Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/kernel.zap#L277)
 

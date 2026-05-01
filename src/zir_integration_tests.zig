@@ -1810,6 +1810,157 @@ test "ZIR: Float overloads preserve exact float width" {
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
 
+test "ZIR: 128-bit integers and extended floats resolve and widen within family" {
+    var result = try compileAndRun(
+        \\pub struct TestProg {
+        \\  pub fn classify(value :: i128) -> String {
+        \\    "i128"
+        \\  }
+        \\
+        \\  pub fn classify(value :: u128) -> String {
+        \\    "u128"
+        \\  }
+        \\
+        \\  pub fn classify(value :: f80) -> String {
+        \\    "f80"
+        \\  }
+        \\
+        \\  pub fn classify(value :: f128) -> String {
+        \\    "f128"
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    IO.puts(classify(1 :: i64))
+        \\    IO.puts(classify(1 :: u64))
+        \\    IO.puts(classify(1.5 :: f64))
+        \\    IO.puts(classify(2.5 :: f128))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("i128\nu128\nf80\nf128\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: Integer supports i128 and u128 helper overloads" {
+    var result = try compileAndRun(
+        \\pub struct TestProg {
+        \\  pub fn accept(value :: i128) -> String {
+        \\    "i128"
+        \\  }
+        \\
+        \\  pub fn accept(value :: u128) -> String {
+        \\    "u128"
+        \\  }
+        \\
+        \\  pub fn accept_string(value :: String) -> String {
+        \\    "String"
+        \\  }
+        \\
+        \\  pub fn accept_float(value :: f64) -> String {
+        \\    "f64"
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    IO.puts(accept((1 :: i128) + (2 :: i128)))
+        \\    IO.puts(accept((5 :: i128) - (2 :: i128)))
+        \\    IO.puts(accept((2 :: u128) * (3 :: u128)))
+        \\    IO.puts(accept(Integer.max(3 :: u128, 2 :: u128)))
+        \\    IO.puts(Integer.to_string((9 :: i128) / (2 :: i128)))
+        \\    IO.puts(Integer.to_string((9 :: u128) rem (4 :: u128)))
+        \\    IO.puts(Integer.to_string(Integer.abs(-7 :: i128)))
+        \\    IO.puts(Integer.to_string(Integer.min(3 :: i128, 2 :: i128)))
+        \\    IO.puts(Integer.to_string(Integer.clamp(9 :: u128, 2 :: u128, 7 :: u128)))
+        \\    IO.puts(Integer.to_string(Integer.pow(2 :: u128, 4 :: u128)))
+        \\    IO.puts(accept_string(Integer.to_string(5 :: u128)))
+        \\    IO.puts(Integer.to_string(Integer.digits(-12345 :: i128)))
+        \\    IO.puts(Integer.to_string(Integer.count_digits(12345 :: u128)))
+        \\    IO.puts(accept_float(Integer.to_float(42 :: u128)))
+        \\    IO.puts(Integer.to_string(Integer.count_leading_zeros(1 :: u128)))
+        \\    IO.puts(Integer.to_string(Integer.count_trailing_zeros(8 :: i128)))
+        \\    IO.puts(Integer.to_string(Integer.popcount(7 :: u128)))
+        \\    IO.puts(accept(Integer.byte_swap(1 :: i128)))
+        \\    IO.puts(accept(Integer.bit_reverse(1 :: u128)))
+        \\    IO.puts(Integer.to_string(Integer.add_sat(1 :: i128, 2 :: i128)))
+        \\    IO.puts(Integer.to_string(Integer.sub_sat(0 :: u128, 1 :: u128)))
+        \\    IO.puts(Integer.to_string(Integer.mul_sat(2 :: i128, 3 :: i128)))
+        \\    IO.puts(Integer.to_string(Integer.band(6 :: u128, 3 :: u128)))
+        \\    IO.puts(Integer.to_string(Integer.bor(6 :: i128, 3 :: i128)))
+        \\    IO.puts(Integer.to_string(Integer.bxor(6 :: u128, 3 :: u128)))
+        \\    IO.puts(accept(Integer.bnot(0 :: i128)))
+        \\    IO.puts(Integer.to_string(Integer.bsl(1 :: u128, 3 :: u128)))
+        \\    IO.puts(Integer.to_string(Integer.bsl(1 :: u128, 100 :: u128)))
+        \\    IO.puts(Integer.to_string(Integer.bsr(8 :: i128, 3 :: i128)))
+        \\    IO.puts(Integer.to_string(Integer.sign(-7 :: i128)))
+        \\    IO.puts(Integer.to_string(Integer.sign(7 :: u128)))
+        \\    IO.puts(Bool.to_string(Integer.even?(8 :: u128)))
+        \\    IO.puts(Bool.to_string(Integer.odd?(7 :: i128)))
+        \\    IO.puts(Integer.to_string(Integer.gcd(48 :: i128, 18 :: i128)))
+        \\    IO.puts(Integer.to_string(Integer.lcm(4 :: u128, 6 :: u128)))
+        \\    IO.puts(Bool.to_string((1 :: i128) == (1 :: i128)))
+        \\    IO.puts(Bool.to_string((1 :: u128) < (2 :: u128)))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings(
+        "i128\ni128\nu128\nu128\n4\n1\n7\n2\n7\n16\nString\n5\n5\nf64\n127\n3\n3\ni128\nu128\n3\n0\n6\n2\n7\n5\ni128\n8\n1267650600228229401496703205376\n1\n-1\n1\ntrue\ntrue\n6\n12\ntrue\ntrue\n",
+        result.stdout,
+    );
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: Float supports f80 and f128 helper overloads" {
+    var result = try compileAndRun(
+        \\pub struct TestProg {
+        \\  pub fn accept(value :: f80) -> String {
+        \\    "f80"
+        \\  }
+        \\
+        \\  pub fn accept(value :: f128) -> String {
+        \\    "f128"
+        \\  }
+        \\
+        \\  pub fn accept_string(value :: String) -> String {
+        \\    "String"
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    IO.puts(accept(Float.abs(-1.5 :: f80)))
+        \\    IO.puts(accept(Float.max(1.0 :: f128, 2.0 :: f128)))
+        \\    IO.puts(accept(Float.min(3.0 :: f80, 2.0 :: f80)))
+        \\    IO.puts(accept(Float.round(1.5 :: f128)))
+        \\    IO.puts(accept(Float.floor(1.9 :: f80)))
+        \\    IO.puts(accept(Float.ceil(1.1 :: f128)))
+        \\    IO.puts(accept((1.5 :: f80) + (2.5 :: f80)))
+        \\    IO.puts(accept((5.0 :: f128) - (2.0 :: f128)))
+        \\    IO.puts(accept((2.0 :: f80) * (3.0 :: f80)))
+        \\    IO.puts(accept((6.0 :: f128) / (2.0 :: f128)))
+        \\    IO.puts(accept((5.5 :: f80) rem (2.0 :: f80)))
+        \\    IO.puts(accept(Float.clamp(5.0 :: f128, 1.0 :: f128, 3.0 :: f128)))
+        \\    IO.puts(accept(Float.truncate(3.75 :: f128)))
+        \\    IO.puts(Integer.to_string(Float.to_integer(3.75 :: f80)))
+        \\    IO.puts(Integer.to_string(Float.floor_to_integer(3.75 :: f128)))
+        \\    IO.puts(Integer.to_string(Float.ceil_to_integer(3.25 :: f80)))
+        \\    IO.puts(Integer.to_string(Float.round_to_integer(3.75 :: f128)))
+        \\    IO.puts(accept_string(Float.to_string(1.5 :: f80)))
+        \\    IO.puts(accept_string(Float.to_string(2.5 :: f128)))
+        \\    IO.puts(Bool.to_string((1.0 :: f80) < (2.0 :: f80)))
+        \\    IO.puts(Bool.to_string((2.0 :: f128) >= (2.0 :: f128)))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings(
+        "f80\nf128\nf80\nf128\nf80\nf128\nf80\nf128\nf80\nf128\nf80\nf128\nf128\n3\n3\n4\n4\nString\nString\ntrue\ntrue\n",
+        result.stdout,
+    );
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
 // ============================================================
 // For comprehensions
 // ============================================================

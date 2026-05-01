@@ -298,7 +298,7 @@ fn emitRuntimeNamespaceField(handle: *ZirBuilderHandle, parent: u32, comptime ns
 fn mapMainReturnType(zig_type: ir.ZigType) u32 {
     return switch (zig_type) {
         .void => 0,
-        .i8, .i16, .i32, .i64, .u8, .u16, .u32, .u64, .usize, .isize => @intFromEnum(Zir.Inst.Ref.u8_type),
+        .i8, .i16, .i32, .i64, .i128, .u8, .u16, .u32, .u64, .u128, .usize, .isize => @intFromEnum(Zir.Inst.Ref.u8_type),
         else => 0, // default to void
     };
 }
@@ -315,15 +315,19 @@ fn mapReturnType(zig_type: ir.ZigType) u32 {
         .i16 => @intFromEnum(Zir.Inst.Ref.i16_type),
         .i32 => @intFromEnum(Zir.Inst.Ref.i32_type),
         .i64 => @intFromEnum(Zir.Inst.Ref.i64_type),
+        .i128 => @intFromEnum(Zir.Inst.Ref.i128_type),
         .u8 => @intFromEnum(Zir.Inst.Ref.u8_type),
         .u16 => @intFromEnum(Zir.Inst.Ref.u16_type),
         .u32 => @intFromEnum(Zir.Inst.Ref.u32_type),
         .u64 => @intFromEnum(Zir.Inst.Ref.u64_type),
+        .u128 => @intFromEnum(Zir.Inst.Ref.u128_type),
         .usize => @intFromEnum(Zir.Inst.Ref.usize_type),
         .isize => @intFromEnum(Zir.Inst.Ref.isize_type),
         .f16 => @intFromEnum(Zir.Inst.Ref.f16_type),
         .f32 => @intFromEnum(Zir.Inst.Ref.f32_type),
         .f64 => @intFromEnum(Zir.Inst.Ref.f64_type),
+        .f80 => @intFromEnum(Zir.Inst.Ref.f80_type),
+        .f128 => @intFromEnum(Zir.Inst.Ref.f128_type),
         .string => @intFromEnum(Zir.Inst.Ref.slice_const_u8_type),
         .optional => |inner| if (inner.* == .string)
             @intFromEnum(Zir.Inst.Ref.slice_const_u8_type)
@@ -345,15 +349,19 @@ fn mapParamType(zig_type: ir.ZigType) u32 {
         .i16 => @intFromEnum(Zir.Inst.Ref.i16_type),
         .i32 => @intFromEnum(Zir.Inst.Ref.i32_type),
         .i64 => @intFromEnum(Zir.Inst.Ref.i64_type),
+        .i128 => @intFromEnum(Zir.Inst.Ref.i128_type),
         .u8 => @intFromEnum(Zir.Inst.Ref.u8_type),
         .u16 => @intFromEnum(Zir.Inst.Ref.u16_type),
         .u32 => @intFromEnum(Zir.Inst.Ref.u32_type),
         .u64 => @intFromEnum(Zir.Inst.Ref.u64_type),
+        .u128 => @intFromEnum(Zir.Inst.Ref.u128_type),
         .usize => @intFromEnum(Zir.Inst.Ref.usize_type),
         .isize => @intFromEnum(Zir.Inst.Ref.isize_type),
         .f16 => @intFromEnum(Zir.Inst.Ref.f16_type),
         .f32 => @intFromEnum(Zir.Inst.Ref.f32_type),
         .f64 => @intFromEnum(Zir.Inst.Ref.f64_type),
+        .f80 => @intFromEnum(Zir.Inst.Ref.f80_type),
+        .f128 => @intFromEnum(Zir.Inst.Ref.f128_type),
         .string => @intFromEnum(Zir.Inst.Ref.slice_const_u8_type),
         else => @intFromEnum(Zir.Inst.Ref.none), // anytype for unknown/struct types
     };
@@ -659,15 +667,19 @@ pub const ZirDriver = struct {
             .i16,
             .i32,
             .i64,
+            .i128,
             .u8,
             .u16,
             .u32,
             .u64,
+            .u128,
             .usize,
             .isize,
             .f16,
             .f32,
             .f64,
+            .f80,
+            .f128,
             .string,
             .atom,
             => unreachable,
@@ -1066,12 +1078,21 @@ pub const ZirDriver = struct {
     fn mapTypeNameToRef(_: *const ZirDriver, type_name: []const u8) u32 {
         if (std.mem.eql(u8, type_name, "[]const u8")) return @intFromEnum(Zir.Inst.Ref.slice_const_u8_type);
         if (std.mem.eql(u8, type_name, "bool")) return @intFromEnum(Zir.Inst.Ref.bool_type);
+        if (std.mem.eql(u8, type_name, "i128")) return @intFromEnum(Zir.Inst.Ref.i128_type);
         if (std.mem.eql(u8, type_name, "i64")) return @intFromEnum(Zir.Inst.Ref.i64_type);
         if (std.mem.eql(u8, type_name, "i32")) return @intFromEnum(Zir.Inst.Ref.i32_type);
-        if (std.mem.eql(u8, type_name, "u32")) return @intFromEnum(Zir.Inst.Ref.u32_type);
+        if (std.mem.eql(u8, type_name, "i16")) return @intFromEnum(Zir.Inst.Ref.i16_type);
+        if (std.mem.eql(u8, type_name, "i8")) return @intFromEnum(Zir.Inst.Ref.i8_type);
+        if (std.mem.eql(u8, type_name, "u128")) return @intFromEnum(Zir.Inst.Ref.u128_type);
         if (std.mem.eql(u8, type_name, "u64")) return @intFromEnum(Zir.Inst.Ref.u64_type);
+        if (std.mem.eql(u8, type_name, "u32")) return @intFromEnum(Zir.Inst.Ref.u32_type);
+        if (std.mem.eql(u8, type_name, "u16")) return @intFromEnum(Zir.Inst.Ref.u16_type);
+        if (std.mem.eql(u8, type_name, "u8")) return @intFromEnum(Zir.Inst.Ref.u8_type);
+        if (std.mem.eql(u8, type_name, "f128")) return @intFromEnum(Zir.Inst.Ref.f128_type);
+        if (std.mem.eql(u8, type_name, "f80")) return @intFromEnum(Zir.Inst.Ref.f80_type);
         if (std.mem.eql(u8, type_name, "f64")) return @intFromEnum(Zir.Inst.Ref.f64_type);
         if (std.mem.eql(u8, type_name, "f32")) return @intFromEnum(Zir.Inst.Ref.f32_type);
+        if (std.mem.eql(u8, type_name, "f16")) return @intFromEnum(Zir.Inst.Ref.f16_type);
         if (std.mem.eql(u8, type_name, "usize")) return @intFromEnum(Zir.Inst.Ref.usize_type);
         if (std.mem.eql(u8, type_name, "void")) return @intFromEnum(Zir.Inst.Ref.void_type);
         return 0; // void fallback
@@ -1610,15 +1631,19 @@ pub const ZirDriver = struct {
             .i16 => @intFromEnum(Zir.Inst.Ref.i16_type),
             .i32 => @intFromEnum(Zir.Inst.Ref.i32_type),
             .i64 => @intFromEnum(Zir.Inst.Ref.i64_type),
+            .i128 => @intFromEnum(Zir.Inst.Ref.i128_type),
             .u8 => @intFromEnum(Zir.Inst.Ref.u8_type),
             .u16 => @intFromEnum(Zir.Inst.Ref.u16_type),
             .u32 => @intFromEnum(Zir.Inst.Ref.u32_type),
             .u64 => @intFromEnum(Zir.Inst.Ref.u64_type),
+            .u128 => @intFromEnum(Zir.Inst.Ref.u128_type),
             .usize => @intFromEnum(Zir.Inst.Ref.usize_type),
             .isize => @intFromEnum(Zir.Inst.Ref.isize_type),
             .f16 => @intFromEnum(Zir.Inst.Ref.f16_type),
             .f32 => @intFromEnum(Zir.Inst.Ref.f32_type),
             .f64 => @intFromEnum(Zir.Inst.Ref.f64_type),
+            .f80 => @intFromEnum(Zir.Inst.Ref.f80_type),
+            .f128 => @intFromEnum(Zir.Inst.Ref.f128_type),
             .string => @intFromEnum(Zir.Inst.Ref.slice_const_u8_type),
             .atom => @intFromEnum(Zir.Inst.Ref.u32_type), // atoms are u32 at runtime
             else => null,
@@ -1786,16 +1811,18 @@ pub const ZirDriver = struct {
     fn emitZeroDefaultForType(self: *ZirDriver, zig_type: ir.ZigType) BuildError!u32 {
         return switch (zig_type) {
             .i64 => zir_builder_emit_int_typed(self.handle, 0, @intFromEnum(Zir.Inst.Ref.i64_type)),
+            .i128 => zir_builder_emit_int_typed(self.handle, 0, @intFromEnum(Zir.Inst.Ref.i128_type)),
             .i32 => zir_builder_emit_int_typed(self.handle, 0, @intFromEnum(Zir.Inst.Ref.i32_type)),
             .i16 => zir_builder_emit_int_typed(self.handle, 0, @intFromEnum(Zir.Inst.Ref.i16_type)),
             .i8 => zir_builder_emit_int_typed(self.handle, 0, @intFromEnum(Zir.Inst.Ref.i8_type)),
             .u64 => zir_builder_emit_int_typed(self.handle, 0, @intFromEnum(Zir.Inst.Ref.u64_type)),
+            .u128 => zir_builder_emit_int_typed(self.handle, 0, @intFromEnum(Zir.Inst.Ref.u128_type)),
             .u32 => zir_builder_emit_int_typed(self.handle, 0, @intFromEnum(Zir.Inst.Ref.u32_type)),
             .u16 => zir_builder_emit_int_typed(self.handle, 0, @intFromEnum(Zir.Inst.Ref.u16_type)),
             .u8 => zir_builder_emit_int_typed(self.handle, 0, @intFromEnum(Zir.Inst.Ref.u8_type)),
             .usize => zir_builder_emit_int_typed(self.handle, 0, @intFromEnum(Zir.Inst.Ref.usize_type)),
             .isize => zir_builder_emit_int_typed(self.handle, 0, @intFromEnum(Zir.Inst.Ref.isize_type)),
-            .f64, .f32, .f16 => zir_builder_emit_float(self.handle, 0.0),
+            .f64, .f32, .f16, .f80, .f128 => zir_builder_emit_float(self.handle, 0.0),
             .bool_type => @intFromEnum(Zir.Inst.Ref.bool_false),
             .string => zir_builder_emit_str(self.handle, "".ptr, 0),
             .atom => zir_builder_emit_int_typed(self.handle, 0, @intFromEnum(Zir.Inst.Ref.u32_type)),
@@ -2018,14 +2045,18 @@ pub const ZirDriver = struct {
     }
 
     fn encodedNameToTypeRef(name: []const u8) ?u32 {
+        if (std.mem.eql(u8, name, "i128")) return @intFromEnum(Zir.Inst.Ref.i128_type);
         if (std.mem.eql(u8, name, "i64")) return @intFromEnum(Zir.Inst.Ref.i64_type);
         if (std.mem.eql(u8, name, "i32")) return @intFromEnum(Zir.Inst.Ref.i32_type);
         if (std.mem.eql(u8, name, "i16")) return @intFromEnum(Zir.Inst.Ref.i16_type);
         if (std.mem.eql(u8, name, "i8")) return @intFromEnum(Zir.Inst.Ref.i8_type);
+        if (std.mem.eql(u8, name, "u128")) return @intFromEnum(Zir.Inst.Ref.u128_type);
         if (std.mem.eql(u8, name, "u64")) return @intFromEnum(Zir.Inst.Ref.u64_type);
         if (std.mem.eql(u8, name, "u32")) return @intFromEnum(Zir.Inst.Ref.u32_type);
         if (std.mem.eql(u8, name, "u16")) return @intFromEnum(Zir.Inst.Ref.u16_type);
         if (std.mem.eql(u8, name, "u8")) return @intFromEnum(Zir.Inst.Ref.u8_type);
+        if (std.mem.eql(u8, name, "f128")) return @intFromEnum(Zir.Inst.Ref.f128_type);
+        if (std.mem.eql(u8, name, "f80")) return @intFromEnum(Zir.Inst.Ref.f80_type);
         if (std.mem.eql(u8, name, "f64")) return @intFromEnum(Zir.Inst.Ref.f64_type);
         if (std.mem.eql(u8, name, "f32")) return @intFromEnum(Zir.Inst.Ref.f32_type);
         if (std.mem.eql(u8, name, "f16")) return @intFromEnum(Zir.Inst.Ref.f16_type);
@@ -2373,15 +2404,19 @@ pub const ZirDriver = struct {
             .i16,
             .i32,
             .i64,
+            .i128,
             .u8,
             .u16,
             .u32,
             .u64,
+            .u128,
             .usize,
             .isize,
             .f16,
             .f32,
             .f64,
+            .f80,
+            .f128,
             .string,
             .atom,
             => unreachable, // handled by mapReturnType
@@ -3073,7 +3108,10 @@ pub const ZirDriver = struct {
             .const_int => |ci| {
                 // Inside case blocks, emit typed i64 to avoid comptime_int
                 // depending on runtime control flow.
-                const ref = if (self.current_case_dest != null)
+                const type_hint_ref: u32 = if (ci.type_hint) |type_hint| mapReturnType(type_hint) else 0;
+                const ref = if (type_hint_ref != 0)
+                    zir_builder_emit_int_typed(self.handle, ci.value, type_hint_ref)
+                else if (self.current_case_dest != null)
                     zir_builder_emit_int_typed(self.handle, ci.value, @intFromEnum(Zir.Inst.Ref.i64_type))
                 else
                     zir_builder_emit_int(self.handle, ci.value);
@@ -3081,7 +3119,13 @@ pub const ZirDriver = struct {
                 try self.setLocal(ci.dest, ref);
             },
             .const_float => |cf| {
-                const ref = zir_builder_emit_float(self.handle, cf.value);
+                const raw_ref = zir_builder_emit_float(self.handle, cf.value);
+                if (raw_ref == error_ref) return error.EmitFailed;
+                const type_hint_ref: u32 = if (cf.type_hint) |type_hint| mapReturnType(type_hint) else 0;
+                const ref = if (type_hint_ref != 0)
+                    zir_builder_emit_as(self.handle, type_hint_ref, raw_ref)
+                else
+                    raw_ref;
                 if (ref == error_ref) return error.EmitFailed;
                 try self.setLocal(cf.dest, ref);
             },

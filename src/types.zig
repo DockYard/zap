@@ -207,6 +207,10 @@ pub const TypeStore = struct {
     pub const UNKNOWN: TypeId = 18;
     pub const ERROR: TypeId = 19;
     pub const TERM: TypeId = 20;
+    pub const I128: TypeId = 21;
+    pub const U128: TypeId = 22;
+    pub const F80: TypeId = 23;
+    pub const F128: TypeId = 24;
     pub const VOID: TypeId = NIL;
 
     pub fn init(allocator: std.mem.Allocator, interner: *const ast.StringInterner) TypeStore {
@@ -251,6 +255,10 @@ pub const TypeStore = struct {
         try self.types.append(self.allocator, .unknown); // 18
         try self.types.append(self.allocator, .error_type); // 19
         try self.types.append(self.allocator, .term_type); // 20
+        try self.types.append(self.allocator, .{ .int = .{ .signedness = .signed, .bits = 128 } }); // 21 - i128
+        try self.types.append(self.allocator, .{ .int = .{ .signedness = .unsigned, .bits = 128 } }); // 22 - u128
+        try self.types.append(self.allocator, .{ .float = .{ .bits = 80 } }); // 23 - f80
+        try self.types.append(self.allocator, .{ .float = .{ .bits = 128 } }); // 24 - f128
     }
 
     pub fn addType(self: *TypeStore, typ: Type) !TypeId {
@@ -341,14 +349,18 @@ pub const TypeStore = struct {
         if (std.mem.eql(u8, name, "Nil")) return NIL;
         if (std.mem.eql(u8, name, "Void")) return VOID;
         if (std.mem.eql(u8, name, "Never")) return NEVER;
+        if (std.mem.eql(u8, name, "i128")) return I128;
         if (std.mem.eql(u8, name, "i64")) return I64;
         if (std.mem.eql(u8, name, "i32")) return I32;
         if (std.mem.eql(u8, name, "i16")) return I16;
         if (std.mem.eql(u8, name, "i8")) return I8;
+        if (std.mem.eql(u8, name, "u128")) return U128;
         if (std.mem.eql(u8, name, "u64")) return U64;
         if (std.mem.eql(u8, name, "u32")) return U32;
         if (std.mem.eql(u8, name, "u16")) return U16;
         if (std.mem.eql(u8, name, "u8")) return U8;
+        if (std.mem.eql(u8, name, "f128")) return F128;
+        if (std.mem.eql(u8, name, "f80")) return F80;
         if (std.mem.eql(u8, name, "f64")) return F64;
         if (std.mem.eql(u8, name, "f32")) return F32;
         if (std.mem.eql(u8, name, "f16")) return F16;
@@ -488,9 +500,9 @@ pub const TypeStore = struct {
     /// Check if a value of type `from` can be implicitly widened to type `to`.
     /// Widening is a fallback after exact overload selection and never crosses
     /// numeric families:
-    ///   Signed integers: i8→i16→i32→i64
-    ///   Unsigned integers: u8→u16→u32→u64
-    ///   Floats: f16→f32→f64
+    ///   Signed integers: i8→i16→i32→i64→i128
+    ///   Unsigned integers: u8→u16→u32→u64→u128
+    ///   Floats: f16→f32→f64→f80→f128
     /// No signed↔unsigned or int↔float widening is implicit.
     pub fn canWidenTo(self: *const TypeStore, from: TypeId, to: TypeId) bool {
         return self.wideningCost(from, to) != null;
@@ -2383,14 +2395,18 @@ pub const TypeChecker = struct {
         if (type_id == TypeStore.ATOM) return "Atom";
         if (type_id == TypeStore.NIL) return "Nil";
         if (type_id == TypeStore.NEVER) return "Never";
+        if (type_id == TypeStore.I128) return "i128";
         if (type_id == TypeStore.I64) return "i64";
         if (type_id == TypeStore.I32) return "i32";
         if (type_id == TypeStore.I16) return "i16";
         if (type_id == TypeStore.I8) return "i8";
+        if (type_id == TypeStore.U128) return "u128";
         if (type_id == TypeStore.U64) return "u64";
         if (type_id == TypeStore.U32) return "u32";
         if (type_id == TypeStore.U16) return "u16";
         if (type_id == TypeStore.U8) return "u8";
+        if (type_id == TypeStore.F128) return "f128";
+        if (type_id == TypeStore.F80) return "f80";
         if (type_id == TypeStore.F64) return "f64";
         if (type_id == TypeStore.F32) return "f32";
         if (type_id == TypeStore.F16) return "f16";
@@ -4653,10 +4669,11 @@ pub const TypeChecker = struct {
                 var candidates: std.ArrayList([]const u8) = .empty;
                 // Collect builtin type names
                 const builtins = [_][]const u8{
-                    "Bool", "String", "Atom",  "Nil", "Never",
-                    "i64",  "i32",    "i16",   "i8",  "u64",
-                    "u32",  "u16",    "u8",    "f64", "f32",
-                    "f16",  "usize",  "isize",
+                    "Bool",  "String", "Atom", "Nil", "Never",
+                    "i128",  "i64",    "i32",  "i16", "i8",
+                    "u128",  "u64",    "u32",  "u16", "u8",
+                    "f128",  "f80",    "f64",  "f32", "f16",
+                    "usize", "isize",
                 };
                 for (&builtins) |b| {
                     candidates.append(self.allocator, b) catch {};
@@ -4686,11 +4703,16 @@ pub const TypeChecker = struct {
             .variable => |tv| {
                 // Check if this type variable name is a near-miss of a builtin type
                 const var_name = self.interner.get(tv.name);
+                if (self.store.resolveTypeName(var_name)) |tid| {
+                    return tid;
+                }
+
                 const builtins = [_][]const u8{
-                    "Bool", "String", "Atom",  "Nil", "Never",
-                    "i64",  "i32",    "i16",   "i8",  "u64",
-                    "u32",  "u16",    "u8",    "f64", "f32",
-                    "f16",  "usize",  "isize",
+                    "Bool",  "String", "Atom", "Nil", "Never",
+                    "i128",  "i64",    "i32",  "i16", "i8",
+                    "u128",  "u64",    "u32",  "u16", "u8",
+                    "f128",  "f80",    "f64",  "f32", "f16",
+                    "usize", "isize",
                 };
                 // Use slightly relaxed threshold for short type names (floating point edge cases)
                 if (similarity.findBestMatch(var_name, &builtins, similarity.SUGGESTION_THRESHOLD - 0.01)) |suggestion| {
@@ -4811,7 +4833,11 @@ test "type store builtin types" {
     try std.testing.expect(store.getType(TypeStore.BOOL) == .bool_type);
     try std.testing.expect(store.getType(TypeStore.STRING) == .string_type);
     try std.testing.expect(store.getType(TypeStore.I64) == .int);
+    try std.testing.expect(store.getType(TypeStore.I128) == .int);
+    try std.testing.expect(store.getType(TypeStore.U128) == .int);
     try std.testing.expect(store.getType(TypeStore.F64) == .float);
+    try std.testing.expect(store.getType(TypeStore.F80) == .float);
+    try std.testing.expect(store.getType(TypeStore.F128) == .float);
     try std.testing.expect(store.getType(TypeStore.NEVER) == .never);
 }
 
@@ -4822,6 +4848,10 @@ test "type store resolve builtin names" {
     defer store.deinit();
 
     try std.testing.expectEqual(TypeStore.I64, store.resolveTypeName("i64").?);
+    try std.testing.expectEqual(TypeStore.I128, store.resolveTypeName("i128").?);
+    try std.testing.expectEqual(TypeStore.U128, store.resolveTypeName("u128").?);
+    try std.testing.expectEqual(TypeStore.F80, store.resolveTypeName("f80").?);
+    try std.testing.expectEqual(TypeStore.F128, store.resolveTypeName("f128").?);
     try std.testing.expectEqual(TypeStore.BOOL, store.resolveTypeName("Bool").?);
     try std.testing.expectEqual(TypeStore.STRING, store.resolveTypeName("String").?);
     try std.testing.expect(store.resolveTypeName("Nonexistent") == null);
@@ -7804,6 +7834,10 @@ test "numeric call matching prefers exact type over widening" {
     try std.testing.expectEqual(@as(?u32, 33), store.callMatchCost(TypeStore.I32, TypeStore.I64));
     try std.testing.expectEqual(@as(?u32, 33), store.callMatchCost(TypeStore.U32, TypeStore.U64));
     try std.testing.expectEqual(@as(?u32, 33), store.callMatchCost(TypeStore.F32, TypeStore.F64));
+    try std.testing.expectEqual(@as(?u32, 65), store.callMatchCost(TypeStore.I64, TypeStore.I128));
+    try std.testing.expectEqual(@as(?u32, 65), store.callMatchCost(TypeStore.U64, TypeStore.U128));
+    try std.testing.expectEqual(@as(?u32, 17), store.callMatchCost(TypeStore.F64, TypeStore.F80));
+    try std.testing.expectEqual(@as(?u32, 49), store.callMatchCost(TypeStore.F80, TypeStore.F128));
 }
 
 test "numeric widening stays within signed unsigned and float families" {
@@ -7813,11 +7847,17 @@ test "numeric widening stays within signed unsigned and float families" {
     defer store.deinit();
 
     try std.testing.expect(store.canWidenTo(TypeStore.I8, TypeStore.I64));
+    try std.testing.expect(store.canWidenTo(TypeStore.I64, TypeStore.I128));
     try std.testing.expect(store.canWidenTo(TypeStore.U8, TypeStore.U64));
+    try std.testing.expect(store.canWidenTo(TypeStore.U64, TypeStore.U128));
     try std.testing.expect(store.canWidenTo(TypeStore.F16, TypeStore.F64));
+    try std.testing.expect(store.canWidenTo(TypeStore.F64, TypeStore.F80));
+    try std.testing.expect(store.canWidenTo(TypeStore.F80, TypeStore.F128));
 
     try std.testing.expect(!store.canWidenTo(TypeStore.U32, TypeStore.I64));
+    try std.testing.expect(!store.canWidenTo(TypeStore.U64, TypeStore.I128));
     try std.testing.expect(!store.canWidenTo(TypeStore.I32, TypeStore.U64));
+    try std.testing.expect(!store.canWidenTo(TypeStore.I64, TypeStore.U128));
     try std.testing.expect(!store.canWidenTo(TypeStore.I32, TypeStore.F64));
     try std.testing.expect(!store.canWidenTo(TypeStore.F32, TypeStore.I64));
 }

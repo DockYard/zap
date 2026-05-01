@@ -113,6 +113,8 @@
 <div class="signature"><code><span class="sig-name">to_string</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
 <div class="signature"><code><span class="sig-name">to_string</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
 <div class="signature"><code><span class="sig-name">to_string</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="signature"><code><span class="sig-name">to_string</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f80</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="signature"><code><span class="sig-name">to_string</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
 <div class="function-doc">
 <p>Converts a floating-point number to its string representation.</p>
 </div>
@@ -127,6 +129,8 @@
 <div class="signature"><code><span class="sig-name">abs</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f16</span></code></div>
 <div class="signature"><code><span class="sig-name">abs</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f32</span></code></div>
 <div class="signature"><code><span class="sig-name">abs</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">abs</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f80</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f80</span></code></div>
+<div class="signature"><code><span class="sig-name">abs</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f128</span></code></div>
 <div class="function-doc">
 <p>Returns the absolute value of a float.</p>
 </div>
@@ -141,6 +145,8 @@
 <div class="signature"><code><span class="sig-name">max</span><span class="sig-paren">(</span>first<span class="sig-separator">::</span><span class="sig-type-pill">f16</span><span class="sig-paren">, </span>second<span class="sig-separator">::</span><span class="sig-type-pill">f16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f16</span></code></div>
 <div class="signature"><code><span class="sig-name">max</span><span class="sig-paren">(</span>first<span class="sig-separator">::</span><span class="sig-type-pill">f32</span><span class="sig-paren">, </span>second<span class="sig-separator">::</span><span class="sig-type-pill">f32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f32</span></code></div>
 <div class="signature"><code><span class="sig-name">max</span><span class="sig-paren">(</span>first<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">, </span>second<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">max</span><span class="sig-paren">(</span>first<span class="sig-separator">::</span><span class="sig-type-pill">f80</span><span class="sig-paren">, </span>second<span class="sig-separator">::</span><span class="sig-type-pill">f80</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f80</span></code></div>
+<div class="signature"><code><span class="sig-name">max</span><span class="sig-paren">(</span>first<span class="sig-separator">::</span><span class="sig-type-pill">f128</span><span class="sig-paren">, </span>second<span class="sig-separator">::</span><span class="sig-type-pill">f128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f128</span></code></div>
 <div class="function-doc">
 <p>Returns the larger of two floats.</p>
 </div>
@@ -155,6 +161,8 @@
 <div class="signature"><code><span class="sig-name">min</span><span class="sig-paren">(</span>first<span class="sig-separator">::</span><span class="sig-type-pill">f16</span><span class="sig-paren">, </span>second<span class="sig-separator">::</span><span class="sig-type-pill">f16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f16</span></code></div>
 <div class="signature"><code><span class="sig-name">min</span><span class="sig-paren">(</span>first<span class="sig-separator">::</span><span class="sig-type-pill">f32</span><span class="sig-paren">, </span>second<span class="sig-separator">::</span><span class="sig-type-pill">f32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f32</span></code></div>
 <div class="signature"><code><span class="sig-name">min</span><span class="sig-paren">(</span>first<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">, </span>second<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">min</span><span class="sig-paren">(</span>first<span class="sig-separator">::</span><span class="sig-type-pill">f80</span><span class="sig-paren">, </span>second<span class="sig-separator">::</span><span class="sig-type-pill">f80</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f80</span></code></div>
+<div class="signature"><code><span class="sig-name">min</span><span class="sig-paren">(</span>first<span class="sig-separator">::</span><span class="sig-type-pill">f128</span><span class="sig-paren">, </span>second<span class="sig-separator">::</span><span class="sig-type-pill">f128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f128</span></code></div>
 <div class="function-doc">
 <p>Returns the smaller of two floats.</p>
 </div>
@@ -182,6 +190,8 @@ a valid float representation.</p>
 <div class="signature"><code><span class="sig-name">round</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f16</span></code></div>
 <div class="signature"><code><span class="sig-name">round</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f32</span></code></div>
 <div class="signature"><code><span class="sig-name">round</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">round</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f80</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f80</span></code></div>
+<div class="signature"><code><span class="sig-name">round</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f128</span></code></div>
 <div class="function-doc">
 <p>Rounds a float to the nearest integer value, returned as a float.</p>
 </div>
@@ -196,6 +206,8 @@ a valid float representation.</p>
 <div class="signature"><code><span class="sig-name">floor</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f16</span></code></div>
 <div class="signature"><code><span class="sig-name">floor</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f32</span></code></div>
 <div class="signature"><code><span class="sig-name">floor</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">floor</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f80</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f80</span></code></div>
+<div class="signature"><code><span class="sig-name">floor</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f128</span></code></div>
 <div class="function-doc">
 <p>Returns the largest integer value less than or equal to the given float.</p>
 </div>
@@ -210,6 +222,8 @@ a valid float representation.</p>
 <div class="signature"><code><span class="sig-name">ceil</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f16</span></code></div>
 <div class="signature"><code><span class="sig-name">ceil</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f32</span></code></div>
 <div class="signature"><code><span class="sig-name">ceil</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">ceil</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f80</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f80</span></code></div>
+<div class="signature"><code><span class="sig-name">ceil</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f128</span></code></div>
 <div class="function-doc">
 <p>Returns the smallest integer value greater than or equal to the given float.</p>
 </div>
@@ -224,6 +238,8 @@ a valid float representation.</p>
 <div class="signature"><code><span class="sig-name">truncate</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f16</span></code></div>
 <div class="signature"><code><span class="sig-name">truncate</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f32</span></code></div>
 <div class="signature"><code><span class="sig-name">truncate</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">truncate</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f80</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f80</span></code></div>
+<div class="signature"><code><span class="sig-name">truncate</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f128</span></code></div>
 <div class="function-doc">
 <p>Truncates a float toward zero, removing the fractional part.</p>
 </div>
@@ -238,6 +254,8 @@ a valid float representation.</p>
 <div class="signature"><code><span class="sig-name">to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
 <div class="signature"><code><span class="sig-name">to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
 <div class="signature"><code><span class="sig-name">to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="signature"><code><span class="sig-name">to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f80</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="signature"><code><span class="sig-name">to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
 <div class="function-doc">
 <p>Converts a float to an integer by truncating toward zero.</p>
 </div>
@@ -252,6 +270,8 @@ a valid float representation.</p>
 <div class="signature"><code><span class="sig-name">clamp</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f16</span><span class="sig-paren">, </span>lower<span class="sig-separator">::</span><span class="sig-type-pill">f16</span><span class="sig-paren">, </span>upper<span class="sig-separator">::</span><span class="sig-type-pill">f16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f16</span></code></div>
 <div class="signature"><code><span class="sig-name">clamp</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f32</span><span class="sig-paren">, </span>lower<span class="sig-separator">::</span><span class="sig-type-pill">f32</span><span class="sig-paren">, </span>upper<span class="sig-separator">::</span><span class="sig-type-pill">f32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f32</span></code></div>
 <div class="signature"><code><span class="sig-name">clamp</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">, </span>lower<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">, </span>upper<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">clamp</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f80</span><span class="sig-paren">, </span>lower<span class="sig-separator">::</span><span class="sig-type-pill">f80</span><span class="sig-paren">, </span>upper<span class="sig-separator">::</span><span class="sig-type-pill">f80</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f80</span></code></div>
+<div class="signature"><code><span class="sig-name">clamp</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f128</span><span class="sig-paren">, </span>lower<span class="sig-separator">::</span><span class="sig-type-pill">f128</span><span class="sig-paren">, </span>upper<span class="sig-separator">::</span><span class="sig-type-pill">f128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f128</span></code></div>
 <div class="function-doc">
 <p>Clamps a float to be within the given range.</p>
 </div>
@@ -263,7 +283,11 @@ a valid float representation.</p>
 <div style="flex:1"></div>
 <a href="#floor_to_integer-1" class="anchor-link">#</a>
 </div>
+<div class="signature"><code><span class="sig-name">floor_to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="signature"><code><span class="sig-name">floor_to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
 <div class="signature"><code><span class="sig-name">floor_to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="signature"><code><span class="sig-name">floor_to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f80</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="signature"><code><span class="sig-name">floor_to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
 <div class="function-doc">
 <p>Floors a float and converts directly to an integer in one step.
 More efficient than <code>Float.to_integer(Float.floor(x))</code>.</p>
@@ -276,7 +300,11 @@ More efficient than <code>Float.to_integer(Float.floor(x))</code>.</p>
 <div style="flex:1"></div>
 <a href="#ceil_to_integer-1" class="anchor-link">#</a>
 </div>
+<div class="signature"><code><span class="sig-name">ceil_to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="signature"><code><span class="sig-name">ceil_to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
 <div class="signature"><code><span class="sig-name">ceil_to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="signature"><code><span class="sig-name">ceil_to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f80</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="signature"><code><span class="sig-name">ceil_to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
 <div class="function-doc">
 <p>Ceils a float and converts directly to an integer in one step.
 More efficient than <code>Float.to_integer(Float.ceil(x))</code>.</p>
@@ -289,7 +317,11 @@ More efficient than <code>Float.to_integer(Float.ceil(x))</code>.</p>
 <div style="flex:1"></div>
 <a href="#round_to_integer-1" class="anchor-link">#</a>
 </div>
+<div class="signature"><code><span class="sig-name">round_to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="signature"><code><span class="sig-name">round_to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
 <div class="signature"><code><span class="sig-name">round_to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="signature"><code><span class="sig-name">round_to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f80</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="signature"><code><span class="sig-name">round_to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
 <div class="function-doc">
 <p>Rounds a float and converts directly to an integer in one step.
 More efficient than <code>Float.to_integer(Float.round(x))</code>.</p>

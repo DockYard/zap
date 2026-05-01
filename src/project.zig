@@ -492,10 +492,11 @@ fn collectTypeRefsFromTypeExpr(
 
 fn isBuiltinTypeName(name: []const u8) bool {
     const builtins = [_][]const u8{
-        "Bool", "String", "Atom",  "Nil", "Never",
-        "i64",  "i32",    "i16",   "i8",  "u64",
-        "u32",  "u16",    "u8",    "f64", "f32",
-        "f16",  "usize",  "isize",
+        "Bool",  "String", "Atom", "Nil", "Never",
+        "i128",  "i64",    "i32",  "i16", "i8",
+        "u128",  "u64",    "u32",  "u16", "u8",
+        "f128",  "f80",    "f64",  "f32", "f16",
+        "usize", "isize",
     };
     for (builtins) |b| {
         if (std.mem.eql(u8, name, b)) return true;

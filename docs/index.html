@@ -391,12 +391,12 @@ countdown(<span class="hl-number">100_000_000</span>)  <span class="hl-comment">
 zap deps update &lt;name&gt;  # Re-resolve a single dependency</code></pre>
 <hr>
 <h2>Type System</h2>
-<p>Types are declared at function boundaries. When resolving a call, Zap first prefers an exact typed clause. If no exact clause matches, narrower numeric types may widen within the same family (e.g., <code>i8</code> to <code>i64</code>), but no lossy or cross-family conversions are implicit.</p>
+<p>Types are declared at function boundaries. When resolving a call, Zap first prefers an exact typed clause. If no exact clause matches, narrower numeric types may widen within the same family (e.g., <code>i8</code> to <code>i128</code>), but no lossy or cross-family conversions are implicit.</p>
 <p>| Category | Types |
 |---|---|
-| Signed integers | <code>i8</code> <code>i16</code> <code>i32</code> <code>i64</code> |
-| Unsigned integers | <code>u8</code> <code>u16</code> <code>u32</code> <code>u64</code> |
-| Floats | <code>f16</code> <code>f32</code> <code>f64</code> |
+| Signed integers | <code>i8</code> <code>i16</code> <code>i32</code> <code>i64</code> <code>i128</code> |
+| Unsigned integers | <code>u8</code> <code>u16</code> <code>u32</code> <code>u64</code> <code>u128</code> |
+| Floats | <code>f16</code> <code>f32</code> <code>f64</code> <code>f80</code> <code>f128</code> |
 | Platform-sized | <code>usize</code> <code>isize</code> |
 | Primitives | <code>Bool</code> <code>String</code> <code>Atom</code> <code>Nil</code> |
 | Bottom | <code>Never</code> |
@@ -458,7 +458,7 @@ medium <span class="hl-op">::</span> <span class="hl-type">i32</span> <span clas
 
 process(medium)  <span class="hl-comment"># selects the i32 clause exactly</span>
 process(small)   <span class="hl-comment"># widens i8 to i32 because no i8 clause exists</span></code></pre>
-<p>Fallback widening rules: <code>i8</code> -&gt; <code>i16</code> -&gt; <code>i32</code> -&gt; <code>i64</code>, <code>u8</code> -&gt; <code>u16</code> -&gt; <code>u32</code> -&gt; <code>u64</code>, <code>f16</code> -&gt; <code>f32</code> -&gt; <code>f64</code>. Signed integers never implicitly widen to unsigned integers, unsigned integers never implicitly widen to signed integers, and integer-to-float conversion is never implicit.</p>
+<p>Fallback widening rules: <code>i8</code> -&gt; <code>i16</code> -&gt; <code>i32</code> -&gt; <code>i64</code> -&gt; <code>i128</code>, <code>u8</code> -&gt; <code>u16</code> -&gt; <code>u32</code> -&gt; <code>u64</code> -&gt; <code>u128</code>, <code>f16</code> -&gt; <code>f32</code> -&gt; <code>f64</code> -&gt; <code>f80</code> -&gt; <code>f128</code>. Signed integers never implicitly widen to unsigned integers, unsigned integers never implicitly widen to signed integers, and integer-to-float conversion is never implicit.</p>
 <hr>
 <h2>Native Function Bindings (<code>:zig</code>)</h2>
 <p>Zap functions that need Zig runtime implementations (I/O, string operations, atom tables, etc.) call into Zig directly via the <code>:zig.Struct.function(args)</code> form:</p>

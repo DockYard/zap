@@ -5233,6 +5233,7 @@ pub const HirBuilder = struct {
                 // Type variable — ensure the same name within a function clause maps
                 // to the same TypeId so that `fn foo(x :: a) -> a` has consistent types.
                 const var_name = self.interner.get(tv.name);
+                if (self.type_store.resolveTypeName(var_name)) |id| return id;
                 if (self.hir_type_var_scope.get(var_name)) |existing| {
                     return existing;
                 }
@@ -5728,12 +5729,15 @@ fn encodeContainerElemName(store: *const types_mod.TypeStore, type_id: types_mod
             16 => if (i.signedness == .signed) "i16" else "u16",
             32 => if (i.signedness == .signed) "i32" else "u32",
             64 => if (i.signedness == .signed) "i64" else "u64",
+            128 => if (i.signedness == .signed) "i128" else "u128",
             else => "i64",
         },
         .float => |f| switch (f.bits) {
             16 => "f16",
             32 => "f32",
             64 => "f64",
+            80 => "f80",
+            128 => "f128",
             else => "f64",
         },
         .bool_type => "bool",
@@ -6202,14 +6206,18 @@ fn typeIdToName(type_id: types_mod.TypeId, type_store: *const types_mod.TypeStor
         types_mod.TypeStore.ATOM => "Atom",
         types_mod.TypeStore.NIL => "Nil",
         types_mod.TypeStore.NEVER => "Never",
+        types_mod.TypeStore.I128 => "i128",
         types_mod.TypeStore.I64 => "i64",
         types_mod.TypeStore.I32 => "i32",
         types_mod.TypeStore.I16 => "i16",
         types_mod.TypeStore.I8 => "i8",
+        types_mod.TypeStore.U128 => "u128",
         types_mod.TypeStore.U64 => "u64",
         types_mod.TypeStore.U32 => "u32",
         types_mod.TypeStore.U16 => "u16",
         types_mod.TypeStore.U8 => "u8",
+        types_mod.TypeStore.F128 => "f128",
+        types_mod.TypeStore.F80 => "f80",
         types_mod.TypeStore.F64 => "f64",
         types_mod.TypeStore.F32 => "f32",
         types_mod.TypeStore.F16 => "f16",

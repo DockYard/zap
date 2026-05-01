@@ -10,4 +10,6 @@ pub impl Stringable for Float {
   pub fn to_string(value :: f16) -> String { :zig.Float.to_string_f16(value) }
   pub fn to_string(value :: f32) -> String { :zig.Float.to_string_f32(value) }
   pub fn to_string(value :: f64) -> String { :zig.Float.to_string_f64(value) }
+  pub fn to_string(value :: f80) -> String { :zig.Float.to_string_f80(value) }
+  pub fn to_string(value :: f128) -> String { :zig.Float.to_string_f128(value) }
 }

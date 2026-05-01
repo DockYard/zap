@@ -462,13 +462,13 @@ zap deps update <name>  # Re-resolve a single dependency
 
 ## Type System
 
-Types are declared at function boundaries. When resolving a call, Zap first prefers an exact typed clause. If no exact clause matches, narrower numeric types may widen within the same family (e.g., `i8` to `i64`), but no lossy or cross-family conversions are implicit.
+Types are declared at function boundaries. When resolving a call, Zap first prefers an exact typed clause. If no exact clause matches, narrower numeric types may widen within the same family (e.g., `i8` to `i128`), but no lossy or cross-family conversions are implicit.
 
 | Category | Types |
 |---|---|
-| Signed integers | `i8` `i16` `i32` `i64` |
-| Unsigned integers | `u8` `u16` `u32` `u64` |
-| Floats | `f16` `f32` `f64` |
+| Signed integers | `i8` `i16` `i32` `i64` `i128` |
+| Unsigned integers | `u8` `u16` `u32` `u64` `u128` |
+| Floats | `f16` `f32` `f64` `f80` `f128` |
 | Platform-sized | `usize` `isize` |
 | Primitives | `Bool` `String` `Atom` `Nil` |
 | Bottom | `Never` |
@@ -555,7 +555,7 @@ process(medium)  # selects the i32 clause exactly
 process(small)   # widens i8 to i32 because no i8 clause exists
 ```
 
-Fallback widening rules: `i8` -> `i16` -> `i32` -> `i64`, `u8` -> `u16` -> `u32` -> `u64`, `f16` -> `f32` -> `f64`. Signed integers never implicitly widen to unsigned integers, unsigned integers never implicitly widen to signed integers, and integer-to-float conversion is never implicit.
+Fallback widening rules: `i8` -> `i16` -> `i32` -> `i64` -> `i128`, `u8` -> `u16` -> `u32` -> `u64` -> `u128`, `f16` -> `f32` -> `f64` -> `f80` -> `f128`. Signed integers never implicitly widen to unsigned integers, unsigned integers never implicitly widen to signed integers, and integer-to-float conversion is never implicit.
 
 ---
 

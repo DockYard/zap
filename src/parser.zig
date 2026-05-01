@@ -3910,10 +3910,10 @@ pub const Parser = struct {
                 return .{ .integer = .{ .signed = signed, .bits = bits } };
             } else |_| {}
         }
-        // Float types: f16, f32, f64
+        // Float types: f16, f32, f64, f80, f128
         if (text.len >= 2 and text[0] == 'f') {
             if (std.fmt.parseInt(u16, text[1..], 10)) |bits| {
-                if (bits == 16 or bits == 32 or bits == 64) {
+                if (bits == 16 or bits == 32 or bits == 64 or bits == 80 or bits == 128) {
                     return .{ .float = .{ .bits = bits } };
                 }
             } else |_| {}

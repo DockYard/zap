@@ -851,13 +851,17 @@ pub const ZigType = union(enum) {
     i16,
     i32,
     i64,
+    i128,
     u8,
     u16,
     u32,
     u64,
+    u128,
     f16,
     f32,
     f64,
+    f80,
+    f128,
     usize,
     isize,
     string, // []const u8
@@ -1996,7 +2000,7 @@ pub const IrBuilder = struct {
                 // Check that the param type is a known integer type
                 const param_type = typeIdToZigType(clause.params[found_literal_param.?].type_id);
                 switch (param_type) {
-                    .i8, .i16, .i32, .i64, .u8, .u16, .u32, .u64, .isize, .usize => {},
+                    .i8, .i16, .i32, .i64, .i128, .u8, .u16, .u32, .u64, .u128, .isize, .usize => {},
                     else => return null,
                 }
                 switch_param_idx = found_literal_param;
@@ -2655,7 +2659,7 @@ pub const IrBuilder = struct {
                     .const_bool = .{ .dest = default_local, .value = false },
                 });
             },
-            .f32, .f64, .f16 => {
+            .f32, .f64, .f16, .f80, .f128 => {
                 try self.current_instrs.append(self.allocator, .{
                     .const_float = .{ .dest = default_local, .value = 0.0 },
                 });
@@ -3794,11 +3798,11 @@ pub const IrBuilder = struct {
         const known_type = self.known_local_types.get(scrutinee) orelse return false;
         return switch (lit) {
             .int => switch (known_type) {
-                .i8, .i16, .i32, .i64, .u8, .u16, .u32, .u64, .isize, .usize => true,
+                .i8, .i16, .i32, .i64, .i128, .u8, .u16, .u32, .u64, .u128, .isize, .usize => true,
                 else => false,
             },
             .float => switch (known_type) {
-                .f16, .f32, .f64 => true,
+                .f16, .f32, .f64, .f80, .f128 => true,
                 else => false,
             },
             .atom => known_type == .atom,
@@ -5143,14 +5147,18 @@ fn findParamGetIdInDecision(decision: *const hir_mod.Decision, target_element: u
 fn zigTypeToEncodedName(zig_type: ZigType) []const u8 {
     return switch (std.meta.activeTag(zig_type)) {
         .i64 => "i64",
+        .i128 => "i128",
         .i32 => "i32",
         .i16 => "i16",
         .i8 => "i8",
         .u64 => "u64",
+        .u128 => "u128",
         .u32 => "u32",
         .u16 => "u16",
         .u8 => "u8",
         .f64 => "f64",
+        .f80 => "f80",
+        .f128 => "f128",
         .f32 => "f32",
         .f16 => "f16",
         .bool_type => "bool",
@@ -5285,14 +5293,18 @@ fn typeIdToZigTypeWithStore(type_id: types_mod.TypeId, type_store: ?*const types
         types_mod.TypeStore.NIL => .nil,
         types_mod.TypeStore.NEVER => .never,
         types_mod.TypeStore.TERM => .term,
+        types_mod.TypeStore.I128 => .i128,
         types_mod.TypeStore.I64 => .i64,
         types_mod.TypeStore.I32 => .i32,
         types_mod.TypeStore.I16 => .i16,
         types_mod.TypeStore.I8 => .i8,
+        types_mod.TypeStore.U128 => .u128,
         types_mod.TypeStore.U64 => .u64,
         types_mod.TypeStore.U32 => .u32,
         types_mod.TypeStore.U16 => .u16,
         types_mod.TypeStore.U8 => .u8,
+        types_mod.TypeStore.F128 => .f128,
+        types_mod.TypeStore.F80 => .f80,
         types_mod.TypeStore.F64 => .f64,
         types_mod.TypeStore.F32 => .f32,
         types_mod.TypeStore.F16 => .f16,
@@ -5378,13 +5390,17 @@ fn zigTypeToStr(zig_type: ZigType) []const u8 {
         .i16 => "i16",
         .i32 => "i32",
         .i64 => "i64",
+        .i128 => "i128",
         .u8 => "u8",
         .u16 => "u16",
         .u32 => "u32",
         .u64 => "u64",
+        .u128 => "u128",
         .f16 => "f16",
         .f32 => "f32",
         .f64 => "f64",
+        .f80 => "f80",
+        .f128 => "f128",
         .usize => "usize",
         .isize => "isize",
         .string => "[]const u8",
