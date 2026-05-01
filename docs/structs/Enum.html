@@ -67,13 +67,26 @@
 <li><a href="../structs/Struct.html">Struct</a></li>
 <li><a href="../structs/System.html">System</a></li>
 <li><a href="../structs/Zest.html">Zest</a></li>
+<li><a href="../structs/Zest.Case.html">Zest.Case</a></li>
+<li><a href="../structs/Zest.Runner.html">Zest.Runner</a></li>
 </ul>
 </div>
 <div class="sidebar-group">
-<h4>Zest</h4>
+<h4>Protocols</h4>
 <ul>
-<li><a href="../structs/Zest.Case.html">Zest.Case</a></li>
-<li><a href="../structs/Zest.Runner.html">Zest.Runner</a></li>
+<li><a href="../structs/Arithmetic.html">Arithmetic</a></li>
+<li><a href="../structs/Comparator.html">Comparator</a></li>
+<li><a href="../structs/Concatenable.html">Concatenable</a></li>
+<li><a href="../structs/Enumerable.html">Enumerable</a></li>
+<li><a href="../structs/Membership.html">Membership</a></li>
+<li><a href="../structs/Stringable.html">Stringable</a></li>
+<li><a href="../structs/Updatable.html">Updatable</a></li>
+</ul>
+</div>
+<div class="sidebar-group">
+<h4>Unions</h4>
+<ul>
+<li><a href="../structs/IO.Mode.html">IO.Mode</a></li>
 </ul>
 </div>
 </nav>
@@ -85,8 +98,24 @@
 <a href="https://github.com/DockYard/zap/blob/v0.1.0/./lib/enum.zap" class="source-file">./lib/enum.zap</a>
 </div>
 </div>
+<p class="tagline">Functions for enumerating and transforming collections.</p>
+<div class="structdoc">
+<p>Functions for enumerating and transforming collections.</p>
+<p>Enum provides higher-order functions that operate on any value
+implementing the <code>Enumerable</code> protocol. Functions that produce a
+collection materialize their result as a list.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Enum.map([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>], <span class="hl-keyword">fn</span>(x) { x <span class="hl-op">*</span> <span class="hl-number">2</span> })       <span class="hl-comment"># =&gt; [2, 4, 6]</span>
+Enum.filter(<span class="hl-number">1..5</span>, <span class="hl-keyword">fn</span>(x) { x <span class="hl-op">&gt;</span> <span class="hl-number">2</span> })          <span class="hl-comment"># =&gt; [3, 4, 5]</span>
+Enum.reduce(%{a: <span class="hl-number">1</span>, b: <span class="hl-number">2</span>}, <span class="hl-number">0</span>, <span class="hl-keyword">fn</span>(acc, kv) {
+  <span class="hl-keyword">case</span> kv {
+    {_key, value} <span class="hl-op">-&gt;</span> acc <span class="hl-op">+</span> value
+  }
+})                                         <span class="hl-comment"># =&gt; 3</span></code></pre>
+</div>
 <h2 id="functions">Functions</h2>
 <table class="summary">
+<tr><td class="summary-name"><a href="#to_list-1">to_list/1</a></td><td class="summary-doc">Converts an enumerable collection to a list.</td></tr>
 <tr><td class="summary-name"><a href="#map-2">map/2</a></td><td class="summary-doc">Transforms each element by applying the callback function.</td></tr>
 <tr><td class="summary-name"><a href="#filter-2">filter/2</a></td><td class="summary-doc">Keeps only elements for which the predicate returns true.</td></tr>
 <tr><td class="summary-name"><a href="#reject-2">reject/2</a></td><td class="summary-doc">Removes elements for which the predicate returns true.</td></tr>
@@ -101,19 +130,36 @@
 <tr><td class="summary-name"><a href="#product-1">product/1</a></td><td class="summary-doc">Returns the product of all elements.</td></tr>
 <tr><td class="summary-name"><a href="#max-1">max/1</a></td><td class="summary-doc">Returns the maximum element.</td></tr>
 <tr><td class="summary-name"><a href="#min-1">min/1</a></td><td class="summary-doc">Returns the minimum element.</td></tr>
-<tr><td class="summary-name"><a href="#sort-2">sort/2</a></td><td class="summary-doc">Sorts the list using a comparator function.</td></tr>
+<tr><td class="summary-name"><a href="#sort-2">sort/2</a></td><td class="summary-doc">Sorts the enumerable values using a comparator function.</td></tr>
 <tr><td class="summary-name"><a href="#flat_map-2">flat_map/2</a></td><td class="summary-doc">Maps each element to a list and flattens the results
 into a single list.</td></tr>
-<tr><td class="summary-name"><a href="#take-2">take/2</a></td><td class="summary-doc">Returns the first `count` elements from the list.</td></tr>
-<tr><td class="summary-name"><a href="#drop-2">drop/2</a></td><td class="summary-doc">Drops the first `count` elements from the list.</td></tr>
-<tr><td class="summary-name"><a href="#reverse-1">reverse/1</a></td><td class="summary-doc">Reverses the order of elements in the list.</td></tr>
-<tr><td class="summary-name"><a href="#member?-2">member?/2</a></td><td class="summary-doc">Returns true if the list contains the given value.</td></tr>
+<tr><td class="summary-name"><a href="#take-2">take/2</a></td><td class="summary-doc">Returns the first `count` elements from the enumerable collection.</td></tr>
+<tr><td class="summary-name"><a href="#drop-2">drop/2</a></td><td class="summary-doc">Drops the first `count` elements from the enumerable collection
+and returns the remaining elements as a list.</td></tr>
+<tr><td class="summary-name"><a href="#reverse-1">reverse/1</a></td><td class="summary-doc">Reverses the order of elements in the enumerable collection.</td></tr>
+<tr><td class="summary-name"><a href="#member?-2">member?/2</a></td><td class="summary-doc">Returns true if the enumerable collection contains the given value.</td></tr>
 <tr><td class="summary-name"><a href="#at-2">at/2</a></td><td class="summary-doc">Returns the element at the given zero-based index.</td></tr>
-<tr><td class="summary-name"><a href="#concat-2">concat/2</a></td><td class="summary-doc">Concatenates two lists into a single list.</td></tr>
+<tr><td class="summary-name"><a href="#at-3">at/3</a></td><td class="summary-doc">Returns the element at the given zero-based index.</td></tr>
+<tr><td class="summary-name"><a href="#concat-2">concat/2</a></td><td class="summary-doc">Concatenates two enumerable collections into a single list.</td></tr>
 <tr><td class="summary-name"><a href="#uniq-1">uniq/1</a></td><td class="summary-doc">Returns a new list with duplicate values removed.</td></tr>
-<tr><td class="summary-name"><a href="#empty?-1">empty?/1</a></td><td class="summary-doc">Returns true if the list has no elements.</td></tr>
+<tr><td class="summary-name"><a href="#empty?-1">empty?/1</a></td><td class="summary-doc">Returns true if the enumerable collection has no elements.</td></tr>
 </table>
 <h2>Function Details</h2>
+<div class="function-detail" id="to_list-1">
+<div class="function-header">
+<h3>to_list<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#to_list-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">to_list</span><span class="sig-paren">(</span>collection<span class="sig-separator">::</span><span class="sig-type-pill">Enumerable</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[element]</span></code></div>
+<div class="function-doc">
+<p>Converts an enumerable collection to a list.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Enum.to_list(<span class="hl-number">1..3</span>)   <span class="hl-comment"># =&gt; [1, 2, 3]</span>
+Enum.to_list(<span class="hl-string">"ab"</span>)   <span class="hl-comment"># =&gt; [&quot;a&quot;, &quot;b&quot;]</span></code></pre>
+</div>
+</div>
 <div class="function-detail" id="map-2">
 <div class="function-header">
 <h3>map<span class="arity">/2</span></h3>
@@ -121,12 +167,12 @@ into a single list.</td></tr>
 <div style="flex:1"></div>
 <a href="#map-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">map</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">, </span>callback<span class="sig-separator">::</span><span class="sig-type-pill">(element) -&gt; result</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[result]</span></code></div>
+<div class="signature"><code><span class="sig-name">map</span><span class="sig-paren">(</span>collection<span class="sig-separator">::</span><span class="sig-type-pill">Enumerable</span><span class="sig-paren">, </span>callback<span class="sig-separator">::</span><span class="sig-type-pill">(element) -&gt; mapped</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[mapped]</span></code></div>
 <div class="function-doc">
 <p>Transforms each element by applying the callback function.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap">Enum.map([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>], <span class="hl-keyword">fn</span>(x) { x <span class="hl-op">*</span> <span class="hl-number">2</span> })  <span class="hl-comment"># =&gt; [2, 4, 6]</span>
-Enum.map([], <span class="hl-keyword">fn</span>(x) { x <span class="hl-op">+</span> <span class="hl-number">1</span> })          <span class="hl-comment"># =&gt; []</span></code></pre>
+Enum.map(<span class="hl-number">1..3</span>, <span class="hl-keyword">fn</span>(x) { x <span class="hl-op">*</span> <span class="hl-number">2</span> })       <span class="hl-comment"># =&gt; [2, 4, 6]</span></code></pre>
 </div>
 </div>
 <div class="function-detail" id="filter-2">
@@ -136,12 +182,12 @@ Enum.map([], <span class="hl-keyword">fn</span>(x) { x <span class="hl-op">+</sp
 <div style="flex:1"></div>
 <a href="#filter-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">filter</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">, </span>predicate<span class="sig-separator">::</span><span class="sig-type-pill">(element) -&gt; Bool</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[element]</span></code></div>
+<div class="signature"><code><span class="sig-name">filter</span><span class="sig-paren">(</span>collection<span class="sig-separator">::</span><span class="sig-type-pill">Enumerable</span><span class="sig-paren">, </span>predicate<span class="sig-separator">::</span><span class="sig-type-pill">(element) -&gt; Bool</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[element]</span></code></div>
 <div class="function-doc">
 <p>Keeps only elements for which the predicate returns true.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap">Enum.filter([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>, <span class="hl-number">4</span>], <span class="hl-keyword">fn</span>(x) { x <span class="hl-op">&gt;</span> <span class="hl-number">2</span> })  <span class="hl-comment"># =&gt; [3, 4]</span>
-Enum.filter([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>], <span class="hl-keyword">fn</span>(x) { x <span class="hl-op">&gt;</span> <span class="hl-number">10</span> })     <span class="hl-comment"># =&gt; []</span></code></pre>
+Enum.filter(<span class="hl-number">1..5</span>, <span class="hl-keyword">fn</span>(x) { x <span class="hl-op">&gt;</span> <span class="hl-number">3</span> })          <span class="hl-comment"># =&gt; [4, 5]</span></code></pre>
 </div>
 </div>
 <div class="function-detail" id="reject-2">
@@ -151,7 +197,7 @@ Enum.filter([<span class="hl-number">1</span>, <span class="hl-number">2</span>,
 <div style="flex:1"></div>
 <a href="#reject-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">reject</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">, </span>predicate<span class="sig-separator">::</span><span class="sig-type-pill">(element) -&gt; Bool</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[element]</span></code></div>
+<div class="signature"><code><span class="sig-name">reject</span><span class="sig-paren">(</span>collection<span class="sig-separator">::</span><span class="sig-type-pill">Enumerable</span><span class="sig-paren">, </span>predicate<span class="sig-separator">::</span><span class="sig-type-pill">(element) -&gt; Bool</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[element]</span></code></div>
 <div class="function-doc">
 <p>Removes elements for which the predicate returns true.
 The opposite of <code>filter/2</code>.</p>
@@ -166,7 +212,7 @@ The opposite of <code>filter/2</code>.</p>
 <div style="flex:1"></div>
 <a href="#reduce-3" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">reduce</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">, </span>initial<span class="sig-separator">::</span><span class="sig-type-pill">element</span><span class="sig-paren">, </span>callback<span class="sig-separator">::</span><span class="sig-type-pill">(element, element) -&gt; element</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">element</span></code></div>
+<div class="signature"><code><span class="sig-name">reduce</span><span class="sig-paren">(</span>collection<span class="sig-separator">::</span><span class="sig-type-pill">Enumerable</span><span class="sig-paren">, </span>initial<span class="sig-separator">::</span><span class="sig-type-pill">accumulator</span><span class="sig-paren">, </span>callback<span class="sig-separator">::</span><span class="sig-type-pill">(accumulator, element) -&gt; accumulator</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">accumulator</span></code></div>
 <div class="function-doc">
 <p>Folds the collection into a single value using an accumulator.
 The callback receives <code>(accumulator, element)</code> and returns
@@ -175,7 +221,7 @@ the new accumulator.</p>
 collection type that implements Enumerable.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap">Enum.reduce([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>], <span class="hl-number">0</span>, <span class="hl-keyword">fn</span>(acc, x) { acc <span class="hl-op">+</span> x })  <span class="hl-comment"># =&gt; 6</span>
-Enum.reduce([<span class="hl-number">2</span>, <span class="hl-number">3</span>, <span class="hl-number">4</span>], <span class="hl-number">1</span>, <span class="hl-keyword">fn</span>(acc, x) { acc <span class="hl-op">*</span> x })   <span class="hl-comment"># =&gt; 24</span></code></pre>
+Enum.reduce(<span class="hl-number">1..4</span>, <span class="hl-number">0</span>, <span class="hl-keyword">fn</span>(acc, x) { acc <span class="hl-op">+</span> x })       <span class="hl-comment"># =&gt; 10</span></code></pre>
 </div>
 </div>
 <div class="function-detail" id="reduce_map-3">
@@ -185,11 +231,14 @@ Enum.reduce([<span class="hl-number">2</span>, <span class="hl-number">3</span>,
 <div style="flex:1"></div>
 <a href="#reduce_map-3" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">reduce_map</span><span class="sig-paren">(</span>map<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">, </span>initial<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>callback<span class="sig-separator">::</span><span class="sig-type-pill">(i64, i64) -&gt; i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="signature"><code><span class="sig-name">reduce_map</span><span class="sig-paren">(</span>map<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">, </span>initial<span class="sig-separator">::</span><span class="sig-type-pill">accumulator</span><span class="sig-paren">, </span>callback<span class="sig-separator">::</span><span class="sig-type-pill">(accumulator, value) -&gt; accumulator</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">accumulator</span></code></div>
 <div class="function-doc">
 <p>Folds map values into a single value using an accumulator.
 The callback receives <code>(accumulator, value)</code> and returns
 the new accumulator.</p>
+<p><code>reduce_map/3</code> is a map-value convenience that enumerates map
+entries through the Enumerable protocol and passes only each value
+to the callback.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap">Enum.reduce_map(%{a: <span class="hl-number">1</span>, b: <span class="hl-number">2</span>, c: <span class="hl-number">3</span>}, <span class="hl-number">0</span>, <span class="hl-keyword">fn</span>(acc, val) { acc <span class="hl-op">+</span> val })
 <span class="hl-comment"># =&gt; 6</span></code></pre>
@@ -202,10 +251,10 @@ the new accumulator.</p>
 <div style="flex:1"></div>
 <a href="#each-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">each</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">, </span>callback<span class="sig-separator">::</span><span class="sig-type-pill">(element) -&gt; element</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[element]</span></code></div>
+<div class="signature"><code><span class="sig-name">each</span><span class="sig-paren">(</span>collection<span class="sig-separator">::</span><span class="sig-type-pill">Enumerable</span><span class="sig-paren">, </span>callback<span class="sig-separator">::</span><span class="sig-type-pill">(element) -&gt; result</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Enumerable</span></code></div>
 <div class="function-doc">
 <p>Applies the callback to each element for side effects.
-Returns the original list unchanged.</p>
+Returns the original collection unchanged.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap">Enum.each([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>], <span class="hl-keyword">fn</span>(x) { IO.puts(Integer.to_string(x)) })</code></pre>
 </div>
@@ -217,13 +266,13 @@ Returns the original list unchanged.</p>
 <div style="flex:1"></div>
 <a href="#find-3" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">find</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">, </span>default<span class="sig-separator">::</span><span class="sig-type-pill">element</span><span class="sig-paren">, </span>predicate<span class="sig-separator">::</span><span class="sig-type-pill">(element) -&gt; Bool</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">element</span></code></div>
+<div class="signature"><code><span class="sig-name">find</span><span class="sig-paren">(</span>collection<span class="sig-separator">::</span><span class="sig-type-pill">Enumerable</span><span class="sig-paren">, </span>default<span class="sig-separator">::</span><span class="sig-type-pill">element</span><span class="sig-paren">, </span>predicate<span class="sig-separator">::</span><span class="sig-type-pill">(element) -&gt; Bool</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">element</span></code></div>
 <div class="function-doc">
 <p>Returns the first element for which the predicate returns true.
 Returns the default value if no element matches.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap">Enum.find([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>, <span class="hl-number">4</span>], <span class="hl-number">0</span>, <span class="hl-keyword">fn</span>(x) { x <span class="hl-op">&gt;</span> <span class="hl-number">2</span> })  <span class="hl-comment"># =&gt; 3</span>
-Enum.find([<span class="hl-number">1</span>, <span class="hl-number">2</span>], <span class="hl-number">0</span>, <span class="hl-keyword">fn</span>(x) { x <span class="hl-op">&gt;</span> <span class="hl-number">10</span> })        <span class="hl-comment"># =&gt; 0</span></code></pre>
+Enum.find(<span class="hl-number">1..2</span>, <span class="hl-number">0</span>, <span class="hl-keyword">fn</span>(x) { x <span class="hl-op">&gt;</span> <span class="hl-number">10</span> })         <span class="hl-comment"># =&gt; 0</span></code></pre>
 </div>
 </div>
 <div class="function-detail" id="any?-2">
@@ -233,12 +282,12 @@ Enum.find([<span class="hl-number">1</span>, <span class="hl-number">2</span>], 
 <div style="flex:1"></div>
 <a href="#any?-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">any?</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">, </span>predicate<span class="sig-separator">::</span><span class="sig-type-pill">(element) -&gt; Bool</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="signature"><code><span class="sig-name">any?</span><span class="sig-paren">(</span>collection<span class="sig-separator">::</span><span class="sig-type-pill">Enumerable</span><span class="sig-paren">, </span>predicate<span class="sig-separator">::</span><span class="sig-type-pill">(element) -&gt; Bool</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
 <div class="function-doc">
 <p>Returns true if the predicate returns true for any element.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap">Enum.any?([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>], <span class="hl-keyword">fn</span>(x) { x <span class="hl-op">&gt;</span> <span class="hl-number">2</span> })   <span class="hl-comment"># =&gt; true</span>
-Enum.any?([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>], <span class="hl-keyword">fn</span>(x) { x <span class="hl-op">&gt;</span> <span class="hl-number">10</span> })  <span class="hl-comment"># =&gt; false</span></code></pre>
+Enum.any?(<span class="hl-number">1..3</span>, <span class="hl-keyword">fn</span>(x) { x <span class="hl-op">&gt;</span> <span class="hl-number">10</span> })       <span class="hl-comment"># =&gt; false</span></code></pre>
 </div>
 </div>
 <div class="function-detail" id="all?-2">
@@ -248,12 +297,12 @@ Enum.any?([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <
 <div style="flex:1"></div>
 <a href="#all?-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">all?</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">, </span>predicate<span class="sig-separator">::</span><span class="sig-type-pill">(element) -&gt; Bool</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="signature"><code><span class="sig-name">all?</span><span class="sig-paren">(</span>collection<span class="sig-separator">::</span><span class="sig-type-pill">Enumerable</span><span class="sig-paren">, </span>predicate<span class="sig-separator">::</span><span class="sig-type-pill">(element) -&gt; Bool</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
 <div class="function-doc">
 <p>Returns true if the predicate returns true for all elements.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap">Enum.all?([<span class="hl-number">2</span>, <span class="hl-number">4</span>, <span class="hl-number">6</span>], <span class="hl-keyword">fn</span>(x) { x <span class="hl-op">&gt;</span> <span class="hl-number">0</span> })   <span class="hl-comment"># =&gt; true</span>
-Enum.all?([<span class="hl-number">2</span>, <span class="hl-number">4</span>, <span class="hl-number">6</span>], <span class="hl-keyword">fn</span>(x) { x <span class="hl-op">&gt;</span> <span class="hl-number">3</span> })   <span class="hl-comment"># =&gt; false</span></code></pre>
+Enum.all?(<span class="hl-number">1..3</span>, <span class="hl-keyword">fn</span>(x) { x <span class="hl-op">&gt;</span> <span class="hl-number">2</span> })        <span class="hl-comment"># =&gt; false</span></code></pre>
 </div>
 </div>
 <div class="function-detail" id="count-2">
@@ -263,7 +312,7 @@ Enum.all?([<span class="hl-number">2</span>, <span class="hl-number">4</span>, <
 <div style="flex:1"></div>
 <a href="#count-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">count</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">, </span>predicate<span class="sig-separator">::</span><span class="sig-type-pill">(element) -&gt; Bool</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="signature"><code><span class="sig-name">count</span><span class="sig-paren">(</span>collection<span class="sig-separator">::</span><span class="sig-type-pill">Enumerable</span><span class="sig-paren">, </span>predicate<span class="sig-separator">::</span><span class="sig-type-pill">(element) -&gt; Bool</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
 <div class="function-doc">
 <p>Counts elements for which the predicate returns true.</p>
 <h2>Examples</h2>
@@ -277,7 +326,7 @@ Enum.all?([<span class="hl-number">2</span>, <span class="hl-number">4</span>, <
 <div style="flex:1"></div>
 <a href="#sum-1" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">sum</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[i64]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="signature"><code><span class="sig-name">sum</span><span class="sig-paren">(</span>collection<span class="sig-separator">::</span><span class="sig-type-pill">Enumerable</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
 <div class="function-doc">
 <p>Returns the sum of all elements.</p>
 <h2>Examples</h2>
@@ -292,10 +341,10 @@ Enum.sum([])             <span class="hl-comment"># =&gt; 0</span></code></pre>
 <div style="flex:1"></div>
 <a href="#product-1" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">product</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[i64]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="signature"><code><span class="sig-name">product</span><span class="sig-paren">(</span>collection<span class="sig-separator">::</span><span class="sig-type-pill">Enumerable</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
 <div class="function-doc">
 <p>Returns the product of all elements.
-Returns 1 for an empty list.</p>
+Returns 1 for an empty collection.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap">Enum.product([<span class="hl-number">2</span>, <span class="hl-number">3</span>, <span class="hl-number">4</span>])  <span class="hl-comment"># =&gt; 24</span>
 Enum.product([])         <span class="hl-comment"># =&gt; 1</span></code></pre>
@@ -308,10 +357,10 @@ Enum.product([])         <span class="hl-comment"># =&gt; 1</span></code></pre>
 <div style="flex:1"></div>
 <a href="#max-1" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">max</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[i64]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="signature"><code><span class="sig-name">max</span><span class="sig-paren">(</span>collection<span class="sig-separator">::</span><span class="sig-type-pill">Enumerable</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
 <div class="function-doc">
 <p>Returns the maximum element.
-Returns 0 for an empty list.</p>
+Returns 0 for an empty collection.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap">Enum.max([<span class="hl-number">3</span>, <span class="hl-number">1</span>, <span class="hl-number">4</span>, <span class="hl-number">1</span>, <span class="hl-number">5</span>])  <span class="hl-comment"># =&gt; 5</span></code></pre>
 </div>
@@ -323,10 +372,10 @@ Returns 0 for an empty list.</p>
 <div style="flex:1"></div>
 <a href="#min-1" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">min</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[i64]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="signature"><code><span class="sig-name">min</span><span class="sig-paren">(</span>collection<span class="sig-separator">::</span><span class="sig-type-pill">Enumerable</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
 <div class="function-doc">
 <p>Returns the minimum element.
-Returns 0 for an empty list.</p>
+Returns 0 for an empty collection.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap">Enum.min([<span class="hl-number">3</span>, <span class="hl-number">1</span>, <span class="hl-number">4</span>, <span class="hl-number">1</span>, <span class="hl-number">5</span>])  <span class="hl-comment"># =&gt; 1</span></code></pre>
 </div>
@@ -338,14 +387,14 @@ Returns 0 for an empty list.</p>
 <div style="flex:1"></div>
 <a href="#sort-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">sort</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">, </span>comparator<span class="sig-separator">::</span><span class="sig-type-pill">(element, element) -&gt; Bool</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[element]</span></code></div>
+<div class="signature"><code><span class="sig-name">sort</span><span class="sig-paren">(</span>collection<span class="sig-separator">::</span><span class="sig-type-pill">Enumerable</span><span class="sig-paren">, </span>comparator<span class="sig-separator">::</span><span class="sig-type-pill">(element, element) -&gt; Bool</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[element]</span></code></div>
 <div class="function-doc">
-<p>Sorts the list using a comparator function.
+<p>Sorts the enumerable values using a comparator function.
 The comparator returns true if the first argument should
 come before the second.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap">Enum.sort([<span class="hl-number">3</span>, <span class="hl-number">1</span>, <span class="hl-number">2</span>], <span class="hl-keyword">fn</span>(a, b) { a <span class="hl-op">&lt;</span> b })  <span class="hl-comment"># =&gt; [1, 2, 3]</span>
-Enum.sort([<span class="hl-number">3</span>, <span class="hl-number">1</span>, <span class="hl-number">2</span>], <span class="hl-keyword">fn</span>(a, b) { a <span class="hl-op">&gt;</span> b })  <span class="hl-comment"># =&gt; [3, 2, 1]</span></code></pre>
+Enum.sort(<span class="hl-number">1..3</span>, <span class="hl-keyword">fn</span>(a, b) { a <span class="hl-op">&gt;</span> b })       <span class="hl-comment"># =&gt; [3, 2, 1]</span></code></pre>
 </div>
 </div>
 <div class="function-detail" id="flat_map-2">
@@ -355,7 +404,7 @@ Enum.sort([<span class="hl-number">3</span>, <span class="hl-number">1</span>, <
 <div style="flex:1"></div>
 <a href="#flat_map-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">flat_map</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">, </span>callback<span class="sig-separator">::</span><span class="sig-type-pill">(element) -&gt; [element]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[element]</span></code></div>
+<div class="signature"><code><span class="sig-name">flat_map</span><span class="sig-paren">(</span>collection<span class="sig-separator">::</span><span class="sig-type-pill">Enumerable</span><span class="sig-paren">, </span>callback<span class="sig-separator">::</span><span class="sig-type-pill">(element) -&gt; [mapped]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[mapped]</span></code></div>
 <div class="function-doc">
 <p>Maps each element to a list and flattens the results
 into a single list.</p>
@@ -371,14 +420,15 @@ into a single list.</p>
 <div style="flex:1"></div>
 <a href="#take-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">take</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">, </span>count<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[element]</span></code></div>
+<div class="signature"><code><span class="sig-name">take</span><span class="sig-paren">(</span>collection<span class="sig-separator">::</span><span class="sig-type-pill">Enumerable</span><span class="sig-paren">, </span>count<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[element]</span></code></div>
 <div class="function-doc">
-<p>Returns the first <code>count</code> elements from the list.</p>
-<p>If <code>count</code> exceeds the list length, returns the entire list.</p>
+<p>Returns the first <code>count</code> elements from the enumerable collection.</p>
+<p>If <code>count</code> exceeds the collection length, returns the entire
+collection as a list.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap">Enum.take([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>, <span class="hl-number">4</span>, <span class="hl-number">5</span>], <span class="hl-number">3</span>)  <span class="hl-comment"># =&gt; [1, 2, 3]</span>
-Enum.take([<span class="hl-number">1</span>, <span class="hl-number">2</span>], <span class="hl-number">5</span>)            <span class="hl-comment"># =&gt; [1, 2]</span>
-Enum.take([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>], <span class="hl-number">0</span>)         <span class="hl-comment"># =&gt; []</span></code></pre>
+Enum.take(<span class="hl-number">1..5</span>, <span class="hl-number">3</span>)             <span class="hl-comment"># =&gt; [1, 2, 3]</span>
+Enum.take([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>], <span class="hl-number">0</span>)        <span class="hl-comment"># =&gt; []</span></code></pre>
 </div>
 </div>
 <div class="function-detail" id="drop-2">
@@ -388,14 +438,15 @@ Enum.take([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <
 <div style="flex:1"></div>
 <a href="#drop-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">drop</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">, </span>count<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[element]</span></code></div>
+<div class="signature"><code><span class="sig-name">drop</span><span class="sig-paren">(</span>collection<span class="sig-separator">::</span><span class="sig-type-pill">Enumerable</span><span class="sig-paren">, </span>count<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[element]</span></code></div>
 <div class="function-doc">
-<p>Drops the first <code>count</code> elements from the list.</p>
-<p>If <code>count</code> exceeds the list length, returns an empty list.</p>
+<p>Drops the first <code>count</code> elements from the enumerable collection
+and returns the remaining elements as a list.</p>
+<p>If <code>count</code> exceeds the collection length, returns an empty list.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap">Enum.drop([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>, <span class="hl-number">4</span>, <span class="hl-number">5</span>], <span class="hl-number">2</span>)  <span class="hl-comment"># =&gt; [3, 4, 5]</span>
-Enum.drop([<span class="hl-number">1</span>, <span class="hl-number">2</span>], <span class="hl-number">5</span>)            <span class="hl-comment"># =&gt; []</span>
-Enum.drop([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>], <span class="hl-number">0</span>)         <span class="hl-comment"># =&gt; [1, 2, 3]</span></code></pre>
+Enum.drop(<span class="hl-number">1..5</span>, <span class="hl-number">2</span>)             <span class="hl-comment"># =&gt; [3, 4, 5]</span>
+Enum.drop([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>], <span class="hl-number">0</span>)        <span class="hl-comment"># =&gt; [1, 2, 3]</span></code></pre>
 </div>
 </div>
 <div class="function-detail" id="reverse-1">
@@ -405,12 +456,12 @@ Enum.drop([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <
 <div style="flex:1"></div>
 <a href="#reverse-1" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">reverse</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[element]</span></code></div>
+<div class="signature"><code><span class="sig-name">reverse</span><span class="sig-paren">(</span>collection<span class="sig-separator">::</span><span class="sig-type-pill">Enumerable</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[element]</span></code></div>
 <div class="function-doc">
-<p>Reverses the order of elements in the list.</p>
+<p>Reverses the order of elements in the enumerable collection.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap">Enum.reverse([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>])  <span class="hl-comment"># =&gt; [3, 2, 1]</span>
-Enum.reverse([])          <span class="hl-comment"># =&gt; []</span></code></pre>
+Enum.reverse(<span class="hl-number">1..3</span>)       <span class="hl-comment"># =&gt; [3, 2, 1]</span></code></pre>
 </div>
 </div>
 <div class="function-detail" id="member?-2">
@@ -420,13 +471,13 @@ Enum.reverse([])          <span class="hl-comment"># =&gt; []</span></code></pre
 <div style="flex:1"></div>
 <a href="#member?-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">member?</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">, </span>value<span class="sig-separator">::</span><span class="sig-type-pill">element</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="signature"><code><span class="sig-name">member?</span><span class="sig-paren">(</span>collection<span class="sig-separator">::</span><span class="sig-type-pill">Enumerable</span><span class="sig-paren">, </span>value<span class="sig-separator">::</span><span class="sig-type-pill">element</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
 <div class="function-doc">
-<p>Returns true if the list contains the given value.</p>
+<p>Returns true if the enumerable collection contains the given value.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap">Enum.member?([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>], <span class="hl-number">2</span>)  <span class="hl-comment"># =&gt; true</span>
-Enum.member?([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>], <span class="hl-number">5</span>)  <span class="hl-comment"># =&gt; false</span>
-Enum.member?([], <span class="hl-number">1</span>)          <span class="hl-comment"># =&gt; false</span></code></pre>
+Enum.member?(<span class="hl-number">1..3</span>, <span class="hl-number">5</span>)       <span class="hl-comment"># =&gt; false</span>
+Enum.member?([], <span class="hl-number">1</span>)         <span class="hl-comment"># =&gt; false</span></code></pre>
 </div>
 </div>
 <div class="function-detail" id="at-2">
@@ -436,13 +487,28 @@ Enum.member?([], <span class="hl-number">1</span>)          <span class="hl-comm
 <div style="flex:1"></div>
 <a href="#at-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">at</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">, </span>index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">element</span></code></div>
+<div class="signature"><code><span class="sig-name">at</span><span class="sig-paren">(</span>collection<span class="sig-separator">::</span><span class="sig-type-pill">Enumerable</span><span class="sig-paren">, </span>index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">element</span></code></div>
 <div class="function-doc">
 <p>Returns the element at the given zero-based index.
 Returns 0 if the index is out of bounds.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap">Enum.at([<span class="hl-number">10</span>, <span class="hl-number">20</span>, <span class="hl-number">30</span>], <span class="hl-number">1</span>)  <span class="hl-comment"># =&gt; 20</span>
-Enum.at([<span class="hl-number">10</span>, <span class="hl-number">20</span>, <span class="hl-number">30</span>], <span class="hl-number">0</span>)  <span class="hl-comment"># =&gt; 10</span></code></pre>
+Enum.at(<span class="hl-number">10..30</span>:<span class="hl-number">10</span>, <span class="hl-number">0</span>)     <span class="hl-comment"># =&gt; 10</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="at-3">
+<div class="function-header">
+<h3>at<span class="arity">/3</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#at-3" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">at</span><span class="sig-paren">(</span>collection<span class="sig-separator">::</span><span class="sig-type-pill">Enumerable</span><span class="sig-paren">, </span>index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>default<span class="sig-separator">::</span><span class="sig-type-pill">element</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">element</span></code></div>
+<div class="function-doc">
+<p>Returns the element at the given zero-based index.
+Returns <code>default</code> if the index is out of bounds.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Enum.at([<span class="hl-string">"a"</span>], <span class="hl-number">2</span>, <span class="hl-string">"none"</span>)  <span class="hl-comment"># =&gt; &quot;none&quot;</span></code></pre>
 </div>
 </div>
 <div class="function-detail" id="concat-2">
@@ -452,13 +518,12 @@ Enum.at([<span class="hl-number">10</span>, <span class="hl-number">20</span>, <
 <div style="flex:1"></div>
 <a href="#concat-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">concat</span><span class="sig-paren">(</span>first<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">, </span>second<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[element]</span></code></div>
+<div class="signature"><code><span class="sig-name">concat</span><span class="sig-paren">(</span>first<span class="sig-separator">::</span><span class="sig-type-pill">Enumerable</span><span class="sig-paren">, </span>second<span class="sig-separator">::</span><span class="sig-type-pill">Enumerable</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[element]</span></code></div>
 <div class="function-doc">
-<p>Concatenates two lists into a single list.</p>
+<p>Concatenates two enumerable collections into a single list.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap">Enum.concat([<span class="hl-number">1</span>, <span class="hl-number">2</span>], [<span class="hl-number">3</span>, <span class="hl-number">4</span>])  <span class="hl-comment"># =&gt; [1, 2, 3, 4]</span>
-Enum.concat([], [<span class="hl-number">1</span>, <span class="hl-number">2</span>])       <span class="hl-comment"># =&gt; [1, 2]</span>
-Enum.concat([<span class="hl-number">1</span>, <span class="hl-number">2</span>], [])       <span class="hl-comment"># =&gt; [1, 2]</span></code></pre>
+Enum.concat(<span class="hl-number">1..2</span>, <span class="hl-number">3..4</span>)      <span class="hl-comment"># =&gt; [1, 2, 3, 4]</span></code></pre>
 </div>
 </div>
 <div class="function-detail" id="uniq-1">
@@ -468,13 +533,13 @@ Enum.concat([<span class="hl-number">1</span>, <span class="hl-number">2</span>]
 <div style="flex:1"></div>
 <a href="#uniq-1" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">uniq</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[element]</span></code></div>
+<div class="signature"><code><span class="sig-name">uniq</span><span class="sig-paren">(</span>collection<span class="sig-separator">::</span><span class="sig-type-pill">Enumerable</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[element]</span></code></div>
 <div class="function-doc">
 <p>Returns a new list with duplicate values removed.
 Preserves the order of first occurrences.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap">Enum.uniq([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>, <span class="hl-number">1</span>])  <span class="hl-comment"># =&gt; [1, 2, 3]</span>
-Enum.uniq([<span class="hl-number">1</span>, <span class="hl-number">1</span>, <span class="hl-number">1</span>])         <span class="hl-comment"># =&gt; [1]</span></code></pre>
+Enum.uniq(<span class="hl-number">1..3</span>)             <span class="hl-comment"># =&gt; [1, 2, 3]</span></code></pre>
 </div>
 </div>
 <div class="function-detail" id="empty?-1">
@@ -484,12 +549,12 @@ Enum.uniq([<span class="hl-number">1</span>, <span class="hl-number">1</span>, <
 <div style="flex:1"></div>
 <a href="#empty?-1" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">empty?</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="signature"><code><span class="sig-name">empty?</span><span class="sig-paren">(</span>collection<span class="sig-separator">::</span><span class="sig-type-pill">Enumerable</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
 <div class="function-doc">
-<p>Returns true if the list has no elements.</p>
+<p>Returns true if the enumerable collection has no elements.</p>
 <h2>Examples</h2>
-<pre><code class="language-zap">Enum.empty?([])        <span class="hl-comment"># =&gt; true</span>
-Enum.empty?([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>]) <span class="hl-comment"># =&gt; false</span></code></pre>
+<pre><code class="language-zap">Enum.empty?([])    <span class="hl-comment"># =&gt; true</span>
+Enum.empty?(<span class="hl-number">1..3</span>)  <span class="hl-comment"># =&gt; false</span></code></pre>
 </div>
 </div>
 </main>
@@ -497,6 +562,7 @@ Enum.empty?([<span class="hl-number">1</span>, <span class="hl-number">2</span>,
 <h3>On This Page</h3>
 <ul>
 <li class="toc-section">Functions</li>
+<li><a href="#to_list-1">to_list/1</a></li>
 <li><a href="#map-2">map/2</a></li>
 <li><a href="#filter-2">filter/2</a></li>
 <li><a href="#reject-2">reject/2</a></li>
@@ -518,6 +584,7 @@ Enum.empty?([<span class="hl-number">1</span>, <span class="hl-number">2</span>,
 <li><a href="#reverse-1">reverse/1</a></li>
 <li><a href="#member?-2">member?/2</a></li>
 <li><a href="#at-2">at/2</a></li>
+<li><a href="#at-3">at/3</a></li>
 <li><a href="#concat-2">concat/2</a></li>
 <li><a href="#uniq-1">uniq/1</a></li>
 <li><a href="#empty?-1">empty?/1</a></li>

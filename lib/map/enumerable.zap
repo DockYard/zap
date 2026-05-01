@@ -1,6 +1,6 @@
 @doc = "Enumerable implementation for `Map`."
 
-pub impl Enumerable for Map(K, V) {
+pub impl Enumerable for Map {
   @doc = """
     Returns the next entry from a map.
 
@@ -11,7 +11,7 @@ pub impl Enumerable for Map(K, V) {
     removes the yielded entry and returns the persistent remainder.
     """
 
-  pub fn next(map :: Map(K, V)) -> {Atom, {K, V}, Map(K, V)} {
+  pub fn next(map :: %{map_key => map_value}) -> {Atom, {map_key, map_value}, %{map_key => map_value}} {
     :zig.Map.next(map)
   }
 }

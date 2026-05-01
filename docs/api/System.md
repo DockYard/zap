@@ -1,5 +1,10 @@
 # System
 
+Functions for interacting with the operating system.
+
+Provides access to command-line arguments, environment variables,
+and build-time configuration options.
+
 ## Functions
 
 ### arg_count/0

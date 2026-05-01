@@ -29,4 +29,5 @@ pub struct Range {
   start :: i64
   end :: i64
   step :: i64 = 1
+  direction :: i64 = 0
 }

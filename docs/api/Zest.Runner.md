@@ -1,5 +1,11 @@
 # Zest.Runner
 
+Discovers and runs Zest test structs.
+
+`use Zest.Runner` expands into a test runner `main/1` that discovers
+Zap source files from configured glob patterns, reflects their structs,
+invokes each discovered struct's `run/0`, and then prints the summary.
+
 ## Functions
 
 ### configure/0

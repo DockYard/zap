@@ -67,13 +67,26 @@
 <li><a href="../structs/Struct.html">Struct</a></li>
 <li><a href="../structs/System.html">System</a></li>
 <li><a href="../structs/Zest.html">Zest</a></li>
+<li class="active"><a href="../structs/Zest.Case.html">Zest.Case</a></li>
+<li><a href="../structs/Zest.Runner.html">Zest.Runner</a></li>
 </ul>
 </div>
 <div class="sidebar-group">
-<h4>Zest</h4>
+<h4>Protocols</h4>
 <ul>
-<li class="active"><a href="../structs/Zest.Case.html">Zest.Case</a></li>
-<li><a href="../structs/Zest.Runner.html">Zest.Runner</a></li>
+<li><a href="../structs/Arithmetic.html">Arithmetic</a></li>
+<li><a href="../structs/Comparator.html">Comparator</a></li>
+<li><a href="../structs/Concatenable.html">Concatenable</a></li>
+<li><a href="../structs/Enumerable.html">Enumerable</a></li>
+<li><a href="../structs/Membership.html">Membership</a></li>
+<li><a href="../structs/Stringable.html">Stringable</a></li>
+<li><a href="../structs/Updatable.html">Updatable</a></li>
+</ul>
+</div>
+<div class="sidebar-group">
+<h4>Unions</h4>
+<ul>
+<li><a href="../structs/IO.Mode.html">IO.Mode</a></li>
 </ul>
 </div>
 </nav>
@@ -82,7 +95,41 @@
 <h1>Zest.Case</h1>
 <div class="title-meta">
 <span class="pub-struct-pill">pub struct</span>
+<a href="https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/case.zap" class="source-file">./lib/zest/case.zap</a>
 </div>
+</div>
+<p class="tagline">Test case DSL for the Zest test framework.</p>
+<div class="structdoc">
+<p>Test case DSL for the Zest test framework.</p>
+<p>Provides <code>describe</code>, <code>test</code>, <code>assert</code>, <code>reject</code>, <code>setup</code>, and
+<code>teardown</code> for writing structured test cases with test tracking.</p>
+<p>Setup runs fresh before EACH test that requests context.
+Teardown runs after each test. Assertions are non-fatal.</p>
+<p>The <code>describe</code> and <code>test</code> macros expand into function declarations
+so that each test becomes a named pub function (test_*) that is
+called at struct level.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> Test.MyTest {
+  <span class="hl-keyword">use</span> Zest.Case
+
+  <span class="hl-keyword">describe</span>(<span class="hl-string">"my feature"</span>) {
+    <span class="hl-builtin">setup</span>() {
+      <span class="hl-number">42</span>
+    }
+
+    <span class="hl-keyword">test</span>(<span class="hl-string">"uses context"</span>, ctx) {
+      <span class="hl-keyword">assert</span>(ctx <span class="hl-op">==</span> <span class="hl-number">42</span>)
+    }
+
+    <span class="hl-keyword">test</span>(<span class="hl-string">"no context needed"</span>) {
+      <span class="hl-keyword">assert</span>(<span class="hl-builtin">true</span>)
+    }
+
+    <span class="hl-builtin">teardown</span>() {
+      IO.puts(<span class="hl-string">"cleanup"</span>)
+    }
+  }
+}</code></pre>
 </div>
 <h2 id="functions">Functions</h2>
 <table class="summary">

@@ -1,5 +1,10 @@
 # SourceGraph
 
+Compile-time access to source-level declarations.
+
+Source graph functions are intended for macros and other compile-time
+code that need to inspect declarations from known source paths.
+
 ## Macros
 
 ### structs/1

@@ -67,13 +67,26 @@
 <li><a href="../structs/Struct.html">Struct</a></li>
 <li><a href="../structs/System.html">System</a></li>
 <li><a href="../structs/Zest.html">Zest</a></li>
+<li><a href="../structs/Zest.Case.html">Zest.Case</a></li>
+<li><a href="../structs/Zest.Runner.html">Zest.Runner</a></li>
 </ul>
 </div>
 <div class="sidebar-group">
-<h4>Zest</h4>
+<h4>Protocols</h4>
 <ul>
-<li><a href="../structs/Zest.Case.html">Zest.Case</a></li>
-<li><a href="../structs/Zest.Runner.html">Zest.Runner</a></li>
+<li><a href="../structs/Arithmetic.html">Arithmetic</a></li>
+<li><a href="../structs/Comparator.html">Comparator</a></li>
+<li><a href="../structs/Concatenable.html">Concatenable</a></li>
+<li><a href="../structs/Enumerable.html">Enumerable</a></li>
+<li><a href="../structs/Membership.html">Membership</a></li>
+<li><a href="../structs/Stringable.html">Stringable</a></li>
+<li><a href="../structs/Updatable.html">Updatable</a></li>
+</ul>
+</div>
+<div class="sidebar-group">
+<h4>Unions</h4>
+<ul>
+<li><a href="../structs/IO.Mode.html">IO.Mode</a></li>
 </ul>
 </div>
 </nav>
@@ -84,6 +97,32 @@
 <span class="pub-struct-pill">pub struct</span>
 <a href="https://github.com/DockYard/zap/blob/v0.1.0/./lib/float.zap" class="source-file">./lib/float.zap</a>
 </div>
+</div>
+<p class="tagline">Functions for working with floating-point numbers.</p>
+<div class="structdoc">
+<p>Functions for working with floating-point numbers.</p>
+<h2>Float Types</h2>
+<p>Zap supports the following floating-point types:</p>
+<table class="markdown-table">
+<thead>
+<tr><th>Type</th><th>Bits</th><th>Precision</th></tr>
+</thead>
+<tbody>
+<tr><td><code>f16</code></td><td>16</td><td>Half precision</td></tr>
+<tr><td><code>f32</code></td><td>32</td><td>Single precision</td></tr>
+<tr><td><code>f64</code></td><td>64</td><td>Double precision</td></tr>
+<tr><td><code>f80</code></td><td>80</td><td>Extended precision</td></tr>
+<tr><td><code>f128</code></td><td>128</td><td>Quad precision</td></tr>
+</tbody>
+</table>
+<p>The default float type for literals is <code>f64</code>.</p>
+<h2>Call Resolution</h2>
+<p>Zap first looks for an exact typed function clause. If no exact
+clause exists, it may widen within the float family:</p>
+<p><code>f16</code> -&gt; <code>f32</code> -&gt; <code>f64</code> -&gt; <code>f80</code> -&gt; <code>f128</code></p>
+<p>Integer-to-float conversion is not implicit because large integers
+cannot always be represented exactly in floating-point. Use
+<code>Integer.to_float/1</code> when needed.</p>
 </div>
 <h2 id="functions">Functions</h2>
 <table class="summary">

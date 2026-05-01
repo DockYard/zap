@@ -1,5 +1,15 @@
 # Kernel
 
+The default struct imported into every Zap struct.
+
+Kernel provides the fundamental language constructs implemented
+as macros: control flow (`if`, `unless`), boolean operators
+(`and`, `or`), the pipe operator (`|>`), sigils (`~s`, `~S`,
+`~w`, `~W`), and declaration macros (`fn`, `struct`, `union`).
+
+You don't need to `import Kernel` — its macros are available
+everywhere automatically.
+
 ## Functions
 
 ### is_integer?/1

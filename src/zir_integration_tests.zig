@@ -366,6 +366,17 @@ test "CLI: run doc target generates documentation without executable root" {
         \\    "hello"
         \\  }
         \\}
+        \\
+        \\@doc = "A documented example protocol."
+        \\pub protocol DocProtocol {
+        \\  fn convert(value :: String) -> String
+        \\}
+        \\
+        \\@doc = "A documented example union."
+        \\pub union DocUnion {
+        \\  Empty,
+        \\  Value :: String
+        \\}
     ;
 
     tmp_dir.dir.writeFile(getTestIo(), .{ .sub_path = "build.zap", .data = build_source }) catch
@@ -402,6 +413,48 @@ test "CLI: run doc target generates documentation without executable root" {
     try std.testing.expect(std.mem.indexOf(u8, result.stderr, "root entry point") == null);
     tmp_dir.dir.access(getTestIo(), "docs/index.html", .{}) catch return error.Unexpected;
     tmp_dir.dir.access(getTestIo(), "docs/structs/DocExample.html", .{}) catch return error.Unexpected;
+
+    const generated_html = tmp_dir.dir.readFileAlloc(
+        getTestIo(),
+        "docs/structs/DocExample.html",
+        allocator,
+        .limited(256 * 1024),
+    ) catch return error.Unexpected;
+    defer allocator.free(generated_html);
+    try std.testing.expect(std.mem.indexOf(u8, generated_html, "A documented example struct.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated_html, "Returns a greeting.") != null);
+
+    const generated_markdown = tmp_dir.dir.readFileAlloc(
+        getTestIo(),
+        "docs/api/DocExample.md",
+        allocator,
+        .limited(256 * 1024),
+    ) catch return error.Unexpected;
+    defer allocator.free(generated_markdown);
+    try std.testing.expect(std.mem.indexOf(u8, generated_markdown, "A documented example struct.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated_markdown, "Returns a greeting.") != null);
+
+    const protocol_html = tmp_dir.dir.readFileAlloc(
+        getTestIo(),
+        "docs/structs/DocProtocol.html",
+        allocator,
+        .limited(256 * 1024),
+    ) catch return error.Unexpected;
+    defer allocator.free(protocol_html);
+    try std.testing.expect(std.mem.indexOf(u8, protocol_html, "A documented example protocol.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, protocol_html, "pub protocol") != null);
+    try std.testing.expect(std.mem.indexOf(u8, protocol_html, "convert(value :: String) -&gt; String") != null);
+
+    const union_html = tmp_dir.dir.readFileAlloc(
+        getTestIo(),
+        "docs/structs/DocUnion.html",
+        allocator,
+        .limited(256 * 1024),
+    ) catch return error.Unexpected;
+    defer allocator.free(union_html);
+    try std.testing.expect(std.mem.indexOf(u8, union_html, "A documented example union.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, union_html, "pub union") != null);
+    try std.testing.expect(std.mem.indexOf(u8, union_html, "Value :: String") != null);
 }
 
 // ============================================================
@@ -2033,6 +2086,93 @@ test "ZIR: for comprehension with filter" {
     );
     defer result.deinit();
     try std.testing.expectEqualStrings("12\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: protocol dispatch rejects unconstrained lowercase receiver type" {
+    try std.testing.expectError(error.CompilationFailed, compileOnly(
+        \\pub struct TestProg {
+        \\  pub fn bad(collection :: enumerable) -> i64 {
+        \\    case Enumerable.next(collection) {
+        \\      {:done, _, _} -> 0
+        \\      {:cont, value, _} -> value
+        \\    }
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    "done"
+        \\  }
+        \\}
+    ));
+}
+
+test "ZIR: protocol parameter rejects unconstrained lowercase argument type" {
+    try std.testing.expectError(error.CompilationFailed, compileOnly(
+        \\pub struct TestProg {
+        \\  pub fn bad(collection :: enumerable) -> [i64] {
+        \\    Enum.to_list(collection)
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    "done"
+        \\  }
+        \\}
+    ));
+}
+
+test "ZIR: Enum map dispatches through exact Enumerable constraint" {
+    var result = try compileAndRun(
+        \\pub struct TestProg {
+        \\  pub fn sum([] :: [i64]) -> i64 {
+        \\    0
+        \\  }
+        \\
+        \\  pub fn sum([h | t] :: [i64]) -> i64 {
+        \\    h + sum(t)
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    doubled = Enum.map(1..3, fn(x :: i64) -> i64 { x * 2 })
+        \\    Kernel.inspect(sum(doubled))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("12\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: Enum reduce maps through Enumerable entries" {
+    var result = try compileAndRun(
+        \\pub struct TestProg {
+        \\  pub fn main() -> String {
+        \\    total = Enum.reduce(%{a: 10, b: 20, c: 30}, 0, fn(accumulator :: i64, entry :: {Atom, i64}) -> i64 {
+        \\      case entry {
+        \\        {_key, value} -> accumulator + value
+        \\      }
+        \\    })
+        \\    Kernel.inspect(total)
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("60\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: Enum at uses caller-provided default type" {
+    var result = try compileAndRun(
+        \\pub struct TestProg {
+        \\  pub fn main() -> String {
+        \\    IO.puts(Enum.at(["a"], 2, "none"))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("none\n", result.stdout);
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
 

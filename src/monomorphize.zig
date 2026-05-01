@@ -97,10 +97,7 @@ pub fn monomorphize(
     // Transitive scan: rescan newly created specializations until fixpoint.
     {
         var scan_start: usize = 0;
-        var transitive_iterations: u32 = 0;
         while (scan_start < ctx.new_groups.items.len) {
-            transitive_iterations += 1;
-            if (transitive_iterations > 10) break; // Safety limit
             const scan_end = ctx.new_groups.items.len;
             // Copy entries to scan since scanning may append to new_groups,
             // which can reallocate and invalidate the items slice.
@@ -222,6 +219,17 @@ const MonomorphContext = struct {
     /// Active substitution map during cloning. Set by cloneGroupWithSubs,
     /// used by cloneExpr/cloneDecision to substitute type_ids.
     current_subs: ?*const SubstitutionMap = null,
+    /// Concrete parameter types for protocol-constrained parameters in the
+    /// group currently being cloned. Protocol constraints are positional:
+    /// `concat(first :: Enumerable, second :: Enumerable)` may specialize
+    /// the two `Enumerable` parameters to different concrete types, so this
+    /// cannot be represented by a TypeId-keyed substitution map.
+    current_protocol_param_types: ?[]const TypeId = null,
+    /// Original parameter types for the group currently being cloned. Used
+    /// with current_protocol_param_types to replace expression-level protocol
+    /// constraints that flow out of protocol calls, e.g. the `next_state`
+    /// binding from `Enumerable.next(state)`.
+    current_protocol_source_param_types: ?[]const hir.TypedParam = null,
     /// Map from group_id → FunctionGroup for generic functions
     generic_groups: std.AutoHashMap(u32, *const hir.FunctionGroup),
     /// Map from hash(group_id, type_args) → specialized group_id
@@ -256,22 +264,179 @@ const MonomorphContext = struct {
         arity: u32,
     ) ?u32 {
         const type_struct = self.store.typeToStructName(concrete_type, self.interner) orelse return null;
-
         for (self.program.impls) |impl_info| {
             if (impl_info.protocol_name != protocol_name) continue;
             if (!std.mem.eql(u8, self.interner.get(impl_info.target_struct), type_struct)) continue;
 
             // Found the impl. Search its function groups for the matching function.
             for (impl_info.function_group_ids) |gid| {
-                for (self.program.top_functions) |*group| {
-                    if (group.id == gid and
-                        std.mem.eql(u8, self.interner.get(group.name), function_name) and
-                        group.arity == arity)
-                    {
-                        return gid;
+                const group = self.findFunctionGroupById(gid) orelse continue;
+                if (std.mem.eql(u8, self.interner.get(group.name), function_name) and
+                    group.arity == arity)
+                {
+                    return gid;
+                }
+            }
+        }
+        return null;
+    }
+
+    fn typeImplementsProtocol(
+        self: *const MonomorphContext,
+        protocol_name: ast.StringId,
+        concrete_type: TypeId,
+    ) bool {
+        const type_struct = self.store.typeToStructName(concrete_type, self.interner) orelse return false;
+        for (self.program.impls) |impl_info| {
+            if (impl_info.protocol_name != protocol_name) continue;
+            if (std.mem.eql(u8, self.interner.get(impl_info.target_struct), type_struct)) return true;
+        }
+        return false;
+    }
+
+    fn protocolParamConcreteType(
+        self: *const MonomorphContext,
+        param_type: TypeId,
+        arg_type: TypeId,
+    ) ?TypeId {
+        if (!self.isConcreteRuntimeType(arg_type)) return null;
+
+        const param_typ = self.store.getType(param_type);
+        if (param_typ != .protocol_constraint) return null;
+        if (!self.typeImplementsProtocol(param_typ.protocol_constraint.protocol_name, arg_type)) return null;
+        return arg_type;
+    }
+
+    fn isConcreteRuntimeType(self: *const MonomorphContext, type_id: TypeId) bool {
+        if (type_id == types_mod.TypeStore.UNKNOWN or type_id == types_mod.TypeStore.ERROR) return false;
+        const typ = self.store.getType(type_id);
+        return switch (typ) {
+            .unknown, .error_type, .type_var, .protocol_constraint => false,
+            .list => |list_type| self.isConcreteRuntimeType(list_type.element),
+            .tuple => |tuple_type| {
+                for (tuple_type.elements) |element| {
+                    if (!self.isConcreteRuntimeType(element)) return false;
+                }
+                return true;
+            },
+            .function => |function_type| {
+                for (function_type.params) |param| {
+                    if (!self.isConcreteRuntimeType(param)) return false;
+                }
+                return self.isConcreteRuntimeType(function_type.return_type);
+            },
+            .map => |map_type| self.isConcreteRuntimeType(map_type.key) and
+                self.isConcreteRuntimeType(map_type.value),
+            .applied => |applied_type| {
+                if (!self.isConcreteRuntimeType(applied_type.base)) return false;
+                for (applied_type.args) |arg| {
+                    if (!self.isConcreteRuntimeType(arg)) return false;
+                }
+                return true;
+            },
+            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .term_type => true,
+            .struct_type, .union_type, .tagged_union, .opaque_type => true,
+        };
+    }
+
+    fn resolveCallArgumentType(
+        self: *const MonomorphContext,
+        arg: hir.CallArg,
+        param_type: ?TypeId,
+    ) TypeId {
+        var arg_type = arg.expr.type_id;
+
+        // If the argument is a call that was already specialized, use
+        // the specialization's return type as the arg type. This handles
+        // nested calls like List.empty?(Enum.map([], f)) where the inner
+        // call has a concrete return type.
+        if (self.store.containsTypeVars(arg_type) and arg.expr.kind == .call) {
+            if (self.call_rewrites.get(@intFromPtr(arg.expr))) |spec_id| {
+                for (self.new_groups.items) |entry| {
+                    if (entry.group.id == spec_id and entry.group.clauses.len > 0) {
+                        const spec_ret = entry.group.clauses[0].return_type;
+                        if (self.isConcreteRuntimeType(spec_ret)) {
+                            arg_type = spec_ret;
+                        }
+                        break;
                     }
                 }
             }
+        }
+
+        // If the argument is a local_get, always check tracked types.
+        // The expression's type_id may be UNKNOWN even when the local
+        // was assigned a concrete type (struct lists, etc.).
+        if (arg.expr.kind == .local_get) {
+            if (self.local_types.get(arg.expr.kind.local_get)) |concrete| {
+                arg_type = concrete;
+            }
+        }
+
+        // If the argument is a param_get inside a specialized function,
+        // use the specialized param's concrete type instead of the
+        // expression type which may not have been substituted correctly.
+        if (arg.expr.kind == .param_get and self.current_scan_params != null) {
+            const pidx = arg.expr.kind.param_get;
+            if (pidx < self.current_scan_params.?.len) {
+                const scan_param_type = self.current_scan_params.?[pidx].type_id;
+                if (self.isConcreteRuntimeType(scan_param_type)) {
+                    arg_type = scan_param_type;
+                }
+            }
+        }
+
+        // Monomorphized call sites carry substituted expected types on
+        // their arguments. Use those when the expression itself is still
+        // `any`/UNKNOWN. This is what lets recursive protocol helpers keep
+        // the concrete state type returned by a protocol impl.
+        if (!self.isConcreteRuntimeType(arg_type) and self.isConcreteRuntimeType(arg.expected_type)) {
+            arg_type = arg.expected_type;
+        }
+
+        // Empty container literal: adopt the parameter's container type so
+        // the call specializes the right way. The previous code defaulted
+        // to `[i64]` / `Map(Atom,i64)` regardless of the parameter, which
+        // silently picked the wrong overload (e.g. `[]` passed to `[String]`
+        // specialized as `[i64]`). We only do this when the parameter is
+        // fully concrete; if it still has type variables (generic context),
+        // let the unifier handle it.
+        if (arg_type == types_mod.TypeStore.UNKNOWN) {
+            if (param_type) |pt| {
+                const param_typ = self.store.getType(pt);
+                switch (param_typ) {
+                    .list => |list_t| {
+                        if (arg.expr.kind == .list_init and self.isConcreteRuntimeType(list_t.element)) {
+                            arg_type = pt;
+                        }
+                    },
+                    .map => |map_t| {
+                        if (arg.expr.kind == .map_init and
+                            self.isConcreteRuntimeType(map_t.key) and
+                            self.isConcreteRuntimeType(map_t.value))
+                        {
+                            arg_type = pt;
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        return arg_type;
+    }
+
+    fn findFunctionGroupById(self: *const MonomorphContext, group_id: u32) ?*const hir.FunctionGroup {
+        for (self.program.structs) |*mod| {
+            for (mod.functions) |*group| {
+                if (group.id == group_id) return group;
+            }
+        }
+        for (self.program.top_functions) |*group| {
+            if (group.id == group_id) return group;
+        }
+        for (self.new_groups.items) |*entry| {
+            if (entry.group.id == group_id) return &entry.group;
         }
         return null;
     }
@@ -335,6 +500,7 @@ const MonomorphContext = struct {
                 }
 
                 // Check if this calls a generic function or a protocol function
+                var protocol_resolved_target = false;
                 const target_id = switch (call.target) {
                     .direct => |dc| dc.function_group_id,
                     .dispatch => |dp| dp.function_group_id,
@@ -343,28 +509,10 @@ const MonomorphContext = struct {
                         if (self.isProtocolCall(nc)) |proto_name| {
                             // Find the concrete type from the first argument
                             if (call.args.len > 0) {
-                                var arg_type = call.args[0].expr.type_id;
-                                // Resolve local_get types
-                                if (self.store.containsTypeVars(arg_type) and call.args[0].expr.kind == .local_get) {
-                                    if (self.local_types.get(call.args[0].expr.kind.local_get)) |concrete| {
-                                        arg_type = concrete;
-                                    }
-                                }
-                                // Resolve param_get types
-                                if (self.store.containsTypeVars(arg_type) and call.args[0].expr.kind == .param_get and self.current_scan_params != null) {
-                                    const pidx = call.args[0].expr.kind.param_get;
-                                    if (pidx < self.current_scan_params.?.len) {
-                                        const scan_param_type = self.current_scan_params.?[pidx].type_id;
-                                        if (!self.store.containsTypeVars(scan_param_type)) {
-                                            arg_type = scan_param_type;
-                                        }
-                                    }
-                                }
-                                if (!self.store.containsTypeVars(arg_type) and arg_type != types_mod.TypeStore.UNKNOWN) {
+                                const arg_type = self.resolveCallArgumentType(call.args[0], null);
+                                if (self.isConcreteRuntimeType(arg_type)) {
                                     if (self.resolveProtocolDispatch(proto_name, nc.name, arg_type, @intCast(call.args.len))) |impl_gid| {
-                                        // Don't record rewrite here — let the generic
-                                        // specialization path handle it after unification.
-                                        // The impl function is generic and needs monomorphization.
+                                        protocol_resolved_target = true;
                                         break :blk impl_gid;
                                     }
                                 }
@@ -378,6 +526,9 @@ const MonomorphContext = struct {
                 };
 
                 const generic_group = self.generic_groups.get(target_id) orelse {
+                    if (protocol_resolved_target) {
+                        try self.call_rewrites.put(@intFromPtr(expr), target_id);
+                    }
                     return;
                 };
 
@@ -389,78 +540,21 @@ const MonomorphContext = struct {
                 var subs = SubstitutionMap.init(self.allocator);
                 defer subs.deinit();
 
+                const protocol_param_types = try self.allocator.alloc(TypeId, first_clause.params.len);
+                defer self.allocator.free(protocol_param_types);
+                @memset(protocol_param_types, types_mod.TypeStore.UNKNOWN);
+
                 // Unify argument types with parameter types. UNKNOWN arguments
                 // are skipped rather than failing — partial unification allows
                 // type variables to be bound from the arguments that ARE known
                 // (e.g., binding element=i64 from the list arg even when the
                 // callback arg is an unresolved function reference).
-                for (first_clause.params, call.args) |param, arg| {
-                    var arg_type = arg.expr.type_id;
-                    // If the argument is a call that was already specialized,
-                    // use the specialization's return type as the arg type.
-                    // This handles nested calls like List.empty?(Enum.map([], f))
-                    // where the inner call has a concrete return type.
-                    if (self.store.containsTypeVars(arg_type) and arg.expr.kind == .call) {
-                        if (self.call_rewrites.get(@intFromPtr(arg.expr))) |spec_id| {
-                            for (self.new_groups.items) |entry| {
-                                if (entry.group.id == spec_id and entry.group.clauses.len > 0) {
-                                    const spec_ret = entry.group.clauses[0].return_type;
-                                    if (!self.store.containsTypeVars(spec_ret)) {
-                                        arg_type = spec_ret;
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    // If the argument is a local_get, always check tracked types.
-                    // The expression's type_id may be UNKNOWN even when the local
-                    // was assigned a concrete type (struct lists, etc.).
-                    if (arg.expr.kind == .local_get) {
-                        if (self.local_types.get(arg.expr.kind.local_get)) |concrete| {
-                            arg_type = concrete;
-                        }
-                    }
-                    // If the argument is a param_get inside a specialized function,
-                    // use the specialized param's concrete type instead of the
-                    // expression type which may not have been substituted correctly.
-                    if (arg.expr.kind == .param_get and self.current_scan_params != null) {
-                        const pidx = arg.expr.kind.param_get;
-                        if (pidx < self.current_scan_params.?.len) {
-                            const scan_param_type = self.current_scan_params.?[pidx].type_id;
-                            if (!self.store.containsTypeVars(scan_param_type)) {
-                                arg_type = scan_param_type;
-                            }
-                        }
-                    }
-                    // Empty container literal: adopt the parameter's container
-                    // type so the call specializes the right way. The previous
-                    // code defaulted to `[i64]` / `Map(Atom,i64)` regardless of
-                    // the parameter, which silently picked the wrong overload
-                    // (e.g. `[]` passed to `[String]` specialized as `[i64]`).
-                    // We only do this when the parameter is fully concrete; if
-                    // it still has type variables (generic context), let the
-                    // unifier handle it.
-                    if (arg_type == types_mod.TypeStore.UNKNOWN) {
-                        const param_typ = self.store.getType(param.type_id);
-                        switch (param_typ) {
-                            .list => |list_t| {
-                                if (arg.expr.kind == .list_init and !self.store.containsTypeVars(list_t.element)) {
-                                    arg_type = param.type_id;
-                                }
-                            },
-                            .map => |map_t| {
-                                if (arg.expr.kind == .map_init and
-                                    !self.store.containsTypeVars(map_t.key) and
-                                    !self.store.containsTypeVars(map_t.value))
-                                {
-                                    arg_type = param.type_id;
-                                }
-                            },
-                            else => {},
-                        }
-                    }
+                for (first_clause.params, call.args, 0..) |param, arg, param_index| {
+                    const arg_type = self.resolveCallArgumentType(arg, param.type_id);
                     if (arg_type == types_mod.TypeStore.UNKNOWN or arg_type == types_mod.TypeStore.ERROR) continue;
+                    if (self.protocolParamConcreteType(param.type_id, arg_type)) |concrete_protocol_type| {
+                        protocol_param_types[param_index] = concrete_protocol_type;
+                    }
                     _ = self.store.unify(param.type_id, arg_type, &subs) catch {};
                 }
 
@@ -503,21 +597,7 @@ const MonomorphContext = struct {
                     var return_scalar_set = return_uses_var_as_scalar orelse std.AutoHashMap(types_mod.TypeVarId, void).init(self.allocator);
                     defer return_scalar_set.deinit();
                     for (first_clause.params, call.args) |param, arg| {
-                        var arg_type = arg.expr.type_id;
-                        if (arg.expr.kind == .local_get) {
-                            if (self.local_types.get(arg.expr.kind.local_get)) |concrete| {
-                                arg_type = concrete;
-                            }
-                        }
-                        if (arg.expr.kind == .param_get and self.current_scan_params != null) {
-                            const pidx = arg.expr.kind.param_get;
-                            if (pidx < self.current_scan_params.?.len) {
-                                const scan_param_type = self.current_scan_params.?[pidx].type_id;
-                                if (!self.store.containsTypeVars(scan_param_type)) {
-                                    arg_type = scan_param_type;
-                                }
-                            }
-                        }
+                        const arg_type = self.resolveCallArgumentType(arg, param.type_id);
                         if (arg_type == types_mod.TypeStore.UNKNOWN or arg_type == types_mod.TypeStore.ERROR) continue;
                         promoteContainerVarsExceptScalarReturn(self.store, param.type_id, arg_type, &return_scalar_set, &subs);
                     }
@@ -538,6 +618,13 @@ const MonomorphContext = struct {
                         try type_args.append(self.allocator, concrete);
                     }
                 }
+                for (protocol_param_types) |protocol_type| {
+                    if (protocol_type != types_mod.TypeStore.UNKNOWN) {
+                        try type_args.append(self.allocator, protocol_type);
+                    }
+                }
+
+                if (self.hasUnboundProtocolParams(first_clause.params, protocol_param_types)) return;
 
                 if (type_args.items.len == 0) return;
 
@@ -545,14 +632,14 @@ const MonomorphContext = struct {
                 // when scanning inside generic function bodies where args are unresolved.
                 // Creating such specializations produces bogus stubs (e.g. head__T).
                 {
-                    var has_vars = false;
+                    var has_unresolved_type = false;
                     for (type_args.items) |ta| {
-                        if (self.store.containsTypeVars(ta)) {
-                            has_vars = true;
+                        if (!self.isConcreteRuntimeType(ta)) {
+                            has_unresolved_type = true;
                             break;
                         }
                     }
-                    if (has_vars) return;
+                    if (has_unresolved_type) return;
                 }
 
                 // Check if this instantiation already exists for THIS struct.
@@ -568,9 +655,9 @@ const MonomorphContext = struct {
                     // Apply subs to the GENERIC GROUP's return type (which uses the
                     // same type var IDs as the subs), NOT expr.type_id (which uses
                     // different type var IDs from the HIR builder's scope).
-                    if (self.store.containsTypeVars(expr.type_id)) {
+                    if (!self.isConcreteRuntimeType(expr.type_id)) {
                         const concrete_return = subs.applyToType(self.store, first_clause.return_type);
-                        if (!self.store.containsTypeVars(concrete_return)) {
+                        if (self.isConcreteRuntimeType(concrete_return)) {
                             @constCast(expr).type_id = concrete_return;
                         }
                     }
@@ -581,7 +668,7 @@ const MonomorphContext = struct {
                 const new_id = self.next_group_id.*;
                 self.next_group_id.* += 1;
 
-                const specialized = try self.cloneGroupWithSubs(generic_group, &subs, new_id);
+                const specialized = try self.cloneGroupWithSubs(generic_group, &subs, protocol_param_types, type_args.items, new_id);
                 try self.new_groups.append(self.allocator, .{
                     .group = specialized,
                     .source_group_id = target_id,
@@ -596,9 +683,9 @@ const MonomorphContext = struct {
                 // which uses the same type var IDs as the subs map. Do NOT use
                 // expr.type_id because the HIR builder resolves type vars in a separate
                 // scope, producing different type var IDs that aren't in the subs.
-                if (self.store.containsTypeVars(expr.type_id)) {
+                if (!self.isConcreteRuntimeType(expr.type_id)) {
                     const concrete_return = subs.applyToType(self.store, first_clause.return_type);
-                    if (!self.store.containsTypeVars(concrete_return)) {
+                    if (self.isConcreteRuntimeType(concrete_return)) {
                         @constCast(expr).type_id = concrete_return;
                     }
                 }
@@ -672,24 +759,162 @@ const MonomorphContext = struct {
         }
     }
 
+    fn hasUnboundProtocolParams(
+        self: *const MonomorphContext,
+        params: []const hir.TypedParam,
+        protocol_param_types: []const TypeId,
+    ) bool {
+        for (params, 0..) |param, param_index| {
+            if (self.store.getType(param.type_id) != .protocol_constraint) continue;
+            if (param_index >= protocol_param_types.len) return true;
+            if (protocol_param_types[param_index] == types_mod.TypeStore.UNKNOWN) return true;
+        }
+        return false;
+    }
+
+    fn protocolConstraintReplacement(self: *const MonomorphContext, constraint_type: TypeId) ?TypeId {
+        const source_params = self.current_protocol_source_param_types orelse return null;
+        const concrete_params = self.current_protocol_param_types orelse return null;
+        const constraint = self.store.getType(constraint_type);
+        if (constraint != .protocol_constraint) return null;
+
+        var replacement: TypeId = types_mod.TypeStore.UNKNOWN;
+        var replacement_count: u32 = 0;
+        for (source_params, 0..) |source_param, param_index| {
+            if (param_index >= concrete_params.len) continue;
+            if (concrete_params[param_index] == types_mod.TypeStore.UNKNOWN) continue;
+            const source_type = self.store.getType(source_param.type_id);
+            if (source_type != .protocol_constraint) continue;
+            if (source_type.protocol_constraint.protocol_name != constraint.protocol_constraint.protocol_name) continue;
+            if (!std.mem.eql(TypeId, source_type.protocol_constraint.type_params, constraint.protocol_constraint.type_params)) continue;
+            replacement = concrete_params[param_index];
+            replacement_count += 1;
+        }
+
+        return if (replacement_count == 1) replacement else null;
+    }
+
+    fn applyActiveProtocolParamTypes(self: *MonomorphContext, type_id: TypeId) error{OutOfMemory}!TypeId {
+        if (type_id == types_mod.TypeStore.UNKNOWN or type_id == types_mod.TypeStore.ERROR) return type_id;
+        const typ = self.store.getType(type_id);
+        return switch (typ) {
+            .protocol_constraint => |pc| blk: {
+                var changed_params = false;
+                const new_params = try self.allocator.alloc(TypeId, pc.type_params.len);
+                for (pc.type_params, 0..) |type_param, index| {
+                    const new_type_param = try self.applyActiveProtocolParamTypes(type_param);
+                    new_params[index] = new_type_param;
+                    if (new_type_param != type_param) changed_params = true;
+                }
+
+                const candidate_type = if (changed_params)
+                    try self.store.addType(.{ .protocol_constraint = .{
+                        .protocol_name = pc.protocol_name,
+                        .type_params = new_params,
+                    } })
+                else blk2: {
+                    self.allocator.free(new_params);
+                    break :blk2 type_id;
+                };
+
+                break :blk self.protocolConstraintReplacement(candidate_type) orelse candidate_type;
+            },
+            .list => |list_type| blk: {
+                const element = try self.applyActiveProtocolParamTypes(list_type.element);
+                if (element == list_type.element) break :blk type_id;
+                break :blk try self.store.addType(.{ .list = .{ .element = element } });
+            },
+            .tuple => |tuple_type| blk: {
+                var changed = false;
+                const elements = try self.allocator.alloc(TypeId, tuple_type.elements.len);
+                for (tuple_type.elements, 0..) |element, index| {
+                    const new_element = try self.applyActiveProtocolParamTypes(element);
+                    elements[index] = new_element;
+                    if (new_element != element) changed = true;
+                }
+                if (!changed) {
+                    self.allocator.free(elements);
+                    break :blk type_id;
+                }
+                break :blk try self.store.addType(.{ .tuple = .{ .elements = elements } });
+            },
+            .function => |function_type| blk: {
+                var changed = false;
+                const params = try self.allocator.alloc(TypeId, function_type.params.len);
+                for (function_type.params, 0..) |param, index| {
+                    const new_param = try self.applyActiveProtocolParamTypes(param);
+                    params[index] = new_param;
+                    if (new_param != param) changed = true;
+                }
+                const return_type = try self.applyActiveProtocolParamTypes(function_type.return_type);
+                if (return_type != function_type.return_type) changed = true;
+                if (!changed) {
+                    self.allocator.free(params);
+                    break :blk type_id;
+                }
+                break :blk try self.store.addType(.{ .function = .{
+                    .params = params,
+                    .return_type = return_type,
+                    .param_ownerships = function_type.param_ownerships,
+                    .return_ownership = function_type.return_ownership,
+                } });
+            },
+            .map => |map_type| blk: {
+                const key = try self.applyActiveProtocolParamTypes(map_type.key);
+                const value = try self.applyActiveProtocolParamTypes(map_type.value);
+                if (key == map_type.key and value == map_type.value) break :blk type_id;
+                break :blk try self.store.addType(.{ .map = .{ .key = key, .value = value } });
+            },
+            .applied => |applied_type| blk: {
+                var changed = false;
+                const base = try self.applyActiveProtocolParamTypes(applied_type.base);
+                if (base != applied_type.base) changed = true;
+                const args = try self.allocator.alloc(TypeId, applied_type.args.len);
+                for (applied_type.args, 0..) |arg, index| {
+                    const new_arg = try self.applyActiveProtocolParamTypes(arg);
+                    args[index] = new_arg;
+                    if (new_arg != arg) changed = true;
+                }
+                if (!changed) {
+                    self.allocator.free(args);
+                    break :blk type_id;
+                }
+                break :blk try self.store.addType(.{ .applied = .{ .base = base, .args = args } });
+            },
+            else => type_id,
+        };
+    }
+
     fn cloneGroupWithSubs(
         self: *MonomorphContext,
         group: *const hir.FunctionGroup,
         subs: *const SubstitutionMap,
+        protocol_param_types: []const TypeId,
+        type_args: []const TypeId,
         new_id: u32,
     ) !hir.FunctionGroup {
         const saved_subs = self.current_subs;
+        const saved_protocol_param_types = self.current_protocol_param_types;
+        const saved_protocol_source_param_types = self.current_protocol_source_param_types;
         self.current_subs = subs;
+        self.current_protocol_param_types = protocol_param_types;
+        self.current_protocol_source_param_types = if (group.clauses.len > 0) group.clauses[0].params else &.{};
         defer self.current_subs = saved_subs;
+        defer self.current_protocol_param_types = saved_protocol_param_types;
+        defer self.current_protocol_source_param_types = saved_protocol_source_param_types;
 
         var new_clauses: std.ArrayListUnmanaged(hir.Clause) = .empty;
         for (group.clauses) |clause| {
             // Substitute types in params
             var new_params = try self.allocator.alloc(hir.TypedParam, clause.params.len);
             for (clause.params, 0..) |param, i| {
+                const protocol_param_type = if (i < protocol_param_types.len) protocol_param_types[i] else types_mod.TypeStore.UNKNOWN;
                 new_params[i] = .{
                     .name = param.name,
-                    .type_id = subs.applyToType(self.store, param.type_id),
+                    .type_id = if (protocol_param_type != types_mod.TypeStore.UNKNOWN)
+                        protocol_param_type
+                    else
+                        try self.applyActiveProtocolParamTypes(subs.applyToType(self.store, param.type_id)),
                     .ownership = param.ownership,
                     .pattern = param.pattern,
                     .default = if (param.default) |d| try self.cloneExpr(d) else null,
@@ -698,7 +923,7 @@ const MonomorphContext = struct {
 
             try new_clauses.append(self.allocator, .{
                 .params = new_params,
-                .return_type = subs.applyToType(self.store, clause.return_type),
+                .return_type = try self.applyActiveProtocolParamTypes(subs.applyToType(self.store, clause.return_type)),
                 .decision = try self.cloneDecision(clause.decision),
                 .body = try self.cloneBlock(clause.body),
                 .refinement = if (clause.refinement) |r| try self.cloneExpr(r) else null,
@@ -732,7 +957,7 @@ const MonomorphContext = struct {
             std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ source_struct_prefix, base_name }) catch base_name
         else
             base_name;
-        const mangled_str = mangleName(self.allocator, qualified_base, self.store, subs) catch qualified_base;
+        const mangled_str = mangleName(self.allocator, qualified_base, self.store, type_args) catch qualified_base;
         const mangled_name = self.interner.intern(mangled_str) catch group.name;
 
         return .{
@@ -758,9 +983,9 @@ const MonomorphContext = struct {
         result.* = .{
             .stmts = try new_stmts.toOwnedSlice(self.allocator),
             .result_type = if (self.current_subs) |subs|
-                subs.applyToType(self.store, block.result_type)
+                try self.applyActiveProtocolParamTypes(subs.applyToType(self.store, block.result_type))
             else
-                block.result_type,
+                try self.applyActiveProtocolParamTypes(block.result_type),
         };
         return result;
     }
@@ -778,10 +1003,22 @@ const MonomorphContext = struct {
 
     fn cloneExpr(self: *MonomorphContext, expr: *const hir.Expr) error{OutOfMemory}!*const hir.Expr {
         const result = try self.allocator.create(hir.Expr);
-        const substituted_type = if (self.current_subs) |subs|
-            subs.applyToType(self.store, expr.type_id)
-        else
-            expr.type_id;
+        const substituted_type = blk: {
+            if (expr.kind == .param_get) {
+                if (self.current_protocol_param_types) |protocol_param_types| {
+                    const param_index = expr.kind.param_get;
+                    if (param_index < protocol_param_types.len and
+                        protocol_param_types[param_index] != types_mod.TypeStore.UNKNOWN)
+                    {
+                        break :blk protocol_param_types[param_index];
+                    }
+                }
+            }
+            if (self.current_subs) |subs| {
+                break :blk try self.applyActiveProtocolParamTypes(subs.applyToType(self.store, expr.type_id));
+            }
+            break :blk try self.applyActiveProtocolParamTypes(expr.type_id);
+        };
         result.* = .{
             .kind = try self.cloneExprKind(expr.kind),
             .type_id = substituted_type,
@@ -813,9 +1050,9 @@ const MonomorphContext = struct {
                         .expr = try self.cloneExpr(arg.expr),
                         .mode = arg.mode,
                         .expected_type = if (self.current_subs) |subs|
-                            subs.applyToType(self.store, arg.expected_type)
+                            try self.applyActiveProtocolParamTypes(subs.applyToType(self.store, arg.expected_type))
                         else
-                            arg.expected_type,
+                            try self.applyActiveProtocolParamTypes(arg.expected_type),
                     };
                 }
                 break :blk .{ .call = .{ .target = c.target, .args = new_args } };
@@ -850,9 +1087,9 @@ const MonomorphContext = struct {
                     new_fields[i] = .{ .name = f.name, .value = try self.cloneExpr(f.value) };
                 }
                 const substituted_struct_type = if (self.current_subs) |subs|
-                    subs.applyToType(self.store, si.type_id)
+                    try self.applyActiveProtocolParamTypes(subs.applyToType(self.store, si.type_id))
                 else
-                    si.type_id;
+                    try self.applyActiveProtocolParamTypes(si.type_id);
                 break :blk .{ .struct_init = .{ .type_id = substituted_struct_type, .fields = new_fields } };
             },
             .field_get => |fg| .{ .field_get = .{
@@ -899,9 +1136,9 @@ const MonomorphContext = struct {
             .unwrap => |e| .{ .unwrap = try self.cloneExpr(e) },
             .union_init => |ui| .{ .union_init = .{
                 .union_type_id = if (self.current_subs) |subs|
-                    subs.applyToType(self.store, ui.union_type_id)
+                    try self.applyActiveProtocolParamTypes(subs.applyToType(self.store, ui.union_type_id))
                 else
-                    ui.union_type_id,
+                    try self.applyActiveProtocolParamTypes(ui.union_type_id),
                 .variant_name = ui.variant_name,
                 .value = try self.cloneExpr(ui.value),
             } },
@@ -1294,25 +1531,15 @@ fn hashInstantiation(group_id: u32, type_args: []const TypeId) u64 {
 
 /// Generate a mangled name for a specialized function.
 /// E.g. "length" with type args [String] → "length__String"
-fn mangleName(allocator: Allocator, base_name: []const u8, store: *const TypeStore, subs: *const SubstitutionMap) ![]const u8 {
-    if (subs.bindings.count() == 0) return base_name;
-
-    // Collect and sort type variable IDs for deterministic name mangling
-    var var_ids: std.ArrayListUnmanaged(types_mod.TypeVarId) = .empty;
-    defer var_ids.deinit(allocator);
-    var it = subs.bindings.iterator();
-    while (it.next()) |entry| {
-        try var_ids.append(allocator, entry.key_ptr.*);
-    }
-    std.mem.sort(types_mod.TypeVarId, var_ids.items, {}, std.sort.asc(types_mod.TypeVarId));
+fn mangleName(allocator: Allocator, base_name: []const u8, store: *const TypeStore, type_args: []const TypeId) ![]const u8 {
+    if (type_args.len == 0) return base_name;
 
     var parts: std.ArrayListUnmanaged(u8) = .empty;
     try parts.appendSlice(allocator, base_name);
     try parts.appendSlice(allocator, "__");
 
-    for (var_ids.items, 0..) |var_id, i| {
+    for (type_args, 0..) |concrete_type, i| {
         if (i > 0) try parts.append(allocator, '_');
-        const concrete_type = subs.bindings.get(var_id) orelse continue;
         const type_name = typeIdToMangledName(store, concrete_type);
         try parts.appendSlice(allocator, type_name);
     }

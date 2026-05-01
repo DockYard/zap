@@ -1,5 +1,32 @@
 # Float
 
+Functions for working with floating-point numbers.
+
+## Float Types
+
+Zap supports the following floating-point types:
+
+| Type  | Bits | Precision        |
+|-------|------|------------------|
+| `f16` | 16   | Half precision   |
+| `f32` | 32   | Single precision |
+| `f64` | 64   | Double precision |
+| `f80` | 80   | Extended precision |
+| `f128` | 128 | Quad precision   |
+
+The default float type for literals is `f64`.
+
+## Call Resolution
+
+Zap first looks for an exact typed function clause. If no exact
+clause exists, it may widen within the float family:
+
+`f16` -> `f32` -> `f64` -> `f80` -> `f128`
+
+Integer-to-float conversion is not implicit because large integers
+cannot always be represented exactly in floating-point. Use
+`Integer.to_float/1` when needed.
+
 ## Functions
 
 ### to_string/1

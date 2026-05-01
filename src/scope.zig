@@ -383,6 +383,8 @@ pub const TypeEntry = struct {
     scope_id: ScopeId,
     kind: TypeKind,
     params: []const ast.TypeParam,
+    /// Type-level attributes (@doc, @deprecated, etc.)
+    attributes: std.ArrayListUnmanaged(Attribute) = .empty,
 };
 
 pub const TypeKind = union(enum) {
@@ -676,6 +678,7 @@ pub const ScopeGraph = struct {
             .scope_id = scope_id,
             .kind = kind,
             .params = params,
+            .attributes = .empty,
         });
         // Register named types for global lookup (skip sentinel 0 for struct-scoped unnamed structs)
         if (name != 0) {

@@ -67,13 +67,26 @@
 <li><a href="../structs/Struct.html">Struct</a></li>
 <li><a href="../structs/System.html">System</a></li>
 <li><a href="../structs/Zest.html">Zest</a></li>
+<li><a href="../structs/Zest.Case.html">Zest.Case</a></li>
+<li><a href="../structs/Zest.Runner.html">Zest.Runner</a></li>
 </ul>
 </div>
 <div class="sidebar-group">
-<h4>Zest</h4>
+<h4>Protocols</h4>
 <ul>
-<li><a href="../structs/Zest.Case.html">Zest.Case</a></li>
-<li><a href="../structs/Zest.Runner.html">Zest.Runner</a></li>
+<li><a href="../structs/Arithmetic.html">Arithmetic</a></li>
+<li><a href="../structs/Comparator.html">Comparator</a></li>
+<li><a href="../structs/Concatenable.html">Concatenable</a></li>
+<li><a href="../structs/Enumerable.html">Enumerable</a></li>
+<li><a href="../structs/Membership.html">Membership</a></li>
+<li><a href="../structs/Stringable.html">Stringable</a></li>
+<li><a href="../structs/Updatable.html">Updatable</a></li>
+</ul>
+</div>
+<div class="sidebar-group">
+<h4>Unions</h4>
+<ul>
+<li><a href="../structs/IO.Mode.html">IO.Mode</a></li>
 </ul>
 </div>
 </nav>
@@ -84,6 +97,16 @@
 <span class="pub-struct-pill">pub struct</span>
 <a href="https://github.com/DockYard/zap/blob/v0.1.0/./lib/kernel.zap" class="source-file">./lib/kernel.zap</a>
 </div>
+</div>
+<p class="tagline">The default struct imported into every Zap struct.</p>
+<div class="structdoc">
+<p>The default struct imported into every Zap struct.</p>
+<p>Kernel provides the fundamental language constructs implemented
+as macros: control flow (<code>if</code>, <code>unless</code>), boolean operators
+(<code>and</code>, <code>or</code>), the pipe operator (<code>|&gt;</code>), sigils (<code>~s</code>, <code>~S</code>,
+<code>~w</code>, <code>~W</code>), and declaration macros (<code>fn</code>, <code>struct</code>, <code>union</code>).</p>
+<p>You don't need to <code>import Kernel</code> — its macros are available
+everywhere automatically.</p>
 </div>
 <h2 id="functions">Functions</h2>
 <table class="summary">
@@ -535,8 +558,8 @@ to the function call on the right.</p>
 <p><code>x |&gt; f(y)</code> becomes <code>f(x, y)</code>.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap"><span class="hl-number">5</span> <span class="hl-op">|&gt;</span> add_one()              <span class="hl-comment"># =&gt; add_one(5)</span>
-<span class="hl-string">"hello"</span> <span class="hl-op">|&gt;</span> <span class="hl-type">String</span>.length()  <span class="hl-comment"># =&gt; String.length(&quot;hello&quot;)</span>
 x <span class="hl-op">|&gt;</span> f() <span class="hl-op">|&gt;</span> g()            <span class="hl-comment"># =&gt; g(f(x))</span></code></pre>
+<pre><code class="language-zap"><span class="hl-string">"hello"</span> <span class="hl-op">|&gt;</span> <span class="hl-type">String</span>.length()  <span class="hl-comment"># =&gt; String.length(&quot;hello&quot;)</span></code></pre>
 </div>
 </div>
 <div class="function-detail" id="<>-2">

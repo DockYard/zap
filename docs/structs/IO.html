@@ -67,13 +67,26 @@
 <li><a href="../structs/Struct.html">Struct</a></li>
 <li><a href="../structs/System.html">System</a></li>
 <li><a href="../structs/Zest.html">Zest</a></li>
+<li><a href="../structs/Zest.Case.html">Zest.Case</a></li>
+<li><a href="../structs/Zest.Runner.html">Zest.Runner</a></li>
 </ul>
 </div>
 <div class="sidebar-group">
-<h4>Zest</h4>
+<h4>Protocols</h4>
 <ul>
-<li><a href="../structs/Zest.Case.html">Zest.Case</a></li>
-<li><a href="../structs/Zest.Runner.html">Zest.Runner</a></li>
+<li><a href="../structs/Arithmetic.html">Arithmetic</a></li>
+<li><a href="../structs/Comparator.html">Comparator</a></li>
+<li><a href="../structs/Concatenable.html">Concatenable</a></li>
+<li><a href="../structs/Enumerable.html">Enumerable</a></li>
+<li><a href="../structs/Membership.html">Membership</a></li>
+<li><a href="../structs/Stringable.html">Stringable</a></li>
+<li><a href="../structs/Updatable.html">Updatable</a></li>
+</ul>
+</div>
+<div class="sidebar-group">
+<h4>Unions</h4>
+<ul>
+<li><a href="../structs/IO.Mode.html">IO.Mode</a></li>
 </ul>
 </div>
 </nav>
@@ -84,6 +97,16 @@
 <span class="pub-struct-pill">pub struct</span>
 <a href="https://github.com/DockYard/zap/blob/v0.1.0/./lib/io.zap" class="source-file">./lib/io.zap</a>
 </div>
+</div>
+<p class="tagline">Functions for standard input/output operations.</p>
+<div class="structdoc">
+<p>Functions for standard input/output operations.</p>
+<p><code>IO</code> provides the basic building blocks for printing to stdout.
+All functions return their input, making them composable in
+pipe chains.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">IO.puts(<span class="hl-string">"Hello, world!"</span>)
+<span class="hl-string">"result"</span> <span class="hl-op">|&gt;</span> IO.puts()</code></pre>
 </div>
 <h2 id="functions">Functions</h2>
 <table class="summary">
@@ -117,8 +140,9 @@ to stdout. Returns the original message, making it suitable <span class="hl-keyw
 
     IO.puts(<span class="hl-string">"Hello, world!"</span>)
     <span class="hl-comment"># =&gt; prints &quot;Hello, world!</span></code></pre>
-<pre><code class="language-zap">    <span class="hl-string">"result"</span> <span class="hl-op">|&gt;</span> IO.puts()
-    <span class="hl-comment"># =&gt; prints &quot;result</span></code></pre>
+<p>&quot; to stdout</p>
+<pre><code class="language-zap">    <span class="hl-string">"result"</span> <span class="hl-op">|&gt;</span> IO.puts()</code></pre>
+<p>&quot;, returns &quot;result&quot;</p>
 </div>
 </div>
 <div class="function-detail" id="print_str-1">

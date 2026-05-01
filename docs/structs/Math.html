@@ -67,13 +67,26 @@
 <li><a href="../structs/Struct.html">Struct</a></li>
 <li><a href="../structs/System.html">System</a></li>
 <li><a href="../structs/Zest.html">Zest</a></li>
+<li><a href="../structs/Zest.Case.html">Zest.Case</a></li>
+<li><a href="../structs/Zest.Runner.html">Zest.Runner</a></li>
 </ul>
 </div>
 <div class="sidebar-group">
-<h4>Zest</h4>
+<h4>Protocols</h4>
 <ul>
-<li><a href="../structs/Zest.Case.html">Zest.Case</a></li>
-<li><a href="../structs/Zest.Runner.html">Zest.Runner</a></li>
+<li><a href="../structs/Arithmetic.html">Arithmetic</a></li>
+<li><a href="../structs/Comparator.html">Comparator</a></li>
+<li><a href="../structs/Concatenable.html">Concatenable</a></li>
+<li><a href="../structs/Enumerable.html">Enumerable</a></li>
+<li><a href="../structs/Membership.html">Membership</a></li>
+<li><a href="../structs/Stringable.html">Stringable</a></li>
+<li><a href="../structs/Updatable.html">Updatable</a></li>
+</ul>
+</div>
+<div class="sidebar-group">
+<h4>Unions</h4>
+<ul>
+<li><a href="../structs/IO.Mode.html">IO.Mode</a></li>
 </ul>
 </div>
 </nav>
@@ -84,6 +97,26 @@
 <span class="pub-struct-pill">pub struct</span>
 <a href="https://github.com/DockYard/zap/blob/v0.1.0/./lib/math.zap" class="source-file">./lib/math.zap</a>
 </div>
+</div>
+<p class="tagline">Mathematical functions for numeric computation.</p>
+<div class="structdoc">
+<p>Mathematical functions for numeric computation.</p>
+<p>Provides trigonometric, exponential, logarithmic, and other
+mathematical operations on numeric values. Functions with numeric
+arguments define exact clauses for <code>i8</code>, <code>i16</code>, <code>i32</code>, <code>i64</code>,
+<code>i128</code>, <code>u8</code>, <code>u16</code>, <code>u32</code>, <code>u64</code>, <code>u128</code>, <code>f16</code>, <code>f32</code>, <code>f64</code>,
+<code>f80</code>, and <code>f128</code> instead of relying on widening.</p>
+<p>Float inputs preserve the caller's concrete float type. Integer
+inputs return <code>f64</code>, except <code>i128</code> and <code>u128</code> inputs which return
+<code>f128</code> to avoid forcing 128-bit values through a narrower result
+type.</p>
+<h2>Constants</h2>
+<p>Use <code>Math.pi()</code> and <code>Math.e()</code> for the standard mathematical
+constants.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Math.sqrt(<span class="hl-number">9.0</span>)      <span class="hl-comment"># =&gt; 3.0</span>
+Math.sin(Math.pi()) <span class="hl-comment"># =&gt; ~0.0</span>
+Math.log(Math.e())  <span class="hl-comment"># =&gt; 1.0</span></code></pre>
 </div>
 <h2 id="functions">Functions</h2>
 <table class="summary">
@@ -136,6 +169,20 @@
 <a href="#sqrt-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">sqrt</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">sqrt</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i8</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">sqrt</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">sqrt</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">sqrt</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">sqrt</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f128</span></code></div>
+<div class="signature"><code><span class="sig-name">sqrt</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u8</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">sqrt</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">sqrt</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">sqrt</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">sqrt</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f128</span></code></div>
+<div class="signature"><code><span class="sig-name">sqrt</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f16</span></code></div>
+<div class="signature"><code><span class="sig-name">sqrt</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f32</span></code></div>
+<div class="signature"><code><span class="sig-name">sqrt</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f80</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f80</span></code></div>
+<div class="signature"><code><span class="sig-name">sqrt</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f128</span></code></div>
 <div class="function-doc">
 <p>Returns the square root of a number.</p>
 <h2>Examples</h2>
@@ -152,6 +199,20 @@ Math.sqrt(<span class="hl-number">0.0</span>)   <span class="hl-comment"># =&gt;
 <a href="#sin-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">sin</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">sin</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i8</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">sin</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">sin</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">sin</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">sin</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f128</span></code></div>
+<div class="signature"><code><span class="sig-name">sin</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u8</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">sin</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">sin</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">sin</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">sin</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f128</span></code></div>
+<div class="signature"><code><span class="sig-name">sin</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f16</span></code></div>
+<div class="signature"><code><span class="sig-name">sin</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f32</span></code></div>
+<div class="signature"><code><span class="sig-name">sin</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f80</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f80</span></code></div>
+<div class="signature"><code><span class="sig-name">sin</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f128</span></code></div>
 <div class="function-doc">
 <p>Returns the sine of an angle in radians.</p>
 <h2>Examples</h2>
@@ -167,6 +228,20 @@ Math.sin(Math.pi())    <span class="hl-comment"># =&gt; ~0.0</span></code></pre>
 <a href="#cos-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">cos</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">cos</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i8</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">cos</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">cos</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">cos</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">cos</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f128</span></code></div>
+<div class="signature"><code><span class="sig-name">cos</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u8</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">cos</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">cos</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">cos</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">cos</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f128</span></code></div>
+<div class="signature"><code><span class="sig-name">cos</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f16</span></code></div>
+<div class="signature"><code><span class="sig-name">cos</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f32</span></code></div>
+<div class="signature"><code><span class="sig-name">cos</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f80</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f80</span></code></div>
+<div class="signature"><code><span class="sig-name">cos</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f128</span></code></div>
 <div class="function-doc">
 <p>Returns the cosine of an angle in radians.</p>
 <h2>Examples</h2>
@@ -182,6 +257,20 @@ Math.cos(Math.pi())    <span class="hl-comment"># =&gt; -1.0</span></code></pre>
 <a href="#tan-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">tan</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">tan</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i8</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">tan</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">tan</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">tan</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">tan</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f128</span></code></div>
+<div class="signature"><code><span class="sig-name">tan</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u8</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">tan</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">tan</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">tan</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">tan</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f128</span></code></div>
+<div class="signature"><code><span class="sig-name">tan</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f16</span></code></div>
+<div class="signature"><code><span class="sig-name">tan</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f32</span></code></div>
+<div class="signature"><code><span class="sig-name">tan</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f80</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f80</span></code></div>
+<div class="signature"><code><span class="sig-name">tan</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f128</span></code></div>
 <div class="function-doc">
 <p>Returns the tangent of an angle in radians.</p>
 <h2>Examples</h2>
@@ -196,6 +285,20 @@ Math.cos(Math.pi())    <span class="hl-comment"># =&gt; -1.0</span></code></pre>
 <a href="#exp-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">exp</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">exp</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i8</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">exp</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">exp</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">exp</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">exp</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f128</span></code></div>
+<div class="signature"><code><span class="sig-name">exp</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u8</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">exp</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">exp</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">exp</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">exp</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f128</span></code></div>
+<div class="signature"><code><span class="sig-name">exp</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f16</span></code></div>
+<div class="signature"><code><span class="sig-name">exp</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f32</span></code></div>
+<div class="signature"><code><span class="sig-name">exp</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f80</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f80</span></code></div>
+<div class="signature"><code><span class="sig-name">exp</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f128</span></code></div>
 <div class="function-doc">
 <p>Returns e raised to the given power.</p>
 <h2>Examples</h2>
@@ -211,6 +314,20 @@ Math.exp(<span class="hl-number">1.0</span>)   <span class="hl-comment"># =&gt; 
 <a href="#exp2-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">exp2</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">exp2</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i8</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">exp2</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">exp2</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">exp2</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">exp2</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f128</span></code></div>
+<div class="signature"><code><span class="sig-name">exp2</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u8</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">exp2</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">exp2</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">exp2</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">exp2</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f128</span></code></div>
+<div class="signature"><code><span class="sig-name">exp2</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f16</span></code></div>
+<div class="signature"><code><span class="sig-name">exp2</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f32</span></code></div>
+<div class="signature"><code><span class="sig-name">exp2</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f80</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f80</span></code></div>
+<div class="signature"><code><span class="sig-name">exp2</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f128</span></code></div>
 <div class="function-doc">
 <p>Returns 2 raised to the given power.</p>
 <h2>Examples</h2>
@@ -226,6 +343,20 @@ Math.exp2(<span class="hl-number">0.0</span>)   <span class="hl-comment"># =&gt;
 <a href="#log-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">log</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">log</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i8</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">log</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">log</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">log</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">log</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f128</span></code></div>
+<div class="signature"><code><span class="sig-name">log</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u8</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">log</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">log</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">log</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">log</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f128</span></code></div>
+<div class="signature"><code><span class="sig-name">log</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f16</span></code></div>
+<div class="signature"><code><span class="sig-name">log</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f32</span></code></div>
+<div class="signature"><code><span class="sig-name">log</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f80</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f80</span></code></div>
+<div class="signature"><code><span class="sig-name">log</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f128</span></code></div>
 <div class="function-doc">
 <p>Returns the natural logarithm (base e) of a number.</p>
 <h2>Examples</h2>
@@ -241,6 +372,20 @@ Math.log(Math.e())    <span class="hl-comment"># =&gt; 1.0</span></code></pre>
 <a href="#log2-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">log2</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">log2</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i8</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">log2</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">log2</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">log2</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">log2</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f128</span></code></div>
+<div class="signature"><code><span class="sig-name">log2</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u8</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">log2</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">log2</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">log2</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">log2</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f128</span></code></div>
+<div class="signature"><code><span class="sig-name">log2</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f16</span></code></div>
+<div class="signature"><code><span class="sig-name">log2</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f32</span></code></div>
+<div class="signature"><code><span class="sig-name">log2</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f80</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f80</span></code></div>
+<div class="signature"><code><span class="sig-name">log2</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f128</span></code></div>
 <div class="function-doc">
 <p>Returns the base-2 logarithm of a number.</p>
 <h2>Examples</h2>
@@ -256,6 +401,20 @@ Math.log2(<span class="hl-number">1.0</span>)   <span class="hl-comment"># =&gt;
 <a href="#log10-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">log10</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">log10</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i8</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">log10</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">log10</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">log10</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">log10</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f128</span></code></div>
+<div class="signature"><code><span class="sig-name">log10</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u8</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">log10</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">log10</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">log10</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
+<div class="signature"><code><span class="sig-name">log10</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f128</span></code></div>
+<div class="signature"><code><span class="sig-name">log10</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f16</span></code></div>
+<div class="signature"><code><span class="sig-name">log10</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f32</span></code></div>
+<div class="signature"><code><span class="sig-name">log10</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f80</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f80</span></code></div>
+<div class="signature"><code><span class="sig-name">log10</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f128</span></code></div>
 <div class="function-doc">
 <p>Returns the base-10 logarithm of a number.</p>
 <h2>Examples</h2>

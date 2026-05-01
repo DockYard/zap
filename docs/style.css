@@ -371,17 +371,18 @@ code, pre, .signature { font-family: var(--ff-mono); font-size: 13px; }
 }
 
 /* ── Prose — serif for documentation text ── */
-.struct_doc, .function-doc {
+.struct_doc, .structdoc, .function-doc {
   font-family: var(--ff-serif);
   font-size: 16px;
   line-height: 1.7;
   color: var(--fg);
 }
-.struct_doc { margin-bottom: 40px; }
-.struct_doc p, .function-doc p { margin-bottom: 14px; }
+.struct_doc, .structdoc { margin-bottom: 40px; }
+.struct_doc p, .structdoc p, .function-doc p { margin-bottom: 14px; }
 .function-doc p { margin-bottom: 10px; font-size: 15.5px; }
 
 .struct_doc pre,
+.structdoc pre,
 .function-doc pre {
   background: var(--bg-elev);
   border: 1px solid var(--border);
@@ -396,6 +397,7 @@ code, pre, .signature { font-family: var(--ff-mono); font-size: 13px; }
 }
 
 .struct_doc code,
+.structdoc code,
 .function-doc code {
   font-family: var(--ff-mono);
   font-size: 0.88em;
@@ -406,20 +408,52 @@ code, pre, .signature { font-family: var(--ff-mono); font-size: 13px; }
   white-space: nowrap;
 }
 .struct_doc pre code,
+.structdoc pre code,
 .function-doc pre code {
   background: none; padding: 0; color: var(--fg); white-space: pre;
 }
 
-.struct_doc h2 { margin-top: 28px; }
-.struct_doc h3 {
+.struct_doc h2, .structdoc h2 { margin-top: 28px; }
+.struct_doc h3, .structdoc h3 {
   font-family: var(--ff-serif);
   font-size: 18px;
   font-weight: 600;
   text-transform: none;
   letter-spacing: 0;
 }
-.struct_doc ul, .function-doc ul { padding-left: 1.25rem; margin-bottom: 14px; }
-.struct_doc li, .function-doc li { margin-bottom: 4px; }
+.struct_doc ul, .structdoc ul, .function-doc ul { padding-left: 1.25rem; margin-bottom: 14px; }
+.struct_doc li, .structdoc li, .function-doc li { margin-bottom: 4px; }
+
+.markdown-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 14px 0 20px;
+  font-family: var(--ff-mono);
+  font-size: 14px;
+}
+
+.markdown-table th,
+.markdown-table td {
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+
+.markdown-table th {
+  color: var(--fg);
+  background: var(--bg-elev);
+  font-weight: 600;
+}
+
+.markdown-table td {
+  color: var(--fg-muted);
+}
+
+.markdown-table code {
+  font-size: 0.92em;
+  white-space: nowrap;
+}
 
 /* ── Summary Table ── */
 .summary {

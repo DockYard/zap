@@ -1,5 +1,16 @@
 # File
 
+Functions for reading and writing files.
+
+All paths are relative to the current working directory.
+File operations return empty strings or false on failure.
+
+## Examples
+
+    content = File.read("config.txt")
+    File.write("output.txt", "Hello, world!")
+    File.exists?("config.txt")  # => true
+
 ## Functions
 
 ### read/1

@@ -83,7 +83,7 @@ pub fn generate(
         if (std.mem.eql(u8, mod_name, "Zap.Dep")) continue;
 
         // Find the source file for this struct
-        const source_file = findStructSourceFile(mod_name, options.source_units) orelse "";
+        const source_file = sourceFileForMeta(mod_entry.decl.meta, options.source_units) orelse "";
 
         // Extract @doc for the struct
         const structdoc = extractDocAttribute(alloc, mod_entry.attributes, "doc", interner) orelse "";
@@ -138,10 +138,60 @@ pub fn generate(
 
         structs.append(alloc, .{
             .name = mod_name,
+            .kind = .@"struct",
             .structdoc = structdoc,
             .source_file = source_file,
             .functions = functions.toOwnedSlice(alloc) catch &.{},
         }) catch {};
+    }
+
+    for (graph.protocols.items) |protocol_entry| {
+        if (protocol_entry.decl.is_private) continue;
+
+        const protocol_name = resolveStructName(alloc, protocol_entry.name, interner) catch continue;
+        if (seen_structs.contains(protocol_name)) continue;
+        seen_structs.put(protocol_name, {}) catch {};
+
+        const source_file = sourceFileForMeta(protocol_entry.decl.meta, options.source_units) orelse "";
+        const protocol_doc = extractDocAttribute(alloc, protocol_entry.attributes, "doc", interner) orelse "";
+        const protocol_functions = buildProtocolFunctionDocs(
+            alloc,
+            protocol_entry.decl.functions,
+            interner,
+        );
+
+        structs.append(alloc, .{
+            .name = protocol_name,
+            .kind = .protocol,
+            .structdoc = protocol_doc,
+            .source_file = source_file,
+            .functions = &.{},
+            .protocol_functions = protocol_functions,
+        }) catch {};
+    }
+
+    for (graph.types.items) |type_entry| {
+        switch (type_entry.kind) {
+            .union_type => |union_decl| {
+                const union_name = interner.get(type_entry.name);
+                if (seen_structs.contains(union_name)) continue;
+                seen_structs.put(union_name, {}) catch {};
+
+                const source_file = sourceFileForMeta(union_decl.meta, options.source_units) orelse "";
+                const union_doc = extractDocAttribute(alloc, type_entry.attributes, "doc", interner) orelse "";
+                const variants = buildUnionVariantDocs(alloc, union_decl.variants, interner);
+
+                structs.append(alloc, .{
+                    .name = union_name,
+                    .kind = .@"union",
+                    .structdoc = union_doc,
+                    .source_file = source_file,
+                    .functions = &.{},
+                    .union_variants = variants,
+                }) catch {};
+            },
+            else => {},
+        }
     }
 
     // Sort structs alphabetically
@@ -192,7 +242,7 @@ pub fn generate(
         }
     }
 
-    std.debug.print("  {d} structs, {d} functions documented\n", .{
+    std.debug.print("  {d} declarations, {d} functions documented\n", .{
         project.structs.len,
         countFunctions(project),
     });
@@ -211,9 +261,18 @@ const DocProject = struct {
 
 const DocStruct = struct {
     name: []const u8,
+    kind: DocKind = .@"struct",
     structdoc: []const u8,
     source_file: []const u8,
     functions: []const DocFunction,
+    protocol_functions: []const DocProtocolFunction = &.{},
+    union_variants: []const DocUnionVariant = &.{},
+};
+
+const DocKind = enum {
+    @"struct",
+    protocol,
+    @"union",
 };
 
 const DocFunction = struct {
@@ -225,6 +284,16 @@ const DocFunction = struct {
     summary: []const u8,
     source_line: u32,
     is_macro: bool,
+};
+
+const DocProtocolFunction = struct {
+    name: []const u8,
+    signature: []const u8,
+};
+
+const DocUnionVariant = struct {
+    name: []const u8,
+    signature: []const u8,
 };
 
 // ============================================================
@@ -428,6 +497,68 @@ fn buildClauseSignature(
     }
 
     return buf.toSlice();
+}
+
+fn buildProtocolFunctionDocs(
+    alloc: std.mem.Allocator,
+    function_sigs: []const ast.ProtocolFunctionSig,
+    interner: *const ast.StringInterner,
+) []const DocProtocolFunction {
+    var docs: std.ArrayListUnmanaged(DocProtocolFunction) = .empty;
+    for (function_sigs) |function_sig| {
+        const function_name = interner.get(function_sig.name);
+        docs.append(alloc, .{
+            .name = function_name,
+            .signature = buildProtocolFunctionSignature(alloc, function_sig, interner),
+        }) catch {};
+    }
+    return docs.toOwnedSlice(alloc) catch &.{};
+}
+
+fn buildProtocolFunctionSignature(
+    alloc: std.mem.Allocator,
+    function_sig: ast.ProtocolFunctionSig,
+    interner: *const ast.StringInterner,
+) []const u8 {
+    var buf = StringBuffer.init(alloc);
+    buf.str(interner.get(function_sig.name));
+    buf.char('(');
+    for (function_sig.params, 0..) |param, index| {
+        if (index > 0) buf.str(", ");
+        buf.str(interner.get(param.name));
+        if (param.type_annotation) |type_annotation| {
+            buf.str(" :: ");
+            appendTypeExpr(&buf, type_annotation, interner);
+        }
+    }
+    buf.char(')');
+    if (function_sig.return_type) |return_type| {
+        buf.str(" -> ");
+        appendTypeExpr(&buf, return_type, interner);
+    }
+    return buf.toSlice();
+}
+
+fn buildUnionVariantDocs(
+    alloc: std.mem.Allocator,
+    variants: []const ast.UnionVariant,
+    interner: *const ast.StringInterner,
+) []const DocUnionVariant {
+    var docs: std.ArrayListUnmanaged(DocUnionVariant) = .empty;
+    for (variants) |variant| {
+        const variant_name = interner.get(variant.name);
+        var signature = StringBuffer.init(alloc);
+        signature.str(variant_name);
+        if (variant.type_expr) |type_expr| {
+            signature.str(" :: ");
+            appendTypeExpr(&signature, type_expr, interner);
+        }
+        docs.append(alloc, .{
+            .name = variant_name,
+            .signature = signature.toSlice(),
+        }) catch {};
+    }
+    return docs.toOwnedSlice(alloc) catch &.{};
 }
 
 fn sourceSlice(meta: ast.NodeMeta, source_units: []const compiler.SourceUnit) ?[]const u8 {
@@ -686,21 +817,46 @@ fn computeLineNumber(meta: ast.NodeMeta, source_units: []const compiler.SourceUn
     return line;
 }
 
-fn findStructSourceFile(mod_name: []const u8, source_units: []const compiler.SourceUnit) ?[]const u8 {
-    for (source_units) |unit| {
-        if (std.mem.indexOf(u8, unit.source, "pub struct ")) |idx| {
-            const rest = unit.source[idx + 11 ..];
-            if (std.mem.startsWith(u8, rest, mod_name)) {
-                if (rest.len > mod_name.len) {
-                    const next = rest[mod_name.len];
-                    if (next == ' ' or next == '{' or next == '\n') {
-                        return unit.file_path;
-                    }
-                }
-            }
-        }
-    }
-    return null;
+fn sourceFileForMeta(meta: ast.NodeMeta, source_units: []const compiler.SourceUnit) ?[]const u8 {
+    const source_id = meta.span.source_id orelse return null;
+    if (source_id >= source_units.len) return null;
+    return source_units[source_id].file_path;
+}
+
+fn docKindLabel(kind: DocKind) []const u8 {
+    return switch (kind) {
+        .@"struct" => "pub struct",
+        .protocol => "pub protocol",
+        .@"union" => "pub union",
+    };
+}
+
+fn docKindSearchType(kind: DocKind) []const u8 {
+    return switch (kind) {
+        .@"struct" => "struct",
+        .protocol => "protocol",
+        .@"union" => "union",
+    };
+}
+
+fn docKindDetailHeading(kind: DocKind) []const u8 {
+    return switch (kind) {
+        .@"struct" => "Function Details",
+        .protocol => "Required Functions",
+        .@"union" => "Variants",
+    };
+}
+
+fn docKindMarkdownHeading(kind: DocKind) []const u8 {
+    return switch (kind) {
+        .@"struct" => "Functions",
+        .protocol => "Required Functions",
+        .@"union" => "Variants",
+    };
+}
+
+fn shouldRenderDeclarationDetails(mod: DocStruct) bool {
+    return mod.protocol_functions.len > 0 or mod.union_variants.len > 0;
 }
 
 fn countFunctions(project: DocProject) usize {
@@ -753,7 +909,7 @@ fn appendDefaultLanding(h: *StringBuffer, project: DocProject) void {
         h.str("</p>\n");
     }
 
-    h.str("<h2>Structs</h2>\n<div class=\"struct-list\">\n");
+    h.str("<h2>Declarations</h2>\n<div class=\"struct-list\">\n");
     for (project.structs) |mod| {
         h.str("<div class=\"struct-card\">\n<h3><a href=\"structs/");
         h.str(mod.name);
@@ -781,13 +937,15 @@ fn generateStructPage(alloc: std.mem.Allocator, mod: DocStruct, project: DocProj
     appendSidebar(&h, project, mod.name, options, "../");
     h.str("<main class=\"content\">\n");
 
-    // Struct header — title row with name left, pub struct pill + source right
+    // Declaration header — title row with name left, declaration kind + source right
     h.str("<div class=\"title-row\">\n");
     h.str("<h1>");
     appendHtmlEscaped(&h, mod.name);
     h.str("</h1>\n");
     h.str("<div class=\"title-meta\">\n");
-    h.str("<span class=\"pub-struct-pill\">pub struct</span>\n");
+    h.str("<span class=\"pub-struct-pill\">");
+    h.str(docKindLabel(mod.kind));
+    h.str("</span>\n");
     if (mod.source_file.len > 0) {
         if (options.source_url) |base_url| {
             h.str("<a href=\"");
@@ -822,6 +980,27 @@ fn generateStructPage(alloc: std.mem.Allocator, mod: DocStruct, project: DocProj
         h.str("<div class=\"structdoc\">\n");
         appendMarkdownAsHtml(&h, mod.structdoc);
         h.str("</div>\n");
+    }
+
+    if (shouldRenderDeclarationDetails(mod)) {
+        h.str("<h2>");
+        h.str(docKindDetailHeading(mod.kind));
+        h.str("</h2>\n<table class=\"summary\">\n");
+        for (mod.protocol_functions) |protocol_function| {
+            h.str("<tr><td class=\"summary-name\"><code>");
+            appendHtmlEscaped(&h, protocol_function.name);
+            h.str("</code></td><td class=\"summary-doc\"><code>");
+            appendHtmlEscaped(&h, protocol_function.signature);
+            h.str("</code></td></tr>\n");
+        }
+        for (mod.union_variants) |variant| {
+            h.str("<tr><td class=\"summary-name\"><code>");
+            appendHtmlEscaped(&h, variant.name);
+            h.str("</code></td><td class=\"summary-doc\"><code>");
+            appendHtmlEscaped(&h, variant.signature);
+            h.str("</code></td></tr>\n");
+        }
+        h.str("</table>\n");
     }
 
     // Separate functions and macros
@@ -1165,6 +1344,25 @@ fn generateStructMarkdown(alloc: std.mem.Allocator, mod: DocStruct, project: Doc
         h.str("\n\n");
     }
 
+    if (shouldRenderDeclarationDetails(mod)) {
+        h.str("## ");
+        h.str(docKindMarkdownHeading(mod.kind));
+        h.str("\n\n");
+
+        for (mod.protocol_functions) |protocol_function| {
+            h.str("```zap\n");
+            h.str("fn ");
+            h.str(protocol_function.signature);
+            h.str("\n```\n\n");
+        }
+
+        for (mod.union_variants) |variant| {
+            h.str("```zap\n");
+            h.str(variant.signature);
+            h.str("\n```\n\n");
+        }
+    }
+
     var functions: std.ArrayListUnmanaged(DocFunction) = .empty;
     var macros: std.ArrayListUnmanaged(DocFunction) = .empty;
     for (mod.functions) |func| {
@@ -1244,6 +1442,8 @@ fn appendSidebar(h: *StringBuffer, project: DocProject, current_struct: ?[]const
     h.str("</span></div>\n");
     h.str("<div class=\"sidebar-search\"><input type=\"text\" id=\"search-input\" placeholder=\"Search (Cmd+K)\" aria-label=\"Search documentation\"></div>\n");
 
+    appendSidebarDeclarationGroups(h, project, current_struct, base);
+
     // Doc groups (guides)
     for (options.doc_groups) |group| {
         h.str("<div class=\"sidebar-group\">\n<h4>");
@@ -1263,79 +1463,55 @@ fn appendSidebar(h: *StringBuffer, project: DocProject, current_struct: ?[]const
         h.str("</ul>\n</div>\n");
     }
 
-    // Auto-group structs by prefix
-    var ungrouped: std.ArrayListUnmanaged(DocStruct) = .empty;
-    var grouped_prefixes: std.ArrayListUnmanaged([]const u8) = .empty;
-    var grouped_structs: std.ArrayListUnmanaged(std.ArrayListUnmanaged(DocStruct)) = .empty;
-
-    for (project.structs) |mod| {
-        if (std.mem.indexOf(u8, mod.name, ".")) |dot_pos| {
-            const prefix = mod.name[0..dot_pos];
-            // Find or create group
-            var found = false;
-            for (grouped_prefixes.items, 0..) |existing, idx| {
-                if (std.mem.eql(u8, existing, prefix)) {
-                    grouped_structs.items[idx].append(h.alloc, mod) catch {};
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                grouped_prefixes.append(h.alloc, prefix) catch {};
-                var list: std.ArrayListUnmanaged(DocStruct) = .empty;
-                list.append(h.alloc, mod) catch {};
-                grouped_structs.append(h.alloc, list) catch {};
-            }
-        } else {
-            ungrouped.append(h.alloc, mod) catch {};
-        }
-    }
-
-    // Render ungrouped structs
-    if (ungrouped.items.len > 0) {
-        h.str("<div class=\"sidebar-group\">\n<h4>Structs</h4>\n<ul>\n");
-        for (ungrouped.items) |mod| {
-            const is_current = if (current_struct) |cm| std.mem.eql(u8, cm, mod.name) else false;
-            if (is_current) {
-                h.str("<li class=\"active\">");
-            } else {
-                h.str("<li>");
-            }
-            h.str("<a href=\"");
-            h.str(base);
-            h.str("structs/");
-            h.str(mod.name);
-            h.str(".html\">");
-            appendHtmlEscaped(h, mod.name);
-            h.str("</a></li>\n");
-        }
-        h.str("</ul>\n</div>\n");
-    }
-
-    // Render grouped structs
-    for (grouped_prefixes.items, 0..) |prefix, idx| {
-        h.str("<div class=\"sidebar-group\">\n<h4>");
-        appendHtmlEscaped(h, prefix);
-        h.str("</h4>\n<ul>\n");
-        for (grouped_structs.items[idx].items) |mod| {
-            const is_current = if (current_struct) |cm| std.mem.eql(u8, cm, mod.name) else false;
-            if (is_current) {
-                h.str("<li class=\"active\">");
-            } else {
-                h.str("<li>");
-            }
-            h.str("<a href=\"");
-            h.str(base);
-            h.str("structs/");
-            h.str(mod.name);
-            h.str(".html\">");
-            appendHtmlEscaped(h, mod.name);
-            h.str("</a></li>\n");
-        }
-        h.str("</ul>\n</div>\n");
-    }
-
     h.str("</nav>\n");
+}
+
+fn appendSidebarDeclarationGroups(h: *StringBuffer, project: DocProject, current_struct: ?[]const u8, base: []const u8) void {
+    appendSidebarDeclarationGroup(h, project, current_struct, base, .@"struct", "Structs");
+    appendSidebarDeclarationGroup(h, project, current_struct, base, .protocol, "Protocols");
+    appendSidebarDeclarationGroup(h, project, current_struct, base, .@"union", "Unions");
+}
+
+fn appendSidebarDeclarationGroup(
+    h: *StringBuffer,
+    project: DocProject,
+    current_struct: ?[]const u8,
+    base: []const u8,
+    kind: DocKind,
+    title: []const u8,
+) void {
+    var has_declarations = false;
+    for (project.structs) |mod| {
+        if (mod.kind == kind) {
+            has_declarations = true;
+            break;
+        }
+    }
+    if (!has_declarations) return;
+
+    h.str("<div class=\"sidebar-group\">\n<h4>");
+    h.str(title);
+    h.str("</h4>\n<ul>\n");
+    for (project.structs) |mod| {
+        if (mod.kind == kind) appendSidebarDeclaration(h, mod, current_struct, base);
+    }
+    h.str("</ul>\n</div>\n");
+}
+
+fn appendSidebarDeclaration(h: *StringBuffer, mod: DocStruct, current_struct: ?[]const u8, base: []const u8) void {
+    const is_current = if (current_struct) |cm| std.mem.eql(u8, cm, mod.name) else false;
+    if (is_current) {
+        h.str("<li class=\"active\">");
+    } else {
+        h.str("<li>");
+    }
+    h.str("<a href=\"");
+    h.str(base);
+    h.str("structs/");
+    h.str(mod.name);
+    h.str(".html\">");
+    appendHtmlEscaped(h, mod.name);
+    h.str("</a></li>\n");
 }
 
 // ============================================================
@@ -1353,7 +1529,9 @@ fn generateSearchIndex(alloc: std.mem.Allocator, project: DocProject, options: D
 
         h.str("  {\"struct\":\"");
         appendJsonEscaped(&h, mod.name);
-        h.str("\",\"type\":\"struct\",\"name\":\"");
+        h.str("\",\"type\":\"");
+        h.str(docKindSearchType(mod.kind));
+        h.str("\",\"name\":\"");
         appendJsonEscaped(&h, mod.name);
         h.str("\",\"summary\":\"");
         const mod_summary = extractFirstSentence(alloc, mod.structdoc);
@@ -1494,8 +1672,13 @@ fn appendMarkdownAsHtml(h: *StringBuffer, markdown: []const u8) void {
     var in_paragraph = false;
     var code_block_buf = StringBuffer.init(h.alloc);
     var code_block_lang: []const u8 = "";
+    var pending_line: ?[]const u8 = null;
 
-    while (lines.next()) |line| {
+    while (true) {
+        const line = if (pending_line) |queued_line| blk: {
+            pending_line = null;
+            break :blk queued_line;
+        } else lines.next() orelse break;
         const trimmed = std.mem.trimStart(u8, line, " \t");
 
         // Fenced code blocks — collect content, then highlight
@@ -1631,6 +1814,46 @@ fn appendMarkdownAsHtml(h: *StringBuffer, markdown: []const u8) void {
             continue;
         }
 
+        // Pipe tables
+        if (isMarkdownTableRow(trimmed)) {
+            if (lines.next()) |separator_line| {
+                const trimmed_separator = std.mem.trimStart(u8, separator_line, " \t");
+                const header_cell_count = markdownTableCellCount(trimmed);
+                if (header_cell_count > 0 and isMarkdownTableSeparator(trimmed_separator, header_cell_count)) {
+                    if (in_paragraph) {
+                        h.str("</p>\n");
+                        in_paragraph = false;
+                    }
+                    if (in_list) {
+                        h.str("</ul>\n");
+                        in_list = false;
+                    }
+
+                    h.str("<table class=\"markdown-table\">\n<thead>\n<tr>");
+                    appendMarkdownTableRow(h, trimmed, "th");
+                    h.str("</tr>\n</thead>\n<tbody>\n");
+
+                    while (lines.next()) |table_line| {
+                        const trimmed_table_line = std.mem.trimStart(u8, table_line, " \t");
+                        if (trimmed_table_line.len == 0) break;
+                        if (!isMarkdownTableRow(trimmed_table_line)) {
+                            pending_line = table_line;
+                            break;
+                        }
+                        if (isMarkdownTableSeparator(trimmed_table_line, header_cell_count)) break;
+
+                        h.str("<tr>");
+                        appendMarkdownTableRow(h, trimmed_table_line, "td");
+                        h.str("</tr>\n");
+                    }
+
+                    h.str("</tbody>\n</table>\n");
+                    continue;
+                }
+                pending_line = separator_line;
+            }
+        }
+
         // Raw HTML passthrough — lines starting with < are passed through verbatim
         if (trimmed.len > 0 and trimmed[0] == '<') {
             if (in_paragraph) {
@@ -1658,6 +1881,7 @@ fn appendMarkdownAsHtml(h: *StringBuffer, markdown: []const u8) void {
                 } else if (std.mem.trimStart(u8, next_line, " \t").len == 0) {
                     code_block_buf.char('\n');
                 } else {
+                    pending_line = next_line;
                     break;
                 }
             }
@@ -1680,6 +1904,79 @@ fn appendMarkdownAsHtml(h: *StringBuffer, markdown: []const u8) void {
     if (in_paragraph) h.str("</p>\n");
     if (in_list) h.str("</ul>\n");
     if (in_code_block) h.str("</code></pre>\n");
+}
+
+fn markdownTableCellCount(row: []const u8) usize {
+    const trimmed = normalizeMarkdownTableRow(row);
+    if (trimmed.len == 0) return 0;
+
+    var count: usize = 0;
+    var raw_cells = std.mem.splitScalar(u8, trimmed, '|');
+    while (raw_cells.next()) |_| {
+        count += 1;
+    }
+    return count;
+}
+
+fn isMarkdownTableRow(line: []const u8) bool {
+    const trimmed = std.mem.trim(u8, line, " \t\r\n");
+    if (trimmed.len == 0) return false;
+    return std.mem.indexOfScalar(u8, trimmed, '|') != null;
+}
+
+fn isMarkdownTableSeparator(line: []const u8, expected_cell_count: usize) bool {
+    const trimmed = normalizeMarkdownTableRow(line);
+    if (trimmed.len == 0) return false;
+    if (std.mem.indexOfScalar(u8, trimmed, '|') == null) return false;
+
+    var valid_cells: usize = 0;
+    var raw_cells = std.mem.splitScalar(u8, trimmed, '|');
+    while (raw_cells.next()) |raw_cell| {
+        const cell = std.mem.trim(u8, raw_cell, " \t");
+        if (cell.len == 0) return false;
+        if (!isMarkdownTableSeparatorCell(cell)) return false;
+        valid_cells += 1;
+    }
+
+    return valid_cells == expected_cell_count;
+}
+
+fn isMarkdownTableSeparatorCell(cell: []const u8) bool {
+    var start: usize = 0;
+    var end = cell.len;
+    if (start < end and cell[start] == ':') start += 1;
+    if (start < end and cell[end - 1] == ':') end -= 1;
+    if (end <= start) return false;
+
+    var dash_count: usize = 0;
+    for (cell[start..end]) |char| {
+        if (char != '-') return false;
+        dash_count += 1;
+    }
+    return dash_count >= 3;
+}
+
+fn appendMarkdownTableRow(h: *StringBuffer, row: []const u8, tag: []const u8) void {
+    const trimmed = normalizeMarkdownTableRow(row);
+    var raw_cells = std.mem.splitScalar(u8, trimmed, '|');
+
+    while (raw_cells.next()) |raw_cell| {
+        const cell = std.mem.trim(u8, raw_cell, " \t");
+        h.char('<');
+        h.str(tag);
+        h.char('>');
+        appendInlineMarkdown(h, cell);
+        h.str("</");
+        h.str(tag);
+        h.char('>');
+    }
+}
+
+fn normalizeMarkdownTableRow(row: []const u8) []const u8 {
+    var trimmed = std.mem.trim(u8, row, " \t\r\n");
+    if (trimmed.len > 0 and trimmed[0] == '|') trimmed = trimmed[1..];
+    if (trimmed.len > 0 and trimmed[trimmed.len - 1] == '|') trimmed = trimmed[0 .. trimmed.len - 1];
+    return trimmed;
 }
 
 fn appendInlineMarkdown(h: *StringBuffer, text: []const u8) void {
@@ -2052,7 +2349,9 @@ fn appendSearchIndexJson(h: *StringBuffer, project: DocProject, alloc: std.mem.A
 
         h.str("{\"struct\":\"");
         appendJsonEscaped(h, mod.name);
-        h.str("\",\"type\":\"struct\",\"name\":\"");
+        h.str("\",\"type\":\"");
+        h.str(docKindSearchType(mod.kind));
+        h.str("\",\"name\":\"");
         appendJsonEscaped(h, mod.name);
         h.str("\",\"summary\":\"");
         const mod_summary = extractFirstSentence(alloc, mod.structdoc);
@@ -2191,6 +2490,125 @@ test "function markdown renders many signatures with one doc body" {
     try std.testing.expect(std.mem.indexOf(u8, markdown, "pub fn abs(value :: i16) -> i16") != null);
     try std.testing.expect(std.mem.indexOf(u8, markdown, "pub fn abs(value :: i64) -> i64") != null);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, markdown, "Shared absolute-value documentation."));
+}
+
+test "markdown renderer renders pipe tables" {
+    var buffer = StringBuffer.init(std.testing.allocator);
+
+    appendMarkdownAsHtml(&buffer,
+        \\| Signed | Unsigned | Bits |
+        \\|--------|----------|------|
+        \\| `i8`   | `u8`     | 8    |
+        \\| `i16`  | `u16`    | 16   |
+    );
+
+    const html = buffer.toSlice();
+    try std.testing.expect(std.mem.indexOf(u8, html, "<table class=\"markdown-table\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "<th>Signed</th>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "<th>Unsigned</th>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "<td><code>i8</code></td>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "<td><code>u16</code></td>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "<p>| Signed") == null);
+}
+
+test "markdown renderer preserves non-table pipe paragraphs" {
+    var buffer = StringBuffer.init(std.testing.allocator);
+
+    appendMarkdownAsHtml(&buffer,
+        \\A paragraph with a | pipe.
+        \\The next line should remain in the same paragraph.
+    );
+
+    const html = buffer.toSlice();
+    try std.testing.expect(std.mem.indexOf(u8, html, "A paragraph with a | pipe.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "The next line should remain in the same paragraph.") != null);
+}
+
+test "markdown renderer keeps paragraph after table" {
+    var buffer = StringBuffer.init(std.testing.allocator);
+
+    appendMarkdownAsHtml(&buffer,
+        \\| Name | Type |
+        \\|------|------|
+        \\| min  | i64  |
+        \\Next paragraph.
+    );
+
+    const html = buffer.toSlice();
+    try std.testing.expect(std.mem.indexOf(u8, html, "<td>min</td><td>i64</td>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "<p>Next paragraph.</p>") != null);
+}
+
+test "sidebar groups declarations by kind with structs first" {
+    const declarations = [_]DocStruct{
+        .{
+            .name = "Arithmetic",
+            .kind = .protocol,
+            .structdoc = "",
+            .source_file = "",
+            .functions = &.{},
+        },
+        .{
+            .name = "IO.Mode",
+            .kind = .@"union",
+            .structdoc = "",
+            .source_file = "",
+            .functions = &.{},
+        },
+        .{
+            .name = "IO",
+            .kind = .@"struct",
+            .structdoc = "",
+            .source_file = "",
+            .functions = &.{},
+        },
+        .{
+            .name = "Zest.Case",
+            .kind = .@"struct",
+            .structdoc = "",
+            .source_file = "",
+            .functions = &.{},
+        },
+        .{
+            .name = "Zest",
+            .kind = .@"struct",
+            .structdoc = "",
+            .source_file = "",
+            .functions = &.{},
+        },
+    };
+    const project = DocProject{
+        .name = "Zap",
+        .version = "0.0.0",
+        .source_url = null,
+        .structs = &declarations,
+    };
+    const options = DocOptions{
+        .project_name = "Zap",
+        .project_version = "0.0.0",
+    };
+
+    var buffer = StringBuffer.init(std.testing.allocator);
+    appendSidebar(&buffer, project, "IO.Mode", options, "");
+
+    const html = buffer.toSlice();
+    try std.testing.expect(std.mem.indexOf(u8, html, "<h4>Declarations</h4>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "<h4>IO</h4>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "<h4>Arithmetic</h4>") == null);
+
+    const structs_group = std.mem.indexOf(u8, html, "<h4>Structs</h4>") orelse return error.TestExpectedEqual;
+    const protocols_group = std.mem.indexOf(u8, html, "<h4>Protocols</h4>") orelse return error.TestExpectedEqual;
+    const unions_group = std.mem.indexOf(u8, html, "<h4>Unions</h4>") orelse return error.TestExpectedEqual;
+    try std.testing.expect(structs_group < protocols_group);
+    try std.testing.expect(protocols_group < unions_group);
+
+    const io_struct = std.mem.indexOf(u8, html[structs_group..protocols_group], "structs/IO.html\">IO</a>") orelse return error.TestExpectedEqual;
+    const zest_case_struct = std.mem.indexOf(u8, html[structs_group..protocols_group], "structs/Zest.Case.html\">Zest.Case</a>") orelse return error.TestExpectedEqual;
+    _ = std.mem.indexOf(u8, html[protocols_group..unions_group], "structs/Arithmetic.html\">Arithmetic</a>") orelse return error.TestExpectedEqual;
+    _ = std.mem.indexOf(u8, html[unions_group..], "structs/IO.Mode.html\">IO.Mode</a>") orelse return error.TestExpectedEqual;
+    try std.testing.expect(io_struct < zest_case_struct);
+
+    try std.testing.expect(std.mem.indexOf(u8, html, "<li class=\"active\"><a href=\"structs/IO.Mode.html\">IO.Mode</a></li>") != null);
 }
 
 test "signature renderer preserves nested patterns and separates guards" {

@@ -5268,14 +5268,15 @@ fn containsTypeVarInStore(store: *const types_mod.TypeStore, type_id: types_mod.
             return false;
         },
         .protocol_constraint => |pc| {
-            // Protocol constraints with type variable params are generic
             if (pc.type_params.len > 0) {
                 for (pc.type_params) |tp| {
                     if (containsTypeVarInStore(store, tp)) return true;
                 }
             }
-            // Bare protocol constraint — resolved through dispatch, not monomorphization
-            return false;
+            // Protocol constraints are compile-time dispatch constraints,
+            // not runtime value types. A function that still has one after
+            // monomorphization is still generic and must not be lowered.
+            return true;
         },
         else => false,
     };

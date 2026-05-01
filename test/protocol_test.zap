@@ -14,7 +14,11 @@ pub struct ProtocolTest {
   }
 
   fn sum_map_values(map :: %{Atom => i64}) -> i64 {
-    Enum.reduce_map(map, 0, fn(accumulator :: i64, value :: i64) -> i64 { accumulator + value })
+    Enum.reduce(map, 0, fn(accumulator :: i64, entry :: {Atom, i64}) -> i64 {
+      case entry {
+        {_key, value} -> accumulator + value
+      }
+    })
   }
 
   describe("Closures with Enum functions") {

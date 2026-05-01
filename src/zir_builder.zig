@@ -138,6 +138,7 @@ extern "c" fn zir_builder_emit_param_imported_type(handle: ?*ZirBuilderHandle, p
 // (the method's own enclosing Zap struct as a parameter type), since
 // `@import(self_name)` is rejected by Zig's build struct system.
 extern "c" fn zir_builder_emit_param_this_type(handle: ?*ZirBuilderHandle, param_name_ptr: [*]const u8, param_name_len: u32) u32;
+extern "c" fn zir_builder_emit_this_type(handle: ?*ZirBuilderHandle) u32;
 
 // Tuple return type
 extern "c" fn zir_builder_set_tuple_return_type(handle: ?*ZirBuilderHandle, types_ptr: [*]const u32, types_len: u32) i32;
@@ -1003,10 +1004,10 @@ pub const ZirDriver = struct {
     /// or foreign nested-in-other-emission. Each case maps to a
     /// specific ZIR sequence:
     ///
-    /// - **Primary** (the file IS this struct): `@import(current_emit_struct)`
-    ///   — Zig's `@import` returns the canonical root struct type for
-    ///   any file, so importing one's own emission yields the same
-    ///   `InternPool.Index` as foreign imports.
+    /// - **Primary** (the file IS this struct): `@This()` — self
+    ///   imports are rejected by Zig's module system, and `@This()`
+    ///   is the canonical root struct type inside the current
+    ///   emission.
     /// - **Nested in primary**: `decl_val(short_name)` — the struct
     ///   is emitted as a nested `pub const` decl by
     ///   `emitNestedTypeDecl`.
@@ -1034,7 +1035,7 @@ pub const ZirDriver = struct {
         var buf: [256]u8 = undefined;
         switch (classifyTypeDef(name, current_struct, &buf)) {
             .primary => {
-                const ref = zir_builder_emit_import(self.handle, current_struct.ptr, @intCast(current_struct.len));
+                const ref = zir_builder_emit_this_type(self.handle);
                 if (ref == error_ref) return error.EmitFailed;
                 return ref;
             },
@@ -5970,6 +5971,107 @@ pub const ZirDriver = struct {
         try self.emitDropSpecializationsForCurrentInstr(cb.dest, null);
     }
 
+    /// Find the setup instruction that defines a guard condition local.
+    fn findInstructionDefiningLocal(
+        instructions: []const ir.Instruction,
+        local: ir.LocalId,
+    ) ?usize {
+        for (instructions, 0..) |instruction, idx| {
+            if (instructionDefinesLocal(instruction, local)) return idx;
+        }
+        return null;
+    }
+
+    fn instructionDefinesLocal(instruction: ir.Instruction, local: ir.LocalId) bool {
+        switch (instruction) {
+            .bin_read_utf8 => |value| return value.dest_codepoint == local or value.dest_len == local,
+            else => {},
+        }
+        return if (instructionDest(instruction)) |dest| dest == local else false;
+    }
+
+    fn instructionDest(instruction: ir.Instruction) ?ir.LocalId {
+        return switch (instruction) {
+            .const_int => |value| value.dest,
+            .const_float => |value| value.dest,
+            .const_string => |value| value.dest,
+            .const_bool => |value| value.dest,
+            .const_atom => |value| value.dest,
+            .const_nil => |dest| dest,
+            .tuple_init => |value| value.dest,
+            .list_init => |value| value.dest,
+            .list_cons => |value| value.dest,
+            .map_init => |value| value.dest,
+            .struct_init => |value| value.dest,
+            .union_init => |value| value.dest,
+            .enum_literal => |value| value.dest,
+            .field_get => |value| value.dest,
+            .index_get => |value| value.dest,
+            .list_len_check => |value| value.dest,
+            .list_get => |value| value.dest,
+            .list_is_not_empty => |value| value.dest,
+            .list_head => |value| value.dest,
+            .list_tail => |value| value.dest,
+            .map_has_key => |value| value.dest,
+            .map_get => |value| value.dest,
+            .binary_op => |value| value.dest,
+            .unary_op => |value| value.dest,
+            .call_direct => |value| value.dest,
+            .call_named => |value| value.dest,
+            .call_closure => |value| value.dest,
+            .call_dispatch => |value| value.dest,
+            .call_builtin => |value| value.dest,
+            .try_call_named => |value| value.dest,
+            .error_catch => |value| value.dest,
+            .if_expr => |value| value.dest,
+            .case_block => |value| value.dest,
+            .switch_literal => |value| value.dest,
+            .union_switch => |value| value.dest,
+            .match_atom => |value| value.dest,
+            .match_int => |value| value.dest,
+            .match_float => |value| value.dest,
+            .match_string => |value| value.dest,
+            .match_type => |value| value.dest,
+            .make_closure => |value| value.dest,
+            .capture_get => |value| value.dest,
+            .optional_unwrap => |value| value.dest,
+            .bin_len_check => |value| value.dest,
+            .bin_read_int => |value| value.dest,
+            .bin_read_float => |value| value.dest,
+            .bin_slice => |value| value.dest,
+            .bin_match_prefix => |value| value.dest,
+            .int_widen => |value| value.dest,
+            .float_widen => |value| value.dest,
+            .phi => |value| value.dest,
+            .reset => |value| value.dest,
+            .reuse_alloc => |value| value.dest,
+            .local_get => |value| value.dest,
+            .local_set => |value| value.dest,
+            .move_value => |value| value.dest,
+            .share_value => |value| value.dest,
+            .param_get => |value| value.dest,
+            .ret,
+            .field_set,
+            .set_safety,
+            .guard_block,
+            .branch,
+            .cond_branch,
+            .switch_tag,
+            .switch_return,
+            .union_switch_return,
+            .match_fail,
+            .match_error_return,
+            .cond_return,
+            .case_break,
+            .jump,
+            .retain,
+            .release,
+            .bin_read_utf8,
+            .tail_call,
+            => null,
+        };
+    }
+
     /// Handle a case_block where the frontend put all logic in pre_instrs
     /// as a flat sequence of guard_blocks (atom/pattern matching). We extract
     /// the guard_blocks as arms and restructure into nested if-else-bodies.
@@ -5998,6 +6100,39 @@ pub const ZirDriver = struct {
             return;
         }
 
+        // Collect guard_blocks from pre_instrs (with their preceding setup).
+        // We process them in REVERSE order for nested if-else construction.
+        var guards = std.ArrayListUnmanaged(struct {
+            setup_start: usize,
+            guard_idx: usize,
+        }).empty;
+        defer guards.deinit(self.allocator);
+
+        var prev_end: usize = 0;
+        for (cb.pre_instrs, 0..) |instr, idx| {
+            if (instr == .guard_block) {
+                try guards.append(self.allocator, .{
+                    .setup_start = prev_end,
+                    .guard_idx = idx,
+                });
+                prev_end = idx + 1;
+            }
+        }
+
+        const common_setup_end = if (guards.items.len > 0) blk: {
+            const first_guard = guards.items[0];
+            const first_guard_block = cb.pre_instrs[first_guard.guard_idx].guard_block;
+            const condition_idx = findInstructionDefiningLocal(
+                cb.pre_instrs[first_guard.setup_start..first_guard.guard_idx],
+                first_guard_block.condition,
+            ) orelse 0;
+            break :blk first_guard.setup_start + condition_idx;
+        } else 0;
+
+        for (cb.pre_instrs[0..common_setup_end]) |setup_instr| {
+            try self.emitInstruction(setup_instr);
+        }
+
         // Instructions after the last guard_block are the default body.
         const default_start = last_guard_idx.? + 1;
         const default_pre_instrs = cb.pre_instrs[default_start..];
@@ -6023,25 +6158,6 @@ pub const ZirDriver = struct {
         @memcpy(current_else_insts, default_ptr[0..default_len]);
         var current_else_result: u32 = default_result;
 
-        // Collect guard_blocks from pre_instrs (with their preceding setup).
-        // We process them in REVERSE order for nested if-else construction.
-        var guards = std.ArrayListUnmanaged(struct {
-            setup_start: usize,
-            guard_idx: usize,
-        }).empty;
-        defer guards.deinit(self.allocator);
-
-        var prev_end: usize = 0;
-        for (cb.pre_instrs, 0..) |instr, idx| {
-            if (instr == .guard_block) {
-                try guards.append(self.allocator, .{
-                    .setup_start = prev_end,
-                    .guard_idx = idx,
-                });
-                prev_end = idx + 1;
-            }
-        }
-
         var index_get_pre_emitted = false;
 
         // If the default body is empty AND there's a catch-all guard (_ pattern),
@@ -6049,14 +6165,18 @@ pub const ZirDriver = struct {
         // The last guard has condition=true (always matches), so the empty default
         // is unreachable. Promoting the catch-all to the default avoids a void
         // else branch that Sema can't merge with the other types.
-        if (current_else_result == @intFromEnum(Zir.Inst.Ref.void_value) and cb.default_instrs.len == 0 and guards.items.len > 0) {
+        if (current_else_result == @intFromEnum(Zir.Inst.Ref.void_value) and
+            default_pre_instrs.len == 0 and
+            cb.default_instrs.len == 0 and
+            guards.items.len > 0)
+        {
             const last_guard = guards.items[guards.items.len - 1];
             const last_gb = cb.pre_instrs[last_guard.guard_idx].guard_block;
 
             // If this is the ONLY guard (catch-all), emit body as top-level instructions
             if (guards.items.len == 1) {
                 // Emit setup instructions (e.g., match_type)
-                for (cb.pre_instrs[0..last_guard.guard_idx]) |si| try self.emitInstruction(si);
+                for (cb.pre_instrs[common_setup_end..last_guard.guard_idx]) |si| try self.emitInstruction(si);
                 // Emit body instructions at top level (flatten any nested
                 // guard_blocks so trailing default ops do not run alongside).
                 try self.emitFlattenedGuardSequence(last_gb.body);
@@ -6073,8 +6193,11 @@ pub const ZirDriver = struct {
             // before any body is captured. Per-guard setup (match_atom) is
             // emitted later in the reverse loop.
             for (guards.items) |guard| {
-                for (cb.pre_instrs[guard.setup_start..guard.guard_idx]) |si| {
-                    if (std.meta.activeTag(si) == .index_get) try self.emitInstruction(si);
+                const setup_start = @max(guard.setup_start, common_setup_end);
+                for (cb.pre_instrs[setup_start..guard.guard_idx]) |si| {
+                    if (std.meta.activeTag(si) == .index_get) {
+                        try self.emitInstruction(si);
+                    }
                 }
             }
             index_get_pre_emitted = true;
@@ -6103,7 +6226,8 @@ pub const ZirDriver = struct {
             gi -= 1;
             const guard = guards.items[gi];
             const gb = cb.pre_instrs[guard.guard_idx].guard_block;
-            const setup_instrs = cb.pre_instrs[guard.setup_start..guard.guard_idx];
+            const setup_start = @max(guard.setup_start, common_setup_end);
+            const setup_instrs = cb.pre_instrs[setup_start..guard.guard_idx];
 
             // Emit per-guard setup. Skip index_get if already pre-emitted
             // before the catchall capture.

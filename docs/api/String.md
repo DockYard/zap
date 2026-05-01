@@ -1,5 +1,17 @@
 # String
 
+Functions for working with UTF-8 encoded strings.
+
+Strings in Zap are immutable byte sequences (`[]const u8` in the
+underlying Zig representation). All operations return new strings
+rather than modifying in place.
+
+## Examples
+
+    String.length("hello")              # => 5
+    String.contains?("hello world", "o") # => true
+    String.slice("hello", 0, 3)         # => "hel"
+
 ## Functions
 
 ### length/1

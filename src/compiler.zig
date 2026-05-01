@@ -2346,7 +2346,12 @@ fn remapTopItem(alloc: std.mem.Allocator, item: *ast.TopItem, remap: []const ast
             try remapImplDecl(alloc, mutable, remap);
             item.* = .{ .priv_impl_decl = mutable };
         },
-        .attribute => {},
+        .attribute => |attr| {
+            const mutable = try alloc.create(ast.AttributeDecl);
+            mutable.* = attr.*;
+            try remapAttributeDecl(alloc, mutable, remap);
+            item.* = .{ .attribute = mutable };
+        },
     }
 }
 
@@ -2368,8 +2373,20 @@ fn remapProtocolDecl(alloc: std.mem.Allocator, proto: *ast.ProtocolDecl, remap: 
         for (sig.params, 0..) |param, j| {
             new_params[j] = param;
             new_params[j].name = if (param.name < remap.len) remap[param.name] else param.name;
+            if (param.type_annotation) |type_annotation| {
+                const mutable_type_annotation = try alloc.create(ast.TypeExpr);
+                mutable_type_annotation.* = type_annotation.*;
+                try remapTypeExpr(alloc, mutable_type_annotation, remap);
+                new_params[j].type_annotation = mutable_type_annotation;
+            }
         }
         new_sig.params = new_params;
+        if (sig.return_type) |return_type| {
+            const mutable_return_type = try alloc.create(ast.TypeExpr);
+            mutable_return_type.* = return_type.*;
+            try remapTypeExpr(alloc, mutable_return_type, remap);
+            new_sig.return_type = mutable_return_type;
+        }
         new_fns[i] = new_sig;
     }
     proto.functions = new_fns;
@@ -2479,19 +2496,7 @@ fn remapStructItem(alloc: std.mem.Allocator, item: *ast.StructItem, remap: []con
         .attribute => |attr| {
             const mutable = try alloc.create(ast.AttributeDecl);
             mutable.* = attr.*;
-            mutable.name = remap[attr.name];
-            if (mutable.type_expr) |te| {
-                const mutable_te = try alloc.create(ast.TypeExpr);
-                mutable_te.* = te.*;
-                try remapTypeExpr(alloc, mutable_te, remap);
-                mutable.type_expr = mutable_te;
-            }
-            if (mutable.value) |v| {
-                const mutable_v = try alloc.create(ast.Expr);
-                mutable_v.* = v.*;
-                try remapExpr(alloc, mutable_v, remap);
-                mutable.value = mutable_v;
-            }
+            try remapAttributeDecl(alloc, mutable, remap);
             item.* = .{ .attribute = mutable };
         },
         .struct_level_expr => |expr| {
@@ -2500,6 +2505,22 @@ fn remapStructItem(alloc: std.mem.Allocator, item: *ast.StructItem, remap: []con
             try remapExpr(alloc, mutable, remap);
             item.* = .{ .struct_level_expr = mutable };
         },
+    }
+}
+
+fn remapAttributeDecl(alloc: std.mem.Allocator, attr: *ast.AttributeDecl, remap: []const ast.StringId) error{OutOfMemory}!void {
+    attr.name = remap[attr.name];
+    if (attr.type_expr) |type_expr| {
+        const mutable_type_expr = try alloc.create(ast.TypeExpr);
+        mutable_type_expr.* = type_expr.*;
+        try remapTypeExpr(alloc, mutable_type_expr, remap);
+        attr.type_expr = mutable_type_expr;
+    }
+    if (attr.value) |value| {
+        const mutable_value = try alloc.create(ast.Expr);
+        mutable_value.* = value.*;
+        try remapExpr(alloc, mutable_value, remap);
+        attr.value = mutable_value;
     }
 }
 
@@ -2671,18 +2692,7 @@ fn remapStmt(alloc: std.mem.Allocator, stmt: *ast.Stmt, remap: []const ast.Strin
         .attribute => |attr| {
             const mutable = try alloc.create(ast.AttributeDecl);
             mutable.* = attr.*;
-            if (attr.type_expr) |type_expr| {
-                const mutable_type = try alloc.create(ast.TypeExpr);
-                mutable_type.* = type_expr.*;
-                try remapTypeExpr(alloc, mutable_type, remap);
-                mutable.type_expr = mutable_type;
-            }
-            if (attr.value) |value| {
-                const mutable_value = try alloc.create(ast.Expr);
-                mutable_value.* = value.*;
-                try remapExpr(alloc, mutable_value, remap);
-                mutable.value = mutable_value;
-            }
+            try remapAttributeDecl(alloc, mutable, remap);
             stmt.* = .{ .attribute = mutable };
         },
     }

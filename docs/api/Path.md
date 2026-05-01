@@ -1,5 +1,19 @@
 # Path
 
+Functions for manipulating file system paths.
+
+Most functions are pure string manipulation. `Path.glob/1` reads
+the file system and returns matching paths in deterministic sorted
+order.
+
+## Examples
+
+    Path.join("src", "main.zap")  # => "src/main.zap"
+    Path.basename("/usr/bin/zap")  # => "zap"
+    Path.dirname("/usr/bin/zap")   # => "/usr/bin"
+    Path.extname("main.zap")       # => ".zap"
+    Path.glob("lib/**/*.zap")      # => ["lib/path.zap", ...]
+
 ## Functions
 
 ### join/2

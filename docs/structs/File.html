@@ -67,13 +67,26 @@
 <li><a href="../structs/Struct.html">Struct</a></li>
 <li><a href="../structs/System.html">System</a></li>
 <li><a href="../structs/Zest.html">Zest</a></li>
+<li><a href="../structs/Zest.Case.html">Zest.Case</a></li>
+<li><a href="../structs/Zest.Runner.html">Zest.Runner</a></li>
 </ul>
 </div>
 <div class="sidebar-group">
-<h4>Zest</h4>
+<h4>Protocols</h4>
 <ul>
-<li><a href="../structs/Zest.Case.html">Zest.Case</a></li>
-<li><a href="../structs/Zest.Runner.html">Zest.Runner</a></li>
+<li><a href="../structs/Arithmetic.html">Arithmetic</a></li>
+<li><a href="../structs/Comparator.html">Comparator</a></li>
+<li><a href="../structs/Concatenable.html">Concatenable</a></li>
+<li><a href="../structs/Enumerable.html">Enumerable</a></li>
+<li><a href="../structs/Membership.html">Membership</a></li>
+<li><a href="../structs/Stringable.html">Stringable</a></li>
+<li><a href="../structs/Updatable.html">Updatable</a></li>
+</ul>
+</div>
+<div class="sidebar-group">
+<h4>Unions</h4>
+<ul>
+<li><a href="../structs/IO.Mode.html">IO.Mode</a></li>
 </ul>
 </div>
 </nav>
@@ -84,6 +97,16 @@
 <span class="pub-struct-pill">pub struct</span>
 <a href="https://github.com/DockYard/zap/blob/v0.1.0/./lib/file.zap" class="source-file">./lib/file.zap</a>
 </div>
+</div>
+<p class="tagline">Functions for reading and writing files.</p>
+<div class="structdoc">
+<p>Functions for reading and writing files.</p>
+<p>All paths are relative to the current working directory.
+File operations return empty strings or false on failure.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">content <span class="hl-op">=</span> File.read(<span class="hl-string">"config.txt"</span>)
+File.write(<span class="hl-string">"output.txt"</span>, <span class="hl-string">"Hello, world!"</span>)
+File.exists?(<span class="hl-string">"config.txt"</span>)  <span class="hl-comment"># =&gt; true</span></code></pre>
 </div>
 <h2 id="functions">Functions</h2>
 <table class="summary">

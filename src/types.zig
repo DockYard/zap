@@ -164,6 +164,13 @@ pub const Type = union(enum) {
     };
 };
 
+const ProtocolDispatchResolution = union(enum) {
+    not_protocol,
+    concrete: ast.StructName,
+    constrained,
+    invalid,
+};
+
 // ============================================================
 // Type store
 // ============================================================
@@ -1460,51 +1467,82 @@ pub const TypeChecker = struct {
         return clause_type;
     }
 
-    /// Type-checker mirror of `HirBuilder.protocolDispatchStruct`. When
-    /// the call's qualifying struct is a registered protocol and the
-    /// first argument's inferred type has a matching `impl Protocol for
-    /// T`, returns T's canonical name so the caller resolves the
-    /// impl's signature instead of the protocol's abstract one. This is
-    /// what makes `Enumerable.next(s :: String)` type as
-    /// `{Atom, String, String}` (the impl's return) rather than
-    /// `{Atom, i64, any}` (the protocol's hardcoded return) — without
-    /// it, downstream pattern-flow assigns the wrong types to the
-    /// cont-arm bindings, and the body's protocol calls (e.g.
-    /// `Concatenable.concat(c, "!")`) can't dispatch because their
-    /// first argument's type is wrong or UNKNOWN.
+    /// Resolve a protocol-qualified call target without conflating
+    /// "this qualifier is not a protocol" with "this is a protocol call
+    /// whose first argument is not known to satisfy the protocol".
     ///
-    /// Returns null when the struct isn't a protocol or no impl
-    /// matches; callers fall back to the original struct name.
-    fn protocolDispatchStruct(
+    /// A concrete first argument dispatches to its impl target. A first
+    /// argument already constrained by the exact same protocol keeps
+    /// the protocol qualifier so generic protocol helpers can type-check.
+    /// Any other first argument is invalid; callers must report a hard
+    /// diagnostic and must not fall back to the protocol's abstract
+    /// signature as if the argument were accepted.
+    fn resolveProtocolDispatch(
         self: *TypeChecker,
-        mod_name: ast.StructName,
+        protocol_name: ast.StructName,
         first_arg: *const ast.Expr,
-    ) ?ast.StructName {
-        if (mod_name.parts.len != 1) return null;
-        const proto_simple = self.interner.get(mod_name.parts[0]);
-        var is_proto = false;
-        for (self.graph.protocols.items) |entry| {
-            if (entry.name.parts.len != 1) continue;
-            if (std.mem.eql(u8, self.interner.get(entry.name.parts[0]), proto_simple)) {
-                is_proto = true;
-                break;
-            }
+    ) !ProtocolDispatchResolution {
+        if (self.graph.findProtocol(protocol_name) == null) return .not_protocol;
+
+        const arg_type = try self.inferExpr(first_arg);
+        if (arg_type == TypeStore.UNKNOWN or arg_type == TypeStore.ERROR) return .invalid;
+
+        if (self.protocolConstraintMatches(arg_type, protocol_name)) {
+            return .constrained;
         }
-        if (!is_proto) return null;
 
-        const arg_type = self.inferExpr(first_arg) catch return null;
-        if (arg_type == TypeStore.UNKNOWN or arg_type == TypeStore.ERROR) return null;
+        if (self.implTargetForProtocolArgument(protocol_name, arg_type)) |target| {
+            return .{ .concrete = target };
+        }
+
+        return .invalid;
+    }
+
+    fn protocolConstraintMatches(self: *const TypeChecker, type_id: TypeId, protocol_name: ast.StructName) bool {
+        if (protocol_name.parts.len == 0) return false;
+        const typ = self.store.getType(type_id);
+        if (typ != .protocol_constraint) return false;
+        return typ.protocol_constraint.protocol_name == protocol_name.parts[protocol_name.parts.len - 1];
+    }
+
+    fn implTargetForProtocolArgument(self: *const TypeChecker, protocol_name: ast.StructName, arg_type: TypeId) ?ast.StructName {
         const target_simple = self.store.typeToStructName(arg_type, self.interner) orelse return null;
-
         for (self.graph.impls.items) |entry| {
-            if (entry.protocol_name.parts.len != 1 or entry.target_type.parts.len != 1) continue;
-            const p = self.interner.get(entry.protocol_name.parts[0]);
-            const t = self.interner.get(entry.target_type.parts[0]);
-            if (std.mem.eql(u8, p, proto_simple) and std.mem.eql(u8, t, target_simple)) {
-                return entry.target_type;
-            }
+            if (!self.structNamesEqual(entry.protocol_name, protocol_name)) continue;
+            if (entry.target_type.parts.len != 1) continue;
+            const target_name = self.interner.get(entry.target_type.parts[0]);
+            if (std.mem.eql(u8, target_name, target_simple)) return entry.target_type;
         }
         return null;
+    }
+
+    fn implTargetForProtocolId(self: *const TypeChecker, protocol_name: ast.StringId, arg_type: TypeId) ?ast.StructName {
+        const target_simple = self.store.typeToStructName(arg_type, self.interner) orelse return null;
+        for (self.graph.impls.items) |entry| {
+            if (entry.protocol_name.parts.len != 1 or entry.protocol_name.parts[0] != protocol_name) continue;
+            if (entry.target_type.parts.len != 1) continue;
+            const target_name = self.interner.get(entry.target_type.parts[0]);
+            if (std.mem.eql(u8, target_name, target_simple)) return entry.target_type;
+        }
+        return null;
+    }
+
+    fn structNamesEqual(_: *const TypeChecker, lhs: ast.StructName, rhs: ast.StructName) bool {
+        if (lhs.parts.len != rhs.parts.len) return false;
+        for (lhs.parts, rhs.parts) |left_part, right_part| {
+            if (left_part != right_part) return false;
+        }
+        return true;
+    }
+
+    fn reportInvalidProtocolDispatch(self: *TypeChecker, protocol_name: ast.StructName, arg: *const ast.Expr) !void {
+        const protocol_text = protocol_name.joinedWith(self.allocator, self.interner, ".") catch self.interner.get(protocol_name.parts[protocol_name.parts.len - 1]);
+        try self.addHardError(
+            try std.fmt.allocPrint(self.allocator, "first argument to protocol `{s}` does not satisfy `{s}`", .{ protocol_text, protocol_text }),
+            arg.getMeta().span,
+            "protocol dispatch requires an exact protocol constraint or a concrete impl",
+            try std.fmt.allocPrint(self.allocator, "annotate the value with `{s}` or pass a type that implements `{s}`", .{ protocol_text, protocol_text }),
+        );
     }
 
     fn recordBindingQualifiedType(self: *TypeChecker, binding_id: scope_mod.BindingId, qualified_type: QualifiedType, source_span: ast.SourceSpan) !void {
@@ -1834,10 +1872,36 @@ pub const TypeChecker = struct {
         var total: u32 = 0;
         const count = @min(signature.params.len, arg_types.len);
         for (arg_types[0..count], signature.params[0..count]) |arg_type, expected| {
-            const cost = self.store.callMatchCost(arg_type, expected) orelse return null;
+            const cost = self.callMatchCost(arg_type, expected) orelse return null;
             total +|= cost;
         }
         return total;
+    }
+
+    fn callMatchCost(self: *const TypeChecker, actual: TypeId, expected: TypeId) ?u32 {
+        if (expected == TypeStore.UNKNOWN or actual == TypeStore.UNKNOWN or actual == TypeStore.ERROR) return 0;
+
+        const expected_type = self.store.getType(expected);
+        const actual_type = self.store.getType(actual);
+        if (expected_type == .protocol_constraint) {
+            if (actual_type == .protocol_constraint) {
+                if (actual_type.protocol_constraint.protocol_name == expected_type.protocol_constraint.protocol_name) return 0;
+                return null;
+            }
+
+            if (self.implTargetForProtocolId(expected_type.protocol_constraint.protocol_name, actual) != null) return 0;
+            return null;
+        }
+
+        if (actual_type == .protocol_constraint) {
+            if (expected_type == .type_var) return 0;
+            return null;
+        }
+
+        if (self.store.containsTypeVars(expected) or self.store.containsTypeVars(actual)) return 0;
+        if (expected_type == .type_var or actual_type == .type_var) return 0;
+
+        return self.store.callMatchCost(actual, expected);
     }
 
     fn inferCallArgTypes(self: *TypeChecker, args: []const *const ast.Expr) ![]const TypeId {
@@ -2421,6 +2485,25 @@ pub const TypeChecker = struct {
             switch (typ) {
                 .struct_type => |st| return self.interner.get(st.name),
                 .tagged_union => |tu| return self.interner.get(tu.name),
+                .list => |lt| {
+                    return std.fmt.allocPrint(self.allocator, "[{s}]", .{self.typeToString(lt.element)}) catch "{type}";
+                },
+                .map => |mt| {
+                    return std.fmt.allocPrint(self.allocator, "%{{{s} => {s}}}", .{ self.typeToString(mt.key), self.typeToString(mt.value) }) catch "{type}";
+                },
+                .function => |ft| {
+                    var buf: std.ArrayList(u8) = .empty;
+                    buf.appendSlice(self.allocator, "(") catch return "{type}";
+                    for (ft.params, 0..) |param, idx| {
+                        if (idx > 0) buf.appendSlice(self.allocator, ", ") catch return "{type}";
+                        buf.appendSlice(self.allocator, self.typeToString(param)) catch return "{type}";
+                    }
+                    buf.appendSlice(self.allocator, " -> ") catch return "{type}";
+                    buf.appendSlice(self.allocator, self.typeToString(ft.return_type)) catch return "{type}";
+                    buf.appendSlice(self.allocator, ")") catch return "{type}";
+                    return buf.toOwnedSlice(self.allocator) catch return "{type}";
+                },
+                .protocol_constraint => |pc| return self.interner.get(pc.protocol_name),
                 .union_type => |ut| {
                     var buf: std.ArrayList(u8) = .empty;
                     for (ut.members, 0..) |member, i| {
@@ -4358,6 +4441,11 @@ pub const TypeChecker = struct {
                             if (idx < signature.params.len) {
                                 const expected = signature.params[idx];
                                 if (expected != TypeStore.UNKNOWN and arg_type != TypeStore.UNKNOWN and arg_type != TypeStore.ERROR) {
+                                    if (self.callMatchCost(arg_type, expected) == null) {
+                                        try self.reportArgumentTypeMismatch(arg, idx, expected, arg_type);
+                                        unification_failed = true;
+                                        continue;
+                                    }
                                     const unified = self.store.unify(expected, arg_type, &subs) catch false;
                                     if (!unified) {
                                         try self.reportArgumentTypeMismatch(arg, idx, expected, arg_type);
@@ -4391,7 +4479,7 @@ pub const TypeChecker = struct {
                         const arg_type = try self.inferExpr(arg);
                         if (idx < signature.params.len) {
                             const expected = signature.params[idx];
-                            if (expected != TypeStore.UNKNOWN and arg_type != TypeStore.UNKNOWN and arg_type != TypeStore.ERROR and self.store.callMatchCost(arg_type, expected) == null) {
+                            if (expected != TypeStore.UNKNOWN and arg_type != TypeStore.UNKNOWN and arg_type != TypeStore.ERROR and self.callMatchCost(arg_type, expected) == null) {
                                 try self.reportArgumentTypeMismatch(arg, idx, expected, arg_type);
                             }
                         }
@@ -4464,16 +4552,27 @@ pub const TypeChecker = struct {
             }
             if (fa.object.* == .struct_ref) {
                 const written_mod_name = fa.object.struct_ref.name;
-                // Protocol dispatch: if the user wrote `Protocol.method(arg, …)`
-                // and `Protocol` is a registered protocol with an impl
-                // for the first argument's concrete type, redirect to the
-                // impl's struct so we resolve the impl's signature
-                // (concrete return type) instead of the protocol's
-                // abstract one. Mirrors the HIR-level dispatch.
-                const mod_name = if (call.args.len > 0)
-                    self.protocolDispatchStruct(written_mod_name, call.args[0]) orelse written_mod_name
-                else
-                    written_mod_name;
+                var mod_name = written_mod_name;
+                if (call.args.len > 0) {
+                    switch (try self.resolveProtocolDispatch(written_mod_name, call.args[0])) {
+                        .not_protocol => {},
+                        .concrete => |target| mod_name = target,
+                        .constrained => {},
+                        .invalid => {
+                            try self.reportInvalidProtocolDispatch(written_mod_name, call.args[0]);
+                            for (call.args) |arg| _ = try self.inferExpr(arg);
+                            return TypeStore.UNKNOWN;
+                        },
+                    }
+                } else if (self.graph.findProtocol(written_mod_name) != null) {
+                    try self.addHardError(
+                        "protocol dispatch requires at least one argument",
+                        call.meta.span,
+                        "missing protocol receiver argument",
+                        null,
+                    );
+                    return TypeStore.UNKNOWN;
+                }
                 for (self.graph.structs.items) |mod_entry| {
                     if (mod_entry.name.parts.len == mod_name.parts.len) {
                         var match = true;
@@ -4509,6 +4608,11 @@ pub const TypeChecker = struct {
                                         if (idx < signature.params.len) {
                                             const expected = signature.params[idx];
                                             if (expected != TypeStore.UNKNOWN and arg_type != TypeStore.UNKNOWN and arg_type != TypeStore.ERROR) {
+                                                if (self.callMatchCost(arg_type, expected) == null) {
+                                                    self.reportArgumentTypeMismatch(arg, idx, expected, arg_type) catch {};
+                                                    mod_unification_failed = true;
+                                                    continue;
+                                                }
                                                 const unified = self.store.unify(expected, arg_type, &mod_subs) catch false;
                                                 if (!unified) {
                                                     self.reportArgumentTypeMismatch(arg, idx, expected, arg_type) catch {};
@@ -4539,7 +4643,7 @@ pub const TypeChecker = struct {
                                     const arg_type = self.inferExpr(arg) catch TypeStore.UNKNOWN;
                                     if (idx < signature.params.len) {
                                         const expected = signature.params[idx];
-                                        if (expected != TypeStore.UNKNOWN and arg_type != TypeStore.UNKNOWN and arg_type != TypeStore.ERROR and self.store.callMatchCost(arg_type, expected) == null) {
+                                        if (expected != TypeStore.UNKNOWN and arg_type != TypeStore.UNKNOWN and arg_type != TypeStore.ERROR and self.callMatchCost(arg_type, expected) == null) {
                                             self.reportArgumentTypeMismatch(arg, idx, expected, arg_type) catch {};
                                         }
                                     }
@@ -5251,7 +5355,7 @@ test "type check generic impl resolves Map(K, V) to map type" {
     // pass on its body); we're confirming the *signature* resolves.
     const source =
         \\pub protocol Enumerable {
-        \\  fn next(state) -> {Atom, i64, any}
+        \\  fn next(state) -> {Atom, any, any}
         \\}
         \\
         \\pub impl Enumerable for Map(K, V) {
@@ -5282,6 +5386,127 @@ test "type check generic impl resolves Map(K, V) to map type" {
         try std.testing.expect(std.mem.find(u8, err.message, "I cannot find a type named `K`") == null);
         try std.testing.expect(std.mem.find(u8, err.message, "I cannot find a type named `V`") == null);
     }
+}
+
+test "protocol dispatch rejects unconstrained type variable receiver" {
+    const source =
+        \\pub protocol Enumerable {
+        \\  fn next(state) -> {Atom, any, any}
+        \\}
+        \\
+        \\pub struct Test {
+        \\  pub fn bad(collection :: enumerable) -> i64 {
+        \\    case Enumerable.next(collection) {
+        \\      {:done, _, _} -> 0
+        \\      {:cont, value, _} -> value
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var found = false;
+    for (checker.errors.items) |err| {
+        if (std.mem.find(u8, err.message, "first argument to protocol `Enumerable` does not satisfy `Enumerable`") != null) {
+            found = true;
+            try std.testing.expect(err.help != null);
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "protocol dispatch accepts exact protocol constraint receiver" {
+    const source =
+        \\pub protocol Enumerable {
+        \\  fn next(state) -> {Atom, any, any}
+        \\}
+        \\
+        \\pub struct Test {
+        \\  pub fn first(collection :: Enumerable) -> i64 {
+        \\    case Enumerable.next(collection) {
+        \\      {:done, _, _} -> 0
+        \\      {:cont, value, _} -> value
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+}
+
+test "protocol parameter rejects unconstrained type variable argument" {
+    const source =
+        \\pub protocol Enumerable {
+        \\  fn next(state) -> {Atom, any, any}
+        \\}
+        \\
+        \\pub struct Enum {
+        \\  pub fn to_list(collection :: Enumerable) -> [i64] {
+        \\    []
+        \\  }
+        \\}
+        \\
+        \\pub struct Test {
+        \\  pub fn bad(collection :: enumerable) -> [i64] {
+        \\    Enum.to_list(collection)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var found = false;
+    for (checker.errors.items) |err| {
+        if (std.mem.find(u8, err.message, "argument 1 expects `Enumerable`") != null) {
+            found = true;
+        }
+    }
+    try std.testing.expect(found);
 }
 
 test "type check return type mismatch" {
@@ -5424,9 +5649,6 @@ test "function ref inference defaults param ownerships to shared" {
     defer checker.deinit();
     try checker.checkProgram(&program);
 
-    for (checker.errors.items) |err| {
-        std.debug.print("ERR_MSG: [{s}]\n", .{err.message});
-    }
     try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
 
     const main_func = program.structs[0].items[0].function;

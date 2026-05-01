@@ -67,13 +67,26 @@
 <li><a href="structs/Struct.html">Struct</a></li>
 <li><a href="structs/System.html">System</a></li>
 <li><a href="structs/Zest.html">Zest</a></li>
+<li><a href="structs/Zest.Case.html">Zest.Case</a></li>
+<li><a href="structs/Zest.Runner.html">Zest.Runner</a></li>
 </ul>
 </div>
 <div class="sidebar-group">
-<h4>Zest</h4>
+<h4>Protocols</h4>
 <ul>
-<li><a href="structs/Zest.Case.html">Zest.Case</a></li>
-<li><a href="structs/Zest.Runner.html">Zest.Runner</a></li>
+<li><a href="structs/Arithmetic.html">Arithmetic</a></li>
+<li><a href="structs/Comparator.html">Comparator</a></li>
+<li><a href="structs/Concatenable.html">Concatenable</a></li>
+<li><a href="structs/Enumerable.html">Enumerable</a></li>
+<li><a href="structs/Membership.html">Membership</a></li>
+<li><a href="structs/Stringable.html">Stringable</a></li>
+<li><a href="structs/Updatable.html">Updatable</a></li>
+</ul>
+</div>
+<div class="sidebar-group">
+<h4>Unions</h4>
+<ul>
+<li><a href="structs/IO.Mode.html">IO.Mode</a></li>
 </ul>
 </div>
 </nav>
@@ -133,11 +146,16 @@ zap run test        # Compile and run test target</code></pre>
 <h2>The Language</h2>
 <h3>Structs and Files</h3>
 <p>Every <code>.zap</code> file contains exactly one struct. The struct name maps to the file path:</p>
-<p>| Struct name | File path |
-|---|---|
-| <code>App</code> | <code>lib/app.zap</code> |
-| <code>Config.Parser</code> | <code>lib/config/parser.zap</code> |
-| <code>JsonParser</code> | <code>lib/json_parser.zap</code> |</p>
+<table class="markdown-table">
+<thead>
+<tr><th>Struct name</th><th>File path</th></tr>
+</thead>
+<tbody>
+<tr><td><code>App</code></td><td><code>lib/app.zap</code></td></tr>
+<tr><td><code>Config.Parser</code></td><td><code>lib/config/parser.zap</code></td></tr>
+<tr><td><code>JsonParser</code></td><td><code>lib/json_parser.zap</code></td></tr>
+</tbody>
+</table>
 <p>The compiler enforces this — a mismatch is a compile error. The compiler discovers files by following struct references from the entry point. No glob patterns or file manifests needed.</p>
 <pre><code class="language-zap"><span class="hl-comment"># lib/math.zap</span>
 <span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> Math {
@@ -361,14 +379,19 @@ countdown(<span class="hl-number">100_000_000</span>)  <span class="hl-comment">
   }
 }</code></pre>
 <p>When <code>root</code> is specified and <code>paths</code> is omitted, the compiler uses import-driven discovery — it starts from the entry struct and follows struct references to find all source files automatically.</p>
-<p>| Field | Description |
-|---|---|
-| <code>name</code> | Output binary name |
-| <code>version</code> | Project version |
-| <code>kind</code> | <code>:bin</code>, <code>:lib</code>, or <code>:obj</code> |
-| <code>root</code> | Entry point as <code>&quot;Struct.function/arity&quot;</code> |
-| <code>deps</code> | List of dependency tuples |
-| <code>optimize</code> | <code>:debug</code>, <code>:release_safe</code>, <code>:release_fast</code>, or <code>:release_small</code> |</p>
+<table class="markdown-table">
+<thead>
+<tr><th>Field</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>name</code></td><td>Output binary name</td></tr>
+<tr><td><code>version</code></td><td>Project version</td></tr>
+<tr><td><code>kind</code></td><td><code>:bin</code>, <code>:lib</code>, or <code>:obj</code></td></tr>
+<tr><td><code>root</code></td><td>Entry point as <code>&quot;Struct.function/arity&quot;</code></td></tr>
+<tr><td><code>deps</code></td><td>List of dependency tuples</td></tr>
+<tr><td><code>optimize</code></td><td><code>:debug</code>, <code>:release_safe</code>, <code>:release_fast</code>, or <code>:release_small</code></td></tr>
+</tbody>
+</table>
 <h3>Dependencies</h3>
 <p>Dependencies are declared in the manifest as tuples:</p>
 <pre><code class="language-zap">%Zap.Manifest{
@@ -381,10 +404,15 @@ countdown(<span class="hl-number">100_000_000</span>)  <span class="hl-comment">
     {<span class="hl-atom">:json_parser</span>, {<span class="hl-atom">:git</span>, <span class="hl-string">"https://github.com/someone/json_parser.zap"</span>, <span class="hl-string">"v1.0.0"</span>}}
   ]
 }</code></pre>
-<p>| Source type | Format | Description |
-|---|---|---|
-| Path | <code>{:name, {:path, &quot;dir&quot;}}</code> | Local Zap library |
-| Git | <code>{:name, {:git, &quot;url&quot;, &quot;ref&quot;}}</code> | Remote Zap library |</p>
+<table class="markdown-table">
+<thead>
+<tr><th>Source type</th><th>Format</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td>Path</td><td><code>{:name, {:path, &quot;dir&quot;}}</code></td><td>Local Zap library</td></tr>
+<tr><td>Git</td><td><code>{:name, {:git, &quot;url&quot;, &quot;ref&quot;}}</code></td><td>Remote Zap library</td></tr>
+</tbody>
+</table>
 <p>Zap dependencies are first-class — their structs are available directly (<code>JsonParser.parse(data)</code>). The compiler discovers dep structs the same way it discovers project structs.</p>
 <p>A <code>zap.lock</code> lockfile is generated automatically on first build and records resolved versions for reproducible builds.</p>
 <pre><code class="language-sh">zap deps update         # Re-resolve all dependencies
@@ -392,15 +420,20 @@ zap deps update &lt;name&gt;  # Re-resolve a single dependency</code></pre>
 <hr>
 <h2>Type System</h2>
 <p>Types are declared at function boundaries. When resolving a call, Zap first prefers an exact typed clause. If no exact clause matches, narrower numeric types may widen within the same family (e.g., <code>i8</code> to <code>i128</code>), but no lossy or cross-family conversions are implicit.</p>
-<p>| Category | Types |
-|---|---|
-| Signed integers | <code>i8</code> <code>i16</code> <code>i32</code> <code>i64</code> <code>i128</code> |
-| Unsigned integers | <code>u8</code> <code>u16</code> <code>u32</code> <code>u64</code> <code>u128</code> |
-| Floats | <code>f16</code> <code>f32</code> <code>f64</code> <code>f80</code> <code>f128</code> |
-| Platform-sized | <code>usize</code> <code>isize</code> |
-| Primitives | <code>Bool</code> <code>String</code> <code>Atom</code> <code>Nil</code> |
-| Bottom | <code>Never</code> |
-| Compound | tuples, lists, maps, structs, unions |</p>
+<table class="markdown-table">
+<thead>
+<tr><th>Category</th><th>Types</th></tr>
+</thead>
+<tbody>
+<tr><td>Signed integers</td><td><code>i8</code> <code>i16</code> <code>i32</code> <code>i64</code> <code>i128</code></td></tr>
+<tr><td>Unsigned integers</td><td><code>u8</code> <code>u16</code> <code>u32</code> <code>u64</code> <code>u128</code></td></tr>
+<tr><td>Floats</td><td><code>f16</code> <code>f32</code> <code>f64</code> <code>f80</code> <code>f128</code></td></tr>
+<tr><td>Platform-sized</td><td><code>usize</code> <code>isize</code></td></tr>
+<tr><td>Primitives</td><td><code>Bool</code> <code>String</code> <code>Atom</code> <code>Nil</code></td></tr>
+<tr><td>Bottom</td><td><code>Never</code></td></tr>
+<tr><td>Compound</td><td>tuples, lists, maps, structs, unions</td></tr>
+</tbody>
+</table>
 <h3>Structs</h3>
 <pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> User {
   name <span class="hl-op">::</span> <span class="hl-type">String</span>,
@@ -422,15 +455,20 @@ zap deps update &lt;name&gt;  # Re-resolve a single dependency</code></pre>
 <hr>
 <h2>Standard Library</h2>
 <p>Zap includes a standard library for working with primitive types and collections:</p>
-<p>| Struct | Functions |
-|---|---|
-| <code>Integer</code> | <code>to_string</code>, <code>abs</code>, <code>max</code>, <code>min</code>, <code>parse</code>, <code>remainder</code>, <code>pow</code>, <code>clamp</code>, <code>digits</code>, <code>to_float</code> |
-| <code>Float</code> | <code>to_string</code>, <code>abs</code>, <code>max</code>, <code>min</code>, <code>parse</code>, <code>round</code>, <code>floor</code>, <code>ceil</code>, <code>truncate</code>, <code>to_integer</code>, <code>clamp</code> |
-| <code>Bool</code> | <code>to_string</code>, <code>negate</code> |
-| <code>String</code> | <code>length</code>, <code>slice</code>, <code>contains</code>, <code>starts_with</code>, <code>ends_with</code>, <code>trim</code>, <code>upcase</code>, <code>downcase</code>, <code>reverse</code>, <code>replace</code>, <code>index_of</code>, <code>pad_leading</code>, <code>pad_trailing</code>, <code>repeat</code>, <code>to_integer</code>, <code>to_float</code> |
-| <code>Atom</code> | <code>to_string</code> |
-| <code>List</code> | <code>empty?</code>, <code>length</code>, <code>head</code>, <code>tail</code>, <code>at</code>, <code>last</code>, <code>contains?</code>, <code>reverse</code>, <code>prepend</code>, <code>append</code>, <code>concat</code>, <code>take</code>, <code>drop</code>, <code>uniq</code> |
-| <code>Enum</code> | <code>map</code>, <code>filter</code>, <code>reject</code>, <code>reduce</code>, <code>each</code>, <code>find</code>, <code>any?</code>, <code>all?</code>, <code>count</code>, <code>sum</code>, <code>product</code>, <code>max</code>, <code>min</code>, <code>sort</code>, <code>flat_map</code> |</p>
+<table class="markdown-table">
+<thead>
+<tr><th>Struct</th><th>Functions</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Integer</code></td><td><code>to_string</code>, <code>abs</code>, <code>max</code>, <code>min</code>, <code>parse</code>, <code>remainder</code>, <code>pow</code>, <code>clamp</code>, <code>digits</code>, <code>to_float</code></td></tr>
+<tr><td><code>Float</code></td><td><code>to_string</code>, <code>abs</code>, <code>max</code>, <code>min</code>, <code>parse</code>, <code>round</code>, <code>floor</code>, <code>ceil</code>, <code>truncate</code>, <code>to_integer</code>, <code>clamp</code></td></tr>
+<tr><td><code>Bool</code></td><td><code>to_string</code>, <code>negate</code></td></tr>
+<tr><td><code>String</code></td><td><code>length</code>, <code>slice</code>, <code>contains</code>, <code>starts_with</code>, <code>ends_with</code>, <code>trim</code>, <code>upcase</code>, <code>downcase</code>, <code>reverse</code>, <code>replace</code>, <code>index_of</code>, <code>pad_leading</code>, <code>pad_trailing</code>, <code>repeat</code>, <code>to_integer</code>, <code>to_float</code></td></tr>
+<tr><td><code>Atom</code></td><td><code>to_string</code></td></tr>
+<tr><td><code>List</code></td><td><code>empty?</code>, <code>length</code>, <code>head</code>, <code>tail</code>, <code>at</code>, <code>last</code>, <code>contains?</code>, <code>reverse</code>, <code>prepend</code>, <code>append</code>, <code>concat</code>, <code>take</code>, <code>drop</code>, <code>uniq</code></td></tr>
+<tr><td><code>Enum</code></td><td><code>map</code>, <code>filter</code>, <code>reject</code>, <code>reduce</code>, <code>each</code>, <code>find</code>, <code>any?</code>, <code>all?</code>, <code>count</code>, <code>sum</code>, <code>product</code>, <code>max</code>, <code>min</code>, <code>sort</code>, <code>flat_map</code></td></tr>
+</tbody>
+</table>
 <h3>Higher-Order Functions</h3>
 <p>Functions are first-class values. Pass named functions or anonymous functions as arguments:</p>
 <pre><code class="language-zap"><span class="hl-comment"># Named function as callback</span>

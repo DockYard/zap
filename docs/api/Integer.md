@@ -1,5 +1,32 @@
 # Integer
 
+Functions for working with integers.
+
+## Integer Types
+
+Zap supports the following integer types:
+
+| Signed  | Unsigned | Bits |
+|---------|----------|------|
+| `i8`    | `u8`     | 8    |
+| `i16`   | `u16`    | 16   |
+| `i32`   | `u32`    | 32   |
+| `i64`   | `u64`    | 64   |
+| `i128`  | `u128`   | 128  |
+
+The default integer type for literals is `i64`.
+
+## Call Resolution
+
+Zap first looks for an exact typed function clause. If no exact
+clause exists, it may widen within the same integer family:
+
+- Signed widening: `i8` -> `i16` -> `i32` -> `i64` -> `i128`
+- Unsigned widening: `u8` -> `u16` -> `u32` -> `u64` -> `u128`
+
+Signed integers do not implicitly widen to unsigned integers, and
+unsigned integers do not implicitly widen to signed integers.
+
 ## Functions
 
 ### to_string/1

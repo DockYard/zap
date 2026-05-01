@@ -3044,10 +3044,14 @@ pub const HirBuilder = struct {
         var impl_infos: std.ArrayList(ImplInfo) = .empty;
         for (self.graph.impls.items) |impl_entry| {
             var group_ids: std.ArrayList(u32) = .empty;
-            // Find function groups that were built from this impl
-            for (top_fns.items) |group| {
-                if (group.scope_id == impl_entry.scope_id) {
-                    try group_ids.append(self.allocator, group.id);
+            // Find function groups that were built from this impl.
+            // Impl functions are spliced onto the target struct's function list,
+            // not emitted as top-level functions.
+            for (structs.items) |mod| {
+                for (mod.functions) |group| {
+                    if (group.scope_id == impl_entry.scope_id) {
+                        try group_ids.append(self.allocator, group.id);
+                    }
                 }
             }
             if (impl_entry.protocol_name.parts.len > 0 and impl_entry.target_type.parts.len > 0) {

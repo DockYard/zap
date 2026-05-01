@@ -1,5 +1,10 @@
 # Struct
 
+Compile-time helpers for reflected struct declarations.
+
+Functions in this struct accept references returned by `SourceGraph`
+reflection APIs.
+
 ## Macros
 
 ### functions/1

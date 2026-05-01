@@ -67,13 +67,26 @@
 <li><a href="../structs/Struct.html">Struct</a></li>
 <li><a href="../structs/System.html">System</a></li>
 <li><a href="../structs/Zest.html">Zest</a></li>
+<li><a href="../structs/Zest.Case.html">Zest.Case</a></li>
+<li><a href="../structs/Zest.Runner.html">Zest.Runner</a></li>
 </ul>
 </div>
 <div class="sidebar-group">
-<h4>Zest</h4>
+<h4>Protocols</h4>
 <ul>
-<li><a href="../structs/Zest.Case.html">Zest.Case</a></li>
-<li><a href="../structs/Zest.Runner.html">Zest.Runner</a></li>
+<li><a href="../structs/Arithmetic.html">Arithmetic</a></li>
+<li><a href="../structs/Comparator.html">Comparator</a></li>
+<li><a href="../structs/Concatenable.html">Concatenable</a></li>
+<li><a href="../structs/Enumerable.html">Enumerable</a></li>
+<li><a href="../structs/Membership.html">Membership</a></li>
+<li><a href="../structs/Stringable.html">Stringable</a></li>
+<li><a href="../structs/Updatable.html">Updatable</a></li>
+</ul>
+</div>
+<div class="sidebar-group">
+<h4>Unions</h4>
+<ul>
+<li><a href="../structs/IO.Mode.html">IO.Mode</a></li>
 </ul>
 </div>
 </nav>
@@ -84,6 +97,34 @@
 <span class="pub-struct-pill">pub struct</span>
 <a href="https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap" class="source-file">./lib/integer.zap</a>
 </div>
+</div>
+<p class="tagline">Functions for working with integers.</p>
+<div class="structdoc">
+<p>Functions for working with integers.</p>
+<h2>Integer Types</h2>
+<p>Zap supports the following integer types:</p>
+<table class="markdown-table">
+<thead>
+<tr><th>Signed</th><th>Unsigned</th><th>Bits</th></tr>
+</thead>
+<tbody>
+<tr><td><code>i8</code></td><td><code>u8</code></td><td>8</td></tr>
+<tr><td><code>i16</code></td><td><code>u16</code></td><td>16</td></tr>
+<tr><td><code>i32</code></td><td><code>u32</code></td><td>32</td></tr>
+<tr><td><code>i64</code></td><td><code>u64</code></td><td>64</td></tr>
+<tr><td><code>i128</code></td><td><code>u128</code></td><td>128</td></tr>
+</tbody>
+</table>
+<p>The default integer type for literals is <code>i64</code>.</p>
+<h2>Call Resolution</h2>
+<p>Zap first looks for an exact typed function clause. If no exact
+clause exists, it may widen within the same integer family:</p>
+<ul>
+<li>Signed widening: <code>i8</code> -&gt; <code>i16</code> -&gt; <code>i32</code> -&gt; <code>i64</code> -&gt; <code>i128</code></li>
+<li>Unsigned widening: <code>u8</code> -&gt; <code>u16</code> -&gt; <code>u32</code> -&gt; <code>u64</code> -&gt; <code>u128</code></li>
+</ul>
+<p>Signed integers do not implicitly widen to unsigned integers, and
+unsigned integers do not implicitly widen to signed integers.</p>
 </div>
 <h2 id="functions">Functions</h2>
 <table class="summary">

@@ -131,13 +131,48 @@ pub struct Zap.EnumTest {
       assert(List.last(result) == 6)
     }
 
+    test("map works with ranges through Enumerable") {
+      result = Enum.map(1..3, fn(x :: i64) -> i64 { x * 2 })
+      assert(List.length(result) == 3)
+      assert(List.head(result) == 2)
+      assert(List.last(result) == 6)
+    }
+
+    test("map works with strings through Enumerable") {
+      result = Enum.map("ab", fn(char :: String) -> String { char <> "!" })
+      assert(List.length(result) == 2)
+      assert(List.head(result) == "a!")
+      assert(List.last(result) == "b!")
+    }
+
     test("filter with anonymous function") {
       result = Enum.filter([1, 2, 3, 4, 5], fn(x :: i64) -> Bool { x > 3 })
       assert(List.length(result) == 2)
     }
 
+    test("filter works with ranges through Enumerable") {
+      result = Enum.filter(1..5, fn(x :: i64) -> Bool { x > 3 })
+      assert(List.length(result) == 2)
+      assert(List.head(result) == 4)
+      assert(List.last(result) == 5)
+    }
+
     test("reduce with anonymous function") {
       assert(Enum.reduce([1, 2, 3, 4], 0, fn(acc :: i64, x :: i64) -> i64 { acc + x }) == 10)
+    }
+
+    test("reduce works with ranges through Enumerable") {
+      assert(Enum.reduce(1..4, 0, fn(acc :: i64, x :: i64) -> i64 { acc + x }) == 10)
+    }
+
+    test("reduce works with maps through Enumerable") {
+      result = Enum.reduce(%{a: 10, b: 20, c: 30}, 0, fn(acc :: i64, entry :: {Atom, i64}) -> i64 {
+        case entry {
+          {_key, value} -> acc + value
+        }
+      })
+
+      assert(result == 60)
     }
 
     test("sort with anonymous comparator") {
@@ -148,6 +183,13 @@ pub struct Zap.EnumTest {
 
     test("take first three") {
       result = Enum.take([1, 2, 3, 4, 5], 3)
+      assert(List.length(result) == 3)
+      assert(List.head(result) == 1)
+      assert(List.last(result) == 3)
+    }
+
+    test("take works with ranges through Enumerable") {
+      result = Enum.take(1..5, 3)
       assert(List.length(result) == 3)
       assert(List.head(result) == 1)
       assert(List.last(result) == 3)
@@ -200,15 +242,19 @@ pub struct Zap.EnumTest {
     }
 
     test("at index") {
-      assert(Enum.at([10, 20, 30], 1) == 20)
+      assert(Enum.at([10, 20, 30], 1, 0) == 20)
     }
 
     test("at first") {
-      assert(Enum.at([10, 20, 30], 0) == 10)
+      assert(Enum.at([10, 20, 30], 0, 0) == 10)
     }
 
     test("at last") {
-      assert(Enum.at([10, 20, 30], 2) == 30)
+      assert(Enum.at([10, 20, 30], 2, 0) == 30)
+    }
+
+    test("at returns typed default") {
+      assert(Enum.at(["a"], 2, "none") == "none")
     }
 
     test("concat two lists") {
@@ -250,6 +296,11 @@ pub struct Zap.EnumTest {
 
     test("empty? on non-empty") {
       reject(Enum.empty?([1, 2, 3]))
+    }
+
+    test("empty? works with ranges through Enumerable") {
+      assert(Enum.empty?(5..1))
+      reject(Enum.empty?(1..3))
     }
   }
 

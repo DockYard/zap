@@ -152,13 +152,9 @@ pub const kernel_struct_name = "Kernel";
 
 /// Structs that discovery must always load even when no source file
 /// references them. `kernel_struct_name` is here because the collector
-/// injects auto-imports against it; `Range` is here because the `..`
-/// range-literal syntax desugars to `%Range{...}` — the user's source
-/// doesn't mention `Range` literally, so the file-discovery pass would
-/// otherwise skip it.
+/// injects auto-imports against it.
 pub const AUTO_IMPORTS = [_][]const u8{
     kernel_struct_name,
-    "Range",
 };
 
 pub fn discover(
@@ -187,6 +183,8 @@ pub fn discoverWithSourceFiles(
         graph.stdlib_structs.put(name, {}) catch return error.OutOfMemory;
     }
 
+    const native_type_structs = try discoverNativeTypeStructs(alloc, source_roots);
+
     // Discovery work queue
     var queue: std.ArrayListUnmanaged([]const u8) = .empty;
     defer queue.deinit(alloc);
@@ -200,7 +198,7 @@ pub fn discoverWithSourceFiles(
         queue.append(alloc, auto_mod) catch return error.OutOfMemory;
     }
 
-    try drainDiscoveryQueue(alloc, &graph, &queue, source_roots);
+    try drainDiscoveryQueue(alloc, &graph, &queue, source_roots, &native_type_structs);
 
     for (explicit_source_files) |file_path| {
         if (graph.known_files.contains(file_path)) continue;
@@ -209,8 +207,8 @@ pub fn discoverWithSourceFiles(
         const source = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, file_path, alloc, .limited(10 * 1024 * 1024)) catch
             return error.ReadError;
         const primary_struct = primaryStructName(alloc, source) catch return error.OutOfMemory;
-        try recordSourceFile(alloc, &graph, file_path, source_root_name, source, primary_struct, &queue);
-        try drainDiscoveryQueue(alloc, &graph, &queue, source_roots);
+        try recordSourceFile(alloc, &graph, file_path, source_root_name, source, primary_struct, &queue, &native_type_structs);
+        try drainDiscoveryQueue(alloc, &graph, &queue, source_roots, &native_type_structs);
     }
 
     // Build imported_by (reverse index)
@@ -247,6 +245,7 @@ fn drainDiscoveryQueue(
     graph: *FileGraph,
     queue: *std.ArrayListUnmanaged([]const u8),
     source_roots: []const SourceRoot,
+    native_type_structs: *const NativeTypeStructs,
 ) DiscoveryError!void {
     while (queue.items.len > 0) {
         const struct_name = queue.orderedRemove(0);
@@ -259,9 +258,11 @@ fn drainDiscoveryQueue(
         const source = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, file_path, alloc, .limited(10 * 1024 * 1024)) catch
             return error.ReadError;
 
-        try recordSourceFile(alloc, graph, file_path, resolved.source_root_name, source, struct_name, queue);
+        try recordSourceFile(alloc, graph, file_path, resolved.source_root_name, source, struct_name, queue, native_type_structs);
     }
 }
+
+const NativeTypeStructs = std.EnumArray(zap.scope.NativeTypeKind, ?[]const u8);
 
 fn recordSourceFile(
     alloc: std.mem.Allocator,
@@ -271,6 +272,7 @@ fn recordSourceFile(
     source: []const u8,
     primary_struct: ?[]const u8,
     queue: *std.ArrayListUnmanaged([]const u8),
+    native_type_structs: *const NativeTypeStructs,
 ) DiscoveryError!void {
     graph.known_files.put(file_path, {}) catch return error.OutOfMemory;
     graph.file_source_root.put(file_path, source_root_name) catch return error.OutOfMemory;
@@ -298,20 +300,215 @@ fn recordSourceFile(
         return error.OutOfMemory;
 
     var imports_list: std.ArrayListUnmanaged([]const u8) = .empty;
+    var import_seen = std.StringHashMap(void).init(alloc);
+    defer import_seen.deinit();
+
     for (refs) |ref| {
-        if (primary_struct) |struct_name| {
-            if (std.mem.eql(u8, ref, struct_name)) continue;
-        }
-        if (structNameDeclaredInFile(declared_structs, ref)) continue;
-        if (graph.stdlib_structs.contains(ref)) continue;
+        try appendDiscoveredImport(alloc, graph, queue, &imports_list, &import_seen, declared_structs, primary_struct, ref);
+    }
 
-        imports_list.append(alloc, ref) catch return error.OutOfMemory;
-
-        if (!graph.struct_to_file.contains(ref)) {
-            queue.append(alloc, ref) catch return error.OutOfMemory;
-        }
+    const native_refs = nativeTypeReferencesInSource(alloc, source, native_type_structs) catch return error.OutOfMemory;
+    for (native_refs) |ref| {
+        try appendDiscoveredImport(alloc, graph, queue, &imports_list, &import_seen, declared_structs, primary_struct, ref);
     }
     graph.file_imports.put(file_path, imports_list) catch return error.OutOfMemory;
+}
+
+fn appendDiscoveredImport(
+    alloc: std.mem.Allocator,
+    graph: *FileGraph,
+    queue: *std.ArrayListUnmanaged([]const u8),
+    imports_list: *std.ArrayListUnmanaged([]const u8),
+    import_seen: *std.StringHashMap(void),
+    declared_structs: []const []const u8,
+    primary_struct: ?[]const u8,
+    ref: []const u8,
+) DiscoveryError!void {
+    if (primary_struct) |struct_name| {
+        if (std.mem.eql(u8, ref, struct_name)) return;
+    }
+    if (structNameDeclaredInFile(declared_structs, ref)) return;
+    if (graph.stdlib_structs.contains(ref)) return;
+    if (import_seen.contains(ref)) return;
+
+    import_seen.put(ref, {}) catch return error.OutOfMemory;
+    imports_list.append(alloc, ref) catch return error.OutOfMemory;
+
+    if (!graph.struct_to_file.contains(ref)) {
+        queue.append(alloc, ref) catch return error.OutOfMemory;
+    }
+}
+
+fn discoverNativeTypeStructs(
+    alloc: std.mem.Allocator,
+    source_roots: []const SourceRoot,
+) DiscoveryError!NativeTypeStructs {
+    var native_type_structs = NativeTypeStructs.initFill(null);
+    for (source_roots) |root| {
+        try scanNativeTypesInDir(alloc, root.path, &native_type_structs);
+    }
+    return native_type_structs;
+}
+
+fn scanNativeTypesInDir(
+    alloc: std.mem.Allocator,
+    dir_path: []const u8,
+    native_type_structs: *NativeTypeStructs,
+) DiscoveryError!void {
+    var dir = std.Io.Dir.cwd().openDir(std.Options.debug_io, dir_path, .{ .iterate = true }) catch return;
+    defer dir.close(std.Options.debug_io);
+
+    var iter = dir.iterate();
+    while (iter.next(std.Options.debug_io) catch null) |entry| {
+        if (entry.kind == .directory) {
+            const child_path = std.fs.path.join(alloc, &.{ dir_path, entry.name }) catch return error.OutOfMemory;
+            defer alloc.free(child_path);
+            try scanNativeTypesInDir(alloc, child_path, native_type_structs);
+            continue;
+        }
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".zap")) continue;
+
+        const file_path = std.fs.path.join(alloc, &.{ dir_path, entry.name }) catch return error.OutOfMemory;
+        defer alloc.free(file_path);
+        const source = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, file_path, alloc, .limited(10 * 1024 * 1024)) catch
+            continue;
+        defer alloc.free(source);
+        if (nativeTypeDeclarationInSource(alloc, source)) |maybe_declaration| {
+            if (maybe_declaration) |declaration| {
+                const slot = native_type_structs.getPtr(declaration.kind);
+                if (slot.* == null) {
+                    slot.* = declaration.struct_name;
+                } else {
+                    alloc.free(declaration.struct_name);
+                }
+            }
+        } else |_| {}
+    }
+}
+
+const NativeTypeDeclaration = struct {
+    kind: zap.scope.NativeTypeKind,
+    struct_name: []const u8,
+};
+
+fn nativeTypeDeclarationInSource(
+    alloc: std.mem.Allocator,
+    source: []const u8,
+) error{OutOfMemory}!?NativeTypeDeclaration {
+    var lexer = zap.Lexer.init(source);
+    var pending_kind: ?zap.scope.NativeTypeKind = null;
+
+    while (true) {
+        const tok = lexer.next();
+        if (tok.tag == .eof) break;
+
+        if (tok.tag == .at_sign) {
+            const name_tok = lexer.next();
+            if (name_tok.tag != .identifier) continue;
+            if (!std.mem.eql(u8, name_tok.slice(source), "native_type")) continue;
+
+            const equal_tok = lexer.next();
+            if (equal_tok.tag != .equal) continue;
+
+            const value_tok = lexer.next();
+            if (value_tok.tag != .string_literal) continue;
+            pending_kind = zap.scope.NativeTypeKind.fromName(stringLiteralContents(value_tok.slice(source)));
+            continue;
+        }
+
+        if (tok.tag == .keyword_struct or tok.tag == .keyword_pub) {
+            var struct_lexer = lexer;
+            const struct_tok = if (tok.tag == .keyword_pub) struct_lexer.next() else tok;
+            if (struct_tok.tag != .keyword_struct) continue;
+
+            const name_tok = struct_lexer.next();
+            if (name_tok.tag != .type_identifier) continue;
+            const kind = pending_kind orelse continue;
+
+            var name_buf: std.ArrayListUnmanaged(u8) = .empty;
+            try name_buf.appendSlice(alloc, name_tok.slice(source));
+            var peek = struct_lexer;
+            while (true) {
+                const dot_tok = peek.next();
+                if (dot_tok.tag != .dot) break;
+                const next_tok = peek.next();
+                if (next_tok.tag != .type_identifier) break;
+                try name_buf.append(alloc, '.');
+                try name_buf.appendSlice(alloc, next_tok.slice(source));
+                struct_lexer = peek;
+            }
+
+            return .{
+                .kind = kind,
+                .struct_name = try name_buf.toOwnedSlice(alloc),
+            };
+        }
+    }
+
+    return null;
+}
+
+fn stringLiteralContents(literal: []const u8) []const u8 {
+    if (literal.len >= 2 and literal[0] == '"' and literal[literal.len - 1] == '"') {
+        return literal[1 .. literal.len - 1];
+    }
+    return literal;
+}
+
+fn nativeTypeReferencesInSource(
+    alloc: std.mem.Allocator,
+    source: []const u8,
+    native_type_structs: *const NativeTypeStructs,
+) error{OutOfMemory}![]const []const u8 {
+    var refs = std.StringHashMap(void).init(alloc);
+    defer refs.deinit();
+
+    var lexer = zap.Lexer.init(source);
+    var in_attribute = false;
+    var in_type_annotation = false;
+    while (true) {
+        const tok = lexer.next();
+        if (tok.tag == .eof) break;
+
+        if (tok.tag == .at_sign) {
+            in_attribute = true;
+            continue;
+        }
+        if (in_attribute) {
+            if (tok.tag == .newline) in_attribute = false;
+            continue;
+        }
+        if (tok.tag == .double_colon or tok.tag == .arrow) {
+            in_type_annotation = true;
+            continue;
+        }
+        if (in_type_annotation) {
+            switch (tok.tag) {
+                .comma, .right_paren, .left_brace, .equal, .newline => in_type_annotation = false,
+                else => {},
+            }
+            continue;
+        }
+
+        const kind: ?zap.scope.NativeTypeKind = switch (tok.tag) {
+            .left_bracket => .list,
+            .percent_brace => .map,
+            .dot_dot => .range,
+            .string_literal, .string_literal_start, .string_literal_part, .string_literal_end => .string,
+            else => null,
+        };
+        const native_kind = kind orelse continue;
+        const struct_name = native_type_structs.get(native_kind) orelse continue;
+        try refs.put(struct_name, {});
+    }
+
+    var result: std.ArrayListUnmanaged([]const u8) = .empty;
+    var it = refs.iterator();
+    while (it.next()) |entry| {
+        try result.append(alloc, entry.key_ptr.*);
+    }
+    return try result.toOwnedSlice(alloc);
 }
 
 /// Enforce that private struct structs are not referenced across dep boundaries.

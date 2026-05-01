@@ -802,23 +802,31 @@ pub const Range = struct {
     /// Iterator protocol for ranges.
     /// Uses the range struct as its own state — `start` is the current position.
     /// Returns {:cont, current, next_range} or {:done, 0, nil_range}.
-    pub fn next(range: anytype) @TypeOf(.{ .@"0" = @as(u32, 0), .@"1" = @as(i64, 0), .@"2" = range }) {
+    pub fn next(range: anytype) std.meta.Tuple(&.{ u32, i64, @TypeOf(range) }) {
         const start = range.start;
         const end_val = range.end;
-        const step_mag = range.step;
-        const going_forward = start <= end_val;
+        const step_mag = if (range.step < 0) -range.step else range.step;
+        const direction: i64 = if (@hasField(@TypeOf(range), "direction") and range.direction != 0)
+            range.direction
+        else if (start <= end_val)
+            1
+        else
+            -1;
 
         // Check if done
-        const done = if (going_forward) start > end_val else start < end_val;
+        const done = if (direction > 0) start > end_val else start < end_val;
         if (done) {
-            return .{ .@"0" = ATOM_DONE, .@"1" = 0, .@"2" = range };
+            return .{ ATOM_DONE, 0, range };
         }
 
         // Advance: create next range with updated start
-        const step: i64 = if (going_forward) step_mag else -step_mag;
+        const step = direction * step_mag;
         var next_range = range;
         next_range.start = start + step;
-        return .{ .@"0" = ATOM_CONT, .@"1" = start, .@"2" = next_range };
+        if (@hasField(@TypeOf(next_range), "direction")) {
+            next_range.direction = direction;
+        }
+        return .{ ATOM_CONT, start, next_range };
     }
 };
 
@@ -5471,38 +5479,578 @@ pub const Float = struct {
 
 pub const Math = struct {
     pub fn sqrt(x: f64) f64 {
+        return sqrt_f64(x);
+    }
+
+    pub fn sqrt_i8(x: i8) f64 {
+        return @sqrt(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn sqrt_i16(x: i16) f64 {
+        return @sqrt(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn sqrt_i32(x: i32) f64 {
+        return @sqrt(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn sqrt_i64(x: i64) f64 {
+        return @sqrt(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn sqrt_i128(x: i128) f128 {
+        return @sqrt(@as(f128, @floatFromInt(x)));
+    }
+
+    pub fn sqrt_u8(x: u8) f64 {
+        return @sqrt(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn sqrt_u16(x: u16) f64 {
+        return @sqrt(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn sqrt_u32(x: u32) f64 {
+        return @sqrt(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn sqrt_u64(x: u64) f64 {
+        return @sqrt(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn sqrt_u128(x: u128) f128 {
+        return @sqrt(@as(f128, @floatFromInt(x)));
+    }
+
+    pub fn sqrt_f16(x: f16) f16 {
+        return @sqrt(x);
+    }
+
+    pub fn sqrt_f32(x: f32) f32 {
+        return @sqrt(x);
+    }
+
+    pub fn sqrt_f64(x: f64) f64 {
+        return @sqrt(x);
+    }
+
+    pub fn sqrt_f80(x: f80) f80 {
+        return @sqrt(x);
+    }
+
+    pub fn sqrt_f128(x: f128) f128 {
         return @sqrt(x);
     }
 
     pub fn sin(x: f64) f64 {
+        return sin_f64(x);
+    }
+
+    pub fn sin_i8(x: i8) f64 {
+        return @sin(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn sin_i16(x: i16) f64 {
+        return @sin(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn sin_i32(x: i32) f64 {
+        return @sin(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn sin_i64(x: i64) f64 {
+        return @sin(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn sin_i128(x: i128) f128 {
+        return @sin(@as(f128, @floatFromInt(x)));
+    }
+
+    pub fn sin_u8(x: u8) f64 {
+        return @sin(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn sin_u16(x: u16) f64 {
+        return @sin(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn sin_u32(x: u32) f64 {
+        return @sin(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn sin_u64(x: u64) f64 {
+        return @sin(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn sin_u128(x: u128) f128 {
+        return @sin(@as(f128, @floatFromInt(x)));
+    }
+
+    pub fn sin_f16(x: f16) f16 {
+        return @sin(x);
+    }
+
+    pub fn sin_f32(x: f32) f32 {
+        return @sin(x);
+    }
+
+    pub fn sin_f64(x: f64) f64 {
+        return @sin(x);
+    }
+
+    pub fn sin_f80(x: f80) f80 {
+        return @sin(x);
+    }
+
+    pub fn sin_f128(x: f128) f128 {
         return @sin(x);
     }
 
     pub fn cos(x: f64) f64 {
+        return cos_f64(x);
+    }
+
+    pub fn cos_i8(x: i8) f64 {
+        return @cos(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn cos_i16(x: i16) f64 {
+        return @cos(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn cos_i32(x: i32) f64 {
+        return @cos(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn cos_i64(x: i64) f64 {
+        return @cos(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn cos_i128(x: i128) f128 {
+        return @cos(@as(f128, @floatFromInt(x)));
+    }
+
+    pub fn cos_u8(x: u8) f64 {
+        return @cos(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn cos_u16(x: u16) f64 {
+        return @cos(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn cos_u32(x: u32) f64 {
+        return @cos(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn cos_u64(x: u64) f64 {
+        return @cos(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn cos_u128(x: u128) f128 {
+        return @cos(@as(f128, @floatFromInt(x)));
+    }
+
+    pub fn cos_f16(x: f16) f16 {
+        return @cos(x);
+    }
+
+    pub fn cos_f32(x: f32) f32 {
+        return @cos(x);
+    }
+
+    pub fn cos_f64(x: f64) f64 {
+        return @cos(x);
+    }
+
+    pub fn cos_f80(x: f80) f80 {
+        return @cos(x);
+    }
+
+    pub fn cos_f128(x: f128) f128 {
         return @cos(x);
     }
 
     pub fn tan(x: f64) f64 {
+        return tan_f64(x);
+    }
+
+    pub fn tan_i8(x: i8) f64 {
+        return @tan(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn tan_i16(x: i16) f64 {
+        return @tan(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn tan_i32(x: i32) f64 {
+        return @tan(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn tan_i64(x: i64) f64 {
+        return @tan(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn tan_i128(x: i128) f128 {
+        return @tan(@as(f128, @floatFromInt(x)));
+    }
+
+    pub fn tan_u8(x: u8) f64 {
+        return @tan(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn tan_u16(x: u16) f64 {
+        return @tan(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn tan_u32(x: u32) f64 {
+        return @tan(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn tan_u64(x: u64) f64 {
+        return @tan(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn tan_u128(x: u128) f128 {
+        return @tan(@as(f128, @floatFromInt(x)));
+    }
+
+    pub fn tan_f16(x: f16) f16 {
+        return @tan(x);
+    }
+
+    pub fn tan_f32(x: f32) f32 {
+        return @tan(x);
+    }
+
+    pub fn tan_f64(x: f64) f64 {
+        return @tan(x);
+    }
+
+    pub fn tan_f80(x: f80) f80 {
+        return @tan(x);
+    }
+
+    pub fn tan_f128(x: f128) f128 {
         return @tan(x);
     }
 
     pub fn exp(x: f64) f64 {
+        return exp_f64(x);
+    }
+
+    pub fn exp_i8(x: i8) f64 {
+        return @exp(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn exp_i16(x: i16) f64 {
+        return @exp(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn exp_i32(x: i32) f64 {
+        return @exp(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn exp_i64(x: i64) f64 {
+        return @exp(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn exp_i128(x: i128) f128 {
+        return @exp(@as(f128, @floatFromInt(x)));
+    }
+
+    pub fn exp_u8(x: u8) f64 {
+        return @exp(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn exp_u16(x: u16) f64 {
+        return @exp(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn exp_u32(x: u32) f64 {
+        return @exp(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn exp_u64(x: u64) f64 {
+        return @exp(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn exp_u128(x: u128) f128 {
+        return @exp(@as(f128, @floatFromInt(x)));
+    }
+
+    pub fn exp_f16(x: f16) f16 {
+        return @exp(x);
+    }
+
+    pub fn exp_f32(x: f32) f32 {
+        return @exp(x);
+    }
+
+    pub fn exp_f64(x: f64) f64 {
+        return @exp(x);
+    }
+
+    pub fn exp_f80(x: f80) f80 {
+        return @exp(x);
+    }
+
+    pub fn exp_f128(x: f128) f128 {
         return @exp(x);
     }
 
     pub fn exp2(x: f64) f64 {
+        return exp2_f64(x);
+    }
+
+    pub fn exp2_i8(x: i8) f64 {
+        return @exp2(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn exp2_i16(x: i16) f64 {
+        return @exp2(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn exp2_i32(x: i32) f64 {
+        return @exp2(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn exp2_i64(x: i64) f64 {
+        return @exp2(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn exp2_i128(x: i128) f128 {
+        return @exp2(@as(f128, @floatFromInt(x)));
+    }
+
+    pub fn exp2_u8(x: u8) f64 {
+        return @exp2(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn exp2_u16(x: u16) f64 {
+        return @exp2(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn exp2_u32(x: u32) f64 {
+        return @exp2(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn exp2_u64(x: u64) f64 {
+        return @exp2(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn exp2_u128(x: u128) f128 {
+        return @exp2(@as(f128, @floatFromInt(x)));
+    }
+
+    pub fn exp2_f16(x: f16) f16 {
+        return @exp2(x);
+    }
+
+    pub fn exp2_f32(x: f32) f32 {
+        return @exp2(x);
+    }
+
+    pub fn exp2_f64(x: f64) f64 {
+        return @exp2(x);
+    }
+
+    pub fn exp2_f80(x: f80) f80 {
+        return @exp2(x);
+    }
+
+    pub fn exp2_f128(x: f128) f128 {
         return @exp2(x);
     }
 
     pub fn log(x: f64) f64 {
+        return log_f64(x);
+    }
+
+    pub fn log_i8(x: i8) f64 {
+        return @log(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn log_i16(x: i16) f64 {
+        return @log(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn log_i32(x: i32) f64 {
+        return @log(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn log_i64(x: i64) f64 {
+        return @log(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn log_i128(x: i128) f128 {
+        return @log(@as(f128, @floatFromInt(x)));
+    }
+
+    pub fn log_u8(x: u8) f64 {
+        return @log(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn log_u16(x: u16) f64 {
+        return @log(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn log_u32(x: u32) f64 {
+        return @log(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn log_u64(x: u64) f64 {
+        return @log(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn log_u128(x: u128) f128 {
+        return @log(@as(f128, @floatFromInt(x)));
+    }
+
+    pub fn log_f16(x: f16) f16 {
+        return @log(x);
+    }
+
+    pub fn log_f32(x: f32) f32 {
+        return @log(x);
+    }
+
+    pub fn log_f64(x: f64) f64 {
+        return @log(x);
+    }
+
+    pub fn log_f80(x: f80) f80 {
+        return @log(x);
+    }
+
+    pub fn log_f128(x: f128) f128 {
         return @log(x);
     }
 
     pub fn log2(x: f64) f64 {
+        return log2_f64(x);
+    }
+
+    pub fn log2_i8(x: i8) f64 {
+        return @log2(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn log2_i16(x: i16) f64 {
+        return @log2(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn log2_i32(x: i32) f64 {
+        return @log2(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn log2_i64(x: i64) f64 {
+        return @log2(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn log2_i128(x: i128) f128 {
+        return @log2(@as(f128, @floatFromInt(x)));
+    }
+
+    pub fn log2_u8(x: u8) f64 {
+        return @log2(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn log2_u16(x: u16) f64 {
+        return @log2(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn log2_u32(x: u32) f64 {
+        return @log2(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn log2_u64(x: u64) f64 {
+        return @log2(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn log2_u128(x: u128) f128 {
+        return @log2(@as(f128, @floatFromInt(x)));
+    }
+
+    pub fn log2_f16(x: f16) f16 {
+        return @log2(x);
+    }
+
+    pub fn log2_f32(x: f32) f32 {
+        return @log2(x);
+    }
+
+    pub fn log2_f64(x: f64) f64 {
+        return @log2(x);
+    }
+
+    pub fn log2_f80(x: f80) f80 {
+        return @log2(x);
+    }
+
+    pub fn log2_f128(x: f128) f128 {
         return @log2(x);
     }
 
     pub fn log10(x: f64) f64 {
+        return log10_f64(x);
+    }
+
+    pub fn log10_i8(x: i8) f64 {
+        return @log10(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn log10_i16(x: i16) f64 {
+        return @log10(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn log10_i32(x: i32) f64 {
+        return @log10(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn log10_i64(x: i64) f64 {
+        return @log10(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn log10_i128(x: i128) f128 {
+        return @log10(@as(f128, @floatFromInt(x)));
+    }
+
+    pub fn log10_u8(x: u8) f64 {
+        return @log10(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn log10_u16(x: u16) f64 {
+        return @log10(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn log10_u32(x: u32) f64 {
+        return @log10(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn log10_u64(x: u64) f64 {
+        return @log10(@as(f64, @floatFromInt(x)));
+    }
+
+    pub fn log10_u128(x: u128) f128 {
+        return @log10(@as(f128, @floatFromInt(x)));
+    }
+
+    pub fn log10_f16(x: f16) f16 {
+        return @log10(x);
+    }
+
+    pub fn log10_f32(x: f32) f32 {
+        return @log10(x);
+    }
+
+    pub fn log10_f64(x: f64) f64 {
+        return @log10(x);
+    }
+
+    pub fn log10_f80(x: f80) f80 {
+        return @log10(x);
+    }
+
+    pub fn log10_f128(x: f128) f128 {
         return @log10(x);
     }
 

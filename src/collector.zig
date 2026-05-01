@@ -111,19 +111,14 @@ pub const Collector = struct {
                 .struct_decl, .priv_struct_decl => |sd| {
                     // Struct already collected above. Attach pending @doc if any.
                     if (pending_top_doc) |doc_attr| {
-                        for (self.graph.structs.items) |*mod_entry| {
-                            if (mod_entry.decl == sd) {
-                                try mod_entry.attributes.append(self.allocator, doc_attr);
-                                break;
-                            }
-                        }
+                        try self.attachTopLevelDocToStruct(sd, doc_attr);
                         pending_top_doc = null;
                     }
                 },
                 .union_decl => |ed| {
-                    try self.collectUnion(ed, self.graph.prelude_scope);
-                    if (pending_top_doc) |_| {
-                        // TODO: attach doc to union type entry when attribute storage is added
+                    const type_id = try self.collectUnion(ed, self.graph.prelude_scope);
+                    if (pending_top_doc) |doc_attr| {
+                        try self.graph.types.items[type_id].attributes.append(self.allocator, doc_attr);
                         pending_top_doc = null;
                     }
                 },
@@ -131,12 +126,7 @@ pub const Collector = struct {
                     try self.collectProtocol(proto);
                     if (pending_top_doc) |doc_attr| {
                         // Attach doc to the protocol entry
-                        for (self.graph.protocols.items) |*proto_entry| {
-                            if (proto_entry.decl == proto) {
-                                try proto_entry.attributes.append(self.allocator, doc_attr);
-                                break;
-                            }
-                        }
+                        try self.attachTopLevelDocToProtocol(proto, doc_attr);
                         pending_top_doc = null;
                     }
                 },
@@ -157,12 +147,18 @@ pub const Collector = struct {
                     pending_top_doc = null;
                 },
                 .type_decl => |td| {
-                    try self.collectType(td, self.graph.prelude_scope);
-                    pending_top_doc = null;
+                    const type_id = try self.collectType(td, self.graph.prelude_scope);
+                    if (pending_top_doc) |doc_attr| {
+                        try self.graph.types.items[type_id].attributes.append(self.allocator, doc_attr);
+                        pending_top_doc = null;
+                    }
                 },
                 .opaque_decl => |od| {
-                    try self.collectOpaque(od, self.graph.prelude_scope);
-                    pending_top_doc = null;
+                    const type_id = try self.collectOpaque(od, self.graph.prelude_scope);
+                    if (pending_top_doc) |doc_attr| {
+                        try self.graph.types.items[type_id].attributes.append(self.allocator, doc_attr);
+                        pending_top_doc = null;
+                    }
                 },
                 .impl_decl, .priv_impl_decl => |impl_d| {
                     try self.collectImpl(impl_d);
@@ -205,6 +201,48 @@ pub const Collector = struct {
                 const kind = scope.NativeTypeKind.fromName(kind_name) orelse continue;
                 if (entry.name.parts.len != 1) continue;
                 self.graph.registerNativeType(kind, entry.name.parts[0]);
+            }
+        }
+    }
+
+    fn sameSourceSpan(left: ast.SourceSpan, right: ast.SourceSpan) bool {
+        return left.start == right.start and
+            left.end == right.end and
+            left.source_id == right.source_id;
+    }
+
+    fn sameStructName(left: ast.StructName, right: ast.StructName) bool {
+        if (left.parts.len != right.parts.len) return false;
+        for (left.parts, right.parts) |left_part, right_part| {
+            if (left_part != right_part) return false;
+        }
+        return true;
+    }
+
+    fn sameStructDeclIdentity(left: *const ast.StructDecl, right: *const ast.StructDecl) bool {
+        return sameStructName(left.name, right.name) and
+            sameSourceSpan(left.meta.span, right.meta.span);
+    }
+
+    fn sameProtocolDeclIdentity(left: *const ast.ProtocolDecl, right: *const ast.ProtocolDecl) bool {
+        return sameStructName(left.name, right.name) and
+            sameSourceSpan(left.meta.span, right.meta.span);
+    }
+
+    fn attachTopLevelDocToStruct(self: *Collector, decl: *const ast.StructDecl, doc_attr: scope.Attribute) !void {
+        for (self.graph.structs.items) |*mod_entry| {
+            if (sameStructDeclIdentity(mod_entry.decl, decl)) {
+                try mod_entry.attributes.append(self.allocator, doc_attr);
+                return;
+            }
+        }
+    }
+
+    fn attachTopLevelDocToProtocol(self: *Collector, decl: *const ast.ProtocolDecl, doc_attr: scope.Attribute) !void {
+        for (self.graph.protocols.items) |*proto_entry| {
+            if (sameProtocolDeclIdentity(proto_entry.decl, decl)) {
+                try proto_entry.attributes.append(self.allocator, doc_attr);
+                return;
             }
         }
     }
@@ -312,10 +350,10 @@ pub const Collector = struct {
                         .value = attr.value,
                     });
                 },
-                .type_decl => |td| try self.collectType(td, mod_scope),
-                .opaque_decl => |od| try self.collectOpaque(od, mod_scope),
+                .type_decl => |td| _ = try self.collectType(td, mod_scope),
+                .opaque_decl => |od| _ = try self.collectOpaque(od, mod_scope),
                 .struct_decl => |sd| try self.collectNestedStruct(sd, mod_scope),
-                .union_decl => |ed| try self.collectUnion(ed, mod_scope),
+                .union_decl => |ed| _ = try self.collectUnion(ed, mod_scope),
                 .alias_decl => |ad| try self.collectAlias(ad, mod_scope),
                 .import_decl => |id_decl| try self.collectImport(id_decl, mod_scope),
                 .use_decl => |ud| {
@@ -700,12 +738,12 @@ pub const Collector = struct {
     // Type/opaque/struct collection
     // ============================================================
 
-    fn collectType(self: *Collector, td: *const ast.TypeDecl, parent_scope: scope.ScopeId) !void {
-        _ = try self.graph.registerType(td.name, parent_scope, .{ .type_alias = td.body }, td.params);
+    fn collectType(self: *Collector, td: *const ast.TypeDecl, parent_scope: scope.ScopeId) !scope.TypeId {
+        return try self.graph.registerType(td.name, parent_scope, .{ .type_alias = td.body }, td.params);
     }
 
-    fn collectOpaque(self: *Collector, od: *const ast.OpaqueDecl, parent_scope: scope.ScopeId) !void {
-        _ = try self.graph.registerType(od.name, parent_scope, .{ .opaque_type = od.body }, od.params);
+    fn collectOpaque(self: *Collector, od: *const ast.OpaqueDecl, parent_scope: scope.ScopeId) !scope.TypeId {
+        return try self.graph.registerType(od.name, parent_scope, .{ .opaque_type = od.body }, od.params);
     }
 
     fn collectNestedStruct(self: *Collector, sd: *const ast.StructDecl, parent_scope: scope.ScopeId) !void {
@@ -718,8 +756,8 @@ pub const Collector = struct {
         );
     }
 
-    fn collectUnion(self: *Collector, ed: *const ast.UnionDecl, parent_scope: scope.ScopeId) !void {
-        _ = try self.graph.registerType(
+    fn collectUnion(self: *Collector, ed: *const ast.UnionDecl, parent_scope: scope.ScopeId) !scope.TypeId {
+        return try self.graph.registerType(
             ed.name,
             parent_scope,
             .{ .union_type = ed },

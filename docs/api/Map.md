@@ -1,5 +1,18 @@
 # Map
 
+Functions for working with maps.
+
+Maps in Zap are immutable key-value collections that support
+any key and value types. The compiler specializes map operations
+at compile time based on the concrete types used.
+
+## Examples
+
+    m = %{name: "Alice", age: 30}
+    Map.get(m, :name, "")    # => "Alice"
+    Map.has_key?(m, :name)   # => true
+    Map.size(m)              # => 2
+
 ## Functions
 
 ### get/3

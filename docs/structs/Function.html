@@ -67,13 +67,26 @@
 <li><a href="../structs/Struct.html">Struct</a></li>
 <li><a href="../structs/System.html">System</a></li>
 <li><a href="../structs/Zest.html">Zest</a></li>
+<li><a href="../structs/Zest.Case.html">Zest.Case</a></li>
+<li><a href="../structs/Zest.Runner.html">Zest.Runner</a></li>
 </ul>
 </div>
 <div class="sidebar-group">
-<h4>Zest</h4>
+<h4>Protocols</h4>
 <ul>
-<li><a href="../structs/Zest.Case.html">Zest.Case</a></li>
-<li><a href="../structs/Zest.Runner.html">Zest.Runner</a></li>
+<li><a href="../structs/Arithmetic.html">Arithmetic</a></li>
+<li><a href="../structs/Comparator.html">Comparator</a></li>
+<li><a href="../structs/Concatenable.html">Concatenable</a></li>
+<li><a href="../structs/Enumerable.html">Enumerable</a></li>
+<li><a href="../structs/Membership.html">Membership</a></li>
+<li><a href="../structs/Stringable.html">Stringable</a></li>
+<li><a href="../structs/Updatable.html">Updatable</a></li>
+</ul>
+</div>
+<div class="sidebar-group">
+<h4>Unions</h4>
+<ul>
+<li><a href="../structs/IO.Mode.html">IO.Mode</a></li>
 </ul>
 </div>
 </nav>
@@ -84,6 +97,20 @@
 <span class="pub-struct-pill">pub struct</span>
 <a href="https://github.com/DockYard/zap/blob/v0.1.0/./lib/function.zap" class="source-file">./lib/function.zap</a>
 </div>
+</div>
+<p class="tagline">Utilities for working with first-class function values.</p>
+<div class="structdoc">
+<p>Utilities for working with first-class function values.</p>
+<p>Zap function values can come from explicit function references such as
+<code>&amp;Struct.name/arity</code> or from anonymous closures written with
+<code>fn(...) -&gt; ... { ... }</code>.</p>
+<p>This struct currently exposes the smallest Elixir-inspired function
+helper that Zap can support cleanly today without runtime metadata or
+broader higher-order standard-library infrastructure.</p>
+<p>Zap already has direct invocation syntax for callable values, so this
+struct does not try to wrap ordinary function calls. It also does not
+provide Elixir-style introspection helpers such as <code>info/1</code> yet because
+Zap does not currently expose stable runtime metadata for function values.</p>
 </div>
 <h2 id="macros">Macros</h2>
 <table class="summary">
