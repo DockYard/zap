@@ -331,6 +331,79 @@ fn compileAndRunWithFiles(source: []const u8, extra_files: []const ExtraFile) Te
     };
 }
 
+test "CLI: run doc target generates documentation without executable root" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    tmp_dir.dir.createDirPath(getTestIo(), "lib") catch return error.Unexpected;
+
+    const build_source =
+        \\pub struct DocExample.Builder {
+        \\  pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
+        \\    case env.target {
+        \\      :doc ->
+        \\        %Zap.Manifest{
+        \\          name: "doc_example",
+        \\          version: "0.1.0",
+        \\          kind: :doc,
+        \\          paths: ["lib/**/*.zap"],
+        \\          deps: [{:zap_stdlib, {:path, "lib"}}]
+        \\        }
+        \\      _ ->
+        \\        panic("Unknown target")
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    const lib_source =
+        \\@doc = "A documented example struct."
+        \\pub struct DocExample {
+        \\  @doc = "Returns a greeting."
+        \\  pub fn greeting() -> String {
+        \\    "hello"
+        \\  }
+        \\}
+    ;
+
+    tmp_dir.dir.writeFile(getTestIo(), .{ .sub_path = "build.zap", .data = build_source }) catch
+        return error.Unexpected;
+    tmp_dir.dir.writeFile(getTestIo(), .{ .sub_path = "lib/doc_example.zap", .data = lib_source }) catch
+        return error.Unexpected;
+
+    const tmp_dir_path = tmp_dir.dir.realPathFileAlloc(getTestIo(), ".", allocator) catch
+        return error.Unexpected;
+    defer allocator.free(tmp_dir_path);
+
+    const zap_binary_raw: []const u8 = getenvSlice("ZAP_BINARY") orelse "zig-out/bin/zap";
+    const zap_binary = if (std.fs.path.isAbsolute(zap_binary_raw))
+        allocator.dupe(u8, zap_binary_raw) catch return error.OutOfMemory
+    else
+        std.Io.Dir.cwd().realPathFileAlloc(getTestIo(), zap_binary_raw, allocator) catch return error.Unexpected;
+    defer allocator.free(zap_binary);
+
+    const result = std.process.run(allocator, getTestIo(), .{
+        .argv = &.{ zap_binary, "run", "doc" },
+        .cwd = .{ .path = tmp_dir_path },
+        .stdout_limit = .limited(256 * 1024),
+        .stderr_limit = .limited(256 * 1024),
+    }) catch return error.RunFailed;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    const exit_code = switch (result.term) {
+        .exited => |code| code,
+        else => return error.RunFailed,
+    };
+
+    try std.testing.expectEqual(@as(u8, 0), exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "root entry point") == null);
+    tmp_dir.dir.access(getTestIo(), "docs/index.html", .{}) catch return error.Unexpected;
+    tmp_dir.dir.access(getTestIo(), "docs/structs/DocExample.html", .{}) catch return error.Unexpected;
+}
+
 // ============================================================
 // Constants and arithmetic
 // ============================================================
@@ -1618,6 +1691,122 @@ test "ZIR: float arithmetic" {
     defer result.deinit();
     // 3.14159 * 1.0 * 1.0 = 3.14159
     try std.testing.expect(std.mem.startsWith(u8, result.stdout, "3.14159"));
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: exact numeric overload beats widening fallback" {
+    var result = try compileAndRun(
+        \\pub struct TestProg {
+        \\  pub fn classify(value :: i64) -> String {
+        \\    "i64"
+        \\  }
+        \\
+        \\  pub fn classify(value :: i32) -> String {
+        \\    "i32"
+        \\  }
+        \\
+        \\  pub fn classify(value :: u32) -> String {
+        \\    "u32"
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    IO.puts(classify(1 :: i32))
+        \\    IO.puts(classify(1 :: u32))
+        \\    IO.puts(classify(1))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("i32\nu32\ni64\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: numeric widening is fallback after exact overload search" {
+    var result = try compileAndRun(
+        \\pub struct TestProg {
+        \\  pub fn classify(value :: i64) -> String {
+        \\    "i64"
+        \\  }
+        \\
+        \\  pub fn classify(value :: u64) -> String {
+        \\    "u64"
+        \\  }
+        \\
+        \\  pub fn classify(value :: f64) -> String {
+        \\    "f64"
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    IO.puts(classify(1 :: i32))
+        \\    IO.puts(classify(1 :: u32))
+        \\    IO.puts(classify(1.5 :: f32))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("i64\nu64\nf64\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: unsigned integer does not widen to signed integer" {
+    try std.testing.expectError(error.CompilationFailed, compileOnly(
+        \\pub struct TestProg {
+        \\  pub fn classify(value :: i64) -> String {
+        \\    "i64"
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    classify(1 :: u32)
+        \\  }
+        \\}
+    ));
+}
+
+test "ZIR: Integer overloads preserve exact integer width" {
+    var result = try compileAndRun(
+        \\pub struct TestProg {
+        \\  pub fn accept(value :: i32) -> String {
+        \\    "i32"
+        \\  }
+        \\
+        \\  pub fn accept(value :: u32) -> String {
+        \\    "u32"
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    IO.puts(accept(Integer.abs(-7 :: i32)))
+        \\    IO.puts(accept(Integer.abs(7 :: u32)))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("i32\nu32\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "ZIR: Float overloads preserve exact float width" {
+    var result = try compileAndRun(
+        \\pub struct TestProg {
+        \\  pub fn accept(value :: f32) -> String {
+        \\    "f32"
+        \\  }
+        \\
+        \\  pub fn accept(value :: f64) -> String {
+        \\    "f64"
+        \\  }
+        \\
+        \\  pub fn main() -> String {
+        \\    IO.puts(accept(Float.abs(-1.5 :: f32)))
+        \\    IO.puts(accept(Float.abs(-2.5)))
+        \\    "done"
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("f32\nf64\n", result.stdout);
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
 

@@ -1,10 +1,5 @@
 # System
 
-Functions for interacting with the operating system.
-
-Provides access to command-line arguments, environment variables,
-and build-time configuration options.
-
 ## Functions
 
 ### arg_count/0
@@ -85,6 +80,22 @@ Returns an empty string if the option is not set.
     System.get_build_opt("optimize")  # => "release_fast"
 
 [Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/system.zap#L70)
+
+---
+
+### cwd/0
+
+```zap
+pub fn cwd() -> String
+```
+
+Returns the current working directory.
+
+## Examples
+
+    System.cwd()  # => "/Users/dev/project"
+
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/system.zap#L82)
 
 ---
 

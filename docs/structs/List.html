@@ -60,7 +60,11 @@
 <li class="active"><a href="../structs/List.html">List</a></li>
 <li><a href="../structs/Map.html">Map</a></li>
 <li><a href="../structs/Math.html">Math</a></li>
+<li><a href="../structs/Path.html">Path</a></li>
+<li><a href="../structs/Range.html">Range</a></li>
+<li><a href="../structs/SourceGraph.html">SourceGraph</a></li>
 <li><a href="../structs/String.html">String</a></li>
+<li><a href="../structs/Struct.html">Struct</a></li>
 <li><a href="../structs/System.html">System</a></li>
 <li><a href="../structs/Zest.html">Zest</a></li>
 </ul>
@@ -81,18 +85,6 @@
 <a href="https://github.com/DockYard/zap/blob/v0.1.0/./lib/list.zap" class="source-file">./lib/list.zap</a>
 </div>
 </div>
-<p class="tagline">Functions for working with lists.</p>
-<div class="struct_doc">
-<p>Functions for working with lists.</p>
-<p>Lists in Zap are singly-linked immutable cons cells using
-nullable pointers. An empty list is <code>[]</code> (null), and a
-non-empty list is a chain of cells each holding a head value
-and a tail pointer.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap">List.length([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>])         <span class="hl-comment"># =&gt; 3</span>
-List.head([<span class="hl-number">10</span>, <span class="hl-number">20</span>, <span class="hl-number">30</span>])        <span class="hl-comment"># =&gt; 10</span>
-List.reverse([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>])        <span class="hl-comment"># =&gt; [3, 2, 1]</span></code></pre>
-</div>
 <h2 id="functions">Functions</h2>
 <table class="summary">
 <tr><td class="summary-name"><a href="#empty?-1">empty?/1</a></td><td class="summary-doc">Returns `true` if the list has no elements.</td></tr>
@@ -109,6 +101,9 @@ List.reverse([<span class="hl-number">1</span>, <span class="hl-number">2</span>
 <tr><td class="summary-name"><a href="#take-2">take/2</a></td><td class="summary-doc">Takes the first `count` elements.</td></tr>
 <tr><td class="summary-name"><a href="#drop-2">drop/2</a></td><td class="summary-doc">Drops the first `count` elements.</td></tr>
 <tr><td class="summary-name"><a href="#uniq-1">uniq/1</a></td><td class="summary-doc">Returns a new list with duplicates removed.</td></tr>
+<tr><td class="summary-name"><a href="#head!-1">head!/1</a></td><td class="summary-doc">Returns the first element of the list.</td></tr>
+<tr><td class="summary-name"><a href="#last!-1">last!/1</a></td><td class="summary-doc">Returns the last element of the list.</td></tr>
+<tr><td class="summary-name"><a href="#at!-2">at!/2</a></td><td class="summary-doc">Returns the element at the given zero-based index.</td></tr>
 </table>
 <h2>Function Details</h2>
 <div class="function-detail" id="empty?-1">
@@ -118,7 +113,7 @@ List.reverse([<span class="hl-number">1</span>, <span class="hl-number">2</span>
 <div style="flex:1"></div>
 <a href="#empty?-1" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">empty?</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[i64]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="signature"><code><span class="sig-name">empty?</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
 <div class="function-doc">
 <p>Returns <code>true</code> if the list has no elements.</p>
 <h2>Examples</h2>
@@ -133,7 +128,7 @@ List.empty?([<span class="hl-number">1</span>, <span class="hl-number">2</span>,
 <div style="flex:1"></div>
 <a href="#length-1" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">length</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[i64]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="signature"><code><span class="sig-name">length</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
 <div class="function-doc">
 <p>Returns the number of elements in the list.</p>
 <h2>Examples</h2>
@@ -148,7 +143,7 @@ List.length([])         <span class="hl-comment"># =&gt; 0</span></code></pre>
 <div style="flex:1"></div>
 <a href="#head-1" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">head</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[i64]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="signature"><code><span class="sig-name">head</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">element</span></code></div>
 <div class="function-doc">
 <p>Returns the first element of the list.
 Returns 0 for an empty list.</p>
@@ -163,7 +158,7 @@ Returns 0 for an empty list.</p>
 <div style="flex:1"></div>
 <a href="#tail-1" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">tail</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[i64]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[i64]</span></code></div>
+<div class="signature"><code><span class="sig-name">tail</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[element]</span></code></div>
 <div class="function-doc">
 <p>Returns the list without its first element.</p>
 <h2>Examples</h2>
@@ -177,7 +172,7 @@ Returns 0 for an empty list.</p>
 <div style="flex:1"></div>
 <a href="#at-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">at</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[i64]</span><span class="sig-paren">, </span>index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="signature"><code><span class="sig-name">at</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">, </span>index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">element</span></code></div>
 <div class="function-doc">
 <p>Returns the element at the given zero-based index.
 Returns 0 if the index is out of bounds.</p>
@@ -192,7 +187,7 @@ Returns 0 if the index is out of bounds.</p>
 <div style="flex:1"></div>
 <a href="#last-1" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">last</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[i64]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="signature"><code><span class="sig-name">last</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">element</span></code></div>
 <div class="function-doc">
 <p>Returns the last element of the list.
 Returns 0 for an empty list.</p>
@@ -207,7 +202,7 @@ Returns 0 for an empty list.</p>
 <div style="flex:1"></div>
 <a href="#contains?-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">contains?</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[i64]</span><span class="sig-paren">, </span>value<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="signature"><code><span class="sig-name">contains?</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">, </span>value<span class="sig-separator">::</span><span class="sig-type-pill">element</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
 <div class="function-doc">
 <p>Returns <code>true</code> if the list contains the given value.</p>
 <h2>Examples</h2>
@@ -222,7 +217,7 @@ List.contains?([<span class="hl-number">1</span>, <span class="hl-number">2</spa
 <div style="flex:1"></div>
 <a href="#reverse-1" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">reverse</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[i64]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[i64]</span></code></div>
+<div class="signature"><code><span class="sig-name">reverse</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[element]</span></code></div>
 <div class="function-doc">
 <p>Reverses the order of elements.</p>
 <h2>Examples</h2>
@@ -236,7 +231,7 @@ List.contains?([<span class="hl-number">1</span>, <span class="hl-number">2</spa
 <div style="flex:1"></div>
 <a href="#prepend-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">prepend</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[i64]</span><span class="sig-paren">, </span>value<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[i64]</span></code></div>
+<div class="signature"><code><span class="sig-name">prepend</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">, </span>value<span class="sig-separator">::</span><span class="sig-type-pill">element</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[element]</span></code></div>
 <div class="function-doc">
 <p>Prepends a value to the front of a list.</p>
 <h2>Examples</h2>
@@ -250,7 +245,7 @@ List.contains?([<span class="hl-number">1</span>, <span class="hl-number">2</spa
 <div style="flex:1"></div>
 <a href="#append-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">append</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[i64]</span><span class="sig-paren">, </span>value<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[i64]</span></code></div>
+<div class="signature"><code><span class="sig-name">append</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">, </span>value<span class="sig-separator">::</span><span class="sig-type-pill">element</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[element]</span></code></div>
 <div class="function-doc">
 <p>Appends a value to the end of a list. O(n).</p>
 <h2>Examples</h2>
@@ -264,7 +259,7 @@ List.contains?([<span class="hl-number">1</span>, <span class="hl-number">2</spa
 <div style="flex:1"></div>
 <a href="#concat-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">concat</span><span class="sig-paren">(</span>first<span class="sig-separator">::</span><span class="sig-type-pill">[i64]</span><span class="sig-paren">, </span>second<span class="sig-separator">::</span><span class="sig-type-pill">[i64]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[i64]</span></code></div>
+<div class="signature"><code><span class="sig-name">concat</span><span class="sig-paren">(</span>first<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">, </span>second<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[element]</span></code></div>
 <div class="function-doc">
 <p>Concatenates two lists.</p>
 <h2>Examples</h2>
@@ -278,7 +273,7 @@ List.contains?([<span class="hl-number">1</span>, <span class="hl-number">2</spa
 <div style="flex:1"></div>
 <a href="#take-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">take</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[i64]</span><span class="sig-paren">, </span>count<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[i64]</span></code></div>
+<div class="signature"><code><span class="sig-name">take</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">, </span>count<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[element]</span></code></div>
 <div class="function-doc">
 <p>Takes the first <code>count</code> elements.</p>
 <h2>Examples</h2>
@@ -292,7 +287,7 @@ List.contains?([<span class="hl-number">1</span>, <span class="hl-number">2</spa
 <div style="flex:1"></div>
 <a href="#drop-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">drop</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[i64]</span><span class="sig-paren">, </span>count<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[i64]</span></code></div>
+<div class="signature"><code><span class="sig-name">drop</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">, </span>count<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[element]</span></code></div>
 <div class="function-doc">
 <p>Drops the first <code>count</code> elements.</p>
 <h2>Examples</h2>
@@ -306,12 +301,60 @@ List.contains?([<span class="hl-number">1</span>, <span class="hl-number">2</spa
 <div style="flex:1"></div>
 <a href="#uniq-1" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">uniq</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[i64]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[i64]</span></code></div>
+<div class="signature"><code><span class="sig-name">uniq</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[element]</span></code></div>
 <div class="function-doc">
 <p>Returns a new list with duplicates removed.
 Preserves the order of first occurrences.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap">List.uniq([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>, <span class="hl-number">1</span>])  <span class="hl-comment"># =&gt; [1, 2, 3]</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="head!-1">
+<div class="function-header">
+<h3>head!<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#head!-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">head!</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">element</span></code></div>
+<div class="function-doc">
+<p>Returns the first element of the list.
+Raises if the list is empty.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">List.head!([<span class="hl-number">10</span>, <span class="hl-number">20</span>])  <span class="hl-comment"># =&gt; 10</span>
+List.head!([])        <span class="hl-comment"># raises</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="last!-1">
+<div class="function-header">
+<h3>last!<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#last!-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">last!</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">element</span></code></div>
+<div class="function-doc">
+<p>Returns the last element of the list.
+Raises if the list is empty.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">List.last!([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>])  <span class="hl-comment"># =&gt; 3</span>
+List.last!([])         <span class="hl-comment"># raises</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="at!-2">
+<div class="function-header">
+<h3>at!<span class="arity">/2</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#at!-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">at!</span><span class="sig-paren">(</span>list<span class="sig-separator">::</span><span class="sig-type-pill">[element]</span><span class="sig-paren">, </span>index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">element</span></code></div>
+<div class="function-doc">
+<p>Returns the element at the given zero-based index.
+Raises if the index is out of bounds.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">List.at!([<span class="hl-number">10</span>, <span class="hl-number">20</span>, <span class="hl-number">30</span>], <span class="hl-number">1</span>)  <span class="hl-comment"># =&gt; 20</span>
+List.at!([<span class="hl-number">10</span>, <span class="hl-number">20</span>], <span class="hl-number">5</span>)      <span class="hl-comment"># raises</span></code></pre>
 </div>
 </div>
 </main>
@@ -333,6 +376,9 @@ Preserves the order of first occurrences.</p>
 <li><a href="#take-2">take/2</a></li>
 <li><a href="#drop-2">drop/2</a></li>
 <li><a href="#uniq-1">uniq/1</a></li>
+<li><a href="#head!-1">head!/1</a></li>
+<li><a href="#last!-1">last!/1</a></li>
+<li><a href="#at!-2">at!/2</a></li>
 </ul>
 </aside>
 </div>

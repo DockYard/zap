@@ -60,7 +60,11 @@
 <li><a href="../structs/List.html">List</a></li>
 <li><a href="../structs/Map.html">Map</a></li>
 <li><a href="../structs/Math.html">Math</a></li>
+<li><a href="../structs/Path.html">Path</a></li>
+<li><a href="../structs/Range.html">Range</a></li>
+<li><a href="../structs/SourceGraph.html">SourceGraph</a></li>
 <li><a href="../structs/String.html">String</a></li>
+<li><a href="../structs/Struct.html">Struct</a></li>
 <li><a href="../structs/System.html">System</a></li>
 <li><a href="../structs/Zest.html">Zest</a></li>
 </ul>
@@ -80,19 +84,6 @@
 <span class="pub-struct-pill">pub struct</span>
 <a href="https://github.com/DockYard/zap/blob/v0.1.0/./lib/atom.zap" class="source-file">./lib/atom.zap</a>
 </div>
-</div>
-<p class="tagline">Functions for working with atoms.</p>
-<div class="struct_doc">
-<p>Functions for working with atoms.</p>
-<p>Atoms are constants whose name is their value. They are
-interned — each unique name maps to a single atom ID,
-making equality comparison constant-time.</p>
-<p>Atoms are written with a leading colon: <code>:ok</code>, <code>:error</code>,
-<code>:my_atom</code>.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap"><span class="hl-atom">:ok</span> <span class="hl-op">==</span> <span class="hl-atom">:ok</span>        <span class="hl-comment"># =&gt; true</span>
-<span class="hl-atom">:ok</span> <span class="hl-op">==</span> <span class="hl-atom">:error</span>     <span class="hl-comment"># =&gt; false</span>
-<span class="hl-type">Atom</span>.to_string(<span class="hl-atom">:hello</span>)  <span class="hl-comment"># =&gt; &quot;hello&quot;</span></code></pre>
 </div>
 <h2 id="functions">Functions</h2>
 <table class="summary">

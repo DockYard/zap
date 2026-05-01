@@ -98,13 +98,14 @@ pub fn generate(
             const func_name = interner.get(family.name);
             const doc_text = extractDocAttribute(alloc, family.attributes, "doc", interner) orelse "";
             const summary = extractFirstSentence(alloc, doc_text);
-            const signature = buildFunctionSignature(alloc, family, interner);
+            const signatures = buildFunctionSignatures(alloc, family, interner, options.source_units);
             const source_line = getSourceLine(family, options.source_units);
 
             functions.append(alloc, .{
                 .name = func_name,
                 .arity = family.arity,
-                .signature = signature,
+                .signature = firstSignature(signatures),
+                .signatures = signatures,
                 .doc = doc_text,
                 .summary = summary,
                 .source_line = source_line,
@@ -120,13 +121,14 @@ pub fn generate(
 
             const doc_text = extractDocAttribute(alloc, family.attributes, "doc", interner) orelse "";
             const summary = extractFirstSentence(alloc, doc_text);
-            const signature = buildMacroSignature(alloc, family, interner);
+            const signatures = buildMacroSignatures(alloc, family, interner, options.source_units);
             const source_line = getMacroSourceLine(family, options.source_units);
 
             functions.append(alloc, .{
                 .name = macro_name,
                 .arity = family.arity,
-                .signature = signature,
+                .signature = firstSignature(signatures),
+                .signatures = signatures,
                 .doc = doc_text,
                 .summary = summary,
                 .source_line = source_line,
@@ -218,6 +220,7 @@ const DocFunction = struct {
     name: []const u8,
     arity: u32,
     signature: []const u8,
+    signatures: []const []const u8,
     doc: []const u8,
     summary: []const u8,
     source_line: u32,
@@ -343,56 +346,73 @@ fn extractFirstSentence(alloc: std.mem.Allocator, doc: []const u8) []const u8 {
     return alloc.dupe(u8, doc[start..end]) catch "";
 }
 
-fn buildFunctionSignature(alloc: std.mem.Allocator, family: scope.FunctionFamily, interner: *const ast.StringInterner) []const u8 {
+fn firstSignature(signatures: []const []const u8) []const u8 {
+    if (signatures.len == 0) return "";
+    return signatures[0];
+}
+
+fn buildFunctionSignatures(
+    alloc: std.mem.Allocator,
+    family: scope.FunctionFamily,
+    interner: *const ast.StringInterner,
+    source_units: []const compiler.SourceUnit,
+) []const []const u8 {
     const func_name = interner.get(family.name);
-    if (family.clauses.items.len == 0) {
-        return std.fmt.allocPrint(alloc, "{s}()", .{func_name}) catch func_name;
-    }
-
-    const first_clause = family.clauses.items[0];
-    const clause = first_clause.decl.clauses[first_clause.clause_index];
-
-    var buf = StringBuffer.init(alloc);
-    buf.str(func_name);
-    buf.char('(');
-
-    for (clause.params, 0..) |param, i| {
-        if (i > 0) buf.str(", ");
-        buf.str(extractParamName(param.pattern, interner));
-        if (param.type_annotation) |type_ann| {
-            buf.str(" :: ");
-            appendTypeExpr(&buf, type_ann, interner);
-        }
-    }
-    buf.char(')');
-
-    if (clause.return_type) |ret| {
-        buf.str(" -> ");
-        appendTypeExpr(&buf, ret, interner);
-    }
-
-    return buf.toSlice();
+    return buildClauseSignatures(alloc, func_name, family.clauses.items, interner, source_units);
 }
 
-fn buildMacroSignature(alloc: std.mem.Allocator, family: scope.MacroFamily, interner: *const ast.StringInterner) []const u8 {
+fn buildMacroSignatures(
+    alloc: std.mem.Allocator,
+    family: scope.MacroFamily,
+    interner: *const ast.StringInterner,
+    source_units: []const compiler.SourceUnit,
+) []const []const u8 {
     const macro_name = interner.get(family.name);
-    if (family.clauses.items.len == 0) {
-        return std.fmt.allocPrint(alloc, "{s}()", .{macro_name}) catch macro_name;
+    return buildClauseSignatures(alloc, macro_name, family.clauses.items, interner, source_units);
+}
+
+fn buildClauseSignatures(
+    alloc: std.mem.Allocator,
+    function_name: []const u8,
+    clauses: []const scope.FunctionClauseRef,
+    interner: *const ast.StringInterner,
+    source_units: []const compiler.SourceUnit,
+) []const []const u8 {
+    var signatures: std.ArrayListUnmanaged([]const u8) = .empty;
+    for (clauses) |clause_ref| {
+        if (clause_ref.clause_index >= clause_ref.decl.clauses.len) continue;
+        const clause = clause_ref.decl.clauses[clause_ref.clause_index];
+        signatures.append(alloc, buildClauseSignature(alloc, function_name, clause, interner, source_units)) catch {};
     }
 
-    const first_clause = family.clauses.items[0];
-    const clause = first_clause.decl.clauses[first_clause.clause_index];
+    if (signatures.items.len == 0) {
+        signatures.append(alloc, std.fmt.allocPrint(alloc, "{s}()", .{function_name}) catch function_name) catch {};
+    }
 
+    return signatures.toOwnedSlice(alloc) catch &.{};
+}
+
+fn buildClauseSignature(
+    alloc: std.mem.Allocator,
+    function_name: []const u8,
+    clause: ast.FunctionClause,
+    interner: *const ast.StringInterner,
+    source_units: []const compiler.SourceUnit,
+) []const u8 {
     var buf = StringBuffer.init(alloc);
-    buf.str(macro_name);
+    buf.str(function_name);
     buf.char('(');
 
     for (clause.params, 0..) |param, i| {
         if (i > 0) buf.str(", ");
-        buf.str(extractParamName(param.pattern, interner));
+        appendPattern(&buf, param.pattern, interner, source_units);
         if (param.type_annotation) |type_ann| {
             buf.str(" :: ");
             appendTypeExpr(&buf, type_ann, interner);
+        }
+        if (param.default) |default_expr| {
+            buf.str(" = ");
+            appendExpr(&buf, default_expr, interner, source_units);
         }
     }
     buf.char(')');
@@ -402,15 +422,209 @@ fn buildMacroSignature(alloc: std.mem.Allocator, family: scope.MacroFamily, inte
         appendTypeExpr(&buf, ret, interner);
     }
 
+    if (clause.refinement) |refinement| {
+        buf.str(" if ");
+        appendExpr(&buf, refinement, interner, source_units);
+    }
+
     return buf.toSlice();
 }
 
-fn extractParamName(pattern: *const ast.Pattern, interner: *const ast.StringInterner) []const u8 {
+fn sourceSlice(meta: ast.NodeMeta, source_units: []const compiler.SourceUnit) ?[]const u8 {
+    const source_id = meta.span.source_id orelse return null;
+    if (source_id >= source_units.len) return null;
+    const source = source_units[source_id].source;
+    if (meta.span.start >= meta.span.end) return null;
+    if (meta.span.end > source.len) return null;
+    return std.mem.trim(u8, source[meta.span.start..meta.span.end], " \t\r\n");
+}
+
+fn appendStructName(buf: *StringBuffer, name: ast.StructName, interner: *const ast.StringInterner) void {
+    for (name.parts, 0..) |part, i| {
+        if (i > 0) buf.char('.');
+        buf.str(interner.get(part));
+    }
+}
+
+fn appendZapStringLiteral(buf: *StringBuffer, value: []const u8) void {
+    buf.char('"');
+    for (value) |c| {
+        switch (c) {
+            '\\' => buf.str("\\\\"),
+            '"' => buf.str("\\\""),
+            '\n' => buf.str("\\n"),
+            '\r' => buf.str("\\r"),
+            '\t' => buf.str("\\t"),
+            else => buf.char(c),
+        }
+    }
+    buf.char('"');
+}
+
+fn appendLiteralPattern(buf: *StringBuffer, literal: ast.LiteralPattern, interner: *const ast.StringInterner) void {
+    switch (literal) {
+        .int => |v| buf.fmt("{d}", .{v.value}),
+        .float => |v| buf.fmt("{d}", .{v.value}),
+        .string => |v| appendZapStringLiteral(buf, interner.get(v.value)),
+        .atom => |v| {
+            buf.char(':');
+            buf.str(interner.get(v.value));
+        },
+        .bool_lit => |v| buf.str(if (v.value) "true" else "false"),
+        .nil => buf.str("nil"),
+    }
+}
+
+fn appendPattern(
+    buf: *StringBuffer,
+    pattern: *const ast.Pattern,
+    interner: *const ast.StringInterner,
+    source_units: []const compiler.SourceUnit,
+) void {
+    if (sourceSlice(pattern.getMeta(), source_units)) |text| {
+        buf.str(text);
+        return;
+    }
+
     switch (pattern.*) {
-        .bind => |v| return interner.get(v.name),
-        .wildcard => return "_",
-        .pin => |p| return interner.get(p.name),
-        else => return "_",
+        .wildcard => buf.char('_'),
+        .bind => |v| buf.str(interner.get(v.name)),
+        .pin => |v| {
+            buf.char('^');
+            buf.str(interner.get(v.name));
+        },
+        .literal => |literal| appendLiteralPattern(buf, literal, interner),
+        .paren => |v| {
+            buf.char('(');
+            appendPattern(buf, v.inner, interner, source_units);
+            buf.char(')');
+        },
+        .tuple => |v| {
+            buf.char('{');
+            for (v.elements, 0..) |element, i| {
+                if (i > 0) buf.str(", ");
+                appendPattern(buf, element, interner, source_units);
+            }
+            buf.char('}');
+        },
+        .list => |v| {
+            buf.char('[');
+            for (v.elements, 0..) |element, i| {
+                if (i > 0) buf.str(", ");
+                appendPattern(buf, element, interner, source_units);
+            }
+            buf.char(']');
+        },
+        .list_cons => |v| {
+            buf.char('[');
+            for (v.heads, 0..) |head, i| {
+                if (i > 0) buf.str(", ");
+                appendPattern(buf, head, interner, source_units);
+            }
+            if (v.heads.len > 0) buf.str(" | ");
+            appendPattern(buf, v.tail, interner, source_units);
+            buf.char(']');
+        },
+        .map => |v| {
+            buf.str("%{");
+            for (v.fields, 0..) |field, i| {
+                if (i > 0) buf.str(", ");
+                appendExpr(buf, field.key, interner, source_units);
+                buf.str(" => ");
+                appendPattern(buf, field.value, interner, source_units);
+            }
+            buf.char('}');
+        },
+        .struct_pattern => |v| {
+            buf.char('%');
+            appendStructName(buf, v.struct_name, interner);
+            buf.char('{');
+            for (v.fields, 0..) |field, i| {
+                if (i > 0) buf.str(", ");
+                buf.str(interner.get(field.name));
+                buf.str(": ");
+                appendPattern(buf, field.pattern, interner, source_units);
+            }
+            buf.char('}');
+        },
+        .binary => |v| {
+            buf.str("<<");
+            for (v.segments, 0..) |segment, i| {
+                if (i > 0) buf.str(", ");
+                switch (segment.value) {
+                    .pattern => |segment_pattern| appendPattern(buf, segment_pattern, interner, source_units),
+                    .string_literal => |string_id| appendZapStringLiteral(buf, interner.get(string_id)),
+                    .expr => |expr| appendExpr(buf, expr, interner, source_units),
+                }
+            }
+            buf.str(">>");
+        },
+    }
+}
+
+fn binaryOpString(op: ast.BinaryOp.Op) []const u8 {
+    return switch (op) {
+        .add => "+",
+        .sub => "-",
+        .mul => "*",
+        .div => "/",
+        .rem_op => "rem",
+        .equal => "==",
+        .not_equal => "!=",
+        .less => "<",
+        .greater => ">",
+        .less_equal => "<=",
+        .greater_equal => ">=",
+        .and_op => "and",
+        .or_op => "or",
+        .concat => "<>",
+        .in_op => "in",
+    };
+}
+
+fn appendExpr(
+    buf: *StringBuffer,
+    expr: *const ast.Expr,
+    interner: *const ast.StringInterner,
+    source_units: []const compiler.SourceUnit,
+) void {
+    if (sourceSlice(expr.getMeta(), source_units)) |text| {
+        buf.str(text);
+        return;
+    }
+
+    switch (expr.*) {
+        .int_literal => |v| buf.fmt("{d}", .{v.value}),
+        .float_literal => |v| buf.fmt("{d}", .{v.value}),
+        .string_literal => |v| appendZapStringLiteral(buf, interner.get(v.value)),
+        .atom_literal => |v| {
+            buf.char(':');
+            buf.str(interner.get(v.value));
+        },
+        .bool_literal => |v| buf.str(if (v.value) "true" else "false"),
+        .nil_literal => buf.str("nil"),
+        .var_ref => |v| buf.str(interner.get(v.name)),
+        .struct_ref => |v| appendStructName(buf, v.name, interner),
+        .type_annotated => |v| {
+            appendExpr(buf, v.expr, interner, source_units);
+            buf.str(" :: ");
+            appendTypeExpr(buf, v.type_expr, interner);
+        },
+        .unary_op => |v| {
+            buf.str(switch (v.op) {
+                .negate => "-",
+                .not_op => "not ",
+            });
+            appendExpr(buf, v.operand, interner, source_units);
+        },
+        .binary_op => |v| {
+            appendExpr(buf, v.lhs, interner, source_units);
+            buf.char(' ');
+            buf.str(binaryOpString(v.op));
+            buf.char(' ');
+            appendExpr(buf, v.rhs, interner, source_units);
+        },
+        else => buf.char('?'),
     }
 }
 
@@ -717,10 +931,13 @@ fn appendFunctionDetail(h: *StringBuffer, func: DocFunction, _: DocStruct, _: Do
     h.str("\" class=\"anchor-link\">#</a>\n");
     h.str("</div>\n");
 
-    // Signature
-    h.str("<div class=\"signature\"><code>");
-    appendRichSignature(h, func.signature);
-    h.str("</code></div>\n");
+    // Clause signatures. A function family has one shared doc body,
+    // but every clause head is rendered so pattern/type matches are visible.
+    for (func.signatures) |signature| {
+        h.str("<div class=\"signature\"><code>");
+        appendRichSignature(h, signature);
+        h.str("</code></div>\n");
+    }
 
     // Doc body
     if (func.doc.len > 0) {
@@ -777,8 +994,9 @@ fn appendRichSignature(h: *StringBuffer, signature: []const u8) void {
             }
             first_param = false;
 
-            // Split on " :: " to get name and type
-            if (std.mem.indexOf(u8, trimmed_param, " :: ")) |sep_idx| {
+            // Split on top-level " :: " to avoid confusing nested pattern syntax
+            // with the parameter's own type annotation.
+            if (indexOfTopLevelToken(trimmed_param, " :: ")) |sep_idx| {
                 const param_name = trimmed_param[0..sep_idx];
                 const param_type = trimmed_param[sep_idx + 4 ..];
                 appendHtmlEscaped(h, param_name);
@@ -799,13 +1017,30 @@ fn appendRichSignature(h: *StringBuffer, signature: []const u8) void {
     if (paren_close + 1 < signature.len) {
         const after_paren = std.mem.trimStart(u8, signature[paren_close + 1 ..], " ");
         if (std.mem.startsWith(u8, after_paren, "-> ")) {
-            const return_type = std.mem.trimStart(u8, after_paren[3..], " ");
-            h.str("<span class=\"sig-arrow\">\u{2192}</span>");
-            h.str("<span class=\"sig-ret-pill\">");
-            appendHtmlEscaped(h, return_type);
-            h.str("</span>");
+            const return_and_guard = std.mem.trimStart(u8, after_paren[3..], " ");
+            const guard_start = indexOfTopLevelToken(return_and_guard, " if ");
+            const return_type = if (guard_start) |idx| std.mem.trim(u8, return_and_guard[0..idx], " \t") else return_and_guard;
+            const guard_expr = if (guard_start) |idx| std.mem.trim(u8, return_and_guard[idx + 4 ..], " \t") else "";
+
+            if (return_type.len > 0) {
+                h.str("<span class=\"sig-arrow\">\u{2192}</span>");
+                h.str("<span class=\"sig-ret-pill\">");
+                appendHtmlEscaped(h, return_type);
+                h.str("</span>");
+            }
+            appendSignatureGuard(h, guard_expr);
+        } else if (std.mem.startsWith(u8, after_paren, "if ")) {
+            appendSignatureGuard(h, std.mem.trim(u8, after_paren[3..], " \t"));
         }
     }
+}
+
+fn appendSignatureGuard(h: *StringBuffer, guard_expr: []const u8) void {
+    if (guard_expr.len == 0) return;
+    h.str("<span class=\"sig-guard-keyword\">if</span>");
+    h.str("<span class=\"sig-guard\">");
+    appendHtmlEscaped(h, guard_expr);
+    h.str("</span>");
 }
 
 /// Split a parameter string by commas, respecting nested parentheses and brackets.
@@ -818,30 +1053,16 @@ const ParamSplitter = struct {
         if (self.pos >= self.source.len) return null;
 
         const start = self.pos;
-        var depth_paren: usize = 0;
-        var depth_bracket: usize = 0;
-        var depth_brace: usize = 0;
+        var scanner: SignatureScanner = .{};
 
         while (self.pos < self.source.len) {
             const c = self.source[self.pos];
-            if (c == '(') {
-                depth_paren += 1;
-            } else if (c == ')') {
-                if (depth_paren > 0) depth_paren -= 1;
-            } else if (c == '[') {
-                depth_bracket += 1;
-            } else if (c == ']') {
-                if (depth_bracket > 0) depth_bracket -= 1;
-            } else if (c == '{') {
-                depth_brace += 1;
-            } else if (c == '}') {
-                if (depth_brace > 0) depth_brace -= 1;
-            } else if (c == ',' and depth_paren == 0 and depth_bracket == 0 and depth_brace == 0) {
+            if (c == ',' and scanner.isTopLevel()) {
                 const result = self.source[start..self.pos];
                 self.pos += 1; // skip the comma
                 return result;
             }
-            self.pos += 1;
+            scanner.consume(self.source, &self.pos);
         }
         return self.source[start..self.pos];
     }
@@ -849,6 +1070,83 @@ const ParamSplitter = struct {
 
 fn splitParams(params: []const u8) ParamSplitter {
     return .{ .source = params, .pos = 0 };
+}
+
+const SignatureScanner = struct {
+    depth_paren: usize = 0,
+    depth_bracket: usize = 0,
+    depth_brace: usize = 0,
+    depth_binary: usize = 0,
+    in_string: bool = false,
+    string_escape: bool = false,
+
+    fn isTopLevel(self: SignatureScanner) bool {
+        return !self.in_string and self.depth_paren == 0 and self.depth_bracket == 0 and self.depth_brace == 0 and self.depth_binary == 0;
+    }
+
+    fn consume(self: *SignatureScanner, source: []const u8, index: *usize) void {
+        const c = source[index.*];
+
+        if (self.in_string) {
+            if (self.string_escape) {
+                self.string_escape = false;
+            } else if (c == '\\') {
+                self.string_escape = true;
+            } else if (c == '"') {
+                self.in_string = false;
+            }
+            index.* += 1;
+            return;
+        }
+
+        if (c == '"') {
+            self.in_string = true;
+            index.* += 1;
+            return;
+        }
+
+        if (index.* + 1 < source.len and source[index.*] == '<' and source[index.* + 1] == '<') {
+            self.depth_binary += 1;
+            index.* += 2;
+            return;
+        }
+
+        if (index.* + 1 < source.len and source[index.*] == '>' and source[index.* + 1] == '>' and self.depth_binary > 0) {
+            self.depth_binary -= 1;
+            index.* += 2;
+            return;
+        }
+
+        switch (c) {
+            '(' => self.depth_paren += 1,
+            ')' => {
+                if (self.depth_paren > 0) self.depth_paren -= 1;
+            },
+            '[' => self.depth_bracket += 1,
+            ']' => {
+                if (self.depth_bracket > 0) self.depth_bracket -= 1;
+            },
+            '{' => self.depth_brace += 1,
+            '}' => {
+                if (self.depth_brace > 0) self.depth_brace -= 1;
+            },
+            else => {},
+        }
+
+        index.* += 1;
+    }
+};
+
+fn indexOfTopLevelToken(source: []const u8, token: []const u8) ?usize {
+    var scanner: SignatureScanner = .{};
+    var index: usize = 0;
+    while (index < source.len) {
+        if (scanner.isTopLevel() and std.mem.startsWith(u8, source[index..], token)) {
+            return index;
+        }
+        scanner.consume(source, &index);
+    }
+    return null;
 }
 
 // ============================================================
@@ -900,13 +1198,16 @@ fn appendFunctionMarkdown(h: *StringBuffer, func: DocFunction, mod: DocStruct, p
     h.fmt("/{d}\n\n", .{func.arity});
 
     h.str("```zap\n");
-    if (func.is_macro) {
-        h.str("pub macro ");
-    } else {
-        h.str("pub fn ");
+    for (func.signatures) |signature| {
+        if (func.is_macro) {
+            h.str("pub macro ");
+        } else {
+            h.str("pub fn ");
+        }
+        h.str(signature);
+        h.char('\n');
     }
-    h.str(func.signature);
-    h.str("\n```\n\n");
+    h.str("```\n\n");
 
     if (func.doc.len > 0) {
         h.str(func.doc);
@@ -1794,6 +2095,128 @@ fn writeFile(path: []const u8, content: []const u8) !void {
 }
 
 const WriteError = error{WriteError};
+
+test "documentation signatures include every function clause pattern" {
+    const source =
+        \\pub struct Example {
+        \\  pub fn classify(0 :: i64) -> String {
+        \\    "zero"
+        \\  }
+        \\
+        \\  pub fn classify(value :: i32) -> String {
+        \\    "i32"
+        \\  }
+        \\
+        \\  pub fn classify(value :: i64) -> String if value > 0 {
+        \\    "positive"
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+
+    var parser = zap.Parser.initWithSharedInterner(alloc, source, &interner, 0);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = zap.Collector.init(alloc, &interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    const source_units = [_]compiler.SourceUnit{.{
+        .file_path = "example.zap",
+        .source = source,
+    }};
+
+    var classify_family: ?scope.FunctionFamily = null;
+    for (collector.graph.families.items) |family| {
+        if (std.mem.eql(u8, interner.get(family.name), "classify")) {
+            classify_family = family;
+            break;
+        }
+    }
+
+    const family = classify_family orelse return error.TestExpectedEqual;
+    const signatures = buildFunctionSignatures(alloc, family, &interner, &source_units);
+
+    try std.testing.expectEqual(@as(usize, 3), signatures.len);
+    try std.testing.expectEqualStrings("classify(0 :: i64) -> String", signatures[0]);
+    try std.testing.expectEqualStrings("classify(value :: i32) -> String", signatures[1]);
+    try std.testing.expectEqualStrings("classify(value :: i64) -> String if value > 0", signatures[2]);
+}
+
+test "function markdown renders many signatures with one doc body" {
+    const signatures = [_][]const u8{
+        "abs(value :: i8) -> i8",
+        "abs(value :: i16) -> i16",
+        "abs(value :: i64) -> i64",
+    };
+    const func = DocFunction{
+        .name = "abs",
+        .arity = 1,
+        .signature = signatures[0],
+        .signatures = &signatures,
+        .doc = "Shared absolute-value documentation.",
+        .summary = "Shared absolute-value documentation.",
+        .source_line = 0,
+        .is_macro = false,
+    };
+    const mod = DocStruct{
+        .name = "Integer",
+        .structdoc = "",
+        .source_file = "",
+        .functions = &.{func},
+    };
+    const project = DocProject{
+        .name = "Zap",
+        .version = "0.0.0",
+        .source_url = null,
+        .structs = &.{mod},
+    };
+    const options = DocOptions{
+        .project_name = "Zap",
+        .project_version = "0.0.0",
+    };
+
+    var buffer = StringBuffer.init(std.testing.allocator);
+    appendFunctionMarkdown(&buffer, func, mod, project, options);
+
+    const markdown = buffer.toSlice();
+    try std.testing.expect(std.mem.indexOf(u8, markdown, "pub fn abs(value :: i8) -> i8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, markdown, "pub fn abs(value :: i16) -> i16") != null);
+    try std.testing.expect(std.mem.indexOf(u8, markdown, "pub fn abs(value :: i64) -> i64") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, markdown, "Shared absolute-value documentation."));
+}
+
+test "signature renderer preserves nested patterns and separates guards" {
+    const params = "%{status => :ok, value => value} :: Map, <<part :: i8, rest>> :: Binary";
+    var param_parts = splitParams(params);
+
+    const first = param_parts.next() orelse return error.TestExpectedEqual;
+    const second = param_parts.next() orelse return error.TestExpectedEqual;
+    try std.testing.expect(param_parts.next() == null);
+    try std.testing.expectEqualStrings("%{status => :ok, value => value} :: Map", std.mem.trim(u8, first, " \t"));
+    try std.testing.expectEqualStrings("<<part :: i8, rest>> :: Binary", std.mem.trim(u8, second, " \t"));
+
+    try std.testing.expectEqual(
+        std.mem.lastIndexOf(u8, second, " :: ").?,
+        indexOfTopLevelToken(second, " :: ").?,
+    );
+
+    var buffer = StringBuffer.init(std.testing.allocator);
+    appendRichSignature(&buffer, "classify(value :: i64) -> String if value > 0");
+    const html = buffer.toSlice();
+
+    try std.testing.expect(std.mem.indexOf(u8, html, "<span class=\"sig-ret-pill\">String</span>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "<span class=\"sig-guard-keyword\">if</span>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "<span class=\"sig-guard\">value &gt; 0</span>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "String if value") == null);
+}
 
 // ============================================================
 // Embedded CSS

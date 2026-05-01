@@ -60,7 +60,11 @@
 <li><a href="structs/List.html">List</a></li>
 <li><a href="structs/Map.html">Map</a></li>
 <li><a href="structs/Math.html">Math</a></li>
+<li><a href="structs/Path.html">Path</a></li>
+<li><a href="structs/Range.html">Range</a></li>
+<li><a href="structs/SourceGraph.html">SourceGraph</a></li>
 <li><a href="structs/String.html">String</a></li>
+<li><a href="structs/Struct.html">Struct</a></li>
 <li><a href="structs/System.html">System</a></li>
 <li><a href="structs/Zest.html">Zest</a></li>
 </ul>
@@ -74,7 +78,7 @@
 </div>
 </nav>
 <main class="content">
-<div class="struct_doc">
+<div class="structdoc">
 <p align="center">
   <br>
   <br>
@@ -387,7 +391,7 @@ countdown(<span class="hl-number">100_000_000</span>)  <span class="hl-comment">
 zap deps update &lt;name&gt;  # Re-resolve a single dependency</code></pre>
 <hr>
 <h2>Type System</h2>
-<p>Types are declared at function boundaries. Narrower numeric types are implicitly widened at call sites (e.g., <code>i8</code> to <code>i64</code>), but no lossy conversions are implicit.</p>
+<p>Types are declared at function boundaries. When resolving a call, Zap first prefers an exact typed clause. If no exact clause matches, narrower numeric types may widen within the same family (e.g., <code>i8</code> to <code>i64</code>), but no lossy or cross-family conversions are implicit.</p>
 <p>| Category | Types |
 |---|---|
 | Signed integers | <code>i8</code> <code>i16</code> <code>i32</code> <code>i64</code> |
@@ -417,7 +421,7 @@ zap deps update &lt;name&gt;  # Re-resolve a single dependency</code></pre>
 }</code></pre>
 <hr>
 <h2>Standard Library</h2>
-<p>Zap includes a standard library of structs for working with primitive types and collections:</p>
+<p>Zap includes a standard library for working with primitive types and collections:</p>
 <p>| Struct | Functions |
 |---|---|
 | <code>Integer</code> | <code>to_string</code>, <code>abs</code>, <code>max</code>, <code>min</code>, <code>parse</code>, <code>remainder</code>, <code>pow</code>, <code>clamp</code>, <code>digits</code>, <code>to_float</code> |
@@ -444,29 +448,36 @@ Enum.reduce([<span class="hl-number">1</span>, <span class="hl-number">2</span>,
 <span class="hl-comment"># Sort with comparator</span>
 Enum.sort([<span class="hl-number">3</span>, <span class="hl-number">1</span>, <span class="hl-number">2</span>], <span class="hl-keyword">fn</span>(a <span class="hl-op">::</span> <span class="hl-type">i64</span>, b <span class="hl-op">::</span> <span class="hl-type">i64</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">Bool</span> { a <span class="hl-op">&lt;</span> b })</code></pre>
 <p>Function type annotations use the arrow syntax: <code>callback :: (i64 -&gt; i64)</code>, <code>predicate :: (i64 -&gt; Bool)</code>.</p>
-<h3>Implicit Numeric Widening</h3>
-<p>Narrower numeric types are automatically widened to wider types at function call sites:</p>
-<pre><code class="language-zap"><span class="hl-keyword">fn</span> process(value <span class="hl-op">::</span> <span class="hl-type">i64</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">i64</span> { value <span class="hl-op">*</span> <span class="hl-number">2</span> }
+<h3>Numeric Call Resolution</h3>
+<p>Exact typed clauses are selected before widening is considered:</p>
+<pre><code class="language-zap"><span class="hl-keyword">fn</span> process(value <span class="hl-op">::</span> <span class="hl-type">i32</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">i32</span> { value }
+<span class="hl-keyword">fn</span> process(value <span class="hl-op">::</span> <span class="hl-type">i64</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">i64</span> { value <span class="hl-op">*</span> <span class="hl-number">2</span> }
 
 small <span class="hl-op">::</span> <span class="hl-type">i8</span> <span class="hl-op">=</span> <span class="hl-number">42</span>
-process(small)  <span class="hl-comment"># i8 automatically widened to i64</span></code></pre>
-<p>Widening rules: <code>i8</code> -&gt; <code>i16</code> -&gt; <code>i32</code> -&gt; <code>i64</code>, <code>u8</code> -&gt; <code>u16</code> -&gt; <code>u32</code> -&gt; <code>u64</code>, <code>f16</code> -&gt; <code>f32</code> -&gt; <code>f64</code>. No lossy conversions (signed-to-unsigned, wider-to-narrower, integer-to-float) are implicit.</p>
+medium <span class="hl-op">::</span> <span class="hl-type">i32</span> <span class="hl-op">=</span> <span class="hl-number">42</span>
+
+process(medium)  <span class="hl-comment"># selects the i32 clause exactly</span>
+process(small)   <span class="hl-comment"># widens i8 to i32 because no i8 clause exists</span></code></pre>
+<p>Fallback widening rules: <code>i8</code> -&gt; <code>i16</code> -&gt; <code>i32</code> -&gt; <code>i64</code>, <code>u8</code> -&gt; <code>u16</code> -&gt; <code>u32</code> -&gt; <code>u64</code>, <code>f16</code> -&gt; <code>f32</code> -&gt; <code>f64</code>. Signed integers never implicitly widen to unsigned integers, unsigned integers never implicitly widen to signed integers, and integer-to-float conversion is never implicit.</p>
 <hr>
-<h2>Native Function Bindings (<code>@native</code>)</h2>
-<p>Zap library functions that need Zig runtime implementations (I/O, string operations, atom tables, etc.) use <code>@native</code> attributes instead of hardcoded compiler knowledge:</p>
+<h2>Native Function Bindings (<code>:zig</code>)</h2>
+<p>Zap functions that need Zig runtime implementations (I/O, string operations, atom tables, etc.) call into Zig directly via the <code>:zig.Struct.function(args)</code> form:</p>
 <pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> IO {
-  @native <span class="hl-op">=</span> <span class="hl-string">"Prelude.println"</span>
-  <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> puts(_message <span class="hl-op">::</span> <span class="hl-type">String</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">String</span>
+  <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> puts(message <span class="hl-op">::</span> <span class="hl-type">String</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">String</span> {
+    <span class="hl-atom">:zig</span>.Prelude.println(message)
+  }
 }
 
 <span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> Zest.Runtime {
-  @native <span class="hl-op">=</span> <span class="hl-string">"ZestRuntime.reset"</span>
-  <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> reset() <span class="hl-op">-&gt;</span> <span class="hl-type">String</span>
+  <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> reset() <span class="hl-op">-&gt;</span> <span class="hl-type">String</span> {
+    <span class="hl-atom">:zig</span>.ZestRuntime.reset()
+  }
 
-  @native <span class="hl-op">=</span> <span class="hl-string">"ZestRuntime.fail"</span>
-  <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> fail(_message <span class="hl-op">::</span> <span class="hl-type">String</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">String</span>
+  <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> fail(message <span class="hl-op">::</span> <span class="hl-type">String</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">String</span> {
+    <span class="hl-atom">:zig</span>.ZestRuntime.fail(message)
+  }
 }</code></pre>
-<p>The <code>@native = &quot;Struct.function&quot;</code> annotation tells the compiler to route calls to <code>@import(&quot;zap_runtime&quot;).Struct.function(args)</code> in the generated ZIR. No function body is needed — the annotation IS the implementation binding. The compiler has zero knowledge of specific library structs; all bindings are declared in <code>.zap</code> source files.</p>
+<p>The <code>:zig.Struct.function(args)</code> call tells the compiler to lower this expression to <code>@import(&quot;zap_runtime&quot;).Struct.function(args)</code> in the generated ZIR. The compiler has zero knowledge of specific library structs; every runtime binding lives in a <code>.zap</code> source file.</p>
 <hr>
 <h2>Architecture</h2>
 <p>Zap uses a per-struct compilation architecture with per-struct ZIR emission:</p>
@@ -476,7 +487,7 @@ process(small)  <span class="hl-comment"># i8 automatically widened to i64</span
 4. <strong>Pass 3</strong> — monomorphize generic functions, lower to IR
 5. <strong>Pass 4</strong> — run analysis pipeline (escape analysis, interprocedural summaries, region solving, lambda sets, Perceus reuse)
 6. <strong>Pass 5</strong> — emit per-struct ZIR, inject into Zig compilation, codegen</p>
-<p>Each Zap struct becomes its own Zig ZIR struct. Cross-struct calls use <code>@import(&quot;Struct&quot;).function(args)</code> chains. Namespace re-export structs are generated for hierarchical struct names (e.g., <code>Zest</code> re-exports <code>Runtime</code>, <code>Case</code>, <code>Runner</code>). <code>@native</code> functions skip ZIR emission — their calls route directly to <code>@import(&quot;zap_runtime&quot;)</code>.</p>
+<p>Each Zap struct becomes its own Zig ZIR struct. Cross-struct calls use <code>@import(&quot;Struct&quot;).function(args)</code> chains. Namespace re-export structs are generated for hierarchical struct names (e.g., <code>Zest</code> re-exports <code>Runtime</code>, <code>Case</code>, <code>Runner</code>). Direct <code>:zig.Struct.fn(...)</code> calls bypass cross-struct routing and emit <code>@import(&quot;zap_runtime&quot;).Struct.fn(...)</code> directly.</p>
 <pre><code class="language-zap">  .zap source files
       <span class="hl-op">|</span>
       v
@@ -512,7 +523,7 @@ process(small)  <span class="hl-comment"># i8 automatically widened to i64</span
       v
    Per-Struct ZIR --- each Zap <span class="hl-keyword">struct</span> <span class="hl-op">-&gt;</span> its own Zig ZIR <span class="hl-keyword">struct</span>
       <span class="hl-op">|</span>                cross-<span class="hl-keyword">struct</span> calls <span class="hl-op">-&gt;</span> @<span class="hl-keyword">import</span> chains
-      <span class="hl-op">|</span>                @native functions <span class="hl-op">-&gt;</span> @<span class="hl-keyword">import</span>(<span class="hl-string">"zap_runtime"</span>)
+      <span class="hl-op">|</span>                <span class="hl-atom">:zig</span>.X.Y(args) calls <span class="hl-op">-&gt;</span> @<span class="hl-keyword">import</span>(<span class="hl-string">"zap_runtime"</span>)
       v
    Codegen ---------- native binary (via LLVM)</code></pre>
 <hr>

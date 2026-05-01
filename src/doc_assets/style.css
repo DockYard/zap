@@ -524,6 +524,8 @@ code, pre, .signature { font-family: var(--ff-mono); font-size: 13px; }
 .sig-paren { color: var(--fg-muted); }
 .sig-separator { color: var(--fg-dim); margin: 0 4px; }
 .sig-arrow { color: var(--accent); font-weight: 600; margin: 0 10px; }
+.sig-guard-keyword { color: var(--accent); font-weight: 600; margin-left: 10px; }
+.sig-guard { color: var(--fg-muted); margin-left: 6px; }
 .sig-type-pill {
   display: inline-block;
   padding: 1px 7px;

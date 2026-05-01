@@ -1,41 +1,5 @@
 # Zest.Case
 
-Test case DSL for the Zest test framework.
-
-Provides `describe`, `test`, `assert`, `reject`, `setup`, and
-`teardown` for writing structured test cases with test tracking.
-
-Setup runs fresh before EACH test that requests context.
-Teardown runs after each test. Assertions are non-fatal.
-
-The `describe` and `test` macros expand into function declarations
-so that each test becomes a named pub function (test_*) that is
-called at struct level.
-
-## Examples
-
-    pub struct Test.MyTest {
-      use Zest.Case
-
-      describe("my feature") {
-        setup() {
-          42
-        }
-
-        test("uses context", ctx) {
-          assert(ctx == 42)
-        }
-
-        test("no context needed") {
-          assert(true)
-        }
-
-        teardown() {
-          IO.puts("cleanup")
-        }
-      }
-    }
-
 ## Functions
 
 ### begin_test/0
@@ -45,8 +9,6 @@ pub fn begin_test() -> Atom
 ```
 
 Wraps `begin_test` for explicit use.
-
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/case.zap#L95)
 
 ---
 
@@ -58,8 +20,6 @@ pub fn end_test() -> Atom
 
 Wraps `end_test` for explicit use.
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/case.zap#L104)
-
 ---
 
 ### print_result/0
@@ -69,8 +29,6 @@ pub fn print_result() -> Atom
 ```
 
 Wraps `print_result` for explicit use.
-
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/case.zap#L113)
 
 ---
 
@@ -84,8 +42,6 @@ Asserts that a boolean value is `true`.
 
 Non-fatal: returns :fail on failure, does not stop execution.
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/case.zap#L124)
-
 ---
 
 ### reject/1
@@ -97,8 +53,6 @@ pub fn reject(value :: Bool) -> String
 Asserts that a boolean value is `false`.
 
 Non-fatal: returns "F" on failure, does not stop execution.
-
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/case.zap#L140)
 
 ---
 
@@ -126,8 +80,6 @@ with begin_test/end_test/print_result tracking calls injected.
       }
     }
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/case.zap#L68)
-
 ---
 
 ### test/2
@@ -146,8 +98,6 @@ with begin_test/end_test/print_result tracking calls wrapping the body.
     test("true is true") {
       assert(true == true)
     }
-
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/case.zap#L87)
 
 ---
 
@@ -168,8 +118,6 @@ to `ctx` in each `test/3` call. Runs fresh for every test.
       connect_db()
     }
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/case.zap#L163)
-
 ---
 
 ### teardown/1
@@ -188,8 +136,6 @@ even if assertions fail (non-fatal assertions).
     teardown() {
       disconnect_db()
     }
-
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/case.zap#L180)
 
 ---
 

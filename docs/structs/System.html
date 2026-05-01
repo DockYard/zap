@@ -60,7 +60,11 @@
 <li><a href="../structs/List.html">List</a></li>
 <li><a href="../structs/Map.html">Map</a></li>
 <li><a href="../structs/Math.html">Math</a></li>
+<li><a href="../structs/Path.html">Path</a></li>
+<li><a href="../structs/Range.html">Range</a></li>
+<li><a href="../structs/SourceGraph.html">SourceGraph</a></li>
 <li><a href="../structs/String.html">String</a></li>
+<li><a href="../structs/Struct.html">Struct</a></li>
 <li class="active"><a href="../structs/System.html">System</a></li>
 <li><a href="../structs/Zest.html">Zest</a></li>
 </ul>
@@ -81,18 +85,13 @@
 <a href="https://github.com/DockYard/zap/blob/v0.1.0/./lib/system.zap" class="source-file">./lib/system.zap</a>
 </div>
 </div>
-<p class="tagline">Functions for interacting with the operating system.</p>
-<div class="struct_doc">
-<p>Functions for interacting with the operating system.</p>
-<p>Provides access to command-line arguments, environment variables,
-and build-time configuration options.</p>
-</div>
 <h2 id="functions">Functions</h2>
 <table class="summary">
 <tr><td class="summary-name"><a href="#arg_count-0">arg_count/0</a></td><td class="summary-doc">Returns the number of command-line arguments passed to the program.</td></tr>
 <tr><td class="summary-name"><a href="#arg_at-1">arg_at/1</a></td><td class="summary-doc">Returns the command-line argument at the given index.</td></tr>
 <tr><td class="summary-name"><a href="#get_env-1">get_env/1</a></td><td class="summary-doc">Reads an environment variable by name.</td></tr>
 <tr><td class="summary-name"><a href="#get_build_opt-1">get_build_opt/1</a></td><td class="summary-doc">Reads a build-time option by name.</td></tr>
+<tr><td class="summary-name"><a href="#cwd-0">cwd/0</a></td><td class="summary-doc">Returns the current working directory.</td></tr>
 </table>
 <h2>Function Details</h2>
 <div class="function-detail" id="arg_count-0">
@@ -164,6 +163,20 @@ Returns an empty string if the option is not set.</p>
 <pre><code class="language-zap">System.get_build_opt(<span class="hl-string">"optimize"</span>)  <span class="hl-comment"># =&gt; &quot;release_fast&quot;</span></code></pre>
 </div>
 </div>
+<div class="function-detail" id="cwd-0">
+<div class="function-header">
+<h3>cwd<span class="arity">/0</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#cwd-0" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">cwd</span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="function-doc">
+<p>Returns the current working directory.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">System.cwd()  <span class="hl-comment"># =&gt; &quot;/Users/dev/project&quot;</span></code></pre>
+</div>
+</div>
 </main>
 <aside class="toc">
 <h3>On This Page</h3>
@@ -173,6 +186,7 @@ Returns an empty string if the option is not set.</p>
 <li><a href="#arg_at-1">arg_at/1</a></li>
 <li><a href="#get_env-1">get_env/1</a></li>
 <li><a href="#get_build_opt-1">get_build_opt/1</a></li>
+<li><a href="#cwd-0">cwd/0</a></li>
 </ul>
 </aside>
 </div>

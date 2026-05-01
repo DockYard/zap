@@ -273,7 +273,9 @@ pub const TypeStore = struct {
         const bt = std.meta.activeTag(b);
         if (at != bt) return false;
         return switch (a) {
-            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type, .term_type => true,
+            .int => |i| i.signedness == b.int.signedness and i.bits == b.int.bits,
+            .float => |f| f.bits == b.float.bits,
+            .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type, .term_type => true,
             .type_var => false,
             .list => |l| l.element == b.list.element,
             .tuple => |t| std.mem.eql(TypeId, t.elements, b.tuple.elements),
@@ -484,14 +486,22 @@ pub const TypeStore = struct {
     }
 
     /// Check if a value of type `from` can be implicitly widened to type `to`.
-    /// Widening is lossless numeric coercion:
-    ///   Integer: i8→i16→i32→i64, u8→u16→u32→u64
-    ///   Unsigned→Signed: u8→i16, u16→i32, u32→i64 (needs strictly more bits)
-    ///   Float: f16→f32→f64
-    ///   No cross-family (int↔float) widening.
+    /// Widening is a fallback after exact overload selection and never crosses
+    /// numeric families:
+    ///   Signed integers: i8→i16→i32→i64
+    ///   Unsigned integers: u8→u16→u32→u64
+    ///   Floats: f16→f32→f64
+    /// No signed↔unsigned or int↔float widening is implicit.
     pub fn canWidenTo(self: *const TypeStore, from: TypeId, to: TypeId) bool {
-        if (from == to) return false;
-        if (from == UNKNOWN or to == UNKNOWN) return false;
+        return self.wideningCost(from, to) != null;
+    }
+
+    /// Return the bit-width delta for a valid implicit widening. Lower costs
+    /// are more specific during overload fallback (`i8 -> i16` beats
+    /// `i8 -> i64`). Null means no implicit widening is permitted.
+    pub fn wideningCost(self: *const TypeStore, from: TypeId, to: TypeId) ?u32 {
+        if (from == to) return null;
+        if (from == UNKNOWN or to == UNKNOWN) return null;
         const from_t = self.getType(from);
         const to_t = self.getType(to);
 
@@ -500,23 +510,29 @@ pub const TypeStore = struct {
             const f = from_t.int;
             const t = to_t.int;
             if (f.signedness == t.signedness) {
-                // Same signedness: just need wider bits
-                return t.bits > f.bits;
+                if (t.bits > f.bits) return @as(u32, t.bits - f.bits);
+                return null;
             }
-            // Unsigned → Signed: target must have strictly more bits
-            if (f.signedness == .unsigned and t.signedness == .signed) {
-                return t.bits > f.bits;
-            }
-            // Signed → Unsigned: never implicit (lossy for negatives)
-            return false;
+            return null;
         }
 
         // Float widening
         if (from_t == .float and to_t == .float) {
-            return to_t.float.bits > from_t.float.bits;
+            if (to_t.float.bits > from_t.float.bits) return @as(u32, to_t.float.bits - from_t.float.bits);
+            return null;
         }
 
-        return false;
+        return null;
+    }
+
+    /// Score a call argument against an expected parameter type.
+    /// Exact compatibility is 0; widening fallback is 1 + bit delta; null
+    /// means the argument cannot satisfy the parameter.
+    pub fn callMatchCost(self: *const TypeStore, actual: TypeId, expected: TypeId) ?u32 {
+        if (expected == UNKNOWN or actual == UNKNOWN or actual == ERROR) return 0;
+        if (self.typeEquals(actual, expected)) return 0;
+        if (self.wideningCost(actual, expected)) |cost| return cost + 1;
+        return null;
     }
 
     // ============================================================
@@ -1105,6 +1121,12 @@ pub const TypeChecker = struct {
         severity: ?@import("diagnostics.zig").Severity = null,
     };
 
+    const ResolvedCallSignature = struct {
+        signature: FunctionSignature,
+        family_id: scope_mod.FunctionFamilyId,
+        clause_index: u32,
+    };
+
     pub fn init(allocator: std.mem.Allocator, interner: *const ast.StringInterner, graph: *scope_mod.ScopeGraph) TypeChecker {
         const store = allocator.create(TypeStore) catch @panic("OOM");
         store.* = TypeStore.init(allocator, interner);
@@ -1638,19 +1660,16 @@ pub const TypeChecker = struct {
         return try self.store.addFunctionType(params, return_type, param_ownerships, .shared);
     }
 
-    fn resolveFamilySignature(self: *TypeChecker, scope_id: scope_mod.ScopeId, name: ast.StringId, arity: u32) !?FunctionSignature {
-        // Allow calls with fewer arguments than the declared arity when
-        // every trailing parameter has a default value. The codegen
-        // backend inlines the defaults at the call site, so the type
-        // checker only needs to validate the supplied arguments and
-        // return a signature truncated to the call-site arity.
-        const resolved = self.graph.resolveFamilyAllowingDefaults(scope_id, name, arity) orelse return null;
-        const family = self.graph.getFamily(resolved.family_id);
-        if (family.clauses.items.len == 0) return null;
-        const clause_ref = family.clauses.items[0];
+    fn resolveClauseSignature(
+        self: *TypeChecker,
+        name: ast.StringId,
+        arity: u32,
+        declared_arity: u32,
+        clause_ref: scope_mod.FunctionClauseRef,
+    ) !?FunctionSignature {
         if (clause_ref.clause_index >= clause_ref.decl.clauses.len) return null;
         const clause = clause_ref.decl.clauses[clause_ref.clause_index];
-        const truncate_to_call_arity = resolved.declared_arity != arity;
+        const truncate_to_call_arity = declared_arity != arity;
 
         // If the resolved family is an impl function, temporarily activate
         // that impl's type-parameter scope so references like `K`/`V` in
@@ -1743,6 +1762,78 @@ pub const TypeChecker = struct {
             .return_type = return_type,
             .return_ownership = self.defaultOwnershipForType(return_type),
         };
+    }
+
+    fn resolveFamilySignature(self: *TypeChecker, scope_id: scope_mod.ScopeId, name: ast.StringId, arity: u32) !?FunctionSignature {
+        // Allow calls with fewer arguments than the declared arity when
+        // every trailing parameter has a default value. The codegen
+        // backend inlines the defaults at the call site, so the type
+        // checker only needs to validate the supplied arguments and
+        // return a signature truncated to the call-site arity.
+        const resolved = self.graph.resolveFamilyAllowingDefaults(scope_id, name, arity) orelse return null;
+        const family = self.graph.getFamily(resolved.family_id);
+        if (family.clauses.items.len == 0) return null;
+        return try self.resolveClauseSignature(name, arity, resolved.declared_arity, family.clauses.items[0]);
+    }
+
+    fn resolveFamilyCallSignature(
+        self: *TypeChecker,
+        scope_id: scope_mod.ScopeId,
+        name: ast.StringId,
+        arity: u32,
+        arg_types: []const TypeId,
+    ) !?ResolvedCallSignature {
+        const resolved = self.graph.resolveFamilyAllowingDefaults(scope_id, name, arity) orelse return null;
+        const family = self.graph.getFamily(resolved.family_id);
+        if (family.clauses.items.len == 0) return null;
+
+        var best_signature: ?FunctionSignature = null;
+        var best_clause_index: u32 = 0;
+        var best_cost: u32 = std.math.maxInt(u32);
+
+        for (family.clauses.items, 0..) |clause_ref, family_clause_index| {
+            const signature = (try self.resolveClauseSignature(name, arity, resolved.declared_arity, clause_ref)) orelse continue;
+            const cost = self.signatureCallMatchCost(signature, arg_types) orelse continue;
+            if (best_signature == null or cost < best_cost) {
+                best_signature = signature;
+                best_clause_index = @intCast(family_clause_index);
+                best_cost = cost;
+                if (cost == 0) break;
+            }
+        }
+
+        if (best_signature) |signature| {
+            return .{
+                .signature = signature,
+                .family_id = resolved.family_id,
+                .clause_index = best_clause_index,
+            };
+        }
+
+        const fallback = (try self.resolveClauseSignature(name, arity, resolved.declared_arity, family.clauses.items[0])) orelse return null;
+        return .{
+            .signature = fallback,
+            .family_id = resolved.family_id,
+            .clause_index = 0,
+        };
+    }
+
+    fn signatureCallMatchCost(self: *const TypeChecker, signature: FunctionSignature, arg_types: []const TypeId) ?u32 {
+        var total: u32 = 0;
+        const count = @min(signature.params.len, arg_types.len);
+        for (arg_types[0..count], signature.params[0..count]) |arg_type, expected| {
+            const cost = self.store.callMatchCost(arg_type, expected) orelse return null;
+            total +|= cost;
+        }
+        return total;
+    }
+
+    fn inferCallArgTypes(self: *TypeChecker, args: []const *const ast.Expr) ![]const TypeId {
+        const arg_types = try self.allocator.alloc(TypeId, args.len);
+        for (args, 0..) |arg, idx| {
+            arg_types[idx] = try self.inferExpr(arg);
+        }
+        return arg_types;
     }
 
     /// True when `name` denotes a compiler-generated helper whose body and
@@ -4119,8 +4210,12 @@ pub const TypeChecker = struct {
                     }
                 }
 
-                // Check function families
-                if (try self.resolveFamilySignature(scope_id, vr.name, arity)) |signature| {
+                // Check function families. Candidate selection is type-aware:
+                // exact typed clauses win first, then same-family numeric
+                // widening is considered as a fallback.
+                const arg_types = try self.inferCallArgTypes(call.args);
+                if (try self.resolveFamilyCallSignature(scope_id, vr.name, arity, arg_types)) |resolved_call| {
+                    const signature = resolved_call.signature;
                     const safe_params = self.safeClosureParamsForCurrentCallee(vr.name, arity);
                     for (call.args, 0..) |arg, idx| {
                         if (arg.* != .var_ref) continue;
@@ -4280,7 +4375,7 @@ pub const TypeChecker = struct {
                         const arg_type = try self.inferExpr(arg);
                         if (idx < signature.params.len) {
                             const expected = signature.params[idx];
-                            if (expected != TypeStore.UNKNOWN and arg_type != TypeStore.UNKNOWN and arg_type != TypeStore.ERROR and !self.store.typeEquals(arg_type, expected)) {
+                            if (expected != TypeStore.UNKNOWN and arg_type != TypeStore.UNKNOWN and arg_type != TypeStore.ERROR and self.store.callMatchCost(arg_type, expected) == null) {
                                 try self.reportArgumentTypeMismatch(arg, idx, expected, arg_type);
                             }
                         }
@@ -4373,7 +4468,9 @@ pub const TypeChecker = struct {
                             }
                         }
                         if (match) {
-                            if (try self.resolveFamilySignature(mod_entry.scope_id, fa.field, arity)) |signature| {
+                            const arg_types = try self.inferCallArgTypes(call.args);
+                            if (try self.resolveFamilyCallSignature(mod_entry.scope_id, fa.field, arity, arg_types)) |resolved_call| {
+                                const signature = resolved_call.signature;
                                 // Check if the signature is generic (contains type variables)
                                 var mod_sig_is_generic = false;
                                 for (signature.params) |param_type| {
@@ -4426,7 +4523,7 @@ pub const TypeChecker = struct {
                                     const arg_type = self.inferExpr(arg) catch TypeStore.UNKNOWN;
                                     if (idx < signature.params.len) {
                                         const expected = signature.params[idx];
-                                        if (expected != TypeStore.UNKNOWN and arg_type != TypeStore.UNKNOWN and arg_type != TypeStore.ERROR and !self.store.typeEquals(arg_type, expected)) {
+                                        if (expected != TypeStore.UNKNOWN and arg_type != TypeStore.UNKNOWN and arg_type != TypeStore.ERROR and self.store.callMatchCost(arg_type, expected) == null) {
                                             self.reportArgumentTypeMismatch(arg, idx, expected, arg_type) catch {};
                                         }
                                     }
@@ -7695,4 +7792,32 @@ test "bare pipe lhs |> f() resolves rhs at arity 1" {
     for (checker.errors.items) |type_err| {
         try std.testing.expect(std.mem.indexOf(u8, type_err.message, "double/0") == null);
     }
+}
+
+test "numeric call matching prefers exact type over widening" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var store = TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+
+    try std.testing.expectEqual(@as(?u32, 0), store.callMatchCost(TypeStore.I32, TypeStore.I32));
+    try std.testing.expectEqual(@as(?u32, 33), store.callMatchCost(TypeStore.I32, TypeStore.I64));
+    try std.testing.expectEqual(@as(?u32, 33), store.callMatchCost(TypeStore.U32, TypeStore.U64));
+    try std.testing.expectEqual(@as(?u32, 33), store.callMatchCost(TypeStore.F32, TypeStore.F64));
+}
+
+test "numeric widening stays within signed unsigned and float families" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var store = TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+
+    try std.testing.expect(store.canWidenTo(TypeStore.I8, TypeStore.I64));
+    try std.testing.expect(store.canWidenTo(TypeStore.U8, TypeStore.U64));
+    try std.testing.expect(store.canWidenTo(TypeStore.F16, TypeStore.F64));
+
+    try std.testing.expect(!store.canWidenTo(TypeStore.U32, TypeStore.I64));
+    try std.testing.expect(!store.canWidenTo(TypeStore.I32, TypeStore.U64));
+    try std.testing.expect(!store.canWidenTo(TypeStore.I32, TypeStore.F64));
+    try std.testing.expect(!store.canWidenTo(TypeStore.F32, TypeStore.I64));
 }

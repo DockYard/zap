@@ -1,20 +1,5 @@
 # Atom
 
-Functions for working with atoms.
-
-Atoms are constants whose name is their value. They are
-interned — each unique name maps to a single atom ID,
-making equality comparison constant-time.
-
-Atoms are written with a leading colon: `:ok`, `:error`,
-`:my_atom`.
-
-## Examples
-
-    :ok == :ok        # => true
-    :ok == :error     # => false
-    Atom.to_string(:hello)  # => "hello"
-
 ## Functions
 
 ### to_string/1

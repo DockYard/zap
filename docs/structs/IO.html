@@ -60,7 +60,11 @@
 <li><a href="../structs/List.html">List</a></li>
 <li><a href="../structs/Map.html">Map</a></li>
 <li><a href="../structs/Math.html">Math</a></li>
+<li><a href="../structs/Path.html">Path</a></li>
+<li><a href="../structs/Range.html">Range</a></li>
+<li><a href="../structs/SourceGraph.html">SourceGraph</a></li>
 <li><a href="../structs/String.html">String</a></li>
+<li><a href="../structs/Struct.html">Struct</a></li>
 <li><a href="../structs/System.html">System</a></li>
 <li><a href="../structs/Zest.html">Zest</a></li>
 </ul>
@@ -81,20 +85,17 @@
 <a href="https://github.com/DockYard/zap/blob/v0.1.0/./lib/io.zap" class="source-file">./lib/io.zap</a>
 </div>
 </div>
-<p class="tagline">Functions for standard input/output operations.</p>
-<div class="struct_doc">
-<p>Functions for standard input/output operations.</p>
-<p><code>IO</code> provides the basic building blocks for printing to stdout.
-All functions return their input, making them composable in
-pipe chains.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap">IO.puts(<span class="hl-string">"Hello, world!"</span>)
-<span class="hl-string">"result"</span> <span class="hl-op">|&gt;</span> IO.puts()</code></pre>
-</div>
 <h2 id="functions">Functions</h2>
 <table class="summary">
 <tr><td class="summary-name"><a href="#puts-1">puts/1</a></td><td class="summary-doc">Prints a value to standard output followed by a newline.</td></tr>
 <tr><td class="summary-name"><a href="#print_str-1">print_str/1</a></td><td class="summary-doc">Prints a value to standard output without a trailing newline.</td></tr>
+<tr><td class="summary-name"><a href="#gets-0">gets/0</a></td><td class="summary-doc">Reads a line from standard input.</td></tr>
+<tr><td class="summary-name"><a href="#warn-1">warn/1</a></td><td class="summary-doc">Prints a message to standard error followed by a newline.</td></tr>
+<tr><td class="summary-name"><a href="#mode-1">mode/1</a></td><td class="summary-doc">Switches the terminal input mode.</td></tr>
+<tr><td class="summary-name"><a href="#mode-2">mode/2</a></td><td class="summary-doc">Switches terminal mode, runs the callback, then restores
+normal mode automatically.</td></tr>
+<tr><td class="summary-name"><a href="#get_char-0">get_char/0</a></td><td class="summary-doc">Reads a single character from standard input.</td></tr>
+<tr><td class="summary-name"><a href="#try_get_char-0">try_get_char/0</a></td><td class="summary-doc">Non-blocking read of a single character from standard input.</td></tr>
 </table>
 <h2>Function Details</h2>
 <div class="function-detail" id="puts-1">
@@ -137,6 +138,114 @@ indicators or prompts.</p>
 <span class="hl-comment"># =&gt; prints &quot;loading...&quot; without newline</span></code></pre>
 </div>
 </div>
+<div class="function-detail" id="gets-0">
+<div class="function-header">
+<h3>gets<span class="arity">/0</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#gets-0" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">gets</span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="function-doc">
+<p>Reads a line from standard input.</p>
+<p>Returns the line without the trailing newline.
+Returns an empty string on EOF.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">name <span class="hl-op">=</span> IO.gets()
+IO.puts(<span class="hl-string">"Hello, "</span> <span class="hl-op">&lt;&gt;</span> name)</code></pre>
+</div>
+</div>
+<div class="function-detail" id="warn-1">
+<div class="function-header">
+<h3>warn<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#warn-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">warn</span><span class="sig-paren">(</span>message<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="function-doc">
+<p>Prints a message to standard error followed by a newline.</p>
+<p>Useful for logging and error messages that should not
+mix with normal output.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">IO.warn(<span class="hl-string">"something went wrong"</span>)</code></pre>
+</div>
+</div>
+<div class="function-detail" id="mode-1">
+<div class="function-header">
+<h3>mode<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#mode-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">mode</span><span class="sig-paren">(</span>mode_value<span class="sig-separator">::</span><span class="sig-type-pill">IO.Mode</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">IO.Mode</span></code></div>
+<div class="function-doc">
+<p>Switches the terminal input mode.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">IO.mode(IO.Mode.Raw)      <span class="hl-comment"># keypress-at-a-time, no echo</span>
+key <span class="hl-op">=</span> IO.get_char()
+IO.mode(IO.Mode.Normal)   <span class="hl-comment"># restore line-buffered mode</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="mode-2">
+<div class="function-header">
+<h3>mode<span class="arity">/2</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#mode-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">mode</span><span class="sig-paren">(</span>mode_value<span class="sig-separator">::</span><span class="sig-type-pill">IO.Mode</span><span class="sig-paren">, </span>callback<span class="sig-separator">::</span><span class="sig-type-pill">() -&gt; result</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">result</span></code></div>
+<div class="function-doc">
+<p>Switches terminal mode, runs the callback, then restores
+normal mode automatically.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">IO.mode(IO.Mode.Raw, <span class="hl-keyword">fn</span>() <span class="hl-op">-&gt;</span> <span class="hl-type">i64</span> {
+  key <span class="hl-op">=</span> IO.get_char()
+  IO.puts(<span class="hl-string">"You pressed: "</span> <span class="hl-op">&lt;&gt;</span> key)
+  <span class="hl-number">0</span>
+})</code></pre>
+</div>
+</div>
+<div class="function-detail" id="get_char-0">
+<div class="function-header">
+<h3>get_char<span class="arity">/0</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#get_char-0" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">get_char</span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="function-doc">
+<p>Reads a single character from standard input.</p>
+<p>In raw mode, returns immediately after one keypress.
+In normal mode, blocks until Enter then returns the first character.</p>
+<p>Returns a single-character string, or empty string on EOF.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">IO.mode(<span class="hl-number">1</span>)
+key <span class="hl-op">=</span> IO.get_char()
+IO.mode(<span class="hl-number">0</span>)</code></pre>
+</div>
+</div>
+<div class="function-detail" id="try_get_char-0">
+<div class="function-header">
+<h3>try_get_char<span class="arity">/0</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#try_get_char-0" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">try_get_char</span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="function-doc">
+<p>Non-blocking read of a single character from standard input.</p>
+<p>Returns a single-character string if a key is available, or
+an empty string if no input is waiting. Must be in raw mode
+for meaningful use.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">IO.mode(IO.Mode.Raw)
+key <span class="hl-op">=</span> IO.try_get_char()
+<span class="hl-keyword">if</span> key <span class="hl-op">==</span> <span class="hl-string">""</span> {
+  IO.puts(<span class="hl-string">"no key pressed"</span>)
+}</code></pre>
+</div>
+</div>
 </main>
 <aside class="toc">
 <h3>On This Page</h3>
@@ -144,6 +253,12 @@ indicators or prompts.</p>
 <li class="toc-section">Functions</li>
 <li><a href="#puts-1">puts/1</a></li>
 <li><a href="#print_str-1">print_str/1</a></li>
+<li><a href="#gets-0">gets/0</a></li>
+<li><a href="#warn-1">warn/1</a></li>
+<li><a href="#mode-1">mode/1</a></li>
+<li><a href="#mode-2">mode/2</a></li>
+<li><a href="#get_char-0">get_char/0</a></li>
+<li><a href="#try_get_char-0">try_get_char/0</a></li>
 </ul>
 </aside>
 </div>

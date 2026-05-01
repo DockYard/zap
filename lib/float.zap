@@ -13,185 +13,91 @@
 
   The default float type for literals is `f64`.
 
-  ## Implicit Widening
+  ## Call Resolution
 
-  Zap automatically widens narrower float types to wider ones at
-  function call sites: `f16` \u{2192} `f32` \u{2192} `f64`. This is
-  lossless and zero-cost — the compiler inserts the conversion
-  automatically.
+  Zap first looks for an exact typed function clause. If no exact
+  clause exists, it may widen within the float family:
 
-  Integer-to-float conversion is **not** implicit because large
-  integers cannot be represented exactly in floating-point. Use
+  `f16` -> `f32` -> `f64`
+
+  Integer-to-float conversion is not implicit because large integers
+  cannot always be represented exactly in floating-point. Use
   `Integer.to_float/1` when needed.
   """
 
 pub struct Float {
-  @doc = """
-    Converts a floating-point number to its string representation.
+  @doc = "Converts a floating-point number to its string representation."
 
-    ## Examples
+  pub fn to_string(value :: f16) -> String { :zig.Float.to_string_f16(value) }
+  pub fn to_string(value :: f32) -> String { :zig.Float.to_string_f32(value) }
+  pub fn to_string(value :: f64) -> String { :zig.Float.to_string_f64(value) }
 
-        Float.to_string(3.14)   # => "3.14"
-        Float.to_string(-0.5)   # => "-0.5"
-    """
+  @doc = "Returns the absolute value of a float."
 
-  pub fn to_string(value :: f64) -> String {
-    :zig.Float.to_string(value)
-  }
+  pub fn abs(value :: f16) -> f16 { :zig.Float.abs_f16(value) }
+  pub fn abs(value :: f32) -> f32 { :zig.Float.abs_f32(value) }
+  pub fn abs(value :: f64) -> f64 { :zig.Float.abs_f64(value) }
 
-  @doc = """
-    Returns the absolute value of a float.
+  @doc = "Returns the larger of two floats."
 
-    ## Examples
+  pub fn max(first :: f16, second :: f16) -> f16 { :zig.Float.max_f16(first, second) }
+  pub fn max(first :: f32, second :: f32) -> f32 { :zig.Float.max_f32(first, second) }
+  pub fn max(first :: f64, second :: f64) -> f64 { :zig.Float.max_f64(first, second) }
 
-        Float.abs(-3.14)  # => 3.14
-        Float.abs(2.5)    # => 2.5
-        Float.abs(0.0)    # => 0.0
-    """
+  @doc = "Returns the smaller of two floats."
 
-  pub fn abs(value :: f64) -> f64 {
-    :zig.Float.abs(value)
-  }
+  pub fn min(first :: f16, second :: f16) -> f16 { :zig.Float.min_f16(first, second) }
+  pub fn min(first :: f32, second :: f32) -> f32 { :zig.Float.min_f32(first, second) }
+  pub fn min(first :: f64, second :: f64) -> f64 { :zig.Float.min_f64(first, second) }
 
   @doc = """
-    Returns the larger of two floats.
-
-    ## Examples
-
-        Float.max(3.0, 7.0)    # => 7.0
-        Float.max(10.5, 2.3)   # => 10.5
-    """
-
-  pub fn max(first :: f64, second :: f64) -> f64 {
-    :zig.Float.max(first, second)
-  }
-
-  @doc = """
-    Returns the smaller of two floats.
-
-    ## Examples
-
-        Float.min(3.0, 7.0)    # => 3.0
-        Float.min(10.5, 2.3)   # => 2.3
-    """
-
-  pub fn min(first :: f64, second :: f64) -> f64 {
-    :zig.Float.min(first, second)
-  }
-
-  @doc = """
-    Parses a string into a float. Returns 0.0 if the string
-    is not a valid float representation.
-
-    ## Examples
-
-        Float.parse("3.14")    # => 3.14
-        Float.parse("-0.5")    # => -0.5
-        Float.parse("hello")   # => 0.0
+    Parses a string into a float. Returns 0.0 if the string is not
+    a valid float representation.
     """
 
   pub fn parse(input :: String) -> f64 {
     :zig.Float.parse(input)
   }
 
-  @doc = """
-    Rounds a float to the nearest integer value, returned as a float.
-    Rounds half-values away from zero.
+  @doc = "Rounds a float to the nearest integer value, returned as a float."
 
-    ## Examples
+  pub fn round(value :: f16) -> f16 { :zig.Float.round_f16(value) }
+  pub fn round(value :: f32) -> f32 { :zig.Float.round_f32(value) }
+  pub fn round(value :: f64) -> f64 { :zig.Float.round_f64(value) }
 
-        Float.round(3.2)   # => 3.0
-        Float.round(3.7)   # => 4.0
-        Float.round(-2.5)  # => -3.0
-    """
+  @doc = "Returns the largest integer value less than or equal to the given float."
 
-  pub fn round(value :: f64) -> f64 {
-    :zig.Float.round(value)
-  }
+  pub fn floor(value :: f16) -> f16 { :zig.Float.floor_f16(value) }
+  pub fn floor(value :: f32) -> f32 { :zig.Float.floor_f32(value) }
+  pub fn floor(value :: f64) -> f64 { :zig.Float.floor_f64(value) }
 
-  @doc = """
-    Returns the largest integer value less than or equal to the
-    given float, returned as a float.
+  @doc = "Returns the smallest integer value greater than or equal to the given float."
 
-    ## Examples
+  pub fn ceil(value :: f16) -> f16 { :zig.Float.ceil_f16(value) }
+  pub fn ceil(value :: f32) -> f32 { :zig.Float.ceil_f32(value) }
+  pub fn ceil(value :: f64) -> f64 { :zig.Float.ceil_f64(value) }
 
-        Float.floor(3.7)   # => 3.0
-        Float.floor(3.0)   # => 3.0
-        Float.floor(-2.3)  # => -3.0
-    """
+  @doc = "Truncates a float toward zero, removing the fractional part."
 
-  pub fn floor(value :: f64) -> f64 {
-    :zig.Float.floor(value)
-  }
+  pub fn truncate(value :: f16) -> f16 { :zig.Float.trunc_f16(value) }
+  pub fn truncate(value :: f32) -> f32 { :zig.Float.trunc_f32(value) }
+  pub fn truncate(value :: f64) -> f64 { :zig.Float.trunc_f64(value) }
 
-  @doc = """
-    Returns the smallest integer value greater than or equal to
-    the given float, returned as a float.
+  @doc = "Converts a float to an integer by truncating toward zero."
 
-    ## Examples
+  pub fn to_integer(value :: f16) -> i64 { :zig.Float.to_i64_f16(value) }
+  pub fn to_integer(value :: f32) -> i64 { :zig.Float.to_i64_f32(value) }
+  pub fn to_integer(value :: f64) -> i64 { :zig.Float.to_i64_f64(value) }
 
-        Float.ceil(3.2)   # => 4.0
-        Float.ceil(3.0)   # => 3.0
-        Float.ceil(-2.7)  # => -2.0
-    """
+  @doc = "Clamps a float to be within the given range."
 
-  pub fn ceil(value :: f64) -> f64 {
-    :zig.Float.ceil(value)
-  }
-
-  @doc = """
-    Truncates a float toward zero, removing the fractional part.
-    Returned as a float.
-
-    ## Examples
-
-        Float.truncate(3.7)   # => 3.0
-        Float.truncate(-2.9)  # => -2.0
-        Float.truncate(5.0)   # => 5.0
-    """
-
-  pub fn truncate(value :: f64) -> f64 {
-    :zig.Float.trunc(value)
-  }
-
-  @doc = """
-    Converts a float to an integer by truncating toward zero.
-
-    ## Examples
-
-        Float.to_integer(3.7)   # => 3
-        Float.to_integer(-2.9)  # => -2
-        Float.to_integer(5.0)   # => 5
-    """
-
-  pub fn to_integer(value :: f64) -> i64 {
-    :zig.Float.to_i64(value)
-  }
-
-  @doc = """
-    Clamps a float to be within the given range.
-
-    ## Examples
-
-        Float.clamp(15.0, 0.0, 10.0)  # => 10.0
-        Float.clamp(-5.0, 0.0, 10.0)  # => 0.0
-        Float.clamp(5.0, 0.0, 10.0)   # => 5.0
-    """
-
-  pub fn clamp(value :: f64, lower :: f64, upper :: f64) -> f64 {
-    Float.min(Float.max(value, lower), upper)
-  }
+  pub fn clamp(value :: f16, lower :: f16, upper :: f16) -> f16 { :zig.Float.clamp_f16(value, lower, upper) }
+  pub fn clamp(value :: f32, lower :: f32, upper :: f32) -> f32 { :zig.Float.clamp_f32(value, lower, upper) }
+  pub fn clamp(value :: f64, lower :: f64, upper :: f64) -> f64 { :zig.Float.clamp_f64(value, lower, upper) }
 
   @doc = """
     Floors a float and converts directly to an integer in one step.
     More efficient than `Float.to_integer(Float.floor(x))`.
-    Uses Zig 0.16's direct float-to-integer conversion builtins.
-
-    ## Examples
-
-        Float.floor_to_integer(3.7)   # => 3
-        Float.floor_to_integer(-2.3)  # => -3
-        Float.floor_to_integer(5.0)   # => 5
     """
 
   pub fn floor_to_integer(value :: f64) -> i64 {
@@ -201,13 +107,6 @@ pub struct Float {
   @doc = """
     Ceils a float and converts directly to an integer in one step.
     More efficient than `Float.to_integer(Float.ceil(x))`.
-    Uses Zig 0.16's direct float-to-integer conversion builtins.
-
-    ## Examples
-
-        Float.ceil_to_integer(3.2)   # => 4
-        Float.ceil_to_integer(-2.7)  # => -2
-        Float.ceil_to_integer(5.0)   # => 5
     """
 
   pub fn ceil_to_integer(value :: f64) -> i64 {
@@ -217,13 +116,6 @@ pub struct Float {
   @doc = """
     Rounds a float and converts directly to an integer in one step.
     More efficient than `Float.to_integer(Float.round(x))`.
-    Uses Zig 0.16's direct float-to-integer conversion builtins.
-
-    ## Examples
-
-        Float.round_to_integer(3.2)   # => 3
-        Float.round_to_integer(3.7)   # => 4
-        Float.round_to_integer(-2.5)  # => -3
     """
 
   pub fn round_to_integer(value :: f64) -> i64 {

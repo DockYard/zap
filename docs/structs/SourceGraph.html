@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Bool — zap_stdlib</title>
+<title>SourceGraph — zap_stdlib</title>
 <link rel="stylesheet" href="../style.css">
 <meta name="zap-docs-base" content="../">
 </head>
@@ -49,7 +49,7 @@
 <h4>Structs</h4>
 <ul>
 <li><a href="../structs/Atom.html">Atom</a></li>
-<li class="active"><a href="../structs/Bool.html">Bool</a></li>
+<li><a href="../structs/Bool.html">Bool</a></li>
 <li><a href="../structs/Enum.html">Enum</a></li>
 <li><a href="../structs/File.html">File</a></li>
 <li><a href="../structs/Float.html">Float</a></li>
@@ -62,7 +62,7 @@
 <li><a href="../structs/Math.html">Math</a></li>
 <li><a href="../structs/Path.html">Path</a></li>
 <li><a href="../structs/Range.html">Range</a></li>
-<li><a href="../structs/SourceGraph.html">SourceGraph</a></li>
+<li class="active"><a href="../structs/SourceGraph.html">SourceGraph</a></li>
 <li><a href="../structs/String.html">String</a></li>
 <li><a href="../structs/Struct.html">Struct</a></li>
 <li><a href="../structs/System.html">System</a></li>
@@ -79,55 +79,37 @@
 </nav>
 <main class="content">
 <div class="title-row">
-<h1>Bool</h1>
+<h1>SourceGraph</h1>
 <div class="title-meta">
 <span class="pub-struct-pill">pub struct</span>
-<a href="https://github.com/DockYard/zap/blob/v0.1.0/./lib/bool.zap" class="source-file">./lib/bool.zap</a>
+<a href="https://github.com/DockYard/zap/blob/v0.1.0/./lib/source_graph.zap" class="source-file">./lib/source_graph.zap</a>
 </div>
 </div>
-<h2 id="functions">Functions</h2>
+<h2 id="macros">Macros</h2>
 <table class="summary">
-<tr><td class="summary-name"><a href="#to_string-1">to_string/1</a></td><td class="summary-doc">Converts a boolean to its string representation.</td></tr>
-<tr><td class="summary-name"><a href="#negate-1">negate/1</a></td><td class="summary-doc">Returns the logical negation of a boolean.</td></tr>
+<tr><td class="summary-name"><a href="#structs-1">structs/1</a></td><td class="summary-doc">Returns struct references declared in the exact source paths provided.</td></tr>
 </table>
-<h2>Function Details</h2>
-<div class="function-detail" id="to_string-1">
+<h2>Macro Details</h2>
+<div class="function-detail" id="structs-1">
 <div class="function-header">
-<h3>to_string<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
+<h3>structs<span class="arity">/1</span></h3>
+<span class="badge">pub macro</span>
 <div style="flex:1"></div>
-<a href="#to_string-1" class="anchor-link">#</a>
+<a href="#structs-1" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">to_string</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">Bool</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="signature"><code><span class="sig-name">structs</span><span class="sig-paren">(</span>paths<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
 <div class="function-doc">
-<p>Converts a boolean to its string representation.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap"><span class="hl-type">Bool</span>.to_string(<span class="hl-builtin">true</span>)   <span class="hl-comment"># =&gt; &quot;true&quot;</span>
-<span class="hl-type">Bool</span>.to_string(<span class="hl-builtin">false</span>)  <span class="hl-comment"># =&gt; &quot;false&quot;</span></code></pre>
-</div>
-</div>
-<div class="function-detail" id="negate-1">
-<div class="function-header">
-<h3>negate<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
-<div style="flex:1"></div>
-<a href="#negate-1" class="anchor-link">#</a>
-</div>
-<div class="signature"><code><span class="sig-name">negate</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">Bool</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
-<div class="function-doc">
-<p>Returns the logical negation of a boolean.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap"><span class="hl-type">Bool</span>.negate(<span class="hl-builtin">true</span>)   <span class="hl-comment"># =&gt; false</span>
-<span class="hl-type">Bool</span>.negate(<span class="hl-builtin">false</span>)  <span class="hl-comment"># =&gt; true</span></code></pre>
+<p>Returns struct references declared in the exact source paths provided.</p>
+<p>Each returned reference can be unquoted into generated code as a
+qualified struct name. Pass a string path or a list of string paths.</p>
 </div>
 </div>
 </main>
 <aside class="toc">
 <h3>On This Page</h3>
 <ul>
-<li class="toc-section">Functions</li>
-<li><a href="#to_string-1">to_string/1</a></li>
-<li><a href="#negate-1">negate/1</a></li>
+<li class="toc-section">Macros</li>
+<li><a href="#structs-1">structs/1</a></li>
 </ul>
 </aside>
 </div>

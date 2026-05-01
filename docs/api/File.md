@@ -1,16 +1,5 @@
 # File
 
-Functions for reading and writing files.
-
-All paths are relative to the current working directory.
-File operations return empty strings or false on failure.
-
-## Examples
-
-    content = File.read("config.txt")
-    File.write("output.txt", "Hello, world!")
-    File.exists?("config.txt")  # => true
-
 ## Functions
 
 ### read/1
@@ -62,6 +51,137 @@ Returns true if the file exists at the given path.
     File.exists?("missing.txt")  # => false
 
 [Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/file.zap#L51)
+
+---
+
+### read!/1
+
+```zap
+pub fn read!(path :: String) -> String
+```
+
+Reads the entire contents of a file. Raises if the file cannot be read.
+
+## Examples
+
+    File.read!("hello.txt")  # => "Hello, world!"
+    File.read!("missing.txt")  # raises RuntimeError
+
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/file.zap#L64)
+
+---
+
+### rm/1
+
+```zap
+pub fn rm(path :: String) -> Bool
+```
+
+Deletes a file. Returns true on success.
+
+## Examples
+
+    File.rm("temp.txt")  # => true
+
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/file.zap#L80)
+
+---
+
+### mkdir/1
+
+```zap
+pub fn mkdir(path :: String) -> Bool
+```
+
+Creates a directory. Returns true on success.
+
+## Examples
+
+    File.mkdir("output")  # => true
+
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/file.zap#L92)
+
+---
+
+### rmdir/1
+
+```zap
+pub fn rmdir(path :: String) -> Bool
+```
+
+Removes an empty directory. Returns true on success.
+
+## Examples
+
+    File.rmdir("output")  # => true
+
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/file.zap#L104)
+
+---
+
+### rename/2
+
+```zap
+pub fn rename(old_path :: String, new_path :: String) -> Bool
+```
+
+Renames or moves a file. Returns true on success.
+
+## Examples
+
+    File.rename("old.txt", "new.txt")  # => true
+
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/file.zap#L116)
+
+---
+
+### cp/2
+
+```zap
+pub fn cp(source :: String, destination :: String) -> Bool
+```
+
+Copies a file. Returns true on success.
+
+## Examples
+
+    File.cp("source.txt", "dest.txt")  # => true
+
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/file.zap#L128)
+
+---
+
+### dir?/1
+
+```zap
+pub fn dir?(path :: String) -> Bool
+```
+
+Returns true if the path is a directory.
+
+## Examples
+
+    File.dir?("src")     # => true
+    File.dir?("main.zap") # => false
+
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/file.zap#L141)
+
+---
+
+### regular?/1
+
+```zap
+pub fn regular?(path :: String) -> Bool
+```
+
+Returns true if the path is a regular file.
+
+## Examples
+
+    File.regular?("main.zap") # => true
+    File.regular?("src")      # => false
+
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/file.zap#L154)
 
 ---
 

@@ -1089,6 +1089,380 @@ pub const Kernel = struct {
         return @rem(a, b);
     }
 
+    pub fn eq_i8(a: i8, b: i8) bool {
+        return a == b;
+    }
+    pub fn eq_i16(a: i16, b: i16) bool {
+        return a == b;
+    }
+    pub fn eq_i32(a: i32, b: i32) bool {
+        return a == b;
+    }
+    pub fn eq_i64(a: i64, b: i64) bool {
+        return a == b;
+    }
+    pub fn eq_u8(a: u8, b: u8) bool {
+        return a == b;
+    }
+    pub fn eq_u16(a: u16, b: u16) bool {
+        return a == b;
+    }
+    pub fn eq_u32(a: u32, b: u32) bool {
+        return a == b;
+    }
+    pub fn eq_u64(a: u64, b: u64) bool {
+        return a == b;
+    }
+    pub fn eq_f16(a: f16, b: f16) bool {
+        return a == b;
+    }
+    pub fn eq_f32(a: f32, b: f32) bool {
+        return a == b;
+    }
+    pub fn eq_f64(a: f64, b: f64) bool {
+        return a == b;
+    }
+
+    pub fn neq_i8(a: i8, b: i8) bool {
+        return a != b;
+    }
+    pub fn neq_i16(a: i16, b: i16) bool {
+        return a != b;
+    }
+    pub fn neq_i32(a: i32, b: i32) bool {
+        return a != b;
+    }
+    pub fn neq_i64(a: i64, b: i64) bool {
+        return a != b;
+    }
+    pub fn neq_u8(a: u8, b: u8) bool {
+        return a != b;
+    }
+    pub fn neq_u16(a: u16, b: u16) bool {
+        return a != b;
+    }
+    pub fn neq_u32(a: u32, b: u32) bool {
+        return a != b;
+    }
+    pub fn neq_u64(a: u64, b: u64) bool {
+        return a != b;
+    }
+    pub fn neq_f16(a: f16, b: f16) bool {
+        return a != b;
+    }
+    pub fn neq_f32(a: f32, b: f32) bool {
+        return a != b;
+    }
+    pub fn neq_f64(a: f64, b: f64) bool {
+        return a != b;
+    }
+
+    pub fn lt_i8(a: i8, b: i8) bool {
+        return a < b;
+    }
+    pub fn lt_i16(a: i16, b: i16) bool {
+        return a < b;
+    }
+    pub fn lt_i32(a: i32, b: i32) bool {
+        return a < b;
+    }
+    pub fn lt_i64(a: i64, b: i64) bool {
+        return a < b;
+    }
+    pub fn lt_u8(a: u8, b: u8) bool {
+        return a < b;
+    }
+    pub fn lt_u16(a: u16, b: u16) bool {
+        return a < b;
+    }
+    pub fn lt_u32(a: u32, b: u32) bool {
+        return a < b;
+    }
+    pub fn lt_u64(a: u64, b: u64) bool {
+        return a < b;
+    }
+    pub fn lt_f16(a: f16, b: f16) bool {
+        return a < b;
+    }
+    pub fn lt_f32(a: f32, b: f32) bool {
+        return a < b;
+    }
+    pub fn lt_f64(a: f64, b: f64) bool {
+        return a < b;
+    }
+
+    pub fn gt_i8(a: i8, b: i8) bool {
+        return a > b;
+    }
+    pub fn gt_i16(a: i16, b: i16) bool {
+        return a > b;
+    }
+    pub fn gt_i32(a: i32, b: i32) bool {
+        return a > b;
+    }
+    pub fn gt_i64(a: i64, b: i64) bool {
+        return a > b;
+    }
+    pub fn gt_u8(a: u8, b: u8) bool {
+        return a > b;
+    }
+    pub fn gt_u16(a: u16, b: u16) bool {
+        return a > b;
+    }
+    pub fn gt_u32(a: u32, b: u32) bool {
+        return a > b;
+    }
+    pub fn gt_u64(a: u64, b: u64) bool {
+        return a > b;
+    }
+    pub fn gt_f16(a: f16, b: f16) bool {
+        return a > b;
+    }
+    pub fn gt_f32(a: f32, b: f32) bool {
+        return a > b;
+    }
+    pub fn gt_f64(a: f64, b: f64) bool {
+        return a > b;
+    }
+
+    pub fn lte_i8(a: i8, b: i8) bool {
+        return a <= b;
+    }
+    pub fn lte_i16(a: i16, b: i16) bool {
+        return a <= b;
+    }
+    pub fn lte_i32(a: i32, b: i32) bool {
+        return a <= b;
+    }
+    pub fn lte_i64(a: i64, b: i64) bool {
+        return a <= b;
+    }
+    pub fn lte_u8(a: u8, b: u8) bool {
+        return a <= b;
+    }
+    pub fn lte_u16(a: u16, b: u16) bool {
+        return a <= b;
+    }
+    pub fn lte_u32(a: u32, b: u32) bool {
+        return a <= b;
+    }
+    pub fn lte_u64(a: u64, b: u64) bool {
+        return a <= b;
+    }
+    pub fn lte_f16(a: f16, b: f16) bool {
+        return a <= b;
+    }
+    pub fn lte_f32(a: f32, b: f32) bool {
+        return a <= b;
+    }
+    pub fn lte_f64(a: f64, b: f64) bool {
+        return a <= b;
+    }
+
+    pub fn gte_i8(a: i8, b: i8) bool {
+        return a >= b;
+    }
+    pub fn gte_i16(a: i16, b: i16) bool {
+        return a >= b;
+    }
+    pub fn gte_i32(a: i32, b: i32) bool {
+        return a >= b;
+    }
+    pub fn gte_i64(a: i64, b: i64) bool {
+        return a >= b;
+    }
+    pub fn gte_u8(a: u8, b: u8) bool {
+        return a >= b;
+    }
+    pub fn gte_u16(a: u16, b: u16) bool {
+        return a >= b;
+    }
+    pub fn gte_u32(a: u32, b: u32) bool {
+        return a >= b;
+    }
+    pub fn gte_u64(a: u64, b: u64) bool {
+        return a >= b;
+    }
+    pub fn gte_f16(a: f16, b: f16) bool {
+        return a >= b;
+    }
+    pub fn gte_f32(a: f32, b: f32) bool {
+        return a >= b;
+    }
+    pub fn gte_f64(a: f64, b: f64) bool {
+        return a >= b;
+    }
+
+    pub fn add_i8(a: i8, b: i8) i8 {
+        return a +% b;
+    }
+    pub fn add_i16(a: i16, b: i16) i16 {
+        return a +% b;
+    }
+    pub fn add_i32(a: i32, b: i32) i32 {
+        return a +% b;
+    }
+    pub fn add_i64(a: i64, b: i64) i64 {
+        return a +% b;
+    }
+    pub fn add_u8(a: u8, b: u8) u8 {
+        return a +% b;
+    }
+    pub fn add_u16(a: u16, b: u16) u16 {
+        return a +% b;
+    }
+    pub fn add_u32(a: u32, b: u32) u32 {
+        return a +% b;
+    }
+    pub fn add_u64(a: u64, b: u64) u64 {
+        return a +% b;
+    }
+    pub fn add_f16(a: f16, b: f16) f16 {
+        return a + b;
+    }
+    pub fn add_f32(a: f32, b: f32) f32 {
+        return a + b;
+    }
+    pub fn add_f64(a: f64, b: f64) f64 {
+        return a + b;
+    }
+
+    pub fn sub_i8(a: i8, b: i8) i8 {
+        return a -% b;
+    }
+    pub fn sub_i16(a: i16, b: i16) i16 {
+        return a -% b;
+    }
+    pub fn sub_i32(a: i32, b: i32) i32 {
+        return a -% b;
+    }
+    pub fn sub_i64(a: i64, b: i64) i64 {
+        return a -% b;
+    }
+    pub fn sub_u8(a: u8, b: u8) u8 {
+        return a -% b;
+    }
+    pub fn sub_u16(a: u16, b: u16) u16 {
+        return a -% b;
+    }
+    pub fn sub_u32(a: u32, b: u32) u32 {
+        return a -% b;
+    }
+    pub fn sub_u64(a: u64, b: u64) u64 {
+        return a -% b;
+    }
+    pub fn sub_f16(a: f16, b: f16) f16 {
+        return a - b;
+    }
+    pub fn sub_f32(a: f32, b: f32) f32 {
+        return a - b;
+    }
+    pub fn sub_f64(a: f64, b: f64) f64 {
+        return a - b;
+    }
+
+    pub fn mul_i8(a: i8, b: i8) i8 {
+        return a *% b;
+    }
+    pub fn mul_i16(a: i16, b: i16) i16 {
+        return a *% b;
+    }
+    pub fn mul_i32(a: i32, b: i32) i32 {
+        return a *% b;
+    }
+    pub fn mul_i64(a: i64, b: i64) i64 {
+        return a *% b;
+    }
+    pub fn mul_u8(a: u8, b: u8) u8 {
+        return a *% b;
+    }
+    pub fn mul_u16(a: u16, b: u16) u16 {
+        return a *% b;
+    }
+    pub fn mul_u32(a: u32, b: u32) u32 {
+        return a *% b;
+    }
+    pub fn mul_u64(a: u64, b: u64) u64 {
+        return a *% b;
+    }
+    pub fn mul_f16(a: f16, b: f16) f16 {
+        return a * b;
+    }
+    pub fn mul_f32(a: f32, b: f32) f32 {
+        return a * b;
+    }
+    pub fn mul_f64(a: f64, b: f64) f64 {
+        return a * b;
+    }
+
+    pub fn divide_i8(a: i8, b: i8) i8 {
+        return @divTrunc(a, b);
+    }
+    pub fn divide_i16(a: i16, b: i16) i16 {
+        return @divTrunc(a, b);
+    }
+    pub fn divide_i32(a: i32, b: i32) i32 {
+        return @divTrunc(a, b);
+    }
+    pub fn divide_i64(a: i64, b: i64) i64 {
+        return @divTrunc(a, b);
+    }
+    pub fn divide_u8(a: u8, b: u8) u8 {
+        return @divTrunc(a, b);
+    }
+    pub fn divide_u16(a: u16, b: u16) u16 {
+        return @divTrunc(a, b);
+    }
+    pub fn divide_u32(a: u32, b: u32) u32 {
+        return @divTrunc(a, b);
+    }
+    pub fn divide_u64(a: u64, b: u64) u64 {
+        return @divTrunc(a, b);
+    }
+    pub fn divide_f16(a: f16, b: f16) f16 {
+        return a / b;
+    }
+    pub fn divide_f32(a: f32, b: f32) f32 {
+        return a / b;
+    }
+    pub fn divide_f64(a: f64, b: f64) f64 {
+        return a / b;
+    }
+
+    pub fn remainder_i8(a: i8, b: i8) i8 {
+        return @rem(a, b);
+    }
+    pub fn remainder_i16(a: i16, b: i16) i16 {
+        return @rem(a, b);
+    }
+    pub fn remainder_i32(a: i32, b: i32) i32 {
+        return @rem(a, b);
+    }
+    pub fn remainder_i64(a: i64, b: i64) i64 {
+        return @rem(a, b);
+    }
+    pub fn remainder_u8(a: u8, b: u8) u8 {
+        return @rem(a, b);
+    }
+    pub fn remainder_u16(a: u16, b: u16) u16 {
+        return @rem(a, b);
+    }
+    pub fn remainder_u32(a: u32, b: u32) u32 {
+        return @rem(a, b);
+    }
+    pub fn remainder_u64(a: u64, b: u64) u64 {
+        return @rem(a, b);
+    }
+    pub fn remainder_f16(a: f16, b: f16) f16 {
+        return @rem(a, b);
+    }
+    pub fn remainder_f32(a: f32, b: f32) f32 {
+        return @rem(a, b);
+    }
+    pub fn remainder_f64(a: f64, b: f64) f64 {
+        return @rem(a, b);
+    }
+
     pub fn sleep(milliseconds: i64) i64 {
         if (milliseconds <= 0) return milliseconds;
         const ms: u64 = @intCast(milliseconds);
@@ -3122,13 +3496,52 @@ pub const MapHelpers = struct {
 // ============================================================
 
 pub const Integer = struct {
-    pub fn to_string(value: i64) []const u8 {
-        var buf: [32]u8 = undefined;
+    fn formatSignedDecimal(value: i64) []const u8 {
+        var buf: [64]u8 = undefined;
         const slice = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return "?";
         const result = bumpAlloc(slice.len);
         if (result.len == 0) return "?";
         @memcpy(result, slice);
         return result;
+    }
+
+    fn formatUnsignedDecimal(value: u64) []const u8 {
+        var buf: [64]u8 = undefined;
+        const slice = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return "?";
+        const result = bumpAlloc(slice.len);
+        if (result.len == 0) return "?";
+        @memcpy(result, slice);
+        return result;
+    }
+
+    fn digitCountUnsigned(value: u64) i64 {
+        var remaining = value;
+        var count: i64 = 1;
+        while (remaining >= 10) {
+            remaining /= 10;
+            count += 1;
+        }
+        return count;
+    }
+
+    fn absMagnitudeI8(value: i8) u8 {
+        if (value >= 0) return @intCast(value);
+        return @as(u8, @intCast(-(value + 1))) + 1;
+    }
+
+    fn absMagnitudeI16(value: i16) u16 {
+        if (value >= 0) return @intCast(value);
+        return @as(u16, @intCast(-(value + 1))) + 1;
+    }
+
+    fn absMagnitudeI32(value: i32) u32 {
+        if (value >= 0) return @intCast(value);
+        return @as(u32, @intCast(-(value + 1))) + 1;
+    }
+
+    fn absMagnitudeI64(value: i64) u64 {
+        if (value >= 0) return @intCast(value);
+        return @as(u64, @intCast(-(value + 1))) + 1;
     }
 
     /// Parse a string into i64, returning 0 on failure (non-optional).
@@ -3141,129 +3554,1255 @@ pub const Integer = struct {
         return std.fmt.parseInt(i64, s, 10) catch null;
     }
 
-    pub fn abs(x: i64) i64 {
-        return if (x < 0) -x else x;
+    pub fn to_string(value: i64) []const u8 {
+        return to_string_i64(value);
     }
 
-    pub fn max(a: i64, b: i64) i64 {
-        return @max(a, b);
+    pub fn to_string_i8(value: i8) []const u8 {
+        return formatSignedDecimal(value);
     }
 
-    pub fn min(a: i64, b: i64) i64 {
-        return @min(a, b);
+    pub fn to_string_i16(value: i16) []const u8 {
+        return formatSignedDecimal(value);
     }
 
-    pub fn div(a: i64, b: i64) i64 {
-        if (b == 0) return 0;
-        return @divTrunc(a, b);
+    pub fn to_string_i32(value: i32) []const u8 {
+        return formatSignedDecimal(value);
     }
 
-    pub fn rem(a: i64, b: i64) i64 {
-        if (b == 0) return 0;
-        return @rem(a, b);
+    pub fn to_string_i64(value: i64) []const u8 {
+        return formatSignedDecimal(value);
     }
 
-    pub fn sign(x: i64) i64 {
-        if (x > 0) return 1;
-        if (x < 0) return -1;
+    pub fn to_string_u8(value: u8) []const u8 {
+        return formatUnsignedDecimal(value);
+    }
+
+    pub fn to_string_u16(value: u16) []const u8 {
+        return formatUnsignedDecimal(value);
+    }
+
+    pub fn to_string_u32(value: u32) []const u8 {
+        return formatUnsignedDecimal(value);
+    }
+
+    pub fn to_string_u64(value: u64) []const u8 {
+        return formatUnsignedDecimal(value);
+    }
+
+    pub fn abs(value: i64) i64 {
+        return abs_i64(value);
+    }
+
+    pub fn abs_i8(value: i8) i8 {
+        return if (value < 0) 0 -% value else value;
+    }
+
+    pub fn abs_i16(value: i16) i16 {
+        return if (value < 0) 0 -% value else value;
+    }
+
+    pub fn abs_i32(value: i32) i32 {
+        return if (value < 0) 0 -% value else value;
+    }
+
+    pub fn abs_i64(value: i64) i64 {
+        return if (value < 0) 0 -% value else value;
+    }
+
+    pub fn abs_u8(value: u8) u8 {
+        return value;
+    }
+
+    pub fn abs_u16(value: u16) u16 {
+        return value;
+    }
+
+    pub fn abs_u32(value: u32) u32 {
+        return value;
+    }
+
+    pub fn abs_u64(value: u64) u64 {
+        return value;
+    }
+
+    pub fn max(value: i64, other: i64) i64 {
+        return max_i64(value, other);
+    }
+
+    pub fn max_i8(value: i8, other: i8) i8 {
+        return @max(value, other);
+    }
+
+    pub fn max_i16(value: i16, other: i16) i16 {
+        return @max(value, other);
+    }
+
+    pub fn max_i32(value: i32, other: i32) i32 {
+        return @max(value, other);
+    }
+
+    pub fn max_i64(value: i64, other: i64) i64 {
+        return @max(value, other);
+    }
+
+    pub fn max_u8(value: u8, other: u8) u8 {
+        return @max(value, other);
+    }
+
+    pub fn max_u16(value: u16, other: u16) u16 {
+        return @max(value, other);
+    }
+
+    pub fn max_u32(value: u32, other: u32) u32 {
+        return @max(value, other);
+    }
+
+    pub fn max_u64(value: u64, other: u64) u64 {
+        return @max(value, other);
+    }
+
+    pub fn min(value: i64, other: i64) i64 {
+        return min_i64(value, other);
+    }
+
+    pub fn min_i8(value: i8, other: i8) i8 {
+        return @min(value, other);
+    }
+
+    pub fn min_i16(value: i16, other: i16) i16 {
+        return @min(value, other);
+    }
+
+    pub fn min_i32(value: i32, other: i32) i32 {
+        return @min(value, other);
+    }
+
+    pub fn min_i64(value: i64, other: i64) i64 {
+        return @min(value, other);
+    }
+
+    pub fn min_u8(value: u8, other: u8) u8 {
+        return @min(value, other);
+    }
+
+    pub fn min_u16(value: u16, other: u16) u16 {
+        return @min(value, other);
+    }
+
+    pub fn min_u32(value: u32, other: u32) u32 {
+        return @min(value, other);
+    }
+
+    pub fn min_u64(value: u64, other: u64) u64 {
+        return @min(value, other);
+    }
+
+    pub fn div(value: i64, divisor: i64) i64 {
+        return div_i64(value, divisor);
+    }
+
+    pub fn div_i8(value: i8, divisor: i8) i8 {
+        if (divisor == 0) return 0;
+        return @divTrunc(value, divisor);
+    }
+
+    pub fn div_i16(value: i16, divisor: i16) i16 {
+        if (divisor == 0) return 0;
+        return @divTrunc(value, divisor);
+    }
+
+    pub fn div_i32(value: i32, divisor: i32) i32 {
+        if (divisor == 0) return 0;
+        return @divTrunc(value, divisor);
+    }
+
+    pub fn div_i64(value: i64, divisor: i64) i64 {
+        if (divisor == 0) return 0;
+        return @divTrunc(value, divisor);
+    }
+
+    pub fn div_u8(value: u8, divisor: u8) u8 {
+        if (divisor == 0) return 0;
+        return @divTrunc(value, divisor);
+    }
+
+    pub fn div_u16(value: u16, divisor: u16) u16 {
+        if (divisor == 0) return 0;
+        return @divTrunc(value, divisor);
+    }
+
+    pub fn div_u32(value: u32, divisor: u32) u32 {
+        if (divisor == 0) return 0;
+        return @divTrunc(value, divisor);
+    }
+
+    pub fn div_u64(value: u64, divisor: u64) u64 {
+        if (divisor == 0) return 0;
+        return @divTrunc(value, divisor);
+    }
+
+    pub fn rem(value: i64, divisor: i64) i64 {
+        return rem_i64(value, divisor);
+    }
+
+    pub fn rem_i8(value: i8, divisor: i8) i8 {
+        if (divisor == 0) return 0;
+        return @rem(value, divisor);
+    }
+
+    pub fn rem_i16(value: i16, divisor: i16) i16 {
+        if (divisor == 0) return 0;
+        return @rem(value, divisor);
+    }
+
+    pub fn rem_i32(value: i32, divisor: i32) i32 {
+        if (divisor == 0) return 0;
+        return @rem(value, divisor);
+    }
+
+    pub fn rem_i64(value: i64, divisor: i64) i64 {
+        if (divisor == 0) return 0;
+        return @rem(value, divisor);
+    }
+
+    pub fn rem_u8(value: u8, divisor: u8) u8 {
+        if (divisor == 0) return 0;
+        return @rem(value, divisor);
+    }
+
+    pub fn rem_u16(value: u16, divisor: u16) u16 {
+        if (divisor == 0) return 0;
+        return @rem(value, divisor);
+    }
+
+    pub fn rem_u32(value: u32, divisor: u32) u32 {
+        if (divisor == 0) return 0;
+        return @rem(value, divisor);
+    }
+
+    pub fn rem_u64(value: u64, divisor: u64) u64 {
+        if (divisor == 0) return 0;
+        return @rem(value, divisor);
+    }
+
+    pub fn pow_i8(base: i8, exponent: i8) i8 {
+        var result: i8 = 1;
+        var remaining = exponent;
+        while (remaining > 0) : (remaining -= 1) result *%= base;
+        return result;
+    }
+
+    pub fn pow_i16(base: i16, exponent: i16) i16 {
+        var result: i16 = 1;
+        var remaining = exponent;
+        while (remaining > 0) : (remaining -= 1) result *%= base;
+        return result;
+    }
+
+    pub fn pow_i32(base: i32, exponent: i32) i32 {
+        var result: i32 = 1;
+        var remaining = exponent;
+        while (remaining > 0) : (remaining -= 1) result *%= base;
+        return result;
+    }
+
+    pub fn pow_i64(base: i64, exponent: i64) i64 {
+        var result: i64 = 1;
+        var remaining = exponent;
+        while (remaining > 0) : (remaining -= 1) result *%= base;
+        return result;
+    }
+
+    pub fn pow_u8(base: u8, exponent: u8) u8 {
+        var result: u8 = 1;
+        var remaining = exponent;
+        while (remaining > 0) : (remaining -= 1) result *%= base;
+        return result;
+    }
+
+    pub fn pow_u16(base: u16, exponent: u16) u16 {
+        var result: u16 = 1;
+        var remaining = exponent;
+        while (remaining > 0) : (remaining -= 1) result *%= base;
+        return result;
+    }
+
+    pub fn pow_u32(base: u32, exponent: u32) u32 {
+        var result: u32 = 1;
+        var remaining = exponent;
+        while (remaining > 0) : (remaining -= 1) result *%= base;
+        return result;
+    }
+
+    pub fn pow_u64(base: u64, exponent: u64) u64 {
+        var result: u64 = 1;
+        var remaining = exponent;
+        while (remaining > 0) : (remaining -= 1) result *%= base;
+        return result;
+    }
+
+    pub fn clamp_i8(value: i8, lower: i8, upper: i8) i8 {
+        return min_i8(max_i8(value, lower), upper);
+    }
+
+    pub fn clamp_i16(value: i16, lower: i16, upper: i16) i16 {
+        return min_i16(max_i16(value, lower), upper);
+    }
+
+    pub fn clamp_i32(value: i32, lower: i32, upper: i32) i32 {
+        return min_i32(max_i32(value, lower), upper);
+    }
+
+    pub fn clamp_i64(value: i64, lower: i64, upper: i64) i64 {
+        return min_i64(max_i64(value, lower), upper);
+    }
+
+    pub fn clamp_u8(value: u8, lower: u8, upper: u8) u8 {
+        return min_u8(max_u8(value, lower), upper);
+    }
+
+    pub fn clamp_u16(value: u16, lower: u16, upper: u16) u16 {
+        return min_u16(max_u16(value, lower), upper);
+    }
+
+    pub fn clamp_u32(value: u32, lower: u32, upper: u32) u32 {
+        return min_u32(max_u32(value, lower), upper);
+    }
+
+    pub fn clamp_u64(value: u64, lower: u64, upper: u64) u64 {
+        return min_u64(max_u64(value, lower), upper);
+    }
+
+    pub fn digits_i8(value: i8) i64 {
+        return digitCountUnsigned(absMagnitudeI8(value));
+    }
+
+    pub fn digits_i16(value: i16) i64 {
+        return digitCountUnsigned(absMagnitudeI16(value));
+    }
+
+    pub fn digits_i32(value: i32) i64 {
+        return digitCountUnsigned(absMagnitudeI32(value));
+    }
+
+    pub fn digits_i64(value: i64) i64 {
+        return digitCountUnsigned(absMagnitudeI64(value));
+    }
+
+    pub fn digits_u8(value: u8) i64 {
+        return digitCountUnsigned(value);
+    }
+
+    pub fn digits_u16(value: u16) i64 {
+        return digitCountUnsigned(value);
+    }
+
+    pub fn digits_u32(value: u32) i64 {
+        return digitCountUnsigned(value);
+    }
+
+    pub fn digits_u64(value: u64) i64 {
+        return digitCountUnsigned(value);
+    }
+
+    pub fn count_digits_i8(value: i8) i64 {
+        return digitCountUnsigned(absMagnitudeI8(value));
+    }
+
+    pub fn count_digits_i16(value: i16) i64 {
+        return digitCountUnsigned(absMagnitudeI16(value));
+    }
+
+    pub fn count_digits_i32(value: i32) i64 {
+        return digitCountUnsigned(absMagnitudeI32(value));
+    }
+
+    pub fn count_digits_i64(value: i64) i64 {
+        return digitCountUnsigned(absMagnitudeI64(value));
+    }
+
+    pub fn count_digits_u8(value: u8) i64 {
+        return digitCountUnsigned(value);
+    }
+
+    pub fn count_digits_u16(value: u16) i64 {
+        return digitCountUnsigned(value);
+    }
+
+    pub fn count_digits_u32(value: u32) i64 {
+        return digitCountUnsigned(value);
+    }
+
+    pub fn count_digits_u64(value: u64) i64 {
+        return digitCountUnsigned(value);
+    }
+
+    pub fn to_f64(value: i64) f64 {
+        return to_f64_i64(value);
+    }
+
+    pub fn to_f64_i8(value: i8) f64 {
+        return @floatFromInt(value);
+    }
+
+    pub fn to_f64_i16(value: i16) f64 {
+        return @floatFromInt(value);
+    }
+
+    pub fn to_f64_i32(value: i32) f64 {
+        return @floatFromInt(value);
+    }
+
+    pub fn to_f64_i64(value: i64) f64 {
+        return @floatFromInt(value);
+    }
+
+    pub fn to_f64_u8(value: u8) f64 {
+        return @floatFromInt(value);
+    }
+
+    pub fn to_f64_u16(value: u16) f64 {
+        return @floatFromInt(value);
+    }
+
+    pub fn to_f64_u32(value: u32) f64 {
+        return @floatFromInt(value);
+    }
+
+    pub fn to_f64_u64(value: u64) f64 {
+        return @floatFromInt(value);
+    }
+
+    pub fn clz(value: i64) i64 {
+        return clz_i64(value);
+    }
+
+    pub fn clz_i8(value: i8) i64 {
+        return @intCast(@clz(value));
+    }
+
+    pub fn clz_i16(value: i16) i64 {
+        return @intCast(@clz(value));
+    }
+
+    pub fn clz_i32(value: i32) i64 {
+        return @intCast(@clz(value));
+    }
+
+    pub fn clz_i64(value: i64) i64 {
+        return @intCast(@clz(value));
+    }
+
+    pub fn clz_u8(value: u8) i64 {
+        return @intCast(@clz(value));
+    }
+
+    pub fn clz_u16(value: u16) i64 {
+        return @intCast(@clz(value));
+    }
+
+    pub fn clz_u32(value: u32) i64 {
+        return @intCast(@clz(value));
+    }
+
+    pub fn clz_u64(value: u64) i64 {
+        return @intCast(@clz(value));
+    }
+
+    pub fn ctz(value: i64) i64 {
+        return ctz_i64(value);
+    }
+
+    pub fn ctz_i8(value: i8) i64 {
+        return @intCast(@ctz(value));
+    }
+
+    pub fn ctz_i16(value: i16) i64 {
+        return @intCast(@ctz(value));
+    }
+
+    pub fn ctz_i32(value: i32) i64 {
+        return @intCast(@ctz(value));
+    }
+
+    pub fn ctz_i64(value: i64) i64 {
+        return @intCast(@ctz(value));
+    }
+
+    pub fn ctz_u8(value: u8) i64 {
+        return @intCast(@ctz(value));
+    }
+
+    pub fn ctz_u16(value: u16) i64 {
+        return @intCast(@ctz(value));
+    }
+
+    pub fn ctz_u32(value: u32) i64 {
+        return @intCast(@ctz(value));
+    }
+
+    pub fn ctz_u64(value: u64) i64 {
+        return @intCast(@ctz(value));
+    }
+
+    pub fn popcount(value: i64) i64 {
+        return popcount_i64(value);
+    }
+
+    pub fn popcount_i8(value: i8) i64 {
+        return @intCast(@popCount(value));
+    }
+
+    pub fn popcount_i16(value: i16) i64 {
+        return @intCast(@popCount(value));
+    }
+
+    pub fn popcount_i32(value: i32) i64 {
+        return @intCast(@popCount(value));
+    }
+
+    pub fn popcount_i64(value: i64) i64 {
+        return @intCast(@popCount(value));
+    }
+
+    pub fn popcount_u8(value: u8) i64 {
+        return @intCast(@popCount(value));
+    }
+
+    pub fn popcount_u16(value: u16) i64 {
+        return @intCast(@popCount(value));
+    }
+
+    pub fn popcount_u32(value: u32) i64 {
+        return @intCast(@popCount(value));
+    }
+
+    pub fn popcount_u64(value: u64) i64 {
+        return @intCast(@popCount(value));
+    }
+
+    pub fn byte_swap(value: i64) i64 {
+        return byte_swap_i64(value);
+    }
+
+    pub fn byte_swap_i8(value: i8) i8 {
+        return @byteSwap(value);
+    }
+
+    pub fn byte_swap_i16(value: i16) i16 {
+        return @byteSwap(value);
+    }
+
+    pub fn byte_swap_i32(value: i32) i32 {
+        return @byteSwap(value);
+    }
+
+    pub fn byte_swap_i64(value: i64) i64 {
+        return @byteSwap(value);
+    }
+
+    pub fn byte_swap_u8(value: u8) u8 {
+        return @byteSwap(value);
+    }
+
+    pub fn byte_swap_u16(value: u16) u16 {
+        return @byteSwap(value);
+    }
+
+    pub fn byte_swap_u32(value: u32) u32 {
+        return @byteSwap(value);
+    }
+
+    pub fn byte_swap_u64(value: u64) u64 {
+        return @byteSwap(value);
+    }
+
+    pub fn bit_reverse(value: i64) i64 {
+        return bit_reverse_i64(value);
+    }
+
+    pub fn bit_reverse_i8(value: i8) i8 {
+        return @bitReverse(value);
+    }
+
+    pub fn bit_reverse_i16(value: i16) i16 {
+        return @bitReverse(value);
+    }
+
+    pub fn bit_reverse_i32(value: i32) i32 {
+        return @bitReverse(value);
+    }
+
+    pub fn bit_reverse_i64(value: i64) i64 {
+        return @bitReverse(value);
+    }
+
+    pub fn bit_reverse_u8(value: u8) u8 {
+        return @bitReverse(value);
+    }
+
+    pub fn bit_reverse_u16(value: u16) u16 {
+        return @bitReverse(value);
+    }
+
+    pub fn bit_reverse_u32(value: u32) u32 {
+        return @bitReverse(value);
+    }
+
+    pub fn bit_reverse_u64(value: u64) u64 {
+        return @bitReverse(value);
+    }
+
+    pub fn add_sat(value: i64, other: i64) i64 {
+        return add_sat_i64(value, other);
+    }
+
+    pub fn add_sat_i8(value: i8, other: i8) i8 {
+        return value +| other;
+    }
+
+    pub fn add_sat_i16(value: i16, other: i16) i16 {
+        return value +| other;
+    }
+
+    pub fn add_sat_i32(value: i32, other: i32) i32 {
+        return value +| other;
+    }
+
+    pub fn add_sat_i64(value: i64, other: i64) i64 {
+        return value +| other;
+    }
+
+    pub fn add_sat_u8(value: u8, other: u8) u8 {
+        return value +| other;
+    }
+
+    pub fn add_sat_u16(value: u16, other: u16) u16 {
+        return value +| other;
+    }
+
+    pub fn add_sat_u32(value: u32, other: u32) u32 {
+        return value +| other;
+    }
+
+    pub fn add_sat_u64(value: u64, other: u64) u64 {
+        return value +| other;
+    }
+
+    pub fn sub_sat(value: i64, other: i64) i64 {
+        return sub_sat_i64(value, other);
+    }
+
+    pub fn sub_sat_i8(value: i8, other: i8) i8 {
+        return value -| other;
+    }
+
+    pub fn sub_sat_i16(value: i16, other: i16) i16 {
+        return value -| other;
+    }
+
+    pub fn sub_sat_i32(value: i32, other: i32) i32 {
+        return value -| other;
+    }
+
+    pub fn sub_sat_i64(value: i64, other: i64) i64 {
+        return value -| other;
+    }
+
+    pub fn sub_sat_u8(value: u8, other: u8) u8 {
+        return value -| other;
+    }
+
+    pub fn sub_sat_u16(value: u16, other: u16) u16 {
+        return value -| other;
+    }
+
+    pub fn sub_sat_u32(value: u32, other: u32) u32 {
+        return value -| other;
+    }
+
+    pub fn sub_sat_u64(value: u64, other: u64) u64 {
+        return value -| other;
+    }
+
+    pub fn mul_sat(value: i64, other: i64) i64 {
+        return mul_sat_i64(value, other);
+    }
+
+    pub fn mul_sat_i8(value: i8, other: i8) i8 {
+        return value *| other;
+    }
+
+    pub fn mul_sat_i16(value: i16, other: i16) i16 {
+        return value *| other;
+    }
+
+    pub fn mul_sat_i32(value: i32, other: i32) i32 {
+        return value *| other;
+    }
+
+    pub fn mul_sat_i64(value: i64, other: i64) i64 {
+        return value *| other;
+    }
+
+    pub fn mul_sat_u8(value: u8, other: u8) u8 {
+        return value *| other;
+    }
+
+    pub fn mul_sat_u16(value: u16, other: u16) u16 {
+        return value *| other;
+    }
+
+    pub fn mul_sat_u32(value: u32, other: u32) u32 {
+        return value *| other;
+    }
+
+    pub fn mul_sat_u64(value: u64, other: u64) u64 {
+        return value *| other;
+    }
+
+    pub fn band(value: i64, other: i64) i64 {
+        return band_i64(value, other);
+    }
+
+    pub fn band_i8(value: i8, other: i8) i8 {
+        return value & other;
+    }
+
+    pub fn band_i16(value: i16, other: i16) i16 {
+        return value & other;
+    }
+
+    pub fn band_i32(value: i32, other: i32) i32 {
+        return value & other;
+    }
+
+    pub fn band_i64(value: i64, other: i64) i64 {
+        return value & other;
+    }
+
+    pub fn band_u8(value: u8, other: u8) u8 {
+        return value & other;
+    }
+
+    pub fn band_u16(value: u16, other: u16) u16 {
+        return value & other;
+    }
+
+    pub fn band_u32(value: u32, other: u32) u32 {
+        return value & other;
+    }
+
+    pub fn band_u64(value: u64, other: u64) u64 {
+        return value & other;
+    }
+
+    pub fn bor(value: i64, other: i64) i64 {
+        return bor_i64(value, other);
+    }
+
+    pub fn bor_i8(value: i8, other: i8) i8 {
+        return value | other;
+    }
+
+    pub fn bor_i16(value: i16, other: i16) i16 {
+        return value | other;
+    }
+
+    pub fn bor_i32(value: i32, other: i32) i32 {
+        return value | other;
+    }
+
+    pub fn bor_i64(value: i64, other: i64) i64 {
+        return value | other;
+    }
+
+    pub fn bor_u8(value: u8, other: u8) u8 {
+        return value | other;
+    }
+
+    pub fn bor_u16(value: u16, other: u16) u16 {
+        return value | other;
+    }
+
+    pub fn bor_u32(value: u32, other: u32) u32 {
+        return value | other;
+    }
+
+    pub fn bor_u64(value: u64, other: u64) u64 {
+        return value | other;
+    }
+
+    pub fn bxor(value: i64, other: i64) i64 {
+        return bxor_i64(value, other);
+    }
+
+    pub fn bxor_i8(value: i8, other: i8) i8 {
+        return value ^ other;
+    }
+
+    pub fn bxor_i16(value: i16, other: i16) i16 {
+        return value ^ other;
+    }
+
+    pub fn bxor_i32(value: i32, other: i32) i32 {
+        return value ^ other;
+    }
+
+    pub fn bxor_i64(value: i64, other: i64) i64 {
+        return value ^ other;
+    }
+
+    pub fn bxor_u8(value: u8, other: u8) u8 {
+        return value ^ other;
+    }
+
+    pub fn bxor_u16(value: u16, other: u16) u16 {
+        return value ^ other;
+    }
+
+    pub fn bxor_u32(value: u32, other: u32) u32 {
+        return value ^ other;
+    }
+
+    pub fn bxor_u64(value: u64, other: u64) u64 {
+        return value ^ other;
+    }
+
+    pub fn bnot(value: i64) i64 {
+        return bnot_i64(value);
+    }
+
+    pub fn bnot_i8(value: i8) i8 {
+        return ~value;
+    }
+
+    pub fn bnot_i16(value: i16) i16 {
+        return ~value;
+    }
+
+    pub fn bnot_i32(value: i32) i32 {
+        return ~value;
+    }
+
+    pub fn bnot_i64(value: i64) i64 {
+        return ~value;
+    }
+
+    pub fn bnot_u8(value: u8) u8 {
+        return ~value;
+    }
+
+    pub fn bnot_u16(value: u16) u16 {
+        return ~value;
+    }
+
+    pub fn bnot_u32(value: u32) u32 {
+        return ~value;
+    }
+
+    pub fn bnot_u64(value: u64) u64 {
+        return ~value;
+    }
+
+    pub fn bsl(value: i64, amount: i64) i64 {
+        return bsl_i64(value, amount);
+    }
+
+    pub fn bsl_i8(value: i8, amount: i8) i8 {
+        if (amount < 0 or amount >= 8) return 0;
+        const shift: u3 = @intCast(amount);
+        return value << shift;
+    }
+
+    pub fn bsl_i16(value: i16, amount: i16) i16 {
+        if (amount < 0 or amount >= 16) return 0;
+        const shift: u4 = @intCast(amount);
+        return value << shift;
+    }
+
+    pub fn bsl_i32(value: i32, amount: i32) i32 {
+        if (amount < 0 or amount >= 32) return 0;
+        const shift: u5 = @intCast(amount);
+        return value << shift;
+    }
+
+    pub fn bsl_i64(value: i64, amount: i64) i64 {
+        if (amount < 0 or amount >= 64) return 0;
+        const shift: u6 = @intCast(amount);
+        return value << shift;
+    }
+
+    pub fn bsl_u8(value: u8, amount: u8) u8 {
+        if (amount >= 8) return 0;
+        const shift: u3 = @intCast(amount);
+        return value << shift;
+    }
+
+    pub fn bsl_u16(value: u16, amount: u16) u16 {
+        if (amount >= 16) return 0;
+        const shift: u4 = @intCast(amount);
+        return value << shift;
+    }
+
+    pub fn bsl_u32(value: u32, amount: u32) u32 {
+        if (amount >= 32) return 0;
+        const shift: u5 = @intCast(amount);
+        return value << shift;
+    }
+
+    pub fn bsl_u64(value: u64, amount: u64) u64 {
+        if (amount >= 64) return 0;
+        const shift: u6 = @intCast(amount);
+        return value << shift;
+    }
+
+    pub fn bsr(value: i64, amount: i64) i64 {
+        return bsr_i64(value, amount);
+    }
+
+    pub fn bsr_i8(value: i8, amount: i8) i8 {
+        if (amount < 0 or amount >= 8) return if (value < 0) -1 else 0;
+        const shift: u3 = @intCast(amount);
+        return value >> shift;
+    }
+
+    pub fn bsr_i16(value: i16, amount: i16) i16 {
+        if (amount < 0 or amount >= 16) return if (value < 0) -1 else 0;
+        const shift: u4 = @intCast(amount);
+        return value >> shift;
+    }
+
+    pub fn bsr_i32(value: i32, amount: i32) i32 {
+        if (amount < 0 or amount >= 32) return if (value < 0) -1 else 0;
+        const shift: u5 = @intCast(amount);
+        return value >> shift;
+    }
+
+    pub fn bsr_i64(value: i64, amount: i64) i64 {
+        if (amount < 0 or amount >= 64) return if (value < 0) -1 else 0;
+        const shift: u6 = @intCast(amount);
+        return value >> shift;
+    }
+
+    pub fn bsr_u8(value: u8, amount: u8) u8 {
+        if (amount >= 8) return 0;
+        const shift: u3 = @intCast(amount);
+        return value >> shift;
+    }
+
+    pub fn bsr_u16(value: u16, amount: u16) u16 {
+        if (amount >= 16) return 0;
+        const shift: u4 = @intCast(amount);
+        return value >> shift;
+    }
+
+    pub fn bsr_u32(value: u32, amount: u32) u32 {
+        if (amount >= 32) return 0;
+        const shift: u5 = @intCast(amount);
+        return value >> shift;
+    }
+
+    pub fn bsr_u64(value: u64, amount: u64) u64 {
+        if (amount >= 64) return 0;
+        const shift: u6 = @intCast(amount);
+        return value >> shift;
+    }
+
+    pub fn sign(value: i64) i64 {
+        return sign_i64(value);
+    }
+
+    pub fn sign_i8(value: i8) i8 {
+        if (value > 0) return 1;
+        if (value < 0) return -1;
         return 0;
     }
 
-    pub fn is_even(x: i64) bool {
-        return @rem(x, 2) == 0;
+    pub fn sign_i16(value: i16) i16 {
+        if (value > 0) return 1;
+        if (value < 0) return -1;
+        return 0;
     }
 
-    pub fn is_odd(x: i64) bool {
-        return @rem(x, 2) != 0;
+    pub fn sign_i32(value: i32) i32 {
+        if (value > 0) return 1;
+        if (value < 0) return -1;
+        return 0;
     }
 
-    pub fn gcd(a: i64, b: i64) i64 {
-        var x = if (a < 0) -a else a;
-        var y = if (b < 0) -b else b;
+    pub fn sign_i64(value: i64) i64 {
+        if (value > 0) return 1;
+        if (value < 0) return -1;
+        return 0;
+    }
+
+    pub fn sign_u8(value: u8) u8 {
+        return if (value > 0) 1 else 0;
+    }
+
+    pub fn sign_u16(value: u16) u16 {
+        return if (value > 0) 1 else 0;
+    }
+
+    pub fn sign_u32(value: u32) u32 {
+        return if (value > 0) 1 else 0;
+    }
+
+    pub fn sign_u64(value: u64) u64 {
+        return if (value > 0) 1 else 0;
+    }
+
+    pub fn is_even(value: i64) bool {
+        return is_even_i64(value);
+    }
+
+    pub fn is_even_i8(value: i8) bool {
+        return @rem(value, 2) == 0;
+    }
+
+    pub fn is_even_i16(value: i16) bool {
+        return @rem(value, 2) == 0;
+    }
+
+    pub fn is_even_i32(value: i32) bool {
+        return @rem(value, 2) == 0;
+    }
+
+    pub fn is_even_i64(value: i64) bool {
+        return @rem(value, 2) == 0;
+    }
+
+    pub fn is_even_u8(value: u8) bool {
+        return @rem(value, 2) == 0;
+    }
+
+    pub fn is_even_u16(value: u16) bool {
+        return @rem(value, 2) == 0;
+    }
+
+    pub fn is_even_u32(value: u32) bool {
+        return @rem(value, 2) == 0;
+    }
+
+    pub fn is_even_u64(value: u64) bool {
+        return @rem(value, 2) == 0;
+    }
+
+    pub fn is_odd(value: i64) bool {
+        return is_odd_i64(value);
+    }
+
+    pub fn is_odd_i8(value: i8) bool {
+        return @rem(value, 2) != 0;
+    }
+
+    pub fn is_odd_i16(value: i16) bool {
+        return @rem(value, 2) != 0;
+    }
+
+    pub fn is_odd_i32(value: i32) bool {
+        return @rem(value, 2) != 0;
+    }
+
+    pub fn is_odd_i64(value: i64) bool {
+        return @rem(value, 2) != 0;
+    }
+
+    pub fn is_odd_u8(value: u8) bool {
+        return @rem(value, 2) != 0;
+    }
+
+    pub fn is_odd_u16(value: u16) bool {
+        return @rem(value, 2) != 0;
+    }
+
+    pub fn is_odd_u32(value: u32) bool {
+        return @rem(value, 2) != 0;
+    }
+
+    pub fn is_odd_u64(value: u64) bool {
+        return @rem(value, 2) != 0;
+    }
+
+    pub fn gcd(value: i64, other: i64) i64 {
+        return gcd_i64(value, other);
+    }
+
+    pub fn gcd_i8(value: i8, other: i8) i8 {
+        var x = abs_i8(value);
+        var y = abs_i8(other);
         while (y != 0) {
-            const t = y;
-            y = @rem(x, t);
-            x = t;
+            const next = @rem(x, y);
+            x = y;
+            y = next;
         }
         return x;
     }
 
-    pub fn lcm(a: i64, b: i64) i64 {
-        if (a == 0 and b == 0) return 0;
-        const g = gcd(a, b);
-        if (g == 0) return 0;
-        const abs_a = if (a < 0) -a else a;
-        const abs_b = if (b < 0) -b else b;
-        return @divTrunc(abs_a, g) * abs_b;
+    pub fn gcd_i16(value: i16, other: i16) i16 {
+        var x = abs_i16(value);
+        var y = abs_i16(other);
+        while (y != 0) {
+            const next = @rem(x, y);
+            x = y;
+            y = next;
+        }
+        return x;
     }
 
-    pub fn add_sat(a: i64, b: i64) i64 {
-        return a +| b;
+    pub fn gcd_i32(value: i32, other: i32) i32 {
+        var x = abs_i32(value);
+        var y = abs_i32(other);
+        while (y != 0) {
+            const next = @rem(x, y);
+            x = y;
+            y = next;
+        }
+        return x;
     }
 
-    pub fn sub_sat(a: i64, b: i64) i64 {
-        return a -| b;
+    pub fn gcd_i64(value: i64, other: i64) i64 {
+        var x = abs_i64(value);
+        var y = abs_i64(other);
+        while (y != 0) {
+            const next = @rem(x, y);
+            x = y;
+            y = next;
+        }
+        return x;
     }
 
-    pub fn mul_sat(a: i64, b: i64) i64 {
-        return a *| b;
+    pub fn gcd_u8(value: u8, other: u8) u8 {
+        var x = value;
+        var y = other;
+        while (y != 0) {
+            const next = @rem(x, y);
+            x = y;
+            y = next;
+        }
+        return x;
     }
 
-    pub fn band(a: i64, b: i64) i64 {
-        return a & b;
+    pub fn gcd_u16(value: u16, other: u16) u16 {
+        var x = value;
+        var y = other;
+        while (y != 0) {
+            const next = @rem(x, y);
+            x = y;
+            y = next;
+        }
+        return x;
     }
 
-    pub fn bor(a: i64, b: i64) i64 {
-        return a | b;
+    pub fn gcd_u32(value: u32, other: u32) u32 {
+        var x = value;
+        var y = other;
+        while (y != 0) {
+            const next = @rem(x, y);
+            x = y;
+            y = next;
+        }
+        return x;
     }
 
-    pub fn bxor(a: i64, b: i64) i64 {
-        return a ^ b;
+    pub fn gcd_u64(value: u64, other: u64) u64 {
+        var x = value;
+        var y = other;
+        while (y != 0) {
+            const next = @rem(x, y);
+            x = y;
+            y = next;
+        }
+        return x;
     }
 
-    pub fn bnot(a: i64) i64 {
-        return ~a;
+    pub fn lcm(value: i64, other: i64) i64 {
+        return lcm_i64(value, other);
     }
 
-    pub fn bsl(a: i64, b: i64) i64 {
-        if (b < 0 or b >= 64) return 0;
-        const shift: u6 = @intCast(b);
-        return a << shift;
+    pub fn lcm_i8(value: i8, other: i8) i8 {
+        if (value == 0 and other == 0) return 0;
+        const divisor = gcd_i8(value, other);
+        if (divisor == 0) return 0;
+        return @divTrunc(abs_i8(value), divisor) *% abs_i8(other);
     }
 
-    pub fn bsr(a: i64, b: i64) i64 {
-        if (b < 0 or b >= 64) return if (a < 0) -1 else 0;
-        const shift: u6 = @intCast(b);
-        return a >> shift;
+    pub fn lcm_i16(value: i16, other: i16) i16 {
+        if (value == 0 and other == 0) return 0;
+        const divisor = gcd_i16(value, other);
+        if (divisor == 0) return 0;
+        return @divTrunc(abs_i16(value), divisor) *% abs_i16(other);
     }
 
-    pub fn clz(x: i64) i64 {
-        return @intCast(@clz(x));
+    pub fn lcm_i32(value: i32, other: i32) i32 {
+        if (value == 0 and other == 0) return 0;
+        const divisor = gcd_i32(value, other);
+        if (divisor == 0) return 0;
+        return @divTrunc(abs_i32(value), divisor) *% abs_i32(other);
     }
 
-    pub fn ctz(x: i64) i64 {
-        return @intCast(@ctz(x));
+    pub fn lcm_i64(value: i64, other: i64) i64 {
+        if (value == 0 and other == 0) return 0;
+        const divisor = gcd_i64(value, other);
+        if (divisor == 0) return 0;
+        return @divTrunc(abs_i64(value), divisor) *% abs_i64(other);
     }
 
-    pub fn popcount(x: i64) i64 {
-        return @intCast(@popCount(x));
+    pub fn lcm_u8(value: u8, other: u8) u8 {
+        if (value == 0 and other == 0) return 0;
+        const divisor = gcd_u8(value, other);
+        if (divisor == 0) return 0;
+        return @divTrunc(value, divisor) *% other;
     }
 
-    pub fn byte_swap(x: i64) i64 {
-        return @byteSwap(x);
+    pub fn lcm_u16(value: u16, other: u16) u16 {
+        if (value == 0 and other == 0) return 0;
+        const divisor = gcd_u16(value, other);
+        if (divisor == 0) return 0;
+        return @divTrunc(value, divisor) *% other;
     }
 
-    pub fn bit_reverse(x: i64) i64 {
-        return @bitReverse(x);
+    pub fn lcm_u32(value: u32, other: u32) u32 {
+        if (value == 0 and other == 0) return 0;
+        const divisor = gcd_u32(value, other);
+        if (divisor == 0) return 0;
+        return @divTrunc(value, divisor) *% other;
     }
 
-    pub fn to_f64(x: i64) f64 {
-        return @floatFromInt(x);
+    pub fn lcm_u64(value: u64, other: u64) u64 {
+        if (value == 0 and other == 0) return 0;
+        const divisor = gcd_u64(value, other);
+        if (divisor == 0) return 0;
+        return @divTrunc(value, divisor) *% other;
     }
 };
 
 pub const Float = struct {
     pub fn to_string(value: f64) []const u8 {
+        return to_string_f64(value);
+    }
+
+    pub fn to_string_f16(value: f16) []const u8 {
+        var buf: [64]u8 = undefined;
+        const slice = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return "?";
+        const result = bumpAlloc(slice.len);
+        if (result.len == 0) return "?";
+        @memcpy(result, slice);
+        return result;
+    }
+
+    pub fn to_string_f32(value: f32) []const u8 {
+        var buf: [64]u8 = undefined;
+        const slice = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return "?";
+        const result = bumpAlloc(slice.len);
+        if (result.len == 0) return "?";
+        @memcpy(result, slice);
+        return result;
+    }
+
+    pub fn to_string_f64(value: f64) []const u8 {
         var buf: [64]u8 = undefined;
         const slice = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return "?";
         const result = bumpAlloc(slice.len);
@@ -3282,36 +4821,144 @@ pub const Float = struct {
         return std.fmt.parseFloat(f64, s) catch null;
     }
 
-    pub fn abs(x: f64) f64 {
-        return @abs(x);
+    pub fn abs(value: f64) f64 {
+        return abs_f64(value);
     }
 
-    pub fn max(a: f64, b: f64) f64 {
-        return @max(a, b);
+    pub fn abs_f16(value: f16) f16 {
+        return @abs(value);
     }
 
-    pub fn min(a: f64, b: f64) f64 {
-        return @min(a, b);
+    pub fn abs_f32(value: f32) f32 {
+        return @abs(value);
     }
 
-    pub fn round(x: f64) f64 {
-        return @round(x);
+    pub fn abs_f64(value: f64) f64 {
+        return @abs(value);
     }
 
-    pub fn floor(x: f64) f64 {
-        return @floor(x);
+    pub fn max(value: f64, other: f64) f64 {
+        return max_f64(value, other);
     }
 
-    pub fn ceil(x: f64) f64 {
-        return @ceil(x);
+    pub fn max_f16(value: f16, other: f16) f16 {
+        return @max(value, other);
     }
 
-    pub fn trunc(x: f64) f64 {
-        return @trunc(x);
+    pub fn max_f32(value: f32, other: f32) f32 {
+        return @max(value, other);
     }
 
-    pub fn to_i64(x: f64) i64 {
-        return @trunc(x);
+    pub fn max_f64(value: f64, other: f64) f64 {
+        return @max(value, other);
+    }
+
+    pub fn min(value: f64, other: f64) f64 {
+        return min_f64(value, other);
+    }
+
+    pub fn min_f16(value: f16, other: f16) f16 {
+        return @min(value, other);
+    }
+
+    pub fn min_f32(value: f32, other: f32) f32 {
+        return @min(value, other);
+    }
+
+    pub fn min_f64(value: f64, other: f64) f64 {
+        return @min(value, other);
+    }
+
+    pub fn round(value: f64) f64 {
+        return round_f64(value);
+    }
+
+    pub fn round_f16(value: f16) f16 {
+        return @round(value);
+    }
+
+    pub fn round_f32(value: f32) f32 {
+        return @round(value);
+    }
+
+    pub fn round_f64(value: f64) f64 {
+        return @round(value);
+    }
+
+    pub fn floor(value: f64) f64 {
+        return floor_f64(value);
+    }
+
+    pub fn floor_f16(value: f16) f16 {
+        return @floor(value);
+    }
+
+    pub fn floor_f32(value: f32) f32 {
+        return @floor(value);
+    }
+
+    pub fn floor_f64(value: f64) f64 {
+        return @floor(value);
+    }
+
+    pub fn ceil(value: f64) f64 {
+        return ceil_f64(value);
+    }
+
+    pub fn ceil_f16(value: f16) f16 {
+        return @ceil(value);
+    }
+
+    pub fn ceil_f32(value: f32) f32 {
+        return @ceil(value);
+    }
+
+    pub fn ceil_f64(value: f64) f64 {
+        return @ceil(value);
+    }
+
+    pub fn trunc(value: f64) f64 {
+        return trunc_f64(value);
+    }
+
+    pub fn trunc_f16(value: f16) f16 {
+        return @trunc(value);
+    }
+
+    pub fn trunc_f32(value: f32) f32 {
+        return @trunc(value);
+    }
+
+    pub fn trunc_f64(value: f64) f64 {
+        return @trunc(value);
+    }
+
+    pub fn clamp_f16(value: f16, lower: f16, upper: f16) f16 {
+        return min_f16(max_f16(value, lower), upper);
+    }
+
+    pub fn clamp_f32(value: f32, lower: f32, upper: f32) f32 {
+        return min_f32(max_f32(value, lower), upper);
+    }
+
+    pub fn clamp_f64(value: f64, lower: f64, upper: f64) f64 {
+        return min_f64(max_f64(value, lower), upper);
+    }
+
+    pub fn to_i64(value: f64) i64 {
+        return to_i64_f64(value);
+    }
+
+    pub fn to_i64_f16(value: f16) i64 {
+        return @intFromFloat(@trunc(value));
+    }
+
+    pub fn to_i64_f32(value: f32) i64 {
+        return @intFromFloat(@trunc(value));
+    }
+
+    pub fn to_i64_f64(value: f64) i64 {
+        return @intFromFloat(@trunc(value));
     }
 };
 

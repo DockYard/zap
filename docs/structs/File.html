@@ -60,7 +60,11 @@
 <li><a href="../structs/List.html">List</a></li>
 <li><a href="../structs/Map.html">Map</a></li>
 <li><a href="../structs/Math.html">Math</a></li>
+<li><a href="../structs/Path.html">Path</a></li>
+<li><a href="../structs/Range.html">Range</a></li>
+<li><a href="../structs/SourceGraph.html">SourceGraph</a></li>
 <li><a href="../structs/String.html">String</a></li>
+<li><a href="../structs/Struct.html">Struct</a></li>
 <li><a href="../structs/System.html">System</a></li>
 <li><a href="../structs/Zest.html">Zest</a></li>
 </ul>
@@ -81,22 +85,20 @@
 <a href="https://github.com/DockYard/zap/blob/v0.1.0/./lib/file.zap" class="source-file">./lib/file.zap</a>
 </div>
 </div>
-<p class="tagline">Functions for reading and writing files.</p>
-<div class="struct_doc">
-<p>Functions for reading and writing files.</p>
-<p>All paths are relative to the current working directory.
-File operations return empty strings or false on failure.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap">content <span class="hl-op">=</span> File.read(<span class="hl-string">"config.txt"</span>)
-File.write(<span class="hl-string">"output.txt"</span>, <span class="hl-string">"Hello, world!"</span>)
-File.exists?(<span class="hl-string">"config.txt"</span>)  <span class="hl-comment"># =&gt; true</span></code></pre>
-</div>
 <h2 id="functions">Functions</h2>
 <table class="summary">
 <tr><td class="summary-name"><a href="#read-1">read/1</a></td><td class="summary-doc">Reads the entire contents of a file as a string.</td></tr>
 <tr><td class="summary-name"><a href="#write-2">write/2</a></td><td class="summary-doc">Writes a string to a file, creating it if it doesn't exist
 and overwriting if it does.</td></tr>
 <tr><td class="summary-name"><a href="#exists?-1">exists?/1</a></td><td class="summary-doc">Returns true if the file exists at the given path.</td></tr>
+<tr><td class="summary-name"><a href="#read!-1">read!/1</a></td><td class="summary-doc">Reads the entire contents of a file.</td></tr>
+<tr><td class="summary-name"><a href="#rm-1">rm/1</a></td><td class="summary-doc">Deletes a file.</td></tr>
+<tr><td class="summary-name"><a href="#mkdir-1">mkdir/1</a></td><td class="summary-doc">Creates a directory.</td></tr>
+<tr><td class="summary-name"><a href="#rmdir-1">rmdir/1</a></td><td class="summary-doc">Removes an empty directory.</td></tr>
+<tr><td class="summary-name"><a href="#rename-2">rename/2</a></td><td class="summary-doc">Renames or moves a file.</td></tr>
+<tr><td class="summary-name"><a href="#cp-2">cp/2</a></td><td class="summary-doc">Copies a file.</td></tr>
+<tr><td class="summary-name"><a href="#dir?-1">dir?/1</a></td><td class="summary-doc">Returns true if the path is a directory.</td></tr>
+<tr><td class="summary-name"><a href="#regular?-1">regular?/1</a></td><td class="summary-doc">Returns true if the path is a regular file.</td></tr>
 </table>
 <h2>Function Details</h2>
 <div class="function-detail" id="read-1">
@@ -145,6 +147,121 @@ and overwriting if it does. Returns true on success.</p>
 File.exists?(<span class="hl-string">"missing.txt"</span>)  <span class="hl-comment"># =&gt; false</span></code></pre>
 </div>
 </div>
+<div class="function-detail" id="read!-1">
+<div class="function-header">
+<h3>read!<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#read!-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">read!</span><span class="sig-paren">(</span>path<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="function-doc">
+<p>Reads the entire contents of a file. Raises if the file cannot be read.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">File.read!(<span class="hl-string">"hello.txt"</span>)  <span class="hl-comment"># =&gt; &quot;Hello, world!&quot;</span>
+File.read!(<span class="hl-string">"missing.txt"</span>)  <span class="hl-comment"># raises RuntimeError</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="rm-1">
+<div class="function-header">
+<h3>rm<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#rm-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">rm</span><span class="sig-paren">(</span>path<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="function-doc">
+<p>Deletes a file. Returns true on success.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">File.rm(<span class="hl-string">"temp.txt"</span>)  <span class="hl-comment"># =&gt; true</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="mkdir-1">
+<div class="function-header">
+<h3>mkdir<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#mkdir-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">mkdir</span><span class="sig-paren">(</span>path<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="function-doc">
+<p>Creates a directory. Returns true on success.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">File.mkdir(<span class="hl-string">"output"</span>)  <span class="hl-comment"># =&gt; true</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="rmdir-1">
+<div class="function-header">
+<h3>rmdir<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#rmdir-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">rmdir</span><span class="sig-paren">(</span>path<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="function-doc">
+<p>Removes an empty directory. Returns true on success.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">File.rmdir(<span class="hl-string">"output"</span>)  <span class="hl-comment"># =&gt; true</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="rename-2">
+<div class="function-header">
+<h3>rename<span class="arity">/2</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#rename-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">rename</span><span class="sig-paren">(</span>old_path<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>new_path<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="function-doc">
+<p>Renames or moves a file. Returns true on success.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">File.rename(<span class="hl-string">"old.txt"</span>, <span class="hl-string">"new.txt"</span>)  <span class="hl-comment"># =&gt; true</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="cp-2">
+<div class="function-header">
+<h3>cp<span class="arity">/2</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#cp-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">cp</span><span class="sig-paren">(</span>source<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>destination<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="function-doc">
+<p>Copies a file. Returns true on success.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">File.cp(<span class="hl-string">"source.txt"</span>, <span class="hl-string">"dest.txt"</span>)  <span class="hl-comment"># =&gt; true</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="dir?-1">
+<div class="function-header">
+<h3>dir?<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#dir?-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">dir?</span><span class="sig-paren">(</span>path<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="function-doc">
+<p>Returns true if the path is a directory.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">File.dir?(<span class="hl-string">"src"</span>)     <span class="hl-comment"># =&gt; true</span>
+File.dir?(<span class="hl-string">"main.zap"</span>) <span class="hl-comment"># =&gt; false</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="regular?-1">
+<div class="function-header">
+<h3>regular?<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#regular?-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">regular?</span><span class="sig-paren">(</span>path<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="function-doc">
+<p>Returns true if the path is a regular file.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">File.regular?(<span class="hl-string">"main.zap"</span>) <span class="hl-comment"># =&gt; true</span>
+File.regular?(<span class="hl-string">"src"</span>)      <span class="hl-comment"># =&gt; false</span></code></pre>
+</div>
+</div>
 </main>
 <aside class="toc">
 <h3>On This Page</h3>
@@ -153,6 +270,14 @@ File.exists?(<span class="hl-string">"missing.txt"</span>)  <span class="hl-comm
 <li><a href="#read-1">read/1</a></li>
 <li><a href="#write-2">write/2</a></li>
 <li><a href="#exists?-1">exists?/1</a></li>
+<li><a href="#read!-1">read!/1</a></li>
+<li><a href="#rm-1">rm/1</a></li>
+<li><a href="#mkdir-1">mkdir/1</a></li>
+<li><a href="#rmdir-1">rmdir/1</a></li>
+<li><a href="#rename-2">rename/2</a></li>
+<li><a href="#cp-2">cp/2</a></li>
+<li><a href="#dir?-1">dir?/1</a></li>
+<li><a href="#regular?-1">regular?/1</a></li>
 </ul>
 </aside>
 </div>

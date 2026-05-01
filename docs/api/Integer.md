@@ -1,47 +1,18 @@
 # Integer
 
-Functions for working with integers.
-
-## Integer Types
-
-Zap supports the following integer types:
-
-| Signed  | Unsigned | Bits |
-|---------|----------|------|
-| `i8`    | `u8`     | 8    |
-| `i16`   | `u16`    | 16   |
-| `i32`   | `u32`    | 32   |
-| `i64`   | `u64`    | 64   |
-
-The default integer type for literals is `i64`.
-
-## Implicit Widening
-
-Zap automatically widens narrower integer types to wider ones at
-function call sites when no data is lost. This means you can pass
-an `i8` value to a function that expects `i64` without an explicit
-cast — the compiler inserts a zero-cost widening instruction.
-
-**Signed widening:** `i8` \u{2192} `i16` \u{2192} `i32` \u{2192} `i64`
-
-**Unsigned widening:** `u8` \u{2192} `u16` \u{2192} `u32` \u{2192} `u64`
-
-**Unsigned to signed:** `u8` \u{2192} `i16`, `u16` \u{2192} `i32`, `u32` \u{2192} `i64`
-(the signed type must have strictly more bits to represent the full
-unsigned range)
-
-The following conversions are **not** implicit:
-
-- Signed to unsigned (negative values would be lost)
-- Wider to narrower (data truncation)
-- Integer to float (precision loss for large values)
-
 ## Functions
 
 ### to_string/1
 
 ```zap
+pub fn to_string(value :: i8) -> String
+pub fn to_string(value :: i16) -> String
+pub fn to_string(value :: i32) -> String
 pub fn to_string(value :: i64) -> String
+pub fn to_string(value :: u8) -> String
+pub fn to_string(value :: u16) -> String
+pub fn to_string(value :: u32) -> String
+pub fn to_string(value :: u64) -> String
 ```
 
 Converts an integer to its string representation.
@@ -52,61 +23,67 @@ Converts an integer to its string representation.
     Integer.to_string(-7)    # => "-7"
     Integer.to_string(0)     # => "0"
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L50)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L40)
 
 ---
 
 ### abs/1
 
 ```zap
+pub fn abs(value :: i8) -> i8
+pub fn abs(value :: i16) -> i16
+pub fn abs(value :: i32) -> i32
 pub fn abs(value :: i64) -> i64
+pub fn abs(value :: u8) -> u8
+pub fn abs(value :: u16) -> u16
+pub fn abs(value :: u32) -> u32
+pub fn abs(value :: u64) -> u64
 ```
 
 Returns the absolute value of an integer.
 
-## Examples
+Unsigned integers are already non-negative, so their absolute
+value is the original value.
 
-    Integer.abs(-42)  # => 42
-    Integer.abs(42)   # => 42
-    Integer.abs(0)    # => 0
-
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L64)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L56)
 
 ---
 
 ### max/2
 
 ```zap
+pub fn max(first :: i8, second :: i8) -> i8
+pub fn max(first :: i16, second :: i16) -> i16
+pub fn max(first :: i32, second :: i32) -> i32
 pub fn max(first :: i64, second :: i64) -> i64
+pub fn max(first :: u8, second :: u8) -> u8
+pub fn max(first :: u16, second :: u16) -> u16
+pub fn max(first :: u32, second :: u32) -> u32
+pub fn max(first :: u64, second :: u64) -> u64
 ```
 
 Returns the larger of two integers.
 
-## Examples
-
-    Integer.max(3, 7)    # => 7
-    Integer.max(10, 2)   # => 10
-    Integer.max(5, 5)    # => 5
-
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L78)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L67)
 
 ---
 
 ### min/2
 
 ```zap
+pub fn min(first :: i8, second :: i8) -> i8
+pub fn min(first :: i16, second :: i16) -> i16
+pub fn min(first :: i32, second :: i32) -> i32
 pub fn min(first :: i64, second :: i64) -> i64
+pub fn min(first :: u8, second :: u8) -> u8
+pub fn min(first :: u16, second :: u16) -> u16
+pub fn min(first :: u32, second :: u32) -> u32
+pub fn min(first :: u64, second :: u64) -> u64
 ```
 
 Returns the smaller of two integers.
 
-## Examples
-
-    Integer.min(3, 7)    # => 3
-    Integer.min(10, 2)   # => 2
-    Integer.min(5, 5)    # => 5
-
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L92)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L78)
 
 ---
 
@@ -116,462 +93,485 @@ Returns the smaller of two integers.
 pub fn parse(input :: String) -> i64
 ```
 
-Parses a string into an integer. Returns 0 if the string
-is not a valid integer representation.
+Parses a string into an integer. Returns 0 if the string is not
+a valid integer representation.
 
-## Examples
-
-    Integer.parse("42")    # => 42
-    Integer.parse("-7")    # => -7
-    Integer.parse("hello") # => 0
-
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L107)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L92)
 
 ---
 
 ### remainder/2
 
 ```zap
+pub fn remainder(dividend :: i8, divisor :: i8) -> i8
+pub fn remainder(dividend :: i16, divisor :: i16) -> i16
+pub fn remainder(dividend :: i32, divisor :: i32) -> i32
 pub fn remainder(dividend :: i64, divisor :: i64) -> i64
+pub fn remainder(dividend :: u8, divisor :: u8) -> u8
+pub fn remainder(dividend :: u16, divisor :: u16) -> u16
+pub fn remainder(dividend :: u32, divisor :: u32) -> u32
+pub fn remainder(dividend :: u64, divisor :: u64) -> u64
 ```
 
 Computes the remainder of integer division.
 
-## Examples
-
-    Integer.remainder(10, 3)   # => 1
-    Integer.remainder(7, 2)    # => 1
-    Integer.remainder(6, 3)    # => 0
-
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L121)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L98)
 
 ---
 
 ### pow/2
 
 ```zap
+pub fn pow(base :: i8, exponent :: i8) -> i8
+pub fn pow(base :: i16, exponent :: i16) -> i16
+pub fn pow(base :: i32, exponent :: i32) -> i32
 pub fn pow(base :: i64, exponent :: i64) -> i64
+pub fn pow(base :: u8, exponent :: u8) -> u8
+pub fn pow(base :: u16, exponent :: u16) -> u16
+pub fn pow(base :: u32, exponent :: u32) -> u32
+pub fn pow(base :: u64, exponent :: u64) -> u64
 ```
 
-Raises `base` to the power of `exponent`. The exponent must
-be non-negative.
+Raises `base` to the power of `exponent`.
 
-## Examples
-
-    Integer.pow(2, 10)   # => 1024
-    Integer.pow(3, 3)    # => 27
-    Integer.pow(5, 0)    # => 1
-    Integer.pow(7, 1)    # => 7
-
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L137)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L109)
 
 ---
 
 ### clamp/3
 
 ```zap
+pub fn clamp(value :: i8, lower :: i8, upper :: i8) -> i8
+pub fn clamp(value :: i16, lower :: i16, upper :: i16) -> i16
+pub fn clamp(value :: i32, lower :: i32, upper :: i32) -> i32
 pub fn clamp(value :: i64, lower :: i64, upper :: i64) -> i64
+pub fn clamp(value :: u8, lower :: u8, upper :: u8) -> u8
+pub fn clamp(value :: u16, lower :: u16, upper :: u16) -> u16
+pub fn clamp(value :: u32, lower :: u32, upper :: u32) -> u32
+pub fn clamp(value :: u64, lower :: u64, upper :: u64) -> u64
 ```
 
 Clamps a value to be within the given range.
 
-## Examples
-
-    Integer.clamp(15, 0, 10)   # => 10
-    Integer.clamp(-5, 0, 10)   # => 0
-    Integer.clamp(5, 0, 10)    # => 5
-
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L154)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L120)
 
 ---
 
 ### digits/1
 
 ```zap
+pub fn digits(value :: i8) -> i64
+pub fn digits(value :: i16) -> i64
+pub fn digits(value :: i32) -> i64
 pub fn digits(value :: i64) -> i64
+pub fn digits(value :: u8) -> i64
+pub fn digits(value :: u16) -> i64
+pub fn digits(value :: u32) -> i64
+pub fn digits(value :: u64) -> i64
 ```
 
-Returns the number of digits in an integer. Negative signs
-are not counted.
+Returns the number of decimal digits in an integer.
 
-## Examples
-
-    Integer.digits(42)     # => 2
-    Integer.digits(0)      # => 1
-    Integer.digits(-123)   # => 3
-    Integer.digits(10000)  # => 5
-
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L170)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L131)
 
 ---
 
 ### count_digits/1
 
 ```zap
+pub fn count_digits(value :: i8) -> i64
+pub fn count_digits(value :: i16) -> i64
+pub fn count_digits(value :: i32) -> i64
 pub fn count_digits(value :: i64) -> i64
+pub fn count_digits(value :: u8) -> i64
+pub fn count_digits(value :: u16) -> i64
+pub fn count_digits(value :: u32) -> i64
+pub fn count_digits(value :: u64) -> i64
 ```
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L174)
+Counts decimal digits in an integer value.
+
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L142)
 
 ---
 
 ### to_float/1
 
 ```zap
+pub fn to_float(value :: i8) -> f64
+pub fn to_float(value :: i16) -> f64
+pub fn to_float(value :: i32) -> f64
 pub fn to_float(value :: i64) -> f64
+pub fn to_float(value :: u8) -> f64
+pub fn to_float(value :: u16) -> f64
+pub fn to_float(value :: u32) -> f64
+pub fn to_float(value :: u64) -> f64
 ```
 
-Converts an integer to a floating-point number.
+Converts an integer to a 64-bit floating-point number.
 
-## Examples
-
-    Integer.to_float(42)   # => 42.0
-    Integer.to_float(-7)   # => -7.0
-    Integer.to_float(0)    # => 0.0
-
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L191)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L153)
 
 ---
 
 ### count_leading_zeros/1
 
 ```zap
+pub fn count_leading_zeros(value :: i8) -> i64
+pub fn count_leading_zeros(value :: i16) -> i64
+pub fn count_leading_zeros(value :: i32) -> i64
 pub fn count_leading_zeros(value :: i64) -> i64
+pub fn count_leading_zeros(value :: u8) -> i64
+pub fn count_leading_zeros(value :: u16) -> i64
+pub fn count_leading_zeros(value :: u32) -> i64
+pub fn count_leading_zeros(value :: u64) -> i64
 ```
 
 Returns the number of leading zeros in the binary representation.
 
-## Examples
-
-    Integer.count_leading_zeros(1)   # => 63
-    Integer.count_leading_zeros(0)   # => 64
-
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L206)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L164)
 
 ---
 
 ### count_trailing_zeros/1
 
 ```zap
+pub fn count_trailing_zeros(value :: i8) -> i64
+pub fn count_trailing_zeros(value :: i16) -> i64
+pub fn count_trailing_zeros(value :: i32) -> i64
 pub fn count_trailing_zeros(value :: i64) -> i64
+pub fn count_trailing_zeros(value :: u8) -> i64
+pub fn count_trailing_zeros(value :: u16) -> i64
+pub fn count_trailing_zeros(value :: u32) -> i64
+pub fn count_trailing_zeros(value :: u64) -> i64
 ```
 
 Returns the number of trailing zeros in the binary representation.
 
-## Examples
-
-    Integer.count_trailing_zeros(8)   # => 3
-    Integer.count_trailing_zeros(1)   # => 0
-
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L219)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L175)
 
 ---
 
 ### popcount/1
 
 ```zap
+pub fn popcount(value :: i8) -> i64
+pub fn popcount(value :: i16) -> i64
+pub fn popcount(value :: i32) -> i64
 pub fn popcount(value :: i64) -> i64
+pub fn popcount(value :: u8) -> i64
+pub fn popcount(value :: u16) -> i64
+pub fn popcount(value :: u32) -> i64
+pub fn popcount(value :: u64) -> i64
 ```
 
-Returns the number of set bits (ones) in the binary representation.
+Returns the number of set bits in the binary representation.
 
-## Examples
-
-    Integer.popcount(7)    # => 3
-    Integer.popcount(255)  # => 8
-    Integer.popcount(0)    # => 0
-
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L233)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L186)
 
 ---
 
 ### byte_swap/1
 
 ```zap
+pub fn byte_swap(value :: i8) -> i8
+pub fn byte_swap(value :: i16) -> i16
+pub fn byte_swap(value :: i32) -> i32
 pub fn byte_swap(value :: i64) -> i64
+pub fn byte_swap(value :: u8) -> u8
+pub fn byte_swap(value :: u16) -> u16
+pub fn byte_swap(value :: u32) -> u32
+pub fn byte_swap(value :: u64) -> u64
 ```
 
-Reverses the byte order of an integer. Useful for converting
-between big-endian and little-endian representations.
+Reverses the byte order of an integer.
 
-## Examples
-
-    Integer.byte_swap(1)  # => 72057594037927936
-
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L246)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L197)
 
 ---
 
 ### bit_reverse/1
 
 ```zap
+pub fn bit_reverse(value :: i8) -> i8
+pub fn bit_reverse(value :: i16) -> i16
+pub fn bit_reverse(value :: i32) -> i32
 pub fn bit_reverse(value :: i64) -> i64
+pub fn bit_reverse(value :: u8) -> u8
+pub fn bit_reverse(value :: u16) -> u16
+pub fn bit_reverse(value :: u32) -> u32
+pub fn bit_reverse(value :: u64) -> u64
 ```
 
 Reverses all bits in the binary representation.
 
-## Examples
-
-    Integer.bit_reverse(1)  # => -9223372036854775808
-
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L258)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L208)
 
 ---
 
 ### add_sat/2
 
 ```zap
+pub fn add_sat(first :: i8, second :: i8) -> i8
+pub fn add_sat(first :: i16, second :: i16) -> i16
+pub fn add_sat(first :: i32, second :: i32) -> i32
 pub fn add_sat(first :: i64, second :: i64) -> i64
+pub fn add_sat(first :: u8, second :: u8) -> u8
+pub fn add_sat(first :: u16, second :: u16) -> u16
+pub fn add_sat(first :: u32, second :: u32) -> u32
+pub fn add_sat(first :: u64, second :: u64) -> u64
 ```
 
-Adds two integers with saturation. If the result would overflow,
-it clamps to the maximum (or minimum) representable value instead.
+Adds two integers with saturation.
 
-## Examples
-
-    Integer.add_sat(9223372036854775807, 1)  # => 9223372036854775807
-    Integer.add_sat(3, 4)                     # => 7
-
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L274)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L219)
 
 ---
 
 ### sub_sat/2
 
 ```zap
+pub fn sub_sat(first :: i8, second :: i8) -> i8
+pub fn sub_sat(first :: i16, second :: i16) -> i16
+pub fn sub_sat(first :: i32, second :: i32) -> i32
 pub fn sub_sat(first :: i64, second :: i64) -> i64
+pub fn sub_sat(first :: u8, second :: u8) -> u8
+pub fn sub_sat(first :: u16, second :: u16) -> u16
+pub fn sub_sat(first :: u32, second :: u32) -> u32
+pub fn sub_sat(first :: u64, second :: u64) -> u64
 ```
 
-Subtracts two integers with saturation. If the result would
-underflow, it clamps to the minimum representable value instead.
+Subtracts two integers with saturation.
 
-## Examples
-
-    Integer.sub_sat(-9223372036854775808, 1)  # => -9223372036854775808
-    Integer.sub_sat(10, 3)                     # => 7
-
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L288)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L230)
 
 ---
 
 ### mul_sat/2
 
 ```zap
+pub fn mul_sat(first :: i8, second :: i8) -> i8
+pub fn mul_sat(first :: i16, second :: i16) -> i16
+pub fn mul_sat(first :: i32, second :: i32) -> i32
 pub fn mul_sat(first :: i64, second :: i64) -> i64
+pub fn mul_sat(first :: u8, second :: u8) -> u8
+pub fn mul_sat(first :: u16, second :: u16) -> u16
+pub fn mul_sat(first :: u32, second :: u32) -> u32
+pub fn mul_sat(first :: u64, second :: u64) -> u64
 ```
 
-Multiplies two integers with saturation. If the result would
-overflow, it clamps to the maximum (or minimum) representable
-value instead.
+Multiplies two integers with saturation.
 
-## Examples
-
-    Integer.mul_sat(9223372036854775807, 2)  # => 9223372036854775807
-    Integer.mul_sat(3, 4)                     # => 12
-
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L303)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L241)
 
 ---
 
 ### band/2
 
 ```zap
+pub fn band(first :: i8, second :: i8) -> i8
+pub fn band(first :: i16, second :: i16) -> i16
+pub fn band(first :: i32, second :: i32) -> i32
 pub fn band(first :: i64, second :: i64) -> i64
+pub fn band(first :: u8, second :: u8) -> u8
+pub fn band(first :: u16, second :: u16) -> u16
+pub fn band(first :: u32, second :: u32) -> u32
+pub fn band(first :: u64, second :: u64) -> u64
 ```
 
 Bitwise AND of two integers.
 
-## Examples
-
-    Integer.band(7, 5)    # => 5
-    Integer.band(255, 15) # => 15
-    Integer.band(0, 42)   # => 0
-
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L319)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L252)
 
 ---
 
 ### bor/2
 
 ```zap
+pub fn bor(first :: i8, second :: i8) -> i8
+pub fn bor(first :: i16, second :: i16) -> i16
+pub fn bor(first :: i32, second :: i32) -> i32
 pub fn bor(first :: i64, second :: i64) -> i64
+pub fn bor(first :: u8, second :: u8) -> u8
+pub fn bor(first :: u16, second :: u16) -> u16
+pub fn bor(first :: u32, second :: u32) -> u32
+pub fn bor(first :: u64, second :: u64) -> u64
 ```
 
 Bitwise OR of two integers.
 
-## Examples
-
-    Integer.bor(5, 3)    # => 7
-    Integer.bor(0, 42)   # => 42
-    Integer.bor(255, 0)  # => 255
-
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L333)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L263)
 
 ---
 
 ### bxor/2
 
 ```zap
+pub fn bxor(first :: i8, second :: i8) -> i8
+pub fn bxor(first :: i16, second :: i16) -> i16
+pub fn bxor(first :: i32, second :: i32) -> i32
 pub fn bxor(first :: i64, second :: i64) -> i64
+pub fn bxor(first :: u8, second :: u8) -> u8
+pub fn bxor(first :: u16, second :: u16) -> u16
+pub fn bxor(first :: u32, second :: u32) -> u32
+pub fn bxor(first :: u64, second :: u64) -> u64
 ```
 
-Bitwise XOR (exclusive OR) of two integers.
+Bitwise XOR of two integers.
 
-## Examples
-
-    Integer.bxor(7, 5)    # => 2
-    Integer.bxor(255, 255) # => 0
-    Integer.bxor(0, 42)   # => 42
-
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L347)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L274)
 
 ---
 
 ### bnot/1
 
 ```zap
+pub fn bnot(value :: i8) -> i8
+pub fn bnot(value :: i16) -> i16
+pub fn bnot(value :: i32) -> i32
 pub fn bnot(value :: i64) -> i64
+pub fn bnot(value :: u8) -> u8
+pub fn bnot(value :: u16) -> u16
+pub fn bnot(value :: u32) -> u32
+pub fn bnot(value :: u64) -> u64
 ```
 
-Bitwise NOT (complement) of an integer.
+Bitwise NOT of an integer.
 
-Flips all bits in the binary representation.
-
-## Examples
-
-    Integer.bnot(0)    # => -1
-    Integer.bnot(-1)   # => 0
-
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L362)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L285)
 
 ---
 
 ### bsl/2
 
 ```zap
+pub fn bsl(value :: i8, amount :: i8) -> i8
+pub fn bsl(value :: i16, amount :: i16) -> i16
+pub fn bsl(value :: i32, amount :: i32) -> i32
 pub fn bsl(value :: i64, amount :: i64) -> i64
+pub fn bsl(value :: u8, amount :: u8) -> u8
+pub fn bsl(value :: u16, amount :: u16) -> u16
+pub fn bsl(value :: u32, amount :: u32) -> u32
+pub fn bsl(value :: u64, amount :: u64) -> u64
 ```
 
-Bitwise shift left. Shifts the bits of the first argument
-left by the number of positions given in the second argument.
+Bitwise shift left.
 
-## Examples
-
-    Integer.bsl(1, 3)    # => 8
-    Integer.bsl(5, 1)    # => 10
-
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L376)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L296)
 
 ---
 
 ### bsr/2
 
 ```zap
+pub fn bsr(value :: i8, amount :: i8) -> i8
+pub fn bsr(value :: i16, amount :: i16) -> i16
+pub fn bsr(value :: i32, amount :: i32) -> i32
 pub fn bsr(value :: i64, amount :: i64) -> i64
+pub fn bsr(value :: u8, amount :: u8) -> u8
+pub fn bsr(value :: u16, amount :: u16) -> u16
+pub fn bsr(value :: u32, amount :: u32) -> u32
+pub fn bsr(value :: u64, amount :: u64) -> u64
 ```
 
-Bitwise shift right (arithmetic). Shifts the bits of the first
-argument right by the number of positions given in the second
-argument. Preserves the sign bit.
+Bitwise shift right.
 
-## Examples
-
-    Integer.bsr(8, 3)    # => 1
-    Integer.bsr(10, 1)   # => 5
-
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L391)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L307)
 
 ---
 
 ### sign/1
 
 ```zap
+pub fn sign(value :: i8) -> i8
+pub fn sign(value :: i16) -> i16
+pub fn sign(value :: i32) -> i32
 pub fn sign(value :: i64) -> i64
+pub fn sign(value :: u8) -> u8
+pub fn sign(value :: u16) -> u16
+pub fn sign(value :: u32) -> u32
+pub fn sign(value :: u64) -> u64
 ```
 
-Returns the sign of an integer: -1 for negative, 0 for zero,
-1 for positive.
+Returns the sign of an integer.
 
-## Examples
-
-    Integer.sign(42)   # => 1
-    Integer.sign(0)    # => 0
-    Integer.sign(-7)   # => -1
-
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L408)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L318)
 
 ---
 
 ### even?/1
 
 ```zap
+pub fn even?(value :: i8) -> Bool
+pub fn even?(value :: i16) -> Bool
+pub fn even?(value :: i32) -> Bool
 pub fn even?(value :: i64) -> Bool
+pub fn even?(value :: u8) -> Bool
+pub fn even?(value :: u16) -> Bool
+pub fn even?(value :: u32) -> Bool
+pub fn even?(value :: u64) -> Bool
 ```
 
 Returns true if the integer is even.
 
-## Examples
-
-    Integer.even?(4)   # => true
-    Integer.even?(3)   # => false
-    Integer.even?(0)   # => true
-
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L422)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L329)
 
 ---
 
 ### odd?/1
 
 ```zap
+pub fn odd?(value :: i8) -> Bool
+pub fn odd?(value :: i16) -> Bool
+pub fn odd?(value :: i32) -> Bool
 pub fn odd?(value :: i64) -> Bool
+pub fn odd?(value :: u8) -> Bool
+pub fn odd?(value :: u16) -> Bool
+pub fn odd?(value :: u32) -> Bool
+pub fn odd?(value :: u64) -> Bool
 ```
 
 Returns true if the integer is odd.
 
-## Examples
-
-    Integer.odd?(3)   # => true
-    Integer.odd?(4)   # => false
-    Integer.odd?(0)   # => false
-
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L436)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L340)
 
 ---
 
 ### gcd/2
 
 ```zap
+pub fn gcd(first :: i8, second :: i8) -> i8
+pub fn gcd(first :: i16, second :: i16) -> i16
+pub fn gcd(first :: i32, second :: i32) -> i32
 pub fn gcd(first :: i64, second :: i64) -> i64
+pub fn gcd(first :: u8, second :: u8) -> u8
+pub fn gcd(first :: u16, second :: u16) -> u16
+pub fn gcd(first :: u32, second :: u32) -> u32
+pub fn gcd(first :: u64, second :: u64) -> u64
 ```
 
-Computes the greatest common divisor of two integers
-using the Euclidean algorithm.
+Computes the greatest common divisor of two integers.
 
-## Examples
-
-    Integer.gcd(12, 8)   # => 4
-    Integer.gcd(54, 24)  # => 6
-    Integer.gcd(7, 5)    # => 1
-
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L451)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L351)
 
 ---
 
 ### lcm/2
 
 ```zap
+pub fn lcm(first :: i8, second :: i8) -> i8
+pub fn lcm(first :: i16, second :: i16) -> i16
+pub fn lcm(first :: i32, second :: i32) -> i32
 pub fn lcm(first :: i64, second :: i64) -> i64
+pub fn lcm(first :: u8, second :: u8) -> u8
+pub fn lcm(first :: u16, second :: u16) -> u16
+pub fn lcm(first :: u32, second :: u32) -> u32
+pub fn lcm(first :: u64, second :: u64) -> u64
 ```
 
 Computes the least common multiple of two integers.
 
-## Examples
-
-    Integer.lcm(4, 6)   # => 12
-    Integer.lcm(3, 5)   # => 15
-    Integer.lcm(7, 7)   # => 7
-
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L465)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap#L362)
 
 ---
 

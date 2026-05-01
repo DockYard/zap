@@ -60,7 +60,11 @@
 <li><a href="../structs/List.html">List</a></li>
 <li><a href="../structs/Map.html">Map</a></li>
 <li><a href="../structs/Math.html">Math</a></li>
+<li><a href="../structs/Path.html">Path</a></li>
+<li><a href="../structs/Range.html">Range</a></li>
+<li><a href="../structs/SourceGraph.html">SourceGraph</a></li>
 <li><a href="../structs/String.html">String</a></li>
+<li><a href="../structs/Struct.html">Struct</a></li>
 <li><a href="../structs/System.html">System</a></li>
 <li><a href="../structs/Zest.html">Zest</a></li>
 </ul>
@@ -81,26 +85,6 @@
 <a href="https://github.com/DockYard/zap/blob/v0.1.0/./lib/float.zap" class="source-file">./lib/float.zap</a>
 </div>
 </div>
-<p class="tagline">Functions for working with floating-point numbers.</p>
-<div class="struct_doc">
-<p>Functions for working with floating-point numbers.</p>
-<h2>Float Types</h2>
-<p>Zap supports the following floating-point types:</p>
-<p>| Type  | Bits | Precision        |
-|-------|------|------------------|
-| <code>f16</code> | 16   | Half precision   |
-| <code>f32</code> | 32   | Single precision |
-| <code>f64</code> | 64   | Double precision |</p>
-<p>The default float type for literals is <code>f64</code>.</p>
-<h2>Implicit Widening</h2>
-<p>Zap automatically widens narrower float types to wider ones at
-function call sites: <code>f16</code> u{2192} <code>f32</code> u{2192} <code>f64</code>. This is
-lossless and zero-cost — the compiler inserts the conversion
-automatically.</p>
-<p>Integer-to-float conversion is <strong>not</strong> implicit because large
-integers cannot be represented exactly in floating-point. Use
-<code>Integer.to_float/1</code> when needed.</p>
-</div>
 <h2 id="functions">Functions</h2>
 <table class="summary">
 <tr><td class="summary-name"><a href="#to_string-1">to_string/1</a></td><td class="summary-doc">Converts a floating-point number to its string representation.</td></tr>
@@ -109,10 +93,8 @@ integers cannot be represented exactly in floating-point. Use
 <tr><td class="summary-name"><a href="#min-2">min/2</a></td><td class="summary-doc">Returns the smaller of two floats.</td></tr>
 <tr><td class="summary-name"><a href="#parse-1">parse/1</a></td><td class="summary-doc">Parses a string into a float.</td></tr>
 <tr><td class="summary-name"><a href="#round-1">round/1</a></td><td class="summary-doc">Rounds a float to the nearest integer value, returned as a float.</td></tr>
-<tr><td class="summary-name"><a href="#floor-1">floor/1</a></td><td class="summary-doc">Returns the largest integer value less than or equal to the
-given float, returned as a float.</td></tr>
-<tr><td class="summary-name"><a href="#ceil-1">ceil/1</a></td><td class="summary-doc">Returns the smallest integer value greater than or equal to
-the given float, returned as a float.</td></tr>
+<tr><td class="summary-name"><a href="#floor-1">floor/1</a></td><td class="summary-doc">Returns the largest integer value less than or equal to the given float.</td></tr>
+<tr><td class="summary-name"><a href="#ceil-1">ceil/1</a></td><td class="summary-doc">Returns the smallest integer value greater than or equal to the given float.</td></tr>
 <tr><td class="summary-name"><a href="#truncate-1">truncate/1</a></td><td class="summary-doc">Truncates a float toward zero, removing the fractional part.</td></tr>
 <tr><td class="summary-name"><a href="#to_integer-1">to_integer/1</a></td><td class="summary-doc">Converts a float to an integer by truncating toward zero.</td></tr>
 <tr><td class="summary-name"><a href="#clamp-3">clamp/3</a></td><td class="summary-doc">Clamps a float to be within the given range.</td></tr>
@@ -128,12 +110,11 @@ the given float, returned as a float.</td></tr>
 <div style="flex:1"></div>
 <a href="#to_string-1" class="anchor-link">#</a>
 </div>
+<div class="signature"><code><span class="sig-name">to_string</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="signature"><code><span class="sig-name">to_string</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
 <div class="signature"><code><span class="sig-name">to_string</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
 <div class="function-doc">
 <p>Converts a floating-point number to its string representation.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap">Float.to_string(<span class="hl-number">3.14</span>)   <span class="hl-comment"># =&gt; &quot;3.14&quot;</span>
-Float.to_string(<span class="hl-number">-0.5</span>)   <span class="hl-comment"># =&gt; &quot;-0.5&quot;</span></code></pre>
 </div>
 </div>
 <div class="function-detail" id="abs-1">
@@ -143,13 +124,11 @@ Float.to_string(<span class="hl-number">-0.5</span>)   <span class="hl-comment">
 <div style="flex:1"></div>
 <a href="#abs-1" class="anchor-link">#</a>
 </div>
+<div class="signature"><code><span class="sig-name">abs</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f16</span></code></div>
+<div class="signature"><code><span class="sig-name">abs</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f32</span></code></div>
 <div class="signature"><code><span class="sig-name">abs</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
 <div class="function-doc">
 <p>Returns the absolute value of a float.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap">Float.abs(<span class="hl-number">-3.14</span>)  <span class="hl-comment"># =&gt; 3.14</span>
-Float.abs(<span class="hl-number">2.5</span>)    <span class="hl-comment"># =&gt; 2.5</span>
-Float.abs(<span class="hl-number">0.0</span>)    <span class="hl-comment"># =&gt; 0.0</span></code></pre>
 </div>
 </div>
 <div class="function-detail" id="max-2">
@@ -159,12 +138,11 @@ Float.abs(<span class="hl-number">0.0</span>)    <span class="hl-comment"># =&gt
 <div style="flex:1"></div>
 <a href="#max-2" class="anchor-link">#</a>
 </div>
+<div class="signature"><code><span class="sig-name">max</span><span class="sig-paren">(</span>first<span class="sig-separator">::</span><span class="sig-type-pill">f16</span><span class="sig-paren">, </span>second<span class="sig-separator">::</span><span class="sig-type-pill">f16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f16</span></code></div>
+<div class="signature"><code><span class="sig-name">max</span><span class="sig-paren">(</span>first<span class="sig-separator">::</span><span class="sig-type-pill">f32</span><span class="sig-paren">, </span>second<span class="sig-separator">::</span><span class="sig-type-pill">f32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f32</span></code></div>
 <div class="signature"><code><span class="sig-name">max</span><span class="sig-paren">(</span>first<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">, </span>second<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
 <div class="function-doc">
 <p>Returns the larger of two floats.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap">Float.max(<span class="hl-number">3.0</span>, <span class="hl-number">7.0</span>)    <span class="hl-comment"># =&gt; 7.0</span>
-Float.max(<span class="hl-number">10.5</span>, <span class="hl-number">2.3</span>)   <span class="hl-comment"># =&gt; 10.5</span></code></pre>
 </div>
 </div>
 <div class="function-detail" id="min-2">
@@ -174,12 +152,11 @@ Float.max(<span class="hl-number">10.5</span>, <span class="hl-number">2.3</span
 <div style="flex:1"></div>
 <a href="#min-2" class="anchor-link">#</a>
 </div>
+<div class="signature"><code><span class="sig-name">min</span><span class="sig-paren">(</span>first<span class="sig-separator">::</span><span class="sig-type-pill">f16</span><span class="sig-paren">, </span>second<span class="sig-separator">::</span><span class="sig-type-pill">f16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f16</span></code></div>
+<div class="signature"><code><span class="sig-name">min</span><span class="sig-paren">(</span>first<span class="sig-separator">::</span><span class="sig-type-pill">f32</span><span class="sig-paren">, </span>second<span class="sig-separator">::</span><span class="sig-type-pill">f32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f32</span></code></div>
 <div class="signature"><code><span class="sig-name">min</span><span class="sig-paren">(</span>first<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">, </span>second<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
 <div class="function-doc">
 <p>Returns the smaller of two floats.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap">Float.min(<span class="hl-number">3.0</span>, <span class="hl-number">7.0</span>)    <span class="hl-comment"># =&gt; 3.0</span>
-Float.min(<span class="hl-number">10.5</span>, <span class="hl-number">2.3</span>)   <span class="hl-comment"># =&gt; 2.3</span></code></pre>
 </div>
 </div>
 <div class="function-detail" id="parse-1">
@@ -191,12 +168,8 @@ Float.min(<span class="hl-number">10.5</span>, <span class="hl-number">2.3</span
 </div>
 <div class="signature"><code><span class="sig-name">parse</span><span class="sig-paren">(</span>input<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
 <div class="function-doc">
-<p>Parses a string into a float. Returns 0.0 if the string
-is not a valid float representation.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap">Float.parse(<span class="hl-string">"3.14"</span>)    <span class="hl-comment"># =&gt; 3.14</span>
-Float.parse(<span class="hl-string">"-0.5"</span>)    <span class="hl-comment"># =&gt; -0.5</span>
-Float.parse(<span class="hl-string">"hello"</span>)   <span class="hl-comment"># =&gt; 0.0</span></code></pre>
+<p>Parses a string into a float. Returns 0.0 if the string is not
+a valid float representation.</p>
 </div>
 </div>
 <div class="function-detail" id="round-1">
@@ -206,14 +179,11 @@ Float.parse(<span class="hl-string">"hello"</span>)   <span class="hl-comment">#
 <div style="flex:1"></div>
 <a href="#round-1" class="anchor-link">#</a>
 </div>
+<div class="signature"><code><span class="sig-name">round</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f16</span></code></div>
+<div class="signature"><code><span class="sig-name">round</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f32</span></code></div>
 <div class="signature"><code><span class="sig-name">round</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
 <div class="function-doc">
-<p>Rounds a float to the nearest integer value, returned as a float.
-Rounds half-values away from zero.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap">Float.round(<span class="hl-number">3.2</span>)   <span class="hl-comment"># =&gt; 3.0</span>
-Float.round(<span class="hl-number">3.7</span>)   <span class="hl-comment"># =&gt; 4.0</span>
-Float.round(<span class="hl-number">-2.5</span>)  <span class="hl-comment"># =&gt; -3.0</span></code></pre>
+<p>Rounds a float to the nearest integer value, returned as a float.</p>
 </div>
 </div>
 <div class="function-detail" id="floor-1">
@@ -223,14 +193,11 @@ Float.round(<span class="hl-number">-2.5</span>)  <span class="hl-comment"># =&g
 <div style="flex:1"></div>
 <a href="#floor-1" class="anchor-link">#</a>
 </div>
+<div class="signature"><code><span class="sig-name">floor</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f16</span></code></div>
+<div class="signature"><code><span class="sig-name">floor</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f32</span></code></div>
 <div class="signature"><code><span class="sig-name">floor</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
 <div class="function-doc">
-<p>Returns the largest integer value less than or equal to the
-given float, returned as a float.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap">Float.floor(<span class="hl-number">3.7</span>)   <span class="hl-comment"># =&gt; 3.0</span>
-Float.floor(<span class="hl-number">3.0</span>)   <span class="hl-comment"># =&gt; 3.0</span>
-Float.floor(<span class="hl-number">-2.3</span>)  <span class="hl-comment"># =&gt; -3.0</span></code></pre>
+<p>Returns the largest integer value less than or equal to the given float.</p>
 </div>
 </div>
 <div class="function-detail" id="ceil-1">
@@ -240,14 +207,11 @@ Float.floor(<span class="hl-number">-2.3</span>)  <span class="hl-comment"># =&g
 <div style="flex:1"></div>
 <a href="#ceil-1" class="anchor-link">#</a>
 </div>
+<div class="signature"><code><span class="sig-name">ceil</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f16</span></code></div>
+<div class="signature"><code><span class="sig-name">ceil</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f32</span></code></div>
 <div class="signature"><code><span class="sig-name">ceil</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
 <div class="function-doc">
-<p>Returns the smallest integer value greater than or equal to
-the given float, returned as a float.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap">Float.ceil(<span class="hl-number">3.2</span>)   <span class="hl-comment"># =&gt; 4.0</span>
-Float.ceil(<span class="hl-number">3.0</span>)   <span class="hl-comment"># =&gt; 3.0</span>
-Float.ceil(<span class="hl-number">-2.7</span>)  <span class="hl-comment"># =&gt; -2.0</span></code></pre>
+<p>Returns the smallest integer value greater than or equal to the given float.</p>
 </div>
 </div>
 <div class="function-detail" id="truncate-1">
@@ -257,14 +221,11 @@ Float.ceil(<span class="hl-number">-2.7</span>)  <span class="hl-comment"># =&gt
 <div style="flex:1"></div>
 <a href="#truncate-1" class="anchor-link">#</a>
 </div>
+<div class="signature"><code><span class="sig-name">truncate</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f16</span></code></div>
+<div class="signature"><code><span class="sig-name">truncate</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f32</span></code></div>
 <div class="signature"><code><span class="sig-name">truncate</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
 <div class="function-doc">
-<p>Truncates a float toward zero, removing the fractional part.
-Returned as a float.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap">Float.truncate(<span class="hl-number">3.7</span>)   <span class="hl-comment"># =&gt; 3.0</span>
-Float.truncate(<span class="hl-number">-2.9</span>)  <span class="hl-comment"># =&gt; -2.0</span>
-Float.truncate(<span class="hl-number">5.0</span>)   <span class="hl-comment"># =&gt; 5.0</span></code></pre>
+<p>Truncates a float toward zero, removing the fractional part.</p>
 </div>
 </div>
 <div class="function-detail" id="to_integer-1">
@@ -274,13 +235,11 @@ Float.truncate(<span class="hl-number">5.0</span>)   <span class="hl-comment"># 
 <div style="flex:1"></div>
 <a href="#to_integer-1" class="anchor-link">#</a>
 </div>
+<div class="signature"><code><span class="sig-name">to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="signature"><code><span class="sig-name">to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
 <div class="signature"><code><span class="sig-name">to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
 <div class="function-doc">
 <p>Converts a float to an integer by truncating toward zero.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap">Float.to_integer(<span class="hl-number">3.7</span>)   <span class="hl-comment"># =&gt; 3</span>
-Float.to_integer(<span class="hl-number">-2.9</span>)  <span class="hl-comment"># =&gt; -2</span>
-Float.to_integer(<span class="hl-number">5.0</span>)   <span class="hl-comment"># =&gt; 5</span></code></pre>
 </div>
 </div>
 <div class="function-detail" id="clamp-3">
@@ -290,13 +249,11 @@ Float.to_integer(<span class="hl-number">5.0</span>)   <span class="hl-comment">
 <div style="flex:1"></div>
 <a href="#clamp-3" class="anchor-link">#</a>
 </div>
+<div class="signature"><code><span class="sig-name">clamp</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f16</span><span class="sig-paren">, </span>lower<span class="sig-separator">::</span><span class="sig-type-pill">f16</span><span class="sig-paren">, </span>upper<span class="sig-separator">::</span><span class="sig-type-pill">f16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f16</span></code></div>
+<div class="signature"><code><span class="sig-name">clamp</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f32</span><span class="sig-paren">, </span>lower<span class="sig-separator">::</span><span class="sig-type-pill">f32</span><span class="sig-paren">, </span>upper<span class="sig-separator">::</span><span class="sig-type-pill">f32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f32</span></code></div>
 <div class="signature"><code><span class="sig-name">clamp</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">, </span>lower<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">, </span>upper<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">f64</span></code></div>
 <div class="function-doc">
 <p>Clamps a float to be within the given range.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap">Float.clamp(<span class="hl-number">15.0</span>, <span class="hl-number">0.0</span>, <span class="hl-number">10.0</span>)  <span class="hl-comment"># =&gt; 10.0</span>
-Float.clamp(<span class="hl-number">-5.0</span>, <span class="hl-number">0.0</span>, <span class="hl-number">10.0</span>)  <span class="hl-comment"># =&gt; 0.0</span>
-Float.clamp(<span class="hl-number">5.0</span>, <span class="hl-number">0.0</span>, <span class="hl-number">10.0</span>)   <span class="hl-comment"># =&gt; 5.0</span></code></pre>
 </div>
 </div>
 <div class="function-detail" id="floor_to_integer-1">
@@ -309,12 +266,7 @@ Float.clamp(<span class="hl-number">5.0</span>, <span class="hl-number">0.0</spa
 <div class="signature"><code><span class="sig-name">floor_to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
 <div class="function-doc">
 <p>Floors a float and converts directly to an integer in one step.
-More efficient than <code>Float.to_integer(Float.floor(x))</code>.
-Uses Zig 0.16's direct float-to-integer conversion builtins.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap">Float.floor_to_integer(<span class="hl-number">3.7</span>)   <span class="hl-comment"># =&gt; 3</span>
-Float.floor_to_integer(<span class="hl-number">-2.3</span>)  <span class="hl-comment"># =&gt; -3</span>
-Float.floor_to_integer(<span class="hl-number">5.0</span>)   <span class="hl-comment"># =&gt; 5</span></code></pre>
+More efficient than <code>Float.to_integer(Float.floor(x))</code>.</p>
 </div>
 </div>
 <div class="function-detail" id="ceil_to_integer-1">
@@ -327,12 +279,7 @@ Float.floor_to_integer(<span class="hl-number">5.0</span>)   <span class="hl-com
 <div class="signature"><code><span class="sig-name">ceil_to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
 <div class="function-doc">
 <p>Ceils a float and converts directly to an integer in one step.
-More efficient than <code>Float.to_integer(Float.ceil(x))</code>.
-Uses Zig 0.16's direct float-to-integer conversion builtins.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap">Float.ceil_to_integer(<span class="hl-number">3.2</span>)   <span class="hl-comment"># =&gt; 4</span>
-Float.ceil_to_integer(<span class="hl-number">-2.7</span>)  <span class="hl-comment"># =&gt; -2</span>
-Float.ceil_to_integer(<span class="hl-number">5.0</span>)   <span class="hl-comment"># =&gt; 5</span></code></pre>
+More efficient than <code>Float.to_integer(Float.ceil(x))</code>.</p>
 </div>
 </div>
 <div class="function-detail" id="round_to_integer-1">
@@ -345,12 +292,7 @@ Float.ceil_to_integer(<span class="hl-number">5.0</span>)   <span class="hl-comm
 <div class="signature"><code><span class="sig-name">round_to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
 <div class="function-doc">
 <p>Rounds a float and converts directly to an integer in one step.
-More efficient than <code>Float.to_integer(Float.round(x))</code>.
-Uses Zig 0.16's direct float-to-integer conversion builtins.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap">Float.round_to_integer(<span class="hl-number">3.2</span>)   <span class="hl-comment"># =&gt; 3</span>
-Float.round_to_integer(<span class="hl-number">3.7</span>)   <span class="hl-comment"># =&gt; 4</span>
-Float.round_to_integer(<span class="hl-number">-2.5</span>)  <span class="hl-comment"># =&gt; -3</span></code></pre>
+More efficient than <code>Float.to_integer(Float.round(x))</code>.</p>
 </div>
 </div>
 </main>

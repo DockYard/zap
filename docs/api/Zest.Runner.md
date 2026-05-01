@@ -1,28 +1,5 @@
 # Zest.Runner
 
-Finalizes test execution and prints the summary report.
-
-Delegates to `:zig.TestTracker.summary()` which prints an
-ExUnit-style summary with test count, assertion count, and
-failure count, then exits with a non-zero code if any tests
-failed.
-
-Supports seed-based deterministic test ordering. Pass
-`--seed <integer>` on the command line to reproduce a
-specific test run. Without `--seed`, a random seed is
-generated from the system clock.
-
-## Examples
-
-    pub struct Test.TestRunner {
-      use Zest.Runner
-
-      pub fn main(_args :: [String]) -> String {
-        Test.MyTest.run()
-        Zest.Runner.run()
-      }
-    }
-
 ## Functions
 
 ### configure/0
@@ -43,7 +20,7 @@ with a yellow "T" indicator.
 Call this before running any tests to ensure the seed and
 timeout are set.
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/runner.zap#L53)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/runner.zap#L89)
 
 ---
 
@@ -57,7 +34,7 @@ Prints the test summary with counts and exits with a
 failure code if any tests failed.
 
 Call this as the last line of the test runner's `main`
-function. It invokes `:zig.TestTracker.summary()` which
+function. It invokes `:zig.Zest.summary()` which
 outputs the final report to stdout, including the seed
 used for test ordering.
 
@@ -69,7 +46,7 @@ used for test ordering.
       Zest.Runner.run()
     }
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/runner.zap#L75)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/runner.zap#L111)
 
 ---
 
@@ -82,7 +59,54 @@ pub fn parse_cli_args(index :: i64, count :: i64) -> Atom
 Recursively scans CLI arguments for `--seed <value>` and
 `--timeout <milliseconds>`, applying each to the test tracker.
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/runner.zap#L85)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/runner.zap#L121)
+
+---
+
+## Macros
+
+### options/1
+
+```zap
+pub macro options(opts :: Expr) -> Expr
+```
+
+Normalizes runner options to a list.
+
+`nil` and `[]` become an empty list, an existing option list is returned
+as-is, and a single non-list option is wrapped in a one-element list.
+
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/runner.zap#L59)
+
+---
+
+### patterns/1
+
+```zap
+pub macro patterns(options :: Expr) -> Expr
+```
+
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/runner.zap#L147)
+
+---
+
+### option_patterns/1
+
+```zap
+pub macro option_patterns(option :: Expr) -> Expr
+```
+
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/runner.zap#L160)
+
+---
+
+### pattern_values/1
+
+```zap
+pub macro pattern_values(value :: Expr) -> Expr
+```
+
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/runner.zap#L172)
 
 ---
 

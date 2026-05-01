@@ -60,7 +60,11 @@
 <li><a href="../structs/List.html">List</a></li>
 <li><a href="../structs/Map.html">Map</a></li>
 <li><a href="../structs/Math.html">Math</a></li>
+<li><a href="../structs/Path.html">Path</a></li>
+<li><a href="../structs/Range.html">Range</a></li>
+<li><a href="../structs/SourceGraph.html">SourceGraph</a></li>
 <li class="active"><a href="../structs/String.html">String</a></li>
+<li><a href="../structs/Struct.html">Struct</a></li>
 <li><a href="../structs/System.html">System</a></li>
 <li><a href="../structs/Zest.html">Zest</a></li>
 </ul>
@@ -81,24 +85,13 @@
 <a href="https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap" class="source-file">./lib/string.zap</a>
 </div>
 </div>
-<p class="tagline">Functions for working with UTF-8 encoded strings.</p>
-<div class="struct_doc">
-<p>Functions for working with UTF-8 encoded strings.</p>
-<p>Strings in Zap are immutable byte sequences (<code>[]const u8</code> in the
-underlying Zig representation). All operations return new strings
-rather than modifying in place.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap"><span class="hl-type">String</span>.length(<span class="hl-string">"hello"</span>)              <span class="hl-comment"># =&gt; 5</span>
-<span class="hl-type">String</span>.contains(<span class="hl-string">"hello world"</span>, <span class="hl-string">"o"</span>) <span class="hl-comment"># =&gt; true</span>
-<span class="hl-type">String</span>.slice(<span class="hl-string">"hello"</span>, <span class="hl-number">0</span>, <span class="hl-number">3</span>)         <span class="hl-comment"># =&gt; &quot;hel&quot;</span></code></pre>
-</div>
 <h2 id="functions">Functions</h2>
 <table class="summary">
 <tr><td class="summary-name"><a href="#length-1">length/1</a></td><td class="summary-doc">Returns the byte length of a string.</td></tr>
 <tr><td class="summary-name"><a href="#byte_at-2">byte_at/2</a></td><td class="summary-doc">Returns the byte at the given index as a single-character string.</td></tr>
-<tr><td class="summary-name"><a href="#contains-2">contains/2</a></td><td class="summary-doc">Returns `true` if `haystack` contains `needle` as a substring.</td></tr>
-<tr><td class="summary-name"><a href="#starts_with-2">starts_with/2</a></td><td class="summary-doc">Returns `true` if the string starts with the given prefix.</td></tr>
-<tr><td class="summary-name"><a href="#ends_with-2">ends_with/2</a></td><td class="summary-doc">Returns `true` if the string ends with the given suffix.</td></tr>
+<tr><td class="summary-name"><a href="#contains?-2">contains?/2</a></td><td class="summary-doc">Returns `true` if `haystack` contains `needle` as a substring.</td></tr>
+<tr><td class="summary-name"><a href="#starts_with?-2">starts_with?/2</a></td><td class="summary-doc">Returns `true` if the string starts with the given prefix.</td></tr>
+<tr><td class="summary-name"><a href="#ends_with?-2">ends_with?/2</a></td><td class="summary-doc">Returns `true` if the string ends with the given suffix.</td></tr>
 <tr><td class="summary-name"><a href="#trim-1">trim/1</a></td><td class="summary-doc">Removes leading and trailing whitespace from a string.</td></tr>
 <tr><td class="summary-name"><a href="#slice-3">slice/3</a></td><td class="summary-doc">Returns a substring from `start` (inclusive) to `end` (exclusive).</td></tr>
 <tr><td class="summary-name"><a href="#to_atom-1">to_atom/1</a></td><td class="summary-doc">Converts a string to an atom, creating it if it doesn't exist.</td></tr>
@@ -120,6 +113,8 @@ the given padding character.</td></tr>
 <tr><td class="summary-name"><a href="#trim_leading-1">trim_leading/1</a></td><td class="summary-doc">Removes leading whitespace from a string.</td></tr>
 <tr><td class="summary-name"><a href="#trim_trailing-1">trim_trailing/1</a></td><td class="summary-doc">Removes trailing whitespace from a string.</td></tr>
 <tr><td class="summary-name"><a href="#count-2">count/2</a></td><td class="summary-doc">Counts non-overlapping occurrences of a substring.</td></tr>
+<tr><td class="summary-name"><a href="#split-2">split/2</a></td><td class="summary-doc">Splits a string by a delimiter, returning a list of strings.</td></tr>
+<tr><td class="summary-name"><a href="#join-2">join/2</a></td><td class="summary-doc">Joins a list of strings with a separator.</td></tr>
 </table>
 <h2>Function Details</h2>
 <div class="function-detail" id="length-1">
@@ -157,50 +152,50 @@ out of bounds.</p>
 <span class="hl-type">String</span>.byte_at(<span class="hl-string">"hello"</span>, <span class="hl-number">99</span>) <span class="hl-comment"># =&gt; &quot;&quot;</span></code></pre>
 </div>
 </div>
-<div class="function-detail" id="contains-2">
+<div class="function-detail" id="contains?-2">
 <div class="function-header">
-<h3>contains<span class="arity">/2</span></h3>
+<h3>contains?<span class="arity">/2</span></h3>
 <span class="badge">pub fn</span>
 <div style="flex:1"></div>
-<a href="#contains-2" class="anchor-link">#</a>
+<a href="#contains?-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">contains</span><span class="sig-paren">(</span>haystack<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>needle<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="signature"><code><span class="sig-name">contains?</span><span class="sig-paren">(</span>haystack<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>needle<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
 <div class="function-doc">
 <p>Returns <code>true</code> if <code>haystack</code> contains <code>needle</code> as a substring.</p>
 <h2>Examples</h2>
-<pre><code class="language-zap"><span class="hl-type">String</span>.contains(<span class="hl-string">"hello world"</span>, <span class="hl-string">"world"</span>)  <span class="hl-comment"># =&gt; true</span>
-<span class="hl-type">String</span>.contains(<span class="hl-string">"hello world"</span>, <span class="hl-string">"xyz"</span>)    <span class="hl-comment"># =&gt; false</span>
-<span class="hl-type">String</span>.contains(<span class="hl-string">"hello"</span>, <span class="hl-string">""</span>)             <span class="hl-comment"># =&gt; true</span></code></pre>
+<pre><code class="language-zap"><span class="hl-type">String</span>.contains?(<span class="hl-string">"hello world"</span>, <span class="hl-string">"world"</span>)  <span class="hl-comment"># =&gt; true</span>
+<span class="hl-type">String</span>.contains?(<span class="hl-string">"hello world"</span>, <span class="hl-string">"xyz"</span>)    <span class="hl-comment"># =&gt; false</span>
+<span class="hl-type">String</span>.contains?(<span class="hl-string">"hello"</span>, <span class="hl-string">""</span>)             <span class="hl-comment"># =&gt; true</span></code></pre>
 </div>
 </div>
-<div class="function-detail" id="starts_with-2">
+<div class="function-detail" id="starts_with?-2">
 <div class="function-header">
-<h3>starts_with<span class="arity">/2</span></h3>
+<h3>starts_with?<span class="arity">/2</span></h3>
 <span class="badge">pub fn</span>
 <div style="flex:1"></div>
-<a href="#starts_with-2" class="anchor-link">#</a>
+<a href="#starts_with?-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">starts_with</span><span class="sig-paren">(</span>s<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>prefix<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="signature"><code><span class="sig-name">starts_with?</span><span class="sig-paren">(</span>s<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>prefix<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
 <div class="function-doc">
 <p>Returns <code>true</code> if the string starts with the given prefix.</p>
 <h2>Examples</h2>
-<pre><code class="language-zap"><span class="hl-type">String</span>.starts_with(<span class="hl-string">"hello"</span>, <span class="hl-string">"hel"</span>)   <span class="hl-comment"># =&gt; true</span>
-<span class="hl-type">String</span>.starts_with(<span class="hl-string">"hello"</span>, <span class="hl-string">"world"</span>) <span class="hl-comment"># =&gt; false</span></code></pre>
+<pre><code class="language-zap"><span class="hl-type">String</span>.starts_with?(<span class="hl-string">"hello"</span>, <span class="hl-string">"hel"</span>)   <span class="hl-comment"># =&gt; true</span>
+<span class="hl-type">String</span>.starts_with?(<span class="hl-string">"hello"</span>, <span class="hl-string">"world"</span>) <span class="hl-comment"># =&gt; false</span></code></pre>
 </div>
 </div>
-<div class="function-detail" id="ends_with-2">
+<div class="function-detail" id="ends_with?-2">
 <div class="function-header">
-<h3>ends_with<span class="arity">/2</span></h3>
+<h3>ends_with?<span class="arity">/2</span></h3>
 <span class="badge">pub fn</span>
 <div style="flex:1"></div>
-<a href="#ends_with-2" class="anchor-link">#</a>
+<a href="#ends_with?-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">ends_with</span><span class="sig-paren">(</span>s<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>suffix<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="signature"><code><span class="sig-name">ends_with?</span><span class="sig-paren">(</span>s<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>suffix<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
 <div class="function-doc">
 <p>Returns <code>true</code> if the string ends with the given suffix.</p>
 <h2>Examples</h2>
-<pre><code class="language-zap"><span class="hl-type">String</span>.ends_with(<span class="hl-string">"hello"</span>, <span class="hl-string">"llo"</span>)    <span class="hl-comment"># =&gt; true</span>
-<span class="hl-type">String</span>.ends_with(<span class="hl-string">"hello"</span>, <span class="hl-string">"world"</span>)  <span class="hl-comment"># =&gt; false</span></code></pre>
+<pre><code class="language-zap"><span class="hl-type">String</span>.ends_with?(<span class="hl-string">"hello"</span>, <span class="hl-string">"llo"</span>)    <span class="hl-comment"># =&gt; true</span>
+<span class="hl-type">String</span>.ends_with?(<span class="hl-string">"hello"</span>, <span class="hl-string">"world"</span>)  <span class="hl-comment"># =&gt; false</span></code></pre>
 </div>
 </div>
 <div class="function-detail" id="trim-1">
@@ -499,6 +494,38 @@ the end only.</p>
 <span class="hl-type">String</span>.count(<span class="hl-string">"hello"</span>, <span class="hl-string">"xyz"</span>)                  <span class="hl-comment"># =&gt; 0</span></code></pre>
 </div>
 </div>
+<div class="function-detail" id="split-2">
+<div class="function-header">
+<h3>split<span class="arity">/2</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#split-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">split</span><span class="sig-paren">(</span>s<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>delimiter<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[String]</span></code></div>
+<div class="function-doc">
+<p>Splits a string by a delimiter, returning a list of strings.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap"><span class="hl-type">String</span>.split(<span class="hl-string">"a,b,c"</span>, <span class="hl-string">","</span>)     <span class="hl-comment"># =&gt; [&quot;a&quot;, &quot;b&quot;, &quot;c&quot;]</span>
+<span class="hl-type">String</span>.split(<span class="hl-string">"hello"</span>, <span class="hl-string">""</span>)       <span class="hl-comment"># =&gt; [&quot;hello&quot;]</span>
+<span class="hl-type">String</span>.split(<span class="hl-string">"no match"</span>, <span class="hl-string">","</span>)   <span class="hl-comment"># =&gt; [&quot;no match&quot;]</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="join-2">
+<div class="function-header">
+<h3>join<span class="arity">/2</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#join-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">join</span><span class="sig-paren">(</span>parts<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>separator<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="function-doc">
+<p>Joins a list of strings with a separator.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap"><span class="hl-type">String</span>.join([<span class="hl-string">"a"</span>, <span class="hl-string">"b"</span>, <span class="hl-string">"c"</span>], <span class="hl-string">", "</span>)  <span class="hl-comment"># =&gt; &quot;a, b, c&quot;</span>
+<span class="hl-type">String</span>.join([<span class="hl-string">"hello"</span>], <span class="hl-string">"-"</span>)          <span class="hl-comment"># =&gt; &quot;hello&quot;</span>
+<span class="hl-type">String</span>.join([], <span class="hl-string">", "</span>)                <span class="hl-comment"># =&gt; &quot;&quot;</span></code></pre>
+</div>
+</div>
 </main>
 <aside class="toc">
 <h3>On This Page</h3>
@@ -506,9 +533,9 @@ the end only.</p>
 <li class="toc-section">Functions</li>
 <li><a href="#length-1">length/1</a></li>
 <li><a href="#byte_at-2">byte_at/2</a></li>
-<li><a href="#contains-2">contains/2</a></li>
-<li><a href="#starts_with-2">starts_with/2</a></li>
-<li><a href="#ends_with-2">ends_with/2</a></li>
+<li><a href="#contains?-2">contains?/2</a></li>
+<li><a href="#starts_with?-2">starts_with?/2</a></li>
+<li><a href="#ends_with?-2">ends_with?/2</a></li>
 <li><a href="#trim-1">trim/1</a></li>
 <li><a href="#slice-3">slice/3</a></li>
 <li><a href="#to_atom-1">to_atom/1</a></li>
@@ -527,6 +554,8 @@ the end only.</p>
 <li><a href="#trim_leading-1">trim_leading/1</a></li>
 <li><a href="#trim_trailing-1">trim_trailing/1</a></li>
 <li><a href="#count-2">count/2</a></li>
+<li><a href="#split-2">split/2</a></li>
+<li><a href="#join-2">join/2</a></li>
 </ul>
 </aside>
 </div>

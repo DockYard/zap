@@ -94,8 +94,8 @@ fn cmdBuild(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     const project_root = try discoverBuildFile(allocator, parsed.build_file);
     defer allocator.free(project_root);
-    const output_path = try buildTarget(allocator, project_root, target, parsed.build_opts, parsed.compile_target);
-    allocator.free(output_path);
+    const artifact = try buildTarget(allocator, project_root, target, parsed.build_opts, parsed.compile_target);
+    allocator.free(artifact.path);
 
     if (parsed.watch) {
         const source_paths = collectWatchPaths(allocator, project_root) catch |err| {
@@ -123,12 +123,32 @@ fn cmdRun(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     const project_root = try discoverBuildFile(allocator, parsed.build_file);
     defer allocator.free(project_root);
-    const output_path = try buildTarget(allocator, project_root, target, parsed.build_opts, parsed.compile_target);
-    defer allocator.free(output_path);
+    const artifact = try buildTarget(allocator, project_root, target, parsed.build_opts, parsed.compile_target);
+    defer allocator.free(artifact.path);
+
+    if (artifact.kind == .doc) {
+        if (parsed.watch) {
+            const source_paths = collectWatchPaths(allocator, project_root) catch |err| {
+                std.debug.print("Error collecting watch paths: {}\n", .{err});
+                return;
+            };
+            defer {
+                for (source_paths) |p| allocator.free(p);
+                allocator.free(source_paths);
+            }
+            std.debug.print("\n[watching for changes...]\n", .{});
+            watchAndRebuild(allocator, source_paths, project_root, target, parsed.build_opts, false, &.{});
+        }
+        return;
+    }
+    if (artifact.kind != .bin) {
+        std.debug.print("Error: target :{s} is {s}, not runnable\n", .{ target, @tagName(artifact.kind) });
+        std.process.exit(1);
+    }
 
     if (parsed.watch) {
         // In watch mode: run, then watch for changes and rebuild+rerun
-        runBinaryIgnoreError(allocator, output_path, parsed.run_args);
+        runBinaryIgnoreError(allocator, artifact.path, parsed.run_args);
 
         const source_paths = collectWatchPaths(allocator, project_root) catch |err| {
             std.debug.print("Error collecting watch paths: {}\n", .{err});
@@ -142,7 +162,7 @@ fn cmdRun(allocator: std.mem.Allocator, args: []const []const u8) !void {
         watchAndRebuild(allocator, source_paths, project_root, target, parsed.build_opts, true, parsed.run_args);
     } else {
         // Normal run: build, run, exit with the binary's exit code
-        const exit_code = compiler.runBinary(allocator, global_io, output_path, parsed.run_args) catch |err| {
+        const exit_code = compiler.runBinary(allocator, global_io, artifact.path, parsed.run_args) catch |err| {
             std.debug.print("Error running program: {}\n", .{err});
             std.process.exit(1);
         };
@@ -160,8 +180,8 @@ fn cmdTest(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     const project_root = try discoverBuildFile(allocator, parsed.build_file);
     defer allocator.free(project_root);
-    const output_path = try buildTarget(allocator, project_root, "test", parsed.build_opts, parsed.compile_target);
-    defer allocator.free(output_path);
+    const artifact = try buildTarget(allocator, project_root, "test", parsed.build_opts, parsed.compile_target);
+    defer allocator.free(artifact.path);
 
     // Build run_args: forward --seed to the test binary if provided
     var test_run_args: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -176,7 +196,7 @@ fn cmdTest(allocator: std.mem.Allocator, args: []const []const u8) !void {
     }
 
     // Run the built test binary
-    const exit_code = compiler.runBinary(allocator, global_io, output_path, test_run_args.items) catch |err| {
+    const exit_code = compiler.runBinary(allocator, global_io, artifact.path, test_run_args.items) catch |err| {
         std.debug.print("Error running tests: {}\n", .{err});
         std.process.exit(1);
     };
@@ -191,17 +211,22 @@ fn cmdDoc(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var parsed = try parseTargetArgs(allocator, args);
     defer parsed.deinit(allocator);
 
+    const target = parsed.target orelse "doc";
+
     const project_root = try discoverBuildFile(allocator, parsed.build_file);
     defer allocator.free(project_root);
 
-    // Check for --no-deps flag
-    var no_deps = false;
-    for (args) |arg| {
-        if (std.mem.eql(u8, arg, "--no-deps")) {
-            no_deps = true;
-        }
-    }
+    const output_path = try generateDocsForTarget(allocator, project_root, target, parsed.build_opts, parsed.no_deps);
+    allocator.free(output_path);
+}
 
+fn generateDocsForTarget(
+    allocator: std.mem.Allocator,
+    project_root: []const u8,
+    target_name: []const u8,
+    build_opts: std.StringHashMapUnmanaged([]const u8),
+    no_deps: bool,
+) ![]const u8 {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -218,13 +243,28 @@ fn cmdDoc(allocator: std.mem.Allocator, args: []const []const u8) !void {
     // Detect zap lib dir for stdlib
     const zap_lib_dir = detectZapLibDir(alloc);
 
-    // Evaluate manifest with :doc target
-    const manifest_eval = builder.ctfeManifestDetailed(alloc, build_source, "doc", parsed.build_opts, zap_lib_dir) catch |err| {
-        std.debug.print("Error: failed to evaluate build.zap manifest for :doc target: {}\n", .{err});
+    const manifest_eval = builder.ctfeManifestDetailed(alloc, build_source, target_name, build_opts, zap_lib_dir) catch |err| {
+        std.debug.print("Error: failed to evaluate build.zap manifest for :{s} target: {}\n", .{ target_name, err });
         std.process.exit(1);
     };
     const config = manifest_eval.config;
 
+    if (config.kind != .doc) {
+        std.debug.print("Error: target :{s} is {s}, not doc\n", .{ target_name, @tagName(config.kind) });
+        std.process.exit(1);
+    }
+
+    try generateDocsFromConfig(alloc, project_root, config, zap_lib_dir, no_deps);
+    return try allocator.dupe(u8, "docs");
+}
+
+fn generateDocsFromConfig(
+    alloc: std.mem.Allocator,
+    project_root: []const u8,
+    config: zap.builder.BuildConfig,
+    zap_lib_dir: ?[]const u8,
+    no_deps: bool,
+) !void {
     // Build source roots from deps
     var source_roots: std.ArrayListUnmanaged(zap.discovery.SourceRoot) = .empty;
     {
@@ -299,15 +339,19 @@ fn cmdDoc(allocator: std.mem.Allocator, args: []const []const u8) !void {
         } else |_| {}
     }
 
-    // Deduplicate
+    // Deduplicate source files after resolving them to their canonical
+    // filesystem paths. Documentation targets often include the same source
+    // root through the project, a local path dep, and the detected stdlib path.
+    // Those may be spelled differently (`./lib/foo.zap` vs `lib/foo.zap`) but
+    // must only be parsed once.
     {
         var seen = std.StringHashMap(void).init(alloc);
         var deduped: std.ArrayListUnmanaged([]const u8) = .empty;
         for (source_files.items) |sf| {
-            const key = std.fs.path.resolve(alloc, &.{sf}) catch sf;
+            const key = std.Io.Dir.cwd().realPathFileAlloc(global_io, sf, alloc) catch try alloc.dupe(u8, sf);
             if (!seen.contains(key)) {
-                seen.put(key, {}) catch {};
-                deduped.append(alloc, sf) catch {};
+                try seen.put(key, {});
+                try deduped.append(alloc, sf);
             }
         }
         source_files = deduped;
@@ -627,14 +671,19 @@ fn detectZapLibDir(allocator: std.mem.Allocator) ?[]const u8 {
 // Build pipeline
 // ---------------------------------------------------------------------------
 
-/// Build a target. Returns the output binary path (arena-allocated).
+const BuildArtifact = struct {
+    path: []const u8,
+    kind: zap.builder.BuildConfig.Kind,
+};
+
+/// Build a target. Returns the output artifact path and target kind.
 fn buildTarget(
     allocator: std.mem.Allocator,
     project_root: []const u8,
     target_name: []const u8,
     build_opts: std.StringHashMapUnmanaged([]const u8),
     compile_target: ?[]const u8,
-) ![]const u8 {
+) !BuildArtifact {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -659,6 +708,14 @@ fn buildTarget(
         std.process.exit(1);
     };
     const config = manifest_eval.config;
+
+    if (config.kind == .doc) {
+        try generateDocsFromConfig(alloc, project_root, config, zap_lib_dir, false);
+        return .{
+            .path = try allocator.dupe(u8, "docs"),
+            .kind = .doc,
+        };
+    }
 
     // Detect zig lib dir
     const zig_lib_dir = zir_backend.detectZigLibDir(alloc) orelse blk: {
@@ -1170,7 +1227,10 @@ fn buildTarget(
 
     if (cache_valid) {
         std.debug.print("[cached] {s}\n", .{output_path});
-        return try allocator.dupe(u8, output_path);
+        return .{
+            .path = try allocator.dupe(u8, output_path),
+            .kind = config.kind,
+        };
     }
 
     // Determine lib_mode from manifest kind
@@ -1286,14 +1346,20 @@ fn buildTarget(
     // Save cache hash atomically (write to .tmp then rename)
     {
         const tmp_hash_file = try std.fmt.allocPrint(alloc, "{s}.tmp", .{hash_file});
-        var hash_f = std.Io.Dir.cwd().createFile(global_io, tmp_hash_file, .{}) catch return try allocator.dupe(u8, output_path);
+        var hash_f = std.Io.Dir.cwd().createFile(global_io, tmp_hash_file, .{}) catch return .{
+            .path = try allocator.dupe(u8, output_path),
+            .kind = config.kind,
+        };
         hash_f.writeStreamingAll(global_io, cache_key_hex) catch {};
         hash_f.close(global_io);
         std.Io.Dir.cwd().rename(tmp_hash_file, std.Io.Dir.cwd(), hash_file, global_io) catch {};
     }
 
     // Return a durable copy of the output path
-    return try allocator.dupe(u8, output_path);
+    return .{
+        .path = try allocator.dupe(u8, output_path),
+        .kind = config.kind,
+    };
 }
 
 fn compileProjectFrontend(
@@ -1458,6 +1524,7 @@ const IncrementalWatchState = struct {
     output_name: []const u8,
     output_mode: u8,
     optimize_mode: u8,
+    kind: zap.builder.BuildConfig.Kind,
     lib_mode: bool,
     link_libc: bool,
     allocator: std.mem.Allocator,
@@ -1489,6 +1556,7 @@ const IncrementalWatchState = struct {
         const zap_lib_dir = detectZapLibDir(alloc);
         const manifest_eval = zap.builder.ctfeManifestDetailed(alloc, build_source, target_name, build_opts, zap_lib_dir) catch return null;
         const config = manifest_eval.config;
+        if (config.kind == .doc) return null;
 
         const zig_lib_dir = zir_backend.detectZigLibDir(alloc) orelse (extractEmbeddedZigLib(alloc) catch return null);
         const output_name_raw = if (config.asset_name) |an| (if (an.len > 0) an else config.name) else config.name;
@@ -1557,6 +1625,7 @@ const IncrementalWatchState = struct {
             .output_name = output_name_duped,
             .output_mode = output_mode_val,
             .optimize_mode = optimize_mode_val,
+            .kind = config.kind,
             .lib_mode = config.kind == .lib,
             .link_libc = true,
             .allocator = allocator,
@@ -1851,6 +1920,7 @@ fn watchAndRebuild(
             // Try incremental rebuild if state exists
             var build_succeeded = false;
             var output_path: ?[]const u8 = null;
+            var output_kind: ?zap.builder.BuildConfig.Kind = null;
             if (incr_state) |*state| {
                 state.rebuild(allocator, project_root, target_name, build_opts, changed_paths.items) catch |err| {
                     std.debug.print("Incremental build failed ({s}), falling back to full rebuild\n", .{@errorName(err)});
@@ -1860,26 +1930,31 @@ fn watchAndRebuild(
                 if (incr_state != null) {
                     build_succeeded = true;
                     output_path = incr_state.?.output_path;
+                    output_kind = incr_state.?.kind;
                 }
             }
 
             // Fall back to full rebuild
             if (!build_succeeded) {
-                const result_path = buildTarget(allocator, project_root, target_name, build_opts, null) catch |err| {
+                const artifact = buildTarget(allocator, project_root, target_name, build_opts, null) catch |err| {
                     std.debug.print("Build error: {}\n", .{err});
                     std.debug.print("\n[watching for changes...]\n", .{});
                     changed_paths = .empty;
                     continue;
                 };
-                output_path = result_path;
+                output_path = artifact.path;
+                output_kind = artifact.kind;
                 build_succeeded = true;
 
                 // Set up incremental state for subsequent builds
-                incr_state = IncrementalWatchState.init(allocator, project_root, target_name, build_opts, null);
+                if (artifact.kind != .doc) {
+                    incr_state = IncrementalWatchState.init(allocator, project_root, target_name, build_opts, null);
+                }
             }
 
             if (build_succeeded) {
-                if (run_after_build) {
+                const should_run = if (output_kind) |kind| kind == .bin else false;
+                if (run_after_build and should_run) {
                     if (output_path) |op| {
                         runBinaryIgnoreError(allocator, op, run_args);
                     }
@@ -1912,11 +1987,11 @@ fn watchBuildTask(
     target_name: []const u8,
     build_opts: std.StringHashMapUnmanaged([]const u8),
 ) WatchBuildResult {
-    const output_path = buildTarget(allocator, project_root, target_name, build_opts, null) catch |err| {
+    const artifact = buildTarget(allocator, project_root, target_name, build_opts, null) catch |err| {
         std.debug.print("Build error: {}\n", .{err});
         return .{ .failed = true };
     };
-    return .{ .output_path = output_path };
+    return .{ .output_path = artifact.path };
 }
 
 // ---------------------------------------------------------------------------
@@ -1931,6 +2006,7 @@ const ParsedArgs = struct {
     seed: ?[]const u8 = null,
     watch: bool = false,
     compile_target: ?[]const u8 = null,
+    no_deps: bool = false,
 
     fn deinit(self: *ParsedArgs, allocator: std.mem.Allocator) void {
         self.build_opts.deinit(allocator);
@@ -1966,6 +2042,8 @@ fn parseTargetArgs(allocator: std.mem.Allocator, args: []const []const u8) !Pars
             }
         } else if (std.mem.eql(u8, arg, "--watch") or std.mem.eql(u8, arg, "-w")) {
             result.watch = true;
+        } else if (std.mem.eql(u8, arg, "--no-deps")) {
+            result.no_deps = true;
         } else if (std.mem.eql(u8, arg, "--target")) {
             i += 1;
             if (i < args.len) {

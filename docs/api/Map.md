@@ -1,24 +1,11 @@
 # Map
 
-Functions for working with maps.
-
-Maps in Zap are immutable key-value collections. Keys are
-atoms (interned identifiers), values are integers. Maps use
-a flat array representation optimized for small collections.
-
-## Examples
-
-    m = %{name: "Alice", age: 30}
-    Map.get(m, :name, 0)     # => atom ID for "Alice"
-    Map.has_key?(m, :name)   # => true
-    Map.size(m)              # => 2
-
 ## Functions
 
 ### get/3
 
 ```zap
-pub fn get(map :: ?, key :: Atom, default :: i64) -> i64
+pub fn get(map :: ?, lookup_key :: key, default :: value) -> value
 ```
 
 Returns the value for the given key, or the default if
@@ -29,14 +16,14 @@ the key is not found.
     Map.get(%{a: 1, b: 2}, :a, 0)  # => 1
     Map.get(%{a: 1}, :z, 99)        # => 99
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/map.zap#L27)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/map.zap#L29)
 
 ---
 
 ### has_key?/2
 
 ```zap
-pub fn has_key?(map :: ?, key :: Atom) -> Bool
+pub fn has_key?(map :: ?, lookup_key :: key) -> Bool
 ```
 
 Returns `true` if the map contains the given key.
@@ -46,7 +33,27 @@ Returns `true` if the map contains the given key.
     Map.has_key?(%{a: 1, b: 2}, :a)  # => true
     Map.has_key?(%{a: 1}, :z)         # => false
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/map.zap#L40)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/map.zap#L42)
+
+---
+
+### has_key/2
+
+```zap
+pub fn has_key(map :: ?, lookup_key :: key) -> Bool
+```
+
+Returns `true` if the map contains the given key.
+Convenience alias for `has_key?` exposed without the predicate
+suffix so call sites that prefer the explicit identifier form
+still resolve.
+
+## Examples
+
+    Map.has_key(%{a: 1, b: 2}, :a)  # => true
+    Map.has_key(%{a: 1}, :z)         # => false
+
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/map.zap#L58)
 
 ---
 
@@ -63,7 +70,7 @@ Returns the number of entries in the map.
     Map.size(%{a: 1, b: 2, c: 3})  # => 3
     Map.size(%{})                    # => 0
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/map.zap#L53)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/map.zap#L71)
 
 ---
 
@@ -80,14 +87,14 @@ Returns `true` if the map has no entries.
     Map.empty?(%{})       # => true
     Map.empty?(%{a: 1})  # => false
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/map.zap#L66)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/map.zap#L84)
 
 ---
 
 ### put/3
 
 ```zap
-pub fn put(map :: ?, key :: Atom, value :: i64) -> ?
+pub fn put(map :: ?, new_key :: key, new_value :: value) -> ?
 ```
 
 Returns a new map with the key set to the given value.
@@ -98,14 +105,14 @@ If the key already exists, its value is updated.
     Map.put(%{a: 1}, :b, 2)  # => %{a: 1, b: 2}
     Map.put(%{a: 1}, :a, 9)  # => %{a: 9}
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/map.zap#L80)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/map.zap#L98)
 
 ---
 
 ### delete/2
 
 ```zap
-pub fn delete(map :: ?, key :: Atom) -> ?
+pub fn delete(map :: ?, remove_key :: key) -> ?
 ```
 
 Returns a new map with the given key removed.
@@ -116,7 +123,7 @@ Returns the map unchanged if the key doesn't exist.
     Map.delete(%{a: 1, b: 2}, :a)  # => %{b: 2}
     Map.delete(%{a: 1}, :z)         # => %{a: 1}
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/map.zap#L94)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/map.zap#L112)
 
 ---
 
@@ -134,14 +141,14 @@ from the first.
     Map.merge(%{a: 1, b: 2}, %{b: 9, c: 3})
     # => %{a: 1, b: 9, c: 3}
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/map.zap#L108)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/map.zap#L126)
 
 ---
 
 ### keys/1
 
 ```zap
-pub fn keys(map :: ?) -> [i64]
+pub fn keys(map :: ?) -> [key]
 ```
 
 Returns a list of all keys in the map.
@@ -150,14 +157,14 @@ Returns a list of all keys in the map.
 
     Map.keys(%{a: 1, b: 2})  # => [:a, :b]
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/map.zap#L120)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/map.zap#L138)
 
 ---
 
 ### values/1
 
 ```zap
-pub fn values(map :: ?) -> [i64]
+pub fn values(map :: ?) -> [value]
 ```
 
 Returns a list of all values in the map.
@@ -166,7 +173,25 @@ Returns a list of all values in the map.
 
     Map.values(%{a: 1, b: 2})  # => [1, 2]
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/map.zap#L132)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/map.zap#L150)
+
+---
+
+### get!/3
+
+```zap
+pub fn get!(map :: ?, lookup_key :: key, default :: value) -> value
+```
+
+Returns the value for the given key.
+Raises if the key is not found.
+
+## Examples
+
+    Map.get!(%{a: 1, b: 2}, :a)  # => 1
+    Map.get!(%{a: 1}, :z)        # raises
+
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/map.zap#L164)
 
 ---
 

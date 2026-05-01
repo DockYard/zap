@@ -874,12 +874,14 @@ const Pipeline = struct {
         hir_program: *const zap.hir.Program,
         type_store: *zap.types.TypeStore,
         next_try_id: *u32,
+        known_name_program: ?*const zap.hir.Program,
     ) CompileError!ir.Program {
         self.progress("IR");
         var ir_builder = zap.ir.IrBuilder.init(self.alloc, &self.ctx.interner);
         ir_builder.type_store = type_store;
         ir_builder.scope_graph = &self.ctx.collector.graph;
         ir_builder.next_try_id = next_try_id.*;
+        ir_builder.known_name_program = known_name_program;
         defer ir_builder.deinit();
         const program = ir_builder.buildProgram(hir_program) catch
             return self.failWith("Error during IR lowering", error.IrFailed);
@@ -1002,10 +1004,11 @@ fn compileHirToIr(
     type_store: *zap.types.TypeStore,
     options: CompileOptions,
     next_try_id: *u32,
+    known_name_program: ?*const zap.hir.Program,
 ) CompileError!ir.Program {
     var pipeline = Pipeline.init(alloc, ctx, options, 0, 0);
     pipeline.defer_render = true;
-    var mod_ir = try pipeline.runIrLoweringWithTryIdSeed(hir_program, type_store, next_try_id);
+    var mod_ir = try pipeline.runIrLoweringWithTryIdSeed(hir_program, type_store, next_try_id, known_name_program);
     pipeline.runCtfeAttributesForStruct(mod_name, &mod_ir);
     return mod_ir;
 }
@@ -1702,7 +1705,7 @@ pub fn compileStructByStruct(
             .top_functions = &.{},
         };
         const mod_name_str = if (mod.name.parts.len > 0) ctx.interner.get(mod.name.parts[mod.name.parts.len - 1]) else "unknown";
-        const mod_ir = compileHirToIr(alloc, ctx, mod_name_str, &single_mod_hir, shared_store, options, &next_try_id) catch {
+        const mod_ir = compileHirToIr(alloc, ctx, mod_name_str, &single_mod_hir, shared_store, options, &next_try_id, &combined_hir) catch {
             continue;
         };
         for (mod_ir.functions) |func| {
@@ -1719,7 +1722,7 @@ pub fn compileStructByStruct(
             .top_functions = combined_hir.top_functions,
             .impls = combined_hir.impls,
         };
-        const mod_ir = compileHirToIr(alloc, ctx, "top", &top_hir, shared_store, options, &next_try_id) catch return error.IrFailed;
+        const mod_ir = compileHirToIr(alloc, ctx, "top", &top_hir, shared_store, options, &next_try_id, &combined_hir) catch return error.IrFailed;
         for (mod_ir.functions) |func| {
             all_functions.append(alloc, func) catch return error.OutOfMemory;
         }

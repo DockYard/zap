@@ -1,17 +1,5 @@
 # String
 
-Functions for working with UTF-8 encoded strings.
-
-Strings in Zap are immutable byte sequences (`[]const u8` in the
-underlying Zig representation). All operations return new strings
-rather than modifying in place.
-
-## Examples
-
-    String.length("hello")              # => 5
-    String.contains("hello world", "o") # => true
-    String.slice("hello", 0, 3)         # => "hel"
-
 ## Functions
 
 ### length/1
@@ -30,7 +18,7 @@ codepoints. For ASCII strings, bytes and characters are the same.
     String.length("hello")  # => 5
     String.length("")       # => 0
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L28)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L30)
 
 ---
 
@@ -51,59 +39,59 @@ out of bounds.
     String.byte_at("hello", 4)  # => "o"
     String.byte_at("hello", 99) # => ""
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L45)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L47)
 
 ---
 
-### contains/2
+### contains?/2
 
 ```zap
-pub fn contains(haystack :: String, needle :: String) -> Bool
+pub fn contains?(haystack :: String, needle :: String) -> Bool
 ```
 
 Returns `true` if `haystack` contains `needle` as a substring.
 
 ## Examples
 
-    String.contains("hello world", "world")  # => true
-    String.contains("hello world", "xyz")    # => false
-    String.contains("hello", "")             # => true
+    String.contains?("hello world", "world")  # => true
+    String.contains?("hello world", "xyz")    # => false
+    String.contains?("hello", "")             # => true
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L59)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L61)
 
 ---
 
-### starts_with/2
+### starts_with?/2
 
 ```zap
-pub fn starts_with(s :: String, prefix :: String) -> Bool
+pub fn starts_with?(s :: String, prefix :: String) -> Bool
 ```
 
 Returns `true` if the string starts with the given prefix.
 
 ## Examples
 
-    String.starts_with("hello", "hel")   # => true
-    String.starts_with("hello", "world") # => false
+    String.starts_with?("hello", "hel")   # => true
+    String.starts_with?("hello", "world") # => false
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L72)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L74)
 
 ---
 
-### ends_with/2
+### ends_with?/2
 
 ```zap
-pub fn ends_with(s :: String, suffix :: String) -> Bool
+pub fn ends_with?(s :: String, suffix :: String) -> Bool
 ```
 
 Returns `true` if the string ends with the given suffix.
 
 ## Examples
 
-    String.ends_with("hello", "llo")    # => true
-    String.ends_with("hello", "world")  # => false
+    String.ends_with?("hello", "llo")    # => true
+    String.ends_with?("hello", "world")  # => false
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L85)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L87)
 
 ---
 
@@ -121,7 +109,7 @@ Strips spaces, tabs, newlines, and carriage returns.
 
     String.trim("  hello  ")   # => "hello"
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L99)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L101)
 
 ---
 
@@ -141,7 +129,7 @@ are clamped to the string length.
     String.slice("hello world", 0, 5)   # => "hello"
     String.slice("hello world", 6, 11)  # => "world"
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L115)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L117)
 
 ---
 
@@ -160,7 +148,7 @@ Atoms are interned — each unique string maps to a single atom ID.
     String.to_atom("ok")    # => :ok
     String.to_atom("error") # => :error
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L130)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L132)
 
 ---
 
@@ -179,7 +167,7 @@ sentinel value if the atom has not been previously interned.
 
     String.to_existing_atom("ok")  # => :ok (if :ok exists)
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L145)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L147)
 
 ---
 
@@ -199,7 +187,7 @@ Only affects ASCII letters (a-z).
     String.upcase("Hello World") # => "HELLO WORLD"
     String.upcase("123")        # => "123"
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L161)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L163)
 
 ---
 
@@ -219,7 +207,7 @@ Only affects ASCII letters (A-Z).
     String.downcase("Hello World") # => "hello world"
     String.downcase("123")        # => "123"
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L177)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L179)
 
 ---
 
@@ -237,7 +225,7 @@ Reverses the bytes of a string.
     String.reverse("abc")    # => "cba"
     String.reverse("")       # => ""
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L191)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L193)
 
 ---
 
@@ -255,7 +243,7 @@ Replaces all occurrences of `pattern` with `replacement`.
     String.replace("aaa", "a", "bb")                # => "bbbbbb"
     String.replace("hello", "xyz", "abc")           # => "hello"
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L205)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L207)
 
 ---
 
@@ -274,7 +262,7 @@ string, or -1 if not found.
     String.index_of("hello", "xyz")           # => -1
     String.index_of("hello", "")              # => 0
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L220)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L222)
 
 ---
 
@@ -292,7 +280,7 @@ the given padding character.
     String.pad_leading("42", 5, "0")   # => "00042"
     String.pad_leading("hello", 3, " ") # => "hello"
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L234)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L236)
 
 ---
 
@@ -310,7 +298,7 @@ the given padding character.
     String.pad_trailing("hi", 5, ".")   # => "hi..."
     String.pad_trailing("hello", 3, " ") # => "hello"
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L248)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L250)
 
 ---
 
@@ -328,7 +316,7 @@ Repeats a string the given number of times.
     String.repeat("x", 5)   # => "xxxxx"
     String.repeat("hi", 0)  # => ""
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L262)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L264)
 
 ---
 
@@ -348,7 +336,7 @@ Delegates to `Integer.parse/1`.
     String.to_integer("42")    # => 42
     String.to_integer("hello") # => 0
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L278)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L280)
 
 ---
 
@@ -368,7 +356,7 @@ Delegates to `Float.parse/1`.
     String.to_float("3.14")    # => 3.14
     String.to_float("hello")   # => 0.0
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L294)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L296)
 
 ---
 
@@ -388,7 +376,7 @@ Only affects ASCII letters.
     String.capitalize("HELLO")   # => "Hello"
     String.capitalize("")        # => ""
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L310)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L312)
 
 ---
 
@@ -408,7 +396,7 @@ the beginning only.
     String.trim_leading("  hello  ")  # => "hello  "
     String.trim_leading("hello")       # => "hello"
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L326)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L328)
 
 ---
 
@@ -428,7 +416,7 @@ the end only.
     String.trim_trailing("  hello  ")  # => "  hello"
     String.trim_trailing("hello")       # => "hello"
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L342)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L344)
 
 ---
 
@@ -446,7 +434,43 @@ Counts non-overlapping occurrences of a substring.
     String.count("aaa", "aa")                     # => 1
     String.count("hello", "xyz")                  # => 0
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L356)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L358)
+
+---
+
+### split/2
+
+```zap
+pub fn split(s :: String, delimiter :: String) -> [String]
+```
+
+Splits a string by a delimiter, returning a list of strings.
+
+## Examples
+
+    String.split("a,b,c", ",")     # => ["a", "b", "c"]
+    String.split("hello", "")       # => ["hello"]
+    String.split("no match", ",")   # => ["no match"]
+
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L372)
+
+---
+
+### join/2
+
+```zap
+pub fn join(parts :: [String], separator :: String) -> String
+```
+
+Joins a list of strings with a separator.
+
+## Examples
+
+    String.join(["a", "b", "c"], ", ")  # => "a, b, c"
+    String.join(["hello"], "-")          # => "hello"
+    String.join([], ", ")                # => ""
+
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap#L386)
 
 ---
 

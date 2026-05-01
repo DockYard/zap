@@ -1194,6 +1194,17 @@ pub const ZirDriver = struct {
         return null;
     }
 
+    /// Find a compiler-generated typed-clause entrypoint for a source
+    /// function group and clause index.
+    fn findFunctionBySourceClause(self: *const ZirDriver, group_id: ir.FunctionId, clause_index: u32) ?ir.Function {
+        if (self.program) |prog| {
+            for (prog.functions) |func| {
+                if (func.source_group_id == group_id and func.source_clause_index == clause_index) return func;
+            }
+        }
+        return null;
+    }
+
     /// Locate a monomorphized impl function compiled into the caller
     /// struct's emitted Zig namespace. The IR call name has the shape
     /// `<TargetStruct>__<func>__<arity>` (e.g. `List__member?__2`); the
@@ -3896,9 +3907,14 @@ pub const ZirDriver = struct {
             // Direct call by function ID — resolve name from program's function table
             .call_direct => |cd| {
                 if (self.program) |prog| {
+                    const selected_func = if (cd.clause_index) |clause_index|
+                        self.findFunctionBySourceClause(cd.function, clause_index)
+                    else
+                        self.findFunctionById(cd.function);
                     // Look up function by ID, not array index (IDs may not match indices
                     // because __try variants and default wrappers are inserted into the list)
                     const func_name = blk: {
+                        if (selected_func) |func| break :blk func.name;
                         for (prog.functions) |f| {
                             if (f.id == cd.function) break :blk f.name;
                         }
@@ -3913,7 +3929,7 @@ pub const ZirDriver = struct {
                         }
 
                         {
-                            const target_func = self.findFunctionById(cd.function);
+                            const target_func = selected_func orelse self.findFunctionById(cd.function);
                             const target_struct = if (target_func) |tf| tf.struct_name else null;
                             const is_cross = xmod: {
                                 if (target_struct == null and self.current_emit_struct == null) break :xmod false;

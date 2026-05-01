@@ -60,7 +60,11 @@
 <li><a href="../structs/List.html">List</a></li>
 <li><a href="../structs/Map.html">Map</a></li>
 <li><a href="../structs/Math.html">Math</a></li>
+<li><a href="../structs/Path.html">Path</a></li>
+<li><a href="../structs/Range.html">Range</a></li>
+<li><a href="../structs/SourceGraph.html">SourceGraph</a></li>
 <li><a href="../structs/String.html">String</a></li>
+<li><a href="../structs/Struct.html">Struct</a></li>
 <li><a href="../structs/System.html">System</a></li>
 <li><a href="../structs/Zest.html">Zest</a></li>
 </ul>
@@ -81,16 +85,24 @@
 <a href="https://github.com/DockYard/zap/blob/v0.1.0/./lib/kernel.zap" class="source-file">./lib/kernel.zap</a>
 </div>
 </div>
-<p class="tagline">The default struct imported into every Zap struct.</p>
-<div class="struct_doc">
-<p>The default struct imported into every Zap struct.</p>
-<p>Kernel provides the fundamental language constructs implemented
-as macros: control flow (<code>if</code>, <code>unless</code>), boolean operators
-(<code>and</code>, <code>or</code>), the pipe operator (<code>|&gt;</code>), sigils (<code>~s</code>, <code>~S</code>,
-<code>~w</code>, <code>~W</code>), and declaration macros (<code>fn</code>, <code>struct</code>, <code>union</code>).</p>
-<p>You don't need to <code>import Kernel</code> — its macros are available
-everywhere automatically.</p>
-</div>
+<h2 id="functions">Functions</h2>
+<table class="summary">
+<tr><td class="summary-name"><a href="#is_integer?-1">is_integer?/1</a></td><td class="summary-doc">Returns true if the value is an integer type (i8, i16, i32, i64, u8, u16, u32, u64).</td></tr>
+<tr><td class="summary-name"><a href="#is_float?-1">is_float?/1</a></td><td class="summary-doc">Returns true if the value is a float type (f16, f32, f64).</td></tr>
+<tr><td class="summary-name"><a href="#is_number?-1">is_number?/1</a></td><td class="summary-doc">Returns true if the value is a number (integer or float).</td></tr>
+<tr><td class="summary-name"><a href="#is_boolean?-1">is_boolean?/1</a></td><td class="summary-doc">Returns true if the value is a boolean.</td></tr>
+<tr><td class="summary-name"><a href="#is_string?-1">is_string?/1</a></td><td class="summary-doc">Returns true if the value is a string.</td></tr>
+<tr><td class="summary-name"><a href="#is_atom?-1">is_atom?/1</a></td><td class="summary-doc">Returns true if the value is an atom.</td></tr>
+<tr><td class="summary-name"><a href="#is_nil?-1">is_nil?/1</a></td><td class="summary-doc">Returns true if the value is nil.</td></tr>
+<tr><td class="summary-name"><a href="#is_list?-1">is_list?/1</a></td><td class="summary-doc">Returns true if the value is a list.</td></tr>
+<tr><td class="summary-name"><a href="#is_tuple?-1">is_tuple?/1</a></td><td class="summary-doc">Returns true if the value is a tuple.</td></tr>
+<tr><td class="summary-name"><a href="#is_map?-1">is_map?/1</a></td><td class="summary-doc">Returns true if the value is a map.</td></tr>
+<tr><td class="summary-name"><a href="#is_struct?-1">is_struct?/1</a></td><td class="summary-doc">Returns true if the value is a struct.</td></tr>
+<tr><td class="summary-name"><a href="#raise-1">raise/1</a></td><td class="summary-doc">Raises a runtime error with the provided message.</td></tr>
+<tr><td class="summary-name"><a href="#sleep-1">sleep/1</a></td><td class="summary-doc">Suspends the current process for the given number of milliseconds.</td></tr>
+<tr><td class="summary-name"><a href="#to_string-1">to_string/1</a></td><td class="summary-doc">Converts any value to its string representation.</td></tr>
+<tr><td class="summary-name"><a href="#inspect-1">inspect/1</a></td><td class="summary-doc">Print a value's string representation to stdout, followed by a newline.</td></tr>
+</table>
 <h2 id="macros">Macros</h2>
 <table class="summary">
 <tr><td class="summary-name"><a href="#if-2">if/2</a></td><td class="summary-doc">Conditional expression with a single branch.</td></tr>
@@ -106,7 +118,207 @@ everywhere automatically.</p>
 <tr><td class="summary-name"><a href="#sigil_w-2">sigil_w/2</a></td><td class="summary-doc">Word list sigil with interpolation support.</td></tr>
 <tr><td class="summary-name"><a href="#sigil_W-2">sigil_W/2</a></td><td class="summary-doc">Word list sigil without interpolation.</td></tr>
 <tr><td class="summary-name"><a href="#|>-2">|&gt;/2</a></td><td class="summary-doc">Pipe operator.</td></tr>
+<tr><td class="summary-name"><a href="#<>-2">&lt;&gt;/2</a></td><td class="summary-doc">Concatenation operator.</td></tr>
 </table>
+<h2>Function Details</h2>
+<div class="function-detail" id="is_integer?-1">
+<div class="function-header">
+<h3>is_integer?<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#is_integer?-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">is_integer?</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">any</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="function-doc">
+<p>Returns true if the value is an integer type (i8, i16, i32, i64, u8, u16, u32, u64).</p>
+</div>
+</div>
+<div class="function-detail" id="is_float?-1">
+<div class="function-header">
+<h3>is_float?<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#is_float?-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">is_float?</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">any</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="function-doc">
+<p>Returns true if the value is a float type (f16, f32, f64).</p>
+</div>
+</div>
+<div class="function-detail" id="is_number?-1">
+<div class="function-header">
+<h3>is_number?<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#is_number?-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">is_number?</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">any</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="function-doc">
+<p>Returns true if the value is a number (integer or float).</p>
+</div>
+</div>
+<div class="function-detail" id="is_boolean?-1">
+<div class="function-header">
+<h3>is_boolean?<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#is_boolean?-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">is_boolean?</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">any</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="function-doc">
+<p>Returns true if the value is a boolean.</p>
+</div>
+</div>
+<div class="function-detail" id="is_string?-1">
+<div class="function-header">
+<h3>is_string?<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#is_string?-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">is_string?</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">any</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="function-doc">
+<p>Returns true if the value is a string.</p>
+</div>
+</div>
+<div class="function-detail" id="is_atom?-1">
+<div class="function-header">
+<h3>is_atom?<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#is_atom?-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">is_atom?</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">any</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="function-doc">
+<p>Returns true if the value is an atom.</p>
+</div>
+</div>
+<div class="function-detail" id="is_nil?-1">
+<div class="function-header">
+<h3>is_nil?<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#is_nil?-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">is_nil?</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">any</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="function-doc">
+<p>Returns true if the value is nil.</p>
+</div>
+</div>
+<div class="function-detail" id="is_list?-1">
+<div class="function-header">
+<h3>is_list?<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#is_list?-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">is_list?</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">any</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="function-doc">
+<p>Returns true if the value is a list.</p>
+</div>
+</div>
+<div class="function-detail" id="is_tuple?-1">
+<div class="function-header">
+<h3>is_tuple?<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#is_tuple?-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">is_tuple?</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">any</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="function-doc">
+<p>Returns true if the value is a tuple.</p>
+</div>
+</div>
+<div class="function-detail" id="is_map?-1">
+<div class="function-header">
+<h3>is_map?<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#is_map?-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">is_map?</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">any</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="function-doc">
+<p>Returns true if the value is a map.</p>
+</div>
+</div>
+<div class="function-detail" id="is_struct?-1">
+<div class="function-header">
+<h3>is_struct?<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#is_struct?-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">is_struct?</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">any</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="function-doc">
+<p>Returns true if the value is a struct.</p>
+</div>
+</div>
+<div class="function-detail" id="raise-1">
+<div class="function-header">
+<h3>raise<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#raise-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">raise</span><span class="sig-paren">(</span>message<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">?</span></code></div>
+<div class="function-doc">
+<p>Raises a runtime error with the provided message.</p>
+</div>
+</div>
+<div class="function-detail" id="sleep-1">
+<div class="function-header">
+<h3>sleep<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#sleep-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">sleep</span><span class="sig-paren">(</span>milliseconds<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="function-doc">
+<p>Suspends the current process for the given number of milliseconds.</p>
+<p>Returns the number of milliseconds slept. Useful for game loops,
+rate limiting, and timed delays.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">sleep(<span class="hl-number">100</span>)    <span class="hl-comment"># pause for 100ms</span>
+sleep(<span class="hl-number">1000</span>)   <span class="hl-comment"># pause for 1 second</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="to_string-1">
+<div class="function-header">
+<h3>to_string<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#to_string-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">to_string</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">any</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="function-doc">
+<p>Converts any value to its string representation.</p>
+<p>Used by string interpolation to convert interpolated expressions
+to strings. Handles all Zap types: integers, floats, booleans,
+atoms, strings, and structs.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">to_string(<span class="hl-number">42</span>)       <span class="hl-comment"># =&gt; &quot;42&quot;</span>
+to_string(<span class="hl-builtin">true</span>)     <span class="hl-comment"># =&gt; &quot;true&quot;</span>
+to_string(<span class="hl-atom">:hello</span>)   <span class="hl-comment"># =&gt; &quot;hello&quot;</span></code></pre>
+</div>
+</div>
+<div class="function-detail" id="inspect-1">
+<div class="function-header">
+<h3>inspect<span class="arity">/1</span></h3>
+<span class="badge">pub fn</span>
+<div style="flex:1"></div>
+<a href="#inspect-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">inspect</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">any</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="function-doc">
+<p>Print a value's string representation to stdout, followed by a newline.</p>
+<p>Equivalent to <code>IO.puts(Kernel.to_string(value))</code>. Useful for quick
+debugging or examples that need a value rendered.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Kernel.inspect(<span class="hl-number">42</span>)       <span class="hl-comment"># prints &quot;42\n&quot;</span>
+Kernel.inspect(<span class="hl-builtin">true</span>)     <span class="hl-comment"># prints &quot;true\n&quot;</span>
+Kernel.inspect(<span class="hl-atom">:hello</span>)   <span class="hl-comment"># prints &quot;hello\n&quot;</span></code></pre>
+</div>
+</div>
 <h2>Macro Details</h2>
 <div class="function-detail" id="if-2">
 <div class="function-header">
@@ -286,7 +498,7 @@ Uppercase sigils suppress interpolation.</p>
 <div class="signature"><code><span class="sig-name">sigil_w</span><span class="sig-paren">(</span>content<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">, </span>_opts<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
 <div class="function-doc">
 <p>Word list sigil with interpolation support.</p>
-<p>Splits the string on whitespace and returns a list of strings.
+<p>Splits the string on a single space and returns a list of strings.
 Lowercase allows <code>\#{}</code> interpolation before splitting.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap">~w<span class="hl-string">"foo bar baz"</span>  <span class="hl-comment"># =&gt; [&quot;foo&quot;, &quot;bar&quot;, &quot;baz&quot;]</span>
@@ -303,7 +515,7 @@ Lowercase allows <code>\#{}</code> interpolation before splitting.</p>
 <div class="signature"><code><span class="sig-name">sigil_W</span><span class="sig-paren">(</span>content<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">, </span>_opts<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
 <div class="function-doc">
 <p>Word list sigil without interpolation.</p>
-<p>Splits the string on whitespace and returns a list of strings.
+<p>Splits the string on a single space and returns a list of strings.
 Uppercase suppresses <code>\#{}</code> interpolation.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap">~W<span class="hl-string">"foo bar baz"</span>  <span class="hl-comment"># =&gt; [&quot;foo&quot;, &quot;bar&quot;, &quot;baz&quot;]</span></code></pre>
@@ -327,10 +539,46 @@ to the function call on the right.</p>
 x <span class="hl-op">|&gt;</span> f() <span class="hl-op">|&gt;</span> g()            <span class="hl-comment"># =&gt; g(f(x))</span></code></pre>
 </div>
 </div>
+<div class="function-detail" id="<>-2">
+<div class="function-header">
+<h3>&lt;&gt;<span class="arity">/2</span></h3>
+<span class="badge">pub macro</span>
+<div style="flex:1"></div>
+<a href="#<>-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">&lt;&gt;</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="function-doc">
+<p>Concatenation operator. Dispatches through the <code>Concatenable</code>
+protocol — any type implementing <code>Concatenable.concat/2</code> (built-in:
+<code>String</code>, <code>List</code>, <code>Map</code>) supports <code>&lt;&gt;</code>. A local <code>pub fn &lt;&gt;</code> (or
+<code>pub macro &lt;&gt;</code>) in the call-site struct still shadows this default,
+so users can override <code>&lt;&gt;</code> for their own types directly.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap"><span class="hl-string">"hello, "</span> <span class="hl-op">&lt;&gt;</span> <span class="hl-string">"world"</span>   <span class="hl-comment"># String</span>
+[<span class="hl-number">1</span>, <span class="hl-number">2</span>] <span class="hl-op">&lt;&gt;</span> [<span class="hl-number">3</span>, <span class="hl-number">4</span>]       <span class="hl-comment"># List</span>
+%{a: <span class="hl-number">1</span>} <span class="hl-op">&lt;&gt;</span> %{b: <span class="hl-number">2</span>}     <span class="hl-comment"># Map</span></code></pre>
+</div>
+</div>
 </main>
 <aside class="toc">
 <h3>On This Page</h3>
 <ul>
+<li class="toc-section">Functions</li>
+<li><a href="#is_integer?-1">is_integer?/1</a></li>
+<li><a href="#is_float?-1">is_float?/1</a></li>
+<li><a href="#is_number?-1">is_number?/1</a></li>
+<li><a href="#is_boolean?-1">is_boolean?/1</a></li>
+<li><a href="#is_string?-1">is_string?/1</a></li>
+<li><a href="#is_atom?-1">is_atom?/1</a></li>
+<li><a href="#is_nil?-1">is_nil?/1</a></li>
+<li><a href="#is_list?-1">is_list?/1</a></li>
+<li><a href="#is_tuple?-1">is_tuple?/1</a></li>
+<li><a href="#is_map?-1">is_map?/1</a></li>
+<li><a href="#is_struct?-1">is_struct?/1</a></li>
+<li><a href="#raise-1">raise/1</a></li>
+<li><a href="#sleep-1">sleep/1</a></li>
+<li><a href="#to_string-1">to_string/1</a></li>
+<li><a href="#inspect-1">inspect/1</a></li>
 <li class="toc-section">Macros</li>
 <li><a href="#if-2">if/2</a></li>
 <li><a href="#if-3">if/3</a></li>
@@ -345,6 +593,7 @@ x <span class="hl-op">|&gt;</span> f() <span class="hl-op">|&gt;</span> g()     
 <li><a href="#sigil_w-2">sigil_w/2</a></li>
 <li><a href="#sigil_W-2">sigil_W/2</a></li>
 <li><a href="#|>-2">|&gt;/2</a></li>
+<li><a href="#<>-2">&lt;&gt;/2</a></li>
 </ul>
 </aside>
 </div>

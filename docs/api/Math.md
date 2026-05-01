@@ -1,22 +1,5 @@
 # Math
 
-Mathematical functions for floating-point computation.
-
-Provides trigonometric, exponential, logarithmic, and other
-mathematical operations on `f64` values. All functions delegate
-to Zig's hardware-accelerated builtins for optimal performance.
-
-## Constants
-
-Use `Math.pi()` and `Math.e()` for the standard mathematical
-constants.
-
-## Examples
-
-    Math.sqrt(9.0)      # => 3.0
-    Math.sin(Math.pi()) # => ~0.0
-    Math.log(Math.e())  # => 1.0
-
 ## Functions
 
 ### pi/0

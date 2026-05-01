@@ -65,6 +65,10 @@ pub const Program = struct {
 pub const Function = struct {
     id: FunctionId,
     name: []const u8,
+    /// When this is a compiler-generated typed-clause entrypoint, these
+    /// identify the source function group and source clause it lowers.
+    source_group_id: ?FunctionId = null,
+    source_clause_index: ?u32 = null,
     /// Struct this function belongs to (e.g., "IO", "Zest_Runtime"). Null for top-level.
     struct_name: ?[]const u8 = null,
     /// Function name within its struct, with arity suffix (e.g., "puts__1"). Used for per-struct ZIR emission.
@@ -506,6 +510,7 @@ pub const UnaryOp = struct {
 pub const CallDirect = struct {
     dest: LocalId,
     function: FunctionId,
+    clause_index: ?u32 = null,
     args: []const LocalId,
     arg_modes: []const ValueMode,
 };
@@ -939,6 +944,10 @@ pub const IrBuilder = struct {
     /// Set of function names that need __try variants (populated by error pipe analysis).
     /// Only functions in this set will get __try variants generated.
     try_variant_names: std.StringHashMap(void),
+    /// Optional whole-program HIR view used only for registering callable
+    /// names during per-struct IR lowering. Emission still uses the
+    /// `hir_program` passed to `buildProgram`.
+    known_name_program: ?*const hir_mod.Program = null,
     /// Current function's declared param types (for param_get fallback when expr type is UNKNOWN).
     current_param_types: std.ArrayListUnmanaged(ZigType) = .empty,
 
@@ -947,6 +956,11 @@ pub const IrBuilder = struct {
         union_type_name: []const u8,
         /// Maps variant type name → variant name in the union
         variants: std.StringHashMap(void),
+    };
+
+    const TypedClauseResolution = struct {
+        declared_arity: u32,
+        clause_index: u32,
     };
 
     pub fn init(allocator: std.mem.Allocator, interner: *const ast.StringInterner) IrBuilder {
@@ -1026,22 +1040,45 @@ pub const IrBuilder = struct {
         // bound on HIR group IDs so `__try` variant IDs can be assigned past the
         // largest existing group without collision (regardless of program size).
         var max_group_id: FunctionId = 0;
-        for (hir_program.structs) |mod| {
+        const name_program = self.known_name_program orelse hir_program;
+        for (name_program.structs) |mod| {
             const struct_prefix = self.structNameToPrefix(mod.name);
             for (mod.functions) |func_group| {
                 if (func_group.id > max_group_id) max_group_id = func_group.id;
                 const func_name = self.interner.get(func_group.name);
                 const mangled_func_name = try mangleSymbolForZig(self.allocator, func_name);
-                const qualified = try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ struct_prefix, mangled_func_name, func_group.arity });
-                try self.known_function_names.put(qualified, {});
+                if (self.type_store != null and self.isTypeOnlyOverloadGroup(&func_group)) {
+                    for (func_group.clauses, 0..) |_, clause_index| {
+                        const qualified = try std.fmt.allocPrint(
+                            self.allocator,
+                            "{s}__{s}__{d}__clause_{d}",
+                            .{ struct_prefix, mangled_func_name, func_group.arity, clause_index },
+                        );
+                        try self.known_function_names.put(qualified, {});
+                    }
+                } else {
+                    const qualified = try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ struct_prefix, mangled_func_name, func_group.arity });
+                    try self.known_function_names.put(qualified, {});
+                }
             }
         }
-        for (hir_program.top_functions) |func_group| {
+        for (name_program.top_functions) |func_group| {
             if (func_group.id > max_group_id) max_group_id = func_group.id;
             const func_name = self.interner.get(func_group.name);
             const mangled_func_name = try mangleSymbolForZig(self.allocator, func_name);
-            const qualified = try std.fmt.allocPrint(self.allocator, "{s}__{d}", .{ mangled_func_name, func_group.arity });
-            try self.known_function_names.put(qualified, {});
+            if (self.type_store != null and self.isTypeOnlyOverloadGroup(&func_group)) {
+                for (func_group.clauses, 0..) |_, clause_index| {
+                    const qualified = try std.fmt.allocPrint(
+                        self.allocator,
+                        "{s}__{d}__clause_{d}",
+                        .{ mangled_func_name, func_group.arity, clause_index },
+                    );
+                    try self.known_function_names.put(qualified, {});
+                }
+            } else {
+                const qualified = try std.fmt.allocPrint(self.allocator, "{s}__{d}", .{ mangled_func_name, func_group.arity });
+                try self.known_function_names.put(qualified, {});
+            }
         }
         // The per-struct IR build path computes `max_group_id` from
         // *this struct's* HIR only. To prevent `__try` IDs from
@@ -1178,6 +1215,172 @@ pub const IrBuilder = struct {
         };
     }
 
+    fn isTypeOnlyOverloadGroup(self: *const IrBuilder, group: *const hir_mod.FunctionGroup) bool {
+        if (group.clauses.len < 2) return false;
+        for (group.clauses) |clause| {
+            if (clause.refinement != null) return false;
+            for (clause.params) |param| {
+                if (param.pattern) |pattern| {
+                    switch (pattern.*) {
+                        .bind, .wildcard => {},
+                        else => return false,
+                    }
+                }
+            }
+        }
+        for (0..group.arity) |param_index| {
+            const first_type = group.clauses[0].params[param_index].type_id;
+            for (group.clauses[1..]) |clause| {
+                if (param_index >= clause.params.len) continue;
+                if (!self.type_store.?.typeEquals(first_type, clause.params[param_index].type_id)) return true;
+            }
+        }
+        return false;
+    }
+
+    fn typeOnlyClauseMatchCost(self: *const IrBuilder, clause: *const hir_mod.Clause, call_arity: usize, args: []const hir_mod.CallArg) ?u32 {
+        const ts = self.type_store orelse return null;
+        if (args.len < call_arity) return null;
+        if (clause.params.len < call_arity) return null;
+
+        var total: u32 = 0;
+        for (args[0..call_arity], clause.params[0..call_arity]) |arg, param| {
+            const cost = ts.callMatchCost(arg.expr.type_id, param.type_id) orelse return null;
+            total +|= cost;
+        }
+        return total;
+    }
+
+    fn selectTypeOnlyNamedClause(
+        self: *IrBuilder,
+        struct_prefix: []const u8,
+        function_name: []const u8,
+        call_arity: usize,
+        args: []const hir_mod.CallArg,
+        requested_clause_index: ?u32,
+    ) ?TypedClauseResolution {
+        _ = self.type_store orelse return null;
+        const program = self.known_name_program orelse return null;
+
+        var best: ?TypedClauseResolution = null;
+        var best_cost: u32 = std.math.maxInt(u32);
+
+        for (program.structs) |candidate_struct| {
+            const candidate_prefix = self.structNameToPrefix(candidate_struct.name);
+            if (!std.mem.eql(u8, candidate_prefix, struct_prefix)) continue;
+
+            for (candidate_struct.functions) |function_group| {
+                if (!std.mem.eql(u8, self.interner.get(function_group.name), function_name)) continue;
+                const declared_arity: usize = @intCast(function_group.arity);
+                if (declared_arity < call_arity) continue;
+                if (declared_arity > call_arity + 4) continue;
+                if (!self.isTypeOnlyOverloadGroup(&function_group)) continue;
+
+                if (requested_clause_index) |clause_index| {
+                    const clause_index_usize: usize = @intCast(clause_index);
+                    if (clause_index_usize >= function_group.clauses.len) continue;
+                    const clause = &function_group.clauses[clause_index_usize];
+                    _ = self.typeOnlyClauseMatchCost(clause, call_arity, args) orelse continue;
+                    return .{
+                        .declared_arity = function_group.arity,
+                        .clause_index = clause_index,
+                    };
+                }
+
+                for (function_group.clauses, 0..) |*clause, clause_index| {
+                    const cost = self.typeOnlyClauseMatchCost(clause, call_arity, args) orelse continue;
+                    if (best == null or cost < best_cost) {
+                        best = .{
+                            .declared_arity = function_group.arity,
+                            .clause_index = @intCast(clause_index),
+                        };
+                        best_cost = cost;
+                        if (cost == 0) return best;
+                    }
+                }
+            }
+        }
+
+        return best;
+    }
+
+    fn buildTypedClauseEntrypoint(self: *IrBuilder, group: *const hir_mod.FunctionGroup, clause: *const hir_mod.Clause, clause_index: u32) !void {
+        const func_id = self.next_try_id;
+        self.next_try_id += 1;
+
+        self.next_local = 0;
+        self.current_instrs = .empty;
+        self.known_local_types.clearRetainingCapacity();
+        self.param_backed_locals.clearRetainingCapacity();
+        self.term_tuple_locals.clearRetainingCapacity();
+        self.current_param_types = .empty;
+
+        var captures: std.ArrayList(Capture) = .empty;
+        for (group.captures, 0..) |capture, idx| {
+            const cap_name = try std.fmt.allocPrint(self.allocator, "__cap_{d}", .{idx});
+            try captures.append(self.allocator, .{
+                .name = cap_name,
+                .type_expr = typeIdToZigTypeWithStore(capture.type_id, self.type_store),
+                .ownership = capture.ownership,
+            });
+        }
+
+        var params: std.ArrayList(Param) = .empty;
+        for (clause.params, 0..) |param, i| {
+            const name = try std.fmt.allocPrint(self.allocator, "__arg_{d}", .{i});
+            const resolved_type = typeIdToZigTypeWithStore(param.type_id, self.type_store);
+            try params.append(self.allocator, .{
+                .name = name,
+                .type_expr = resolved_type,
+                .type_id = param.type_id,
+            });
+            try self.current_param_types.append(self.allocator, resolved_type);
+        }
+
+        const single_clause = [_]hir_mod.Clause{clause.*};
+        self.next_local = computeMaxBindingLocalForClauses(single_clause[0..]);
+        try self.emitTupleBindings(clause);
+        try self.emitStructBindings(clause);
+        try self.emitBinaryBindings(clause);
+        try self.emitMapBindings(clause);
+        const result_local = try self.lowerBlock(clause.body);
+        try self.current_instrs.append(self.allocator, .{ .ret = .{ .value = result_local } });
+        const entry_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
+
+        const raw_name = if (group.name < self.interner.strings.items.len)
+            self.interner.get(group.name)
+        else
+            "anonymous";
+        const mangled_raw_name = try mangleSymbolForZig(self.allocator, raw_name);
+        const local_name = try std.fmt.allocPrint(self.allocator, "{s}__{d}__clause_{d}", .{ mangled_raw_name, group.arity, clause_index });
+        const name_str = if (self.current_struct_prefix) |prefix|
+            try std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ prefix, local_name })
+        else
+            local_name;
+
+        try self.known_function_names.put(name_str, {});
+        try self.functions.append(self.allocator, .{
+            .id = func_id,
+            .name = name_str,
+            .source_group_id = group.id,
+            .source_clause_index = clause_index,
+            .struct_name = self.current_struct_prefix,
+            .local_name = local_name,
+            .scope_id = group.scope_id,
+            .arity = group.arity,
+            .params = try params.toOwnedSlice(self.allocator),
+            .return_type = typeIdToZigTypeWithStore(clause.return_type, self.type_store),
+            .return_type_id = clause.return_type,
+            .body = try self.allocSlice(Block, &.{.{
+                .label = 0,
+                .instructions = entry_instrs,
+            }}),
+            .is_closure = group.captures.len > 0,
+            .captures = try captures.toOwnedSlice(self.allocator),
+            .local_count = self.next_local,
+        });
+    }
+
     fn buildFunctionGroup(self: *IrBuilder, group: *const hir_mod.FunctionGroup) !void {
         if (group.clauses.len == 0) return;
 
@@ -1186,6 +1389,13 @@ pub const IrBuilder = struct {
         // (produced by the monomorphization pass) should be compiled.
         if (self.type_store) |ts| {
             if (isGenericHirGroup(ts, group)) return;
+        }
+
+        if (self.type_store != null and self.isTypeOnlyOverloadGroup(group)) {
+            for (group.clauses, 0..) |*clause, clause_index| {
+                try self.buildTypedClauseEntrypoint(group, clause, @intCast(clause_index));
+            }
+            return;
         }
 
         const func_id: FunctionId = group.id;
@@ -4110,7 +4320,7 @@ pub const IrBuilder = struct {
                         const lowered_args = try args.toOwnedSlice(self.allocator);
                         const lowered_modes = try arg_modes.toOwnedSlice(self.allocator);
                         try self.current_instrs.append(self.allocator, .{
-                            .call_direct = .{ .dest = dest, .function = dc.function_group_id, .args = lowered_args, .arg_modes = lowered_modes },
+                            .call_direct = .{ .dest = dest, .function = dc.function_group_id, .clause_index = dc.clause_index, .args = lowered_args, .arg_modes = lowered_modes },
                         });
                     },
                     .named => |nc| {
@@ -4121,6 +4331,18 @@ pub const IrBuilder = struct {
                         // declarations registered in known_function_names.
                         const resolved_name = if (nc.struct_name) |mod| blk: {
                             const mangled_call_name = try mangleSymbolForZig(self.allocator, nc.name);
+                            if (self.selectTypeOnlyNamedClause(mod, nc.name, call_arity, call.args, nc.clause_index)) |selected_clause| {
+                                const candidate = try std.fmt.allocPrint(
+                                    self.allocator,
+                                    "{s}__{s}__{d}__clause_{d}",
+                                    .{ mod, mangled_call_name, selected_clause.declared_arity, selected_clause.clause_index },
+                                );
+                                if (self.known_function_names.contains(candidate)) break :blk candidate;
+                            }
+                            if (nc.clause_index) |clause_index| {
+                                const candidate = try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}__clause_{d}", .{ mod, mangled_call_name, call_arity, clause_index });
+                                if (self.known_function_names.contains(candidate)) break :blk candidate;
+                            }
                             var try_a: usize = call_arity;
                             while (try_a <= call_arity + 4) : (try_a += 1) {
                                 const candidate = try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ mod, mangled_call_name, try_a });

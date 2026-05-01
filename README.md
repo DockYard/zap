@@ -462,7 +462,7 @@ zap deps update <name>  # Re-resolve a single dependency
 
 ## Type System
 
-Types are declared at function boundaries. Narrower numeric types are implicitly widened at call sites (e.g., `i8` to `i64`), but no lossy conversions are implicit.
+Types are declared at function boundaries. When resolving a call, Zap first prefers an exact typed clause. If no exact clause matches, narrower numeric types may widen within the same family (e.g., `i8` to `i64`), but no lossy or cross-family conversions are implicit.
 
 | Category | Types |
 |---|---|
@@ -540,18 +540,22 @@ Enum.sort([3, 1, 2], fn(a :: i64, b :: i64) -> Bool { a < b })
 
 Function type annotations use the arrow syntax: `callback :: (i64 -> i64)`, `predicate :: (i64 -> Bool)`.
 
-### Implicit Numeric Widening
+### Numeric Call Resolution
 
-Narrower numeric types are automatically widened to wider types at function call sites:
+Exact typed clauses are selected before widening is considered:
 
 ```zap
+fn process(value :: i32) -> i32 { value }
 fn process(value :: i64) -> i64 { value * 2 }
 
 small :: i8 = 42
-process(small)  # i8 automatically widened to i64
+medium :: i32 = 42
+
+process(medium)  # selects the i32 clause exactly
+process(small)   # widens i8 to i32 because no i8 clause exists
 ```
 
-Widening rules: `i8` -> `i16` -> `i32` -> `i64`, `u8` -> `u16` -> `u32` -> `u64`, `f16` -> `f32` -> `f64`. No lossy conversions (signed-to-unsigned, wider-to-narrower, integer-to-float) are implicit.
+Fallback widening rules: `i8` -> `i16` -> `i32` -> `i64`, `u8` -> `u16` -> `u32` -> `u64`, `f16` -> `f32` -> `f64`. Signed integers never implicitly widen to unsigned integers, unsigned integers never implicitly widen to signed integers, and integer-to-float conversion is never implicit.
 
 ---
 

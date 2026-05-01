@@ -1,14 +1,213 @@
 # Kernel
 
-The default struct imported into every Zap struct.
+## Functions
 
-Kernel provides the fundamental language constructs implemented
-as macros: control flow (`if`, `unless`), boolean operators
-(`and`, `or`), the pipe operator (`|>`), sigils (`~s`, `~S`,
-`~w`, `~W`), and declaration macros (`fn`, `struct`, `union`).
+### is_integer?/1
 
-You don't need to `import Kernel` — its macros are available
-everywhere automatically.
+```zap
+pub fn is_integer?(value :: any) -> Bool
+```
+
+Returns true if the value is an integer type (i8, i16, i32, i64, u8, u16, u32, u64).
+
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/kernel.zap#L269)
+
+---
+
+### is_float?/1
+
+```zap
+pub fn is_float?(value :: any) -> Bool
+```
+
+Returns true if the value is a float type (f16, f32, f64).
+
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/kernel.zap#L277)
+
+---
+
+### is_number?/1
+
+```zap
+pub fn is_number?(value :: any) -> Bool
+```
+
+Returns true if the value is a number (integer or float).
+
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/kernel.zap#L285)
+
+---
+
+### is_boolean?/1
+
+```zap
+pub fn is_boolean?(value :: any) -> Bool
+```
+
+Returns true if the value is a boolean.
+
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/kernel.zap#L293)
+
+---
+
+### is_string?/1
+
+```zap
+pub fn is_string?(value :: any) -> Bool
+```
+
+Returns true if the value is a string.
+
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/kernel.zap#L301)
+
+---
+
+### is_atom?/1
+
+```zap
+pub fn is_atom?(value :: any) -> Bool
+```
+
+Returns true if the value is an atom.
+
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/kernel.zap#L309)
+
+---
+
+### is_nil?/1
+
+```zap
+pub fn is_nil?(value :: any) -> Bool
+```
+
+Returns true if the value is nil.
+
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/kernel.zap#L317)
+
+---
+
+### is_list?/1
+
+```zap
+pub fn is_list?(value :: any) -> Bool
+```
+
+Returns true if the value is a list.
+
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/kernel.zap#L325)
+
+---
+
+### is_tuple?/1
+
+```zap
+pub fn is_tuple?(value :: any) -> Bool
+```
+
+Returns true if the value is a tuple.
+
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/kernel.zap#L333)
+
+---
+
+### is_map?/1
+
+```zap
+pub fn is_map?(value :: any) -> Bool
+```
+
+Returns true if the value is a map.
+
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/kernel.zap#L341)
+
+---
+
+### is_struct?/1
+
+```zap
+pub fn is_struct?(value :: any) -> Bool
+```
+
+Returns true if the value is a struct.
+
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/kernel.zap#L349)
+
+---
+
+### raise/1
+
+```zap
+pub fn raise(message :: String) -> ?
+```
+
+Raises a runtime error with the provided message.
+
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/kernel.zap#L357)
+
+---
+
+### sleep/1
+
+```zap
+pub fn sleep(milliseconds :: i64) -> i64
+```
+
+Suspends the current process for the given number of milliseconds.
+
+Returns the number of milliseconds slept. Useful for game loops,
+rate limiting, and timed delays.
+
+## Examples
+
+    sleep(100)    # pause for 100ms
+    sleep(1000)   # pause for 1 second
+
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/kernel.zap#L373)
+
+---
+
+### to_string/1
+
+```zap
+pub fn to_string(value :: any) -> String
+```
+
+Converts any value to its string representation.
+
+Used by string interpolation to convert interpolated expressions
+to strings. Handles all Zap types: integers, floats, booleans,
+atoms, strings, and structs.
+
+## Examples
+
+    to_string(42)       # => "42"
+    to_string(true)     # => "true"
+    to_string(:hello)   # => "hello"
+
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/kernel.zap#L391)
+
+---
+
+### inspect/1
+
+```zap
+pub fn inspect(value :: any) -> String
+```
+
+Print a value's string representation to stdout, followed by a newline.
+
+Equivalent to `IO.puts(Kernel.to_string(value))`. Useful for quick
+debugging or examples that need a value rendered.
+
+## Examples
+
+    Kernel.inspect(42)       # prints "42\n"
+    Kernel.inspect(true)     # prints "true\n"
+    Kernel.inspect(:hello)   # prints "hello\n"
+
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/kernel.zap#L408)
+
+---
 
 ## Macros
 
@@ -211,7 +410,7 @@ pub macro sigil_w(content :: Expr, _opts :: Expr) -> Expr
 
 Word list sigil with interpolation support.
 
-Splits the string on whitespace and returns a list of strings.
+Splits the string on a single space and returns a list of strings.
 Lowercase allows `\#{}` interpolation before splitting.
 
 ## Examples
@@ -231,14 +430,14 @@ pub macro sigil_W(content :: Expr, _opts :: Expr) -> Expr
 
 Word list sigil without interpolation.
 
-Splits the string on whitespace and returns a list of strings.
+Splits the string on a single space and returns a list of strings.
 Uppercase suppresses `\#{}` interpolation.
 
 ## Examples
 
     ~W"foo bar baz"  # => ["foo", "bar", "baz"]
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/kernel.zap#L218)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/kernel.zap#L220)
 
 ---
 
@@ -259,7 +458,29 @@ to the function call on the right.
     "hello" |> String.length()  # => String.length("hello")
     x |> f() |> g()            # => g(f(x))
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/kernel.zap#L235)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/kernel.zap#L239)
+
+---
+
+### <>/2
+
+```zap
+pub macro <>(left :: Expr, right :: Expr) -> Expr
+```
+
+Concatenation operator. Dispatches through the `Concatenable`
+protocol — any type implementing `Concatenable.concat/2` (built-in:
+`String`, `List`, `Map`) supports `<>`. A local `pub fn <>` (or
+`pub macro <>`) in the call-site struct still shadows this default,
+so users can override `<>` for their own types directly.
+
+## Examples
+
+    "hello, " <> "world"   # String
+    [1, 2] <> [3, 4]       # List
+    %{a: 1} <> %{b: 2}     # Map
+
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/kernel.zap#L261)
 
 ---
 

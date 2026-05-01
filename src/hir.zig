@@ -277,6 +277,7 @@ pub const CallArg = struct {
 pub const NamedCall = struct {
     struct_name: ?[]const u8,
     name: []const u8,
+    clause_index: ?u32 = null,
 };
 
 pub const CallTarget = union(enum) {
@@ -289,7 +290,7 @@ pub const CallTarget = union(enum) {
 
 pub const DirectCall = struct {
     function_group_id: u32,
-    clause_index: u32,
+    clause_index: ?u32 = null,
 };
 
 pub const DispatchCall = struct {
@@ -2599,6 +2600,95 @@ pub const HirBuilder = struct {
         return param_types;
     }
 
+    const ResolvedFunctionCall = struct {
+        param_types: []const types_mod.TypeId,
+        param_ownerships: []const Ownership,
+        return_type: types_mod.TypeId,
+        clause_index: u32,
+    };
+
+    fn resolveCallInScope(self: *HirBuilder, scope_id: scope_mod.ScopeId, name: ast.StringId, arity: u32, args: []const CallArg) ?ResolvedFunctionCall {
+        const resolved = self.graph.resolveFamilyAllowingDefaults(scope_id, name, arity) orelse return null;
+        const family = self.graph.getFamily(resolved.family_id);
+        if (family.clauses.items.len == 0) return null;
+
+        var best: ?ResolvedFunctionCall = null;
+        var best_cost: u32 = std.math.maxInt(u32);
+        for (family.clauses.items, 0..) |clause_ref, idx| {
+            const candidate = self.resolveClauseCallInfo(name, arity, resolved.declared_arity, clause_ref, @intCast(idx)) orelse continue;
+            const cost = self.callInfoMatchCost(candidate, args) orelse continue;
+            if (best == null or cost < best_cost) {
+                best = candidate;
+                best_cost = cost;
+                if (cost == 0) break;
+            }
+        }
+        if (best) |resolved_call| return resolved_call;
+        return self.resolveClauseCallInfo(name, arity, resolved.declared_arity, family.clauses.items[0], 0);
+    }
+
+    fn resolveCallInStruct(self: *HirBuilder, struct_name: []const u8, name: ast.StringId, arity: u32, args: []const CallArg) ?ResolvedFunctionCall {
+        for (self.graph.structs.items) |struct_entry| {
+            if (struct_entry.name.parts.len == 0) continue;
+            const last_part = self.interner.get(struct_entry.name.parts[struct_entry.name.parts.len - 1]);
+            if (!std.mem.eql(u8, last_part, struct_name)) continue;
+            return self.resolveCallInScope(struct_entry.scope_id, name, arity, args);
+        }
+        return null;
+    }
+
+    fn resolveClauseCallInfo(
+        self: *HirBuilder,
+        name: ast.StringId,
+        arity: u32,
+        declared_arity: u32,
+        clause_ref: scope_mod.FunctionClauseRef,
+        family_clause_index: u32,
+    ) ?ResolvedFunctionCall {
+        if (clause_ref.clause_index >= clause_ref.decl.clauses.len) return null;
+        const clause = clause_ref.decl.clauses[clause_ref.clause_index];
+        const param_types = self.allocator.alloc(types_mod.TypeId, clause.params.len) catch return null;
+        const param_ownerships = self.allocator.alloc(Ownership, clause.params.len) catch return null;
+        for (clause.params, 0..) |param, idx| {
+            const param_type = blk: {
+                if (param.pattern.* == .bind) {
+                    const clause_scope = self.graph.resolveClauseScope(clause.meta) orelse clause.meta.scope_id;
+                    if (self.graph.resolveBindingHygienic(clause_scope, param.pattern.bind.name, param.pattern.bind.meta.scopes)) |binding_id| {
+                        if (self.graph.bindings.items[binding_id].type_id) |prov| break :blk prov.type_id;
+                    }
+                }
+                if (param.type_annotation) |ann| break :blk self.resolveTypeExpr(ann);
+                break :blk types_mod.TypeStore.UNKNOWN;
+            };
+            param_types[idx] = param_type;
+            param_ownerships[idx] = self.resolveParamOwnership(param, param_type);
+        }
+        var final_param_types = param_types;
+        var final_param_ownerships = param_ownerships;
+        if (declared_arity != arity) {
+            final_param_types = param_types[0..arity];
+            final_param_ownerships = param_ownerships[0..arity];
+        }
+        const return_type = if (clause.return_type) |rt| self.resolveTypeExpr(rt) else types_mod.TypeStore.UNKNOWN;
+        _ = name;
+        return .{
+            .param_types = final_param_types,
+            .param_ownerships = final_param_ownerships,
+            .return_type = return_type,
+            .clause_index = family_clause_index,
+        };
+    }
+
+    fn callInfoMatchCost(self: *const HirBuilder, call_info: ResolvedFunctionCall, args: []const CallArg) ?u32 {
+        var total: u32 = 0;
+        const count = @min(call_info.param_types.len, args.len);
+        for (args[0..count], call_info.param_types[0..count]) |arg, expected| {
+            const cost = self.type_store.callMatchCost(arg.expr.type_id, expected) orelse return null;
+            total +|= cost;
+        }
+        return total;
+    }
+
     fn resolveFunctionValueGroup(self: *const HirBuilder, name: ast.StringId) ?u32 {
         var current: ?scope_mod.ScopeId = self.current_clause_scope orelse self.current_struct_scope orelse self.graph.prelude_scope;
         var found: ?u32 = null;
@@ -3972,10 +4062,18 @@ pub const HirBuilder = struct {
                                 var args: std.ArrayList(CallArg) = .empty;
                                 try args.append(self.allocator, .{ .expr = lhs_expr, .mode = .share });
                                 try args.append(self.allocator, .{ .expr = rhs_expr, .mode = .share });
+                                const selected_call_info = if (self.interner.lookupExisting(op_meta.method)) |method_id|
+                                    self.resolveCallInStruct(struct_name, method_id, 2, args.items)
+                                else
+                                    null;
 
                                 return try self.create(Expr, .{
                                     .kind = .{ .call = .{
-                                        .target = .{ .named = .{ .struct_name = struct_name, .name = op_meta.method } },
+                                        .target = .{ .named = .{
+                                            .struct_name = struct_name,
+                                            .name = op_meta.method,
+                                            .clause_index = if (selected_call_info) |info| info.clause_index else null,
+                                        } },
                                         .args = try args.toOwnedSlice(self.allocator),
                                     } },
                                     .type_id = op_meta.result_type(operand_type),
@@ -4011,14 +4109,21 @@ pub const HirBuilder = struct {
                     .span = bo.meta.span,
                 });
             },
-            .unary_op => |uo| try self.create(Expr, .{
-                .kind = .{ .unary = .{
-                    .op = uo.op,
-                    .operand = try self.buildExpr(uo.operand),
-                } },
-                .type_id = types_mod.TypeStore.UNKNOWN,
-                .span = uo.meta.span,
-            }),
+            .unary_op => |uo| blk: {
+                const operand = try self.buildExpr(uo.operand);
+                const result_type = switch (uo.op) {
+                    .negate => operand.type_id,
+                    .not_op => types_mod.TypeStore.BOOL,
+                };
+                break :blk try self.create(Expr, .{
+                    .kind = .{ .unary = .{
+                        .op = uo.op,
+                        .operand = operand,
+                    } },
+                    .type_id = result_type,
+                    .span = uo.meta.span,
+                });
+            },
             .call => |call| {
                 // Check for union variant constructor: Result.Ok("hello")
                 // Parsed as call(struct_ref(["Result", "Ok"]), args)
@@ -4056,6 +4161,7 @@ pub const HirBuilder = struct {
                 }
 
                 var callee_expr: ?*const Expr = null;
+                var selected_call_info: ?ResolvedFunctionCall = null;
 
                 // Check for struct-qualified call: IO.puts(...), Math.square(...)
                 // or :zig runtime bridge: :zig.println(...)
@@ -4075,7 +4181,8 @@ pub const HirBuilder = struct {
                             self.protocolDispatchStruct(initial_mod, args.items[0].expr.type_id) orelse initial_mod
                         else
                             initial_mod;
-                        break :blk .{ .named = .{ .struct_name = dispatched_mod, .name = func_name } };
+                        selected_call_info = self.resolveCallInStruct(dispatched_mod, fa.field, @intCast(call.args.len), args.items);
+                        break :blk .{ .named = .{ .struct_name = dispatched_mod, .name = func_name, .clause_index = if (selected_call_info) |info| info.clause_index else null } };
                     }
                     // :zig.function() or :zig.Struct.function() — bridge to Zig runtime
                     if (fa.object.* == .atom_literal) {
@@ -4150,7 +4257,8 @@ pub const HirBuilder = struct {
                     const scope_id = self.current_clause_scope orelse self.current_struct_scope orelse self.graph.prelude_scope;
                     if (self.graph.resolveFamily(scope_id, vr.name, @intCast(call.args.len))) |family_id| {
                         if (self.family_to_group.get(family_id)) |group_id| {
-                            break :blk .{ .direct = .{ .function_group_id = group_id, .clause_index = 0 } };
+                            selected_call_info = self.resolveCallInScope(scope_id, vr.name, @intCast(call.args.len), args.items);
+                            break :blk .{ .direct = .{ .function_group_id = group_id, .clause_index = if (selected_call_info) |info| info.clause_index else null } };
                         }
                     }
                     // Check if this bare call resolves to an imported function
@@ -4166,8 +4274,14 @@ pub const HirBuilder = struct {
                 }
 
                 // Populate expected_type on each arg for implicit widening.
-                // For direct and bare-named calls, resolve from the scope graph.
-                if (call.callee.* == .var_ref) {
+                // The selected clause decides the expected types: exact
+                // overloads are favored first, and widening is only fallback.
+                if (selected_call_info) |info| {
+                    const count = @min(args.items.len, info.param_types.len);
+                    for (args.items[0..count], info.param_types[0..count]) |*arg, param_type| {
+                        arg.expected_type = param_type;
+                    }
+                } else if (call.callee.* == .var_ref) {
                     if (self.resolveFunctionParamTypes(call.callee.var_ref.name, @intCast(call.args.len))) |param_types| {
                         const count = @min(args.items.len, param_types.len);
                         for (args.items[0..count], param_types[0..count]) |*arg, param_type| {
@@ -4222,7 +4336,7 @@ pub const HirBuilder = struct {
                 }
 
                 // Resolve return type for named calls
-                const call_return_type: types_mod.TypeId = switch (target) {
+                const call_return_type: types_mod.TypeId = if (selected_call_info) |info| info.return_type else switch (target) {
                     .direct => blk: {
                         if (call.callee.* == .var_ref) {
                             const raw = self.resolveFunctionReturnType(call.callee.var_ref.name, @intCast(call.args.len));
@@ -4283,7 +4397,7 @@ pub const HirBuilder = struct {
                 if (target == .named and call.callee.* == .var_ref) {
                     const named = target.named;
                     if (named.struct_name == null) {
-                        if (self.resolveFunctionParamOwnerships(call.callee.var_ref.name, @intCast(call.args.len))) |ownerships| {
+                        if (if (selected_call_info) |info| info.param_ownerships else self.resolveFunctionParamOwnerships(call.callee.var_ref.name, @intCast(call.args.len))) |ownerships| {
                             const count = @min(args.items.len, ownerships.len);
                             for (args.items[0..count], ownerships[0..count]) |*arg, ownership| {
                                 arg.mode = switch (ownership) {
@@ -4296,7 +4410,7 @@ pub const HirBuilder = struct {
                     }
                 }
                 if (target == .direct and call.callee.* == .var_ref) {
-                    if (self.resolveFunctionParamOwnerships(call.callee.var_ref.name, @intCast(call.args.len))) |ownerships| {
+                    if (if (selected_call_info) |info| info.param_ownerships else self.resolveFunctionParamOwnerships(call.callee.var_ref.name, @intCast(call.args.len))) |ownerships| {
                         const offset = args.items.len - call.args.len;
                         const count = @min(call.args.len, ownerships.len);
                         for (args.items[offset .. offset + count], ownerships[0..count]) |*arg, ownership| {

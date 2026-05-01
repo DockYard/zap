@@ -1,15 +1,5 @@
 # Zest
 
-Zest test framework.
-
-For test cases: `use Zest.Case` (provides assert/reject + describe/test DSL).
-For test runner: `use Zest.Runner` (provides summary).
-
-This struct provides standalone assert and reject functions
-with non-fatal test tracking via `:zig.TestTracker`. Failed
-assertions mark the current test as failed and return "F"
-but do not stop execution.
-
 ## Functions
 
 ### assert/1
