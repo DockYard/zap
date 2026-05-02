@@ -174,7 +174,7 @@ pub const SourceUnit = struct {
 
 fn registerSourceUnits(graph: *zap.scope.ScopeGraph, source_units: []const SourceUnit) !void {
     for (source_units, 0..) |unit, source_index| {
-        try graph.registerSourceFile(@intCast(source_index), unit.file_path);
+        try graph.registerSourceFileWithContent(@intCast(source_index), unit.file_path, unit.source);
     }
 }
 

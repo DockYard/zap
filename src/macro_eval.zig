@@ -1925,9 +1925,11 @@ fn structFunctionsIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtV
     while (family_iter.next()) |entry| {
         const family = &ctx.graph.families.items[entry.value_ptr.*];
         if (family.visibility != .public) continue;
+        if (family.clauses.items.len == 0) continue;
         const name = ctx.interner.get(family.name);
         const doc_text = extractDocAttributeText(env.alloc, ctx.interner, family.attributes) orelse "";
-        try result_list.append(env.alloc, try makeFunctionRef(env, name, family.arity, family.visibility, doc_text));
+        const loc = declSourceLocation(ctx.graph, family.clauses.items[0].decl.meta);
+        try result_list.append(env.alloc, try makeFunctionRef(env, name, family.arity, family.visibility, doc_text, loc.path, loc.line));
     }
 
     const id = env.store.alloc(env.alloc, .list, null);
@@ -1966,7 +1968,8 @@ fn structMacrosIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtValu
         const name = ctx.interner.get(family.name);
         if (std.mem.startsWith(u8, name, "__")) continue;
         const doc_text = extractDocAttributeText(env.alloc, ctx.interner, family.attributes) orelse "";
-        try result_list.append(env.alloc, try makeFunctionRef(env, name, family.arity, visibility, doc_text));
+        const loc = declSourceLocation(ctx.graph, family.clauses.items[0].decl.meta);
+        try result_list.append(env.alloc, try makeFunctionRef(env, name, family.arity, visibility, doc_text, loc.path, loc.line));
     }
 
     const id = env.store.alloc(env.alloc, .list, null);
@@ -2109,14 +2112,41 @@ fn makeFunctionRef(
     arity: u32,
     visibility: ast.FunctionDecl.Visibility,
     doc_text: []const u8,
+    source_file: []const u8,
+    source_line: u32,
 ) !CtValue {
-    const entries = try env.alloc.alloc(CtValue.CtMapEntry, 4);
+    const entries = try env.alloc.alloc(CtValue.CtMapEntry, 6);
     entries[0] = .{ .key = .{ .atom = "name" }, .value = .{ .string = name } };
     entries[1] = .{ .key = .{ .atom = "arity" }, .value = .{ .int = @intCast(arity) } };
     entries[2] = .{ .key = .{ .atom = "visibility" }, .value = .{ .atom = @tagName(visibility) } };
     entries[3] = .{ .key = .{ .atom = "doc" }, .value = .{ .string = doc_text } };
+    entries[4] = .{ .key = .{ .atom = "source_file" }, .value = .{ .string = source_file } };
+    entries[5] = .{ .key = .{ .atom = "source_line" }, .value = .{ .int = @intCast(source_line) } };
     const id = env.store.alloc(env.alloc, .map, null);
     return CtValue{ .map = .{ .alloc_id = id, .entries = entries } };
+}
+
+/// Convert a 0-based byte offset into a 1-based line number using the
+/// source bytes. Returns 0 when `offset` exceeds `source.len`, mirroring
+/// the convention used by `doc_generator.computeLineNumber`.
+fn lineNumberFromOffset(source: []const u8, offset: u32) u32 {
+    if (offset > source.len) return 0;
+    var line: u32 = 1;
+    var i: usize = 0;
+    while (i < offset) : (i += 1) {
+        if (source[i] == '\n') line += 1;
+    }
+    return line;
+}
+
+/// Return the project-relative source path and 1-based line number for
+/// a declaration's first byte. The first clause of a function or macro
+/// family is treated as the canonical declaration site.
+fn declSourceLocation(graph: *const scope.ScopeGraph, meta: ast.NodeMeta) struct { path: []const u8, line: u32 } {
+    const source_id = meta.span.source_id orelse return .{ .path = "", .line = 0 };
+    const path = graph.sourcePathById(source_id) orelse "";
+    const source = graph.sourceContentById(source_id);
+    return .{ .path = path, .line = lineNumberFromOffset(source, meta.span.start) };
 }
 
 /// Extract the value of an `@doc = "..."` attribute on a declaration, or

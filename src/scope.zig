@@ -427,6 +427,11 @@ pub const StructEntry = struct {
 pub const SourceFileEntry = struct {
     id: u32,
     path: []const u8,
+    /// Source bytes for the file. Allows reflection callers to resolve
+    /// span byte-offsets to 1-based line numbers without threading
+    /// `compiler.SourceUnit` slices through every API. Empty when the
+    /// caller registered only the path (legacy entry points).
+    source: []const u8 = "",
 };
 
 // ============================================================
@@ -704,15 +709,28 @@ pub const ScopeGraph = struct {
     /// APIs use this to answer path-scoped source graph queries without
     /// guessing from struct names.
     pub fn registerSourceFile(self: *ScopeGraph, source_id: u32, path: []const u8) !void {
+        try self.registerSourceFileWithContent(source_id, path, "");
+    }
+
+    /// Like `registerSourceFile`, but also stashes the source bytes so
+    /// reflection callers can compute line numbers from span offsets.
+    pub fn registerSourceFileWithContent(
+        self: *ScopeGraph,
+        source_id: u32,
+        path: []const u8,
+        source: []const u8,
+    ) !void {
         for (self.source_files.items) |*entry| {
             if (entry.id == source_id) {
                 entry.path = path;
+                if (source.len > 0) entry.source = source;
                 return;
             }
         }
         try self.source_files.append(self.allocator, .{
             .id = source_id,
             .path = path,
+            .source = source,
         });
     }
 
@@ -721,6 +739,17 @@ pub const ScopeGraph = struct {
             if (entry.id == source_id) return entry.path;
         }
         return null;
+    }
+
+    /// Return the registered source bytes for `source_id`, or an empty
+    /// slice when the file was registered without content (older entry
+    /// points). Reflection helpers use this to convert span byte offsets
+    /// into 1-based line numbers.
+    pub fn sourceContentById(self: *const ScopeGraph, source_id: u32) []const u8 {
+        for (self.source_files.items) |entry| {
+            if (entry.id == source_id) return entry.source;
+        }
+        return "";
     }
 
     /// Resolve a clause's owning scope. Prefers `meta.scope_id` (set

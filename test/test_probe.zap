@@ -28,6 +28,16 @@ pub struct TestProbe {
     _func_count = list_length(_funcs)
     _macro_count = list_length(_macros)
 
+    _add_source_files = for _f <- _funcs, map_get(_f, :name, "") == "add" {
+      map_get(_f, :source_file, "MISSING")
+    }
+    _add_source_lines = for _f <- _funcs, map_get(_f, :name, "") == "add" {
+      map_get(_f, :source_line, 0)
+    }
+    _twice_source_lines = for _m <- _macros, map_get(_m, :name, "") == "twice" {
+      map_get(_m, :source_line, 0)
+    }
+
     _info = struct_info(ReflectionSubject)
     _info_name = map_get(_info, :name, "MISSING")
     _info_source = map_get(_info, :source_file, "MISSING")
@@ -73,6 +83,18 @@ pub struct TestProbe {
 
       pub fn subject_is_private() -> Bool {
         unquote(_info_private)
+      }
+
+      pub fn add_source_file() -> String {
+        unquote(list_at(_add_source_files, 0))
+      }
+
+      pub fn add_source_line() -> i64 {
+        unquote(list_at(_add_source_lines, 0))
+      }
+
+      pub fn twice_source_line() -> i64 {
+        unquote(list_at(_twice_source_lines, 0))
       }
     }
   }

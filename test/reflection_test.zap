@@ -47,4 +47,18 @@ pub struct ReflectionTest {
       assert(subject_is_private() == false)
     }
   }
+
+  describe("function refs carry source location") {
+    test("source_file matches the file the function is declared in") {
+      assert(String.ends_with?(add_source_file(), "reflection_subject.zap"))
+    }
+
+    test("source_line points at the function declaration") {
+      assert(add_source_line() == 10)
+    }
+
+    test("macro source_line points at the macro declaration") {
+      assert(twice_source_line() == 28)
+    }
+  }
 }
