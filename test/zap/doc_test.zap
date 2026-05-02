@@ -1,6 +1,10 @@
 pub struct Zap.DocTest {
   use Zest.Case
 
+  fn empty_string_list() -> [String] {
+    List.tail(["sentinel"])
+  }
+
   describe("Zap.Doc.page_title") {
     test("renders an h1 with the module name") {
       assert(Zap.Doc.page_title("Enum") == "<h1 class=\"page-title\">Enum</h1>\n")
@@ -179,6 +183,11 @@ pub struct Zap.DocTest {
   }
 
   describe("Zap.Doc.implements_row") {
+    test("empty protocol list renders nothing") {
+      _empty = empty_string_list()
+      assert(Zap.Doc.implements_row(_empty) == "")
+    }
+
     test("renders one accent link per protocol") {
       _result = Zap.Doc.implements_row(["Arithmetic", "Comparator"])
       assert(String.contains?(_result, "<span class=\"implements-label\">Implements</span>"))
