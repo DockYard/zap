@@ -93,5 +93,17 @@ pub struct MarkdownTest {
     test("HTML special characters in the body are escaped") {
       assert(Markdown.to_html("```\na < b\n```") == "<pre><code>a &lt; b</code></pre>\n")
     }
+
+    test("a multi-line body preserves line breaks") {
+      assert(Markdown.to_html("```\nline one\nline two\n```") == "<pre><code>line one\nline two</code></pre>\n")
+    }
+  }
+
+  describe("pipe tables") {
+    test("a header / separator / row trio renders a markdown-table") {
+      _input = "| Field | Description |\n| --- | --- |\n| name | Output name |"
+      _expected = "<table class=\"markdown-table\">\n<thead>\n<tr><th>Field</th><th>Description</th></tr>\n</thead>\n<tbody>\n<tr><td>name</td><td>Output name</td></tr>\n</tbody>\n</table>\n"
+      assert(Markdown.to_html(_input) == _expected)
+    }
   }
 }

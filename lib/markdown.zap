@@ -41,14 +41,22 @@ pub struct Markdown {
   }
 
   pub fn render_line(line :: String, rest :: [String], mode :: Atom, code_lang :: String, acc :: String) -> String {
-    if mode == :code {
+    if mode == :code_open {
       if String.starts_with?(String.trim(line), "```") {
         render_lines(rest, :start, "", acc <> "</code></pre>\n")
       } else {
         render_lines(rest, :code, code_lang, acc <> escape_html(line))
       }
     } else {
-      classify_line(line, rest, mode, acc)
+      if mode == :code {
+        if String.starts_with?(String.trim(line), "```") {
+          render_lines(rest, :start, "", acc <> "</code></pre>\n")
+        } else {
+          render_lines(rest, :code, code_lang, acc <> "\n" <> escape_html(line))
+        }
+      } else {
+        classify_line(line, rest, mode, acc)
+      }
     }
   }
 
@@ -77,7 +85,19 @@ pub struct Markdown {
               if is_list_item?(line) {
                 render_list_item(line, rest, mode, acc)
               } else {
-                render_paragraph_line(line, rest, mode, acc)
+                if is_table_header?(line, rest) {
+                  open_table(line, rest, mode, acc)
+                } else {
+                  if mode == :table {
+                    if is_pipe_row?(line) {
+                      render_lines(rest, :table, "", acc <> render_table_row(line, "td"))
+                    } else {
+                      render_paragraph_line(line, rest, :start, close_block(:table, acc))
+                    }
+                  } else {
+                    render_paragraph_line(line, rest, mode, acc)
+                  }
+                }
               }
             }
           }
@@ -86,14 +106,94 @@ pub struct Markdown {
     }
   }
 
+  @doc = """
+    A pipe-table header is detected by the next line being a separator
+    row (`| --- | --- |`). Matching the GFM-flavored shape the doc
+    generator emits.
+    """
+
+  pub fn is_table_header?(line :: String, rest :: [String]) -> Bool {
+    if is_pipe_row?(line) {
+      case rest {
+        [] -> false
+        [next | _] -> is_table_separator?(next)
+      }
+    } else {
+      false
+    }
+  }
+
+  pub fn is_pipe_row?(line :: String) -> Bool {
+    String.starts_with?(String.trim(line), "|")
+  }
+
+  pub fn is_table_separator?(line :: String) -> Bool {
+    trimmed = String.trim(line)
+    String.starts_with?(trimmed, "|") and String.contains?(trimmed, "---")
+  }
+
+  pub fn open_table(line :: String, rest :: [String], mode :: Atom, acc :: String) -> String {
+    closed = close_block(mode, acc)
+    head = "<table class=\"markdown-table\">\n<thead>\n" <> render_table_row(line, "th") <> "</thead>\n<tbody>\n"
+    case rest {
+      [] -> close_block(:table, closed <> head)
+      [_separator | body_lines] -> render_lines(body_lines, :table, "", closed <> head)
+    }
+  }
+
+  pub fn render_table_row(line :: String, cell_tag :: String) -> String {
+    cells = parse_pipe_cells(line)
+    "<tr>" <> render_table_cells(cells, cell_tag, "") <> "</tr>\n"
+  }
+
+  pub fn render_table_cells(cells :: [String], cell_tag :: String, acc :: String) -> String {
+    case cells {
+      [] -> acc
+      [cell | rest] -> render_table_cells(rest, cell_tag, acc <> "<" <> cell_tag <> ">" <> render_inline(cell) <> "</" <> cell_tag <> ">")
+    }
+  }
+
+  @doc = """
+    Split a pipe-row into its cells, dropping the leading and trailing
+    pipe characters. Whitespace inside each cell is trimmed so
+    `| Field | Description |` produces `["Field", "Description"]`.
+    """
+
+  pub fn parse_pipe_cells(line :: String) -> [String] {
+    trimmed = String.trim(line)
+    inner = strip_pipes(trimmed)
+    parts = String.split(inner, "|")
+    trim_each(parts, [])
+  }
+
+  pub fn strip_pipes(line :: String) -> String {
+    a = if String.starts_with?(line, "|") {
+      String.slice(line, 1, String.length(line))
+    } else {
+      line
+    }
+    if String.ends_with?(a, "|") {
+      String.slice(a, 0, String.length(a) - 1)
+    } else {
+      a
+    }
+  }
+
+  pub fn trim_each(parts :: [String], acc :: [String]) -> [String] {
+    case parts {
+      [] -> List.reverse(acc)
+      [head | tail] -> trim_each(tail, [String.trim(head) | acc])
+    }
+  }
+
   pub fn open_code_block(line :: String, rest :: [String], mode :: Atom, acc :: String) -> String {
     trimmed = String.trim(line)
     lang = String.slice(trimmed, 3, String.length(trimmed))
     closed = close_block(mode, acc)
     if String.length(lang) == 0 {
-      render_lines(rest, :code, "", closed <> "<pre><code>")
+      render_lines(rest, :code_open, "", closed <> "<pre><code>")
     } else {
-      render_lines(rest, :code, lang, closed <> "<pre><code class=\"language-" <> lang <> "\">")
+      render_lines(rest, :code_open, lang, closed <> "<pre><code class=\"language-" <> lang <> "\">")
     }
   }
 
@@ -121,7 +221,11 @@ pub struct Markdown {
       if mode == :list {
         acc <> "</li>\n</ul>\n"
       } else {
-        acc
+        if mode == :table {
+          acc <> "</tbody>\n</table>\n"
+        } else {
+          acc
+        }
       }
     }
   }
