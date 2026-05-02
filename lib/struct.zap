@@ -50,6 +50,31 @@ pub struct Struct {
   }
 
   @doc = """
+    Returns the variants of a reflected union as a list of compile-time
+    maps with `:name` and `:signature` (the rendered Zap-syntax form,
+    `Variant` for bare variants and `Variant :: TypeExpr` for typed
+    payloads).
+    """
+
+  pub macro union_variants(union_ref :: Expr) -> Expr {
+    quote {
+      union_variants(unquote(union_ref))
+    }
+  }
+
+  @doc = """
+    Returns the required functions a protocol declares as a list of
+    compile-time maps with `:name` and `:signature`. Signatures use
+    the same renderer the doc generator drives.
+    """
+
+  pub macro protocol_required_functions(protocol_ref :: Expr) -> Expr {
+    quote {
+      protocol_required_functions(unquote(protocol_ref))
+    }
+  }
+
+  @doc = """
     Returns true when a reflected struct exposes a public function with
     the given name and arity.
     """

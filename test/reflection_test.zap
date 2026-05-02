@@ -82,6 +82,16 @@ pub struct ReflectionTest {
     }
   }
 
+  describe("Protocol.required_functions enumerates required functions") {
+    test("the fixture protocol declares one required function") {
+      assert(protocol_required_count() == 1)
+    }
+
+    test("the required function carries its typed signature") {
+      assert(protocol_required_signature() == "next(state) -> {Atom, element, any}")
+    }
+  }
+
   describe("SourceGraph.unions enumerates unions by path") {
     test("the fixture file produces exactly one union ref") {
       assert(union_count() == 1)
@@ -89,6 +99,20 @@ pub struct ReflectionTest {
 
     test("Struct.info on a union ref returns its qualified name") {
       assert(first_union_name() == "ReflectionUnion")
+    }
+  }
+
+  describe("Union.variants enumerates union variants") {
+    test("variant count matches the declaration") {
+      assert(union_variant_count() == 3)
+    }
+
+    test("bare variant has just its name as signature") {
+      assert(union_variant_first_signature() == "Up")
+    }
+
+    test("typed variant signature includes the payload type") {
+      assert(union_variant_last_signature() == "Tag :: i64")
     }
   }
 

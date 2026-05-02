@@ -495,6 +495,12 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
             if (std.mem.eql(u8, form_name, "struct_info")) {
                 return structInfoIntrinsic(env, arg_elems);
             }
+            if (std.mem.eql(u8, form_name, "union_variants")) {
+                return unionVariantsIntrinsic(env, arg_elems);
+            }
+            if (std.mem.eql(u8, form_name, "protocol_required_functions")) {
+                return protocolRequiredFunctionsIntrinsic(env, arg_elems);
+            }
 
             // For-comprehension at comptime: iterate a list/string,
             // bind the loop pattern, optionally filter, accumulate
@@ -1367,7 +1373,9 @@ fn isCompileTimeIntrinsicExpansion(value: CtValue) bool {
         std.mem.eql(u8, form.atom, "source_graph_impls") or
         std.mem.eql(u8, form.atom, "struct_functions") or
         std.mem.eql(u8, form.atom, "struct_macros") or
-        std.mem.eql(u8, form.atom, "struct_info");
+        std.mem.eql(u8, form.atom, "struct_info") or
+        std.mem.eql(u8, form.atom, "union_variants") or
+        std.mem.eql(u8, form.atom, "protocol_required_functions");
 }
 
 fn evalDispatchedClause(
@@ -2085,6 +2093,95 @@ fn structNameToString(alloc: Allocator, interner: *ast.StringInterner, name: ast
         try buf.appendSlice(alloc, interner.get(part));
     }
     return buf.toOwnedSlice(alloc);
+}
+
+/// Reflect on the variants of a union type. Each result is a
+/// compile-time map with `:name` and `:signature`. The signature is
+/// `Variant` for bare variants and `Variant :: TypeExpr` for typed
+/// payload variants — the same shape `signature.buildUnionVariantSignature`
+/// produces for the in-tree doc generator.
+fn unionVariantsIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtValue {
+    if (args.len != 1) return .nil;
+    if (!hasReflectionCapability(env)) {
+        env.last_capability_error = std.fmt.allocPrint(
+            env.alloc,
+            "macro `{s}` calls `union_variants` but does not declare `@requires = [:reflect_source]`",
+            .{env.current_macro_name orelse "<top-level>"},
+        ) catch return MacroEvalError.EvalFailed;
+        return MacroEvalError.EvalFailed;
+    }
+
+    const ctx = env.struct_ctx orelse return .nil;
+    const ref_value = try eval(env, args[0]);
+    const union_name = (try extractStructRefName(env.alloc, ref_value)) orelse return .nil;
+
+    var union_decl: ?*const ast.UnionDecl = null;
+    for (ctx.graph.types.items) |type_entry| {
+        const decl = switch (type_entry.kind) {
+            .union_type => |u| u,
+            else => continue,
+        };
+        const local_name = ctx.interner.get(type_entry.name);
+        if (!std.mem.eql(u8, local_name, union_name)) continue;
+        union_decl = decl;
+        break;
+    }
+    const decl = union_decl orelse return .nil;
+
+    var result_list: std.ArrayListUnmanaged(CtValue) = .empty;
+    for (decl.variants) |variant| {
+        const sig = signature.buildUnionVariantSignature(env.alloc, variant, ctx.interner);
+        const entries = try env.alloc.alloc(CtValue.CtMapEntry, 2);
+        entries[0] = .{ .key = .{ .atom = "name" }, .value = .{ .string = ctx.interner.get(variant.name) } };
+        entries[1] = .{ .key = .{ .atom = "signature" }, .value = .{ .string = sig } };
+        const map_id = env.store.alloc(env.alloc, .map, null);
+        try result_list.append(env.alloc, CtValue{ .map = .{ .alloc_id = map_id, .entries = entries } });
+    }
+
+    const id = env.store.alloc(env.alloc, .list, null);
+    return CtValue{ .list = .{ .alloc_id = id, .elems = result_list.items } };
+}
+
+/// Reflect on the required functions a protocol declares. Each result
+/// is a compile-time map with `:name` and `:signature` (the bare
+/// `next(state) -> {Atom, element, any}` form), letting the doc
+/// generator render the protocol's contract surface alongside the
+/// protocol's own `@doc`.
+fn protocolRequiredFunctionsIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtValue {
+    if (args.len != 1) return .nil;
+    if (!hasReflectionCapability(env)) {
+        env.last_capability_error = std.fmt.allocPrint(
+            env.alloc,
+            "macro `{s}` calls `protocol_required_functions` but does not declare `@requires = [:reflect_source]`",
+            .{env.current_macro_name orelse "<top-level>"},
+        ) catch return MacroEvalError.EvalFailed;
+        return MacroEvalError.EvalFailed;
+    }
+
+    const ctx = env.struct_ctx orelse return .nil;
+    const ref_value = try eval(env, args[0]);
+    const protocol_name = (try extractStructRefName(env.alloc, ref_value)) orelse return .nil;
+
+    var protocol_decl: ?*const ast.ProtocolDecl = null;
+    for (ctx.graph.protocols.items) |entry| {
+        if (!structNameMatches(ctx.interner, entry.name, protocol_name)) continue;
+        protocol_decl = entry.decl;
+        break;
+    }
+    const decl = protocol_decl orelse return .nil;
+
+    var result_list: std.ArrayListUnmanaged(CtValue) = .empty;
+    for (decl.functions) |fn_sig| {
+        const sig = signature.buildProtocolFunctionSignature(env.alloc, fn_sig, ctx.interner);
+        const entries = try env.alloc.alloc(CtValue.CtMapEntry, 2);
+        entries[0] = .{ .key = .{ .atom = "name" }, .value = .{ .string = ctx.interner.get(fn_sig.name) } };
+        entries[1] = .{ .key = .{ .atom = "signature" }, .value = .{ .string = sig } };
+        const map_id = env.store.alloc(env.alloc, .map, null);
+        try result_list.append(env.alloc, CtValue{ .map = .{ .alloc_id = map_id, .entries = entries } });
+    }
+
+    const id = env.store.alloc(env.alloc, .list, null);
+    return CtValue{ .list = .{ .alloc_id = id, .elems = result_list.items } };
 }
 
 /// Reflect on the public macros declared in a struct's scope and return

@@ -54,11 +54,18 @@ pub struct TestProbe {
     _protocol_count = list_length(_protocol_refs)
     _proto_info = struct_info(list_at(_protocol_refs, 0))
     _proto_name = map_get(_proto_info, :name, "MISSING")
+    _proto_required = protocol_required_functions(list_at(_protocol_refs, 0))
+    _proto_required_count = list_length(_proto_required)
+    _proto_required_signature = map_get(list_at(_proto_required, 0), :signature, "MISSING")
 
     _union_refs = source_graph_unions("test/reflection_union.zap")
     _union_count = list_length(_union_refs)
     _union_info = struct_info(list_at(_union_refs, 0))
     _union_name = map_get(_union_info, :name, "MISSING")
+    _union_variants = union_variants(list_at(_union_refs, 0))
+    _union_variant_count = list_length(_union_variants)
+    _first_variant_signature = map_get(list_at(_union_variants, 0), :signature, "MISSING")
+    _last_variant_signature = map_get(list_at(_union_variants, 2), :signature, "MISSING")
 
     # Verify the source-graph impls intrinsic returns a list shape even
     # when no impls are declared in the path. A separate test (once a
@@ -141,12 +148,32 @@ pub struct TestProbe {
         unquote(_proto_name)
       }
 
+      pub fn protocol_required_count() -> i64 {
+        unquote(_proto_required_count)
+      }
+
+      pub fn protocol_required_signature() -> String {
+        unquote(_proto_required_signature)
+      }
+
       pub fn union_count() -> i64 {
         unquote(_union_count)
       }
 
       pub fn first_union_name() -> String {
         unquote(_union_name)
+      }
+
+      pub fn union_variant_count() -> i64 {
+        unquote(_union_variant_count)
+      }
+
+      pub fn union_variant_first_signature() -> String {
+        unquote(_first_variant_signature)
+      }
+
+      pub fn union_variant_last_signature() -> String {
+        unquote(_last_variant_signature)
       }
 
       pub fn impl_count() -> i64 {
