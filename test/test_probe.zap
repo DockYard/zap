@@ -28,6 +28,12 @@ pub struct TestProbe {
     _func_count = list_length(_funcs)
     _macro_count = list_length(_macros)
 
+    _info = struct_info(ReflectionSubject)
+    _info_name = map_get(_info, :name, "MISSING")
+    _info_source = map_get(_info, :source_file, "MISSING")
+    _info_doc = map_get(_info, :doc, "MISSING")
+    _info_private = map_get(_info, :is_private, true)
+
     quote {
       pub fn add_doc() -> String {
         unquote(list_at(_add_docs, 0))
@@ -51,6 +57,22 @@ pub struct TestProbe {
 
       pub fn macro_count() -> i64 {
         unquote(_macro_count)
+      }
+
+      pub fn subject_name() -> String {
+        unquote(_info_name)
+      }
+
+      pub fn subject_source_file() -> String {
+        unquote(_info_source)
+      }
+
+      pub fn subject_doc() -> String {
+        unquote(_info_doc)
+      }
+
+      pub fn subject_is_private() -> Bool {
+        unquote(_info_private)
       }
     }
   }

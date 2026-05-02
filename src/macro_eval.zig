@@ -482,6 +482,9 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
             if (std.mem.eql(u8, form_name, "struct_macros")) {
                 return structMacrosIntrinsic(env, arg_elems);
             }
+            if (std.mem.eql(u8, form_name, "struct_info")) {
+                return structInfoIntrinsic(env, arg_elems);
+            }
 
             // For-comprehension at comptime: iterate a list/string,
             // bind the loop pattern, optionally filter, accumulate
@@ -1350,7 +1353,8 @@ fn isCompileTimeIntrinsicExpansion(value: CtValue) bool {
     if (form != .atom) return false;
     return std.mem.eql(u8, form.atom, "source_graph_structs") or
         std.mem.eql(u8, form.atom, "struct_functions") or
-        std.mem.eql(u8, form.atom, "struct_macros");
+        std.mem.eql(u8, form.atom, "struct_macros") or
+        std.mem.eql(u8, form.atom, "struct_info");
 }
 
 fn evalDispatchedClause(
@@ -1967,6 +1971,48 @@ fn structMacrosIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtValu
 
     const id = env.store.alloc(env.alloc, .list, null);
     return CtValue{ .list = .{ .alloc_id = id, .elems = result_list.items } };
+}
+
+/// Return struct-level metadata for a single struct: `:name`,
+/// `:source_file` (project-relative path of the file the struct was
+/// declared in), `:is_private`, and `:doc` (heredoc-stripped `@doc`
+/// text, empty when missing). Used by the Zap doc generator to drive
+/// breadcrumbs, source-link rendering, and visibility filtering.
+fn structInfoIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtValue {
+    if (args.len != 1) return .nil;
+    if (!hasReflectionCapability(env)) {
+        env.last_capability_error = std.fmt.allocPrint(
+            env.alloc,
+            "macro `{s}` calls `struct_info` but does not declare `@requires = [:reflect_source]`",
+            .{env.current_macro_name orelse "<top-level>"},
+        ) catch return MacroEvalError.EvalFailed;
+        return MacroEvalError.EvalFailed;
+    }
+
+    const ctx = env.struct_ctx orelse return .nil;
+    const ref_value = try eval(env, args[0]);
+    const struct_name = (try extractStructRefName(env.alloc, ref_value)) orelse return .nil;
+
+    var struct_entry: ?scope.StructEntry = null;
+    for (ctx.graph.structs.items) |entry| {
+        if (structNameMatches(ctx.interner, entry.name, struct_name)) {
+            struct_entry = entry;
+            break;
+        }
+    }
+    const entry = struct_entry orelse return .nil;
+
+    const source_id = entry.decl.meta.span.source_id orelse 0;
+    const source_path = ctx.graph.sourcePathById(source_id) orelse "";
+    const doc_text = extractDocAttributeText(env.alloc, ctx.interner, entry.attributes) orelse "";
+
+    const entries = try env.alloc.alloc(CtValue.CtMapEntry, 4);
+    entries[0] = .{ .key = .{ .atom = "name" }, .value = .{ .string = env.alloc.dupe(u8, struct_name) catch struct_name } };
+    entries[1] = .{ .key = .{ .atom = "source_file" }, .value = .{ .string = source_path } };
+    entries[2] = .{ .key = .{ .atom = "is_private" }, .value = .{ .bool_val = entry.decl.is_private } };
+    entries[3] = .{ .key = .{ .atom = "doc" }, .value = .{ .string = doc_text } };
+    const id = env.store.alloc(env.alloc, .map, null);
+    return CtValue{ .map = .{ .alloc_id = id, .entries = entries } };
 }
 
 fn hasReflectionCapability(env: *const Env) bool {

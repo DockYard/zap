@@ -37,6 +37,19 @@ pub struct Struct {
   }
 
   @doc = """
+    Returns struct-level metadata for a reflected struct as a compile-time
+    map: `:name`, `:source_file` (project-relative path), `:is_private`,
+    and `:doc` (the struct's `@doc` attribute, heredoc-stripped, or
+    empty when missing).
+    """
+
+  pub macro info(struct_ref :: Expr) -> Expr {
+    quote {
+      struct_info(unquote(struct_ref))
+    }
+  }
+
+  @doc = """
     Returns true when a reflected struct exposes a public function with
     the given name and arity.
     """

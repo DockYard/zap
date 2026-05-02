@@ -29,4 +29,22 @@ pub struct ReflectionTest {
       assert(macro_count() == 1)
     }
   }
+
+  describe("Struct.info returns struct-level metadata") {
+    test("name round-trips") {
+      assert(subject_name() == "ReflectionSubject")
+    }
+
+    test("source_file is the relative lib/test path") {
+      assert(String.ends_with?(subject_source_file(), "reflection_subject.zap"))
+    }
+
+    test("@doc text round-trips") {
+      assert(String.starts_with?(subject_doc(), "Test fixture for compile-time reflection tests."))
+    }
+
+    test("public struct reports is_private = false") {
+      assert(subject_is_private() == false)
+    }
+  }
 }
