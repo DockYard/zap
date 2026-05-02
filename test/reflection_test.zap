@@ -61,4 +61,14 @@ pub struct ReflectionTest {
       assert(twice_source_line() == 28)
     }
   }
+
+  describe("SourceGraph.protocols enumerates protocols by path") {
+    test("the fixture file produces exactly one protocol ref") {
+      assert(protocol_count() == 1)
+    }
+
+    test("Struct.info on a protocol ref returns its qualified name") {
+      assert(first_protocol_name() == "ReflectionProtocol")
+    }
+  }
 }

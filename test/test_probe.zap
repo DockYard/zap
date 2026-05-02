@@ -38,6 +38,15 @@ pub struct TestProbe {
       map_get(_m, :source_line, 0)
     }
 
+    # Reference ReflectionProtocol by name so the file-graph discovery
+    # picks up `test/reflection_protocol.zap` even though it does not
+    # match the `*_test.zap` build glob.
+    _proto_marker = ReflectionProtocol
+    _protocol_refs = source_graph_protocols("test/reflection_protocol.zap")
+    _protocol_count = list_length(_protocol_refs)
+    _proto_info = struct_info(list_at(_protocol_refs, 0))
+    _proto_name = map_get(_proto_info, :name, "MISSING")
+
     _info = struct_info(ReflectionSubject)
     _info_name = map_get(_info, :name, "MISSING")
     _info_source = map_get(_info, :source_file, "MISSING")
@@ -95,6 +104,14 @@ pub struct TestProbe {
 
       pub fn twice_source_line() -> i64 {
         unquote(list_at(_twice_source_lines, 0))
+      }
+
+      pub fn protocol_count() -> i64 {
+        unquote(_protocol_count)
+      }
+
+      pub fn first_protocol_name() -> String {
+        unquote(_proto_name)
       }
     }
   }

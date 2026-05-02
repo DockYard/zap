@@ -20,4 +20,17 @@ pub struct SourceGraph {
       source_graph_structs(unquote(paths))
     }
   }
+
+  @doc = """
+    Returns protocol references declared in the exact source paths
+    provided. Each ref carries the protocol's qualified name in the
+    same `__aliases__` AST shape as `structs/1` results. Combine with
+    `Struct.info/1` to retrieve protocol-level metadata.
+    """
+
+  pub macro protocols(paths :: Expr) -> Expr {
+    quote {
+      source_graph_protocols(unquote(paths))
+    }
+  }
 }

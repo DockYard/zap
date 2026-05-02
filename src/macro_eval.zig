@@ -476,6 +476,9 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
             if (std.mem.eql(u8, form_name, "source_graph_structs")) {
                 return sourceGraphStructsIntrinsic(env, arg_elems);
             }
+            if (std.mem.eql(u8, form_name, "source_graph_protocols")) {
+                return sourceGraphProtocolsIntrinsic(env, arg_elems);
+            }
             if (std.mem.eql(u8, form_name, "struct_functions")) {
                 return structFunctionsIntrinsic(env, arg_elems);
             }
@@ -1352,6 +1355,7 @@ fn isCompileTimeIntrinsicExpansion(value: CtValue) bool {
     const form = value.tuple.elems[0];
     if (form != .atom) return false;
     return std.mem.eql(u8, form.atom, "source_graph_structs") or
+        std.mem.eql(u8, form.atom, "source_graph_protocols") or
         std.mem.eql(u8, form.atom, "struct_functions") or
         std.mem.eql(u8, form.atom, "struct_macros") or
         std.mem.eql(u8, form.atom, "struct_info");
@@ -1936,6 +1940,38 @@ fn structFunctionsIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtV
     return CtValue{ .list = .{ .alloc_id = id, .elems = result_list.items } };
 }
 
+/// Enumerate every public protocol declared in any of the source paths
+/// supplied. Each result is an `__aliases__` AST ref pointing at the
+/// protocol — the same shape as `source_graph_structs`, so callers can
+/// hand the result to `struct_info` for protocol-level metadata.
+fn sourceGraphProtocolsIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtValue {
+    if (args.len != 1) return .nil;
+    if (!hasReflectionCapability(env)) {
+        env.last_capability_error = std.fmt.allocPrint(
+            env.alloc,
+            "macro `{s}` calls `source_graph_protocols` but does not declare `@requires = [:reflect_source]`",
+            .{env.current_macro_name orelse "<top-level>"},
+        ) catch return MacroEvalError.EvalFailed;
+        return MacroEvalError.EvalFailed;
+    }
+
+    const paths_raw = try eval(env, args[0]);
+    const paths = extractPathFilter(env, paths_raw) catch return .nil;
+    const ctx = env.struct_ctx orelse return .nil;
+
+    var result_list: std.ArrayListUnmanaged(CtValue) = .empty;
+    for (ctx.graph.protocols.items) |protocol_entry| {
+        if (protocol_entry.decl.is_private) continue;
+        const source_id = protocol_entry.decl.meta.span.source_id orelse continue;
+        const path = ctx.graph.sourcePathById(source_id) orelse continue;
+        if (!pathFilterContains(env.alloc, paths, path)) continue;
+        try result_list.append(env.alloc, try makeAliasRef(env, ctx.interner, protocol_entry.name));
+    }
+
+    const id = env.store.alloc(env.alloc, .list, null);
+    return CtValue{ .list = .{ .alloc_id = id, .elems = result_list.items } };
+}
+
 /// Reflect on the public macros declared in a struct's scope and return
 /// them as a list of maps with the same shape as `struct_functions`.
 /// Macros prefixed with `__` (e.g. `__using__`, `__before_compile__`) are
@@ -1996,23 +2032,36 @@ fn structInfoIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtValue 
     const ref_value = try eval(env, args[0]);
     const struct_name = (try extractStructRefName(env.alloc, ref_value)) orelse return .nil;
 
-    var struct_entry: ?scope.StructEntry = null;
+    // Look up struct, protocol, and union entries by name. The same
+    // `struct_info` intrinsic answers for any of them — refs returned
+    // from the source-graph reflection intrinsics are interchangeable.
     for (ctx.graph.structs.items) |entry| {
-        if (structNameMatches(ctx.interner, entry.name, struct_name)) {
-            struct_entry = entry;
-            break;
-        }
+        if (!structNameMatches(ctx.interner, entry.name, struct_name)) continue;
+        return makeDeclInfoMap(env, ctx, struct_name, entry.decl.meta, entry.decl.is_private, entry.attributes);
     }
-    const entry = struct_entry orelse return .nil;
+    for (ctx.graph.protocols.items) |entry| {
+        if (!structNameMatches(ctx.interner, entry.name, struct_name)) continue;
+        return makeDeclInfoMap(env, ctx, struct_name, entry.decl.meta, entry.decl.is_private, entry.attributes);
+    }
+    return .nil;
+}
 
-    const source_id = entry.decl.meta.span.source_id orelse 0;
+fn makeDeclInfoMap(
+    env: *Env,
+    ctx: StructContext,
+    name: []const u8,
+    meta: ast.NodeMeta,
+    is_private: bool,
+    attributes: std.ArrayListUnmanaged(scope.Attribute),
+) !CtValue {
+    const source_id = meta.span.source_id orelse 0;
     const source_path = ctx.graph.sourcePathById(source_id) orelse "";
-    const doc_text = extractDocAttributeText(env.alloc, ctx.interner, entry.attributes) orelse "";
+    const doc_text = extractDocAttributeText(env.alloc, ctx.interner, attributes) orelse "";
 
     const entries = try env.alloc.alloc(CtValue.CtMapEntry, 4);
-    entries[0] = .{ .key = .{ .atom = "name" }, .value = .{ .string = env.alloc.dupe(u8, struct_name) catch struct_name } };
+    entries[0] = .{ .key = .{ .atom = "name" }, .value = .{ .string = env.alloc.dupe(u8, name) catch name } };
     entries[1] = .{ .key = .{ .atom = "source_file" }, .value = .{ .string = source_path } };
-    entries[2] = .{ .key = .{ .atom = "is_private" }, .value = .{ .bool_val = entry.decl.is_private } };
+    entries[2] = .{ .key = .{ .atom = "is_private" }, .value = .{ .bool_val = is_private } };
     entries[3] = .{ .key = .{ .atom = "doc" }, .value = .{ .string = doc_text } };
     const id = env.store.alloc(env.alloc, .map, null);
     return CtValue{ .map = .{ .alloc_id = id, .entries = entries } };
@@ -2092,9 +2141,17 @@ fn makeStructRef(
 ) !CtValue {
     _ = path;
     _ = source_id;
+    return makeAliasRef(env, interner, struct_entry.name);
+}
 
+/// Build the `__aliases__` AST tuple form for a dotted struct/protocol
+/// name. The macro engine's `extractStructRefName` decodes this back to
+/// a dotted string, and the parser produces the same shape for type
+/// identifiers in source — so refs round-trip cleanly between
+/// reflection results and user code.
+fn makeAliasRef(env: *Env, interner: *ast.StringInterner, name: ast.StructName) !CtValue {
     var parts: std.ArrayListUnmanaged(CtValue) = .empty;
-    for (struct_entry.name.parts) |part| {
+    for (name.parts) |part| {
         try parts.append(env.alloc, .{ .atom = interner.get(part) });
     }
     return ast_data.makeTuple3(
