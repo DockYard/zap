@@ -165,6 +165,66 @@ pub struct Zap.Doc {
     }
   }
 
+  @doc = """
+    Wrap a sequence of pre-rendered summary rows in the
+    `<h2>` + `<table class="summary">` shell. Returns the empty
+    string for an empty body so callers can splice unconditionally.
+    """
+  pub fn summary_table(heading :: String, anchor :: String, rows :: String) -> String {
+    if String.length(rows) == 0 {
+      ""
+    } else {
+      "<h2 id=\"" <> anchor <> "\">" <> escape_html(heading) <> "</h2>\n<table class=\"summary\">\n" <> rows <> "</table>\n"
+    }
+  }
+
+  @doc = """
+    Wrap a sequence of pre-rendered function detail blocks under a
+    `<h2>` heading (`Function Details` / `Macro Details`). Returns
+    the empty string for an empty body.
+    """
+  pub fn function_details_section(heading :: String, blocks :: String) -> String {
+    if String.length(blocks) == 0 {
+      ""
+    } else {
+      "<h2>" <> escape_html(heading) <> "</h2>\n" <> blocks
+    }
+  }
+
+  @doc = """
+    Render a single anchor in the right-rail "On this page" list. Each
+    item is a `name/arity` link styled with a left-bordered tick that
+    highlights the active section as the page scrolls.
+    """
+  pub fn toc_item(name :: String, arity :: i64) -> String {
+    anchor = anchor_id(name, arity)
+    "<li><a href=\"#" <> anchor <> "\">" <> escape_html(name) <> "/" <> Integer.to_string(arity) <> "</a></li>\n"
+  }
+
+  @doc = """
+    Wrap pre-rendered TOC items in the right-rail aside, returning the
+    empty string when the page has no anchorable entries (data-only
+    structs like `Range`). Section labels (`Functions`, `Macros`) are
+    handled by the caller stitching `<li class="toc-section">...</li>`
+    into the items body.
+    """
+  pub fn right_rail(items :: String) -> String {
+    if String.length(items) == 0 {
+      ""
+    } else {
+      "<aside class=\"toc\">\n<h3>On This Page</h3>\n<ul>\n" <> items <> "</ul>\n</aside>\n"
+    }
+  }
+
+  @doc = """
+    Build the `<li class="toc-section">Label</li>` divider used inside
+    the right-rail to group items under "Functions" and "Macros"
+    headings.
+    """
+  pub fn toc_section_label(text :: String) -> String {
+    "<li class=\"toc-section\">" <> escape_html(text) <> "</li>\n"
+  }
+
   pub fn function_detail(name :: String, arity :: i64, is_macro :: Bool, signatures :: [String], doc_html :: String) -> String {
     sig_blocks = for sig <- signatures {
       signature_block(sig)

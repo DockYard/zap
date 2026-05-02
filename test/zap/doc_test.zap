@@ -131,6 +131,61 @@ pub struct Zap.DocTest {
     }
   }
 
+  describe("Zap.Doc.summary_table") {
+    test("empty rows body renders nothing") {
+      assert(Zap.Doc.summary_table("Functions", "functions", "") == "")
+    }
+
+    test("non-empty rows wrap in heading and table") {
+      _row = Zap.Doc.summary_row("map", 2, "Transforms each element.")
+      _result = Zap.Doc.summary_table("Functions", "functions", _row)
+      assert(String.starts_with?(_result, "<h2 id=\"functions\">Functions</h2>"))
+      assert(String.contains?(_result, "<table class=\"summary\">"))
+      assert(String.contains?(_result, "<a href=\"#map-2\">map/2</a>"))
+      assert(String.ends_with?(_result, "</table>\n"))
+    }
+  }
+
+  describe("Zap.Doc.toc_item") {
+    test("renders an in-page anchor list item") {
+      assert(Zap.Doc.toc_item("map", 2) == "<li><a href=\"#map-2\">map/2</a></li>\n")
+    }
+  }
+
+  describe("Zap.Doc.toc_section_label") {
+    test("renders the section divider li") {
+      assert(Zap.Doc.toc_section_label("Functions") == "<li class=\"toc-section\">Functions</li>\n")
+    }
+  }
+
+  describe("Zap.Doc.right_rail") {
+    test("empty items renders no rail") {
+      assert(Zap.Doc.right_rail("") == "")
+    }
+
+    test("non-empty items wrap in aside.toc") {
+      _items = Zap.Doc.toc_item("map", 2)
+      _result = Zap.Doc.right_rail(_items)
+      assert(String.starts_with?(_result, "<aside class=\"toc\">"))
+      assert(String.contains?(_result, "<h3>On This Page</h3>"))
+      assert(String.contains?(_result, "<li><a href=\"#map-2\">map/2</a></li>"))
+      assert(String.ends_with?(_result, "</aside>\n"))
+    }
+  }
+
+  describe("Zap.Doc.function_details_section") {
+    test("empty body renders nothing") {
+      assert(Zap.Doc.function_details_section("Function Details", "") == "")
+    }
+
+    test("non-empty body wraps in heading") {
+      _block = Zap.Doc.function_detail("map", 2, false, ["map(x :: i64) -> i64"], "<p>Transforms.</p>\n")
+      _result = Zap.Doc.function_details_section("Function Details", _block)
+      assert(String.starts_with?(_result, "<h2>Function Details</h2>"))
+      assert(String.contains?(_result, "<div class=\"function-detail\" id=\"map-2\">"))
+    }
+  }
+
   describe("Zap.Doc.function_detail") {
     test("composes id, header, signature, and rendered doc") {
       _result = Zap.Doc.function_detail("map", 2, false, ["map(value :: i64) -> i64"], "<p>Transforms each element.</p>\n")
