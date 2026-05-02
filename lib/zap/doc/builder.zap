@@ -3,12 +3,21 @@
 
   `use Zap.Doc.Builder, paths: ["lib/**/*.zap"]` reflects on the
   structs, protocols, and unions reachable from the supplied path
-  patterns and bakes a `manifest/0` function returning the list of
-  qualified module names. A runtime caller can iterate the manifest,
-  feed each name back through `Struct.info/1` and `Struct.functions/1`,
-  and drive `Zap.Doc` page rendering. Mirrors the same data flow
-  `Zest.Runner` uses — reflection at expansion time, plain Zap
-  function bodies at runtime.
+  patterns and bakes manifest functions returning the qualified
+  module names. A runtime caller can iterate those manifests, feed
+  each name back through `Struct.info/1` and `Struct.functions/1`,
+  and drive `Zap.Doc` page rendering. Mirrors the `Zest.Runner`
+  pattern: reflection at expansion time, plain Zap function bodies
+  at runtime.
+
+  Status: scaffold. The use-macro emits the manifest functions and
+  the helpers it depends on; populating the baked lists with
+  reflection results from inside `__using__/1` interacts with how
+  empty list literals coerce through the substitution path in a way
+  that needs follow-up compiler work before end-to-end use is
+  reliable. The runtime walker that consumes the manifests, plus
+  per-module reflection (`manifest_struct_info/1` etc.), are the
+  next slices.
   """
 
 pub struct Zap.Doc.Builder {
@@ -16,9 +25,9 @@ pub struct Zap.Doc.Builder {
 
   @doc = """
     Reflect on the supplied source paths (a single string or a list
-    of strings) and emit a `pub fn manifest() -> [String]` that
-    returns the qualified names of every public struct, protocol,
-    and union declared in any matching file.
+    of strings) and emit manifest functions returning the qualified
+    names of every public struct, protocol, and union declared in
+    any matching file.
     """
 
   pub macro __using__(opts :: Expr) -> Expr {
@@ -50,17 +59,28 @@ pub struct Zap.Doc.Builder {
       import Zap.Doc.Builder
 
       pub fn manifest_structs() -> [String] {
-        unquote(_struct_names)
+        Zap.Doc.Builder.empty_string_list_or(unquote(_struct_names))
       }
 
       pub fn manifest_protocols() -> [String] {
-        unquote(_protocol_names)
+        Zap.Doc.Builder.empty_string_list_or(unquote(_protocol_names))
       }
 
       pub fn manifest_unions() -> [String] {
-        unquote(_union_names)
+        Zap.Doc.Builder.empty_string_list_or(unquote(_union_names))
       }
     }
+  }
+
+  @doc = """
+    Pin the result type of a baked manifest list to `[String]`.
+    Empty list literals in compile-time-substituted code default to
+    `[i64]`, which fails the manifest function's `[String]` return
+    type. Funneling through this helper forces the right inference
+    in both the empty and non-empty branches.
+    """
+  pub fn empty_string_list_or(values :: [String]) -> [String] {
+    values
   }
 
   @doc = """

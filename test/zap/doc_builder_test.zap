@@ -1,12 +1,6 @@
 pub struct Zap.DocBuilderTest {
   use Zest.Case
-  use Zap.Doc.Builder, paths: ["test/zap/doc_builder_fixture.zap"]
-
-  # Force discovery to pull in the fixture file so source-graph
-  # reflection at expansion time can find its struct entry.
-  fn ensure_fixture_discovered() -> i64 {
-    Zap.DocBuilderFixture.marker()
-  }
+  use Zap.Doc.Builder, paths: ["lib/atom.zap", "lib/stringable.zap"]
 
   describe("Zap.Doc.Builder bakes manifest functions") {
     test("manifest_structs returns a list shape") {
@@ -23,5 +17,12 @@ pub struct Zap.DocBuilderTest {
       _names = manifest_unions()
       assert(List.empty?(_names) or true)
     }
+
+    # Compile-time→runtime data baking has a known issue around
+    # populating these lists from reflection results in __using__/1.
+    # Once the inference path for unquoted empty lists vs lists of
+    # strings is sorted out, replace the shape-only assertions
+    # above with `List.contains?(manifest_structs(), "Atom")`-style
+    # membership checks.
   }
 }

@@ -73,6 +73,10 @@ pub struct TestProbe {
     _impl_entries = source_graph_impls("test/no_impls_here.zap")
     _impl_count = list_length(_impl_entries)
 
+    # Verify path-filter resolution works for stdlib paths.
+    _stdlib_lib_atom_refs = source_graph_structs("lib/atom.zap")
+    _stdlib_lib_atom_count = list_length(_stdlib_lib_atom_refs)
+
     _info = struct_info(ReflectionSubject)
     _info_name = map_get(_info, :name, "MISSING")
     _info_source = map_get(_info, :source_file, "MISSING")
@@ -178,6 +182,10 @@ pub struct TestProbe {
 
       pub fn impl_count() -> i64 {
         unquote(_impl_count)
+      }
+
+      pub fn stdlib_lib_atom_count() -> i64 {
+        unquote(_stdlib_lib_atom_count)
       }
     }
   }

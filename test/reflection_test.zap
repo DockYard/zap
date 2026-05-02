@@ -121,4 +121,10 @@ pub struct ReflectionTest {
       assert(impl_count() == 0)
     }
   }
+
+  describe("source_graph_structs path-filter resolution") {
+    test("path 'lib/atom.zap' (relative) finds the Atom struct") {
+      assert(stdlib_lib_atom_count() == 1)
+    }
+  }
 }
