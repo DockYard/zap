@@ -1,5 +1,7 @@
 # Float
 
+**Implements:** `Arithmetic`, `Comparator`, `Stringable`
+
 Functions for working with floating-point numbers.
 
 ## Float Types

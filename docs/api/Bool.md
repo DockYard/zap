@@ -1,5 +1,7 @@
 # Bool
 
+**Implements:** `Stringable`
+
 Functions for working with boolean values.
 
 Zap has two boolean values: `true` and `false`. Booleans are

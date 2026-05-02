@@ -47,7 +47,7 @@ fn begin_test() -> Atom
 
 Wraps `begin_test` for explicit use.
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0//Users/bcardarella/projects/zap/lib/zest/case.zap#L174)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/case.zap#L174)
 
 ---
 
@@ -59,7 +59,7 @@ fn end_test() -> Atom
 
 Wraps `end_test` for explicit use.
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0//Users/bcardarella/projects/zap/lib/zest/case.zap#L183)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/case.zap#L183)
 
 ---
 
@@ -71,7 +71,7 @@ fn print_result() -> Atom
 
 Wraps `print_result` for explicit use.
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0//Users/bcardarella/projects/zap/lib/zest/case.zap#L192)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/case.zap#L192)
 
 ---
 
@@ -85,7 +85,7 @@ Asserts that a boolean value is `true`.
 
 Non-fatal: returns :fail on failure, does not stop execution.
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0//Users/bcardarella/projects/zap/lib/zest/case.zap#L203)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/case.zap#L203)
 
 ---
 
@@ -99,7 +99,7 @@ Asserts that a boolean value is `false`.
 
 Non-fatal: returns "F" on failure, does not stop execution.
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0//Users/bcardarella/projects/zap/lib/zest/case.zap#L219)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/case.zap#L219)
 
 ---
 
@@ -127,7 +127,7 @@ and registers the generated function for `run/0`.
       }
     }
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0//Users/bcardarella/projects/zap/lib/zest/case.zap#L124)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/case.zap#L124)
 
 ---
 
@@ -148,7 +148,7 @@ with begin_test/end_test/print_result tracking calls wrapping the body.
       assert(true == true)
     }
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0//Users/bcardarella/projects/zap/lib/zest/case.zap#L156)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/case.zap#L156)
 
 ---
 
@@ -169,7 +169,7 @@ to `ctx` in each `test/3` call. Runs fresh for every test.
       connect_db()
     }
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0//Users/bcardarella/projects/zap/lib/zest/case.zap#L242)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/case.zap#L242)
 
 ---
 
@@ -190,7 +190,7 @@ even if assertions fail (non-fatal assertions).
       disconnect_db()
     }
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0//Users/bcardarella/projects/zap/lib/zest/case.zap#L259)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/case.zap#L259)
 
 ---
 

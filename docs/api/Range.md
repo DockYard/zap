@@ -1,5 +1,7 @@
 # Range
 
+**Implements:** `Enumerable`, `Membership`
+
 A range of integers with a start, end, and step.
 
 Ranges are created with the `..` syntax:

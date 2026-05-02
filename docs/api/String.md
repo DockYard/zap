@@ -1,5 +1,7 @@
 # String
 
+**Implements:** `Comparator`, `Concatenable`, `Enumerable`, `Membership`, `Stringable`
+
 Functions for working with UTF-8 encoded strings.
 
 Strings in Zap are immutable byte sequences (`[]const u8` in the

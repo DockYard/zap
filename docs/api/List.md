@@ -1,5 +1,7 @@
 # List
 
+**Implements:** `Concatenable`, `Enumerable`, `Membership`
+
 Functions for working with lists.
 
 Lists in Zap are singly-linked immutable cons cells using

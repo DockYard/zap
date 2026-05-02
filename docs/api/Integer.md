@@ -1,5 +1,7 @@
 # Integer
 
+**Implements:** `Arithmetic`, `Comparator`, `Stringable`
+
 Functions for working with integers.
 
 ## Integer Types

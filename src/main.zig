@@ -271,6 +271,21 @@ fn generateDocsFromConfig(
         const lib_dir = try std.fs.path.join(alloc, &.{ project_root, "lib" });
         if (std.Io.Dir.cwd().access(global_io, lib_dir, .{})) |_| {
             try source_roots.append(alloc, .{ .name = "project", .path = lib_dir });
+
+            // Walk one level into `lib/` so files like
+            // `lib/integer/arithmetic.zap` (protocol impls) are discovered
+            // alongside `lib/integer.zap`. Without this, doc generation
+            // misses impls and the per-type "Implements" list stays empty.
+            if (std.Io.Dir.cwd().openDir(global_io, lib_dir, .{ .iterate = true })) |dir_handle| {
+                var dir = dir_handle;
+                defer dir.close(global_io);
+                var it = dir.iterate();
+                while (it.next(global_io) catch null) |entry| {
+                    if (entry.kind != .directory) continue;
+                    const subdir = try std.fs.path.join(alloc, &.{ lib_dir, entry.name });
+                    try source_roots.append(alloc, .{ .name = "project", .path = subdir });
+                }
+            } else |_| {}
         } else |_| {}
         try source_roots.append(alloc, .{ .name = "project", .path = project_root });
     }

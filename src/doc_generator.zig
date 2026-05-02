@@ -155,9 +155,31 @@ pub fn generate(
     for (graph.protocols.items) |protocol_entry| {
         if (protocol_entry.decl.is_private) continue;
 
-        const protocol_name = resolveStructName(alloc, protocol_entry.name, interner) catch continue;
-        if (seen_structs.contains(protocol_name)) continue;
-        seen_structs.put(protocol_name, {}) catch {};
+        const local_name = resolveStructName(alloc, protocol_entry.name, interner) catch continue;
+
+        // Qualify nested protocols with their parent struct's name when
+        // the language admits them — e.g. `pub protocol Foo {}` declared
+        // inside `pub struct Bar` becomes `Bar.Foo`. Top-level protocols
+        // and dotted names pass through unchanged.
+        const qualified_name = blk: {
+            const parent = @constCast(graph).findStructByScope(protocol_entry.scope_id) orelse {
+                break :blk local_name;
+            };
+            if (parent.decl.is_private) continue;
+            const parent_name = resolveStructName(alloc, parent.name, interner) catch break :blk local_name;
+            if (parent_name.len == 0) break :blk local_name;
+            // Already qualified (e.g. parser produced a dotted name).
+            if (std.mem.startsWith(u8, local_name, parent_name) and
+                local_name.len > parent_name.len and
+                local_name[parent_name.len] == '.')
+            {
+                break :blk local_name;
+            }
+            break :blk std.fmt.allocPrint(alloc, "{s}.{s}", .{ parent_name, local_name }) catch local_name;
+        };
+
+        if (seen_structs.contains(qualified_name)) continue;
+        seen_structs.put(qualified_name, {}) catch {};
 
         const source_file = sourceFileForMeta(protocol_entry.decl.meta, options.source_units) orelse "";
         const protocol_doc = extractDocAttribute(alloc, protocol_entry.attributes, "doc", interner) orelse "";
@@ -168,7 +190,7 @@ pub fn generate(
         );
 
         structs.append(alloc, .{
-            .name = protocol_name,
+            .name = qualified_name,
             .kind = .protocol,
             .structdoc = protocol_doc,
             .source_file = source_file,
@@ -183,16 +205,30 @@ pub fn generate(
                 // Documentation is only for the public API.
                 if (union_decl.is_private) continue;
 
-                const union_name = interner.get(type_entry.name);
-                if (seen_structs.contains(union_name)) continue;
-                seen_structs.put(union_name, {}) catch {};
+                // Qualify nested unions with their parent struct's name so
+                // `pub union MyUnion {...}` declared inside `pub struct Enum`
+                // appears in the docs as `Enum.MyUnion`. Top-level dotted
+                // names like `IO.Mode` are already qualified at parse time.
+                const local_name = interner.get(type_entry.name);
+                const qualified_name = blk: {
+                    const parent = @constCast(graph).findStructByScope(type_entry.scope_id) orelse {
+                        break :blk local_name;
+                    };
+                    if (parent.decl.is_private) continue;
+                    const parent_name = resolveStructName(alloc, parent.name, interner) catch break :blk local_name;
+                    if (parent_name.len == 0) break :blk local_name;
+                    break :blk std.fmt.allocPrint(alloc, "{s}.{s}", .{ parent_name, local_name }) catch local_name;
+                };
+
+                if (seen_structs.contains(qualified_name)) continue;
+                seen_structs.put(qualified_name, {}) catch {};
 
                 const source_file = sourceFileForMeta(union_decl.meta, options.source_units) orelse "";
                 const union_doc = extractDocAttribute(alloc, type_entry.attributes, "doc", interner) orelse "";
                 const variants = buildUnionVariantDocs(alloc, union_decl.variants, interner);
 
                 structs.append(alloc, .{
-                    .name = union_name,
+                    .name = qualified_name,
                     .kind = .@"union",
                     .structdoc = union_doc,
                     .source_file = source_file,
@@ -216,6 +252,31 @@ pub fn generate(
     // A guide is enabled when `<project_root>/guides/<slug>.md` exists.
     for (@constCast(mod_slice)) |*mod| {
         mod.guide_slug = resolveGuideSlug(alloc, options.project_root, mod.name, mod.source_file);
+    }
+
+    // For each module, collect the public protocols its type implements.
+    // The list shows up under "Implements" on the module page so a reader
+    // browsing `Integer` can see that it satisfies `Arithmetic`,
+    // `Comparator`, and `Stringable` without hunting through impl files.
+    for (@constCast(mod_slice)) |*mod| {
+        var protos: std.ArrayListUnmanaged([]const u8) = .empty;
+        var seen_protos = std.StringHashMap(void).init(alloc);
+        for (graph.impls.items) |impl| {
+            if (impl.is_private) continue;
+            const target_name = resolveStructName(alloc, impl.target_type, interner) catch continue;
+            if (!std.mem.eql(u8, target_name, mod.name)) continue;
+            const protocol_name = resolveStructName(alloc, impl.protocol_name, interner) catch continue;
+            if (seen_protos.contains(protocol_name)) continue;
+            seen_protos.put(protocol_name, {}) catch {};
+            protos.append(alloc, protocol_name) catch {};
+        }
+        const proto_slice = protos.toOwnedSlice(alloc) catch &.{};
+        std.mem.sort([]const u8, @constCast(proto_slice), {}, struct {
+            fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.order(u8, a, b) == .lt;
+            }
+        }.lessThan);
+        mod.implemented_protocols = proto_slice;
     }
 
     const project = DocProject{
@@ -292,6 +353,10 @@ const DocStruct = struct {
     /// `<project_root>/guides/<slug>.md` exists at generation time.
     /// Drives the "Guide" tab in the top bar of the module page.
     guide_slug: ?[]const u8 = null,
+    /// Names of protocols this type implements, sorted alphabetically.
+    /// Populated by walking `graph.impls` for entries whose
+    /// `target_type` matches this struct/union/protocol.
+    implemented_protocols: []const []const u8 = &.{},
 };
 
 const DocKind = enum {
@@ -1093,34 +1158,26 @@ fn generateStructPage(alloc: std.mem.Allocator, mod: DocStruct, project: DocProj
 
     appendBreadcrumb(&h, mod.kind, mod.name);
 
-    // Declaration header — title row with name left, declaration kind + source right
-    h.str("<div class=\"title-row\">\n");
-    h.str("<h1>");
+    // Title — just the module name. Visibility and source path are not
+    // surfaced: docs cover only the public API by definition, and the
+    // breadcrumb already places the page within its kind category.
+    h.str("<h1 class=\"page-title\">");
     appendHtmlEscaped(&h, mod.name);
     h.str("</h1>\n");
-    h.str("<div class=\"title-meta\">\n");
-    h.str("<span class=\"pub-struct-pill\">");
-    h.str(docKindLabel(mod.kind));
-    h.str("</span>\n");
-    if (mod.source_file.len > 0) {
-        if (options.source_url) |base_url| {
-            h.str("<a href=\"");
-            h.str(base_url);
-            h.str("/blob/v");
-            h.str(project.version);
-            h.str("/");
-            h.str(mod.source_file);
-            h.str("\" class=\"source-file\">");
-            h.str(mod.source_file);
+
+    // Implements — protocols this type satisfies, when any.
+    if (mod.implemented_protocols.len > 0) {
+        h.str("<div class=\"implements\">\n");
+        h.str("<span class=\"implements-label\">Implements</span>\n");
+        for (mod.implemented_protocols) |proto_name| {
+            h.str("<a class=\"implements-link\" href=\"../structs/");
+            appendHtmlEscaped(&h, proto_name);
+            h.str(".html\">");
+            appendHtmlEscaped(&h, proto_name);
             h.str("</a>\n");
-        } else {
-            h.str("<span class=\"source-file\">");
-            h.str(mod.source_file);
-            h.str("</span>\n");
         }
+        h.str("</div>\n");
     }
-    h.str("</div>\n");
-    h.str("</div>\n");
 
     // Tagline — extract first sentence of structdoc
     if (mod.structdoc.len > 0) {
@@ -1494,6 +1551,17 @@ fn generateStructMarkdown(alloc: std.mem.Allocator, mod: DocStruct, project: Doc
     h.str("# ");
     h.str(mod.name);
     h.str("\n\n");
+
+    if (mod.implemented_protocols.len > 0) {
+        h.str("**Implements:** ");
+        for (mod.implemented_protocols, 0..) |proto_name, i| {
+            if (i > 0) h.str(", ");
+            h.char('`');
+            h.str(proto_name);
+            h.char('`');
+        }
+        h.str("\n\n");
+    }
 
     if (mod.structdoc.len > 0) {
         h.str(mod.structdoc);
@@ -2676,6 +2744,50 @@ test "documentation signatures include every function clause pattern" {
     try std.testing.expectEqualStrings("classify(0 :: i64) -> String", signatures[0]);
     try std.testing.expectEqualStrings("classify(value :: i32) -> String", signatures[1]);
     try std.testing.expectEqualStrings("classify(value :: i64) -> String if value > 0", signatures[2]);
+}
+
+test "nested public union is qualified with its parent struct name" {
+    const source =
+        \\pub struct Container {
+        \\  pub union Mode {
+        \\    Cooked,
+        \\    Raw
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+
+    var parser = zap.Parser.initWithSharedInterner(alloc, source, &interner, 0);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = zap.Collector.init(alloc, &interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var qualified_seen = false;
+    for (collector.graph.types.items) |entry| {
+        if (entry.kind != .union_type) continue;
+        const decl = entry.kind.union_type;
+        if (decl.is_private) continue;
+
+        const local_name = interner.get(entry.name);
+        const parent = collector.graph.findStructByScope(entry.scope_id) orelse {
+            try std.testing.expect(false); // expected a parent
+            continue;
+        };
+        const parent_name = try resolveStructName(alloc, parent.name, &interner);
+        try std.testing.expectEqualStrings("Container", parent_name);
+        try std.testing.expectEqualStrings("Mode", local_name);
+        qualified_seen = true;
+    }
+    try std.testing.expect(qualified_seen);
 }
 
 test "function markdown renders many signatures with one doc body" {

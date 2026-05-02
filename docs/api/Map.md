@@ -1,5 +1,7 @@
 # Map
 
+**Implements:** `Concatenable`, `Enumerable`, `Membership`, `Updatable`
+
 Functions for working with maps.
 
 Maps in Zap are immutable key-value collections that support

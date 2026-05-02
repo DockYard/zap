@@ -1,5 +1,7 @@
 # Atom
 
+**Implements:** `Stringable`
+
 Functions for working with atoms.
 
 Atoms are constants whose name is their value. They are

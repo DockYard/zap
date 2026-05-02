@@ -73,6 +73,7 @@
   {"struct":"IO","type":"function","name":"get_char/0","summary":"Reads a single character from standard input.","url":"structs/IO.html#get_char-0"},
   {"struct":"IO","type":"function","name":"try_get_char/0","summary":"Non-blocking read of a single character from standard input.","url":"structs/IO.html#try_get_char-0"},
   {"struct":"IO","type":"guide","name":"IO Guide","summary":"Long-form guide for IO","url":"guides/io.html"},
+  {"struct":"IO.Mode","type":"union","name":"IO.Mode","summary":"Terminal input mode used by `IO.mode/1` and `IO.mode/2`.","url":"structs/IO.Mode.html"},
   {"struct":"Integer","type":"struct","name":"Integer","summary":"Functions for working with integers.","url":"structs/Integer.html"},
   {"struct":"Integer","type":"function","name":"to_string/1","summary":"Converts an integer to its string representation.","url":"structs/Integer.html#to_string-1"},
   {"struct":"Integer","type":"function","name":"abs/1","summary":"Returns the absolute value of an integer.","url":"structs/Integer.html#abs-1"},
