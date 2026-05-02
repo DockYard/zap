@@ -10,7 +10,7 @@ code that need to inspect declarations from known source paths.
 ### structs/1
 
 ```zap
-pub macro structs(paths :: Expr) -> Expr
+macro structs(paths :: Expr) -> Expr
 ```
 
 Returns struct references declared in the exact source paths provided.

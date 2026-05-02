@@ -70,6 +70,9 @@ pub fn generate(
     var seen_structs = std.StringHashMap(void).init(alloc);
 
     for (graph.structs.items) |mod_entry| {
+        // Documentation is only for the public API.
+        if (mod_entry.decl.is_private) continue;
+
         const mod_name = resolveStructName(alloc, mod_entry.name, interner) catch continue;
 
         // Skip duplicate structs (same struct discovered from multiple source roots)
@@ -115,6 +118,10 @@ pub fn generate(
 
         for (graph.macro_families.items) |family| {
             if (family.scope_id != mod_entry.scope_id) continue;
+            // Documentation is only for the public API. Macros carry visibility
+            // on each clause's FunctionDecl — peek at the first clause.
+            if (family.clauses.items.len == 0) continue;
+            if (family.clauses.items[0].decl.visibility != .public) continue;
 
             const macro_name = interner.get(family.name);
             if (std.mem.startsWith(u8, macro_name, "__")) continue;
@@ -173,6 +180,9 @@ pub fn generate(
     for (graph.types.items) |type_entry| {
         switch (type_entry.kind) {
             .union_type => |union_decl| {
+                // Documentation is only for the public API.
+                if (union_decl.is_private) continue;
+
                 const union_name = interner.get(type_entry.name);
                 if (seen_structs.contains(union_name)) continue;
                 seen_structs.put(union_name, {}) catch {};
@@ -202,6 +212,12 @@ pub fn generate(
         }
     }.lessThan);
 
+    // Resolve long-form guide markdown files for each module.
+    // A guide is enabled when `<project_root>/guides/<slug>.md` exists.
+    for (@constCast(mod_slice)) |*mod| {
+        mod.guide_slug = resolveGuideSlug(alloc, options.project_root, mod.name, mod.source_file);
+    }
+
     const project = DocProject{
         .name = options.project_name,
         .version = options.project_version,
@@ -216,14 +232,19 @@ pub fn generate(
     std.Io.Dir.cwd().createDirPath(io, structs_dir) catch {};
     const api_dir = try std.fmt.allocPrint(alloc, "{s}/api", .{options.output_dir});
     std.Io.Dir.cwd().createDirPath(io, api_dir) catch {};
+    const guides_dir = try std.fmt.allocPrint(alloc, "{s}/guides", .{options.output_dir});
+    std.Io.Dir.cwd().createDirPath(io, guides_dir) catch {};
 
     // Generate landing page
     try generateLandingPage(alloc, project, options);
 
-    // Generate struct pages (HTML + Markdown)
+    // Generate struct pages (HTML + Markdown) and guide pages where applicable
     for (project.structs) |mod| {
         try generateStructPage(alloc, mod, project, options);
         try generateStructMarkdown(alloc, mod, project, options);
+        if (mod.guide_slug) |_| {
+            try generateModuleGuidePage(alloc, mod, project, options);
+        }
     }
 
     // Generate search index
@@ -267,6 +288,10 @@ const DocStruct = struct {
     functions: []const DocFunction,
     protocol_functions: []const DocProtocolFunction = &.{},
     union_variants: []const DocUnionVariant = &.{},
+    /// Slug of the long-form guide for this module, if a matching
+    /// `<project_root>/guides/<slug>.md` exists at generation time.
+    /// Drives the "Guide" tab in the top bar of the module page.
+    guide_slug: ?[]const u8 = null,
 };
 
 const DocKind = enum {
@@ -825,10 +850,70 @@ fn sourceFileForMeta(meta: ast.NodeMeta, source_units: []const compiler.SourceUn
 
 fn docKindLabel(kind: DocKind) []const u8 {
     return switch (kind) {
-        .@"struct" => "pub struct",
-        .protocol => "pub protocol",
-        .@"union" => "pub union",
+        .@"struct" => "struct",
+        .protocol => "protocol",
+        .@"union" => "union",
     };
+}
+
+/// Slug derivation for a module that has a source file: take the
+/// basename, drop the `.zap` extension. `lib/enum.zap` -> `enum`,
+/// `lib/source_graph.zap` -> `source_graph`. The slug matches the lib
+/// filename so guides are discoverable by the obvious convention.
+fn slugFromSourceFile(source_file: []const u8) ?[]const u8 {
+    if (source_file.len == 0) return null;
+    const basename = std.fs.path.basename(source_file);
+    if (std.mem.endsWith(u8, basename, ".zap")) {
+        return basename[0 .. basename.len - 4];
+    }
+    return basename;
+}
+
+/// Fallback slug derivation for modules with no source file: convert
+/// the module name to lowercase and replace `.` with `_`. Camel-case
+/// boundaries are split with underscores so `SourceGraph` -> `source_graph`.
+fn moduleNameToSlug(alloc: std.mem.Allocator, name: []const u8) []const u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    var i: usize = 0;
+    while (i < name.len) : (i += 1) {
+        const c = name[i];
+        const is_upper = c >= 'A' and c <= 'Z';
+        if (c == '.') {
+            buf.append(alloc, '_') catch return name;
+        } else if (is_upper and i > 0) {
+            const prev = name[i - 1];
+            const prev_lower = prev >= 'a' and prev <= 'z';
+            const next_lower = i + 1 < name.len and (name[i + 1] >= 'a' and name[i + 1] <= 'z');
+            const prev_separator = prev == '.' or prev == '_';
+            // Insert `_` between lowercase->upper (camelCase) and between
+            // a run of caps and a final cap that begins a new word
+            // (e.g. `IOMode` -> `io_mode`). Skip after `.`/`_` separators.
+            if (!prev_separator and (prev_lower or next_lower)) {
+                buf.append(alloc, '_') catch return name;
+            }
+            buf.append(alloc, c + ('a' - 'A')) catch return name;
+        } else {
+            const lower = if (is_upper) c + ('a' - 'A') else c;
+            buf.append(alloc, lower) catch return name;
+        }
+    }
+    return buf.toOwnedSlice(alloc) catch return name;
+}
+
+/// Return the guide slug for a module, or null when no
+/// `<project_root>/guides/<slug>.md` exists. Prefers the source-file
+/// basename so the guide name mirrors the `lib/<name>.zap` convention.
+fn resolveGuideSlug(
+    alloc: std.mem.Allocator,
+    project_root: []const u8,
+    name: []const u8,
+    source_file: []const u8,
+) ?[]const u8 {
+    const slug = slugFromSourceFile(source_file) orelse moduleNameToSlug(alloc, name);
+    const filename = std.fmt.allocPrint(alloc, "{s}.md", .{slug}) catch return null;
+    const path = std.fs.path.join(alloc, &.{ project_root, "guides", filename }) catch return null;
+    std.Io.Dir.cwd().access(std.Options.debug_io, path, .{}) catch return null;
+    return slug;
 }
 
 fn docKindCategoryLabel(kind: DocKind) []const u8 {
@@ -893,7 +978,7 @@ fn countFunctions(project: DocProject) usize {
 
 fn generateLandingPage(alloc: std.mem.Allocator, project: DocProject, options: DocOptions) !void {
     var h = StringBuffer.init(alloc);
-    appendPageHeader(&h, project.name, project, "");
+    appendPageHeader(&h, project.name, project, "", null);
     h.str("<div class=\"layout\">\n");
     appendSidebar(&h, project, null, options, "");
     h.str("<main class=\"content\">\n");
@@ -950,9 +1035,58 @@ fn appendDefaultLanding(h: *StringBuffer, project: DocProject) void {
     h.str("</div>\n");
 }
 
+/// Render the long-form guide for a module from `<project_root>/guides/<slug>.md`.
+/// Wraps the rendered markdown in the same chrome as a struct page, with the
+/// top-bar tab switch flipped to "Guide" and a kicker linking back to the
+/// reference. Caller guarantees `mod.guide_slug` is non-null.
+fn generateModuleGuidePage(alloc: std.mem.Allocator, mod: DocStruct, project: DocProject, options: DocOptions) !void {
+    const slug = mod.guide_slug orelse return;
+    const filename = try std.fmt.allocPrint(alloc, "{s}.md", .{slug});
+    const source_path = try std.fs.path.join(alloc, &.{ options.project_root, "guides", filename });
+    const markdown = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, source_path, alloc, .limited(1024 * 1024)) catch return;
+
+    var h = StringBuffer.init(alloc);
+    const ref_url = try std.fmt.allocPrint(alloc, "../structs/{s}.html", .{mod.name});
+    const guide_url = try std.fmt.allocPrint(alloc, "../guides/{s}.html", .{slug});
+    const tabs = TopbarTabs{
+        .current = .guide,
+        .reference_url = ref_url,
+        .guide_url = guide_url,
+    };
+    appendPageHeader(&h, mod.name, project, "../", tabs);
+    h.str("<div class=\"layout\">\n");
+    appendSidebar(&h, project, mod.name, options, "../");
+    h.str("<main class=\"content\">\n");
+
+    appendBreadcrumb(&h, mod.kind, mod.name);
+
+    // Kicker — labels the page as a guide and links back to the reference.
+    h.str("<div class=\"guide-kicker\">\n");
+    h.str("<span class=\"guide-kicker-label\">Guide</span>\n");
+    h.str("<a class=\"guide-kicker-link\" href=\"");
+    h.str(ref_url);
+    h.str("\">View reference \u{2192}</a>\n");
+    h.str("</div>\n");
+
+    h.str("<article class=\"guide-article structdoc\">\n");
+    appendMarkdownAsHtml(&h, markdown);
+    h.str("</article>\n");
+
+    h.str("</main>\n</div>\n");
+    appendPageFooter(&h, "../");
+
+    const out_path = try std.fmt.allocPrint(alloc, "{s}/guides/{s}.html", .{ options.output_dir, slug });
+    try writeFile(out_path, h.toSlice());
+}
+
 fn generateStructPage(alloc: std.mem.Allocator, mod: DocStruct, project: DocProject, options: DocOptions) !void {
     var h = StringBuffer.init(alloc);
-    appendPageHeader(&h, mod.name, project, "../");
+    const tabs = if (mod.guide_slug) |slug| TopbarTabs{
+        .current = .reference,
+        .reference_url = std.fmt.allocPrint(alloc, "../structs/{s}.html", .{mod.name}) catch "",
+        .guide_url = std.fmt.allocPrint(alloc, "../guides/{s}.html", .{slug}) catch "",
+    } else null;
+    appendPageHeader(&h, mod.name, project, "../", tabs);
     h.str("<div class=\"layout\">\n");
     appendSidebar(&h, project, mod.name, options, "../");
     h.str("<main class=\"content\">\n");
@@ -1122,9 +1256,9 @@ fn appendFunctionDetail(h: *StringBuffer, func: DocFunction, _: DocStruct, _: Do
     h.str("</span></h3>\n");
 
     if (func.is_macro) {
-        h.str("<span class=\"badge\">pub macro</span>\n");
+        h.str("<span class=\"badge\">macro</span>\n");
     } else {
-        h.str("<span class=\"badge\">pub fn</span>\n");
+        h.str("<span class=\"badge\">fn</span>\n");
     }
     h.str("<div style=\"flex:1\"></div>\n");
     h.str("<a href=\"#");
@@ -1420,9 +1554,9 @@ fn appendFunctionMarkdown(h: *StringBuffer, func: DocFunction, mod: DocStruct, p
     h.str("```zap\n");
     for (func.signatures) |signature| {
         if (func.is_macro) {
-            h.str("pub macro ");
+            h.str("macro ");
         } else {
-            h.str("pub fn ");
+            h.str("fn ");
         }
         h.str(signature);
         h.char('\n');
@@ -1592,6 +1726,18 @@ fn generateSearchIndex(alloc: std.mem.Allocator, project: DocProject, options: D
             h.fmt("-{d}", .{func.arity});
             h.str("\"}");
         }
+
+        if (mod.guide_slug) |slug| {
+            h.str(",\n  {\"struct\":\"");
+            appendJsonEscaped(&h, mod.name);
+            h.str("\",\"type\":\"guide\",\"name\":\"");
+            appendJsonEscaped(&h, mod.name);
+            h.str(" Guide\",\"summary\":\"Long-form guide for ");
+            appendJsonEscaped(&h, mod.name);
+            h.str("\",\"url\":\"guides/");
+            appendJsonEscaped(&h, slug);
+            h.str(".html\"}");
+        }
     }
 
     h.str("\n]\n");
@@ -1612,7 +1758,7 @@ fn generateDocGroupPage(alloc: std.mem.Allocator, page_path: []const u8, project
     const stem = if (std.mem.endsWith(u8, basename, ".md")) basename[0 .. basename.len - 3] else basename;
 
     var h = StringBuffer.init(alloc);
-    appendPageHeader(&h, stem, project, "../");
+    appendPageHeader(&h, stem, project, "../", null);
     h.str("<div class=\"layout\">\n");
     appendSidebar(&h, project, null, options, "../");
     h.str("<main class=\"content\"><div class=\"structdoc\">\n");
@@ -1631,8 +1777,14 @@ fn generateDocGroupPage(alloc: std.mem.Allocator, page_path: []const u8, project
 // Page wrapper
 // ============================================================
 
-fn appendPageHeader(h: *StringBuffer, title: []const u8, project: DocProject, base: []const u8) void {
-    h.str("<!DOCTYPE html>\n<html lang=\"en\" data-theme=\"light\">\n<head>\n");
+const TopbarTabs = struct {
+    current: enum { reference, guide },
+    reference_url: []const u8,
+    guide_url: []const u8,
+};
+
+fn appendPageHeader(h: *StringBuffer, title: []const u8, project: DocProject, base: []const u8, tabs: ?TopbarTabs) void {
+    h.str("<!DOCTYPE html>\n<html lang=\"en\" data-theme=\"dark\">\n<head>\n");
     h.str("<meta charset=\"UTF-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n");
     h.str("<title>");
     appendHtmlEscaped(h, title);
@@ -1667,6 +1819,23 @@ fn appendPageHeader(h: *StringBuffer, title: []const u8, project: DocProject, ba
     h.str("</button>\n");
     h.str("</div>\n");
     h.str("<div class=\"topbar-right\">\n");
+    if (tabs) |t| {
+        h.str("<div class=\"topbar-tabs\" role=\"tablist\">\n");
+        const ref_class = if (t.current == .reference) "topbar-tab active" else "topbar-tab";
+        h.str("<a class=\"");
+        h.str(ref_class);
+        h.str("\" href=\"");
+        h.str(t.reference_url);
+        h.str("\" role=\"tab\">Reference</a>\n");
+        const guide_class = if (t.current == .guide) "topbar-tab active" else "topbar-tab";
+        h.str("<a class=\"");
+        h.str(guide_class);
+        h.str("\" href=\"");
+        h.str(t.guide_url);
+        h.str("\" role=\"tab\">Guide</a>\n");
+        h.str("</div>\n");
+        h.str("<div class=\"topbar-divider\"></div>\n");
+    }
     h.str("<button id=\"theme-toggle\" aria-label=\"Toggle dark mode\" title=\"Toggle dark mode\">\n");
     h.str("<span class=\"theme-icon-light\">\u{2600}</span>\n");
     h.str("<span class=\"theme-icon-dark\">\u{263e}</span>\n");
@@ -2425,6 +2594,18 @@ fn appendSearchIndexJson(h: *StringBuffer, project: DocProject, alloc: std.mem.A
             h.fmt("-{d}", .{func.arity});
             h.str("\"}");
         }
+
+        if (mod.guide_slug) |slug| {
+            h.str(",\n{\"struct\":\"");
+            appendJsonEscaped(h, mod.name);
+            h.str("\",\"type\":\"guide\",\"name\":\"");
+            appendJsonEscaped(h, mod.name);
+            h.str(" Guide\",\"summary\":\"Long-form guide for ");
+            appendJsonEscaped(h, mod.name);
+            h.str("\",\"url\":\"guides/");
+            appendJsonEscaped(h, slug);
+            h.str(".html\"}");
+        }
     }
     h.str("\n]");
 }
@@ -2534,9 +2715,11 @@ test "function markdown renders many signatures with one doc body" {
     appendFunctionMarkdown(&buffer, func, mod, project, options);
 
     const markdown = buffer.toSlice();
-    try std.testing.expect(std.mem.indexOf(u8, markdown, "pub fn abs(value :: i8) -> i8") != null);
-    try std.testing.expect(std.mem.indexOf(u8, markdown, "pub fn abs(value :: i16) -> i16") != null);
-    try std.testing.expect(std.mem.indexOf(u8, markdown, "pub fn abs(value :: i64) -> i64") != null);
+    try std.testing.expect(std.mem.indexOf(u8, markdown, "fn abs(value :: i8) -> i8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, markdown, "fn abs(value :: i16) -> i16") != null);
+    try std.testing.expect(std.mem.indexOf(u8, markdown, "fn abs(value :: i64) -> i64") != null);
+    // Visibility prefix is omitted: docs cover only the public API.
+    try std.testing.expect(std.mem.indexOf(u8, markdown, "pub fn") == null);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, markdown, "Shared absolute-value documentation."));
 }
 
@@ -2662,6 +2845,58 @@ test "sidebar groups declarations by kind with structs first" {
     try std.testing.expect(std.mem.indexOf(u8, html, "<button class=\"sidebar-group-header\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "class=\"chevron\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "data-group=\"Structs\"") != null);
+}
+
+test "module name slug snake-cases and dot-to-underscore" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    try std.testing.expectEqualStrings("enum", moduleNameToSlug(alloc, "Enum"));
+    try std.testing.expectEqualStrings("io", moduleNameToSlug(alloc, "IO"));
+    try std.testing.expectEqualStrings("io_mode", moduleNameToSlug(alloc, "IO.Mode"));
+    try std.testing.expectEqualStrings("zest_case", moduleNameToSlug(alloc, "Zest.Case"));
+    try std.testing.expectEqualStrings("source_graph", moduleNameToSlug(alloc, "SourceGraph"));
+}
+
+test "slug from source file uses lib basename without extension" {
+    try std.testing.expectEqualStrings("enum", slugFromSourceFile("lib/enum.zap").?);
+    try std.testing.expectEqualStrings("source_graph", slugFromSourceFile("lib/source_graph.zap").?);
+    try std.testing.expectEqualStrings("io", slugFromSourceFile("./lib/io.zap").?);
+    try std.testing.expect(slugFromSourceFile("") == null);
+}
+
+test "topbar tabs render with current selection" {
+    var buffer = StringBuffer.init(std.testing.allocator);
+    const project = DocProject{
+        .name = "Zap",
+        .version = "0.1.0",
+        .source_url = null,
+        .structs = &.{},
+    };
+    appendPageHeader(&buffer, "Enum", project, "../", .{
+        .current = .reference,
+        .reference_url = "../structs/Enum.html",
+        .guide_url = "../guides/enum.html",
+    });
+    const html = buffer.toSlice();
+    try std.testing.expect(std.mem.indexOf(u8, html, "class=\"topbar-tabs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "topbar-tab active\" href=\"../structs/Enum.html\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "<a class=\"topbar-tab\" href=\"../guides/enum.html\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, ">Reference</a>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, ">Guide</a>") != null);
+}
+
+test "topbar tabs hidden when no guide is associated" {
+    var buffer = StringBuffer.init(std.testing.allocator);
+    const project = DocProject{
+        .name = "Zap",
+        .version = "0.1.0",
+        .source_url = null,
+        .structs = &.{},
+    };
+    appendPageHeader(&buffer, "Enum", project, "../", null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.toSlice(), "topbar-tabs") == null);
 }
 
 test "breadcrumb renders kind category and current page name" {

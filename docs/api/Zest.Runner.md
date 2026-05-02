@@ -11,7 +11,7 @@ invokes each discovered struct's `run/0`, and then prints the summary.
 ### configure/0
 
 ```zap
-pub fn configure() -> Atom
+fn configure() -> Atom
 ```
 
 Parses `--seed` and `--timeout` from CLI arguments and applies
@@ -33,7 +33,7 @@ timeout are set.
 ### run/0
 
 ```zap
-pub fn run() -> String
+fn run() -> String
 ```
 
 Prints the test summary with counts and exits with a
@@ -59,7 +59,7 @@ used for test ordering.
 ### parse_cli_args/2
 
 ```zap
-pub fn parse_cli_args(index :: i64, count :: i64) -> Atom
+fn parse_cli_args(index :: i64, count :: i64) -> Atom
 ```
 
 Recursively scans CLI arguments for `--seed <value>` and
@@ -74,7 +74,7 @@ Recursively scans CLI arguments for `--seed <value>` and
 ### options/1
 
 ```zap
-pub macro options(opts :: Expr) -> Expr
+macro options(opts :: Expr) -> Expr
 ```
 
 Normalizes runner options to a list.
@@ -83,36 +83,6 @@ Normalizes runner options to a list.
 as-is, and a single non-list option is wrapped in a one-element list.
 
 [Source](https://github.com/DockYard/zap/blob/v0.1.0//Users/bcardarella/projects/zap/lib/zest/runner.zap#L59)
-
----
-
-### patterns/1
-
-```zap
-pub macro patterns(options :: Expr) -> Expr
-```
-
-[Source](https://github.com/DockYard/zap/blob/v0.1.0//Users/bcardarella/projects/zap/lib/zest/runner.zap#L147)
-
----
-
-### option_patterns/1
-
-```zap
-pub macro option_patterns(option :: Expr) -> Expr
-```
-
-[Source](https://github.com/DockYard/zap/blob/v0.1.0//Users/bcardarella/projects/zap/lib/zest/runner.zap#L160)
-
----
-
-### pattern_values/1
-
-```zap
-pub macro pattern_values(value :: Expr) -> Expr
-```
-
-[Source](https://github.com/DockYard/zap/blob/v0.1.0//Users/bcardarella/projects/zap/lib/zest/runner.zap#L172)
 
 ---
 

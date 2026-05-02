@@ -15,7 +15,7 @@ everywhere automatically.
 ### is_integer?/1
 
 ```zap
-pub fn is_integer?(value :: any) -> Bool
+fn is_integer?(value :: any) -> Bool
 ```
 
 Returns true if the value is an integer type (i8, i16, i32, i64, i128, u8, u16, u32, u64, u128).
@@ -27,7 +27,7 @@ Returns true if the value is an integer type (i8, i16, i32, i64, i128, u8, u16, 
 ### is_float?/1
 
 ```zap
-pub fn is_float?(value :: any) -> Bool
+fn is_float?(value :: any) -> Bool
 ```
 
 Returns true if the value is a float type (f16, f32, f64, f80, f128).
@@ -39,7 +39,7 @@ Returns true if the value is a float type (f16, f32, f64, f80, f128).
 ### is_number?/1
 
 ```zap
-pub fn is_number?(value :: any) -> Bool
+fn is_number?(value :: any) -> Bool
 ```
 
 Returns true if the value is a number (integer or float).
@@ -51,7 +51,7 @@ Returns true if the value is a number (integer or float).
 ### is_boolean?/1
 
 ```zap
-pub fn is_boolean?(value :: any) -> Bool
+fn is_boolean?(value :: any) -> Bool
 ```
 
 Returns true if the value is a boolean.
@@ -63,7 +63,7 @@ Returns true if the value is a boolean.
 ### is_string?/1
 
 ```zap
-pub fn is_string?(value :: any) -> Bool
+fn is_string?(value :: any) -> Bool
 ```
 
 Returns true if the value is a string.
@@ -75,7 +75,7 @@ Returns true if the value is a string.
 ### is_atom?/1
 
 ```zap
-pub fn is_atom?(value :: any) -> Bool
+fn is_atom?(value :: any) -> Bool
 ```
 
 Returns true if the value is an atom.
@@ -87,7 +87,7 @@ Returns true if the value is an atom.
 ### is_nil?/1
 
 ```zap
-pub fn is_nil?(value :: any) -> Bool
+fn is_nil?(value :: any) -> Bool
 ```
 
 Returns true if the value is nil.
@@ -99,7 +99,7 @@ Returns true if the value is nil.
 ### is_list?/1
 
 ```zap
-pub fn is_list?(value :: any) -> Bool
+fn is_list?(value :: any) -> Bool
 ```
 
 Returns true if the value is a list.
@@ -111,7 +111,7 @@ Returns true if the value is a list.
 ### is_tuple?/1
 
 ```zap
-pub fn is_tuple?(value :: any) -> Bool
+fn is_tuple?(value :: any) -> Bool
 ```
 
 Returns true if the value is a tuple.
@@ -123,7 +123,7 @@ Returns true if the value is a tuple.
 ### is_map?/1
 
 ```zap
-pub fn is_map?(value :: any) -> Bool
+fn is_map?(value :: any) -> Bool
 ```
 
 Returns true if the value is a map.
@@ -135,7 +135,7 @@ Returns true if the value is a map.
 ### is_struct?/1
 
 ```zap
-pub fn is_struct?(value :: any) -> Bool
+fn is_struct?(value :: any) -> Bool
 ```
 
 Returns true if the value is a struct.
@@ -147,7 +147,7 @@ Returns true if the value is a struct.
 ### raise/1
 
 ```zap
-pub fn raise(message :: String) -> ?
+fn raise(message :: String) -> ?
 ```
 
 Raises a runtime error with the provided message.
@@ -159,7 +159,7 @@ Raises a runtime error with the provided message.
 ### sleep/1
 
 ```zap
-pub fn sleep(milliseconds :: i64) -> i64
+fn sleep(milliseconds :: i64) -> i64
 ```
 
 Suspends the current process for the given number of milliseconds.
@@ -179,7 +179,7 @@ rate limiting, and timed delays.
 ### to_string/1
 
 ```zap
-pub fn to_string(value :: any) -> String
+fn to_string(value :: any) -> String
 ```
 
 Converts any value to its string representation.
@@ -201,7 +201,7 @@ atoms, strings, and structs.
 ### inspect/1
 
 ```zap
-pub fn inspect(value :: any) -> String
+fn inspect(value :: any) -> String
 ```
 
 Print a value's string representation to stdout, followed by a newline.
@@ -224,7 +224,7 @@ debugging or examples that need a value rendered.
 ### if/2
 
 ```zap
-pub macro if(condition :: Expr, then_body :: Expr) -> Nil
+macro if(condition :: Expr, then_body :: Expr) -> Nil
 ```
 
 Conditional expression with a single branch.
@@ -245,7 +245,7 @@ Returns `nil` if the condition is false.
 ### if/3
 
 ```zap
-pub macro if(condition :: Expr, then_body :: Expr, else_body :: Expr) -> Nil
+macro if(condition :: Expr, then_body :: Expr, else_body :: Expr) -> Nil
 ```
 
 Conditional expression with both branches.
@@ -268,7 +268,7 @@ Evaluates `condition` and executes `then_body` if truthy,
 ### unless/2
 
 ```zap
-pub macro unless(condition :: Expr, body :: Expr) -> Nil
+macro unless(condition :: Expr, body :: Expr) -> Nil
 ```
 
 Negated conditional. Executes the body when the condition is false.
@@ -286,7 +286,7 @@ Negated conditional. Executes the body when the condition is false.
 ### and/2
 
 ```zap
-pub macro and(left :: Expr, right :: Expr) -> Expr
+macro and(left :: Expr, right :: Expr) -> Expr
 ```
 
 Short-circuit logical AND.
@@ -307,7 +307,7 @@ Otherwise evaluates and returns the right operand.
 ### or/2
 
 ```zap
-pub macro or(left :: Expr, right :: Expr) -> Expr
+macro or(left :: Expr, right :: Expr) -> Expr
 ```
 
 Short-circuit logical OR.
@@ -328,7 +328,7 @@ Otherwise evaluates and returns the right operand.
 ### fn/1
 
 ```zap
-pub macro fn(decl :: Expr) -> Expr
+macro fn(decl :: Expr) -> Expr
 ```
 
 Declaration macro for function definitions.
@@ -345,7 +345,7 @@ compile-time checks.
 ### struct/1
 
 ```zap
-pub macro struct(decl :: Expr) -> Expr
+macro struct(decl :: Expr) -> Expr
 ```
 
 Declaration macro for struct definitions.
@@ -360,7 +360,7 @@ Identity transform — hook point for future customization.
 ### union/1
 
 ```zap
-pub macro union(decl :: Expr) -> Expr
+macro union(decl :: Expr) -> Expr
 ```
 
 Declaration macro for union/enum definitions.
@@ -375,7 +375,7 @@ Identity transform — hook point for future customization.
 ### sigil_s/2
 
 ```zap
-pub macro sigil_s(content :: Expr, _opts :: Expr) -> Expr
+macro sigil_s(content :: Expr, _opts :: Expr) -> Expr
 ```
 
 String sigil with interpolation support.
@@ -395,7 +395,7 @@ Lowercase sigils allow `\#{}` interpolation.
 ### sigil_S/2
 
 ```zap
-pub macro sigil_S(content :: Expr, _opts :: Expr) -> Expr
+macro sigil_S(content :: Expr, _opts :: Expr) -> Expr
 ```
 
 Raw string sigil without interpolation.
@@ -415,7 +415,7 @@ Uppercase sigils suppress interpolation.
 ### sigil_w/2
 
 ```zap
-pub macro sigil_w(content :: Expr, _opts :: Expr) -> Expr
+macro sigil_w(content :: Expr, _opts :: Expr) -> Expr
 ```
 
 Word list sigil with interpolation support.
@@ -435,7 +435,7 @@ Lowercase allows `\#{}` interpolation before splitting.
 ### sigil_W/2
 
 ```zap
-pub macro sigil_W(content :: Expr, _opts :: Expr) -> Expr
+macro sigil_W(content :: Expr, _opts :: Expr) -> Expr
 ```
 
 Word list sigil without interpolation.
@@ -454,7 +454,7 @@ Uppercase suppresses `\#{}` interpolation.
 ### |>/2
 
 ```zap
-pub macro |>(left :: Expr, right :: Expr) -> Expr
+macro |>(left :: Expr, right :: Expr) -> Expr
 ```
 
 Pipe operator. Passes the left value as the first argument
@@ -475,7 +475,7 @@ to the function call on the right.
 ### <>/2
 
 ```zap
-pub macro <>(left :: Expr, right :: Expr) -> Expr
+macro <>(left :: Expr, right :: Expr) -> Expr
 ```
 
 Concatenation operator. Dispatches through the `Concatenable`

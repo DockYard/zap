@@ -21,7 +21,7 @@ collection materialize their result as a list.
 ### to_list/1
 
 ```zap
-pub fn to_list(collection :: Enumerable) -> [element]
+fn to_list(collection :: Enumerable) -> [element]
 ```
 
 Converts an enumerable collection to a list.
@@ -38,7 +38,7 @@ Converts an enumerable collection to a list.
 ### map/2
 
 ```zap
-pub fn map(collection :: Enumerable, callback :: (element) -> mapped) -> [mapped]
+fn map(collection :: Enumerable, callback :: (element) -> mapped) -> [mapped]
 ```
 
 Transforms each element by applying the callback function.
@@ -55,7 +55,7 @@ Transforms each element by applying the callback function.
 ### filter/2
 
 ```zap
-pub fn filter(collection :: Enumerable, predicate :: (element) -> Bool) -> [element]
+fn filter(collection :: Enumerable, predicate :: (element) -> Bool) -> [element]
 ```
 
 Keeps only elements for which the predicate returns true.
@@ -72,7 +72,7 @@ Keeps only elements for which the predicate returns true.
 ### reject/2
 
 ```zap
-pub fn reject(collection :: Enumerable, predicate :: (element) -> Bool) -> [element]
+fn reject(collection :: Enumerable, predicate :: (element) -> Bool) -> [element]
 ```
 
 Removes elements for which the predicate returns true.
@@ -89,7 +89,7 @@ The opposite of `filter/2`.
 ### reduce/3
 
 ```zap
-pub fn reduce(collection :: Enumerable, initial :: accumulator, callback :: (accumulator, element) -> accumulator) -> accumulator
+fn reduce(collection :: Enumerable, initial :: accumulator, callback :: (accumulator, element) -> accumulator) -> accumulator
 ```
 
 Folds the collection into a single value using an accumulator.
@@ -111,7 +111,7 @@ collection type that implements Enumerable.
 ### each/2
 
 ```zap
-pub fn each(collection :: Enumerable, callback :: (element) -> result) -> Nil
+fn each(collection :: Enumerable, callback :: (element) -> result) -> Nil
 ```
 
 Applies the callback to each element for side effects.
@@ -128,7 +128,7 @@ Returns `nil` after the collection has been exhausted.
 ### find/3
 
 ```zap
-pub fn find(collection :: Enumerable, default :: element, predicate :: (element) -> Bool) -> element
+fn find(collection :: Enumerable, default :: element, predicate :: (element) -> Bool) -> element
 ```
 
 Returns the first element for which the predicate returns true.
@@ -146,7 +146,7 @@ Returns the default value if no element matches.
 ### any?/2
 
 ```zap
-pub fn any?(collection :: Enumerable, predicate :: (element) -> Bool) -> Bool
+fn any?(collection :: Enumerable, predicate :: (element) -> Bool) -> Bool
 ```
 
 Returns true if the predicate returns true for any element.
@@ -163,7 +163,7 @@ Returns true if the predicate returns true for any element.
 ### all?/2
 
 ```zap
-pub fn all?(collection :: Enumerable, predicate :: (element) -> Bool) -> Bool
+fn all?(collection :: Enumerable, predicate :: (element) -> Bool) -> Bool
 ```
 
 Returns true if the predicate returns true for all elements.
@@ -180,7 +180,7 @@ Returns true if the predicate returns true for all elements.
 ### count/2
 
 ```zap
-pub fn count(collection :: Enumerable, predicate :: (element) -> Bool) -> i64
+fn count(collection :: Enumerable, predicate :: (element) -> Bool) -> i64
 ```
 
 Counts elements for which the predicate returns true.
@@ -196,7 +196,7 @@ Counts elements for which the predicate returns true.
 ### sum/1
 
 ```zap
-pub fn sum(collection :: Enumerable) -> i64
+fn sum(collection :: Enumerable) -> i64
 ```
 
 Returns the sum of all elements.
@@ -213,7 +213,7 @@ Returns the sum of all elements.
 ### product/1
 
 ```zap
-pub fn product(collection :: Enumerable) -> i64
+fn product(collection :: Enumerable) -> i64
 ```
 
 Returns the product of all elements.
@@ -231,7 +231,7 @@ Returns 1 for an empty collection.
 ### max/1
 
 ```zap
-pub fn max(collection :: Enumerable) -> i64
+fn max(collection :: Enumerable) -> i64
 ```
 
 Returns the maximum element.
@@ -248,7 +248,7 @@ Returns 0 for an empty collection.
 ### min/1
 
 ```zap
-pub fn min(collection :: Enumerable) -> i64
+fn min(collection :: Enumerable) -> i64
 ```
 
 Returns the minimum element.
@@ -265,7 +265,7 @@ Returns 0 for an empty collection.
 ### sort/2
 
 ```zap
-pub fn sort(collection :: Enumerable, comparator :: (element, element) -> Bool) -> [element]
+fn sort(collection :: Enumerable, comparator :: (element, element) -> Bool) -> [element]
 ```
 
 Sorts the enumerable values using a comparator function.
@@ -284,7 +284,7 @@ come before the second.
 ### flat_map/2
 
 ```zap
-pub fn flat_map(collection :: Enumerable, callback :: (element) -> [mapped]) -> [mapped]
+fn flat_map(collection :: Enumerable, callback :: (element) -> [mapped]) -> [mapped]
 ```
 
 Maps each element to a list and flattens the results
@@ -302,7 +302,7 @@ into a single list.
 ### take/2
 
 ```zap
-pub fn take(collection :: Enumerable, count :: i64) -> [element]
+fn take(collection :: Enumerable, count :: i64) -> [element]
 ```
 
 Returns the first `count` elements from the enumerable collection.
@@ -323,7 +323,7 @@ collection as a list.
 ### drop/2
 
 ```zap
-pub fn drop(collection :: Enumerable, count :: i64) -> [element]
+fn drop(collection :: Enumerable, count :: i64) -> [element]
 ```
 
 Drops the first `count` elements from the enumerable collection
@@ -344,7 +344,7 @@ If `count` exceeds the collection length, returns an empty list.
 ### reverse/1
 
 ```zap
-pub fn reverse(collection :: Enumerable) -> [element]
+fn reverse(collection :: Enumerable) -> [element]
 ```
 
 Reverses the order of elements in the enumerable collection.
@@ -361,7 +361,7 @@ Reverses the order of elements in the enumerable collection.
 ### member?/2
 
 ```zap
-pub fn member?(collection :: Enumerable, value :: element) -> Bool
+fn member?(collection :: Enumerable, value :: element) -> Bool
 ```
 
 Returns true if the enumerable collection contains the given value.
@@ -379,7 +379,7 @@ Returns true if the enumerable collection contains the given value.
 ### at/3
 
 ```zap
-pub fn at(collection :: Enumerable, index :: i64, default :: element) -> element
+fn at(collection :: Enumerable, index :: i64, default :: element) -> element
 ```
 
 Returns the element at the given zero-based index.
@@ -397,7 +397,7 @@ Returns `default` if the index is out of bounds.
 ### concat/2
 
 ```zap
-pub fn concat(first :: Enumerable, second :: Enumerable) -> [element]
+fn concat(first :: Enumerable, second :: Enumerable) -> [element]
 ```
 
 Concatenates two enumerable collections into a single list.
@@ -414,7 +414,7 @@ Concatenates two enumerable collections into a single list.
 ### uniq/1
 
 ```zap
-pub fn uniq(collection :: Enumerable) -> [element]
+fn uniq(collection :: Enumerable) -> [element]
 ```
 
 Returns a new list with duplicate values removed.
@@ -432,7 +432,7 @@ Preserves the order of first occurrences.
 ### empty?/1
 
 ```zap
-pub fn empty?(collection :: Enumerable) -> Bool
+fn empty?(collection :: Enumerable) -> Bool
 ```
 
 Returns true if the enumerable collection has no elements.

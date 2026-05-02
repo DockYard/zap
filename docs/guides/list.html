@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>List — zap_stdlib</title>
+<link rel="stylesheet" href="../style.css">
+<meta name="zap-docs-base" content="../">
+</head>
+<body>
+<header class="topbar">
+<div class="topbar-left">
+<svg class="zap-mark" width="22" height="22" viewBox="0 0 22 22" fill="none">
+<rect x="0.5" y="0.5" width="21" height="21" rx="3" stroke="var(--border-strong)"/>
+<path d="M6 6 L15 6 L8 13 L16 13 L16 16 L6 16 L13 9 L6 9 Z" fill="var(--accent)"/>
+</svg>
+<a href="../index.html" class="topbar-title">zap_stdlib</a>
+<span class="topbar-version">v0.1.0</span>
+<span class="docs-label">docs</span>
+</div>
+<div class="topbar-center">
+<button class="topbar-search-trigger" id="search-trigger">
+<svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+<circle cx="7" cy="7" r="5" stroke="var(--fg-muted)" stroke-width="1.3"/>
+<line x1="10.6" y1="10.6" x2="14" y2="14" stroke="var(--fg-muted)" stroke-width="1.3" stroke-linecap="round"/>
+</svg>
+<span>Search structs, functions, guides...</span>
+<kbd>⌘</kbd><kbd>K</kbd>
+</button>
+</div>
+<div class="topbar-right">
+<div class="topbar-tabs" role="tablist">
+<a class="topbar-tab" href="../structs/List.html" role="tab">Reference</a>
+<a class="topbar-tab active" href="../guides/list.html" role="tab">Guide</a>
+</div>
+<div class="topbar-divider"></div>
+<button id="theme-toggle" aria-label="Toggle dark mode" title="Toggle dark mode">
+<span class="theme-icon-light">☀</span>
+<span class="theme-icon-dark">☾</span>
+</button>
+<div class="topbar-divider"></div>
+<a href="https://github.com/DockYard/zap" class="topbar-github" aria-label="GitHub repository" title="GitHub">
+<svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor">
+<path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>
+</svg>
+</a>
+</div>
+</header>
+<div class="layout">
+<nav class="sidebar">
+<div class="sidebar-header"><a href="../index.html" class="sidebar-title">zap_stdlib</a> <span class="sidebar-version">v0.1.0</span></div>
+<div class="sidebar-search"><input type="text" id="search-input" placeholder="Search (Cmd+K)" aria-label="Search documentation"></div>
+<div class="sidebar-group" data-group="Structs">
+<button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Structs</h4></button>
+<ul>
+<li><a href="../structs/Atom.html">Atom</a></li>
+<li><a href="../structs/Bool.html">Bool</a></li>
+<li><a href="../structs/Enum.html">Enum</a></li>
+<li><a href="../structs/File.html">File</a></li>
+<li><a href="../structs/Float.html">Float</a></li>
+<li><a href="../structs/Function.html">Function</a></li>
+<li><a href="../structs/IO.html">IO</a></li>
+<li><a href="../structs/Integer.html">Integer</a></li>
+<li><a href="../structs/Kernel.html">Kernel</a></li>
+<li class="active"><a href="../structs/List.html">List</a></li>
+<li><a href="../structs/Map.html">Map</a></li>
+<li><a href="../structs/Math.html">Math</a></li>
+<li><a href="../structs/Path.html">Path</a></li>
+<li><a href="../structs/Range.html">Range</a></li>
+<li><a href="../structs/SourceGraph.html">SourceGraph</a></li>
+<li><a href="../structs/String.html">String</a></li>
+<li><a href="../structs/Struct.html">Struct</a></li>
+<li><a href="../structs/System.html">System</a></li>
+<li><a href="../structs/Zest.html">Zest</a></li>
+<li><a href="../structs/Zest.Case.html">Zest.Case</a></li>
+<li><a href="../structs/Zest.Runner.html">Zest.Runner</a></li>
+</ul>
+</div>
+<div class="sidebar-group" data-group="Protocols">
+<button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Protocols</h4></button>
+<ul>
+<li><a href="../structs/Arithmetic.html">Arithmetic</a></li>
+<li><a href="../structs/Comparator.html">Comparator</a></li>
+<li><a href="../structs/Concatenable.html">Concatenable</a></li>
+<li><a href="../structs/Enumerable.html">Enumerable</a></li>
+<li><a href="../structs/Membership.html">Membership</a></li>
+<li><a href="../structs/Stringable.html">Stringable</a></li>
+<li><a href="../structs/Updatable.html">Updatable</a></li>
+</ul>
+</div>
+</nav>
+<main class="content">
+<nav class="breadcrumb" aria-label="Breadcrumb">
+<span>Structs</span>
+<span>/</span>
+<span class="breadcrumb-current">List</span>
+</nav>
+<div class="guide-kicker">
+<span class="guide-kicker-label">Guide</span>
+<a class="guide-kicker-link" href="../structs/List.html">View reference →</a>
+</div>
+<article class="guide-article structdoc">
+<h1>List</h1>
+<p>A <code>List</code> in Zap is a singly-linked list of homogeneous elements. The literal
+syntax is <code>[1, 2, 3]</code>, and the cons pattern is <code>[head | tail]</code>.</p>
+<p>Because lists are linked, the access patterns are asymmetric: <code>head/1</code> and
+<code>prepend/2</code> are O(1); <code>last/1</code>, <code>append/2</code>, and <code>at/2</code> are O(n). When you
+need fast random access or constant-time append, a different shape (an array
+or a map keyed by index) is the right tool. When you need cheap structural
+sharing and pattern matching, lists are the right tool.</p>
+<h2>Construction and destructuring</h2>
+<pre><code class="language-zap">xs <span class="hl-op">=</span> [<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>]
+[head <span class="hl-op">|</span> tail] <span class="hl-op">=</span> xs       <span class="hl-comment"># head = 1, tail = [2, 3]</span>
+[]                       <span class="hl-comment"># the empty list</span></code></pre>
+<p>Pattern matching extends to function clauses:</p>
+<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> sum([] <span class="hl-op">::</span> [<span class="hl-type">i64</span>]) <span class="hl-op">-&gt;</span> <span class="hl-type">i64</span> {
+  <span class="hl-number">0</span>
+}
+
+<span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> sum([head <span class="hl-op">|</span> tail] <span class="hl-op">::</span> [<span class="hl-type">i64</span>]) <span class="hl-op">-&gt;</span> <span class="hl-type">i64</span> {
+  head <span class="hl-op">+</span> sum(tail)
+}</code></pre>
+<p>The first clause binds the empty case; the second binds head and tail and
+recurses. Zap's overload resolver picks the right clause without you writing
+a <code>case</code> body.</p>
+<h2>Two shapes of operations</h2>
+<p><code>List</code> exposes the operations that need to know about the linked structure
+of a list — <code>head/1</code>, <code>tail/1</code>, <code>prepend/2</code>, <code>append/2</code>, <code>concat/2</code>, plus
+the bang versions for known-non-empty lists.</p>
+<p><code>Enum</code> exposes the operations that work on any enumerable — <code>map/2</code>,
+<code>filter/2</code>, <code>reduce/3</code>, <code>take/2</code>, <code>drop/2</code>, etc. They work on lists too,
+because <code>List</code> implements <code>Enumerable</code>.</p>
+<p>If a function exists in both modules, prefer the <code>Enum</code> version when you
+might generalize later, and the <code>List</code> version when you specifically want
+the list-shape behavior.</p>
+<h2>Bang versions</h2>
+<p>Functions that fail on the empty list come in pairs:</p>
+<pre><code class="language-zap">List.head([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>])     <span class="hl-comment"># =&gt; 1</span>
+List.head([])            <span class="hl-comment"># =&gt; raises</span>
+
+List.head!([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>])    <span class="hl-comment"># =&gt; 1</span>
+List.head!([])           <span class="hl-comment"># =&gt; raises (same)</span></code></pre>
+<p>The convention: a trailing <code>!</code> means &quot;this function trusts you that the
+input meets its precondition; if not, it raises.&quot; Use it when you've just
+checked emptiness or when the type system has narrowed the input. Use the
+non-bang version when you have a sensible default to provide.</p>
+<h2>Building lists efficiently</h2>
+<p>Prepending is cheap (<code>O(1)</code>); appending is expensive (<code>O(n)</code>). Build lists
+by prepending and reverse at the end:</p>
+<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> collect_evens(xs <span class="hl-op">::</span> [<span class="hl-type">i64</span>]) <span class="hl-op">-&gt;</span> [<span class="hl-type">i64</span>] {
+  collect_evens_loop(xs, [])
+}
+
+<span class="hl-keyword">fn</span> collect_evens_loop([] <span class="hl-op">::</span> [<span class="hl-type">i64</span>], acc <span class="hl-op">::</span> [<span class="hl-type">i64</span>]) <span class="hl-op">-&gt;</span> [<span class="hl-type">i64</span>] {
+  List.reverse(acc)
+}
+
+<span class="hl-keyword">fn</span> collect_evens_loop([head <span class="hl-op">|</span> tail] <span class="hl-op">::</span> [<span class="hl-type">i64</span>], acc <span class="hl-op">::</span> [<span class="hl-type">i64</span>]) <span class="hl-op">-&gt;</span> [<span class="hl-type">i64</span>] {
+  <span class="hl-keyword">if</span> Integer.even?(head) {
+    collect_evens_loop(tail, [head <span class="hl-op">|</span> acc])
+  } <span class="hl-keyword">else</span> {
+    collect_evens_loop(tail, acc)
+  }
+}</code></pre>
+<p>In practice you'd write that as <code>Enum.filter(xs, &amp;Integer.even?/1)</code>. The
+hand-written version is what <code>Enum.filter</code> becomes after lowering.</p>
+<h2>Concatenation</h2>
+<p>Two lists join with <code>concat/2</code> or the <code>&lt;&gt;</code> operator (via <code>Concatenable</code>):</p>
+<pre><code class="language-zap">List.concat([<span class="hl-number">1</span>, <span class="hl-number">2</span>], [<span class="hl-number">3</span>, <span class="hl-number">4</span>])    <span class="hl-comment"># =&gt; [1, 2, 3, 4]</span>
+[<span class="hl-number">1</span>, <span class="hl-number">2</span>] <span class="hl-op">&lt;&gt;</span> [<span class="hl-number">3</span>, <span class="hl-number">4</span>]               <span class="hl-comment"># =&gt; [1, 2, 3, 4]</span></code></pre>
+<p><code>concat/2</code> walks the left list and prepends each element to the right list,
+so it's <code>O(left)</code>. Don't use it inside an inner loop over the right list.</p>
+<h2>Querying</h2>
+<pre><code class="language-zap">List.length([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>])         <span class="hl-comment"># =&gt; 3</span>
+List.empty?([])                <span class="hl-comment"># =&gt; true</span>
+List.contains?([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>], <span class="hl-number">2</span>)   <span class="hl-comment"># =&gt; true</span>
+List.uniq([<span class="hl-number">1</span>, <span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>, <span class="hl-number">2</span>])     <span class="hl-comment"># =&gt; [1, 2, 3]</span>
+List.reverse([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>])        <span class="hl-comment"># =&gt; [3, 2, 1]</span></code></pre>
+<p><code>length/1</code> walks the whole list — there is no cached length. If you find
+yourself calling <code>length</code> repeatedly in a loop, restructure to count once.</p>
+<h2>See also</h2>
+<ul>
+<li><code>Enum</code> — operations that work on every enumerable, including lists</li>
+<li><code>Range</code> — when you want a list-of-integers but don't want to materialize it</li>
+<li><code>Map</code> — when you need keyed access instead of positional</li>
+</ul>
+</article>
+</main>
+</div>
+<div id="search-modal" class="search-modal" hidden>
+<div class="search-backdrop"></div>
+<div class="search-dialog">
+<div class="search-header">
+<svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+<circle cx="7" cy="7" r="5" stroke="currentColor" stroke-width="1.3"/>
+<line x1="10.6" y1="10.6" x2="14" y2="14" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+</svg>
+<input type="text" id="search-modal-input" placeholder="Search Zap docs…" aria-label="Search">
+<kbd>ESC</kbd>
+</div>
+<ul id="search-results" class="search-results"></ul>
+<div class="search-footer">
+<span class="search-footer-item"><kbd>↑</kbd><kbd>↓</kbd> navigate</span>
+<span class="search-footer-item"><kbd>↵</kbd> open</span>
+<span class="spacer"></span>
+<span class="search-footer-item"><kbd>ESC</kbd> close</span>
+</div>
+</div>
+</div>
+<script src="../app.js"></script>
+</body>
+</html>

@@ -18,7 +18,7 @@ at compile time based on the concrete types used.
 ### get/3
 
 ```zap
-pub fn get(map :: ?, lookup_key :: key, default :: value) -> value
+fn get(map :: ?, lookup_key :: key, default :: value) -> value
 ```
 
 Returns the value for the given key, or the default if
@@ -36,7 +36,7 @@ the key is not found.
 ### has_key?/2
 
 ```zap
-pub fn has_key?(map :: ?, lookup_key :: key) -> Bool
+fn has_key?(map :: ?, lookup_key :: key) -> Bool
 ```
 
 Returns `true` if the map contains the given key.
@@ -53,7 +53,7 @@ Returns `true` if the map contains the given key.
 ### has_key/2
 
 ```zap
-pub fn has_key(map :: ?, lookup_key :: key) -> Bool
+fn has_key(map :: ?, lookup_key :: key) -> Bool
 ```
 
 Returns `true` if the map contains the given key.
@@ -73,7 +73,7 @@ still resolve.
 ### size/1
 
 ```zap
-pub fn size(map :: ?) -> i64
+fn size(map :: ?) -> i64
 ```
 
 Returns the number of entries in the map.
@@ -90,7 +90,7 @@ Returns the number of entries in the map.
 ### empty?/1
 
 ```zap
-pub fn empty?(map :: ?) -> Bool
+fn empty?(map :: ?) -> Bool
 ```
 
 Returns `true` if the map has no entries.
@@ -107,7 +107,7 @@ Returns `true` if the map has no entries.
 ### put/3
 
 ```zap
-pub fn put(map :: ?, new_key :: key, new_value :: value) -> ?
+fn put(map :: ?, new_key :: key, new_value :: value) -> ?
 ```
 
 Returns a new map with the key set to the given value.
@@ -125,7 +125,7 @@ If the key already exists, its value is updated.
 ### delete/2
 
 ```zap
-pub fn delete(map :: ?, remove_key :: key) -> ?
+fn delete(map :: ?, remove_key :: key) -> ?
 ```
 
 Returns a new map with the given key removed.
@@ -143,7 +143,7 @@ Returns the map unchanged if the key doesn't exist.
 ### merge/2
 
 ```zap
-pub fn merge(map_a :: ?, map_b :: ?) -> ?
+fn merge(map_a :: ?, map_b :: ?) -> ?
 ```
 
 Merges two maps. Keys from the second map override keys
@@ -161,7 +161,7 @@ from the first.
 ### keys/1
 
 ```zap
-pub fn keys(map :: ?) -> [key]
+fn keys(map :: ?) -> [key]
 ```
 
 Returns a list of all keys in the map.
@@ -177,7 +177,7 @@ Returns a list of all keys in the map.
 ### values/1
 
 ```zap
-pub fn values(map :: ?) -> [value]
+fn values(map :: ?) -> [value]
 ```
 
 Returns a list of all values in the map.
@@ -193,7 +193,7 @@ Returns a list of all values in the map.
 ### get!/3
 
 ```zap
-pub fn get!(map :: ?, lookup_key :: key, default :: value) -> value
+fn get!(map :: ?, lookup_key :: key, default :: value) -> value
 ```
 
 Returns the value for the given key.

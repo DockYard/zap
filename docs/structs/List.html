@@ -29,6 +29,11 @@
 </button>
 </div>
 <div class="topbar-right">
+<div class="topbar-tabs" role="tablist">
+<a class="topbar-tab active" href="../structs/List.html" role="tab">Reference</a>
+<a class="topbar-tab" href="../guides/list.html" role="tab">Guide</a>
+</div>
+<div class="topbar-divider"></div>
 <button id="theme-toggle" aria-label="Toggle dark mode" title="Toggle dark mode">
 <span class="theme-icon-light">☀</span>
 <span class="theme-icon-dark">☾</span>
@@ -93,7 +98,7 @@
 <div class="title-row">
 <h1>List</h1>
 <div class="title-meta">
-<span class="pub-struct-pill">pub struct</span>
+<span class="pub-struct-pill">struct</span>
 <a href="https://github.com/DockYard/zap/blob/v0.1.0/./lib/list.zap" class="source-file">./lib/list.zap</a>
 </div>
 </div>
@@ -133,7 +138,7 @@ List.reverse([<span class="hl-number">1</span>, <span class="hl-number">2</span>
 <div class="function-detail" id="empty?-1">
 <div class="function-header">
 <h3>empty?<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#empty?-1" class="anchor-link">#</a>
 </div>
@@ -148,7 +153,7 @@ List.empty?([<span class="hl-number">1</span>, <span class="hl-number">2</span>,
 <div class="function-detail" id="length-1">
 <div class="function-header">
 <h3>length<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#length-1" class="anchor-link">#</a>
 </div>
@@ -163,7 +168,7 @@ List.length([])         <span class="hl-comment"># =&gt; 0</span></code></pre>
 <div class="function-detail" id="head-1">
 <div class="function-header">
 <h3>head<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#head-1" class="anchor-link">#</a>
 </div>
@@ -178,7 +183,7 @@ Returns 0 for an empty list.</p>
 <div class="function-detail" id="tail-1">
 <div class="function-header">
 <h3>tail<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#tail-1" class="anchor-link">#</a>
 </div>
@@ -192,7 +197,7 @@ Returns 0 for an empty list.</p>
 <div class="function-detail" id="at-2">
 <div class="function-header">
 <h3>at<span class="arity">/2</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#at-2" class="anchor-link">#</a>
 </div>
@@ -207,7 +212,7 @@ Returns 0 if the index is out of bounds.</p>
 <div class="function-detail" id="last-1">
 <div class="function-header">
 <h3>last<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#last-1" class="anchor-link">#</a>
 </div>
@@ -222,7 +227,7 @@ Returns 0 for an empty list.</p>
 <div class="function-detail" id="contains?-2">
 <div class="function-header">
 <h3>contains?<span class="arity">/2</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#contains?-2" class="anchor-link">#</a>
 </div>
@@ -237,7 +242,7 @@ List.contains?([<span class="hl-number">1</span>, <span class="hl-number">2</spa
 <div class="function-detail" id="reverse-1">
 <div class="function-header">
 <h3>reverse<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#reverse-1" class="anchor-link">#</a>
 </div>
@@ -251,7 +256,7 @@ List.contains?([<span class="hl-number">1</span>, <span class="hl-number">2</spa
 <div class="function-detail" id="prepend-2">
 <div class="function-header">
 <h3>prepend<span class="arity">/2</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#prepend-2" class="anchor-link">#</a>
 </div>
@@ -265,7 +270,7 @@ List.contains?([<span class="hl-number">1</span>, <span class="hl-number">2</spa
 <div class="function-detail" id="append-2">
 <div class="function-header">
 <h3>append<span class="arity">/2</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#append-2" class="anchor-link">#</a>
 </div>
@@ -279,7 +284,7 @@ List.contains?([<span class="hl-number">1</span>, <span class="hl-number">2</spa
 <div class="function-detail" id="concat-2">
 <div class="function-header">
 <h3>concat<span class="arity">/2</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#concat-2" class="anchor-link">#</a>
 </div>
@@ -293,7 +298,7 @@ List.contains?([<span class="hl-number">1</span>, <span class="hl-number">2</spa
 <div class="function-detail" id="take-2">
 <div class="function-header">
 <h3>take<span class="arity">/2</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#take-2" class="anchor-link">#</a>
 </div>
@@ -307,7 +312,7 @@ List.contains?([<span class="hl-number">1</span>, <span class="hl-number">2</spa
 <div class="function-detail" id="drop-2">
 <div class="function-header">
 <h3>drop<span class="arity">/2</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#drop-2" class="anchor-link">#</a>
 </div>
@@ -321,7 +326,7 @@ List.contains?([<span class="hl-number">1</span>, <span class="hl-number">2</spa
 <div class="function-detail" id="uniq-1">
 <div class="function-header">
 <h3>uniq<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#uniq-1" class="anchor-link">#</a>
 </div>
@@ -336,7 +341,7 @@ Preserves the order of first occurrences.</p>
 <div class="function-detail" id="head!-1">
 <div class="function-header">
 <h3>head!<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#head!-1" class="anchor-link">#</a>
 </div>
@@ -352,7 +357,7 @@ List.head!([])        <span class="hl-comment"># raises</span></code></pre>
 <div class="function-detail" id="last!-1">
 <div class="function-header">
 <h3>last!<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#last!-1" class="anchor-link">#</a>
 </div>
@@ -368,7 +373,7 @@ List.last!([])         <span class="hl-comment"># raises</span></code></pre>
 <div class="function-detail" id="at!-2">
 <div class="function-header">
 <h3>at!<span class="arity">/2</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#at!-2" class="anchor-link">#</a>
 </div>

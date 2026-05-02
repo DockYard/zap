@@ -20,7 +20,7 @@ Zap does not currently expose stable runtime metadata for function values.
 ### identity/1
 
 ```zap
-pub macro identity(value_expression :: Expr) -> Expr
+macro identity(value_expression :: Expr) -> Expr
 ```
 
 Returns the value unchanged.

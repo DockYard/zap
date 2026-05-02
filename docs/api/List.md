@@ -18,7 +18,7 @@ and a tail pointer.
 ### empty?/1
 
 ```zap
-pub fn empty?(list :: [element]) -> Bool
+fn empty?(list :: [element]) -> Bool
 ```
 
 Returns `true` if the list has no elements.
@@ -35,7 +35,7 @@ Returns `true` if the list has no elements.
 ### length/1
 
 ```zap
-pub fn length(list :: [element]) -> i64
+fn length(list :: [element]) -> i64
 ```
 
 Returns the number of elements in the list.
@@ -52,7 +52,7 @@ Returns the number of elements in the list.
 ### head/1
 
 ```zap
-pub fn head(list :: [element]) -> element
+fn head(list :: [element]) -> element
 ```
 
 Returns the first element of the list.
@@ -69,7 +69,7 @@ Returns 0 for an empty list.
 ### tail/1
 
 ```zap
-pub fn tail(list :: [element]) -> [element]
+fn tail(list :: [element]) -> [element]
 ```
 
 Returns the list without its first element.
@@ -85,7 +85,7 @@ Returns the list without its first element.
 ### at/2
 
 ```zap
-pub fn at(list :: [element], index :: i64) -> element
+fn at(list :: [element], index :: i64) -> element
 ```
 
 Returns the element at the given zero-based index.
@@ -102,7 +102,7 @@ Returns 0 if the index is out of bounds.
 ### last/1
 
 ```zap
-pub fn last(list :: [element]) -> element
+fn last(list :: [element]) -> element
 ```
 
 Returns the last element of the list.
@@ -119,7 +119,7 @@ Returns 0 for an empty list.
 ### contains?/2
 
 ```zap
-pub fn contains?(list :: [element], value :: element) -> Bool
+fn contains?(list :: [element], value :: element) -> Bool
 ```
 
 Returns `true` if the list contains the given value.
@@ -136,7 +136,7 @@ Returns `true` if the list contains the given value.
 ### reverse/1
 
 ```zap
-pub fn reverse(list :: [element]) -> [element]
+fn reverse(list :: [element]) -> [element]
 ```
 
 Reverses the order of elements.
@@ -152,7 +152,7 @@ Reverses the order of elements.
 ### prepend/2
 
 ```zap
-pub fn prepend(list :: [element], value :: element) -> [element]
+fn prepend(list :: [element], value :: element) -> [element]
 ```
 
 Prepends a value to the front of a list.
@@ -168,7 +168,7 @@ Prepends a value to the front of a list.
 ### append/2
 
 ```zap
-pub fn append(list :: [element], value :: element) -> [element]
+fn append(list :: [element], value :: element) -> [element]
 ```
 
 Appends a value to the end of a list. O(n).
@@ -184,7 +184,7 @@ Appends a value to the end of a list. O(n).
 ### concat/2
 
 ```zap
-pub fn concat(first :: [element], second :: [element]) -> [element]
+fn concat(first :: [element], second :: [element]) -> [element]
 ```
 
 Concatenates two lists.
@@ -200,7 +200,7 @@ Concatenates two lists.
 ### take/2
 
 ```zap
-pub fn take(list :: [element], count :: i64) -> [element]
+fn take(list :: [element], count :: i64) -> [element]
 ```
 
 Takes the first `count` elements.
@@ -216,7 +216,7 @@ Takes the first `count` elements.
 ### drop/2
 
 ```zap
-pub fn drop(list :: [element], count :: i64) -> [element]
+fn drop(list :: [element], count :: i64) -> [element]
 ```
 
 Drops the first `count` elements.
@@ -232,7 +232,7 @@ Drops the first `count` elements.
 ### uniq/1
 
 ```zap
-pub fn uniq(list :: [element]) -> [element]
+fn uniq(list :: [element]) -> [element]
 ```
 
 Returns a new list with duplicates removed.
@@ -249,7 +249,7 @@ Preserves the order of first occurrences.
 ### head!/1
 
 ```zap
-pub fn head!(list :: [element]) -> element
+fn head!(list :: [element]) -> element
 ```
 
 Returns the first element of the list.
@@ -267,7 +267,7 @@ Raises if the list is empty.
 ### last!/1
 
 ```zap
-pub fn last!(list :: [element]) -> element
+fn last!(list :: [element]) -> element
 ```
 
 Returns the last element of the list.
@@ -285,7 +285,7 @@ Raises if the list is empty.
 ### at!/2
 
 ```zap
-pub fn at!(list :: [element], index :: i64) -> element
+fn at!(list :: [element], index :: i64) -> element
 ```
 
 Returns the element at the given zero-based index.

@@ -19,7 +19,7 @@ order.
 ### join/2
 
 ```zap
-pub fn join(left :: String, right :: String) -> String
+fn join(left :: String, right :: String) -> String
 ```
 
 Joins two path segments with a separator.
@@ -36,7 +36,7 @@ Joins two path segments with a separator.
 ### basename/1
 
 ```zap
-pub fn basename(path :: String) -> String
+fn basename(path :: String) -> String
 ```
 
 Returns the last component of a path.
@@ -53,7 +53,7 @@ Returns the last component of a path.
 ### dirname/1
 
 ```zap
-pub fn dirname(path :: String) -> String
+fn dirname(path :: String) -> String
 ```
 
 Returns the directory component of a path.
@@ -70,7 +70,7 @@ Returns the directory component of a path.
 ### extname/1
 
 ```zap
-pub fn extname(path :: String) -> String
+fn extname(path :: String) -> String
 ```
 
 Returns the file extension including the dot.
@@ -87,7 +87,7 @@ Returns the file extension including the dot.
 ### glob/1
 
 ```zap
-pub fn glob(pattern :: String) -> [String]
+fn glob(pattern :: String) -> [String]
 ```
 
 Returns paths matching a glob pattern as a sorted list of strings.

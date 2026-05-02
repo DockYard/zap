@@ -29,6 +29,11 @@
 </button>
 </div>
 <div class="topbar-right">
+<div class="topbar-tabs" role="tablist">
+<a class="topbar-tab active" href="../structs/String.html" role="tab">Reference</a>
+<a class="topbar-tab" href="../guides/string.html" role="tab">Guide</a>
+</div>
+<div class="topbar-divider"></div>
 <button id="theme-toggle" aria-label="Toggle dark mode" title="Toggle dark mode">
 <span class="theme-icon-light">☀</span>
 <span class="theme-icon-dark">☾</span>
@@ -93,7 +98,7 @@
 <div class="title-row">
 <h1>String</h1>
 <div class="title-meta">
-<span class="pub-struct-pill">pub struct</span>
+<span class="pub-struct-pill">struct</span>
 <a href="https://github.com/DockYard/zap/blob/v0.1.0/./lib/string.zap" class="source-file">./lib/string.zap</a>
 </div>
 </div>
@@ -143,7 +148,7 @@ the given padding character.</td></tr>
 <div class="function-detail" id="length-1">
 <div class="function-header">
 <h3>length<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#length-1" class="anchor-link">#</a>
 </div>
@@ -160,7 +165,7 @@ codepoints. For ASCII strings, bytes and characters are the same.</p>
 <div class="function-detail" id="byte_at-2">
 <div class="function-header">
 <h3>byte_at<span class="arity">/2</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#byte_at-2" class="anchor-link">#</a>
 </div>
@@ -178,7 +183,7 @@ out of bounds.</p>
 <div class="function-detail" id="contains?-2">
 <div class="function-header">
 <h3>contains?<span class="arity">/2</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#contains?-2" class="anchor-link">#</a>
 </div>
@@ -194,7 +199,7 @@ out of bounds.</p>
 <div class="function-detail" id="starts_with?-2">
 <div class="function-header">
 <h3>starts_with?<span class="arity">/2</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#starts_with?-2" class="anchor-link">#</a>
 </div>
@@ -209,7 +214,7 @@ out of bounds.</p>
 <div class="function-detail" id="ends_with?-2">
 <div class="function-header">
 <h3>ends_with?<span class="arity">/2</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#ends_with?-2" class="anchor-link">#</a>
 </div>
@@ -224,7 +229,7 @@ out of bounds.</p>
 <div class="function-detail" id="trim-1">
 <div class="function-header">
 <h3>trim<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#trim-1" class="anchor-link">#</a>
 </div>
@@ -239,7 +244,7 @@ out of bounds.</p>
 <div class="function-detail" id="slice-3">
 <div class="function-header">
 <h3>slice<span class="arity">/3</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#slice-3" class="anchor-link">#</a>
 </div>
@@ -256,7 +261,7 @@ are clamped to the string length.</p>
 <div class="function-detail" id="to_atom-1">
 <div class="function-header">
 <h3>to_atom<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#to_atom-1" class="anchor-link">#</a>
 </div>
@@ -272,7 +277,7 @@ are clamped to the string length.</p>
 <div class="function-detail" id="to_existing_atom-1">
 <div class="function-header">
 <h3>to_existing_atom<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#to_existing_atom-1" class="anchor-link">#</a>
 </div>
@@ -288,7 +293,7 @@ sentinel value if the atom has not been previously interned.</p>
 <div class="function-detail" id="upcase-1">
 <div class="function-header">
 <h3>upcase<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#upcase-1" class="anchor-link">#</a>
 </div>
@@ -305,7 +310,7 @@ sentinel value if the atom has not been previously interned.</p>
 <div class="function-detail" id="downcase-1">
 <div class="function-header">
 <h3>downcase<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#downcase-1" class="anchor-link">#</a>
 </div>
@@ -322,7 +327,7 @@ sentinel value if the atom has not been previously interned.</p>
 <div class="function-detail" id="reverse-1">
 <div class="function-header">
 <h3>reverse<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#reverse-1" class="anchor-link">#</a>
 </div>
@@ -338,7 +343,7 @@ sentinel value if the atom has not been previously interned.</p>
 <div class="function-detail" id="replace-3">
 <div class="function-header">
 <h3>replace<span class="arity">/3</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#replace-3" class="anchor-link">#</a>
 </div>
@@ -354,7 +359,7 @@ sentinel value if the atom has not been previously interned.</p>
 <div class="function-detail" id="index_of-2">
 <div class="function-header">
 <h3>index_of<span class="arity">/2</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#index_of-2" class="anchor-link">#</a>
 </div>
@@ -371,7 +376,7 @@ string, or -1 if not found.</p>
 <div class="function-detail" id="pad_leading-3">
 <div class="function-header">
 <h3>pad_leading<span class="arity">/3</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#pad_leading-3" class="anchor-link">#</a>
 </div>
@@ -387,7 +392,7 @@ the given padding character.</p>
 <div class="function-detail" id="pad_trailing-3">
 <div class="function-header">
 <h3>pad_trailing<span class="arity">/3</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#pad_trailing-3" class="anchor-link">#</a>
 </div>
@@ -403,7 +408,7 @@ the given padding character.</p>
 <div class="function-detail" id="repeat-2">
 <div class="function-header">
 <h3>repeat<span class="arity">/2</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#repeat-2" class="anchor-link">#</a>
 </div>
@@ -419,7 +424,7 @@ the given padding character.</p>
 <div class="function-detail" id="to_integer-1">
 <div class="function-header">
 <h3>to_integer<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#to_integer-1" class="anchor-link">#</a>
 </div>
@@ -436,7 +441,7 @@ is not a valid integer.</p>
 <div class="function-detail" id="to_float-1">
 <div class="function-header">
 <h3>to_float<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#to_float-1" class="anchor-link">#</a>
 </div>
@@ -453,7 +458,7 @@ is not a valid float.</p>
 <div class="function-detail" id="capitalize-1">
 <div class="function-header">
 <h3>capitalize<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#capitalize-1" class="anchor-link">#</a>
 </div>
@@ -470,7 +475,7 @@ is not a valid float.</p>
 <div class="function-detail" id="trim_leading-1">
 <div class="function-header">
 <h3>trim_leading<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#trim_leading-1" class="anchor-link">#</a>
 </div>
@@ -487,7 +492,7 @@ the beginning only.</p>
 <div class="function-detail" id="trim_trailing-1">
 <div class="function-header">
 <h3>trim_trailing<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#trim_trailing-1" class="anchor-link">#</a>
 </div>
@@ -504,7 +509,7 @@ the end only.</p>
 <div class="function-detail" id="count-2">
 <div class="function-header">
 <h3>count<span class="arity">/2</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#count-2" class="anchor-link">#</a>
 </div>
@@ -520,7 +525,7 @@ the end only.</p>
 <div class="function-detail" id="split-2">
 <div class="function-header">
 <h3>split<span class="arity">/2</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#split-2" class="anchor-link">#</a>
 </div>
@@ -536,7 +541,7 @@ the end only.</p>
 <div class="function-detail" id="join-2">
 <div class="function-header">
 <h3>join<span class="arity">/2</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#join-2" class="anchor-link">#</a>
 </div>

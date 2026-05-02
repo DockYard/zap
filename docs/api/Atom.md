@@ -20,7 +20,7 @@ Atoms are written with a leading colon: `:ok`, `:error`,
 ### to_string/1
 
 ```zap
-pub fn to_string(atom :: Atom) -> String
+fn to_string(atom :: Atom) -> String
 ```
 
 Converts an atom to its string representation (the name

@@ -93,7 +93,7 @@
 <div class="title-row">
 <h1>Zest.Case</h1>
 <div class="title-meta">
-<span class="pub-struct-pill">pub struct</span>
+<span class="pub-struct-pill">struct</span>
 <a href="https://github.com/DockYard/zap/blob/v0.1.0//Users/bcardarella/projects/zap/lib/zest/case.zap" class="source-file">/Users/bcardarella/projects/zap/lib/zest/case.zap</a>
 </div>
 </div>
@@ -141,7 +141,6 @@ struct after all tests have been registered.</p>
 </table>
 <h2 id="macros">Macros</h2>
 <table class="summary">
-<tr><td class="summary-name"><a href="#build_describe_test-4">build_describe_test/4</a></td><td class="summary-doc"></td></tr>
 <tr><td class="summary-name"><a href="#describe-2">describe/2</a></td><td class="summary-doc">Groups related tests under a descriptive label.</td></tr>
 <tr><td class="summary-name"><a href="#test-2">test/2</a></td><td class="summary-doc">Defines a test case without context.</td></tr>
 <tr><td class="summary-name"><a href="#setup-1">setup/1</a></td><td class="summary-doc">Declares setup code that runs before each test with context.</td></tr>
@@ -151,7 +150,7 @@ struct after all tests have been registered.</p>
 <div class="function-detail" id="begin_test-0">
 <div class="function-header">
 <h3>begin_test<span class="arity">/0</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#begin_test-0" class="anchor-link">#</a>
 </div>
@@ -163,7 +162,7 @@ struct after all tests have been registered.</p>
 <div class="function-detail" id="end_test-0">
 <div class="function-header">
 <h3>end_test<span class="arity">/0</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#end_test-0" class="anchor-link">#</a>
 </div>
@@ -175,7 +174,7 @@ struct after all tests have been registered.</p>
 <div class="function-detail" id="print_result-0">
 <div class="function-header">
 <h3>print_result<span class="arity">/0</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#print_result-0" class="anchor-link">#</a>
 </div>
@@ -187,7 +186,7 @@ struct after all tests have been registered.</p>
 <div class="function-detail" id="assert-1">
 <div class="function-header">
 <h3>assert<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#assert-1" class="anchor-link">#</a>
 </div>
@@ -200,7 +199,7 @@ struct after all tests have been registered.</p>
 <div class="function-detail" id="reject-1">
 <div class="function-header">
 <h3>reject<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#reject-1" class="anchor-link">#</a>
 </div>
@@ -211,19 +210,10 @@ struct after all tests have been registered.</p>
 </div>
 </div>
 <h2>Macro Details</h2>
-<div class="function-detail" id="build_describe_test-4">
-<div class="function-header">
-<h3>build_describe_test<span class="arity">/4</span></h3>
-<span class="badge">pub macro</span>
-<div style="flex:1"></div>
-<a href="#build_describe_test-4" class="anchor-link">#</a>
-</div>
-<div class="signature"><code><span class="sig-name">build_describe_test</span><span class="sig-paren">(</span>desc_slug<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">, </span>test_expr<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">, </span>setup_body<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">, </span>teardown_body<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
-</div>
 <div class="function-detail" id="describe-2">
 <div class="function-header">
 <h3>describe<span class="arity">/2</span></h3>
-<span class="badge">pub macro</span>
+<span class="badge">macro</span>
 <div style="flex:1"></div>
 <a href="#describe-2" class="anchor-link">#</a>
 </div>
@@ -246,7 +236,7 @@ and registers the generated function for <code>run/0</code>.</p>
 <div class="function-detail" id="test-2">
 <div class="function-header">
 <h3>test<span class="arity">/2</span></h3>
-<span class="badge">pub macro</span>
+<span class="badge">macro</span>
 <div style="flex:1"></div>
 <a href="#test-2" class="anchor-link">#</a>
 </div>
@@ -264,7 +254,7 @@ with begin_test/end_test/print_result tracking calls wrapping the body.</p>
 <div class="function-detail" id="setup-1">
 <div class="function-header">
 <h3>setup<span class="arity">/1</span></h3>
-<span class="badge">pub macro</span>
+<span class="badge">macro</span>
 <div style="flex:1"></div>
 <a href="#setup-1" class="anchor-link">#</a>
 </div>
@@ -282,7 +272,7 @@ to <code>ctx</code> in each <code>test/3</code> call. Runs fresh for every test.
 <div class="function-detail" id="teardown-1">
 <div class="function-header">
 <h3>teardown<span class="arity">/1</span></h3>
-<span class="badge">pub macro</span>
+<span class="badge">macro</span>
 <div style="flex:1"></div>
 <a href="#teardown-1" class="anchor-link">#</a>
 </div>
@@ -308,7 +298,6 @@ even if assertions fail (non-fatal assertions).</p>
 <li><a href="#assert-1">assert/1</a></li>
 <li><a href="#reject-1">reject/1</a></li>
 <li class="toc-section">Macros</li>
-<li><a href="#build_describe_test-4">build_describe_test/4</a></li>
 <li><a href="#describe-2">describe/2</a></li>
 <li><a href="#test-2">test/2</a></li>
 <li><a href="#setup-1">setup/1</a></li>

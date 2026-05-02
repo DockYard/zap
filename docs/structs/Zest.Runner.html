@@ -93,7 +93,7 @@
 <div class="title-row">
 <h1>Zest.Runner</h1>
 <div class="title-meta">
-<span class="pub-struct-pill">pub struct</span>
+<span class="pub-struct-pill">struct</span>
 <a href="https://github.com/DockYard/zap/blob/v0.1.0//Users/bcardarella/projects/zap/lib/zest/runner.zap" class="source-file">/Users/bcardarella/projects/zap/lib/zest/runner.zap</a>
 </div>
 </div>
@@ -116,15 +116,12 @@ failure code if any tests failed.</td></tr>
 <h2 id="macros">Macros</h2>
 <table class="summary">
 <tr><td class="summary-name"><a href="#options-1">options/1</a></td><td class="summary-doc">Normalizes runner options to a list.</td></tr>
-<tr><td class="summary-name"><a href="#patterns-1">patterns/1</a></td><td class="summary-doc"></td></tr>
-<tr><td class="summary-name"><a href="#option_patterns-1">option_patterns/1</a></td><td class="summary-doc"></td></tr>
-<tr><td class="summary-name"><a href="#pattern_values-1">pattern_values/1</a></td><td class="summary-doc"></td></tr>
 </table>
 <h2>Function Details</h2>
 <div class="function-detail" id="configure-0">
 <div class="function-header">
 <h3>configure<span class="arity">/0</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#configure-0" class="anchor-link">#</a>
 </div>
@@ -144,7 +141,7 @@ timeout are set.</p>
 <div class="function-detail" id="run-0">
 <div class="function-header">
 <h3>run<span class="arity">/0</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#run-0" class="anchor-link">#</a>
 </div>
@@ -167,7 +164,7 @@ used for test ordering.</p>
 <div class="function-detail" id="parse_cli_args-2">
 <div class="function-header">
 <h3>parse_cli_args<span class="arity">/2</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#parse_cli_args-2" class="anchor-link">#</a>
 </div>
@@ -181,7 +178,7 @@ used for test ordering.</p>
 <div class="function-detail" id="options-1">
 <div class="function-header">
 <h3>options<span class="arity">/1</span></h3>
-<span class="badge">pub macro</span>
+<span class="badge">macro</span>
 <div style="flex:1"></div>
 <a href="#options-1" class="anchor-link">#</a>
 </div>
@@ -191,33 +188,6 @@ used for test ordering.</p>
 <p><code>nil</code> and <code>[]</code> become an empty list, an existing option list is returned
 as-is, and a single non-list option is wrapped in a one-element list.</p>
 </div>
-</div>
-<div class="function-detail" id="patterns-1">
-<div class="function-header">
-<h3>patterns<span class="arity">/1</span></h3>
-<span class="badge">pub macro</span>
-<div style="flex:1"></div>
-<a href="#patterns-1" class="anchor-link">#</a>
-</div>
-<div class="signature"><code><span class="sig-name">patterns</span><span class="sig-paren">(</span>options<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
-</div>
-<div class="function-detail" id="option_patterns-1">
-<div class="function-header">
-<h3>option_patterns<span class="arity">/1</span></h3>
-<span class="badge">pub macro</span>
-<div style="flex:1"></div>
-<a href="#option_patterns-1" class="anchor-link">#</a>
-</div>
-<div class="signature"><code><span class="sig-name">option_patterns</span><span class="sig-paren">(</span>option<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
-</div>
-<div class="function-detail" id="pattern_values-1">
-<div class="function-header">
-<h3>pattern_values<span class="arity">/1</span></h3>
-<span class="badge">pub macro</span>
-<div style="flex:1"></div>
-<a href="#pattern_values-1" class="anchor-link">#</a>
-</div>
-<div class="signature"><code><span class="sig-name">pattern_values</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
 </div>
 </main>
 <aside class="toc">
@@ -229,9 +199,6 @@ as-is, and a single non-list option is wrapped in a one-element list.</p>
 <li><a href="#parse_cli_args-2">parse_cli_args/2</a></li>
 <li class="toc-section">Macros</li>
 <li><a href="#options-1">options/1</a></li>
-<li><a href="#patterns-1">patterns/1</a></li>
-<li><a href="#option_patterns-1">option_patterns/1</a></li>
-<li><a href="#pattern_values-1">pattern_values/1</a></li>
 </ul>
 </aside>
 </div>

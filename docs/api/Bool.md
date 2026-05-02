@@ -14,7 +14,7 @@ that can be passed as values or used in pipes.
 ### to_string/1
 
 ```zap
-pub fn to_string(value :: Bool) -> String
+fn to_string(value :: Bool) -> String
 ```
 
 Converts a boolean to its string representation.
@@ -31,7 +31,7 @@ Converts a boolean to its string representation.
 ### negate/1
 
 ```zap
-pub fn negate(value :: Bool) -> Bool
+fn negate(value :: Bool) -> Bool
 ```
 
 Returns the logical negation of a boolean.

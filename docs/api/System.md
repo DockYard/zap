@@ -10,7 +10,7 @@ and build-time configuration options.
 ### arg_count/0
 
 ```zap
-pub fn arg_count() -> i64
+fn arg_count() -> i64
 ```
 
 Returns the number of command-line arguments passed to the program.
@@ -29,7 +29,7 @@ Does not count the program name itself.
 ### arg_at/1
 
 ```zap
-pub fn arg_at(index :: i64) -> String
+fn arg_at(index :: i64) -> String
 ```
 
 Returns the command-line argument at the given index.
@@ -51,7 +51,7 @@ if the index is out of bounds.
 ### get_env/1
 
 ```zap
-pub fn get_env(name :: String) -> String
+fn get_env(name :: String) -> String
 ```
 
 Reads an environment variable by name.
@@ -71,7 +71,7 @@ string if it is not set.
 ### get_build_opt/1
 
 ```zap
-pub fn get_build_opt(name :: String) -> String
+fn get_build_opt(name :: String) -> String
 ```
 
 Reads a build-time option by name.
@@ -91,7 +91,7 @@ Returns an empty string if the option is not set.
 ### cwd/0
 
 ```zap
-pub fn cwd() -> String
+fn cwd() -> String
 ```
 
 Returns the current working directory.

@@ -29,6 +29,11 @@
 </button>
 </div>
 <div class="topbar-right">
+<div class="topbar-tabs" role="tablist">
+<a class="topbar-tab active" href="../structs/IO.html" role="tab">Reference</a>
+<a class="topbar-tab" href="../guides/io.html" role="tab">Guide</a>
+</div>
+<div class="topbar-divider"></div>
 <button id="theme-toggle" aria-label="Toggle dark mode" title="Toggle dark mode">
 <span class="theme-icon-light">☀</span>
 <span class="theme-icon-dark">☾</span>
@@ -93,7 +98,7 @@
 <div class="title-row">
 <h1>IO</h1>
 <div class="title-meta">
-<span class="pub-struct-pill">pub struct</span>
+<span class="pub-struct-pill">struct</span>
 <a href="https://github.com/DockYard/zap/blob/v0.1.0/./lib/io.zap" class="source-file">./lib/io.zap</a>
 </div>
 </div>
@@ -123,7 +128,7 @@ normal mode automatically.</td></tr>
 <div class="function-detail" id="puts-1">
 <div class="function-header">
 <h3>puts<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#puts-1" class="anchor-link">#</a>
 </div>
@@ -147,7 +152,7 @@ to stdout. Returns the original message, making it suitable <span class="hl-keyw
 <div class="function-detail" id="print_str-1">
 <div class="function-header">
 <h3>print_str<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#print_str-1" class="anchor-link">#</a>
 </div>
@@ -164,7 +169,7 @@ indicators or prompts.</p>
 <div class="function-detail" id="gets-0">
 <div class="function-header">
 <h3>gets<span class="arity">/0</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#gets-0" class="anchor-link">#</a>
 </div>
@@ -181,7 +186,7 @@ IO.puts(<span class="hl-string">"Hello, "</span> <span class="hl-op">&lt;&gt;</s
 <div class="function-detail" id="warn-1">
 <div class="function-header">
 <h3>warn<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#warn-1" class="anchor-link">#</a>
 </div>
@@ -197,7 +202,7 @@ mix with normal output.</p>
 <div class="function-detail" id="mode-1">
 <div class="function-header">
 <h3>mode<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#mode-1" class="anchor-link">#</a>
 </div>
@@ -213,7 +218,7 @@ IO.mode(IO.Mode.Normal)   <span class="hl-comment"># restore line-buffered mode<
 <div class="function-detail" id="mode-2">
 <div class="function-header">
 <h3>mode<span class="arity">/2</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#mode-2" class="anchor-link">#</a>
 </div>
@@ -232,7 +237,7 @@ normal mode automatically.</p>
 <div class="function-detail" id="get_char-0">
 <div class="function-header">
 <h3>get_char<span class="arity">/0</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#get_char-0" class="anchor-link">#</a>
 </div>
@@ -251,7 +256,7 @@ IO.mode(<span class="hl-number">0</span>)</code></pre>
 <div class="function-detail" id="try_get_char-0">
 <div class="function-header">
 <h3>try_get_char<span class="arity">/0</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#try_get_char-0" class="anchor-link">#</a>
 </div>

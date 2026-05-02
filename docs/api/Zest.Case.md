@@ -42,7 +42,7 @@ struct after all tests have been registered.
 ### begin_test/0
 
 ```zap
-pub fn begin_test() -> Atom
+fn begin_test() -> Atom
 ```
 
 Wraps `begin_test` for explicit use.
@@ -54,7 +54,7 @@ Wraps `begin_test` for explicit use.
 ### end_test/0
 
 ```zap
-pub fn end_test() -> Atom
+fn end_test() -> Atom
 ```
 
 Wraps `end_test` for explicit use.
@@ -66,7 +66,7 @@ Wraps `end_test` for explicit use.
 ### print_result/0
 
 ```zap
-pub fn print_result() -> Atom
+fn print_result() -> Atom
 ```
 
 Wraps `print_result` for explicit use.
@@ -78,7 +78,7 @@ Wraps `print_result` for explicit use.
 ### assert/1
 
 ```zap
-pub fn assert(value :: Bool) -> String
+fn assert(value :: Bool) -> String
 ```
 
 Asserts that a boolean value is `true`.
@@ -92,7 +92,7 @@ Non-fatal: returns :fail on failure, does not stop execution.
 ### reject/1
 
 ```zap
-pub fn reject(value :: Bool) -> String
+fn reject(value :: Bool) -> String
 ```
 
 Asserts that a boolean value is `false`.
@@ -105,20 +105,10 @@ Non-fatal: returns "F" on failure, does not stop execution.
 
 ## Macros
 
-### build_describe_test/4
-
-```zap
-pub macro build_describe_test(desc_slug :: Expr, test_expr :: Expr, setup_body :: Expr, teardown_body :: Expr) -> Expr
-```
-
-[Source](https://github.com/DockYard/zap/blob/v0.1.0//Users/bcardarella/projects/zap/lib/zest/case.zap#L93)
-
----
-
 ### describe/2
 
 ```zap
-pub macro describe(_name :: Expr, body :: Expr) -> Expr
+macro describe(_name :: Expr, body :: Expr) -> Expr
 ```
 
 Groups related tests under a descriptive label.
@@ -144,7 +134,7 @@ and registers the generated function for `run/0`.
 ### test/2
 
 ```zap
-pub macro test(_name :: Expr, body :: Expr) -> Expr
+macro test(_name :: Expr, body :: Expr) -> Expr
 ```
 
 Defines a test case without context.
@@ -165,7 +155,7 @@ with begin_test/end_test/print_result tracking calls wrapping the body.
 ### setup/1
 
 ```zap
-pub macro setup(body :: Expr) -> Expr
+macro setup(body :: Expr) -> Expr
 ```
 
 Declares setup code that runs before each test with context.
@@ -186,7 +176,7 @@ to `ctx` in each `test/3` call. Runs fresh for every test.
 ### teardown/1
 
 ```zap
-pub macro teardown(body :: Expr) -> Expr
+macro teardown(body :: Expr) -> Expr
 ```
 
 Declares teardown code that runs after each test.

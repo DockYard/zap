@@ -16,7 +16,7 @@ File operations return empty strings or false on failure.
 ### read/1
 
 ```zap
-pub fn read(path :: String) -> String
+fn read(path :: String) -> String
 ```
 
 Reads the entire contents of a file as a string.
@@ -34,7 +34,7 @@ Returns an empty string if the file cannot be read.
 ### write/2
 
 ```zap
-pub fn write(path :: String, content :: String) -> Bool
+fn write(path :: String, content :: String) -> Bool
 ```
 
 Writes a string to a file, creating it if it doesn't exist
@@ -51,7 +51,7 @@ and overwriting if it does. Returns true on success.
 ### exists?/1
 
 ```zap
-pub fn exists?(path :: String) -> Bool
+fn exists?(path :: String) -> Bool
 ```
 
 Returns true if the file exists at the given path.
@@ -68,7 +68,7 @@ Returns true if the file exists at the given path.
 ### read!/1
 
 ```zap
-pub fn read!(path :: String) -> String
+fn read!(path :: String) -> String
 ```
 
 Reads the entire contents of a file. Raises if the file cannot be read.
@@ -85,7 +85,7 @@ Reads the entire contents of a file. Raises if the file cannot be read.
 ### rm/1
 
 ```zap
-pub fn rm(path :: String) -> Bool
+fn rm(path :: String) -> Bool
 ```
 
 Deletes a file. Returns true on success.
@@ -101,7 +101,7 @@ Deletes a file. Returns true on success.
 ### mkdir/1
 
 ```zap
-pub fn mkdir(path :: String) -> Bool
+fn mkdir(path :: String) -> Bool
 ```
 
 Creates a directory. Returns true on success.
@@ -117,7 +117,7 @@ Creates a directory. Returns true on success.
 ### rmdir/1
 
 ```zap
-pub fn rmdir(path :: String) -> Bool
+fn rmdir(path :: String) -> Bool
 ```
 
 Removes an empty directory. Returns true on success.
@@ -133,7 +133,7 @@ Removes an empty directory. Returns true on success.
 ### rename/2
 
 ```zap
-pub fn rename(old_path :: String, new_path :: String) -> Bool
+fn rename(old_path :: String, new_path :: String) -> Bool
 ```
 
 Renames or moves a file. Returns true on success.
@@ -149,7 +149,7 @@ Renames or moves a file. Returns true on success.
 ### cp/2
 
 ```zap
-pub fn cp(source :: String, destination :: String) -> Bool
+fn cp(source :: String, destination :: String) -> Bool
 ```
 
 Copies a file. Returns true on success.
@@ -165,7 +165,7 @@ Copies a file. Returns true on success.
 ### dir?/1
 
 ```zap
-pub fn dir?(path :: String) -> Bool
+fn dir?(path :: String) -> Bool
 ```
 
 Returns true if the path is a directory.
@@ -182,7 +182,7 @@ Returns true if the path is a directory.
 ### regular?/1
 
 ```zap
-pub fn regular?(path :: String) -> Bool
+fn regular?(path :: String) -> Bool
 ```
 
 Returns true if the path is a regular file.

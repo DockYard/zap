@@ -16,7 +16,7 @@ pipe chains.
 ### puts/1
 
 ```zap
-pub fn puts(message :: String) -> String
+fn puts(message :: String) -> String
 ```
 
     Prints a value to standard output followed by a newline.
@@ -42,7 +42,7 @@ pub fn puts(message :: String) -> String
 ### print_str/1
 
 ```zap
-pub fn print_str(message :: String) -> String
+fn print_str(message :: String) -> String
 ```
 
 Prints a value to standard output without a trailing newline.
@@ -62,7 +62,7 @@ indicators or prompts.
 ### gets/0
 
 ```zap
-pub fn gets() -> String
+fn gets() -> String
 ```
 
 Reads a line from standard input.
@@ -82,7 +82,7 @@ Returns an empty string on EOF.
 ### warn/1
 
 ```zap
-pub fn warn(message :: String) -> String
+fn warn(message :: String) -> String
 ```
 
 Prints a message to standard error followed by a newline.
@@ -101,7 +101,7 @@ mix with normal output.
 ### mode/1
 
 ```zap
-pub fn mode(mode_value :: IO.Mode) -> IO.Mode
+fn mode(mode_value :: IO.Mode) -> IO.Mode
 ```
 
 Switches the terminal input mode.
@@ -119,7 +119,7 @@ Switches the terminal input mode.
 ### mode/2
 
 ```zap
-pub fn mode(mode_value :: IO.Mode, callback :: () -> result) -> result
+fn mode(mode_value :: IO.Mode, callback :: () -> result) -> result
 ```
 
 Switches terminal mode, runs the callback, then restores
@@ -140,7 +140,7 @@ normal mode automatically.
 ### get_char/0
 
 ```zap
-pub fn get_char() -> String
+fn get_char() -> String
 ```
 
 Reads a single character from standard input.
@@ -163,7 +163,7 @@ Returns a single-character string, or empty string on EOF.
 ### try_get_char/0
 
 ```zap
-pub fn try_get_char() -> String
+fn try_get_char() -> String
 ```
 
 Non-blocking read of a single character from standard input.

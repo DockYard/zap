@@ -29,6 +29,11 @@
 </button>
 </div>
 <div class="topbar-right">
+<div class="topbar-tabs" role="tablist">
+<a class="topbar-tab active" href="../structs/Integer.html" role="tab">Reference</a>
+<a class="topbar-tab" href="../guides/integer.html" role="tab">Guide</a>
+</div>
+<div class="topbar-divider"></div>
 <button id="theme-toggle" aria-label="Toggle dark mode" title="Toggle dark mode">
 <span class="theme-icon-light">☀</span>
 <span class="theme-icon-dark">☾</span>
@@ -93,7 +98,7 @@
 <div class="title-row">
 <h1>Integer</h1>
 <div class="title-meta">
-<span class="pub-struct-pill">pub struct</span>
+<span class="pub-struct-pill">struct</span>
 <a href="https://github.com/DockYard/zap/blob/v0.1.0/./lib/integer.zap" class="source-file">./lib/integer.zap</a>
 </div>
 </div>
@@ -162,7 +167,7 @@ unsigned integers do not implicitly widen to signed integers.</p>
 <div class="function-detail" id="to_string-1">
 <div class="function-header">
 <h3>to_string<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#to_string-1" class="anchor-link">#</a>
 </div>
@@ -187,7 +192,7 @@ Integer.to_string(<span class="hl-number">0</span>)     <span class="hl-comment"
 <div class="function-detail" id="abs-1">
 <div class="function-header">
 <h3>abs<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#abs-1" class="anchor-link">#</a>
 </div>
@@ -210,7 +215,7 @@ value is the original value.</p>
 <div class="function-detail" id="max-2">
 <div class="function-header">
 <h3>max<span class="arity">/2</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#max-2" class="anchor-link">#</a>
 </div>
@@ -231,7 +236,7 @@ value is the original value.</p>
 <div class="function-detail" id="min-2">
 <div class="function-header">
 <h3>min<span class="arity">/2</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#min-2" class="anchor-link">#</a>
 </div>
@@ -252,7 +257,7 @@ value is the original value.</p>
 <div class="function-detail" id="parse-1">
 <div class="function-header">
 <h3>parse<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#parse-1" class="anchor-link">#</a>
 </div>
@@ -265,7 +270,7 @@ a valid integer representation.</p>
 <div class="function-detail" id="remainder-2">
 <div class="function-header">
 <h3>remainder<span class="arity">/2</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#remainder-2" class="anchor-link">#</a>
 </div>
@@ -286,7 +291,7 @@ a valid integer representation.</p>
 <div class="function-detail" id="pow-2">
 <div class="function-header">
 <h3>pow<span class="arity">/2</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#pow-2" class="anchor-link">#</a>
 </div>
@@ -307,7 +312,7 @@ a valid integer representation.</p>
 <div class="function-detail" id="clamp-3">
 <div class="function-header">
 <h3>clamp<span class="arity">/3</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#clamp-3" class="anchor-link">#</a>
 </div>
@@ -328,7 +333,7 @@ a valid integer representation.</p>
 <div class="function-detail" id="digits-1">
 <div class="function-header">
 <h3>digits<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#digits-1" class="anchor-link">#</a>
 </div>
@@ -349,7 +354,7 @@ a valid integer representation.</p>
 <div class="function-detail" id="count_digits-1">
 <div class="function-header">
 <h3>count_digits<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#count_digits-1" class="anchor-link">#</a>
 </div>
@@ -370,7 +375,7 @@ a valid integer representation.</p>
 <div class="function-detail" id="to_float-1">
 <div class="function-header">
 <h3>to_float<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#to_float-1" class="anchor-link">#</a>
 </div>
@@ -391,7 +396,7 @@ a valid integer representation.</p>
 <div class="function-detail" id="count_leading_zeros-1">
 <div class="function-header">
 <h3>count_leading_zeros<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#count_leading_zeros-1" class="anchor-link">#</a>
 </div>
@@ -412,7 +417,7 @@ a valid integer representation.</p>
 <div class="function-detail" id="count_trailing_zeros-1">
 <div class="function-header">
 <h3>count_trailing_zeros<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#count_trailing_zeros-1" class="anchor-link">#</a>
 </div>
@@ -433,7 +438,7 @@ a valid integer representation.</p>
 <div class="function-detail" id="popcount-1">
 <div class="function-header">
 <h3>popcount<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#popcount-1" class="anchor-link">#</a>
 </div>
@@ -454,7 +459,7 @@ a valid integer representation.</p>
 <div class="function-detail" id="byte_swap-1">
 <div class="function-header">
 <h3>byte_swap<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#byte_swap-1" class="anchor-link">#</a>
 </div>
@@ -475,7 +480,7 @@ a valid integer representation.</p>
 <div class="function-detail" id="bit_reverse-1">
 <div class="function-header">
 <h3>bit_reverse<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#bit_reverse-1" class="anchor-link">#</a>
 </div>
@@ -496,7 +501,7 @@ a valid integer representation.</p>
 <div class="function-detail" id="add_sat-2">
 <div class="function-header">
 <h3>add_sat<span class="arity">/2</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#add_sat-2" class="anchor-link">#</a>
 </div>
@@ -517,7 +522,7 @@ a valid integer representation.</p>
 <div class="function-detail" id="sub_sat-2">
 <div class="function-header">
 <h3>sub_sat<span class="arity">/2</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#sub_sat-2" class="anchor-link">#</a>
 </div>
@@ -538,7 +543,7 @@ a valid integer representation.</p>
 <div class="function-detail" id="mul_sat-2">
 <div class="function-header">
 <h3>mul_sat<span class="arity">/2</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#mul_sat-2" class="anchor-link">#</a>
 </div>
@@ -559,7 +564,7 @@ a valid integer representation.</p>
 <div class="function-detail" id="band-2">
 <div class="function-header">
 <h3>band<span class="arity">/2</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#band-2" class="anchor-link">#</a>
 </div>
@@ -580,7 +585,7 @@ a valid integer representation.</p>
 <div class="function-detail" id="bor-2">
 <div class="function-header">
 <h3>bor<span class="arity">/2</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#bor-2" class="anchor-link">#</a>
 </div>
@@ -601,7 +606,7 @@ a valid integer representation.</p>
 <div class="function-detail" id="bxor-2">
 <div class="function-header">
 <h3>bxor<span class="arity">/2</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#bxor-2" class="anchor-link">#</a>
 </div>
@@ -622,7 +627,7 @@ a valid integer representation.</p>
 <div class="function-detail" id="bnot-1">
 <div class="function-header">
 <h3>bnot<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#bnot-1" class="anchor-link">#</a>
 </div>
@@ -643,7 +648,7 @@ a valid integer representation.</p>
 <div class="function-detail" id="bsl-2">
 <div class="function-header">
 <h3>bsl<span class="arity">/2</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#bsl-2" class="anchor-link">#</a>
 </div>
@@ -664,7 +669,7 @@ a valid integer representation.</p>
 <div class="function-detail" id="bsr-2">
 <div class="function-header">
 <h3>bsr<span class="arity">/2</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#bsr-2" class="anchor-link">#</a>
 </div>
@@ -685,7 +690,7 @@ a valid integer representation.</p>
 <div class="function-detail" id="sign-1">
 <div class="function-header">
 <h3>sign<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#sign-1" class="anchor-link">#</a>
 </div>
@@ -706,7 +711,7 @@ a valid integer representation.</p>
 <div class="function-detail" id="even?-1">
 <div class="function-header">
 <h3>even?<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#even?-1" class="anchor-link">#</a>
 </div>
@@ -727,7 +732,7 @@ a valid integer representation.</p>
 <div class="function-detail" id="odd?-1">
 <div class="function-header">
 <h3>odd?<span class="arity">/1</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#odd?-1" class="anchor-link">#</a>
 </div>
@@ -748,7 +753,7 @@ a valid integer representation.</p>
 <div class="function-detail" id="gcd-2">
 <div class="function-header">
 <h3>gcd<span class="arity">/2</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#gcd-2" class="anchor-link">#</a>
 </div>
@@ -769,7 +774,7 @@ a valid integer representation.</p>
 <div class="function-detail" id="lcm-2">
 <div class="function-header">
 <h3>lcm<span class="arity">/2</span></h3>
-<span class="badge">pub fn</span>
+<span class="badge">fn</span>
 <div style="flex:1"></div>
 <a href="#lcm-2" class="anchor-link">#</a>
 </div>

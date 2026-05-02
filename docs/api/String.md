@@ -17,7 +17,7 @@ rather than modifying in place.
 ### length/1
 
 ```zap
-pub fn length(s :: String) -> i64
+fn length(s :: String) -> i64
 ```
 
 Returns the byte length of a string.
@@ -37,7 +37,7 @@ codepoints. For ASCII strings, bytes and characters are the same.
 ### byte_at/2
 
 ```zap
-pub fn byte_at(s :: String, index :: i64) -> String
+fn byte_at(s :: String, index :: i64) -> String
 ```
 
 Returns the byte at the given index as a single-character string.
@@ -58,7 +58,7 @@ out of bounds.
 ### contains?/2
 
 ```zap
-pub fn contains?(haystack :: String, needle :: String) -> Bool
+fn contains?(haystack :: String, needle :: String) -> Bool
 ```
 
 Returns `true` if `haystack` contains `needle` as a substring.
@@ -76,7 +76,7 @@ Returns `true` if `haystack` contains `needle` as a substring.
 ### starts_with?/2
 
 ```zap
-pub fn starts_with?(s :: String, prefix :: String) -> Bool
+fn starts_with?(s :: String, prefix :: String) -> Bool
 ```
 
 Returns `true` if the string starts with the given prefix.
@@ -93,7 +93,7 @@ Returns `true` if the string starts with the given prefix.
 ### ends_with?/2
 
 ```zap
-pub fn ends_with?(s :: String, suffix :: String) -> Bool
+fn ends_with?(s :: String, suffix :: String) -> Bool
 ```
 
 Returns `true` if the string ends with the given suffix.
@@ -110,7 +110,7 @@ Returns `true` if the string ends with the given suffix.
 ### trim/1
 
 ```zap
-pub fn trim(s :: String) -> String
+fn trim(s :: String) -> String
 ```
 
 Removes leading and trailing whitespace from a string.
@@ -128,7 +128,7 @@ Strips spaces, tabs, newlines, and carriage returns.
 ### slice/3
 
 ```zap
-pub fn slice(s :: String, start :: i64, end :: i64) -> String
+fn slice(s :: String, start :: i64, end :: i64) -> String
 ```
 
 Returns a substring from `start` (inclusive) to `end` (exclusive).
@@ -148,7 +148,7 @@ are clamped to the string length.
 ### to_atom/1
 
 ```zap
-pub fn to_atom(name :: String) -> Atom
+fn to_atom(name :: String) -> Atom
 ```
 
 Converts a string to an atom, creating it if it doesn't exist.
@@ -167,7 +167,7 @@ Atoms are interned — each unique string maps to a single atom ID.
 ### to_existing_atom/1
 
 ```zap
-pub fn to_existing_atom(name :: String) -> Atom
+fn to_existing_atom(name :: String) -> Atom
 ```
 
 Converts a string to an existing atom.
@@ -186,7 +186,7 @@ sentinel value if the atom has not been previously interned.
 ### upcase/1
 
 ```zap
-pub fn upcase(s :: String) -> String
+fn upcase(s :: String) -> String
 ```
 
 Converts all characters to uppercase.
@@ -206,7 +206,7 @@ Only affects ASCII letters (a-z).
 ### downcase/1
 
 ```zap
-pub fn downcase(s :: String) -> String
+fn downcase(s :: String) -> String
 ```
 
 Converts all characters to lowercase.
@@ -226,7 +226,7 @@ Only affects ASCII letters (A-Z).
 ### reverse/1
 
 ```zap
-pub fn reverse(s :: String) -> String
+fn reverse(s :: String) -> String
 ```
 
 Reverses the bytes of a string.
@@ -244,7 +244,7 @@ Reverses the bytes of a string.
 ### replace/3
 
 ```zap
-pub fn replace(s :: String, pattern :: String, replacement :: String) -> String
+fn replace(s :: String, pattern :: String, replacement :: String) -> String
 ```
 
 Replaces all occurrences of `pattern` with `replacement`.
@@ -262,7 +262,7 @@ Replaces all occurrences of `pattern` with `replacement`.
 ### index_of/2
 
 ```zap
-pub fn index_of(haystack :: String, needle :: String) -> i64
+fn index_of(haystack :: String, needle :: String) -> i64
 ```
 
 Returns the index of the first occurrence of `needle` in the
@@ -281,7 +281,7 @@ string, or -1 if not found.
 ### pad_leading/3
 
 ```zap
-pub fn pad_leading(s :: String, total_length :: i64, pad_char :: String) -> String
+fn pad_leading(s :: String, total_length :: i64, pad_char :: String) -> String
 ```
 
 Pads the string on the left to reach the target length using
@@ -299,7 +299,7 @@ the given padding character.
 ### pad_trailing/3
 
 ```zap
-pub fn pad_trailing(s :: String, total_length :: i64, pad_char :: String) -> String
+fn pad_trailing(s :: String, total_length :: i64, pad_char :: String) -> String
 ```
 
 Pads the string on the right to reach the target length using
@@ -317,7 +317,7 @@ the given padding character.
 ### repeat/2
 
 ```zap
-pub fn repeat(s :: String, count :: i64) -> String
+fn repeat(s :: String, count :: i64) -> String
 ```
 
 Repeats a string the given number of times.
@@ -335,7 +335,7 @@ Repeats a string the given number of times.
 ### to_integer/1
 
 ```zap
-pub fn to_integer(s :: String) -> i64
+fn to_integer(s :: String) -> i64
 ```
 
 Parses a string into an integer. Returns 0 if the string
@@ -355,7 +355,7 @@ Delegates to `Integer.parse/1`.
 ### to_float/1
 
 ```zap
-pub fn to_float(s :: String) -> f64
+fn to_float(s :: String) -> f64
 ```
 
 Parses a string into a float. Returns 0.0 if the string
@@ -375,7 +375,7 @@ Delegates to `Float.parse/1`.
 ### capitalize/1
 
 ```zap
-pub fn capitalize(s :: String) -> String
+fn capitalize(s :: String) -> String
 ```
 
 Capitalizes the first character and lowercases the rest.
@@ -395,7 +395,7 @@ Only affects ASCII letters.
 ### trim_leading/1
 
 ```zap
-pub fn trim_leading(s :: String) -> String
+fn trim_leading(s :: String) -> String
 ```
 
 Removes leading whitespace from a string.
@@ -415,7 +415,7 @@ the beginning only.
 ### trim_trailing/1
 
 ```zap
-pub fn trim_trailing(s :: String) -> String
+fn trim_trailing(s :: String) -> String
 ```
 
 Removes trailing whitespace from a string.
@@ -435,7 +435,7 @@ the end only.
 ### count/2
 
 ```zap
-pub fn count(haystack :: String, needle :: String) -> i64
+fn count(haystack :: String, needle :: String) -> i64
 ```
 
 Counts non-overlapping occurrences of a substring.
@@ -453,7 +453,7 @@ Counts non-overlapping occurrences of a substring.
 ### split/2
 
 ```zap
-pub fn split(s :: String, delimiter :: String) -> [String]
+fn split(s :: String, delimiter :: String) -> [String]
 ```
 
 Splits a string by a delimiter, returning a list of strings.
@@ -471,7 +471,7 @@ Splits a string by a delimiter, returning a list of strings.
 ### join/2
 
 ```zap
-pub fn join(parts :: [String], separator :: String) -> String
+fn join(parts :: [String], separator :: String) -> String
 ```
 
 Joins a list of strings with a separator.

@@ -374,7 +374,7 @@ pub const Parser = struct {
                         },
                         .keyword_union => {
                             self.restoreLexerState(saved);
-                            if (self.parseUnionDecl()) |ed| {
+                            if (self.parseUnionDecl(false)) |ed| {
                                 try top_items.append(self.allocator, .{ .union_decl = ed });
                             } else |_| {
                                 self.synchronize();
@@ -452,7 +452,7 @@ pub const Parser = struct {
                     }
                 },
                 .keyword_union => {
-                    if (self.parseUnionDecl()) |ed| {
+                    if (self.parseUnionDecl(true)) |ed| {
                         try top_items.append(self.allocator, .{ .union_decl = ed });
                     } else |_| {
                         self.synchronize();
@@ -626,7 +626,7 @@ pub const Parser = struct {
                         },
                         .keyword_union => {
                             self.restoreLexerState(saved);
-                            if (self.parseUnionDecl()) |ed| {
+                            if (self.parseUnionDecl(false)) |ed| {
                                 try items.append(self.allocator, .{ .union_decl = ed });
                             } else |_| {
                                 self.synchronize();
@@ -666,7 +666,7 @@ pub const Parser = struct {
                     }
                 },
                 .keyword_union => {
-                    if (self.parseUnionDecl()) |ed| {
+                    if (self.parseUnionDecl(true)) |ed| {
                         try items.append(self.allocator, .{ .union_decl = ed });
                     } else |_| {
                         self.synchronize();
@@ -1324,7 +1324,7 @@ pub const Parser = struct {
         });
     }
 
-    fn parseUnionDecl(self: *Parser) !*const ast.UnionDecl {
+    fn parseUnionDecl(self: *Parser, is_private: bool) !*const ast.UnionDecl {
         const start = self.currentSpan();
         if (self.check(.keyword_pub)) _ = self.advance();
         _ = try self.expect(.keyword_union);
@@ -1377,6 +1377,7 @@ pub const Parser = struct {
             .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
             .name = name,
             .variants = try variants.toOwnedSlice(self.allocator),
+            .is_private = is_private,
         });
     }
 

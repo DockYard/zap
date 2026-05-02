@@ -368,6 +368,7 @@ pub const UnionDecl = struct {
     meta: NodeMeta,
     name: StringId,
     variants: []const UnionVariant,
+    is_private: bool = false,
 };
 
 pub const UnionVariant = struct {

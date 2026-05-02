@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Atom — zap_stdlib</title>
+<title>IO — zap_stdlib</title>
 <link rel="stylesheet" href="../style.css">
 <meta name="zap-docs-base" content="../">
 </head>
@@ -29,6 +29,11 @@
 </button>
 </div>
 <div class="topbar-right">
+<div class="topbar-tabs" role="tablist">
+<a class="topbar-tab" href="../structs/IO.html" role="tab">Reference</a>
+<a class="topbar-tab active" href="../guides/io.html" role="tab">Guide</a>
+</div>
+<div class="topbar-divider"></div>
 <button id="theme-toggle" aria-label="Toggle dark mode" title="Toggle dark mode">
 <span class="theme-icon-light">☀</span>
 <span class="theme-icon-dark">☾</span>
@@ -48,13 +53,13 @@
 <div class="sidebar-group" data-group="Structs">
 <button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Structs</h4></button>
 <ul>
-<li class="active"><a href="../structs/Atom.html">Atom</a></li>
+<li><a href="../structs/Atom.html">Atom</a></li>
 <li><a href="../structs/Bool.html">Bool</a></li>
 <li><a href="../structs/Enum.html">Enum</a></li>
 <li><a href="../structs/File.html">File</a></li>
 <li><a href="../structs/Float.html">Float</a></li>
 <li><a href="../structs/Function.html">Function</a></li>
-<li><a href="../structs/IO.html">IO</a></li>
+<li class="active"><a href="../structs/IO.html">IO</a></li>
 <li><a href="../structs/Integer.html">Integer</a></li>
 <li><a href="../structs/Kernel.html">Kernel</a></li>
 <li><a href="../structs/List.html">List</a></li>
@@ -88,58 +93,83 @@
 <nav class="breadcrumb" aria-label="Breadcrumb">
 <span>Structs</span>
 <span>/</span>
-<span class="breadcrumb-current">Atom</span>
+<span class="breadcrumb-current">IO</span>
 </nav>
-<div class="title-row">
-<h1>Atom</h1>
-<div class="title-meta">
-<span class="pub-struct-pill">struct</span>
-<a href="https://github.com/DockYard/zap/blob/v0.1.0/./lib/atom.zap" class="source-file">./lib/atom.zap</a>
+<div class="guide-kicker">
+<span class="guide-kicker-label">Guide</span>
+<a class="guide-kicker-link" href="../structs/IO.html">View reference →</a>
 </div>
-</div>
-<p class="tagline">Functions for working with atoms.</p>
-<div class="structdoc">
-<p>Functions for working with atoms.</p>
-<p>Atoms are constants whose name is their value. They are
-interned — each unique name maps to a single atom ID,
-making equality comparison constant-time.</p>
-<p>Atoms are written with a leading colon: <code>:ok</code>, <code>:error</code>,
-<code>:my_atom</code>.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap"><span class="hl-atom">:ok</span> <span class="hl-op">==</span> <span class="hl-atom">:ok</span>        <span class="hl-comment"># =&gt; true</span>
-<span class="hl-atom">:ok</span> <span class="hl-op">==</span> <span class="hl-atom">:error</span>     <span class="hl-comment"># =&gt; false</span>
-<span class="hl-type">Atom</span>.to_string(<span class="hl-atom">:hello</span>)  <span class="hl-comment"># =&gt; &quot;hello&quot;</span></code></pre>
-</div>
-<h2 id="functions">Functions</h2>
-<table class="summary">
-<tr><td class="summary-name"><a href="#to_string-1">to_string/1</a></td><td class="summary-doc">Converts an atom to its string representation (the name
-without the leading colon).</td></tr>
-</table>
-<h2>Function Details</h2>
-<div class="function-detail" id="to_string-1">
-<div class="function-header">
-<h3>to_string<span class="arity">/1</span></h3>
-<span class="badge">fn</span>
-<div style="flex:1"></div>
-<a href="#to_string-1" class="anchor-link">#</a>
-</div>
-<div class="signature"><code><span class="sig-name">to_string</span><span class="sig-paren">(</span>atom<span class="sig-separator">::</span><span class="sig-type-pill">Atom</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<div class="function-doc">
-<p>Converts an atom to its string representation (the name
-without the leading colon).</p>
-<h2>Examples</h2>
-<pre><code class="language-zap"><span class="hl-type">Atom</span>.to_string(<span class="hl-atom">:hello</span>)  <span class="hl-comment"># =&gt; &quot;hello&quot;</span>
-<span class="hl-type">Atom</span>.to_string(<span class="hl-atom">:ok</span>)     <span class="hl-comment"># =&gt; &quot;ok&quot;</span></code></pre>
-</div>
-</div>
-</main>
-<aside class="toc">
-<h3>On This Page</h3>
+<article class="guide-article structdoc">
+<h1>IO</h1>
+<p><code>IO</code> is the bridge between your Zap program and the world outside it. It
+covers the three streams every program inherits — <code>stdout</code>, <code>stderr</code>,
+<code>stdin</code> — and the terminal modes that make interactive programs possible.</p>
+<p>There is intentionally no buffered, structured &quot;logger&quot; or &quot;file handle&quot;
+here. <code>File</code> covers files; <code>IO</code> covers the program's standard streams.</p>
+<h2>Writing to stdout</h2>
+<pre><code class="language-zap">IO.puts(<span class="hl-string">"hello"</span>)            <span class="hl-comment"># writes &quot;hello\n&quot;</span>
+IO.print_str(<span class="hl-string">"no newline"</span>)  <span class="hl-comment"># writes &quot;no newline&quot;</span></code></pre>
+<p><code>puts/1</code> is the right default for human-readable output. Use <code>print_str/1</code>
+when you're composing fragments that would otherwise produce stray newlines.</p>
+<p>For diagnostic output, prefer <code>warn/1</code>:</p>
+<pre><code class="language-zap">IO.warn(<span class="hl-string">"ignoring malformed line"</span>)   <span class="hl-comment"># writes to stderr with newline</span></code></pre>
+<p>Sending diagnostics to <code>stderr</code> keeps them out of any pipeline that consumes
+your program's <code>stdout</code>.</p>
+<h2>Reading from stdin</h2>
+<pre><code class="language-zap">line <span class="hl-op">=</span> IO.gets()    <span class="hl-comment"># blocks until a newline is read</span></code></pre>
+<p><code>gets/0</code> returns the line including the trailing newline. Use <code>String.trim/1</code>
+if you want it stripped:</p>
+<pre><code class="language-zap">IO.print_str(<span class="hl-string">"name: "</span>)
+name <span class="hl-op">=</span> <span class="hl-type">String</span>.trim(IO.gets())
+IO.puts(<span class="hl-string">"hello, \#{name}"</span>)</code></pre>
+<p>Single-character reads are explicit:</p>
+<pre><code class="language-zap">ch <span class="hl-op">=</span> IO.get_char()        <span class="hl-comment"># blocking, one byte</span>
+maybe <span class="hl-op">=</span> IO.try_get_char() <span class="hl-comment"># non-blocking; returns &quot;&quot; if no input is ready</span></code></pre>
+<p><code>try_get_char/0</code> is the building block for event loops that can't afford to
+block while waiting for a key.</p>
+<h2>Terminal modes</h2>
+<p>Standard &quot;cooked&quot; terminal mode buffers input until you press Enter and
+echoes characters back. Interactive programs usually need raw mode — every
+key arrives immediately, there is no echo, and signal characters like
+Ctrl+C don't get special treatment.</p>
+<p>The two-arity form is the safe way to use raw mode:</p>
+<pre><code class="language-zap">IO.mode(<span class="hl-atom">:raw</span>, <span class="hl-keyword">fn</span>() {
+  <span class="hl-keyword">case</span> IO.get_char() {
+    <span class="hl-string">"q"</span> <span class="hl-op">-&gt;</span> <span class="hl-atom">:quit</span>
+    other <span class="hl-op">-&gt;</span> other
+  }
+})</code></pre>
+<p><code>IO.mode/2</code> switches into the requested mode, runs your callback, and always
+restores the previous mode — even if the callback raises. You don't have to
+remember to flip the terminal back; if you forgot, your shell would be stuck
+in raw mode after the program exited.</p>
+<p>The single-arity form is escape hatch for cases where you genuinely want to
+manage the lifetime yourself:</p>
+<pre><code class="language-zap">IO.mode(<span class="hl-atom">:raw</span>)
+<span class="hl-comment"># ... do work ...</span>
+IO.mode(<span class="hl-atom">:cooked</span>)</code></pre>
+<h2>A small example: a key-driven menu</h2>
+<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> run() {
+  IO.mode(<span class="hl-atom">:raw</span>, <span class="hl-keyword">fn</span>() {
+    IO.puts(<span class="hl-string">"Press: (q)uit, (r)eload, (h)elp"</span>)
+    <span class="hl-keyword">case</span> IO.get_char() {
+      <span class="hl-string">"q"</span> <span class="hl-op">-&gt;</span> <span class="hl-atom">:quit</span>
+      <span class="hl-string">"r"</span> <span class="hl-op">-&gt;</span> reload()
+      <span class="hl-string">"h"</span> <span class="hl-op">-&gt;</span> help()
+      _   <span class="hl-op">-&gt;</span> <span class="hl-atom">:unknown</span>
+    }
+  })
+}</code></pre>
+<p>The callback returns its value out of <code>IO.mode/2</code>, so the result of the
+menu propagates normally.</p>
+<h2>See also</h2>
 <ul>
-<li class="toc-section">Functions</li>
-<li><a href="#to_string-1">to_string/1</a></li>
+<li><code>File</code> — reading and writing files</li>
+<li><code>System</code> — environment variables, command-line arguments, process info</li>
+<li><code>IO.Mode</code> — the union of supported terminal modes</li>
 </ul>
-</aside>
+</article>
+</main>
 </div>
 <div id="search-modal" class="search-modal" hidden>
 <div class="search-backdrop"></div>

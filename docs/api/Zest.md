@@ -15,7 +15,7 @@ but do not stop execution.
 ### assert/1
 
 ```zap
-pub fn assert(value :: Bool) -> String
+fn assert(value :: Bool) -> String
 ```
 
 Asserts that a boolean value is `true`.
@@ -31,7 +31,7 @@ counter and returns "F". Execution continues (non-fatal).
 ### assert/2
 
 ```zap
-pub fn assert(value :: Bool, message :: String) -> String
+fn assert(value :: Bool, message :: String) -> String
 ```
 
 Asserts that a boolean value is `true` with a custom message.
@@ -47,7 +47,7 @@ counter and returns "F". Execution continues (non-fatal).
 ### reject/1
 
 ```zap
-pub fn reject(value :: Bool) -> String
+fn reject(value :: Bool) -> String
 ```
 
 Asserts that a boolean value is `false`.
@@ -63,7 +63,7 @@ counter and returns "F". Execution continues (non-fatal).
 ### reject/2
 
 ```zap
-pub fn reject(value :: Bool, message :: String) -> String
+fn reject(value :: Bool, message :: String) -> String
 ```
 
 Asserts that a boolean value is `false` with a custom message.
