@@ -146,6 +146,41 @@ pub struct Zap.DocTest {
     }
   }
 
+  describe("Zap.Doc.module_main_content") {
+    test("composes breadcrumb, title, implements, tagline, structdoc, sections in order") {
+      _result = Zap.Doc.module_main_content(:struct, "Enum", ["Enumerable"], "A range of integers.", "<p>body</p>\n", "<tr><td>row</td></tr>\n", "", "<div class=\"function-detail\" id=\"map-2\">d</div>\n", "")
+      assert(String.contains?(_result, "<span class=\"breadcrumb-current\">Enum</span>"))
+      assert(String.contains?(_result, "<h1 class=\"page-title\">Enum</h1>"))
+      assert(String.contains?(_result, "<a class=\"implements-link\" href=\"../structs/Enumerable.html\">"))
+      assert(String.contains?(_result, "<p class=\"tagline\">A range of integers.</p>"))
+      assert(String.contains?(_result, "<div class=\"structdoc\">\n<p>body</p>"))
+      assert(String.contains?(_result, "<h2 id=\"functions\">Functions</h2>"))
+      assert(String.contains?(_result, "<h2>Function Details</h2>"))
+    }
+
+    test("empty structdoc/macros/details collapse cleanly") {
+      _result = Zap.Doc.module_main_content(:struct, "Empty", empty_string_list(), "", "", "", "", "", "")
+      assert(String.contains?(_result, "<h1 class=\"page-title\">Empty</h1>"))
+      assert(String.contains?(_result, "implements-link") == false)
+      assert(String.contains?(_result, "structdoc") == false)
+      assert(String.contains?(_result, "<h2") == false)
+    }
+  }
+
+  describe("Zap.Doc.struct_page") {
+    test("wraps chrome around composed sidebar / main / rail") {
+      _result = Zap.Doc.struct_page("zap_stdlib", "0.1.0", "Enum", "../", "", "<nav class=\"sidebar\">S</nav>", "main", "<aside class=\"toc\">R</aside>")
+      assert(String.starts_with?(_result, "<!DOCTYPE html>"))
+      assert(String.contains?(_result, "<title>Enum"))
+      assert(String.contains?(_result, "<header class=\"topbar\">"))
+      assert(String.contains?(_result, "<nav class=\"sidebar\">S</nav>"))
+      assert(String.contains?(_result, "<main class=\"content\">\nmain</main>"))
+      assert(String.contains?(_result, "<aside class=\"toc\">R</aside>"))
+      assert(String.contains?(_result, "<script src=\"../app.js\">"))
+      assert(String.ends_with?(_result, "</body>\n</html>\n"))
+    }
+  }
+
   describe("Zap.Doc.layout") {
     test("with right rail uses the three-column layout") {
       _result = Zap.Doc.layout("<nav>S</nav>", "body", "<aside>R</aside>")

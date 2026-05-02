@@ -315,6 +315,51 @@ pub struct Zap.Doc {
     `layout-no-toc` modifier collapses the grid to two columns so
     the content fills the freed space.
     """
+  @doc = """
+    Compose the main column of a module's reference page from its
+    pre-rendered child strings:
+
+    - `kind` and `name` drive the breadcrumb and `<h1>` title.
+    - `implements` is the list of protocol names this type satisfies.
+    - `tagline_text` is the first sentence of the module's `@doc`
+      attribute (already extracted by the caller).
+    - `structdoc_html` is the markdown-rendered prose.
+    - `functions_rows` / `macros_rows` are pre-rendered summary
+      table rows; pass `""` to suppress the section.
+    - `functions_details` / `macros_details` are pre-rendered
+      function detail blocks; pass `""` to suppress.
+    """
+  pub fn module_main_content(kind :: Atom, name :: String, implements :: [String], tagline_text :: String, structdoc_html :: String, functions_rows :: String, macros_rows :: String, functions_details :: String, macros_details :: String) -> String {
+    head = breadcrumb(kind, name) <> page_title(name) <> implements_row(implements) <> tagline(tagline_text)
+    structdoc = if String.length(structdoc_html) == 0 {
+      ""
+    } else {
+      "<div class=\"structdoc\">\n" <> structdoc_html <> "</div>\n"
+    }
+    summaries = summary_table("Functions", "functions", functions_rows) <> summary_table("Macros", "macros", macros_rows)
+    details = function_details_section("Function Details", functions_details) <> function_details_section("Macro Details", macros_details)
+    head <> structdoc <> summaries <> details
+  }
+
+  @doc = """
+    Compose a complete struct/protocol/union reference page from its
+    parts. Wraps the chrome (`page_open`, `topbar`, `layout`,
+    `page_close`) around a pre-rendered sidebar HTML, main content,
+    and optional right-rail HTML.
+
+    `title` populates the `<title>` element; pass the module's name.
+    `base` is the path prefix from this page to the docs root
+    (`"../"` from a struct page, `""` from the index).
+    `source_url` is the GitHub repo URL (`""` to omit the GH icon).
+    """
+  pub fn struct_page(project_name :: String, project_version :: String, title :: String, base :: String, source_url :: String, sidebar_html :: String, content_html :: String, rail_html :: String) -> String {
+    head = page_open(title, project_name, base)
+    bar = topbar(project_name, project_version, base, source_url)
+    body = layout(sidebar_html, content_html, rail_html)
+    tail = page_close(base)
+    head <> bar <> body <> tail
+  }
+
   pub fn layout(sidebar_html :: String, content_html :: String, rail_html :: String) -> String {
     has_rail = String.length(rail_html) > 0
     open_div = if has_rail {
