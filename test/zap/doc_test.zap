@@ -146,6 +146,43 @@ pub struct Zap.DocTest {
     }
   }
 
+  describe("Zap.Doc.topbar") {
+    test("renders brand, search trigger, theme toggle, github link") {
+      _result = Zap.Doc.topbar("zap_stdlib", "0.1.0", "../", "https://github.com/DockYard/zap")
+      assert(String.starts_with?(_result, "<header class=\"topbar\">"))
+      assert(String.contains?(_result, "<a href=\"../index.html\" class=\"topbar-title\">zap_stdlib</a>"))
+      assert(String.contains?(_result, "<span class=\"topbar-version\">v0.1.0</span>"))
+      assert(String.contains?(_result, "id=\"search-trigger\""))
+      assert(String.contains?(_result, "id=\"theme-toggle\""))
+      assert(String.contains?(_result, "href=\"https://github.com/DockYard/zap\""))
+    }
+
+    test("empty source_url omits the github link") {
+      _result = Zap.Doc.topbar("name", "0.0.0", "", "")
+      assert(String.contains?(_result, "topbar-github") == false)
+    }
+  }
+
+  describe("Zap.Doc.page_open") {
+    test("renders doctype, head, and body open") {
+      _result = Zap.Doc.page_open("Enum", "zap_stdlib", "../")
+      assert(String.starts_with?(_result, "<!DOCTYPE html>"))
+      assert(String.contains?(_result, "<title>Enum"))
+      assert(String.contains?(_result, "<link rel=\"stylesheet\" href=\"../style.css\">"))
+      assert(String.contains?(_result, "<meta name=\"zap-docs-base\" content=\"../\">"))
+      assert(String.ends_with?(_result, "</head>\n<body>\n"))
+    }
+  }
+
+  describe("Zap.Doc.page_close") {
+    test("renders search modal and closing script") {
+      _result = Zap.Doc.page_close("../")
+      assert(String.contains?(_result, "id=\"search-modal\""))
+      assert(String.contains?(_result, "<script src=\"../app.js\">"))
+      assert(String.ends_with?(_result, "</body>\n</html>\n"))
+    }
+  }
+
   describe("Zap.Doc.toc_item") {
     test("renders an in-page anchor list item") {
       assert(Zap.Doc.toc_item("map", 2) == "<li><a href=\"#map-2\">map/2</a></li>\n")

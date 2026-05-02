@@ -225,6 +225,89 @@ pub struct Zap.Doc {
     "<li class=\"toc-section\">" <> escape_html(text) <> "</li>\n"
   }
 
+  @doc = """
+    Render the sticky top-bar — brand cluster on the left, command-K
+    search trigger in the center, theme toggle + GitHub link cluster
+    on the right. Same markup the existing Zig generator emits so the
+    in-page JS (theme toggle, palette) keeps working unchanged.
+
+    `project_name` and `version` populate the brand text. `base` is
+    the path prefix from the current page back to the docs root
+    (`""` from index.html, `"../"` from a struct page). `source_url`
+    is the GitHub repo URL for the project — pass empty string to
+    omit the GitHub icon.
+    """
+  pub fn topbar(project_name :: String, version :: String, base :: String, source_url :: String) -> String {
+    open = "<header class=\"topbar\">\n"
+    left = topbar_left(project_name, version, base)
+    center = topbar_center()
+    right = topbar_right(source_url)
+    open <> left <> center <> right <> "</header>\n"
+  }
+
+  pub fn topbar_left(project_name :: String, version :: String, base :: String) -> String {
+    z_mark = "<svg class=\"zap-mark\" width=\"22\" height=\"22\" viewBox=\"0 0 22 22\" fill=\"none\">\n<rect x=\"0.5\" y=\"0.5\" width=\"21\" height=\"21\" rx=\"3\" stroke=\"var(--border-strong)\"/>\n<path d=\"M6 6 L15 6 L8 13 L16 13 L16 16 L6 16 L13 9 L6 9 Z\" fill=\"var(--accent)\"/>\n</svg>\n"
+    title = "<a href=\"" <> base <> "index.html\" class=\"topbar-title\">" <> escape_html(project_name) <> "</a>\n"
+    version_pill = "<span class=\"topbar-version\">v" <> escape_html(version) <> "</span>\n"
+    docs_label = "<span class=\"docs-label\">docs</span>\n"
+    "<div class=\"topbar-left\">\n" <> z_mark <> title <> version_pill <> docs_label <> "</div>\n"
+  }
+
+  pub fn topbar_center() -> String {
+    icon = "<svg width=\"14\" height=\"14\" viewBox=\"0 0 16 16\" fill=\"none\">\n<circle cx=\"7\" cy=\"7\" r=\"5\" stroke=\"var(--fg-muted)\" stroke-width=\"1.3\"/>\n<line x1=\"10.6\" y1=\"10.6\" x2=\"14\" y2=\"14\" stroke=\"var(--fg-muted)\" stroke-width=\"1.3\" stroke-linecap=\"round\"/>\n</svg>\n"
+    label = "<span>Search structs, functions, guides...</span>\n"
+    kbd = "<kbd>\u{2318}</kbd><kbd>K</kbd>\n"
+    button = "<button class=\"topbar-search-trigger\" id=\"search-trigger\">\n" <> icon <> label <> kbd <> "</button>\n"
+    "<div class=\"topbar-center\">\n" <> button <> "</div>\n"
+  }
+
+  pub fn topbar_right(source_url :: String) -> String {
+    theme = "<button id=\"theme-toggle\" aria-label=\"Toggle dark mode\" title=\"Toggle dark mode\">\n<span class=\"theme-icon-light\">\u{2600}</span>\n<span class=\"theme-icon-dark\">\u{263e}</span>\n</button>\n"
+    divider = "<div class=\"topbar-divider\"></div>\n"
+    github = if String.length(source_url) == 0 {
+      ""
+    } else {
+      gh_icon = "<svg width=\"18\" height=\"18\" viewBox=\"0 0 16 16\" fill=\"currentColor\">\n<path d=\"M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z\"/>\n</svg>\n"
+      "<a href=\"" <> escape_html(source_url) <> "\" class=\"topbar-github\" aria-label=\"GitHub repository\" title=\"GitHub\">\n" <> gh_icon <> "</a>\n"
+    }
+    "<div class=\"topbar-right\">\n" <> theme <> divider <> github <> "</div>\n"
+  }
+
+  @doc = """
+    Open the HTML document — `<!DOCTYPE>`, `<html>`, `<head>` (CSS
+    link, title, base-path meta), and `<body>`. Matches the existing
+    Zig generator's wrapper exactly so the in-page JS (which reads
+    `meta[name=\"zap-docs-base\"]`) continues to work.
+    """
+  pub fn page_open(title :: String, project_name :: String, base :: String) -> String {
+    head_open = "<!DOCTYPE html>\n<html lang=\"en\" data-theme=\"dark\">\n<head>\n"
+    meta = "<meta charset=\"UTF-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n"
+    title_tag = "<title>" <> escape_html(title) <> " \u{2014} " <> escape_html(project_name) <> "</title>\n"
+    css = "<link rel=\"stylesheet\" href=\"" <> base <> "style.css\">\n"
+    base_meta = "<meta name=\"zap-docs-base\" content=\"" <> base <> "\">\n"
+    head_open <> meta <> title_tag <> css <> base_meta <> "</head>\n<body>\n"
+  }
+
+  @doc = """
+    Close the document — search modal, `app.js` script tag, `</body>`,
+    `</html>`. Mirrors the existing Zig generator's footer so the
+    in-page palette + theme toggle pick up the right asset paths.
+    """
+  pub fn page_close(base :: String) -> String {
+    modal = search_modal()
+    script = "<script src=\"" <> base <> "app.js\"></script>\n"
+    modal <> script <> "</body>\n</html>\n"
+  }
+
+  pub fn search_modal() -> String {
+    open = "<div id=\"search-modal\" class=\"search-modal\" hidden>\n<div class=\"search-backdrop\"></div>\n<div class=\"search-dialog\">\n"
+    icon = "<svg width=\"15\" height=\"15\" viewBox=\"0 0 16 16\" fill=\"none\" aria-hidden=\"true\">\n<circle cx=\"7\" cy=\"7\" r=\"5\" stroke=\"currentColor\" stroke-width=\"1.3\"/>\n<line x1=\"10.6\" y1=\"10.6\" x2=\"14\" y2=\"14\" stroke=\"currentColor\" stroke-width=\"1.3\" stroke-linecap=\"round\"/>\n</svg>\n"
+    header = "<div class=\"search-header\">\n" <> icon <> "<input type=\"text\" id=\"search-modal-input\" placeholder=\"Search Zap docs\u{2026}\" aria-label=\"Search\">\n<kbd>ESC</kbd>\n</div>\n"
+    results = "<ul id=\"search-results\" class=\"search-results\"></ul>\n"
+    footer_top = "<div class=\"search-footer\">\n<span class=\"search-footer-item\"><kbd>\u{2191}</kbd><kbd>\u{2193}</kbd> navigate</span>\n<span class=\"search-footer-item\"><kbd>\u{21b5}</kbd> open</span>\n<span class=\"spacer\"></span>\n<span class=\"search-footer-item\"><kbd>ESC</kbd> close</span>\n</div>\n"
+    open <> header <> results <> footer_top <> "</div>\n</div>\n"
+  }
+
   pub fn function_detail(name :: String, arity :: i64, is_macro :: Bool, signatures :: [String], doc_html :: String) -> String {
     sig_blocks = for sig <- signatures {
       signature_block(sig)
