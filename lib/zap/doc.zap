@@ -130,6 +130,41 @@ pub struct Zap.Doc {
     panels stacked). `doc_html` is the markdown-rendered prose;
     callers pass `Markdown.to_html(func.doc)`.
     """
+  @doc = """
+    Render one `<li>` row in a sidebar group's struct list. The active
+    module gets `class="active"` so CSS can highlight its row with the
+    accent left-border + accent-soft fill from the design tokens.
+    """
+  pub fn sidebar_item(name :: String, active? :: Bool, base :: String) -> String {
+    li_open = if active? { "<li class=\"active\">" } else { "<li>" }
+    li_open <> "<a href=\"" <> base <> "structs/" <> escape_html(name) <> ".html\">" <> escape_html(name) <> "</a></li>\n"
+  }
+
+  @doc = """
+    Render one collapsible sidebar group — the chevron-button header
+    plus the `<ul>` of struct items. `members` is the list of member
+    qualified names, `current` is the active page's name (use the
+    empty string when no module is active, e.g. on the landing page).
+    `base` is the relative path prefix (`""` from the landing page,
+    `"../"` from a struct page).
+    """
+  pub fn sidebar_group(title :: String, members :: [String], current :: String, base :: String) -> String {
+    items = render_sidebar_items(members, current, base, "")
+    open_div = "<div class=\"sidebar-group\" data-group=\"" <> escape_html(title) <> "\">\n"
+    button = "<button class=\"sidebar-group-header\" type=\"button\" aria-label=\"Toggle group\"><span class=\"chevron\" aria-hidden=\"true\">\u{25b8}</span><h4>" <> escape_html(title) <> "</h4></button>\n"
+    open_div <> button <> "<ul>\n" <> items <> "</ul>\n</div>\n"
+  }
+
+  pub fn render_sidebar_items(members :: [String], current :: String, base :: String, acc :: String) -> String {
+    if List.empty?(members) {
+      acc
+    } else {
+      head = List.head(members)
+      tail = List.tail(members)
+      render_sidebar_items(tail, current, base, acc <> sidebar_item(head, head == current, base))
+    }
+  }
+
   pub fn function_detail(name :: String, arity :: i64, is_macro :: Bool, signatures :: [String], doc_html :: String) -> String {
     sig_blocks = for sig <- signatures {
       signature_block(sig)

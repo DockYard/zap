@@ -95,6 +95,38 @@ pub struct Zap.DocTest {
     }
   }
 
+  describe("Zap.Doc.sidebar_item") {
+    test("inactive item renders without active class") {
+      assert(Zap.Doc.sidebar_item("Atom", false, "../") == "<li><a href=\"../structs/Atom.html\">Atom</a></li>\n")
+    }
+
+    test("active item gets the active class") {
+      assert(Zap.Doc.sidebar_item("Enum", true, "../") == "<li class=\"active\"><a href=\"../structs/Enum.html\">Enum</a></li>\n")
+    }
+
+    test("base prefix is preserved in the href") {
+      assert(String.contains?(Zap.Doc.sidebar_item("Atom", false, ""), "href=\"structs/Atom.html\""))
+    }
+  }
+
+  describe("Zap.Doc.sidebar_group") {
+    test("renders chevron button and one item per member") {
+      _result = Zap.Doc.sidebar_group("Structs", ["Atom", "Bool", "Enum"], "Bool", "../")
+      assert(String.contains?(_result, "data-group=\"Structs\""))
+      assert(String.contains?(_result, "<button class=\"sidebar-group-header\""))
+      assert(String.contains?(_result, "<h4>Structs</h4>"))
+      assert(String.contains?(_result, "<li><a href=\"../structs/Atom.html\">Atom</a></li>"))
+      assert(String.contains?(_result, "<li class=\"active\"><a href=\"../structs/Bool.html\">Bool</a></li>"))
+      assert(String.contains?(_result, "<li><a href=\"../structs/Enum.html\">Enum</a></li>"))
+    }
+
+    test("empty current name leaves all items inactive") {
+      _result = Zap.Doc.sidebar_group("Structs", ["Atom"], "", "../")
+      assert(String.contains?(_result, "<li><a"))
+      assert(String.contains?(_result, "class=\"active\"") == false)
+    }
+  }
+
   describe("Zap.Doc.function_detail") {
     test("composes id, header, signature, and rendered doc") {
       _result = Zap.Doc.function_detail("map", 2, false, ["map(value :: i64) -> i64"], "<p>Transforms each element.</p>\n")
