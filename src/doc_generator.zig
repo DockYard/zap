@@ -1152,7 +1152,18 @@ fn generateStructPage(alloc: std.mem.Allocator, mod: DocStruct, project: DocProj
         .guide_url = std.fmt.allocPrint(alloc, "../guides/{s}.html", .{slug}) catch "",
     } else null;
     appendPageHeader(&h, mod.name, project, "../", tabs);
-    h.str("<div class=\"layout\">\n");
+
+    // Decide layout columns up front: when there are no public functions
+    // or macros to anchor, drop the right-rail "On this page" entirely
+    // (and collapse the grid back to a 2-column layout) instead of
+    // showing an empty rail.
+    const has_toc_entries = mod.functions.len > 0;
+
+    if (has_toc_entries) {
+        h.str("<div class=\"layout\">\n");
+    } else {
+        h.str("<div class=\"layout layout-no-toc\">\n");
+    }
     appendSidebar(&h, project, mod.name, options, "../");
     h.str("<main class=\"content\">\n");
 
@@ -1272,31 +1283,39 @@ fn generateStructPage(alloc: std.mem.Allocator, mod: DocStruct, project: DocProj
         }
     }
 
-    // Right-hand TOC
-    h.str("</main>\n<aside class=\"toc\">\n<h3>On This Page</h3>\n<ul>\n");
-    if (functions.items.len > 0) {
-        h.str("<li class=\"toc-section\">Functions</li>\n");
-        for (functions.items) |func| {
-            h.str("<li><a href=\"#");
-            appendAnchorId(&h, func);
-            h.str("\">");
-            appendHtmlEscaped(&h, func.name);
-            h.fmt("/{d}", .{func.arity});
-            h.str("</a></li>\n");
+    h.str("</main>\n");
+
+    // Right-hand "On this page" — only when there is at least one
+    // function or macro to anchor. Modules whose public surface is just
+    // a struct definition (e.g. Range) skip the rail entirely; the
+    // layout-no-toc class collapses the empty third column above.
+    if (functions.items.len > 0 or macros.items.len > 0) {
+        h.str("<aside class=\"toc\">\n<h3>On This Page</h3>\n<ul>\n");
+        if (functions.items.len > 0) {
+            h.str("<li class=\"toc-section\">Functions</li>\n");
+            for (functions.items) |func| {
+                h.str("<li><a href=\"#");
+                appendAnchorId(&h, func);
+                h.str("\">");
+                appendHtmlEscaped(&h, func.name);
+                h.fmt("/{d}", .{func.arity});
+                h.str("</a></li>\n");
+            }
         }
-    }
-    if (macros.items.len > 0) {
-        h.str("<li class=\"toc-section\">Macros</li>\n");
-        for (macros.items) |func| {
-            h.str("<li><a href=\"#");
-            appendAnchorId(&h, func);
-            h.str("\">");
-            appendHtmlEscaped(&h, func.name);
-            h.fmt("/{d}", .{func.arity});
-            h.str("</a></li>\n");
+        if (macros.items.len > 0) {
+            h.str("<li class=\"toc-section\">Macros</li>\n");
+            for (macros.items) |func| {
+                h.str("<li><a href=\"#");
+                appendAnchorId(&h, func);
+                h.str("\">");
+                appendHtmlEscaped(&h, func.name);
+                h.fmt("/{d}", .{func.arity});
+                h.str("</a></li>\n");
+            }
         }
+        h.str("</ul>\n</aside>\n");
     }
-    h.str("</ul>\n</aside>\n</div>\n");
+    h.str("</div>\n");
     appendPageFooter(&h, "../");
 
     const path = try std.fmt.allocPrint(alloc, "{s}/structs/{s}.html", .{ options.output_dir, mod.name });

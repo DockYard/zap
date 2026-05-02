@@ -265,6 +265,13 @@ code, pre, .signature { font-family: var(--ff-mono); font-size: 13px; }
   min-height: calc(100vh - var(--topbar-h));
 }
 
+/* Modules with no public functions or macros (e.g. data-only structs
+   like Range) skip the right rail entirely — collapse the grid so the
+   content occupies the freed space instead of leaving a blank column. */
+.layout.layout-no-toc {
+  grid-template-columns: var(--sidebar-w) 1fr;
+}
+
 /* ══════════════════════════════════════
    Sidebar
    ══════════════════════════════════════ */
