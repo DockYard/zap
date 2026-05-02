@@ -306,6 +306,26 @@ pub struct Zap.Doc {
     (`""` from non-module pages); `base` is the path prefix to the
     docs root.
     """
+  @doc = """
+    Wrap the page chrome around a fully-composed main column. The
+    layout is a CSS grid with `<nav class="sidebar">` on the left,
+    `<main class="content">` in the middle, and an optional
+    `<aside class="toc">` (the right rail) on the right. When the
+    page has no anchorable entries, pass `""` for the rail and the
+    `layout-no-toc` modifier collapses the grid to two columns so
+    the content fills the freed space.
+    """
+  pub fn layout(sidebar_html :: String, content_html :: String, rail_html :: String) -> String {
+    has_rail = String.length(rail_html) > 0
+    open_div = if has_rail {
+      "<div class=\"layout\">\n"
+    } else {
+      "<div class=\"layout layout-no-toc\">\n"
+    }
+    main_html = "<main class=\"content\">\n" <> content_html <> "</main>\n"
+    open_div <> sidebar_html <> main_html <> rail_html <> "</div>\n"
+  }
+
   pub fn sidebar(structs :: [String], protocols :: [String], unions :: [String], current :: String, base :: String) -> String {
     structs_group = if List.empty?(structs) {
       ""

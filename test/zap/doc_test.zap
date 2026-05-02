@@ -146,6 +146,22 @@ pub struct Zap.DocTest {
     }
   }
 
+  describe("Zap.Doc.layout") {
+    test("with right rail uses the three-column layout") {
+      _result = Zap.Doc.layout("<nav>S</nav>", "body", "<aside>R</aside>")
+      assert(String.starts_with?(_result, "<div class=\"layout\">"))
+      assert(String.contains?(_result, "<nav>S</nav>"))
+      assert(String.contains?(_result, "<main class=\"content\">\nbody</main>"))
+      assert(String.contains?(_result, "<aside>R</aside>"))
+    }
+
+    test("without right rail uses the two-column layout") {
+      _result = Zap.Doc.layout("<nav>S</nav>", "body", "")
+      assert(String.starts_with?(_result, "<div class=\"layout layout-no-toc\">"))
+      assert(String.contains?(_result, "<aside") == false)
+    }
+  }
+
   describe("Zap.Doc.sidebar") {
     test("renders one group per non-empty member list") {
       _result = Zap.Doc.sidebar(["Atom", "Bool"], ["Stringable"], empty_string_list(), "Bool", "../")
