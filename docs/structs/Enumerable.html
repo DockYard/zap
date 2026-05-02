@@ -83,12 +83,6 @@
 <li><a href="../structs/Updatable.html">Updatable</a></li>
 </ul>
 </div>
-<div class="sidebar-group">
-<h4>Unions</h4>
-<ul>
-<li><a href="../structs/IO.Mode.html">IO.Mode</a></li>
-</ul>
-</div>
 </nav>
 <main class="content">
 <div class="title-row">
@@ -105,13 +99,13 @@
 comprehensions and <code>Enum</code> functions.</p>
 <p>Implementors provide <code>next/1</code> which takes an iteration state
 and returns <code>{:cont, value, next_state}</code> to yield a value,
-or <code>{:done, 0, nil}</code> when iteration is complete.</p>
+or <code>{:done, ignored_value, state}</code> when iteration is complete.</p>
 <p>For lists, the list itself is the state.
 For ranges, the Range struct is the initial state.</p>
 </div>
 <h2>Required Functions</h2>
 <table class="summary">
-<tr><td class="summary-name"><code>next</code></td><td class="summary-doc"><code>next(state) -&gt; {Atom, i64, any}</code></td></tr>
+<tr><td class="summary-name"><code>next</code></td><td class="summary-doc"><code>next(state) -&gt; {Atom, element, any}</code></td></tr>
 </table>
 </main>
 <aside class="toc">

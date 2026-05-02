@@ -83,19 +83,13 @@
 <li><a href="../structs/Updatable.html">Updatable</a></li>
 </ul>
 </div>
-<div class="sidebar-group">
-<h4>Unions</h4>
-<ul>
-<li><a href="../structs/IO.Mode.html">IO.Mode</a></li>
-</ul>
-</div>
 </nav>
 <main class="content">
 <div class="title-row">
 <h1>Zest.Case</h1>
 <div class="title-meta">
 <span class="pub-struct-pill">pub struct</span>
-<a href="https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/case.zap" class="source-file">./lib/zest/case.zap</a>
+<a href="https://github.com/DockYard/zap/blob/v0.1.0//Users/bcardarella/projects/zap/lib/zest/case.zap" class="source-file">/Users/bcardarella/projects/zap/lib/zest/case.zap</a>
 </div>
 </div>
 <p class="tagline">Test case DSL for the Zest test framework.</p>
@@ -106,8 +100,9 @@
 <p>Setup runs fresh before EACH test that requests context.
 Teardown runs after each test. Assertions are non-fatal.</p>
 <p>The <code>describe</code> and <code>test</code> macros expand into function declarations
-so that each test becomes a named pub function (test_*) that is
-called at struct level.</p>
+so that each test becomes a named pub function (test_*). <code>use Zest.Case</code>
+installs a compile-time hook that generates <code>run/0</code> for the enclosing
+struct after all tests have been registered.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> Test.MyTest {
   <span class="hl-keyword">use</span> Zest.Case
@@ -141,6 +136,7 @@ called at struct level.</p>
 </table>
 <h2 id="macros">Macros</h2>
 <table class="summary">
+<tr><td class="summary-name"><a href="#build_describe_test-4">build_describe_test/4</a></td><td class="summary-doc"></td></tr>
 <tr><td class="summary-name"><a href="#describe-2">describe/2</a></td><td class="summary-doc">Groups related tests under a descriptive label.</td></tr>
 <tr><td class="summary-name"><a href="#test-2">test/2</a></td><td class="summary-doc">Defines a test case without context.</td></tr>
 <tr><td class="summary-name"><a href="#setup-1">setup/1</a></td><td class="summary-doc">Declares setup code that runs before each test with context.</td></tr>
@@ -210,6 +206,15 @@ called at struct level.</p>
 </div>
 </div>
 <h2>Macro Details</h2>
+<div class="function-detail" id="build_describe_test-4">
+<div class="function-header">
+<h3>build_describe_test<span class="arity">/4</span></h3>
+<span class="badge">pub macro</span>
+<div style="flex:1"></div>
+<a href="#build_describe_test-4" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">build_describe_test</span><span class="sig-paren">(</span>desc_slug<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">, </span>test_expr<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">, </span>setup_body<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">, </span>teardown_body<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+</div>
 <div class="function-detail" id="describe-2">
 <div class="function-header">
 <h3>describe<span class="arity">/2</span></h3>
@@ -222,7 +227,7 @@ called at struct level.</p>
 <p>Groups related tests under a descriptive label.</p>
 <p>Scans the body for <code>setup</code> and <code>teardown</code> blocks, then
 transforms each <code>test</code> call into a pub function declaration
-with begin_test/end_test/print_result tracking calls injected.</p>
+and registers the generated function for <code>run/0</code>.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap"><span class="hl-keyword">describe</span>(<span class="hl-string">"math"</span>) {
   <span class="hl-builtin">setup</span>() { <span class="hl-number">42</span> }
@@ -298,6 +303,7 @@ even if assertions fail (non-fatal assertions).</p>
 <li><a href="#assert-1">assert/1</a></li>
 <li><a href="#reject-1">reject/1</a></li>
 <li class="toc-section">Macros</li>
+<li><a href="#build_describe_test-4">build_describe_test/4</a></li>
 <li><a href="#describe-2">describe/2</a></li>
 <li><a href="#test-2">test/2</a></li>
 <li><a href="#setup-1">setup/1</a></li>

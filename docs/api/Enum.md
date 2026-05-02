@@ -10,8 +10,8 @@ collection materialize their result as a list.
 
     Enum.map([1, 2, 3], fn(x) { x * 2 })       # => [2, 4, 6]
     Enum.filter(1..5, fn(x) { x > 2 })          # => [3, 4, 5]
-    Enum.reduce(%{a: 1, b: 2}, 0, fn(acc, kv) {
-      case kv {
+    Enum.reduce(%{a: 1, b: 2}, 0, fn(acc, entry) {
+      case entry {
         {_key, value} -> acc + value
       }
     })                                         # => 3
@@ -108,43 +108,20 @@ collection type that implements Enumerable.
 
 ---
 
-### reduce_map/3
-
-```zap
-pub fn reduce_map(map :: ?, initial :: accumulator, callback :: (accumulator, value) -> accumulator) -> accumulator
-```
-
-Folds map values into a single value using an accumulator.
-The callback receives `(accumulator, value)` and returns
-the new accumulator.
-
-`reduce_map/3` is a map-value convenience that enumerates map
-entries through the Enumerable protocol and passes only each value
-to the callback.
-
-## Examples
-
-    Enum.reduce_map(%{a: 1, b: 2, c: 3}, 0, fn(acc, val) { acc + val })
-    # => 6
-
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/enum.zap#L105)
-
----
-
 ### each/2
 
 ```zap
-pub fn each(collection :: Enumerable, callback :: (element) -> result) -> Enumerable
+pub fn each(collection :: Enumerable, callback :: (element) -> result) -> Nil
 ```
 
 Applies the callback to each element for side effects.
-Returns the original collection unchanged.
+Returns `nil` after the collection has been exhausted.
 
 ## Examples
 
     Enum.each([1, 2, 3], fn(x) { IO.puts(Integer.to_string(x)) })
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/enum.zap#L118)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/enum.zap#L99)
 
 ---
 
@@ -162,7 +139,7 @@ Returns the default value if no element matches.
     Enum.find([1, 2, 3, 4], 0, fn(x) { x > 2 })  # => 3
     Enum.find(1..2, 0, fn(x) { x > 10 })         # => 0
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/enum.zap#L133)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/enum.zap#L113)
 
 ---
 
@@ -179,7 +156,7 @@ Returns true if the predicate returns true for any element.
     Enum.any?([1, 2, 3], fn(x) { x > 2 })   # => true
     Enum.any?(1..3, fn(x) { x > 10 })       # => false
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/enum.zap#L146)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/enum.zap#L126)
 
 ---
 
@@ -196,7 +173,7 @@ Returns true if the predicate returns true for all elements.
     Enum.all?([2, 4, 6], fn(x) { x > 0 })   # => true
     Enum.all?(1..3, fn(x) { x > 2 })        # => false
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/enum.zap#L159)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/enum.zap#L139)
 
 ---
 
@@ -212,7 +189,7 @@ Counts elements for which the predicate returns true.
 
     Enum.count([1, 2, 3, 4, 5], fn(x) { x > 2 })  # => 3
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/enum.zap#L171)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/enum.zap#L151)
 
 ---
 
@@ -229,7 +206,7 @@ Returns the sum of all elements.
     Enum.sum([1, 2, 3, 4])  # => 10
     Enum.sum([])             # => 0
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/enum.zap#L184)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/enum.zap#L164)
 
 ---
 
@@ -247,7 +224,7 @@ Returns 1 for an empty collection.
     Enum.product([2, 3, 4])  # => 24
     Enum.product([])         # => 1
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/enum.zap#L198)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/enum.zap#L178)
 
 ---
 
@@ -264,7 +241,7 @@ Returns 0 for an empty collection.
 
     Enum.max([3, 1, 4, 1, 5])  # => 5
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/enum.zap#L211)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/enum.zap#L191)
 
 ---
 
@@ -281,7 +258,7 @@ Returns 0 for an empty collection.
 
     Enum.min([3, 1, 4, 1, 5])  # => 1
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/enum.zap#L224)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/enum.zap#L204)
 
 ---
 
@@ -300,7 +277,7 @@ come before the second.
     Enum.sort([3, 1, 2], fn(a, b) { a < b })  # => [1, 2, 3]
     Enum.sort(1..3, fn(a, b) { a > b })       # => [3, 2, 1]
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/enum.zap#L239)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/enum.zap#L219)
 
 ---
 
@@ -318,7 +295,7 @@ into a single list.
     Enum.flat_map([1, 2, 3], fn(x) { [x, x * 10] })
     # => [1, 10, 2, 20, 3, 30]
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/enum.zap#L253)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/enum.zap#L233)
 
 ---
 
@@ -339,7 +316,7 @@ collection as a list.
     Enum.take(1..5, 3)             # => [1, 2, 3]
     Enum.take([1, 2, 3], 0)        # => []
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/enum.zap#L270)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/enum.zap#L250)
 
 ---
 
@@ -360,7 +337,7 @@ If `count` exceeds the collection length, returns an empty list.
     Enum.drop(1..5, 2)             # => [3, 4, 5]
     Enum.drop([1, 2, 3], 0)        # => [1, 2, 3]
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/enum.zap#L287)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/enum.zap#L267)
 
 ---
 
@@ -377,7 +354,7 @@ Reverses the order of elements in the enumerable collection.
     Enum.reverse([1, 2, 3])  # => [3, 2, 1]
     Enum.reverse(1..3)       # => [3, 2, 1]
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/enum.zap#L300)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/enum.zap#L280)
 
 ---
 
@@ -395,25 +372,7 @@ Returns true if the enumerable collection contains the given value.
     Enum.member?(1..3, 5)       # => false
     Enum.member?([], 1)         # => false
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/enum.zap#L314)
-
----
-
-### at/2
-
-```zap
-pub fn at(collection :: Enumerable, index :: i64) -> element
-```
-
-Returns the element at the given zero-based index.
-Returns 0 if the index is out of bounds.
-
-## Examples
-
-    Enum.at([10, 20, 30], 1)  # => 20
-    Enum.at(10..30:10, 0)     # => 10
-
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/enum.zap#L328)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/enum.zap#L294)
 
 ---
 
@@ -428,9 +387,10 @@ Returns `default` if the index is out of bounds.
 
 ## Examples
 
+    Enum.at([10, 20, 30], 1, 0)  # => 20
     Enum.at(["a"], 2, "none")  # => "none"
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/enum.zap#L341)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/enum.zap#L308)
 
 ---
 
@@ -447,7 +407,7 @@ Concatenates two enumerable collections into a single list.
     Enum.concat([1, 2], [3, 4])  # => [1, 2, 3, 4]
     Enum.concat(1..2, 3..4)      # => [1, 2, 3, 4]
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/enum.zap#L354)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/enum.zap#L321)
 
 ---
 
@@ -465,7 +425,7 @@ Preserves the order of first occurrences.
     Enum.uniq([1, 2, 2, 3, 1])  # => [1, 2, 3]
     Enum.uniq(1..3)             # => [1, 2, 3]
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/enum.zap#L368)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/enum.zap#L335)
 
 ---
 
@@ -482,7 +442,7 @@ Returns true if the enumerable collection has no elements.
     Enum.empty?([])    # => true
     Enum.empty?(1..3)  # => false
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/enum.zap#L381)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/enum.zap#L348)
 
 ---
 

@@ -83,123 +83,199 @@
 <li><a href="structs/Updatable.html">Updatable</a></li>
 </ul>
 </div>
-<div class="sidebar-group">
-<h4>Unions</h4>
-<ul>
-<li><a href="structs/IO.Mode.html">IO.Mode</a></li>
-</ul>
-</div>
 </nav>
 <main class="content">
 <div class="structdoc">
-<p align="center">
-  <br>
-  <br>
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/trycog/zap/main/.github/zap-dark.svg">
-    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/trycog/zap/main/.github/zap-light.svg">
-    <img alt="Zap" width="140">
-  </picture>
-  <br>
-  <br>
-</p>
-<h3 align="center">A functional language that compiles to native code.</h3>
-<p align="center">
-<p>Pattern matching &nbsp;&middot;&nbsp; Type safety &nbsp;&middot;&nbsp; Native binaries</p>
-</p>
-<hr>
-<p>Zap takes the developer experience of functional programming — pattern matching, pipe operators, algebraic types — and strips away the overhead. No VM, no garbage collector, no interpreter. Your code compiles directly to a native binary.</p>
-<blockquote><p><strong>Early stage.</strong> The core pipeline works and examples compile and run, but not everything described here is fully implemented yet.</p></blockquote>
-<hr>
-<h2>Quick Start</h2>
-<h3>Install from release</h3>
-<p>Download the latest release tarball for your platform. Extract it — the archive contains <code>bin/zap</code> and <code>lib/zig/</code> (the Zig standard library). Add <code>bin/</code> to your PATH. No separate Zig installation is required.</p>
-<h3>Build from source</h3>
-<p>Zap links against a fork of the Zig compiler (<code>libzap_compiler.a</code>) with LLVM enabled. Building from source requires:</p>
+<h1>Zap</h1>
+<p>Zap is an early-stage functional programming language that compiles to native
+code through Zig's ZIR pipeline. It is built around structs, pattern matching,
+macros written in Zap, protocols, algebraic data, and a small standard library.</p>
+<p>The compiler is still moving quickly. The codebase is usable for examples,
+stdlib development, documentation generation, and the current test suite, but
+the language is not stable yet.</p>
+<h2>Highlights</h2>
 <ul>
-<li><strong>Zig 0.16.0</strong> (install via <a href="https://asdf-vm.com/">asdf</a>, <a href="https://github.com/marler8/zigup">zigup</a>, or <a href="https://ziglang.org/download/">ziglang.org</a>)</li>
+<li>Native binaries with no VM and no interpreter.</li>
+<li>Struct-centered code organization with no separate namespace construct.</li>
+<li>Pattern-matched multi-clause functions with typed overload resolution.</li>
+<li>Protocols and impls for extensible dispatch.</li>
+<li>First-class functions and capturing anonymous functions.</li>
+<li>Compile-time macros written in Zap.</li>
+<li>Build manifests written in Zap and evaluated at compile time.</li>
+<li>Zest test framework with compile-time test discovery.</li>
+<li>Documentation generation from <code>@doc</code> attributes.</li>
+<li>Direct ZIR emission through the Zap Zig fork.</li>
 </ul>
-<pre><code class="language-sh">git clone https://github.com/DockYard/zap.git
+<h2>Quick Start</h2>
+<h3>Build From Source</h3>
+<p>Zap links against <code>libzap_compiler.a</code> from the Zap Zig fork. For the normal
+source build, first download the prebuilt dependency bundle for your platform:</p>
+<pre><code class="language-sh">git clone git@github.com:DockYard/zap.git
 cd zap
-zig build setup    # Downloads pre-built deps for your platform
-zig build          # Builds the zap binary</code></pre>
-<p>This produces the compiler binary at <code>zig-out/bin/zap</code>.</p>
-<p><code>zig build setup</code> automatically downloads the correct <code>zap-deps</code> tarball for your platform (macOS Apple Silicon, Linux arm64, or Linux x86_64) from the <a href="https://github.com/DockYard/zig/releases/tag/v0.16.0-zap.1">Zig fork releases</a>. You can also pass custom paths if you have your own build of the Zig fork:</p>
+zig build setup
+zig build</code></pre>
+<p>This builds the compiler at:</p>
+<pre><code class="language-sh">zig-out/bin/zap</code></pre>
+<p>If you already have a local build of the Zig fork, pass the dependency paths
+explicitly:</p>
 <pre><code class="language-sh">zig build \
-  -Dzap-compiler-lib=path/to/libzap_compiler.a \
-  -Dllvm-lib-path=path/to/llvm-libs</code></pre>
-<p>To build <code>libzap_compiler.a</code> and the LLVM libraries yourself from scratch, see <a href="#building-the-zig-fork">Building the Zig Fork</a> below.</p>
-<h3>Create a project</h3>
-<pre><code class="language-sh">mkdir my_app &amp;&amp; cd my_app
+  -Dzap-compiler-lib=/path/to/libzap_compiler.a \
+  -Dllvm-lib-path=/path/to/llvm-libs</code></pre>
+<h3>Create a Project</h3>
+<pre><code class="language-sh">mkdir my_app
+cd my_app
 zap init</code></pre>
-<p>This creates:</p>
-<pre><code class="language-zap">my_app<span class="hl-op">/</span>
-  build.zap       <span class="hl-comment"># Build manifest</span>
-  lib<span class="hl-op">/</span>my_app.zap  <span class="hl-comment"># Main source file</span>
-  <span class="hl-keyword">test</span><span class="hl-op">/</span>my_app_test.zap</code></pre>
-<h3>Build and run</h3>
-<pre><code class="language-sh">zap build           # Compile (uses default target)
-zap run             # Compile and run
-zap run test        # Compile and run test target</code></pre>
-<p>You can also specify a target explicitly: <code>zap build my_app</code>. The binary is output to <code>zap-out/bin/my_app</code>.</p>
-<hr>
-<h2>The Language</h2>
-<h3>Structs and Files</h3>
-<p>Every <code>.zap</code> file contains exactly one struct. The struct name maps to the file path:</p>
+<p><code>zap init</code> creates a minimal project:</p>
+<pre><code class="language-text">my_app/
+  README.md
+  build.zap
+  lib/my_app.zap
+  test/my_app_test.zap</code></pre>
+<h3>Build, Run, Test, Document</h3>
+<pre><code class="language-sh">zap build
+zap run
+zap test
+zap doc</code></pre>
+<p>Targets default to <code>:default</code> for <code>build</code> and <code>run</code>, and to <code>:test</code> for
+<code>test</code>. You can name a target explicitly:</p>
+<pre><code class="language-sh">zap build my_app
+zap run my_app -- arg1 arg2
+zap test --seed 12345
+zap doc --no-deps</code></pre>
+<h2>CLI Reference</h2>
+<pre><code class="language-text">zap init                       Scaffold a new project in the current directory
+zap build [target]             Build a target from build.zap
+zap run [target] [-- args]     Build and run a bin target
+zap test [options]             Build and run the :test target
+zap doc [target] [options]     Generate documentation from a doc target
+zap deps update                Re-resolve all dependencies
+zap deps update &lt;name&gt;         Re-resolve one dependency</code></pre>
+<p>Common options:</p>
+<pre><code class="language-text">-Dkey=value                    Pass a build option to build.zap
+--build-file &lt;path&gt;            Use a build file other than build.zap
+--watch, -w                    Rebuild on changes
+--target &lt;triple&gt;              Cross-compile for a Zig target triple
+--seed &lt;integer&gt;               Use deterministic test ordering
+-- &lt;args...&gt;                   Pass runtime args to zap run</code></pre>
+<h2>Build Manifest</h2>
+<p>Every project is driven by <code>build.zap</code>. The manifest is ordinary Zap code:</p>
+<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> MyApp.Builder {
+  <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> manifest(env <span class="hl-op">::</span> Zap.Env) <span class="hl-op">-&gt;</span> Zap.Manifest {
+    <span class="hl-keyword">case</span> env.target {
+      <span class="hl-atom">:my_app</span> <span class="hl-op">-&gt;</span> my_app(env)
+      <span class="hl-atom">:test</span> <span class="hl-op">-&gt;</span> <span class="hl-keyword">test</span>(env)
+      <span class="hl-atom">:doc</span> <span class="hl-op">-&gt;</span> docs(env)
+      _default <span class="hl-op">-&gt;</span> my_app(env)
+    }
+  }
+
+  <span class="hl-keyword">fn</span> my_app(_env <span class="hl-op">::</span> Zap.Env) <span class="hl-op">-&gt;</span> Zap.Manifest {
+    %Zap.Manifest{
+      name: <span class="hl-string">"my_app"</span>,
+      version: <span class="hl-string">"0.1.0"</span>,
+      kind: <span class="hl-atom">:bin</span>,
+      root: <span class="hl-string">"MyApp.main/1"</span>,
+      paths: [<span class="hl-string">"lib/**/*.zap"</span>],
+      optimize: <span class="hl-atom">:release_safe</span>
+    }
+  }
+
+  <span class="hl-keyword">fn</span> <span class="hl-keyword">test</span>(_env <span class="hl-op">::</span> Zap.Env) <span class="hl-op">-&gt;</span> Zap.Manifest {
+    %Zap.Manifest{
+      name: <span class="hl-string">"my_app_test"</span>,
+      version: <span class="hl-string">"0.1.0"</span>,
+      kind: <span class="hl-atom">:bin</span>,
+      root: <span class="hl-string">"TestRunner.main/1"</span>,
+      paths: [<span class="hl-string">"lib/**/*.zap"</span>, <span class="hl-string">"test/**/*.zap"</span>],
+      optimize: <span class="hl-atom">:debug</span>
+    }
+  }
+
+  <span class="hl-keyword">fn</span> docs(_env <span class="hl-op">::</span> Zap.Env) <span class="hl-op">-&gt;</span> Zap.Manifest {
+    %Zap.Manifest{
+      name: <span class="hl-string">"my_app"</span>,
+      version: <span class="hl-string">"0.1.0"</span>,
+      kind: <span class="hl-atom">:doc</span>,
+      paths: [<span class="hl-string">"lib/**/*.zap"</span>],
+      source_url: <span class="hl-string">"https://github.com/example/my_app"</span>,
+      landing_page: <span class="hl-string">"README.md"</span>
+    }
+  }
+}</code></pre>
+<p>Manifest fields:</p>
 <table class="markdown-table">
 <thead>
-<tr><th>Struct name</th><th>File path</th></tr>
+<tr><th>Field</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>App</code></td><td><code>lib/app.zap</code></td></tr>
-<tr><td><code>Config.Parser</code></td><td><code>lib/config/parser.zap</code></td></tr>
-<tr><td><code>JsonParser</code></td><td><code>lib/json_parser.zap</code></td></tr>
+<tr><td><code>name</code></td><td>Output artifact name</td></tr>
+<tr><td><code>version</code></td><td>Project version string</td></tr>
+<tr><td><code>kind</code></td><td><code>:bin</code>, <code>:lib</code>, <code>:obj</code>, or <code>:doc</code></td></tr>
+<tr><td><code>root</code></td><td>Entry point, formatted as <code>&quot;Struct.function/arity&quot;</code></td></tr>
+<tr><td><code>paths</code></td><td>Source glob patterns, relative to the project root</td></tr>
+<tr><td><code>deps</code></td><td>Dependency declarations</td></tr>
+<tr><td><code>optimize</code></td><td><code>:debug</code>, <code>:release_safe</code>, <code>:release_fast</code>, or <code>:release_small</code></td></tr>
+<tr><td><code>test_timeout</code></td><td>Test timeout in milliseconds</td></tr>
+<tr><td><code>source_url</code></td><td>Base source URL for generated documentation</td></tr>
+<tr><td><code>landing_page</code></td><td>Markdown landing page for generated documentation</td></tr>
+<tr><td><code>doc_groups</code></td><td>Extra documentation page groups</td></tr>
 </tbody>
 </table>
-<p>The compiler enforces this — a mismatch is a compile error. The compiler discovers files by following struct references from the entry point. No glob patterns or file manifests needed.</p>
-<pre><code class="language-zap"><span class="hl-comment"># lib/math.zap</span>
-<span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> Math {
-  <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> square(x <span class="hl-op">::</span> <span class="hl-type">i64</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">i64</span> {
-    x <span class="hl-op">*</span> x
-  }
-
-  <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> double(x <span class="hl-op">::</span> <span class="hl-type">i64</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">i64</span> {
-    x <span class="hl-op">*</span> <span class="hl-number">2</span>
-  }
+<p>If <code>paths</code> is present, those globs define the source graph input. If <code>paths</code> is
+omitted for a binary target, Zap can discover sources from the <code>root</code> entry
+point and struct references.</p>
+<h3>Dependencies</h3>
+<p>Dependencies can point at local paths or Git repositories:</p>
+<pre><code class="language-zap">%Zap.Manifest{
+  name: <span class="hl-string">"my_app"</span>,
+  version: <span class="hl-string">"0.1.0"</span>,
+  kind: <span class="hl-atom">:bin</span>,
+  root: <span class="hl-string">"MyApp.main/1"</span>,
+  deps: [
+    {<span class="hl-atom">:shared_utils</span>, {<span class="hl-atom">:path</span>, <span class="hl-string">"../shared_utils"</span>}},
+    {<span class="hl-atom">:parser</span>, {<span class="hl-atom">:git</span>, <span class="hl-string">"https://github.com/example/parser.git"</span>, tag: <span class="hl-string">"v1.0.0"</span>}}
+  ]
 }</code></pre>
-<h3>Visibility</h3>
-<ul>
-<li><code>pub fn</code> / <code>pub macro</code> — public function/macro</li>
-<li><code>fn</code> / <code>macro</code> — private to the struct (file)</li>
-<li><code>pub struct</code> — public struct</li>
-<li><code>struct</code> — private struct (visible within the dep, invisible outside)</li>
-</ul>
-<h3>Entry Point</h3>
-<p>Every program needs a <code>main</code> function inside a struct. The <code>build.zap</code> manifest specifies the entry point:</p>
+<p>Zap writes <code>zap.lock</code> to record resolved dependency state. Use:</p>
+<pre><code class="language-sh">zap deps update
+zap deps update parser</code></pre>
+<h2>Language</h2>
+<h3>Structs, Protocols, Unions, and Files</h3>
+<p>Zap code is organized around top-level declarations:</p>
+<pre><code class="language-zap">@doc <span class="hl-op">=</span> <span class="hl-string">"A two-dimensional point."</span>
+<span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> Point {
+  x <span class="hl-op">::</span> <span class="hl-type">i64</span>
+  y <span class="hl-op">::</span> <span class="hl-type">i64</span>
+}
+
+@doc <span class="hl-op">=</span> <span class="hl-string">"Possible directions."</span>
+<span class="hl-keyword">pub</span> <span class="hl-keyword">union</span> Direction {
+  North,
+  South,
+  East,
+  West
+}
+
+@doc <span class="hl-op">=</span> <span class="hl-string">"Values that can be converted to a string."</span>
+<span class="hl-keyword">pub</span> protocol Stringable {
+  <span class="hl-keyword">fn</span> to_string(value) <span class="hl-op">-&gt;</span> <span class="hl-type">String</span>
+}</code></pre>
+<p>A file may contain more than one top-level declaration. Public declarations are
+visible outside their dependency; private declarations are local to the
+dependency.</p>
+<p>Use <code>@doc</code> immediately before the declaration it documents. Documentation is
+generated from those attributes for structs, protocols, unions, impls,
+functions, and macros.</p>
+<h3>Entry Points</h3>
+<p>Binary targets name a root function in the manifest:</p>
 <pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> MyApp {
   <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> main(_args <span class="hl-op">::</span> [<span class="hl-type">String</span>]) {
-    IO.puts(<span class="hl-string">"Hello!"</span>)
+    IO.puts(<span class="hl-string">"Hello from Zap"</span>)
   }
 }</code></pre>
-<h3>Pipe Operator</h3>
-<p>Chain function calls, passing the result of each step as the first argument to the next:</p>
-<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> Pipes {
-  <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> double(x <span class="hl-op">::</span> <span class="hl-type">i64</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">i64</span> {
-    x <span class="hl-op">*</span> <span class="hl-number">2</span>
-  }
-
-  <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> add_one(x <span class="hl-op">::</span> <span class="hl-type">i64</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">i64</span> {
-    x <span class="hl-op">+</span> <span class="hl-number">1</span>
-  }
-
-  <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> main() {
-    <span class="hl-number">5</span>
-    <span class="hl-op">|&gt;</span> Pipes.double()
-    <span class="hl-op">|&gt;</span> Pipes.add_one()
-  }
-}</code></pre>
-<h3>Pattern Matching</h3>
-<p>Multiple function clauses with the same name form an overload group. The compiler resolves which clause to call based on argument values and types.</p>
+<h3>Functions and Pattern Matching</h3>
+<p>Functions can have multiple clauses. Dispatch prefers exact typed matches
+before considering numeric widening:</p>
 <pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> Factorial {
   <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> factorial(<span class="hl-number">0</span> <span class="hl-op">::</span> <span class="hl-type">i64</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">i64</span> {
     <span class="hl-number">1</span>
@@ -209,217 +285,27 @@ zap run test        # Compile and run test target</code></pre>
     n <span class="hl-op">*</span> factorial(n - <span class="hl-number">1</span>)
   }
 }</code></pre>
-<h3>Guards</h3>
-<p>Function clauses can carry guard conditions that participate in dispatch:</p>
-<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> Guards {
-  <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> classify(n <span class="hl-op">::</span> <span class="hl-type">i64</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">String</span> <span class="hl-keyword">if</span> n <span class="hl-op">&gt;</span> <span class="hl-number">0</span> {
-    <span class="hl-string">"positive"</span>
-  }
-
-  <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> classify(n <span class="hl-op">::</span> <span class="hl-type">i64</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">String</span> <span class="hl-keyword">if</span> n <span class="hl-op">&lt;</span> <span class="hl-number">0</span> {
-    <span class="hl-string">"negative"</span>
-  }
-
-  <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> classify(_ <span class="hl-op">::</span> <span class="hl-type">i64</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">String</span> {
-    <span class="hl-string">"zero"</span>
-  }
-}</code></pre>
-<h3>Case Expressions</h3>
-<p>Pattern matching inside function bodies:</p>
-<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> CaseExpr {
-  <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> check(result) <span class="hl-op">-&gt;</span> <span class="hl-type">String</span> {
-    <span class="hl-keyword">case</span> result {
-      {<span class="hl-atom">:ok</span>, v} <span class="hl-op">-&gt;</span>
-        v
-      {<span class="hl-atom">:error</span>, e} <span class="hl-op">-&gt;</span>
-        e
-      _ <span class="hl-op">-&gt;</span>
-        <span class="hl-string">"unknown"</span>
-    }
-  }
-}</code></pre>
-<h3>If / Else</h3>
-<p>If/else is an expression — it produces a value:</p>
-<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> Math {
-  <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> abs(x <span class="hl-op">::</span> <span class="hl-type">i64</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">i64</span> {
-    <span class="hl-keyword">if</span> x <span class="hl-op">&lt;</span> <span class="hl-number">0</span> {
-      -x
-    } <span class="hl-keyword">else</span> {
-      x
-    }
-  }
-}</code></pre>
-<h3>Strings</h3>
-<p>String interpolation with <code>#{}</code>, escape sequences, and concatenation with <code>&lt;&gt;</code>:</p>
-<pre><code class="language-zap">name <span class="hl-op">=</span> <span class="hl-string">"World"</span>
-IO.puts(<span class="hl-string">"Hello, #{name}!"</span>)           <span class="hl-comment"># Hello, World!</span>
-IO.puts(<span class="hl-string">"count: #{42}"</span>)              <span class="hl-comment"># count: 42 (auto to_string)</span>
-IO.puts(<span class="hl-string">"line1\nline2"</span>)              <span class="hl-comment"># escape sequences: \n \t \\ \&quot;</span>
-IO.puts(<span class="hl-string">"hello"</span> <span class="hl-op">&lt;&gt;</span> <span class="hl-string">" "</span> <span class="hl-op">&lt;&gt;</span> <span class="hl-string">"world"</span>)  <span class="hl-comment"># concatenation</span></code></pre>
-<h3>Maps</h3>
-<p>Create maps with <code>%{}</code> and update with <code>%{map | key: value}</code>:</p>
-<pre><code class="language-zap">m <span class="hl-op">=</span> %{name: <span class="hl-string">"Alice"</span>, age: <span class="hl-number">30</span>}
-m2 <span class="hl-op">=</span> %{m <span class="hl-op">|</span> name: <span class="hl-string">"Bob"</span>}        <span class="hl-comment"># update — creates modified copy</span></code></pre>
-<p>Map pattern matching in functions:</p>
-<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> greet(%{name: n, greeting: g} <span class="hl-op">::</span> %{<span class="hl-type">Atom</span> <span class="hl-op">-&gt;</span> <span class="hl-type">String</span>}) <span class="hl-op">-&gt;</span> <span class="hl-type">String</span> {
-  g <span class="hl-op">&lt;&gt;</span> <span class="hl-string">", "</span> <span class="hl-op">&lt;&gt;</span> n <span class="hl-op">&lt;&gt;</span> <span class="hl-string">"!"</span>
-}</code></pre>
-<h3>Keyword Lists</h3>
-<p>Shorthand for lists of <code>{atom, value}</code> tuples:</p>
-<pre><code class="language-zap">opts <span class="hl-op">=</span> [name: <span class="hl-string">"Brian"</span>, age: <span class="hl-number">42</span>]
-<span class="hl-comment"># equivalent to: [{:name, &quot;Brian&quot;}, {:age, 42}]</span>
-
-<span class="hl-keyword">case</span> opts {
-  [name: n, age: a] <span class="hl-op">-&gt;</span> IO.puts(<span class="hl-string">"#{n} is #{a}"</span>)
-}</code></pre>
-<h3>Lists</h3>
-<p>Lists support pattern matching with cons (<code>[h | t]</code>), recursive processing, and for comprehensions:</p>
-<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> sum([] <span class="hl-op">::</span> [<span class="hl-type">i64</span>]) <span class="hl-op">-&gt;</span> <span class="hl-type">i64</span> { <span class="hl-number">0</span> }
-<span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> sum([h <span class="hl-op">|</span> t] <span class="hl-op">::</span> [<span class="hl-type">i64</span>]) <span class="hl-op">-&gt;</span> <span class="hl-type">i64</span> { h <span class="hl-op">+</span> sum(t) }
-
-sum([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>])  <span class="hl-comment"># 6</span></code></pre>
-<h3>Binary Pattern Matching</h3>
-<p>Match and extract data from binary/string data using <code>&lt;&lt;&gt;&gt;</code> patterns:</p>
-<pre><code class="language-zap"><span class="hl-keyword">fn</span> first_byte(data <span class="hl-op">::</span> <span class="hl-type">String</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">i64</span> {
-  <span class="hl-keyword">case</span> data {
-    <span class="hl-op">&lt;</span><span class="hl-op">&lt;</span>a, _<span class="hl-op">&gt;</span><span class="hl-op">&gt;</span> <span class="hl-op">-&gt;</span> a
-    _ <span class="hl-op">-&gt;</span> <span class="hl-number">0</span>
-  }
+<p>Guards participate in clause dispatch:</p>
+<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> classify(n <span class="hl-op">::</span> <span class="hl-type">i64</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">String</span> <span class="hl-keyword">if</span> n <span class="hl-op">&gt;</span> <span class="hl-number">0</span> {
+  <span class="hl-string">"positive"</span>
 }
 
-<span class="hl-keyword">fn</span> after_prefix(data <span class="hl-op">::</span> <span class="hl-type">String</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">String</span> {
-  <span class="hl-keyword">case</span> data {
-    <span class="hl-op">&lt;</span><span class="hl-op">&lt;</span><span class="hl-string">"GET "</span><span class="hl-op">::</span><span class="hl-type">String</span>, path<span class="hl-op">::</span><span class="hl-type">String</span><span class="hl-op">&gt;</span><span class="hl-op">&gt;</span> <span class="hl-op">-&gt;</span> path
-    _ <span class="hl-op">-&gt;</span> <span class="hl-string">"no match"</span>
-  }
-}</code></pre>
-<h3>For Comprehensions</h3>
-<p>Transform and filter lists:</p>
-<pre><code class="language-zap">doubled <span class="hl-op">=</span> <span class="hl-keyword">for</span> x <span class="hl-op">&lt;-</span> [<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>] {
-  x <span class="hl-op">*</span> <span class="hl-number">2</span>
-}
-<span class="hl-comment"># [2, 4, 6]</span>
-
-evens <span class="hl-op">=</span> <span class="hl-keyword">for</span> x <span class="hl-op">&lt;-</span> [<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>, <span class="hl-number">4</span>, <span class="hl-number">5</span>, <span class="hl-number">6</span>], x rem <span class="hl-number">2</span> <span class="hl-op">==</span> <span class="hl-number">0</span> {
-  x
-}
-<span class="hl-comment"># [2, 4, 6]</span></code></pre>
-<h3>Catch Basin (<code>~&gt;</code>)</h3>
-<p>Catch unmatched values in pipe chains. When a multi-clause function doesn't match, the handler runs and remaining pipe steps are skipped:</p>
-<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> process(input <span class="hl-op">::</span> <span class="hl-type">String</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">String</span> {
-  input
-  <span class="hl-op">|&gt;</span> parse_number()
-  <span class="hl-op">|&gt;</span> format_result()
-  <span class="hl-op">~&gt;</span> {
-    _ <span class="hl-op">-&gt;</span> <span class="hl-string">"Error: unrecognized"</span>
-  }
-}</code></pre>
-<h3>Use</h3>
-<p><code>use Struct</code> imports a struct and calls its <code>__using__/1</code> callback if defined. This enables library DSLs:</p>
-<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> Greeter {
-  <span class="hl-keyword">pub</span> <span class="hl-keyword">macro</span> __using__(_opts <span class="hl-op">::</span> <span class="hl-type">Expr</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">Expr</span> {
-    <span class="hl-keyword">quote</span> {
-      <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> hello() <span class="hl-op">-&gt;</span> <span class="hl-type">String</span> {
-        <span class="hl-string">"Hello from Greeter!"</span>
-      }
-    }
-  }
+<span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> classify(n <span class="hl-op">::</span> <span class="hl-type">i64</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">String</span> <span class="hl-keyword">if</span> n <span class="hl-op">&lt;</span> <span class="hl-number">0</span> {
+  <span class="hl-string">"negative"</span>
 }
 
-<span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> MyApp {
-  <span class="hl-keyword">use</span> Greeter     <span class="hl-comment"># imports + injects hello/0 via __using__</span>
-
-  <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> main() {
-    IO.puts(hello())
+<span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> classify(_ <span class="hl-op">::</span> <span class="hl-type">i64</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">String</span> {
+  <span class="hl-string">"zero"</span>
+}</code></pre>
+<p>Case expressions match inside function bodies:</p>
+<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> unwrap(result <span class="hl-op">::</span> {<span class="hl-type">Atom</span>, <span class="hl-type">String</span>}) <span class="hl-op">-&gt;</span> <span class="hl-type">String</span> {
+  <span class="hl-keyword">case</span> result {
+    {<span class="hl-atom">:ok</span>, value} <span class="hl-op">-&gt;</span> value
+    {<span class="hl-atom">:error</span>, reason} <span class="hl-op">-&gt;</span> reason
   }
 }</code></pre>
-<h3>Testing with Zest</h3>
-<p>Zest is Zap's built-in test framework. Use <code>Zest.Case</code> for assertions and describe/test DSL:</p>
-<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> Test.MathTest {
-  <span class="hl-keyword">use</span> Zest.Case
-
-  <span class="hl-keyword">describe</span>(<span class="hl-string">"math"</span>) {
-    <span class="hl-keyword">test</span>(<span class="hl-string">"addition"</span>) {
-      <span class="hl-keyword">assert</span>(<span class="hl-number">1</span> <span class="hl-op">+</span> <span class="hl-number">1</span> <span class="hl-op">==</span> <span class="hl-number">2</span>)
-    }
-
-    <span class="hl-keyword">test</span>(<span class="hl-string">"negative check"</span>) {
-      <span class="hl-keyword">reject</span>(<span class="hl-number">5</span> <span class="hl-op">&lt;</span> <span class="hl-number">0</span>)
-    }
-  }
-}</code></pre>
-<p>Test output shows green dots for passing tests and red F for failures, with a summary:</p>
-<pre><code class="language-zap">.....................................
-
-<span class="hl-number">37</span> tests, <span class="hl-number">0</span> failures
-<span class="hl-number">43</span> assertions, <span class="hl-number">0</span> failures</code></pre>
-<p>Failed assertions don't kill the process — the test records the failure and continues to the next test.</p>
-<h3>Tail Call Optimization</h3>
-<p>Recursive functions in tail position are guaranteed to use constant stack space via LLVM's <code>musttail</code>:</p>
-<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> countdown(<span class="hl-number">0</span> <span class="hl-op">::</span> <span class="hl-type">i64</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">i64</span> { <span class="hl-number">0</span> }
-<span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> countdown(n <span class="hl-op">::</span> <span class="hl-type">i64</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">i64</span> { countdown(n - <span class="hl-number">1</span>) }
-
-countdown(<span class="hl-number">100_000_000</span>)  <span class="hl-comment"># runs in constant stack space</span></code></pre>
-<hr>
-<h2>Build Manifest</h2>
-<p>Every Zap project has a <code>build.zap</code> that defines build targets:</p>
-<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> MyApp.Builder {
-  <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> manifest(env <span class="hl-op">::</span> Zap.Env) <span class="hl-op">-&gt;</span> Zap.Manifest {
-    <span class="hl-keyword">case</span> env.target {
-      <span class="hl-atom">:my_app</span> <span class="hl-op">-&gt;</span>
-        %Zap.Manifest{
-          name: <span class="hl-string">"my_app"</span>,
-          version: <span class="hl-string">"0.1.0"</span>,
-          kind: <span class="hl-atom">:bin</span>,
-          root: <span class="hl-string">"MyApp.main/0"</span>
-        }
-      _ <span class="hl-op">-&gt;</span>
-        <span class="hl-keyword">panic</span>(<span class="hl-string">"Unknown target"</span>)
-    }
-  }
-}</code></pre>
-<p>When <code>root</code> is specified and <code>paths</code> is omitted, the compiler uses import-driven discovery — it starts from the entry struct and follows struct references to find all source files automatically.</p>
-<table class="markdown-table">
-<thead>
-<tr><th>Field</th><th>Description</th></tr>
-</thead>
-<tbody>
-<tr><td><code>name</code></td><td>Output binary name</td></tr>
-<tr><td><code>version</code></td><td>Project version</td></tr>
-<tr><td><code>kind</code></td><td><code>:bin</code>, <code>:lib</code>, or <code>:obj</code></td></tr>
-<tr><td><code>root</code></td><td>Entry point as <code>&quot;Struct.function/arity&quot;</code></td></tr>
-<tr><td><code>deps</code></td><td>List of dependency tuples</td></tr>
-<tr><td><code>optimize</code></td><td><code>:debug</code>, <code>:release_safe</code>, <code>:release_fast</code>, or <code>:release_small</code></td></tr>
-</tbody>
-</table>
-<h3>Dependencies</h3>
-<p>Dependencies are declared in the manifest as tuples:</p>
-<pre><code class="language-zap">%Zap.Manifest{
-  name: <span class="hl-string">"my_app"</span>,
-  version: <span class="hl-string">"0.1.0"</span>,
-  kind: <span class="hl-atom">:bin</span>,
-  root: <span class="hl-string">"App.main/0"</span>,
-  deps: [
-    {<span class="hl-atom">:shared_utils</span>, {<span class="hl-atom">:path</span>, <span class="hl-string">"../shared_utils"</span>}},
-    {<span class="hl-atom">:json_parser</span>, {<span class="hl-atom">:git</span>, <span class="hl-string">"https://github.com/someone/json_parser.zap"</span>, <span class="hl-string">"v1.0.0"</span>}}
-  ]
-}</code></pre>
-<table class="markdown-table">
-<thead>
-<tr><th>Source type</th><th>Format</th><th>Description</th></tr>
-</thead>
-<tbody>
-<tr><td>Path</td><td><code>{:name, {:path, &quot;dir&quot;}}</code></td><td>Local Zap library</td></tr>
-<tr><td>Git</td><td><code>{:name, {:git, &quot;url&quot;, &quot;ref&quot;}}</code></td><td>Remote Zap library</td></tr>
-</tbody>
-</table>
-<p>Zap dependencies are first-class — their structs are available directly (<code>JsonParser.parse(data)</code>). The compiler discovers dep structs the same way it discovers project structs.</p>
-<p>A <code>zap.lock</code> lockfile is generated automatically on first build and records resolved versions for reproducible builds.</p>
-<pre><code class="language-sh">zap deps update         # Re-resolve all dependencies
-zap deps update &lt;name&gt;  # Re-resolve a single dependency</code></pre>
-<hr>
-<h2>Type System</h2>
-<p>Types are declared at function boundaries. When resolving a call, Zap first prefers an exact typed clause. If no exact clause matches, narrower numeric types may widen within the same family (e.g., <code>i8</code> to <code>i128</code>), but no lossy or cross-family conversions are implicit.</p>
+<h3>Types</h3>
+<p>Zap supports typed function parameters, typed locals, and typed patterns.</p>
 <table class="markdown-table">
 <thead>
 <tr><th>Category</th><th>Types</th></tr>
@@ -428,334 +314,246 @@ zap deps update &lt;name&gt;  # Re-resolve a single dependency</code></pre>
 <tr><td>Signed integers</td><td><code>i8</code> <code>i16</code> <code>i32</code> <code>i64</code> <code>i128</code></td></tr>
 <tr><td>Unsigned integers</td><td><code>u8</code> <code>u16</code> <code>u32</code> <code>u64</code> <code>u128</code></td></tr>
 <tr><td>Floats</td><td><code>f16</code> <code>f32</code> <code>f64</code> <code>f80</code> <code>f128</code></td></tr>
-<tr><td>Platform-sized</td><td><code>usize</code> <code>isize</code></td></tr>
+<tr><td>Platform-sized integers</td><td><code>usize</code> <code>isize</code></td></tr>
 <tr><td>Primitives</td><td><code>Bool</code> <code>String</code> <code>Atom</code> <code>Nil</code></td></tr>
 <tr><td>Bottom</td><td><code>Never</code></td></tr>
-<tr><td>Compound</td><td>tuples, lists, maps, structs, unions</td></tr>
+<tr><td>Compound</td><td>tuples, lists, maps, ranges, structs, unions</td></tr>
 </tbody>
 </table>
-<h3>Structs</h3>
-<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> User {
-  name <span class="hl-op">::</span> <span class="hl-type">String</span>,
-  email <span class="hl-op">::</span> <span class="hl-type">String</span>,
-  age <span class="hl-op">::</span> <span class="hl-type">i64</span>,
+<p>Integer literals default to <code>i64</code>. Float literals default to <code>f64</code>.</p>
+<p>Numeric overload resolution is exact-first. If no exact clause exists, Zap may
+widen within the same numeric family:</p>
+<pre><code class="language-text">i8 -&gt; i16 -&gt; i32 -&gt; i64 -&gt; i128
+u8 -&gt; u16 -&gt; u32 -&gt; u64 -&gt; u128
+f16 -&gt; f32 -&gt; f64 -&gt; f80 -&gt; f128</code></pre>
+<p>Signed integers do not implicitly widen to unsigned integers. Unsigned integers
+do not implicitly widen to signed integers. Integer-to-float conversion is not
+implicit.</p>
+<h3>Collections</h3>
+<p>Lists:</p>
+<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> sum([] <span class="hl-op">::</span> [<span class="hl-type">i64</span>]) <span class="hl-op">-&gt;</span> <span class="hl-type">i64</span> {
+  <span class="hl-number">0</span>
 }
 
-<span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> Circle <span class="hl-keyword">extends</span> Shape {
-  radius <span class="hl-op">::</span> <span class="hl-type">f64</span>,
+<span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> sum([head <span class="hl-op">|</span> tail] <span class="hl-op">::</span> [<span class="hl-type">i64</span>]) <span class="hl-op">-&gt;</span> <span class="hl-type">i64</span> {
+  head <span class="hl-op">+</span> sum(tail)
 }</code></pre>
-<h3>Unions</h3>
-<p>Tagged unions represent values that can be one of several variants:</p>
-<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">union</span> Direction {
-  North,
-  South,
-  East,
-  West,
+<p>Maps:</p>
+<pre><code class="language-zap">user <span class="hl-op">=</span> %{name: <span class="hl-string">"Alice"</span>, age: <span class="hl-number">30</span>}
+updated <span class="hl-op">=</span> %{user <span class="hl-op">|</span> name: <span class="hl-string">"Bob"</span>}</code></pre>
+<p>Ranges:</p>
+<pre><code class="language-zap"><span class="hl-number">1..10</span>
+<span class="hl-number">1..10</span>:<span class="hl-number">2</span>
+<span class="hl-number">10..1</span></code></pre>
+<p>Ranges are direction-aware. <code>10..1</code> iterates downward.</p>
+<p>Keyword lists are syntax for lists of atom-keyed tuples:</p>
+<pre><code class="language-zap">opts <span class="hl-op">=</span> [name: <span class="hl-string">"Brian"</span>, age: <span class="hl-number">42</span>]
+<span class="hl-comment"># equivalent to: [{:name, &quot;Brian&quot;}, {:age, 42}]</span></code></pre>
+<h3>Protocols</h3>
+<p>Protocols provide compile-time dispatch across different data types:</p>
+<pre><code class="language-zap"><span class="hl-keyword">pub</span> protocol Enumerable(element) {
+  <span class="hl-keyword">fn</span> next(state) <span class="hl-op">-&gt;</span> {<span class="hl-type">Atom</span>, element, any}
+}
+
+<span class="hl-keyword">pub</span> impl Enumerable(<span class="hl-type">i64</span>) <span class="hl-keyword">for</span> Range {
+  <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> next(range <span class="hl-op">::</span> Range) <span class="hl-op">-&gt;</span> {<span class="hl-type">Atom</span>, <span class="hl-type">i64</span>, Range} {
+    <span class="hl-atom">:zig</span>.Range.next(range)
+  }
 }</code></pre>
-<hr>
+<p>Protocol names are matched exactly as declared. <code>Enumerable</code> and <code>enumerable</code>
+are different names; using the wrong casing is a compile error.</p>
+<p>The standard library uses protocols for <code>Enumerable</code>, <code>Stringable</code>,
+<code>Arithmetic</code>, <code>Comparator</code>, <code>Concatenable</code>, <code>Membership</code>, and <code>Updatable</code>.</p>
+<h3>Functions as Values</h3>
+<p>Named functions and anonymous functions can be passed as values. Anonymous
+functions may capture local variables:</p>
+<pre><code class="language-zap">multiplier <span class="hl-op">=</span> <span class="hl-number">3</span>
+Enum.map([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>], <span class="hl-keyword">fn</span>(value <span class="hl-op">::</span> <span class="hl-type">i64</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">i64</span> {
+  value <span class="hl-op">*</span> multiplier
+})</code></pre>
+<p>Function type annotations use arrow syntax:</p>
+<pre><code class="language-zap">callback <span class="hl-op">::</span> (<span class="hl-type">i64</span> <span class="hl-op">-&gt;</span> <span class="hl-type">i64</span>)
+reducer <span class="hl-op">::</span> (<span class="hl-type">i64</span>, <span class="hl-type">i64</span> <span class="hl-op">-&gt;</span> <span class="hl-type">i64</span>)</code></pre>
+<h3>Pipes and Catch Basin</h3>
+<p>The pipe operator passes the left side as the first argument to the next call:</p>
+<pre><code class="language-zap"><span class="hl-number">5</span>
+<span class="hl-op">|&gt;</span> Integer.to_string()
+<span class="hl-op">|&gt;</span> <span class="hl-type">String</span>.reverse()</code></pre>
+<p>The catch basin operator handles unmatched pipe values and skips the remaining
+pipe steps:</p>
+<pre><code class="language-zap">input
+<span class="hl-op">|&gt;</span> parse_number()
+<span class="hl-op">|&gt;</span> format_number()
+<span class="hl-op">~&gt;</span> {
+  _ <span class="hl-op">-&gt;</span> <span class="hl-string">"unrecognized"</span>
+}</code></pre>
+<h3>For Comprehensions</h3>
+<p>For comprehensions work with values that implement <code>Enumerable</code>:</p>
+<pre><code class="language-zap">doubled <span class="hl-op">=</span> <span class="hl-keyword">for</span> value <span class="hl-op">&lt;-</span> [<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>] {
+  value <span class="hl-op">*</span> <span class="hl-number">2</span>
+}
+
+evens <span class="hl-op">=</span> <span class="hl-keyword">for</span> value <span class="hl-op">&lt;-</span> <span class="hl-number">1..10</span>, Integer.remainder(value, <span class="hl-number">2</span>) <span class="hl-op">==</span> <span class="hl-number">0</span> {
+  value
+}</code></pre>
+<h3>Binary Pattern Matching</h3>
+<p>Binary patterns match and extract bytes and strings:</p>
+<pre><code class="language-zap"><span class="hl-keyword">fn</span> after_get(data <span class="hl-op">::</span> <span class="hl-type">String</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">String</span> {
+  <span class="hl-keyword">case</span> data {
+    <span class="hl-op">&lt;</span><span class="hl-op">&lt;</span><span class="hl-string">"GET "</span><span class="hl-op">::</span><span class="hl-type">String</span>, path<span class="hl-op">::</span><span class="hl-type">String</span><span class="hl-op">&gt;</span><span class="hl-op">&gt;</span> <span class="hl-op">-&gt;</span> path
+    _ <span class="hl-op">-&gt;</span> <span class="hl-string">""</span>
+  }
+}</code></pre>
+<h3>Macros</h3>
+<p>Macros are Zap code. They return quoted Zap AST:</p>
+<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> Unless {
+  <span class="hl-keyword">pub</span> <span class="hl-keyword">macro</span> <span class="hl-keyword">unless</span>(condition <span class="hl-op">::</span> <span class="hl-type">Expr</span>, body <span class="hl-op">::</span> <span class="hl-type">Expr</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">Expr</span> {
+    <span class="hl-keyword">quote</span> {
+      <span class="hl-keyword">if</span> <span class="hl-keyword">not</span> <span class="hl-keyword">unquote</span>(condition) {
+        <span class="hl-keyword">unquote</span>(body)
+      }
+    }
+  }
+}</code></pre>
+<p><code>use Struct</code> imports a struct and calls <code>Struct.__using__/1</code> indirectly when it
+exists:</p>
+<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> Greeter {
+  <span class="hl-keyword">pub</span> <span class="hl-keyword">macro</span> __using__(_opts <span class="hl-op">::</span> <span class="hl-type">Expr</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">Expr</span> {
+    <span class="hl-keyword">quote</span> {
+      <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> hello() <span class="hl-op">-&gt;</span> <span class="hl-type">String</span> {
+        <span class="hl-string">"Hello from Greeter"</span>
+      }
+    }
+  }
+}
+
+<span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> MyApp {
+  <span class="hl-keyword">use</span> Greeter
+}</code></pre>
+<p>Macros can call Zap functions that have already been compiled for compile-time
+execution. This is how library features such as <code>Zest.Runner</code> use
+<code>Path.glob/1</code>, <code>SourceGraph.structs/1</code>, and reflection helpers without compiler
+special-casing standard-library struct names.</p>
+<h2>Testing With Zest</h2>
+<p>Use <code>Zest.Case</code> for the test DSL and assertions:</p>
+<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> MathTest {
+  <span class="hl-keyword">use</span> Zest.Case
+
+  <span class="hl-keyword">describe</span>(<span class="hl-string">"addition"</span>) {
+    <span class="hl-keyword">test</span>(<span class="hl-string">"adds two integers"</span>) {
+      <span class="hl-keyword">assert</span>(<span class="hl-number">1</span> <span class="hl-op">+</span> <span class="hl-number">1</span> <span class="hl-op">==</span> <span class="hl-number">2</span>)
+    }
+
+    <span class="hl-keyword">test</span>(<span class="hl-string">"rejects false conditions"</span>) {
+      <span class="hl-keyword">reject</span>(<span class="hl-number">1</span> <span class="hl-op">+</span> <span class="hl-number">1</span> <span class="hl-op">==</span> <span class="hl-number">3</span>)
+    }
+  }
+}</code></pre>
+<p>Use <code>Zest.Runner</code> to generate a <code>main/1</code> test entry point at compile time:</p>
+<pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> TestRunner {
+  <span class="hl-keyword">use</span> Zest.Runner, pattern: <span class="hl-string">"test/**/*_test.zap"</span>
+}</code></pre>
+<p><code>pattern</code> and <code>patterns</code> are project-root-relative glob patterns. The runner
+discovers matching source files, finds structs with <code>run/0</code>, invokes them, and
+prints the final summary. If no pattern is given, the default is
+<code>test/**/*_test.zap</code>.</p>
+<p>Run tests with:</p>
+<pre><code class="language-sh">zap test
+zap test --seed 12345
+zap test -- --timeout 5000</code></pre>
+<h2>Documentation</h2>
+<p>Documentation comes from <code>@doc</code> attributes placed immediately before the thing
+being documented:</p>
+<pre><code class="language-zap">@doc <span class="hl-op">=</span> <span class="hl-string">"Functions for working with points."</span>
+<span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> Point {
+  @doc <span class="hl-op">=</span> <span class="hl-string">"Builds a point from x and y coordinates."</span>
+  <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> new(x <span class="hl-op">::</span> <span class="hl-type">i64</span>, y <span class="hl-op">::</span> <span class="hl-type">i64</span>) <span class="hl-op">-&gt;</span> Point {
+    %Point{x: x, y: y}
+  }
+}</code></pre>
+<p>Generate documentation with:</p>
+<pre><code class="language-sh">zap doc
+zap doc --no-deps</code></pre>
+<p>Documentation targets use <code>kind: :doc</code> in <code>build.zap</code>. Generated output is
+written to <code>docs/</code>.</p>
 <h2>Standard Library</h2>
-<p>Zap includes a standard library for working with primitive types and collections:</p>
+<p>The standard library lives in <code>lib/</code>. Important public structs and protocols:</p>
 <table class="markdown-table">
 <thead>
-<tr><th>Struct</th><th>Functions</th></tr>
+<tr><th>Declaration</th><th>Purpose</th></tr>
 </thead>
 <tbody>
-<tr><td><code>Integer</code></td><td><code>to_string</code>, <code>abs</code>, <code>max</code>, <code>min</code>, <code>parse</code>, <code>remainder</code>, <code>pow</code>, <code>clamp</code>, <code>digits</code>, <code>to_float</code></td></tr>
-<tr><td><code>Float</code></td><td><code>to_string</code>, <code>abs</code>, <code>max</code>, <code>min</code>, <code>parse</code>, <code>round</code>, <code>floor</code>, <code>ceil</code>, <code>truncate</code>, <code>to_integer</code>, <code>clamp</code></td></tr>
-<tr><td><code>Bool</code></td><td><code>to_string</code>, <code>negate</code></td></tr>
-<tr><td><code>String</code></td><td><code>length</code>, <code>slice</code>, <code>contains</code>, <code>starts_with</code>, <code>ends_with</code>, <code>trim</code>, <code>upcase</code>, <code>downcase</code>, <code>reverse</code>, <code>replace</code>, <code>index_of</code>, <code>pad_leading</code>, <code>pad_trailing</code>, <code>repeat</code>, <code>to_integer</code>, <code>to_float</code></td></tr>
-<tr><td><code>Atom</code></td><td><code>to_string</code></td></tr>
-<tr><td><code>List</code></td><td><code>empty?</code>, <code>length</code>, <code>head</code>, <code>tail</code>, <code>at</code>, <code>last</code>, <code>contains?</code>, <code>reverse</code>, <code>prepend</code>, <code>append</code>, <code>concat</code>, <code>take</code>, <code>drop</code>, <code>uniq</code></td></tr>
-<tr><td><code>Enum</code></td><td><code>map</code>, <code>filter</code>, <code>reject</code>, <code>reduce</code>, <code>each</code>, <code>find</code>, <code>any?</code>, <code>all?</code>, <code>count</code>, <code>sum</code>, <code>product</code>, <code>max</code>, <code>min</code>, <code>sort</code>, <code>flat_map</code></td></tr>
+<tr><td><code>Kernel</code></td><td>Core macros and operators</td></tr>
+<tr><td><code>Integer</code></td><td>Integer conversion, arithmetic helpers, bit operations</td></tr>
+<tr><td><code>Float</code></td><td>Float conversion and numeric helpers</td></tr>
+<tr><td><code>Math</code></td><td>Numeric math functions for integer and float widths</td></tr>
+<tr><td><code>Bool</code>, <code>Atom</code>, <code>String</code></td><td>Primitive helpers</td></tr>
+<tr><td><code>List</code>, <code>Map</code>, <code>Range</code></td><td>Collection types and helpers</td></tr>
+<tr><td><code>Enum</code></td><td>Higher-order operations over <code>Enumerable</code> values</td></tr>
+<tr><td><code>Path</code>, <code>File</code>, <code>System</code>, <code>IO</code></td><td>Filesystem, process, and I/O helpers</td></tr>
+<tr><td><code>Struct</code>, <code>SourceGraph</code></td><td>Compile-time reflection helpers</td></tr>
+<tr><td><code>Zest</code>, <code>Zest.Case</code>, <code>Zest.Runner</code></td><td>Test framework</td></tr>
+<tr><td><code>Enumerable</code>, <code>Stringable</code>, <code>Arithmetic</code></td><td>Core protocols</td></tr>
 </tbody>
 </table>
-<h3>Higher-Order Functions</h3>
-<p>Functions are first-class values. Pass named functions or anonymous functions as arguments:</p>
-<pre><code class="language-zap"><span class="hl-comment"># Named function as callback</span>
-Enum.map([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>], double)
-
-<span class="hl-comment"># Anonymous function with type annotations</span>
-Enum.map([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>], <span class="hl-keyword">fn</span>(x <span class="hl-op">::</span> <span class="hl-type">i64</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">i64</span> { x <span class="hl-op">*</span> <span class="hl-number">2</span> })
-
-<span class="hl-comment"># Filter with predicate</span>
-Enum.filter([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>, <span class="hl-number">4</span>, <span class="hl-number">5</span>], <span class="hl-keyword">fn</span>(x <span class="hl-op">::</span> <span class="hl-type">i64</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">Bool</span> { x <span class="hl-op">&gt;</span> <span class="hl-number">3</span> })
-
-<span class="hl-comment"># Reduce with accumulator</span>
-Enum.reduce([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>, <span class="hl-number">4</span>], <span class="hl-number">0</span>, <span class="hl-keyword">fn</span>(acc <span class="hl-op">::</span> <span class="hl-type">i64</span>, x <span class="hl-op">::</span> <span class="hl-type">i64</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">i64</span> { acc <span class="hl-op">+</span> x })
-
-<span class="hl-comment"># Sort with comparator</span>
-Enum.sort([<span class="hl-number">3</span>, <span class="hl-number">1</span>, <span class="hl-number">2</span>], <span class="hl-keyword">fn</span>(a <span class="hl-op">::</span> <span class="hl-type">i64</span>, b <span class="hl-op">::</span> <span class="hl-type">i64</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">Bool</span> { a <span class="hl-op">&lt;</span> b })</code></pre>
-<p>Function type annotations use the arrow syntax: <code>callback :: (i64 -&gt; i64)</code>, <code>predicate :: (i64 -&gt; Bool)</code>.</p>
-<h3>Numeric Call Resolution</h3>
-<p>Exact typed clauses are selected before widening is considered:</p>
-<pre><code class="language-zap"><span class="hl-keyword">fn</span> process(value <span class="hl-op">::</span> <span class="hl-type">i32</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">i32</span> { value }
-<span class="hl-keyword">fn</span> process(value <span class="hl-op">::</span> <span class="hl-type">i64</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">i64</span> { value <span class="hl-op">*</span> <span class="hl-number">2</span> }
-
-small <span class="hl-op">::</span> <span class="hl-type">i8</span> <span class="hl-op">=</span> <span class="hl-number">42</span>
-medium <span class="hl-op">::</span> <span class="hl-type">i32</span> <span class="hl-op">=</span> <span class="hl-number">42</span>
-
-process(medium)  <span class="hl-comment"># selects the i32 clause exactly</span>
-process(small)   <span class="hl-comment"># widens i8 to i32 because no i8 clause exists</span></code></pre>
-<p>Fallback widening rules: <code>i8</code> -&gt; <code>i16</code> -&gt; <code>i32</code> -&gt; <code>i64</code> -&gt; <code>i128</code>, <code>u8</code> -&gt; <code>u16</code> -&gt; <code>u32</code> -&gt; <code>u64</code> -&gt; <code>u128</code>, <code>f16</code> -&gt; <code>f32</code> -&gt; <code>f64</code> -&gt; <code>f80</code> -&gt; <code>f128</code>. Signed integers never implicitly widen to unsigned integers, unsigned integers never implicitly widen to signed integers, and integer-to-float conversion is never implicit.</p>
-<hr>
-<h2>Native Function Bindings (<code>:zig</code>)</h2>
-<p>Zap functions that need Zig runtime implementations (I/O, string operations, atom tables, etc.) call into Zig directly via the <code>:zig.Struct.function(args)</code> form:</p>
+<p><code>Enum</code> works through the <code>Enumerable</code> protocol, so functions such as
+<code>Enum.map/2</code>, <code>Enum.reduce/3</code>, <code>Enum.filter/2</code>, <code>Enum.take/2</code>, and
+<code>Enum.empty?/1</code> work for lists, maps, ranges, strings, and user-defined
+enumerables.</p>
+<h2>Native Runtime Bindings</h2>
+<p>Zap standard-library code can call primitive Zig runtime functions through
+<code>:zig.Struct.function(...)</code>:</p>
 <pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> IO {
   <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> puts(message <span class="hl-op">::</span> <span class="hl-type">String</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">String</span> {
-    <span class="hl-atom">:zig</span>.Prelude.println(message)
-  }
-}
-
-<span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> Zest.Runtime {
-  <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> reset() <span class="hl-op">-&gt;</span> <span class="hl-type">String</span> {
-    <span class="hl-atom">:zig</span>.ZestRuntime.reset()
-  }
-
-  <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> fail(message <span class="hl-op">::</span> <span class="hl-type">String</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">String</span> {
-    <span class="hl-atom">:zig</span>.ZestRuntime.fail(message)
+    <span class="hl-atom">:zig</span>.IO.println(message)
+    message
   }
 }</code></pre>
-<p>The <code>:zig.Struct.function(args)</code> call tells the compiler to lower this expression to <code>@import(&quot;zap_runtime&quot;).Struct.function(args)</code> in the generated ZIR. The compiler has zero knowledge of specific library structs; every runtime binding lives in a <code>.zap</code> source file.</p>
-<hr>
+<p>These bindings are declared in Zap source files. The compiler should remain a
+general-purpose language compiler; standard-library behavior belongs in Zap
+unless it is a true parser, type-system, ZIR, or runtime primitive.</p>
 <h2>Architecture</h2>
-<p>Zap uses a per-struct compilation architecture with per-struct ZIR emission:</p>
-<p>1. <strong>Discovery</strong> — start from the entry point, follow struct references to find files
-2. <strong>Pass 1</strong> — parse all files, collect declarations into a shared scope graph
-3. <strong>Pass 2</strong> — compile each file: macro expand, desugar, type check, HIR
-4. <strong>Pass 3</strong> — monomorphize generic functions, lower to IR
-5. <strong>Pass 4</strong> — run analysis pipeline (escape analysis, interprocedural summaries, region solving, lambda sets, Perceus reuse)
-6. <strong>Pass 5</strong> — emit per-struct ZIR, inject into Zig compilation, codegen</p>
-<p>Each Zap struct becomes its own Zig ZIR struct. Cross-struct calls use <code>@import(&quot;Struct&quot;).function(args)</code> chains. Namespace re-export structs are generated for hierarchical struct names (e.g., <code>Zest</code> re-exports <code>Runtime</code>, <code>Case</code>, <code>Runner</code>). Direct <code>:zig.Struct.fn(...)</code> calls bypass cross-struct routing and emit <code>@import(&quot;zap_runtime&quot;).Struct.fn(...)</code> directly.</p>
-<pre><code class="language-zap">  .zap source files
-      <span class="hl-op">|</span>
-      v
-   Discovery -------- follow <span class="hl-keyword">struct</span> references from entry point
-      <span class="hl-op">|</span>
-      v
-   Parse ------------ per-file ASTs
-      <span class="hl-op">|</span>
-      v
-   Collect ---------- shared scope graph <span class="hl-op">+</span> type store
-      <span class="hl-op">|</span>
-      v
-   Macro Expansion -- AST<span class="hl-op">-&gt;</span>AST transforms (Kernel macros: <span class="hl-keyword">if</span>, <span class="hl-keyword">and</span>, <span class="hl-keyword">or</span>, <span class="hl-op">|&gt;</span>)
-      <span class="hl-op">|</span>
-      v
-   Desugar ---------- simplify syntax
-      <span class="hl-op">|</span>
-      v
-   Type Check ------- overload resolution <span class="hl-op">+</span> inference
-      <span class="hl-op">|</span>
-      v
-   HIR Lowering ----- typed intermediate representation
-      <span class="hl-op">|</span>
-      v
-   Monomorphize ---- specialize generic functions <span class="hl-keyword">for</span> concrete types
-      <span class="hl-op">|</span>
-      v
-   IR Lowering ------ lower-level IR (arity-suffixed function names)
-      <span class="hl-op">|</span>
-      v
-   Analysis --------- escape, regions, lambda sets, Perceus
-      <span class="hl-op">|</span>
-      v
-   Per-Struct ZIR --- each Zap <span class="hl-keyword">struct</span> <span class="hl-op">-&gt;</span> its own Zig ZIR <span class="hl-keyword">struct</span>
-      <span class="hl-op">|</span>                cross-<span class="hl-keyword">struct</span> calls <span class="hl-op">-&gt;</span> @<span class="hl-keyword">import</span> chains
-      <span class="hl-op">|</span>                <span class="hl-atom">:zig</span>.X.Y(args) calls <span class="hl-op">-&gt;</span> @<span class="hl-keyword">import</span>(<span class="hl-string">"zap_runtime"</span>)
-      v
-   Codegen ---------- native binary (via LLVM)</code></pre>
-<hr>
-<h2>CLI Reference</h2>
-<pre><code class="language-zap">zap init                     Create a new project <span class="hl-keyword">in</span> the current directory
-zap build [target]           Compile a target defined <span class="hl-keyword">in</span> build.zap (defaults to <span class="hl-atom">:default</span>)
-zap run [target] [-- args]   Compile <span class="hl-keyword">and</span> run a target (defaults to <span class="hl-atom">:default</span>)
-zap <span class="hl-keyword">test</span>                     Run the <span class="hl-keyword">test</span> suite (<span class="hl-keyword">alias</span> <span class="hl-keyword">for</span> `zap run <span class="hl-keyword">test</span>`)
-zap deps update [name]       Re-resolve dependencies <span class="hl-keyword">and</span> rewrite zap.lock</code></pre>
-<hr>
+<p>Zap lowers to ZIR. The active backend is the ZIR builder path, not legacy Zig
+source text generation.</p>
+<p>Compilation pipeline:</p>
+<p>1. Parse source files.
+2. Collect declarations into the source graph and scope graph.
+3. Stage and expand macros.
+4. Desugar high-level syntax.
+5. Type check and resolve overloads, protocols, and generics.
+6. Lower to HIR.
+7. Monomorphize generic functions.
+8. Lower to IR.
+9. Run analysis passes such as escape analysis, lambda-set analysis, and
+Perceus reuse analysis.
+10. Emit per-struct ZIR through the Zig fork C ABI.
+11. Let Zig and LLVM produce the final native artifact.</p>
+<p>Each Zap struct emits as a Zig ZIR struct. Cross-struct calls are emitted as
+imports between those structs. Direct <code>:zig.*</code> calls target the embedded Zap
+runtime.</p>
 <h2>Development</h2>
-<pre><code class="language-sh"># Download pre-built deps (first time only)
-zig build setup
-
-# Build the zap compiler
+<p>Common development commands:</p>
+<pre><code class="language-sh">zig build setup
 zig build
-
-# Run Zig-level unit tests
 zig build test
-
-# Run Zap test suite (323 tests across 28 structs)
-zap test
-
-# Build and run an example
-cd examples/hello
-zap run hello</code></pre>
-<hr>
-<h2>Building the Zig Fork</h2>
-<p>Zap depends on a fork of the Zig compiler (<code>libzig_compiler.a</code>) with LLVM enabled. The fork adds a C-ABI surface (<code>zir_api.zig</code>) that allows Zap to inject ZIR directly into Zig's compilation pipeline.</p>
-<p>The build follows the same process as the official <a href="https://codeberg.org/ziglang/zig-bootstrap">zig-bootstrap</a>:</p>
-<h3>Prerequisites</h3>
-<ul>
-<li>C/C++ compiler (Xcode command line tools on macOS, GCC on Linux)</li>
-<li>CMake 3.19+</li>
-<li>Ninja</li>
-<li>Zig 0.16.0 (only needed if skipping the bootstrap)</li>
-</ul>
-<h3>Step 1: Clone zig-bootstrap 0.16.0</h3>
-<pre><code class="language-sh">git clone --depth 1 --branch 0.16.0 \
-  https://codeberg.org/ziglang/zig-bootstrap.git \
-  ~/zig-bootstrap-0.16.0</code></pre>
-<h3>Step 2: Build LLVM, Clang, LLD from source (host)</h3>
-<pre><code class="language-sh">cd ~/zig-bootstrap-0.16.0
-mkdir -p out/build-llvm-host &amp;&amp; cd out/build-llvm-host
-cmake ../../llvm \
-  -DCMAKE_INSTALL_PREFIX=&quot;$HOME/zig-bootstrap-0.16.0/out/host&quot; \
-  -DCMAKE_PREFIX_PATH=&quot;$HOME/zig-bootstrap-0.16.0/out/host&quot; \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DLLVM_ENABLE_PROJECTS=&quot;lld;clang&quot; \
-  -DLLVM_ENABLE_BINDINGS=OFF \
-  -DLLVM_ENABLE_LIBEDIT=OFF \
-  -DLLVM_ENABLE_LIBPFM=OFF \
-  -DLLVM_ENABLE_LIBXML2=OFF \
-  -DLLVM_ENABLE_OCAMLDOC=OFF \
-  -DLLVM_ENABLE_PLUGINS=OFF \
-  -DLLVM_ENABLE_Z3_SOLVER=OFF \
-  -DLLVM_ENABLE_ZSTD=OFF \
-  -DLLVM_INCLUDE_UTILS=OFF \
-  -DLLVM_INCLUDE_TESTS=OFF \
-  -DLLVM_INCLUDE_EXAMPLES=OFF \
-  -DLLVM_INCLUDE_BENCHMARKS=OFF \
-  -DLLVM_INCLUDE_DOCS=OFF \
-  -DCLANG_BUILD_TOOLS=OFF \
-  -DCLANG_INCLUDE_DOCS=OFF \
-  -DCLANG_INCLUDE_TESTS=OFF \
-  -GNinja
-cmake --build . --target install</code></pre>
-<p>This takes ~20 minutes.</p>
-<h3>Step 3: Build host Zig via CMake</h3>
-<pre><code class="language-sh">cd ~/zig-bootstrap-0.16.0
-mkdir -p out/build-zig-host &amp;&amp; cd out/build-zig-host
-cmake ../../zig \
-  -DCMAKE_INSTALL_PREFIX=&quot;$HOME/zig-bootstrap-0.16.0/out/host&quot; \
-  -DCMAKE_PREFIX_PATH=&quot;$HOME/zig-bootstrap-0.16.0/out/host&quot; \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DZIG_VERSION=&quot;0.16.0&quot; \
-  -GNinja
-cmake --build . --target install</code></pre>
-<p>This bootstraps through wasm2c -&gt; zig1 -&gt; zig2 -&gt; stage3. Takes ~15 minutes.</p>
-<h3>Step 4: Rebuild LLVM with Zig as the compiler</h3>
-<pre><code class="language-sh">cd ~/zig-bootstrap-0.16.0
-ROOTDIR=&quot;$(pwd)&quot;
-TARGET=&quot;aarch64-macos-none&quot;  # or x86_64-linux-gnu, etc.
-MCPU=&quot;baseline&quot;
-ZIG=&quot;$ROOTDIR/out/host/bin/zig&quot;
-
-# Build zlib
-mkdir -p out/build-zlib-$TARGET-$MCPU &amp;&amp; cd out/build-zlib-$TARGET-$MCPU
-cmake &quot;$ROOTDIR/zlib&quot; \
-  -DCMAKE_INSTALL_PREFIX=&quot;$ROOTDIR/out/$TARGET-$MCPU&quot; \
-  -DCMAKE_PREFIX_PATH=&quot;$ROOTDIR/out/$TARGET-$MCPU&quot; \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_CROSSCOMPILING=True \
-  -DCMAKE_SYSTEM_NAME=&quot;Darwin&quot; \
-  -DCMAKE_C_COMPILER=&quot;$ZIG;cc;-fno-sanitize=all;-s;-target;$TARGET;-mcpu=$MCPU&quot; \
-  -DCMAKE_CXX_COMPILER=&quot;$ZIG;c++;-fno-sanitize=all;-s;-target;$TARGET;-mcpu=$MCPU&quot; \
-  -DCMAKE_ASM_COMPILER=&quot;$ZIG;cc;-fno-sanitize=all;-s;-target;$TARGET;-mcpu=$MCPU&quot; \
-  -DCMAKE_AR=&quot;$ROOTDIR/out/host/bin/llvm-ar&quot; \
-  -DCMAKE_RANLIB=&quot;$ROOTDIR/out/host/bin/llvm-ranlib&quot; \
-  -GNinja
-cmake --build . --target install
-
-# Build zstd
-mkdir -p &quot;$ROOTDIR/out/$TARGET-$MCPU/lib&quot;
-cp &quot;$ROOTDIR/zstd/lib/zstd.h&quot; &quot;$ROOTDIR/out/$TARGET-$MCPU/include/zstd.h&quot;
-cd &quot;$ROOTDIR/out/$TARGET-$MCPU/lib&quot;
-$ZIG build-lib --name zstd -target $TARGET -mcpu=$MCPU -fstrip -OReleaseFast -lc \
-  &quot;$ROOTDIR/zstd/lib/decompress/zstd_ddict.c&quot; \
-  &quot;$ROOTDIR/zstd/lib/decompress/zstd_decompress.c&quot; \
-  &quot;$ROOTDIR/zstd/lib/decompress/huf_decompress.c&quot; \
-  &quot;$ROOTDIR/zstd/lib/decompress/huf_decompress_amd64.S&quot; \
-  &quot;$ROOTDIR/zstd/lib/decompress/zstd_decompress_block.c&quot; \
-  &quot;$ROOTDIR/zstd/lib/compress/zstdmt_compress.c&quot; \
-  &quot;$ROOTDIR/zstd/lib/compress/zstd_opt.c&quot; \
-  &quot;$ROOTDIR/zstd/lib/compress/hist.c&quot; \
-  &quot;$ROOTDIR/zstd/lib/compress/zstd_ldm.c&quot; \
-  &quot;$ROOTDIR/zstd/lib/compress/zstd_fast.c&quot; \
-  &quot;$ROOTDIR/zstd/lib/compress/zstd_compress_literals.c&quot; \
-  &quot;$ROOTDIR/zstd/lib/compress/zstd_double_fast.c&quot; \
-  &quot;$ROOTDIR/zstd/lib/compress/huf_compress.c&quot; \
-  &quot;$ROOTDIR/zstd/lib/compress/fse_compress.c&quot; \
-  &quot;$ROOTDIR/zstd/lib/compress/zstd_lazy.c&quot; \
-  &quot;$ROOTDIR/zstd/lib/compress/zstd_compress.c&quot; \
-  &quot;$ROOTDIR/zstd/lib/compress/zstd_compress_sequences.c&quot; \
-  &quot;$ROOTDIR/zstd/lib/compress/zstd_compress_superblock.c&quot; \
-  &quot;$ROOTDIR/zstd/lib/deprecated/zbuff_compress.c&quot; \
-  &quot;$ROOTDIR/zstd/lib/deprecated/zbuff_decompress.c&quot; \
-  &quot;$ROOTDIR/zstd/lib/deprecated/zbuff_common.c&quot; \
-  &quot;$ROOTDIR/zstd/lib/common/entropy_common.c&quot; \
-  &quot;$ROOTDIR/zstd/lib/common/pool.c&quot; \
-  &quot;$ROOTDIR/zstd/lib/common/threading.c&quot; \
-  &quot;$ROOTDIR/zstd/lib/common/zstd_common.c&quot; \
-  &quot;$ROOTDIR/zstd/lib/common/xxhash.c&quot; \
-  &quot;$ROOTDIR/zstd/lib/common/debug.c&quot; \
-  &quot;$ROOTDIR/zstd/lib/common/fse_decompress.c&quot; \
-  &quot;$ROOTDIR/zstd/lib/common/error_private.c&quot; \
-  &quot;$ROOTDIR/zstd/lib/dictBuilder/zdict.c&quot; \
-  &quot;$ROOTDIR/zstd/lib/dictBuilder/divsufsort.c&quot; \
-  &quot;$ROOTDIR/zstd/lib/dictBuilder/fastcover.c&quot; \
-  &quot;$ROOTDIR/zstd/lib/dictBuilder/cover.c&quot;
-
-# Rebuild LLVM with Zig
-mkdir -p &quot;$ROOTDIR/out/build-llvm-$TARGET-$MCPU&quot; &amp;&amp; cd &quot;$ROOTDIR/out/build-llvm-$TARGET-$MCPU&quot;
-cmake &quot;$ROOTDIR/llvm&quot; \
-  -DCMAKE_INSTALL_PREFIX=&quot;$ROOTDIR/out/$TARGET-$MCPU&quot; \
-  -DCMAKE_PREFIX_PATH=&quot;$ROOTDIR/out/$TARGET-$MCPU&quot; \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_CROSSCOMPILING=True \
-  -DCMAKE_SYSTEM_NAME=&quot;Darwin&quot; \
-  -DCMAKE_C_COMPILER=&quot;$ZIG;cc;-fno-sanitize=all;-s;-target;$TARGET;-mcpu=$MCPU&quot; \
-  -DCMAKE_CXX_COMPILER=&quot;$ZIG;c++;-fno-sanitize=all;-s;-target;$TARGET;-mcpu=$MCPU&quot; \
-  -DCMAKE_ASM_COMPILER=&quot;$ZIG;cc;-fno-sanitize=all;-s;-target;$TARGET;-mcpu=$MCPU&quot; \
-  -DCMAKE_AR=&quot;$ROOTDIR/out/host/bin/llvm-ar&quot; \
-  -DCMAKE_RANLIB=&quot;$ROOTDIR/out/host/bin/llvm-ranlib&quot; \
-  -DLLVM_ENABLE_PROJECTS=&quot;lld;clang&quot; \
-  -DLLVM_ENABLE_ZLIB=FORCE_ON \
-  -DLLVM_ENABLE_ZSTD=FORCE_ON \
-  -DLLVM_USE_STATIC_ZSTD=ON \
-  -DLLVM_BUILD_STATIC=ON \
-  -DLLVM_BUILD_TOOLS=OFF \
-  -DLLVM_BUILD_UTILS=OFF \
-  -DLLVM_INCLUDE_TESTS=OFF \
-  -DLLVM_INCLUDE_EXAMPLES=OFF \
-  -DLLVM_INCLUDE_BENCHMARKS=OFF \
-  -DLLVM_INCLUDE_DOCS=OFF \
-  -DLLVM_TABLEGEN=&quot;$ROOTDIR/out/host/bin/llvm-tblgen&quot; \
-  -DCLANG_TABLEGEN=&quot;$ROOTDIR/out/build-llvm-host/bin/clang-tblgen&quot; \
-  -DCLANG_BUILD_TOOLS=OFF \
-  -DCLANG_INCLUDE_TESTS=OFF \
-  -DCLANG_INCLUDE_DOCS=OFF \
-  -DLLD_BUILD_TOOLS=OFF \
-  -GNinja
-cmake --build . --target install</code></pre>
-<p>This takes ~30 minutes. The output at <code>out/aarch64-macos-none-baseline/lib/</code> contains all the LLVM static libraries.</p>
-<h3>Step 5: Build <code>libzig_compiler.a</code> for Zap</h3>
-<pre><code class="language-sh">cd ~/projects/zig   # the Zap Zig fork
-ROOTDIR=&quot;$HOME/zig-bootstrap-0.16.0&quot;
-TARGET=&quot;aarch64-macos-none&quot;
-MCPU=&quot;baseline&quot;
-ZIG=&quot;$ROOTDIR/out/host/bin/zig&quot;
-
-$ZIG build lib \
-  --search-prefix &quot;$ROOTDIR/out/$TARGET-$MCPU&quot; \
+./zig-out/bin/zap test
+./zig-out/bin/zap test --seed 123
+./zig-out/bin/zap doc --no-deps</code></pre>
+<p>When changing the Zig fork, rebuild <code>libzap_compiler.a</code> and point Zap at it:</p>
+<pre><code class="language-sh">cd ~/projects/zig
+/path/to/zig build lib \
+  --search-prefix /path/to/zig-bootstrap/out/aarch64-macos-none-baseline \
   -Dstatic-llvm \
   -Doptimize=ReleaseSafe \
-  -Dtarget=&quot;$TARGET&quot; \
-  -Dcpu=&quot;$MCPU&quot; \
-  -Dversion-string=&quot;0.16.0&quot;</code></pre>
-<p>Output: <code>zig-out/lib/libzig_compiler.a</code></p>
-<h3>Step 6: Build Zap</h3>
-<pre><code class="language-sh">cd ~/projects/zap
-zig build -Dllvm-lib-path=&quot;$HOME/zig-bootstrap-0.16.0/out/aarch64-macos-none-baseline/lib&quot;</code></pre>
-<p>Output: <code>zig-out/bin/zap</code></p>
-<hr>
+  -Dtarget=aarch64-macos-none \
+  -Dcpu=baseline \
+  -Dversion-string=0.16.0
+
+cd ~/projects/zap
+zig build \
+  -Dzap-compiler-lib=$HOME/projects/zig/zig-out/lib/libzap_compiler.a \
+  -Dllvm-lib-path=/path/to/zig-bootstrap/out/aarch64-macos-none-baseline/lib</code></pre>
+<p>The exact target triple and bootstrap path depend on your platform.</p>
 <h2>License</h2>
 <p><a href="LICENSE">MIT</a></p>
 </div>

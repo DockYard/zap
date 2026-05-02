@@ -9,8 +9,9 @@ Setup runs fresh before EACH test that requests context.
 Teardown runs after each test. Assertions are non-fatal.
 
 The `describe` and `test` macros expand into function declarations
-so that each test becomes a named pub function (test_*) that is
-called at struct level.
+so that each test becomes a named pub function (test_*). `use Zest.Case`
+installs a compile-time hook that generates `run/0` for the enclosing
+struct after all tests have been registered.
 
 ## Examples
 
@@ -46,7 +47,7 @@ pub fn begin_test() -> Atom
 
 Wraps `begin_test` for explicit use.
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/case.zap#L133)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0//Users/bcardarella/projects/zap/lib/zest/case.zap#L174)
 
 ---
 
@@ -58,7 +59,7 @@ pub fn end_test() -> Atom
 
 Wraps `end_test` for explicit use.
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/case.zap#L142)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0//Users/bcardarella/projects/zap/lib/zest/case.zap#L183)
 
 ---
 
@@ -70,7 +71,7 @@ pub fn print_result() -> Atom
 
 Wraps `print_result` for explicit use.
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/case.zap#L151)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0//Users/bcardarella/projects/zap/lib/zest/case.zap#L192)
 
 ---
 
@@ -84,7 +85,7 @@ Asserts that a boolean value is `true`.
 
 Non-fatal: returns :fail on failure, does not stop execution.
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/case.zap#L162)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0//Users/bcardarella/projects/zap/lib/zest/case.zap#L203)
 
 ---
 
@@ -98,11 +99,21 @@ Asserts that a boolean value is `false`.
 
 Non-fatal: returns "F" on failure, does not stop execution.
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/case.zap#L178)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0//Users/bcardarella/projects/zap/lib/zest/case.zap#L219)
 
 ---
 
 ## Macros
+
+### build_describe_test/4
+
+```zap
+pub macro build_describe_test(desc_slug :: Expr, test_expr :: Expr, setup_body :: Expr, teardown_body :: Expr) -> Expr
+```
+
+[Source](https://github.com/DockYard/zap/blob/v0.1.0//Users/bcardarella/projects/zap/lib/zest/case.zap#L93)
+
+---
 
 ### describe/2
 
@@ -114,7 +125,7 @@ Groups related tests under a descriptive label.
 
 Scans the body for `setup` and `teardown` blocks, then
 transforms each `test` call into a pub function declaration
-with begin_test/end_test/print_result tracking calls injected.
+and registers the generated function for `run/0`.
 
 ## Examples
 
@@ -126,7 +137,7 @@ with begin_test/end_test/print_result tracking calls injected.
       }
     }
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/case.zap#L68)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0//Users/bcardarella/projects/zap/lib/zest/case.zap#L124)
 
 ---
 
@@ -147,7 +158,7 @@ with begin_test/end_test/print_result tracking calls wrapping the body.
       assert(true == true)
     }
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/case.zap#L111)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0//Users/bcardarella/projects/zap/lib/zest/case.zap#L156)
 
 ---
 
@@ -168,7 +179,7 @@ to `ctx` in each `test/3` call. Runs fresh for every test.
       connect_db()
     }
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/case.zap#L201)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0//Users/bcardarella/projects/zap/lib/zest/case.zap#L242)
 
 ---
 
@@ -189,7 +200,7 @@ even if assertions fail (non-fatal assertions).
       disconnect_db()
     }
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/case.zap#L218)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0//Users/bcardarella/projects/zap/lib/zest/case.zap#L259)
 
 ---
 

@@ -26,7 +26,7 @@ with a yellow "T" indicator.
 Call this before running any tests to ensure the seed and
 timeout are set.
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/runner.zap#L89)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0//Users/bcardarella/projects/zap/lib/zest/runner.zap#L89)
 
 ---
 
@@ -52,7 +52,7 @@ used for test ordering.
       Zest.Runner.run()
     }
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/runner.zap#L111)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0//Users/bcardarella/projects/zap/lib/zest/runner.zap#L111)
 
 ---
 
@@ -65,7 +65,7 @@ pub fn parse_cli_args(index :: i64, count :: i64) -> Atom
 Recursively scans CLI arguments for `--seed <value>` and
 `--timeout <milliseconds>`, applying each to the test tracker.
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/runner.zap#L121)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0//Users/bcardarella/projects/zap/lib/zest/runner.zap#L121)
 
 ---
 
@@ -82,7 +82,7 @@ Normalizes runner options to a list.
 `nil` and `[]` become an empty list, an existing option list is returned
 as-is, and a single non-list option is wrapped in a one-element list.
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/runner.zap#L59)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0//Users/bcardarella/projects/zap/lib/zest/runner.zap#L59)
 
 ---
 
@@ -92,7 +92,7 @@ as-is, and a single non-list option is wrapped in a one-element list.
 pub macro patterns(options :: Expr) -> Expr
 ```
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/runner.zap#L147)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0//Users/bcardarella/projects/zap/lib/zest/runner.zap#L147)
 
 ---
 
@@ -102,7 +102,7 @@ pub macro patterns(options :: Expr) -> Expr
 pub macro option_patterns(option :: Expr) -> Expr
 ```
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/runner.zap#L160)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0//Users/bcardarella/projects/zap/lib/zest/runner.zap#L160)
 
 ---
 
@@ -112,7 +112,7 @@ pub macro option_patterns(option :: Expr) -> Expr
 pub macro pattern_values(value :: Expr) -> Expr
 ```
 
-[Source](https://github.com/DockYard/zap/blob/v0.1.0/./lib/zest/runner.zap#L172)
+[Source](https://github.com/DockYard/zap/blob/v0.1.0//Users/bcardarella/projects/zap/lib/zest/runner.zap#L172)
 
 ---
 
