@@ -2623,12 +2623,18 @@ pub const MacroEngine = struct {
 
     /// Try to expand `use Struct` by calling Struct.__using__/1.
     /// Returns injected struct items if __using__ exists, null otherwise.
+    ///
+    /// Looks up `__using__/1` in the use TARGET's scope, not in the calling
+    /// scope. A general scope-walk lookup would find the first `__using__/1`
+    /// reachable through the consumer's imports — so when a consumer does
+    /// `use Foo` and `use Bar` (both defining `__using__/1`), `use Bar` would
+    /// silently invoke Foo's `__using__` instead of Bar's.
     fn tryExpandUsing(self: *MacroEngine, ud: *const ast.UseDecl) ?[]const ast.StructItem {
         // Build the __using__ name
         const using_name = self.interner.intern("__using__") catch return null;
 
-        // Look up __using__ macro with arity 1
-        const macro_id = self.findMacro(using_name, 1) orelse return null;
+        // Look up __using__/1 directly in the use target's scope
+        const macro_id = self.findMacroInStruct(ud.struct_path, using_name, 1) orelse return null;
 
         const family = &self.graph.macro_families.items[macro_id];
         if (family.clauses.items.len == 0) return null;
@@ -6702,4 +6708,69 @@ test "use macro receives bare pattern keyword option list" {
     }
 
     try std.testing.expect(found_received_opts);
+}
+
+// When a consumer struct does multiple `use` declarations and several of
+// the targets define `__using__/1`, every target's `__using__` must run
+// against the consumer — not just the first one reachable through the
+// consumer's import chain.
+test "use macro looks up __using__ in the use target's own scope, not the consumer's import-walk" {
+    const source =
+        \\pub struct First {
+        \\  pub macro __using__(_opts :: Expr) -> Expr {
+        \\    quote {
+        \\      pub fn first_marker() -> i64 {
+        \\        1
+        \\      }
+        \\    }
+        \\  }
+        \\}
+        \\
+        \\pub struct Second {
+        \\  pub macro __using__(_opts :: Expr) -> Expr {
+        \\    quote {
+        \\      pub fn second_marker() -> i64 {
+        \\        2
+        \\      }
+        \\    }
+        \\  }
+        \\}
+        \\
+        \\pub struct Consumer {
+        \\  use First
+        \\  use Second
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    const expanded = try engine.expandProgram(&program);
+
+    var found_first_marker = false;
+    var found_second_marker = false;
+    for (expanded.structs) |mod| {
+        if (mod.name.parts.len != 1) continue;
+        if (!std.mem.eql(u8, parser.interner.get(mod.name.parts[0]), "Consumer")) continue;
+        for (mod.items) |item| {
+            if (item != .function) continue;
+            const name = parser.interner.get(item.function.name);
+            if (std.mem.eql(u8, name, "first_marker")) found_first_marker = true;
+            if (std.mem.eql(u8, name, "second_marker")) found_second_marker = true;
+        }
+    }
+
+    try std.testing.expect(found_first_marker);
+    try std.testing.expect(found_second_marker);
 }
