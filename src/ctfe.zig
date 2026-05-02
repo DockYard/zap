@@ -1199,8 +1199,9 @@ pub const Interpreter = struct {
     call_stack: std.ArrayListUnmanaged(CtfeFrame),
     errors: std.ArrayListUnmanaged(CtfeError),
     memo_cache: std.AutoHashMapUnmanaged(CacheKey, CtValue),
-    scope_graph: ?*const scope.ScopeGraph,
+    scope_graph: ?*scope.ScopeGraph,
     interner: ?*const ast.StringInterner,
+    current_struct_scope: ?scope.ScopeId = null,
     build_opts: std.StringHashMapUnmanaged([]const u8) = .empty,
     compile_options_hash: u64 = 0,
     current_attribute_context: ?CtfeError.AttributeContext = null,
@@ -1224,6 +1225,7 @@ pub const Interpreter = struct {
             .allocation_store = .{},
             .scope_graph = null,
             .interner = null,
+            .current_struct_scope = null,
             .current_attribute_context = null,
         };
         // Build name -> id index (use func.id, NOT array index)
@@ -2833,6 +2835,15 @@ pub const Interpreter = struct {
         if (std.mem.eql(u8, cb.name, "struct_functions")) {
             return self.builtinReflectedStructFunctions(args);
         }
+        if (std.mem.eql(u8, cb.name, "struct_put_attribute")) {
+            return self.builtinStructPutAttribute(args);
+        }
+        if (std.mem.eql(u8, cb.name, "struct_get_attribute")) {
+            return self.builtinStructGetAttribute(args);
+        }
+        if (std.mem.eql(u8, cb.name, "struct_register_attribute")) {
+            return self.builtinStructRegisterAttribute(args);
+        }
         if (std.mem.eql(u8, cb.name, "map_get")) {
             return self.builtinMapGet(args);
         }
@@ -3147,7 +3158,7 @@ pub const Interpreter = struct {
         };
 
         const path_filter = try self.extractPathFilter(args[0]);
-        const graph_hash = computeSourceReflectionHash(graph, interner, path_filter);
+        const graph_hash = computeSourceReflectionHash(self.allocator, graph, interner, path_filter);
         try self.dependencies.append(self.allocator, .{
             .reflected_source = .{
                 .paths = path_filter,
@@ -3159,7 +3170,7 @@ pub const Interpreter = struct {
         for (graph.structs.items) |struct_entry| {
             const source_id = struct_entry.decl.meta.span.source_id orelse continue;
             const path = graph.sourcePathById(source_id) orelse continue;
-            if (!pathFilterContains(path_filter, path)) continue;
+            if (!pathFilterContains(self.allocator, path_filter, path)) continue;
             try result_list.append(self.allocator, try self.makeStructRef(struct_entry, path, source_id));
         }
 
@@ -3212,6 +3223,53 @@ pub const Interpreter = struct {
 
         const alloc_id = self.allocation_store.alloc(self.allocator, .list, self.currentFunctionId());
         return .{ .list = .{ .alloc_id = alloc_id, .elems = result_list.items } };
+    }
+
+    fn builtinStructPutAttribute(self: *Interpreter, args: []const CtValue) CtfeInterpretError!CtValue {
+        if (args.len != 2) return .nil;
+        const graph = self.scope_graph orelse return .nil;
+        const interner = self.interner orelse return .nil;
+        const scope_id = self.current_struct_scope orelse return .nil;
+        const struct_entry = graph.findStructByScope(scope_id) orelse return .nil;
+        const name = extractAttributeName(args[0]) orelse return .nil;
+        const name_id = interner.lookupExisting(name) orelse return .nil;
+        const value = unwrapCtAstLiteral(args[1]);
+        const exported = exportValue(self.allocator, value) catch return .nil;
+        graph.putStructAttribute(struct_entry, name_id, exported) catch return error.OutOfMemory;
+        return .nil;
+    }
+
+    fn builtinStructGetAttribute(self: *Interpreter, args: []const CtValue) CtfeInterpretError!CtValue {
+        if (args.len != 1) return .nil;
+        const graph = self.scope_graph orelse return .nil;
+        const interner = self.interner orelse return .nil;
+        const scope_id = self.current_struct_scope orelse return .nil;
+        const struct_entry = graph.findStructByScope(scope_id) orelse return .nil;
+        const name = extractAttributeName(args[0]) orelse return .nil;
+        const name_id = interner.lookupExisting(name) orelse return .nil;
+        const value = graph.getStructAttribute(struct_entry, name_id) catch return error.OutOfMemory;
+        return if (value) |attribute_value| importConstValue(attribute_value) else .nil;
+    }
+
+    fn builtinStructRegisterAttribute(self: *Interpreter, args: []const CtValue) CtfeInterpretError!CtValue {
+        if (args.len != 1) return .nil;
+        const graph = self.scope_graph orelse return .nil;
+        const interner = self.interner orelse return .nil;
+        const scope_id = self.current_struct_scope orelse return .nil;
+        const struct_entry = graph.findStructByScope(scope_id) orelse return .nil;
+        const name = extractAttributeName(args[0]) orelse return .nil;
+        const name_id = interner.lookupExisting(name) orelse return .nil;
+        graph.registerAccumulatingAttribute(struct_entry, name_id) catch return error.OutOfMemory;
+        return .nil;
+    }
+
+    fn extractAttributeName(value: CtValue) ?[]const u8 {
+        const unwrapped = unwrapCtAstLiteral(value);
+        return switch (unwrapped) {
+            .atom => |raw| if (raw.len > 0 and raw[0] == ':') raw[1..] else raw,
+            .string => |name| name,
+            else => null,
+        };
     }
 
     fn extractPathFilter(self: *Interpreter, value: CtValue) CtfeInterpretError![]const []const u8 {
@@ -3860,6 +3918,7 @@ fn computeStructInterfaceHash(
 }
 
 fn computeSourceReflectionHash(
+    alloc: std.mem.Allocator,
     graph: *const scope.ScopeGraph,
     interner: *const ast.StringInterner,
     paths: []const []const u8,
@@ -3870,7 +3929,7 @@ fn computeSourceReflectionHash(
     for (graph.structs.items) |struct_entry| {
         const source_id = struct_entry.decl.meta.span.source_id orelse continue;
         const path = graph.sourcePathById(source_id) orelse continue;
-        if (!pathFilterContains(paths, path)) continue;
+        if (!pathFilterContains(alloc, paths, path)) continue;
 
         var struct_hasher = std.hash.Wyhash.init(0);
         struct_hasher.update(normalizeSourcePath(path));
@@ -3888,15 +3947,24 @@ fn computeSourceReflectionHash(
     return final_hasher.final();
 }
 
-fn pathFilterContains(paths: []const []const u8, path: []const u8) bool {
+fn pathFilterContains(alloc: std.mem.Allocator, paths: []const []const u8, path: []const u8) bool {
     for (paths) |candidate| {
-        if (sourcePathsEqual(candidate, path)) return true;
+        if (sourcePathsEqual(alloc, candidate, path)) return true;
     }
     return false;
 }
 
-fn sourcePathsEqual(left: []const u8, right: []const u8) bool {
-    return std.mem.eql(u8, normalizeSourcePath(left), normalizeSourcePath(right));
+fn sourcePathsEqual(alloc: std.mem.Allocator, left: []const u8, right: []const u8) bool {
+    const normalized_left = normalizeSourcePath(left);
+    const normalized_right = normalizeSourcePath(right);
+    if (std.mem.eql(u8, normalized_left, normalized_right)) return true;
+
+    const canonical_left = canonicalSourcePath(alloc, normalized_left) catch return false;
+    defer alloc.free(canonical_left);
+    const canonical_right = canonicalSourcePath(alloc, normalized_right) catch return false;
+    defer alloc.free(canonical_right);
+
+    return std.mem.eql(u8, canonical_left, canonical_right);
 }
 
 fn normalizeSourcePath(path: []const u8) []const u8 {
@@ -3905,6 +3973,13 @@ fn normalizeSourcePath(path: []const u8) []const u8 {
         normalized = normalized[2..];
     }
     return normalized;
+}
+
+fn canonicalSourcePath(alloc: std.mem.Allocator, path: []const u8) ![]const u8 {
+    const real_path = std.Io.Dir.cwd().realPathFileAlloc(std.Options.debug_io, path, alloc) catch
+        return std.fs.path.resolve(alloc, &.{path});
+    defer alloc.free(real_path);
+    return try alloc.dupe(u8, real_path);
 }
 
 fn unwrapCtAstLiteral(value: CtValue) CtValue {
@@ -4929,7 +5004,7 @@ pub const PersistentCache = struct {
                 .reflected_source => |rs| {
                     const current_graph = graph orelse return false;
                     const current_interner = interner orelse return false;
-                    const current_hash = computeSourceReflectionHash(current_graph, current_interner, rs.paths);
+                    const current_hash = computeSourceReflectionHash(alloc, current_graph, current_interner, rs.paths);
                     if (current_hash != rs.graph_hash) return false;
                 },
             }

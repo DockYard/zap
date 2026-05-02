@@ -1,6 +1,6 @@
 @doc = "Enumerable implementation for `Map`."
 
-pub impl Enumerable for Map {
+pub impl Enumerable({map_key, map_value}) for Map(map_key, map_value) {
   @doc = """
     Returns the next entry from a map.
 

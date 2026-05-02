@@ -855,11 +855,7 @@ pub fn ctValueToExpr(
             if (dot_form == .atom and std.mem.eql(u8, dot_form.atom, ".") and dot_args == .list and dot_args.list.elems.len == 2) {
                 // Reconstruct: object.field(args)
                 const object = try ctValueToExpr(alloc, interner, dot_args.list.elems[0]);
-                const field_atom = dot_args.list.elems[1];
-                const field_name = if (field_atom == .atom)
-                    try interner.intern(field_atom.atom)
-                else
-                    try interner.intern("unknown");
+                const field_name = try interner.intern(ctFieldName(dot_args.list.elems[1]) orelse "unknown");
 
                 const callee = try alloc.create(ast.Expr);
                 callee.* = .{ .field_access = .{ .meta = node_meta, .object = object, .field = field_name } };
@@ -1038,15 +1034,17 @@ pub fn ctValueToExpr(
     }
 
     if (std.mem.eql(u8, form_name, ".")) {
-        if (arg_elems.len == 2 and arg_elems[1] == .atom) {
-            const obj = try ctValueToExpr(alloc, interner, arg_elems[0]);
-            const expr = try alloc.create(ast.Expr);
-            expr.* = .{ .field_access = .{
-                .meta = node_meta,
-                .object = obj,
-                .field = try interner.intern(arg_elems[1].atom),
-            } };
-            return expr;
+        if (arg_elems.len == 2) {
+            if (ctFieldName(arg_elems[1])) |field_name| {
+                const obj = try ctValueToExpr(alloc, interner, arg_elems[0]);
+                const expr = try alloc.create(ast.Expr);
+                expr.* = .{ .field_access = .{
+                    .meta = node_meta,
+                    .object = obj,
+                    .field = try interner.intern(field_name),
+                } };
+                return expr;
+            }
         }
     }
 
@@ -1533,6 +1531,14 @@ fn ctValueToStmt(
     }
     // Default: treat as expression statement
     return .{ .expr = try ctValueToExpr(alloc, interner, value) };
+}
+
+fn ctFieldName(value: CtValue) ?[]const u8 {
+    return switch (value) {
+        .atom => |raw| if (raw.len > 0 and raw[0] == ':') raw[1..] else raw,
+        .string => |name| name,
+        else => null,
+    };
 }
 
 /// Convert a CtValue to a statement list (for do/else blocks).

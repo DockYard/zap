@@ -331,6 +331,92 @@ fn compileAndRunWithFiles(source: []const u8, extra_files: []const ExtraFile) Te
     };
 }
 
+test "CLI: zap test runs Zest cases discovered by project-root relative pattern" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    tmp_dir.dir.createDirPath(getTestIo(), "test") catch return error.Unexpected;
+
+    const build_source =
+        \\pub struct TestProject.Builder {
+        \\  pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
+        \\    case env.target {
+        \\      :test ->
+        \\        %Zap.Manifest{
+        \\          name: "zap_test",
+        \\          version: "0.1.0",
+        \\          kind: :bin,
+        \\          root: "TestRunner.main/1",
+        \\          paths: ["test/**/*_test.zap"]
+        \\        }
+        \\      _ ->
+        \\        panic("Unknown target")
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    const runner_source =
+        \\pub struct TestRunner {
+        \\  use Zest.Runner, pattern: "test/**/*_test.zap"
+        \\}
+    ;
+
+    const test_source =
+        \\pub struct SampleTest {
+        \\  use Zest.Case
+        \\
+        \\  describe("sample") {
+        \\    test("one") {
+        \\      assert(true)
+        \\    }
+        \\
+        \\    test("two") {
+        \\      reject(false)
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    tmp_dir.dir.writeFile(getTestIo(), .{ .sub_path = "build.zap", .data = build_source }) catch
+        return error.Unexpected;
+    tmp_dir.dir.writeFile(getTestIo(), .{ .sub_path = "test/test_runner.zap", .data = runner_source }) catch
+        return error.Unexpected;
+    tmp_dir.dir.writeFile(getTestIo(), .{ .sub_path = "test/sample_test.zap", .data = test_source }) catch
+        return error.Unexpected;
+
+    const tmp_dir_path = tmp_dir.dir.realPathFileAlloc(getTestIo(), ".", allocator) catch
+        return error.Unexpected;
+    defer allocator.free(tmp_dir_path);
+
+    const zap_binary_raw: []const u8 = getenvSlice("ZAP_BINARY") orelse "zig-out/bin/zap";
+    const zap_binary = if (std.fs.path.isAbsolute(zap_binary_raw))
+        allocator.dupe(u8, zap_binary_raw) catch return error.OutOfMemory
+    else
+        std.Io.Dir.cwd().realPathFileAlloc(getTestIo(), zap_binary_raw, allocator) catch return error.Unexpected;
+    defer allocator.free(zap_binary);
+
+    const result = std.process.run(allocator, getTestIo(), .{
+        .argv = &.{ zap_binary, "test", "--seed", "123" },
+        .cwd = .{ .path = tmp_dir_path },
+        .stdout_limit = .limited(256 * 1024),
+        .stderr_limit = .limited(256 * 1024),
+    }) catch return error.RunFailed;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    const exit_code = switch (result.term) {
+        .exited => |code| code,
+        else => return error.RunFailed,
+    };
+
+    try std.testing.expectEqual(@as(u8, 0), exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "2 tests, 0 failures") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "2 assertions, 0 failures") != null);
+}
+
 test "CLI: run doc target generates documentation without executable root" {
     const allocator = std.testing.allocator;
 

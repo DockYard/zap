@@ -26,6 +26,8 @@ pub struct Struct {
     the given name and arity.
     """
 
+  @requires = [:reflect_source]
+
   pub macro has_function?(struct_ref :: Expr, function_name :: Expr, function_arity :: Expr) -> Expr {
     _matches = for _function <- functions(struct_ref), map_get(_function, :name, "") == function_name and map_get(_function, :arity, -1) == function_arity {
       _function

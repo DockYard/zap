@@ -1,6 +1,6 @@
 @doc = "Enumerable implementation for `Range`."
 
-pub impl Enumerable for Range {
+pub impl Enumerable(i64) for Range {
   @doc = """
     Returns the next value from a range.
 

@@ -878,62 +878,44 @@ pub const Kernel = struct {
 
     /// Call a callable value — either a bare function pointer or a
     /// closure struct with `{call_fn, env, env_release}` fields.
-    pub inline fn callCallable0(callable: anytype) @TypeOf(callable()) {
-        const T = @TypeOf(callable);
-        if (@typeInfo(T) == .@"struct" and @hasField(T, "call_fn")) {
+    pub inline fn callCallable0(callable: anytype) CallableReturn(@TypeOf(callable)) {
+        if (comptime isZapClosure(@TypeOf(callable))) {
             return callable.call_fn(callable.env);
-        } else {
-            return callable();
         }
+        if (comptime isBareFunction(@TypeOf(callable))) {
+            return callBare0(callable);
+        }
+        return callable();
     }
 
-    pub inline fn callCallable1(callable: anytype, arg0: anytype) CallReturnType(@TypeOf(callable)) {
-        const T = @TypeOf(callable);
-        if (@typeInfo(T) == .@"struct" and @hasField(T, "call_fn")) {
+    pub inline fn callCallable1(callable: anytype, arg0: anytype) CallableReturn(@TypeOf(callable)) {
+        if (comptime isZapClosure(@TypeOf(callable))) {
             return callable.call_fn(callable.env, arg0);
-        } else {
-            return callable(arg0);
         }
+        if (comptime isBareFunction(@TypeOf(callable))) {
+            return callBare1(callable, arg0);
+        }
+        return callable(arg0);
     }
 
-    pub inline fn callCallable2(callable: anytype, arg0: anytype, arg1: anytype) CallReturnType(@TypeOf(callable)) {
-        const T = @TypeOf(callable);
-        if (@typeInfo(T) == .@"struct" and @hasField(T, "call_fn")) {
+    pub inline fn callCallable2(callable: anytype, arg0: anytype, arg1: anytype) CallableReturn(@TypeOf(callable)) {
+        if (comptime isZapClosure(@TypeOf(callable))) {
             return callable.call_fn(callable.env, arg0, arg1);
-        } else {
-            return callable(arg0, arg1);
         }
+        if (comptime isBareFunction(@TypeOf(callable))) {
+            return callBare2(callable, arg0, arg1);
+        }
+        return callable(arg0, arg1);
     }
 
-    pub inline fn callCallable3(callable: anytype, arg0: anytype, arg1: anytype, arg2: anytype) CallReturnType(@TypeOf(callable)) {
-        const T = @TypeOf(callable);
-        if (@typeInfo(T) == .@"struct" and @hasField(T, "call_fn")) {
+    pub inline fn callCallable3(callable: anytype, arg0: anytype, arg1: anytype, arg2: anytype) CallableReturn(@TypeOf(callable)) {
+        if (comptime isZapClosure(@TypeOf(callable))) {
             return callable.call_fn(callable.env, arg0, arg1, arg2);
-        } else {
-            return callable(arg0, arg1, arg2);
         }
-    }
-
-    fn CallReturnType(comptime T: type) type {
-        if (@typeInfo(T) == .@"struct" and @hasField(T, "call_fn")) {
-            const fn_info = @typeInfo(@TypeOf(@field(@as(T, undefined), "call_fn")));
-            if (fn_info == .pointer) {
-                const child = @typeInfo(fn_info.pointer.child);
-                if (child == .@"fn") {
-                    return child.@"fn".return_type orelse i64;
-                }
-            }
-            return i64;
-        } else {
-            const info = @typeInfo(T);
-            if (info == .pointer) {
-                const child = @typeInfo(info.pointer.child);
-                if (child == .@"fn") {
-                    return child.@"fn".return_type orelse i64;
-                }
-            }
-            return i64;
+        if (comptime isBareFunction(@TypeOf(callable))) {
+            return callBare3(callable, arg0, arg1, arg2);
         }
+        return callable(arg0, arg1, arg2);
     }
 
     pub fn is_integer(value: anytype) bool {
@@ -1935,25 +1917,80 @@ pub const BinaryHelpers = struct {
 // ============================================================
 
 // ---- Callable dispatch helpers ----
-// Handle both bare function pointers and closure structs transparently.
-// Used by List, Map, and List higher-order functions.
+// Handle both bare function pointers and Zap closure structs transparently.
+// Used by List and Map higher-order helpers.
 
-inline fn call1(callback: anytype, arg0: anytype) @TypeOf(if (@typeInfo(@TypeOf(callback)) == .@"struct" and @hasField(@TypeOf(callback), "call_fn")) callback.call_fn(callback.env, arg0) else callback(arg0)) {
-    const T = @TypeOf(callback);
-    if (@typeInfo(T) == .@"struct" and @hasField(T, "call_fn")) {
-        return callback.call_fn(callback.env, arg0);
-    } else {
-        return callback(arg0);
-    }
+fn isZapClosure(comptime Callback: type) bool {
+    return switch (@typeInfo(Callback)) {
+        .@"struct" => @hasField(Callback, "call_fn") and @hasField(Callback, "env"),
+        else => false,
+    };
 }
 
-inline fn call2(callback: anytype, arg0: anytype, arg1: anytype) @TypeOf(if (@typeInfo(@TypeOf(callback)) == .@"struct" and @hasField(@TypeOf(callback), "call_fn")) callback.call_fn(callback.env, arg0, arg1) else callback(arg0, arg1)) {
-    const T = @TypeOf(callback);
-    if (@typeInfo(T) == .@"struct" and @hasField(T, "call_fn")) {
-        return callback.call_fn(callback.env, arg0, arg1);
-    } else {
-        return callback(arg0, arg1);
+fn isBareFunction(comptime Callback: type) bool {
+    return switch (@typeInfo(Callback)) {
+        .@"fn" => true,
+        .pointer => |pointer| @typeInfo(pointer.child) == .@"fn",
+        else => false,
+    };
+}
+
+inline fn callBare0(callable: anytype) CallableReturn(@TypeOf(callable)) {
+    if (comptime @typeInfo(@TypeOf(callable)) == .pointer) return @call(.auto, callable, .{});
+    return @call(.auto, &callable, .{});
+}
+
+inline fn callBare1(callable: anytype, arg0: anytype) CallableReturn(@TypeOf(callable)) {
+    if (comptime @typeInfo(@TypeOf(callable)) == .pointer) return @call(.auto, callable, .{arg0});
+    return @call(.auto, &callable, .{arg0});
+}
+
+inline fn callBare2(callable: anytype, arg0: anytype, arg1: anytype) CallableReturn(@TypeOf(callable)) {
+    if (comptime @typeInfo(@TypeOf(callable)) == .pointer) return @call(.auto, callable, .{ arg0, arg1 });
+    return @call(.auto, &callable, .{ arg0, arg1 });
+}
+
+inline fn callBare3(callable: anytype, arg0: anytype, arg1: anytype, arg2: anytype) CallableReturn(@TypeOf(callable)) {
+    if (comptime @typeInfo(@TypeOf(callable)) == .pointer) return @call(.auto, callable, .{ arg0, arg1, arg2 });
+    return @call(.auto, &callable, .{ arg0, arg1, arg2 });
+}
+
+fn CallableReturn(comptime Callback: type) type {
+    return switch (@typeInfo(Callback)) {
+        .@"struct" => if (@hasField(Callback, "call_fn") and @hasField(Callback, "env"))
+            FunctionReturn(@FieldType(Callback, "call_fn"))
+        else
+            FunctionReturn(Callback),
+        else => FunctionReturn(Callback),
+    };
+}
+
+fn FunctionReturn(comptime Function: type) type {
+    return switch (@typeInfo(Function)) {
+        .pointer => |pointer| FunctionReturn(pointer.child),
+        .@"fn" => |function| function.return_type orelse void,
+        else => @compileError("callable value must be a function pointer or Zap closure, got " ++ @typeName(Function)),
+    };
+}
+
+inline fn call1(callback: anytype, arg0: anytype) CallableReturn(@TypeOf(callback)) {
+    if (comptime isZapClosure(@TypeOf(callback))) {
+        return callback.call_fn(callback.env, arg0);
     }
+    if (comptime isBareFunction(@TypeOf(callback))) {
+        return callBare1(callback, arg0);
+    }
+    return callback(arg0);
+}
+
+inline fn call2(callback: anytype, arg0: anytype, arg1: anytype) CallableReturn(@TypeOf(callback)) {
+    if (comptime isZapClosure(@TypeOf(callback))) {
+        return callback.call_fn(callback.env, arg0, arg1);
+    }
+    if (comptime isBareFunction(@TypeOf(callback))) {
+        return callBare2(callback, arg0, arg1);
+    }
+    return callback(arg0, arg1);
 }
 
 // ============================================================

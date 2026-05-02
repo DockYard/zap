@@ -817,6 +817,27 @@ pub const Parser = struct {
         }
         const name = try self.parseStructName();
 
+        var type_params: std.ArrayList(ast.StringId) = .empty;
+        if (self.check(.left_paren)) {
+            _ = self.advance();
+            while (!self.check(.right_paren) and !self.check(.eof)) {
+                if (!self.check(.identifier) and !self.check(.type_identifier)) {
+                    try self.addRichError(
+                        "I was expecting a protocol type-parameter name inside the parens",
+                        self.currentSpan(),
+                        null,
+                        "protocol type parameters look like: `protocol Enumerable(element) { ... }`",
+                    );
+                    return error.ParseError;
+                }
+                const tok = self.advance();
+                try type_params.append(self.allocator, try self.internToken(tok));
+                if (!self.match(.comma)) break;
+                self.skipNewlines();
+            }
+            _ = try self.expect(.right_paren);
+        }
+
         _ = try self.expect(.left_brace);
         self.skipNewlines();
 
@@ -847,6 +868,7 @@ pub const Parser = struct {
         return .{
             .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
             .name = name,
+            .type_params = try type_params.toOwnedSlice(self.allocator),
             .functions = try functions.toOwnedSlice(self.allocator),
             .is_private = is_private,
         };
@@ -921,6 +943,17 @@ pub const Parser = struct {
             return error.ParseError;
         }
         const protocol_name = try self.parseStructName();
+
+        var protocol_type_args: std.ArrayList(*const ast.TypeExpr) = .empty;
+        if (self.check(.left_paren)) {
+            _ = self.advance();
+            while (!self.check(.right_paren) and !self.check(.eof)) {
+                try protocol_type_args.append(self.allocator, try self.parseTypeExpr());
+                if (!self.match(.comma)) break;
+                self.skipNewlines();
+            }
+            _ = try self.expect(.right_paren);
+        }
 
         if (!self.match(.keyword_for)) {
             try self.addRichError(
@@ -1017,6 +1050,7 @@ pub const Parser = struct {
         return .{
             .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
             .protocol_name = protocol_name,
+            .protocol_type_args = try protocol_type_args.toOwnedSlice(self.allocator),
             .target_type = target_type,
             .type_params = try type_params.toOwnedSlice(self.allocator),
             .functions = try functions.toOwnedSlice(self.allocator),

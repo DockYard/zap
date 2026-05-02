@@ -97,72 +97,72 @@ pub const Collector = struct {
 
         // Process top-level items (functions, types outside structs)
         // Structs are already processed above via program.structs, skip them here.
-        // Top-level @doc attributes are attached to the next definition.
-        var pending_top_doc: ?scope.Attribute = null;
+        // Top-level attributes are attached to the next definition.
+        var pending_top_attrs: std.ArrayList(scope.Attribute) = .empty;
+        defer pending_top_attrs.deinit(self.allocator);
         for (program.top_items) |item| {
             switch (item) {
                 .attribute => |attr| {
-                    pending_top_doc = .{
+                    try pending_top_attrs.append(self.allocator, .{
                         .name = attr.name,
                         .type_expr = attr.type_expr,
                         .value = attr.value,
-                    };
+                    });
                 },
                 .struct_decl, .priv_struct_decl => |sd| {
-                    // Struct already collected above. Attach pending @doc if any.
-                    if (pending_top_doc) |doc_attr| {
-                        try self.attachTopLevelDocToStruct(sd, doc_attr);
-                        pending_top_doc = null;
+                    // Struct already collected above. Attach pending attributes if any.
+                    for (pending_top_attrs.items) |top_attr| {
+                        try self.attachTopLevelAttributeToStruct(sd, top_attr);
                     }
+                    pending_top_attrs.clearRetainingCapacity();
                 },
                 .union_decl => |ed| {
                     const type_id = try self.collectUnion(ed, self.graph.prelude_scope);
-                    if (pending_top_doc) |doc_attr| {
-                        try self.graph.types.items[type_id].attributes.append(self.allocator, doc_attr);
-                        pending_top_doc = null;
+                    for (pending_top_attrs.items) |top_attr| {
+                        try self.graph.types.items[type_id].attributes.append(self.allocator, top_attr);
                     }
+                    pending_top_attrs.clearRetainingCapacity();
                 },
                 .protocol, .priv_protocol => |proto| {
                     try self.collectProtocol(proto);
-                    if (pending_top_doc) |doc_attr| {
-                        // Attach doc to the protocol entry
-                        try self.attachTopLevelDocToProtocol(proto, doc_attr);
-                        pending_top_doc = null;
+                    for (pending_top_attrs.items) |top_attr| {
+                        try self.attachTopLevelAttributeToProtocol(proto, top_attr);
                     }
+                    pending_top_attrs.clearRetainingCapacity();
                 },
                 .function => |func| {
                     try self.collectFunction(func, self.graph.prelude_scope);
-                    pending_top_doc = null;
+                    pending_top_attrs.clearRetainingCapacity();
                 },
                 .priv_function => |func| {
                     try self.collectFunction(func, self.graph.prelude_scope);
-                    pending_top_doc = null;
+                    pending_top_attrs.clearRetainingCapacity();
                 },
                 .macro => |mac| {
                     try self.collectMacro(mac, self.graph.prelude_scope);
-                    pending_top_doc = null;
+                    pending_top_attrs.clearRetainingCapacity();
                 },
                 .priv_macro => |mac| {
                     try self.collectMacro(mac, self.graph.prelude_scope);
-                    pending_top_doc = null;
+                    pending_top_attrs.clearRetainingCapacity();
                 },
                 .type_decl => |td| {
                     const type_id = try self.collectType(td, self.graph.prelude_scope);
-                    if (pending_top_doc) |doc_attr| {
-                        try self.graph.types.items[type_id].attributes.append(self.allocator, doc_attr);
-                        pending_top_doc = null;
+                    for (pending_top_attrs.items) |top_attr| {
+                        try self.graph.types.items[type_id].attributes.append(self.allocator, top_attr);
                     }
+                    pending_top_attrs.clearRetainingCapacity();
                 },
                 .opaque_decl => |od| {
                     const type_id = try self.collectOpaque(od, self.graph.prelude_scope);
-                    if (pending_top_doc) |doc_attr| {
-                        try self.graph.types.items[type_id].attributes.append(self.allocator, doc_attr);
-                        pending_top_doc = null;
+                    for (pending_top_attrs.items) |top_attr| {
+                        try self.graph.types.items[type_id].attributes.append(self.allocator, top_attr);
                     }
+                    pending_top_attrs.clearRetainingCapacity();
                 },
                 .impl_decl, .priv_impl_decl => |impl_d| {
                     try self.collectImpl(impl_d);
-                    pending_top_doc = null;
+                    pending_top_attrs.clearRetainingCapacity();
                 },
             }
         }
@@ -229,19 +229,19 @@ pub const Collector = struct {
             sameSourceSpan(left.meta.span, right.meta.span);
     }
 
-    fn attachTopLevelDocToStruct(self: *Collector, decl: *const ast.StructDecl, doc_attr: scope.Attribute) !void {
+    fn attachTopLevelAttributeToStruct(self: *Collector, decl: *const ast.StructDecl, top_attr: scope.Attribute) !void {
         for (self.graph.structs.items) |*mod_entry| {
             if (sameStructDeclIdentity(mod_entry.decl, decl)) {
-                try mod_entry.attributes.append(self.allocator, doc_attr);
+                try mod_entry.attributes.append(self.allocator, top_attr);
                 return;
             }
         }
     }
 
-    fn attachTopLevelDocToProtocol(self: *Collector, decl: *const ast.ProtocolDecl, doc_attr: scope.Attribute) !void {
+    fn attachTopLevelAttributeToProtocol(self: *Collector, decl: *const ast.ProtocolDecl, top_attr: scope.Attribute) !void {
         for (self.graph.protocols.items) |*proto_entry| {
             if (sameProtocolDeclIdentity(proto_entry.decl, decl)) {
-                try proto_entry.attributes.append(self.allocator, doc_attr);
+                try proto_entry.attributes.append(self.allocator, top_attr);
                 return;
             }
         }

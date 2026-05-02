@@ -1,6 +1,6 @@
 @doc = "Enumerable implementation for `List`."
 
-pub impl Enumerable for List {
+pub impl Enumerable(member) for List(member) {
   @doc = """
     Returns the next element from a list.
 

@@ -30,9 +30,16 @@ pub const MacroEvalError = error{
 /// (legacy CTFE attribute evaluation) leave it null and the
 /// intrinsics fall back to evaluator-local behavior or no-ops.
 pub const StructContext = struct {
-    graph: *@import("scope.zig").ScopeGraph,
-    interner: *@import("ast.zig").StringInterner,
-    current_struct_scope: ?u32 = null,
+    graph: *scope.ScopeGraph,
+    interner: *ast.StringInterner,
+    /// Lexical struct scope used to resolve unqualified function and
+    /// macro helper calls while evaluating macro code.
+    current_struct_scope: ?scope.ScopeId = null,
+    /// Struct scope that struct attribute intrinsics should read and
+    /// write. This can differ from `current_struct_scope` when a macro
+    /// helper is evaluated in its provider struct but still needs to
+    /// mutate the caller struct being expanded.
+    attribute_struct_scope: ?scope.ScopeId = null,
 };
 
 pub const Env = struct {
@@ -1040,7 +1047,7 @@ fn structIntrinsicPut(env: *Env, args: []const CtValue) MacroEvalError!CtValue {
     const name_val = try eval(env, args[0]);
     const value_ct = try eval(env, args[1]);
     const ctx = env.struct_ctx orelse return .nil;
-    const scope_id = ctx.current_struct_scope orelse return .nil;
+    const scope_id = attributeStructScope(ctx) orelse return .nil;
     const mod_entry = ctx.graph.findStructByScope(scope_id) orelse return .nil;
 
     const name_str = extractAtomName(name_val) orelse return .nil;
@@ -1290,6 +1297,7 @@ fn evalCompiledQualifiedFunction(
     if (env.struct_ctx) |ctx| {
         interpreter.scope_graph = ctx.graph;
         interpreter.interner = ctx.interner;
+        interpreter.current_struct_scope = attributeStructScope(ctx);
     }
     interpreter.capabilities = env.current_macro_caps;
     interpreter.steps_remaining = interpreter.step_budget;
@@ -1366,6 +1374,7 @@ fn evalDispatchedClause(
         .graph = ctx.graph,
         .interner = ctx.interner,
         .current_struct_scope = callee_scope,
+        .attribute_struct_scope = attributeStructScope(ctx),
     };
     child_env.compiled_program = env.compiled_program;
     child_env.dispatch_depth = env.dispatch_depth + 1;
@@ -1507,10 +1516,12 @@ fn dispatchComptimeCall(
     var callee_caps: ctfe.CapabilitySet = ctfe.CapabilitySet.build;
     var callee_is_macro = false;
 
+    var callee_scope = scope_id;
     const clause: *const ast.FunctionClause = blk: {
         if (ctx.graph.resolveFamily(scope_id, name_id, arity)) |fid| {
             const family = &ctx.graph.families.items[fid];
             if (family.clauses.items.len == 0) return null;
+            callee_scope = family.scope_id;
             const cref = family.clauses.items[0];
             break :blk &cref.decl.clauses[cref.clause_index];
         }
@@ -1519,6 +1530,7 @@ fn dispatchComptimeCall(
             if (mfamily.clauses.items.len == 0) return null;
             callee_caps = mfamily.required_caps;
             callee_is_macro = true;
+            callee_scope = mfamily.scope_id;
             const cref = mfamily.clauses.items[0];
             break :blk &cref.decl.clauses[cref.clause_index];
         }
@@ -1568,7 +1580,12 @@ fn dispatchComptimeCall(
     // child's bindings can't leak into the caller's scope.
     var child_env = Env.init(env.alloc, env.store);
     defer child_env.deinit();
-    child_env.struct_ctx = env.struct_ctx;
+    child_env.struct_ctx = .{
+        .graph = ctx.graph,
+        .interner = ctx.interner,
+        .current_struct_scope = callee_scope,
+        .attribute_struct_scope = attributeStructScope(ctx),
+    };
     child_env.compiled_program = env.compiled_program;
     child_env.dispatch_depth = env.dispatch_depth + 1;
     // When dispatching into a macro body, narrow the child env's
@@ -1610,6 +1627,10 @@ fn dispatchComptimeCall(
             }
             return err;
         };
+    }
+
+    if (callee_is_macro and isCompileTimeIntrinsicExpansion(result)) {
+        return try eval(&child_env, result);
     }
 
     // The function may legitimately return nil. Return the actual
@@ -1820,7 +1841,7 @@ fn structIntrinsicGet(env: *Env, args: []const CtValue) MacroEvalError!CtValue {
     if (args.len != 1) return .nil;
     const name_val = try eval(env, args[0]);
     const ctx = env.struct_ctx orelse return .nil;
-    const scope_id = ctx.current_struct_scope orelse return .nil;
+    const scope_id = attributeStructScope(ctx) orelse return .nil;
     const mod_entry = ctx.graph.findStructByScope(scope_id) orelse return .nil;
 
     const name_str = extractAtomName(name_val) orelse return .nil;
@@ -1834,13 +1855,17 @@ fn structIntrinsicRegister(env: *Env, args: []const CtValue) MacroEvalError!CtVa
     if (args.len < 1) return .nil;
     const name_val = try eval(env, args[0]);
     const ctx = env.struct_ctx orelse return .nil;
-    const scope_id = ctx.current_struct_scope orelse return .nil;
+    const scope_id = attributeStructScope(ctx) orelse return .nil;
     const mod_entry = ctx.graph.findStructByScope(scope_id) orelse return .nil;
 
     const name_str = extractAtomName(name_val) orelse return .nil;
     const name_id = ctx.interner.intern(name_str) catch return .nil;
     ctx.graph.registerAccumulatingAttribute(mod_entry, name_id) catch return .nil;
     return .nil;
+}
+
+fn attributeStructScope(ctx: StructContext) ?scope.ScopeId {
+    return ctx.attribute_struct_scope orelse ctx.current_struct_scope;
 }
 
 fn sourceGraphStructsIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtValue {
@@ -1862,7 +1887,7 @@ fn sourceGraphStructsIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!
     for (ctx.graph.structs.items) |struct_entry| {
         const source_id = struct_entry.decl.meta.span.source_id orelse continue;
         const path = ctx.graph.sourcePathById(source_id) orelse continue;
-        if (!pathFilterContains(paths, path)) continue;
+        if (!pathFilterContains(env.alloc, paths, path)) continue;
         try result_list.append(env.alloc, try makeStructRef(env, ctx.interner, struct_entry, path, source_id));
     }
 
@@ -2024,15 +2049,24 @@ fn structNameMatches(interner: *const ast.StringInterner, name: ast.StructName, 
     return index == target.len;
 }
 
-fn pathFilterContains(paths: []const []const u8, path: []const u8) bool {
+fn pathFilterContains(alloc: Allocator, paths: []const []const u8, path: []const u8) bool {
     for (paths) |candidate| {
-        if (sourcePathsEqual(candidate, path)) return true;
+        if (sourcePathsEqual(alloc, candidate, path)) return true;
     }
     return false;
 }
 
-fn sourcePathsEqual(left: []const u8, right: []const u8) bool {
-    return std.mem.eql(u8, normalizeSourcePath(left), normalizeSourcePath(right));
+fn sourcePathsEqual(alloc: Allocator, left: []const u8, right: []const u8) bool {
+    const normalized_left = normalizeSourcePath(left);
+    const normalized_right = normalizeSourcePath(right);
+    if (std.mem.eql(u8, normalized_left, normalized_right)) return true;
+
+    const canonical_left = canonicalSourcePath(alloc, normalized_left) catch return false;
+    defer alloc.free(canonical_left);
+    const canonical_right = canonicalSourcePath(alloc, normalized_right) catch return false;
+    defer alloc.free(canonical_right);
+
+    return std.mem.eql(u8, canonical_left, canonical_right);
 }
 
 fn normalizeSourcePath(path: []const u8) []const u8 {
@@ -2041,6 +2075,13 @@ fn normalizeSourcePath(path: []const u8) []const u8 {
         normalized = normalized[2..];
     }
     return normalized;
+}
+
+fn canonicalSourcePath(alloc: Allocator, path: []const u8) ![]const u8 {
+    const real_path = std.Io.Dir.cwd().realPathFileAlloc(std.Options.debug_io, path, alloc) catch
+        return std.fs.path.resolve(alloc, &.{path});
+    defer alloc.free(real_path);
+    return try alloc.dupe(u8, real_path);
 }
 
 /// Extract an atom name from a CtValue, dropping the leading `:`
@@ -2271,11 +2312,21 @@ test "eval: map_get returns matching value or default" {
 }
 
 test "source path filters treat leading dot slash as equivalent" {
+    const alloc = std.testing.allocator;
     const exact_paths = [_][]const u8{"test/zap/zest_runner_test.zap"};
-    try std.testing.expect(pathFilterContains(&exact_paths, "test/zap/zest_runner_test.zap"));
-    try std.testing.expect(pathFilterContains(&exact_paths, "./test/zap/zest_runner_test.zap"));
+    try std.testing.expect(pathFilterContains(alloc, &exact_paths, "test/zap/zest_runner_test.zap"));
+    try std.testing.expect(pathFilterContains(alloc, &exact_paths, "./test/zap/zest_runner_test.zap"));
 
     const dot_slash_paths = [_][]const u8{"./test/zap/zest_runner_test.zap"};
-    try std.testing.expect(pathFilterContains(&dot_slash_paths, "test/zap/zest_runner_test.zap"));
-    try std.testing.expect(!pathFilterContains(&exact_paths, "test/other_test.zap"));
+    try std.testing.expect(pathFilterContains(alloc, &dot_slash_paths, "test/zap/zest_runner_test.zap"));
+    try std.testing.expect(!pathFilterContains(alloc, &exact_paths, "test/other_test.zap"));
+}
+
+test "source path filters treat project-relative and absolute paths as equivalent" {
+    const alloc = std.testing.allocator;
+    const absolute_path = try std.Io.Dir.cwd().realPathFileAlloc(std.Options.debug_io, "src/macro_eval.zig", alloc);
+    defer alloc.free(absolute_path);
+
+    const relative_paths = [_][]const u8{"src/macro_eval.zig"};
+    try std.testing.expect(pathFilterContains(alloc, &relative_paths, absolute_path));
 }

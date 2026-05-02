@@ -260,6 +260,7 @@ pub const StructName = struct {
 pub const ProtocolDecl = struct {
     meta: NodeMeta,
     name: StructName,
+    type_params: []const StringId = &.{},
     functions: []const ProtocolFunctionSig,
     is_private: bool = false,
 };
@@ -284,6 +285,9 @@ pub const ProtocolParam = struct {
 pub const ImplDecl = struct {
     meta: NodeMeta,
     protocol_name: StructName,
+    /// Type arguments supplied to the protocol being implemented, e.g.
+    /// `element` in `impl Enumerable(element) for List(element)`.
+    protocol_type_args: []const *const TypeExpr = &.{},
     target_type: StructName,
     /// Type parameters declared on the impl header, e.g. `K, V` in
     /// `impl Enumerable for Map(K, V)`. Empty when the target type is

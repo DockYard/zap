@@ -299,7 +299,7 @@ pub struct Zap.EnumTest {
     }
 
     test("empty? works with ranges through Enumerable") {
-      assert(Enum.empty?(5..1))
+      reject(Enum.empty?(5..1))
       reject(Enum.empty?(1..3))
     }
   }

@@ -138,6 +138,7 @@ extern "c" fn zir_builder_emit_param_imported_type(handle: ?*ZirBuilderHandle, p
 // (the method's own enclosing Zap struct as a parameter type), since
 // `@import(self_name)` is rejected by Zig's build struct system.
 extern "c" fn zir_builder_emit_param_this_type(handle: ?*ZirBuilderHandle, param_name_ptr: [*]const u8, param_name_len: u32) u32;
+extern "c" fn zir_builder_emit_param_type_body(handle: ?*ZirBuilderHandle, param_name_ptr: [*]const u8, param_name_len: u32, type_body_inst_indices_ptr: [*]const u32, type_body_inst_indices_len: u32, type_result: u32) u32;
 extern "c" fn zir_builder_emit_this_type(handle: ?*ZirBuilderHandle) u32;
 
 // Tuple return type
@@ -376,6 +377,14 @@ fn mapParamType(zig_type: ir.ZigType) u32 {
 // ZirDriver
 // ---------------------------------------------------------------------------
 
+fn instructionsEndNoReturn(instructions: []const ir.Instruction) bool {
+    if (instructions.len == 0) return false;
+    return switch (instructions[instructions.len - 1]) {
+        .match_fail, .match_error_return, .ret => true,
+        else => false,
+    };
+}
+
 pub const ZirDriver = struct {
     handle: *ZirBuilderHandle,
     local_refs: std.AutoHashMapUnmanaged(ir.LocalId, ValueRef),
@@ -450,10 +459,18 @@ pub const ZirDriver = struct {
     /// Populated by make_closure, propagated by local_set/local_get/move/share.
     /// Used by call_closure to resolve 0-capture closures to direct named calls.
     closure_function_map: std.AutoHashMapUnmanaged(ir.LocalId, ir.FunctionId) = .empty,
+    /// Forward-propagating set of locals whose value originated from a
+    /// function parameter. When such a local is used as a call_closure callee,
+    /// the runtime value may be either a bare function pointer or a closure
+    /// struct; callCallableN handles both shapes.
+    param_derived_closure_locals: std.AutoHashMapUnmanaged(ir.LocalId, void) = .empty,
     /// Maps (closure_function_id, capture_index) → captured closure function ID.
     /// When a closure captures another closure value, this allows the inner function's
     /// capture_get to propagate the closure_function_map across function boundaries.
     capture_closure_function_map: std.AutoHashMapUnmanaged(u64, ir.FunctionId) = .empty,
+    /// Maps (closure_function_id, capture_index) for captured callable values
+    /// whose runtime representation originated from a function parameter.
+    capture_param_derived_closure_map: std.AutoHashMapUnmanaged(u64, void) = .empty,
     /// Compilation context for per-struct ZIR injection.
     compilation_ctx: ?*ZirContext = null,
     /// Struct currently being emitted (e.g., "IO", "Zest_Case"). Null when emitting root.
@@ -485,7 +502,9 @@ pub const ZirDriver = struct {
         self.local_refs.deinit(self.allocator);
         self.param_refs.deinit(self.allocator);
         self.closure_function_map.deinit(self.allocator);
+        self.param_derived_closure_locals.deinit(self.allocator);
         self.capture_closure_function_map.deinit(self.allocator);
+        self.capture_param_derived_closure_map.deinit(self.allocator);
         self.reuse_backed_struct_locals.deinit(self.allocator);
         self.term_typed_locals.deinit(self.allocator);
         self.reuse_backed_union_locals.deinit(self.allocator);
@@ -623,6 +642,43 @@ pub const ZirDriver = struct {
         };
     }
 
+    fn emitClosureEnvParam(self: *ZirDriver, captures: []const ir.Capture) BuildError!u32 {
+        if (captures.len == 0) {
+            const ref = zir_builder_emit_param(self.handle, "__closure_env".ptr, 13, @intFromEnum(Zir.Inst.Ref.none));
+            if (ref == error_ref) return error.EmitFailed;
+            return ref;
+        }
+
+        var env_name_buf: [64]u8 = undefined;
+        const env_name = self.closureEnvTypeName(self.current_function_id, &env_name_buf);
+        const ref = zir_builder_emit_param_decl_val_type(
+            self.handle,
+            "__closure_env".ptr,
+            13,
+            env_name.ptr,
+            @intCast(env_name.len),
+        );
+        if (ref == error_ref) return error.EmitFailed;
+        return ref;
+    }
+
+    fn emitClosureEnvTypeRefForTarget(self: *ZirDriver, target_func: ir.Function) BuildError!u32 {
+        var env_name_buf: [64]u8 = undefined;
+        const env_name = self.closureEnvTypeName(target_func.id, &env_name_buf);
+        const target_struct = target_func.struct_name;
+        const is_cross = blk: {
+            if (target_struct == null and self.current_emit_struct == null) break :blk false;
+            if (target_struct == null or self.current_emit_struct == null) break :blk true;
+            break :blk !self.currentStructMatches(target_struct.?);
+        };
+        if (is_cross and target_struct != null) {
+            return try self.emitCrossStructRef(target_struct.?, env_name);
+        }
+        const ref = zir_builder_emit_decl_val(self.handle, env_name.ptr, @intCast(env_name.len));
+        if (ref == error_ref) return error.EmitFailed;
+        return ref;
+    }
+
     /// Resolve any Zap type to a ZIR type ref for use inside compound type
     /// declarations (e.g., tuple element types). Emits import instructions
     /// for complex types that need runtime type resolution.
@@ -744,6 +800,22 @@ pub const ZirDriver = struct {
         }
     }
 
+    fn markParamDerivedClosureLocal(self: *ZirDriver, local: ir.LocalId) !void {
+        try self.param_derived_closure_locals.put(self.allocator, local, {});
+    }
+
+    fn unmarkParamDerivedClosureLocal(self: *ZirDriver, local: ir.LocalId) void {
+        _ = self.param_derived_closure_locals.remove(local);
+    }
+
+    fn propagateParamDerivedClosureLocal(self: *ZirDriver, dest: ir.LocalId, source: ir.LocalId) !void {
+        if (self.param_derived_closure_locals.contains(source)) {
+            try self.markParamDerivedClosureLocal(dest);
+        } else {
+            self.unmarkParamDerivedClosureLocal(dest);
+        }
+    }
+
     /// Emit struct type declarations for all struct type_defs in the IR program.
     /// These become named constants in the struct's ZIR (e.g., `const Point = struct { x: i64, y: i64 };`).
     /// Check if any function in the given struct references a struct type by name.
@@ -814,6 +886,8 @@ pub const ZirDriver = struct {
             }
         }
 
+        try self.emitClosureEnvTypeDecls(&emitted);
+
         // Emit the primary struct's fields at the file's root
         // struct_decl (instruction 0 / `main_struct_inst`). When the
         // primary has no `struct_def` entry — e.g. a top-level Zap
@@ -824,6 +898,84 @@ pub const ZirDriver = struct {
             .struct_def => |def| try self.emitRootFields(def),
             else => {},
         };
+    }
+
+    fn currentStructMatches(self: *const ZirDriver, struct_name: []const u8) bool {
+        const current_struct = self.current_emit_struct orelse return false;
+        var buf: [256]u8 = undefined;
+        const normalized = dottedPrefixToImportName(struct_name, &buf) orelse return false;
+        return std.mem.eql(u8, normalized, current_struct);
+    }
+
+    fn closureEnvTypeName(self: *const ZirDriver, function_id: ir.FunctionId, buf: []u8) []const u8 {
+        _ = self;
+        return std.fmt.bufPrint(buf, "__ClosureEnv_{d}", .{function_id}) catch "__ClosureEnv";
+    }
+
+    fn mapClosureEnvFieldTypeRef(self: *const ZirDriver, zig_type: ir.ZigType) BuildError!u32 {
+        const simple = mapReturnType(zig_type);
+        if (simple != 0) return simple;
+        return switch (zig_type) {
+            .struct_ref => |name| blk: {
+                const short_name = if (std.mem.lastIndexOf(u8, name, ".")) |dot_idx|
+                    name[dot_idx + 1 ..]
+                else
+                    name;
+                if (self.findEnumDef(name) or self.findEnumDef(short_name)) {
+                    break :blk @intFromEnum(Zir.Inst.Ref.u32_type);
+                }
+                return error.EmitFailed;
+            },
+            .tagged_union => @intFromEnum(Zir.Inst.Ref.u32_type),
+            else => error.EmitFailed,
+        };
+    }
+
+    fn emitClosureEnvTypeDecls(self: *ZirDriver, emitted: *std.StringHashMap(void)) !void {
+        const prog = self.program orelse return;
+        for (prog.functions) |func| {
+            if (!func.is_closure or func.captures.len == 0) continue;
+            if (func.struct_name) |owner| {
+                if (!self.currentStructMatches(owner)) continue;
+            } else if (self.current_emit_struct != null) {
+                continue;
+            }
+
+            const lowering = self.getClosureLowering(func.id, func.captures.len);
+            if (!lowering.needs_env_param) continue;
+
+            var env_name_buf: [64]u8 = undefined;
+            const env_name = self.closureEnvTypeName(func.id, &env_name_buf);
+            if (emitted.contains(env_name)) continue;
+            try emitted.put(env_name, {});
+
+            var field_name_ptrs: std.ArrayListUnmanaged([*]const u8) = .empty;
+            defer field_name_ptrs.deinit(self.allocator);
+            var field_name_lens: std.ArrayListUnmanaged(u32) = .empty;
+            defer field_name_lens.deinit(self.allocator);
+            var field_type_refs: std.ArrayListUnmanaged(u32) = .empty;
+            defer field_type_refs.deinit(self.allocator);
+
+            for (func.captures, 0..) |capture, capture_index| {
+                const field_name = indexFieldName(capture_index);
+                try field_name_ptrs.append(self.allocator, field_name.ptr);
+                try field_name_lens.append(self.allocator, field_name.len);
+                try field_type_refs.append(self.allocator, try self.mapClosureEnvFieldTypeRef(capture.type_expr));
+            }
+
+            if (zir_builder_add_struct_type(
+                self.handle,
+                env_name.ptr,
+                @intCast(env_name.len),
+                field_name_ptrs.items.ptr,
+                field_name_lens.items.ptr,
+                field_type_refs.items.ptr,
+                null,
+                @intCast(func.captures.len),
+            ) != 0) {
+                return error.EmitFailed;
+            }
+        }
     }
 
     /// Whether a type_def belongs to the current emission, and how:
@@ -1309,6 +1461,8 @@ pub const ZirDriver = struct {
 
     pub fn buildProgram(self: *ZirDriver, program: ir.Program) !void {
         self.program = program;
+        self.capture_closure_function_map.clearRetainingCapacity();
+        self.capture_param_derived_closure_map.clearRetainingCapacity();
 
         const ctx = self.compilation_ctx;
 
@@ -1897,6 +2051,49 @@ pub const ZirDriver = struct {
         }
     }
 
+    fn emitTupleParam(self: *ZirDriver, param: ir.Param, elements: []const ir.ZigType) !u32 {
+        var support_inst_indices: std.ArrayListUnmanaged(u32) = .empty;
+        defer support_inst_indices.deinit(self.allocator);
+        var tuple_type_refs: std.ArrayListUnmanaged(u32) = .empty;
+        defer tuple_type_refs.deinit(self.allocator);
+
+        self.pending_ret_ty_untracked.clearRetainingCapacity();
+        for (elements) |element_type| {
+            const before = zir_builder_get_body_inst_count(self.handle);
+            const untracked_before = self.pending_ret_ty_untracked.items.len;
+            const ref = self.mapTupleElementType(element_type);
+            if (ref == 0) return error.EmitFailed;
+            try self.captureBodyInsts(before, &support_inst_indices);
+            if (self.pending_ret_ty_untracked.items.len > untracked_before) {
+                for (self.pending_ret_ty_untracked.items[untracked_before..]) |idx| {
+                    try support_inst_indices.append(self.allocator, idx);
+                }
+            }
+            try tuple_type_refs.append(self.allocator, ref);
+        }
+
+        const tuple_ref = zir_builder_emit_tuple_decl_untracked(
+            self.handle,
+            tuple_type_refs.items.ptr,
+            @intCast(tuple_type_refs.items.len),
+        );
+        if (tuple_ref == error_ref) return error.EmitFailed;
+        const tuple_idx = zir_builder_ref_to_inst_index(self.handle, tuple_ref);
+        if (tuple_idx == 0xFFFFFFFF) return error.EmitFailed;
+        try support_inst_indices.append(self.allocator, tuple_idx);
+
+        const ref = zir_builder_emit_param_type_body(
+            self.handle,
+            param.name.ptr,
+            @intCast(param.name.len),
+            support_inst_indices.items.ptr,
+            @intCast(support_inst_indices.items.len),
+            tuple_ref,
+        );
+        if (ref == error_ref) return error.EmitFailed;
+        return ref;
+    }
+
     fn setContainerReturnTypeWithSupport(
         self: *ZirDriver,
         generic_name: []const u8,
@@ -2157,6 +2354,9 @@ pub const ZirDriver = struct {
                     }
                 }
             }
+        }
+        if (std.meta.activeTag(param.type_expr) == .tuple) {
+            return try self.emitTupleParam(param, param.type_expr.tuple);
         }
         // Map and list params use anytype — generic container types like
         // ListOf(T) and MapOf(K,V) can't be expressed as named imports.
@@ -2441,6 +2641,7 @@ pub const ZirDriver = struct {
         self.local_refs.clearRetainingCapacity();
         self.param_refs.clearRetainingCapacity();
         self.closure_function_map.clearRetainingCapacity();
+        self.param_derived_closure_locals.clearRetainingCapacity();
         self.capture_param_refs.clearRetainingCapacity();
         self.cached_list_cell_ref = 0;
         self.cached_list_gethead_ref = 0;
@@ -2518,13 +2719,13 @@ pub const ZirDriver = struct {
         // top of the body to get OS args via std.process.argsAlloc and store
         // the result as the first param's local ref.
         if (closure_lowering.needs_env_param) {
-            const env_param_ref = zir_builder_emit_param(self.handle, "__closure_env".ptr, 13, @intFromEnum(Zir.Inst.Ref.none));
-            if (env_param_ref == error_ref) return error.EmitFailed;
+            const env_param_ref = try self.emitClosureEnvParam(func.captures);
             self.current_closure_env_ref = env_param_ref;
             for (func.params, 0..) |param, i| {
                 const param_ref = try self.emitTypedParam(param);
                 try self.param_refs.append(self.allocator, param_ref);
                 try self.setLocal(@intCast(i), param_ref);
+                try self.markParamDerivedClosureLocal(@intCast(i));
             }
         } else if (is_main and func.params.len == 1) {
             // Inject: const args = @import("zap_runtime").getArgv()
@@ -2539,6 +2740,7 @@ pub const ZirDriver = struct {
             // Store as the first param's local ref
             try self.param_refs.append(self.allocator, args_ref);
             try self.setLocal(0, args_ref);
+            try self.markParamDerivedClosureLocal(0);
         } else {
             // Lambda-lifted closures: captures are passed as prepended
             // ordinary parameters at every call site (see HIR direct-call
@@ -2559,6 +2761,7 @@ pub const ZirDriver = struct {
                 const param_ref = try self.emitTypedParam(param);
                 try self.param_refs.append(self.allocator, param_ref);
                 try self.setLocal(@intCast(i), param_ref);
+                try self.markParamDerivedClosureLocal(@intCast(i));
             }
         }
 
@@ -2621,20 +2824,7 @@ pub const ZirDriver = struct {
     }
 
     fn isParamDerivedClosure(self: *const ZirDriver, local: ir.LocalId) bool {
-        if (self.program) |prog| {
-            for (prog.functions) |func| {
-                if (func.id != self.current_function_id) continue;
-                for (func.body) |block| {
-                    for (block.instructions) |instr| {
-                        switch (instr) {
-                            .param_get => |pg| if (pg.dest == local) return true,
-                            else => {},
-                        }
-                    }
-                }
-            }
-        }
-        return false;
+        return self.param_derived_closure_locals.contains(local);
     }
 
     fn findClosureTarget(self: *const ZirDriver, local: ir.LocalId) ?ir.FunctionId {
@@ -2885,14 +3075,65 @@ pub const ZirDriver = struct {
         return ref;
     }
 
+    fn emitFunctionRefForTarget(self: *ZirDriver, target_func: ir.Function) BuildError!u32 {
+        const target_struct = target_func.struct_name;
+        const is_cross = blk: {
+            if (target_struct == null and self.current_emit_struct == null) break :blk false;
+            if (target_struct == null or self.current_emit_struct == null) break :blk true;
+            break :blk !self.currentStructMatches(target_struct.?);
+        };
+        if (is_cross and target_struct != null) {
+            return try self.emitCrossStructRef(target_struct.?, target_func.local_name);
+        }
+        const call_name = if (self.current_emit_struct != null and target_func.local_name.len > 0)
+            target_func.local_name
+        else
+            target_func.name;
+        const ref = zir_builder_emit_decl_ref(self.handle, call_name.ptr, @intCast(call_name.len));
+        if (ref == error_ref) return error.EmitFailed;
+        return ref;
+    }
+
+    fn emitCapturedClosureTargetCall(self: *ZirDriver, callee: ir.LocalId, target_id: ir.FunctionId, args_locals: []const ir.LocalId) !u32 {
+        const target_func = self.findFunctionById(target_id) orelse return error.EmitFailed;
+        const callee_ref = self.refForLocal(callee) catch return error.EmitFailed;
+        const env_ref = zir_builder_emit_field_val(self.handle, callee_ref, "env", 3);
+        if (env_ref == error_ref) return error.EmitFailed;
+
+        var args: std.ArrayListUnmanaged(u32) = .empty;
+        defer args.deinit(self.allocator);
+        try args.append(self.allocator, env_ref);
+        for (args_locals) |arg| {
+            const ref_arg = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
+            try args.append(self.allocator, ref_arg);
+        }
+
+        const target_struct = target_func.struct_name;
+        const is_cross = blk: {
+            if (target_struct == null and self.current_emit_struct == null) break :blk false;
+            if (target_struct == null or self.current_emit_struct == null) break :blk true;
+            break :blk !self.currentStructMatches(target_struct.?);
+        };
+        if (is_cross and target_struct != null) {
+            return try self.emitCrossStructCall(target_struct.?, target_func.local_name, args.items);
+        }
+
+        const call_name = if (self.current_emit_struct != null and target_func.local_name.len > 0)
+            target_func.local_name
+        else
+            target_func.name;
+        const ref = zir_builder_emit_call(self.handle, call_name.ptr, @intCast(call_name.len), args.items.ptr, @intCast(args.items.len));
+        if (ref == error_ref) return error.EmitFailed;
+        return ref;
+    }
+
     fn emitTailNamedCallToTarget(self: *ZirDriver, target_id: ir.FunctionId, args_locals: []const ir.LocalId) !void {
         const ref = try self.emitNamedCallToTarget(target_id, args_locals);
         if (zir_builder_emit_ret(self.handle, ref) != 0) return error.EmitFailed;
     }
 
     fn emitTailInvokeWrapperCall(self: *ZirDriver, callee: ir.LocalId, function_id: ir.FunctionId, args_locals: []const ir.LocalId) !bool {
-        const prog = self.program orelse return false;
-        if (function_id >= prog.functions.len) return false;
+        const func_def = self.findFunctionById(function_id) orelse return false;
 
         const callee_ref = self.refForLocal(callee) catch return false;
         const env_ref = zir_builder_emit_field_val(self.handle, callee_ref, "env", 3);
@@ -2901,7 +3142,6 @@ pub const ZirDriver = struct {
         const invoke_name = try std.fmt.allocPrint(self.allocator, "__closure_invoke_{d}", .{function_id});
         defer self.allocator.free(invoke_name);
 
-        const func_def = prog.functions[function_id];
         var name_ptrs = try self.allocator.alloc([*]const u8, func_def.params.len);
         defer self.allocator.free(name_ptrs);
         var name_lens = try self.allocator.alloc(u32, func_def.params.len);
@@ -3026,7 +3266,6 @@ pub const ZirDriver = struct {
     }
 
     fn emitClosureSwitchDispatch(self: *ZirDriver, cc: ir.CallClosure, targets: []const ir.FunctionId) !bool {
-        const prog = self.program orelse return false;
         const callee_ref = self.refForLocal(cc.callee) catch return false;
         const call_fn_ref = zir_builder_emit_field_val(self.handle, callee_ref, "call_fn", 7);
         if (call_fn_ref == error_ref) return false;
@@ -3053,11 +3292,11 @@ pub const ZirDriver = struct {
         while (i > 0) {
             i -= 1;
             const target_id = targets[i];
-            if (target_id >= prog.functions.len) continue;
-            if (prog.functions[target_id].captures.len != 0) continue;
+            const target_func = self.findFunctionById(target_id) orelse continue;
+            if (target_func.captures.len != 0) continue;
             emitted = true;
 
-            const target_name = prog.functions[target_id].name;
+            const target_name = target_func.name;
             const name_ref = zir_builder_emit_str(self.handle, target_name.ptr, @intCast(target_name.len));
             if (name_ref == error_ref) return error.EmitFailed;
             const cond_ref = zir_builder_emit_binop(self.handle, @intFromEnum(Zir.Inst.Tag.cmp_eq), call_fn_ref, name_ref);
@@ -3168,6 +3407,7 @@ pub const ZirDriver = struct {
                 try self.propagateReuseBackedStructLocal(lg.dest, lg.source);
                 try self.propagateReuseBackedUnionLocal(lg.dest, lg.source);
                 try self.propagateReuseBackedTupleLocal(lg.dest, lg.source);
+                try self.propagateParamDerivedClosureLocal(lg.dest, lg.source);
                 if (self.closure_function_map.get(lg.source)) |func_id|
                     try self.closure_function_map.put(self.allocator, lg.dest, func_id);
                 if (self.local_refs.get(lg.source)) |value_ref| {
@@ -3178,6 +3418,7 @@ pub const ZirDriver = struct {
                 try self.propagateReuseBackedStructLocal(ls.dest, ls.value);
                 try self.propagateReuseBackedUnionLocal(ls.dest, ls.value);
                 try self.propagateReuseBackedTupleLocal(ls.dest, ls.value);
+                try self.propagateParamDerivedClosureLocal(ls.dest, ls.value);
                 if (self.closure_function_map.get(ls.value)) |func_id|
                     try self.closure_function_map.put(self.allocator, ls.dest, func_id);
                 if (self.local_refs.get(ls.value)) |value_ref| {
@@ -3188,6 +3429,7 @@ pub const ZirDriver = struct {
                 try self.propagateReuseBackedStructLocal(mv.dest, mv.source);
                 try self.propagateReuseBackedUnionLocal(mv.dest, mv.source);
                 try self.propagateReuseBackedTupleLocal(mv.dest, mv.source);
+                try self.propagateParamDerivedClosureLocal(mv.dest, mv.source);
                 if (self.closure_function_map.get(mv.source)) |func_id|
                     try self.closure_function_map.put(self.allocator, mv.dest, func_id);
                 if (self.local_refs.get(mv.source)) |value_ref| {
@@ -3198,6 +3440,7 @@ pub const ZirDriver = struct {
                 try self.propagateReuseBackedStructLocal(sv.dest, sv.source);
                 try self.propagateReuseBackedUnionLocal(sv.dest, sv.source);
                 try self.propagateReuseBackedTupleLocal(sv.dest, sv.source);
+                try self.propagateParamDerivedClosureLocal(sv.dest, sv.source);
                 if (self.closure_function_map.get(sv.source)) |func_id|
                     try self.closure_function_map.put(self.allocator, sv.dest, func_id);
                 if (self.local_refs.get(sv.source)) |value_ref| {
@@ -3223,9 +3466,11 @@ pub const ZirDriver = struct {
                 // earlier param_get dest assignments.
                 if (pg.index < self.param_refs.items.len) {
                     try self.setLocal(pg.dest, self.param_refs.items[pg.index]);
+                    try self.markParamDerivedClosureLocal(pg.dest);
                 } else if (self.local_refs.get(pg.index)) |value_ref| {
                     const materialized = try self.materializeValueRef(value_ref);
                     try self.setLocal(pg.dest, materialized);
+                    try self.propagateParamDerivedClosureLocal(pg.dest, pg.index);
                 }
             },
 
@@ -4784,6 +5029,27 @@ pub const ZirDriver = struct {
                 // It could be either a bare function pointer or a closure struct
                 // with {call_fn, env}. Use Kernel.callCallableN for dispatch.
                 if (callee_is_param) {
+                    if (self.getCallSiteSpecialization()) |spec| {
+                        switch (spec.decision) {
+                            .direct_call, .contified => {
+                                if (spec.lambda_set.isSingleton()) {
+                                    const target_id = spec.lambda_set.members[0];
+                                    if (self.findFunctionById(target_id)) |target_func| {
+                                        const ref = if (target_func.captures.len == 0)
+                                            try self.emitNamedCallToTarget(target_id, cc.args)
+                                        else
+                                            try self.emitCapturedClosureTargetCall(cc.callee, target_id, cc.args);
+                                        if (ref != error_ref) {
+                                            try self.setLocal(cc.dest, ref);
+                                            return;
+                                        }
+                                    }
+                                }
+                            },
+                            else => {},
+                        }
+                    }
+
                     const callee_ref = self.refForLocal(cc.callee) catch return error.EmitFailed;
                     var args: std.ArrayListUnmanaged(u32) = .empty;
                     defer args.deinit(self.allocator);
@@ -4872,8 +5138,8 @@ pub const ZirDriver = struct {
                         .direct_call, .contified => {
                             if (spec.decision == .contified and self.isTailReturnOf(cc.dest) and spec.lambda_set.isSingleton()) {
                                 const target_id = spec.lambda_set.members[0];
-                                if (self.program) |prog| {
-                                    if (target_id < prog.functions.len and prog.functions[target_id].captures.len == 0) {
+                                if (self.findFunctionById(target_id)) |target_func| {
+                                    if (target_func.captures.len == 0) {
                                         try self.emitTailNamedCallToTarget(target_id, cc.args);
                                         self.skip_next_ret_local = cc.dest;
                                         return;
@@ -4885,9 +5151,9 @@ pub const ZirDriver = struct {
                                 }
                             }
                             if (spec.lambda_set.isSingleton()) {
-                                if (self.program) |prog| {
-                                    const target_id = spec.lambda_set.members[0];
-                                    if (target_id < prog.functions.len and prog.functions[target_id].captures.len == 0) {
+                                const target_id = spec.lambda_set.members[0];
+                                if (self.findFunctionById(target_id)) |target_func| {
+                                    if (target_func.captures.len == 0) {
                                         const ref = try self.emitNamedCallToTarget(target_id, cc.args);
                                         if (ref != error_ref) {
                                             try self.setLocal(cc.dest, ref);
@@ -4916,11 +5182,11 @@ pub const ZirDriver = struct {
                             };
                             if (actx.getLambdaSet(vkey)) |ls| {
                                 if (ls.isSingleton()) {
-                                    if (self.program) |prog| {
-                                        if (ls.members.len > 0 and ls.members[0] < prog.functions.len) {
-                                            const target_func = prog.functions[ls.members[0]];
+                                    if (ls.members.len > 0) {
+                                        const target_id = ls.members[0];
+                                        if (self.findFunctionById(target_id)) |target_func| {
                                             if (target_func.captures.len == 0) {
-                                                break :blk .{ .function_id = ls.members[0], .captures = &.{} };
+                                                break :blk .{ .function_id = target_id, .captures = &.{} };
                                             }
                                         }
                                     }
@@ -5001,6 +5267,10 @@ pub const ZirDriver = struct {
                         const key = @as(u64, mc.function) << 32 | @as(u64, @intCast(cap_idx));
                         try self.capture_closure_function_map.put(self.allocator, key, captured_func_id);
                     }
+                    if (self.param_derived_closure_locals.contains(cap_local)) {
+                        const key = @as(u64, mc.function) << 32 | @as(u64, @intCast(cap_idx));
+                        try self.capture_param_derived_closure_map.put(self.allocator, key, {});
+                    }
                 }
 
                 // Resolve the correct name for the current struct context.
@@ -5047,8 +5317,10 @@ pub const ZirDriver = struct {
                     try env_values.append(self.allocator, cap_ref);
                 }
 
-                const env_ref = zir_builder_emit_struct_init_anon(
+                const env_type_ref = try self.emitClosureEnvTypeRefForTarget(target_func);
+                const env_ref = zir_builder_emit_struct_init_typed(
                     self.handle,
+                    env_type_ref,
                     env_names_ptrs.items.ptr,
                     env_names_lens.items.ptr,
                     env_values.items.ptr,
@@ -5086,6 +5358,11 @@ pub const ZirDriver = struct {
                     const key = @as(u64, self.current_function_id) << 32 | @as(u64, cg.index);
                     if (self.capture_closure_function_map.get(key)) |func_id| {
                         try self.closure_function_map.put(self.allocator, cg.dest, func_id);
+                    }
+                    if (self.capture_param_derived_closure_map.contains(key)) {
+                        try self.markParamDerivedClosureLocal(cg.dest);
+                    } else {
+                        self.unmarkParamDerivedClosureLocal(cg.dest);
                     }
                 }
                 if (self.currentClosureLowering()) |lowering| {
@@ -5556,6 +5833,8 @@ pub const ZirDriver = struct {
         const default_ptr = self.endCapture(&default_len);
         const default_result: u32 = if (dest_opt) |d|
             if (self.local_refs.get(d)) |vr| self.materializeValueRef(vr) catch void_ref else void_ref
+        else if (instructionsEndNoReturn(default_instrs))
+            @intFromEnum(Zir.Inst.Ref.unreachable_value)
         else
             void_ref;
 
@@ -5775,6 +6054,8 @@ pub const ZirDriver = struct {
         const default_ptr = self.endCapture(&default_len);
         const default_result: u32 = if (sl.default_result) |dr|
             self.refForLocal(dr) catch @intFromEnum(Zir.Inst.Ref.void_value)
+        else if (instructionsEndNoReturn(sl.default_instrs))
+            @intFromEnum(Zir.Inst.Ref.unreachable_value)
         else
             @intFromEnum(Zir.Inst.Ref.void_value);
 
@@ -5900,6 +6181,8 @@ pub const ZirDriver = struct {
         const default_ptr = self.endCapture(&default_len);
         const default_result: u32 = if (cb.default_result) |dr|
             self.refForLocal(dr) catch @intFromEnum(Zir.Inst.Ref.void_value)
+        else if (instructionsEndNoReturn(cb.default_instrs))
+            @intFromEnum(Zir.Inst.Ref.unreachable_value)
         else
             @intFromEnum(Zir.Inst.Ref.void_value);
 
@@ -6145,6 +6428,8 @@ pub const ZirDriver = struct {
         const default_ptr = self.endCapture(&default_len);
         var default_result: u32 = if (cb.default_result) |dr|
             self.refForLocal(dr) catch void_ref
+        else if (instructionsEndNoReturn(default_pre_instrs) or instructionsEndNoReturn(cb.default_instrs))
+            @intFromEnum(Zir.Inst.Ref.unreachable_value)
         else
             void_ref;
 

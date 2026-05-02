@@ -952,8 +952,16 @@ pub const IrBuilder = struct {
     /// names during per-struct IR lowering. Emission still uses the
     /// `hir_program` passed to `buildProgram`.
     known_name_program: ?*const hir_mod.Program = null,
+    /// HIR program currently being lowered. Used to recover concrete
+    /// parameter types after monomorphization rewrites call targets to
+    /// specialized function groups.
+    current_hir_program: ?*const hir_mod.Program = null,
     /// Current function's declared param types (for param_get fallback when expr type is UNKNOWN).
     current_param_types: std.ArrayListUnmanaged(ZigType) = .empty,
+    /// Contextual type supplied by a call argument slot while lowering the
+    /// argument expression. Used for empty container literals whose own HIR
+    /// type is intentionally underconstrained.
+    current_expected_type: ?types_mod.TypeId = null,
 
     pub const UnionDispatchInfo = struct {
         param_idx: u32,
@@ -1003,16 +1011,137 @@ pub const IrBuilder = struct {
         return self.param_backed_locals.contains(local);
     }
 
-    /// Extract the list element ZigType from an HIR expression's type_id.
-    /// Returns .i64 as default when type info is unavailable or not a list type.
-    fn listElementTypeFromHir(self: *const IrBuilder, type_id: types_mod.TypeId) ZigType {
+    fn hirFunctionGroupById(self: *const IrBuilder, group_id: FunctionId) ?*const hir_mod.FunctionGroup {
+        const program = self.current_hir_program orelse return null;
+        for (program.structs) |*struct_info| {
+            for (struct_info.functions) |*function_group| {
+                if (function_group.id == group_id) return function_group;
+            }
+        }
+        for (program.top_functions) |*function_group| {
+            if (function_group.id == group_id) return function_group;
+        }
+        return null;
+    }
+
+    fn resolveNamedHirGroup(self: *const IrBuilder, named: hir_mod.NamedCall, arity: u32) ?*const hir_mod.FunctionGroup {
+        const target_struct = named.struct_name orelse return null;
+        const program = self.current_hir_program orelse return null;
+        for (program.structs) |*struct_info| {
+            if (struct_info.name.parts.len == 0) continue;
+            const last_part = self.interner.get(struct_info.name.parts[struct_info.name.parts.len - 1]);
+            if (!std.mem.eql(u8, last_part, target_struct)) continue;
+            for (struct_info.functions) |*function_group| {
+                if (function_group.arity == arity and
+                    std.mem.eql(u8, self.interner.get(function_group.name), named.name))
+                {
+                    return function_group;
+                }
+            }
+        }
+        return null;
+    }
+
+    fn callTargetExpectedType(
+        self: *const IrBuilder,
+        target: hir_mod.CallTarget,
+        arg_count: usize,
+        arg_index: usize,
+    ) ?types_mod.TypeId {
+        const group_id = switch (target) {
+            .direct => |direct| direct.function_group_id,
+            .dispatch => |dispatch| dispatch.function_group_id,
+            .named => |named| blk: {
+                const resolved = self.resolveNamedHirGroup(named, @intCast(arg_count)) orelse return null;
+                break :blk resolved.id;
+            },
+            else => return null,
+        };
+        const group = self.hirFunctionGroupById(group_id) orelse return null;
+        if (group.clauses.len == 0) return null;
+        if (arg_index >= group.clauses[0].params.len) return null;
+        return group.clauses[0].params[arg_index].type_id;
+    }
+
+    fn listElementTypeFromHirMaybe(self: *const IrBuilder, type_id: types_mod.TypeId) ?ZigType {
         const ts = self.type_store orelse return .i64;
         if (type_id >= ts.types.items.len) return .i64;
         const typ = ts.types.items[type_id];
         return switch (typ) {
             .list => |lt| typeIdToZigTypeWithStore(lt.element, self.type_store),
-            else => .i64,
+            else => null,
         };
+    }
+
+    /// Extract the list element ZigType from an HIR expression's type_id.
+    /// Returns .i64 as default when type info is unavailable or not a list type.
+    fn listElementTypeFromHir(self: *const IrBuilder, type_id: types_mod.TypeId) ZigType {
+        return self.listElementTypeFromHirMaybe(type_id) orelse .i64;
+    }
+
+    fn listTypeFromElement(self: *const IrBuilder, element_type: ZigType) !ZigType {
+        const element_ptr = try self.allocator.create(ZigType);
+        element_ptr.* = element_type;
+        return .{ .list = element_ptr };
+    }
+
+    fn listTypeFromHirOrElement(self: *const IrBuilder, type_id: types_mod.TypeId, element_type: ZigType) !ZigType {
+        if (self.listElementTypeFromHirMaybe(type_id)) |hir_element_type| {
+            if (hir_element_type != .any or element_type == .any) {
+                return typeIdToZigTypeWithStore(type_id, self.type_store);
+            }
+        }
+        if (self.current_expected_type) |expected_type| {
+            if (self.listElementTypeFromHirMaybe(expected_type)) |expected_element_type| {
+                if (expected_element_type != .any or element_type == .any) {
+                    return typeIdToZigTypeWithStore(expected_type, self.type_store);
+                }
+            }
+        }
+        return try self.listTypeFromElement(element_type);
+    }
+
+    fn chooseListElementType(self: *const IrBuilder, hir_type_id: types_mod.TypeId, fallback_type: ZigType) ZigType {
+        if (self.listElementTypeFromHirMaybe(hir_type_id)) |hir_element_type| {
+            if (hir_element_type != .any or fallback_type == .any) {
+                return hir_element_type;
+            }
+        }
+        if (self.current_expected_type) |expected_type| {
+            if (self.listElementTypeFromHirMaybe(expected_type)) |expected_element_type| {
+                if (expected_element_type != .any or fallback_type == .any) {
+                    return expected_element_type;
+                }
+            }
+        }
+        return fallback_type;
+    }
+
+    fn listElementTypeFromLocal(self: *const IrBuilder, local: LocalId) ?ZigType {
+        if (self.known_local_types.get(local)) |local_type| {
+            return local_type;
+        }
+        return null;
+    }
+
+    fn listElementTypeFromTailLocal(self: *const IrBuilder, tail: LocalId) ?ZigType {
+        if (self.known_local_types.get(tail)) |tail_type| {
+            if (tail_type == .list) {
+                return tail_type.list.*;
+            }
+        }
+        return null;
+    }
+
+    fn closureReturnType(self: *const IrBuilder, expr_type: types_mod.TypeId, callee: LocalId) ZigType {
+        const expr_zig_type = typeIdToZigTypeWithStore(expr_type, self.type_store);
+        if (expr_zig_type != .any) return expr_zig_type;
+        if (self.known_local_types.get(callee)) |callee_type| {
+            if (callee_type == .function) {
+                return callee_type.function.return_type.*;
+            }
+        }
+        return expr_zig_type;
     }
 
     /// Extract the list element ZigType from a local's known type.
@@ -1033,10 +1162,15 @@ pub const IrBuilder = struct {
     /// default for non-Range right-hand sides.
     fn isNativeRangeStruct(self: *const IrBuilder, name_id: ast.StringId) bool {
         const graph = self.scope_graph orelse return false;
-        return graph.isNativeTypeName(.range, name_id);
+        const registered = graph.nativeTypeStructName(.range) orelse return false;
+        return registered == name_id or std.mem.eql(u8, self.interner.get(registered), self.interner.get(name_id));
     }
 
     pub fn buildProgram(self: *IrBuilder, hir_program: *const hir_mod.Program) !Program {
+        const saved_hir_program = self.current_hir_program;
+        self.current_hir_program = hir_program;
+        defer self.current_hir_program = saved_hir_program;
+
         // First pass: register all qualified function names for bare call resolution.
         // Mangle the raw symbol so operator-named functions (`+`, `<>`, etc.) become
         // valid Zig identifiers; downstream lookups always go through the same mangler
@@ -1675,6 +1809,7 @@ pub const IrBuilder = struct {
         };
 
         const final_params = try params.toOwnedSlice(self.allocator);
+
         // Collect default parameter values for call-site inlining
         var defaults_list: std.ArrayList(DefaultValue) = .empty;
         if (group.clauses.len == 1) {
@@ -4258,8 +4393,18 @@ pub const IrBuilder = struct {
                 var args: std.ArrayList(LocalId) = .empty;
                 var arg_modes: std.ArrayList(ValueMode) = .empty;
                 var shared_release_locals: std.ArrayList(LocalId) = .empty;
-                for (call.args) |arg| {
-                    const arg_local = try self.lowerExpr(arg.expr);
+                for (call.args, 0..) |arg, arg_index| {
+                    const arg_local = blk: {
+                        const saved_expected_type = self.current_expected_type;
+                        const target_expected_type = self.callTargetExpectedType(call.target, call.args.len, arg_index) orelse arg.expected_type;
+                        self.current_expected_type = if (target_expected_type != types_mod.TypeStore.UNKNOWN and
+                            target_expected_type != types_mod.TypeStore.ERROR)
+                            target_expected_type
+                        else
+                            null;
+                        defer self.current_expected_type = saved_expected_type;
+                        break :blk try self.lowerExpr(arg.expr);
+                    };
                     const lowered_arg = switch (arg.mode) {
                         .move => blk: {
                             const moved_local = self.next_local;
@@ -4414,9 +4559,13 @@ pub const IrBuilder = struct {
                         const callee_local = try self.lowerExpr(callee);
                         const lowered_args = try args.toOwnedSlice(self.allocator);
                         const lowered_modes = try arg_modes.toOwnedSlice(self.allocator);
+                        const return_type = self.closureReturnType(expr.type_id, callee_local);
                         try self.current_instrs.append(self.allocator, .{
-                            .call_closure = .{ .dest = dest, .callee = callee_local, .args = lowered_args, .arg_modes = lowered_modes, .return_type = typeIdToZigTypeWithStore(expr.type_id, self.type_store) },
+                            .call_closure = .{ .dest = dest, .callee = callee_local, .args = lowered_args, .arg_modes = lowered_modes, .return_type = return_type },
                         });
+                        if (return_type != .any and return_type != .void) {
+                            try self.known_local_types.put(dest, return_type);
+                        }
                     },
                     .dispatch => |dc| {
                         const lowered_args = try args.toOwnedSlice(self.allocator);
@@ -4611,21 +4760,30 @@ pub const IrBuilder = struct {
                     try locals.append(self.allocator, try self.lowerExpr(elem));
                 }
                 const elements = try locals.toOwnedSlice(self.allocator);
-                const elem_type = self.listElementTypeFromHir(expr.type_id);
+                const fallback_elem_type: ZigType = blk: {
+                    if (elements.len > 0) {
+                        break :blk self.listElementTypeFromLocal(elements[0]) orelse .i64;
+                    }
+                    break :blk ZigType.i64;
+                };
+                const elem_type = self.chooseListElementType(expr.type_id, fallback_elem_type);
                 try self.current_instrs.append(self.allocator, .{
                     .list_init = .{ .dest = dest, .elements = elements, .element_type = elem_type },
                 });
-                const list_zig_type = typeIdToZigTypeWithStore(expr.type_id, self.type_store);
+                const list_zig_type = try self.listTypeFromHirOrElement(expr.type_id, elem_type);
                 try self.known_local_types.put(dest, list_zig_type);
             },
             .list_cons => |lc| {
                 const head = try self.lowerExpr(lc.head);
                 const tail = try self.lowerExpr(lc.tail);
-                const elem_type = self.listElementTypeFromHir(expr.type_id);
+                const fallback_elem_type = self.listElementTypeFromTailLocal(tail) orelse
+                    self.listElementTypeFromLocal(head) orelse
+                    ZigType.i64;
+                const elem_type = self.chooseListElementType(expr.type_id, fallback_elem_type);
                 try self.current_instrs.append(self.allocator, .{
                     .list_cons = .{ .dest = dest, .head = head, .tail = tail, .element_type = elem_type },
                 });
-                const list_zig_type = typeIdToZigTypeWithStore(expr.type_id, self.type_store);
+                const list_zig_type = try self.listTypeFromHirOrElement(expr.type_id, elem_type);
                 try self.known_local_types.put(dest, list_zig_type);
             },
             .panic => |msg| {

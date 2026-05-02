@@ -34,13 +34,16 @@ pub const Program = struct {
 
 pub const ProtocolInfo = struct {
     name: ast.StringId,
+    type_params: []const ast.StringId = &.{},
     function_names: []const ast.StringId,
     function_arities: []const u32,
 };
 
 pub const ImplInfo = struct {
     protocol_name: ast.StringId,
+    protocol_type_args: []const TypeId = &.{},
     target_struct: ast.StringId,
+    target_type_pattern: TypeId = types_mod.TypeStore.UNKNOWN,
     impl_scope_id: scope_mod.ScopeId,
     function_group_ids: []const u32,
 };
@@ -2220,6 +2223,75 @@ pub const HirBuilder = struct {
         self.errors.deinit(self.allocator);
     }
 
+    fn isNativeTypeName(self: *const HirBuilder, kind: scope_mod.NativeTypeKind, name: ast.StringId) bool {
+        const registered = self.graph.nativeTypeStructName(kind) orelse return false;
+        return registered == name or std.mem.eql(u8, self.interner.get(registered), self.interner.get(name));
+    }
+
+    fn resolveImplTargetTypePattern(self: *HirBuilder, impl_d: *const ast.ImplDecl) !TypeId {
+        if (impl_d.target_type.parts.len == 0) return types_mod.TypeStore.UNKNOWN;
+        const target_name = impl_d.target_type.parts[impl_d.target_type.parts.len - 1];
+        const target_text = self.interner.get(target_name);
+
+        if (self.isNativeTypeName(.list, target_name) and impl_d.type_params.len == 1) {
+            const element_name = self.interner.get(impl_d.type_params[0]);
+            const element_type = self.hir_type_var_scope.get(element_name) orelse types_mod.TypeStore.UNKNOWN;
+            return try self.type_store.addType(.{ .list = .{ .element = element_type } });
+        }
+
+        if (self.isNativeTypeName(.map, target_name) and impl_d.type_params.len == 2) {
+            const key_name = self.interner.get(impl_d.type_params[0]);
+            const value_name = self.interner.get(impl_d.type_params[1]);
+            const key_type = self.hir_type_var_scope.get(key_name) orelse types_mod.TypeStore.UNKNOWN;
+            const value_type = self.hir_type_var_scope.get(value_name) orelse types_mod.TypeStore.UNKNOWN;
+            return try self.type_store.addType(.{ .map = .{ .key = key_type, .value = value_type } });
+        }
+
+        if (impl_d.type_params.len > 0) {
+            const base = self.type_store.name_to_type.get(target_name) orelse
+                self.type_store.resolveTypeName(target_text) orelse
+                types_mod.TypeStore.UNKNOWN;
+            const args = try self.allocator.alloc(TypeId, impl_d.type_params.len);
+            for (impl_d.type_params, 0..) |type_param, index| {
+                const name = self.interner.get(type_param);
+                args[index] = self.hir_type_var_scope.get(name) orelse types_mod.TypeStore.UNKNOWN;
+            }
+            return try self.type_store.addType(.{ .applied = .{ .base = base, .args = args } });
+        }
+
+        if (self.type_store.resolveTypeName(target_text)) |type_id| return type_id;
+        if (self.type_store.name_to_type.get(target_name)) |type_id| return type_id;
+        return types_mod.TypeStore.UNKNOWN;
+    }
+
+    fn resolveImplProtocolTypeData(
+        self: *HirBuilder,
+        impl_d: *const ast.ImplDecl,
+    ) !struct { protocol_type_args: []const TypeId, target_type_pattern: TypeId } {
+        const saved_scope = self.hir_type_var_scope;
+        self.hir_type_var_scope = std.StringHashMap(types_mod.TypeId).init(self.allocator);
+        defer {
+            self.hir_type_var_scope.deinit();
+            self.hir_type_var_scope = saved_scope;
+        }
+
+        for (impl_d.type_params) |type_param| {
+            const name = self.interner.get(type_param);
+            const fresh = try self.type_store.freshVar();
+            try self.hir_type_var_scope.put(name, fresh);
+        }
+
+        const protocol_type_args = try self.allocator.alloc(TypeId, impl_d.protocol_type_args.len);
+        for (impl_d.protocol_type_args, 0..) |type_arg, index| {
+            protocol_type_args[index] = self.resolveTypeExpr(type_arg);
+        }
+
+        return .{
+            .protocol_type_args = protocol_type_args,
+            .target_type_pattern = try self.resolveImplTargetTypePattern(impl_d),
+        };
+    }
+
     /// Look up a binding's type_id from the scope graph.
     /// Returns the type_id if found, otherwise UNKNOWN.
     /// `reference_scopes` carries the Flatt-2016 hygiene marks of the
@@ -3035,6 +3107,7 @@ pub const HirBuilder = struct {
             }
             try protocol_infos.append(self.allocator, .{
                 .name = proto.name.parts[proto.name.parts.len - 1],
+                .type_params = proto.decl.type_params,
                 .function_names = try names.toOwnedSlice(self.allocator),
                 .function_arities = try arities.toOwnedSlice(self.allocator),
             });
@@ -3055,9 +3128,12 @@ pub const HirBuilder = struct {
                 }
             }
             if (impl_entry.protocol_name.parts.len > 0 and impl_entry.target_type.parts.len > 0) {
+                const impl_type_data = try self.resolveImplProtocolTypeData(impl_entry.decl);
                 try impl_infos.append(self.allocator, .{
                     .protocol_name = impl_entry.protocol_name.parts[impl_entry.protocol_name.parts.len - 1],
+                    .protocol_type_args = impl_type_data.protocol_type_args,
                     .target_struct = impl_entry.target_type.parts[impl_entry.target_type.parts.len - 1],
+                    .target_type_pattern = impl_type_data.target_type_pattern,
                     .impl_scope_id = impl_entry.scope_id,
                     .function_group_ids = try group_ids.toOwnedSlice(self.allocator),
                 });
@@ -3186,6 +3262,13 @@ pub const HirBuilder = struct {
         self.current_function_name = self.interner.get(decls[0].name);
         self.current_function_name_id = decls[0].name;
 
+        const saved_hir_type_var_scope = self.hir_type_var_scope;
+        self.hir_type_var_scope = std.StringHashMap(types_mod.TypeId).init(self.allocator);
+        defer {
+            self.hir_type_var_scope.deinit();
+            self.hir_type_var_scope = saved_hir_type_var_scope;
+        }
+
         var clauses: std.ArrayList(Clause) = .empty;
         for (decls) |func| {
             for (func.clauses) |clause| {
@@ -3225,6 +3308,12 @@ pub const HirBuilder = struct {
         const saved_function_name_id = self.current_function_name_id;
         self.current_function_name = self.interner.get(func.name);
         self.current_function_name_id = func.name;
+        const saved_hir_type_var_scope = self.hir_type_var_scope;
+        self.hir_type_var_scope = std.StringHashMap(types_mod.TypeId).init(self.allocator);
+        defer {
+            self.hir_type_var_scope.deinit();
+            self.hir_type_var_scope = saved_hir_type_var_scope;
+        }
         const saved_next_local = self.next_local;
         const saved_root_scope = self.current_function_root_scope;
         const saved_capture_map = self.current_capture_map;
@@ -3402,7 +3491,6 @@ pub const HirBuilder = struct {
 
     fn buildClause(self: *HirBuilder, clause: *const ast.FunctionClause) !Clause {
         self.next_local = 0;
-        self.hir_type_var_scope.clearRetainingCapacity();
 
         // While building an impl block's clauses, pre-populate the
         // type-var scope with the impl's declared type parameters so
@@ -5113,12 +5201,12 @@ pub const HirBuilder = struct {
                 // `NativeTypeKind`), so users can shadow `List`/`Map`
                 // safely without triggering compiler-special handling.
                 if (n.args.len > 0) {
-                    if (self.graph.isNativeTypeName(.map, n.name) and n.args.len == 2) {
+                    if (self.isNativeTypeName(.map, n.name) and n.args.len == 2) {
                         const key_t = self.resolveTypeExpr(n.args[0]);
                         const value_t = self.resolveTypeExpr(n.args[1]);
                         return store_ptr.addType(.{ .map = .{ .key = key_t, .value = value_t } }) catch types_mod.TypeStore.UNKNOWN;
                     }
-                    if (self.graph.isNativeTypeName(.list, n.name) and n.args.len == 1) {
+                    if (self.isNativeTypeName(.list, n.name) and n.args.len == 1) {
                         const elem_t = self.resolveTypeExpr(n.args[0]);
                         return store_ptr.addType(.{ .list = .{ .element = elem_t } }) catch types_mod.TypeStore.UNKNOWN;
                     }

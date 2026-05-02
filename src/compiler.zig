@@ -2363,6 +2363,14 @@ fn remapProtocolDecl(alloc: std.mem.Allocator, proto: *ast.ProtocolDecl, remap: 
     }
     proto.name.parts = new_parts;
 
+    if (proto.type_params.len > 0) {
+        const new_type_params = try alloc.alloc(ast.StringId, proto.type_params.len);
+        for (proto.type_params, 0..) |type_param, i| {
+            new_type_params[i] = if (type_param < remap.len) remap[type_param] else type_param;
+        }
+        proto.type_params = new_type_params;
+    }
+
     // Remap function signature names and type expressions
     const new_fns = try alloc.alloc(ast.ProtocolFunctionSig, proto.functions.len);
     for (proto.functions, 0..) |sig, i| {
@@ -2399,6 +2407,17 @@ fn remapImplDecl(alloc: std.mem.Allocator, impl_d: *ast.ImplDecl, remap: []const
         new_proto_parts[i] = if (part < remap.len) remap[part] else part;
     }
     impl_d.protocol_name.parts = new_proto_parts;
+
+    if (impl_d.protocol_type_args.len > 0) {
+        const new_protocol_type_args = try alloc.alloc(*const ast.TypeExpr, impl_d.protocol_type_args.len);
+        for (impl_d.protocol_type_args, 0..) |type_arg, i| {
+            const mutable_type_arg = try alloc.create(ast.TypeExpr);
+            mutable_type_arg.* = type_arg.*;
+            try remapTypeExpr(alloc, mutable_type_arg, remap);
+            new_protocol_type_args[i] = mutable_type_arg;
+        }
+        impl_d.protocol_type_args = new_protocol_type_args;
+    }
 
     // Remap target type name parts
     const new_type_parts = try alloc.alloc(ast.StringId, impl_d.target_type.parts.len);

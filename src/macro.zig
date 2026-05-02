@@ -389,6 +389,7 @@ pub const MacroEngine = struct {
         const new_impl = try self.create(ast.ImplDecl, .{
             .meta = impl.meta,
             .protocol_name = impl.protocol_name,
+            .protocol_type_args = impl.protocol_type_args,
             .target_type = impl.target_type,
             .type_params = impl.type_params,
             .functions = try new_functions.toOwnedSlice(self.allocator),
@@ -534,6 +535,7 @@ pub const MacroEngine = struct {
     ) !void {
         switch (cv) {
             .atom => |name| try out.append(alloc, name),
+            .string => |name| try out.append(alloc, name),
             .list => |elems| for (elems) |e| try collectHookAtoms(out, alloc, e),
             else => {}, // ignore other shapes — invalid hook target
         }
@@ -552,15 +554,13 @@ pub const MacroEngine = struct {
     ) !void {
         switch (expr.*) {
             .atom_literal => |a| try out.append(alloc, interner.get(a.value)),
+            .string_literal => |s| try out.append(alloc, interner.get(s.value)),
             .list => |l| for (l.elements) |elem| {
                 try collectHookAtomsFromExpr(out, alloc, interner, elem);
             },
             .struct_ref => |m| {
-                // `@before_compile = SomeStruct` — single-part name
-                // becomes the hook target. Multi-part names (e.g.
-                // `Foo.Bar`) are unsupported here.
-                if (m.name.parts.len == 1) {
-                    try out.append(alloc, interner.get(m.name.parts[0]));
+                if (m.name.parts.len > 0) {
+                    try out.append(alloc, try m.name.toDottedString(alloc, interner));
                 }
             },
             else => {},
@@ -579,11 +579,7 @@ pub const MacroEngine = struct {
     ) ![]ast.StructItem {
         // Resolve hook struct name → scope id → __before_compile__/1
         // macro family.
-        const hook_struct_id = try self.interner.intern(hook_struct_name);
-        const hook_struct_path: ast.StructName = .{
-            .parts = try self.allocator.dupe(ast.StringId, &.{hook_struct_id}),
-            .span = .{ .start = 0, .end = 0 },
-        };
+        const hook_struct_path = try dottedHookNameToStructName(self.allocator, self.interner, hook_struct_name);
         const hook_scope = self.graph.findStructScope(hook_struct_path) orelse {
             // Hook struct not found — emit error and return empty.
             try self.errors.append(self.allocator, .{
@@ -633,18 +629,7 @@ pub const MacroEngine = struct {
 
         if (clause.params.len > 0 and clause.params[0].pattern.* == .bind) {
             const param_name = self.interner.get(clause.params[0].pattern.bind.name);
-            // Caller struct name as a colon-prefixed atom (the AST
-            // encoding for atom literals). For multi-part names we
-            // dot-join the parts so hooks see something readable.
-            const name_string = try caller_struct_name.toDottedString(self.allocator, self.interner);
-            const colon_prefixed = try std.fmt.allocPrint(self.allocator, ":{s}", .{name_string});
-            const env_arg = try ast_data.makeTuple3(
-                self.allocator,
-                &store,
-                .{ .atom = colon_prefixed },
-                try ast_data.emptyList(self.allocator, &store),
-                .nil,
-            );
+            const env_arg = try self.structNameToAliasCtValue(&store, caller_struct_name);
             try env.bind(param_name, env_arg);
         }
 
@@ -660,6 +645,45 @@ pub const MacroEngine = struct {
         // results, dropping anything that isn't a recognized
         // declaration shape.
         return try self.ctValueToStructItems(result);
+    }
+
+    fn structNameToAliasCtValue(
+        self: *MacroEngine,
+        store: *ctfe.AllocationStore,
+        struct_name: ast.StructName,
+    ) !ctfe.CtValue {
+        const parts = try self.allocator.alloc(ctfe.CtValue, struct_name.parts.len);
+        for (struct_name.parts, 0..) |part_id, index| {
+            parts[index] = .{ .atom = self.interner.get(part_id) };
+        }
+
+        return ast_data.makeTuple3(
+            self.allocator,
+            store,
+            .{ .atom = "__aliases__" },
+            try ast_data.emptyList(self.allocator, store),
+            try ast_data.makeListFromSlice(self.allocator, store, parts),
+        );
+    }
+
+    fn dottedHookNameToStructName(
+        allocator: std.mem.Allocator,
+        interner: *ast.StringInterner,
+        hook_name: []const u8,
+    ) !ast.StructName {
+        var parts: std.ArrayListUnmanaged(ast.StringId) = .empty;
+        errdefer parts.deinit(allocator);
+
+        var split = std.mem.splitScalar(u8, hook_name, '.');
+        while (split.next()) |part| {
+            if (part.len == 0) continue;
+            try parts.append(allocator, try interner.intern(part));
+        }
+
+        return .{
+            .parts = try parts.toOwnedSlice(allocator),
+            .span = .{ .start = 0, .end = 0 },
+        };
     }
 
     /// Convert a hook's CtValue result into a list of StructItems.
@@ -1605,6 +1629,7 @@ pub const MacroEngine = struct {
         defer interpreter.deinit();
         interpreter.scope_graph = self.graph;
         interpreter.interner = self.interner;
+        interpreter.current_struct_scope = self.current_struct_scope;
         interpreter.capabilities = family.required_caps;
         interpreter.steps_remaining = interpreter.step_budget;
 
@@ -2658,7 +2683,7 @@ pub const MacroEngine = struct {
         env.struct_ctx = .{
             .graph = self.graph,
             .interner = self.interner,
-            .current_struct_scope = family.scope_id,
+            .current_struct_scope = self.current_struct_scope,
         };
         env.current_macro_caps = family.required_caps;
         env.current_macro_name = self.interner.get(family.name);
@@ -4000,6 +4025,120 @@ test "@before_compile: hook fires and splices result into target struct" {
             else => {},
         }
     }
+    try std.testing.expect(found_injected);
+}
+
+test "@before_compile: hook target may be a nested struct" {
+    const source =
+        \\pub struct Hooks.Nested {
+        \\  pub macro __before_compile__(_env :: Expr) -> Decl {
+        \\    quote {
+        \\      pub fn injected_marker() -> i64 {
+        \\        99
+        \\      }
+        \\    }
+        \\  }
+        \\}
+        \\
+        \\pub struct Target {
+        \\  pub fn original() -> i64 {
+        \\    1
+        \\  }
+        \\
+        \\  @before_compile = Hooks.Nested
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    const expanded = try engine.expandProgram(&program);
+
+    var found_injected = false;
+    for (expanded.structs) |mod| {
+        if (mod.name.parts.len != 1) continue;
+        if (!std.mem.eql(u8, parser.interner.get(mod.name.parts[0]), "Target")) continue;
+
+        for (mod.items) |item| {
+            if (item != .function) continue;
+            const name = parser.interner.get(item.function.name);
+            if (std.mem.eql(u8, name, "injected_marker")) {
+                found_injected = true;
+                break;
+            }
+        }
+    }
+
+    try std.testing.expect(found_injected);
+}
+
+test "use macro struct attributes apply to the caller struct" {
+    const source =
+        \\pub struct Hooks {
+        \\  pub macro __before_compile__(_env :: Expr) -> Decl {
+        \\    quote {
+        \\      pub fn injected_marker() -> i64 {
+        \\        99
+        \\      }
+        \\    }
+        \\  }
+        \\}
+        \\
+        \\pub struct Provider {
+        \\  pub macro __using__(_opts :: Expr) -> Expr {
+        \\    struct_register_attribute(:before_compile)
+        \\    struct_put_attribute(:before_compile, "Hooks")
+        \\    quote { nil }
+        \\  }
+        \\}
+        \\
+        \\pub struct Target {
+        \\  use Provider
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    const expanded = try engine.expandProgram(&program);
+
+    var found_injected = false;
+    for (expanded.structs) |mod| {
+        if (mod.name.parts.len != 1) continue;
+        if (!std.mem.eql(u8, parser.interner.get(mod.name.parts[0]), "Target")) continue;
+
+        for (mod.items) |item| {
+            if (item != .function) continue;
+            const name = parser.interner.get(item.function.name);
+            if (std.mem.eql(u8, name, "injected_marker")) {
+                found_injected = true;
+                break;
+            }
+        }
+    }
+
     try std.testing.expect(found_injected);
 }
 

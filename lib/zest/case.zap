@@ -8,8 +8,9 @@
   Teardown runs after each test. Assertions are non-fatal.
 
   The `describe` and `test` macros expand into function declarations
-  so that each test becomes a named pub function (test_*) that is
-  called at struct level.
+  so that each test becomes a named pub function (test_*). `use Zest.Case`
+  installs a compile-time hook that generates `run/0` for the enclosing
+  struct after all tests have been registered.
 
   ## Examples
 
@@ -42,8 +43,63 @@ pub struct Zest.Case {
     """
 
   pub macro __using__(_opts :: Expr) -> Expr {
+    struct_register_attribute(:before_compile)
+    struct_put_attribute(:before_compile, "Zest.Case")
+    struct_register_attribute(:zest_tests)
+
     quote {
       import Zest.Case
+    }
+  }
+
+  @doc = """
+    Generates the `run/0` function for a test struct.
+
+    The hook reads the tests registered by `describe/2` and `test/2`,
+    then emits a single public runner function that executes each test
+    with Zest tracking around the call.
+    """
+
+  pub macro __before_compile__(_env :: Expr) -> Decl {
+    _tests = struct_get_attribute(:zest_tests)
+    _test_list = if _tests == nil {
+      []
+    } else {
+      if list_length(_tests) == 0 {
+        [_tests]
+      } else {
+        _tests
+      }
+    }
+    _run_calls = for _test <- _test_list {
+      quote {
+        :zig.Zest.begin_test()
+        unquote(make_call(".", [_env, _test]))()
+        :zig.Zest.end_test()
+        :zig.Zest.print_result()
+      }
+    }
+
+    quote {
+      @doc = "Runs all registered Zest tests in this struct."
+
+      pub fn run() -> String {
+        unquote_splicing(_run_calls)
+        "ok"
+      }
+    }
+  }
+
+  macro build_describe_test(desc_slug :: Expr, test_expr :: Expr, setup_body :: Expr, teardown_body :: Expr) -> Expr {
+    test_name = intern_atom("test_" <> desc_slug <> "_" <> slugify(list_at(elem(test_expr, 2), 0)))
+    struct_put_attribute(:zest_tests, test_name)
+
+    quote {
+      @doc = "Generated Zest test function."
+
+      pub fn unquote(test_name)() -> String {
+        unquote(make_call("__block__", list_concat(list_concat(list_concat(if list_length(elem(test_expr, 2)) == 3 and setup_body != nil { [make_call("=", [ctx, setup_body])] } else { [] }, if elem(list_at(elem(test_expr, 2), -1), 0) == :__block__ { elem(list_at(elem(test_expr, 2), -1), 2) } else { [list_at(elem(test_expr, 2), -1)] }), if teardown_body != nil { [teardown_body] } else { [] }), ["ok"])))
+      }
     }
   }
 
@@ -52,7 +108,7 @@ pub struct Zest.Case {
 
     Scans the body for `setup` and `teardown` blocks, then
     transforms each `test` call into a pub function declaration
-    with begin_test/end_test/print_result tracking calls injected.
+    and registers the generated function for `run/0`.
 
     ## Examples
 
@@ -74,18 +130,7 @@ pub struct Zest.Case {
     _desc_slug = slugify(_name)
 
     _per_test = for _t <- _stmts, elem(_t, 0) == :test {
-      quote {
-        @doc = "Generated Zest test function."
-
-        pub fn unquote(intern_atom("test_" <> _desc_slug <> "_" <> slugify(list_at(elem(_t, 2), 0))))() -> String {
-          unquote(make_call("__block__", list_concat(list_concat(list_concat(if list_length(elem(_t, 2)) == 3 and _setup_body != nil { [make_call("=", [ctx, _setup_body])] } else { [] }, if elem(list_at(elem(_t, 2), -1), 0) == :__block__ { elem(list_at(elem(_t, 2), -1), 2) } else { [list_at(elem(_t, 2), -1)] }), if _teardown_body != nil { [_teardown_body] } else { [] }), ["ok"])))
-        }
-        :zig.Zest.begin_test()
-        unquote(intern_atom("test_" <> _desc_slug <> "_" <> slugify(list_at(elem(_t, 2), 0))))()
-        :zig.Zest.end_test()
-        :zig.Zest.print_result()
-        "."
-      }
+      build_describe_test(_desc_slug, _t, _setup_body, _teardown_body)
     }
 
     _passthrough = for _s <- _stmts, elem(_s, 0) != :test and elem(_s, 0) != :setup and elem(_s, 0) != :teardown { _s }
@@ -110,6 +155,8 @@ pub struct Zest.Case {
 
   pub macro test(_name :: Expr, body :: Expr) -> Expr {
     fn_name = intern_atom("test_" <> slugify(_name))
+    struct_put_attribute(:zest_tests, fn_name)
+
     quote {
       @doc = "Generated Zest test function."
 
@@ -117,12 +164,6 @@ pub struct Zest.Case {
         unquote(body)
         "ok"
       }
-
-      :zig.Zest.begin_test()
-      unquote(fn_name)()
-      :zig.Zest.end_test()
-      :zig.Zest.print_result()
-      "."
     }
   }
 

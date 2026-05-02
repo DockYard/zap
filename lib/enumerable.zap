@@ -12,6 +12,6 @@
   For ranges, the Range struct is the initial state.
   """
 
-pub protocol Enumerable {
-  fn next(state) -> {Atom, any, any}
+pub protocol Enumerable(element) {
+  fn next(state) -> {Atom, element, any}
 }

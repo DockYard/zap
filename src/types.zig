@@ -1204,6 +1204,11 @@ pub const TypeChecker = struct {
         self.analysis_program = program;
     }
 
+    fn isNativeTypeName(self: *const TypeChecker, kind: scope_mod.NativeTypeKind, name: ast.StringId) bool {
+        const registered = self.graph.nativeTypeStructName(kind) orelse return false;
+        return registered == name or std.mem.eql(u8, self.interner.get(registered), self.interner.get(name));
+    }
+
     fn defaultOwnershipForType(self: *const TypeChecker, type_id: TypeId) Ownership {
         const typ = self.store.getType(type_id);
         return switch (typ) {
@@ -4700,12 +4705,12 @@ pub const TypeChecker = struct {
                 // shadows `Map`/`List` with their own struct doesn't get
                 // those sugar mappings.
                 if (tn.args.len > 0) {
-                    if (self.graph.isNativeTypeName(.map, tn.name) and tn.args.len == 2) {
+                    if (self.isNativeTypeName(.map, tn.name) and tn.args.len == 2) {
                         const key_t = try self.resolveTypeExpr(tn.args[0]);
                         const value_t = try self.resolveTypeExpr(tn.args[1]);
                         return try self.store.addType(.{ .map = .{ .key = key_t, .value = value_t } });
                     }
-                    if (self.graph.isNativeTypeName(.list, tn.name) and tn.args.len == 1) {
+                    if (self.isNativeTypeName(.list, tn.name) and tn.args.len == 1) {
                         const elem_t = try self.resolveTypeExpr(tn.args[0]);
                         return try self.store.addType(.{ .list = .{ .element = elem_t } });
                     }
