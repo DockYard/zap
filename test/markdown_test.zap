@@ -48,4 +48,50 @@ pub struct MarkdownTest {
       assert(Markdown.to_html("Tom & Jerry") == "<p>Tom &amp; Jerry</p>\n")
     }
   }
+
+  describe("unordered lists") {
+    test("a single dash item becomes a one-element ul") {
+      assert(Markdown.to_html("- alpha") == "<ul>\n<li>alpha</li>\n</ul>\n")
+    }
+
+    test("contiguous list items collapse into one ul") {
+      assert(Markdown.to_html("- alpha\n- beta") == "<ul>\n<li>alpha</li>\n<li>beta</li>\n</ul>\n")
+    }
+
+    test("a list followed by a paragraph closes cleanly") {
+      assert(Markdown.to_html("- alpha\n\ntext") == "<ul>\n<li>alpha</li>\n</ul>\n<p>text</p>\n")
+    }
+
+    test("an asterisk also opens a list item") {
+      assert(Markdown.to_html("* alpha") == "<ul>\n<li>alpha</li>\n</ul>\n")
+    }
+  }
+
+  describe("inline code spans") {
+    test("backticks in a paragraph wrap as <code>") {
+      assert(Markdown.to_html("use `Enum.map` to transform") == "<p>use <code>Enum.map</code> to transform</p>\n")
+    }
+
+    test("two adjacent code spans both render") {
+      assert(Markdown.to_html("`a` and `b`") == "<p><code>a</code> and <code>b</code></p>\n")
+    }
+
+    test("HTML inside backticks is still escaped") {
+      assert(Markdown.to_html("`a < b`") == "<p><code>a &lt; b</code></p>\n")
+    }
+  }
+
+  describe("fenced code blocks") {
+    test("a triple-backtick block becomes <pre><code>") {
+      assert(Markdown.to_html("```\nhello\n```") == "<pre><code>hello</code></pre>\n")
+    }
+
+    test("a language tag becomes a class") {
+      assert(Markdown.to_html("```sh\necho hi\n```") == "<pre><code class=\"language-sh\">echo hi</code></pre>\n")
+    }
+
+    test("HTML special characters in the body are escaped") {
+      assert(Markdown.to_html("```\na < b\n```") == "<pre><code>a &lt; b</code></pre>\n")
+    }
+  }
 }
