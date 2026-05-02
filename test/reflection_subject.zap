@@ -23,4 +23,11 @@ pub struct ReflectionSubject {
   pub fn no_doc(value :: i64) -> i64 {
     value
   }
+
+  @doc = "Doubles its argument at compile time."
+  pub macro twice(value :: Expr) -> Expr {
+    quote {
+      unquote(value) + unquote(value)
+    }
+  }
 }

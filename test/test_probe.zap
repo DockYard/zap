@@ -12,6 +12,7 @@ pub struct TestProbe {
   pub macro __using__(_opts :: Expr) -> Expr {
     _ignore = _opts
     _funcs = struct_functions(ReflectionSubject)
+    _macros = struct_macros(ReflectionSubject)
     _add_docs = for _f <- _funcs, map_get(_f, :name, "") == "add" {
       map_get(_f, :doc, "MISSING")
     }
@@ -21,6 +22,11 @@ pub struct TestProbe {
     _no_doc_docs = for _f <- _funcs, map_get(_f, :name, "") == "no_doc" {
       map_get(_f, :doc, "MISSING")
     }
+    _twice_docs = for _m <- _macros, map_get(_m, :name, "") == "twice" {
+      map_get(_m, :doc, "MISSING")
+    }
+    _func_count = list_length(_funcs)
+    _macro_count = list_length(_macros)
 
     quote {
       pub fn add_doc() -> String {
@@ -33,6 +39,18 @@ pub struct TestProbe {
 
       pub fn no_doc_doc() -> String {
         unquote(list_at(_no_doc_docs, 0))
+      }
+
+      pub fn twice_doc() -> String {
+        unquote(list_at(_twice_docs, 0))
+      }
+
+      pub fn function_count() -> i64 {
+        unquote(_func_count)
+      }
+
+      pub fn macro_count() -> i64 {
+        unquote(_macro_count)
       }
     }
   }

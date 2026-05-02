@@ -479,6 +479,9 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
             if (std.mem.eql(u8, form_name, "struct_functions")) {
                 return structFunctionsIntrinsic(env, arg_elems);
             }
+            if (std.mem.eql(u8, form_name, "struct_macros")) {
+                return structMacrosIntrinsic(env, arg_elems);
+            }
 
             // For-comprehension at comptime: iterate a list/string,
             // bind the loop pattern, optionally filter, accumulate
@@ -1346,7 +1349,8 @@ fn isCompileTimeIntrinsicExpansion(value: CtValue) bool {
     const form = value.tuple.elems[0];
     if (form != .atom) return false;
     return std.mem.eql(u8, form.atom, "source_graph_structs") or
-        std.mem.eql(u8, form.atom, "struct_functions");
+        std.mem.eql(u8, form.atom, "struct_functions") or
+        std.mem.eql(u8, form.atom, "struct_macros");
 }
 
 fn evalDispatchedClause(
@@ -1920,6 +1924,45 @@ fn structFunctionsIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtV
         const name = ctx.interner.get(family.name);
         const doc_text = extractDocAttributeText(env.alloc, ctx.interner, family.attributes) orelse "";
         try result_list.append(env.alloc, try makeFunctionRef(env, name, family.arity, family.visibility, doc_text));
+    }
+
+    const id = env.store.alloc(env.alloc, .list, null);
+    return CtValue{ .list = .{ .alloc_id = id, .elems = result_list.items } };
+}
+
+/// Reflect on the public macros declared in a struct's scope and return
+/// them as a list of maps with the same shape as `struct_functions`.
+/// Macros prefixed with `__` (e.g. `__using__`, `__before_compile__`) are
+/// excluded — they're language hooks, not public API surface that doc
+/// generation would render.
+fn structMacrosIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtValue {
+    if (args.len != 1) return .nil;
+    if (!hasReflectionCapability(env)) {
+        env.last_capability_error = std.fmt.allocPrint(
+            env.alloc,
+            "macro `{s}` calls `struct_macros` but does not declare `@requires = [:reflect_source]`",
+            .{env.current_macro_name orelse "<top-level>"},
+        ) catch return MacroEvalError.EvalFailed;
+        return MacroEvalError.EvalFailed;
+    }
+
+    const ctx = env.struct_ctx orelse return .nil;
+    const ref_value = try eval(env, args[0]);
+    const struct_name = (try extractStructRefName(env.alloc, ref_value)) orelse return .nil;
+    const struct_scope_id = findStructScopeByName(ctx.graph, ctx.interner, struct_name) orelse return .nil;
+    const struct_scope = ctx.graph.getScope(struct_scope_id);
+
+    var result_list: std.ArrayListUnmanaged(CtValue) = .empty;
+    var iter = struct_scope.macros.iterator();
+    while (iter.next()) |entry| {
+        const family = &ctx.graph.macro_families.items[entry.value_ptr.*];
+        if (family.clauses.items.len == 0) continue;
+        const visibility = family.clauses.items[0].decl.visibility;
+        if (visibility != .public) continue;
+        const name = ctx.interner.get(family.name);
+        if (std.mem.startsWith(u8, name, "__")) continue;
+        const doc_text = extractDocAttributeText(env.alloc, ctx.interner, family.attributes) orelse "";
+        try result_list.append(env.alloc, try makeFunctionRef(env, name, family.arity, visibility, doc_text));
     }
 
     const id = env.store.alloc(env.alloc, .list, null);
