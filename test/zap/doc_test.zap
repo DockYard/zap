@@ -76,6 +76,76 @@ pub struct Zap.DocTest {
     }
   }
 
+  describe("Zap.Doc.summary_row") {
+    test("renders name/arity link cell and doc cell") {
+      _result = Zap.Doc.summary_row("map", 2, "Transforms each element.")
+      assert(String.contains?(_result, "<tr><td class=\"summary-name\"><a href=\"#map-2\">map/2</a></td>"))
+      assert(String.contains?(_result, "<td class=\"summary-doc\">Transforms each element.</td>"))
+    }
+
+    test("HTML-escapes the summary text") {
+      _result = Zap.Doc.summary_row("danger", 0, "use < not &")
+      assert(String.contains?(_result, "use &lt; not &amp;"))
+    }
+  }
+
+  describe("Zap.Doc.signature_block") {
+    test("wraps the signature in a code panel") {
+      assert(Zap.Doc.signature_block("map(value :: i64) -> i64") == "<div class=\"signature\"><code>map(value :: i64) -&gt; i64</code></div>\n")
+    }
+  }
+
+  describe("Zap.Doc.function_detail") {
+    test("composes id, header, signature, and rendered doc") {
+      _result = Zap.Doc.function_detail("map", 2, false, ["map(value :: i64) -> i64"], "<p>Transforms each element.</p>\n")
+      assert(String.starts_with?(_result, "<div class=\"function-detail\" id=\"map-2\">"))
+      assert(String.contains?(_result, "<span class=\"badge\">fn</span>"))
+      assert(String.contains?(_result, "<div class=\"signature\">"))
+      assert(String.contains?(_result, "<div class=\"function-doc\">\n<p>Transforms each element.</p>\n</div>"))
+      assert(String.ends_with?(_result, "</div>\n"))
+    }
+
+    test("multi-clause functions get multiple signature panels") {
+      _result = Zap.Doc.function_detail("classify", 1, false, ["classify(0 :: i64) -> String", "classify(value :: i64) -> String"], "")
+      assert(String.contains?(_result, "0 :: i64"))
+      assert(String.contains?(_result, "value :: i64"))
+    }
+
+    test("undocumented functions omit the doc div") {
+      _result = Zap.Doc.function_detail("noop", 0, false, ["noop() -> Atom"], "")
+      assert(String.contains?(_result, "function-doc") == false)
+    }
+  }
+
+  describe("Zap.Doc.anchor_id") {
+    test("name and arity join with a dash") {
+      assert(Zap.Doc.anchor_id("map", 2) == "map-2")
+    }
+
+    test("zero-arity functions still get an arity suffix") {
+      assert(Zap.Doc.anchor_id("run", 0) == "run-0")
+    }
+  }
+
+  describe("Zap.Doc.function_header") {
+    test("public function gets an fn badge and anchor link") {
+      _result = Zap.Doc.function_header("map", 2, false)
+      assert(String.contains?(_result, "<h3>map<span class=\"arity\">/2</span></h3>"))
+      assert(String.contains?(_result, "<span class=\"badge\">fn</span>"))
+      assert(String.contains?(_result, "<a href=\"#map-2\" class=\"anchor-link\">#</a>"))
+    }
+
+    test("public macro swaps the badge to macro") {
+      _result = Zap.Doc.function_header("twice", 1, true)
+      assert(String.contains?(_result, "<span class=\"badge\">macro</span>"))
+    }
+
+    test("header HTML-escapes the function name") {
+      _result = Zap.Doc.function_header("<bad>", 0, false)
+      assert(String.contains?(_result, "&lt;bad&gt;"))
+    }
+  }
+
   describe("Zap.Doc.implements_row") {
     test("renders one accent link per protocol") {
       _result = Zap.Doc.implements_row(["Arithmetic", "Comparator"])

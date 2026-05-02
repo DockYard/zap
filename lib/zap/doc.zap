@@ -76,6 +76,86 @@ pub struct Zap.Doc {
     parked while a list-element type-inference snag in the recursive
     fold path is sorted out in a follow-up commit.
     """
+  @doc = """
+    Build the anchor id for a function or macro entry. The convention is
+    `<name>-<arity>`; the renderer uses this both for the `id="..."`
+    attribute on a function detail block and for the `href="#..."` of
+    in-page links (right rail, summary table, "see also" rows).
+    """
+  pub fn anchor_id(name :: String, arity :: i64) -> String {
+    name <> "-" <> Integer.to_string(arity)
+  }
+
+  @doc = """
+    Render the header row at the top of a function or macro detail
+    block: an `<h3>` with the qualified name and a muted `/arity`
+    span, a small kind badge (`fn` for functions, `macro` for
+    macros), a flex-spacer, and a `#`-prefixed anchor link that
+    deep-links back to this entry.
+    """
+  @doc = """
+    Render a single row in the per-struct summary table — name+arity
+    cell on the left, doc-summary cell on the right. The first sentence
+    of the function's `@doc` is its summary; passing the empty string
+    for `summary` produces an empty doc cell, matching the doc
+    generator's behavior for undocumented functions.
+    """
+  pub fn summary_row(name :: String, arity :: i64, summary :: String) -> String {
+    anchor = anchor_id(name, arity)
+    name_cell = "<tr><td class=\"summary-name\"><a href=\"#" <> anchor <> "\">" <> escape_html(name) <> "/" <> Integer.to_string(arity) <> "</a></td>"
+    doc_cell = "<td class=\"summary-doc\">" <> escape_html(summary) <> "</td></tr>\n"
+    name_cell <> doc_cell
+  }
+
+  @doc = """
+    Render a single signature block — the bordered code panel that
+    holds the typed call form (`name(p :: T, ...) -> R [if guard]`).
+    Signature strings are produced by `Struct.functions/1` reflection;
+    this function wraps them in the panel without further parsing,
+    matching the in-tree Zig generator's plain `<code>` rendering for
+    signatures the rich pill renderer can't parse.
+    """
+  pub fn signature_block(signature :: String) -> String {
+    "<div class=\"signature\"><code>" <> escape_html(signature) <> "</code></div>\n"
+  }
+
+  @doc = """
+    Render a complete per-function detail block — the section that
+    appears under "Function Details" on each module page. Composes
+    the header, all clause signatures, and the doc body (already
+    rendered to HTML by `Markdown.to_html/1`).
+
+    `signatures` is a list of pre-rendered Zap-syntax signature
+    strings, one per clause (multi-clause functions get multiple
+    panels stacked). `doc_html` is the markdown-rendered prose;
+    callers pass `Markdown.to_html(func.doc)`.
+    """
+  pub fn function_detail(name :: String, arity :: i64, is_macro :: Bool, signatures :: [String], doc_html :: String) -> String {
+    sig_blocks = for sig <- signatures {
+      signature_block(sig)
+    }
+    sigs = String.join(sig_blocks, "")
+    open_div = "<div class=\"function-detail\" id=\"" <> anchor_id(name, arity) <> "\">\n"
+    header = function_header(name, arity, is_macro)
+    body = if String.length(doc_html) == 0 {
+      ""
+    } else {
+      "<div class=\"function-doc\">\n" <> doc_html <> "</div>\n"
+    }
+    open_div <> header <> sigs <> body <> "</div>\n"
+  }
+
+  pub fn function_header(name :: String, arity :: i64, is_macro :: Bool) -> String {
+    badge = if is_macro { "macro" } else { "fn" }
+    anchor = anchor_id(name, arity)
+    open_div = "<div class=\"function-header\">\n"
+    h3 = "<h3>" <> escape_html(name) <> "<span class=\"arity\">/" <> Integer.to_string(arity) <> "</span></h3>\n"
+    badge_span = "<span class=\"badge\">" <> badge <> "</span>\n"
+    spacer = "<div style=\"flex:1\"></div>\n"
+    anchor_link = "<a href=\"#" <> anchor <> "\" class=\"anchor-link\">#</a>\n"
+    open_div <> h3 <> badge_span <> spacer <> anchor_link <> "</div>\n"
+  }
+
   pub fn implements_link(name :: String) -> String {
     safe = escape_html(name)
     "<a class=\"implements-link\" href=\"../structs/" <> safe <> ".html\">" <> safe <> "</a>\n"
