@@ -9,15 +9,6 @@
   and drive `Zap.Doc` page rendering. Mirrors the `Zest.Runner`
   pattern: reflection at expansion time, plain Zap function bodies
   at runtime.
-
-  Status: scaffold. The use-macro emits the manifest functions and
-  the helpers it depends on; populating the baked lists with
-  reflection results from inside `__using__/1` interacts with how
-  empty list literals coerce through the substitution path in a way
-  that needs follow-up compiler work before end-to-end use is
-  reliable. The runtime walker that consumes the manifests, plus
-  per-module reflection (`manifest_struct_info/1` etc.), are the
-  next slices.
   """
 
 pub struct Zap.Doc.Builder {
@@ -56,31 +47,18 @@ pub struct Zap.Doc.Builder {
     }
 
     quote {
-      import Zap.Doc.Builder
-
       pub fn manifest_structs() -> [String] {
-        Zap.Doc.Builder.empty_string_list_or(unquote(_struct_names))
+        unquote(_struct_names)
       }
 
       pub fn manifest_protocols() -> [String] {
-        Zap.Doc.Builder.empty_string_list_or(unquote(_protocol_names))
+        unquote(_protocol_names)
       }
 
       pub fn manifest_unions() -> [String] {
-        Zap.Doc.Builder.empty_string_list_or(unquote(_union_names))
+        unquote(_union_names)
       }
     }
-  }
-
-  @doc = """
-    Pin the result type of a baked manifest list to `[String]`.
-    Empty list literals in compile-time-substituted code default to
-    `[i64]`, which fails the manifest function's `[String]` return
-    type. Funneling through this helper forces the right inference
-    in both the empty and non-empty branches.
-    """
-  pub fn empty_string_list_or(values :: [String]) -> [String] {
-    values
   }
 
   @doc = """
