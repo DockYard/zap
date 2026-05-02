@@ -44,6 +44,13 @@ pub struct Zap.Doc.Builder {
       map_get(struct_info(_ref), :name, "")
     }
 
+    _struct_summaries = for _ref <- _struct_refs {
+      %{
+        name: map_get(struct_info(_ref), :name, ""),
+        doc: map_get(struct_info(_ref), :doc, ""),
+      }
+    }
+
     quote {
       pub fn manifest_structs() -> [String] {
         unquote(_struct_names)
@@ -55,6 +62,10 @@ pub struct Zap.Doc.Builder {
 
       pub fn manifest_unions() -> [String] {
         unquote(_union_names)
+      }
+
+      pub fn manifest_struct_summaries() -> [%{Atom => String}] {
+        unquote(_struct_summaries)
       }
     }
   }

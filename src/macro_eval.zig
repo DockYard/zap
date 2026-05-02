@@ -455,6 +455,39 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
                 return CtValue{ .tuple = .{ .alloc_id = id, .elems = elems } };
             }
 
+            // %{key => value, ...} — construct a map at compile time.
+            // The parser encodes a map literal as `{:%{}, meta, [pair, ...]}`
+            // where each pair is `{key_form, value_form}`. Evaluating each
+            // entry's key and value yields a CtValue map that downstream
+            // operators (`map_get`, equality) can consume, and `unquote`
+            // can splice into a runtime function body as a literal map.
+            //
+            // We deliberately keep entries in their wrapped AST form
+            // (`{form, meta, nil}` for literals) rather than unwrapping
+            // them. The map round-trips through `ctValueToExpr` when
+            // unquoted into a runtime body, and atom keys must reach
+            // that conversion as wrapped atom literals so they don't get
+            // misclassified as variable references — `unwrapAstLiteral`
+            // strips the leading `:` from atom names, which destroys the
+            // signal that distinguishes `:name` from a `name` var.
+            if (std.mem.eql(u8, form_name, "%{}")) {
+                var entries = try env.alloc.alloc(CtValue.CtMapEntry, arg_elems.len);
+                for (arg_elems, 0..) |pair, i| {
+                    if (pair == .tuple and pair.tuple.elems.len == 2) {
+                        const key = try eval(env, pair.tuple.elems[0]);
+                        const val = try eval(env, pair.tuple.elems[1]);
+                        entries[i] = .{ .key = key, .value = val };
+                    } else {
+                        // Malformed pair — fall back to nil entry so the
+                        // resulting map shape is still well-formed and the
+                        // surrounding eval path can surface a precise error.
+                        entries[i] = .{ .key = .nil, .value = .nil };
+                    }
+                }
+                const id = env.store.alloc(env.alloc, .map, null);
+                return CtValue{ .map = .{ .alloc_id = id, .entries = entries } };
+            }
+
             // Struct attribute intrinsics — callable from within macro
             // bodies to read/write the current struct's compile-time
             // attribute table. Inert when no struct context is wired
@@ -1830,7 +1863,16 @@ fn debugPrintCtValue(val: CtValue, max_depth: u32) void {
             }
             std.debug.print("}}", .{});
         },
-        .map => std.debug.print("<map>", .{}),
+        .map => |m| {
+            std.debug.print("%{{", .{});
+            for (m.entries, 0..) |entry, i| {
+                if (i > 0) std.debug.print(", ", .{});
+                debugPrintCtValue(entry.key, max_depth - 1);
+                std.debug.print(" => ", .{});
+                debugPrintCtValue(entry.value, max_depth - 1);
+            }
+            std.debug.print("}}", .{});
+        },
         .struct_val => std.debug.print("<struct>", .{}),
         .union_val => std.debug.print("<union>", .{}),
         .enum_val => std.debug.print("<enum>", .{}),

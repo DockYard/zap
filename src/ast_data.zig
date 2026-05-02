@@ -779,6 +779,26 @@ pub fn ctValueToExpr(
         return expr;
     }
 
+    // Bare map CtValue (typically the result of evaluating a `%{}` map
+    // literal at macro expansion time, then unquoted into a runtime
+    // function body). Reconstruct as an `ast.MapExpr` so the type checker
+    // sees a normal map literal rather than falling back to `nil`.
+    if (value == .map) {
+        var fields: std.ArrayListUnmanaged(ast.MapField) = .empty;
+        for (value.map.entries) |entry| {
+            const key = try ctValueToExpr(alloc, interner, entry.key);
+            const val = try ctValueToExpr(alloc, interner, entry.value);
+            try fields.append(alloc, .{ .key = key, .value = val });
+        }
+        const expr = try alloc.create(ast.Expr);
+        expr.* = .{ .map = .{
+            .meta = meta,
+            .update_source = null,
+            .fields = try fields.toOwnedSlice(alloc),
+        } };
+        return expr;
+    }
+
     // Must be a 3-tuple: {form, metadata, args}
     if (value != .tuple or value.tuple.elems.len != 3) {
         // Fallback: nil literal
