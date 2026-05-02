@@ -146,6 +146,24 @@ pub struct Zap.DocTest {
     }
   }
 
+  describe("Zap.Doc.sidebar") {
+    test("renders one group per non-empty member list") {
+      _result = Zap.Doc.sidebar(["Atom", "Bool"], ["Stringable"], empty_string_list(), "Bool", "../")
+      assert(String.starts_with?(_result, "<nav class=\"sidebar\">"))
+      assert(String.contains?(_result, "<h4>Structs</h4>"))
+      assert(String.contains?(_result, "<h4>Protocols</h4>"))
+      assert(String.contains?(_result, "<h4>Unions</h4>") == false)
+      assert(String.contains?(_result, "<li class=\"active\"><a href=\"../structs/Bool.html\">Bool</a></li>"))
+    }
+
+    test("empty groups produce a sidebar with only the search header") {
+      _empty = empty_string_list()
+      _result = Zap.Doc.sidebar(_empty, _empty, _empty, "", "")
+      assert(String.contains?(_result, "<h4>") == false)
+      assert(String.contains?(_result, "<div class=\"sidebar-search\">"))
+    }
+  }
+
   describe("Zap.Doc.topbar") {
     test("renders brand, search trigger, theme toggle, github link") {
       _result = Zap.Doc.topbar("zap_stdlib", "0.1.0", "../", "https://github.com/DockYard/zap")

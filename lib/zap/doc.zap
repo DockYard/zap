@@ -299,6 +299,35 @@ pub struct Zap.Doc {
     modal <> script <> "</body>\n</html>\n"
   }
 
+  @doc = """
+    Render the entire left sidebar — three potential groups
+    (`Structs`, `Protocols`, `Unions`), each only emitted when its
+    members list is non-empty. `current` is the active module's name
+    (`""` from non-module pages); `base` is the path prefix to the
+    docs root.
+    """
+  pub fn sidebar(structs :: [String], protocols :: [String], unions :: [String], current :: String, base :: String) -> String {
+    structs_group = if List.empty?(structs) {
+      ""
+    } else {
+      sidebar_group("Structs", structs, current, base)
+    }
+    protocols_group = if List.empty?(protocols) {
+      ""
+    } else {
+      sidebar_group("Protocols", protocols, current, base)
+    }
+    unions_group = if List.empty?(unions) {
+      ""
+    } else {
+      sidebar_group("Unions", unions, current, base)
+    }
+    open_nav = "<nav class=\"sidebar\">\n"
+    header = "<div class=\"sidebar-header\"><a href=\"" <> base <> "index.html\" class=\"sidebar-title\"></a> <span class=\"sidebar-version\"></span></div>\n"
+    search_input = "<div class=\"sidebar-search\"><input type=\"text\" id=\"search-input\" placeholder=\"Search (Cmd+K)\" aria-label=\"Search documentation\"></div>\n"
+    open_nav <> header <> search_input <> structs_group <> protocols_group <> unions_group <> "</nav>\n"
+  }
+
   pub fn search_modal() -> String {
     open = "<div id=\"search-modal\" class=\"search-modal\" hidden>\n<div class=\"search-backdrop\"></div>\n<div class=\"search-dialog\">\n"
     icon = "<svg width=\"15\" height=\"15\" viewBox=\"0 0 16 16\" fill=\"none\" aria-hidden=\"true\">\n<circle cx=\"7\" cy=\"7\" r=\"5\" stroke=\"currentColor\" stroke-width=\"1.3\"/>\n<line x1=\"10.6\" y1=\"10.6\" x2=\"14\" y2=\"14\" stroke=\"currentColor\" stroke-width=\"1.3\" stroke-linecap=\"round\"/>\n</svg>\n"
