@@ -1,7 +1,6 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 const scope = @import("scope.zig");
-const ctfe = @import("ctfe.zig");
 
 // ============================================================
 // Declaration collector
@@ -431,112 +430,25 @@ pub const Collector = struct {
                 if (parent.macros.get(key)) |mid| {
                     for (pending_attrs.items) |attr| {
                         try self.graph.macro_families.items[mid].attributes.append(self.allocator, attr);
-                        // Recognize the structural `@requires` attribute and
-                        // lift it into the macro family's typed capability
-                        // set so the evaluator and dispatcher can consult it
-                        // without re-parsing the attribute table on every
-                        // call. We deliberately resolve `@requires` here at
-                        // collection time, not lazily, because every macro
-                        // invocation needs the capability bitset and the
-                        // declaration is fixed at parse time.
+                        // `@requires` was historically a hand-written
+                        // capability declaration. The compiler now infers
+                        // each macro's capability set from its call graph
+                        // (see `capability_inference.zig`), so the
+                        // annotation is no longer meaningful — emit an
+                        // error so authors don't write a no-op.
                         const attr_name = self.interner.get(attr.name);
                         if (std.mem.eql(u8, attr_name, "requires")) {
-                            try self.applyRequiresAttribute(mid, attr);
+                            const span = if (attr.value) |v| v.getMeta().span else ast.SourceSpan{ .start = 0, .end = 0 };
+                            const msg = try std.fmt.allocPrint(
+                                self.allocator,
+                                "`@requires` is no longer supported — compile-time capabilities are inferred from the macro body's call graph",
+                                .{},
+                            );
+                            try self.errors.append(self.allocator, .{ .message = msg, .span = span });
                         }
                     }
                 }
             }
-        }
-    }
-
-    /// Resolve a `@requires` attribute's value expression into a
-    /// `CapabilitySet` and store it on the macro family. Accepts:
-    ///   - `:pure`               → empty set
-    ///   - `:read_file`          → singleton
-    ///   - `[:cap1, :cap2]`      → union
-    /// Unknown atoms or other shapes produce a collector error so the
-    /// author sees the offending source location, and the macro keeps
-    /// its default empty capability set (the safest possible failure
-    /// mode — it forces an under-declaration error if the body is
-    /// impure rather than silently allowing impure work).
-    fn applyRequiresAttribute(
-        self: *Collector,
-        macro_id: scope.MacroFamilyId,
-        attr: scope.Attribute,
-    ) !void {
-        const family = &self.graph.macro_families.items[macro_id];
-        family.required_caps_declared = true;
-
-        const value_expr = attr.value orelse {
-            const msg = try std.fmt.allocPrint(
-                self.allocator,
-                "@requires must have a value (e.g. `@requires = [:read_file]`)",
-                .{},
-            );
-            try self.errors.append(self.allocator, .{ .message = msg, .span = .{ .start = 0, .end = 0 } });
-            return;
-        };
-
-        family.required_caps = try self.exprToCapabilitySet(value_expr);
-    }
-
-    /// Translate a `@requires` value expression into a CapabilitySet.
-    /// Errors are appended to the collector's diagnostics; on any error
-    /// the function returns the empty set so the macro is treated as
-    /// pure and any impure body call surfaces an under-declaration
-    /// error rather than silently passing.
-    fn exprToCapabilitySet(self: *Collector, expr: *const ast.Expr) !ctfe.CapabilitySet {
-        switch (expr.*) {
-            .atom_literal => |atom| {
-                const name = self.interner.get(atom.value);
-                if (ctfe.CapabilitySet.capabilityFromAtomName(name)) |cap| {
-                    if (cap == .pure) return ctfe.CapabilitySet.pure_only;
-                    return ctfe.CapabilitySet.pure_only.with(cap);
-                }
-                const msg = try std.fmt.allocPrint(
-                    self.allocator,
-                    "unknown capability `:{s}` — expected one of :pure, :read_file, :read_env, :reflect_struct, :reflect_source",
-                    .{name},
-                );
-                try self.errors.append(self.allocator, .{ .message = msg, .span = atom.meta.span });
-                return ctfe.CapabilitySet.pure_only;
-            },
-            .list => |list_expr| {
-                var caps = ctfe.CapabilitySet.pure_only;
-                for (list_expr.elements) |elem| {
-                    if (elem.* != .atom_literal) {
-                        const msg = try std.fmt.allocPrint(
-                            self.allocator,
-                            "@requires list elements must be capability atoms (e.g. :read_file)",
-                            .{},
-                        );
-                        try self.errors.append(self.allocator, .{ .message = msg, .span = elem.getMeta().span });
-                        continue;
-                    }
-                    const atom = elem.atom_literal;
-                    const name = self.interner.get(atom.value);
-                    if (ctfe.CapabilitySet.capabilityFromAtomName(name)) |cap| {
-                        if (cap != .pure) caps = caps.with(cap);
-                    } else {
-                        const msg = try std.fmt.allocPrint(
-                            self.allocator,
-                            "unknown capability `:{s}` — expected one of :pure, :read_file, :read_env, :reflect_struct, :reflect_source",
-                            .{name},
-                        );
-                        try self.errors.append(self.allocator, .{ .message = msg, .span = atom.meta.span });
-                    }
-                }
-                return caps;
-            },
-            else => {
-                const msg = try std.fmt.allocPrint(
-                    self.allocator,
-                    "@requires value must be a capability atom or list of atoms",
-                    .{},
-                );
-                try self.errors.append(self.allocator, .{ .message = msg, .span = expr.getMeta().span });
-                return ctfe.CapabilitySet.pure_only;
-            },
         }
     }
 

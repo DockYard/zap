@@ -553,10 +553,8 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
             }
 
             // read_file(path) — read a file at compile time.
-            // Gated by the `read_file` capability. The first impure
-            // intrinsic in the macro language: a macro that calls this
-            // must declare `@requires = [:read_file]`, otherwise
-            // expansion fails with a capability_violation diagnostic.
+            // Gated by the `read_file` capability, inferred by
+            // `capability_inference.zig` from the macro's call graph.
             // Returns a `string` CtValue containing the file's bytes.
             //
             // Resource bound: the read is capped at 1 MiB to keep
@@ -569,7 +567,7 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
                     const caller = env.current_macro_name orelse "<top-level>";
                     const msg = std.fmt.allocPrint(
                         env.alloc,
-                        "macro `{s}` calls `read_file` but does not declare `@requires = [:read_file]` — add the capability to allow compile-time file reads",
+                        "internal: macro `{s}` reached `read_file` without the inferred read_file capability — capability inference is out of sync with the call graph",
                         .{caller},
                     ) catch return MacroEvalError.EvalFailed;
                     env.last_capability_error = msg;
@@ -1902,7 +1900,7 @@ fn sourceGraphStructsIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!
     if (!hasReflectionCapability(env)) {
         env.last_capability_error = std.fmt.allocPrint(
             env.alloc,
-            "macro `{s}` calls `source_graph_structs` but does not declare `@requires = [:reflect_source]`",
+            "macro `{s}` reached `source_graph_structs` without the inferred reflect_source capability — capability inference is out of sync with the call graph",
             .{env.current_macro_name orelse "<top-level>"},
         ) catch return MacroEvalError.EvalFailed;
         return MacroEvalError.EvalFailed;
@@ -1929,7 +1927,7 @@ fn structFunctionsIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtV
     if (!hasReflectionCapability(env)) {
         env.last_capability_error = std.fmt.allocPrint(
             env.alloc,
-            "macro `{s}` calls `struct_functions` but does not declare `@requires = [:reflect_source]`",
+            "macro `{s}` reached `struct_functions` without the inferred reflect_source capability — capability inference is out of sync with the call graph",
             .{env.current_macro_name orelse "<top-level>"},
         ) catch return MacroEvalError.EvalFailed;
         return MacroEvalError.EvalFailed;
@@ -1967,7 +1965,7 @@ fn sourceGraphProtocolsIntrinsic(env: *Env, args: []const CtValue) MacroEvalErro
     if (!hasReflectionCapability(env)) {
         env.last_capability_error = std.fmt.allocPrint(
             env.alloc,
-            "macro `{s}` calls `source_graph_protocols` but does not declare `@requires = [:reflect_source]`",
+            "macro `{s}` reached `source_graph_protocols` without the inferred reflect_source capability — capability inference is out of sync with the call graph",
             .{env.current_macro_name orelse "<top-level>"},
         ) catch return MacroEvalError.EvalFailed;
         return MacroEvalError.EvalFailed;
@@ -2003,7 +2001,7 @@ fn sourceGraphUnionsIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!C
     if (!hasReflectionCapability(env)) {
         env.last_capability_error = std.fmt.allocPrint(
             env.alloc,
-            "macro `{s}` calls `source_graph_unions` but does not declare `@requires = [:reflect_source]`",
+            "macro `{s}` reached `source_graph_unions` without the inferred reflect_source capability — capability inference is out of sync with the call graph",
             .{env.current_macro_name orelse "<top-level>"},
         ) catch return MacroEvalError.EvalFailed;
         return MacroEvalError.EvalFailed;
@@ -2049,7 +2047,7 @@ fn sourceGraphImplsIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!Ct
     if (!hasReflectionCapability(env)) {
         env.last_capability_error = std.fmt.allocPrint(
             env.alloc,
-            "macro `{s}` calls `source_graph_impls` but does not declare `@requires = [:reflect_source]`",
+            "macro `{s}` reached `source_graph_impls` without the inferred reflect_source capability — capability inference is out of sync with the call graph",
             .{env.current_macro_name orelse "<top-level>"},
         ) catch return MacroEvalError.EvalFailed;
         return MacroEvalError.EvalFailed;
@@ -2105,7 +2103,7 @@ fn unionVariantsIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtVal
     if (!hasReflectionCapability(env)) {
         env.last_capability_error = std.fmt.allocPrint(
             env.alloc,
-            "macro `{s}` calls `union_variants` but does not declare `@requires = [:reflect_source]`",
+            "macro `{s}` reached `union_variants` without the inferred reflect_source capability — capability inference is out of sync with the call graph",
             .{env.current_macro_name orelse "<top-level>"},
         ) catch return MacroEvalError.EvalFailed;
         return MacroEvalError.EvalFailed;
@@ -2152,7 +2150,7 @@ fn protocolRequiredFunctionsIntrinsic(env: *Env, args: []const CtValue) MacroEva
     if (!hasReflectionCapability(env)) {
         env.last_capability_error = std.fmt.allocPrint(
             env.alloc,
-            "macro `{s}` calls `protocol_required_functions` but does not declare `@requires = [:reflect_source]`",
+            "macro `{s}` reached `protocol_required_functions` without the inferred reflect_source capability — capability inference is out of sync with the call graph",
             .{env.current_macro_name orelse "<top-level>"},
         ) catch return MacroEvalError.EvalFailed;
         return MacroEvalError.EvalFailed;
@@ -2194,7 +2192,7 @@ fn structMacrosIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtValu
     if (!hasReflectionCapability(env)) {
         env.last_capability_error = std.fmt.allocPrint(
             env.alloc,
-            "macro `{s}` calls `struct_macros` but does not declare `@requires = [:reflect_source]`",
+            "macro `{s}` reached `struct_macros` without the inferred reflect_source capability — capability inference is out of sync with the call graph",
             .{env.current_macro_name orelse "<top-level>"},
         ) catch return MacroEvalError.EvalFailed;
         return MacroEvalError.EvalFailed;
@@ -2235,7 +2233,7 @@ fn structInfoIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtValue 
     if (!hasReflectionCapability(env)) {
         env.last_capability_error = std.fmt.allocPrint(
             env.alloc,
-            "macro `{s}` calls `struct_info` but does not declare `@requires = [:reflect_source]`",
+            "macro `{s}` reached `struct_info` without the inferred reflect_source capability — capability inference is out of sync with the call graph",
             .{env.current_macro_name orelse "<top-level>"},
         ) catch return MacroEvalError.EvalFailed;
         return MacroEvalError.EvalFailed;

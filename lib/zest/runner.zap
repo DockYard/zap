@@ -7,8 +7,6 @@
   """
 
 pub struct Zest.Runner {
-  @requires = [:read_file, :reflect_source]
-
   @doc = """
     Imports `Zest.Runner` and generates a `main/1` test entry point.
 

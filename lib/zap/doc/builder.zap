@@ -12,8 +12,6 @@
   """
 
 pub struct Zap.Doc.Builder {
-  @requires = [:reflect_source, :read_file]
-
   @doc = """
     Reflect on the supplied source paths (a single string or a list
     of strings) and emit manifest functions returning the qualified

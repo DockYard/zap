@@ -12,8 +12,6 @@
   """
 
 pub struct ListBakeProbe {
-  @requires = [:reflect_source, :read_file]
-
   pub macro __using__(_opts :: Expr) -> Expr {
     _baked = ["Atom", "Stringable"]
 

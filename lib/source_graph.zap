@@ -6,8 +6,6 @@
   """
 
 pub struct SourceGraph {
-  @requires = [:reflect_source]
-
   @doc = """
     Returns struct references declared in the exact source paths provided.
 

@@ -40,6 +40,7 @@ pub const discovery = @import("discovery.zig");
 pub const glob = @import("glob.zig");
 pub const attr_substitute = @import("attr_substitute.zig");
 pub const ctfe = @import("ctfe.zig");
+pub const capability_inference = @import("capability_inference.zig");
 pub const lockfile = @import("lockfile.zig");
 pub const monomorphize = @import("monomorphize.zig");
 pub const env = @import("env.zig");
@@ -83,6 +84,7 @@ test {
     _ = @import("lockfile.zig");
     _ = @import("attr_substitute.zig");
     _ = @import("ctfe.zig");
+    _ = @import("capability_inference.zig");
     _ = @import("monomorphize.zig");
     _ = @import("env.zig");
 }

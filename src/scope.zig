@@ -302,18 +302,13 @@ pub const MacroFamily = struct {
     clauses: std.ArrayList(FunctionClauseRef),
     /// Attributes attached to this macro (@doc, @debug, etc.)
     attributes: std.ArrayListUnmanaged(Attribute) = .empty,
-    /// Capabilities this macro is declared to require via `@requires`.
-    /// Defaults to the empty set (pure). When the body invokes an
-    /// impure intrinsic that is not in this set, expansion is rejected
-    /// with a `capability_violation` diagnostic. Caller/callee
-    /// attenuation also uses this field: a macro M1 may only call
-    /// macro M2 when `decl(M2) ⊆ decl(M1)`.
+    /// Capabilities this macro requires at compile time, populated by
+    /// the static inference pass in `capability_inference.zig`. Each
+    /// flag is set when the body — or a function/macro it transitively
+    /// calls — invokes a capability-bearing intrinsic. The macro
+    /// evaluator and CTFE interpreter consult this set to grant the
+    /// matching permissions during expansion.
     required_caps: ctfe.CapabilitySet = .{},
-    /// True when `@requires` was explicitly declared on the macro.
-    /// Distinguishes "author wrote `@requires = []`" from "no annotation
-    /// at all" so future inference passes can treat the unannotated
-    /// case differently from an explicit pure declaration.
-    required_caps_declared: bool = false,
     /// Per-family Flatt-2016 macro-introduction scope. Allocated lazily
     /// the first time a macro in this family is expanded, then reused
     /// for every subsequent expansion of any of its clauses. The

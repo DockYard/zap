@@ -5178,19 +5178,17 @@ test "struct attribute intrinsics: register makes attribute accumulate" {
 // ============================================================
 // Capability tests (Task #15)
 //
-// Exercise the `@requires` annotation, the `read_file`
-// intrinsic, and the caller/callee attenuation rule. Each test
-// stages a small Zap program through the full
-// parse → collect → expand pipeline so the surface diagnostics
-// (engine.errors) can be asserted.
+// Capabilities are inferred by `capability_inference.zig` from each
+// macro's call graph; authors no longer write `@requires` annotations.
+// These tests stage small Zap programs and assert that the inferred
+// `MacroFamily.required_caps` matches what the body actually does.
 // ============================================================
 
-test "capability: @requires annotation is parsed and stored on MacroFamily" {
+test "capability inference: macro using read_file gets read_file in its set" {
     const source =
         \\pub struct Test {
-        \\  @requires = [:read_file]
         \\  pub macro embed(path :: Expr) {
-        \\    quote { unquote(path) }
+        \\    read_file("doesnotmatter")
         \\  }
         \\}
     ;
@@ -5207,14 +5205,15 @@ test "capability: @requires annotation is parsed and stored on MacroFamily" {
     try collector.collectProgram(&program);
     try std.testing.expectEqual(@as(usize, 0), collector.errors.items.len);
 
+    try @import("capability_inference.zig").inferAndApply(alloc, &collector.graph, parser.interner);
+
     try std.testing.expect(collector.graph.macro_families.items.len > 0);
     const family = collector.graph.macro_families.items[0];
-    try std.testing.expect(family.required_caps_declared);
     try std.testing.expect(family.required_caps.has(.read_file));
     try std.testing.expect(!family.required_caps.has(.read_env));
 }
 
-test "capability: macro without @requires defaults to pure" {
+test "capability inference: pure macro has empty cap set" {
     const source =
         \\pub struct Test {
         \\  pub macro id(x :: Expr) {
@@ -5234,16 +5233,84 @@ test "capability: macro without @requires defaults to pure" {
     defer collector.deinit();
     try collector.collectProgram(&program);
 
+    try @import("capability_inference.zig").inferAndApply(alloc, &collector.graph, parser.interner);
+
     try std.testing.expect(collector.graph.macro_families.items.len > 0);
     const family = collector.graph.macro_families.items[0];
-    try std.testing.expect(!family.required_caps_declared);
     try std.testing.expectEqual(@as(u8, 0), family.required_caps.flags);
+}
+
+test "capability inference: caps propagate transitively through macro-to-macro calls" {
+    const source =
+        \\pub struct Test {
+        \\  pub macro inner() {
+        \\    read_file("x")
+        \\  }
+        \\  pub macro outer() {
+        \\    inner()
+        \\  }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    try @import("capability_inference.zig").inferAndApply(alloc, &collector.graph, parser.interner);
+
+    // Both macros must have read_file in their inferred set: `inner`
+    // because it directly calls `read_file`, and `outer` because the
+    // call graph propagates `inner`'s caps up to its caller.
+    try std.testing.expectEqual(@as(usize, 2), collector.graph.macro_families.items.len);
+    for (collector.graph.macro_families.items) |family| {
+        try std.testing.expect(family.required_caps.has(.read_file));
+    }
+}
+
+test "capability inference: writing @requires is a compile error" {
+    const source =
+        \\pub struct Test {
+        \\  @requires = [:read_file]
+        \\  pub macro deprecated() {
+        \\    quote { 1 }
+        \\  }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var saw_deprecation_error = false;
+    for (collector.errors.items) |err| {
+        if (std.mem.find(u8, err.message, "@requires") != null and
+            std.mem.find(u8, err.message, "no longer supported") != null)
+        {
+            saw_deprecation_error = true;
+            break;
+        }
+    }
+    try std.testing.expect(saw_deprecation_error);
 }
 
 /// Build a Zap source string that exercises the given macro
 /// declarations and a fn that calls `entry_macro_name`. Centralizes
-/// the boilerplate so each capability test focuses on the @requires
-/// shape under test.
+/// the boilerplate so each capability test focuses on the body shape
+/// under test rather than test scaffolding.
 fn buildCapTestSource(
     alloc: std.mem.Allocator,
     macros_decls: []const u8,
@@ -5261,7 +5328,7 @@ fn buildCapTestSource(
     , .{ macros_decls, entry_macro_call });
 }
 
-test "capability T1: macro with @requires=[:read_file] can call read_file" {
+test "capability: macro using read_file expands without diagnostics" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -5270,12 +5337,11 @@ test "capability T1: macro with @requires=[:read_file] can call read_file" {
     defer tmp_dir.cleanup();
     try tmp_dir.dir.writeFile(std.Options.debug_io, .{
         .sub_path = "fixture.txt",
-        .data = "T1 fixture contents",
+        .data = "fixture contents",
     });
     const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, "fixture.txt", alloc);
 
     const macros_decl = try std.fmt.allocPrint(alloc,
-        \\  @requires = [:read_file]
         \\  pub macro embed_fixture() {{
         \\    read_file("{s}")
         \\  }}
@@ -5291,6 +5357,8 @@ test "capability T1: macro with @requires=[:read_file] can call read_file" {
     try collector.collectProgram(&program);
     try std.testing.expectEqual(@as(usize, 0), collector.errors.items.len);
 
+    try @import("capability_inference.zig").inferAndApply(alloc, &collector.graph, parser.interner);
+
     var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
     defer engine.deinit();
     _ = try engine.expandProgram(&program);
@@ -5298,99 +5366,6 @@ test "capability T1: macro with @requires=[:read_file] can call read_file" {
     for (engine.errors.items) |err| {
         try std.testing.expect(std.mem.find(u8, err.message, "read_file") == null);
     }
-}
-
-test "capability T2: macro WITHOUT @requires calling read_file is a compile error" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
-        .sub_path = "fixture.txt",
-        .data = "T2 fixture",
-    });
-    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, "fixture.txt", alloc);
-
-    const macros_decl = try std.fmt.allocPrint(alloc,
-        \\  pub macro embed_no_caps() {{
-        \\    read_file("{s}")
-        \\  }}
-    , .{tmp_path});
-    const source = try buildCapTestSource(alloc, macros_decl, "embed_no_caps()");
-
-    var parser = Parser.init(alloc, source);
-    defer parser.deinit();
-    const program = try parser.parseProgram();
-
-    var collector = Collector.init(alloc, parser.interner, null);
-    defer collector.deinit();
-    try collector.collectProgram(&program);
-
-    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
-    defer engine.deinit();
-    _ = try engine.expandProgram(&program);
-
-    var saw_read_file_error = false;
-    for (engine.errors.items) |err| {
-        if (std.mem.find(u8, err.message, "read_file") != null and
-            std.mem.find(u8, err.message, "read_file") != null)
-        {
-            saw_read_file_error = true;
-            break;
-        }
-    }
-    try std.testing.expect(saw_read_file_error);
-}
-
-test "capability T3: pure caller cannot invoke a @requires=[:read_file] macro" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
-        .sub_path = "fixture.txt",
-        .data = "T3",
-    });
-    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, "fixture.txt", alloc);
-
-    const macros_decl = try std.fmt.allocPrint(alloc,
-        \\  @requires = [:read_file]
-        \\  pub macro inner_io() {{
-        \\    read_file("{s}")
-        \\  }}
-        \\
-        \\  pub macro outer_pure() {{
-        \\    inner_io()
-        \\  }}
-    , .{tmp_path});
-    const source = try buildCapTestSource(alloc, macros_decl, "outer_pure()");
-
-    var parser = Parser.init(alloc, source);
-    defer parser.deinit();
-    const program = try parser.parseProgram();
-
-    var collector = Collector.init(alloc, parser.interner, null);
-    defer collector.deinit();
-    try collector.collectProgram(&program);
-
-    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
-    defer engine.deinit();
-    _ = try engine.expandProgram(&program);
-
-    var saw_attenuation = false;
-    for (engine.errors.items) |err| {
-        if (std.mem.find(u8, err.message, "inner_io") != null or
-            std.mem.find(u8, err.message, "read_file") != null)
-        {
-            saw_attenuation = true;
-            break;
-        }
-    }
-    try std.testing.expect(saw_attenuation);
 }
 
 test "macro eval rejects bare underscore-prefixed call in macro body" {
@@ -5559,7 +5534,7 @@ test "macro engine rejects direct qualified __using__ macro call" {
     try std.testing.expect(found_error);
 }
 
-test "capability T4: matching capabilities pass attenuation" {
+test "capability: macro-to-macro chain expands cleanly when inference grants caps" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -5568,17 +5543,15 @@ test "capability T4: matching capabilities pass attenuation" {
     defer tmp_dir.cleanup();
     try tmp_dir.dir.writeFile(std.Options.debug_io, .{
         .sub_path = "fixture.txt",
-        .data = "T4",
+        .data = "fixture",
     });
     const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, "fixture.txt", alloc);
 
     const macros_decl = try std.fmt.allocPrint(alloc,
-        \\  @requires = [:read_file]
         \\  pub macro inner_io() {{
         \\    read_file("{s}")
         \\  }}
         \\
-        \\  @requires = [:read_file]
         \\  pub macro outer_io() {{
         \\    inner_io()
         \\  }}
@@ -5593,6 +5566,8 @@ test "capability T4: matching capabilities pass attenuation" {
     defer collector.deinit();
     try collector.collectProgram(&program);
     try std.testing.expectEqual(@as(usize, 0), collector.errors.items.len);
+
+    try @import("capability_inference.zig").inferAndApply(alloc, &collector.graph, parser.interner);
 
     var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
     defer engine.deinit();

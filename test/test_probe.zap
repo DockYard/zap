@@ -7,8 +7,6 @@
   """
 
 pub struct TestProbe {
-  @requires = [:reflect_source]
-
   pub macro __using__(_opts :: Expr) -> Expr {
     _ignore = _opts
     _funcs = struct_functions(ReflectionSubject)

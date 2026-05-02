@@ -429,6 +429,13 @@ pub fn collectAllFromUnits(
         return error.CollectFailed;
     }
 
+    // Static capability inference: walk every macro/function body, identify
+    // direct uses of impure intrinsics, and propagate to the fixed point so
+    // each `MacroFamily.required_caps` reflects what the body actually does.
+    // Replaces the historical `@requires` annotation; macro authors no
+    // longer write capability sets by hand.
+    zap.capability_inference.inferAndApply(alloc, &collector.graph, &interner) catch {};
+
     // Run macro expansion and desugaring. When the discovery graph supplies a
     // struct order, expand one struct at a time and compile each completed
     // dependency level to IR so later macros can call already compiled Zap
@@ -523,6 +530,11 @@ pub fn collectAllFromUnits(
             return error.CollectFailed;
         };
     }
+
+    // Re-run capability inference on the post-expansion graph so any
+    // downstream consumer (HIR, runtime CTFE) reads the same inferred
+    // capability sets the macro engine used.
+    zap.capability_inference.inferAndApply(alloc, &final_collector.graph, &interner) catch {};
 
     const units = try buildCompilationUnits(alloc, struct_programs, all_source_units);
 
@@ -3814,7 +3826,6 @@ test "staged macro expansion can call compiled Zap functions that use allowed CT
         .{
             .file_path = "lib/macro_provider.zap",
             .source = "pub struct MacroProvider {\n" ++
-                "  @requires = [:read_file]\n" ++
                 "  pub macro build() -> Expr {\n" ++
                 "    paths = Globber.files()\n" ++
                 "    count = list_length(paths)\n" ++
@@ -3862,7 +3873,6 @@ test "staged use macro expansion can call previously compiled Zap functions" {
         .{
             .file_path = "lib/macro_provider.zap",
             .source = "pub struct MacroProvider {\n" ++
-                "  @requires = [:read_file]\n" ++
                 "  pub macro __using__(_opts :: Expr) -> Expr {\n" ++
                 "    paths = Globber.files()\n" ++
                 "    count = list_length(paths)\n" ++
