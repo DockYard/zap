@@ -76,4 +76,18 @@ pub struct Zap.DocTest {
     }
   }
 
+  describe("Zap.Doc.implements_row") {
+    test("renders one accent link per protocol") {
+      _result = Zap.Doc.implements_row(["Arithmetic", "Comparator"])
+      assert(String.contains?(_result, "<span class=\"implements-label\">Implements</span>"))
+      assert(String.contains?(_result, "../structs/Arithmetic.html"))
+      assert(String.contains?(_result, "../structs/Comparator.html"))
+    }
+
+    test("wraps the row in the implements div") {
+      _result = Zap.Doc.implements_row(["Stringable"])
+      assert(String.starts_with?(_result, "<div class=\"implements\">"))
+      assert(String.ends_with?(_result, "</div>\n"))
+    }
+  }
 }

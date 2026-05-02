@@ -81,6 +81,32 @@ pub struct Zap.Doc {
     "<a class=\"implements-link\" href=\"../structs/" <> safe <> ".html\">" <> safe <> "</a>\n"
   }
 
+  @doc = """
+    Render the "Implements" row when a type satisfies one or more
+    protocols. Each protocol becomes an accent-bordered link pill
+    pointing at its reference page. Returns the empty string for an
+    empty list so the caller can splice unconditionally.
+
+    Implementation note: builds the body via a `for` comprehension
+    that produces `[String]`, then folds with `Enum.reduce` to a
+    single string. The recursive multi-clause form
+    (`render_links([] :: [String]) | [head|tail]`) currently provokes
+    a closure-codegen issue elsewhere in the test suite — the
+    comprehension path avoids it.
+    """
+  pub fn implements_row(protocols :: [String]) -> String {
+    if List.empty?(protocols) {
+      ""
+    } else {
+      links_list = for name <- protocols {
+        implements_link(name)
+      }
+      links = String.join(links_list, "")
+      "<div class=\"implements\">\n<span class=\"implements-label\">Implements</span>\n" <> links <> "</div>\n"
+    }
+  }
+
+
   pub fn escape_html(text :: String) -> String {
     escape_chars(text, 0, String.length(text), "")
   }
