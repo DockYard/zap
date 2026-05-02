@@ -5,42 +5,6 @@
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;1,8..60,400&display=swap');
 
 :root {
-  --bg: #f7f6f2;
-  --bg-elev: #ffffff;
-  --bg-subtle: #efede7;
-  --panel: #fbfaf6;
-  --border: #e3e0d7;
-  --border-strong: #c9c5b8;
-  --fg: #1a1f26;
-  --fg-muted: #55616d;
-  --fg-dim: #8b95a0;
-  --accent: #0369a1;
-  --accent-strong: #0284c7;
-  --accent-soft: rgba(3, 105, 161, 0.08);
-  --selection: rgba(3, 105, 161, 0.15);
-
-  --syn-kw: #7c3aed;
-  --syn-str: #16a34a;
-  --syn-type: #b45309;
-  --syn-atom: #be185d;
-  --syn-cmt: #a0a096;
-  --syn-num: #b45309;
-  --syn-op: rgba(3, 105, 161, 0.85);
-  --syn-bi: #7c3aed;
-
-  --type: #b45309;
-  --keyword: #7c3aed;
-
-  --ff-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
-  --ff-serif: 'Source Serif 4', 'Iowan Old Style', Charter, Georgia, serif;
-  --ff-mono: 'JetBrains Mono', 'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, monospace;
-
-  --topbar-h: 56px;
-  --sidebar-w: 280px;
-  --toc-w: 220px;
-}
-
-[data-theme="dark"] {
   --bg: #0b0f14;
   --bg-elev: #10161d;
   --bg-subtle: #0e141b;
@@ -53,6 +17,8 @@
   --accent: #7dd3fc;
   --accent-strong: #38bdf8;
   --accent-soft: rgba(125, 211, 252, 0.12);
+  --accent-pill-border: rgba(125, 211, 252, 0.4);
+  --accent-pill-border-soft: rgba(125, 211, 252, 0.2);
   --selection: rgba(125, 211, 252, 0.22);
 
   --syn-kw: #c4b5fd;
@@ -66,6 +32,44 @@
 
   --type: #fcd34d;
   --keyword: #c4b5fd;
+
+  --ff-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  --ff-serif: 'Source Serif 4', 'Iowan Old Style', Charter, Georgia, serif;
+  --ff-mono: 'JetBrains Mono', 'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+
+  --topbar-h: 56px;
+  --sidebar-w: 280px;
+  --toc-w: 220px;
+}
+
+[data-theme="light"] {
+  --bg: #f7f6f2;
+  --bg-elev: #ffffff;
+  --bg-subtle: #efede7;
+  --panel: #fbfaf6;
+  --border: #e3e0d7;
+  --border-strong: #c9c5b8;
+  --fg: #1a1f26;
+  --fg-muted: #55616d;
+  --fg-dim: #8b95a0;
+  --accent: #0369a1;
+  --accent-strong: #0284c7;
+  --accent-soft: rgba(3, 105, 161, 0.08);
+  --accent-pill-border: rgba(3, 105, 161, 0.4);
+  --accent-pill-border-soft: rgba(3, 105, 161, 0.2);
+  --selection: rgba(3, 105, 161, 0.15);
+
+  --syn-kw: #7c3aed;
+  --syn-str: #16a34a;
+  --syn-type: #b45309;
+  --syn-atom: #be185d;
+  --syn-cmt: #a0a096;
+  --syn-num: #b45309;
+  --syn-op: rgba(3, 105, 161, 0.85);
+  --syn-bi: #7c3aed;
+
+  --type: #b45309;
+  --keyword: #7c3aed;
 }
 
 /* ── Reset ── */
@@ -196,7 +200,8 @@ code, pre, .signature { font-family: var(--ff-mono); font-size: 13px; }
   margin: 0 10px;
 }
 
-.github-link {
+.github-link,
+.topbar-github {
   width: 32px;
   height: 32px;
   display: flex;
@@ -209,7 +214,8 @@ code, pre, .signature { font-family: var(--ff-mono); font-size: 13px; }
   cursor: pointer;
   transition: all .12s;
 }
-.github-link:hover {
+.github-link:hover,
+.topbar-github:hover {
   background: var(--bg-elev);
   border-color: var(--border);
   color: var(--fg);
@@ -267,7 +273,43 @@ code, pre, .signature { font-family: var(--ff-mono); font-size: 13px; }
 .sidebar-search input::placeholder { color: var(--fg-dim); font-size: 12px; }
 
 .sidebar-group { margin-bottom: 18px; }
-.sidebar-group h4 {
+.sidebar-group-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 4px 20px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  margin-bottom: 4px;
+  text-align: left;
+}
+.sidebar-group-header h4 {
+  font-family: var(--ff-sans);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 1.4px;
+  color: var(--fg-dim);
+  font-weight: 600;
+  margin: 0;
+}
+.sidebar-group-header .chevron {
+  display: inline-block;
+  width: 8px;
+  font-size: 9px;
+  color: var(--fg-dim);
+  transform: rotate(90deg);
+  transition: transform .15s;
+}
+.sidebar-group[data-collapsed="true"] .chevron {
+  transform: rotate(0deg);
+}
+.sidebar-group[data-collapsed="true"] ul {
+  display: none;
+}
+/* Legacy (non-collapsible) header style — kept for compatibility */
+.sidebar-group > h4 {
   display: flex; align-items: center; gap: 6px;
   padding: 4px 20px;
   font-family: var(--ff-sans);
@@ -309,8 +351,8 @@ code, pre, .signature { font-family: var(--ff-mono); font-size: 13px; }
   min-width: 0;
 }
 
-/* Breadcrumb style for source-file */
-.source-file {
+/* Breadcrumb above title row — design: "Standard library / Enum" */
+.breadcrumb {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -319,12 +361,17 @@ code, pre, .signature { font-family: var(--ff-mono); font-size: 13px; }
   color: var(--fg-dim);
   margin-bottom: 16px;
 }
-.source-file a {
+.breadcrumb-current { color: var(--fg-muted); }
+
+/* Source link inside title-meta — mono, small */
+.source-file {
+  font-family: var(--ff-mono);
+  font-size: 11px;
   color: var(--fg-muted);
   text-decoration: none;
   border-bottom: 1px solid var(--border);
 }
-.source-file a:hover { color: var(--accent); border-color: var(--accent); }
+.source-file:hover { color: var(--accent); border-color: var(--accent); }
 
 .content h1 {
   font-family: var(--ff-mono);
@@ -564,31 +611,23 @@ code, pre, .signature { font-family: var(--ff-mono); font-size: 13px; }
   display: inline-block;
   padding: 1px 7px;
   background: var(--accent-soft);
-  border: 1px solid;
-  border-color: rgba(125, 211, 252, 0.2);
+  border: 1px solid var(--accent-pill-border-soft);
   border-radius: 3px;
   color: var(--type);
   font-size: 12px;
   font-weight: 500;
   letter-spacing: 0.1px;
-}
-[data-theme="light"] .sig-type-pill {
-  border-color: rgba(3, 105, 161, 0.2);
 }
 .sig-ret-pill {
   display: inline-block;
   padding: 1px 7px;
   background: var(--accent-soft);
-  border: 1px solid;
-  border-color: rgba(125, 211, 252, 0.4);
+  border: 1px solid var(--accent-pill-border);
   border-radius: 3px;
   color: var(--type);
   font-size: 12px;
   font-weight: 500;
   letter-spacing: 0.1px;
-}
-[data-theme="light"] .sig-ret-pill {
-  border-color: rgba(3, 105, 161, 0.4);
 }
 
 /* ── Struct Title ── */
@@ -780,17 +819,6 @@ code, pre, .signature { font-family: var(--ff-mono); font-size: 13px; }
   overflow: hidden;
 }
 
-#search-modal-input {
-  width: 100%;
-  padding: 12px 14px;
-  border: none;
-  border-bottom: 1px solid var(--border);
-  background: transparent;
-  color: var(--fg);
-  font-family: var(--ff-sans);
-  font-size: 15px;
-  outline: none;
-}
 #search-modal-input::placeholder { color: var(--fg-dim); }
 
 .search-results {
@@ -811,11 +839,23 @@ code, pre, .signature { font-family: var(--ff-mono); font-size: 13px; }
 .search-results li:hover,
 .search-results li.selected { background: var(--accent-soft); }
 
+.result-type {
+  width: 64px;
+  flex-shrink: 0;
+  font-family: var(--ff-mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--fg-dim);
+}
+.search-results li.selected .result-type { color: var(--accent); }
 .result-name {
   font-family: var(--ff-mono);
   font-size: 13.5px;
   font-weight: 500;
   color: var(--fg);
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 .result-struct {
   font-family: var(--ff-mono);
@@ -832,6 +872,91 @@ code, pre, .signature { font-family: var(--ff-mono); font-size: 13px; }
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.result-enter {
+  font-family: var(--ff-mono);
+  font-size: 10px;
+  color: var(--fg-dim);
+  flex-shrink: 0;
+}
+
+.search-footer {
+  display: flex;
+  gap: 18px;
+  padding: 8px 14px;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--fg-dim);
+  font-family: var(--ff-sans);
+  align-items: center;
+}
+.search-footer .spacer { flex: 1; }
+.search-footer-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.search-footer kbd {
+  font-family: var(--ff-mono);
+  font-size: 10px;
+  padding: 1px 5px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--fg-muted);
+}
+
+/* Header inside the search dialog — magnifier + input + ESC */
+.search-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.search-header svg { flex-shrink: 0; }
+#search-modal-input {
+  flex: 1;
+  border: none;
+  background: transparent;
+  color: var(--fg);
+  font-family: var(--ff-sans);
+  font-size: 15px;
+  outline: none;
+  padding: 0;
+}
+.search-header kbd {
+  font-family: var(--ff-mono);
+  font-size: 10px;
+  padding: 1px 5px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--fg-muted);
+}
+
+/* See also — accent-colored function links, comma-free */
+.see-also {
+  margin-top: 12px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-family: var(--ff-sans);
+  font-size: 12px;
+  color: var(--fg-dim);
+  flex-wrap: wrap;
+}
+.see-also-label {
+  text-transform: uppercase;
+  letter-spacing: 1.2px;
+  font-size: 10px;
+}
+.see-also a {
+  font-family: var(--ff-mono);
+  font-size: 12px;
+  color: var(--accent);
+  text-decoration: none;
+}
+.see-also a:hover { color: var(--accent-strong); }
 
 /* ══════════════════════════════════════
    Copy Button

@@ -2,15 +2,12 @@
 (function() {
   'use strict';
 
-  // Dark mode
+  // Theme — dark is default per design; toggle persists user choice.
+  // No system-preference sniffing.
   var toggle = document.getElementById('theme-toggle');
   var html = document.documentElement;
   var saved = localStorage.getItem('zap-docs-theme');
-  if (saved) {
-    html.setAttribute('data-theme', saved);
-  } else if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
-    html.setAttribute('data-theme', 'dark');
-  }
+  html.setAttribute('data-theme', saved === 'light' ? 'light' : 'dark');
   if (toggle) {
     toggle.addEventListener('click', function() {
       var current = html.getAttribute('data-theme');
@@ -19,6 +16,24 @@
       localStorage.setItem('zap-docs-theme', next);
     });
   }
+
+  // Sidebar group collapse — chevron toggles on header click, state persists.
+  var groupState = {};
+  try { groupState = JSON.parse(localStorage.getItem('zap-docs-sidebar') || '{}'); } catch (e) {}
+  document.querySelectorAll('.sidebar-group').forEach(function(group) {
+    var key = group.getAttribute('data-group') || '';
+    if (groupState[key] === true) group.setAttribute('data-collapsed', 'true');
+    var header = group.querySelector('.sidebar-group-header');
+    if (header) {
+      header.addEventListener('click', function() {
+        var collapsed = group.getAttribute('data-collapsed') === 'true';
+        if (collapsed) group.removeAttribute('data-collapsed');
+        else group.setAttribute('data-collapsed', 'true');
+        groupState[key] = !collapsed;
+        try { localStorage.setItem('zap-docs-sidebar', JSON.stringify(groupState)); } catch (e) {}
+      });
+    }
+  });
 
   // Base path from meta tag
   var baseMeta = document.querySelector('meta[name="zap-docs-base"]');
@@ -44,22 +59,50 @@
     searchModal.hidden = true;
   }
 
+  function rankScore(haystack, needle) {
+    if (haystack.startsWith(needle)) return 0;
+    if (haystack.indexOf(needle) !== -1) return 1;
+    return 2;
+  }
+
   function doSearch(query) {
     if (!searchData || !query) { searchResults.innerHTML = ''; return; }
     var q = query.toLowerCase();
-    var matches = searchData.filter(function(item) {
-      return item.name.toLowerCase().indexOf(q) !== -1 ||
-             item.struct.toLowerCase().indexOf(q) !== -1 ||
-             item.summary.toLowerCase().indexOf(q) !== -1;
-    }).slice(0, 20);
+    var scored = [];
+    for (var i = 0; i < searchData.length; i++) {
+      var item = searchData[i];
+      var bestScore = Math.min(
+        rankScore(item.name.toLowerCase(), q),
+        rankScore(item.struct.toLowerCase(), q),
+        item.summary ? rankScore(item.summary.toLowerCase(), q) : 2
+      );
+      if (bestScore < 2) scored.push({ item: item, score: bestScore });
+    }
+    scored.sort(function(a, b) { return a.score - b.score; });
+    var matches = scored.slice(0, 12).map(function(x) { return x.item; });
     searchResults.innerHTML = matches.map(function(item, i) {
-      return '<li data-url="' + basePath + item.url + '"' + (i === 0 ? ' class="selected"' : '') + '>' +
-        '<div class="result-name">' + escapeHtml(item.name) + '</div>' +
-        '<div class="result-struct">' + escapeHtml(item.struct) + ' &middot; ' + item.type + '</div>' +
-        (item.summary ? '<div class="result-summary">' + escapeHtml(item.summary) + '</div>' : '') +
+      var typeLabel = (item.type || '').toUpperCase();
+      var label = item.struct && item.type === 'function' || item.type === 'macro'
+        ? item.struct + '.' + item.name
+        : item.name;
+      var selected = i === 0;
+      return '<li data-url="' + basePath + item.url + '"' + (selected ? ' class="selected"' : '') + '>' +
+        '<span class="result-type">' + escapeHtml(typeLabel) + '</span>' +
+        '<span class="result-name">' + escapeHtml(label) + '</span>' +
+        (item.summary ? '<span class="result-summary">' + escapeHtml(item.summary) + '</span>' : '<span class="result-summary"></span>') +
+        '<span class="result-enter">' + (selected ? '↵' : '') + '</span>' +
         '</li>';
     }).join('');
     selectedIndex = matches.length > 0 ? 0 : -1;
+  }
+
+  function updateSelectionStyles() {
+    var items = searchResults.querySelectorAll('li');
+    items.forEach(function(li, i) {
+      li.className = i === selectedIndex ? 'selected' : '';
+      var enter = li.querySelector('.result-enter');
+      if (enter) enter.textContent = i === selectedIndex ? '↵' : '';
+    });
   }
 
   function escapeHtml(s) {
@@ -78,12 +121,12 @@
       if (e.key === 'ArrowDown') {
         e.preventDefault();
         selectedIndex = Math.min(selectedIndex + 1, items.length - 1);
-        items.forEach(function(li, i) { li.className = i === selectedIndex ? 'selected' : ''; });
+        updateSelectionStyles();
       }
       if (e.key === 'ArrowUp') {
         e.preventDefault();
         selectedIndex = Math.max(selectedIndex - 1, 0);
-        items.forEach(function(li, i) { li.className = i === selectedIndex ? 'selected' : ''; });
+        updateSelectionStyles();
       }
       if (e.key === 'Enter' && selectedIndex >= 0 && selectedIndex < items.length) {
         e.preventDefault();

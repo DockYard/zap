@@ -831,6 +831,26 @@ fn docKindLabel(kind: DocKind) []const u8 {
     };
 }
 
+fn docKindCategoryLabel(kind: DocKind) []const u8 {
+    return switch (kind) {
+        .@"struct" => "Structs",
+        .protocol => "Protocols",
+        .@"union" => "Unions",
+    };
+}
+
+fn appendBreadcrumb(h: *StringBuffer, kind: DocKind, name: []const u8) void {
+    h.str("<nav class=\"breadcrumb\" aria-label=\"Breadcrumb\">\n");
+    h.str("<span>");
+    h.str(docKindCategoryLabel(kind));
+    h.str("</span>\n");
+    h.str("<span>/</span>\n");
+    h.str("<span class=\"breadcrumb-current\">");
+    appendHtmlEscaped(h, name);
+    h.str("</span>\n");
+    h.str("</nav>\n");
+}
+
 fn docKindSearchType(kind: DocKind) []const u8 {
     return switch (kind) {
         .@"struct" => "struct",
@@ -936,6 +956,8 @@ fn generateStructPage(alloc: std.mem.Allocator, mod: DocStruct, project: DocProj
     h.str("<div class=\"layout\">\n");
     appendSidebar(&h, project, mod.name, options, "../");
     h.str("<main class=\"content\">\n");
+
+    appendBreadcrumb(&h, mod.kind, mod.name);
 
     // Declaration header — title row with name left, declaration kind + source right
     h.str("<div class=\"title-row\">\n");
@@ -1446,9 +1468,11 @@ fn appendSidebar(h: *StringBuffer, project: DocProject, current_struct: ?[]const
 
     // Doc groups (guides)
     for (options.doc_groups) |group| {
-        h.str("<div class=\"sidebar-group\">\n<h4>");
+        h.str("<div class=\"sidebar-group\" data-group=\"");
         appendHtmlEscaped(h, group.name);
-        h.str("</h4>\n<ul>\n");
+        h.str("\">\n");
+        appendSidebarGroupHeader(h, group.name);
+        h.str("<ul>\n");
         for (group.pages) |page| {
             const basename = std.fs.path.basename(page);
             const stem = if (std.mem.endsWith(u8, basename, ".md")) basename[0 .. basename.len - 3] else basename;
@@ -1464,6 +1488,15 @@ fn appendSidebar(h: *StringBuffer, project: DocProject, current_struct: ?[]const
     }
 
     h.str("</nav>\n");
+}
+
+fn appendSidebarGroupHeader(h: *StringBuffer, title: []const u8) void {
+    h.str("<button class=\"sidebar-group-header\" type=\"button\" aria-label=\"Toggle group\">");
+    h.str("<span class=\"chevron\" aria-hidden=\"true\">\u{25B8}</span>");
+    h.str("<h4>");
+    h.str(title);
+    h.str("</h4>");
+    h.str("</button>\n");
 }
 
 fn appendSidebarDeclarationGroups(h: *StringBuffer, project: DocProject, current_struct: ?[]const u8, base: []const u8) void {
@@ -1489,9 +1522,11 @@ fn appendSidebarDeclarationGroup(
     }
     if (!has_declarations) return;
 
-    h.str("<div class=\"sidebar-group\">\n<h4>");
+    h.str("<div class=\"sidebar-group\" data-group=\"");
     h.str(title);
-    h.str("</h4>\n<ul>\n");
+    h.str("\">\n");
+    appendSidebarGroupHeader(h, title);
+    h.str("<ul>\n");
     for (project.structs) |mod| {
         if (mod.kind == kind) appendSidebarDeclaration(h, mod, current_struct, base);
     }
@@ -1653,8 +1688,21 @@ fn appendPageFooter(h: *StringBuffer, base: []const u8) void {
     h.str("<div id=\"search-modal\" class=\"search-modal\" hidden>\n");
     h.str("<div class=\"search-backdrop\"></div>\n");
     h.str("<div class=\"search-dialog\">\n");
-    h.str("<input type=\"text\" id=\"search-modal-input\" placeholder=\"Search documentation...\" aria-label=\"Search\">\n");
+    h.str("<div class=\"search-header\">\n");
+    h.str("<svg width=\"15\" height=\"15\" viewBox=\"0 0 16 16\" fill=\"none\" aria-hidden=\"true\">\n");
+    h.str("<circle cx=\"7\" cy=\"7\" r=\"5\" stroke=\"currentColor\" stroke-width=\"1.3\"/>\n");
+    h.str("<line x1=\"10.6\" y1=\"10.6\" x2=\"14\" y2=\"14\" stroke=\"currentColor\" stroke-width=\"1.3\" stroke-linecap=\"round\"/>\n");
+    h.str("</svg>\n");
+    h.str("<input type=\"text\" id=\"search-modal-input\" placeholder=\"Search Zap docs\u{2026}\" aria-label=\"Search\">\n");
+    h.str("<kbd>ESC</kbd>\n");
+    h.str("</div>\n");
     h.str("<ul id=\"search-results\" class=\"search-results\"></ul>\n");
+    h.str("<div class=\"search-footer\">\n");
+    h.str("<span class=\"search-footer-item\"><kbd>\u{2191}</kbd><kbd>\u{2193}</kbd> navigate</span>\n");
+    h.str("<span class=\"search-footer-item\"><kbd>\u{21B5}</kbd> open</span>\n");
+    h.str("<span class=\"spacer\"></span>\n");
+    h.str("<span class=\"search-footer-item\"><kbd>ESC</kbd> close</span>\n");
+    h.str("</div>\n");
     h.str("</div>\n</div>\n");
     h.str("<script src=\"");
     h.str(base);
@@ -2609,6 +2657,30 @@ test "sidebar groups declarations by kind with structs first" {
     try std.testing.expect(io_struct < zest_case_struct);
 
     try std.testing.expect(std.mem.indexOf(u8, html, "<li class=\"active\"><a href=\"structs/IO.Mode.html\">IO.Mode</a></li>") != null);
+
+    // Group headers are wrapped in collapsible buttons with chevrons
+    try std.testing.expect(std.mem.indexOf(u8, html, "<button class=\"sidebar-group-header\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "class=\"chevron\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "data-group=\"Structs\"") != null);
+}
+
+test "breadcrumb renders kind category and current page name" {
+    var buffer = StringBuffer.init(std.testing.allocator);
+    appendBreadcrumb(&buffer, .@"struct", "Enum");
+
+    const html = buffer.toSlice();
+    try std.testing.expect(std.mem.indexOf(u8, html, "class=\"breadcrumb\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "<span>Structs</span>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "<span class=\"breadcrumb-current\">Enum</span>") != null);
+
+    var protocol_buf = StringBuffer.init(std.testing.allocator);
+    appendBreadcrumb(&protocol_buf, .protocol, "Enumerable");
+    try std.testing.expect(std.mem.indexOf(u8, protocol_buf.toSlice(), "<span>Protocols</span>") != null);
+
+    var union_buf = StringBuffer.init(std.testing.allocator);
+    appendBreadcrumb(&union_buf, .@"union", "IO.Mode");
+    try std.testing.expect(std.mem.indexOf(u8, union_buf.toSlice(), "<span>Unions</span>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, union_buf.toSlice(), "<span class=\"breadcrumb-current\">IO.Mode</span>") != null);
 }
 
 test "signature renderer preserves nested patterns and separates guards" {
