@@ -33,4 +33,18 @@ pub struct SourceGraph {
       source_graph_protocols(unquote(paths))
     }
   }
+
+  @doc = """
+    Returns union references declared in the exact source paths
+    provided. Top-level dotted unions (e.g. `pub union IO.Mode`) keep
+    their fully qualified name; nested unions declared inside a struct
+    appear with their local name here — qualify them with the parent
+    struct yourself when rendering.
+    """
+
+  pub macro unions(paths :: Expr) -> Expr {
+    quote {
+      source_graph_unions(unquote(paths))
+    }
+  }
 }

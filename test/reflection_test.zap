@@ -71,4 +71,14 @@ pub struct ReflectionTest {
       assert(first_protocol_name() == "ReflectionProtocol")
     }
   }
+
+  describe("SourceGraph.unions enumerates unions by path") {
+    test("the fixture file produces exactly one union ref") {
+      assert(union_count() == 1)
+    }
+
+    test("Struct.info on a union ref returns its qualified name") {
+      assert(first_union_name() == "ReflectionUnion")
+    }
+  }
 }

@@ -2053,7 +2053,7 @@ pub fn validateOneStructPerFile(
     // Count top-level declarations (struct, protocol, or impl)
     var struct_count: u32 = 0;
     var struct_name_parts: ?[]const ast.StringId = null;
-    var has_protocol_or_impl = false;
+    var has_protocol_or_impl_or_union = false;
     for (program.top_items) |item| {
         switch (item) {
             .struct_decl => |mod| {
@@ -2070,10 +2070,18 @@ pub fn validateOneStructPerFile(
                 }
             },
             .protocol, .priv_protocol => {
-                has_protocol_or_impl = true;
+                has_protocol_or_impl_or_union = true;
             },
             .impl_decl, .priv_impl_decl => {
-                has_protocol_or_impl = true;
+                has_protocol_or_impl_or_union = true;
+            },
+            // A standalone `pub union Foo {...}` file (e.g.,
+            // `lib/io/mode.zap`) is a valid declaration — it carries
+            // its own `@doc` and shows up in the docs as a kind of its
+            // own. The "one struct per file" rule only kicks in when
+            // a file actually declares a struct.
+            .union_decl => {
+                has_protocol_or_impl_or_union = true;
             },
             else => {},
         }
@@ -2088,8 +2096,8 @@ pub fn validateOneStructPerFile(
         }
     }
 
-    // Protocol and impl files don't need a struct declaration
-    if (has_protocol_or_impl and struct_count == 0) {
+    // Protocol, impl, and union files don't need a struct declaration
+    if (has_protocol_or_impl_or_union and struct_count == 0) {
         return null;
     }
 

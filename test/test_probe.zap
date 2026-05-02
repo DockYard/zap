@@ -42,10 +42,16 @@ pub struct TestProbe {
     # picks up `test/reflection_protocol.zap` even though it does not
     # match the `*_test.zap` build glob.
     _proto_marker = ReflectionProtocol
+    _union_marker = ReflectionUnion
     _protocol_refs = source_graph_protocols("test/reflection_protocol.zap")
     _protocol_count = list_length(_protocol_refs)
     _proto_info = struct_info(list_at(_protocol_refs, 0))
     _proto_name = map_get(_proto_info, :name, "MISSING")
+
+    _union_refs = source_graph_unions("test/reflection_union.zap")
+    _union_count = list_length(_union_refs)
+    _union_info = struct_info(list_at(_union_refs, 0))
+    _union_name = map_get(_union_info, :name, "MISSING")
 
     _info = struct_info(ReflectionSubject)
     _info_name = map_get(_info, :name, "MISSING")
@@ -112,6 +118,14 @@ pub struct TestProbe {
 
       pub fn first_protocol_name() -> String {
         unquote(_proto_name)
+      }
+
+      pub fn union_count() -> i64 {
+        unquote(_union_count)
+      }
+
+      pub fn first_union_name() -> String {
+        unquote(_union_name)
       }
     }
   }

@@ -479,6 +479,9 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
             if (std.mem.eql(u8, form_name, "source_graph_protocols")) {
                 return sourceGraphProtocolsIntrinsic(env, arg_elems);
             }
+            if (std.mem.eql(u8, form_name, "source_graph_unions")) {
+                return sourceGraphUnionsIntrinsic(env, arg_elems);
+            }
             if (std.mem.eql(u8, form_name, "struct_functions")) {
                 return structFunctionsIntrinsic(env, arg_elems);
             }
@@ -1356,6 +1359,7 @@ fn isCompileTimeIntrinsicExpansion(value: CtValue) bool {
     if (form != .atom) return false;
     return std.mem.eql(u8, form.atom, "source_graph_structs") or
         std.mem.eql(u8, form.atom, "source_graph_protocols") or
+        std.mem.eql(u8, form.atom, "source_graph_unions") or
         std.mem.eql(u8, form.atom, "struct_functions") or
         std.mem.eql(u8, form.atom, "struct_macros") or
         std.mem.eql(u8, form.atom, "struct_info");
@@ -1972,6 +1976,55 @@ fn sourceGraphProtocolsIntrinsic(env: *Env, args: []const CtValue) MacroEvalErro
     return CtValue{ .list = .{ .alloc_id = id, .elems = result_list.items } };
 }
 
+/// Enumerate every public union declared in any of the source paths
+/// supplied. Returns `__aliases__` AST refs in the same shape as
+/// `source_graph_structs` and `source_graph_protocols`.
+///
+/// Unions whose names are dotted at the top level (e.g. `pub union
+/// IO.Mode`) are emitted with their fully qualified name; nested unions
+/// declared inside a struct keep their local name here — the doc
+/// generator qualifies those by walking the parent struct scope.
+fn sourceGraphUnionsIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtValue {
+    if (args.len != 1) return .nil;
+    if (!hasReflectionCapability(env)) {
+        env.last_capability_error = std.fmt.allocPrint(
+            env.alloc,
+            "macro `{s}` calls `source_graph_unions` but does not declare `@requires = [:reflect_source]`",
+            .{env.current_macro_name orelse "<top-level>"},
+        ) catch return MacroEvalError.EvalFailed;
+        return MacroEvalError.EvalFailed;
+    }
+
+    const paths_raw = try eval(env, args[0]);
+    const paths = extractPathFilter(env, paths_raw) catch return .nil;
+    const ctx = env.struct_ctx orelse return .nil;
+
+    var result_list: std.ArrayListUnmanaged(CtValue) = .empty;
+    for (ctx.graph.types.items) |type_entry| {
+        const union_decl = switch (type_entry.kind) {
+            .union_type => |u| u,
+            else => continue,
+        };
+        if (union_decl.is_private) continue;
+        const source_id = union_decl.meta.span.source_id orelse continue;
+        const path = ctx.graph.sourcePathById(source_id) orelse continue;
+        if (!pathFilterContains(env.alloc, paths, path)) continue;
+        // Fabricate a single-segment StructName from the registered
+        // union name so the alias-ref shape matches the other source
+        // graph results. Dotted names declared at top-level (e.g.
+        // `IO.Mode`) are interned as a single string by the parser, so
+        // a single-segment ref still round-trips through the resolver.
+        const name = ast.StructName{
+            .parts = &[_]ast.StringId{type_entry.name},
+            .span = union_decl.meta.span,
+        };
+        try result_list.append(env.alloc, try makeAliasRef(env, ctx.interner, name));
+    }
+
+    const id = env.store.alloc(env.alloc, .list, null);
+    return CtValue{ .list = .{ .alloc_id = id, .elems = result_list.items } };
+}
+
 /// Reflect on the public macros declared in a struct's scope and return
 /// them as a list of maps with the same shape as `struct_functions`.
 /// Macros prefixed with `__` (e.g. `__using__`, `__before_compile__`) are
@@ -2042,6 +2095,15 @@ fn structInfoIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtValue 
     for (ctx.graph.protocols.items) |entry| {
         if (!structNameMatches(ctx.interner, entry.name, struct_name)) continue;
         return makeDeclInfoMap(env, ctx, struct_name, entry.decl.meta, entry.decl.is_private, entry.attributes);
+    }
+    for (ctx.graph.types.items) |type_entry| {
+        const union_decl = switch (type_entry.kind) {
+            .union_type => |u| u,
+            else => continue,
+        };
+        const local_name = ctx.interner.get(type_entry.name);
+        if (!std.mem.eql(u8, local_name, struct_name)) continue;
+        return makeDeclInfoMap(env, ctx, struct_name, union_decl.meta, union_decl.is_private, type_entry.attributes);
     }
     return .nil;
 }
