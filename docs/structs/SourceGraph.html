@@ -106,6 +106,12 @@ code that need to inspect declarations from known source paths.</p>
 <h2 id="macros">Macros</h2>
 <table class="summary">
 <tr><td class="summary-name"><a href="#structs-1">structs/1</a></td><td class="summary-doc">Returns struct references declared in the exact source paths provided.</td></tr>
+<tr><td class="summary-name"><a href="#protocols-1">protocols/1</a></td><td class="summary-doc">Returns protocol references declared in the exact source paths
+provided.</td></tr>
+<tr><td class="summary-name"><a href="#unions-1">unions/1</a></td><td class="summary-doc">Returns union references declared in the exact source paths
+provided.</td></tr>
+<tr><td class="summary-name"><a href="#impls-1">impls/1</a></td><td class="summary-doc">Returns public protocol-impl entries declared in the supplied
+source paths.</td></tr>
 </table>
 <h2>Macro Details</h2>
 <div class="function-detail" id="structs-1">
@@ -122,12 +128,62 @@ code that need to inspect declarations from known source paths.</p>
 qualified struct name. Pass a string path or a list of string paths.</p>
 </div>
 </div>
+<div class="function-detail" id="protocols-1">
+<div class="function-header">
+<h3>protocols<span class="arity">/1</span></h3>
+<span class="badge">macro</span>
+<div style="flex:1"></div>
+<a href="#protocols-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">protocols</span><span class="sig-paren">(</span>paths<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="function-doc">
+<p>Returns protocol references declared in the exact source paths
+provided. Each ref carries the protocol's qualified name in the
+same <code>__aliases__</code> AST shape as <code>structs/1</code> results. Combine with
+<code>Struct.info/1</code> to retrieve protocol-level metadata.</p>
+</div>
+</div>
+<div class="function-detail" id="unions-1">
+<div class="function-header">
+<h3>unions<span class="arity">/1</span></h3>
+<span class="badge">macro</span>
+<div style="flex:1"></div>
+<a href="#unions-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">unions</span><span class="sig-paren">(</span>paths<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="function-doc">
+<p>Returns union references declared in the exact source paths
+provided. Top-level dotted unions (e.g. <code>pub union IO.Mode</code>) keep
+their fully qualified name; nested unions declared inside a struct
+appear with their local name here — qualify them with the parent
+struct yourself when rendering.</p>
+</div>
+</div>
+<div class="function-detail" id="impls-1">
+<div class="function-header">
+<h3>impls<span class="arity">/1</span></h3>
+<span class="badge">macro</span>
+<div style="flex:1"></div>
+<a href="#impls-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">impls</span><span class="sig-paren">(</span>paths<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="function-doc">
+<p>Returns public protocol-impl entries declared in the supplied
+source paths. Each entry is a compile-time map with <code>:protocol</code>
+(qualified name), <code>:target</code> (qualified type name), <code>:source_file</code>,
+and <code>:is_private</code>. Doc generation reads this list to render the
+per-type &quot;Implements&quot; row.</p>
+</div>
+</div>
 </main>
 <aside class="toc">
 <h3>On This Page</h3>
 <ul>
 <li class="toc-section">Macros</li>
 <li><a href="#structs-1">structs/1</a></li>
+<li><a href="#protocols-1">protocols/1</a></li>
+<li><a href="#unions-1">unions/1</a></li>
+<li><a href="#impls-1">impls/1</a></li>
 </ul>
 </aside>
 </div>

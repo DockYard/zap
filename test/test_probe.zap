@@ -38,6 +38,13 @@ pub struct TestProbe {
       map_get(_m, :source_line, 0)
     }
 
+    _add_signatures = for _f <- _funcs, map_get(_f, :name, "") == "add" {
+      list_at(map_get(_f, :signatures, []), 0)
+    }
+    _twice_signatures = for _m <- _macros, map_get(_m, :name, "") == "twice" {
+      list_at(map_get(_m, :signatures, []), 0)
+    }
+
     # Reference ReflectionProtocol by name so the file-graph discovery
     # picks up `test/reflection_protocol.zap` even though it does not
     # match the `*_test.zap` build glob.
@@ -116,6 +123,14 @@ pub struct TestProbe {
 
       pub fn twice_source_line() -> i64 {
         unquote(list_at(_twice_source_lines, 0))
+      }
+
+      pub fn add_signature() -> String {
+        unquote(list_at(_add_signatures, 0))
+      }
+
+      pub fn twice_signature() -> String {
+        unquote(list_at(_twice_signatures, 0))
       }
 
       pub fn protocol_count() -> i64 {

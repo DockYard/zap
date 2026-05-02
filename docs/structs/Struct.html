@@ -106,6 +106,12 @@ reflection APIs.</p>
 <h2 id="macros">Macros</h2>
 <table class="summary">
 <tr><td class="summary-name"><a href="#functions-1">functions/1</a></td><td class="summary-doc">Returns the public functions declared on a reflected struct.</td></tr>
+<tr><td class="summary-name"><a href="#macros-1">macros/1</a></td><td class="summary-doc">Returns the public macros declared on a reflected struct, with the
+same map shape as `functions/1`.</td></tr>
+<tr><td class="summary-name"><a href="#info-1">info/1</a></td><td class="summary-doc">Returns struct-level metadata for a reflected struct as a compile-time
+map: `:name`, `:source_file` (project-relative path), `:is_private`,
+and `:doc` (the struct's `@doc` attribute, heredoc-stripped, or
+empty when missing).</td></tr>
 <tr><td class="summary-name"><a href="#has_function?-3">has_function?/3</a></td><td class="summary-doc">Returns true when a reflected struct exposes a public function with
 the given name and arity.</td></tr>
 </table>
@@ -120,8 +126,40 @@ the given name and arity.</td></tr>
 <div class="signature"><code><span class="sig-name">functions</span><span class="sig-paren">(</span>struct_ref<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
 <div class="function-doc">
 <p>Returns the public functions declared on a reflected struct.</p>
-<p>Each result is a compile-time map with <code>:name</code>, <code>:arity</code>, and
-<code>:visibility</code> entries.</p>
+<p>Each result is a compile-time map with <code>:name</code>, <code>:arity</code>,
+<code>:visibility</code>, and <code>:doc</code> entries. The <code>:doc</code> value is the
+function's <code>@doc</code> attribute string (heredoc indentation stripped),
+or an empty string when no <code>@doc</code> is attached.</p>
+</div>
+</div>
+<div class="function-detail" id="macros-1">
+<div class="function-header">
+<h3>macros<span class="arity">/1</span></h3>
+<span class="badge">macro</span>
+<div style="flex:1"></div>
+<a href="#macros-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">macros</span><span class="sig-paren">(</span>struct_ref<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="function-doc">
+<p>Returns the public macros declared on a reflected struct, with the
+same map shape as <code>functions/1</code>. Language hooks like <code>__using__</code>
+and <code>__before_compile__</code> are excluded — they are not part of the
+public API surface.</p>
+</div>
+</div>
+<div class="function-detail" id="info-1">
+<div class="function-header">
+<h3>info<span class="arity">/1</span></h3>
+<span class="badge">macro</span>
+<div style="flex:1"></div>
+<a href="#info-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">info</span><span class="sig-paren">(</span>struct_ref<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="function-doc">
+<p>Returns struct-level metadata for a reflected struct as a compile-time
+map: <code>:name</code>, <code>:source_file</code> (project-relative path), <code>:is_private</code>,
+and <code>:doc</code> (the struct's <code>@doc</code> attribute, heredoc-stripped, or
+empty when missing).</p>
 </div>
 </div>
 <div class="function-detail" id="has_function?-3">
@@ -143,6 +181,8 @@ the given name and arity.</p>
 <ul>
 <li class="toc-section">Macros</li>
 <li><a href="#functions-1">functions/1</a></li>
+<li><a href="#macros-1">macros/1</a></li>
+<li><a href="#info-1">info/1</a></li>
 <li><a href="#has_function?-3">has_function?/3</a></li>
 </ul>
 </aside>

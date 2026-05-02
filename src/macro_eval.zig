@@ -15,6 +15,7 @@ const ctfe = @import("ctfe.zig");
 const ast_data = @import("ast_data.zig");
 const scope = @import("scope.zig");
 const ir = @import("ir.zig");
+const signature = @import("signature.zig");
 const CtValue = ctfe.CtValue;
 const AllocationStore = ctfe.AllocationStore;
 const Allocator = std.mem.Allocator;
@@ -1941,7 +1942,8 @@ fn structFunctionsIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtV
         const name = ctx.interner.get(family.name);
         const doc_text = extractDocAttributeText(env.alloc, ctx.interner, family.attributes) orelse "";
         const loc = declSourceLocation(ctx.graph, family.clauses.items[0].decl.meta);
-        try result_list.append(env.alloc, try makeFunctionRef(env, name, family.arity, family.visibility, doc_text, loc.path, loc.line));
+        const signatures = signature.buildClauseSignatures(env.alloc, name, family.clauses.items, ctx.interner, ctx.graph);
+        try result_list.append(env.alloc, try makeFunctionRef(env, name, family.arity, family.visibility, doc_text, loc.path, loc.line, signatures));
     }
 
     const id = env.store.alloc(env.alloc, .list, null);
@@ -2118,7 +2120,8 @@ fn structMacrosIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtValu
         if (std.mem.startsWith(u8, name, "__")) continue;
         const doc_text = extractDocAttributeText(env.alloc, ctx.interner, family.attributes) orelse "";
         const loc = declSourceLocation(ctx.graph, family.clauses.items[0].decl.meta);
-        try result_list.append(env.alloc, try makeFunctionRef(env, name, family.arity, visibility, doc_text, loc.path, loc.line));
+        const signatures = signature.buildClauseSignatures(env.alloc, name, family.clauses.items, ctx.interner, ctx.graph);
+        try result_list.append(env.alloc, try makeFunctionRef(env, name, family.arity, visibility, doc_text, loc.path, loc.line, signatures));
     }
 
     const id = env.store.alloc(env.alloc, .list, null);
@@ -2293,14 +2296,23 @@ fn makeFunctionRef(
     doc_text: []const u8,
     source_file: []const u8,
     source_line: u32,
+    signatures: []const []const u8,
 ) !CtValue {
-    const entries = try env.alloc.alloc(CtValue.CtMapEntry, 6);
+    var sig_elems: std.ArrayListUnmanaged(CtValue) = .empty;
+    for (signatures) |sig| {
+        try sig_elems.append(env.alloc, .{ .string = sig });
+    }
+    const sig_list_id = env.store.alloc(env.alloc, .list, null);
+    const signatures_value = CtValue{ .list = .{ .alloc_id = sig_list_id, .elems = sig_elems.items } };
+
+    const entries = try env.alloc.alloc(CtValue.CtMapEntry, 7);
     entries[0] = .{ .key = .{ .atom = "name" }, .value = .{ .string = name } };
     entries[1] = .{ .key = .{ .atom = "arity" }, .value = .{ .int = @intCast(arity) } };
     entries[2] = .{ .key = .{ .atom = "visibility" }, .value = .{ .atom = @tagName(visibility) } };
     entries[3] = .{ .key = .{ .atom = "doc" }, .value = .{ .string = doc_text } };
     entries[4] = .{ .key = .{ .atom = "source_file" }, .value = .{ .string = source_file } };
     entries[5] = .{ .key = .{ .atom = "source_line" }, .value = .{ .int = @intCast(source_line) } };
+    entries[6] = .{ .key = .{ .atom = "signatures" }, .value = signatures_value };
     const id = env.store.alloc(env.alloc, .map, null);
     return CtValue{ .map = .{ .alloc_id = id, .entries = entries } };
 }

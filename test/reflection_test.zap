@@ -62,6 +62,16 @@ pub struct ReflectionTest {
     }
   }
 
+  describe("function refs carry typed signatures per clause") {
+    test("function signature renders as 'name(p :: T, ...) -> R'") {
+      assert(add_signature() == "add(a :: i64, b :: i64) -> i64")
+    }
+
+    test("macro signature renders the same shape") {
+      assert(twice_signature() == "twice(value :: Expr) -> Expr")
+    }
+  }
+
   describe("SourceGraph.protocols enumerates protocols by path") {
     test("the fixture file produces exactly one protocol ref") {
       assert(protocol_count() == 1)
