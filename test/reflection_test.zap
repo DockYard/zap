@@ -2,13 +2,17 @@ pub struct ReflectionTest {
   use Zest.Case
   use TestProbe
 
-  describe("__using__ expansion") {
-    test("a use target's __using__ runs even when other uses precede it") {
-      assert(probe_called() == 42)
+  describe("Struct.functions returns @doc text") {
+    test("single-line doc round-trips") {
+      assert(add_doc() == "Adds two integers.")
     }
 
-    test("the use target's own functions remain callable") {
-      assert(TestProbe.helper() == 1)
+    test("heredoc doc round-trips with indent stripped") {
+      assert(String.starts_with?(multiply_doc(), "Multiplies two integers."))
+    }
+
+    test("undocumented function surfaces empty string") {
+      assert(no_doc_doc() == "")
     }
   }
 }

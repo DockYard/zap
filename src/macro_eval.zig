@@ -1918,7 +1918,8 @@ fn structFunctionsIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtV
         const family = &ctx.graph.families.items[entry.value_ptr.*];
         if (family.visibility != .public) continue;
         const name = ctx.interner.get(family.name);
-        try result_list.append(env.alloc, try makeFunctionRef(env, name, family.arity, family.visibility));
+        const doc_text = extractDocAttributeText(env.alloc, ctx.interner, family.attributes) orelse "";
+        try result_list.append(env.alloc, try makeFunctionRef(env, name, family.arity, family.visibility, doc_text));
     }
 
     const id = env.store.alloc(env.alloc, .list, null);
@@ -2018,13 +2019,84 @@ fn makeFunctionRef(
     name: []const u8,
     arity: u32,
     visibility: ast.FunctionDecl.Visibility,
+    doc_text: []const u8,
 ) !CtValue {
-    const entries = try env.alloc.alloc(CtValue.CtMapEntry, 3);
+    const entries = try env.alloc.alloc(CtValue.CtMapEntry, 4);
     entries[0] = .{ .key = .{ .atom = "name" }, .value = .{ .string = name } };
     entries[1] = .{ .key = .{ .atom = "arity" }, .value = .{ .int = @intCast(arity) } };
     entries[2] = .{ .key = .{ .atom = "visibility" }, .value = .{ .atom = @tagName(visibility) } };
+    entries[3] = .{ .key = .{ .atom = "doc" }, .value = .{ .string = doc_text } };
     const id = env.store.alloc(env.alloc, .map, null);
     return CtValue{ .map = .{ .alloc_id = id, .entries = entries } };
+}
+
+/// Extract the value of an `@doc = "..."` attribute on a declaration, or
+/// return null when there is no doc attribute. The string is heredoc-stripped
+/// (common leading whitespace removed) so multi-line `@doc = """ ... """`
+/// values round-trip cleanly into runtime literal strings.
+fn extractDocAttributeText(
+    alloc: Allocator,
+    interner: *ast.StringInterner,
+    attributes: std.ArrayListUnmanaged(scope.Attribute),
+) ?[]const u8 {
+    for (attributes.items) |attr| {
+        const name = interner.get(attr.name);
+        if (!std.mem.eql(u8, name, "doc")) continue;
+        const expr = attr.value orelse return null;
+        if (expr.* != .string_literal) return null;
+        const raw = interner.get(expr.string_literal.value);
+        return stripHeredocCommonIndent(alloc, raw);
+    }
+    return null;
+}
+
+/// Strip the common leading-whitespace prefix from every non-blank line in
+/// `text` so that `@doc = """\n    Body\n    """` round-trips as `"Body"`
+/// without the heredoc indentation. Lines that are empty (or whitespace-only)
+/// stay empty in the output.
+fn stripHeredocCommonIndent(alloc: Allocator, text: []const u8) []const u8 {
+    var min_indent: usize = std.math.maxInt(usize);
+    var line_iter = std.mem.splitSequence(u8, text, "\n");
+    while (line_iter.next()) |line| {
+        if (std.mem.trim(u8, line, " \t").len == 0) continue;
+        var indent: usize = 0;
+        for (line) |c| {
+            if (c == ' ') {
+                indent += 1;
+            } else if (c == '\t') {
+                indent += 4;
+            } else break;
+        }
+        if (indent < min_indent) min_indent = indent;
+    }
+    if (min_indent == 0 or min_indent == std.math.maxInt(usize)) {
+        return alloc.dupe(u8, text) catch text;
+    }
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var lines = std.mem.splitSequence(u8, text, "\n");
+    var first = true;
+    while (lines.next()) |line| {
+        if (!first) out.append(alloc, '\n') catch {};
+        first = false;
+        if (std.mem.trim(u8, line, " \t").len == 0) continue;
+        var to_strip = min_indent;
+        var start: usize = 0;
+        while (start < line.len and to_strip > 0) {
+            if (line[start] == ' ') {
+                to_strip -= 1;
+                start += 1;
+            } else if (line[start] == '\t') {
+                if (to_strip >= 4) {
+                    to_strip -= 4;
+                } else {
+                    to_strip = 0;
+                }
+                start += 1;
+            } else break;
+        }
+        out.appendSlice(alloc, line[start..]) catch {};
+    }
+    return out.toOwnedSlice(alloc) catch text;
 }
 
 fn findStructScopeByName(graph: *const scope.ScopeGraph, interner: *const ast.StringInterner, name: []const u8) ?scope.ScopeId {
