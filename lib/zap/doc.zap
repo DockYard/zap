@@ -352,6 +352,60 @@ pub struct Zap.Doc {
     (`"../"` from a struct page, `""` from the index).
     `source_url` is the GitHub repo URL (`""` to omit the GH icon).
     """
+  @doc = """
+    Render summary table rows from a list of `{name, arity, summary}`
+    triples. Used by the runtime walker to build the body of a
+    summary table from reflection results.
+    """
+  pub fn render_summary_rows(items :: [{String, i64, String}], acc :: String) -> String {
+    if List.empty?(items) {
+      acc
+    } else {
+      head = List.head(items)
+      tail = List.tail(items)
+      case head {
+        {name, arity, summary} -> render_summary_rows(tail, acc <> summary_row(name, arity, summary))
+      }
+    }
+  }
+
+  @doc = """
+    Extract the first sentence of a doc body for the summary table
+    cell. Splits on the first `.` (followed by whitespace or end of
+    string), or returns the whole text when no period is found —
+    matching the in-tree Zig `extractFirstSentence` heuristic.
+    """
+  pub fn first_sentence(text :: String) -> String {
+    if String.length(text) == 0 {
+      ""
+    } else {
+      first_sentence_walk(text, 0, String.length(text))
+    }
+  }
+
+  pub fn first_sentence_walk(text :: String, index :: i64, end :: i64) -> String {
+    if index >= end {
+      text
+    } else {
+      ch = String.byte_at(text, index)
+      if ch == "." {
+        # End of sentence if next char is whitespace or end.
+        if index + 1 >= end {
+          String.slice(text, 0, index + 1)
+        } else {
+          next_ch = String.byte_at(text, index + 1)
+          if next_ch == " " or next_ch == "\n" or next_ch == "\t" {
+            String.slice(text, 0, index + 1)
+          } else {
+            first_sentence_walk(text, index + 1, end)
+          }
+        }
+      } else {
+        first_sentence_walk(text, index + 1, end)
+      }
+    }
+  }
+
   pub fn struct_page(project_name :: String, project_version :: String, title :: String, base :: String, source_url :: String, sidebar_html :: String, content_html :: String, rail_html :: String) -> String {
     head = page_open(title, project_name, base)
     bar = topbar(project_name, project_version, base, source_url)

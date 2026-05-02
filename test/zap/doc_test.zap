@@ -146,6 +146,39 @@ pub struct Zap.DocTest {
     }
   }
 
+  describe("Zap.Doc.first_sentence") {
+    test("trims at the first period followed by space") {
+      assert(Zap.Doc.first_sentence("First. Second.") == "First.")
+    }
+
+    test("returns whole text when no period exists") {
+      assert(Zap.Doc.first_sentence("no period here") == "no period here")
+    }
+
+    test("empty input returns empty") {
+      assert(Zap.Doc.first_sentence("") == "")
+    }
+
+    test("period followed by newline counts as boundary") {
+      assert(Zap.Doc.first_sentence("Line one.\nLine two.") == "Line one.")
+    }
+  }
+
+  describe("Zap.Doc.render_summary_rows") {
+    test("empty list renders nothing") {
+      _empty = List.tail([{"sentinel", 0, ""}])
+      assert(Zap.Doc.render_summary_rows(_empty, "") == "")
+    }
+
+    test("multi-element list renders one row per entry") {
+      _items = [{"map", 2, "Transforms each element."}, {"filter", 2, "Keeps matching elements."}]
+      _result = Zap.Doc.render_summary_rows(_items, "")
+      assert(String.contains?(_result, "<a href=\"#map-2\">map/2</a>"))
+      assert(String.contains?(_result, "<a href=\"#filter-2\">filter/2</a>"))
+      assert(String.contains?(_result, "Transforms each element."))
+    }
+  }
+
   describe("Zap.Doc.module_main_content") {
     test("composes breadcrumb, title, implements, tagline, structdoc, sections in order") {
       _result = Zap.Doc.module_main_content(:struct, "Enum", ["Enumerable"], "A range of integers.", "<p>body</p>\n", "<tr><td>row</td></tr>\n", "", "<div class=\"function-detail\" id=\"map-2\">d</div>\n", "")
