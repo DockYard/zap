@@ -53,6 +53,12 @@ pub struct TestProbe {
     _union_info = struct_info(list_at(_union_refs, 0))
     _union_name = map_get(_union_info, :name, "MISSING")
 
+    # Verify the source-graph impls intrinsic returns a list shape even
+    # when no impls are declared in the path. A separate test (once a
+    # working impl fixture lands) will cover the populated case.
+    _impl_entries = source_graph_impls("test/no_impls_here.zap")
+    _impl_count = list_length(_impl_entries)
+
     _info = struct_info(ReflectionSubject)
     _info_name = map_get(_info, :name, "MISSING")
     _info_source = map_get(_info, :source_file, "MISSING")
@@ -126,6 +132,10 @@ pub struct TestProbe {
 
       pub fn first_union_name() -> String {
         unquote(_union_name)
+      }
+
+      pub fn impl_count() -> i64 {
+        unquote(_impl_count)
       }
     }
   }

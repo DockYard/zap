@@ -81,4 +81,10 @@ pub struct ReflectionTest {
       assert(first_union_name() == "ReflectionUnion")
     }
   }
+
+  describe("SourceGraph.impls returns a list shape") {
+    test("a path with no impls yields an empty list") {
+      assert(impl_count() == 0)
+    }
+  }
 }

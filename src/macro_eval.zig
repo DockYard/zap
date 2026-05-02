@@ -482,6 +482,9 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
             if (std.mem.eql(u8, form_name, "source_graph_unions")) {
                 return sourceGraphUnionsIntrinsic(env, arg_elems);
             }
+            if (std.mem.eql(u8, form_name, "source_graph_impls")) {
+                return sourceGraphImplsIntrinsic(env, arg_elems);
+            }
             if (std.mem.eql(u8, form_name, "struct_functions")) {
                 return structFunctionsIntrinsic(env, arg_elems);
             }
@@ -1360,6 +1363,7 @@ fn isCompileTimeIntrinsicExpansion(value: CtValue) bool {
     return std.mem.eql(u8, form.atom, "source_graph_structs") or
         std.mem.eql(u8, form.atom, "source_graph_protocols") or
         std.mem.eql(u8, form.atom, "source_graph_unions") or
+        std.mem.eql(u8, form.atom, "source_graph_impls") or
         std.mem.eql(u8, form.atom, "struct_functions") or
         std.mem.eql(u8, form.atom, "struct_macros") or
         std.mem.eql(u8, form.atom, "struct_info");
@@ -2023,6 +2027,62 @@ fn sourceGraphUnionsIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!C
 
     const id = env.store.alloc(env.alloc, .list, null);
     return CtValue{ .list = .{ .alloc_id = id, .elems = result_list.items } };
+}
+
+/// Enumerate every public protocol implementation declared in any of
+/// the source paths supplied. Each result is a compile-time map with
+/// `:protocol` (the qualified protocol name as a string), `:target`
+/// (the qualified target type name), `:source_file`, and `:is_private`.
+/// Doc generation uses this to render the per-type "Implements" row.
+fn sourceGraphImplsIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtValue {
+    if (args.len != 1) return .nil;
+    if (!hasReflectionCapability(env)) {
+        env.last_capability_error = std.fmt.allocPrint(
+            env.alloc,
+            "macro `{s}` calls `source_graph_impls` but does not declare `@requires = [:reflect_source]`",
+            .{env.current_macro_name orelse "<top-level>"},
+        ) catch return MacroEvalError.EvalFailed;
+        return MacroEvalError.EvalFailed;
+    }
+
+    const paths_raw = try eval(env, args[0]);
+    const paths = extractPathFilter(env, paths_raw) catch return .nil;
+    const ctx = env.struct_ctx orelse return .nil;
+
+    var result_list: std.ArrayListUnmanaged(CtValue) = .empty;
+    for (ctx.graph.impls.items) |impl_entry| {
+        if (impl_entry.is_private) continue;
+        const source_id = impl_entry.decl.meta.span.source_id orelse continue;
+        const path = ctx.graph.sourcePathById(source_id) orelse continue;
+        if (!pathFilterContains(env.alloc, paths, path)) continue;
+
+        const protocol_name = try structNameToString(env.alloc, ctx.interner, impl_entry.protocol_name);
+        const target_name = try structNameToString(env.alloc, ctx.interner, impl_entry.target_type);
+
+        const entries = try env.alloc.alloc(CtValue.CtMapEntry, 4);
+        entries[0] = .{ .key = .{ .atom = "protocol" }, .value = .{ .string = protocol_name } };
+        entries[1] = .{ .key = .{ .atom = "target" }, .value = .{ .string = target_name } };
+        entries[2] = .{ .key = .{ .atom = "source_file" }, .value = .{ .string = path } };
+        entries[3] = .{ .key = .{ .atom = "is_private" }, .value = .{ .bool_val = impl_entry.is_private } };
+        const map_id = env.store.alloc(env.alloc, .map, null);
+        try result_list.append(env.alloc, CtValue{ .map = .{ .alloc_id = map_id, .entries = entries } });
+    }
+
+    const id = env.store.alloc(env.alloc, .list, null);
+    return CtValue{ .list = .{ .alloc_id = id, .elems = result_list.items } };
+}
+
+/// Render a `StructName`'s segments joined with `.` so reflection
+/// callers can identify a protocol or target type with a plain string
+/// (matching the format the doc generator uses for cross-links).
+fn structNameToString(alloc: Allocator, interner: *ast.StringInterner, name: ast.StructName) ![]const u8 {
+    if (name.parts.len == 0) return "";
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    for (name.parts, 0..) |part, i| {
+        if (i > 0) try buf.append(alloc, '.');
+        try buf.appendSlice(alloc, interner.get(part));
+    }
+    return buf.toOwnedSlice(alloc);
 }
 
 /// Reflect on the public macros declared in a struct's scope and return

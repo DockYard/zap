@@ -47,4 +47,18 @@ pub struct SourceGraph {
       source_graph_unions(unquote(paths))
     }
   }
+
+  @doc = """
+    Returns public protocol-impl entries declared in the supplied
+    source paths. Each entry is a compile-time map with `:protocol`
+    (qualified name), `:target` (qualified type name), `:source_file`,
+    and `:is_private`. Doc generation reads this list to render the
+    per-type "Implements" row.
+    """
+
+  pub macro impls(paths :: Expr) -> Expr {
+    quote {
+      source_graph_impls(unquote(paths))
+    }
+  }
 }
