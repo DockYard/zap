@@ -113,6 +113,31 @@ pub struct Zap.Doc.Builder {
       }
     })
 
+    _variant_summaries = list_flatten(for _ref <- _union_refs {
+      for _v <- union_variants(_ref) {
+        %{
+          module: map_get(struct_info(_ref), :name, ""),
+          name: map_get(_v, :name, ""),
+          signature: map_get(_v, :signature, ""),
+          # Pin the value type to `Term` so the list composes with the
+          # other Term-valued manifests; arity is unused for variants
+          # but its presence keeps the inference stable.
+          arity: 0,
+        }
+      }
+    })
+
+    _required_function_summaries = list_flatten(for _ref <- _protocol_refs {
+      for _f <- protocol_required_functions(_ref) {
+        %{
+          module: map_get(struct_info(_ref), :name, ""),
+          name: map_get(_f, :name, ""),
+          signature: map_get(_f, :signature, ""),
+          arity: 0,
+        }
+      }
+    })
+
     quote {
       pub fn manifest_structs() -> [String] {
         unquote(_struct_names)
@@ -151,6 +176,16 @@ pub struct Zap.Doc.Builder {
       @doc = "Flat list of every protocol-impl declared across reflected modules, each with `:proto_name` and `:target` qualified names."
       pub fn manifest_impl_summaries() -> [%{Atom => Term}] {
         unquote(_impl_summaries)
+      }
+
+      @doc = "Flat list of every union variant across reflected modules, each with `:module`, `:name`, `:signature`."
+      pub fn manifest_variant_summaries() -> [%{Atom => Term}] {
+        unquote(_variant_summaries)
+      }
+
+      @doc = "Flat list of every protocol's required functions across reflected modules, each with `:module`, `:name`, `:signature`."
+      pub fn manifest_required_function_summaries() -> [%{Atom => Term}] {
+        unquote(_required_function_summaries)
       }
 
       pub fn render_first_struct_html() -> String {

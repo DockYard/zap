@@ -95,6 +95,16 @@ pub struct Zap.DocBuilderTest {
       assert(List.length(_impls) >= 0)
     }
 
+    test("manifest_variant_summaries returns a list shape") {
+      _variants = manifest_variant_summaries()
+      assert(List.length(_variants) >= 0)
+    }
+
+    test("manifest_required_function_summaries returns a list shape") {
+      _required = manifest_required_function_summaries()
+      assert(List.length(_required) >= 0)
+    }
+
     test("write_docs_to writes one HTML file per reflected module") {
       _ = File.mkdir("zap-out/test-docs")
       _count = write_docs_to("zap-out/test-docs")
