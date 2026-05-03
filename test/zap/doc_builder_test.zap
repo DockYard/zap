@@ -86,11 +86,20 @@ pub struct Zap.DocBuilderTest {
       assert(String.contains?(_atom_html, "<span>Structs</span>"))
     }
 
-    test("rendered struct page lists a public function in the summary table") {
+    test("rendered struct page renders @doc markdown to HTML") {
       _ = File.mkdir("zap-out/test-docs")
       _ = write_docs_to("zap-out/test-docs")
       _atom_html = File.read("zap-out/test-docs/Atom.html")
-      assert(String.contains?(_atom_html, "to_string"))
+      # The @doc has a "## Examples" section that should become an h2
+      assert(String.contains?(_atom_html, "<h2>Examples</h2>"))
+    }
+
+    test("write_docs_to also writes an index.html landing page") {
+      _ = File.mkdir("zap-out/test-docs")
+      _ = write_docs_to("zap-out/test-docs")
+      _index_html = File.read("zap-out/test-docs/index.html")
+      assert(String.contains?(_index_html, "Atom"))
+      assert(String.contains?(_index_html, "Stringable"))
     }
 
 

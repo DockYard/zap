@@ -571,7 +571,7 @@ pub struct Zap.Doc {
   pub fn render_summary_page(summary :: %{Atom => Term}, kind :: Atom, structs :: [String], protocols :: [String], unions :: [String]) -> String {
     name = Map.get(summary, :name, "")
     doc = Map.get(summary, :doc, "")
-    structdoc_html = "<p>" <> escape_html(doc) <> "</p>"
+    structdoc_html = Markdown.to_html(doc)
     content = module_main_content(kind, name, [] :: [String], first_sentence(doc), structdoc_html, "", "", "", "")
     sidebar_html = sidebar(structs, protocols, unions, name, "")
     struct_page("Zap", "0.0.0", name, "", "", sidebar_html, content, "")
@@ -594,7 +594,50 @@ pub struct Zap.Doc {
     written_structs = write_summary_pages(out_dir, struct_summaries, :struct, structs, protocols, unions, 0)
     written_protocols = write_summary_pages(out_dir, protocol_summaries, :protocol, structs, protocols, unions, 0)
     written_unions = write_summary_pages(out_dir, union_summaries, :union, structs, protocols, unions, 0)
+    index_html = render_index_page(structs, protocols, unions)
+    _ = File.write(out_dir <> "/index.html", index_html)
     written_structs + written_protocols + written_unions
+  }
+
+  @doc = """
+    Compose the docs landing page. Lists every module name from the
+    three sidebar lists under category headings. Linked entries point
+    at `<name>.html`. The page reuses the same chrome (`page_open`,
+    `topbar`, `sidebar`, `page_close`) as the per-module pages so the
+    layout is consistent.
+    """
+  pub fn render_index_page(structs :: [String], protocols :: [String], unions :: [String]) -> String {
+    structs_section = render_index_section("Structs", structs, "")
+    protocols_section = render_index_section("Protocols", protocols, "")
+    unions_section = render_index_section("Unions", unions, "")
+    content = "<h1 class=\"page-title\">Reference</h1>\n" <> structs_section <> protocols_section <> unions_section
+    sidebar_html = sidebar(structs, protocols, unions, "", "")
+    struct_page("Zap", "0.0.0", "Reference", "", "", sidebar_html, content, "")
+  }
+
+  @doc = """
+    Render one section of the index page: a heading plus a `<ul>` of
+    links, one per name. Returns the empty string when the name list
+    is empty so the caller can emit all three section calls
+    unconditionally and let the renderer drop empty kinds.
+    """
+  pub fn render_index_section(heading :: String, names :: [String], _unused :: String) -> String {
+    if List.empty?(names) {
+      ""
+    } else {
+      "<h2>" <> escape_html(heading) <> "</h2>\n<ul class=\"index-list\">\n" <> render_index_links(names, "") <> "</ul>\n"
+    }
+  }
+
+  pub fn render_index_links(names :: [String], acc :: String) -> String {
+    if List.empty?(names) {
+      acc
+    } else {
+      head = List.head(names)
+      tail = List.tail(names)
+      link = "<li><a href=\"" <> escape_html(head) <> ".html\">" <> escape_html(head) <> "</a></li>\n"
+      render_index_links(tail, acc <> link)
+    }
   }
 
   @doc = """
