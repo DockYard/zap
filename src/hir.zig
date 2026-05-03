@@ -2684,36 +2684,38 @@ pub const HirBuilder = struct {
         const family = self.graph.getFamily(resolved.family_id);
         if (family.clauses.items.len == 0) return null;
 
-        // Two-pass overload selection. Pass 1 finds the lowest applicability
-        // cost across all clauses. Pass 2 picks among the cost-tied candidates
-        // by canonical-rank: when an argument's static type is UNKNOWN every
-        // overload of a type-only multi-overload family ties at cost 0, and
-        // the older single-pass first-wins logic landed on whichever overload
-        // was declared first — typically the narrowest int (i8). For numeric
-        // overloads we prefer i64-then-narrower for ints and f64-then-narrower
-        // for floats so the dispatch picks the canonical natural width when
-        // no constraint disambiguates.
-        var best_cost: u32 = std.math.maxInt(u32);
-        for (family.clauses.items, 0..) |clause_ref, idx| {
-            const candidate = self.resolveClauseCallInfo(name, arity, resolved.declared_arity, clause_ref, @intCast(idx)) orelse continue;
-            const cost = self.callInfoMatchCost(candidate, args) orelse continue;
-            if (cost < best_cost) best_cost = cost;
-        }
-
-        if (best_cost == std.math.maxInt(u32)) {
-            return self.resolveClauseCallInfo(name, arity, resolved.declared_arity, family.clauses.items[0], 0);
-        }
-
+        // Single-pass overload selection. We track three pieces of state:
+        //   `best`     — the current best ResolvedFunctionCall (lowest cost,
+        //                tiebroken by canonical rank)
+        //   `best_cost` — its applicability cost
+        //   `best_rank` — its canonical-rank score (used only on ties)
+        // When a new candidate has strictly lower cost it wins outright;
+        // when it ties at cost it wins only if its canonical rank is lower.
+        // The canonical rank prefers i64-then-narrower for ints (and
+        // f64-then-narrower for floats) when an arg's static type is UNKNOWN,
+        // so a type-only multi-overload family (e.g. `Integer.to_string`'s
+        // 12 i8…u128 clauses) reliably lands on the natural-width overload
+        // instead of whichever clause was declared first. Single-pass keeps
+        // the per-call cost linear in the clause count — important because
+        // dispatch fires once per `<>` operator (which expands to a
+        // `Concatenable.concat` call), and long concat chains otherwise
+        // multiply the dispatch work.
         var best: ?ResolvedFunctionCall = null;
+        var best_cost: u32 = std.math.maxInt(u32);
         var best_rank: u32 = std.math.maxInt(u32);
         for (family.clauses.items, 0..) |clause_ref, idx| {
             const candidate = self.resolveClauseCallInfo(name, arity, resolved.declared_arity, clause_ref, @intCast(idx)) orelse continue;
             const cost = self.callInfoMatchCost(candidate, args) orelse continue;
-            if (cost != best_cost) continue;
-            const rank = self.canonicalParamRank(candidate, args);
-            if (best == null or rank < best_rank) {
+            if (best == null or cost < best_cost) {
                 best = candidate;
-                best_rank = rank;
+                best_cost = cost;
+                best_rank = self.canonicalParamRank(candidate, args);
+            } else if (cost == best_cost) {
+                const rank = self.canonicalParamRank(candidate, args);
+                if (rank < best_rank) {
+                    best = candidate;
+                    best_rank = rank;
+                }
             }
         }
 

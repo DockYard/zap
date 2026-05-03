@@ -711,12 +711,8 @@ pub struct Zap.Doc {
     protocol, and union becomes one JSON entry matching the legacy
     Zig-side search index shape so the bundled `app.js` can index
     and render results without changes. Per-function entries are
-    deferred until task #15 (compile-phase ordering for type-only
-    overload families) lands, since rendering each function row
-    requires extracting an `i64` arity from a `Term`-valued map slot
-    and that introduces a multi-overload `Integer.to_string` dispatch
-    inside a Zap-side helper that triggers an exponential frontend
-    blowup beyond the canonical-rank tiebreaker's reach.
+    deferred until task #15 PART 2 (super-linear compile-time scaling
+    for long `<>` chains containing function calls) lands.
     """
   pub fn render_search_index(struct_summaries :: [%{Atom => Term}], protocol_summaries :: [%{Atom => Term}], union_summaries :: [%{Atom => Term}]) -> String {
     structs_json = render_struct_search_entries(struct_summaries, "struct", "")
