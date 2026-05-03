@@ -886,7 +886,7 @@ pub const ZirDriver = struct {
             }
         }
 
-        try self.emitClosureEnvTypeDecls(&emitted);
+        try self.emitClosureEnvTypeDecls();
 
         // Emit the primary struct's fields at the file's root
         // struct_decl (instruction 0 / `main_struct_inst`). When the
@@ -931,8 +931,19 @@ pub const ZirDriver = struct {
         };
     }
 
-    fn emitClosureEnvTypeDecls(self: *ZirDriver, emitted: *std.StringHashMap(void)) !void {
+    fn emitClosureEnvTypeDecls(self: *ZirDriver) !void {
         const prog = self.program orelse return;
+
+        // Dedup by function id directly. The earlier StringHashMap-based
+        // dedup keyed on a stack-allocated `env_name_buf` slice — the
+        // hashmap stored those slices by reference, so each iteration's
+        // `bufPrint` overwrote the bytes of every prior key, yielding
+        // spurious `contains` hits and silently skipping legitimate env
+        // decls. Function ids are unique and stable, so a u32 set is
+        // both correct and cheaper.
+        var emitted_ids: std.AutoHashMap(ir.FunctionId, void) = .init(self.allocator);
+        defer emitted_ids.deinit();
+
         for (prog.functions) |func| {
             if (!func.is_closure or func.captures.len == 0) continue;
             if (func.struct_name) |owner| {
@@ -944,10 +955,11 @@ pub const ZirDriver = struct {
             const lowering = self.getClosureLowering(func.id, func.captures.len);
             if (!lowering.needs_env_param) continue;
 
+            if (emitted_ids.contains(func.id)) continue;
+            try emitted_ids.put(func.id, {});
+
             var env_name_buf: [64]u8 = undefined;
             const env_name = self.closureEnvTypeName(func.id, &env_name_buf);
-            if (emitted.contains(env_name)) continue;
-            try emitted.put(env_name, {});
 
             var field_name_ptrs: std.ArrayListUnmanaged([*]const u8) = .empty;
             defer field_name_ptrs.deinit(self.allocator);

@@ -170,7 +170,21 @@ pub struct Zap.DocBuilderTest {
       assert(String.length(_link) == 0)
     }
 
+    test("write_docs_to writes a search-index.json with struct entries") {
+      _ = File.mkdir("zap-out/test-docs")
+      _ = write_docs_to("zap-out/test-docs", "Zap", "0.0.0", "https://github.com/DockYard/zap")
+      _index = File.read("zap-out/test-docs/search-index.json")
+      assert(String.contains?(_index, "\"struct\":\"Atom\""))
+      assert(String.contains?(_index, "\"type\":\"struct\""))
+    }
 
+    test("search-index.json includes protocol entries") {
+      _ = File.mkdir("zap-out/test-docs")
+      _ = write_docs_to("zap-out/test-docs", "Zap", "0.0.0", "https://github.com/DockYard/zap")
+      _index = File.read("zap-out/test-docs/search-index.json")
+      assert(String.contains?(_index, "\"struct\":\"Stringable\""))
+      assert(String.contains?(_index, "\"type\":\"protocol\""))
+    }
 
   }
 }

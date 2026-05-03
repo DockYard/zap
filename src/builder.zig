@@ -107,7 +107,7 @@ pub fn ctfeManifestDetailed(
     // Run discovery so the staged macro pipeline has a topo order. Without
     // this, the legacy expansion path runs without a compiled IR, and any
     // macro `__using__` body that calls a regular Zap function via CTFE
-    // (e.g. `Path.glob` from `Zap.Doc.Builder.__using__`) hits a null
+    // (e.g. the glob helper from `Zap.Doc.Builder.__using__`) hits a null
     // `compiled_program` and falls through to AST evaluation that can't
     // execute `:zig.*` builtins. See `dispatchQualifiedComptimeCall` in
     // `macro_eval.zig` for the diagnostic path that surfaces the failure.
@@ -181,11 +181,11 @@ const StructOrderData = struct {
 ///
 /// Used by `ctfeManifestDetailed` to drive the staged macro-expansion
 /// pipeline so a macro `__using__` body that CTFE-calls another stdlib
-/// function (e.g. `Path.glob`) sees that function's IR by the time the
-/// using struct is expanded. Failure to discover (e.g. missing primary
-/// struct in build.zap) is non-fatal — the caller falls back to the
-/// legacy expansion path and only macros that don't reach into other
-/// structs' compiled bodies will succeed.
+/// function (e.g. the glob helper) sees that function's IR by the time
+/// the using struct is expanded. Failure to discover (e.g. missing
+/// primary struct in build.zap) is non-fatal — the caller falls back
+/// to the legacy expansion path and only macros that don't reach into
+/// other structs' compiled bodies will succeed.
 fn computeStructOrder(
     alloc: std.mem.Allocator,
     build_source: []const u8,

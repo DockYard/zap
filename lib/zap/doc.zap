@@ -661,6 +661,69 @@ pub struct Zap.Doc {
   }
 
   @doc = """
+    Escape a string for safe inclusion as a JSON string literal.
+    Replaces backslash, double-quote, and newline with their JSON
+    escape sequences. Other control characters are rare in stdlib
+    `@doc` text.
+    """
+  pub fn json_escape(text :: String) -> String {
+    step1 = String.replace(text, "\\", "\\\\")
+    step2 = String.replace(step1, "\"", "\\\"")
+    String.replace(step2, "\n", "\\n")
+  }
+
+  @doc = "Render one struct/protocol/union summary as a JSON entry."
+  pub fn struct_search_entry(summary :: %{Atom => Term}, kind_label :: String) -> String {
+    name = Map.get(summary, :name, "")
+    doc_text = Map.get(summary, :doc, "")
+    "{\"struct\":\"" <> json_escape(name) <> "\",\"type\":\"" <> kind_label <> "\",\"name\":\"" <> json_escape(name) <> "\",\"summary\":\"" <> json_escape(first_sentence(doc_text)) <> "\",\"url\":\"" <> json_escape(name) <> ".html\"},\n"
+  }
+
+  @doc = "Walk a list of struct/protocol/union summaries, accumulating JSON search entries."
+  pub fn render_struct_search_entries(summaries :: [%{Atom => Term}], kind_label :: String, acc :: String) -> String {
+    if List.empty?(summaries) {
+      acc
+    } else {
+      head = List.head(summaries)
+      tail = List.tail(summaries)
+      entry_text = struct_search_entry(head, kind_label)
+      render_struct_search_entries(tail, kind_label, acc <> entry_text)
+    }
+  }
+
+  @doc = """
+    Strip the trailing `,\\n` separator left on each per-entry
+    string by `*_search_entry`. Recursive walkers keep their bodies
+    branch-free (every entry adds the same suffix); the array
+    closer here drops the last separator before the `]`.
+    """
+  pub fn strip_trailing_comma_newline(body :: String) -> String {
+    n = String.length(body)
+    if n < 2 {
+      body
+    } else {
+      String.slice(body, 0, n - 2)
+    }
+  }
+
+  @doc = """
+    Compose the full search-index JSON document. Each struct,
+    protocol, and union becomes one JSON entry matching the legacy
+    Zig-side search index shape so the bundled `app.js` can index
+    and render results without changes. Per-function entries are
+    deferred until task #15 (Term → compound-value runtime unboxing)
+    lands, since rendering each function row requires extracting an
+    `i64` arity from a `Term`-valued map slot.
+    """
+  pub fn render_search_index(struct_summaries :: [%{Atom => Term}], protocol_summaries :: [%{Atom => Term}], union_summaries :: [%{Atom => Term}]) -> String {
+    structs_json = render_struct_search_entries(struct_summaries, "struct", "")
+    protocols_json = render_struct_search_entries(protocol_summaries, "protocol", "")
+    unions_json = render_struct_search_entries(union_summaries, "union", "")
+    body = structs_json <> protocols_json <> unions_json
+    "[\n" <> strip_trailing_comma_newline(body) <> "\n]\n"
+  }
+
+  @doc = """
     Render kind-specific summary tables that don't fit
     `module_main_content`'s hardcoded Functions/Macros slots.
 
@@ -782,6 +845,8 @@ pub struct Zap.Doc {
     written_unions = write_summary_pages(out_dir, union_summaries, :union, project_name, project_version, source_url, structs, protocols, unions, function_summaries, macro_summaries, impl_summaries, variant_summaries, required_summaries, 0)
     index_html = render_index_page(structs, protocols, unions)
     _ = File.write(out_dir <> "/index.html", index_html)
+    search_json = render_search_index(struct_summaries, protocol_summaries, union_summaries)
+    _ = File.write(out_dir <> "/search-index.json", search_json)
     written_structs + written_protocols + written_unions
   }
 
@@ -866,4 +931,5 @@ pub struct Zap.Doc {
       }
     }
   }
+
 }
