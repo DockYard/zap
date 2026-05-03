@@ -12,9 +12,11 @@ pub struct Zap.Builder {
         }
       :doc ->
         %Zap.Manifest{
-          name: "zap_stdlib",
+          name: "zap_docs",
           version: "0.1.0",
-          kind: :doc,
+          kind: :bin,
+          root: "Zap.DocsRunner.main/1",
+          paths: ["lib/**/*.zap"],
           source_url: "https://github.com/DockYard/zap",
           landing_page: "README.md",
           deps: [{:zap_stdlib, {:path, "lib"}}]

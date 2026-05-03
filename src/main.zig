@@ -216,8 +216,29 @@ fn cmdDoc(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const project_root = try discoverBuildFile(allocator, parsed.build_file);
     defer allocator.free(project_root);
 
-    const output_path = try generateDocsForTarget(allocator, project_root, target, parsed.build_opts, parsed.no_deps);
-    allocator.free(output_path);
+    // Build the target as a regular binary and run its `main/1`. The
+    // doc pipeline lives in Zap source — `Zap.DocsRunner` (or any
+    // user-defined doc-runner referenced from `build.zap`) calls
+    // `Zap.Doc.Builder`'s `write_docs_to/1` to render and write
+    // pages. The Zig CLI is just a thin shell around build+run, so
+    // the same machinery that powers `zap test` powers `zap doc`.
+    const artifact = try buildTarget(allocator, project_root, target, parsed.build_opts, parsed.compile_target);
+    defer allocator.free(artifact.path);
+
+    if (artifact.kind == .doc) {
+        // Legacy `kind: :doc` build manifests still drop output via
+        // the historical Zig generator path — `buildTarget` did the
+        // work and returned the output dir as the artifact path.
+        // Migrate to `kind: :bin` with a `Zap.DocsRunner`-style
+        // entry to use the supported flow.
+        return;
+    }
+
+    const exit_code = compiler.runBinary(allocator, global_io, artifact.path, parsed.run_args) catch |err| {
+        std.debug.print("Error running doc generator: {}\n", .{err});
+        std.process.exit(1);
+    };
+    std.process.exit(exit_code);
 }
 
 fn generateDocsForTarget(

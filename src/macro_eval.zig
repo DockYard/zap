@@ -1310,7 +1310,32 @@ fn dispatchQualifiedComptimeCall(
         }
         if (family.clauses.items.len == 0) return null;
         const clause_ref = family.clauses.items[0];
-        return evalDispatchedClause(env, &clause_ref.decl.clauses[clause_ref.clause_index], arg_forms, struct_scope, false, ctfe.CapabilitySet.build, function_name);
+        if (try evalDispatchedClause(env, &clause_ref.decl.clauses[clause_ref.clause_index], arg_forms, struct_scope, false, ctfe.CapabilitySet.build, function_name)) |result| {
+            return result;
+        }
+        // The function exists but neither evaluation path could produce
+        // a value:
+        //   - `evalCompiledQualifiedFunction` returned null because the
+        //     function isn't yet in the compiled-IR table (staged
+        //     compilation order placed the consumer before the
+        //     provider's IR was built).
+        //   - `evalDispatchedClause` returned null because the body
+        //     isn't comptime-safe for AST evaluation (it calls a
+        //     `:zig.*` builtin or other unevaluable form).
+        //
+        // Returning null here lets eval fall through to `return value`,
+        // leaving the unevaluated AST tuple in the caller's slot. That
+        // silently propagates as nil/[Nil] through downstream operations
+        // and produces wrong-type errors many phases away from the
+        // actual cause. Raise a precise diagnostic instead so the
+        // staging issue is visible at the point of failure.
+        const dotted = std.mem.join(env.alloc, ".", segments.items) catch return MacroEvalError.EvalFailed;
+        env.last_capability_error = std.fmt.allocPrint(
+            env.alloc,
+            "comptime call to `{s}/{d}` couldn't be evaluated — the function's IR isn't available at this expansion stage and its body uses `:zig.*` builtins the AST evaluator can't run. The consumer's compilation likely landed in a topo-order wave before the provider's dependencies were compiled.",
+            .{ dotted, arity },
+        ) catch return MacroEvalError.EvalFailed;
+        return MacroEvalError.EvalFailed;
     }
 
     if (struct_scope_value.macros.get(key)) |macro_id| {

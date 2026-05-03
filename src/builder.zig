@@ -104,10 +104,25 @@ pub fn ctfeManifestDetailed(
     // Add build.zap as the final source unit
     try source_units.append(alloc, .{ .file_path = "build.zap", .source = build_source });
 
-    // Compile through the full frontend pipeline to get IR
-    var ctx = compiler.collectAllFromUnits(alloc, source_units.items, .{
+    // Run discovery so the staged macro pipeline has a topo order. Without
+    // this, the legacy expansion path runs without a compiled IR, and any
+    // macro `__using__` body that calls a regular Zap function via CTFE
+    // (e.g. `Path.glob` from `Zap.Doc.Builder.__using__`) hits a null
+    // `compiled_program` and falls through to AST evaluation that can't
+    // execute `:zig.*` builtins. See `dispatchQualifiedComptimeCall` in
+    // `macro_eval.zig` for the diagnostic path that surfaces the failure.
+    const struct_order_data = computeStructOrder(alloc, build_source, source_units.items, zap_lib_dir) catch null;
+
+    var collect_options = compiler.CompileOptions{
         .show_progress = false,
-    }) catch return error.CompileFailed;
+    };
+    if (struct_order_data) |order| {
+        collect_options.struct_order = order.struct_order;
+        collect_options.level_boundaries = order.level_boundaries;
+    }
+
+    // Compile through the full frontend pipeline to get IR
+    var ctx = compiler.collectAllFromUnits(alloc, source_units.items, collect_options) catch return error.CompileFailed;
     const result = compiler.compileForCtfe(alloc, &ctx, .{
         .show_progress = false,
     }) catch return error.CompileFailed;
@@ -152,6 +167,68 @@ pub fn ctfeManifestDetailed(
         .config = try constValueToBuildConfig(alloc, manifest_result.value),
         .dependencies = manifest_result.dependencies,
         .result_hash = manifest_result.result_hash,
+    };
+}
+
+const StructOrderData = struct {
+    struct_order: [][]const u8,
+    level_boundaries: []u32,
+};
+
+/// Run import-driven discovery over `build.zap` + the supplied stdlib
+/// source units to produce a topological compilation order. Returns the
+/// ordered list of struct names plus the per-wave boundary indices.
+///
+/// Used by `ctfeManifestDetailed` to drive the staged macro-expansion
+/// pipeline so a macro `__using__` body that CTFE-calls another stdlib
+/// function (e.g. `Path.glob`) sees that function's IR by the time the
+/// using struct is expanded. Failure to discover (e.g. missing primary
+/// struct in build.zap) is non-fatal — the caller falls back to the
+/// legacy expansion path and only macros that don't reach into other
+/// structs' compiled bodies will succeed.
+fn computeStructOrder(
+    alloc: std.mem.Allocator,
+    build_source: []const u8,
+    source_units: []const compiler.SourceUnit,
+    zap_lib_dir: ?[]const u8,
+) !StructOrderData {
+    const entry = (try zap.discovery.primaryStructName(alloc, build_source)) orelse return error.NoPrimaryStruct;
+
+    var source_roots: std.ArrayListUnmanaged(zap.discovery.SourceRoot) = .empty;
+    if (zap_lib_dir) |lib_dir| {
+        try source_roots.append(alloc, .{ .name = "stdlib", .path = lib_dir });
+    }
+
+    var explicit_paths: std.ArrayListUnmanaged([]const u8) = .empty;
+    for (source_units) |unit| {
+        try explicit_paths.append(alloc, unit.file_path);
+    }
+
+    var graph = try zap.discovery.discoverWithSourceFiles(
+        alloc,
+        entry,
+        source_roots.items,
+        &zap.discovery.BUILTIN_TYPE_NAMES,
+        explicit_paths.items,
+        null,
+    );
+    defer graph.deinit();
+
+    var order: std.ArrayListUnmanaged([]const u8) = .empty;
+    for (graph.topo_order.items) |file_path| {
+        if (graph.file_to_struct.get(file_path)) |struct_name| {
+            try order.append(alloc, try alloc.dupe(u8, struct_name));
+        }
+    }
+
+    var levels: std.ArrayListUnmanaged(u32) = .empty;
+    for (graph.level_boundaries.items) |boundary| {
+        try levels.append(alloc, boundary);
+    }
+
+    return .{
+        .struct_order = try order.toOwnedSlice(alloc),
+        .level_boundaries = try levels.toOwnedSlice(alloc),
     };
 }
 

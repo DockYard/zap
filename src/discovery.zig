@@ -664,7 +664,7 @@ fn sourceRootNameForFile(
     return null;
 }
 
-fn primaryStructName(alloc: std.mem.Allocator, source: []const u8) error{OutOfMemory}!?[]const u8 {
+pub fn primaryStructName(alloc: std.mem.Allocator, source: []const u8) error{OutOfMemory}!?[]const u8 {
     const declared_structs = try structNamesInSource(alloc, source);
     if (declared_structs.len == 0) return null;
     return declared_structs[0];
