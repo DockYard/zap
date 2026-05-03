@@ -138,6 +138,14 @@ pub struct Zap.Doc.Builder {
       }
     })
 
+    # Embed the static stylesheet and theme/search JS at compile time
+    # so the runtime walker can drop them next to the generated HTML
+    # without any filesystem awareness of the original asset locations.
+    # Authors who need to override these can set their own
+    # `style.css` / `app.js` after `write_docs_to` writes the defaults.
+    _doc_css = read_file("lib/zap/doc/assets/style.css")
+    _doc_js = read_file("lib/zap/doc/assets/app.js")
+
     quote {
       pub fn manifest_structs() -> [String] {
         unquote(_struct_names)
@@ -194,6 +202,8 @@ pub struct Zap.Doc.Builder {
 
       @doc = "Render every reflected module to `<out_dir>/<name>.html` and return the page count."
       pub fn write_docs_to(out_dir :: String) -> i64 {
+        _ = File.write(out_dir <> "/style.css", unquote(_doc_css))
+        _ = File.write(out_dir <> "/app.js", unquote(_doc_js))
         Zap.Doc.write_pages_to(out_dir, manifest_struct_summaries(), manifest_protocol_summaries(), manifest_union_summaries(), manifest_function_summaries(), manifest_macro_summaries(), manifest_impl_summaries(), manifest_variant_summaries(), manifest_required_function_summaries())
       }
     }

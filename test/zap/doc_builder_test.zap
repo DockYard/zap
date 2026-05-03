@@ -105,6 +105,20 @@ pub struct Zap.DocBuilderTest {
       assert(List.length(_required) >= 0)
     }
 
+    test("write_docs_to writes style.css alongside the HTML pages") {
+      _ = File.mkdir("zap-out/test-docs")
+      _ = write_docs_to("zap-out/test-docs")
+      _css = File.read("zap-out/test-docs/style.css")
+      assert(String.length(_css) > 0)
+    }
+
+    test("write_docs_to writes app.js alongside the HTML pages") {
+      _ = File.mkdir("zap-out/test-docs")
+      _ = write_docs_to("zap-out/test-docs")
+      _js = File.read("zap-out/test-docs/app.js")
+      assert(String.length(_js) > 0)
+    }
+
     test("write_docs_to writes one HTML file per reflected module") {
       _ = File.mkdir("zap-out/test-docs")
       _count = write_docs_to("zap-out/test-docs")
