@@ -691,34 +691,36 @@ pub struct Zap.Doc {
     }
   }
 
-  # task #15 PART 2 — super-linear compile-time scaling for long `<>` chains
-  # containing function calls. Keep this comment block in sync with the
-  # task description so a follow-up session can paste the probe back in,
-  # reproduce the blowup, and instrument the offending pass. Restoring
-  # the probe inflates `zap test` from ~17s to 3+ minutes, so it MUST NOT
-  # land in the source tree until the underlying bug is fixed.
-  #
-  #   pub fn _probe_arity(entry :: %{Atom => Term}, kind_label :: String) -> String {
-  #     module_name = Map.get(entry, :module, "")
-  #     fn_name = Map.get(entry, :name, "")
-  #     arity = Map.get(entry, :arity, 0)
-  #     doc_text = Map.get(entry, :doc, "")
-  #     arity_str = Integer.to_string(arity)
-  #     "{\"struct\":\"" <> json_escape(module_name) <> "\",\"type\":\"" <>
-  #       kind_label <> "\",\"name\":\"" <> json_escape(fn_name) <> "/" <>
-  #       arity_str <> "\",\"summary\":\"" <>
-  #       json_escape(first_sentence(doc_text)) <> "\",\"url\":\"structs/" <>
-  #       json_escape(module_name) <> ".html#" <> json_escape(fn_name) <>
-  #       "-" <> arity_str <> "\"},\n"
-  #   }
-  #
-  # Bisect data:
-  #   * baseline `zap test`                                       17s
-  #   * +13 `<>` chain over typed Strings only (no fn calls)      53s
-  #   * +13 `<>` chain with one inner function call                3+ min
-  #   * Triggers regardless of whether the call returns a Term-derived
-  #     value or a literal — the chain length × function-call count
-  #     scaling is what compounds, not Term unboxing per se.
+  @doc = """
+    Compose one function/macro JSON search-index entry from already-typed
+    fields. `function_search_entry` does the `Map.get` extraction at the
+    call boundary so the `i64`/`String` parameters here are concretely
+    typed — Zap dispatches `Integer.to_string` and `<>`/`Concatenable.concat`
+    against the concrete types without going through Term unboxing inside
+    the body. Mirrors the `compose_member_detail` pattern used elsewhere
+    in this struct.
+    """
+  pub fn compose_function_search_entry(module_name :: String, fn_name :: String, arity :: i64, doc_text :: String, kind_label :: String) -> String {
+    arity_str = Integer.to_string(arity)
+    "{\"struct\":\"" <> json_escape(module_name) <> "\",\"type\":\"" <> kind_label <> "\",\"name\":\"" <> json_escape(fn_name) <> "/" <> arity_str <> "\",\"summary\":\"" <> json_escape(first_sentence(doc_text)) <> "\",\"url\":\"structs/" <> json_escape(module_name) <> ".html#" <> json_escape(fn_name) <> "-" <> arity_str <> "\"},\n"
+  }
+
+  @doc = "Render a `:module` + `:name` + `:arity` flat-summary entry as a JSON search entry. Used for functions and macros."
+  pub fn function_search_entry(entry :: %{Atom => Term}, kind_label :: String) -> String {
+    compose_function_search_entry(Map.get(entry, :module, ""), Map.get(entry, :name, ""), Map.get(entry, :arity, 0), Map.get(entry, :doc, ""), kind_label)
+  }
+
+  @doc = "Walk a list of function/macro flat-summaries, accumulating JSON search entries."
+  pub fn render_function_search_entries(items :: [%{Atom => Term}], kind_label :: String, acc :: String) -> String {
+    if List.empty?(items) {
+      acc
+    } else {
+      head = List.head(items)
+      tail = List.tail(items)
+      entry_text = function_search_entry(head, kind_label)
+      render_function_search_entries(tail, kind_label, acc <> entry_text)
+    }
+  }
 
   @doc = """
     Strip the trailing `,\\n` separator left on each per-entry
@@ -737,17 +739,17 @@ pub struct Zap.Doc {
 
   @doc = """
     Compose the full search-index JSON document. Each struct,
-    protocol, and union becomes one JSON entry matching the legacy
-    Zig-side search index shape so the bundled `app.js` can index
-    and render results without changes. Per-function entries are
-    deferred until task #15 PART 2 (super-linear compile-time scaling
-    for long `<>` chains containing function calls) lands.
+    protocol, union, function, and macro becomes one JSON entry
+    matching the legacy Zig-side search index shape so the bundled
+    `app.js` can index and render results without changes.
     """
-  pub fn render_search_index(struct_summaries :: [%{Atom => Term}], protocol_summaries :: [%{Atom => Term}], union_summaries :: [%{Atom => Term}]) -> String {
+  pub fn render_search_index(struct_summaries :: [%{Atom => Term}], protocol_summaries :: [%{Atom => Term}], union_summaries :: [%{Atom => Term}], function_summaries :: [%{Atom => Term}], macro_summaries :: [%{Atom => Term}]) -> String {
     structs_json = render_struct_search_entries(struct_summaries, "struct", "")
     protocols_json = render_struct_search_entries(protocol_summaries, "protocol", "")
     unions_json = render_struct_search_entries(union_summaries, "union", "")
-    body = structs_json <> protocols_json <> unions_json
+    functions_json = render_function_search_entries(function_summaries, "function", "")
+    macros_json = render_function_search_entries(macro_summaries, "macro", "")
+    body = structs_json <> protocols_json <> unions_json <> functions_json <> macros_json
     "[\n" <> strip_trailing_comma_newline(body) <> "\n]\n"
   }
 
@@ -874,7 +876,7 @@ pub struct Zap.Doc {
     written_unions = write_summary_pages(out_dir, union_summaries, :union, project_name, project_version, source_url, structs, protocols, unions, function_summaries, macro_summaries, impl_summaries, variant_summaries, required_summaries, 0)
     index_html = render_index_page(structs, protocols, unions)
     _ = File.write(out_dir <> "/index.html", index_html)
-    search_json = render_search_index(struct_summaries, protocol_summaries, union_summaries)
+    search_json = render_search_index(struct_summaries, protocol_summaries, union_summaries, function_summaries, macro_summaries)
     _ = File.write(out_dir <> "/search-index.json", search_json)
     written_structs + written_protocols + written_unions
   }

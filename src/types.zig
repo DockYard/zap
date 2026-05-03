@@ -1100,8 +1100,17 @@ pub const TypeChecker = struct {
     graph: *scope_mod.ScopeGraph,
     errors: std.ArrayList(Error),
 
-    // Expression type mapping
+    // Expression type mapping. Used as a memo cache by `inferExpr` to
+    // collapse the O(2^N) redundant re-inference of nested-call AST
+    // pointers across the ~14 sites in `inferCall` that all walk the
+    // same arg slice. The cache only persists for the duration of a
+    // single top-level `inferExpr` invocation — `infer_depth` tracks
+    // recursion depth and the cache is cleared when depth returns to
+    // zero so external callers (e.g. tests that manipulate ownership
+    // state between `inferExpr` calls) always get fresh side-effect
+    // handling. See task #15 PART 2 for the full diagnosis.
     expr_types: std.AutoHashMap(usize, TypeId),
+    infer_depth: u32 = 0,
 
     // Current scope tracking for var_ref resolution
     current_scope: ?scope_mod.ScopeId,
@@ -3591,6 +3600,38 @@ pub const TypeChecker = struct {
     // ============================================================
 
     fn inferExpr(self: *TypeChecker, expr: *const ast.Expr) anyerror!TypeId {
+        // Memoize by AST pointer to collapse the O(2^N) redundant
+        // re-inference of nested-call AST pointers in `inferCall` (~14
+        // sites at lines 4160, 4304, 4316, 4463, 4502, 4544, 4555, 4564,
+        // 4586, 4630, 4666, 4688, 4695 all walk the same arg slice). For
+        // an N-deep nested-call chain (e.g. a 13-`<>` chain expanded to
+        // nested `Concatenable.concat` calls) this redundant recursion
+        // pushed `TypeChecker.checkProgram` from sub-second to 5+ minutes
+        // for the single struct holding the chain — task #15 PART 2's
+        // root cause.
+        //
+        // The cache is scoped to a single top-level `inferExpr` call
+        // tree: `infer_depth` increments on entry, decrements on exit,
+        // and the cache is cleared when depth returns to zero. This
+        // ensures side-effects (binding-ownership tracking, error
+        // reporting) fire on the FIRST visit within a top-level call
+        // tree, while external callers (e.g. tests that mutate
+        // ownership state between `inferExpr` calls) always start with
+        // a fresh cache.
+        if (self.expr_types.get(@intFromPtr(expr))) |cached| return cached;
+        self.infer_depth += 1;
+        const result = self.inferExprUncached(expr) catch |err| {
+            self.infer_depth -= 1;
+            if (self.infer_depth == 0) self.expr_types.clearRetainingCapacity();
+            return err;
+        };
+        self.expr_types.put(@intFromPtr(expr), result) catch {};
+        self.infer_depth -= 1;
+        if (self.infer_depth == 0) self.expr_types.clearRetainingCapacity();
+        return result;
+    }
+
+    fn inferExprUncached(self: *TypeChecker, expr: *const ast.Expr) anyerror!TypeId {
         return switch (expr.*) {
             .int_literal => TypeStore.I64,
             .float_literal => TypeStore.F64,

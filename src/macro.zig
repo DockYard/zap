@@ -887,7 +887,25 @@ pub const MacroEngine = struct {
                                 return .{ .expr = expr, .changed = false };
                             }
                             const expanded = try self.expandMacroCall(expr, callee_name, mid);
-                            return .{ .expr = expanded, .changed = true };
+                            // Recursively re-expand the macro result so any
+                            // further-expandable forms it contains (nested
+                            // macros from the quote template, including
+                            // forms produced by `unquote(...)` whose own
+                            // operands are themselves macro calls) drain
+                            // in the SAME fixed-point iteration. Without
+                            // this, each iteration peels exactly one layer
+                            // of the produced AST tree, and a 13-deep `<>`
+                            // chain dragged the macro fixed-point loop
+                            // through 9+ iterations even after the if_expr
+                            // and operand-first fixes — task #15 PART 2.
+                            //
+                            // Pointer-equality guard: `expandMacroCall`
+                            // returns its input `expr` on error (e.g. an
+                            // empty-clauses macro family). Re-expanding
+                            // the same expr would loop forever.
+                            if (expanded == expr) return .{ .expr = expr, .changed = false };
+                            const drained = (try self.expandExpr(expanded)).expr;
+                            return .{ .expr = drained, .changed = true };
                         }
                     }
                 }
@@ -907,7 +925,9 @@ pub const MacroEngine = struct {
                                 return .{ .expr = expr, .changed = false };
                             }
                             const expanded = try self.expandMacroCall(expr, fa.field, mid);
-                            return .{ .expr = expanded, .changed = true };
+                            if (expanded == expr) return .{ .expr = expr, .changed = false };
+                            const drained = (try self.expandExpr(expanded)).expr;
+                            return .{ .expr = drained, .changed = true };
                         }
                     }
                 }
@@ -931,32 +951,40 @@ pub const MacroEngine = struct {
 
             // Recurse into compound expressions
             .if_expr => |ie| {
-                // Bootstrap fallback: expand if to case.
-                // Kernel.if macro provides the same behavior but allows user override.
-                const cond_exp = (try self.expandExpr(ie.condition)).expr;
+                // Bootstrap fallback: expand if to case. Kernel.if macro
+                // provides the same behavior but allows user override.
+                //
+                // Pre-expand the condition AND the then/else bodies so a
+                // nested `if/else` chain collapses in ONE fixed-point
+                // iteration. Without inner expansion, each iteration peeled
+                // exactly one outer layer; deeply nested if/else (e.g. the
+                // kind-dispatch ladder in `Zap.Doc.kind_category_label_*`)
+                // dragged the macro fixed-point loop through O(N) iterations
+                // where N is the nesting depth, with each iteration walking
+                // every struct in the program — task #15 PART 2.
+                const cond_exp = try self.expandExpr(ie.condition);
+                const then_exp = try self.expandBlock(ie.then_block);
+                const else_exp_opt: ?ExpandedBlock = if (ie.else_block) |else_block|
+                    try self.expandBlock(else_block)
+                else
+                    null;
+
                 const true_pat = try self.create(ast.Pattern, .{ .literal = .{ .bool_lit = .{ .meta = ie.meta, .value = true } } });
                 const false_pat = try self.create(ast.Pattern, .{ .literal = .{ .bool_lit = .{ .meta = ie.meta, .value = false } } });
 
-                var then_stmts: std.ArrayList(ast.Stmt) = .empty;
-                for (ie.then_block) |s| try then_stmts.append(self.allocator, s);
-                const then_body = try then_stmts.toOwnedSlice(self.allocator);
-
-                var else_body: []const ast.Stmt = undefined;
-                if (ie.else_block) |else_block| {
-                    var es: std.ArrayList(ast.Stmt) = .empty;
-                    for (else_block) |s| try es.append(self.allocator, s);
-                    else_body = try es.toOwnedSlice(self.allocator);
-                } else {
+                const else_body: []const ast.Stmt = if (else_exp_opt) |eb|
+                    eb.stmts
+                else blk: {
                     const nil_expr = try self.create(ast.Expr, .{ .nil_literal = .{ .meta = ie.meta } });
-                    else_body = try self.allocSlice(ast.Stmt, &.{.{ .expr = nil_expr }});
-                }
+                    break :blk try self.allocSlice(ast.Stmt, &.{.{ .expr = nil_expr }});
+                };
 
                 const clauses = try self.allocator.alloc(ast.CaseClause, 2);
-                clauses[0] = .{ .meta = ie.meta, .pattern = true_pat, .type_annotation = null, .guard = null, .body = then_body };
+                clauses[0] = .{ .meta = ie.meta, .pattern = true_pat, .type_annotation = null, .guard = null, .body = then_exp.stmts };
                 clauses[1] = .{ .meta = ie.meta, .pattern = false_pat, .type_annotation = null, .guard = null, .body = else_body };
                 return .{
                     .expr = try self.create(ast.Expr, .{
-                        .case_expr = .{ .meta = ie.meta, .scrutinee = cond_exp, .clauses = clauses },
+                        .case_expr = .{ .meta = ie.meta, .scrutinee = cond_exp.expr, .clauses = clauses },
                     }),
                     .changed = true,
                 };
@@ -1015,12 +1043,17 @@ pub const MacroEngine = struct {
                 // Try operator-named function first so a local `pub fn OP` shadows
                 // any Kernel macro of the same name (matches normal scope rules).
                 if (try self.tryDispatchToFunction(macro_name, &.{ lhs_pre.expr, rhs_pre.expr }, bo.meta)) |result| {
-                    return .{ .expr = result, .changed = true };
+                    const drained = (try self.expandExpr(result)).expr;
+                    return .{ .expr = drained, .changed = true };
                 }
 
-                // Then try Kernel/imported operator macro.
+                // Then try Kernel/imported operator macro. Recursively re-expand
+                // the macro output so further-expandable forms inside the
+                // produced AST drain in the same iteration — see the bare
+                // macro call branch above for the full task #15 PART 2 reasoning.
                 if (self.tryExpandBinaryMacro(macro_name, lhs_pre.expr, rhs_pre.expr, bo.meta)) |result| {
-                    return .{ .expr = result, .changed = true };
+                    const drained = (try self.expandExpr(result)).expr;
+                    return .{ .expr = drained, .changed = true };
                 }
 
                 // Bootstrap fallback: and/or get short-circuit case expansion
@@ -1087,9 +1120,13 @@ pub const MacroEngine = struct {
             },
 
             .pipe => |pe| {
-                // Try Kernel.|> macro first
+                // Try Kernel.|> macro first. Recursively re-expand the
+                // result so that further-expandable forms it contains
+                // drain in the same iteration — see the bare macro call
+                // branch for the full task #15 PART 2 reasoning.
                 if (self.tryExpandBinaryMacro("|>", pe.lhs, pe.rhs, pe.meta)) |result| {
-                    return .{ .expr = result, .changed = true };
+                    const drained = (try self.expandExpr(result)).expr;
+                    return .{ .expr = drained, .changed = true };
                 }
 
                 // Bootstrap fallback: desugar pipe directly
