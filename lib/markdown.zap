@@ -73,35 +73,82 @@ pub struct Markdown {
       if String.starts_with?(String.trim(line), "```") {
         open_code_block(line, rest, mode, acc)
       } else {
-        if String.starts_with?(line, "#### ") {
-          render_lines(rest, :start, "", close_block(mode, acc) <> render_heading("h4", String.slice(line, 5, String.length(line))))
-        } else {
-          if String.starts_with?(line, "### ") {
-            render_lines(rest, :start, "", close_block(mode, acc) <> render_heading("h3", String.slice(line, 4, String.length(line))))
+        if mode == :indent_code {
+          if is_indented_code_line?(line) {
+            render_lines(rest, :indent_code, "", acc <> "\n" <> escape_html(strip_indent4(line)))
           } else {
-            if String.starts_with?(line, "## ") {
-              render_lines(rest, :start, "", close_block(mode, acc) <> render_heading("h2", String.slice(line, 3, String.length(line))))
+            classify_after_close(line, rest, :start, close_block(:indent_code, acc))
+          }
+        } else {
+          if mode == :start and is_indented_code_line?(line) {
+            render_lines(rest, :indent_code, "", acc <> "<pre><code class=\"language-zap\">" <> escape_html(strip_indent4(line)))
+          } else {
+            classify_after_close(line, rest, mode, acc)
+          }
+        }
+      }
+    }
+  }
+
+  @doc = """
+    Continue line classification after a code-block close. Identical to the
+    inner heading/list/table/paragraph cascade in `classify_line` but without
+    the `is_indented_code_line?` re-check, since the caller has already
+    decided this line ended the indented code run.
+    """
+  pub fn classify_after_close(line :: String, rest :: [String], mode :: Atom, acc :: String) -> String {
+    if String.starts_with?(line, "#### ") {
+      render_lines(rest, :start, "", close_block(mode, acc) <> render_heading("h4", String.slice(line, 5, String.length(line))))
+    } else {
+      if String.starts_with?(line, "### ") {
+        render_lines(rest, :start, "", close_block(mode, acc) <> render_heading("h3", String.slice(line, 4, String.length(line))))
+      } else {
+        if String.starts_with?(line, "## ") {
+          render_lines(rest, :start, "", close_block(mode, acc) <> render_heading("h2", String.slice(line, 3, String.length(line))))
+        } else {
+          if is_list_item?(line) {
+            render_list_item(line, rest, mode, acc)
+          } else {
+            if is_table_header?(line, rest) {
+              open_table(line, rest, mode, acc)
             } else {
-              if is_list_item?(line) {
-                render_list_item(line, rest, mode, acc)
-              } else {
-                if is_table_header?(line, rest) {
-                  open_table(line, rest, mode, acc)
+              if mode == :table {
+                if is_pipe_row?(line) {
+                  render_lines(rest, :table, "", acc <> render_table_row(line, "td"))
                 } else {
-                  if mode == :table {
-                    if is_pipe_row?(line) {
-                      render_lines(rest, :table, "", acc <> render_table_row(line, "td"))
-                    } else {
-                      render_paragraph_line(line, rest, :start, close_block(:table, acc))
-                    }
-                  } else {
-                    render_paragraph_line(line, rest, mode, acc)
-                  }
+                  render_paragraph_line(line, rest, :start, close_block(:table, acc))
                 }
+              } else {
+                render_paragraph_line(line, rest, mode, acc)
               }
             }
           }
         }
+      }
+    }
+  }
+
+  @doc = """
+    A line qualifies as part of an indented code block when its first
+    four characters are spaces (or a tab). Mirrors the CommonMark
+    rule used to render `@doc` Example blocks as `<pre><code>`.
+    """
+  pub fn is_indented_code_line?(line :: String) -> Bool {
+    if String.length(line) < 4 {
+      false
+    } else {
+      String.starts_with?(line, "    ") or String.starts_with?(line, "\t")
+    }
+  }
+
+  pub fn strip_indent4(line :: String) -> String {
+    if String.starts_with?(line, "    ") {
+      String.slice(line, 4, String.length(line))
+    } else {
+      if String.starts_with?(line, "\t") {
+        String.slice(line, 1, String.length(line))
+      } else {
+        line
       }
     }
   }
@@ -224,7 +271,11 @@ pub struct Markdown {
         if mode == :table {
           acc <> "</tbody>\n</table>\n"
         } else {
-          acc
+          if mode == :indent_code {
+            acc <> "</code></pre>\n"
+          } else {
+            acc
+          }
         }
       }
     }

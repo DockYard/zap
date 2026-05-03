@@ -433,6 +433,78 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
                 }
             }
 
+            // html_escape(text) — escape `&`, `<`, `>`, `"` for safe
+            // emission as HTML body text or attribute content. Mirrors
+            // the runtime `Zap.Doc.escape_html` helper so doc-builder
+            // macros that bake pre-rendered HTML (signatures, table
+            // cells) can escape inputs at expansion time.
+            if (std.mem.eql(u8, form_name, "html_escape")) {
+                if (arg_elems.len == 1) {
+                    const text_value = try eval(env, arg_elems[0]);
+                    if (text_value != .string) return CtValue{ .string = "" };
+                    const text = text_value.string;
+                    var needed: usize = text.len;
+                    for (text) |c| switch (c) {
+                        '&' => needed += 4,
+                        '<' => needed += 3,
+                        '>' => needed += 3,
+                        '"' => needed += 5,
+                        else => {},
+                    };
+                    var buf = try env.alloc.alloc(u8, needed);
+                    var idx: usize = 0;
+                    for (text) |c| switch (c) {
+                        '&' => {
+                            @memcpy(buf[idx .. idx + 5], "&amp;");
+                            idx += 5;
+                        },
+                        '<' => {
+                            @memcpy(buf[idx .. idx + 4], "&lt;");
+                            idx += 4;
+                        },
+                        '>' => {
+                            @memcpy(buf[idx .. idx + 4], "&gt;");
+                            idx += 4;
+                        },
+                        '"' => {
+                            @memcpy(buf[idx .. idx + 6], "&quot;");
+                            idx += 6;
+                        },
+                        else => {
+                            buf[idx] = c;
+                            idx += 1;
+                        },
+                    };
+                    return CtValue{ .string = buf };
+                }
+            }
+
+            // string_concat_list(list_of_strings) — concatenate every
+            // string element in the list into a single string. Useful
+            // for collapsing the output of a `for` comprehension into a
+            // single rendered chunk when the doc-builder bakes
+            // pre-rendered HTML at compile time. Non-string elements
+            // are skipped; the empty list yields the empty string.
+            if (std.mem.eql(u8, form_name, "string_concat_list")) {
+                if (arg_elems.len == 1) {
+                    const list = try eval(env, arg_elems[0]);
+                    if (list != .list) return CtValue{ .string = "" };
+                    var total: usize = 0;
+                    for (list.list.elems) |e| {
+                        if (e == .string) total += e.string.len;
+                    }
+                    var buf = try env.alloc.alloc(u8, total);
+                    var idx: usize = 0;
+                    for (list.list.elems) |e| {
+                        if (e == .string) {
+                            @memcpy(buf[idx .. idx + e.string.len], e.string);
+                            idx += e.string.len;
+                        }
+                    }
+                    return CtValue{ .string = buf };
+                }
+            }
+
             // map_get(map, key, default) — fetch a compile-time
             // map entry by key, returning the caller-provided default
             // when the value is absent or the first argument is not a map.

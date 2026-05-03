@@ -425,7 +425,7 @@ pub struct Zap.Doc {
     open_div <> sidebar_html <> main_html <> rail_html <> "</div>\n"
   }
 
-  pub fn sidebar(structs :: [String], protocols :: [String], unions :: [String], current :: String, base :: String) -> String {
+  pub fn sidebar(structs :: [String], protocols :: [String], unions :: [String], current :: String, base :: String, project_name :: String, project_version :: String) -> String {
     structs_group = if List.empty?(structs) {
       ""
     } else {
@@ -442,7 +442,7 @@ pub struct Zap.Doc {
       sidebar_group("Unions", unions, current, base)
     }
     open_nav = "<nav class=\"sidebar\">\n"
-    header = "<div class=\"sidebar-header\"><a href=\"" <> base <> "index.html\" class=\"sidebar-title\"></a> <span class=\"sidebar-version\"></span></div>\n"
+    header = "<div class=\"sidebar-header\"><a href=\"" <> base <> "index.html\" class=\"sidebar-title\">" <> escape_html(project_name) <> "</a> <span class=\"sidebar-version\">v" <> escape_html(project_version) <> "</span></div>\n"
     search_input = "<div class=\"sidebar-search\"><input type=\"text\" id=\"search-input\" placeholder=\"Search (Cmd+K)\" aria-label=\"Search documentation\"></div>\n"
     open_nav <> header <> search_input <> structs_group <> protocols_group <> unions_group <> "</nav>\n"
   }
@@ -572,16 +572,217 @@ pub struct Zap.Doc {
     name = Map.get(summary, :name, "")
     doc = Map.get(summary, :doc, "")
     structdoc_html = Markdown.to_html(doc)
-    functions_rows = render_module_member_rows(all_functions, name, "")
-    macros_rows = render_module_member_rows(all_macros, name, "")
-    functions_details = render_module_member_details(all_functions, name, false, source_url, project_version, "")
-    macros_details = render_module_member_details(all_macros, name, true, source_url, project_version, "")
     implements = collect_implemented_protocols(all_impls, name, [] :: [String])
+    sorted_functions = sort_members_by_source_line(filter_members_by_module(all_functions, name))
+    sorted_macros = sort_members_by_source_line(filter_members_by_module(all_macros, name))
+    functions_rows = render_summary_rows_from_members(sorted_functions, "")
+    macros_rows = render_summary_rows_from_members(sorted_macros, "")
+    functions_details = render_member_details_sorted(sorted_functions, false, source_url, project_version, "")
+    macros_details = render_member_details_sorted(sorted_macros, true, source_url, project_version, "")
     body_html = module_main_content(kind, name, implements, first_sentence(doc), structdoc_html, functions_rows, macros_rows, functions_details, macros_details)
     extras = render_kind_extras(kind, name, all_variants, all_required)
     content = body_html <> extras
-    sidebar_html = sidebar(structs, protocols, unions, name, "../")
+    sidebar_html = sidebar(structs, protocols, unions, name, "../", project_name, project_version)
     struct_page(project_name, project_version, name, "../", source_url, sidebar_html, content, "")
+  }
+
+  @doc = """
+    Filter a flat function/macro manifest down to only the entries
+    whose `:module` field equals `module_name`. Used by
+    `render_summary_page` so the per-module sort and render passes
+    don't have to re-check the module name on every iteration.
+    """
+  pub fn filter_members_by_module(members :: [%{Atom => Term}], module_name :: String) -> [%{Atom => Term}] {
+    filter_members_walk(members, module_name, [] :: [%{Atom => Term}])
+  }
+
+  pub fn filter_members_walk(members :: [%{Atom => Term}], module_name :: String, acc :: [%{Atom => Term}]) -> [%{Atom => Term}] {
+    if List.empty?(members) {
+      acc
+    } else {
+      head = List.head(members)
+      tail = List.tail(members)
+      if Map.get(head, :module, "") == module_name {
+        filter_members_walk(tail, module_name, List.append(acc, head))
+      } else {
+        filter_members_walk(tail, module_name, acc)
+      }
+    }
+  }
+
+  @doc = """
+    Sort a list of member maps by `:source_line` ascending. Insertion
+    sort: predictable, stable on equal keys, and avoids the recursive
+    splitting Zap's lambda surface still has rough edges around. Each
+    member is read once and inserted into the accumulator in
+    source-line order, so the output preserves the source-file
+    layout the legacy generator emitted — the same order an
+    `@doc`-driven reader expects when scanning a module's reference page.
+    """
+  pub fn sort_members_by_source_line(members :: [%{Atom => Term}]) -> [%{Atom => Term}] {
+    sort_members_walk(members, [] :: [%{Atom => Term}])
+  }
+
+  pub fn sort_members_walk(remaining :: [%{Atom => Term}], sorted :: [%{Atom => Term}]) -> [%{Atom => Term}] {
+    if List.empty?(remaining) {
+      sorted
+    } else {
+      head = List.head(remaining)
+      tail = List.tail(remaining)
+      sort_members_walk(tail, insert_member_by_line(sorted, head))
+    }
+  }
+
+  pub fn insert_member_by_line(sorted :: [%{Atom => Term}], item :: %{Atom => Term}) -> [%{Atom => Term}] {
+    insert_member_walk(sorted, item, [] :: [%{Atom => Term}])
+  }
+
+  pub fn insert_member_walk(sorted :: [%{Atom => Term}], item :: %{Atom => Term}, prefix :: [%{Atom => Term}]) -> [%{Atom => Term}] {
+    if List.empty?(sorted) {
+      List.append(prefix, item)
+    } else {
+      head = List.head(sorted)
+      tail = List.tail(sorted)
+      if member_lt?(item, head) {
+        list_concat_two(List.append(prefix, item), sorted)
+      } else {
+        insert_member_walk(tail, item, List.append(prefix, head))
+      }
+    }
+  }
+
+  @doc = """
+    Order two member maps for the per-page table sort. Compare on
+    `:source_file` first so functions from the struct's own source group
+    together, then on `:source_line` within a file so the order matches
+    the legacy generator's source-driven layout. Falls back to `:name`
+    when the location fields are identical (e.g. macro-generated
+    siblings) so the order remains stable across runs.
+    """
+  pub fn member_lt?(a :: %{Atom => Term}, b :: %{Atom => Term}) -> Bool {
+    file_lt_or_eq?(Map.get(a, :source_file, ""), Map.get(b, :source_file, ""), a, b)
+  }
+
+  pub fn file_lt_or_eq?(a_file :: String, b_file :: String, a :: %{Atom => Term}, b :: %{Atom => Term}) -> Bool {
+    if string_lt?(a_file, b_file) {
+      true
+    } else {
+      file_eq_or_gt?(string_eq?(a_file, b_file), a, b)
+    }
+  }
+
+  pub fn file_eq_or_gt?(file_eq :: Bool, a :: %{Atom => Term}, b :: %{Atom => Term}) -> Bool {
+    if file_eq {
+      line_lt_or_eq?(Map.get(a, :source_line, 0), Map.get(b, :source_line, 0), a, b)
+    } else {
+      false
+    }
+  }
+
+  pub fn line_lt_or_eq?(a_line :: i64, b_line :: i64, a :: %{Atom => Term}, b :: %{Atom => Term}) -> Bool {
+    if a_line < b_line {
+      true
+    } else {
+      line_eq_or_gt?(a_line == b_line, a, b)
+    }
+  }
+
+  pub fn line_eq_or_gt?(line_eq :: Bool, a :: %{Atom => Term}, b :: %{Atom => Term}) -> Bool {
+    if line_eq {
+      string_lt?(Map.get(a, :name, ""), Map.get(b, :name, ""))
+    } else {
+      false
+    }
+  }
+
+  @doc = """
+    True when `left` sorts strictly before `right` lexicographically by
+    byte order. Implemented in Zap to keep the doc generator
+    self-contained — `String` doesn't yet expose a public compare
+    primitive.
+    """
+  pub fn string_lt?(left :: String, right :: String) -> Bool {
+    string_lt_walk?(left, right, 0, String.length(left), String.length(right))
+  }
+
+  pub fn string_lt_walk?(left :: String, right :: String, index :: i64, left_len :: i64, right_len :: i64) -> Bool {
+    if index >= left_len {
+      index < right_len
+    } else {
+      if index >= right_len {
+        false
+      } else {
+        l = String.byte_at(left, index)
+        r = String.byte_at(right, index)
+        if l == r {
+          string_lt_walk?(left, right, index + 1, left_len, right_len)
+        } else {
+          l < r
+        }
+      }
+    }
+  }
+
+  @doc = "True when two strings are byte-equal."
+  pub fn string_eq?(left :: String, right :: String) -> Bool {
+    if String.length(left) == String.length(right) {
+      string_eq_walk?(left, right, 0, String.length(left))
+    } else {
+      false
+    }
+  }
+
+  pub fn string_eq_walk?(left :: String, right :: String, index :: i64, end_index :: i64) -> Bool {
+    if index >= end_index {
+      true
+    } else {
+      if String.byte_at(left, index) == String.byte_at(right, index) {
+        string_eq_walk?(left, right, index + 1, end_index)
+      } else {
+        false
+      }
+    }
+  }
+
+  pub fn list_concat_two(left :: [%{Atom => Term}], right :: [%{Atom => Term}]) -> [%{Atom => Term}] {
+    if List.empty?(right) {
+      left
+    } else {
+      list_concat_two(List.append(left, List.head(right)), List.tail(right))
+    }
+  }
+
+  @doc = """
+    Render summary table rows from a list of member maps already
+    filtered to one module's entries. Each row uses the member's
+    `:name`, `:arity`, and the first sentence of `:doc`.
+    """
+  pub fn render_summary_rows_from_members(members :: [%{Atom => Term}], acc :: String) -> String {
+    if List.empty?(members) {
+      acc
+    } else {
+      head = List.head(members)
+      tail = List.tail(members)
+      row = summary_row(Map.get(head, :name, ""), Map.get(head, :arity, 0), first_sentence(Map.get(head, :doc, "")))
+      render_summary_rows_from_members(tail, acc <> row)
+    }
+  }
+
+  @doc = """
+    Render function detail blocks from a list of member maps already
+    filtered+sorted to one module's entries. Mirrors
+    `render_module_member_details` but skips the per-iteration module
+    filter — the caller has done that work.
+    """
+  pub fn render_member_details_sorted(members :: [%{Atom => Term}], is_macro :: Bool, source_url :: String, project_version :: String, acc :: String) -> String {
+    if List.empty?(members) {
+      acc
+    } else {
+      head = List.head(members)
+      tail = List.tail(members)
+      block = compose_member_detail(Map.get(head, :name, ""), Map.get(head, :arity, 0), is_macro, Map.get(head, :doc, ""), Map.get(head, :source_file, ""), Map.get(head, :source_line, 0), Map.get(head, :signatures_html, ""), source_url, project_version)
+      render_member_details_sorted(tail, is_macro, source_url, project_version, acc <> block)
+    }
   }
 
   @doc = """
@@ -603,13 +804,13 @@ pub struct Zap.Doc {
 
   pub fn member_detail_for_module(member :: %{Atom => Term}, module_name :: String, is_macro :: Bool, source_url :: String, project_version :: String) -> String {
     if Map.get(member, :module, "") == module_name {
-      compose_member_detail(Map.get(member, :name, ""), Map.get(member, :arity, 0), is_macro, Map.get(member, :doc, ""), Map.get(member, :source_file, ""), Map.get(member, :source_line, 0), source_url, project_version)
+      compose_member_detail(Map.get(member, :name, ""), Map.get(member, :arity, 0), is_macro, Map.get(member, :doc, ""), Map.get(member, :source_file, ""), Map.get(member, :source_line, 0), Map.get(member, :signatures_html, ""), source_url, project_version)
     } else {
       ""
     }
   }
 
-  pub fn compose_member_detail(name :: String, arity :: i64, is_macro :: Bool, doc :: String, source_file :: String, source_line :: i64, source_url :: String, project_version :: String) -> String {
+  pub fn compose_member_detail(name :: String, arity :: i64, is_macro :: Bool, doc :: String, source_file :: String, source_line :: i64, signatures_html :: String, source_url :: String, project_version :: String) -> String {
     doc_html = Markdown.to_html(doc)
     open_div = "<div class=\"function-detail\" id=\"" <> anchor_id(name, arity) <> "\">\n"
     header = function_header(name, arity, is_macro)
@@ -619,7 +820,7 @@ pub struct Zap.Doc {
       "<div class=\"function-doc\">\n" <> doc_html <> "</div>\n"
     }
     source = source_link(source_file, source_line, source_url, project_version)
-    open_div <> header <> body <> source <> "</div>\n"
+    open_div <> header <> signatures_html <> body <> source <> "</div>\n"
   }
 
   @doc = """
@@ -820,9 +1021,31 @@ pub struct Zap.Doc {
       target = Map.get(head, :target, "")
       if target == module_name {
         proto_name = Map.get(head, :proto_name, "")
-        collect_implemented_protocols(tail, module_name, List.append(acc, proto_name))
+        if list_contains?(acc, proto_name) {
+          collect_implemented_protocols(tail, module_name, acc)
+        } else {
+          collect_implemented_protocols(tail, module_name, List.append(acc, proto_name))
+        }
       } else {
         collect_implemented_protocols(tail, module_name, acc)
+      }
+    }
+  }
+
+  @doc = """
+    Return true when `needle` appears in `items`. Tail-recursive so the
+    `Implements` deduplication walk doesn't depend on a richer
+    list-membership protocol.
+    """
+  pub fn list_contains?(items :: [String], needle :: String) -> Bool {
+    if List.empty?(items) {
+      false
+    } else {
+      head = List.head(items)
+      if head == needle {
+        true
+      } else {
+        list_contains?(List.tail(items), needle)
       }
     }
   }
@@ -874,7 +1097,7 @@ pub struct Zap.Doc {
     written_structs = write_summary_pages(out_dir, struct_summaries, :struct, project_name, project_version, source_url, structs, protocols, unions, function_summaries, macro_summaries, impl_summaries, variant_summaries, required_summaries, 0)
     written_protocols = write_summary_pages(out_dir, protocol_summaries, :protocol, project_name, project_version, source_url, structs, protocols, unions, function_summaries, macro_summaries, impl_summaries, variant_summaries, required_summaries, 0)
     written_unions = write_summary_pages(out_dir, union_summaries, :union, project_name, project_version, source_url, structs, protocols, unions, function_summaries, macro_summaries, impl_summaries, variant_summaries, required_summaries, 0)
-    index_html = render_index_page(structs, protocols, unions)
+    index_html = render_index_page(structs, protocols, unions, project_name, project_version, source_url)
     _ = File.write(out_dir <> "/index.html", index_html)
     search_json = render_search_index(struct_summaries, protocol_summaries, union_summaries, function_summaries, macro_summaries)
     _ = File.write(out_dir <> "/search-index.json", search_json)
@@ -888,13 +1111,13 @@ pub struct Zap.Doc {
     `topbar`, `sidebar`, `page_close`) as the per-module pages so the
     layout is consistent.
     """
-  pub fn render_index_page(structs :: [String], protocols :: [String], unions :: [String]) -> String {
+  pub fn render_index_page(structs :: [String], protocols :: [String], unions :: [String], project_name :: String, project_version :: String, source_url :: String) -> String {
     structs_section = render_index_section("Structs", structs, "")
     protocols_section = render_index_section("Protocols", protocols, "")
     unions_section = render_index_section("Unions", unions, "")
-    content = "<h1 class=\"page-title\">Reference</h1>\n" <> structs_section <> protocols_section <> unions_section
-    sidebar_html = sidebar(structs, protocols, unions, "", "")
-    struct_page("Zap", "0.0.0", "Reference", "", "", sidebar_html, content, "")
+    content = "<h1 class=\"page-title\">" <> escape_html(project_name) <> "</h1>\n" <> structs_section <> protocols_section <> unions_section
+    sidebar_html = sidebar(structs, protocols, unions, "", "", project_name, project_version)
+    struct_page(project_name, project_version, project_name, "", source_url, sidebar_html, content, "")
   }
 
   @doc = """

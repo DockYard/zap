@@ -210,6 +210,42 @@ pub const Parser = struct {
                             buf.append(self.allocator, 'x') catch return text;
                         }
                     },
+                    'u' => {
+                        // Unicode escape: \u{HHHH...} — up to 6 hex digits, encodes as UTF-8.
+                        if (i + 2 < text.len and text[i + 2] == '{') {
+                            const hex_start = i + 3;
+                            var hex_end = hex_start;
+                            while (hex_end < text.len and text[hex_end] != '}') : (hex_end += 1) {}
+                            if (hex_end < text.len and hex_end > hex_start and (hex_end - hex_start) <= 6) {
+                                var codepoint: u32 = 0;
+                                var ok = true;
+                                var k: usize = hex_start;
+                                while (k < hex_end) : (k += 1) {
+                                    const d = std.fmt.charToDigit(text[k], 16) catch {
+                                        ok = false;
+                                        break;
+                                    };
+                                    codepoint = codepoint * 16 + d;
+                                }
+                                if (ok and codepoint <= 0x10FFFF) {
+                                    var utf8_buf: [4]u8 = undefined;
+                                    const n = std.unicode.utf8Encode(@as(u21, @intCast(codepoint)), &utf8_buf) catch {
+                                        buf.append(self.allocator, '\\') catch return text;
+                                        buf.append(self.allocator, 'u') catch return text;
+                                        i += 2;
+                                        continue;
+                                    };
+                                    buf.appendSlice(self.allocator, utf8_buf[0..n]) catch return text;
+                                    i = hex_end + 1;
+                                    continue;
+                                }
+                            }
+                        }
+                        buf.append(self.allocator, '\\') catch return text;
+                        buf.append(self.allocator, 'u') catch return text;
+                        i += 2;
+                        continue;
+                    },
                     else => {
                         // Unknown escape — keep as-is
                         buf.append(self.allocator, '\\') catch return text;

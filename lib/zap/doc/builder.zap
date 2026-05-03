@@ -73,11 +73,11 @@ pub struct Zap.Doc.Builder {
 
     # Flat list of every public function across every reflected
     # struct, with the owning module qualified-name attached so the
-    # walker can filter per-page. Each entry holds primitive-typed
-    # values only (String + i64) — nested compound values inside a
-    # `Term`-valued map slot don't currently round-trip through the
-    # runtime extraction path (see task #15), so anything richer
-    # (signatures, source locations) is omitted until that's fixed.
+    # walker can filter per-page. The per-clause typed signatures are
+    # rendered to HTML at compile time and stored as a single
+    # `:signatures_html` String — this avoids round-tripping a
+    # `[String]` value through the `Term`-valued map slot, which the
+    # runtime extraction path doesn't currently support.
     _function_summaries = list_flatten(for _ref <- _struct_refs {
       for _f <- struct_functions(_ref) {
         %{
@@ -87,6 +87,9 @@ pub struct Zap.Doc.Builder {
           doc: map_get(_f, :doc, ""),
           source_file: map_get(_f, :source_file, ""),
           source_line: map_get(_f, :source_line, 0),
+          signatures_html: string_concat_list(for _sig <- map_get(_f, :signatures, []) {
+            "<div class=\"signature\"><code>" <> html_escape(_sig) <> "</code></div>\n"
+          }),
         }
       }
     })
@@ -100,6 +103,9 @@ pub struct Zap.Doc.Builder {
           doc: map_get(_m, :doc, ""),
           source_file: map_get(_m, :source_file, ""),
           source_line: map_get(_m, :source_line, 0),
+          signatures_html: string_concat_list(for _sig <- map_get(_m, :signatures, []) {
+            "<div class=\"signature\"><code>" <> html_escape(_sig) <> "</code></div>\n"
+          }),
         }
       }
     })
