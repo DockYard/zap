@@ -580,8 +580,8 @@ pub struct Zap.Doc {
     body_html = module_main_content(kind, name, implements, first_sentence(doc), structdoc_html, functions_rows, macros_rows, functions_details, macros_details)
     extras = render_kind_extras(kind, name, all_variants, all_required)
     content = body_html <> extras
-    sidebar_html = sidebar(structs, protocols, unions, name, "")
-    struct_page(project_name, project_version, name, "", source_url, sidebar_html, content, "")
+    sidebar_html = sidebar(structs, protocols, unions, name, "../")
+    struct_page(project_name, project_version, name, "../", source_url, sidebar_html, content, "")
   }
 
   @doc = """
@@ -676,7 +676,7 @@ pub struct Zap.Doc {
   pub fn struct_search_entry(summary :: %{Atom => Term}, kind_label :: String) -> String {
     name = Map.get(summary, :name, "")
     doc_text = Map.get(summary, :doc, "")
-    "{\"struct\":\"" <> json_escape(name) <> "\",\"type\":\"" <> kind_label <> "\",\"name\":\"" <> json_escape(name) <> "\",\"summary\":\"" <> json_escape(first_sentence(doc_text)) <> "\",\"url\":\"" <> json_escape(name) <> ".html\"},\n"
+    "{\"struct\":\"" <> json_escape(name) <> "\",\"type\":\"" <> kind_label <> "\",\"name\":\"" <> json_escape(name) <> "\",\"summary\":\"" <> json_escape(first_sentence(doc_text)) <> "\",\"url\":\"structs/" <> json_escape(name) <> ".html\"},\n"
   }
 
   @doc = "Walk a list of struct/protocol/union summaries, accumulating JSON search entries."
@@ -837,6 +837,7 @@ pub struct Zap.Doc {
     `use Zap.Doc.Builder`.
     """
   pub fn write_pages_to(out_dir :: String, project_name :: String, project_version :: String, source_url :: String, struct_summaries :: [%{Atom => Term}], protocol_summaries :: [%{Atom => Term}], union_summaries :: [%{Atom => Term}], function_summaries :: [%{Atom => Term}], macro_summaries :: [%{Atom => Term}], impl_summaries :: [%{Atom => Term}], variant_summaries :: [%{Atom => Term}], required_summaries :: [%{Atom => Term}]) -> i64 {
+    _ = File.mkdir(out_dir <> "/structs")
     structs = manifest_names(struct_summaries, [])
     protocols = manifest_names(protocol_summaries, [])
     unions = manifest_names(union_summaries, [])
@@ -886,7 +887,7 @@ pub struct Zap.Doc {
     } else {
       head = List.head(names)
       tail = List.tail(names)
-      link = "<li><a href=\"" <> escape_html(head) <> ".html\">" <> escape_html(head) <> "</a></li>\n"
+      link = "<li><a href=\"structs/" <> escape_html(head) <> ".html\">" <> escape_html(head) <> "</a></li>\n"
       render_index_links(tail, acc <> link)
     }
   }
@@ -922,7 +923,7 @@ pub struct Zap.Doc {
       tail = List.tail(summaries)
       name = Map.get(head, :name, "")
       html = render_summary_page(head, kind, project_name, project_version, source_url, structs, protocols, unions, all_functions, all_macros, all_impls, all_variants, all_required)
-      path = out_dir <> "/" <> name <> ".html"
+      path = out_dir <> "/structs/" <> name <> ".html"
       ok = File.write(path, html)
       if ok {
         write_summary_pages(out_dir, tail, kind, project_name, project_version, source_url, structs, protocols, unions, all_functions, all_macros, all_impls, all_variants, all_required, acc + 1)

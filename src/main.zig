@@ -126,21 +126,6 @@ fn cmdRun(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const artifact = try buildTarget(allocator, project_root, target, parsed.build_opts, parsed.compile_target);
     defer allocator.free(artifact.path);
 
-    if (artifact.kind == .doc) {
-        if (parsed.watch) {
-            const source_paths = collectWatchPaths(allocator, project_root) catch |err| {
-                std.debug.print("Error collecting watch paths: {}\n", .{err});
-                return;
-            };
-            defer {
-                for (source_paths) |p| allocator.free(p);
-                allocator.free(source_paths);
-            }
-            std.debug.print("\n[watching for changes...]\n", .{});
-            watchAndRebuild(allocator, source_paths, project_root, target, parsed.build_opts, false, &.{});
-        }
-        return;
-    }
     if (artifact.kind != .bin) {
         std.debug.print("Error: target :{s} is {s}, not runnable\n", .{ target, @tagName(artifact.kind) });
         std.process.exit(1);
@@ -225,15 +210,6 @@ fn cmdDoc(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const artifact = try buildTarget(allocator, project_root, target, parsed.build_opts, parsed.compile_target);
     defer allocator.free(artifact.path);
 
-    if (artifact.kind == .doc) {
-        // Legacy `kind: :doc` build manifests still drop output via
-        // the historical Zig generator path — `buildTarget` did the
-        // work and returned the output dir as the artifact path.
-        // Migrate to `kind: :bin` with a `Zap.DocsRunner`-style
-        // entry to use the supported flow.
-        return;
-    }
-
     const exit_code = compiler.runBinary(allocator, global_io, artifact.path, parsed.run_args) catch |err| {
         std.debug.print("Error running doc generator: {}\n", .{err});
         std.process.exit(1);
@@ -241,201 +217,6 @@ fn cmdDoc(allocator: std.mem.Allocator, args: []const []const u8) !void {
     std.process.exit(exit_code);
 }
 
-fn generateDocsForTarget(
-    allocator: std.mem.Allocator,
-    project_root: []const u8,
-    target_name: []const u8,
-    build_opts: std.StringHashMapUnmanaged([]const u8),
-    no_deps: bool,
-) ![]const u8 {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    const builder = zap.builder;
-
-    // Read build.zap
-    const build_file_path = try std.fs.path.join(alloc, &.{ project_root, "build.zap" });
-    const build_source = std.Io.Dir.cwd().readFileAlloc(global_io, build_file_path, alloc, .limited(10 * 1024 * 1024)) catch |err| {
-        std.debug.print("Error reading build.zap: {}\n", .{err});
-        std.process.exit(1);
-    };
-
-    // Detect zap lib dir for stdlib
-    const zap_lib_dir = detectZapLibDir(alloc);
-
-    const manifest_eval = builder.ctfeManifestDetailed(alloc, build_source, target_name, build_opts, zap_lib_dir) catch |err| {
-        std.debug.print("Error: failed to evaluate build.zap manifest for :{s} target: {}\n", .{ target_name, err });
-        std.process.exit(1);
-    };
-    const config = manifest_eval.config;
-
-    if (config.kind != .doc) {
-        std.debug.print("Error: target :{s} is {s}, not doc\n", .{ target_name, @tagName(config.kind) });
-        std.process.exit(1);
-    }
-
-    try generateDocsFromConfig(alloc, project_root, config, zap_lib_dir, no_deps);
-    return try allocator.dupe(u8, "docs");
-}
-
-fn generateDocsFromConfig(
-    alloc: std.mem.Allocator,
-    project_root: []const u8,
-    config: zap.builder.BuildConfig,
-    zap_lib_dir: ?[]const u8,
-    no_deps: bool,
-) !void {
-    // Build source roots from deps
-    var source_roots: std.ArrayListUnmanaged(zap.discovery.SourceRoot) = .empty;
-    {
-        const lib_dir = try std.fs.path.join(alloc, &.{ project_root, "lib" });
-        if (std.Io.Dir.cwd().access(global_io, lib_dir, .{})) |_| {
-            try source_roots.append(alloc, .{ .name = "project", .path = lib_dir });
-
-            // Walk one level into `lib/` so files like
-            // `lib/integer/arithmetic.zap` (protocol impls) are discovered
-            // alongside `lib/integer.zap`. Without this, doc generation
-            // misses impls and the per-type "Implements" list stays empty.
-            if (std.Io.Dir.cwd().openDir(global_io, lib_dir, .{ .iterate = true })) |dir_handle| {
-                var dir = dir_handle;
-                defer dir.close(global_io);
-                var it = dir.iterate();
-                while (it.next(global_io) catch null) |entry| {
-                    if (entry.kind != .directory) continue;
-                    const subdir = try std.fs.path.join(alloc, &.{ lib_dir, entry.name });
-                    try source_roots.append(alloc, .{ .name = "project", .path = subdir });
-                }
-            } else |_| {}
-        } else |_| {}
-        try source_roots.append(alloc, .{ .name = "project", .path = project_root });
-    }
-
-    // Process deps for source roots (unless --no-deps)
-    if (!no_deps) {
-        for (config.deps) |dep| {
-            const dep_name = try std.fmt.allocPrint(alloc, "dep:{s}", .{dep.name});
-            switch (dep.source) {
-                .path => |dep_path| {
-                    const dep_dir = try std.fs.path.join(alloc, &.{ project_root, dep_path });
-                    const dep_lib_dir = try std.fs.path.join(alloc, &.{ dep_dir, "lib" });
-                    if (std.Io.Dir.cwd().access(global_io, dep_lib_dir, .{})) |_| {
-                        try source_roots.append(alloc, .{ .name = dep_name, .path = dep_lib_dir });
-                    } else |_| {
-                        try source_roots.append(alloc, .{ .name = dep_name, .path = dep_dir });
-                    }
-                    // Scan subdirectories
-                    const dep_resolved = if (std.Io.Dir.cwd().access(global_io, dep_lib_dir, .{}))
-                        dep_lib_dir
-                    else |_|
-                        dep_dir;
-                    if (std.Io.Dir.cwd().openDir(global_io, dep_resolved, .{ .iterate = true })) |dir_handle| {
-                        var dir = dir_handle;
-                        defer dir.close(global_io);
-                        var it = dir.iterate();
-                        while (it.next(global_io) catch null) |entry| {
-                            if (entry.kind == .directory) {
-                                const subdir = try std.fs.path.join(alloc, &.{ dep_resolved, entry.name });
-                                try source_roots.append(alloc, .{ .name = dep_name, .path = subdir });
-                            }
-                        }
-                    } else |_| {}
-                },
-                .git => {},
-            }
-        }
-    }
-
-    // Add zap lib dir as a source root so stdlib structs are discovered
-    if (zap_lib_dir) |zap_lib| {
-        try source_roots.append(alloc, .{ .name = "zap_stdlib", .path = zap_lib });
-        const zap_subdir = try std.fs.path.join(alloc, &.{ zap_lib, "zap" });
-        if (std.Io.Dir.cwd().access(global_io, zap_subdir, .{})) |_| {
-            try source_roots.append(alloc, .{ .name = "zap_stdlib", .path = zap_subdir });
-        } else |_| {}
-        const zest_subdir = try std.fs.path.join(alloc, &.{ zap_lib, "zest" });
-        if (std.Io.Dir.cwd().access(global_io, zest_subdir, .{})) |_| {
-            try source_roots.append(alloc, .{ .name = "zap_stdlib", .path = zest_subdir });
-        } else |_| {}
-    }
-
-    // Discover ALL .zap files from source roots (not import-driven — we want everything)
-    var source_files: std.ArrayListUnmanaged([]const u8) = .empty;
-    for (source_roots.items) |root| {
-        if (std.Io.Dir.cwd().openDir(global_io, root.path, .{ .iterate = true })) |dir_handle| {
-            var dir = dir_handle;
-            defer dir.close(global_io);
-            var it = dir.iterate();
-            while (it.next(global_io) catch null) |entry| {
-                if (entry.kind != .file) continue;
-                if (!std.mem.endsWith(u8, entry.name, ".zap")) continue;
-                const file_path = try std.fs.path.join(alloc, &.{ root.path, entry.name });
-                try source_files.append(alloc, file_path);
-            }
-        } else |_| {}
-    }
-
-    // Deduplicate source files after resolving them to their canonical
-    // filesystem paths. Documentation targets often include the same source
-    // root through the project, a local path dep, and the detected stdlib path.
-    // Those may be spelled differently (`./lib/foo.zap` vs `lib/foo.zap`) but
-    // must only be parsed once.
-    {
-        var seen = std.StringHashMap(void).init(alloc);
-        var deduped: std.ArrayListUnmanaged([]const u8) = .empty;
-        for (source_files.items) |sf| {
-            const key = std.Io.Dir.cwd().realPathFileAlloc(global_io, sf, alloc) catch try alloc.dupe(u8, sf);
-            if (!seen.contains(key)) {
-                try seen.put(key, {});
-                try deduped.append(alloc, sf);
-            }
-        }
-        source_files = deduped;
-    }
-
-    if (source_files.items.len == 0) {
-        std.debug.print("Error: no .zap source files found for documentation\n", .{});
-        std.process.exit(1);
-    }
-
-    // Read and parse all source files
-    var source_units: std.ArrayListUnmanaged(compiler.SourceUnit) = .empty;
-    var mapped_files: std.ArrayListUnmanaged(compiler.MappedFile) = .empty;
-
-    for (source_files.items) |sf| {
-        if (std.mem.eql(u8, std.fs.path.basename(sf), "build.zap")) continue;
-        const mapped = try compiler.mmapSourceFile(global_io, sf, alloc);
-        try mapped_files.append(alloc, mapped);
-        try source_units.append(alloc, .{ .file_path = sf, .source = mapped.bytes() });
-    }
-
-    // Parse and collect — this gives us the scope graph with all @doc attributes
-    var ctx = compiler.collectAllFromUnits(alloc, source_units.items, .{
-        .show_progress = false,
-    }) catch {
-        std.debug.print("Error: failed to parse source files for documentation\n", .{});
-        std.process.exit(1);
-    };
-
-    // Generate documentation
-    const doc_generator = zap.doc_generator;
-    doc_generator.generate(alloc, &ctx, .{
-        .project_name = config.name,
-        .project_version = config.version,
-        .source_url = config.source_url,
-        .landing_page = config.landing_page,
-        .doc_groups = config.doc_groups,
-        .output_dir = "docs",
-        .project_root = project_root,
-        .source_units = source_units.items,
-        .no_deps = no_deps,
-    }) catch |err| {
-        std.debug.print("Error generating documentation: {}\n", .{err});
-        std.process.exit(1);
-    };
-
-    std.debug.print("Documentation generated in docs/\n", .{});
-}
 
 // ---------------------------------------------------------------------------
 // Command: init
@@ -744,14 +525,6 @@ fn buildTarget(
         std.process.exit(1);
     };
     const config = manifest_eval.config;
-
-    if (config.kind == .doc) {
-        try generateDocsFromConfig(alloc, project_root, config, zap_lib_dir, false);
-        return .{
-            .path = try allocator.dupe(u8, "docs"),
-            .kind = .doc,
-        };
-    }
 
     // Detect zig lib dir
     const zig_lib_dir = zir_backend.detectZigLibDir(alloc) orelse blk: {
@@ -1235,7 +1008,6 @@ fn buildTarget(
         .bin => "zap-out/bin",
         .lib => "zap-out/lib",
         .obj => "zap-out/obj",
-        .doc => "docs",
     };
     std.Io.Dir.cwd().createDirPath(global_io, ".zap-cache") catch {};
     std.Io.Dir.cwd().createDirPath(global_io, out_dir) catch {};
@@ -1244,7 +1016,6 @@ fn buildTarget(
         .bin => output_name,
         .lib => try std.fmt.allocPrint(alloc, "{s}.a", .{output_name}),
         .obj => try std.fmt.allocPrint(alloc, "{s}.o", .{output_name}),
-        .doc => output_name,
     };
     const output_path = try std.fs.path.join(alloc, &.{ out_dir, output_filename });
 
@@ -1357,7 +1128,6 @@ fn buildTarget(
         .bin => 0,
         .lib => 1,
         .obj => 2,
-        .doc => 0, // doc target handled by cmdDoc, not buildTarget
     };
     zir_backend.compile(alloc, result.ir_program, .{
         .zig_lib_dir = zig_lib_dir,
@@ -1592,7 +1362,6 @@ const IncrementalWatchState = struct {
         const zap_lib_dir = detectZapLibDir(alloc);
         const manifest_eval = zap.builder.ctfeManifestDetailed(alloc, build_source, target_name, build_opts, zap_lib_dir) catch return null;
         const config = manifest_eval.config;
-        if (config.kind == .doc) return null;
 
         const zig_lib_dir = zir_backend.detectZigLibDir(alloc) orelse (extractEmbeddedZigLib(alloc) catch return null);
         const output_name_raw = if (config.asset_name) |an| (if (an.len > 0) an else config.name) else config.name;
@@ -1600,13 +1369,11 @@ const IncrementalWatchState = struct {
             .bin => "zap-out/bin",
             .lib => "zap-out/lib",
             .obj => "zap-out/obj",
-            .doc => "docs",
         };
         const output_filename = switch (config.kind) {
             .bin => output_name_raw,
             .lib => std.fmt.allocPrint(alloc, "{s}.a", .{output_name_raw}) catch return null,
             .obj => std.fmt.allocPrint(alloc, "{s}.o", .{output_name_raw}) catch return null,
-            .doc => output_name_raw,
         };
         const output_path = std.fs.path.join(alloc, &.{ out_dir, output_filename }) catch return null;
 
@@ -1614,7 +1381,6 @@ const IncrementalWatchState = struct {
             .bin => 0,
             .lib => 1,
             .obj => 2,
-            .doc => 0,
         };
         const optimize_mode_val: u8 = switch (config.optimize) {
             .debug => 0,
@@ -1983,9 +1749,7 @@ fn watchAndRebuild(
                 build_succeeded = true;
 
                 // Set up incremental state for subsequent builds
-                if (artifact.kind != .doc) {
-                    incr_state = IncrementalWatchState.init(allocator, project_root, target_name, build_opts, null);
-                }
+                incr_state = IncrementalWatchState.init(allocator, project_root, target_name, build_opts, null);
             }
 
             if (build_succeeded) {

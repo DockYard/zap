@@ -40,7 +40,7 @@ pub const BuildConfig = struct {
         pages: []const []const u8,
     };
 
-    pub const Kind = enum { bin, lib, obj, doc };
+    pub const Kind = enum { bin, lib, obj };
     pub const Optimize = enum { debug, release_safe, release_fast, release_small };
 
     pub const Dep = struct {
@@ -300,8 +300,6 @@ fn constValueToBuildConfig(alloc: std.mem.Allocator, val: zap.ctfe.ConstValue) !
                             .lib
                         else if (std.mem.eql(u8, a, "obj"))
                             .obj
-                        else if (std.mem.eql(u8, a, "doc"))
-                            .doc
                         else
                             .bin,
                         else => .bin,

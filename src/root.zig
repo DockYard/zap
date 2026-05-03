@@ -44,7 +44,6 @@ pub const capability_inference = @import("capability_inference.zig");
 pub const lockfile = @import("lockfile.zig");
 pub const monomorphize = @import("monomorphize.zig");
 pub const env = @import("env.zig");
-pub const doc_generator = @import("doc_generator.zig");
 pub const signature = @import("signature.zig");
 
 test {

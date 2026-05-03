@@ -417,7 +417,7 @@ test "CLI: zap test runs Zest cases discovered by project-root relative pattern"
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "2 assertions, 0 failures") != null);
 }
 
-test "CLI: run doc target generates documentation without executable root" {
+test "CLI: zap run doc-runner target generates documentation via Zap-side pipeline" {
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -425,6 +425,11 @@ test "CLI: run doc target generates documentation without executable root" {
 
     tmp_dir.dir.createDirPath(getTestIo(), "lib") catch return error.Unexpected;
 
+    // The doc pipeline lives entirely in Zap source: `Zap.Doc.Builder`'s
+    // compile-time `__using__` macro reflects on the supplied paths and
+    // bakes manifest functions; the user's `DocsRunner.main/1` body then
+    // calls `write_docs_to/4` to render and persist HTML pages. The CLI
+    // is just a thin shell that builds the binary and runs it.
     const build_source =
         \\pub struct DocExample.Builder {
         \\  pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
@@ -433,7 +438,8 @@ test "CLI: run doc target generates documentation without executable root" {
         \\        %Zap.Manifest{
         \\          name: "doc_example",
         \\          version: "0.1.0",
-        \\          kind: :doc,
+        \\          kind: :bin,
+        \\          root: "DocExample.DocsRunner.main/1",
         \\          paths: ["lib/**/*.zap"],
         \\          deps: [{:zap_stdlib, {:path, "lib"}}]
         \\        }
@@ -465,9 +471,22 @@ test "CLI: run doc target generates documentation without executable root" {
         \\}
     ;
 
+    const docs_runner_source =
+        \\pub struct DocExample.DocsRunner {
+        \\  use Zap.Doc.Builder, paths: ["lib/**/*.zap"]
+        \\
+        \\  pub fn main(_args :: [String]) -> String {
+        \\    _count = write_docs_to("docs", "DocExample", "0.1.0", "")
+        \\    "Documentation generated in docs/"
+        \\  }
+        \\}
+    ;
+
     tmp_dir.dir.writeFile(getTestIo(), .{ .sub_path = "build.zap", .data = build_source }) catch
         return error.Unexpected;
     tmp_dir.dir.writeFile(getTestIo(), .{ .sub_path = "lib/doc_example.zap", .data = lib_source }) catch
+        return error.Unexpected;
+    tmp_dir.dir.writeFile(getTestIo(), .{ .sub_path = "lib/docs_runner.zap", .data = docs_runner_source }) catch
         return error.Unexpected;
 
     const tmp_dir_path = tmp_dir.dir.realPathFileAlloc(getTestIo(), ".", allocator) catch
@@ -496,9 +515,11 @@ test "CLI: run doc target generates documentation without executable root" {
     };
 
     try std.testing.expectEqual(@as(u8, 0), exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "root entry point") == null);
     tmp_dir.dir.access(getTestIo(), "docs/index.html", .{}) catch return error.Unexpected;
     tmp_dir.dir.access(getTestIo(), "docs/structs/DocExample.html", .{}) catch return error.Unexpected;
+    tmp_dir.dir.access(getTestIo(), "docs/structs/DocProtocol.html", .{}) catch return error.Unexpected;
+    tmp_dir.dir.access(getTestIo(), "docs/structs/DocUnion.html", .{}) catch return error.Unexpected;
+    tmp_dir.dir.access(getTestIo(), "docs/search-index.json", .{}) catch return error.Unexpected;
 
     const generated_html = tmp_dir.dir.readFileAlloc(
         getTestIo(),
@@ -510,16 +531,6 @@ test "CLI: run doc target generates documentation without executable root" {
     try std.testing.expect(std.mem.indexOf(u8, generated_html, "A documented example struct.") != null);
     try std.testing.expect(std.mem.indexOf(u8, generated_html, "Returns a greeting.") != null);
 
-    const generated_markdown = tmp_dir.dir.readFileAlloc(
-        getTestIo(),
-        "docs/api/DocExample.md",
-        allocator,
-        .limited(256 * 1024),
-    ) catch return error.Unexpected;
-    defer allocator.free(generated_markdown);
-    try std.testing.expect(std.mem.indexOf(u8, generated_markdown, "A documented example struct.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, generated_markdown, "Returns a greeting.") != null);
-
     const protocol_html = tmp_dir.dir.readFileAlloc(
         getTestIo(),
         "docs/structs/DocProtocol.html",
@@ -528,8 +539,8 @@ test "CLI: run doc target generates documentation without executable root" {
     ) catch return error.Unexpected;
     defer allocator.free(protocol_html);
     try std.testing.expect(std.mem.indexOf(u8, protocol_html, "A documented example protocol.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, protocol_html, "pub protocol") != null);
-    try std.testing.expect(std.mem.indexOf(u8, protocol_html, "convert(value :: String) -&gt; String") != null);
+    try std.testing.expect(std.mem.indexOf(u8, protocol_html, "Required Functions") != null);
+    try std.testing.expect(std.mem.indexOf(u8, protocol_html, "convert") != null);
 
     const union_html = tmp_dir.dir.readFileAlloc(
         getTestIo(),
@@ -539,8 +550,20 @@ test "CLI: run doc target generates documentation without executable root" {
     ) catch return error.Unexpected;
     defer allocator.free(union_html);
     try std.testing.expect(std.mem.indexOf(u8, union_html, "A documented example union.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, union_html, "pub union") != null);
-    try std.testing.expect(std.mem.indexOf(u8, union_html, "Value :: String") != null);
+    try std.testing.expect(std.mem.indexOf(u8, union_html, "Variants") != null);
+    try std.testing.expect(std.mem.indexOf(u8, union_html, "Value") != null);
+
+    const search_index = tmp_dir.dir.readFileAlloc(
+        getTestIo(),
+        "docs/search-index.json",
+        allocator,
+        .limited(256 * 1024),
+    ) catch return error.Unexpected;
+    defer allocator.free(search_index);
+    try std.testing.expect(std.mem.indexOf(u8, search_index, "\"struct\":\"DocExample\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, search_index, "\"struct\":\"DocProtocol\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, search_index, "\"struct\":\"DocUnion\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, search_index, "\"url\":\"structs/DocExample.html\"") != null);
 }
 
 // ============================================================

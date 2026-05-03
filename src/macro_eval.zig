@@ -2489,8 +2489,7 @@ fn makeFunctionRef(
 }
 
 /// Convert a 0-based byte offset into a 1-based line number using the
-/// source bytes. Returns 0 when `offset` exceeds `source.len`, mirroring
-/// the convention used by `doc_generator.computeLineNumber`.
+/// source bytes. Returns 0 when `offset` exceeds `source.len`.
 fn lineNumberFromOffset(source: []const u8, offset: u32) u32 {
     if (offset > source.len) return 0;
     var line: u32 = 1;
