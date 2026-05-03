@@ -14,6 +14,57 @@ const ast = zap.ast;
 const runtime_source = @embedFile("runtime.zig");
 const lexer = @import("lexer.zig");
 
+/// Per-stage timing diagnostic. Gated by `ZAP_PROFILE`: production builds
+/// stay quiet, but `ZAP_PROFILE=1 zap test` (or any compile-driving
+/// command) emits `[stage NAME] ms=N` lines so a regression hunt can
+/// pinpoint which compile stage owns a slowdown without recompiling
+/// the toolchain. Tracks the inflection points the task-#15 PART 2
+/// investigation identified — `compileStagedStructHir` (per-struct
+/// HIR-stage type-check vs HIR-build split) and the per-wave Phase
+/// boundaries (HIR collect, monomorphize, IR build, analysis+contify).
+const ZapTimer = struct {
+    last_ns: i128,
+
+    fn nowNs() i128 {
+        var ts: std.c.timespec = .{ .sec = 0, .nsec = 0 };
+        _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+        return @as(i128, ts.sec) * 1_000_000_000 + @as(i128, ts.nsec);
+    }
+
+    pub fn start() ZapTimer {
+        return .{ .last_ns = nowNs() };
+    }
+
+    pub fn lapMs(self: *ZapTimer) u64 {
+        const now = nowNs();
+        const ms = @as(u64, @intCast(@divTrunc(now - self.last_ns, 1_000_000)));
+        self.last_ns = now;
+        return ms;
+    }
+
+    pub fn readMs(self: *const ZapTimer) u64 {
+        return @as(u64, @intCast(@divTrunc(nowNs() - self.last_ns, 1_000_000)));
+    }
+
+    pub fn reset(self: *ZapTimer) void {
+        self.last_ns = nowNs();
+    }
+};
+
+/// True when `ZAP_PROFILE` is set in the process environment. Cached on
+/// first call so the env scan runs once per process. Use as a guard
+/// around `std.debug.print` calls in stage-timing diagnostics.
+fn profilingEnabled() bool {
+    const Cache = struct {
+        var inited: bool = false;
+        var enabled: bool = false;
+    };
+    if (Cache.inited) return Cache.enabled;
+    Cache.enabled = std.c.getenv("ZAP_PROFILE") != null;
+    Cache.inited = true;
+    return Cache.enabled;
+}
+
 pub const CompileResult = struct {
     ir_program: ir.Program,
     analysis_context: ?zap.escape_lattice.AnalysisContext = null,
@@ -1078,8 +1129,10 @@ fn stagedMacroExpandAndDesugar(
     var hir_results: std.ArrayListUnmanaged(StructHirResult) = .empty;
     var group_id_offset: u32 = 0;
 
+    var staged_timer = ZapTimer.start();
     for (struct_order) |struct_name| {
         const original = lookupStructProgramInSlice(original_structs, struct_name) orelse continue;
+        staged_timer.reset();
         const desugared = try expandAndDesugarStagedStruct(
             alloc,
             original,
@@ -1088,6 +1141,7 @@ fn stagedMacroExpandAndDesugar(
             diag_engine,
             &compiled_executor,
         );
+        const expand_ms = staged_timer.lapMs();
         try expanded_structs.append(alloc, .{ .name = original.name, .program = desugared });
         try seen_structs.put(original.name, {});
 
@@ -1101,6 +1155,7 @@ fn stagedMacroExpandAndDesugar(
             shared_store,
             group_id_offset,
         );
+        const hir_ms = staged_timer.lapMs();
         group_id_offset = hir_result.next_group_id;
         try hir_results.append(alloc, hir_result);
 
@@ -1112,6 +1167,10 @@ fn stagedMacroExpandAndDesugar(
             shared_store,
             group_id_offset,
         );
+        const rebuild_ms = staged_timer.lapMs();
+        if (profilingEnabled() and (expand_ms + hir_ms + rebuild_ms) >= 100) {
+            std.debug.print("\n[staged struct={s} expand+desugar_ms={d} stagedHIR_ms={d} rebuildIR_ms={d}]\n", .{ struct_name, expand_ms, hir_ms, rebuild_ms });
+        }
     }
 
     for (original_structs) |original| {
@@ -1323,9 +1382,11 @@ fn compileStagedStructHir(
     }
     shared_store.inferred_signatures.clearRetainingCapacity();
 
+    var sub_timer = ZapTimer.start();
     var type_checker = zap.types.TypeChecker.initWithSharedStore(alloc, shared_store, interner, &collector.graph);
     defer type_checker.deinit();
     type_checker.checkProgram(desugared) catch {};
+    const tc_ms = sub_timer.lapMs();
     for (type_checker.errors.items) |type_err| {
         diag_engine.reportDiagnostic(.{
             .severity = type_err.severity orelse .@"error",
@@ -1340,6 +1401,7 @@ fn compileStagedStructHir(
 
     var hir_builder = zap.hir.HirBuilder.init(alloc, interner, &collector.graph, shared_store);
     hir_builder.next_group_id = group_id_offset;
+    sub_timer.reset();
     const hir_program = hir_builder.buildProgram(desugared) catch {
         for (hir_builder.errors.items) |hir_err| {
             diag_engine.err(hir_err.message, hir_err.span) catch {};
@@ -1348,6 +1410,10 @@ fn compileStagedStructHir(
     };
     for (hir_builder.errors.items) |hir_err| {
         diag_engine.err(hir_err.message, hir_err.span) catch {};
+    }
+    const hb_ms = sub_timer.lapMs();
+    if (profilingEnabled() and (tc_ms + hb_ms) >= 100) {
+        std.debug.print("\n[hir-stage struct={s} type_check_ms={d} hir_build_ms={d}]\n", .{ struct_name, tc_ms, hb_ms });
     }
     if (diag_engine.errorCount() > error_baseline) return error.HirFailed;
 
@@ -1657,6 +1723,8 @@ pub fn compileStructByStruct(
     // Phase 1: every struct → HIR. Shared TypeStore and globally-
     // unique group IDs let later phases monomorphize across struct
     // boundaries.
+    var phase_timer = ZapTimer.start();
+    var per_struct_timer = ZapTimer.start();
     var hir_results: std.ArrayListUnmanaged(StructHirResult) = .empty;
     var group_id_offset: u32 = 0;
     for (struct_order, 0..) |mod_name, mod_idx| {
@@ -1668,9 +1736,19 @@ pub fn compileStructByStruct(
         // engine inside the helper; the loop continues so other
         // structs still compile and the user sees as many errors as
         // possible in one run.
+        per_struct_timer.reset();
         const hir_result = compileSingleStructHir(alloc, ctx, mod_name, mod_program, shared_store, group_id_offset, options) catch continue;
+        const hir_elapsed_ms = per_struct_timer.readMs();
+        if (profilingEnabled() and hir_elapsed_ms >= 100) {
+            std.debug.print("\n[stage HIR struct={s}] ms={d}\n", .{ mod_name, hir_elapsed_ms });
+        }
         group_id_offset = hir_result.next_group_id;
         hir_results.append(alloc, hir_result) catch return error.OutOfMemory;
+    }
+    if (profilingEnabled()) {
+        std.debug.print("\n[stage Phase1-AllHIR] ms={d}\n", .{phase_timer.lapMs()});
+    } else {
+        _ = phase_timer.lapMs();
     }
 
     // Phase 2: merge per-struct HIR programs.
@@ -1699,10 +1777,20 @@ pub fn compileStructByStruct(
         .protocols = all_hir_protocols.toOwnedSlice(alloc) catch return error.OutOfMemory,
         .impls = all_hir_impls.toOwnedSlice(alloc) catch return error.OutOfMemory,
     };
+    if (profilingEnabled()) {
+        std.debug.print("\n[stage Phase2-MergeHIR] ms={d}\n", .{phase_timer.lapMs()});
+    } else {
+        _ = phase_timer.lapMs();
+    }
 
     // Phase 3: whole-program monomorphization.
     var mono_next = group_id_offset;
     combined_hir = try pipeline.runMonomorphize(&combined_hir, shared_store, &mono_next);
+    if (profilingEnabled()) {
+        std.debug.print("\n[stage Phase3-Monomorphize] ms={d}\n", .{phase_timer.lapMs()});
+    } else {
+        _ = phase_timer.lapMs();
+    }
 
     // Phase 4: each struct's HIR → IR. Function IDs are already
     // globally unique from the HIR stage (group_id_offset advancement
@@ -1717,9 +1805,14 @@ pub fn compileStructByStruct(
             .top_functions = &.{},
         };
         const mod_name_str = if (mod.name.parts.len > 0) ctx.interner.get(mod.name.parts[mod.name.parts.len - 1]) else "unknown";
+        per_struct_timer.reset();
         const mod_ir = compileHirToIr(alloc, ctx, mod_name_str, &single_mod_hir, shared_store, options, &next_try_id, &combined_hir) catch {
             continue;
         };
+        const ir_elapsed_ms = per_struct_timer.readMs();
+        if (profilingEnabled() and ir_elapsed_ms >= 100) {
+            std.debug.print("\n[stage IR struct={s}] ms={d}\n", .{ mod_name_str, ir_elapsed_ms });
+        }
         for (mod_ir.functions) |func| {
             all_functions.append(alloc, func) catch return error.OutOfMemory;
         }
@@ -1744,6 +1837,12 @@ pub fn compileStructByStruct(
         }
     }
 
+    if (profilingEnabled()) {
+        std.debug.print("\n[stage Phase4-AllIR] ms={d}\n", .{phase_timer.lapMs()});
+    } else {
+        _ = phase_timer.lapMs();
+    }
+
     // Phase 5: analysis + contification on the merged IR.
     var merged_ir = ir.Program{
         .functions = all_functions.items,
@@ -1751,6 +1850,11 @@ pub fn compileStructByStruct(
         .entry = entry_id,
     };
     const analysis_result = try pipeline.runAnalysisAndContify(&merged_ir);
+    if (profilingEnabled()) {
+        std.debug.print("\n[stage Phase5-AnalysisAndContify] ms={d}\n", .{phase_timer.lapMs()});
+    } else {
+        _ = phase_timer.lapMs();
+    }
 
     // Single rendering pass for all per-struct diagnostics. Each
     // sub-pipeline accumulated into the shared engine without flushing,
