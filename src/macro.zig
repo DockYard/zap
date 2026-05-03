@@ -996,22 +996,38 @@ pub const MacroEngine = struct {
             .binary_op => |bo| {
                 const macro_name = binopMacroName(bo.op);
 
+                // Expand operands first so a chain like `a <> b <> c <> d`
+                // collapses in ONE fixed-point iteration instead of peeling
+                // one outer layer per pass. Without this, the outer macro
+                // expansion produced `Concatenable.concat(unexpanded_inner,
+                // rhs)`, the fixed-point loop re-walked every struct in the
+                // program to peel the next layer, and the work scaled as
+                // O(N² · structs) where N is the chain depth — adding a
+                // function call to a 13-`<>` chain in `lib/zap/doc.zap`
+                // pushed `zap test` from 53s to 3+ minutes (task #15
+                // PART 2). Operand-first expansion fixes the depth blowup
+                // while keeping the macro semantically identical: Kernel's
+                // `<>` body only substitutes its operands, it does not
+                // pattern-match on un-expanded forms.
+                const lhs_pre = try self.expandExpr(bo.lhs);
+                const rhs_pre = try self.expandExpr(bo.rhs);
+
                 // Try operator-named function first so a local `pub fn OP` shadows
                 // any Kernel macro of the same name (matches normal scope rules).
-                if (try self.tryDispatchToFunction(macro_name, &.{ bo.lhs, bo.rhs }, bo.meta)) |result| {
+                if (try self.tryDispatchToFunction(macro_name, &.{ lhs_pre.expr, rhs_pre.expr }, bo.meta)) |result| {
                     return .{ .expr = result, .changed = true };
                 }
 
                 // Then try Kernel/imported operator macro.
-                if (self.tryExpandBinaryMacro(macro_name, bo.lhs, bo.rhs, bo.meta)) |result| {
+                if (self.tryExpandBinaryMacro(macro_name, lhs_pre.expr, rhs_pre.expr, bo.meta)) |result| {
                     return .{ .expr = result, .changed = true };
                 }
 
                 // Bootstrap fallback: and/or get short-circuit case expansion
                 // (Kernel.and/or macros take precedence when available)
                 if (bo.op == .and_op) {
-                    const lhs_exp = (try self.expandExpr(bo.lhs)).expr;
-                    const rhs_exp = (try self.expandExpr(bo.rhs)).expr;
+                    const lhs_exp = lhs_pre.expr;
+                    const rhs_exp = rhs_pre.expr;
                     const false_pat = try self.create(ast.Pattern, .{ .literal = .{ .bool_lit = .{ .meta = bo.meta, .value = false } } });
                     const wild_pat = try self.create(ast.Pattern, .{ .wildcard = .{ .meta = bo.meta } });
                     const false_expr = try self.create(ast.Expr, .{ .bool_literal = .{ .meta = bo.meta, .value = false } });
@@ -1023,8 +1039,8 @@ pub const MacroEngine = struct {
                     return .{ .expr = try self.create(ast.Expr, .{ .case_expr = .{ .meta = bo.meta, .scrutinee = lhs_exp, .clauses = clauses } }), .changed = true };
                 }
                 if (bo.op == .or_op) {
-                    const lhs_exp = (try self.expandExpr(bo.lhs)).expr;
-                    const rhs_exp = (try self.expandExpr(bo.rhs)).expr;
+                    const lhs_exp = lhs_pre.expr;
+                    const rhs_exp = rhs_pre.expr;
                     const false_pat = try self.create(ast.Pattern, .{ .literal = .{ .bool_lit = .{ .meta = bo.meta, .value = false } } });
                     const wild_pat = try self.create(ast.Pattern, .{ .wildcard = .{ .meta = bo.meta } });
                     const rhs_body2 = try self.allocSlice(ast.Stmt, &.{.{ .expr = rhs_exp }});
@@ -1035,13 +1051,12 @@ pub const MacroEngine = struct {
                     return .{ .expr = try self.create(ast.Expr, .{ .case_expr = .{ .meta = bo.meta, .scrutinee = lhs_exp, .clauses = clauses } }), .changed = true };
                 }
 
-                // Bootstrap fallback: other operators pass through with recursive expansion
-                const lhs = try self.expandExpr(bo.lhs);
-                const rhs = try self.expandExpr(bo.rhs);
-                if (!lhs.changed and !rhs.changed) return .{ .expr = expr, .changed = false };
+                // Bootstrap fallback: other operators pass through with the
+                // pre-expanded operands.
+                if (!lhs_pre.changed and !rhs_pre.changed) return .{ .expr = expr, .changed = false };
                 return .{
                     .expr = try self.create(ast.Expr, .{
-                        .binary_op = .{ .meta = bo.meta, .op = bo.op, .lhs = lhs.expr, .rhs = rhs.expr },
+                        .binary_op = .{ .meta = bo.meta, .op = bo.op, .lhs = lhs_pre.expr, .rhs = rhs_pre.expr },
                     }),
                     .changed = true,
                 };

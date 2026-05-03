@@ -691,6 +691,35 @@ pub struct Zap.Doc {
     }
   }
 
+  # task #15 PART 2 — super-linear compile-time scaling for long `<>` chains
+  # containing function calls. Keep this comment block in sync with the
+  # task description so a follow-up session can paste the probe back in,
+  # reproduce the blowup, and instrument the offending pass. Restoring
+  # the probe inflates `zap test` from ~17s to 3+ minutes, so it MUST NOT
+  # land in the source tree until the underlying bug is fixed.
+  #
+  #   pub fn _probe_arity(entry :: %{Atom => Term}, kind_label :: String) -> String {
+  #     module_name = Map.get(entry, :module, "")
+  #     fn_name = Map.get(entry, :name, "")
+  #     arity = Map.get(entry, :arity, 0)
+  #     doc_text = Map.get(entry, :doc, "")
+  #     arity_str = Integer.to_string(arity)
+  #     "{\"struct\":\"" <> json_escape(module_name) <> "\",\"type\":\"" <>
+  #       kind_label <> "\",\"name\":\"" <> json_escape(fn_name) <> "/" <>
+  #       arity_str <> "\",\"summary\":\"" <>
+  #       json_escape(first_sentence(doc_text)) <> "\",\"url\":\"structs/" <>
+  #       json_escape(module_name) <> ".html#" <> json_escape(fn_name) <>
+  #       "-" <> arity_str <> "\"},\n"
+  #   }
+  #
+  # Bisect data:
+  #   * baseline `zap test`                                       17s
+  #   * +13 `<>` chain over typed Strings only (no fn calls)      53s
+  #   * +13 `<>` chain with one inner function call                3+ min
+  #   * Triggers regardless of whether the call returns a Term-derived
+  #     value or a literal — the chain length × function-call count
+  #     scaling is what compounds, not Term unboxing per se.
+
   @doc = """
     Strip the trailing `,\\n` separator left on each per-entry
     string by `*_search_entry`. Recursive walkers keep their bodies
