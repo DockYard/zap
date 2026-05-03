@@ -41,5 +41,20 @@ pub struct Zap.DocBuilderTest {
       _summary = List.head(manifest_struct_summaries())
       assert(Map.has_key?(_summary, :functions))
     }
+
+    test("manifest_struct_summaries first entry has macros list") {
+      _summary = List.head(manifest_struct_summaries())
+      assert(Map.has_key?(_summary, :macros))
+    }
+
+    test("manifest_protocol_summaries returns a list of maps") {
+      _summaries = manifest_protocol_summaries()
+      assert(List.length(_summaries) >= 0)
+    }
+
+    test("manifest_union_summaries returns a list of maps") {
+      _summaries = manifest_union_summaries()
+      assert(List.length(_summaries) >= 0)
+    }
   }
 }

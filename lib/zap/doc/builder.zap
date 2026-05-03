@@ -51,6 +51,27 @@ pub struct Zap.Doc.Builder {
         source_file: map_get(struct_info(_ref), :source_file, ""),
         is_private: map_get(struct_info(_ref), :is_private, false),
         functions: struct_functions(_ref),
+        macros: struct_macros(_ref),
+      }
+    }
+
+    _protocol_summaries = for _ref <- _protocol_refs {
+      %{
+        name: map_get(struct_info(_ref), :name, ""),
+        doc: map_get(struct_info(_ref), :doc, ""),
+        source_file: map_get(struct_info(_ref), :source_file, ""),
+        is_private: map_get(struct_info(_ref), :is_private, false),
+        required_functions: protocol_required_functions(_ref),
+      }
+    }
+
+    _union_summaries = for _ref <- _union_refs {
+      %{
+        name: map_get(struct_info(_ref), :name, ""),
+        doc: map_get(struct_info(_ref), :doc, ""),
+        source_file: map_get(struct_info(_ref), :source_file, ""),
+        is_private: map_get(struct_info(_ref), :is_private, false),
+        variants: union_variants(_ref),
       }
     }
 
@@ -69,6 +90,14 @@ pub struct Zap.Doc.Builder {
 
       pub fn manifest_struct_summaries() -> [%{Atom => Term}] {
         unquote(_struct_summaries)
+      }
+
+      pub fn manifest_protocol_summaries() -> [%{Atom => Term}] {
+        unquote(_protocol_summaries)
+      }
+
+      pub fn manifest_union_summaries() -> [%{Atom => Term}] {
+        unquote(_union_summaries)
       }
     }
   }
