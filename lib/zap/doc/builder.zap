@@ -48,6 +48,9 @@ pub struct Zap.Doc.Builder {
       %{
         name: map_get(struct_info(_ref), :name, ""),
         doc: map_get(struct_info(_ref), :doc, ""),
+        source_file: map_get(struct_info(_ref), :source_file, ""),
+        is_private: map_get(struct_info(_ref), :is_private, false),
+        functions: struct_functions(_ref),
       }
     }
 
@@ -64,7 +67,7 @@ pub struct Zap.Doc.Builder {
         unquote(_union_names)
       }
 
-      pub fn manifest_struct_summaries() -> [%{Atom => String}] {
+      pub fn manifest_struct_summaries() -> [%{Atom => Term}] {
         unquote(_struct_summaries)
       }
     }

@@ -1882,6 +1882,14 @@ fn debugPrintCtValue(val: CtValue, max_depth: u32) void {
 }
 
 fn unwrapAstLiteral(val: CtValue) CtValue {
+    // A bare atom carrying a leading `:` is unambiguously an atom
+    // literal at the CtValue layer — variables never start with `:`,
+    // so the prefix is the only thing that distinguishes a stored
+    // atom literal from a variable reference. Strip it so equality
+    // and map-key comparisons match the unwrapped lookup keys.
+    if (val == .atom and val.atom.len > 0 and val.atom[0] == ':') {
+        return CtValue{ .atom = val.atom[1..] };
+    }
     if (val != .tuple or val.tuple.elems.len != 3) return val;
     if (val.tuple.elems[2] != .nil) return val;
     const form = val.tuple.elems[0];
@@ -2110,10 +2118,10 @@ fn sourceGraphImplsIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!Ct
         const target_name = try structNameToString(env.alloc, ctx.interner, impl_entry.target_type);
 
         const entries = try env.alloc.alloc(CtValue.CtMapEntry, 4);
-        entries[0] = .{ .key = .{ .atom = "protocol" }, .value = .{ .string = protocol_name } };
-        entries[1] = .{ .key = .{ .atom = "target" }, .value = .{ .string = target_name } };
-        entries[2] = .{ .key = .{ .atom = "source_file" }, .value = .{ .string = path } };
-        entries[3] = .{ .key = .{ .atom = "is_private" }, .value = .{ .bool_val = impl_entry.is_private } };
+        entries[0] = .{ .key = .{ .atom = ":protocol" }, .value = .{ .string = protocol_name } };
+        entries[1] = .{ .key = .{ .atom = ":target" }, .value = .{ .string = target_name } };
+        entries[2] = .{ .key = .{ .atom = ":source_file" }, .value = .{ .string = path } };
+        entries[3] = .{ .key = .{ .atom = ":is_private" }, .value = .{ .bool_val = impl_entry.is_private } };
         const map_id = env.store.alloc(env.alloc, .map, null);
         try result_list.append(env.alloc, CtValue{ .map = .{ .alloc_id = map_id, .entries = entries } });
     }
@@ -2172,8 +2180,8 @@ fn unionVariantsIntrinsic(env: *Env, args: []const CtValue) MacroEvalError!CtVal
     for (decl.variants) |variant| {
         const sig = signature.buildUnionVariantSignature(env.alloc, variant, ctx.interner);
         const entries = try env.alloc.alloc(CtValue.CtMapEntry, 2);
-        entries[0] = .{ .key = .{ .atom = "name" }, .value = .{ .string = ctx.interner.get(variant.name) } };
-        entries[1] = .{ .key = .{ .atom = "signature" }, .value = .{ .string = sig } };
+        entries[0] = .{ .key = .{ .atom = ":name" }, .value = .{ .string = ctx.interner.get(variant.name) } };
+        entries[1] = .{ .key = .{ .atom = ":signature" }, .value = .{ .string = sig } };
         const map_id = env.store.alloc(env.alloc, .map, null);
         try result_list.append(env.alloc, CtValue{ .map = .{ .alloc_id = map_id, .entries = entries } });
     }
@@ -2214,8 +2222,8 @@ fn protocolRequiredFunctionsIntrinsic(env: *Env, args: []const CtValue) MacroEva
     for (decl.functions) |fn_sig| {
         const sig = signature.buildProtocolFunctionSignature(env.alloc, fn_sig, ctx.interner);
         const entries = try env.alloc.alloc(CtValue.CtMapEntry, 2);
-        entries[0] = .{ .key = .{ .atom = "name" }, .value = .{ .string = ctx.interner.get(fn_sig.name) } };
-        entries[1] = .{ .key = .{ .atom = "signature" }, .value = .{ .string = sig } };
+        entries[0] = .{ .key = .{ .atom = ":name" }, .value = .{ .string = ctx.interner.get(fn_sig.name) } };
+        entries[1] = .{ .key = .{ .atom = ":signature" }, .value = .{ .string = sig } };
         const map_id = env.store.alloc(env.alloc, .map, null);
         try result_list.append(env.alloc, CtValue{ .map = .{ .alloc_id = map_id, .entries = entries } });
     }
@@ -2321,10 +2329,10 @@ fn makeDeclInfoMap(
     const doc_text = extractDocAttributeText(env.alloc, ctx.interner, attributes) orelse "";
 
     const entries = try env.alloc.alloc(CtValue.CtMapEntry, 4);
-    entries[0] = .{ .key = .{ .atom = "name" }, .value = .{ .string = env.alloc.dupe(u8, name) catch name } };
-    entries[1] = .{ .key = .{ .atom = "source_file" }, .value = .{ .string = source_path } };
-    entries[2] = .{ .key = .{ .atom = "is_private" }, .value = .{ .bool_val = is_private } };
-    entries[3] = .{ .key = .{ .atom = "doc" }, .value = .{ .string = doc_text } };
+    entries[0] = .{ .key = .{ .atom = ":name" }, .value = .{ .string = env.alloc.dupe(u8, name) catch name } };
+    entries[1] = .{ .key = .{ .atom = ":source_file" }, .value = .{ .string = source_path } };
+    entries[2] = .{ .key = .{ .atom = ":is_private" }, .value = .{ .bool_val = is_private } };
+    entries[3] = .{ .key = .{ .atom = ":doc" }, .value = .{ .string = doc_text } };
     const id = env.store.alloc(env.alloc, .map, null);
     return CtValue{ .map = .{ .alloc_id = id, .entries = entries } };
 }
@@ -2443,13 +2451,14 @@ fn makeFunctionRef(
     const signatures_value = CtValue{ .list = .{ .alloc_id = sig_list_id, .elems = sig_elems.items } };
 
     const entries = try env.alloc.alloc(CtValue.CtMapEntry, 7);
-    entries[0] = .{ .key = .{ .atom = "name" }, .value = .{ .string = name } };
-    entries[1] = .{ .key = .{ .atom = "arity" }, .value = .{ .int = @intCast(arity) } };
-    entries[2] = .{ .key = .{ .atom = "visibility" }, .value = .{ .atom = @tagName(visibility) } };
-    entries[3] = .{ .key = .{ .atom = "doc" }, .value = .{ .string = doc_text } };
-    entries[4] = .{ .key = .{ .atom = "source_file" }, .value = .{ .string = source_file } };
-    entries[5] = .{ .key = .{ .atom = "source_line" }, .value = .{ .int = @intCast(source_line) } };
-    entries[6] = .{ .key = .{ .atom = "signatures" }, .value = signatures_value };
+    entries[0] = .{ .key = .{ .atom = ":name" }, .value = .{ .string = name } };
+    entries[1] = .{ .key = .{ .atom = ":arity" }, .value = .{ .int = @intCast(arity) } };
+    const visibility_atom = std.fmt.allocPrint(env.alloc, ":{s}", .{@tagName(visibility)}) catch ":public";
+    entries[2] = .{ .key = .{ .atom = ":visibility" }, .value = .{ .atom = visibility_atom } };
+    entries[3] = .{ .key = .{ .atom = ":doc" }, .value = .{ .string = doc_text } };
+    entries[4] = .{ .key = .{ .atom = ":source_file" }, .value = .{ .string = source_file } };
+    entries[5] = .{ .key = .{ .atom = ":source_line" }, .value = .{ .int = @intCast(source_line) } };
+    entries[6] = .{ .key = .{ .atom = ":signatures" }, .value = signatures_value };
     const id = env.store.alloc(env.alloc, .map, null);
     return CtValue{ .map = .{ .alloc_id = id, .entries = entries } };
 }
@@ -2813,8 +2822,8 @@ test "eval: map_get returns matching value or default" {
     defer env.deinit();
 
     const entries = try alloc.alloc(CtValue.CtMapEntry, 2);
-    entries[0] = .{ .key = .{ .atom = "name" }, .value = .{ .string = "run" } };
-    entries[1] = .{ .key = .{ .atom = "arity" }, .value = .{ .int = 0 } };
+    entries[0] = .{ .key = .{ .atom = ":name" }, .value = .{ .string = "run" } };
+    entries[1] = .{ .key = .{ .atom = ":arity" }, .value = .{ .int = 0 } };
     const map_value = CtValue{ .map = .{ .alloc_id = store.alloc(alloc, .map, null), .entries = entries } };
 
     const name_key = try ast_data.makeTuple3(alloc, &store, .{ .atom = ":name" }, try ast_data.emptyList(alloc, &store), .nil);

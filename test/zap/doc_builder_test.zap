@@ -26,5 +26,20 @@ pub struct Zap.DocBuilderTest {
       assert(Map.has_key?(_summary, :name))
       assert(Map.has_key?(_summary, :doc))
     }
+
+    test("manifest_struct_summaries first entry has source_file") {
+      _summary = List.head(manifest_struct_summaries())
+      assert(Map.has_key?(_summary, :source_file))
+    }
+
+    test("manifest_struct_summaries first entry has is_private") {
+      _summary = List.head(manifest_struct_summaries())
+      assert(Map.has_key?(_summary, :is_private))
+    }
+
+    test("manifest_struct_summaries first entry has functions list") {
+      _summary = List.head(manifest_struct_summaries())
+      assert(Map.has_key?(_summary, :functions))
+    }
   }
 }

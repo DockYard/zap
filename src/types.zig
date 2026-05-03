@@ -350,6 +350,13 @@ pub const TypeStore = struct {
 
     /// Resolve a type name string to a TypeId
     pub fn resolveTypeName(_: *const TypeStore, name: []const u8) ?TypeId {
+        // `Term` is the surface name for the dynamic-value type that
+        // arises when a compile-time map literal mixes value types
+        // (e.g. baked reflection summaries with both `String` doc
+        // text and `Bool` is_private). It's distinct from `any`
+        // (which maps to UNKNOWN) — Term is the actual unioned-value
+        // category produced by heterogeneous CtValue maps.
+        if (std.mem.eql(u8, name, "Term")) return TERM;
         if (std.mem.eql(u8, name, "Bool")) return BOOL;
         if (std.mem.eql(u8, name, "String")) return STRING;
         if (std.mem.eql(u8, name, "Atom")) return ATOM;
