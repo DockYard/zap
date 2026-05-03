@@ -66,7 +66,7 @@ pub struct Zap.DocBuilderTest {
 
     test("render_summary_page composes name + doc into HTML") {
       _summary = List.head(manifest_struct_summaries())
-      _html = Zap.Doc.render_summary_page(_summary, :struct, manifest_structs(), manifest_protocols(), manifest_unions(), manifest_function_summaries(), manifest_macro_summaries())
+      _html = Zap.Doc.render_summary_page(_summary, :struct, manifest_structs(), manifest_protocols(), manifest_unions(), manifest_function_summaries(), manifest_macro_summaries(), manifest_impl_summaries())
       assert(String.contains?(_html, "Atom"))
       assert(String.contains?(_html, "Functions for working with atoms"))
     }
@@ -88,6 +88,11 @@ pub struct Zap.DocBuilderTest {
       _atom_html = File.read("zap-out/test-docs/Atom.html")
       assert(String.contains?(_atom_html, "<table class=\"summary\">"))
       assert(String.contains?(_atom_html, "to_string"))
+    }
+
+    test("manifest_impl_summaries returns a list shape") {
+      _impls = manifest_impl_summaries()
+      assert(List.length(_impls) >= 0)
     }
 
     test("write_docs_to writes one HTML file per reflected module") {

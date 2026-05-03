@@ -100,6 +100,19 @@ pub struct Zap.Doc.Builder {
       }
     })
 
+    _impl_summaries = list_flatten(for _path <- _source_paths {
+      for _impl <- source_graph_impls(_path) {
+        %{
+          proto_name: map_get(_impl, :protocol, ""),
+          target: map_get(_impl, :target, ""),
+          # Bool value forces the map's value type to `Term` so it
+          # composes with the other Term-valued summary lists in the
+          # walker without requiring per-list type-narrowing.
+          is_private: map_get(_impl, :is_private, false),
+        }
+      }
+    })
+
     quote {
       pub fn manifest_structs() -> [String] {
         unquote(_struct_names)
@@ -135,13 +148,18 @@ pub struct Zap.Doc.Builder {
         unquote(_macro_summaries)
       }
 
+      @doc = "Flat list of every protocol-impl declared across reflected modules, each with `:proto_name` and `:target` qualified names."
+      pub fn manifest_impl_summaries() -> [%{Atom => Term}] {
+        unquote(_impl_summaries)
+      }
+
       pub fn render_first_struct_html() -> String {
-        Zap.Doc.render_summary_page(List.head(manifest_struct_summaries()), :struct, manifest_structs(), manifest_protocols(), manifest_unions(), manifest_function_summaries(), manifest_macro_summaries())
+        Zap.Doc.render_summary_page(List.head(manifest_struct_summaries()), :struct, manifest_structs(), manifest_protocols(), manifest_unions(), manifest_function_summaries(), manifest_macro_summaries(), manifest_impl_summaries())
       }
 
       @doc = "Render every reflected module to `<out_dir>/<name>.html` and return the page count."
       pub fn write_docs_to(out_dir :: String) -> i64 {
-        Zap.Doc.write_pages_to(out_dir, manifest_struct_summaries(), manifest_protocol_summaries(), manifest_union_summaries(), manifest_function_summaries(), manifest_macro_summaries())
+        Zap.Doc.write_pages_to(out_dir, manifest_struct_summaries(), manifest_protocol_summaries(), manifest_union_summaries(), manifest_function_summaries(), manifest_macro_summaries(), manifest_impl_summaries())
       }
     }
   }

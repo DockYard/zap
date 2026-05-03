@@ -568,15 +568,38 @@ pub struct Zap.Doc {
     page heading and its `@doc` text as the lead paragraph; the
     sidebar highlights the current module.
     """
-  pub fn render_summary_page(summary :: %{Atom => Term}, kind :: Atom, structs :: [String], protocols :: [String], unions :: [String], all_functions :: [%{Atom => Term}], all_macros :: [%{Atom => Term}]) -> String {
+  pub fn render_summary_page(summary :: %{Atom => Term}, kind :: Atom, structs :: [String], protocols :: [String], unions :: [String], all_functions :: [%{Atom => Term}], all_macros :: [%{Atom => Term}], all_impls :: [%{Atom => Term}]) -> String {
     name = Map.get(summary, :name, "")
     doc = Map.get(summary, :doc, "")
     structdoc_html = Markdown.to_html(doc)
     functions_rows = render_module_member_rows(all_functions, name, "")
     macros_rows = render_module_member_rows(all_macros, name, "")
-    content = module_main_content(kind, name, [] :: [String], first_sentence(doc), structdoc_html, functions_rows, macros_rows, "", "")
+    implements = collect_implemented_protocols(all_impls, name, [] :: [String])
+    content = module_main_content(kind, name, implements, first_sentence(doc), structdoc_html, functions_rows, macros_rows, "", "")
     sidebar_html = sidebar(structs, protocols, unions, name, "")
     struct_page("Zap", "0.0.0", name, "", "", sidebar_html, content, "")
+  }
+
+  @doc = """
+    Walk the flat impl manifest and collect protocol names whose
+    `:target` matches `module_name`. Returns the collected list so
+    `module_main_content` can populate the "Implements" row above the
+    title without further filtering.
+    """
+  pub fn collect_implemented_protocols(impls :: [%{Atom => Term}], module_name :: String, acc :: [String]) -> [String] {
+    if List.empty?(impls) {
+      acc
+    } else {
+      head = List.head(impls)
+      tail = List.tail(impls)
+      target = Map.get(head, :target, "")
+      if target == module_name {
+        proto_name = Map.get(head, :proto_name, "")
+        collect_implemented_protocols(tail, module_name, List.append(acc, proto_name))
+      } else {
+        collect_implemented_protocols(tail, module_name, acc)
+      }
+    }
   }
 
   @doc = """
@@ -618,13 +641,13 @@ pub struct Zap.Doc {
     Typically called from a project's `main/1` after invoking
     `use Zap.Doc.Builder`.
     """
-  pub fn write_pages_to(out_dir :: String, struct_summaries :: [%{Atom => Term}], protocol_summaries :: [%{Atom => Term}], union_summaries :: [%{Atom => Term}], function_summaries :: [%{Atom => Term}], macro_summaries :: [%{Atom => Term}]) -> i64 {
+  pub fn write_pages_to(out_dir :: String, struct_summaries :: [%{Atom => Term}], protocol_summaries :: [%{Atom => Term}], union_summaries :: [%{Atom => Term}], function_summaries :: [%{Atom => Term}], macro_summaries :: [%{Atom => Term}], impl_summaries :: [%{Atom => Term}]) -> i64 {
     structs = manifest_names(struct_summaries, [])
     protocols = manifest_names(protocol_summaries, [])
     unions = manifest_names(union_summaries, [])
-    written_structs = write_summary_pages(out_dir, struct_summaries, :struct, structs, protocols, unions, function_summaries, macro_summaries, 0)
-    written_protocols = write_summary_pages(out_dir, protocol_summaries, :protocol, structs, protocols, unions, function_summaries, macro_summaries, 0)
-    written_unions = write_summary_pages(out_dir, union_summaries, :union, structs, protocols, unions, function_summaries, macro_summaries, 0)
+    written_structs = write_summary_pages(out_dir, struct_summaries, :struct, structs, protocols, unions, function_summaries, macro_summaries, impl_summaries, 0)
+    written_protocols = write_summary_pages(out_dir, protocol_summaries, :protocol, structs, protocols, unions, function_summaries, macro_summaries, impl_summaries, 0)
+    written_unions = write_summary_pages(out_dir, union_summaries, :union, structs, protocols, unions, function_summaries, macro_summaries, impl_summaries, 0)
     index_html = render_index_page(structs, protocols, unions)
     _ = File.write(out_dir <> "/index.html", index_html)
     written_structs + written_protocols + written_unions
@@ -694,20 +717,20 @@ pub struct Zap.Doc {
     surfaces a Bool, which we count toward the total only when true so
     a partial failure doesn't lie about how much output landed.
     """
-  pub fn write_summary_pages(out_dir :: String, summaries :: [%{Atom => Term}], kind :: Atom, structs :: [String], protocols :: [String], unions :: [String], all_functions :: [%{Atom => Term}], all_macros :: [%{Atom => Term}], acc :: i64) -> i64 {
+  pub fn write_summary_pages(out_dir :: String, summaries :: [%{Atom => Term}], kind :: Atom, structs :: [String], protocols :: [String], unions :: [String], all_functions :: [%{Atom => Term}], all_macros :: [%{Atom => Term}], all_impls :: [%{Atom => Term}], acc :: i64) -> i64 {
     if List.empty?(summaries) {
       acc
     } else {
       head = List.head(summaries)
       tail = List.tail(summaries)
       name = Map.get(head, :name, "")
-      html = render_summary_page(head, kind, structs, protocols, unions, all_functions, all_macros)
+      html = render_summary_page(head, kind, structs, protocols, unions, all_functions, all_macros, all_impls)
       path = out_dir <> "/" <> name <> ".html"
       ok = File.write(path, html)
       if ok {
-        write_summary_pages(out_dir, tail, kind, structs, protocols, unions, all_functions, all_macros, acc + 1)
+        write_summary_pages(out_dir, tail, kind, structs, protocols, unions, all_functions, all_macros, all_impls, acc + 1)
       } else {
-        write_summary_pages(out_dir, tail, kind, structs, protocols, unions, all_functions, all_macros, acc)
+        write_summary_pages(out_dir, tail, kind, structs, protocols, unions, all_functions, all_macros, all_impls, acc)
       }
     }
   }
