@@ -56,5 +56,11 @@ pub struct Zap.DocBuilderTest {
       _summaries = manifest_union_summaries()
       assert(List.length(_summaries) >= 0)
     }
+
+    test("first struct summary's :name extracts as a String") {
+      _summary = List.head(manifest_struct_summaries())
+      _name = Map.get(_summary, :name, "")
+      assert(String.length(_name) > 0)
+    }
   }
 }
