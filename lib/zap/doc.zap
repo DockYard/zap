@@ -713,7 +713,9 @@ pub struct Zap.Doc {
     and render results without changes. Per-function entries are
     deferred until task #15 (Term → compound-value runtime unboxing)
     lands, since rendering each function row requires extracting an
-    `i64` arity from a `Term`-valued map slot.
+    `i64` arity from a `Term`-valued map slot — call sites that
+    introduce that intermediate trigger an exponential overload
+    search at the `Integer.to_string` dispatch.
     """
   pub fn render_search_index(struct_summaries :: [%{Atom => Term}], protocol_summaries :: [%{Atom => Term}], union_summaries :: [%{Atom => Term}]) -> String {
     structs_json = render_struct_search_entries(struct_summaries, "struct", "")
