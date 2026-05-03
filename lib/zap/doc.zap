@@ -556,4 +556,84 @@ pub struct Zap.Doc {
       ch
     }
   }
+
+  @doc = """
+    Compose a complete HTML page for a single module summary.
+
+    `summary` is a `%{Atom => Term}` map produced by
+    `Zap.Doc.Builder` — it carries `:name`, `:doc`, and
+    kind-specific fields. `structs`, `protocols`, and `unions` are
+    the sidebar name lists (typically the corresponding `manifest_*`
+    accessors). The returned HTML embeds the struct's name as the
+    page heading and its `@doc` text as the lead paragraph; the
+    sidebar highlights the current module.
+    """
+  pub fn render_summary_page(summary :: %{Atom => Term}, structs :: [String], protocols :: [String], unions :: [String]) -> String {
+    name = Map.get(summary, :name, "")
+    doc = Map.get(summary, :doc, "")
+    content = "<h1>" <> escape_html(name) <> "</h1>\n<p>" <> escape_html(doc) <> "</p>\n"
+    sidebar_html = sidebar(structs, protocols, unions, name, "")
+    struct_page("Zap", "0.0.0", name, "", "", sidebar_html, content, "")
+  }
+
+  @doc = """
+    Render every summary list to disk under `out_dir` and return the
+    total number of pages written. Each summary becomes
+    `<out_dir>/<name>.html`. The sidebar shows all three name lists so
+    cross-links between structs, protocols, and unions resolve from
+    every page.
+
+    Typically called from a project's `main/1` after invoking
+    `use Zap.Doc.Builder`.
+    """
+  pub fn write_pages_to(out_dir :: String, struct_summaries :: [%{Atom => Term}], protocol_summaries :: [%{Atom => Term}], union_summaries :: [%{Atom => Term}]) -> i64 {
+    structs = manifest_names(struct_summaries, [])
+    protocols = manifest_names(protocol_summaries, [])
+    unions = manifest_names(union_summaries, [])
+    written_structs = write_summary_pages(out_dir, struct_summaries, structs, protocols, unions, 0)
+    written_protocols = write_summary_pages(out_dir, protocol_summaries, structs, protocols, unions, 0)
+    written_unions = write_summary_pages(out_dir, union_summaries, structs, protocols, unions, 0)
+    written_structs + written_protocols + written_unions
+  }
+
+  @doc = """
+    Recursively pull `:name` from each summary, accumulating into a
+    list of strings. Used to build the sidebar name lists from a
+    single-pass walk so callers don't have to maintain three parallel
+    arrays of names alongside their summaries.
+    """
+  pub fn manifest_names(summaries :: [%{Atom => Term}], acc :: [String]) -> [String] {
+    if List.empty?(summaries) {
+      acc
+    } else {
+      head = List.head(summaries)
+      tail = List.tail(summaries)
+      manifest_names(tail, List.append(acc, Map.get(head, :name, "")))
+    }
+  }
+
+  @doc = """
+    Iterate `summaries`, render each as a full HTML page, and write
+    `<out_dir>/<name>.html`. Returns the number of pages written.
+    Files that fail to write are skipped without raising — `File.write`
+    surfaces a Bool, which we count toward the total only when true so
+    a partial failure doesn't lie about how much output landed.
+    """
+  pub fn write_summary_pages(out_dir :: String, summaries :: [%{Atom => Term}], structs :: [String], protocols :: [String], unions :: [String], acc :: i64) -> i64 {
+    if List.empty?(summaries) {
+      acc
+    } else {
+      head = List.head(summaries)
+      tail = List.tail(summaries)
+      name = Map.get(head, :name, "")
+      html = render_summary_page(head, structs, protocols, unions)
+      path = out_dir <> "/" <> name <> ".html"
+      ok = File.write(path, html)
+      if ok {
+        write_summary_pages(out_dir, tail, structs, protocols, unions, acc + 1)
+      } else {
+        write_summary_pages(out_dir, tail, structs, protocols, unions, acc)
+      }
+    }
+  }
 }

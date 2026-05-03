@@ -73,6 +73,21 @@ pub struct Zap.DocBuilderTest {
       assert(String.contains?(_html, "Functions for working with atoms"))
     }
 
+    test("render_summary_page composes name + doc into HTML") {
+      _summary = List.head(manifest_struct_summaries())
+      _html = Zap.Doc.render_summary_page(_summary, manifest_structs(), manifest_protocols(), manifest_unions())
+      assert(String.contains?(_html, "Atom"))
+      assert(String.contains?(_html, "Functions for working with atoms"))
+    }
+
+    test("write_docs_to writes one HTML file per reflected module") {
+      _ = File.mkdir("zap-out/test-docs")
+      _count = write_docs_to("zap-out/test-docs")
+      assert(_count > 0)
+      _atom_html = File.read("zap-out/test-docs/Atom.html")
+      assert(String.contains?(_atom_html, "Functions for working with atoms"))
+    }
+
 
 
   }
