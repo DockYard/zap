@@ -50,8 +50,6 @@ pub struct Zap.Doc.Builder {
         doc: map_get(struct_info(_ref), :doc, ""),
         source_file: map_get(struct_info(_ref), :source_file, ""),
         is_private: map_get(struct_info(_ref), :is_private, false),
-        functions: struct_functions(_ref),
-        macros: struct_macros(_ref),
       }
     }
 
@@ -101,7 +99,7 @@ pub struct Zap.Doc.Builder {
       }
 
       pub fn render_first_struct_html() -> String {
-        Zap.Doc.render_summary_page(List.head(manifest_struct_summaries()), manifest_structs(), manifest_protocols(), manifest_unions())
+        Zap.Doc.render_summary_page(List.head(manifest_struct_summaries()), :struct, manifest_structs(), manifest_protocols(), manifest_unions())
       }
 
       @doc = "Render every reflected module to `<out_dir>/<name>.html` and return the page count."

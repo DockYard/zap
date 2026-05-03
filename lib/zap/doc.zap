@@ -568,10 +568,11 @@ pub struct Zap.Doc {
     page heading and its `@doc` text as the lead paragraph; the
     sidebar highlights the current module.
     """
-  pub fn render_summary_page(summary :: %{Atom => Term}, structs :: [String], protocols :: [String], unions :: [String]) -> String {
+  pub fn render_summary_page(summary :: %{Atom => Term}, kind :: Atom, structs :: [String], protocols :: [String], unions :: [String]) -> String {
     name = Map.get(summary, :name, "")
     doc = Map.get(summary, :doc, "")
-    content = "<h1>" <> escape_html(name) <> "</h1>\n<p>" <> escape_html(doc) <> "</p>\n"
+    structdoc_html = "<p>" <> escape_html(doc) <> "</p>"
+    content = module_main_content(kind, name, [] :: [String], first_sentence(doc), structdoc_html, "", "", "", "")
     sidebar_html = sidebar(structs, protocols, unions, name, "")
     struct_page("Zap", "0.0.0", name, "", "", sidebar_html, content, "")
   }
@@ -590,9 +591,9 @@ pub struct Zap.Doc {
     structs = manifest_names(struct_summaries, [])
     protocols = manifest_names(protocol_summaries, [])
     unions = manifest_names(union_summaries, [])
-    written_structs = write_summary_pages(out_dir, struct_summaries, structs, protocols, unions, 0)
-    written_protocols = write_summary_pages(out_dir, protocol_summaries, structs, protocols, unions, 0)
-    written_unions = write_summary_pages(out_dir, union_summaries, structs, protocols, unions, 0)
+    written_structs = write_summary_pages(out_dir, struct_summaries, :struct, structs, protocols, unions, 0)
+    written_protocols = write_summary_pages(out_dir, protocol_summaries, :protocol, structs, protocols, unions, 0)
+    written_unions = write_summary_pages(out_dir, union_summaries, :union, structs, protocols, unions, 0)
     written_structs + written_protocols + written_unions
   }
 
@@ -619,20 +620,20 @@ pub struct Zap.Doc {
     surfaces a Bool, which we count toward the total only when true so
     a partial failure doesn't lie about how much output landed.
     """
-  pub fn write_summary_pages(out_dir :: String, summaries :: [%{Atom => Term}], structs :: [String], protocols :: [String], unions :: [String], acc :: i64) -> i64 {
+  pub fn write_summary_pages(out_dir :: String, summaries :: [%{Atom => Term}], kind :: Atom, structs :: [String], protocols :: [String], unions :: [String], acc :: i64) -> i64 {
     if List.empty?(summaries) {
       acc
     } else {
       head = List.head(summaries)
       tail = List.tail(summaries)
       name = Map.get(head, :name, "")
-      html = render_summary_page(head, structs, protocols, unions)
+      html = render_summary_page(head, kind, structs, protocols, unions)
       path = out_dir <> "/" <> name <> ".html"
       ok = File.write(path, html)
       if ok {
-        write_summary_pages(out_dir, tail, structs, protocols, unions, acc + 1)
+        write_summary_pages(out_dir, tail, kind, structs, protocols, unions, acc + 1)
       } else {
-        write_summary_pages(out_dir, tail, structs, protocols, unions, acc)
+        write_summary_pages(out_dir, tail, kind, structs, protocols, unions, acc)
       }
     }
   }

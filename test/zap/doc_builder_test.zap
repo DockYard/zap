@@ -37,15 +37,6 @@ pub struct Zap.DocBuilderTest {
       assert(Map.has_key?(_summary, :is_private))
     }
 
-    test("manifest_struct_summaries first entry has functions list") {
-      _summary = List.head(manifest_struct_summaries())
-      assert(Map.has_key?(_summary, :functions))
-    }
-
-    test("manifest_struct_summaries first entry has macros list") {
-      _summary = List.head(manifest_struct_summaries())
-      assert(Map.has_key?(_summary, :macros))
-    }
 
     test("manifest_protocol_summaries returns a list of maps") {
       _summaries = manifest_protocol_summaries()
@@ -75,7 +66,7 @@ pub struct Zap.DocBuilderTest {
 
     test("render_summary_page composes name + doc into HTML") {
       _summary = List.head(manifest_struct_summaries())
-      _html = Zap.Doc.render_summary_page(_summary, manifest_structs(), manifest_protocols(), manifest_unions())
+      _html = Zap.Doc.render_summary_page(_summary, :struct, manifest_structs(), manifest_protocols(), manifest_unions())
       assert(String.contains?(_html, "Atom"))
       assert(String.contains?(_html, "Functions for working with atoms"))
     }
@@ -86,6 +77,20 @@ pub struct Zap.DocBuilderTest {
       assert(_count > 0)
       _atom_html = File.read("zap-out/test-docs/Atom.html")
       assert(String.contains?(_atom_html, "Functions for working with atoms"))
+    }
+
+    test("rendered struct page breadcrumb labels Atom as a Struct") {
+      _ = File.mkdir("zap-out/test-docs")
+      _ = write_docs_to("zap-out/test-docs")
+      _atom_html = File.read("zap-out/test-docs/Atom.html")
+      assert(String.contains?(_atom_html, "<span>Structs</span>"))
+    }
+
+    test("rendered struct page lists a public function in the summary table") {
+      _ = File.mkdir("zap-out/test-docs")
+      _ = write_docs_to("zap-out/test-docs")
+      _atom_html = File.read("zap-out/test-docs/Atom.html")
+      assert(String.contains?(_atom_html, "to_string"))
     }
 
 
