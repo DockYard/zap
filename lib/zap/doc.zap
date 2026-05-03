@@ -568,16 +568,70 @@ pub struct Zap.Doc {
     page heading and its `@doc` text as the lead paragraph; the
     sidebar highlights the current module.
     """
-  pub fn render_summary_page(summary :: %{Atom => Term}, kind :: Atom, structs :: [String], protocols :: [String], unions :: [String], all_functions :: [%{Atom => Term}], all_macros :: [%{Atom => Term}], all_impls :: [%{Atom => Term}]) -> String {
+  pub fn render_summary_page(summary :: %{Atom => Term}, kind :: Atom, structs :: [String], protocols :: [String], unions :: [String], all_functions :: [%{Atom => Term}], all_macros :: [%{Atom => Term}], all_impls :: [%{Atom => Term}], all_variants :: [%{Atom => Term}], all_required :: [%{Atom => Term}]) -> String {
     name = Map.get(summary, :name, "")
     doc = Map.get(summary, :doc, "")
     structdoc_html = Markdown.to_html(doc)
     functions_rows = render_module_member_rows(all_functions, name, "")
     macros_rows = render_module_member_rows(all_macros, name, "")
     implements = collect_implemented_protocols(all_impls, name, [] :: [String])
-    content = module_main_content(kind, name, implements, first_sentence(doc), structdoc_html, functions_rows, macros_rows, "", "")
+    body_html = module_main_content(kind, name, implements, first_sentence(doc), structdoc_html, functions_rows, macros_rows, "", "")
+    extras = render_kind_extras(kind, name, all_variants, all_required)
+    content = body_html <> extras
     sidebar_html = sidebar(structs, protocols, unions, name, "")
     struct_page("Zap", "0.0.0", name, "", "", sidebar_html, content, "")
+  }
+
+  @doc = """
+    Render kind-specific summary tables that don't fit
+    `module_main_content`'s hardcoded Functions/Macros slots.
+
+    Unions get a "Variants" table from `all_variants` filtered by
+    `:module`. Protocols get a "Required Functions" table from
+    `all_required`. Other kinds emit nothing. Each section uses
+    `summary_table` so an empty filter result collapses the whole
+    block.
+    """
+  pub fn render_kind_extras(kind :: Atom, name :: String, all_variants :: [%{Atom => Term}], all_required :: [%{Atom => Term}]) -> String {
+    if kind == :union {
+      summary_table("Variants", "variants", render_variant_rows(all_variants, name, ""))
+    } else {
+      if kind == :protocol {
+        summary_table("Required Functions", "required-functions", render_required_rows(all_required, name, ""))
+      } else {
+        ""
+      }
+    }
+  }
+
+  pub fn render_variant_rows(variants :: [%{Atom => Term}], module_name :: String, acc :: String) -> String {
+    if List.empty?(variants) {
+      acc
+    } else {
+      head = List.head(variants)
+      tail = List.tail(variants)
+      row = if Map.get(head, :module, "") == module_name {
+        summary_row(Map.get(head, :name, ""), 0, Map.get(head, :signature, ""))
+      } else {
+        ""
+      }
+      render_variant_rows(tail, module_name, acc <> row)
+    }
+  }
+
+  pub fn render_required_rows(required :: [%{Atom => Term}], module_name :: String, acc :: String) -> String {
+    if List.empty?(required) {
+      acc
+    } else {
+      head = List.head(required)
+      tail = List.tail(required)
+      row = if Map.get(head, :module, "") == module_name {
+        summary_row(Map.get(head, :name, ""), 0, Map.get(head, :signature, ""))
+      } else {
+        ""
+      }
+      render_required_rows(tail, module_name, acc <> row)
+    }
   }
 
   @doc = """
@@ -641,13 +695,13 @@ pub struct Zap.Doc {
     Typically called from a project's `main/1` after invoking
     `use Zap.Doc.Builder`.
     """
-  pub fn write_pages_to(out_dir :: String, struct_summaries :: [%{Atom => Term}], protocol_summaries :: [%{Atom => Term}], union_summaries :: [%{Atom => Term}], function_summaries :: [%{Atom => Term}], macro_summaries :: [%{Atom => Term}], impl_summaries :: [%{Atom => Term}]) -> i64 {
+  pub fn write_pages_to(out_dir :: String, struct_summaries :: [%{Atom => Term}], protocol_summaries :: [%{Atom => Term}], union_summaries :: [%{Atom => Term}], function_summaries :: [%{Atom => Term}], macro_summaries :: [%{Atom => Term}], impl_summaries :: [%{Atom => Term}], variant_summaries :: [%{Atom => Term}], required_summaries :: [%{Atom => Term}]) -> i64 {
     structs = manifest_names(struct_summaries, [])
     protocols = manifest_names(protocol_summaries, [])
     unions = manifest_names(union_summaries, [])
-    written_structs = write_summary_pages(out_dir, struct_summaries, :struct, structs, protocols, unions, function_summaries, macro_summaries, impl_summaries, 0)
-    written_protocols = write_summary_pages(out_dir, protocol_summaries, :protocol, structs, protocols, unions, function_summaries, macro_summaries, impl_summaries, 0)
-    written_unions = write_summary_pages(out_dir, union_summaries, :union, structs, protocols, unions, function_summaries, macro_summaries, impl_summaries, 0)
+    written_structs = write_summary_pages(out_dir, struct_summaries, :struct, structs, protocols, unions, function_summaries, macro_summaries, impl_summaries, variant_summaries, required_summaries, 0)
+    written_protocols = write_summary_pages(out_dir, protocol_summaries, :protocol, structs, protocols, unions, function_summaries, macro_summaries, impl_summaries, variant_summaries, required_summaries, 0)
+    written_unions = write_summary_pages(out_dir, union_summaries, :union, structs, protocols, unions, function_summaries, macro_summaries, impl_summaries, variant_summaries, required_summaries, 0)
     index_html = render_index_page(structs, protocols, unions)
     _ = File.write(out_dir <> "/index.html", index_html)
     written_structs + written_protocols + written_unions
@@ -717,20 +771,20 @@ pub struct Zap.Doc {
     surfaces a Bool, which we count toward the total only when true so
     a partial failure doesn't lie about how much output landed.
     """
-  pub fn write_summary_pages(out_dir :: String, summaries :: [%{Atom => Term}], kind :: Atom, structs :: [String], protocols :: [String], unions :: [String], all_functions :: [%{Atom => Term}], all_macros :: [%{Atom => Term}], all_impls :: [%{Atom => Term}], acc :: i64) -> i64 {
+  pub fn write_summary_pages(out_dir :: String, summaries :: [%{Atom => Term}], kind :: Atom, structs :: [String], protocols :: [String], unions :: [String], all_functions :: [%{Atom => Term}], all_macros :: [%{Atom => Term}], all_impls :: [%{Atom => Term}], all_variants :: [%{Atom => Term}], all_required :: [%{Atom => Term}], acc :: i64) -> i64 {
     if List.empty?(summaries) {
       acc
     } else {
       head = List.head(summaries)
       tail = List.tail(summaries)
       name = Map.get(head, :name, "")
-      html = render_summary_page(head, kind, structs, protocols, unions, all_functions, all_macros, all_impls)
+      html = render_summary_page(head, kind, structs, protocols, unions, all_functions, all_macros, all_impls, all_variants, all_required)
       path = out_dir <> "/" <> name <> ".html"
       ok = File.write(path, html)
       if ok {
-        write_summary_pages(out_dir, tail, kind, structs, protocols, unions, all_functions, all_macros, all_impls, acc + 1)
+        write_summary_pages(out_dir, tail, kind, structs, protocols, unions, all_functions, all_macros, all_impls, all_variants, all_required, acc + 1)
       } else {
-        write_summary_pages(out_dir, tail, kind, structs, protocols, unions, all_functions, all_macros, all_impls, acc)
+        write_summary_pages(out_dir, tail, kind, structs, protocols, unions, all_functions, all_macros, all_impls, all_variants, all_required, acc)
       }
     }
   }

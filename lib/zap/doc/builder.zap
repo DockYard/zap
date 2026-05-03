@@ -189,12 +189,12 @@ pub struct Zap.Doc.Builder {
       }
 
       pub fn render_first_struct_html() -> String {
-        Zap.Doc.render_summary_page(List.head(manifest_struct_summaries()), :struct, manifest_structs(), manifest_protocols(), manifest_unions(), manifest_function_summaries(), manifest_macro_summaries(), manifest_impl_summaries())
+        Zap.Doc.render_summary_page(List.head(manifest_struct_summaries()), :struct, manifest_structs(), manifest_protocols(), manifest_unions(), manifest_function_summaries(), manifest_macro_summaries(), manifest_impl_summaries(), manifest_variant_summaries(), manifest_required_function_summaries())
       }
 
       @doc = "Render every reflected module to `<out_dir>/<name>.html` and return the page count."
       pub fn write_docs_to(out_dir :: String) -> i64 {
-        Zap.Doc.write_pages_to(out_dir, manifest_struct_summaries(), manifest_protocol_summaries(), manifest_union_summaries(), manifest_function_summaries(), manifest_macro_summaries(), manifest_impl_summaries())
+        Zap.Doc.write_pages_to(out_dir, manifest_struct_summaries(), manifest_protocol_summaries(), manifest_union_summaries(), manifest_function_summaries(), manifest_macro_summaries(), manifest_impl_summaries(), manifest_variant_summaries(), manifest_required_function_summaries())
       }
     }
   }
