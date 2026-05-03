@@ -59,7 +59,6 @@ pub struct Zap.Doc.Builder {
         doc: map_get(struct_info(_ref), :doc, ""),
         source_file: map_get(struct_info(_ref), :source_file, ""),
         is_private: map_get(struct_info(_ref), :is_private, false),
-        required_functions: protocol_required_functions(_ref),
       }
     }
 
@@ -69,9 +68,37 @@ pub struct Zap.Doc.Builder {
         doc: map_get(struct_info(_ref), :doc, ""),
         source_file: map_get(struct_info(_ref), :source_file, ""),
         is_private: map_get(struct_info(_ref), :is_private, false),
-        variants: union_variants(_ref),
       }
     }
+
+    # Flat list of every public function across every reflected
+    # struct, with the owning module qualified-name attached so the
+    # walker can filter per-page. Each entry holds primitive-typed
+    # values only (String + i64) — nested compound values inside a
+    # `Term`-valued map slot don't currently round-trip through the
+    # runtime extraction path (see task #15), so anything richer
+    # (signatures, source locations) is omitted until that's fixed.
+    _function_summaries = list_flatten(for _ref <- _struct_refs {
+      for _f <- struct_functions(_ref) {
+        %{
+          module: map_get(struct_info(_ref), :name, ""),
+          name: map_get(_f, :name, ""),
+          arity: map_get(_f, :arity, 0),
+          doc: map_get(_f, :doc, ""),
+        }
+      }
+    })
+
+    _macro_summaries = list_flatten(for _ref <- _struct_refs {
+      for _m <- struct_macros(_ref) {
+        %{
+          module: map_get(struct_info(_ref), :name, ""),
+          name: map_get(_m, :name, ""),
+          arity: map_get(_m, :arity, 0),
+          doc: map_get(_m, :doc, ""),
+        }
+      }
+    })
 
     quote {
       pub fn manifest_structs() -> [String] {
@@ -98,13 +125,23 @@ pub struct Zap.Doc.Builder {
         unquote(_union_summaries)
       }
 
+      @doc = "Flat list of every public function across reflected modules, each with `:module`, `:name`, `:arity`, `:doc`."
+      pub fn manifest_function_summaries() -> [%{Atom => Term}] {
+        unquote(_function_summaries)
+      }
+
+      @doc = "Flat list of every public macro across reflected modules, same shape as `manifest_function_summaries`."
+      pub fn manifest_macro_summaries() -> [%{Atom => Term}] {
+        unquote(_macro_summaries)
+      }
+
       pub fn render_first_struct_html() -> String {
-        Zap.Doc.render_summary_page(List.head(manifest_struct_summaries()), :struct, manifest_structs(), manifest_protocols(), manifest_unions())
+        Zap.Doc.render_summary_page(List.head(manifest_struct_summaries()), :struct, manifest_structs(), manifest_protocols(), manifest_unions(), manifest_function_summaries(), manifest_macro_summaries())
       }
 
       @doc = "Render every reflected module to `<out_dir>/<name>.html` and return the page count."
       pub fn write_docs_to(out_dir :: String) -> i64 {
-        Zap.Doc.write_pages_to(out_dir, manifest_struct_summaries(), manifest_protocol_summaries(), manifest_union_summaries())
+        Zap.Doc.write_pages_to(out_dir, manifest_struct_summaries(), manifest_protocol_summaries(), manifest_union_summaries(), manifest_function_summaries(), manifest_macro_summaries())
       }
     }
   }
