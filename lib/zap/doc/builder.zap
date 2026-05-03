@@ -100,6 +100,14 @@ pub struct Zap.Doc.Builder {
         unquote(_union_summaries)
       }
 
+      pub fn render_first_struct_html() -> String {
+        _summary = List.head(manifest_struct_summaries())
+        _name = Map.get(_summary, :name, "")
+        _doc = Map.get(_summary, :doc, "")
+        _content = "<h1>" <> Zap.Doc.escape_html(_name) <> "</h1>\n<p>" <> Zap.Doc.escape_html(_doc) <> "</p>\n"
+        _sidebar = Zap.Doc.sidebar(manifest_structs(), manifest_protocols(), manifest_unions(), _name, "")
+        Zap.Doc.struct_page("Zap", "0.0.0", _name, "", "", _sidebar, _content, "")
+      }
     }
   }
 

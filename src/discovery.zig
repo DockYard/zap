@@ -61,6 +61,16 @@ pub const FileGraph = struct {
     /// Struct name → true if declared with private struct (private to dep)
     struct_is_private: std.StringHashMap(bool),
 
+    /// File path → list of glob patterns the file declares with
+    /// `@compile_after_glob`. Each pattern names files this one must be
+    /// compiled AFTER. Used by structs that reflect on a file glob at
+    /// macro-expansion time (e.g. a test runner enumerating test files):
+    /// without an explicit ordering hint the topological sort can place
+    /// the reflecting file ahead of its globbed peers, so reflection
+    /// runs before those peers' macros have generated the functions
+    /// the runner is querying.
+    file_compile_after_globs: std.StringHashMap(std.ArrayListUnmanaged([]const u8)),
+
     pub fn init(allocator: std.mem.Allocator) FileGraph {
         return .{
             .allocator = allocator,
@@ -75,6 +85,7 @@ pub const FileGraph = struct {
             .stdlib_structs = std.StringHashMap(void).init(allocator),
             .file_source_root = std.StringHashMap([]const u8).init(allocator),
             .struct_is_private = std.StringHashMap(bool).init(allocator),
+            .file_compile_after_globs = std.StringHashMap(std.ArrayListUnmanaged([]const u8)).init(allocator),
         };
     }
 
@@ -102,6 +113,11 @@ pub const FileGraph = struct {
         self.stdlib_structs.deinit();
         self.file_source_root.deinit();
         self.struct_is_private.deinit();
+        {
+            var it = self.file_compile_after_globs.iterator();
+            while (it.next()) |entry| entry.value_ptr.deinit(self.allocator);
+        }
+        self.file_compile_after_globs.deinit();
     }
 
     pub fn structForFile(self: *const FileGraph, file_path: []const u8) ?[]const u8 {
@@ -211,6 +227,14 @@ pub fn discoverWithSourceFiles(
         try drainDiscoveryQueue(alloc, &graph, &queue, source_roots, &native_type_structs);
     }
 
+    // Resolve `@compile_after_glob` declarations into struct-name imports.
+    // Now that every file is in the graph, we can glob-expand each pattern
+    // and append the matching files' primary struct names to the
+    // declaring file's imports list. The topological sort treats those as
+    // ordinary dependency edges so the declaring file always lands after
+    // its globbed peers.
+    try resolveCompileAfterGlobs(alloc, &graph);
+
     // Build imported_by (reverse index)
     {
         var it = graph.file_imports.iterator();
@@ -312,6 +336,15 @@ fn recordSourceFile(
         try appendDiscoveredImport(alloc, graph, queue, &imports_list, &import_seen, declared_structs, primary_struct, ref);
     }
     graph.file_imports.put(file_path, imports_list) catch return error.OutOfMemory;
+
+    const compile_after_globs = extractCompileAfterGlobs(alloc, source) catch return error.OutOfMemory;
+    if (compile_after_globs.len > 0) {
+        var globs_list: std.ArrayListUnmanaged([]const u8) = .empty;
+        for (compile_after_globs) |pattern| {
+            globs_list.append(alloc, pattern) catch return error.OutOfMemory;
+        }
+        graph.file_compile_after_globs.put(file_path, globs_list) catch return error.OutOfMemory;
+    }
 }
 
 fn appendDiscoveredImport(
@@ -831,6 +864,109 @@ fn extractStructReferences(
 
 /// Topological sort of the file graph using Kahn's algorithm.
 /// Produces dependencies-first ordering. Detects circular dependencies.
+/// Extract `@compile_after_glob` attribute values from a file's source.
+/// Accepts the same syntactic forms the parser does:
+///   `@compile_after_glob = "test/**/*_test.zap"`
+///   `@compile_after_glob = ["a/*.zap", "b/*.zap"]`
+/// Returns a deduplicated, allocator-owned list of pattern strings;
+/// the caller frees each entry plus the outer slice.
+fn extractCompileAfterGlobs(alloc: std.mem.Allocator, source: []const u8) ![]const []const u8 {
+    var patterns: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (patterns.items) |p| alloc.free(p);
+        patterns.deinit(alloc);
+    }
+
+    const needle = "@compile_after_glob";
+    var search_index: usize = 0;
+    while (search_index < source.len) {
+        const found_offset = std.mem.indexOfPos(u8, source, search_index, needle) orelse break;
+        const after_needle = found_offset + needle.len;
+        search_index = after_needle;
+
+        // Skip whitespace and an optional `=`. Anything else means this
+        // hit isn't an attribute assignment (could be inside a string,
+        // doc comment, etc.) — bail to the next match without recording.
+        var cursor = after_needle;
+        while (cursor < source.len and (source[cursor] == ' ' or source[cursor] == '\t')) cursor += 1;
+        if (cursor >= source.len or source[cursor] != '=') continue;
+        cursor += 1;
+        while (cursor < source.len and (source[cursor] == ' ' or source[cursor] == '\t' or source[cursor] == '\n')) cursor += 1;
+        if (cursor >= source.len) continue;
+
+        const ch = source[cursor];
+        if (ch == '"') {
+            const end_quote = std.mem.indexOfScalarPos(u8, source, cursor + 1, '"') orelse continue;
+            const pattern = source[cursor + 1 .. end_quote];
+            const dup = try alloc.dupe(u8, pattern);
+            try patterns.append(alloc, dup);
+        } else if (ch == '[') {
+            // Walk the list, picking out each "..." element. Stops at
+            // the first unmatched `]` or end of input.
+            var inner = cursor + 1;
+            while (inner < source.len and source[inner] != ']') {
+                while (inner < source.len and source[inner] != '"' and source[inner] != ']') inner += 1;
+                if (inner >= source.len or source[inner] == ']') break;
+                const end_quote = std.mem.indexOfScalarPos(u8, source, inner + 1, '"') orelse break;
+                const pattern = source[inner + 1 .. end_quote];
+                const dup = try alloc.dupe(u8, pattern);
+                try patterns.append(alloc, dup);
+                inner = end_quote + 1;
+            }
+        }
+    }
+
+    return patterns.toOwnedSlice(alloc);
+}
+
+/// For each file with `@compile_after_glob` patterns, glob-expand each
+/// pattern and append the primary struct name of every matching file to
+/// the file's imports list. The topological sort then orders the
+/// declaring file after each matched peer.
+fn resolveCompileAfterGlobs(alloc: std.mem.Allocator, graph: *FileGraph) !void {
+    var glob_it = graph.file_compile_after_globs.iterator();
+    while (glob_it.next()) |entry| {
+        const declaring_file = entry.key_ptr.*;
+        for (entry.value_ptr.items) |pattern| {
+            const matches = @import("glob.zig").collect(alloc, std.Options.debug_io, pattern, .{}) catch continue;
+            defer @import("glob.zig").freeMatches(alloc, matches);
+            for (matches) |matched_path| {
+                // Normalize so leading `./` (often present on graph keys
+                // because the compiler walks relative paths from the
+                // project root) matches whether the glob produced the
+                // bare or prefixed form.
+                const lookup_key = if (graph.file_to_struct.contains(matched_path))
+                    matched_path
+                else blk: {
+                    const prefixed = std.fmt.allocPrint(alloc, "./{s}", .{matched_path}) catch continue;
+                    if (graph.file_to_struct.contains(prefixed)) break :blk prefixed;
+                    alloc.free(prefixed);
+                    break :blk matched_path;
+                };
+                if (std.mem.eql(u8, lookup_key, declaring_file)) continue;
+                const struct_name = graph.file_to_struct.get(lookup_key) orelse continue;
+                const imports_entry = graph.file_imports.getOrPut(declaring_file) catch return error.OutOfMemory;
+                if (!imports_entry.found_existing) {
+                    imports_entry.value_ptr.* = .empty;
+                }
+                // Avoid duplicate edges — the topological sort caps each
+                // edge at one anyway, but cleaner imports are easier to
+                // debug when the discovery log is dumped.
+                var already_present = false;
+                for (imports_entry.value_ptr.items) |existing| {
+                    if (std.mem.eql(u8, existing, struct_name)) {
+                        already_present = true;
+                        break;
+                    }
+                }
+                if (!already_present) {
+                    imports_entry.value_ptr.append(alloc, struct_name) catch return error.OutOfMemory;
+                }
+            }
+        }
+    }
+}
+
 fn topologicalSort(alloc: std.mem.Allocator, graph: *FileGraph) DiscoveryError!void {
     // in_degree[file] = number of dependencies this file has (how many structs it imports
     // that are in the graph). Files with in_degree 0 have no dependencies = leaf libraries.
