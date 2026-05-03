@@ -20,8 +20,7 @@ pub struct Zap.DocsRunner {
   @doc = "Render every reflected module to `docs/<name>.html` and write `style.css` + `app.js`."
 
   pub fn main(_args :: [String]) -> String {
-    _ = File.mkdir("docs")
-    _count = write_docs_to("docs")
+    _count = write_docs_to("docs", "Zap", "0.0.0", "https://github.com/DockYard/zap")
     "Documentation generated in docs/"
   }
 }

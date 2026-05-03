@@ -568,20 +568,20 @@ pub struct Zap.Doc {
     page heading and its `@doc` text as the lead paragraph; the
     sidebar highlights the current module.
     """
-  pub fn render_summary_page(summary :: %{Atom => Term}, kind :: Atom, structs :: [String], protocols :: [String], unions :: [String], all_functions :: [%{Atom => Term}], all_macros :: [%{Atom => Term}], all_impls :: [%{Atom => Term}], all_variants :: [%{Atom => Term}], all_required :: [%{Atom => Term}]) -> String {
+  pub fn render_summary_page(summary :: %{Atom => Term}, kind :: Atom, project_name :: String, project_version :: String, source_url :: String, structs :: [String], protocols :: [String], unions :: [String], all_functions :: [%{Atom => Term}], all_macros :: [%{Atom => Term}], all_impls :: [%{Atom => Term}], all_variants :: [%{Atom => Term}], all_required :: [%{Atom => Term}]) -> String {
     name = Map.get(summary, :name, "")
     doc = Map.get(summary, :doc, "")
     structdoc_html = Markdown.to_html(doc)
     functions_rows = render_module_member_rows(all_functions, name, "")
     macros_rows = render_module_member_rows(all_macros, name, "")
-    functions_details = render_module_member_details(all_functions, name, false, "")
-    macros_details = render_module_member_details(all_macros, name, true, "")
+    functions_details = render_module_member_details(all_functions, name, false, source_url, project_version, "")
+    macros_details = render_module_member_details(all_macros, name, true, source_url, project_version, "")
     implements = collect_implemented_protocols(all_impls, name, [] :: [String])
     body_html = module_main_content(kind, name, implements, first_sentence(doc), structdoc_html, functions_rows, macros_rows, functions_details, macros_details)
     extras = render_kind_extras(kind, name, all_variants, all_required)
     content = body_html <> extras
     sidebar_html = sidebar(structs, protocols, unions, name, "")
-    struct_page("Zap", "0.0.0", name, "", "", sidebar_html, content, "")
+    struct_page(project_name, project_version, name, "", source_url, sidebar_html, content, "")
   }
 
   @doc = """
@@ -593,23 +593,23 @@ pub struct Zap.Doc {
     the result to `module_main_content`'s `functions_details` or
     `macros_details` slot.
     """
-  pub fn render_module_member_details(members :: [%{Atom => Term}], module_name :: String, is_macro :: Bool, acc :: String) -> String {
+  pub fn render_module_member_details(members :: [%{Atom => Term}], module_name :: String, is_macro :: Bool, source_url :: String, project_version :: String, acc :: String) -> String {
     if List.empty?(members) {
       acc
     } else {
-      render_module_member_details(List.tail(members), module_name, is_macro, acc <> member_detail_for_module(List.head(members), module_name, is_macro))
+      render_module_member_details(List.tail(members), module_name, is_macro, source_url, project_version, acc <> member_detail_for_module(List.head(members), module_name, is_macro, source_url, project_version))
     }
   }
 
-  pub fn member_detail_for_module(member :: %{Atom => Term}, module_name :: String, is_macro :: Bool) -> String {
+  pub fn member_detail_for_module(member :: %{Atom => Term}, module_name :: String, is_macro :: Bool, source_url :: String, project_version :: String) -> String {
     if Map.get(member, :module, "") == module_name {
-      compose_member_detail(Map.get(member, :name, ""), Map.get(member, :arity, 0), is_macro, Map.get(member, :doc, ""))
+      compose_member_detail(Map.get(member, :name, ""), Map.get(member, :arity, 0), is_macro, Map.get(member, :doc, ""), Map.get(member, :source_file, ""), Map.get(member, :source_line, 0), source_url, project_version)
     } else {
       ""
     }
   }
 
-  pub fn compose_member_detail(name :: String, arity :: i64, is_macro :: Bool, doc :: String) -> String {
+  pub fn compose_member_detail(name :: String, arity :: i64, is_macro :: Bool, doc :: String, source_file :: String, source_line :: i64, source_url :: String, project_version :: String) -> String {
     doc_html = Markdown.to_html(doc)
     open_div = "<div class=\"function-detail\" id=\"" <> anchor_id(name, arity) <> "\">\n"
     header = function_header(name, arity, is_macro)
@@ -618,7 +618,46 @@ pub struct Zap.Doc {
     } else {
       "<div class=\"function-doc\">\n" <> doc_html <> "</div>\n"
     }
-    open_div <> header <> body <> "</div>\n"
+    source = source_link(source_file, source_line, source_url, project_version)
+    open_div <> header <> body <> source <> "</div>\n"
+  }
+
+  @doc = """
+    Render a `[Source]` link pointing at the function's declaration
+    in the project's repository. Returns the empty string when any
+    of the inputs is missing — `source_url == ""` (the project hasn't
+    declared a repo URL), `source_file == ""` (reflection didn't
+    capture a source location), or `source_line <= 0`. Format
+    matches the historical Zig generator: `<url>/blob/v<version>/<file>#L<line>`.
+    """
+  pub fn source_link(source_file :: String, source_line :: i64, source_url :: String, project_version :: String) -> String {
+    if String.length(source_url) == 0 {
+      ""
+    } else {
+      if String.length(source_file) == 0 {
+        ""
+      } else {
+        if source_line <= 0 {
+          ""
+        } else {
+          href = source_url <> "/blob/v" <> project_version <> "/" <> strip_dot_slash(source_file) <> "#L" <> Integer.to_string(source_line)
+          "<a class=\"source-link\" href=\"" <> escape_html(href) <> "\">Source</a>\n"
+        }
+      }
+    }
+  }
+
+  @doc = """
+    Strip a leading `./` prefix that the macro-eval source-id resolver
+    sometimes attaches to relative paths. The repo URLs the
+    `[Source]` link points at don't tolerate the redundant segment.
+    """
+  pub fn strip_dot_slash(path :: String) -> String {
+    if String.starts_with?(path, "./") {
+      String.slice(path, 2, String.length(path))
+    } else {
+      path
+    }
   }
 
   @doc = """
@@ -734,13 +773,13 @@ pub struct Zap.Doc {
     Typically called from a project's `main/1` after invoking
     `use Zap.Doc.Builder`.
     """
-  pub fn write_pages_to(out_dir :: String, struct_summaries :: [%{Atom => Term}], protocol_summaries :: [%{Atom => Term}], union_summaries :: [%{Atom => Term}], function_summaries :: [%{Atom => Term}], macro_summaries :: [%{Atom => Term}], impl_summaries :: [%{Atom => Term}], variant_summaries :: [%{Atom => Term}], required_summaries :: [%{Atom => Term}]) -> i64 {
+  pub fn write_pages_to(out_dir :: String, project_name :: String, project_version :: String, source_url :: String, struct_summaries :: [%{Atom => Term}], protocol_summaries :: [%{Atom => Term}], union_summaries :: [%{Atom => Term}], function_summaries :: [%{Atom => Term}], macro_summaries :: [%{Atom => Term}], impl_summaries :: [%{Atom => Term}], variant_summaries :: [%{Atom => Term}], required_summaries :: [%{Atom => Term}]) -> i64 {
     structs = manifest_names(struct_summaries, [])
     protocols = manifest_names(protocol_summaries, [])
     unions = manifest_names(union_summaries, [])
-    written_structs = write_summary_pages(out_dir, struct_summaries, :struct, structs, protocols, unions, function_summaries, macro_summaries, impl_summaries, variant_summaries, required_summaries, 0)
-    written_protocols = write_summary_pages(out_dir, protocol_summaries, :protocol, structs, protocols, unions, function_summaries, macro_summaries, impl_summaries, variant_summaries, required_summaries, 0)
-    written_unions = write_summary_pages(out_dir, union_summaries, :union, structs, protocols, unions, function_summaries, macro_summaries, impl_summaries, variant_summaries, required_summaries, 0)
+    written_structs = write_summary_pages(out_dir, struct_summaries, :struct, project_name, project_version, source_url, structs, protocols, unions, function_summaries, macro_summaries, impl_summaries, variant_summaries, required_summaries, 0)
+    written_protocols = write_summary_pages(out_dir, protocol_summaries, :protocol, project_name, project_version, source_url, structs, protocols, unions, function_summaries, macro_summaries, impl_summaries, variant_summaries, required_summaries, 0)
+    written_unions = write_summary_pages(out_dir, union_summaries, :union, project_name, project_version, source_url, structs, protocols, unions, function_summaries, macro_summaries, impl_summaries, variant_summaries, required_summaries, 0)
     index_html = render_index_page(structs, protocols, unions)
     _ = File.write(out_dir <> "/index.html", index_html)
     written_structs + written_protocols + written_unions
@@ -810,20 +849,20 @@ pub struct Zap.Doc {
     surfaces a Bool, which we count toward the total only when true so
     a partial failure doesn't lie about how much output landed.
     """
-  pub fn write_summary_pages(out_dir :: String, summaries :: [%{Atom => Term}], kind :: Atom, structs :: [String], protocols :: [String], unions :: [String], all_functions :: [%{Atom => Term}], all_macros :: [%{Atom => Term}], all_impls :: [%{Atom => Term}], all_variants :: [%{Atom => Term}], all_required :: [%{Atom => Term}], acc :: i64) -> i64 {
+  pub fn write_summary_pages(out_dir :: String, summaries :: [%{Atom => Term}], kind :: Atom, project_name :: String, project_version :: String, source_url :: String, structs :: [String], protocols :: [String], unions :: [String], all_functions :: [%{Atom => Term}], all_macros :: [%{Atom => Term}], all_impls :: [%{Atom => Term}], all_variants :: [%{Atom => Term}], all_required :: [%{Atom => Term}], acc :: i64) -> i64 {
     if List.empty?(summaries) {
       acc
     } else {
       head = List.head(summaries)
       tail = List.tail(summaries)
       name = Map.get(head, :name, "")
-      html = render_summary_page(head, kind, structs, protocols, unions, all_functions, all_macros, all_impls, all_variants, all_required)
+      html = render_summary_page(head, kind, project_name, project_version, source_url, structs, protocols, unions, all_functions, all_macros, all_impls, all_variants, all_required)
       path = out_dir <> "/" <> name <> ".html"
       ok = File.write(path, html)
       if ok {
-        write_summary_pages(out_dir, tail, kind, structs, protocols, unions, all_functions, all_macros, all_impls, all_variants, all_required, acc + 1)
+        write_summary_pages(out_dir, tail, kind, project_name, project_version, source_url, structs, protocols, unions, all_functions, all_macros, all_impls, all_variants, all_required, acc + 1)
       } else {
-        write_summary_pages(out_dir, tail, kind, structs, protocols, unions, all_functions, all_macros, all_impls, all_variants, all_required, acc)
+        write_summary_pages(out_dir, tail, kind, project_name, project_version, source_url, structs, protocols, unions, all_functions, all_macros, all_impls, all_variants, all_required, acc)
       }
     }
   }

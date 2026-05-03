@@ -66,7 +66,7 @@ pub struct Zap.DocBuilderTest {
 
     test("render_summary_page composes name + doc into HTML") {
       _summary = List.head(manifest_struct_summaries())
-      _html = Zap.Doc.render_summary_page(_summary, :struct, manifest_structs(), manifest_protocols(), manifest_unions(), manifest_function_summaries(), manifest_macro_summaries(), manifest_impl_summaries(), manifest_variant_summaries(), manifest_required_function_summaries())
+      _html = Zap.Doc.render_summary_page(_summary, :struct, "Zap", "0.0.0", "https://github.com/DockYard/zap", manifest_structs(), manifest_protocols(), manifest_unions(), manifest_function_summaries(), manifest_macro_summaries(), manifest_impl_summaries(), manifest_variant_summaries(), manifest_required_function_summaries())
       assert(String.contains?(_html, "Atom"))
       assert(String.contains?(_html, "Functions for working with atoms"))
     }
@@ -92,7 +92,7 @@ pub struct Zap.DocBuilderTest {
 
     test("rendered Atom page contains a Functions summary table with to_string row") {
       _ = File.mkdir("zap-out/test-docs")
-      _ = write_docs_to("zap-out/test-docs")
+      _ = write_docs_to("zap-out/test-docs", "Zap", "0.0.0", "https://github.com/DockYard/zap")
       _atom_html = File.read("zap-out/test-docs/Atom.html")
       assert(String.contains?(_atom_html, "<table class=\"summary\">"))
       assert(String.contains?(_atom_html, "to_string"))
@@ -115,21 +115,21 @@ pub struct Zap.DocBuilderTest {
 
     test("write_docs_to writes style.css alongside the HTML pages") {
       _ = File.mkdir("zap-out/test-docs")
-      _ = write_docs_to("zap-out/test-docs")
+      _ = write_docs_to("zap-out/test-docs", "Zap", "0.0.0", "https://github.com/DockYard/zap")
       _css = File.read("zap-out/test-docs/style.css")
       assert(String.length(_css) > 0)
     }
 
     test("write_docs_to writes app.js alongside the HTML pages") {
       _ = File.mkdir("zap-out/test-docs")
-      _ = write_docs_to("zap-out/test-docs")
+      _ = write_docs_to("zap-out/test-docs", "Zap", "0.0.0", "https://github.com/DockYard/zap")
       _js = File.read("zap-out/test-docs/app.js")
       assert(String.length(_js) > 0)
     }
 
     test("write_docs_to writes one HTML file per reflected module") {
       _ = File.mkdir("zap-out/test-docs")
-      _count = write_docs_to("zap-out/test-docs")
+      _count = write_docs_to("zap-out/test-docs", "Zap", "0.0.0", "https://github.com/DockYard/zap")
       assert(_count > 0)
       _atom_html = File.read("zap-out/test-docs/Atom.html")
       assert(String.contains?(_atom_html, "Functions for working with atoms"))
@@ -137,14 +137,14 @@ pub struct Zap.DocBuilderTest {
 
     test("rendered struct page breadcrumb labels Atom as a Struct") {
       _ = File.mkdir("zap-out/test-docs")
-      _ = write_docs_to("zap-out/test-docs")
+      _ = write_docs_to("zap-out/test-docs", "Zap", "0.0.0", "https://github.com/DockYard/zap")
       _atom_html = File.read("zap-out/test-docs/Atom.html")
       assert(String.contains?(_atom_html, "<span>Structs</span>"))
     }
 
     test("rendered struct page renders @doc markdown to HTML") {
       _ = File.mkdir("zap-out/test-docs")
-      _ = write_docs_to("zap-out/test-docs")
+      _ = write_docs_to("zap-out/test-docs", "Zap", "0.0.0", "https://github.com/DockYard/zap")
       _atom_html = File.read("zap-out/test-docs/Atom.html")
       # The @doc has a "## Examples" section that should become an h2
       assert(String.contains?(_atom_html, "<h2>Examples</h2>"))
@@ -152,10 +152,22 @@ pub struct Zap.DocBuilderTest {
 
     test("write_docs_to also writes an index.html landing page") {
       _ = File.mkdir("zap-out/test-docs")
-      _ = write_docs_to("zap-out/test-docs")
+      _ = write_docs_to("zap-out/test-docs", "Zap", "0.0.0", "https://github.com/DockYard/zap")
       _index_html = File.read("zap-out/test-docs/index.html")
       assert(String.contains?(_index_html, "Atom"))
       assert(String.contains?(_index_html, "Stringable"))
+    }
+
+    test("rendered function detail block has a source link") {
+      _ = File.mkdir("zap-out/test-docs")
+      _ = write_docs_to("zap-out/test-docs", "Zap", "0.0.0", "https://github.com/DockYard/zap")
+      _atom_html = File.read("zap-out/test-docs/Atom.html")
+      assert(String.contains?(_atom_html, "github.com/DockYard/zap/blob/v0.0.0/lib/atom.zap#L"))
+    }
+
+    test("source_link suppresses the link when source_url is empty") {
+      _link = Zap.Doc.source_link("lib/atom.zap", 10, "", "0.0.0")
+      assert(String.length(_link) == 0)
     }
 
 
