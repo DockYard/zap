@@ -1523,6 +1523,12 @@ pub const MacroEngine = struct {
             env.current_macro_caps = family.required_caps;
             env.current_macro_name = self.interner.get(name);
             env.current_macro_span = call.meta.span;
+            env.current_macro_source_path = blk: {
+                if (clause_ref.decl.meta.span.source_id) |source_id| {
+                    break :blk self.graph.sourcePathById(source_id);
+                }
+                break :blk null;
+            };
 
             // Bind macro parameters to CtValue representations of the
             // arguments. Each argument's identifiers are tagged with
@@ -2694,6 +2700,12 @@ pub const MacroEngine = struct {
         env.current_macro_caps = family.required_caps;
         env.current_macro_name = self.interner.get(family.name);
         env.current_macro_span = ud.meta.span;
+        env.current_macro_source_path = blk: {
+            if (clause_ref.decl.meta.span.source_id) |source_id| {
+                break :blk self.graph.sourcePathById(source_id);
+            }
+            break :blk null;
+        };
 
         for (clause.params) |param| {
             if (param.pattern.* == .bind) {

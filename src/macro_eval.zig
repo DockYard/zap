@@ -69,6 +69,13 @@ pub const Env = struct {
     current_macro_name: ?[]const u8 = null,
     /// Source span of the macro call site, for diagnostics.
     current_macro_span: ?ast.SourceSpan = null,
+    /// Filesystem path of the source file containing the macro family
+    /// currently being expanded. `read_file` uses this to anchor
+    /// relative paths against the macro's source-file directory rather
+    /// than the compilation cwd, so a macro that bundles assets via
+    /// `read_file("assets/foo.css")` keeps working when the consuming
+    /// program is compiled from any working directory.
+    current_macro_source_path: ?[]const u8 = null,
     /// Last capability-violation message produced during eval. The
     /// surface-level macro engine queries this to forward a precise
     /// diagnostic when expansion fails. Owned by `alloc`.
@@ -609,17 +616,37 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
                 const path_raw = try eval(env, arg_elems[0]);
                 const path_ct = unwrapAstLiteral(path_raw);
                 if (path_ct != .string) return MacroEvalError.EvalFailed;
-                const bytes = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, path_ct.string, env.alloc, .limited(1 << 20)) catch |err| {
+                // Try the cwd-relative path first, falling back to the
+                // macro source-file directory when the cwd lookup misses.
+                // Macro authors bundling assets next to the macro source
+                // (e.g. `read_file("assets/style.css")` from a stdlib
+                // macro) get correct resolution regardless of the
+                // consumer's compilation cwd; consumer-cwd lookups still
+                // win for paths the consumer itself owns.
+                const cwd_attempt = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, path_ct.string, env.alloc, .limited(1 << 20));
+                if (cwd_attempt) |bytes| {
+                    return CtValue{ .string = bytes };
+                } else |cwd_err| {
+                    if (env.current_macro_source_path) |macro_path| {
+                        if (std.fs.path.dirname(macro_path)) |macro_dir| {
+                            const joined = std.fs.path.join(env.alloc, &.{ macro_dir, path_ct.string }) catch return MacroEvalError.EvalFailed;
+                            if (std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, joined, env.alloc, .limited(1 << 20))) |bytes| {
+                                env.alloc.free(joined);
+                                return CtValue{ .string = bytes };
+                            } else |_| {
+                                env.alloc.free(joined);
+                            }
+                        }
+                    }
                     const caller = env.current_macro_name orelse "<top-level>";
                     const msg = std.fmt.allocPrint(
                         env.alloc,
                         "`read_file` in macro `{s}` failed to read `{s}`: {s}",
-                        .{ caller, path_ct.string, @errorName(err) },
+                        .{ caller, path_ct.string, @errorName(cwd_err) },
                     ) catch return MacroEvalError.EvalFailed;
                     env.last_capability_error = msg;
                     return MacroEvalError.EvalFailed;
-                };
-                return CtValue{ .string = bytes };
+                }
             }
 
             // debug_value(label, value) — comptime debug print to stderr.
@@ -1466,9 +1493,17 @@ fn evalDispatchedClause(
     if (callee_is_macro) {
         child_env.current_macro_caps = callee_caps;
         child_env.current_macro_name = callee_name;
+        // When dispatching into another macro, anchor `read_file` etc.
+        // against the callee's source file so the callee's own
+        // bundled assets resolve regardless of caller cwd.
+        child_env.current_macro_source_path = if (clause.meta.span.source_id) |sid|
+            ctx.graph.sourcePathById(sid)
+        else
+            env.current_macro_source_path;
     } else {
         child_env.current_macro_caps = env.current_macro_caps;
         child_env.current_macro_name = env.current_macro_name;
+        child_env.current_macro_source_path = env.current_macro_source_path;
     }
 
     for (clause.params, 0..) |param, index| {
@@ -1681,9 +1716,14 @@ fn dispatchComptimeCall(
     if (callee_is_macro) {
         child_env.current_macro_caps = callee_caps;
         child_env.current_macro_name = form_name;
+        child_env.current_macro_source_path = if (clause.meta.span.source_id) |sid|
+            ctx.graph.sourcePathById(sid)
+        else
+            env.current_macro_source_path;
     } else {
         child_env.current_macro_caps = env.current_macro_caps;
         child_env.current_macro_name = env.current_macro_name;
+        child_env.current_macro_source_path = env.current_macro_source_path;
     }
 
     for (clause.params, 0..) |param, i| {

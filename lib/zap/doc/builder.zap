@@ -147,8 +147,8 @@ pub struct Zap.Doc.Builder {
     # without any filesystem awareness of the original asset locations.
     # Authors who need to override these can set their own
     # `style.css` / `app.js` after `write_docs_to` writes the defaults.
-    _doc_css = read_file("lib/zap/doc/assets/style.css")
-    _doc_js = read_file("lib/zap/doc/assets/app.js")
+    _doc_css = read_file("assets/style.css")
+    _doc_js = read_file("assets/app.js")
 
     quote {
       pub fn manifest_structs() -> [String] {
@@ -164,40 +164,40 @@ pub struct Zap.Doc.Builder {
       }
 
       pub fn manifest_struct_summaries() -> [%{Atom => Term}] {
-        unquote(_struct_summaries)
+        unquote(if list_length(_struct_summaries) > 0 { _struct_summaries } else { quote { [] :: [%{Atom => Term}] } })
       }
 
       pub fn manifest_protocol_summaries() -> [%{Atom => Term}] {
-        unquote(_protocol_summaries)
+        unquote(if list_length(_protocol_summaries) > 0 { _protocol_summaries } else { quote { [] :: [%{Atom => Term}] } })
       }
 
       pub fn manifest_union_summaries() -> [%{Atom => Term}] {
-        unquote(_union_summaries)
+        unquote(if list_length(_union_summaries) > 0 { _union_summaries } else { quote { [] :: [%{Atom => Term}] } })
       }
 
       @doc = "Flat list of every public function across reflected modules, each with `:module`, `:name`, `:arity`, `:doc`."
       pub fn manifest_function_summaries() -> [%{Atom => Term}] {
-        unquote(_function_summaries)
+        unquote(if list_length(_function_summaries) > 0 { _function_summaries } else { quote { [] :: [%{Atom => Term}] } })
       }
 
       @doc = "Flat list of every public macro across reflected modules, same shape as `manifest_function_summaries`."
       pub fn manifest_macro_summaries() -> [%{Atom => Term}] {
-        unquote(_macro_summaries)
+        unquote(if list_length(_macro_summaries) > 0 { _macro_summaries } else { quote { [] :: [%{Atom => Term}] } })
       }
 
       @doc = "Flat list of every protocol-impl declared across reflected modules, each with `:proto_name` and `:target` qualified names."
       pub fn manifest_impl_summaries() -> [%{Atom => Term}] {
-        unquote(_impl_summaries)
+        unquote(if list_length(_impl_summaries) > 0 { _impl_summaries } else { quote { [] :: [%{Atom => Term}] } })
       }
 
       @doc = "Flat list of every union variant across reflected modules, each with `:module`, `:name`, `:signature`."
       pub fn manifest_variant_summaries() -> [%{Atom => Term}] {
-        unquote(_variant_summaries)
+        unquote(if list_length(_variant_summaries) > 0 { _variant_summaries } else { quote { [] :: [%{Atom => Term}] } })
       }
 
       @doc = "Flat list of every protocol's required functions across reflected modules, each with `:module`, `:name`, `:signature`."
       pub fn manifest_required_function_summaries() -> [%{Atom => Term}] {
-        unquote(_required_function_summaries)
+        unquote(if list_length(_required_function_summaries) > 0 { _required_function_summaries } else { quote { [] :: [%{Atom => Term}] } })
       }
 
       pub fn render_first_struct_html() -> String {
