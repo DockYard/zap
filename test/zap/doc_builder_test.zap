@@ -2,6 +2,15 @@ pub struct Zap.DocBuilderTest {
   use Zest.Case
   use Zap.Doc.Builder, paths: ["lib/atom.zap", "lib/stringable.zap"]
 
+  fn render_first_struct_html() -> String {
+    _summary = List.head(manifest_struct_summaries())
+    _name = Map.get(_summary, :name, "")
+    _doc = Map.get(_summary, :doc, "")
+    _content = "<h1>" <> Zap.Doc.escape_html(_name) <> "</h1>\n<p>" <> Zap.Doc.escape_html(_doc) <> "</p>\n"
+    _sidebar = Zap.Doc.sidebar(manifest_structs(), manifest_protocols(), manifest_unions(), _name, "")
+    Zap.Doc.struct_page("Zap", "0.0.0", _name, "", "", _sidebar, _content, "")
+  }
+
   describe("Zap.Doc.Builder bakes manifest functions") {
     test("manifest_structs contains Atom") {
       assert(List.contains?(manifest_structs(), "Atom"))
@@ -62,5 +71,18 @@ pub struct Zap.DocBuilderTest {
       _name = Map.get(_summary, :name, "")
       assert(String.length(_name) > 0)
     }
+
+    test("render_first_struct_html embeds the struct name") {
+      _html = render_first_struct_html()
+      assert(String.contains?(_html, "Atom"))
+    }
+
+    test("render_first_struct_html embeds the struct doc") {
+      _html = render_first_struct_html()
+      assert(String.contains?(_html, "Functions for working with atoms"))
+    }
+
+
+
   }
 }

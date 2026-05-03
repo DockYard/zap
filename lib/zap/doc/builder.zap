@@ -99,6 +99,7 @@ pub struct Zap.Doc.Builder {
       pub fn manifest_union_summaries() -> [%{Atom => Term}] {
         unquote(_union_summaries)
       }
+
     }
   }
 
