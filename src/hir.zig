@@ -2684,19 +2684,74 @@ pub const HirBuilder = struct {
         const family = self.graph.getFamily(resolved.family_id);
         if (family.clauses.items.len == 0) return null;
 
-        var best: ?ResolvedFunctionCall = null;
+        // Two-pass overload selection. Pass 1 finds the lowest applicability
+        // cost across all clauses. Pass 2 picks among the cost-tied candidates
+        // by canonical-rank: when an argument's static type is UNKNOWN every
+        // overload of a type-only multi-overload family ties at cost 0, and
+        // the older single-pass first-wins logic landed on whichever overload
+        // was declared first — typically the narrowest int (i8). For numeric
+        // overloads we prefer i64-then-narrower for ints and f64-then-narrower
+        // for floats so the dispatch picks the canonical natural width when
+        // no constraint disambiguates.
         var best_cost: u32 = std.math.maxInt(u32);
         for (family.clauses.items, 0..) |clause_ref, idx| {
             const candidate = self.resolveClauseCallInfo(name, arity, resolved.declared_arity, clause_ref, @intCast(idx)) orelse continue;
             const cost = self.callInfoMatchCost(candidate, args) orelse continue;
-            if (best == null or cost < best_cost) {
+            if (cost < best_cost) best_cost = cost;
+        }
+
+        if (best_cost == std.math.maxInt(u32)) {
+            return self.resolveClauseCallInfo(name, arity, resolved.declared_arity, family.clauses.items[0], 0);
+        }
+
+        var best: ?ResolvedFunctionCall = null;
+        var best_rank: u32 = std.math.maxInt(u32);
+        for (family.clauses.items, 0..) |clause_ref, idx| {
+            const candidate = self.resolveClauseCallInfo(name, arity, resolved.declared_arity, clause_ref, @intCast(idx)) orelse continue;
+            const cost = self.callInfoMatchCost(candidate, args) orelse continue;
+            if (cost != best_cost) continue;
+            const rank = self.canonicalParamRank(candidate, args);
+            if (best == null or rank < best_rank) {
                 best = candidate;
-                best_cost = cost;
-                if (cost == 0) break;
+                best_rank = rank;
             }
         }
+
         if (best) |resolved_call| return resolved_call;
         return self.resolveClauseCallInfo(name, arity, resolved.declared_arity, family.clauses.items[0], 0);
+    }
+
+    /// Score a candidate by how "canonical" its parameter types are when the
+    /// corresponding argument's static type is UNKNOWN. Lower rank wins.
+    /// For a known argument the per-parameter contribution is zero — it was
+    /// already disambiguated by `callInfoMatchCost`. For UNKNOWN args we
+    /// score the expected param type by its distance from the canonical
+    /// 64-bit width: i64 = 0, i32 = 64, i8 = 112, i128 = 128. Floats follow
+    /// the same shape biased above all ints (256 + dist) so an int overload
+    /// beats a float overload at equal width-distance.
+    fn canonicalParamRank(self: *const HirBuilder, call_info: ResolvedFunctionCall, args: []const CallArg) u32 {
+        var total: u32 = 0;
+        const count = @min(call_info.param_types.len, args.len);
+        for (args[0..count], call_info.param_types[0..count]) |arg, expected| {
+            if (arg.expr.type_id != types_mod.TypeStore.UNKNOWN) continue;
+            const expected_t = self.type_store.getType(expected);
+            const slot: u32 = switch (expected_t) {
+                .int => |int_info| blk: {
+                    const bits = @as(i32, int_info.bits);
+                    const dist: u32 = @intCast(if (bits >= 64) bits - 64 else 64 - bits);
+                    const sign_penalty: u32 = if (int_info.signedness == .signed) 0 else 1;
+                    break :blk dist * 2 + sign_penalty;
+                },
+                .float => |float_info| blk: {
+                    const bits = @as(i32, float_info.bits);
+                    const dist: u32 = @intCast(if (bits >= 64) bits - 64 else 64 - bits);
+                    break :blk @as(u32, 256) + dist;
+                },
+                else => 1024,
+            };
+            total +|= slot;
+        }
+        return total;
     }
 
     fn resolveCallInStruct(self: *HirBuilder, struct_name: []const u8, name: ast.StringId, arity: u32, args: []const CallArg) ?ResolvedFunctionCall {
