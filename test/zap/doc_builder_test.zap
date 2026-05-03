@@ -82,6 +82,14 @@ pub struct Zap.DocBuilderTest {
       assert(Map.has_key?(_f, :name))
     }
 
+    test("manifest_function_summaries first entry carries :source_file and :source_line") {
+      _f = List.head(manifest_function_summaries())
+      _source = Map.get(_f, :source_file, "")
+      assert(String.length(_source) > 0)
+      _line = Map.get(_f, :source_line, 0)
+      assert(_line > 0)
+    }
+
     test("rendered Atom page contains a Functions summary table with to_string row") {
       _ = File.mkdir("zap-out/test-docs")
       _ = write_docs_to("zap-out/test-docs")

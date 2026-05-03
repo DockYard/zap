@@ -85,6 +85,8 @@ pub struct Zap.Doc.Builder {
           name: map_get(_f, :name, ""),
           arity: map_get(_f, :arity, 0),
           doc: map_get(_f, :doc, ""),
+          source_file: map_get(_f, :source_file, ""),
+          source_line: map_get(_f, :source_line, 0),
         }
       }
     })
@@ -96,6 +98,8 @@ pub struct Zap.Doc.Builder {
           name: map_get(_m, :name, ""),
           arity: map_get(_m, :arity, 0),
           doc: map_get(_m, :doc, ""),
+          source_file: map_get(_m, :source_file, ""),
+          source_line: map_get(_m, :source_line, 0),
         }
       }
     })

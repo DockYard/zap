@@ -574,12 +574,51 @@ pub struct Zap.Doc {
     structdoc_html = Markdown.to_html(doc)
     functions_rows = render_module_member_rows(all_functions, name, "")
     macros_rows = render_module_member_rows(all_macros, name, "")
+    functions_details = render_module_member_details(all_functions, name, false, "")
+    macros_details = render_module_member_details(all_macros, name, true, "")
     implements = collect_implemented_protocols(all_impls, name, [] :: [String])
-    body_html = module_main_content(kind, name, implements, first_sentence(doc), structdoc_html, functions_rows, macros_rows, "", "")
+    body_html = module_main_content(kind, name, implements, first_sentence(doc), structdoc_html, functions_rows, macros_rows, functions_details, macros_details)
     extras = render_kind_extras(kind, name, all_variants, all_required)
     content = body_html <> extras
     sidebar_html = sidebar(structs, protocols, unions, name, "")
     struct_page("Zap", "0.0.0", name, "", "", sidebar_html, content, "")
+  }
+
+  @doc = """
+    Walk the flat function or macro manifest, filter by `:module` to
+    keep only entries belonging to `module_name`, and emit a
+    `<div class="function-detail">` block per match — header with
+    name/arity/anchor + Markdown-rendered doc body. Returns the
+    concatenation of all matching detail blocks; the caller passes
+    the result to `module_main_content`'s `functions_details` or
+    `macros_details` slot.
+    """
+  pub fn render_module_member_details(members :: [%{Atom => Term}], module_name :: String, is_macro :: Bool, acc :: String) -> String {
+    if List.empty?(members) {
+      acc
+    } else {
+      render_module_member_details(List.tail(members), module_name, is_macro, acc <> member_detail_for_module(List.head(members), module_name, is_macro))
+    }
+  }
+
+  pub fn member_detail_for_module(member :: %{Atom => Term}, module_name :: String, is_macro :: Bool) -> String {
+    if Map.get(member, :module, "") == module_name {
+      compose_member_detail(Map.get(member, :name, ""), Map.get(member, :arity, 0), is_macro, Map.get(member, :doc, ""))
+    } else {
+      ""
+    }
+  }
+
+  pub fn compose_member_detail(name :: String, arity :: i64, is_macro :: Bool, doc :: String) -> String {
+    doc_html = Markdown.to_html(doc)
+    open_div = "<div class=\"function-detail\" id=\"" <> anchor_id(name, arity) <> "\">\n"
+    header = function_header(name, arity, is_macro)
+    body = if String.length(doc_html) == 0 {
+      ""
+    } else {
+      "<div class=\"function-doc\">\n" <> doc_html <> "</div>\n"
+    }
+    open_div <> header <> body <> "</div>\n"
   }
 
   @doc = """
