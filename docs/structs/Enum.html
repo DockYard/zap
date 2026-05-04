@@ -162,6 +162,12 @@ and returns the remaining elements as a list.</td></tr>
 <tr><td class="summary-name"><a href="#concat-2">concat/2</a></td><td class="summary-doc">Concatenates two enumerable collections into a single list.</td></tr>
 <tr><td class="summary-name"><a href="#uniq-1">uniq/1</a></td><td class="summary-doc">Returns a new list with duplicate values removed.</td></tr>
 <tr><td class="summary-name"><a href="#empty?-1">empty?/1</a></td><td class="summary-doc">Returns true if the enumerable collection has no elements.</td></tr>
+<tr><td class="summary-name"><a href="#first-1">first/1</a></td><td class="summary-doc">Returns the first element of the collection.</td></tr>
+<tr><td class="summary-name"><a href="#first-2">first/2</a></td><td class="summary-doc">Returns the first element of the collection, or `default` when
+the collection is empty.</td></tr>
+<tr><td class="summary-name"><a href="#last-1">last/1</a></td><td class="summary-doc">Returns the last element of the collection.</td></tr>
+<tr><td class="summary-name"><a href="#last-2">last/2</a></td><td class="summary-doc"></td></tr>
+<tr><td class="summary-name"><a href="#count-1">count/1</a></td><td class="summary-doc">Returns the number of elements in the collection.</td></tr>
 </table>
 <h2>Function Details</h2>
 <div class="function-detail" id="to_list-1">
@@ -336,6 +342,7 @@ Enum.all?(<span class="hl-number">1..3</span>, <span class="hl-keyword">fn</span
 <a href="#sum-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">sum</span><span class="sig-paren">(</span>collection<span class="sig-separator">::</span><span class="sig-type-pill">Enumerable</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="signature"><code><span class="sig-name">sum</span><span class="sig-paren">(</span>range<span class="sig-separator">::</span><span class="sig-type-pill">Range</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
 <div class="function-doc">
 <p>Returns the sum of all elements.</p>
 <h2>Examples</h2>
@@ -359,7 +366,7 @@ Returns 1 for an empty collection.</p>
 <pre><code class="language-zap">Enum.product([<span class="hl-number">2</span>, <span class="hl-number">3</span>, <span class="hl-number">4</span>])  <span class="hl-comment"># =&gt; 24</span>
 Enum.product([])         <span class="hl-comment"># =&gt; 1</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L178">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L189">Source</a>
 </div>
 <div class="function-detail" id="max-1">
 <div class="function-header">
@@ -375,7 +382,7 @@ Returns 0 for an empty collection.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap">Enum.max([<span class="hl-number">3</span>, <span class="hl-number">1</span>, <span class="hl-number">4</span>, <span class="hl-number">1</span>, <span class="hl-number">5</span>])  <span class="hl-comment"># =&gt; 5</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L191">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L202">Source</a>
 </div>
 <div class="function-detail" id="min-1">
 <div class="function-header">
@@ -391,7 +398,7 @@ Returns 0 for an empty collection.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap">Enum.min([<span class="hl-number">3</span>, <span class="hl-number">1</span>, <span class="hl-number">4</span>, <span class="hl-number">1</span>, <span class="hl-number">5</span>])  <span class="hl-comment"># =&gt; 1</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L204">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L215">Source</a>
 </div>
 <div class="function-detail" id="sort-2">
 <div class="function-header">
@@ -409,7 +416,7 @@ come before the second.</p>
 <pre><code class="language-zap">Enum.sort([<span class="hl-number">3</span>, <span class="hl-number">1</span>, <span class="hl-number">2</span>], <span class="hl-keyword">fn</span>(a, b) { a <span class="hl-op">&lt;</span> b })  <span class="hl-comment"># =&gt; [1, 2, 3]</span>
 Enum.sort(<span class="hl-number">1..3</span>, <span class="hl-keyword">fn</span>(a, b) { a <span class="hl-op">&gt;</span> b })       <span class="hl-comment"># =&gt; [3, 2, 1]</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L219">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L230">Source</a>
 </div>
 <div class="function-detail" id="flat_map-2">
 <div class="function-header">
@@ -426,7 +433,7 @@ into a single list.</p>
 <pre><code class="language-zap">Enum.flat_map([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>], <span class="hl-keyword">fn</span>(x) { [x, x <span class="hl-op">*</span> <span class="hl-number">10</span>] })
 <span class="hl-comment"># =&gt; [1, 10, 2, 20, 3, 30]</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L233">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L244">Source</a>
 </div>
 <div class="function-detail" id="take-2">
 <div class="function-header">
@@ -445,7 +452,7 @@ collection as a list.</p>
 Enum.take(<span class="hl-number">1..5</span>, <span class="hl-number">3</span>)             <span class="hl-comment"># =&gt; [1, 2, 3]</span>
 Enum.take([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>], <span class="hl-number">0</span>)        <span class="hl-comment"># =&gt; []</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L250">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L261">Source</a>
 </div>
 <div class="function-detail" id="drop-2">
 <div class="function-header">
@@ -464,7 +471,7 @@ and returns the remaining elements as a list.</p>
 Enum.drop(<span class="hl-number">1..5</span>, <span class="hl-number">2</span>)             <span class="hl-comment"># =&gt; [3, 4, 5]</span>
 Enum.drop([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>], <span class="hl-number">0</span>)        <span class="hl-comment"># =&gt; [1, 2, 3]</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L267">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L278">Source</a>
 </div>
 <div class="function-detail" id="reverse-1">
 <div class="function-header">
@@ -480,7 +487,7 @@ Enum.drop([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <
 <pre><code class="language-zap">Enum.reverse([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>])  <span class="hl-comment"># =&gt; [3, 2, 1]</span>
 Enum.reverse(<span class="hl-number">1..3</span>)       <span class="hl-comment"># =&gt; [3, 2, 1]</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L280">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L291">Source</a>
 </div>
 <div class="function-detail" id="member?-2">
 <div class="function-header">
@@ -497,7 +504,7 @@ Enum.reverse(<span class="hl-number">1..3</span>)       <span class="hl-comment"
 Enum.member?(<span class="hl-number">1..3</span>, <span class="hl-number">5</span>)       <span class="hl-comment"># =&gt; false</span>
 Enum.member?([], <span class="hl-number">1</span>)         <span class="hl-comment"># =&gt; false</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L294">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L305">Source</a>
 </div>
 <div class="function-detail" id="at-3">
 <div class="function-header">
@@ -514,7 +521,7 @@ Returns <code>default</code> if the index is out of bounds.</p>
 <pre><code class="language-zap">Enum.at([<span class="hl-number">10</span>, <span class="hl-number">20</span>, <span class="hl-number">30</span>], <span class="hl-number">1</span>, <span class="hl-number">0</span>)  <span class="hl-comment"># =&gt; 20</span>
 Enum.at([<span class="hl-string">"a"</span>], <span class="hl-number">2</span>, <span class="hl-string">"none"</span>)  <span class="hl-comment"># =&gt; &quot;none&quot;</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L308">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L319">Source</a>
 </div>
 <div class="function-detail" id="concat-2">
 <div class="function-header">
@@ -530,7 +537,7 @@ Enum.at([<span class="hl-string">"a"</span>], <span class="hl-number">2</span>, 
 <pre><code class="language-zap">Enum.concat([<span class="hl-number">1</span>, <span class="hl-number">2</span>], [<span class="hl-number">3</span>, <span class="hl-number">4</span>])  <span class="hl-comment"># =&gt; [1, 2, 3, 4]</span>
 Enum.concat(<span class="hl-number">1..2</span>, <span class="hl-number">3..4</span>)      <span class="hl-comment"># =&gt; [1, 2, 3, 4]</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L321">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L332">Source</a>
 </div>
 <div class="function-detail" id="uniq-1">
 <div class="function-header">
@@ -547,7 +554,7 @@ Preserves the order of first occurrences.</p>
 <pre><code class="language-zap">Enum.uniq([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>, <span class="hl-number">1</span>])  <span class="hl-comment"># =&gt; [1, 2, 3]</span>
 Enum.uniq(<span class="hl-number">1..3</span>)             <span class="hl-comment"># =&gt; [1, 2, 3]</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L335">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L346">Source</a>
 </div>
 <div class="function-detail" id="empty?-1">
 <div class="function-header">
@@ -563,7 +570,95 @@ Enum.uniq(<span class="hl-number">1..3</span>)             <span class="hl-comme
 <pre><code class="language-zap">Enum.empty?([])    <span class="hl-comment"># =&gt; true</span>
 Enum.empty?(<span class="hl-number">1..3</span>)  <span class="hl-comment"># =&gt; false</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L348">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L359">Source</a>
+</div>
+<div class="function-detail" id="first-1">
+<div class="function-header">
+<h3>first<span class="arity">/1</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#first-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">first</span><span class="sig-paren">(</span>collection<span class="sig-separator">::</span><span class="sig-type-pill">Enumerable</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">element</span></code></div>
+<div class="function-doc">
+<p>Returns the first element of the collection. Panics on an empty
+collection — use <code>first/2</code> to supply a default for that case.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Enum.first([<span class="hl-number">10</span>, <span class="hl-number">20</span>, <span class="hl-number">30</span>])  <span class="hl-comment"># =&gt; 10</span>
+Enum.first(<span class="hl-number">5..15</span>)         <span class="hl-comment"># =&gt; 5</span></code></pre>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L376">Source</a>
+</div>
+<div class="function-detail" id="first-2">
+<div class="function-header">
+<h3>first<span class="arity">/2</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#first-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">first</span><span class="sig-paren">(</span>collection<span class="sig-separator">::</span><span class="sig-type-pill">Enumerable</span><span class="sig-paren">, </span>default<span class="sig-separator">::</span><span class="sig-type-pill">element</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">element</span></code></div>
+<div class="function-doc">
+<p>Returns the first element of the collection, or <code>default</code> when
+the collection is empty.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Enum.first([<span class="hl-number">10</span>, <span class="hl-number">20</span>], -<span class="hl-number">1</span>)  <span class="hl-comment"># =&gt; 10</span>
+Enum.first([], -<span class="hl-number">1</span>)        <span class="hl-comment"># =&gt; -1</span></code></pre>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L393">Source</a>
+</div>
+<div class="function-detail" id="last-1">
+<div class="function-header">
+<h3>last<span class="arity">/1</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#last-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">last</span><span class="sig-paren">(</span>collection<span class="sig-separator">::</span><span class="sig-type-pill">Enumerable</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">element</span></code></div>
+<div class="signature"><code><span class="sig-name">last</span><span class="sig-paren">(</span>range<span class="sig-separator">::</span><span class="sig-type-pill">Range</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="function-doc">
+<p>Returns the last element of the collection. Panics on an empty
+collection — use <code>last/2</code> to supply a default for that case.
+The generic implementation walks the collection; <code>Range</code> and
+other types with closed-form last-element formulas can override
+via type-specific clauses for an O(1) result.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Enum.last([<span class="hl-number">10</span>, <span class="hl-number">20</span>, <span class="hl-number">30</span>])  <span class="hl-comment"># =&gt; 30</span>
+Enum.last(<span class="hl-number">1..10</span>:<span class="hl-number">3</span>)       <span class="hl-comment"># =&gt; 10</span>
+Enum.last(<span class="hl-number">10..1</span>)         <span class="hl-comment"># =&gt; 1</span></code></pre>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L414">Source</a>
+</div>
+<div class="function-detail" id="last-2">
+<div class="function-header">
+<h3>last<span class="arity">/2</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#last-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">last</span><span class="sig-paren">(</span>collection<span class="sig-separator">::</span><span class="sig-type-pill">Enumerable</span><span class="sig-paren">, </span>default<span class="sig-separator">::</span><span class="sig-type-pill">element</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">element</span></code></div>
+<div class="signature"><code><span class="sig-name">last</span><span class="sig-paren">(</span>range<span class="sig-separator">::</span><span class="sig-type-pill">Range</span><span class="sig-paren">, </span>_default<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L421">Source</a>
+</div>
+<div class="function-detail" id="count-1">
+<div class="function-header">
+<h3>count<span class="arity">/1</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#count-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">count</span><span class="sig-paren">(</span>collection<span class="sig-separator">::</span><span class="sig-type-pill">Enumerable</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="signature"><code><span class="sig-name">count</span><span class="sig-paren">(</span>range<span class="sig-separator">::</span><span class="sig-type-pill">Range</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
+<div class="function-doc">
+<p>Returns the number of elements in the collection. The generic
+implementation walks the entire collection; the <code>Range</code> clause
+computes <code>|end - start| / step + 1</code> in O(1).</p>
+<p><code>Enum.count/2</code> (with a predicate) counts only elements that
+satisfy the predicate.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Enum.count([<span class="hl-number">10</span>, <span class="hl-number">20</span>, <span class="hl-number">30</span>])  <span class="hl-comment"># =&gt; 3</span>
+Enum.count(<span class="hl-number">1..10</span>:<span class="hl-number">3</span>)       <span class="hl-comment"># =&gt; 4</span></code></pre>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L481">Source</a>
 </div>
 </main>
 <aside class="toc">
@@ -594,6 +689,11 @@ Enum.empty?(<span class="hl-number">1..3</span>)  <span class="hl-comment"># =&g
 <li><a href="#concat-2">concat/2</a></li>
 <li><a href="#uniq-1">uniq/1</a></li>
 <li><a href="#empty?-1">empty?/1</a></li>
+<li><a href="#first-1">first/1</a></li>
+<li><a href="#first-2">first/2</a></li>
+<li><a href="#last-1">last/1</a></li>
+<li><a href="#last-2">last/2</a></li>
+<li><a href="#count-1">count/1</a></li>
 </ul>
 </aside>
 </div>
