@@ -2598,14 +2598,70 @@ pub const TypeChecker = struct {
     }
 
     fn registerUserTypes(self: *TypeChecker) !void {
+        // Pass 1 — forward-declare every user-defined nominal type so
+        // its name is in `name_to_type` BEFORE any field/variant
+        // resolution runs. Without this, a `pub struct Tree { left ::
+        // Tree | nil }` would type-check `Tree` inside its own field
+        // expression and find no entry — the union member would
+        // resolve to `TypeStore.UNKNOWN`, the recursive edge would be
+        // invisible to `analyzeStructFieldStorage`, and the field
+        // would stay `.direct` storage and blow up at struct-decl
+        // layout time. The placeholder entries written here get
+        // overwritten in pass 2 with the resolved field/variant
+        // lists; the `TypeId`s never change, so any `name_to_type`
+        // lookup made during pass 2 yields a stable identity.
+        for (self.graph.types.items) |type_entry| {
+            switch (type_entry.kind) {
+                .struct_type => {
+                    const name = type_entry.name;
+                    if (name == 0) continue;
+                    if (self.store.name_to_type.get(name) != null) continue;
+                    const name_str = self.interner.get(name);
+                    if (self.store.resolveTypeName(name_str) != null) continue; // builtin wins; pass 2 will diagnose
+                    const type_id = try self.store.addType(.{ .struct_type = .{
+                        .name = name,
+                        .fields = &.{},
+                    } });
+                    try self.store.name_to_type.put(name, type_id);
+                },
+                .union_type => |ud| {
+                    if (self.store.name_to_type.get(ud.name) != null) continue;
+                    const enum_name_str = self.interner.get(ud.name);
+                    if (self.store.resolveTypeName(enum_name_str) != null) continue;
+                    const type_id = try self.store.addType(.{ .tagged_union = .{
+                        .name = ud.name,
+                        .variants = &.{},
+                    } });
+                    try self.store.name_to_type.put(ud.name, type_id);
+                },
+                .opaque_type => {
+                    if (self.store.name_to_type.get(type_entry.name) != null) continue;
+                    const opaque_name_str = self.interner.get(type_entry.name);
+                    if (self.store.resolveTypeName(opaque_name_str) != null) continue;
+                    // Inner is a real TypeId field, not a slice — use
+                    // `UNKNOWN` as the placeholder; pass 2 overwrites.
+                    const type_id = try self.store.addType(.{ .opaque_type = .{
+                        .name = type_entry.name,
+                        .inner = TypeStore.UNKNOWN,
+                    } });
+                    try self.store.name_to_type.put(type_entry.name, type_id);
+                },
+                else => {},
+            }
+        }
+
+        // Pass 2 — resolve fields/variants/inner with every user-
+        // defined nominal name now visible. Diagnoses builtin-shadow
+        // collisions that pass 1 silently skipped.
         for (self.graph.types.items) |type_entry| {
             switch (type_entry.kind) {
                 .struct_type => |sd| {
                     const name = type_entry.name;
                     if (name == 0) continue;
-                    if (self.store.name_to_type.get(name) != null) continue;
                     const name_str = self.interner.get(name);
-                    if (self.store.resolveTypeName(name_str) != null) {
+                    if (self.store.resolveTypeName(name_str) != null and
+                        self.store.name_to_type.get(name) == null)
+                    {
                         try self.errors.append(self.allocator, .{
                             .message = try std.fmt.allocPrint(self.allocator, "`{s}` shadows a builtin type — choose a different name", .{name_str}),
                             .span = sd.meta.span,
@@ -2613,11 +2669,13 @@ pub const TypeChecker = struct {
                             .help = try std.fmt.allocPrint(self.allocator, "the builtin `{s}` type takes priority over this definition", .{name_str}),
                             .severity = .warning,
                         });
-                        continue; // builtin wins
+                        continue;
                     }
-                    // Build struct fields with resolved types
+                    const type_id = self.store.name_to_type.get(name) orelse continue;
+                    // Build struct fields with resolved types. Parent
+                    // fields come first, then own fields (extending
+                    // parent fields type-check here).
                     var fields: std.ArrayList(Type.StructField) = .empty;
-                    // First collect parent fields if extends
                     if (sd.parent) |parent_name| {
                         if (self.graph.resolveTypeByName(parent_name)) |parent_scope_tid| {
                             const parent_entry = self.graph.types.items[parent_scope_tid];
@@ -2633,15 +2691,12 @@ pub const TypeChecker = struct {
                             }
                         }
                     }
-                    // Then add own fields (may override parent defaults but type check happens here)
                     for (sd.fields) |field| {
                         const field_type = self.resolveTypeExpr(field.type_expr) catch TypeStore.UNKNOWN;
                         const default = field.default;
-                        // Check if this field already exists from parent
                         var found_parent = false;
                         for (fields.items) |*pf| {
                             if (pf.name == field.name) {
-                                // Validate type doesn't change
                                 if (pf.type_id != field_type and pf.type_id != TypeStore.UNKNOWN and field_type != TypeStore.UNKNOWN) {
                                     try self.addHardError(
                                         try std.fmt.allocPrint(self.allocator, "field `{s}` type cannot be changed in extends", .{self.interner.get(field.name)}),
@@ -2662,16 +2717,16 @@ pub const TypeChecker = struct {
                             });
                         }
                     }
-                    const type_id = try self.store.addType(.{ .struct_type = .{
+                    self.store.types.items[type_id] = .{ .struct_type = .{
                         .name = name,
                         .fields = try fields.toOwnedSlice(self.allocator),
-                    } });
-                    try self.store.name_to_type.put(name, type_id);
+                    } };
                 },
                 .union_type => |ud| {
-                    if (self.store.name_to_type.get(ud.name) != null) continue;
                     const enum_name_str = self.interner.get(ud.name);
-                    if (self.store.resolveTypeName(enum_name_str) != null) {
+                    if (self.store.resolveTypeName(enum_name_str) != null and
+                        self.store.name_to_type.get(ud.name) == null)
+                    {
                         try self.errors.append(self.allocator, .{
                             .message = try std.fmt.allocPrint(self.allocator, "`{s}` shadows a builtin type — choose a different name", .{enum_name_str}),
                             .span = ud.meta.span,
@@ -2679,8 +2734,9 @@ pub const TypeChecker = struct {
                             .help = try std.fmt.allocPrint(self.allocator, "the builtin `{s}` type takes priority over this definition", .{enum_name_str}),
                             .severity = .warning,
                         });
-                        continue; // builtin wins
+                        continue;
                     }
+                    const type_id = self.store.name_to_type.get(ud.name) orelse continue;
                     var variant_entries: std.ArrayList(Type.TaggedUnionVariant) = .empty;
                     for (ud.variants) |v| {
                         const vtype = if (v.type_expr) |te|
@@ -2692,16 +2748,16 @@ pub const TypeChecker = struct {
                             .type_id = vtype,
                         });
                     }
-                    const type_id = try self.store.addType(.{ .tagged_union = .{
+                    self.store.types.items[type_id] = .{ .tagged_union = .{
                         .name = ud.name,
                         .variants = try variant_entries.toOwnedSlice(self.allocator),
-                    } });
-                    try self.store.name_to_type.put(ud.name, type_id);
+                    } };
                 },
                 .opaque_type => |opaque_body| {
-                    if (self.store.name_to_type.get(type_entry.name) != null) continue;
                     const opaque_name_str = self.interner.get(type_entry.name);
-                    if (self.store.resolveTypeName(opaque_name_str) != null) {
+                    if (self.store.resolveTypeName(opaque_name_str) != null and
+                        self.store.name_to_type.get(type_entry.name) == null)
+                    {
                         try self.errors.append(self.allocator, .{
                             .message = try std.fmt.allocPrint(self.allocator, "`{s}` shadows a builtin type — choose a different name", .{opaque_name_str}),
                             .span = type_entry.kind.opaque_type.getMeta().span,
@@ -2711,13 +2767,12 @@ pub const TypeChecker = struct {
                         });
                         continue;
                     }
-
+                    const type_id = self.store.name_to_type.get(type_entry.name) orelse continue;
                     const inner_type = try self.resolveTypeExpr(opaque_body);
-                    const type_id = try self.store.addType(.{ .opaque_type = .{
+                    self.store.types.items[type_id] = .{ .opaque_type = .{
                         .name = type_entry.name,
                         .inner = inner_type,
-                    } });
-                    try self.store.name_to_type.put(type_entry.name, type_id);
+                    } };
                 },
                 else => {},
             }
