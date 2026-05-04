@@ -801,6 +801,23 @@ This completely removes Zap's dependency on LLVM `musttail` for byref state. The
 
 These fixes shipped during the investigation. They unblock the *compile path* but not the runtime/scale path. Including them so the research agent doesn't waste time re-investigating already-fixed bugs.
 
+### Status update (later session)
+
+Three additional fixes landed after the original brief was written:
+
+- **Blocker 1 fully resolved** (fork: `8352916bdb`, Zap: `3b3eec9`). Streaming per-field-body API in the fork; Zap migrated to `ZigType` field types and routes non-primitive field types through `emitImportedTypeRef` in body context. The `Body { x :: f64, ... }` + `Bodies { sun :: Body, jupiter :: Body }` hierarchy now compiles and runs end-to-end. Verified with a `pair_dist(bs.sun, bs.jupiter) -> f64` function that crosses struct boundaries and returns a primitive.
+
+- **Blocker 2 foundation landed** (fork: `7c5d77c5e8`, Zap: `f175a43`). Adds `FieldStorage` enum on `StructFieldDef`, `zigTypeReachesStruct` walker for self-recursion detection, `indirectFieldType` rewrite (`?T` → `?*const T`, `T` → `*const T`), `emit_optional_type` and `emit_single_const_ptr_type` ZIR primitives + Zap-side `.optional` / `.ptr` cases in `emitImportedTypeRef`. The lowering machinery is correct end-to-end but **does not yet light up on real recursive types** because of a *separate* type-checker bug:
+  > When `pub struct Tree { left :: Tree | nil }` is type-checked, Tree's own name is not yet registered in the `TypeStore` when its fields are processed, so `Tree | nil` resolves as `union(unknown, nil_type)` instead of `union(struct_type Tree, nil_type)`. The storage-detection walker doesn't see a struct_ref to match against, the field stays `.direct`, and the indirect-lowering code is never invoked.
+
+  **The prerequisite fix** (next step for Blocker 2): two-pass struct type registration in `src/types.zig`. First pass registers every `pub struct` name with a placeholder `TypeId`; second pass resolves field types with all names visible. Once that lands, the storage-strategy machinery activates automatically.
+
+  Construction codegen, field-access auto-deref, pattern-match auto-deref, and uninhabited-recursive-type diagnostics are also still pending — each requires the type-checker fix to be testable.
+
+- **Blocker 3 still open**. Loopification is the right primary path per the refined recommendations (§6.5). Implementation sketch: wrap function bodies in a ZIR `loop` block, allocate stack slots for each parameter, redirect `param_get` to slot loads, replace each `tail_call` IR instruction with slot-update + `repeat`. This bypasses LLVM `musttail` entirely so byref-shaped state runs bounded-stack. Estimated scope: 300-500 lines in `src/ir.zig` + `src/zir_builder.zig`. Not started.
+
+The byref-guard from earlier (Fix C) remains in place as the correctness floor — it stops `musttail` from being marked on byref signatures so the compile path stays clean even without loopification.
+
 ### Fix A — `struct_init_field_type` body tracking (in fork)
 
 Commit `7234629... zir_builder: body-track struct_init_field_type instructions` on branch `zap-zir-library-0.16` of `~/projects/zig`.
