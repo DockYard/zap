@@ -51,6 +51,16 @@ extern "c" fn zir_builder_emit_import(handle: ?*ZirBuilderHandle, name_ptr: [*]c
 extern "c" fn zir_builder_emit_field_val(handle: ?*ZirBuilderHandle, object: u32, field_ptr: [*]const u8, field_len: u32) u32;
 extern "c" fn zir_builder_emit_call_ref(handle: ?*ZirBuilderHandle, callee: u32, args_ptr: [*]const u32, args_len: u32) u32;
 extern "c" fn zir_builder_emit_typeof(handle: ?*ZirBuilderHandle, operand: u32) u32;
+/// Emit `?T` — wraps `child` in an optional type. Used by the
+/// recursive-struct storage strategy plus any call-site that
+/// needs to express optional types in a body context.
+extern "c" fn zir_builder_emit_optional_type(handle: ?*ZirBuilderHandle, child: u32) u32;
+/// Emit `*const T` — a single-element, immutable, default-
+/// address-space pointer. The recursive-struct storage strategy
+/// inserts this between a self-referential field's nominal type
+/// and its enclosing optional, breaking what would otherwise be
+/// an infinite-size value-typed cycle.
+extern "c" fn zir_builder_emit_single_const_ptr_type(handle: ?*ZirBuilderHandle, pointee: u32) u32;
 extern "c" fn zir_builder_emit_if_else(handle: ?*ZirBuilderHandle, condition: u32, then_value: u32, else_value: u32) u32;
 extern "c" fn zir_builder_emit_struct_init_anon(handle: ?*ZirBuilderHandle, names_ptrs: [*]const [*]const u8, names_lens: [*]const u32, values_ptr: [*]const u32, fields_len: u32) u32;
 extern "c" fn zir_builder_emit_union_init(handle: ?*ZirBuilderHandle, union_type: u32, field_name_ptr: [*]const u8, field_name_len: u32, init_value: u32) u32;
@@ -723,10 +733,31 @@ pub const ZirDriver = struct {
             .tuple => self.mapTupleElementType(zig_type),
             .struct_ref => |name| return try self.emitStructTypeRef(name),
             .term => return try self.emitTermTypeRef(),
+            .optional => |inner| {
+                // `?T` — emit T's ref, then wrap in optional. Used by
+                // the recursive-struct storage strategy to lower a
+                // source `?Tree` field as `?*const Tree` once the
+                // pointer indirection has been synthesized below.
+                const inner_ref = try self.emitImportedTypeRef(inner.*);
+                const ref = zir_builder_emit_optional_type(self.handle, inner_ref);
+                if (ref == error_ref) return error.EmitFailed;
+                return ref;
+            },
+            .ptr => |pointee| {
+                // `*const T` — emit T's ref, then wrap in single-
+                // const pointer. The recursive-storage path inserts
+                // this between an `optional` and a `struct_ref` to
+                // break what would otherwise be an infinite-size
+                // value-typed cycle.
+                const pointee_ref = try self.emitImportedTypeRef(pointee.*);
+                const ref = zir_builder_emit_single_const_ptr_type(self.handle, pointee_ref);
+                if (ref == error_ref) return error.EmitFailed;
+                return ref;
+            },
             // void/nil/never should not appear as tuple elements
             .void, .nil, .never => return error.EmitFailed,
             // Types that don't have runtime representations as tuple elements yet
-            .function, .tagged_union, .ptr, .optional, .any => return error.EmitFailed,
+            .function, .tagged_union, .any => return error.EmitFailed,
             // Primitives are handled above by mapReturnType — they never reach here
             .bool_type,
             .i8,
@@ -1111,8 +1142,33 @@ pub const ZirDriver = struct {
     /// Emit one root field's name + type body via the streaming API.
     /// Picks the static-ref fast path for primitives, the recorded
     /// body path otherwise.
+    ///
+    /// For fields marked `FieldStorage.indirect` (self-referential
+    /// fields, detected by `analyzeStructFieldStorage`), the source-
+    /// level `ZigType` is rewritten into the matching pointer-
+    /// indirected shape before being lowered. The two cases that
+    /// matter:
+    ///
+    /// - source `?T` where T transitively includes the owner
+    ///   → lower as `?*const T` (the natural binary-tree shape)
+    /// - source `T` where T transitively includes the owner
+    ///   → lower as `*const T` (uninhabited at the source level —
+    ///     value-typed self-recursion has no terminator. Compiles,
+    ///     but cannot be constructed, exactly as if the user had
+    ///     declared a struct with no nullable child)
+    ///
+    /// Only the field's storage shape is rewritten — pattern
+    /// matching, field access, and construction all observe the
+    /// source-level type. The codegen plumbing for those (auto-deref
+    /// on access, heap-allocate on construction) is the next
+    /// portion of the recursive-storage work.
     fn emitRootFieldType(self: *ZirDriver, field: ir.StructFieldDef) !void {
-        const simple = mapReturnType(field.type_expr);
+        const lowered_type = if (field.storage == .indirect)
+            indirectFieldType(field.type_expr)
+        else
+            field.type_expr;
+
+        const simple = mapReturnType(lowered_type);
         if (simple != 0) {
             if (zir_builder_set_root_field_static(
                 self.handle,
@@ -1131,7 +1187,7 @@ pub const ZirDriver = struct {
             @intCast(field.name.len),
         ) != 0) return error.EmitFailed;
 
-        const final_ref = self.emitImportedTypeRef(field.type_expr) catch |err| {
+        const final_ref = self.emitImportedTypeRef(lowered_type) catch |err| {
             // Best-effort cleanup: end the body with `void_value` so
             // the field at least exists in the struct decl rather
             // than the builder being left in an inconsistent state.
@@ -1147,6 +1203,40 @@ pub const ZirDriver = struct {
         if (zir_builder_end_root_field_body(self.handle, final_ref) != 0) {
             return error.EmitFailed;
         }
+    }
+
+    /// Rewrite a source-level field type into its
+    /// indirect-storage shape: insert a `*const T` between the
+    /// outer optional (if any) and the recursive nominal target.
+    ///
+    /// `?T`     → `?*const T`
+    /// `T`      → `*const T` (uninhabited at the source level, but
+    ///            we still synthesize a valid type so the struct
+    ///            compiles — Sema rejects construction at the leaf)
+    /// other shapes (list/map/tuple containing self) fall through
+    /// unchanged today; future work could extend the rewrite to
+    /// indirect through container element positions, but the common
+    /// recursive-tree pattern uses optional or bare struct refs.
+    fn indirectFieldType(t: ir.ZigType) ir.ZigType {
+        return switch (t) {
+            .optional => |inner| blk: {
+                // Heap-allocate a new ZigType node for the pointer
+                // wrapper. The lifetime matches the surrounding
+                // struct emission scope, which is bounded — the
+                // global allocator behind ir.zig handles this fine.
+                const ptr_inner_box = std.heap.page_allocator.create(ir.ZigType) catch break :blk t;
+                ptr_inner_box.* = inner.*;
+                const ptr_box = std.heap.page_allocator.create(ir.ZigType) catch break :blk t;
+                ptr_box.* = .{ .ptr = ptr_inner_box };
+                break :blk .{ .optional = ptr_box };
+            },
+            .struct_ref => blk: {
+                const inner_box = std.heap.page_allocator.create(ir.ZigType) catch break :blk t;
+                inner_box.* = t;
+                break :blk .{ .ptr = inner_box };
+            },
+            else => t,
+        };
     }
 
     fn findStructDef(self: *const ZirDriver, type_name: []const u8) ?ir.StructDef {

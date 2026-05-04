@@ -37,6 +37,31 @@ pub const StructDef = struct {
     fields: []const StructFieldDef,
 };
 
+/// How a struct field is laid out at the runtime/Zig level. Only
+/// matters for nominal struct fields whose type creates a layout
+/// cycle: a self-referential `Tree { left :: ?Tree }` has infinite
+/// size if every `Tree` value contains another `Tree` value, so
+/// the compiler must internally indirect the recursive edge with
+/// a pointer. Source nullability stays source-driven — `?Tree`
+/// stays optional at the source level, but its storage is
+/// `?*Tree` (optional pointer); `Tree` (non-optional) is rejected
+/// as uninhabited if no terminating constructor is reachable.
+pub const FieldStorage = enum {
+    /// Field is laid out by value at its declared type. The default
+    /// for every primitive, every nominal struct type that doesn't
+    /// participate in a recursion cycle, and every container of
+    /// either of those.
+    direct,
+    /// Field is laid out via a hidden pointer indirection that
+    /// breaks an otherwise-infinite layout cycle. Source-level
+    /// access still returns the deref'd value; construction
+    /// auto-promotes the value to the heap. Triggered only for
+    /// fields whose type transitively references the struct that
+    /// owns them (self-recursion today; mutual recursion through
+    /// SCC analysis is the next step).
+    indirect,
+};
+
 pub const StructFieldDef = struct {
     name: []const u8,
     /// Field type as a structured `ZigType`. The previous string
@@ -48,6 +73,12 @@ pub const StructFieldDef = struct {
     /// at every literal site.
     type_expr: ZigType,
     default_value: ?DefaultValue = null,
+    /// Storage strategy for this field. `.direct` is the default and
+    /// applies to everything except recursive edges; `.indirect`
+    /// inserts a hidden pointer to break a layout cycle (see
+    /// `FieldStorage`). Computed by `analyzeStructFieldStorage`
+    /// during IR construction.
+    storage: FieldStorage = .direct,
 };
 
 pub const EnumDef = struct {
@@ -1272,13 +1303,20 @@ pub const IrBuilder = struct {
             for (ts.types.items) |typ| {
                 switch (typ) {
                     .struct_type => |st| {
+                        const owner_name = self.interner.get(st.name);
                         var fields: std.ArrayList(StructFieldDef) = .empty;
                         for (st.fields) |field| {
                             const default_val: ?DefaultValue = if (field.default_expr) |expr| self.extractDefaultValue(expr) else null;
+                            const field_zig_type = typeIdToZigTypeWithStore(field.type_id, self.type_store);
+                            const storage: FieldStorage = if (zigTypeReachesStruct(field_zig_type, owner_name))
+                                .indirect
+                            else
+                                .direct;
                             try fields.append(self.allocator, .{
                                 .name = self.interner.get(field.name),
-                                .type_expr = typeIdToZigTypeWithStore(field.type_id, self.type_store),
+                                .type_expr = field_zig_type,
                                 .default_value = default_val,
+                                .storage = storage,
                             });
                         }
                         try type_defs.append(self.allocator, .{
@@ -5627,6 +5665,71 @@ fn typeIdToZigTypeWithStore(type_id: types_mod.TypeId, type_store: ?*const types
             }
             return .any;
         },
+    };
+}
+
+/// Walk a ZigType and return true if it transitively references a
+/// nominal struct type matching `owner_name`. Used to detect
+/// self-referential struct fields so the IR can mark them with
+/// `FieldStorage.indirect` and the codegen can break the layout
+/// cycle with a hidden pointer.
+///
+/// Self-recursion only — mutual recursion through SCC analysis is
+/// the next step. If a future change adds it, this function should
+/// be extended to walk a precomputed SCC map rather than the
+/// in-place name match.
+fn zigTypeReachesStruct(t: ZigType, owner_name: []const u8) bool {
+    return switch (t) {
+        .struct_ref => |name| std.mem.eql(u8, name, owner_name),
+        .optional => |inner| zigTypeReachesStruct(inner.*, owner_name),
+        .ptr => |pointee| zigTypeReachesStruct(pointee.*, owner_name),
+        .list => |elem| zigTypeReachesStruct(elem.*, owner_name),
+        .map => |mt| zigTypeReachesStruct(mt.key.*, owner_name) or
+            zigTypeReachesStruct(mt.value.*, owner_name),
+        .tuple => |elems| blk: {
+            for (elems) |elem| {
+                if (zigTypeReachesStruct(elem, owner_name)) break :blk true;
+            }
+            break :blk false;
+        },
+        .function => |ft| blk: {
+            for (ft.params) |p| {
+                if (zigTypeReachesStruct(p, owner_name)) break :blk true;
+            }
+            break :blk zigTypeReachesStruct(ft.return_type.*, owner_name);
+        },
+        // Primitives and tagged_union (a name reference, not a
+        // structural type) cannot transitively reach a struct.
+        // tagged_union variants currently lower as u32 enum tags
+        // anyway; if/when payload variants land they'd need
+        // separate recursion handling.
+        .void,
+        .bool_type,
+        .nil,
+        .never,
+        .term,
+        .any,
+        .string,
+        .atom,
+        .i8,
+        .i16,
+        .i32,
+        .i64,
+        .i128,
+        .u8,
+        .u16,
+        .u32,
+        .u64,
+        .u128,
+        .f16,
+        .f32,
+        .f64,
+        .f80,
+        .f128,
+        .usize,
+        .isize,
+        .tagged_union,
+        => false,
     };
 }
 
