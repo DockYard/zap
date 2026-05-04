@@ -1165,9 +1165,13 @@ fn buildTarget(
         // Zig 0.16 error formatting options from manifest
         .error_style = config.error_style,
         .multiline_errors = config.multiline_errors,
-    }) catch {
-        // stderr writer removed in 0.16
-        std.debug.print("Error: compilation failed\n", .{});
+    }) catch |err| {
+        // stderr writer removed in 0.16. The error name discriminates
+        // EmitFailed (Zap-side ZIR builder failures) from
+        // CompilationFailed (Sema/AIR/LLVM diagnostics that already
+        // printed their own message), which is genuinely useful when
+        // the compile path is silently dropping diagnostics.
+        std.debug.print("Error: compilation failed: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
 

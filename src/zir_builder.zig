@@ -119,6 +119,15 @@ extern "c" fn zir_builder_add_struct_type(handle: ?*ZirBuilderHandle, name_ptr: 
 // struct directly — same `InternPool.Index`, single canonical nominal
 // identity. count == 0 clears any prior config (no-op fallback).
 extern "c" fn zir_builder_set_root_fields(handle: ?*ZirBuilderHandle, name_ptrs: [*]const [*]const u8, name_lens: [*]const u32, type_refs: [*]const u32, count: u32) i32;
+/// Streaming per-field-body API. Pair with `begin_root_field_body` /
+/// `end_root_field_body` to emit fields whose type body is more than
+/// a single static Ref (nominal struct types, generic containers,
+/// lists, maps, tuples of nominal). Primitives use the
+/// `set_root_field_static` fast path. Replacement for the
+/// fundamentally-limited single-Ref-per-field shape.
+extern "c" fn zir_builder_set_root_field_static(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32, type_ref: u32) i32;
+extern "c" fn zir_builder_begin_root_field_body(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32) i32;
+extern "c" fn zir_builder_end_root_field_body(handle: ?*ZirBuilderHandle, final_ref: u32) i32;
 extern "c" fn zir_builder_set_decl_val_return_type(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32) i32;
 extern "c" fn zir_builder_emit_param_decl_val_type(handle: ?*ZirBuilderHandle, param_name_ptr: [*]const u8, param_name_len: u32, type_name_ptr: [*]const u8, type_name_len: u32) u32;
 
@@ -1040,8 +1049,22 @@ pub const ZirDriver = struct {
                 for (def.fields) |field| {
                     try field_name_ptrs.append(self.allocator, field.name.ptr);
                     try field_name_lens.append(self.allocator, @intCast(field.name.len));
-                    const type_ref = self.mapTypeNameToRef(field.type_expr);
-                    try field_type_refs.append(self.allocator, type_ref);
+                    // Nested struct decls go through the older
+                    // `add_struct_type` C-ABI which only takes static
+                    // type Refs — primitives work, complex field
+                    // types still degrade. Lifting nested struct
+                    // emission onto the streaming root-field-body
+                    // API would require an analogous fork-side
+                    // change to `add_struct_type` (a separate
+                    // mini-feature; out of scope here). The dominant
+                    // case for non-primitive fields is the file's
+                    // root struct, which goes through
+                    // `emitRootFields` above.
+                    const simple = mapReturnType(field.type_expr);
+                    try field_type_refs.append(
+                        self.allocator,
+                        if (simple != 0) simple else 0,
+                    );
                 }
 
                 if (zir_builder_add_struct_type(
@@ -1062,35 +1085,66 @@ pub const ZirDriver = struct {
     }
 
     /// Emit the primary struct's fields onto the file's root
-    /// `struct_decl` via `zir_builder_set_root_fields`. The Zig fork
-    /// hard-pins this struct_decl at instruction 0, so every
-    /// `@import("...")` of this emission's file yields the same
+    /// `struct_decl` via the fork's streaming root-field-body API.
+    /// The Zig fork hard-pins this struct_decl at instruction 0, so
+    /// every `@import("...")` of this emission's file yields the same
     /// `InternPool.Index` — a single canonical nominal identity for
     /// the Zap struct, regardless of how many other emissions
     /// reference it.
+    ///
+    /// Each field is dispatched on its `ZigType` shape:
+    ///
+    /// - Primitives (`i64`, `f64`, `bool`, …, `string`/`atom`/`nil`)
+    ///   → `set_root_field_static` with the primitive's named ZIR Ref.
+    ///
+    /// - Nominal struct refs, lists, maps, tuples, or other types
+    ///   that need a multi-instruction type body → bracket the
+    ///   emission with `begin_root_field_body` / `end_root_field_body`
+    ///   and reuse `emitImportedTypeRef`, the same helper that
+    ///   already handles every `ZigType` shape in body context for
+    ///   parameter and capture types.
     fn emitRootFields(self: *ZirDriver, def: ir.StructDef) !void {
         if (def.fields.len == 0) return;
+        for (def.fields) |field| try self.emitRootFieldType(field);
+    }
 
-        var name_ptrs: std.ArrayListUnmanaged([*]const u8) = .empty;
-        defer name_ptrs.deinit(self.allocator);
-        var name_lens: std.ArrayListUnmanaged(u32) = .empty;
-        defer name_lens.deinit(self.allocator);
-        var type_refs: std.ArrayListUnmanaged(u32) = .empty;
-        defer type_refs.deinit(self.allocator);
-
-        for (def.fields) |field| {
-            try name_ptrs.append(self.allocator, field.name.ptr);
-            try name_lens.append(self.allocator, @intCast(field.name.len));
-            try type_refs.append(self.allocator, self.mapTypeNameToRef(field.type_expr));
+    /// Emit one root field's name + type body via the streaming API.
+    /// Picks the static-ref fast path for primitives, the recorded
+    /// body path otherwise.
+    fn emitRootFieldType(self: *ZirDriver, field: ir.StructFieldDef) !void {
+        const simple = mapReturnType(field.type_expr);
+        if (simple != 0) {
+            if (zir_builder_set_root_field_static(
+                self.handle,
+                field.name.ptr,
+                @intCast(field.name.len),
+                simple,
+            ) != 0) return error.EmitFailed;
+            return;
         }
 
-        if (zir_builder_set_root_fields(
+        // Non-primitive: open a transient body, emit the type
+        // expression's instructions into it, close with the result Ref.
+        if (zir_builder_begin_root_field_body(
             self.handle,
-            name_ptrs.items.ptr,
-            name_lens.items.ptr,
-            type_refs.items.ptr,
-            @intCast(def.fields.len),
-        ) != 0) {
+            field.name.ptr,
+            @intCast(field.name.len),
+        ) != 0) return error.EmitFailed;
+
+        const final_ref = self.emitImportedTypeRef(field.type_expr) catch |err| {
+            // Best-effort cleanup: end the body with `void_value` so
+            // the field at least exists in the struct decl rather
+            // than the builder being left in an inconsistent state.
+            // The original error is propagated; this just keeps
+            // subsequent fields emittable.
+            _ = zir_builder_end_root_field_body(
+                self.handle,
+                @intFromEnum(Zir.Inst.Ref.void_value),
+            );
+            return err;
+        };
+
+        if (zir_builder_end_root_field_body(self.handle, final_ref) != 0) {
             return error.EmitFailed;
         }
     }

@@ -39,7 +39,14 @@ pub const StructDef = struct {
 
 pub const StructFieldDef = struct {
     name: []const u8,
-    type_expr: []const u8,
+    /// Field type as a structured `ZigType`. The previous string
+    /// representation collapsed every non-primitive type to a printable
+    /// name and forced the ZIR builder to round-trip through string
+    /// matching that only handled scalars — every other shape silently
+    /// fell through to `Zir.Inst.Ref` discriminant 0 (`u0_type`,
+    /// not `void_type`), producing `expected type 'u0', found 'X'`
+    /// at every literal site.
+    type_expr: ZigType,
     default_value: ?DefaultValue = null,
 };
 
@@ -1270,7 +1277,7 @@ pub const IrBuilder = struct {
                             const default_val: ?DefaultValue = if (field.default_expr) |expr| self.extractDefaultValue(expr) else null;
                             try fields.append(self.allocator, .{
                                 .name = self.interner.get(field.name),
-                                .type_expr = typeIdToZigTypeStrWithStore(field.type_id, self.type_store),
+                                .type_expr = typeIdToZigTypeWithStore(field.type_id, self.type_store),
                                 .default_value = default_val,
                             });
                         }
