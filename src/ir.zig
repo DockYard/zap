@@ -1800,8 +1800,9 @@ pub const IrBuilder = struct {
             }
         }
 
-        // Rewrite tail-recursive calls: replace call_named + ret/break with tail_call
-        entry_instrs = try self.rewriteTailCalls(entry_instrs, name_str);
+        // Rewrite tail-recursive calls: replace call_named + ret/break with tail_call.
+        // Skipped for byref-shaped signatures — see `rewriteTailCalls` doc.
+        entry_instrs = try self.rewriteTailCalls(entry_instrs, name_str, params.items, return_type);
 
         const entry_block = Block{
             .label = 0,
@@ -1978,10 +1979,93 @@ pub const IrBuilder = struct {
         }
     }
 
+    /// Whether a given Zig type is safe to pass through an LLVM
+    /// `musttail` call site without breaking the no-caller-frame-
+    /// references invariant. Only types that fastcc passes/returns
+    /// purely in registers qualify. Anything that the Zig backend
+    /// classifies as `byref` (the `isByRef` predicate at
+    /// `codegen/llvm/FuncGen.zig:7223`) — every non-zero struct,
+    /// tuple, slice, list, map, optional-of-byref, tagged union, or
+    /// `runtime.Term` — would force the caller to allocate on its own
+    /// frame and pass a pointer; LLVM then rejects `musttail` because
+    /// the callee retains a pointer into the caller's frame past the
+    /// jump. The conservative approach: emit `tail_call` only when
+    /// every parameter and the return type are scalar-by-value.
+    fn isTcoSafeType(t: ZigType) bool {
+        return switch (t) {
+            .void,
+            .bool_type,
+            .nil,
+            .i8,
+            .i16,
+            .i32,
+            .i64,
+            .i128,
+            .u8,
+            .u16,
+            .u32,
+            .u64,
+            .u128,
+            .f16,
+            .f32,
+            .f64,
+            .f80,
+            .f128,
+            .usize,
+            .isize,
+            .atom,
+            .never,
+            .ptr,
+            => true,
+            // Anything routed through Zig's by-ref ABI is unsafe for
+            // `musttail`. Strings (slices), structs, tuples, lists,
+            // maps, tagged unions, optionals, term, function values,
+            // and `any` all fall here.
+            .string,
+            .struct_ref,
+            .tuple,
+            .list,
+            .map,
+            .function,
+            .tagged_union,
+            .optional,
+            .term,
+            .any,
+            => false,
+        };
+    }
+
+    fn isTcoEligible(params: []const Param, return_type: ZigType) bool {
+        if (!isTcoSafeType(return_type)) return false;
+        for (params) |p| {
+            if (!isTcoSafeType(p.type_expr)) return false;
+        }
+        return true;
+    }
+
     /// Rewrite tail-recursive calls in a function's instruction list.
     /// Scans for patterns where the last operation before a return/break is a
     /// recursive call to the same function, and replaces them with tail_call.
-    fn rewriteTailCalls(self: *IrBuilder, instrs: []const Instruction, func_name: []const u8) ![]const Instruction {
+    ///
+    /// Bails out without rewriting whenever any parameter or the
+    /// return type is by-ref (struct, slice, list, map, …). Marking
+    /// such a call as LLVM `musttail` is unsupportable on AArch64
+    /// fastcc — the caller-frame allocas backing those args would
+    /// have to survive the tail jump and LLVM rejects the IR with
+    /// `failed to perform tail call elimination on a call site
+    /// marked musttail`. Falling back to ordinary `call_named + ret`
+    /// here is correctness-preserving (the recursion just builds a
+    /// real frame). Restoring TCO for byref-shaped state is a
+    /// separate, larger ABI design effort.
+    fn rewriteTailCalls(
+        self: *IrBuilder,
+        instrs: []const Instruction,
+        func_name: []const u8,
+        params: []const Param,
+        return_type: ZigType,
+    ) ![]const Instruction {
+        if (!isTcoEligible(params, return_type)) return instrs;
+
         var result: std.ArrayList(Instruction) = .empty;
         for (instrs) |instr| {
             switch (instr) {
@@ -5954,4 +6038,159 @@ test "IR shared opaque call emits retain and release" {
     }
     try std.testing.expectEqual(@as(usize, 1), share_count);
     try std.testing.expectEqual(@as(usize, 1), release_count);
+}
+
+test "isTcoSafeType: scalars are safe" {
+    try std.testing.expect(IrBuilder.isTcoSafeType(.i64));
+    try std.testing.expect(IrBuilder.isTcoSafeType(.f64));
+    try std.testing.expect(IrBuilder.isTcoSafeType(.bool_type));
+    try std.testing.expect(IrBuilder.isTcoSafeType(.atom));
+    try std.testing.expect(IrBuilder.isTcoSafeType(.usize));
+    try std.testing.expect(IrBuilder.isTcoSafeType(.never));
+    try std.testing.expect(IrBuilder.isTcoSafeType(.void));
+}
+
+test "isTcoSafeType: byref aggregates are unsafe" {
+    try std.testing.expect(!IrBuilder.isTcoSafeType(.{ .struct_ref = "Body" }));
+    try std.testing.expect(!IrBuilder.isTcoSafeType(.string));
+    const elem: ZigType = .i64;
+    try std.testing.expect(!IrBuilder.isTcoSafeType(.{ .list = &elem }));
+    try std.testing.expect(!IrBuilder.isTcoSafeType(.{ .tuple = &.{} }));
+    try std.testing.expect(!IrBuilder.isTcoSafeType(.term));
+    try std.testing.expect(!IrBuilder.isTcoSafeType(.any));
+}
+
+test "rewriteTailCalls skips functions with byref params" {
+    // A multi-clause recursive function whose parameter list contains
+    // a struct must not be marked `tail_call` — LLVM's musttail
+    // requires no caller-frame escape and `State` is byref under
+    // fastcc. The IR builder must keep the recursion as
+    // `call_named + ret`, even though the call sits in tail position.
+    const source =
+        \\pub struct State {
+        \\  a :: f64
+        \\  b :: f64
+        \\}
+        \\
+        \\pub struct LoopHost {
+        \\  pub fn loop(s :: State, 0 :: i64) -> State {
+        \\    s
+        \\  }
+        \\  pub fn loop(s :: State, n :: i64) -> State {
+        \\    LoopHost.loop(s, n - 1)
+        \\  }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var type_store = types_mod.TypeStore.init(alloc, parser.interner);
+    defer type_store.deinit();
+    var checker = types_mod.TypeChecker.initWithSharedStore(alloc, &type_store, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, &type_store);
+    defer hir_builder.deinit();
+    const hir_program = try hir_builder.buildProgram(&program);
+
+    var ir_builder = IrBuilder.init(alloc, parser.interner);
+    ir_builder.type_store = &type_store;
+    defer ir_builder.deinit();
+    const ir_program = try ir_builder.buildProgram(&hir_program);
+
+    var saw_tail_call = false;
+    for (ir_program.functions) |func| {
+        if (!std.mem.startsWith(u8, func.name, "LoopHost__loop")) continue;
+        for (func.body) |block| {
+            for (block.instructions) |instr| {
+                if (instr == .tail_call) saw_tail_call = true;
+                if (instr == .switch_return) {
+                    for (instr.switch_return.cases) |case| {
+                        for (case.body_instrs) |bi| if (bi == .tail_call) {
+                            saw_tail_call = true;
+                        };
+                    }
+                    for (instr.switch_return.default_instrs) |bi| if (bi == .tail_call) {
+                        saw_tail_call = true;
+                    };
+                }
+            }
+        }
+    }
+    try std.testing.expect(!saw_tail_call);
+}
+
+test "rewriteTailCalls still rewrites primitive-only recursion" {
+    // The companion to the byref test: a recursive function with
+    // only scalar parameters and a scalar return must still get the
+    // `tail_call` rewrite. This is the working primitive case the
+    // existing TCO support targets, and the byref guard must not
+    // accidentally disable it.
+    const source =
+        \\pub struct LoopHostScalar {
+        \\  pub fn loop(0 :: i64, acc :: i64) -> i64 {
+        \\    acc
+        \\  }
+        \\  pub fn loop(n :: i64, acc :: i64) -> i64 {
+        \\    LoopHostScalar.loop(n - 1, acc + 1)
+        \\  }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var type_store = types_mod.TypeStore.init(alloc, parser.interner);
+    defer type_store.deinit();
+    var checker = types_mod.TypeChecker.initWithSharedStore(alloc, &type_store, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, &type_store);
+    defer hir_builder.deinit();
+    const hir_program = try hir_builder.buildProgram(&program);
+
+    var ir_builder = IrBuilder.init(alloc, parser.interner);
+    ir_builder.type_store = &type_store;
+    defer ir_builder.deinit();
+    const ir_program = try ir_builder.buildProgram(&hir_program);
+
+    var saw_tail_call = false;
+    for (ir_program.functions) |func| {
+        if (!std.mem.startsWith(u8, func.name, "LoopHostScalar__loop")) continue;
+        for (func.body) |block| {
+            for (block.instructions) |instr| {
+                if (instr == .tail_call) saw_tail_call = true;
+                if (instr == .switch_return) {
+                    for (instr.switch_return.cases) |case| {
+                        for (case.body_instrs) |bi| if (bi == .tail_call) {
+                            saw_tail_call = true;
+                        };
+                    }
+                    for (instr.switch_return.default_instrs) |bi| if (bi == .tail_call) {
+                        saw_tail_call = true;
+                    };
+                }
+            }
+        }
+    }
+    try std.testing.expect(saw_tail_call);
 }
