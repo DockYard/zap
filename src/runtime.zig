@@ -581,6 +581,18 @@ pub const String = struct {
         return result;
     }
 
+    /// Construct a one-byte string from an integer 0..255. The inverse
+    /// of `byte_at`. Higher bits of the input are masked off, so the
+    /// result is always exactly one byte and never panics on out-of-
+    /// range input. Lets Zap code emit raw binary (e.g., PBM image
+    /// data) without needing a Zig primitive at the call site.
+    pub fn from_byte(byte: i64) []const u8 {
+        const result = bumpAlloc(1);
+        if (result.len == 0) return "";
+        result[0] = @intCast(@as(u64, @bitCast(byte)) & 0xFF);
+        return result;
+    }
+
     /// Iterator protocol for strings. The slice itself is the iteration
     /// state — each call returns the first byte (as a single-character
     /// string) and the remaining slice. This lets `for ch <- "hello"`

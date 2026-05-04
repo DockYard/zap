@@ -49,6 +49,24 @@ pub struct String {
   }
 
   @doc = """
+    Constructs a one-byte string from an integer in `0..255`. The
+    inverse of `byte_at` — useful when emitting raw binary output
+    (e.g., PBM image data) where higher-level string functions
+    aren't appropriate. Higher bits of the input are masked off, so
+    the result is always exactly one byte.
+
+    ## Examples
+
+        String.from_byte(65)  # => "A"
+        String.from_byte(0)   # => one-byte string with byte 0x00
+        String.from_byte(255) # => one-byte string with byte 0xFF
+    """
+
+  pub fn from_byte(byte :: i64) -> String {
+    :zig.String.from_byte(byte)
+  }
+
+  @doc = """
     Returns `true` if `haystack` contains `needle` as a substring.
 
     ## Examples
