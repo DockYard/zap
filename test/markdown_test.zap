@@ -101,9 +101,9 @@ pub struct MarkdownTest {
 
   describe("pipe tables") {
     test("a header / separator / row trio renders a markdown-table") {
-      _input = "| Field | Description |\n| --- | --- |\n| name | Output name |"
-      _expected = "<table class=\"markdown-table\">\n<thead>\n<tr><th>Field</th><th>Description</th></tr>\n</thead>\n<tbody>\n<tr><td>name</td><td>Output name</td></tr>\n</tbody>\n</table>\n"
-      assert(Markdown.to_html(_input) == _expected)
+      input = "| Field | Description |\n| --- | --- |\n| name | Output name |"
+      expected = "<table class=\"markdown-table\">\n<thead>\n<tr><th>Field</th><th>Description</th></tr>\n</thead>\n<tbody>\n<tr><td>name</td><td>Output name</td></tr>\n</tbody>\n</table>\n"
+      assert(Markdown.to_html(input) == expected)
     }
   }
 }

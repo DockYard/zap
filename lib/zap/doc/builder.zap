@@ -20,54 +20,54 @@ pub struct Zap.Doc.Builder {
     """
 
   pub macro __using__(opts :: Expr) -> Expr {
-    _options = options(opts)
-    _patterns = patterns(_options)
-    _source_paths = list_flatten(for _pattern <- _patterns {
-      Path.glob(_pattern)
+    normalized_options = options(opts)
+    glob_patterns = patterns(normalized_options)
+    source_paths = list_flatten(for pattern <- glob_patterns {
+      Path.glob(pattern)
     })
-    _struct_refs = list_flatten(for _path <- _source_paths {
-      source_graph_structs(_path)
+    struct_refs = list_flatten(for path <- source_paths {
+      source_graph_structs(path)
     })
-    _protocol_refs = list_flatten(for _path <- _source_paths {
-      source_graph_protocols(_path)
+    protocol_refs = list_flatten(for path <- source_paths {
+      source_graph_protocols(path)
     })
-    _union_refs = list_flatten(for _path <- _source_paths {
-      source_graph_unions(_path)
+    union_refs = list_flatten(for path <- source_paths {
+      source_graph_unions(path)
     })
-    _struct_names = for _ref <- _struct_refs {
-      map_get(struct_info(_ref), :name, "")
+    struct_names = for ref <- struct_refs {
+      map_get(struct_info(ref), :name, "")
     }
-    _protocol_names = for _ref <- _protocol_refs {
-      map_get(struct_info(_ref), :name, "")
+    protocol_names = for ref <- protocol_refs {
+      map_get(struct_info(ref), :name, "")
     }
-    _union_names = for _ref <- _union_refs {
-      map_get(struct_info(_ref), :name, "")
+    union_names = for ref <- union_refs {
+      map_get(struct_info(ref), :name, "")
     }
 
-    _struct_summaries = for _ref <- _struct_refs {
+    struct_summaries = for ref <- struct_refs {
       %{
-        name: map_get(struct_info(_ref), :name, ""),
-        doc: map_get(struct_info(_ref), :doc, ""),
-        source_file: map_get(struct_info(_ref), :source_file, ""),
-        is_private: map_get(struct_info(_ref), :is_private, false),
+        name: map_get(struct_info(ref), :name, ""),
+        doc: map_get(struct_info(ref), :doc, ""),
+        source_file: map_get(struct_info(ref), :source_file, ""),
+        is_private: map_get(struct_info(ref), :is_private, false),
       }
     }
 
-    _protocol_summaries = for _ref <- _protocol_refs {
+    protocol_summaries = for ref <- protocol_refs {
       %{
-        name: map_get(struct_info(_ref), :name, ""),
-        doc: map_get(struct_info(_ref), :doc, ""),
-        source_file: map_get(struct_info(_ref), :source_file, ""),
-        is_private: map_get(struct_info(_ref), :is_private, false),
+        name: map_get(struct_info(ref), :name, ""),
+        doc: map_get(struct_info(ref), :doc, ""),
+        source_file: map_get(struct_info(ref), :source_file, ""),
+        is_private: map_get(struct_info(ref), :is_private, false),
       }
     }
 
-    _union_summaries = for _ref <- _union_refs {
+    union_summaries = for ref <- union_refs {
       %{
-        name: map_get(struct_info(_ref), :name, ""),
-        doc: map_get(struct_info(_ref), :doc, ""),
-        source_file: map_get(struct_info(_ref), :source_file, ""),
-        is_private: map_get(struct_info(_ref), :is_private, false),
+        name: map_get(struct_info(ref), :name, ""),
+        doc: map_get(struct_info(ref), :doc, ""),
+        source_file: map_get(struct_info(ref), :source_file, ""),
+        is_private: map_get(struct_info(ref), :is_private, false),
       }
     }
 
@@ -78,57 +78,57 @@ pub struct Zap.Doc.Builder {
     # `:signatures_html` String — this avoids round-tripping a
     # `[String]` value through the `Term`-valued map slot, which the
     # runtime extraction path doesn't currently support.
-    _function_summaries = list_flatten(for _ref <- _struct_refs {
-      for _f <- struct_functions(_ref) {
+    function_summaries = list_flatten(for ref <- struct_refs {
+      for f <- struct_functions(ref) {
         %{
-          module: map_get(struct_info(_ref), :name, ""),
-          name: map_get(_f, :name, ""),
-          arity: map_get(_f, :arity, 0),
-          doc: map_get(_f, :doc, ""),
-          source_file: map_get(_f, :source_file, ""),
-          source_line: map_get(_f, :source_line, 0),
-          signatures_joined: string_concat_list(for _sig <- map_get(_f, :signatures, []) {
-            _sig <> "\n"
+          module: map_get(struct_info(ref), :name, ""),
+          name: map_get(f, :name, ""),
+          arity: map_get(f, :arity, 0),
+          doc: map_get(f, :doc, ""),
+          source_file: map_get(f, :source_file, ""),
+          source_line: map_get(f, :source_line, 0),
+          signatures_joined: string_concat_list(for sig <- map_get(f, :signatures, []) {
+            sig <> "\n"
           }),
         }
       }
     })
 
-    _macro_summaries = list_flatten(for _ref <- _struct_refs {
-      for _m <- struct_macros(_ref) {
+    macro_summaries = list_flatten(for ref <- struct_refs {
+      for m <- struct_macros(ref) {
         %{
-          module: map_get(struct_info(_ref), :name, ""),
-          name: map_get(_m, :name, ""),
-          arity: map_get(_m, :arity, 0),
-          doc: map_get(_m, :doc, ""),
-          source_file: map_get(_m, :source_file, ""),
-          source_line: map_get(_m, :source_line, 0),
-          signatures_joined: string_concat_list(for _sig <- map_get(_m, :signatures, []) {
-            _sig <> "\n"
+          module: map_get(struct_info(ref), :name, ""),
+          name: map_get(m, :name, ""),
+          arity: map_get(m, :arity, 0),
+          doc: map_get(m, :doc, ""),
+          source_file: map_get(m, :source_file, ""),
+          source_line: map_get(m, :source_line, 0),
+          signatures_joined: string_concat_list(for sig <- map_get(m, :signatures, []) {
+            sig <> "\n"
           }),
         }
       }
     })
 
-    _impl_summaries = list_flatten(for _path <- _source_paths {
-      for _impl <- source_graph_impls(_path) {
+    impl_summaries = list_flatten(for path <- source_paths {
+      for impl_decl <- source_graph_impls(path) {
         %{
-          proto_name: map_get(_impl, :protocol, ""),
-          target: map_get(_impl, :target, ""),
+          proto_name: map_get(impl_decl, :protocol, ""),
+          target: map_get(impl_decl, :target, ""),
           # Bool value forces the map's value type to `Term` so it
           # composes with the other Term-valued summary lists in the
           # walker without requiring per-list type-narrowing.
-          is_private: map_get(_impl, :is_private, false),
+          is_private: map_get(impl_decl, :is_private, false),
         }
       }
     })
 
-    _variant_summaries = list_flatten(for _ref <- _union_refs {
-      for _v <- union_variants(_ref) {
+    variant_summaries = list_flatten(for ref <- union_refs {
+      for v <- union_variants(ref) {
         %{
-          module: map_get(struct_info(_ref), :name, ""),
-          name: map_get(_v, :name, ""),
-          signature: map_get(_v, :signature, ""),
+          module: map_get(struct_info(ref), :name, ""),
+          name: map_get(v, :name, ""),
+          signature: map_get(v, :signature, ""),
           # Pin the value type to `Term` so the list composes with the
           # other Term-valued manifests; arity is unused for variants
           # but its presence keeps the inference stable.
@@ -137,12 +137,12 @@ pub struct Zap.Doc.Builder {
       }
     })
 
-    _required_function_summaries = list_flatten(for _ref <- _protocol_refs {
-      for _f <- protocol_required_functions(_ref) {
+    required_function_summaries = list_flatten(for ref <- protocol_refs {
+      for f <- protocol_required_functions(ref) {
         %{
-          module: map_get(struct_info(_ref), :name, ""),
-          name: map_get(_f, :name, ""),
-          signature: map_get(_f, :signature, ""),
+          module: map_get(struct_info(ref), :name, ""),
+          name: map_get(f, :name, ""),
+          signature: map_get(f, :signature, ""),
           arity: 0,
         }
       }
@@ -153,57 +153,57 @@ pub struct Zap.Doc.Builder {
     # without any filesystem awareness of the original asset locations.
     # Authors who need to override these can set their own
     # `style.css` / `app.js` after `write_docs_to` writes the defaults.
-    _doc_css = read_file("assets/style.css")
-    _doc_js = read_file("assets/app.js")
+    doc_css = read_file("assets/style.css")
+    doc_js = read_file("assets/app.js")
 
     quote {
       pub fn manifest_structs() -> [String] {
-        unquote(_struct_names)
+        unquote(struct_names)
       }
 
       pub fn manifest_protocols() -> [String] {
-        unquote(_protocol_names)
+        unquote(protocol_names)
       }
 
       pub fn manifest_unions() -> [String] {
-        unquote(_union_names)
+        unquote(union_names)
       }
 
       pub fn manifest_struct_summaries() -> [%{Atom => Term}] {
-        unquote(if list_length(_struct_summaries) > 0 { _struct_summaries } else { quote { [] :: [%{Atom => Term}] } })
+        unquote(if list_length(struct_summaries) > 0 { struct_summaries } else { quote { [] :: [%{Atom => Term}] } })
       }
 
       pub fn manifest_protocol_summaries() -> [%{Atom => Term}] {
-        unquote(if list_length(_protocol_summaries) > 0 { _protocol_summaries } else { quote { [] :: [%{Atom => Term}] } })
+        unquote(if list_length(protocol_summaries) > 0 { protocol_summaries } else { quote { [] :: [%{Atom => Term}] } })
       }
 
       pub fn manifest_union_summaries() -> [%{Atom => Term}] {
-        unquote(if list_length(_union_summaries) > 0 { _union_summaries } else { quote { [] :: [%{Atom => Term}] } })
+        unquote(if list_length(union_summaries) > 0 { union_summaries } else { quote { [] :: [%{Atom => Term}] } })
       }
 
       @doc = "Flat list of every public function across reflected modules, each with `:module`, `:name`, `:arity`, `:doc`."
       pub fn manifest_function_summaries() -> [%{Atom => Term}] {
-        unquote(if list_length(_function_summaries) > 0 { _function_summaries } else { quote { [] :: [%{Atom => Term}] } })
+        unquote(if list_length(function_summaries) > 0 { function_summaries } else { quote { [] :: [%{Atom => Term}] } })
       }
 
       @doc = "Flat list of every public macro across reflected modules, same shape as `manifest_function_summaries`."
       pub fn manifest_macro_summaries() -> [%{Atom => Term}] {
-        unquote(if list_length(_macro_summaries) > 0 { _macro_summaries } else { quote { [] :: [%{Atom => Term}] } })
+        unquote(if list_length(macro_summaries) > 0 { macro_summaries } else { quote { [] :: [%{Atom => Term}] } })
       }
 
       @doc = "Flat list of every protocol-impl declared across reflected modules, each with `:proto_name` and `:target` qualified names."
       pub fn manifest_impl_summaries() -> [%{Atom => Term}] {
-        unquote(if list_length(_impl_summaries) > 0 { _impl_summaries } else { quote { [] :: [%{Atom => Term}] } })
+        unquote(if list_length(impl_summaries) > 0 { impl_summaries } else { quote { [] :: [%{Atom => Term}] } })
       }
 
       @doc = "Flat list of every union variant across reflected modules, each with `:module`, `:name`, `:signature`."
       pub fn manifest_variant_summaries() -> [%{Atom => Term}] {
-        unquote(if list_length(_variant_summaries) > 0 { _variant_summaries } else { quote { [] :: [%{Atom => Term}] } })
+        unquote(if list_length(variant_summaries) > 0 { variant_summaries } else { quote { [] :: [%{Atom => Term}] } })
       }
 
       @doc = "Flat list of every protocol's required functions across reflected modules, each with `:module`, `:name`, `:signature`."
       pub fn manifest_required_function_summaries() -> [%{Atom => Term}] {
-        unquote(if list_length(_required_function_summaries) > 0 { _required_function_summaries } else { quote { [] :: [%{Atom => Term}] } })
+        unquote(if list_length(required_function_summaries) > 0 { required_function_summaries } else { quote { [] :: [%{Atom => Term}] } })
       }
 
       pub fn render_first_struct_html() -> String {
@@ -232,11 +232,11 @@ pub struct Zap.Doc.Builder {
         """
       pub fn write_docs_to(out_dir :: String, project_name :: String, project_version :: String, source_url :: String, landing_md :: String) -> i64 {
         _ = File.mkdir(out_dir)
-        _ = File.write(out_dir <> "/style.css", unquote(_doc_css))
+        _ = File.write(out_dir <> "/style.css", unquote(doc_css))
         # `app.js` is written inside `Zap.Doc.write_pages_to` after the
         # search index has been rendered, so the bundled JS lands with
         # its `ZAP_SEARCH_DATA` corpus already inlined at the top.
-        Zap.Doc.write_pages_to(out_dir, project_name, project_version, source_url, landing_md, manifest_struct_summaries(), manifest_protocol_summaries(), manifest_union_summaries(), manifest_function_summaries(), manifest_macro_summaries(), manifest_impl_summaries(), manifest_variant_summaries(), manifest_required_function_summaries(), unquote(_doc_js))
+        Zap.Doc.write_pages_to(out_dir, project_name, project_version, source_url, landing_md, manifest_struct_summaries(), manifest_protocol_summaries(), manifest_union_summaries(), manifest_function_summaries(), manifest_macro_summaries(), manifest_impl_summaries(), manifest_variant_summaries(), manifest_required_function_summaries(), unquote(doc_js))
       }
     }
   }
@@ -272,14 +272,14 @@ pub struct Zap.Doc.Builder {
     """
 
   pub macro patterns(options :: Expr) -> Expr {
-    _groups = for _option <- options {
-      option_patterns(_option)
+    groups = for option <- options {
+      option_patterns(option)
     }
-    _patterns = list_flatten(_groups)
-    if _patterns == [] {
+    flattened_patterns = list_flatten(groups)
+    if flattened_patterns == [] {
       ["lib/**/*.zap"]
     } else {
-      _patterns
+      flattened_patterns
     }
   }
 

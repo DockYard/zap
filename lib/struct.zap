@@ -78,10 +78,10 @@ pub struct Struct {
     """
 
   pub macro has_function?(struct_ref :: Expr, function_name :: Expr, function_arity :: Expr) -> Expr {
-    _matches = for _function <- functions(struct_ref), map_get(_function, :name, "") == function_name and map_get(_function, :arity, -1) == function_arity {
-      _function
+    matches = for f <- functions(struct_ref), map_get(f, :name, "") == function_name and map_get(f, :arity, -1) == function_arity {
+      f
     }
 
-    list_length(_matches) > 0
+    list_length(matches) > 0
   }
 }

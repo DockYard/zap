@@ -237,11 +237,11 @@ pub struct Kernel {
     """
 
   pub macro |>(left :: Expr, right :: Expr) -> Expr {
-    _name = elem(right, 0)
-    _meta = elem(right, 1)
-    _args = elem(right, 2)
-    _new_args = prepend(_args, left)
-    tuple(_name, _meta, _new_args)
+    name = elem(right, 0)
+    meta = elem(right, 1)
+    args = elem(right, 2)
+    new_args = prepend(args, left)
+    tuple(name, meta, new_args)
   }
 
   @doc = """

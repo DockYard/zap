@@ -117,7 +117,26 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
                 .atom => |name| {
                     // Check if it's a variable reference
                     if (name.len > 0 and (name[0] == '_' or std.ascii.isLower(name[0]))) {
-                        if (env.lookup(name)) |bound| return bound;
+                        if (env.lookup(name)) |bound| {
+                            // Reading a single-`_`-prefixed binding is a
+                            // contradiction: the prefix declares the
+                            // binding intentionally unused. The
+                            // type-checker enforces this rule for runtime
+                            // function bodies; macro bodies aren't
+                            // type-checked, so the macro evaluator
+                            // enforces it here. Double-underscore names
+                            // (`__foo`) stay in the language-hook
+                            // namespace and are readable.
+                            if (isReservedUnderscoreReadName(name)) {
+                                env.last_capability_error = std.fmt.allocPrint(
+                                    env.alloc,
+                                    "cannot read `{s}` — single-underscore-prefixed bindings are intentionally unused; drop the leading `_` to use the value (rename to `{s}`)",
+                                    .{ name, name[1..] },
+                                ) catch return MacroEvalError.EvalFailed;
+                                return MacroEvalError.EvalFailed;
+                            }
+                            return bound;
+                        }
                     }
                     return value;
                 },
@@ -806,6 +825,17 @@ fn isDisallowedUnderscoreComptimeCallName(name: []const u8) bool {
     if (name.len == 0 or name[0] != '_') return false;
     if (std.mem.eql(u8, name, "__block__")) return false;
     if (std.mem.eql(u8, name, "__aliases__")) return false;
+    return true;
+}
+
+/// True for names that begin with a single `_` and therefore declare
+/// "intentionally unused" — a read of one is the macro-body counterpart
+/// of the type-checker's `rejectUnderscoreVarRead`. Double-underscore
+/// names (`__foo`, `__foo__`) belong to the language-hook namespace
+/// and stay readable.
+fn isReservedUnderscoreReadName(name: []const u8) bool {
+    if (name.len == 0 or name[0] != '_') return false;
+    if (name.len >= 2 and name[1] == '_') return false;
     return true;
 }
 

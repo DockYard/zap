@@ -60,21 +60,21 @@ pub struct Zest.Case {
     with Zest tracking around the call.
     """
 
-  pub macro __before_compile__(_env :: Expr) -> Decl {
-    _tests = struct_get_attribute(:zest_tests)
-    _test_list = if _tests == nil {
+  pub macro __before_compile__(env :: Expr) -> Decl {
+    tests = struct_get_attribute(:zest_tests)
+    test_list = if tests == nil {
       []
     } else {
-      if list_length(_tests) == 0 {
-        [_tests]
+      if list_length(tests) == 0 {
+        [tests]
       } else {
-        _tests
+        tests
       }
     }
-    _run_calls = for _test <- _test_list {
+    run_calls = for test <- test_list {
       quote {
         :zig.Zest.begin_test()
-        unquote(make_call(".", [_env, _test]))()
+        unquote(make_call(".", [env, test]))()
         :zig.Zest.end_test()
         :zig.Zest.print_result()
       }
@@ -84,7 +84,7 @@ pub struct Zest.Case {
       @doc = "Runs all registered Zest tests in this struct."
 
       pub fn run() -> String {
-        unquote_splicing(_run_calls)
+        unquote_splicing(run_calls)
         "ok"
       }
     }
@@ -121,23 +121,23 @@ pub struct Zest.Case {
         }
     """
 
-  pub macro describe(_name :: Expr, body :: Expr) -> Expr {
-    _stmts = elem(body, 2)
-    _setup_matches = for _s <- _stmts, elem(_s, 0) == :setup { list_at(elem(_s, 2), -1) }
-    _teardown_matches = for _s <- _stmts, elem(_s, 0) == :teardown { list_at(elem(_s, 2), -1) }
-    _setup_body = list_at(_setup_matches, 0)
-    _teardown_body = list_at(_teardown_matches, 0)
-    _desc_slug = slugify(_name)
+  pub macro describe(name :: Expr, body :: Expr) -> Expr {
+    stmts = elem(body, 2)
+    setup_matches = for s <- stmts, elem(s, 0) == :setup { list_at(elem(s, 2), -1) }
+    teardown_matches = for s <- stmts, elem(s, 0) == :teardown { list_at(elem(s, 2), -1) }
+    setup_body = list_at(setup_matches, 0)
+    teardown_body = list_at(teardown_matches, 0)
+    desc_slug = slugify(name)
 
-    _per_test = for _t <- _stmts, elem(_t, 0) == :test {
-      build_describe_test(_desc_slug, _t, _setup_body, _teardown_body)
+    per_test = for t <- stmts, elem(t, 0) == :test {
+      build_describe_test(desc_slug, t, setup_body, teardown_body)
     }
 
-    _passthrough = for _s <- _stmts, elem(_s, 0) != :test and elem(_s, 0) != :setup and elem(_s, 0) != :teardown { _s }
+    passthrough = for s <- stmts, elem(s, 0) != :test and elem(s, 0) != :setup and elem(s, 0) != :teardown { s }
 
-    _all = list_concat(_per_test, _passthrough)
+    all_stmts = list_concat(per_test, passthrough)
 
-    quote { unquote_splicing(_all) }
+    quote { unquote_splicing(all_stmts) }
   }
 
   @doc = """
@@ -153,8 +153,8 @@ pub struct Zest.Case {
         }
     """
 
-  pub macro test(_name :: Expr, body :: Expr) -> Expr {
-    fn_name = intern_atom("test_" <> slugify(_name))
+  pub macro test(name :: Expr, body :: Expr) -> Expr {
+    fn_name = intern_atom("test_" <> slugify(name))
     struct_put_attribute(:zest_tests, fn_name)
 
     quote {

@@ -2746,6 +2746,26 @@ pub const TypeChecker = struct {
         return !(self.isSyntheticHelperName(name) and isSyntheticSpan(meta.span));
     }
 
+    /// Single-`_`-prefixed bindings declare "I won't read this" — a
+    /// later read contradicts the declaration. `__name` (double prefix)
+    /// stays in the language-hook namespace and is fine to read.
+    fn isReservedUnderscoreReadName(text: []const u8) bool {
+        if (text.len == 0 or text[0] != '_') return false;
+        if (text.len >= 2 and text[1] == '_') return false;
+        return true;
+    }
+
+    fn rejectUnderscoreVarRead(self: *TypeChecker, name: ast.StringId, span: ast.SourceSpan) !void {
+        const text = self.interner.get(name);
+        if (!isReservedUnderscoreReadName(text)) return;
+        try self.addRichError(
+            try std.fmt.allocPrint(self.allocator, "cannot read `{s}` — single-underscore-prefixed bindings are intentionally unused", .{text}),
+            span,
+            "underscore-prefixed identifiers may only be assigned to, not read",
+            try std.fmt.allocPrint(self.allocator, "drop the leading `_` if you need the value (rename to `{s}`)", .{text[1..]}),
+        );
+    }
+
     fn rejectUnderscoreCall(self: *TypeChecker, name: []const u8, arity: u32, span: ast.SourceSpan) !void {
         try self.addRichError(
             try std.fmt.allocPrint(self.allocator, "cannot call underscore-prefixed function `{s}/{d}`", .{ name, arity }),
@@ -3640,9 +3660,36 @@ pub const TypeChecker = struct {
             .bool_literal => TypeStore.BOOL,
             .nil_literal => TypeStore.NIL,
             .var_ref => |vr| {
+                // Bare `_` is a discarder pattern. The parser folds
+                // `_` in pattern position into `Pattern.wildcard`, so
+                // a `_` reaching this branch is always a *read* of the
+                // discarder, which is illegal — by definition there's
+                // no value to read.
+                {
+                    const name = self.interner.get(vr.name);
+                    if (std.mem.eql(u8, name, "_")) {
+                        try self.addRichError(
+                            try self.allocator.dupe(u8, "cannot read `_` — bare underscore is a discarder, not a binding"),
+                            vr.meta.span,
+                            "the discarder pattern `_` discards a value; it cannot be read back",
+                            try self.allocator.dupe(u8, "introduce a named binding (e.g. `value = expr`) if you need the value"),
+                        );
+                        return TypeStore.UNKNOWN;
+                    }
+                }
                 // Resolve type from scope binding
                 if (self.current_scope) |scope_id| {
                     if (self.graph.resolveBindingHygienic(scope_id, vr.name, vr.meta.scopes)) |bid| {
+                        // Reading a single-`_`-prefixed binding is a
+                        // contradiction: the prefix tells the compiler
+                        // the binding is intentionally unused, so a
+                        // subsequent read either means the prefix is a
+                        // mistake (drop it) or the read is a typo.
+                        // Double-underscore (`__foo`) names are reserved
+                        // for the language-hook namespace and stay
+                        // readable. Bare `_` parses as a discarder
+                        // pattern and never reaches this branch.
+                        try self.rejectUnderscoreVarRead(vr.name, vr.meta.span);
                         _ = try self.ensureBindingAvailable(bid, vr.meta.span);
                         self.referenced_bindings.put(bid, {}) catch {};
                         const binding = self.graph.bindings.items[bid];

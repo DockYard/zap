@@ -3969,8 +3969,8 @@ test "struct attribute intrinsics: put writes to current StructEntry" {
     // side effect happens at expansion time; the macro returns nil.
     const source =
         \\pub struct Test {
-        \\  pub macro track(_name :: Expr) -> Nil {
-        \\    struct_put_attribute(:registered_tests, _name)
+        \\  pub macro track(name :: Expr) -> Nil {
+        \\    struct_put_attribute(:registered_tests, name)
         \\    quote { nil }
         \\  }
         \\
@@ -4220,8 +4220,8 @@ test "Zest test/2 macro: multi-stmt quote body matches lib/zest/case.zap shape" 
     // which is what zap-test-suite hits.
     const source =
         \\pub struct Test {
-        \\  pub macro tm(_name :: Expr, body :: Expr) -> Expr {
-        \\    fn_name = intern_atom("test_" <> slugify(_name))
+        \\  pub macro tm(name :: Expr, body :: Expr) -> Expr {
+        \\    fn_name = intern_atom("test_" <> slugify(name))
         \\    quote {
         \\      pub fn unquote(fn_name)() -> i64 {
         \\        unquote(body)
@@ -4287,8 +4287,8 @@ test "Zest test/2 macro: multiple tests with setup/teardown sibling calls" {
     // calls in the parent struct's items list.
     const source =
         \\pub struct Test {
-        \\  pub macro test_macro(_name :: Expr, body :: Expr) -> Expr {
-        \\    fn_name = intern_atom("test_" <> slugify(_name))
+        \\  pub macro test_macro(name :: Expr, body :: Expr) -> Expr {
+        \\    fn_name = intern_atom("test_" <> slugify(name))
         \\    quote {
         \\      pub fn unquote(fn_name)() -> i64 {
         \\        unquote(body)
@@ -4357,8 +4357,8 @@ test "Zest test/2 macro: multiple tests through a passthrough wrapper" {
     // must resolve to bare identifiers.
     const source =
         \\pub struct Test {
-        \\  pub macro test_macro(_name :: Expr, body :: Expr) -> Expr {
-        \\    fn_name = intern_atom("test_" <> slugify(_name))
+        \\  pub macro test_macro(name :: Expr, body :: Expr) -> Expr {
+        \\    fn_name = intern_atom("test_" <> slugify(name))
         \\    quote {
         \\      pub fn unquote(fn_name)() -> i64 {
         \\        unquote(body)
@@ -4426,8 +4426,8 @@ test "Zest test/2 macro: works through a passthrough wrapper macro" {
     // tracking call having callee ':test_X' instead of 'test_X'.
     const source =
         \\pub struct Test {
-        \\  pub macro test_macro(_name :: Expr, body :: Expr) -> Expr {
-        \\    fn_name = intern_atom("test_" <> slugify(_name))
+        \\  pub macro test_macro(name :: Expr, body :: Expr) -> Expr {
+        \\    fn_name = intern_atom("test_" <> slugify(name))
         \\    quote {
         \\      pub fn unquote(fn_name)() -> i64 {
         \\        unquote(body)
@@ -4493,8 +4493,8 @@ test "Zest test/2 macro: generates dynamically-named fn + tracking call" {
     // Zest struct) and inline the same logic as a one-off macro.
     const source =
         \\pub struct Test {
-        \\  pub macro test_macro(_name :: Expr, body :: Expr) -> Expr {
-        \\    fn_name = intern_atom("test_" <> slugify(_name))
+        \\  pub macro test_macro(name :: Expr, body :: Expr) -> Expr {
+        \\    fn_name = intern_atom("test_" <> slugify(name))
         \\    quote {
         \\      pub fn unquote(fn_name)() -> i64 {
         \\        unquote(body)
@@ -4877,8 +4877,8 @@ test "comptime intrinsics: slugify produces snake_case from string" {
     // intrinsic from the more complex name-splicing path.
     const source =
         \\pub struct Test {
-        \\  pub macro slug_of(_label :: StringLit) -> Expr {
-        \\    s = slugify(_label)
+        \\  pub macro slug_of(label :: StringLit) -> Expr {
+        \\    s = slugify(label)
         \\    quote { unquote(s) }
         \\  }
         \\
@@ -4944,8 +4944,8 @@ test "comptime intrinsics: slugify + intern produces dynamic fn name" {
     // detection logic that's exercised in other tests.
     const source =
         \\pub struct Test {
-        \\  pub macro emit_named(_label :: StringLit) -> Expr {
-        \\    fn_name_str = "test_" <> slugify(_label)
+        \\  pub macro emit_named(label :: StringLit) -> Expr {
+        \\    fn_name_str = "test_" <> slugify(label)
         \\    quote { unquote(fn_name_str) }
         \\  }
         \\
@@ -5005,9 +5005,9 @@ test "dynamic fn name: unquote in fn-name position resolves at expansion" {
     // Zest migration.
     const source =
         \\pub struct Test {
-        \\  pub macro define_const(_name :: AtomLit) -> Decl {
+        \\  pub macro define_const(name :: AtomLit) -> Decl {
         \\    quote {
-        \\      pub fn unquote(_name)() -> i64 {
+        \\      pub fn unquote(name)() -> i64 {
         \\        42
         \\      }
         \\    }
@@ -5078,9 +5078,9 @@ test "@before_compile: hook reads caller's accumulated attributes" {
         \\}
         \\
         \\pub struct Target {
-        \\  pub macro track(_name :: AtomLit) -> Nil {
+        \\  pub macro track(name :: AtomLit) -> Nil {
         \\    struct_register_attribute(:tests)
-        \\    struct_put_attribute(:tests, _name)
+        \\    struct_put_attribute(:tests, name)
         \\    quote { nil }
         \\  }
         \\
@@ -5187,8 +5187,8 @@ test "struct attribute intrinsics: register makes attribute accumulate" {
         \\    quote { nil }
         \\  }
         \\
-        \\  pub macro track(_name :: Expr) -> Nil {
-        \\    struct_put_attribute(:tests, _name)
+        \\  pub macro track(name :: Expr) -> Nil {
+        \\    struct_put_attribute(:tests, name)
         \\    quote { nil }
         \\  }
         \\
@@ -5516,15 +5516,16 @@ test "macro eval rejects qualified underscore-prefixed call in macro body" {
     try std.testing.expect(found_error);
 }
 
-test "macro engine rejects direct bare underscore-prefixed macro call" {
+test "collector rejects defining a single-underscore-prefixed macro" {
+    // The Collector now rejects single-`_`-prefixed function and macro
+    // definitions at collect time (the "reserved for intentionally-unused
+    // bindings" rule). A program that *defines* `pub macro _hidden` should
+    // never reach the macro engine — the diagnostic surfaces from the
+    // collector before expansion runs.
     const source =
         \\pub struct Test {
         \\  pub macro _hidden() -> Expr {
         \\    quote { 1 }
-        \\  }
-        \\
-        \\  pub fn run() -> i64 {
-        \\    _hidden()
         \\  }
         \\}
     ;
@@ -5541,13 +5542,9 @@ test "macro engine rejects direct bare underscore-prefixed macro call" {
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
-    defer engine.deinit();
-    _ = try engine.expandProgram(&program);
-
     var found_error = false;
-    for (engine.errors.items) |err| {
-        if (std.mem.find(u8, err.message, "cannot call underscore-prefixed function `_hidden/0`") != null) {
+    for (collector.errors.items) |err| {
+        if (std.mem.find(u8, err.message, "macro `_hidden` cannot start with `_`") != null) {
             found_error = true;
             break;
         }
@@ -5707,32 +5704,32 @@ const ZEST_DESCRIBE_INLINE_PRELUDE =
     \\    quote { unquote(body) }
     \\  }
     \\
-    \\  pub macro describe(_name :: Expr, body :: Expr) -> Expr {
-    \\    _stmts = elem(body, 2)
-    \\    _setup_matches = for _s <- _stmts, elem(_s, 0) == :setup { list_at(elem(_s, 2), -1) }
-    \\    _teardown_matches = for _s <- _stmts, elem(_s, 0) == :teardown { list_at(elem(_s, 2), -1) }
-    \\    _setup_body = list_at(_setup_matches, 0)
-    \\    _teardown_body = list_at(_teardown_matches, 0)
-    \\    _desc_slug = slugify(_name)
+    \\  pub macro describe(name :: Expr, body :: Expr) -> Expr {
+    \\    stmts = elem(body, 2)
+    \\    setup_matches = for s <- stmts, elem(s, 0) == :setup { list_at(elem(s, 2), -1) }
+    \\    teardown_matches = for s <- stmts, elem(s, 0) == :teardown { list_at(elem(s, 2), -1) }
+    \\    setup_body = list_at(setup_matches, 0)
+    \\    teardown_body = list_at(teardown_matches, 0)
+    \\    desc_slug = slugify(name)
     \\
-    \\    _per_test = for _t <- _stmts, elem(_t, 0) == :test {
+    \\    per_test = for t <- stmts, elem(t, 0) == :test {
     \\      quote {
-    \\        pub fn unquote(intern_atom("test_" <> _desc_slug <> "_" <> slugify(list_at(elem(_t, 2), 0))))() -> String {
-    \\          unquote(make_call("__block__", list_concat(list_concat(list_concat(if list_length(elem(_t, 2)) == 3 and _setup_body != nil { [make_call("=", [ctx, _setup_body])] } else { [] }, if elem(list_at(elem(_t, 2), -1), 0) == :__block__ { elem(list_at(elem(_t, 2), -1), 2) } else { [list_at(elem(_t, 2), -1)] }), if _teardown_body != nil { [_teardown_body] } else { [] }), ["ok"])))
+    \\        pub fn unquote(intern_atom("test_" <> desc_slug <> "_" <> slugify(list_at(elem(t, 2), 0))))() -> String {
+    \\          unquote(make_call("__block__", list_concat(list_concat(list_concat(if list_length(elem(t, 2)) == 3 and setup_body != nil { [make_call("=", [ctx, setup_body])] } else { [] }, if elem(list_at(elem(t, 2), -1), 0) == :__block__ { elem(list_at(elem(t, 2), -1), 2) } else { [list_at(elem(t, 2), -1)] }), if teardown_body != nil { [teardown_body] } else { [] }), ["ok"])))
     \\        }
     \\        :zig.Zest.begin_test()
-    \\        unquote(intern_atom("test_" <> _desc_slug <> "_" <> slugify(list_at(elem(_t, 2), 0))))()
+    \\        unquote(intern_atom("test_" <> desc_slug <> "_" <> slugify(list_at(elem(t, 2), 0))))()
     \\        :zig.Zest.end_test()
     \\        :zig.Zest.print_result()
     \\        "."
     \\      }
     \\    }
     \\
-    \\    _passthrough = for _s <- _stmts, elem(_s, 0) != :test and elem(_s, 0) != :setup and elem(_s, 0) != :teardown { _s }
+    \\    passthrough = for s <- stmts, elem(s, 0) != :test and elem(s, 0) != :setup and elem(s, 0) != :teardown { s }
     \\
-    \\    _all = list_concat(_per_test, _passthrough)
+    \\    all = list_concat(per_test, passthrough)
     \\
-    \\    quote { unquote_splicing(_all) }
+    \\    quote { unquote_splicing(all) }
     \\  }
 ;
 
@@ -6000,15 +5997,15 @@ test "Zest describe migration T5: bare test outside describe produces test_<slug
     // builtin produced).
     const source =
         \\pub struct Test {
-        \\  pub macro test(_name :: Expr, body :: Expr) -> Expr {
-        \\    _fn_atom = intern_atom("test_" <> slugify(_name))
+        \\  pub macro test(name :: Expr, body :: Expr) -> Expr {
+        \\    fn_atom = intern_atom("test_" <> slugify(name))
         \\    quote {
-        \\      pub fn unquote(_fn_atom)() -> String {
+        \\      pub fn unquote(fn_atom)() -> String {
         \\        unquote(body)
         \\        "ok"
         \\      }
         \\      :zig.Zest.begin_test()
-        \\      unquote(_fn_atom)()
+        \\      unquote(fn_atom)()
         \\      :zig.Zest.end_test()
         \\      :zig.Zest.print_result()
         \\      "."
@@ -6646,9 +6643,9 @@ test "expansion provenance: source-level nodes have no expansion stamp" {
 test "use macro receives explicit empty option list" {
     const source =
         \\pub struct Provider {
-        \\  pub macro __using__(_opts :: Expr) -> Expr {
+        \\  pub macro __using__(opts :: Expr) -> Expr {
         \\    quote {
-        \\      @received_opts = unquote(_opts)
+        \\      @received_opts = unquote(opts)
         \\    }
         \\  }
         \\}
@@ -6695,9 +6692,9 @@ test "use macro receives explicit empty option list" {
 test "use macro receives bare pattern keyword option list" {
     const source =
         \\pub struct Provider {
-        \\  pub macro __using__(_opts :: Expr) -> Expr {
+        \\  pub macro __using__(opts :: Expr) -> Expr {
         \\    quote {
-        \\      @received_opts = unquote(_opts)
+        \\      @received_opts = unquote(opts)
         \\    }
         \\  }
         \\}

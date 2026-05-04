@@ -67,6 +67,30 @@ pub const Collector = struct {
         try self.errors.append(self.allocator, .{ .message = message, .span = span });
     }
 
+    /// True for identifiers that begin with a single underscore (`_foo`)
+    /// and are therefore reserved for "intentionally unused" bindings —
+    /// not legal as function or macro names.  Double-underscore names
+    /// (`__using__`, `__before_compile__`, etc.) are the language-hook
+    /// namespace and stay legal.
+    fn isReservedUnderscoreName(text: []const u8) bool {
+        if (text.len == 0) return false;
+        if (text[0] != '_') return false;
+        if (text.len >= 2 and text[1] == '_') return false;
+        return true;
+    }
+
+    fn rejectUnderscoreFunctionName(self: *Collector, name: ast.StringId, span: ast.SourceSpan, kind: []const u8) !bool {
+        const text = self.interner.get(name);
+        if (!isReservedUnderscoreName(text)) return false;
+        const message = try std.fmt.allocPrint(
+            self.allocator,
+            "{s} `{s}` cannot start with `_` — single-underscore names are reserved for intentionally-unused bindings; rename to `{s}` or, if this is a language hook, use `__{s}__`",
+            .{ kind, text, text[1..], text[1..] },
+        );
+        try self.errors.append(self.allocator, .{ .message = message, .span = span });
+        return true;
+    }
+
     // ============================================================
     // Top-level collection entry point
     // ============================================================
@@ -567,6 +591,12 @@ pub const Collector = struct {
     }
 
     pub fn collectFunction(self: *Collector, func: *const ast.FunctionDecl, parent_scope: scope.ScopeId) !void {
+        // Reject `pub fn _name` / `fn _name` at definition time. Single
+        // underscore names are reserved for intentionally-unused bindings
+        // (parameters, locals); they aren't legal function names.
+        if (func.clauses.len > 0) {
+            if (try self.rejectUnderscoreFunctionName(func.name, func.clauses[0].meta.span, "function")) return;
+        }
         // Iterate by pointer so the `clause.meta.scope_id` write below
         // mutates the actual slice element. With `|clause, idx|` the loop
         // variable is a stack copy, and the mutation is silently discarded
@@ -617,6 +647,13 @@ pub const Collector = struct {
     // ============================================================
 
     fn collectMacro(self: *Collector, mac: *const ast.FunctionDecl, parent_scope: scope.ScopeId) !void {
+        // Same definition-time rule as `collectFunction`: single-`_`
+        // macro names are reserved. Double-underscore stays legal so
+        // language-hook macros (`__using__`, `__before_compile__`) can
+        // continue to be defined.
+        if (mac.clauses.len > 0) {
+            if (try self.rejectUnderscoreFunctionName(mac.name, mac.clauses[0].meta.span, "macro")) return;
+        }
         for (mac.clauses, 0..) |*clause, clause_idx| {
             const arity: u32 = @intCast(clause.params.len);
             const key = scope.FamilyKey{ .name = mac.name, .arity = arity };

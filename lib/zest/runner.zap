@@ -16,21 +16,21 @@ pub struct Zest.Runner {
     the runner uses `test/**/*_test.zap`.
     """
 
-  pub macro __using__(_opts :: Expr) -> Expr {
-    _options = options(_opts)
-    _patterns = patterns(_options)
-    _source_paths = list_flatten(for _pattern <- _patterns {
-      Path.glob(_pattern)
+  pub macro __using__(opts :: Expr) -> Expr {
+    normalized_options = options(opts)
+    glob_patterns = patterns(normalized_options)
+    source_paths = list_flatten(for pattern <- glob_patterns {
+      Path.glob(pattern)
     })
-    _source_structs = list_flatten(for _source_path <- _source_paths {
-      SourceGraph.structs(_source_path)
+    source_structs = list_flatten(for source_path <- source_paths {
+      SourceGraph.structs(source_path)
     })
-    _test_structs = for _struct <- _source_structs, Struct.has_function?(_struct, "run", 0) {
-      _struct
+    test_structs = for s <- source_structs, Struct.has_function?(s, "run", 0) {
+      s
     }
-    _run_calls = for _struct <- _test_structs {
+    run_calls = for s <- test_structs {
       quote {
-        unquote(_struct).run()
+        unquote(s).run()
       }
     }
 
@@ -41,7 +41,7 @@ pub struct Zest.Runner {
 
       pub fn main(_args :: [String]) -> String {
         Zest.Runner.configure()
-        unquote_splicing(_run_calls)
+        unquote_splicing(run_calls)
         Zest.Runner.run()
       }
     }
@@ -143,15 +143,15 @@ pub struct Zest.Runner {
   }
 
   macro patterns(options :: Expr) -> Expr {
-    _pattern_groups = for _option <- options {
-      option_patterns(_option)
+    pattern_groups = for option <- options {
+      option_patterns(option)
     }
-    _patterns = list_flatten(_pattern_groups)
+    flattened_patterns = list_flatten(pattern_groups)
 
-    if _patterns == [] {
+    if flattened_patterns == [] {
       ["test/**/*_test.zap"]
     } else {
-      _patterns
+      flattened_patterns
     }
   }
 

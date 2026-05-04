@@ -8,39 +8,38 @@
 
 pub struct TestProbe {
   pub macro __using__(_opts :: Expr) -> Expr {
-    _ignore = _opts
-    _funcs = struct_functions(ReflectionSubject)
-    _macros = struct_macros(ReflectionSubject)
-    _add_docs = for _f <- _funcs, map_get(_f, :name, "") == "add" {
-      map_get(_f, :doc, "MISSING")
+    funcs = struct_functions(ReflectionSubject)
+    macros = struct_macros(ReflectionSubject)
+    add_docs = for f <- funcs, map_get(f, :name, "") == "add" {
+      map_get(f, :doc, "MISSING")
     }
-    _multiply_docs = for _f <- _funcs, map_get(_f, :name, "") == "multiply" {
-      map_get(_f, :doc, "MISSING")
+    multiply_docs = for f <- funcs, map_get(f, :name, "") == "multiply" {
+      map_get(f, :doc, "MISSING")
     }
-    _no_doc_docs = for _f <- _funcs, map_get(_f, :name, "") == "no_doc" {
-      map_get(_f, :doc, "MISSING")
+    no_doc_docs = for f <- funcs, map_get(f, :name, "") == "no_doc" {
+      map_get(f, :doc, "MISSING")
     }
-    _twice_docs = for _m <- _macros, map_get(_m, :name, "") == "twice" {
-      map_get(_m, :doc, "MISSING")
+    twice_docs = for m <- macros, map_get(m, :name, "") == "twice" {
+      map_get(m, :doc, "MISSING")
     }
-    _func_count = list_length(_funcs)
-    _macro_count = list_length(_macros)
+    func_count = list_length(funcs)
+    macro_count_val = list_length(macros)
 
-    _add_source_files = for _f <- _funcs, map_get(_f, :name, "") == "add" {
-      map_get(_f, :source_file, "MISSING")
+    add_source_files = for f <- funcs, map_get(f, :name, "") == "add" {
+      map_get(f, :source_file, "MISSING")
     }
-    _add_source_lines = for _f <- _funcs, map_get(_f, :name, "") == "add" {
-      map_get(_f, :source_line, 0)
+    add_source_lines = for f <- funcs, map_get(f, :name, "") == "add" {
+      map_get(f, :source_line, 0)
     }
-    _twice_source_lines = for _m <- _macros, map_get(_m, :name, "") == "twice" {
-      map_get(_m, :source_line, 0)
+    twice_source_lines = for m <- macros, map_get(m, :name, "") == "twice" {
+      map_get(m, :source_line, 0)
     }
 
-    _add_signatures = for _f <- _funcs, map_get(_f, :name, "") == "add" {
-      list_at(map_get(_f, :signatures, []), 0)
+    add_signatures = for f <- funcs, map_get(f, :name, "") == "add" {
+      list_at(map_get(f, :signatures, []), 0)
     }
-    _twice_signatures = for _m <- _macros, map_get(_m, :name, "") == "twice" {
-      list_at(map_get(_m, :signatures, []), 0)
+    twice_signatures = for m <- macros, map_get(m, :name, "") == "twice" {
+      list_at(map_get(m, :signatures, []), 0)
     }
 
     # Reference ReflectionProtocol by name so the file-graph discovery
@@ -48,142 +47,142 @@ pub struct TestProbe {
     # match the `*_test.zap` build glob.
     _proto_marker = ReflectionProtocol
     _union_marker = ReflectionUnion
-    _protocol_refs = source_graph_protocols("test/reflection_protocol.zap")
-    _protocol_count = list_length(_protocol_refs)
-    _proto_info = struct_info(list_at(_protocol_refs, 0))
-    _proto_name = map_get(_proto_info, :name, "MISSING")
-    _proto_required = protocol_required_functions(list_at(_protocol_refs, 0))
-    _proto_required_count = list_length(_proto_required)
-    _proto_required_signature = map_get(list_at(_proto_required, 0), :signature, "MISSING")
+    protocol_refs = source_graph_protocols("test/reflection_protocol.zap")
+    protocol_count_val = list_length(protocol_refs)
+    proto_info = struct_info(list_at(protocol_refs, 0))
+    proto_name = map_get(proto_info, :name, "MISSING")
+    proto_required = protocol_required_functions(list_at(protocol_refs, 0))
+    proto_required_count = list_length(proto_required)
+    proto_required_signature = map_get(list_at(proto_required, 0), :signature, "MISSING")
 
-    _union_refs = source_graph_unions("test/reflection_union.zap")
-    _union_count = list_length(_union_refs)
-    _union_info = struct_info(list_at(_union_refs, 0))
-    _union_name = map_get(_union_info, :name, "MISSING")
-    _union_variants = union_variants(list_at(_union_refs, 0))
-    _union_variant_count = list_length(_union_variants)
-    _first_variant_signature = map_get(list_at(_union_variants, 0), :signature, "MISSING")
-    _last_variant_signature = map_get(list_at(_union_variants, 2), :signature, "MISSING")
+    union_refs = source_graph_unions("test/reflection_union.zap")
+    union_count_val = list_length(union_refs)
+    union_info = struct_info(list_at(union_refs, 0))
+    union_name = map_get(union_info, :name, "MISSING")
+    union_variants_list = union_variants(list_at(union_refs, 0))
+    union_variant_count_val = list_length(union_variants_list)
+    first_variant_signature = map_get(list_at(union_variants_list, 0), :signature, "MISSING")
+    last_variant_signature = map_get(list_at(union_variants_list, 2), :signature, "MISSING")
 
     # Verify the source-graph impls intrinsic returns a list shape even
     # when no impls are declared in the path. A separate test (once a
     # working impl fixture lands) will cover the populated case.
-    _impl_entries = source_graph_impls("test/no_impls_here.zap")
-    _impl_count = list_length(_impl_entries)
+    impl_entries = source_graph_impls("test/no_impls_here.zap")
+    impl_count_val = list_length(impl_entries)
 
     # Verify path-filter resolution works for stdlib paths.
-    _stdlib_lib_atom_refs = source_graph_structs("lib/atom.zap")
-    _stdlib_lib_atom_count = list_length(_stdlib_lib_atom_refs)
+    stdlib_lib_atom_refs = source_graph_structs("lib/atom.zap")
+    stdlib_lib_atom_count = list_length(stdlib_lib_atom_refs)
 
-    _info = struct_info(ReflectionSubject)
-    _info_name = map_get(_info, :name, "MISSING")
-    _info_source = map_get(_info, :source_file, "MISSING")
-    _info_doc = map_get(_info, :doc, "MISSING")
-    _info_private = map_get(_info, :is_private, true)
+    info = struct_info(ReflectionSubject)
+    info_name = map_get(info, :name, "MISSING")
+    info_source = map_get(info, :source_file, "MISSING")
+    info_doc = map_get(info, :doc, "MISSING")
+    info_private = map_get(info, :is_private, true)
 
     quote {
       pub fn add_doc() -> String {
-        unquote(list_at(_add_docs, 0))
+        unquote(list_at(add_docs, 0))
       }
 
       pub fn multiply_doc() -> String {
-        unquote(list_at(_multiply_docs, 0))
+        unquote(list_at(multiply_docs, 0))
       }
 
       pub fn no_doc_doc() -> String {
-        unquote(list_at(_no_doc_docs, 0))
+        unquote(list_at(no_doc_docs, 0))
       }
 
       pub fn twice_doc() -> String {
-        unquote(list_at(_twice_docs, 0))
+        unquote(list_at(twice_docs, 0))
       }
 
       pub fn function_count() -> i64 {
-        unquote(_func_count)
+        unquote(func_count)
       }
 
       pub fn macro_count() -> i64 {
-        unquote(_macro_count)
+        unquote(macro_count_val)
       }
 
       pub fn subject_name() -> String {
-        unquote(_info_name)
+        unquote(info_name)
       }
 
       pub fn subject_source_file() -> String {
-        unquote(_info_source)
+        unquote(info_source)
       }
 
       pub fn subject_doc() -> String {
-        unquote(_info_doc)
+        unquote(info_doc)
       }
 
       pub fn subject_is_private() -> Bool {
-        unquote(_info_private)
+        unquote(info_private)
       }
 
       pub fn add_source_file() -> String {
-        unquote(list_at(_add_source_files, 0))
+        unquote(list_at(add_source_files, 0))
       }
 
       pub fn add_source_line() -> i64 {
-        unquote(list_at(_add_source_lines, 0))
+        unquote(list_at(add_source_lines, 0))
       }
 
       pub fn twice_source_line() -> i64 {
-        unquote(list_at(_twice_source_lines, 0))
+        unquote(list_at(twice_source_lines, 0))
       }
 
       pub fn add_signature() -> String {
-        unquote(list_at(_add_signatures, 0))
+        unquote(list_at(add_signatures, 0))
       }
 
       pub fn twice_signature() -> String {
-        unquote(list_at(_twice_signatures, 0))
+        unquote(list_at(twice_signatures, 0))
       }
 
       pub fn protocol_count() -> i64 {
-        unquote(_protocol_count)
+        unquote(protocol_count_val)
       }
 
       pub fn first_protocol_name() -> String {
-        unquote(_proto_name)
+        unquote(proto_name)
       }
 
       pub fn protocol_required_count() -> i64 {
-        unquote(_proto_required_count)
+        unquote(proto_required_count)
       }
 
       pub fn protocol_required_signature() -> String {
-        unquote(_proto_required_signature)
+        unquote(proto_required_signature)
       }
 
       pub fn union_count() -> i64 {
-        unquote(_union_count)
+        unquote(union_count_val)
       }
 
       pub fn first_union_name() -> String {
-        unquote(_union_name)
+        unquote(union_name)
       }
 
       pub fn union_variant_count() -> i64 {
-        unquote(_union_variant_count)
+        unquote(union_variant_count_val)
       }
 
       pub fn union_variant_first_signature() -> String {
-        unquote(_first_variant_signature)
+        unquote(first_variant_signature)
       }
 
       pub fn union_variant_last_signature() -> String {
-        unquote(_last_variant_signature)
+        unquote(last_variant_signature)
       }
 
       pub fn impl_count() -> i64 {
-        unquote(_impl_count)
+        unquote(impl_count_val)
       }
 
       pub fn stdlib_lib_atom_count() -> i64 {
-        unquote(_stdlib_lib_atom_count)
+        unquote(stdlib_lib_atom_count)
       }
     }
   }
