@@ -238,10 +238,24 @@ pub struct Zap.Doc {
     omit the GitHub icon.
     """
   pub fn topbar(project_name :: String, version :: String, base :: String, source_url :: String) -> String {
+    topbar_with_tabs(project_name, version, base, source_url, :none, "", "")
+  }
+
+  @doc = """
+    Render the topbar with an optional Reference/Guide tab switch in
+    the right cluster. `tab_state` is `:reference` on a struct page
+    that has a matching guide, `:guide` on the corresponding guide
+    page, or `:none` when no tabs apply. `ref_url` and `guide_url`
+    are the relative URLs the tab anchors point at; both must be
+    populated whenever `tab_state` is not `:none`. Mirrors the
+    `TopbarTabs` struct the legacy Zig generator passed to
+    `appendPageHeader`.
+    """
+  pub fn topbar_with_tabs(project_name :: String, version :: String, base :: String, source_url :: String, tab_state :: Atom, ref_url :: String, guide_url :: String) -> String {
     open = "<header class=\"topbar\">\n"
     left = topbar_left(project_name, version, base)
     center = topbar_center()
-    right = topbar_right(source_url)
+    right = topbar_right_with_tabs(source_url, tab_state, ref_url, guide_url)
     open <> left <> center <> right <> "</header>\n"
   }
 
@@ -262,6 +276,11 @@ pub struct Zap.Doc {
   }
 
   pub fn topbar_right(source_url :: String) -> String {
+    topbar_right_with_tabs(source_url, :none, "", "")
+  }
+
+  pub fn topbar_right_with_tabs(source_url :: String, tab_state :: Atom, ref_url :: String, guide_url :: String) -> String {
+    tabs_html = render_topbar_tabs(tab_state, ref_url, guide_url)
     theme = "<button id=\"theme-toggle\" aria-label=\"Toggle dark mode\" title=\"Toggle dark mode\">\n<span class=\"theme-icon-light\">\u{2600}</span>\n<span class=\"theme-icon-dark\">\u{263e}</span>\n</button>\n"
     divider = "<div class=\"topbar-divider\"></div>\n"
     github = if String.length(source_url) == 0 {
@@ -270,7 +289,28 @@ pub struct Zap.Doc {
       gh_icon = "<svg width=\"18\" height=\"18\" viewBox=\"0 0 16 16\" fill=\"currentColor\">\n<path d=\"M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z\"/>\n</svg>\n"
       "<a href=\"" <> escape_html(source_url) <> "\" class=\"topbar-github\" aria-label=\"GitHub repository\" title=\"GitHub\">\n" <> gh_icon <> "</a>\n"
     }
-    "<div class=\"topbar-right\">\n" <> theme <> divider <> github <> "</div>\n"
+    "<div class=\"topbar-right\">\n" <> tabs_html <> theme <> divider <> github <> "</div>\n"
+  }
+
+  @doc = """
+    Render the `<div class="topbar-tabs">` Reference/Guide switch
+    that appears in the topbar's right cluster on pages where a
+    struct has a matching guide. `tab_state` selects which tab gets
+    the `active` class; `:none` returns the empty string so callers
+    can splice unconditionally.
+    """
+  pub fn render_topbar_tabs(tab_state :: Atom, ref_url :: String, guide_url :: String) -> String {
+    if tab_state == :none {
+      ""
+    } else {
+      compose_topbar_tabs(tab_state, ref_url, guide_url)
+    }
+  }
+
+  pub fn compose_topbar_tabs(tab_state :: Atom, ref_url :: String, guide_url :: String) -> String {
+    ref_class = if tab_state == :reference { "topbar-tab active" } else { "topbar-tab" }
+    guide_class = if tab_state == :guide { "topbar-tab active" } else { "topbar-tab" }
+    "<div class=\"topbar-tabs\" role=\"tablist\">\n<a class=\"" <> ref_class <> "\" href=\"" <> escape_html(ref_url) <> "\" role=\"tab\">Reference</a>\n<a class=\"" <> guide_class <> "\" href=\"" <> escape_html(guide_url) <> "\" role=\"tab\">Guide</a>\n</div>\n<div class=\"topbar-divider\"></div>\n"
   }
 
   @doc = """
@@ -407,8 +447,19 @@ pub struct Zap.Doc {
   }
 
   pub fn struct_page(project_name :: String, project_version :: String, title :: String, base :: String, source_url :: String, sidebar_html :: String, content_html :: String, rail_html :: String) -> String {
+    struct_page_with_tabs(project_name, project_version, title, base, source_url, sidebar_html, content_html, rail_html, :none, "", "")
+  }
+
+  @doc = """
+    Compose a full struct/guide/index page with an optional
+    Reference/Guide topbar tab switch. `tab_state` is `:reference`,
+    `:guide`, or `:none`; the matching urls populate the tab anchors
+    when state isn't `:none`. Mirrors the `TopbarTabs` argument the
+    legacy generator threaded through `appendPageHeader`.
+    """
+  pub fn struct_page_with_tabs(project_name :: String, project_version :: String, title :: String, base :: String, source_url :: String, sidebar_html :: String, content_html :: String, rail_html :: String, tab_state :: Atom, ref_url :: String, guide_url :: String) -> String {
     head = page_open(title, project_name, base)
-    bar = topbar(project_name, project_version, base, source_url)
+    bar = topbar_with_tabs(project_name, project_version, base, source_url, tab_state, ref_url, guide_url)
     body = layout(sidebar_html, content_html, rail_html)
     tail = page_close(base)
     head <> bar <> body <> tail
@@ -666,7 +717,17 @@ pub struct Zap.Doc {
     content = body_html <> extras
     sidebar_html = sidebar(structs, protocols, unions, guide_slugs, name, "../", project_name, project_version)
     rail_html = render_right_rail(sorted_functions, sorted_macros)
-    struct_page(project_name, project_version, name, "../", source_url, sidebar_html, content, rail_html)
+    # When the struct has a matching guide (slug = lowercased last
+    # segment of the qualified name), the topbar shows a
+    # Reference/Guide tab switch with Reference active. Without a
+    # match, `:none` collapses the tabs and the topbar lays out the
+    # theme/github cluster as before.
+    slug = slug_for_struct_name(name)
+    has_guide = list_contains?(guide_slugs, slug)
+    tab_state = if has_guide { :reference } else { :none }
+    ref_url = if has_guide { "../structs/" <> name <> ".html" } else { "" }
+    guide_url = if has_guide { "../guides/" <> slug <> ".html" } else { "" }
+    struct_page_with_tabs(project_name, project_version, name, "../", source_url, sidebar_html, content, rail_html, tab_state, ref_url, guide_url)
   }
 
   @doc = """
@@ -1568,7 +1629,101 @@ pub struct Zap.Doc {
     body_html = Markdown.to_html(markdown_text)
     article = "<article class=\"guide-article structdoc\">\n" <> body_html <> "</article>\n"
     sidebar_html = sidebar(structs, protocols, unions, guide_slugs, slug, "../", project_name, project_version)
-    struct_page(project_name, project_version, title, "../", source_url, sidebar_html, article, "")
+    # Find the struct (if any) whose lowercased last-segment matches
+    # this guide's slug. When matched, the topbar shows a
+    # Reference/Guide switch with Guide active and the Reference tab
+    # linking back to the struct page.
+    struct_name = struct_name_for_guide_slug(structs, slug)
+    has_struct = String.length(struct_name) > 0
+    tab_state = if has_struct { :guide } else { :none }
+    ref_url = if has_struct { "../structs/" <> struct_name <> ".html" } else { "" }
+    guide_url = if has_struct { "../guides/" <> slug <> ".html" } else { "" }
+    struct_page_with_tabs(project_name, project_version, title, "../", source_url, sidebar_html, article, "", tab_state, ref_url, guide_url)
+  }
+
+  @doc = """
+    Find the qualified struct name whose lowercased last-segment
+    matches `slug`. Returns the empty string when no struct matches —
+    that signal collapses the topbar tab switch on the corresponding
+    guide page (no Reference target to link at).
+    """
+  pub fn struct_name_for_guide_slug(structs :: [String], slug :: String) -> String {
+    if List.empty?(structs) {
+      ""
+    } else {
+      head = List.head(structs)
+      tail = List.tail(structs)
+      if slug_for_struct_name(head) == slug {
+        head
+      } else {
+        struct_name_for_guide_slug(tail, slug)
+      }
+    }
+  }
+
+  @doc = """
+    Derive the guide slug for a struct by lowercasing the last
+    dotted segment of its qualified name: `Integer` -> `integer`,
+    `Zap.Doc.Builder` -> `builder`. The lowercase walk only touches
+    ASCII A-Z; non-ASCII bytes pass through unchanged so the slug
+    matches the file-naming convention `guides/<slug>.md`.
+    """
+  pub fn slug_for_struct_name(name :: String) -> String {
+    last_segment = last_dotted_segment(name)
+    downcase_ascii(last_segment)
+  }
+
+  pub fn last_dotted_segment(name :: String) -> String {
+    last_dotted_walk(name, String.length(name) - 1, String.length(name))
+  }
+
+  pub fn last_dotted_walk(name :: String, index :: i64, end_index :: i64) -> String {
+    if index < 0 {
+      name
+    } else {
+      if String.byte_at(name, index) == "." {
+        String.slice(name, index + 1, end_index)
+      } else {
+        last_dotted_walk(name, index - 1, end_index)
+      }
+    }
+  }
+
+  pub fn downcase_ascii(text :: String) -> String {
+    downcase_walk(text, 0, String.length(text), "")
+  }
+
+  pub fn downcase_walk(text :: String, index :: i64, end_index :: i64, acc :: String) -> String {
+    if index >= end_index {
+      acc
+    } else {
+      ch = String.byte_at(text, index)
+      downcase_walk(text, index + 1, end_index, acc <> downcase_byte(ch))
+    }
+  }
+
+  pub fn downcase_byte(ch :: String) -> String {
+    if ch >= "A" and ch <= "Z" {
+      String.byte_at("abcdefghijklmnopqrstuvwxyz", downcase_index(ch))
+    } else {
+      ch
+    }
+  }
+
+  pub fn downcase_index(ch :: String) -> i64 {
+    downcase_index_walk(ch, 0)
+  }
+
+  pub fn downcase_index_walk(ch :: String, idx :: i64) -> i64 {
+    if idx >= 26 {
+      0
+    } else {
+      if String.byte_at("ABCDEFGHIJKLMNOPQRSTUVWXYZ", idx) == ch {
+        idx
+      } else {
+        downcase_index_walk(ch, idx + 1)
+      }
+    }
   }
 
   @doc = """
