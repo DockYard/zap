@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Enum — zap_stdlib</title>
+<title>Enum — Zap</title>
 <link rel="stylesheet" href="../style.css">
 <meta name="zap-docs-base" content="../">
 </head>
@@ -14,8 +14,8 @@
 <rect x="0.5" y="0.5" width="21" height="21" rx="3" stroke="var(--border-strong)"/>
 <path d="M6 6 L15 6 L8 13 L16 13 L16 16 L6 16 L13 9 L6 9 Z" fill="var(--accent)"/>
 </svg>
-<a href="../index.html" class="topbar-title">zap_stdlib</a>
-<span class="topbar-version">v0.1.0</span>
+<a href="../index.html" class="topbar-title">Zap</a>
+<span class="topbar-version">v0.0.0</span>
 <span class="docs-label">docs</span>
 </div>
 <div class="topbar-center">
@@ -29,11 +29,6 @@
 </button>
 </div>
 <div class="topbar-right">
-<div class="topbar-tabs" role="tablist">
-<a class="topbar-tab active" href="../structs/Enum.html" role="tab">Reference</a>
-<a class="topbar-tab" href="../guides/enum.html" role="tab">Guide</a>
-</div>
-<div class="topbar-divider"></div>
 <button id="theme-toggle" aria-label="Toggle dark mode" title="Toggle dark mode">
 <span class="theme-icon-light">☀</span>
 <span class="theme-icon-dark">☾</span>
@@ -48,7 +43,7 @@
 </header>
 <div class="layout">
 <nav class="sidebar">
-<div class="sidebar-header"><a href="../index.html" class="sidebar-title">zap_stdlib</a> <span class="sidebar-version">v0.1.0</span></div>
+<div class="sidebar-header"><a href="../index.html" class="sidebar-title">Zap</a> <span class="sidebar-version">v0.0.0</span></div>
 <div class="sidebar-search"><input type="text" id="search-input" placeholder="Search (Cmd+K)" aria-label="Search documentation"></div>
 <div class="sidebar-group" data-group="Structs">
 <button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Structs</h4></button>
@@ -64,6 +59,7 @@
 <li><a href="../structs/Kernel.html">Kernel</a></li>
 <li><a href="../structs/List.html">List</a></li>
 <li><a href="../structs/Map.html">Map</a></li>
+<li><a href="../structs/Markdown.html">Markdown</a></li>
 <li><a href="../structs/Math.html">Math</a></li>
 <li><a href="../structs/Path.html">Path</a></li>
 <li><a href="../structs/Range.html">Range</a></li>
@@ -71,6 +67,12 @@
 <li><a href="../structs/String.html">String</a></li>
 <li><a href="../structs/Struct.html">Struct</a></li>
 <li><a href="../structs/System.html">System</a></li>
+<li><a href="../structs/Zap.Dep.html">Zap.Dep</a></li>
+<li><a href="../structs/Zap.Doc.html">Zap.Doc</a></li>
+<li><a href="../structs/Zap.Doc.Builder.html">Zap.Doc.Builder</a></li>
+<li><a href="../structs/Zap.DocsRunner.html">Zap.DocsRunner</a></li>
+<li><a href="../structs/Zap.Env.html">Zap.Env</a></li>
+<li><a href="../structs/Zap.Manifest.html">Zap.Manifest</a></li>
 <li><a href="../structs/Zest.html">Zest</a></li>
 <li><a href="../structs/Zest.Case.html">Zest.Case</a></li>
 <li><a href="../structs/Zest.Runner.html">Zest.Runner</a></li>
@@ -161,6 +163,7 @@ and returns the remaining elements as a list.</td></tr>
 <pre><code class="language-zap">Enum.to_list(<span class="hl-number">1..3</span>)   <span class="hl-comment"># =&gt; [1, 2, 3]</span>
 Enum.to_list(<span class="hl-string">"ab"</span>)   <span class="hl-comment"># =&gt; [&quot;a&quot;, &quot;b&quot;]</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L29">Source</a>
 </div>
 <div class="function-detail" id="map-2">
 <div class="function-header">
@@ -176,6 +179,7 @@ Enum.to_list(<span class="hl-string">"ab"</span>)   <span class="hl-comment"># =
 <pre><code class="language-zap">Enum.map([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>], <span class="hl-keyword">fn</span>(x) { x <span class="hl-op">*</span> <span class="hl-number">2</span> })  <span class="hl-comment"># =&gt; [2, 4, 6]</span>
 Enum.map(<span class="hl-number">1..3</span>, <span class="hl-keyword">fn</span>(x) { x <span class="hl-op">*</span> <span class="hl-number">2</span> })       <span class="hl-comment"># =&gt; [2, 4, 6]</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L42">Source</a>
 </div>
 <div class="function-detail" id="filter-2">
 <div class="function-header">
@@ -191,6 +195,7 @@ Enum.map(<span class="hl-number">1..3</span>, <span class="hl-keyword">fn</span>
 <pre><code class="language-zap">Enum.filter([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>, <span class="hl-number">4</span>], <span class="hl-keyword">fn</span>(x) { x <span class="hl-op">&gt;</span> <span class="hl-number">2</span> })  <span class="hl-comment"># =&gt; [3, 4]</span>
 Enum.filter(<span class="hl-number">1..5</span>, <span class="hl-keyword">fn</span>(x) { x <span class="hl-op">&gt;</span> <span class="hl-number">3</span> })          <span class="hl-comment"># =&gt; [4, 5]</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L55">Source</a>
 </div>
 <div class="function-detail" id="reject-2">
 <div class="function-header">
@@ -206,6 +211,7 @@ The opposite of <code>filter/2</code>.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap">Enum.<span class="hl-keyword">reject</span>([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>, <span class="hl-number">4</span>], <span class="hl-keyword">fn</span>(x) { x <span class="hl-op">&gt;</span> <span class="hl-number">2</span> })  <span class="hl-comment"># =&gt; [1, 2]</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L68">Source</a>
 </div>
 <div class="function-detail" id="reduce-3">
 <div class="function-header">
@@ -225,6 +231,7 @@ collection type that implements Enumerable.</p>
 <pre><code class="language-zap">Enum.reduce([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>], <span class="hl-number">0</span>, <span class="hl-keyword">fn</span>(acc, x) { acc <span class="hl-op">+</span> x })  <span class="hl-comment"># =&gt; 6</span>
 Enum.reduce(<span class="hl-number">1..4</span>, <span class="hl-number">0</span>, <span class="hl-keyword">fn</span>(acc, x) { acc <span class="hl-op">+</span> x })       <span class="hl-comment"># =&gt; 10</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L86">Source</a>
 </div>
 <div class="function-detail" id="each-2">
 <div class="function-header">
@@ -240,6 +247,7 @@ Returns <code>nil</code> after the collection has been exhausted.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap">Enum.each([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>], <span class="hl-keyword">fn</span>(x) { IO.puts(Integer.to_string(x)) })</code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L99">Source</a>
 </div>
 <div class="function-detail" id="find-3">
 <div class="function-header">
@@ -256,6 +264,7 @@ Returns the default value if no element matches.</p>
 <pre><code class="language-zap">Enum.find([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>, <span class="hl-number">4</span>], <span class="hl-number">0</span>, <span class="hl-keyword">fn</span>(x) { x <span class="hl-op">&gt;</span> <span class="hl-number">2</span> })  <span class="hl-comment"># =&gt; 3</span>
 Enum.find(<span class="hl-number">1..2</span>, <span class="hl-number">0</span>, <span class="hl-keyword">fn</span>(x) { x <span class="hl-op">&gt;</span> <span class="hl-number">10</span> })         <span class="hl-comment"># =&gt; 0</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L113">Source</a>
 </div>
 <div class="function-detail" id="any?-2">
 <div class="function-header">
@@ -271,6 +280,7 @@ Enum.find(<span class="hl-number">1..2</span>, <span class="hl-number">0</span>,
 <pre><code class="language-zap">Enum.any?([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>], <span class="hl-keyword">fn</span>(x) { x <span class="hl-op">&gt;</span> <span class="hl-number">2</span> })   <span class="hl-comment"># =&gt; true</span>
 Enum.any?(<span class="hl-number">1..3</span>, <span class="hl-keyword">fn</span>(x) { x <span class="hl-op">&gt;</span> <span class="hl-number">10</span> })       <span class="hl-comment"># =&gt; false</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L126">Source</a>
 </div>
 <div class="function-detail" id="all?-2">
 <div class="function-header">
@@ -286,6 +296,7 @@ Enum.any?(<span class="hl-number">1..3</span>, <span class="hl-keyword">fn</span
 <pre><code class="language-zap">Enum.all?([<span class="hl-number">2</span>, <span class="hl-number">4</span>, <span class="hl-number">6</span>], <span class="hl-keyword">fn</span>(x) { x <span class="hl-op">&gt;</span> <span class="hl-number">0</span> })   <span class="hl-comment"># =&gt; true</span>
 Enum.all?(<span class="hl-number">1..3</span>, <span class="hl-keyword">fn</span>(x) { x <span class="hl-op">&gt;</span> <span class="hl-number">2</span> })        <span class="hl-comment"># =&gt; false</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L139">Source</a>
 </div>
 <div class="function-detail" id="count-2">
 <div class="function-header">
@@ -300,6 +311,7 @@ Enum.all?(<span class="hl-number">1..3</span>, <span class="hl-keyword">fn</span
 <h2>Examples</h2>
 <pre><code class="language-zap">Enum.count([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>, <span class="hl-number">4</span>, <span class="hl-number">5</span>], <span class="hl-keyword">fn</span>(x) { x <span class="hl-op">&gt;</span> <span class="hl-number">2</span> })  <span class="hl-comment"># =&gt; 3</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L151">Source</a>
 </div>
 <div class="function-detail" id="sum-1">
 <div class="function-header">
@@ -315,6 +327,7 @@ Enum.all?(<span class="hl-number">1..3</span>, <span class="hl-keyword">fn</span
 <pre><code class="language-zap">Enum.sum([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>, <span class="hl-number">4</span>])  <span class="hl-comment"># =&gt; 10</span>
 Enum.sum([])             <span class="hl-comment"># =&gt; 0</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L164">Source</a>
 </div>
 <div class="function-detail" id="product-1">
 <div class="function-header">
@@ -331,6 +344,7 @@ Returns 1 for an empty collection.</p>
 <pre><code class="language-zap">Enum.product([<span class="hl-number">2</span>, <span class="hl-number">3</span>, <span class="hl-number">4</span>])  <span class="hl-comment"># =&gt; 24</span>
 Enum.product([])         <span class="hl-comment"># =&gt; 1</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L178">Source</a>
 </div>
 <div class="function-detail" id="max-1">
 <div class="function-header">
@@ -346,6 +360,7 @@ Returns 0 for an empty collection.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap">Enum.max([<span class="hl-number">3</span>, <span class="hl-number">1</span>, <span class="hl-number">4</span>, <span class="hl-number">1</span>, <span class="hl-number">5</span>])  <span class="hl-comment"># =&gt; 5</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L191">Source</a>
 </div>
 <div class="function-detail" id="min-1">
 <div class="function-header">
@@ -361,6 +376,7 @@ Returns 0 for an empty collection.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap">Enum.min([<span class="hl-number">3</span>, <span class="hl-number">1</span>, <span class="hl-number">4</span>, <span class="hl-number">1</span>, <span class="hl-number">5</span>])  <span class="hl-comment"># =&gt; 1</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L204">Source</a>
 </div>
 <div class="function-detail" id="sort-2">
 <div class="function-header">
@@ -378,6 +394,7 @@ come before the second.</p>
 <pre><code class="language-zap">Enum.sort([<span class="hl-number">3</span>, <span class="hl-number">1</span>, <span class="hl-number">2</span>], <span class="hl-keyword">fn</span>(a, b) { a <span class="hl-op">&lt;</span> b })  <span class="hl-comment"># =&gt; [1, 2, 3]</span>
 Enum.sort(<span class="hl-number">1..3</span>, <span class="hl-keyword">fn</span>(a, b) { a <span class="hl-op">&gt;</span> b })       <span class="hl-comment"># =&gt; [3, 2, 1]</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L219">Source</a>
 </div>
 <div class="function-detail" id="flat_map-2">
 <div class="function-header">
@@ -394,6 +411,7 @@ into a single list.</p>
 <pre><code class="language-zap">Enum.flat_map([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>], <span class="hl-keyword">fn</span>(x) { [x, x <span class="hl-op">*</span> <span class="hl-number">10</span>] })
 <span class="hl-comment"># =&gt; [1, 10, 2, 20, 3, 30]</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L233">Source</a>
 </div>
 <div class="function-detail" id="take-2">
 <div class="function-header">
@@ -412,6 +430,7 @@ collection as a list.</p>
 Enum.take(<span class="hl-number">1..5</span>, <span class="hl-number">3</span>)             <span class="hl-comment"># =&gt; [1, 2, 3]</span>
 Enum.take([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>], <span class="hl-number">0</span>)        <span class="hl-comment"># =&gt; []</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L250">Source</a>
 </div>
 <div class="function-detail" id="drop-2">
 <div class="function-header">
@@ -430,6 +449,7 @@ and returns the remaining elements as a list.</p>
 Enum.drop(<span class="hl-number">1..5</span>, <span class="hl-number">2</span>)             <span class="hl-comment"># =&gt; [3, 4, 5]</span>
 Enum.drop([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>], <span class="hl-number">0</span>)        <span class="hl-comment"># =&gt; [1, 2, 3]</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L267">Source</a>
 </div>
 <div class="function-detail" id="reverse-1">
 <div class="function-header">
@@ -445,6 +465,7 @@ Enum.drop([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <
 <pre><code class="language-zap">Enum.reverse([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>])  <span class="hl-comment"># =&gt; [3, 2, 1]</span>
 Enum.reverse(<span class="hl-number">1..3</span>)       <span class="hl-comment"># =&gt; [3, 2, 1]</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L280">Source</a>
 </div>
 <div class="function-detail" id="member?-2">
 <div class="function-header">
@@ -461,6 +482,7 @@ Enum.reverse(<span class="hl-number">1..3</span>)       <span class="hl-comment"
 Enum.member?(<span class="hl-number">1..3</span>, <span class="hl-number">5</span>)       <span class="hl-comment"># =&gt; false</span>
 Enum.member?([], <span class="hl-number">1</span>)         <span class="hl-comment"># =&gt; false</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L294">Source</a>
 </div>
 <div class="function-detail" id="at-3">
 <div class="function-header">
@@ -477,6 +499,7 @@ Returns <code>default</code> if the index is out of bounds.</p>
 <pre><code class="language-zap">Enum.at([<span class="hl-number">10</span>, <span class="hl-number">20</span>, <span class="hl-number">30</span>], <span class="hl-number">1</span>, <span class="hl-number">0</span>)  <span class="hl-comment"># =&gt; 20</span>
 Enum.at([<span class="hl-string">"a"</span>], <span class="hl-number">2</span>, <span class="hl-string">"none"</span>)  <span class="hl-comment"># =&gt; &quot;none&quot;</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L308">Source</a>
 </div>
 <div class="function-detail" id="concat-2">
 <div class="function-header">
@@ -492,6 +515,7 @@ Enum.at([<span class="hl-string">"a"</span>], <span class="hl-number">2</span>, 
 <pre><code class="language-zap">Enum.concat([<span class="hl-number">1</span>, <span class="hl-number">2</span>], [<span class="hl-number">3</span>, <span class="hl-number">4</span>])  <span class="hl-comment"># =&gt; [1, 2, 3, 4]</span>
 Enum.concat(<span class="hl-number">1..2</span>, <span class="hl-number">3..4</span>)      <span class="hl-comment"># =&gt; [1, 2, 3, 4]</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L321">Source</a>
 </div>
 <div class="function-detail" id="uniq-1">
 <div class="function-header">
@@ -508,6 +532,7 @@ Preserves the order of first occurrences.</p>
 <pre><code class="language-zap">Enum.uniq([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>, <span class="hl-number">1</span>])  <span class="hl-comment"># =&gt; [1, 2, 3]</span>
 Enum.uniq(<span class="hl-number">1..3</span>)             <span class="hl-comment"># =&gt; [1, 2, 3]</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L335">Source</a>
 </div>
 <div class="function-detail" id="empty?-1">
 <div class="function-header">
@@ -523,6 +548,7 @@ Enum.uniq(<span class="hl-number">1..3</span>)             <span class="hl-comme
 <pre><code class="language-zap">Enum.empty?([])    <span class="hl-comment"># =&gt; true</span>
 Enum.empty?(<span class="hl-number">1..3</span>)  <span class="hl-comment"># =&gt; false</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/enum.zap#L348">Source</a>
 </div>
 </main>
 <aside class="toc">

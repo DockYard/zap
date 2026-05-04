@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>File — zap_stdlib</title>
+<title>File — Zap</title>
 <link rel="stylesheet" href="../style.css">
 <meta name="zap-docs-base" content="../">
 </head>
@@ -14,8 +14,8 @@
 <rect x="0.5" y="0.5" width="21" height="21" rx="3" stroke="var(--border-strong)"/>
 <path d="M6 6 L15 6 L8 13 L16 13 L16 16 L6 16 L13 9 L6 9 Z" fill="var(--accent)"/>
 </svg>
-<a href="../index.html" class="topbar-title">zap_stdlib</a>
-<span class="topbar-version">v0.1.0</span>
+<a href="../index.html" class="topbar-title">Zap</a>
+<span class="topbar-version">v0.0.0</span>
 <span class="docs-label">docs</span>
 </div>
 <div class="topbar-center">
@@ -43,7 +43,7 @@
 </header>
 <div class="layout">
 <nav class="sidebar">
-<div class="sidebar-header"><a href="../index.html" class="sidebar-title">zap_stdlib</a> <span class="sidebar-version">v0.1.0</span></div>
+<div class="sidebar-header"><a href="../index.html" class="sidebar-title">Zap</a> <span class="sidebar-version">v0.0.0</span></div>
 <div class="sidebar-search"><input type="text" id="search-input" placeholder="Search (Cmd+K)" aria-label="Search documentation"></div>
 <div class="sidebar-group" data-group="Structs">
 <button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Structs</h4></button>
@@ -59,6 +59,7 @@
 <li><a href="../structs/Kernel.html">Kernel</a></li>
 <li><a href="../structs/List.html">List</a></li>
 <li><a href="../structs/Map.html">Map</a></li>
+<li><a href="../structs/Markdown.html">Markdown</a></li>
 <li><a href="../structs/Math.html">Math</a></li>
 <li><a href="../structs/Path.html">Path</a></li>
 <li><a href="../structs/Range.html">Range</a></li>
@@ -66,6 +67,12 @@
 <li><a href="../structs/String.html">String</a></li>
 <li><a href="../structs/Struct.html">Struct</a></li>
 <li><a href="../structs/System.html">System</a></li>
+<li><a href="../structs/Zap.Dep.html">Zap.Dep</a></li>
+<li><a href="../structs/Zap.Doc.html">Zap.Doc</a></li>
+<li><a href="../structs/Zap.Doc.Builder.html">Zap.Doc.Builder</a></li>
+<li><a href="../structs/Zap.DocsRunner.html">Zap.DocsRunner</a></li>
+<li><a href="../structs/Zap.Env.html">Zap.Env</a></li>
+<li><a href="../structs/Zap.Manifest.html">Zap.Manifest</a></li>
 <li><a href="../structs/Zest.html">Zest</a></li>
 <li><a href="../structs/Zest.Case.html">Zest.Case</a></li>
 <li><a href="../structs/Zest.Runner.html">Zest.Runner</a></li>
@@ -138,6 +145,7 @@ Returns an empty string if the file cannot be read.</p>
 <pre><code class="language-zap">File.read(<span class="hl-string">"hello.txt"</span>)  <span class="hl-comment"># =&gt; &quot;Hello, world!&quot;</span>
 File.read(<span class="hl-string">"missing.txt"</span>)  <span class="hl-comment"># =&gt; &quot;&quot;</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/file.zap#L25">Source</a>
 </div>
 <div class="function-detail" id="write-2">
 <div class="function-header">
@@ -153,6 +161,7 @@ and overwriting if it does. Returns true on success.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap">File.write(<span class="hl-string">"output.txt"</span>, <span class="hl-string">"Hello!"</span>)  <span class="hl-comment"># =&gt; true</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/file.zap#L38">Source</a>
 </div>
 <div class="function-detail" id="exists?-1">
 <div class="function-header">
@@ -168,6 +177,7 @@ and overwriting if it does. Returns true on success.</p>
 <pre><code class="language-zap">File.exists?(<span class="hl-string">"build.zap"</span>)   <span class="hl-comment"># =&gt; true</span>
 File.exists?(<span class="hl-string">"missing.txt"</span>)  <span class="hl-comment"># =&gt; false</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/file.zap#L51">Source</a>
 </div>
 <div class="function-detail" id="read!-1">
 <div class="function-header">
@@ -183,6 +193,7 @@ File.exists?(<span class="hl-string">"missing.txt"</span>)  <span class="hl-comm
 <pre><code class="language-zap">File.read!(<span class="hl-string">"hello.txt"</span>)  <span class="hl-comment"># =&gt; &quot;Hello, world!&quot;</span>
 File.read!(<span class="hl-string">"missing.txt"</span>)  <span class="hl-comment"># raises RuntimeError</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/file.zap#L64">Source</a>
 </div>
 <div class="function-detail" id="rm-1">
 <div class="function-header">
@@ -197,6 +208,7 @@ File.read!(<span class="hl-string">"missing.txt"</span>)  <span class="hl-commen
 <h2>Examples</h2>
 <pre><code class="language-zap">File.rm(<span class="hl-string">"temp.txt"</span>)  <span class="hl-comment"># =&gt; true</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/file.zap#L80">Source</a>
 </div>
 <div class="function-detail" id="mkdir-1">
 <div class="function-header">
@@ -211,6 +223,7 @@ File.read!(<span class="hl-string">"missing.txt"</span>)  <span class="hl-commen
 <h2>Examples</h2>
 <pre><code class="language-zap">File.mkdir(<span class="hl-string">"output"</span>)  <span class="hl-comment"># =&gt; true</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/file.zap#L92">Source</a>
 </div>
 <div class="function-detail" id="rmdir-1">
 <div class="function-header">
@@ -225,6 +238,7 @@ File.read!(<span class="hl-string">"missing.txt"</span>)  <span class="hl-commen
 <h2>Examples</h2>
 <pre><code class="language-zap">File.rmdir(<span class="hl-string">"output"</span>)  <span class="hl-comment"># =&gt; true</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/file.zap#L104">Source</a>
 </div>
 <div class="function-detail" id="rename-2">
 <div class="function-header">
@@ -239,6 +253,7 @@ File.read!(<span class="hl-string">"missing.txt"</span>)  <span class="hl-commen
 <h2>Examples</h2>
 <pre><code class="language-zap">File.rename(<span class="hl-string">"old.txt"</span>, <span class="hl-string">"new.txt"</span>)  <span class="hl-comment"># =&gt; true</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/file.zap#L116">Source</a>
 </div>
 <div class="function-detail" id="cp-2">
 <div class="function-header">
@@ -253,6 +268,7 @@ File.read!(<span class="hl-string">"missing.txt"</span>)  <span class="hl-commen
 <h2>Examples</h2>
 <pre><code class="language-zap">File.cp(<span class="hl-string">"source.txt"</span>, <span class="hl-string">"dest.txt"</span>)  <span class="hl-comment"># =&gt; true</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/file.zap#L128">Source</a>
 </div>
 <div class="function-detail" id="dir?-1">
 <div class="function-header">
@@ -268,6 +284,7 @@ File.read!(<span class="hl-string">"missing.txt"</span>)  <span class="hl-commen
 <pre><code class="language-zap">File.dir?(<span class="hl-string">"src"</span>)     <span class="hl-comment"># =&gt; true</span>
 File.dir?(<span class="hl-string">"main.zap"</span>) <span class="hl-comment"># =&gt; false</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/file.zap#L141">Source</a>
 </div>
 <div class="function-detail" id="regular?-1">
 <div class="function-header">
@@ -283,6 +300,7 @@ File.dir?(<span class="hl-string">"main.zap"</span>) <span class="hl-comment"># 
 <pre><code class="language-zap">File.regular?(<span class="hl-string">"main.zap"</span>) <span class="hl-comment"># =&gt; true</span>
 File.regular?(<span class="hl-string">"src"</span>)      <span class="hl-comment"># =&gt; false</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/file.zap#L154">Source</a>
 </div>
 </main>
 <aside class="toc">

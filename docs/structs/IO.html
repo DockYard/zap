@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>IO — zap_stdlib</title>
+<title>IO — Zap</title>
 <link rel="stylesheet" href="../style.css">
 <meta name="zap-docs-base" content="../">
 </head>
@@ -14,8 +14,8 @@
 <rect x="0.5" y="0.5" width="21" height="21" rx="3" stroke="var(--border-strong)"/>
 <path d="M6 6 L15 6 L8 13 L16 13 L16 16 L6 16 L13 9 L6 9 Z" fill="var(--accent)"/>
 </svg>
-<a href="../index.html" class="topbar-title">zap_stdlib</a>
-<span class="topbar-version">v0.1.0</span>
+<a href="../index.html" class="topbar-title">Zap</a>
+<span class="topbar-version">v0.0.0</span>
 <span class="docs-label">docs</span>
 </div>
 <div class="topbar-center">
@@ -29,11 +29,6 @@
 </button>
 </div>
 <div class="topbar-right">
-<div class="topbar-tabs" role="tablist">
-<a class="topbar-tab active" href="../structs/IO.html" role="tab">Reference</a>
-<a class="topbar-tab" href="../guides/io.html" role="tab">Guide</a>
-</div>
-<div class="topbar-divider"></div>
 <button id="theme-toggle" aria-label="Toggle dark mode" title="Toggle dark mode">
 <span class="theme-icon-light">☀</span>
 <span class="theme-icon-dark">☾</span>
@@ -48,7 +43,7 @@
 </header>
 <div class="layout">
 <nav class="sidebar">
-<div class="sidebar-header"><a href="../index.html" class="sidebar-title">zap_stdlib</a> <span class="sidebar-version">v0.1.0</span></div>
+<div class="sidebar-header"><a href="../index.html" class="sidebar-title">Zap</a> <span class="sidebar-version">v0.0.0</span></div>
 <div class="sidebar-search"><input type="text" id="search-input" placeholder="Search (Cmd+K)" aria-label="Search documentation"></div>
 <div class="sidebar-group" data-group="Structs">
 <button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Structs</h4></button>
@@ -64,6 +59,7 @@
 <li><a href="../structs/Kernel.html">Kernel</a></li>
 <li><a href="../structs/List.html">List</a></li>
 <li><a href="../structs/Map.html">Map</a></li>
+<li><a href="../structs/Markdown.html">Markdown</a></li>
 <li><a href="../structs/Math.html">Math</a></li>
 <li><a href="../structs/Path.html">Path</a></li>
 <li><a href="../structs/Range.html">Range</a></li>
@@ -71,6 +67,12 @@
 <li><a href="../structs/String.html">String</a></li>
 <li><a href="../structs/Struct.html">Struct</a></li>
 <li><a href="../structs/System.html">System</a></li>
+<li><a href="../structs/Zap.Dep.html">Zap.Dep</a></li>
+<li><a href="../structs/Zap.Doc.html">Zap.Doc</a></li>
+<li><a href="../structs/Zap.Doc.Builder.html">Zap.Doc.Builder</a></li>
+<li><a href="../structs/Zap.DocsRunner.html">Zap.DocsRunner</a></li>
+<li><a href="../structs/Zap.Env.html">Zap.Env</a></li>
+<li><a href="../structs/Zap.Manifest.html">Zap.Manifest</a></li>
 <li><a href="../structs/Zest.html">Zest</a></li>
 <li><a href="../structs/Zest.Case.html">Zest.Case</a></li>
 <li><a href="../structs/Zest.Runner.html">Zest.Runner</a></li>
@@ -114,7 +116,7 @@ pipe chains.</p>
 </div>
 <h2 id="functions">Functions</h2>
 <table class="summary">
-<tr><td class="summary-name"><a href="#puts-1">puts/1</a></td><td class="summary-doc">Prints a value to standard output followed by a newline.</td></tr>
+<tr><td class="summary-name"><a href="#puts-1">puts/1</a></td><td class="summary-doc">    Prints a value to standard output followed by a newline.</td></tr>
 <tr><td class="summary-name"><a href="#print_str-1">print_str/1</a></td><td class="summary-doc">Prints a value to standard output without a trailing newline.</td></tr>
 <tr><td class="summary-name"><a href="#gets-0">gets/0</a></td><td class="summary-doc">Reads a line from standard input.</td></tr>
 <tr><td class="summary-name"><a href="#warn-1">warn/1</a></td><td class="summary-doc">Prints a message to standard error followed by a newline.</td></tr>
@@ -134,20 +136,19 @@ normal mode automatically.</td></tr>
 </div>
 <div class="signature"><code><span class="sig-name">puts</span><span class="sig-paren">(</span>message<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
 <div class="function-doc">
-<pre><code class="language-zap">Prints a value to standard output followed by a newline.
-
-The value is converted to its string representation <span class="hl-keyword">and</span> written
+<pre><code class="language-zap">Prints a value to standard output followed by a newline.</code></pre>
+<pre><code class="language-zap">The value is converted to its string representation <span class="hl-keyword">and</span> written
 to stdout. Returns the original message, making it suitable <span class="hl-keyword">for</span>
-<span class="hl-keyword">use</span> <span class="hl-keyword">in</span> pipe chains.
-
-<span class="hl-comment">## Examples</span>
-
-    IO.puts(<span class="hl-string">"Hello, world!"</span>)
+<span class="hl-keyword">use</span> <span class="hl-keyword">in</span> pipe chains.</code></pre>
+<pre><code class="language-zap"><span class="hl-comment">## Examples</span></code></pre>
+<pre><code class="language-zap">    IO.puts(<span class="hl-string">"Hello, world!"</span>)
     <span class="hl-comment"># =&gt; prints &quot;Hello, world!</span></code></pre>
 <p>&quot; to stdout</p>
-<pre><code class="language-zap">    <span class="hl-string">"result"</span> <span class="hl-op">|&gt;</span> IO.puts()</code></pre>
+<pre><code class="language-zap">    <span class="hl-string">"result"</span> <span class="hl-op">|&gt;</span> IO.puts()
+    <span class="hl-comment"># =&gt; prints &quot;result</span></code></pre>
 <p>&quot;, returns &quot;result&quot;</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/io.zap#L31">Source</a>
 </div>
 <div class="function-detail" id="print_str-1">
 <div class="function-header">
@@ -165,6 +166,7 @@ indicators or prompts.</p>
 <pre><code class="language-zap">IO.print_str(<span class="hl-string">"loading..."</span>)
 <span class="hl-comment"># =&gt; prints &quot;loading...&quot; without newline</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/io.zap#L48">Source</a>
 </div>
 <div class="function-detail" id="gets-0">
 <div class="function-header">
@@ -182,6 +184,7 @@ Returns an empty string on EOF.</p>
 <pre><code class="language-zap">name <span class="hl-op">=</span> IO.gets()
 IO.puts(<span class="hl-string">"Hello, "</span> <span class="hl-op">&lt;&gt;</span> name)</code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/io.zap#L65">Source</a>
 </div>
 <div class="function-detail" id="warn-1">
 <div class="function-header">
@@ -198,6 +201,7 @@ mix with normal output.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap">IO.warn(<span class="hl-string">"something went wrong"</span>)</code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/io.zap#L80">Source</a>
 </div>
 <div class="function-detail" id="mode-1">
 <div class="function-header">
@@ -214,6 +218,7 @@ mix with normal output.</p>
 key <span class="hl-op">=</span> IO.get_char()
 IO.mode(IO.Mode.Normal)   <span class="hl-comment"># restore line-buffered mode</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/io.zap#L95">Source</a>
 </div>
 <div class="function-detail" id="mode-2">
 <div class="function-header">
@@ -233,6 +238,7 @@ normal mode automatically.</p>
   <span class="hl-number">0</span>
 })</code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/io.zap#L113">Source</a>
 </div>
 <div class="function-detail" id="get_char-0">
 <div class="function-header">
@@ -252,6 +258,7 @@ In normal mode, blocks until Enter then returns the first character.</p>
 key <span class="hl-op">=</span> IO.get_char()
 IO.mode(<span class="hl-number">0</span>)</code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/io.zap#L135">Source</a>
 </div>
 <div class="function-detail" id="try_get_char-0">
 <div class="function-header">
@@ -273,6 +280,7 @@ key <span class="hl-op">=</span> IO.try_get_char()
   IO.puts(<span class="hl-string">"no key pressed"</span>)
 }</code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/io.zap#L155">Source</a>
 </div>
 </main>
 <aside class="toc">

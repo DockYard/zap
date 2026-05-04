@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Stringable — Zap</title>
+<title>Zap.Doc.Builder — Zap</title>
 <link rel="stylesheet" href="../style.css">
 <meta name="zap-docs-base" content="../">
 </head>
@@ -41,7 +41,7 @@
 </a>
 </div>
 </header>
-<div class="layout layout-no-toc">
+<div class="layout">
 <nav class="sidebar">
 <div class="sidebar-header"><a href="../index.html" class="sidebar-title">Zap</a> <span class="sidebar-version">v0.0.0</span></div>
 <div class="sidebar-search"><input type="text" id="search-input" placeholder="Search (Cmd+K)" aria-label="Search documentation"></div>
@@ -69,7 +69,7 @@
 <li><a href="../structs/System.html">System</a></li>
 <li><a href="../structs/Zap.Dep.html">Zap.Dep</a></li>
 <li><a href="../structs/Zap.Doc.html">Zap.Doc</a></li>
-<li><a href="../structs/Zap.Doc.Builder.html">Zap.Doc.Builder</a></li>
+<li class="active"><a href="../structs/Zap.Doc.Builder.html">Zap.Doc.Builder</a></li>
 <li><a href="../structs/Zap.DocsRunner.html">Zap.DocsRunner</a></li>
 <li><a href="../structs/Zap.Env.html">Zap.Env</a></li>
 <li><a href="../structs/Zap.Manifest.html">Zap.Manifest</a></li>
@@ -86,7 +86,7 @@
 <li><a href="../structs/Concatenable.html">Concatenable</a></li>
 <li><a href="../structs/Enumerable.html">Enumerable</a></li>
 <li><a href="../structs/Membership.html">Membership</a></li>
-<li class="active"><a href="../structs/Stringable.html">Stringable</a></li>
+<li><a href="../structs/Stringable.html">Stringable</a></li>
 <li><a href="../structs/Updatable.html">Updatable</a></li>
 </ul>
 </div>
@@ -99,34 +99,94 @@
 </nav>
 <main class="content">
 <nav class="breadcrumb" aria-label="Breadcrumb">
-<span>Protocols</span>
+<span>Structs</span>
 <span>/</span>
-<span class="breadcrumb-current">Stringable</span>
+<span class="breadcrumb-current">Zap.Doc.Builder</span>
 </nav>
-<h1 class="page-title">Stringable</h1>
-<p class="tagline">Protocol for types that can be converted to a `String`.</p>
+<h1 class="page-title">Zap.Doc.Builder</h1>
+<p class="tagline">Compile-time entry point for the Zap-side documentation generator.</p>
 <div class="structdoc">
-<p>Protocol for types that can be converted to a <code>String</code>.</p>
-<p>String interpolation <code>&quot;hello \#{x}&quot;</code> desugars to
-<code>&quot;hello &quot; &lt;&gt; Stringable.to_string(x)</code>, so any type with a
-<code>Stringable</code> impl can appear inside a <code>\#{}</code> interpolation. Built-in
-implementations cover <code>Atom</code>, <code>Bool</code>, <code>Float</code>, <code>Integer</code>, and
-<code>String</code> (the identity case). User types can opt in with
-<code>pub impl Stringable for MyType { pub fn to_string(...) }</code>.</p>
-<p>Compared to a single <code>Kernel.to_string(value :: any)</code> function with
-runtime type-dispatch, the protocol form lets the compiler pick the
-right implementation at HIR time based on the argument's static type
-— no any-tagging, no runtime branch.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap"><span class="hl-string">"n is \#{42}"</span>        <span class="hl-comment"># uses `Integer.to_string`</span>
-<span class="hl-string">"ok is \#{:ok}"</span>      <span class="hl-comment"># uses `Atom.to_string`</span>
-<span class="hl-string">"flag is \#{true}"</span>   <span class="hl-comment"># uses `Bool.to_string`</span></code></pre>
+<p>Compile-time entry point for the Zap-side documentation generator.</p>
+<p><code>use Zap.Doc.Builder, paths: [&quot;lib/**/*.zap&quot;]</code> reflects on the
+structs, protocols, and unions reachable from the supplied path
+patterns and bakes manifest functions returning the qualified
+module names. A runtime caller can iterate those manifests, feed
+each name back through <code>Struct.info/1</code> and <code>Struct.functions/1</code>,
+and drive <code>Zap.Doc</code> page rendering. Mirrors the <code>Zest.Runner</code>
+pattern: reflection at expansion time, plain Zap function bodies
+at runtime.</p>
 </div>
-<h2 id="required-functions">Required Functions</h2>
+<h2 id="macros">Macros</h2>
 <table class="summary">
-<tr><td class="summary-name"><a href="#to_string-0">to_string/0</a></td><td class="summary-doc">to_string(value) -&gt; String</td></tr>
+<tr><td class="summary-name"><a href="#options-1">options/1</a></td><td class="summary-doc">Normalize the option list passed to `use Zap.Doc.Builder`.</td></tr>
+<tr><td class="summary-name"><a href="#patterns-1">patterns/1</a></td><td class="summary-doc">Pull the `:paths` (or `:path`) glob list out of the use options.</td></tr>
+<tr><td class="summary-name"><a href="#option_patterns-1">option_patterns/1</a></td><td class="summary-doc"></td></tr>
+<tr><td class="summary-name"><a href="#pattern_values-1">pattern_values/1</a></td><td class="summary-doc"></td></tr>
 </table>
+<h2>Macro Details</h2>
+<div class="function-detail" id="options-1">
+<div class="function-header">
+<h3>options<span class="arity">/1</span></h3>
+<span class="badge">macro</span>
+<div style="flex:1"></div>
+<a href="#options-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">options</span><span class="sig-paren">(</span>opts<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="function-doc">
+<p>Normalize the option list passed to <code>use Zap.Doc.Builder</code>. <code>nil</code>
+and <code>[]</code> collapse to the empty list; a single keyword pair gets
+wrapped in a one-element list; an existing list passes through.
+Same shape <code>Zest.Runner.options/1</code> accepts.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc/builder.zap#L251">Source</a>
+</div>
+<div class="function-detail" id="patterns-1">
+<div class="function-header">
+<h3>patterns<span class="arity">/1</span></h3>
+<span class="badge">macro</span>
+<div style="flex:1"></div>
+<a href="#patterns-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">patterns</span><span class="sig-paren">(</span>options<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="function-doc">
+<p>Pull the <code>:paths</code> (or <code>:path</code>) glob list out of the use options.
+A single string is wrapped into a one-element list; a list of
+strings passes through. When neither key is present, fall back
+to <code>lib/**/*.zap</code>.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc/builder.zap#L274">Source</a>
+</div>
+<div class="function-detail" id="option_patterns-1">
+<div class="function-header">
+<h3>option_patterns<span class="arity">/1</span></h3>
+<span class="badge">macro</span>
+<div style="flex:1"></div>
+<a href="#option_patterns-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">option_patterns</span><span class="sig-paren">(</span>option<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc/builder.zap#L286">Source</a>
+</div>
+<div class="function-detail" id="pattern_values-1">
+<div class="function-header">
+<h3>pattern_values<span class="arity">/1</span></h3>
+<span class="badge">macro</span>
+<div style="flex:1"></div>
+<a href="#pattern_values-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">pattern_values</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc/builder.zap#L298">Source</a>
+</div>
 </main>
+<aside class="toc">
+<h3>On This Page</h3>
+<ul>
+<li class="toc-section">Macros</li>
+<li><a href="#options-1">options/1</a></li>
+<li><a href="#patterns-1">patterns/1</a></li>
+<li><a href="#option_patterns-1">option_patterns/1</a></li>
+<li><a href="#pattern_values-1">pattern_values/1</a></li>
+</ul>
+</aside>
 </div>
 <div id="search-modal" class="search-modal" hidden>
 <div class="search-backdrop"></div>

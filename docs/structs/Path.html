@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Path — zap_stdlib</title>
+<title>Path — Zap</title>
 <link rel="stylesheet" href="../style.css">
 <meta name="zap-docs-base" content="../">
 </head>
@@ -14,8 +14,8 @@
 <rect x="0.5" y="0.5" width="21" height="21" rx="3" stroke="var(--border-strong)"/>
 <path d="M6 6 L15 6 L8 13 L16 13 L16 16 L6 16 L13 9 L6 9 Z" fill="var(--accent)"/>
 </svg>
-<a href="../index.html" class="topbar-title">zap_stdlib</a>
-<span class="topbar-version">v0.1.0</span>
+<a href="../index.html" class="topbar-title">Zap</a>
+<span class="topbar-version">v0.0.0</span>
 <span class="docs-label">docs</span>
 </div>
 <div class="topbar-center">
@@ -43,7 +43,7 @@
 </header>
 <div class="layout">
 <nav class="sidebar">
-<div class="sidebar-header"><a href="../index.html" class="sidebar-title">zap_stdlib</a> <span class="sidebar-version">v0.1.0</span></div>
+<div class="sidebar-header"><a href="../index.html" class="sidebar-title">Zap</a> <span class="sidebar-version">v0.0.0</span></div>
 <div class="sidebar-search"><input type="text" id="search-input" placeholder="Search (Cmd+K)" aria-label="Search documentation"></div>
 <div class="sidebar-group" data-group="Structs">
 <button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Structs</h4></button>
@@ -59,6 +59,7 @@
 <li><a href="../structs/Kernel.html">Kernel</a></li>
 <li><a href="../structs/List.html">List</a></li>
 <li><a href="../structs/Map.html">Map</a></li>
+<li><a href="../structs/Markdown.html">Markdown</a></li>
 <li><a href="../structs/Math.html">Math</a></li>
 <li class="active"><a href="../structs/Path.html">Path</a></li>
 <li><a href="../structs/Range.html">Range</a></li>
@@ -66,6 +67,12 @@
 <li><a href="../structs/String.html">String</a></li>
 <li><a href="../structs/Struct.html">Struct</a></li>
 <li><a href="../structs/System.html">System</a></li>
+<li><a href="../structs/Zap.Dep.html">Zap.Dep</a></li>
+<li><a href="../structs/Zap.Doc.html">Zap.Doc</a></li>
+<li><a href="../structs/Zap.Doc.Builder.html">Zap.Doc.Builder</a></li>
+<li><a href="../structs/Zap.DocsRunner.html">Zap.DocsRunner</a></li>
+<li><a href="../structs/Zap.Env.html">Zap.Env</a></li>
+<li><a href="../structs/Zap.Manifest.html">Zap.Manifest</a></li>
 <li><a href="../structs/Zest.html">Zest</a></li>
 <li><a href="../structs/Zest.Case.html">Zest.Case</a></li>
 <li><a href="../structs/Zest.Runner.html">Zest.Runner</a></li>
@@ -133,6 +140,7 @@ Path.glob(<span class="hl-string">"lib/**/*.zap"</span>)      <span class="hl-co
 <pre><code class="language-zap">Path.join(<span class="hl-string">"src"</span>, <span class="hl-string">"main.zap"</span>)  <span class="hl-comment"># =&gt; &quot;src/main.zap&quot;</span>
 Path.join(<span class="hl-string">"src/"</span>, <span class="hl-string">"main.zap"</span>) <span class="hl-comment"># =&gt; &quot;src/main.zap&quot;</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/path.zap#L27">Source</a>
 </div>
 <div class="function-detail" id="basename-1">
 <div class="function-header">
@@ -148,6 +156,7 @@ Path.join(<span class="hl-string">"src/"</span>, <span class="hl-string">"main.z
 <pre><code class="language-zap">Path.basename(<span class="hl-string">"/usr/bin/zap"</span>)  <span class="hl-comment"># =&gt; &quot;zap&quot;</span>
 Path.basename(<span class="hl-string">"main.zap"</span>)      <span class="hl-comment"># =&gt; &quot;main.zap&quot;</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/path.zap#L40">Source</a>
 </div>
 <div class="function-detail" id="dirname-1">
 <div class="function-header">
@@ -163,6 +172,7 @@ Path.basename(<span class="hl-string">"main.zap"</span>)      <span class="hl-co
 <pre><code class="language-zap">Path.dirname(<span class="hl-string">"/usr/bin/zap"</span>)  <span class="hl-comment"># =&gt; &quot;/usr/bin&quot;</span>
 Path.dirname(<span class="hl-string">"main.zap"</span>)      <span class="hl-comment"># =&gt; &quot;.&quot;</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/path.zap#L53">Source</a>
 </div>
 <div class="function-detail" id="extname-1">
 <div class="function-header">
@@ -178,6 +188,7 @@ Path.dirname(<span class="hl-string">"main.zap"</span>)      <span class="hl-com
 <pre><code class="language-zap">Path.extname(<span class="hl-string">"main.zap"</span>)   <span class="hl-comment"># =&gt; &quot;.zap&quot;</span>
 Path.extname(<span class="hl-string">"Makefile"</span>)   <span class="hl-comment"># =&gt; &quot;&quot;</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/path.zap#L66">Source</a>
 </div>
 <div class="function-detail" id="glob-1">
 <div class="function-header">
@@ -196,6 +207,7 @@ return relative paths. If no paths match, returns an empty list.</p>
 Path.glob(<span class="hl-string">"lib/**/*.zap"</span>) <span class="hl-comment"># =&gt; [&quot;lib/list/enumerable.zap&quot;, ...]</span>
 Path.glob(<span class="hl-string">"missing/*"</span>)    <span class="hl-comment"># =&gt; []</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/path.zap#L83">Source</a>
 </div>
 </main>
 <aside class="toc">

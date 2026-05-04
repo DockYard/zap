@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Zest.Case — zap_stdlib</title>
+<title>Zest.Case — Zap</title>
 <link rel="stylesheet" href="../style.css">
 <meta name="zap-docs-base" content="../">
 </head>
@@ -14,8 +14,8 @@
 <rect x="0.5" y="0.5" width="21" height="21" rx="3" stroke="var(--border-strong)"/>
 <path d="M6 6 L15 6 L8 13 L16 13 L16 16 L6 16 L13 9 L6 9 Z" fill="var(--accent)"/>
 </svg>
-<a href="../index.html" class="topbar-title">zap_stdlib</a>
-<span class="topbar-version">v0.1.0</span>
+<a href="../index.html" class="topbar-title">Zap</a>
+<span class="topbar-version">v0.0.0</span>
 <span class="docs-label">docs</span>
 </div>
 <div class="topbar-center">
@@ -43,7 +43,7 @@
 </header>
 <div class="layout">
 <nav class="sidebar">
-<div class="sidebar-header"><a href="../index.html" class="sidebar-title">zap_stdlib</a> <span class="sidebar-version">v0.1.0</span></div>
+<div class="sidebar-header"><a href="../index.html" class="sidebar-title">Zap</a> <span class="sidebar-version">v0.0.0</span></div>
 <div class="sidebar-search"><input type="text" id="search-input" placeholder="Search (Cmd+K)" aria-label="Search documentation"></div>
 <div class="sidebar-group" data-group="Structs">
 <button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Structs</h4></button>
@@ -59,6 +59,7 @@
 <li><a href="../structs/Kernel.html">Kernel</a></li>
 <li><a href="../structs/List.html">List</a></li>
 <li><a href="../structs/Map.html">Map</a></li>
+<li><a href="../structs/Markdown.html">Markdown</a></li>
 <li><a href="../structs/Math.html">Math</a></li>
 <li><a href="../structs/Path.html">Path</a></li>
 <li><a href="../structs/Range.html">Range</a></li>
@@ -66,6 +67,12 @@
 <li><a href="../structs/String.html">String</a></li>
 <li><a href="../structs/Struct.html">Struct</a></li>
 <li><a href="../structs/System.html">System</a></li>
+<li><a href="../structs/Zap.Dep.html">Zap.Dep</a></li>
+<li><a href="../structs/Zap.Doc.html">Zap.Doc</a></li>
+<li><a href="../structs/Zap.Doc.Builder.html">Zap.Doc.Builder</a></li>
+<li><a href="../structs/Zap.DocsRunner.html">Zap.DocsRunner</a></li>
+<li><a href="../structs/Zap.Env.html">Zap.Env</a></li>
+<li><a href="../structs/Zap.Manifest.html">Zap.Manifest</a></li>
 <li><a href="../structs/Zest.html">Zest</a></li>
 <li class="active"><a href="../structs/Zest.Case.html">Zest.Case</a></li>
 <li><a href="../structs/Zest.Runner.html">Zest.Runner</a></li>
@@ -110,22 +117,18 @@ installs a compile-time hook that generates <code>run/0</code> for the enclosing
 struct after all tests have been registered.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> Test.MyTest {
-  <span class="hl-keyword">use</span> Zest.Case
-
-  <span class="hl-keyword">describe</span>(<span class="hl-string">"my feature"</span>) {
+  <span class="hl-keyword">use</span> Zest.Case</code></pre>
+<pre><code class="language-zap">  <span class="hl-keyword">describe</span>(<span class="hl-string">"my feature"</span>) {
     <span class="hl-builtin">setup</span>() {
       <span class="hl-number">42</span>
-    }
-
-    <span class="hl-keyword">test</span>(<span class="hl-string">"uses context"</span>, ctx) {
+    }</code></pre>
+<pre><code class="language-zap">    <span class="hl-keyword">test</span>(<span class="hl-string">"uses context"</span>, ctx) {
       <span class="hl-keyword">assert</span>(ctx <span class="hl-op">==</span> <span class="hl-number">42</span>)
-    }
-
-    <span class="hl-keyword">test</span>(<span class="hl-string">"no context needed"</span>) {
+    }</code></pre>
+<pre><code class="language-zap">    <span class="hl-keyword">test</span>(<span class="hl-string">"no context needed"</span>) {
       <span class="hl-keyword">assert</span>(<span class="hl-builtin">true</span>)
-    }
-
-    <span class="hl-builtin">teardown</span>() {
+    }</code></pre>
+<pre><code class="language-zap">    <span class="hl-builtin">teardown</span>() {
       IO.puts(<span class="hl-string">"cleanup"</span>)
     }
   }
@@ -158,6 +161,7 @@ struct after all tests have been registered.</p>
 <div class="function-doc">
 <p>Wraps <code>begin_test</code> for explicit use.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/case.zap#L174">Source</a>
 </div>
 <div class="function-detail" id="end_test-0">
 <div class="function-header">
@@ -170,6 +174,7 @@ struct after all tests have been registered.</p>
 <div class="function-doc">
 <p>Wraps <code>end_test</code> for explicit use.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/case.zap#L183">Source</a>
 </div>
 <div class="function-detail" id="print_result-0">
 <div class="function-header">
@@ -182,6 +187,7 @@ struct after all tests have been registered.</p>
 <div class="function-doc">
 <p>Wraps <code>print_result</code> for explicit use.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/case.zap#L192">Source</a>
 </div>
 <div class="function-detail" id="assert-1">
 <div class="function-header">
@@ -195,6 +201,7 @@ struct after all tests have been registered.</p>
 <p>Asserts that a boolean value is <code>true</code>.</p>
 <p>Non-fatal: returns :fail on failure, does not stop execution.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/case.zap#L203">Source</a>
 </div>
 <div class="function-detail" id="reject-1">
 <div class="function-header">
@@ -208,6 +215,7 @@ struct after all tests have been registered.</p>
 <p>Asserts that a boolean value is <code>false</code>.</p>
 <p>Non-fatal: returns &quot;F&quot; on failure, does not stop execution.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/case.zap#L219">Source</a>
 </div>
 <h2>Macro Details</h2>
 <div class="function-detail" id="describe-2">
@@ -225,13 +233,13 @@ transforms each <code>test</code> call into a pub function declaration
 and registers the generated function for <code>run/0</code>.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap"><span class="hl-keyword">describe</span>(<span class="hl-string">"math"</span>) {
-  <span class="hl-builtin">setup</span>() { <span class="hl-number">42</span> }
-
-  <span class="hl-keyword">test</span>(<span class="hl-string">"addition"</span>, ctx) {
+  <span class="hl-builtin">setup</span>() { <span class="hl-number">42</span> }</code></pre>
+<pre><code class="language-zap">  <span class="hl-keyword">test</span>(<span class="hl-string">"addition"</span>, ctx) {
     <span class="hl-keyword">assert</span>(ctx <span class="hl-op">==</span> <span class="hl-number">42</span>)
   }
 }</code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/case.zap#L124">Source</a>
 </div>
 <div class="function-detail" id="test-2">
 <div class="function-header">
@@ -250,6 +258,7 @@ with begin_test/end_test/print_result tracking calls wrapping the body.</p>
   <span class="hl-keyword">assert</span>(<span class="hl-builtin">true</span> <span class="hl-op">==</span> <span class="hl-builtin">true</span>)
 }</code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/case.zap#L156">Source</a>
 </div>
 <div class="function-detail" id="setup-1">
 <div class="function-header">
@@ -268,6 +277,7 @@ to <code>ctx</code> in each <code>test/3</code> call. Runs fresh for every test.
   connect_db()
 }</code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/case.zap#L242">Source</a>
 </div>
 <div class="function-detail" id="teardown-1">
 <div class="function-header">
@@ -286,6 +296,7 @@ even if assertions fail (non-fatal assertions).</p>
   disconnect_db()
 }</code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/case.zap#L259">Source</a>
 </div>
 </main>
 <aside class="toc">

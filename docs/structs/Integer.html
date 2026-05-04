@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Integer — zap_stdlib</title>
+<title>Integer — Zap</title>
 <link rel="stylesheet" href="../style.css">
 <meta name="zap-docs-base" content="../">
 </head>
@@ -14,8 +14,8 @@
 <rect x="0.5" y="0.5" width="21" height="21" rx="3" stroke="var(--border-strong)"/>
 <path d="M6 6 L15 6 L8 13 L16 13 L16 16 L6 16 L13 9 L6 9 Z" fill="var(--accent)"/>
 </svg>
-<a href="../index.html" class="topbar-title">zap_stdlib</a>
-<span class="topbar-version">v0.1.0</span>
+<a href="../index.html" class="topbar-title">Zap</a>
+<span class="topbar-version">v0.0.0</span>
 <span class="docs-label">docs</span>
 </div>
 <div class="topbar-center">
@@ -29,11 +29,6 @@
 </button>
 </div>
 <div class="topbar-right">
-<div class="topbar-tabs" role="tablist">
-<a class="topbar-tab active" href="../structs/Integer.html" role="tab">Reference</a>
-<a class="topbar-tab" href="../guides/integer.html" role="tab">Guide</a>
-</div>
-<div class="topbar-divider"></div>
 <button id="theme-toggle" aria-label="Toggle dark mode" title="Toggle dark mode">
 <span class="theme-icon-light">☀</span>
 <span class="theme-icon-dark">☾</span>
@@ -48,7 +43,7 @@
 </header>
 <div class="layout">
 <nav class="sidebar">
-<div class="sidebar-header"><a href="../index.html" class="sidebar-title">zap_stdlib</a> <span class="sidebar-version">v0.1.0</span></div>
+<div class="sidebar-header"><a href="../index.html" class="sidebar-title">Zap</a> <span class="sidebar-version">v0.0.0</span></div>
 <div class="sidebar-search"><input type="text" id="search-input" placeholder="Search (Cmd+K)" aria-label="Search documentation"></div>
 <div class="sidebar-group" data-group="Structs">
 <button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Structs</h4></button>
@@ -64,6 +59,7 @@
 <li><a href="../structs/Kernel.html">Kernel</a></li>
 <li><a href="../structs/List.html">List</a></li>
 <li><a href="../structs/Map.html">Map</a></li>
+<li><a href="../structs/Markdown.html">Markdown</a></li>
 <li><a href="../structs/Math.html">Math</a></li>
 <li><a href="../structs/Path.html">Path</a></li>
 <li><a href="../structs/Range.html">Range</a></li>
@@ -71,6 +67,12 @@
 <li><a href="../structs/String.html">String</a></li>
 <li><a href="../structs/Struct.html">Struct</a></li>
 <li><a href="../structs/System.html">System</a></li>
+<li><a href="../structs/Zap.Dep.html">Zap.Dep</a></li>
+<li><a href="../structs/Zap.Doc.html">Zap.Doc</a></li>
+<li><a href="../structs/Zap.Doc.Builder.html">Zap.Doc.Builder</a></li>
+<li><a href="../structs/Zap.DocsRunner.html">Zap.DocsRunner</a></li>
+<li><a href="../structs/Zap.Env.html">Zap.Env</a></li>
+<li><a href="../structs/Zap.Manifest.html">Zap.Manifest</a></li>
 <li><a href="../structs/Zest.html">Zest</a></li>
 <li><a href="../structs/Zest.Case.html">Zest.Case</a></li>
 <li><a href="../structs/Zest.Runner.html">Zest.Runner</a></li>
@@ -191,9 +193,10 @@ unsigned integers do not implicitly widen to signed integers.</p>
 <p>Converts an integer to its string representation.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap">Integer.to_string(<span class="hl-number">42</span>)    <span class="hl-comment"># =&gt; &quot;42&quot;</span>
-Integer.to_string(<span class="hl-number">-7</span>)    <span class="hl-comment"># =&gt; &quot;-7&quot;</span>
+Integer.to_string(-<span class="hl-number">7</span>)    <span class="hl-comment"># =&gt; &quot;-7&quot;</span>
 Integer.to_string(<span class="hl-number">0</span>)     <span class="hl-comment"># =&gt; &quot;0&quot;</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L41">Source</a>
 </div>
 <div class="function-detail" id="abs-1">
 <div class="function-header">
@@ -217,6 +220,7 @@ Integer.to_string(<span class="hl-number">0</span>)     <span class="hl-comment"
 <p>Unsigned integers are already non-negative, so their absolute
 value is the original value.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L59">Source</a>
 </div>
 <div class="function-detail" id="max-2">
 <div class="function-header">
@@ -238,6 +242,7 @@ value is the original value.</p>
 <div class="function-doc">
 <p>Returns the larger of two integers.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L72">Source</a>
 </div>
 <div class="function-detail" id="min-2">
 <div class="function-header">
@@ -259,6 +264,7 @@ value is the original value.</p>
 <div class="function-doc">
 <p>Returns the smaller of two integers.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L85">Source</a>
 </div>
 <div class="function-detail" id="parse-1">
 <div class="function-header">
@@ -272,6 +278,7 @@ value is the original value.</p>
 <p>Parses a string into an integer. Returns 0 if the string is not
 a valid integer representation.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L101">Source</a>
 </div>
 <div class="function-detail" id="remainder-2">
 <div class="function-header">
@@ -293,6 +300,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Computes the remainder of integer division.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L107">Source</a>
 </div>
 <div class="function-detail" id="pow-2">
 <div class="function-header">
@@ -314,6 +322,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Raises <code>base</code> to the power of <code>exponent</code>.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L120">Source</a>
 </div>
 <div class="function-detail" id="clamp-3">
 <div class="function-header">
@@ -335,6 +344,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Clamps a value to be within the given range.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L133">Source</a>
 </div>
 <div class="function-detail" id="digits-1">
 <div class="function-header">
@@ -356,6 +366,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Returns the number of decimal digits in an integer.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L146">Source</a>
 </div>
 <div class="function-detail" id="count_digits-1">
 <div class="function-header">
@@ -377,6 +388,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Counts decimal digits in an integer value.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L159">Source</a>
 </div>
 <div class="function-detail" id="to_float-1">
 <div class="function-header">
@@ -398,6 +410,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Converts an integer to a 64-bit floating-point number.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L172">Source</a>
 </div>
 <div class="function-detail" id="count_leading_zeros-1">
 <div class="function-header">
@@ -419,6 +432,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Returns the number of leading zeros in the binary representation.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L185">Source</a>
 </div>
 <div class="function-detail" id="count_trailing_zeros-1">
 <div class="function-header">
@@ -440,6 +454,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Returns the number of trailing zeros in the binary representation.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L198">Source</a>
 </div>
 <div class="function-detail" id="popcount-1">
 <div class="function-header">
@@ -461,6 +476,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Returns the number of set bits in the binary representation.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L211">Source</a>
 </div>
 <div class="function-detail" id="byte_swap-1">
 <div class="function-header">
@@ -482,6 +498,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Reverses the byte order of an integer.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L224">Source</a>
 </div>
 <div class="function-detail" id="bit_reverse-1">
 <div class="function-header">
@@ -503,6 +520,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Reverses all bits in the binary representation.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L237">Source</a>
 </div>
 <div class="function-detail" id="add_sat-2">
 <div class="function-header">
@@ -524,6 +542,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Adds two integers with saturation.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L250">Source</a>
 </div>
 <div class="function-detail" id="sub_sat-2">
 <div class="function-header">
@@ -545,6 +564,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Subtracts two integers with saturation.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L263">Source</a>
 </div>
 <div class="function-detail" id="mul_sat-2">
 <div class="function-header">
@@ -566,6 +586,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Multiplies two integers with saturation.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L276">Source</a>
 </div>
 <div class="function-detail" id="band-2">
 <div class="function-header">
@@ -587,6 +608,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Bitwise AND of two integers.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L289">Source</a>
 </div>
 <div class="function-detail" id="bor-2">
 <div class="function-header">
@@ -608,6 +630,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Bitwise OR of two integers.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L302">Source</a>
 </div>
 <div class="function-detail" id="bxor-2">
 <div class="function-header">
@@ -629,6 +652,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Bitwise XOR of two integers.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L315">Source</a>
 </div>
 <div class="function-detail" id="bnot-1">
 <div class="function-header">
@@ -650,6 +674,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Bitwise NOT of an integer.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L328">Source</a>
 </div>
 <div class="function-detail" id="bsl-2">
 <div class="function-header">
@@ -671,6 +696,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Bitwise shift left.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L341">Source</a>
 </div>
 <div class="function-detail" id="bsr-2">
 <div class="function-header">
@@ -692,6 +718,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Bitwise shift right.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L354">Source</a>
 </div>
 <div class="function-detail" id="sign-1">
 <div class="function-header">
@@ -713,6 +740,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Returns the sign of an integer.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L367">Source</a>
 </div>
 <div class="function-detail" id="even?-1">
 <div class="function-header">
@@ -734,6 +762,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Returns true if the integer is even.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L380">Source</a>
 </div>
 <div class="function-detail" id="odd?-1">
 <div class="function-header">
@@ -755,6 +784,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Returns true if the integer is odd.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L393">Source</a>
 </div>
 <div class="function-detail" id="gcd-2">
 <div class="function-header">
@@ -776,6 +806,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Computes the greatest common divisor of two integers.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L406">Source</a>
 </div>
 <div class="function-detail" id="lcm-2">
 <div class="function-header">
@@ -797,6 +828,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Computes the least common multiple of two integers.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L419">Source</a>
 </div>
 </main>
 <aside class="toc">

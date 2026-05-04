@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Math — zap_stdlib</title>
+<title>Math — Zap</title>
 <link rel="stylesheet" href="../style.css">
 <meta name="zap-docs-base" content="../">
 </head>
@@ -14,8 +14,8 @@
 <rect x="0.5" y="0.5" width="21" height="21" rx="3" stroke="var(--border-strong)"/>
 <path d="M6 6 L15 6 L8 13 L16 13 L16 16 L6 16 L13 9 L6 9 Z" fill="var(--accent)"/>
 </svg>
-<a href="../index.html" class="topbar-title">zap_stdlib</a>
-<span class="topbar-version">v0.1.0</span>
+<a href="../index.html" class="topbar-title">Zap</a>
+<span class="topbar-version">v0.0.0</span>
 <span class="docs-label">docs</span>
 </div>
 <div class="topbar-center">
@@ -43,7 +43,7 @@
 </header>
 <div class="layout">
 <nav class="sidebar">
-<div class="sidebar-header"><a href="../index.html" class="sidebar-title">zap_stdlib</a> <span class="sidebar-version">v0.1.0</span></div>
+<div class="sidebar-header"><a href="../index.html" class="sidebar-title">Zap</a> <span class="sidebar-version">v0.0.0</span></div>
 <div class="sidebar-search"><input type="text" id="search-input" placeholder="Search (Cmd+K)" aria-label="Search documentation"></div>
 <div class="sidebar-group" data-group="Structs">
 <button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Structs</h4></button>
@@ -59,6 +59,7 @@
 <li><a href="../structs/Kernel.html">Kernel</a></li>
 <li><a href="../structs/List.html">List</a></li>
 <li><a href="../structs/Map.html">Map</a></li>
+<li><a href="../structs/Markdown.html">Markdown</a></li>
 <li class="active"><a href="../structs/Math.html">Math</a></li>
 <li><a href="../structs/Path.html">Path</a></li>
 <li><a href="../structs/Range.html">Range</a></li>
@@ -66,6 +67,12 @@
 <li><a href="../structs/String.html">String</a></li>
 <li><a href="../structs/Struct.html">Struct</a></li>
 <li><a href="../structs/System.html">System</a></li>
+<li><a href="../structs/Zap.Dep.html">Zap.Dep</a></li>
+<li><a href="../structs/Zap.Doc.html">Zap.Doc</a></li>
+<li><a href="../structs/Zap.Doc.Builder.html">Zap.Doc.Builder</a></li>
+<li><a href="../structs/Zap.DocsRunner.html">Zap.DocsRunner</a></li>
+<li><a href="../structs/Zap.Env.html">Zap.Env</a></li>
+<li><a href="../structs/Zap.Manifest.html">Zap.Manifest</a></li>
 <li><a href="../structs/Zest.html">Zest</a></li>
 <li><a href="../structs/Zest.Case.html">Zest.Case</a></li>
 <li><a href="../structs/Zest.Runner.html">Zest.Runner</a></li>
@@ -145,6 +152,7 @@ Math.log(Math.e())  <span class="hl-comment"># =&gt; 1.0</span></code></pre>
 <h2>Examples</h2>
 <pre><code class="language-zap">Math.pi()  <span class="hl-comment"># =&gt; 3.141592653589793</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/math.zap#L36">Source</a>
 </div>
 <div class="function-detail" id="e-0">
 <div class="function-header">
@@ -159,6 +167,7 @@ Math.log(Math.e())  <span class="hl-comment"># =&gt; 1.0</span></code></pre>
 <h2>Examples</h2>
 <pre><code class="language-zap">Math.e()  <span class="hl-comment"># =&gt; 2.718281828459045</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/math.zap#L48">Source</a>
 </div>
 <div class="function-detail" id="sqrt-1">
 <div class="function-header">
@@ -189,6 +198,7 @@ Math.log(Math.e())  <span class="hl-comment"># =&gt; 1.0</span></code></pre>
 Math.sqrt(<span class="hl-number">2.0</span>)   <span class="hl-comment"># =&gt; 1.4142135623730951</span>
 Math.sqrt(<span class="hl-number">0.0</span>)   <span class="hl-comment"># =&gt; 0.0</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/math.zap#L62">Source</a>
 </div>
 <div class="function-detail" id="sin-1">
 <div class="function-header">
@@ -218,6 +228,7 @@ Math.sqrt(<span class="hl-number">0.0</span>)   <span class="hl-comment"># =&gt;
 <pre><code class="language-zap">Math.sin(<span class="hl-number">0.0</span>)          <span class="hl-comment"># =&gt; 0.0</span>
 Math.sin(Math.pi())    <span class="hl-comment"># =&gt; ~0.0</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/math.zap#L90">Source</a>
 </div>
 <div class="function-detail" id="cos-1">
 <div class="function-header">
@@ -247,6 +258,7 @@ Math.sin(Math.pi())    <span class="hl-comment"># =&gt; ~0.0</span></code></pre>
 <pre><code class="language-zap">Math.cos(<span class="hl-number">0.0</span>)          <span class="hl-comment"># =&gt; 1.0</span>
 Math.cos(Math.pi())    <span class="hl-comment"># =&gt; -1.0</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/math.zap#L118">Source</a>
 </div>
 <div class="function-detail" id="tan-1">
 <div class="function-header">
@@ -275,6 +287,7 @@ Math.cos(Math.pi())    <span class="hl-comment"># =&gt; -1.0</span></code></pre>
 <h2>Examples</h2>
 <pre><code class="language-zap">Math.tan(<span class="hl-number">0.0</span>)   <span class="hl-comment"># =&gt; 0.0</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/math.zap#L145">Source</a>
 </div>
 <div class="function-detail" id="exp-1">
 <div class="function-header">
@@ -304,6 +317,7 @@ Math.cos(Math.pi())    <span class="hl-comment"># =&gt; -1.0</span></code></pre>
 <pre><code class="language-zap">Math.exp(<span class="hl-number">0.0</span>)   <span class="hl-comment"># =&gt; 1.0</span>
 Math.exp(<span class="hl-number">1.0</span>)   <span class="hl-comment"># =&gt; 2.718281828459045</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/math.zap#L173">Source</a>
 </div>
 <div class="function-detail" id="exp2-1">
 <div class="function-header">
@@ -333,6 +347,7 @@ Math.exp(<span class="hl-number">1.0</span>)   <span class="hl-comment"># =&gt; 
 <pre><code class="language-zap">Math.exp2(<span class="hl-number">3.0</span>)   <span class="hl-comment"># =&gt; 8.0</span>
 Math.exp2(<span class="hl-number">0.0</span>)   <span class="hl-comment"># =&gt; 1.0</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/math.zap#L201">Source</a>
 </div>
 <div class="function-detail" id="log-1">
 <div class="function-header">
@@ -362,6 +377,7 @@ Math.exp2(<span class="hl-number">0.0</span>)   <span class="hl-comment"># =&gt;
 <pre><code class="language-zap">Math.log(<span class="hl-number">1.0</span>)         <span class="hl-comment"># =&gt; 0.0</span>
 Math.log(Math.e())    <span class="hl-comment"># =&gt; 1.0</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/math.zap#L229">Source</a>
 </div>
 <div class="function-detail" id="log2-1">
 <div class="function-header">
@@ -391,6 +407,7 @@ Math.log(Math.e())    <span class="hl-comment"># =&gt; 1.0</span></code></pre>
 <pre><code class="language-zap">Math.log2(<span class="hl-number">8.0</span>)   <span class="hl-comment"># =&gt; 3.0</span>
 Math.log2(<span class="hl-number">1.0</span>)   <span class="hl-comment"># =&gt; 0.0</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/math.zap#L257">Source</a>
 </div>
 <div class="function-detail" id="log10-1">
 <div class="function-header">
@@ -420,6 +437,7 @@ Math.log2(<span class="hl-number">1.0</span>)   <span class="hl-comment"># =&gt;
 <pre><code class="language-zap">Math.log10(<span class="hl-number">1000.0</span>)   <span class="hl-comment"># =&gt; 3.0</span>
 Math.log10(<span class="hl-number">1.0</span>)      <span class="hl-comment"># =&gt; 0.0</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/math.zap#L285">Source</a>
 </div>
 </main>
 <aside class="toc">

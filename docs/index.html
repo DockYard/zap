@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>zap_stdlib — zap_stdlib</title>
+<title>Zap — Zap</title>
 <link rel="stylesheet" href="style.css">
 <meta name="zap-docs-base" content="">
 </head>
@@ -14,8 +14,8 @@
 <rect x="0.5" y="0.5" width="21" height="21" rx="3" stroke="var(--border-strong)"/>
 <path d="M6 6 L15 6 L8 13 L16 13 L16 16 L6 16 L13 9 L6 9 Z" fill="var(--accent)"/>
 </svg>
-<a href="index.html" class="topbar-title">zap_stdlib</a>
-<span class="topbar-version">v0.1.0</span>
+<a href="index.html" class="topbar-title">Zap</a>
+<span class="topbar-version">v0.0.0</span>
 <span class="docs-label">docs</span>
 </div>
 <div class="topbar-center">
@@ -41,9 +41,9 @@
 </a>
 </div>
 </header>
-<div class="layout">
+<div class="layout layout-no-toc">
 <nav class="sidebar">
-<div class="sidebar-header"><a href="index.html" class="sidebar-title">zap_stdlib</a> <span class="sidebar-version">v0.1.0</span></div>
+<div class="sidebar-header"><a href="index.html" class="sidebar-title">Zap</a> <span class="sidebar-version">v0.0.0</span></div>
 <div class="sidebar-search"><input type="text" id="search-input" placeholder="Search (Cmd+K)" aria-label="Search documentation"></div>
 <div class="sidebar-group" data-group="Structs">
 <button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Structs</h4></button>
@@ -59,6 +59,7 @@
 <li><a href="structs/Kernel.html">Kernel</a></li>
 <li><a href="structs/List.html">List</a></li>
 <li><a href="structs/Map.html">Map</a></li>
+<li><a href="structs/Markdown.html">Markdown</a></li>
 <li><a href="structs/Math.html">Math</a></li>
 <li><a href="structs/Path.html">Path</a></li>
 <li><a href="structs/Range.html">Range</a></li>
@@ -66,6 +67,12 @@
 <li><a href="structs/String.html">String</a></li>
 <li><a href="structs/Struct.html">Struct</a></li>
 <li><a href="structs/System.html">System</a></li>
+<li><a href="structs/Zap.Dep.html">Zap.Dep</a></li>
+<li><a href="structs/Zap.Doc.html">Zap.Doc</a></li>
+<li><a href="structs/Zap.Doc.Builder.html">Zap.Doc.Builder</a></li>
+<li><a href="structs/Zap.DocsRunner.html">Zap.DocsRunner</a></li>
+<li><a href="structs/Zap.Env.html">Zap.Env</a></li>
+<li><a href="structs/Zap.Manifest.html">Zap.Manifest</a></li>
 <li><a href="structs/Zest.html">Zest</a></li>
 <li><a href="structs/Zest.Case.html">Zest.Case</a></li>
 <li><a href="structs/Zest.Runner.html">Zest.Runner</a></li>
@@ -531,7 +538,7 @@ source text generation.</p>
 7. Monomorphize generic functions.
 8. Lower to IR.
 9. Run analysis passes such as escape analysis, lambda-set analysis, and
-Perceus reuse analysis.
+   Perceus reuse analysis.
 10. Emit per-struct ZIR through the Zig fork C ABI.
 11. Let Zig and LLVM produce the final native artifact.</p>
 <p>Each Zap struct emits as a Zig ZIR struct. Cross-struct calls are emitted as

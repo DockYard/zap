@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Struct — zap_stdlib</title>
+<title>Struct — Zap</title>
 <link rel="stylesheet" href="../style.css">
 <meta name="zap-docs-base" content="../">
 </head>
@@ -14,8 +14,8 @@
 <rect x="0.5" y="0.5" width="21" height="21" rx="3" stroke="var(--border-strong)"/>
 <path d="M6 6 L15 6 L8 13 L16 13 L16 16 L6 16 L13 9 L6 9 Z" fill="var(--accent)"/>
 </svg>
-<a href="../index.html" class="topbar-title">zap_stdlib</a>
-<span class="topbar-version">v0.1.0</span>
+<a href="../index.html" class="topbar-title">Zap</a>
+<span class="topbar-version">v0.0.0</span>
 <span class="docs-label">docs</span>
 </div>
 <div class="topbar-center">
@@ -43,7 +43,7 @@
 </header>
 <div class="layout">
 <nav class="sidebar">
-<div class="sidebar-header"><a href="../index.html" class="sidebar-title">zap_stdlib</a> <span class="sidebar-version">v0.1.0</span></div>
+<div class="sidebar-header"><a href="../index.html" class="sidebar-title">Zap</a> <span class="sidebar-version">v0.0.0</span></div>
 <div class="sidebar-search"><input type="text" id="search-input" placeholder="Search (Cmd+K)" aria-label="Search documentation"></div>
 <div class="sidebar-group" data-group="Structs">
 <button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Structs</h4></button>
@@ -59,6 +59,7 @@
 <li><a href="../structs/Kernel.html">Kernel</a></li>
 <li><a href="../structs/List.html">List</a></li>
 <li><a href="../structs/Map.html">Map</a></li>
+<li><a href="../structs/Markdown.html">Markdown</a></li>
 <li><a href="../structs/Math.html">Math</a></li>
 <li><a href="../structs/Path.html">Path</a></li>
 <li><a href="../structs/Range.html">Range</a></li>
@@ -66,6 +67,12 @@
 <li><a href="../structs/String.html">String</a></li>
 <li class="active"><a href="../structs/Struct.html">Struct</a></li>
 <li><a href="../structs/System.html">System</a></li>
+<li><a href="../structs/Zap.Dep.html">Zap.Dep</a></li>
+<li><a href="../structs/Zap.Doc.html">Zap.Doc</a></li>
+<li><a href="../structs/Zap.Doc.Builder.html">Zap.Doc.Builder</a></li>
+<li><a href="../structs/Zap.DocsRunner.html">Zap.DocsRunner</a></li>
+<li><a href="../structs/Zap.Env.html">Zap.Env</a></li>
+<li><a href="../structs/Zap.Manifest.html">Zap.Manifest</a></li>
 <li><a href="../structs/Zest.html">Zest</a></li>
 <li><a href="../structs/Zest.Case.html">Zest.Case</a></li>
 <li><a href="../structs/Zest.Runner.html">Zest.Runner</a></li>
@@ -112,6 +119,12 @@ same map shape as `functions/1`.</td></tr>
 map: `:name`, `:source_file` (project-relative path), `:is_private`,
 and `:doc` (the struct's `@doc` attribute, heredoc-stripped, or
 empty when missing).</td></tr>
+<tr><td class="summary-name"><a href="#union_variants-1">union_variants/1</a></td><td class="summary-doc">Returns the variants of a reflected union as a list of compile-time
+maps with `:name` and `:signature` (the rendered Zap-syntax form,
+`Variant` for bare variants and `Variant :: TypeExpr` for typed
+payloads).</td></tr>
+<tr><td class="summary-name"><a href="#protocol_required_functions-1">protocol_required_functions/1</a></td><td class="summary-doc">Returns the required functions a protocol declares as a list of
+compile-time maps with `:name` and `:signature`.</td></tr>
 <tr><td class="summary-name"><a href="#has_function?-3">has_function?/3</a></td><td class="summary-doc">Returns true when a reflected struct exposes a public function with
 the given name and arity.</td></tr>
 </table>
@@ -131,6 +144,7 @@ the given name and arity.</td></tr>
 function's <code>@doc</code> attribute string (heredoc indentation stripped),
 or an empty string when no <code>@doc</code> is attached.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/struct.zap#L18">Source</a>
 </div>
 <div class="function-detail" id="macros-1">
 <div class="function-header">
@@ -146,6 +160,7 @@ same map shape as <code>functions/1</code>. Language hooks like <code>__using__<
 and <code>__before_compile__</code> are excluded — they are not part of the
 public API surface.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/struct.zap#L31">Source</a>
 </div>
 <div class="function-detail" id="info-1">
 <div class="function-header">
@@ -161,6 +176,38 @@ map: <code>:name</code>, <code>:source_file</code> (project-relative path), <cod
 and <code>:doc</code> (the struct's <code>@doc</code> attribute, heredoc-stripped, or
 empty when missing).</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/struct.zap#L44">Source</a>
+</div>
+<div class="function-detail" id="union_variants-1">
+<div class="function-header">
+<h3>union_variants<span class="arity">/1</span></h3>
+<span class="badge">macro</span>
+<div style="flex:1"></div>
+<a href="#union_variants-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">union_variants</span><span class="sig-paren">(</span>union_ref<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="function-doc">
+<p>Returns the variants of a reflected union as a list of compile-time
+maps with <code>:name</code> and <code>:signature</code> (the rendered Zap-syntax form,
+<code>Variant</code> for bare variants and <code>Variant :: TypeExpr</code> for typed
+payloads).</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/struct.zap#L57">Source</a>
+</div>
+<div class="function-detail" id="protocol_required_functions-1">
+<div class="function-header">
+<h3>protocol_required_functions<span class="arity">/1</span></h3>
+<span class="badge">macro</span>
+<div style="flex:1"></div>
+<a href="#protocol_required_functions-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">protocol_required_functions</span><span class="sig-paren">(</span>protocol_ref<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="function-doc">
+<p>Returns the required functions a protocol declares as a list of
+compile-time maps with <code>:name</code> and <code>:signature</code>. Signatures use
+the same renderer the doc generator drives.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/struct.zap#L69">Source</a>
 </div>
 <div class="function-detail" id="has_function?-3">
 <div class="function-header">
@@ -174,6 +221,7 @@ empty when missing).</p>
 <p>Returns true when a reflected struct exposes a public function with
 the given name and arity.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/struct.zap#L80">Source</a>
 </div>
 </main>
 <aside class="toc">
@@ -183,6 +231,8 @@ the given name and arity.</p>
 <li><a href="#functions-1">functions/1</a></li>
 <li><a href="#macros-1">macros/1</a></li>
 <li><a href="#info-1">info/1</a></li>
+<li><a href="#union_variants-1">union_variants/1</a></li>
+<li><a href="#protocol_required_functions-1">protocol_required_functions/1</a></li>
 <li><a href="#has_function?-3">has_function?/3</a></li>
 </ul>
 </aside>

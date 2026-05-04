@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Kernel — zap_stdlib</title>
+<title>Kernel — Zap</title>
 <link rel="stylesheet" href="../style.css">
 <meta name="zap-docs-base" content="../">
 </head>
@@ -14,8 +14,8 @@
 <rect x="0.5" y="0.5" width="21" height="21" rx="3" stroke="var(--border-strong)"/>
 <path d="M6 6 L15 6 L8 13 L16 13 L16 16 L6 16 L13 9 L6 9 Z" fill="var(--accent)"/>
 </svg>
-<a href="../index.html" class="topbar-title">zap_stdlib</a>
-<span class="topbar-version">v0.1.0</span>
+<a href="../index.html" class="topbar-title">Zap</a>
+<span class="topbar-version">v0.0.0</span>
 <span class="docs-label">docs</span>
 </div>
 <div class="topbar-center">
@@ -43,7 +43,7 @@
 </header>
 <div class="layout">
 <nav class="sidebar">
-<div class="sidebar-header"><a href="../index.html" class="sidebar-title">zap_stdlib</a> <span class="sidebar-version">v0.1.0</span></div>
+<div class="sidebar-header"><a href="../index.html" class="sidebar-title">Zap</a> <span class="sidebar-version">v0.0.0</span></div>
 <div class="sidebar-search"><input type="text" id="search-input" placeholder="Search (Cmd+K)" aria-label="Search documentation"></div>
 <div class="sidebar-group" data-group="Structs">
 <button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Structs</h4></button>
@@ -59,6 +59,7 @@
 <li class="active"><a href="../structs/Kernel.html">Kernel</a></li>
 <li><a href="../structs/List.html">List</a></li>
 <li><a href="../structs/Map.html">Map</a></li>
+<li><a href="../structs/Markdown.html">Markdown</a></li>
 <li><a href="../structs/Math.html">Math</a></li>
 <li><a href="../structs/Path.html">Path</a></li>
 <li><a href="../structs/Range.html">Range</a></li>
@@ -66,6 +67,12 @@
 <li><a href="../structs/String.html">String</a></li>
 <li><a href="../structs/Struct.html">Struct</a></li>
 <li><a href="../structs/System.html">System</a></li>
+<li><a href="../structs/Zap.Dep.html">Zap.Dep</a></li>
+<li><a href="../structs/Zap.Doc.html">Zap.Doc</a></li>
+<li><a href="../structs/Zap.Doc.Builder.html">Zap.Doc.Builder</a></li>
+<li><a href="../structs/Zap.DocsRunner.html">Zap.DocsRunner</a></li>
+<li><a href="../structs/Zap.Env.html">Zap.Env</a></li>
+<li><a href="../structs/Zap.Manifest.html">Zap.Manifest</a></li>
 <li><a href="../structs/Zest.html">Zest</a></li>
 <li><a href="../structs/Zest.Case.html">Zest.Case</a></li>
 <li><a href="../structs/Zest.Runner.html">Zest.Runner</a></li>
@@ -154,6 +161,7 @@ everywhere automatically.</p>
 <div class="function-doc">
 <p>Returns true if the value is an integer type (i8, i16, i32, i64, i128, u8, u16, u32, u64, u128).</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L269">Source</a>
 </div>
 <div class="function-detail" id="is_float?-1">
 <div class="function-header">
@@ -166,6 +174,7 @@ everywhere automatically.</p>
 <div class="function-doc">
 <p>Returns true if the value is a float type (f16, f32, f64, f80, f128).</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L277">Source</a>
 </div>
 <div class="function-detail" id="is_number?-1">
 <div class="function-header">
@@ -178,6 +187,7 @@ everywhere automatically.</p>
 <div class="function-doc">
 <p>Returns true if the value is a number (integer or float).</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L285">Source</a>
 </div>
 <div class="function-detail" id="is_boolean?-1">
 <div class="function-header">
@@ -190,6 +200,7 @@ everywhere automatically.</p>
 <div class="function-doc">
 <p>Returns true if the value is a boolean.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L293">Source</a>
 </div>
 <div class="function-detail" id="is_string?-1">
 <div class="function-header">
@@ -202,6 +213,7 @@ everywhere automatically.</p>
 <div class="function-doc">
 <p>Returns true if the value is a string.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L301">Source</a>
 </div>
 <div class="function-detail" id="is_atom?-1">
 <div class="function-header">
@@ -214,6 +226,7 @@ everywhere automatically.</p>
 <div class="function-doc">
 <p>Returns true if the value is an atom.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L309">Source</a>
 </div>
 <div class="function-detail" id="is_nil?-1">
 <div class="function-header">
@@ -226,6 +239,7 @@ everywhere automatically.</p>
 <div class="function-doc">
 <p>Returns true if the value is nil.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L317">Source</a>
 </div>
 <div class="function-detail" id="is_list?-1">
 <div class="function-header">
@@ -238,6 +252,7 @@ everywhere automatically.</p>
 <div class="function-doc">
 <p>Returns true if the value is a list.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L325">Source</a>
 </div>
 <div class="function-detail" id="is_tuple?-1">
 <div class="function-header">
@@ -250,6 +265,7 @@ everywhere automatically.</p>
 <div class="function-doc">
 <p>Returns true if the value is a tuple.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L333">Source</a>
 </div>
 <div class="function-detail" id="is_map?-1">
 <div class="function-header">
@@ -262,6 +278,7 @@ everywhere automatically.</p>
 <div class="function-doc">
 <p>Returns true if the value is a map.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L341">Source</a>
 </div>
 <div class="function-detail" id="is_struct?-1">
 <div class="function-header">
@@ -274,6 +291,7 @@ everywhere automatically.</p>
 <div class="function-doc">
 <p>Returns true if the value is a struct.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L349">Source</a>
 </div>
 <div class="function-detail" id="raise-1">
 <div class="function-header">
@@ -286,6 +304,7 @@ everywhere automatically.</p>
 <div class="function-doc">
 <p>Raises a runtime error with the provided message.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L357">Source</a>
 </div>
 <div class="function-detail" id="sleep-1">
 <div class="function-header">
@@ -303,6 +322,7 @@ rate limiting, and timed delays.</p>
 <pre><code class="language-zap">sleep(<span class="hl-number">100</span>)    <span class="hl-comment"># pause for 100ms</span>
 sleep(<span class="hl-number">1000</span>)   <span class="hl-comment"># pause for 1 second</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L373">Source</a>
 </div>
 <div class="function-detail" id="to_string-1">
 <div class="function-header">
@@ -322,6 +342,7 @@ atoms, strings, and structs.</p>
 to_string(<span class="hl-builtin">true</span>)     <span class="hl-comment"># =&gt; &quot;true&quot;</span>
 to_string(<span class="hl-atom">:hello</span>)   <span class="hl-comment"># =&gt; &quot;hello&quot;</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L391">Source</a>
 </div>
 <div class="function-detail" id="inspect-1">
 <div class="function-header">
@@ -340,6 +361,7 @@ debugging or examples that need a value rendered.</p>
 Kernel.inspect(<span class="hl-builtin">true</span>)     <span class="hl-comment"># prints &quot;true\n&quot;</span>
 Kernel.inspect(<span class="hl-atom">:hello</span>)   <span class="hl-comment"># prints &quot;hello\n&quot;</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L408">Source</a>
 </div>
 <h2>Macro Details</h2>
 <div class="function-detail" id="if-2">
@@ -359,6 +381,7 @@ Returns <code>nil</code> if the condition is false.</p>
   <span class="hl-string">"positive"</span>
 }</code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L27">Source</a>
 </div>
 <div class="function-detail" id="if-3">
 <div class="function-header">
@@ -379,6 +402,7 @@ Returns <code>nil</code> if the condition is false.</p>
   <span class="hl-string">"non-positive"</span>
 }</code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L51">Source</a>
 </div>
 <div class="function-detail" id="unless-2">
 <div class="function-header">
@@ -395,6 +419,7 @@ Returns <code>nil</code> if the condition is false.</p>
   IO.puts(<span class="hl-string">"still working..."</span>)
 }</code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L70">Source</a>
 </div>
 <div class="function-detail" id="and-2">
 <div class="function-header">
@@ -413,6 +438,7 @@ Otherwise evaluates and returns the right operand.</p>
 <span class="hl-builtin">true</span> <span class="hl-keyword">and</span> <span class="hl-builtin">false</span>   <span class="hl-comment"># =&gt; false</span>
 <span class="hl-builtin">false</span> <span class="hl-keyword">and</span> expr   <span class="hl-comment"># =&gt; false (expr not evaluated)</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L91">Source</a>
 </div>
 <div class="function-detail" id="or-2">
 <div class="function-header">
@@ -431,6 +457,7 @@ Otherwise evaluates and returns the right operand.</p>
 <span class="hl-builtin">false</span> <span class="hl-keyword">or</span> <span class="hl-builtin">false</span>  <span class="hl-comment"># =&gt; false</span>
 <span class="hl-builtin">true</span> <span class="hl-keyword">or</span> expr    <span class="hl-comment"># =&gt; true (expr not evaluated)</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L113">Source</a>
 </div>
 <div class="function-detail" id="fn-1">
 <div class="function-header">
@@ -447,6 +474,7 @@ Identity transform — provides a hook point for future
 customization such as validation, instrumentation, or
 compile-time checks.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L131">Source</a>
 </div>
 <div class="function-detail" id="struct-1">
 <div class="function-header">
@@ -461,6 +489,7 @@ compile-time checks.</p>
 <p>Receives the full struct declaration AST and returns it.
 Identity transform — hook point for future customization.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L142">Source</a>
 </div>
 <div class="function-detail" id="union-1">
 <div class="function-header">
@@ -475,6 +504,7 @@ Identity transform — hook point for future customization.</p>
 <p>Receives the full union declaration AST and returns it.
 Identity transform — hook point for future customization.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L153">Source</a>
 </div>
 <div class="function-detail" id="sigil_s-2">
 <div class="function-header">
@@ -492,6 +522,7 @@ Lowercase sigils allow <code>\#{}</code> interpolation.</p>
 <pre><code class="language-zap">~s<span class="hl-string">"hello"</span>         <span class="hl-comment"># =&gt; &quot;hello&quot;</span>
 ~s<span class="hl-string">"count: \#{42}"</span> <span class="hl-comment"># =&gt; &quot;count: 42&quot;</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L171">Source</a>
 </div>
 <div class="function-detail" id="sigil_S-2">
 <div class="function-header">
@@ -509,6 +540,7 @@ Uppercase sigils suppress interpolation.</p>
 <pre><code class="language-zap">~S<span class="hl-string">"hello"</span>          <span class="hl-comment"># =&gt; &quot;hello&quot;</span>
 ~S<span class="hl-string">"no \#{interp}"</span>   <span class="hl-comment"># =&gt; &quot;no \#{interp}&quot; (literal)</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L187">Source</a>
 </div>
 <div class="function-detail" id="sigil_w-2">
 <div class="function-header">
@@ -526,6 +558,7 @@ Lowercase allows <code>\#{}</code> interpolation before splitting.</p>
 <pre><code class="language-zap">~w<span class="hl-string">"foo bar baz"</span>  <span class="hl-comment"># =&gt; [&quot;foo&quot;, &quot;bar&quot;, &quot;baz&quot;]</span>
 ~w<span class="hl-string">"hello world"</span>  <span class="hl-comment"># =&gt; [&quot;hello&quot;, &quot;world&quot;]</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L203">Source</a>
 </div>
 <div class="function-detail" id="sigil_W-2">
 <div class="function-header">
@@ -542,6 +575,7 @@ Uppercase suppresses <code>\#{}</code> interpolation.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap">~W<span class="hl-string">"foo bar baz"</span>  <span class="hl-comment"># =&gt; [&quot;foo&quot;, &quot;bar&quot;, &quot;baz&quot;]</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L220">Source</a>
 </div>
 <div class="function-detail" id="|>-2">
 <div class="function-header">
@@ -557,9 +591,10 @@ to the function call on the right.</p>
 <p><code>x |&gt; f(y)</code> becomes <code>f(x, y)</code>.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap"><span class="hl-number">5</span> <span class="hl-op">|&gt;</span> add_one()              <span class="hl-comment"># =&gt; add_one(5)</span>
+<span class="hl-string">"hello"</span> <span class="hl-op">|&gt;</span> <span class="hl-type">String</span>.length()  <span class="hl-comment"># =&gt; String.length(&quot;hello&quot;)</span>
 x <span class="hl-op">|&gt;</span> f() <span class="hl-op">|&gt;</span> g()            <span class="hl-comment"># =&gt; g(f(x))</span></code></pre>
-<pre><code class="language-zap"><span class="hl-string">"hello"</span> <span class="hl-op">|&gt;</span> <span class="hl-type">String</span>.length()  <span class="hl-comment"># =&gt; String.length(&quot;hello&quot;)</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L239">Source</a>
 </div>
 <div class="function-detail" id="<>-2">
 <div class="function-header">
@@ -580,6 +615,7 @@ so users can override <code>&lt;&gt;</code> for their own types directly.</p>
 [<span class="hl-number">1</span>, <span class="hl-number">2</span>] <span class="hl-op">&lt;&gt;</span> [<span class="hl-number">3</span>, <span class="hl-number">4</span>]       <span class="hl-comment"># List</span>
 %{a: <span class="hl-number">1</span>} <span class="hl-op">&lt;&gt;</span> %{b: <span class="hl-number">2</span>}     <span class="hl-comment"># Map</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L261">Source</a>
 </div>
 </main>
 <aside class="toc">

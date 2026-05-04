@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Float — zap_stdlib</title>
+<title>Float — Zap</title>
 <link rel="stylesheet" href="../style.css">
 <meta name="zap-docs-base" content="../">
 </head>
@@ -14,8 +14,8 @@
 <rect x="0.5" y="0.5" width="21" height="21" rx="3" stroke="var(--border-strong)"/>
 <path d="M6 6 L15 6 L8 13 L16 13 L16 16 L6 16 L13 9 L6 9 Z" fill="var(--accent)"/>
 </svg>
-<a href="../index.html" class="topbar-title">zap_stdlib</a>
-<span class="topbar-version">v0.1.0</span>
+<a href="../index.html" class="topbar-title">Zap</a>
+<span class="topbar-version">v0.0.0</span>
 <span class="docs-label">docs</span>
 </div>
 <div class="topbar-center">
@@ -43,7 +43,7 @@
 </header>
 <div class="layout">
 <nav class="sidebar">
-<div class="sidebar-header"><a href="../index.html" class="sidebar-title">zap_stdlib</a> <span class="sidebar-version">v0.1.0</span></div>
+<div class="sidebar-header"><a href="../index.html" class="sidebar-title">Zap</a> <span class="sidebar-version">v0.0.0</span></div>
 <div class="sidebar-search"><input type="text" id="search-input" placeholder="Search (Cmd+K)" aria-label="Search documentation"></div>
 <div class="sidebar-group" data-group="Structs">
 <button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Structs</h4></button>
@@ -59,6 +59,7 @@
 <li><a href="../structs/Kernel.html">Kernel</a></li>
 <li><a href="../structs/List.html">List</a></li>
 <li><a href="../structs/Map.html">Map</a></li>
+<li><a href="../structs/Markdown.html">Markdown</a></li>
 <li><a href="../structs/Math.html">Math</a></li>
 <li><a href="../structs/Path.html">Path</a></li>
 <li><a href="../structs/Range.html">Range</a></li>
@@ -66,6 +67,12 @@
 <li><a href="../structs/String.html">String</a></li>
 <li><a href="../structs/Struct.html">Struct</a></li>
 <li><a href="../structs/System.html">System</a></li>
+<li><a href="../structs/Zap.Dep.html">Zap.Dep</a></li>
+<li><a href="../structs/Zap.Doc.html">Zap.Doc</a></li>
+<li><a href="../structs/Zap.Doc.Builder.html">Zap.Doc.Builder</a></li>
+<li><a href="../structs/Zap.DocsRunner.html">Zap.DocsRunner</a></li>
+<li><a href="../structs/Zap.Env.html">Zap.Env</a></li>
+<li><a href="../structs/Zap.Manifest.html">Zap.Manifest</a></li>
 <li><a href="../structs/Zest.html">Zest</a></li>
 <li><a href="../structs/Zest.Case.html">Zest.Case</a></li>
 <li><a href="../structs/Zest.Runner.html">Zest.Runner</a></li>
@@ -162,6 +169,7 @@ cannot always be represented exactly in floating-point. Use
 <div class="function-doc">
 <p>Converts a floating-point number to its string representation.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L33">Source</a>
 </div>
 <div class="function-detail" id="abs-1">
 <div class="function-header">
@@ -178,6 +186,7 @@ cannot always be represented exactly in floating-point. Use
 <div class="function-doc">
 <p>Returns the absolute value of a float.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L41">Source</a>
 </div>
 <div class="function-detail" id="max-2">
 <div class="function-header">
@@ -194,6 +203,7 @@ cannot always be represented exactly in floating-point. Use
 <div class="function-doc">
 <p>Returns the larger of two floats.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L49">Source</a>
 </div>
 <div class="function-detail" id="min-2">
 <div class="function-header">
@@ -210,6 +220,7 @@ cannot always be represented exactly in floating-point. Use
 <div class="function-doc">
 <p>Returns the smaller of two floats.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L57">Source</a>
 </div>
 <div class="function-detail" id="parse-1">
 <div class="function-header">
@@ -223,6 +234,7 @@ cannot always be represented exactly in floating-point. Use
 <p>Parses a string into a float. Returns 0.0 if the string is not
 a valid float representation.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L68">Source</a>
 </div>
 <div class="function-detail" id="round-1">
 <div class="function-header">
@@ -239,6 +251,7 @@ a valid float representation.</p>
 <div class="function-doc">
 <p>Rounds a float to the nearest integer value, returned as a float.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L74">Source</a>
 </div>
 <div class="function-detail" id="floor-1">
 <div class="function-header">
@@ -255,6 +268,7 @@ a valid float representation.</p>
 <div class="function-doc">
 <p>Returns the largest integer value less than or equal to the given float.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L82">Source</a>
 </div>
 <div class="function-detail" id="ceil-1">
 <div class="function-header">
@@ -271,6 +285,7 @@ a valid float representation.</p>
 <div class="function-doc">
 <p>Returns the smallest integer value greater than or equal to the given float.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L90">Source</a>
 </div>
 <div class="function-detail" id="truncate-1">
 <div class="function-header">
@@ -287,6 +302,7 @@ a valid float representation.</p>
 <div class="function-doc">
 <p>Truncates a float toward zero, removing the fractional part.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L98">Source</a>
 </div>
 <div class="function-detail" id="to_integer-1">
 <div class="function-header">
@@ -303,6 +319,7 @@ a valid float representation.</p>
 <div class="function-doc">
 <p>Converts a float to an integer by truncating toward zero.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L106">Source</a>
 </div>
 <div class="function-detail" id="clamp-3">
 <div class="function-header">
@@ -319,6 +336,7 @@ a valid float representation.</p>
 <div class="function-doc">
 <p>Clamps a float to be within the given range.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L114">Source</a>
 </div>
 <div class="function-detail" id="floor_to_integer-1">
 <div class="function-header">
@@ -336,6 +354,7 @@ a valid float representation.</p>
 <p>Floors a float and converts directly to an integer in one step.
 More efficient than <code>Float.to_integer(Float.floor(x))</code>.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L125">Source</a>
 </div>
 <div class="function-detail" id="ceil_to_integer-1">
 <div class="function-header">
@@ -353,6 +372,7 @@ More efficient than <code>Float.to_integer(Float.floor(x))</code>.</p>
 <p>Ceils a float and converts directly to an integer in one step.
 More efficient than <code>Float.to_integer(Float.ceil(x))</code>.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L136">Source</a>
 </div>
 <div class="function-detail" id="round_to_integer-1">
 <div class="function-header">
@@ -370,6 +390,7 @@ More efficient than <code>Float.to_integer(Float.ceil(x))</code>.</p>
 <p>Rounds a float and converts directly to an integer in one step.
 More efficient than <code>Float.to_integer(Float.round(x))</code>.</p>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L147">Source</a>
 </div>
 </main>
 <aside class="toc">

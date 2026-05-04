@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Map — zap_stdlib</title>
+<title>Map — Zap</title>
 <link rel="stylesheet" href="../style.css">
 <meta name="zap-docs-base" content="../">
 </head>
@@ -14,8 +14,8 @@
 <rect x="0.5" y="0.5" width="21" height="21" rx="3" stroke="var(--border-strong)"/>
 <path d="M6 6 L15 6 L8 13 L16 13 L16 16 L6 16 L13 9 L6 9 Z" fill="var(--accent)"/>
 </svg>
-<a href="../index.html" class="topbar-title">zap_stdlib</a>
-<span class="topbar-version">v0.1.0</span>
+<a href="../index.html" class="topbar-title">Zap</a>
+<span class="topbar-version">v0.0.0</span>
 <span class="docs-label">docs</span>
 </div>
 <div class="topbar-center">
@@ -43,7 +43,7 @@
 </header>
 <div class="layout">
 <nav class="sidebar">
-<div class="sidebar-header"><a href="../index.html" class="sidebar-title">zap_stdlib</a> <span class="sidebar-version">v0.1.0</span></div>
+<div class="sidebar-header"><a href="../index.html" class="sidebar-title">Zap</a> <span class="sidebar-version">v0.0.0</span></div>
 <div class="sidebar-search"><input type="text" id="search-input" placeholder="Search (Cmd+K)" aria-label="Search documentation"></div>
 <div class="sidebar-group" data-group="Structs">
 <button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Structs</h4></button>
@@ -59,6 +59,7 @@
 <li><a href="../structs/Kernel.html">Kernel</a></li>
 <li><a href="../structs/List.html">List</a></li>
 <li class="active"><a href="../structs/Map.html">Map</a></li>
+<li><a href="../structs/Markdown.html">Markdown</a></li>
 <li><a href="../structs/Math.html">Math</a></li>
 <li><a href="../structs/Path.html">Path</a></li>
 <li><a href="../structs/Range.html">Range</a></li>
@@ -66,6 +67,12 @@
 <li><a href="../structs/String.html">String</a></li>
 <li><a href="../structs/Struct.html">Struct</a></li>
 <li><a href="../structs/System.html">System</a></li>
+<li><a href="../structs/Zap.Dep.html">Zap.Dep</a></li>
+<li><a href="../structs/Zap.Doc.html">Zap.Doc</a></li>
+<li><a href="../structs/Zap.Doc.Builder.html">Zap.Doc.Builder</a></li>
+<li><a href="../structs/Zap.DocsRunner.html">Zap.DocsRunner</a></li>
+<li><a href="../structs/Zap.Env.html">Zap.Env</a></li>
+<li><a href="../structs/Zap.Manifest.html">Zap.Manifest</a></li>
 <li><a href="../structs/Zest.html">Zest</a></li>
 <li><a href="../structs/Zest.Case.html">Zest.Case</a></li>
 <li><a href="../structs/Zest.Runner.html">Zest.Runner</a></li>
@@ -147,6 +154,7 @@ the key is not found.</p>
 <pre><code class="language-zap">Map.get(%{a: <span class="hl-number">1</span>, b: <span class="hl-number">2</span>}, <span class="hl-atom">:a</span>, <span class="hl-number">0</span>)  <span class="hl-comment"># =&gt; 1</span>
 Map.get(%{a: <span class="hl-number">1</span>}, <span class="hl-atom">:z</span>, <span class="hl-number">99</span>)        <span class="hl-comment"># =&gt; 99</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/map.zap#L29">Source</a>
 </div>
 <div class="function-detail" id="has_key?-2">
 <div class="function-header">
@@ -162,6 +170,7 @@ Map.get(%{a: <span class="hl-number">1</span>}, <span class="hl-atom">:z</span>,
 <pre><code class="language-zap">Map.has_key?(%{a: <span class="hl-number">1</span>, b: <span class="hl-number">2</span>}, <span class="hl-atom">:a</span>)  <span class="hl-comment"># =&gt; true</span>
 Map.has_key?(%{a: <span class="hl-number">1</span>}, <span class="hl-atom">:z</span>)         <span class="hl-comment"># =&gt; false</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/map.zap#L42">Source</a>
 </div>
 <div class="function-detail" id="has_key-2">
 <div class="function-header">
@@ -180,6 +189,7 @@ still resolve.</p>
 <pre><code class="language-zap">Map.has_key(%{a: <span class="hl-number">1</span>, b: <span class="hl-number">2</span>}, <span class="hl-atom">:a</span>)  <span class="hl-comment"># =&gt; true</span>
 Map.has_key(%{a: <span class="hl-number">1</span>}, <span class="hl-atom">:z</span>)         <span class="hl-comment"># =&gt; false</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/map.zap#L58">Source</a>
 </div>
 <div class="function-detail" id="size-1">
 <div class="function-header">
@@ -195,6 +205,7 @@ Map.has_key(%{a: <span class="hl-number">1</span>}, <span class="hl-atom">:z</sp
 <pre><code class="language-zap">Map.size(%{a: <span class="hl-number">1</span>, b: <span class="hl-number">2</span>, c: <span class="hl-number">3</span>})  <span class="hl-comment"># =&gt; 3</span>
 Map.size(%{})                    <span class="hl-comment"># =&gt; 0</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/map.zap#L71">Source</a>
 </div>
 <div class="function-detail" id="empty?-1">
 <div class="function-header">
@@ -210,6 +221,7 @@ Map.size(%{})                    <span class="hl-comment"># =&gt; 0</span></code
 <pre><code class="language-zap">Map.empty?(%{})       <span class="hl-comment"># =&gt; true</span>
 Map.empty?(%{a: <span class="hl-number">1</span>})  <span class="hl-comment"># =&gt; false</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/map.zap#L84">Source</a>
 </div>
 <div class="function-detail" id="put-3">
 <div class="function-header">
@@ -226,6 +238,7 @@ If the key already exists, its value is updated.</p>
 <pre><code class="language-zap">Map.put(%{a: <span class="hl-number">1</span>}, <span class="hl-atom">:b</span>, <span class="hl-number">2</span>)  <span class="hl-comment"># =&gt; %{a: 1, b: 2}</span>
 Map.put(%{a: <span class="hl-number">1</span>}, <span class="hl-atom">:a</span>, <span class="hl-number">9</span>)  <span class="hl-comment"># =&gt; %{a: 9}</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/map.zap#L98">Source</a>
 </div>
 <div class="function-detail" id="delete-2">
 <div class="function-header">
@@ -242,6 +255,7 @@ Returns the map unchanged if the key doesn't exist.</p>
 <pre><code class="language-zap">Map.delete(%{a: <span class="hl-number">1</span>, b: <span class="hl-number">2</span>}, <span class="hl-atom">:a</span>)  <span class="hl-comment"># =&gt; %{b: 2}</span>
 Map.delete(%{a: <span class="hl-number">1</span>}, <span class="hl-atom">:z</span>)         <span class="hl-comment"># =&gt; %{a: 1}</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/map.zap#L112">Source</a>
 </div>
 <div class="function-detail" id="merge-2">
 <div class="function-header">
@@ -258,6 +272,7 @@ from the first.</p>
 <pre><code class="language-zap">Map.merge(%{a: <span class="hl-number">1</span>, b: <span class="hl-number">2</span>}, %{b: <span class="hl-number">9</span>, c: <span class="hl-number">3</span>})
 <span class="hl-comment"># =&gt; %{a: 1, b: 9, c: 3}</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/map.zap#L126">Source</a>
 </div>
 <div class="function-detail" id="keys-1">
 <div class="function-header">
@@ -272,6 +287,7 @@ from the first.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap">Map.keys(%{a: <span class="hl-number">1</span>, b: <span class="hl-number">2</span>})  <span class="hl-comment"># =&gt; [:a, :b]</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/map.zap#L138">Source</a>
 </div>
 <div class="function-detail" id="values-1">
 <div class="function-header">
@@ -286,6 +302,7 @@ from the first.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap">Map.values(%{a: <span class="hl-number">1</span>, b: <span class="hl-number">2</span>})  <span class="hl-comment"># =&gt; [1, 2]</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/map.zap#L150">Source</a>
 </div>
 <div class="function-detail" id="get!-3">
 <div class="function-header">
@@ -302,6 +319,7 @@ Raises if the key is not found.</p>
 <pre><code class="language-zap">Map.get!(%{a: <span class="hl-number">1</span>, b: <span class="hl-number">2</span>}, <span class="hl-atom">:a</span>)  <span class="hl-comment"># =&gt; 1</span>
 Map.get!(%{a: <span class="hl-number">1</span>}, <span class="hl-atom">:z</span>)        <span class="hl-comment"># raises</span></code></pre>
 </div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/map.zap#L164">Source</a>
 </div>
 </main>
 <aside class="toc">
