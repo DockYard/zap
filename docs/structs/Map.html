@@ -128,7 +128,6 @@ Map.size(m)              <span class="hl-comment"># =&gt; 2</span></code></pre>
 <tr><td class="summary-name"><a href="#get-3">get/3</a></td><td class="summary-doc">Returns the value for the given key, or the default if
 the key is not found.</td></tr>
 <tr><td class="summary-name"><a href="#has_key?-2">has_key?/2</a></td><td class="summary-doc">Returns `true` if the map contains the given key.</td></tr>
-<tr><td class="summary-name"><a href="#has_key-2">has_key/2</a></td><td class="summary-doc">Returns `true` if the map contains the given key.</td></tr>
 <tr><td class="summary-name"><a href="#size-1">size/1</a></td><td class="summary-doc">Returns the number of entries in the map.</td></tr>
 <tr><td class="summary-name"><a href="#empty?-1">empty?/1</a></td><td class="summary-doc">Returns `true` if the map has no entries.</td></tr>
 <tr><td class="summary-name"><a href="#put-3">put/3</a></td><td class="summary-doc">Returns a new map with the key set to the given value.</td></tr>
@@ -172,25 +171,6 @@ Map.has_key?(%{a: <span class="hl-number">1</span>}, <span class="hl-atom">:z</s
 </div>
 <a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/map.zap#L42">Source</a>
 </div>
-<div class="function-detail" id="has_key-2">
-<div class="function-header">
-<h3>has_key<span class="arity">/2</span></h3>
-<span class="badge">fn</span>
-<div style="flex:1"></div>
-<a href="#has_key-2" class="anchor-link">#</a>
-</div>
-<div class="signature"><code><span class="sig-name">has_key</span><span class="sig-paren">(</span>map<span class="sig-separator">::</span><span class="sig-type-pill">?</span><span class="sig-paren">, </span>lookup_key<span class="sig-separator">::</span><span class="sig-type-pill">key</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
-<div class="function-doc">
-<p>Returns <code>true</code> if the map contains the given key.
-Convenience alias for <code>has_key?</code> exposed without the predicate
-suffix so call sites that prefer the explicit identifier form
-still resolve.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap">Map.has_key(%{a: <span class="hl-number">1</span>, b: <span class="hl-number">2</span>}, <span class="hl-atom">:a</span>)  <span class="hl-comment"># =&gt; true</span>
-Map.has_key(%{a: <span class="hl-number">1</span>}, <span class="hl-atom">:z</span>)         <span class="hl-comment"># =&gt; false</span></code></pre>
-</div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/map.zap#L58">Source</a>
-</div>
 <div class="function-detail" id="size-1">
 <div class="function-header">
 <h3>size<span class="arity">/1</span></h3>
@@ -205,7 +185,7 @@ Map.has_key(%{a: <span class="hl-number">1</span>}, <span class="hl-atom">:z</sp
 <pre><code class="language-zap">Map.size(%{a: <span class="hl-number">1</span>, b: <span class="hl-number">2</span>, c: <span class="hl-number">3</span>})  <span class="hl-comment"># =&gt; 3</span>
 Map.size(%{})                    <span class="hl-comment"># =&gt; 0</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/map.zap#L71">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/map.zap#L55">Source</a>
 </div>
 <div class="function-detail" id="empty?-1">
 <div class="function-header">
@@ -221,7 +201,7 @@ Map.size(%{})                    <span class="hl-comment"># =&gt; 0</span></code
 <pre><code class="language-zap">Map.empty?(%{})       <span class="hl-comment"># =&gt; true</span>
 Map.empty?(%{a: <span class="hl-number">1</span>})  <span class="hl-comment"># =&gt; false</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/map.zap#L84">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/map.zap#L68">Source</a>
 </div>
 <div class="function-detail" id="put-3">
 <div class="function-header">
@@ -238,7 +218,7 @@ If the key already exists, its value is updated.</p>
 <pre><code class="language-zap">Map.put(%{a: <span class="hl-number">1</span>}, <span class="hl-atom">:b</span>, <span class="hl-number">2</span>)  <span class="hl-comment"># =&gt; %{a: 1, b: 2}</span>
 Map.put(%{a: <span class="hl-number">1</span>}, <span class="hl-atom">:a</span>, <span class="hl-number">9</span>)  <span class="hl-comment"># =&gt; %{a: 9}</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/map.zap#L98">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/map.zap#L82">Source</a>
 </div>
 <div class="function-detail" id="delete-2">
 <div class="function-header">
@@ -255,7 +235,7 @@ Returns the map unchanged if the key doesn't exist.</p>
 <pre><code class="language-zap">Map.delete(%{a: <span class="hl-number">1</span>, b: <span class="hl-number">2</span>}, <span class="hl-atom">:a</span>)  <span class="hl-comment"># =&gt; %{b: 2}</span>
 Map.delete(%{a: <span class="hl-number">1</span>}, <span class="hl-atom">:z</span>)         <span class="hl-comment"># =&gt; %{a: 1}</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/map.zap#L112">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/map.zap#L96">Source</a>
 </div>
 <div class="function-detail" id="merge-2">
 <div class="function-header">
@@ -272,7 +252,7 @@ from the first.</p>
 <pre><code class="language-zap">Map.merge(%{a: <span class="hl-number">1</span>, b: <span class="hl-number">2</span>}, %{b: <span class="hl-number">9</span>, c: <span class="hl-number">3</span>})
 <span class="hl-comment"># =&gt; %{a: 1, b: 9, c: 3}</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/map.zap#L126">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/map.zap#L110">Source</a>
 </div>
 <div class="function-detail" id="keys-1">
 <div class="function-header">
@@ -287,7 +267,7 @@ from the first.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap">Map.keys(%{a: <span class="hl-number">1</span>, b: <span class="hl-number">2</span>})  <span class="hl-comment"># =&gt; [:a, :b]</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/map.zap#L138">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/map.zap#L122">Source</a>
 </div>
 <div class="function-detail" id="values-1">
 <div class="function-header">
@@ -302,7 +282,7 @@ from the first.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap">Map.values(%{a: <span class="hl-number">1</span>, b: <span class="hl-number">2</span>})  <span class="hl-comment"># =&gt; [1, 2]</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/map.zap#L150">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/map.zap#L134">Source</a>
 </div>
 <div class="function-detail" id="get!-3">
 <div class="function-header">
@@ -319,7 +299,7 @@ Raises if the key is not found.</p>
 <pre><code class="language-zap">Map.get!(%{a: <span class="hl-number">1</span>, b: <span class="hl-number">2</span>}, <span class="hl-atom">:a</span>)  <span class="hl-comment"># =&gt; 1</span>
 Map.get!(%{a: <span class="hl-number">1</span>}, <span class="hl-atom">:z</span>)        <span class="hl-comment"># raises</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/map.zap#L164">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/map.zap#L148">Source</a>
 </div>
 </main>
 <aside class="toc">
@@ -328,7 +308,6 @@ Map.get!(%{a: <span class="hl-number">1</span>}, <span class="hl-atom">:z</span>
 <li class="toc-section">Functions</li>
 <li><a href="#get-3">get/3</a></li>
 <li><a href="#has_key?-2">has_key?/2</a></li>
-<li><a href="#has_key-2">has_key/2</a></li>
 <li><a href="#size-1">size/1</a></li>
 <li><a href="#empty?-1">empty?/1</a></li>
 <li><a href="#put-3">put/3</a></li>

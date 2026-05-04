@@ -225,7 +225,7 @@ struct after all tests have been registered.</p>
 <div style="flex:1"></div>
 <a href="#describe-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">describe</span><span class="sig-paren">(</span>_name<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">, </span>body<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="signature"><code><span class="sig-name">describe</span><span class="sig-paren">(</span>name<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">, </span>body<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
 <div class="function-doc">
 <p>Groups related tests under a descriptive label.</p>
 <p>Scans the body for <code>setup</code> and <code>teardown</code> blocks, then
@@ -248,7 +248,7 @@ and registers the generated function for <code>run/0</code>.</p>
 <div style="flex:1"></div>
 <a href="#test-2" class="anchor-link">#</a>
 </div>
-<div class="signature"><code><span class="sig-name">test</span><span class="sig-paren">(</span>_name<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">, </span>body<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="signature"><code><span class="sig-name">test</span><span class="sig-paren">(</span>name<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">, </span>body<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
 <div class="function-doc">
 <p>Defines a test case without context.</p>
 <p>Expands into a pub function declaration named test_&lt;slugified_name&gt;

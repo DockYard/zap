@@ -149,7 +149,6 @@ unsigned integers do not implicitly widen to signed integers.</p>
 <tr><td class="summary-name"><a href="#pow-2">pow/2</a></td><td class="summary-doc">Raises `base` to the power of `exponent`.</td></tr>
 <tr><td class="summary-name"><a href="#clamp-3">clamp/3</a></td><td class="summary-doc">Clamps a value to be within the given range.</td></tr>
 <tr><td class="summary-name"><a href="#digits-1">digits/1</a></td><td class="summary-doc">Returns the number of decimal digits in an integer.</td></tr>
-<tr><td class="summary-name"><a href="#count_digits-1">count_digits/1</a></td><td class="summary-doc">Counts decimal digits in an integer value.</td></tr>
 <tr><td class="summary-name"><a href="#to_float-1">to_float/1</a></td><td class="summary-doc">Converts an integer to a 64-bit floating-point number.</td></tr>
 <tr><td class="summary-name"><a href="#count_leading_zeros-1">count_leading_zeros/1</a></td><td class="summary-doc">Returns the number of leading zeros in the binary representation.</td></tr>
 <tr><td class="summary-name"><a href="#count_trailing_zeros-1">count_trailing_zeros/1</a></td><td class="summary-doc">Returns the number of trailing zeros in the binary representation.</td></tr>
@@ -368,28 +367,6 @@ a valid integer representation.</p>
 </div>
 <a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L146">Source</a>
 </div>
-<div class="function-detail" id="count_digits-1">
-<div class="function-header">
-<h3>count_digits<span class="arity">/1</span></h3>
-<span class="badge">fn</span>
-<div style="flex:1"></div>
-<a href="#count_digits-1" class="anchor-link">#</a>
-</div>
-<div class="signature"><code><span class="sig-name">count_digits</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i8</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
-<div class="signature"><code><span class="sig-name">count_digits</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
-<div class="signature"><code><span class="sig-name">count_digits</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
-<div class="signature"><code><span class="sig-name">count_digits</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
-<div class="signature"><code><span class="sig-name">count_digits</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">i128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
-<div class="signature"><code><span class="sig-name">count_digits</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u8</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
-<div class="signature"><code><span class="sig-name">count_digits</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
-<div class="signature"><code><span class="sig-name">count_digits</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
-<div class="signature"><code><span class="sig-name">count_digits</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
-<div class="signature"><code><span class="sig-name">count_digits</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">u128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
-<div class="function-doc">
-<p>Counts decimal digits in an integer value.</p>
-</div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L159">Source</a>
-</div>
 <div class="function-detail" id="to_float-1">
 <div class="function-header">
 <h3>to_float<span class="arity">/1</span></h3>
@@ -410,7 +387,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Converts an integer to a 64-bit floating-point number.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L172">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L159">Source</a>
 </div>
 <div class="function-detail" id="count_leading_zeros-1">
 <div class="function-header">
@@ -432,7 +409,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Returns the number of leading zeros in the binary representation.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L185">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L172">Source</a>
 </div>
 <div class="function-detail" id="count_trailing_zeros-1">
 <div class="function-header">
@@ -454,7 +431,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Returns the number of trailing zeros in the binary representation.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L198">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L185">Source</a>
 </div>
 <div class="function-detail" id="popcount-1">
 <div class="function-header">
@@ -476,7 +453,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Returns the number of set bits in the binary representation.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L211">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L198">Source</a>
 </div>
 <div class="function-detail" id="byte_swap-1">
 <div class="function-header">
@@ -498,7 +475,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Reverses the byte order of an integer.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L224">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L211">Source</a>
 </div>
 <div class="function-detail" id="bit_reverse-1">
 <div class="function-header">
@@ -520,7 +497,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Reverses all bits in the binary representation.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L237">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L224">Source</a>
 </div>
 <div class="function-detail" id="add_sat-2">
 <div class="function-header">
@@ -542,7 +519,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Adds two integers with saturation.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L250">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L237">Source</a>
 </div>
 <div class="function-detail" id="sub_sat-2">
 <div class="function-header">
@@ -564,7 +541,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Subtracts two integers with saturation.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L263">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L250">Source</a>
 </div>
 <div class="function-detail" id="mul_sat-2">
 <div class="function-header">
@@ -586,7 +563,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Multiplies two integers with saturation.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L276">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L263">Source</a>
 </div>
 <div class="function-detail" id="band-2">
 <div class="function-header">
@@ -608,7 +585,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Bitwise AND of two integers.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L289">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L276">Source</a>
 </div>
 <div class="function-detail" id="bor-2">
 <div class="function-header">
@@ -630,7 +607,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Bitwise OR of two integers.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L302">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L289">Source</a>
 </div>
 <div class="function-detail" id="bxor-2">
 <div class="function-header">
@@ -652,7 +629,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Bitwise XOR of two integers.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L315">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L302">Source</a>
 </div>
 <div class="function-detail" id="bnot-1">
 <div class="function-header">
@@ -674,7 +651,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Bitwise NOT of an integer.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L328">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L315">Source</a>
 </div>
 <div class="function-detail" id="bsl-2">
 <div class="function-header">
@@ -696,7 +673,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Bitwise shift left.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L341">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L328">Source</a>
 </div>
 <div class="function-detail" id="bsr-2">
 <div class="function-header">
@@ -718,7 +695,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Bitwise shift right.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L354">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L341">Source</a>
 </div>
 <div class="function-detail" id="sign-1">
 <div class="function-header">
@@ -740,7 +717,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Returns the sign of an integer.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L367">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L354">Source</a>
 </div>
 <div class="function-detail" id="even?-1">
 <div class="function-header">
@@ -762,7 +739,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Returns true if the integer is even.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L380">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L367">Source</a>
 </div>
 <div class="function-detail" id="odd?-1">
 <div class="function-header">
@@ -784,7 +761,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Returns true if the integer is odd.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L393">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L380">Source</a>
 </div>
 <div class="function-detail" id="gcd-2">
 <div class="function-header">
@@ -806,7 +783,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Computes the greatest common divisor of two integers.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L406">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L393">Source</a>
 </div>
 <div class="function-detail" id="lcm-2">
 <div class="function-header">
@@ -828,7 +805,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Computes the least common multiple of two integers.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L419">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L406">Source</a>
 </div>
 </main>
 <aside class="toc">
@@ -844,7 +821,6 @@ a valid integer representation.</p>
 <li><a href="#pow-2">pow/2</a></li>
 <li><a href="#clamp-3">clamp/3</a></li>
 <li><a href="#digits-1">digits/1</a></li>
-<li><a href="#count_digits-1">count_digits/1</a></li>
 <li><a href="#to_float-1">to_float/1</a></li>
 <li><a href="#count_leading_zeros-1">count_leading_zeros/1</a></li>
 <li><a href="#count_trailing_zeros-1">count_trailing_zeros/1</a></li>

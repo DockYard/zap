@@ -147,11 +147,8 @@ cannot always be represented exactly in floating-point. Use
 <tr><td class="summary-name"><a href="#floor-1">floor/1</a></td><td class="summary-doc">Returns the largest integer value less than or equal to the given float.</td></tr>
 <tr><td class="summary-name"><a href="#ceil-1">ceil/1</a></td><td class="summary-doc">Returns the smallest integer value greater than or equal to the given float.</td></tr>
 <tr><td class="summary-name"><a href="#truncate-1">truncate/1</a></td><td class="summary-doc">Truncates a float toward zero, removing the fractional part.</td></tr>
-<tr><td class="summary-name"><a href="#to_integer-1">to_integer/1</a></td><td class="summary-doc">Converts a float to an integer by truncating toward zero.</td></tr>
+<tr><td class="summary-name"><a href="#to_integer-1">to_integer/1</a></td><td class="summary-doc">Converts a float to an `i64` by truncating toward zero.</td></tr>
 <tr><td class="summary-name"><a href="#clamp-3">clamp/3</a></td><td class="summary-doc">Clamps a float to be within the given range.</td></tr>
-<tr><td class="summary-name"><a href="#floor_to_integer-1">floor_to_integer/1</a></td><td class="summary-doc">Floors a float and converts directly to an integer in one step.</td></tr>
-<tr><td class="summary-name"><a href="#ceil_to_integer-1">ceil_to_integer/1</a></td><td class="summary-doc">Ceils a float and converts directly to an integer in one step.</td></tr>
-<tr><td class="summary-name"><a href="#round_to_integer-1">round_to_integer/1</a></td><td class="summary-doc">Rounds a float and converts directly to an integer in one step.</td></tr>
 </table>
 <h2>Function Details</h2>
 <div class="function-detail" id="to_string-1">
@@ -317,9 +314,17 @@ a valid float representation.</p>
 <div class="signature"><code><span class="sig-name">to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f80</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
 <div class="signature"><code><span class="sig-name">to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
 <div class="function-doc">
-<p>Converts a float to an integer by truncating toward zero.</p>
+<p>Converts a float to an <code>i64</code> by truncating toward zero. Total over
+finite values that fit in <code>i64</code> and panics on every other input —
+<code>NaN</code>, <code>+∞</code>, <code>-∞</code>, and any finite value whose truncated magnitude
+falls outside the <code>i64</code> range. Compose with <code>Float.floor</code>,
+<code>Float.ceil</code>, <code>Float.round</code>, or <code>Float.truncate</code> to get a specific
+rounding mode:</p>
+<pre><code class="language-zap">Float.floor(<span class="hl-number">0.7</span>) <span class="hl-op">|&gt;</span> Float.to_integer()    <span class="hl-comment"># =&gt; 0</span>
+Float.ceil(<span class="hl-number">0.2</span>)  <span class="hl-op">|&gt;</span> Float.to_integer()    <span class="hl-comment"># =&gt; 1</span>
+Float.round(<span class="hl-number">0.5</span>) <span class="hl-op">|&gt;</span> Float.to_integer()    <span class="hl-comment"># =&gt; 1</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L106">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L117">Source</a>
 </div>
 <div class="function-detail" id="clamp-3">
 <div class="function-header">
@@ -336,61 +341,7 @@ a valid float representation.</p>
 <div class="function-doc">
 <p>Clamps a float to be within the given range.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L114">Source</a>
-</div>
-<div class="function-detail" id="floor_to_integer-1">
-<div class="function-header">
-<h3>floor_to_integer<span class="arity">/1</span></h3>
-<span class="badge">fn</span>
-<div style="flex:1"></div>
-<a href="#floor_to_integer-1" class="anchor-link">#</a>
-</div>
-<div class="signature"><code><span class="sig-name">floor_to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
-<div class="signature"><code><span class="sig-name">floor_to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
-<div class="signature"><code><span class="sig-name">floor_to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
-<div class="signature"><code><span class="sig-name">floor_to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f80</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
-<div class="signature"><code><span class="sig-name">floor_to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
-<div class="function-doc">
-<p>Floors a float and converts directly to an integer in one step.
-More efficient than <code>Float.to_integer(Float.floor(x))</code>.</p>
-</div>
 <a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L125">Source</a>
-</div>
-<div class="function-detail" id="ceil_to_integer-1">
-<div class="function-header">
-<h3>ceil_to_integer<span class="arity">/1</span></h3>
-<span class="badge">fn</span>
-<div style="flex:1"></div>
-<a href="#ceil_to_integer-1" class="anchor-link">#</a>
-</div>
-<div class="signature"><code><span class="sig-name">ceil_to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
-<div class="signature"><code><span class="sig-name">ceil_to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
-<div class="signature"><code><span class="sig-name">ceil_to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
-<div class="signature"><code><span class="sig-name">ceil_to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f80</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
-<div class="signature"><code><span class="sig-name">ceil_to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
-<div class="function-doc">
-<p>Ceils a float and converts directly to an integer in one step.
-More efficient than <code>Float.to_integer(Float.ceil(x))</code>.</p>
-</div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L136">Source</a>
-</div>
-<div class="function-detail" id="round_to_integer-1">
-<div class="function-header">
-<h3>round_to_integer<span class="arity">/1</span></h3>
-<span class="badge">fn</span>
-<div style="flex:1"></div>
-<a href="#round_to_integer-1" class="anchor-link">#</a>
-</div>
-<div class="signature"><code><span class="sig-name">round_to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f16</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
-<div class="signature"><code><span class="sig-name">round_to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f32</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
-<div class="signature"><code><span class="sig-name">round_to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
-<div class="signature"><code><span class="sig-name">round_to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f80</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
-<div class="signature"><code><span class="sig-name">round_to_integer</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">f128</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
-<div class="function-doc">
-<p>Rounds a float and converts directly to an integer in one step.
-More efficient than <code>Float.to_integer(Float.round(x))</code>.</p>
-</div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L147">Source</a>
 </div>
 </main>
 <aside class="toc">
@@ -408,9 +359,6 @@ More efficient than <code>Float.to_integer(Float.round(x))</code>.</p>
 <li><a href="#truncate-1">truncate/1</a></li>
 <li><a href="#to_integer-1">to_integer/1</a></li>
 <li><a href="#clamp-3">clamp/3</a></li>
-<li><a href="#floor_to_integer-1">floor_to_integer/1</a></li>
-<li><a href="#ceil_to_integer-1">ceil_to_integer/1</a></li>
-<li><a href="#round_to_integer-1">round_to_integer/1</a></li>
 </ul>
 </aside>
 </div>
