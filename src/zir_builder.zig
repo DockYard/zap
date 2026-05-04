@@ -1147,21 +1147,6 @@ pub const ZirDriver = struct {
         return buf[0..prefix.len];
     }
 
-    /// Check if a struct type name is declared in the current ZIR
-    /// emission. With the file-IS-the-struct architecture, this is
-    /// true iff the struct is the primary struct of the current
-    /// emission (its fields are at the file's root struct_decl) or
-    /// is nested *inside* the primary struct. Foreign structs — peer
-    /// top-level structs from other Zap source units, structs nested
-    /// inside other emissions — are NOT in this emission's
-    /// namespace; consumers reach them via `@import("...")`.
-    fn structIsInCurrentEmitStruct(self: *const ZirDriver, type_name: []const u8) bool {
-        if (self.findStructDef(type_name) == null) return false;
-        const current_struct = self.current_emit_struct orelse return false;
-        var buf: [256]u8 = undefined;
-        return classifyTypeDef(type_name, current_struct, &buf) != .foreign;
-    }
-
     /// Emit a ZIR ref to a struct type by name. Dispatches on whether
     /// the struct is the primary of the current emission, nested
     /// inside the primary, foreign top-level (own emission's root),
@@ -2524,20 +2509,24 @@ pub const ZirDriver = struct {
                     }
                     self.current_ret_type = 1;
                     self.cached_union_ret_type_ref = zir_builder_get_union_ret_type_ref(self.handle);
-                } else if (self.structIsInCurrentEmitStruct(name)) {
-                    // Nominal struct type declared in the current struct:
-                    // reference via decl_val.
-                    const short_name = if (std.mem.lastIndexOf(u8, name, ".")) |dot_idx|
-                        name[dot_idx + 1 ..]
-                    else
-                        name;
-                    if (zir_builder_set_decl_val_return_type(self.handle, short_name.ptr, @intCast(short_name.len)) != 0)
-                        return error.EmitFailed;
-                    self.current_ret_type = 1;
                 } else if (self.findStructDef(name) != null) {
-                    // Cross-emission struct return type — dispatch
-                    // by classification so the import / `@This()` /
-                    // field access lands inside the ret_ty body.
+                    // Struct return type. Dispatch by classification
+                    // against the current emission so the matching
+                    // ZIR primitive lands inside the ret_ty body:
+                    //
+                    //   .primary  →  @This()       (self-typed return)
+                    //   .nested   →  decl_val(X)   (inner struct of the primary)
+                    //   .foreign  →  @import(...)  (peer / cross-emission)
+                    //
+                    // A single switch keeps the param-side
+                    // (`emitTypedParam`) and return-side resolution
+                    // logic in lockstep — historically a separate
+                    // `structIsInCurrentEmitStruct` pre-check
+                    // shadowed `.primary` by emitting `decl_val(X)`,
+                    // producing "use of undeclared identifier 'X'"
+                    // for any `pub fn ... -> Self` declared in the
+                    // primary struct's own body. Generic across
+                    // every struct (native or user-defined).
                     if (self.current_emit_struct) |current| {
                         var buf: [256]u8 = undefined;
                         const cls = classifyTypeDef(name, current, &buf);

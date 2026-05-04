@@ -30,4 +30,21 @@ pub struct Range {
   end :: i64
   step :: i64 = 1
   direction :: i64 = 0
+
+  @doc = """
+    Flip a range's direction by swapping its `start` and `end` while
+    preserving the step magnitude. Returns a new `Range` — the input
+    is unchanged. Distinct from `Enum.reverse/1`, which materialises
+    the range as a `[i64]` in reverse order.
+
+    ## Examples
+
+        Range.reverse(1..10)    # => 10..1
+        Range.reverse(100..1)   # => 1..100
+        Range.reverse(1..10:3)  # => 10..1:3
+    """
+
+  pub fn reverse(range :: Range) -> Range {
+    :zig.Range.reverse(range)
+  }
 }

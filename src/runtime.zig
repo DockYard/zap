@@ -828,6 +828,21 @@ pub const Range = struct {
         }
         return .{ ATOM_CONT, start, next_range };
     }
+
+    /// Flip a range's direction by swapping `start` and `end`. The
+    /// `step` magnitude is preserved; the implicit direction (derived
+    /// from `start` vs `end` when `direction == 0`) flips because the
+    /// endpoints swapped. Returns a fresh range value — the input is
+    /// not mutated.
+    pub fn reverse(range: anytype) @TypeOf(range) {
+        var flipped = range;
+        flipped.start = range.end;
+        flipped.end = range.start;
+        if (@hasField(@TypeOf(flipped), "direction")) {
+            flipped.direction = 0;
+        }
+        return flipped;
+    }
 };
 
 pub const Kernel = struct {

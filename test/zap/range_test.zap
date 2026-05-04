@@ -138,4 +138,30 @@ pub struct Zap.RangeTest {
     "unknown"
   }
 
+  describe("Range.reverse") {
+    test("flips ascending to descending") {
+      r = Range.reverse(1..10)
+      assert(r.start == 10)
+      assert(r.end == 1)
+    }
+
+    test("flips descending to ascending") {
+      r = Range.reverse(100..1)
+      assert(r.start == 1)
+      assert(r.end == 100)
+    }
+
+    test("preserves step") {
+      r = Range.reverse(1..10:3)
+      assert(r.start == 10)
+      assert(r.end == 1)
+      assert(r.step == 3)
+    }
+
+    test("single-point range round-trips") {
+      r = Range.reverse(5..5)
+      assert(r.start == 5)
+      assert(r.end == 5)
+    }
+  }
 }
