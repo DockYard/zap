@@ -113,6 +113,77 @@ pub struct Zap.EnumTest {
       assert(Enum.min([3, 1, 4, 1, 5]) == 1)
     }
 
+    test("first list") {
+      assert(Enum.first([10, 20, 30]) == 10)
+    }
+
+    test("first range") {
+      assert(Enum.first(5..15) == 5)
+    }
+
+    test("first with default falls through on empty list") {
+      assert(Enum.first([] :: [i64], -1) == -1)
+    }
+
+    test("first with default returns first element when present") {
+      assert(Enum.first([42, 99], -1) == 42)
+    }
+
+    test("last list") {
+      assert(Enum.last([10, 20, 30]) == 30)
+    }
+
+    test("last range step 1") {
+      assert(Enum.last(5..15) == 15)
+    }
+
+    test("last range step doesn't divide evenly") {
+      assert(Enum.last(1..10:3) == 10)
+      assert(Enum.last(1..10:2) == 9)
+    }
+
+    test("last descending range") {
+      assert(Enum.last(10..1) == 1)
+    }
+
+    test("last with default falls through on empty list") {
+      assert(Enum.last([] :: [i64], -1) == -1)
+    }
+
+    test("count list") {
+      assert(Enum.count([10, 20, 30]) == 3)
+    }
+
+    test("count range step 1") {
+      assert(Enum.count(1..10) == 10)
+    }
+
+    test("count range step doesn't divide evenly") {
+      assert(Enum.count(1..10:3) == 4)
+      assert(Enum.count(1..10:2) == 5)
+    }
+
+    test("count descending range") {
+      assert(Enum.count(10..1) == 10)
+    }
+
+    test("count empty list") {
+      assert(Enum.count([] :: [i64]) == 0)
+    }
+
+    test("sum range step 1 matches walk") {
+      assert(Enum.sum(1..10) == 55)
+    }
+
+    test("sum range with step") {
+      assert(Enum.sum(1..10:3) == 22)
+      assert(Enum.sum(1..10:2) == 25)
+    }
+
+    test("sum descending range") {
+      assert(Enum.sum(10..1) == 55)
+    }
+
     test("sort ascending") {
       result = Enum.sort([3, 1, 4, 1, 5], less_than)
       assert(List.head(result) == 1)

@@ -166,6 +166,17 @@ pub struct Enum {
   }
 
   @doc = """
+    Range fast-path for `sum/1`: closed-form Gauss
+    `count * (first + last) / 2`. O(1) versus the O(n) walk the
+    generic `Enumerable` implementation performs.
+    """
+
+  pub fn sum(range :: Range) -> i64 {
+    n = range_count(range)
+    n * (range.start + range_last(range)) / 2
+  }
+
+  @doc = """
     Returns the product of all elements.
     Returns 1 for an empty collection.
 
@@ -349,6 +360,136 @@ pub struct Enum {
     case Enumerable.next(collection) {
       {:done, _, _} -> true
       {:cont, _, _} -> false
+    }
+  }
+
+  @doc = """
+    Returns the first element of the collection. Panics on an empty
+    collection — use `first/2` to supply a default for that case.
+
+    ## Examples
+
+        Enum.first([10, 20, 30])  # => 10
+        Enum.first(5..15)         # => 5
+    """
+
+  pub fn first(collection :: Enumerable(element)) -> element {
+    case Enumerable.next(collection) {
+      {:done, _, _} -> panic("Enum.first/1 called on an empty collection")
+      {:cont, value, _} -> value
+    }
+  }
+
+  @doc = """
+    Returns the first element of the collection, or `default` when
+    the collection is empty.
+
+    ## Examples
+
+        Enum.first([10, 20], -1)  # => 10
+        Enum.first([], -1)        # => -1
+    """
+
+  pub fn first(collection :: Enumerable(element), default :: element) -> element {
+    case Enumerable.next(collection) {
+      {:done, _, _} -> default
+      {:cont, value, _} -> value
+    }
+  }
+
+  @doc = """
+    Returns the last element of the collection. Panics on an empty
+    collection — use `last/2` to supply a default for that case.
+    The generic implementation walks the collection; `Range` and
+    other types with closed-form last-element formulas can override
+    via type-specific clauses for an O(1) result.
+
+    ## Examples
+
+        Enum.last([10, 20, 30])  # => 30
+        Enum.last(1..10:3)       # => 10
+        Enum.last(10..1)         # => 1
+    """
+
+  pub fn last(collection :: Enumerable(element)) -> element {
+    case Enumerable.next(collection) {
+      {:done, _, _} -> panic("Enum.last/1 called on an empty collection")
+      {:cont, value, next_state} -> last_walk(next_state, value)
+    }
+  }
+
+  pub fn last(collection :: Enumerable(element), default :: element) -> element {
+    case Enumerable.next(collection) {
+      {:done, _, _} -> default
+      {:cont, value, next_state} -> last_walk(next_state, value)
+    }
+  }
+
+  @doc = """
+    Range fast-path for `last/1`: closed-form
+    `start + step * (count - 1)` for ascending ranges (or the
+    descending mirror), avoiding the protocol walk.
+    """
+
+  pub fn last(range :: Range) -> i64 {
+    range_last(range)
+  }
+
+  pub fn last(range :: Range, _default :: i64) -> i64 {
+    range_last(range)
+  }
+
+  fn last_walk(state :: Enumerable(element), seen :: element) -> element {
+    case Enumerable.next(state) {
+      {:done, _, _} -> seen
+      {:cont, value, next_state} -> last_walk(next_state, value)
+    }
+  }
+
+  fn range_last(range :: Range) -> i64 {
+    n = range_count(range) - 1
+    if range.start <= range.end {
+      range.start + range.step * n
+    } else {
+      range.start - range.step * n
+    }
+  }
+
+  fn range_count(range :: Range) -> i64 {
+    diff = if range.start <= range.end {
+      range.end - range.start
+    } else {
+      range.start - range.end
+    }
+    diff / range.step + 1
+  }
+
+  @doc = """
+    Returns the number of elements in the collection. The generic
+    implementation walks the entire collection; the `Range` clause
+    computes `|end - start| / step + 1` in O(1).
+
+    `Enum.count/2` (with a predicate) counts only elements that
+    satisfy the predicate.
+
+    ## Examples
+
+        Enum.count([10, 20, 30])  # => 3
+        Enum.count(1..10:3)       # => 4
+    """
+
+  pub fn count(collection :: Enumerable(element)) -> i64 {
+    count_total_next(collection, 0)
+  }
+
+  pub fn count(range :: Range) -> i64 {
+    range_count(range)
+  }
+
+  fn count_total_next(state :: Enumerable(element), total :: i64) -> i64 {
+    case Enumerable.next(state) {
+      {:done, _, _} -> total
+      {:cont, _, next_state} -> count_total_next(next_state, total + 1)
     }
   }
 
