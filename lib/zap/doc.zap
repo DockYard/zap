@@ -1380,7 +1380,7 @@ pub struct Zap.Doc {
     Typically called from a project's `main/1` after invoking
     `use Zap.Doc.Builder`.
     """
-  pub fn write_pages_to(out_dir :: String, project_name :: String, project_version :: String, source_url :: String, landing_md :: String, struct_summaries :: [%{Atom => Term}], protocol_summaries :: [%{Atom => Term}], union_summaries :: [%{Atom => Term}], function_summaries :: [%{Atom => Term}], macro_summaries :: [%{Atom => Term}], impl_summaries :: [%{Atom => Term}], variant_summaries :: [%{Atom => Term}], required_summaries :: [%{Atom => Term}]) -> i64 {
+  pub fn write_pages_to(out_dir :: String, project_name :: String, project_version :: String, source_url :: String, landing_md :: String, struct_summaries :: [%{Atom => Term}], protocol_summaries :: [%{Atom => Term}], union_summaries :: [%{Atom => Term}], function_summaries :: [%{Atom => Term}], macro_summaries :: [%{Atom => Term}], impl_summaries :: [%{Atom => Term}], variant_summaries :: [%{Atom => Term}], required_summaries :: [%{Atom => Term}], js_content :: String) -> i64 {
     _ = File.mkdir(out_dir <> "/structs")
     structs = sort_names_alpha(manifest_names(struct_summaries, []))
     protocols = sort_names_alpha(manifest_names(protocol_summaries, []))
@@ -1392,6 +1392,12 @@ pub struct Zap.Doc {
     _ = File.write(out_dir <> "/index.html", index_html)
     search_json = render_search_index(struct_summaries, protocol_summaries, union_summaries, function_summaries, macro_summaries)
     _ = File.write(out_dir <> "/search-index.json", search_json)
+    # The bundled app.js reads its search corpus from a `ZAP_SEARCH_DATA`
+    # global declared at the top of the file. Inline the rendered
+    # `search-index.json` ahead of the static JS so the file:// fallback
+    # works without a fetch — matching the legacy generator's
+    # `generateScriptWithIndex` shape.
+    _ = File.write(out_dir <> "/app.js", "var ZAP_SEARCH_DATA = " <> search_json <> ";\n" <> js_content)
     written_structs + written_protocols + written_unions
   }
 
