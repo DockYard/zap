@@ -41,7 +41,7 @@
 </a>
 </div>
 </header>
-<div class="layout layout-no-toc">
+<div class="layout">
 <nav class="sidebar">
 <div class="sidebar-header"><a href="../index.html" class="sidebar-title">Zap</a> <span class="sidebar-version">v0.0.0</span></div>
 <div class="sidebar-search"><input type="text" id="search-input" placeholder="Search (Cmd+K)" aria-label="Search documentation"></div>
@@ -138,7 +138,40 @@ r.step    <span class="hl-comment"># =&gt; 1</span></code></pre>
 <pre><code class="language-zap"><span class="hl-number">5</span> <span class="hl-keyword">in</span> <span class="hl-number">1..10</span>        <span class="hl-comment"># =&gt; true</span>
 <span class="hl-number">3</span> <span class="hl-keyword">in</span> <span class="hl-number">1..10</span>:<span class="hl-number">2</span>      <span class="hl-comment"># =&gt; false (only 1, 3, 5, 7, 9)</span></code></pre>
 </div>
+<h2 id="functions">Functions</h2>
+<table class="summary">
+<tr><td class="summary-name"><a href="#reverse-1">reverse/1</a></td><td class="summary-doc">Flip a range's direction by swapping its `start` and `end` while
+preserving the step magnitude.</td></tr>
+</table>
+<h2>Function Details</h2>
+<div class="function-detail" id="reverse-1">
+<div class="function-header">
+<h3>reverse<span class="arity">/1</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#reverse-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">reverse</span><span class="sig-paren">(</span>range<span class="sig-separator">::</span><span class="sig-type-pill">Range</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Range</span></code></div>
+<div class="function-doc">
+<p>Flip a range's direction by swapping its <code>start</code> and <code>end</code> while
+preserving the step magnitude. Returns a new <code>Range</code> — the input
+is unchanged. Distinct from <code>Enum.reverse/1</code>, which materialises
+the range as a <code>[i64]</code> in reverse order.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Range.reverse(<span class="hl-number">1..10</span>)    <span class="hl-comment"># =&gt; 10..1</span>
+Range.reverse(<span class="hl-number">100..1</span>)   <span class="hl-comment"># =&gt; 1..100</span>
+Range.reverse(<span class="hl-number">1..10</span>:<span class="hl-number">3</span>)  <span class="hl-comment"># =&gt; 10..1:3</span></code></pre>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/range.zap#L47">Source</a>
+</div>
 </main>
+<aside class="toc">
+<h3>On This Page</h3>
+<ul>
+<li class="toc-section">Functions</li>
+<li><a href="#reverse-1">reverse/1</a></li>
+</ul>
+</aside>
 </div>
 <div id="search-modal" class="search-modal" hidden>
 <div class="search-backdrop"></div>
