@@ -1380,7 +1380,7 @@ pub struct Zap.Doc {
     Typically called from a project's `main/1` after invoking
     `use Zap.Doc.Builder`.
     """
-  pub fn write_pages_to(out_dir :: String, project_name :: String, project_version :: String, source_url :: String, struct_summaries :: [%{Atom => Term}], protocol_summaries :: [%{Atom => Term}], union_summaries :: [%{Atom => Term}], function_summaries :: [%{Atom => Term}], macro_summaries :: [%{Atom => Term}], impl_summaries :: [%{Atom => Term}], variant_summaries :: [%{Atom => Term}], required_summaries :: [%{Atom => Term}]) -> i64 {
+  pub fn write_pages_to(out_dir :: String, project_name :: String, project_version :: String, source_url :: String, landing_md :: String, struct_summaries :: [%{Atom => Term}], protocol_summaries :: [%{Atom => Term}], union_summaries :: [%{Atom => Term}], function_summaries :: [%{Atom => Term}], macro_summaries :: [%{Atom => Term}], impl_summaries :: [%{Atom => Term}], variant_summaries :: [%{Atom => Term}], required_summaries :: [%{Atom => Term}]) -> i64 {
     _ = File.mkdir(out_dir <> "/structs")
     structs = sort_names_alpha(manifest_names(struct_summaries, []))
     protocols = sort_names_alpha(manifest_names(protocol_summaries, []))
@@ -1388,7 +1388,7 @@ pub struct Zap.Doc {
     written_structs = write_summary_pages(out_dir, struct_summaries, :struct, project_name, project_version, source_url, structs, protocols, unions, function_summaries, macro_summaries, impl_summaries, variant_summaries, required_summaries, 0)
     written_protocols = write_summary_pages(out_dir, protocol_summaries, :protocol, project_name, project_version, source_url, structs, protocols, unions, function_summaries, macro_summaries, impl_summaries, variant_summaries, required_summaries, 0)
     written_unions = write_summary_pages(out_dir, union_summaries, :union, project_name, project_version, source_url, structs, protocols, unions, function_summaries, macro_summaries, impl_summaries, variant_summaries, required_summaries, 0)
-    index_html = render_index_page(structs, protocols, unions, project_name, project_version, source_url)
+    index_html = render_index_page(structs, protocols, unions, struct_summaries, project_name, project_version, source_url, landing_md)
     _ = File.write(out_dir <> "/index.html", index_html)
     search_json = render_search_index(struct_summaries, protocol_summaries, union_summaries, function_summaries, macro_summaries)
     _ = File.write(out_dir <> "/search-index.json", search_json)
@@ -1396,19 +1396,62 @@ pub struct Zap.Doc {
   }
 
   @doc = """
-    Compose the docs landing page. Lists every module name from the
-    three sidebar lists under category headings. Linked entries point
-    at `<name>.html`. The page reuses the same chrome (`page_open`,
-    `topbar`, `sidebar`, `page_close`) as the per-module pages so the
-    layout is consistent.
+    Compose the docs landing page. When `landing_md` is non-empty it
+    is rendered through `Markdown.to_html` and used as the main
+    column body — the legacy generator fed the project's
+    `README.md` here. When `landing_md` is empty the renderer falls
+    back to a struct-card grid with the project name, version pill,
+    and one card per declared struct (legacy `appendDefaultLanding`).
     """
-  pub fn render_index_page(structs :: [String], protocols :: [String], unions :: [String], project_name :: String, project_version :: String, source_url :: String) -> String {
-    structs_section = render_index_section("Structs", structs, "")
-    protocols_section = render_index_section("Protocols", protocols, "")
-    unions_section = render_index_section("Unions", unions, "")
-    content = "<h1 class=\"page-title\">" <> escape_html(project_name) <> "</h1>\n" <> structs_section <> protocols_section <> unions_section
+  pub fn render_index_page(structs :: [String], protocols :: [String], unions :: [String], struct_summaries :: [%{Atom => Term}], project_name :: String, project_version :: String, source_url :: String, landing_md :: String) -> String {
+    content = if String.length(landing_md) == 0 {
+      render_default_landing(structs, struct_summaries, project_name, project_version)
+    } else {
+      "<div class=\"structdoc\">\n" <> Markdown.to_html(landing_md) <> "</div>\n"
+    }
     sidebar_html = sidebar(structs, protocols, unions, "", "", project_name, project_version)
     struct_page(project_name, project_version, project_name, "", source_url, sidebar_html, content, "")
+  }
+
+  @doc = """
+    Default landing-page body used when no `landing_md` is supplied.
+    Renders the project name as `<h1>`, an optional version pill, and
+    a grid of struct cards — one per public struct, each with the
+    first sentence of its `@doc` as the lead summary. Mirrors the
+    legacy `appendDefaultLanding` Zig helper.
+    """
+  pub fn render_default_landing(structs :: [String], struct_summaries :: [%{Atom => Term}], project_name :: String, project_version :: String) -> String {
+    title = "<h1>" <> escape_html(project_name) <> "</h1>\n"
+    version_pill = if String.length(project_version) == 0 {
+      ""
+    } else {
+      "<p class=\"version\">v" <> escape_html(project_version) <> "</p>\n"
+    }
+    cards_open = "<h2>Declarations</h2>\n<div class=\"struct-list\">\n"
+    cards = render_struct_cards(struct_summaries, "")
+    title <> version_pill <> cards_open <> cards <> "</div>\n"
+  }
+
+  pub fn render_struct_cards(summaries :: [%{Atom => Term}], acc :: String) -> String {
+    if List.empty?(summaries) {
+      acc
+    } else {
+      render_struct_cards(List.tail(summaries), acc <> render_struct_card(List.head(summaries)))
+    }
+  }
+
+  pub fn render_struct_card(entry :: %{Atom => Term}) -> String {
+    name = Map.get(entry, :name, "")
+    summary_p = render_struct_card_summary(first_sentence(Map.get(entry, :doc, "")))
+    "<div class=\"struct-card\">\n<h3><a href=\"structs/" <> escape_html(name) <> ".html\">" <> escape_html(name) <> "</a></h3>\n" <> summary_p <> "</div>\n"
+  }
+
+  pub fn render_struct_card_summary(summary :: String) -> String {
+    if String.length(summary) == 0 {
+      ""
+    } else {
+      "<p>" <> escape_html(summary) <> "</p>\n"
+    }
   }
 
   @doc = """

@@ -125,20 +125,24 @@ pub struct Markdown {
         if String.starts_with?(line, "## ") {
           render_lines(rest, :start, "", close_block(mode, acc) <> render_heading("h2", String.slice(line, 3, String.length(line))))
         } else {
-          if is_list_item?(line) {
-            render_list_item(line, rest, mode, acc)
+          if String.starts_with?(line, "# ") {
+            render_lines(rest, :start, "", close_block(mode, acc) <> render_heading("h1", String.slice(line, 2, String.length(line))))
           } else {
-            if is_table_header?(line, rest) {
-              open_table(line, rest, mode, acc)
+            if is_list_item?(line) {
+              render_list_item(line, rest, mode, acc)
             } else {
-              if mode == :table {
-                if is_pipe_row?(line) {
-                  render_lines(rest, :table, "", acc <> render_table_row(line, "td"))
-                } else {
-                  render_paragraph_line(line, rest, :start, close_block(:table, acc))
-                }
+              if is_table_header?(line, rest) {
+                open_table(line, rest, mode, acc)
               } else {
-                render_paragraph_line(line, rest, mode, acc)
+                if mode == :table {
+                  if is_pipe_row?(line) {
+                    render_lines(rest, :table, "", acc <> render_table_row(line, "td"))
+                  } else {
+                    render_paragraph_line(line, rest, :start, close_block(:table, acc))
+                  }
+                } else {
+                  render_paragraph_line(line, rest, mode, acc)
+                }
               }
             }
           }
@@ -339,9 +343,87 @@ pub struct Markdown {
           inline_walk(text, index + 1, end, true, acc <> "<code>")
         }
       } else {
-        inline_walk(text, index + 1, end, in_code, acc <> escape_one(ch))
+        if in_code {
+          inline_walk(text, index + 1, end, in_code, acc <> escape_one(ch))
+        } else {
+          inline_try_link(text, index, end, ch, acc)
+        }
       }
     }
+  }
+
+  @doc = """
+    When the cursor sits on `[`, scan ahead for a `](...)` close to
+    classify this as a Markdown inline link and emit `<a href=\"url\">text</a>`.
+    Anything else (including a stray `[` with no matching close) falls
+    back to the normal escape-and-advance path so partial bracket
+    syntax in prose doesn't get mangled.
+    """
+  pub fn inline_try_link(text :: String, index :: i64, end :: i64, ch :: String, acc :: String) -> String {
+    if ch == "[" {
+      close_idx = find_link_text_close(text, index + 1, end)
+      if close_idx < 0 {
+        inline_walk(text, index + 1, end, false, acc <> escape_one(ch))
+      } else {
+        inline_try_link_paren(text, index, close_idx, end, acc)
+      }
+    } else {
+      inline_walk(text, index + 1, end, false, acc <> escape_one(ch))
+    }
+  }
+
+  pub fn inline_try_link_paren(text :: String, index :: i64, close_idx :: i64, end :: i64, acc :: String) -> String {
+    if close_idx + 1 < end and String.byte_at(text, close_idx + 1) == "(" {
+      url_close = find_link_url_close(text, close_idx + 2, end)
+      if url_close < 0 {
+        inline_walk(text, index + 1, end, false, acc <> escape_one("["))
+      } else {
+        link_text = String.slice(text, index + 1, close_idx)
+        link_url = String.slice(text, close_idx + 2, url_close)
+        link_html = "<a href=\"" <> escape_html(link_url) <> "\">" <> escape_inline(link_text) <> "</a>"
+        inline_walk(text, url_close + 1, end, false, acc <> link_html)
+      }
+    } else {
+      inline_walk(text, index + 1, end, false, acc <> escape_one("["))
+    }
+  }
+
+  pub fn find_link_text_close(text :: String, index :: i64, end :: i64) -> i64 {
+    if index >= end {
+      -1
+    } else {
+      ch = String.byte_at(text, index)
+      if ch == "]" {
+        index
+      } else {
+        if ch == "\n" or ch == "[" {
+          -1
+        } else {
+          find_link_text_close(text, index + 1, end)
+        }
+      }
+    }
+  }
+
+  pub fn find_link_url_close(text :: String, index :: i64, end :: i64) -> i64 {
+    if index >= end {
+      -1
+    } else {
+      ch = String.byte_at(text, index)
+      if ch == ")" {
+        index
+      } else {
+        if ch == "\n" {
+          -1
+        } else {
+          find_link_url_close(text, index + 1, end)
+        }
+      }
+    }
+  }
+
+  pub fn escape_inline(text :: String) -> String {
+    escape_chars(text, 0, String.length(text), "")
   }
 
   pub fn escape_html(text :: String) -> String {
@@ -443,7 +525,45 @@ pub struct Markdown {
   pub fn highlight_string(line :: String, index :: i64, end_index :: i64, acc :: String) -> String {
     string_end = find_string_end(line, index + 1, end_index)
     chunk = String.slice(line, index, string_end)
-    highlight_walk(line, string_end, end_index, acc <> "<span class=\"hl-string\">" <> escape_html(chunk) <> "</span>")
+    highlight_walk(line, string_end, end_index, acc <> "<span class=\"hl-string\">" <> escape_html_no_quotes(chunk) <> "</span>")
+  }
+
+  @doc = """
+    HTML-escape only `&`, `<`, `>` — leave `"` alone. The legacy
+    syntax highlighter wrote raw double-quotes inside its
+    `<span class="hl-string">` blocks because `"` doesn't need
+    escaping in body-text context, and the bundled stylesheet's
+    selectors target the literal character. Used by the string and
+    keyword highlighters where `"` appearing as content is part of
+    the source rather than an attribute delimiter.
+    """
+  pub fn escape_html_no_quotes(text :: String) -> String {
+    escape_no_quotes_walk(text, 0, String.length(text), "")
+  }
+
+  pub fn escape_no_quotes_walk(text :: String, index :: i64, end_index :: i64, acc :: String) -> String {
+    if index >= end_index {
+      acc
+    } else {
+      ch = String.byte_at(text, index)
+      escape_no_quotes_walk(text, index + 1, end_index, acc <> escape_one_no_quote(ch))
+    }
+  }
+
+  pub fn escape_one_no_quote(ch :: String) -> String {
+    if ch == "&" {
+      "&amp;"
+    } else {
+      if ch == "<" {
+        "&lt;"
+      } else {
+        if ch == ">" {
+          "&gt;"
+        } else {
+          ch
+        }
+      }
+    }
   }
 
   pub fn find_string_end(line :: String, index :: i64, end_index :: i64) -> i64 {
@@ -507,8 +627,43 @@ pub struct Markdown {
     if is_zap_keyword?(word) {
       highlight_walk(line, word_end, end_index, acc <> "<span class=\"hl-keyword\">" <> escape_html(word) <> "</span>")
     } else {
-      highlight_walk(line, word_end, end_index, acc <> escape_html(word))
+      if is_zap_builtin?(word) {
+        highlight_walk(line, word_end, end_index, acc <> "<span class=\"hl-builtin\">" <> escape_html(word) <> "</span>")
+      } else {
+        if is_zap_primitive_type?(word) {
+          highlight_walk(line, word_end, end_index, acc <> "<span class=\"hl-type\">" <> escape_html(word) <> "</span>")
+        } else {
+          highlight_walk(line, word_end, end_index, acc <> escape_html(word))
+        }
+      }
     }
+  }
+
+  pub fn is_zap_builtin?(word :: String) -> Bool {
+    word == "true" or word == "false" or word == "nil" or word == "setup" or word == "teardown"
+  }
+
+  @doc = """
+    Recognise the small set of words the legacy syntax highlighter
+    classified as primitive types — the integer / float widths plus
+    `Bool`, `String`, `Atom`, `Nil`, `Never`, and `Expr`. Wrapped in
+    `<span class="hl-type">` so the bundled stylesheet can paint
+    them with the type colour rather than as bare identifiers.
+    """
+  pub fn is_zap_primitive_type?(word :: String) -> Bool {
+    if is_zap_int_type?(word) or is_zap_float_type?(word) {
+      true
+    } else {
+      word == "Bool" or word == "String" or word == "Atom" or word == "Nil" or word == "Never" or word == "Expr" or word == "usize" or word == "isize"
+    }
+  }
+
+  pub fn is_zap_int_type?(word :: String) -> Bool {
+    word == "i8" or word == "i16" or word == "i32" or word == "i64" or word == "i128" or word == "u8" or word == "u16" or word == "u32" or word == "u64" or word == "u128"
+  }
+
+  pub fn is_zap_float_type?(word :: String) -> Bool {
+    word == "f16" or word == "f32" or word == "f64" or word == "f80" or word == "f128"
   }
 
   pub fn scan_word_end(line :: String, index :: i64, end_index :: i64) -> i64 {
@@ -632,7 +787,7 @@ pub struct Markdown {
     if word == "alias" or word == "quote" or word == "unquote" or word == "panic" or word == "extends" {
       true
     } else {
-      if word == "describe" or word == "test" or word == "assert" or word == "reject" or word == "impl" {
+      if word == "describe" or word == "test" or word == "assert" or word == "reject" {
         true
       } else {
         false

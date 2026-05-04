@@ -218,10 +218,23 @@ pub struct Zap.Doc.Builder {
         string for `source_url` to suppress source links.
         """
       pub fn write_docs_to(out_dir :: String, project_name :: String, project_version :: String, source_url :: String) -> i64 {
+        write_docs_to(out_dir, project_name, project_version, source_url, "")
+      }
+
+      @doc = """
+        Render every reflected module to `<out_dir>/<name>.html` and
+        write `style.css` + `app.js` alongside, plus an `index.html`
+        whose main column is the rendered `landing_md` markdown — pass
+        the contents of the project's `README.md` to drop the README
+        onto the docs landing page the way the legacy generator did
+        when its manifest set `landing_page: \"README.md\"`. An empty
+        `landing_md` falls back to the auto-generated struct-card grid.
+        """
+      pub fn write_docs_to(out_dir :: String, project_name :: String, project_version :: String, source_url :: String, landing_md :: String) -> i64 {
         _ = File.mkdir(out_dir)
         _ = File.write(out_dir <> "/style.css", unquote(_doc_css))
         _ = File.write(out_dir <> "/app.js", unquote(_doc_js))
-        Zap.Doc.write_pages_to(out_dir, project_name, project_version, source_url, manifest_struct_summaries(), manifest_protocol_summaries(), manifest_union_summaries(), manifest_function_summaries(), manifest_macro_summaries(), manifest_impl_summaries(), manifest_variant_summaries(), manifest_required_function_summaries())
+        Zap.Doc.write_pages_to(out_dir, project_name, project_version, source_url, landing_md, manifest_struct_summaries(), manifest_protocol_summaries(), manifest_union_summaries(), manifest_function_summaries(), manifest_macro_summaries(), manifest_impl_summaries(), manifest_variant_summaries(), manifest_required_function_summaries())
       }
     }
   }
