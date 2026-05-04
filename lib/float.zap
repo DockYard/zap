@@ -101,7 +101,18 @@ pub struct Float {
   pub fn truncate(value :: f80) -> f80 { :zig.Float.trunc_f80(value) }
   pub fn truncate(value :: f128) -> f128 { :zig.Float.trunc_f128(value) }
 
-  @doc = "Converts a float to an integer by truncating toward zero."
+  @doc = """
+    Converts a float to an `i64` by truncating toward zero. Total over
+    finite values that fit in `i64` and panics on every other input —
+    `NaN`, `+∞`, `-∞`, and any finite value whose truncated magnitude
+    falls outside the `i64` range. Compose with `Float.floor`,
+    `Float.ceil`, `Float.round`, or `Float.truncate` to get a specific
+    rounding mode:
+
+        Float.floor(0.7) |> Float.to_integer()    # => 0
+        Float.ceil(0.2)  |> Float.to_integer()    # => 1
+        Float.round(0.5) |> Float.to_integer()    # => 1
+    """
 
   pub fn to_integer(value :: f16) -> i64 { :zig.Float.to_i64_f16(value) }
   pub fn to_integer(value :: f32) -> i64 { :zig.Float.to_i64_f32(value) }
@@ -117,36 +128,4 @@ pub struct Float {
   pub fn clamp(value :: f80, lower :: f80, upper :: f80) -> f80 { :zig.Float.clamp_f80(value, lower, upper) }
   pub fn clamp(value :: f128, lower :: f128, upper :: f128) -> f128 { :zig.Float.clamp_f128(value, lower, upper) }
 
-  @doc = """
-    Floors a float and converts directly to an integer in one step.
-    More efficient than `Float.to_integer(Float.floor(x))`.
-    """
-
-  pub fn floor_to_integer(value :: f16) -> i64 { :zig.Math.floor_to_i64_f16(value) }
-  pub fn floor_to_integer(value :: f32) -> i64 { :zig.Math.floor_to_i64_f32(value) }
-  pub fn floor_to_integer(value :: f64) -> i64 { :zig.Math.floor_to_i64_f64(value) }
-  pub fn floor_to_integer(value :: f80) -> i64 { :zig.Math.floor_to_i64_f80(value) }
-  pub fn floor_to_integer(value :: f128) -> i64 { :zig.Math.floor_to_i64_f128(value) }
-
-  @doc = """
-    Ceils a float and converts directly to an integer in one step.
-    More efficient than `Float.to_integer(Float.ceil(x))`.
-    """
-
-  pub fn ceil_to_integer(value :: f16) -> i64 { :zig.Math.ceil_to_i64_f16(value) }
-  pub fn ceil_to_integer(value :: f32) -> i64 { :zig.Math.ceil_to_i64_f32(value) }
-  pub fn ceil_to_integer(value :: f64) -> i64 { :zig.Math.ceil_to_i64_f64(value) }
-  pub fn ceil_to_integer(value :: f80) -> i64 { :zig.Math.ceil_to_i64_f80(value) }
-  pub fn ceil_to_integer(value :: f128) -> i64 { :zig.Math.ceil_to_i64_f128(value) }
-
-  @doc = """
-    Rounds a float and converts directly to an integer in one step.
-    More efficient than `Float.to_integer(Float.round(x))`.
-    """
-
-  pub fn round_to_integer(value :: f16) -> i64 { :zig.Math.round_to_i64_f16(value) }
-  pub fn round_to_integer(value :: f32) -> i64 { :zig.Math.round_to_i64_f32(value) }
-  pub fn round_to_integer(value :: f64) -> i64 { :zig.Math.round_to_i64_f64(value) }
-  pub fn round_to_integer(value :: f80) -> i64 { :zig.Math.round_to_i64_f80(value) }
-  pub fn round_to_integer(value :: f128) -> i64 { :zig.Math.round_to_i64_f128(value) }
 }

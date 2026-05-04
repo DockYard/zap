@@ -118,38 +118,42 @@ pub struct Zap.FloatTest {
       assert(Float.clamp(15.0, 0.0, 10.0) == 10.0)
     }
 
-    # Direct float-to-integer conversions (Zig 0.16)
+    # Composed float-to-integer conversions. The compound forms
+    # (`Float.floor_to_integer/1`, `_ceil_to_integer/1`,
+    # `_round_to_integer/1`) were removed once `Float.to_integer/1`
+    # gained its NaN / ±∞ / range-overflow panic contract — every
+    # rounding policy now decomposes cleanly through the pipe.
 
-    test("floor_to_integer positive") {
-      assert(Float.floor_to_integer(3.7) == 3)
+    test("floor then to_integer positive") {
+      assert(Float.floor(3.7) |> Float.to_integer() == 3)
     }
 
-    test("floor_to_integer negative") {
-      assert(Float.floor_to_integer(-2.3) == -3)
+    test("floor then to_integer negative") {
+      assert(Float.floor(-2.3) |> Float.to_integer() == -3)
     }
 
-    test("floor_to_integer exact") {
-      assert(Float.floor_to_integer(5.0) == 5)
+    test("floor then to_integer exact") {
+      assert(Float.floor(5.0) |> Float.to_integer() == 5)
     }
 
-    test("ceil_to_integer positive") {
-      assert(Float.ceil_to_integer(3.2) == 4)
+    test("ceil then to_integer positive") {
+      assert(Float.ceil(3.2) |> Float.to_integer() == 4)
     }
 
-    test("ceil_to_integer negative") {
-      assert(Float.ceil_to_integer(-2.7) == -2)
+    test("ceil then to_integer negative") {
+      assert(Float.ceil(-2.7) |> Float.to_integer() == -2)
     }
 
-    test("ceil_to_integer exact") {
-      assert(Float.ceil_to_integer(5.0) == 5)
+    test("ceil then to_integer exact") {
+      assert(Float.ceil(5.0) |> Float.to_integer() == 5)
     }
 
-    test("round_to_integer down") {
-      assert(Float.round_to_integer(3.2) == 3)
+    test("round then to_integer down") {
+      assert(Float.round(3.2) |> Float.to_integer() == 3)
     }
 
-    test("round_to_integer up") {
-      assert(Float.round_to_integer(3.7) == 4)
+    test("round then to_integer up") {
+      assert(Float.round(3.7) |> Float.to_integer() == 4)
     }
   }
 }

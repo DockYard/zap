@@ -154,19 +154,6 @@ pub struct Integer {
   pub fn digits(value :: u64) -> i64 { :zig.Integer.digits_u64(value) }
   pub fn digits(value :: u128) -> i64 { :zig.Integer.digits_u128(value) }
 
-  @doc = "Counts decimal digits in an integer value."
-
-  pub fn count_digits(value :: i8) -> i64 { :zig.Integer.count_digits_i8(value) }
-  pub fn count_digits(value :: i16) -> i64 { :zig.Integer.count_digits_i16(value) }
-  pub fn count_digits(value :: i32) -> i64 { :zig.Integer.count_digits_i32(value) }
-  pub fn count_digits(value :: i64) -> i64 { :zig.Integer.count_digits_i64(value) }
-  pub fn count_digits(value :: i128) -> i64 { :zig.Integer.count_digits_i128(value) }
-  pub fn count_digits(value :: u8) -> i64 { :zig.Integer.count_digits_u8(value) }
-  pub fn count_digits(value :: u16) -> i64 { :zig.Integer.count_digits_u16(value) }
-  pub fn count_digits(value :: u32) -> i64 { :zig.Integer.count_digits_u32(value) }
-  pub fn count_digits(value :: u64) -> i64 { :zig.Integer.count_digits_u64(value) }
-  pub fn count_digits(value :: u128) -> i64 { :zig.Integer.count_digits_u128(value) }
-
   @doc = "Converts an integer to a 64-bit floating-point number."
 
   pub fn to_float(value :: i8) -> f64 { :zig.Integer.to_f64_i8(value) }

@@ -4088,37 +4088,10 @@ pub const Integer = struct {
         return digitCountUnsigned(value);
     }
 
-    pub fn count_digits_i8(value: i8) i64 {
-        return digitCountUnsigned(absMagnitudeI8(value));
-    }
-
-    pub fn count_digits_i16(value: i16) i64 {
-        return digitCountUnsigned(absMagnitudeI16(value));
-    }
-
-    pub fn count_digits_i32(value: i32) i64 {
-        return digitCountUnsigned(absMagnitudeI32(value));
-    }
-
-    pub fn count_digits_i64(value: i64) i64 {
-        return digitCountUnsigned(absMagnitudeI64(value));
-    }
-
-    pub fn count_digits_u8(value: u8) i64 {
-        return digitCountUnsigned(value);
-    }
-
-    pub fn count_digits_u16(value: u16) i64 {
-        return digitCountUnsigned(value);
-    }
-
-    pub fn count_digits_u32(value: u32) i64 {
-        return digitCountUnsigned(value);
-    }
-
-    pub fn count_digits_u64(value: u64) i64 {
-        return digitCountUnsigned(value);
-    }
+    // `count_digits_*` was a synonym of `digits_*` — same body, same
+    // result type. The duplicate surface was removed when the Zap-side
+    // `Integer.count_digits/1` got dropped in favour of `Integer.digits/1`,
+    // and these intrinsics had no other consumer.
 
     pub fn to_f64(value: i64) f64 {
         return to_f64_i64(value);
@@ -5042,14 +5015,6 @@ pub const Integer = struct {
         return digitCountUnsigned(value);
     }
 
-    pub fn count_digits_i128(value: i128) i64 {
-        return digitCountUnsigned(absMagnitudeI128(value));
-    }
-
-    pub fn count_digits_u128(value: u128) i64 {
-        return digitCountUnsigned(value);
-    }
-
     pub fn to_f64_i128(value: i128) f64 {
         return @floatFromInt(value);
     }
@@ -5411,16 +5376,47 @@ pub const Float = struct {
         return to_i64_f64(value);
     }
 
+    /// Convert a float to an i64 by truncating toward zero. Total over the
+    /// finite-and-in-range float domain; panics on NaN, ±Inf, and values
+    /// that don't round-trip into an i64 after truncation. The unchecked
+    /// `@intFromFloat` builtin used previously was undefined behaviour on
+    /// every one of those edges, so the surface conversion silently
+    /// corrupted state when fed an upstream divide-by-zero or oversized
+    /// magnitude. Each width gets its own helper because the safe upper
+    /// bound depends on the float's mantissa precision — for f16 every
+    /// finite value already fits in i64; for f32 the boundary is exactly
+    /// 2^63 (representable); for f64 the closest representable value at
+    /// the i64-max edge is 2^63 itself, which is i64 max + 1 and must be
+    /// rejected.
     pub fn to_i64_f16(value: f16) i64 {
+        if (std.math.isNan(value)) Kernel.raise("Float.to_integer: cannot convert NaN to integer");
+        if (std.math.isInf(value)) Kernel.raise("Float.to_integer: cannot convert infinity to integer");
         return @intFromFloat(@trunc(value));
     }
 
     pub fn to_i64_f32(value: f32) i64 {
-        return @intFromFloat(@trunc(value));
+        if (std.math.isNan(value)) Kernel.raise("Float.to_integer: cannot convert NaN to integer");
+        if (std.math.isInf(value)) Kernel.raise("Float.to_integer: cannot convert infinity to integer");
+        const truncated = @trunc(value);
+        if (truncated < -9.2233720368547758e18 or truncated >= 9.2233720368547758e18) {
+            Kernel.raise("Float.to_integer: value out of i64 range");
+        }
+        return @intFromFloat(truncated);
     }
 
     pub fn to_i64_f64(value: f64) i64 {
-        return @intFromFloat(@trunc(value));
+        if (std.math.isNan(value)) Kernel.raise("Float.to_integer: cannot convert NaN to integer");
+        if (std.math.isInf(value)) Kernel.raise("Float.to_integer: cannot convert infinity to integer");
+        const truncated = @trunc(value);
+        // i64 min == -2^63 is exactly representable as f64; i64 max == 2^63 - 1
+        // is *not* — the closest f64 is 2^63, which would overflow. So the
+        // upper bound is strict-less-than 2^63.
+        const max_plus_one: f64 = 9.223372036854776e18;
+        const min_value: f64 = -9.223372036854776e18;
+        if (truncated < min_value or truncated >= max_plus_one) {
+            Kernel.raise("Float.to_integer: value out of i64 range");
+        }
+        return @intFromFloat(truncated);
     }
 
     pub fn to_string_f80(value: f80) []const u8 {
@@ -5506,11 +5502,27 @@ pub const Float = struct {
     }
 
     pub fn to_i64_f80(value: f80) i64 {
-        return @intFromFloat(@trunc(value));
+        if (std.math.isNan(value)) Kernel.raise("Float.to_integer: cannot convert NaN to integer");
+        if (std.math.isInf(value)) Kernel.raise("Float.to_integer: cannot convert infinity to integer");
+        const truncated = @trunc(value);
+        const max_plus_one: f80 = 9.223372036854775808e18;
+        const min_value: f80 = -9.223372036854775808e18;
+        if (truncated < min_value or truncated >= max_plus_one) {
+            Kernel.raise("Float.to_integer: value out of i64 range");
+        }
+        return @intFromFloat(truncated);
     }
 
     pub fn to_i64_f128(value: f128) i64 {
-        return @intFromFloat(@trunc(value));
+        if (std.math.isNan(value)) Kernel.raise("Float.to_integer: cannot convert NaN to integer");
+        if (std.math.isInf(value)) Kernel.raise("Float.to_integer: cannot convert infinity to integer");
+        const truncated = @trunc(value);
+        const max_plus_one: f128 = 9.223372036854775808e18;
+        const min_value: f128 = -9.223372036854775808e18;
+        if (truncated < min_value or truncated >= max_plus_one) {
+            Kernel.raise("Float.to_integer: value out of i64 range");
+        }
+        return @intFromFloat(truncated);
     }
 };
 
@@ -6091,83 +6103,13 @@ pub const Math = struct {
         return @log10(x);
     }
 
-    /// Floors a float and converts directly to an integer in one
-    /// step — more efficient than `Float.to_i64(Float.floor(x))`.
-    pub fn floor_to_i64(x: f64) i64 {
-        return floor_to_i64_f64(x);
-    }
-
-    pub fn floor_to_i64_f16(x: f16) i64 {
-        return @intFromFloat(@floor(x));
-    }
-
-    pub fn floor_to_i64_f32(x: f32) i64 {
-        return @intFromFloat(@floor(x));
-    }
-
-    pub fn floor_to_i64_f64(x: f64) i64 {
-        return @intFromFloat(@floor(x));
-    }
-
-    pub fn floor_to_i64_f80(x: f80) i64 {
-        return @intFromFloat(@floor(x));
-    }
-
-    pub fn floor_to_i64_f128(x: f128) i64 {
-        return @intFromFloat(@floor(x));
-    }
-
-    /// Ceils a float and converts directly to an integer in one
-    /// step — more efficient than `Float.to_i64(Float.ceil(x))`.
-    pub fn ceil_to_i64(x: f64) i64 {
-        return ceil_to_i64_f64(x);
-    }
-
-    pub fn ceil_to_i64_f16(x: f16) i64 {
-        return @intFromFloat(@ceil(x));
-    }
-
-    pub fn ceil_to_i64_f32(x: f32) i64 {
-        return @intFromFloat(@ceil(x));
-    }
-
-    pub fn ceil_to_i64_f64(x: f64) i64 {
-        return @intFromFloat(@ceil(x));
-    }
-
-    pub fn ceil_to_i64_f80(x: f80) i64 {
-        return @intFromFloat(@ceil(x));
-    }
-
-    pub fn ceil_to_i64_f128(x: f128) i64 {
-        return @intFromFloat(@ceil(x));
-    }
-
-    /// Rounds a float and converts directly to an integer in one
-    /// step — more efficient than `Float.to_i64(Float.round(x))`.
-    pub fn round_to_i64(x: f64) i64 {
-        return round_to_i64_f64(x);
-    }
-
-    pub fn round_to_i64_f16(x: f16) i64 {
-        return @intFromFloat(@round(x));
-    }
-
-    pub fn round_to_i64_f32(x: f32) i64 {
-        return @intFromFloat(@round(x));
-    }
-
-    pub fn round_to_i64_f64(x: f64) i64 {
-        return @intFromFloat(@round(x));
-    }
-
-    pub fn round_to_i64_f80(x: f80) i64 {
-        return @intFromFloat(@round(x));
-    }
-
-    pub fn round_to_i64_f128(x: f128) i64 {
-        return @intFromFloat(@round(x));
-    }
+    // The legacy `floor_to_i64_*`, `ceil_to_i64_*`, and `round_to_i64_*`
+    // intrinsics fused the rounding step with the i64 conversion. Now that
+    // `Float.to_i64_f*` panics on NaN/±Inf/out-of-range, callers compose
+    // `Float.to_integer(Float.floor(x))` and the optimizer is free to fuse
+    // the rounding+convert when it can. Keeping a separate fused entry
+    // would re-introduce the old "intrinsic doesn't validate, surface
+    // function does" split that hid silent UB on edge values.
 };
 
 pub const Bool = struct {

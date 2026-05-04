@@ -2037,7 +2037,7 @@ test "ZIR: Integer supports i128 and u128 helper overloads" {
         \\    IO.puts(Integer.to_string(Integer.pow(2 :: u128, 4 :: u128)))
         \\    IO.puts(accept_string(Integer.to_string(5 :: u128)))
         \\    IO.puts(Integer.to_string(Integer.digits(-12345 :: i128)))
-        \\    IO.puts(Integer.to_string(Integer.count_digits(12345 :: u128)))
+        \\    IO.puts(Integer.to_string(Integer.digits(12345 :: u128)))
         \\    IO.puts(accept_float(Integer.to_float(42 :: u128)))
         \\    IO.puts(Integer.to_string(Integer.count_leading_zeros(1 :: u128)))
         \\    IO.puts(Integer.to_string(Integer.count_trailing_zeros(8 :: i128)))
@@ -2104,9 +2104,9 @@ test "ZIR: Float supports f80 and f128 helper overloads" {
         \\    IO.puts(accept(Float.clamp(5.0 :: f128, 1.0 :: f128, 3.0 :: f128)))
         \\    IO.puts(accept(Float.truncate(3.75 :: f128)))
         \\    IO.puts(Integer.to_string(Float.to_integer(3.75 :: f80)))
-        \\    IO.puts(Integer.to_string(Float.floor_to_integer(3.75 :: f128)))
-        \\    IO.puts(Integer.to_string(Float.ceil_to_integer(3.25 :: f80)))
-        \\    IO.puts(Integer.to_string(Float.round_to_integer(3.75 :: f128)))
+        \\    IO.puts(Integer.to_string(Float.to_integer(Float.floor(3.75 :: f128))))
+        \\    IO.puts(Integer.to_string(Float.to_integer(Float.ceil(3.25 :: f80))))
+        \\    IO.puts(Integer.to_string(Float.to_integer(Float.round(3.75 :: f128))))
         \\    IO.puts(accept_string(Float.to_string(1.5 :: f80)))
         \\    IO.puts(accept_string(Float.to_string(2.5 :: f128)))
         \\    IO.puts(Bool.to_string((1.0 :: f80) < (2.0 :: f80)))
@@ -2428,12 +2428,12 @@ test "ZIR: map has_key check" {
         \\pub struct TestProg {
         \\  pub fn main() -> String {
         \\    m = %{name: "Alice", age: 30}
-        \\    if Map.has_key(m, :name) {
+        \\    if Map.has_key?(m, :name) {
         \\      IO.puts("has name")
         \\    } else {
         \\      IO.puts("no name")
         \\    }
-        \\    if Map.has_key(m, :email) {
+        \\    if Map.has_key?(m, :email) {
         \\      IO.puts("has email")
         \\    } else {
         \\      IO.puts("no email")
