@@ -1902,7 +1902,7 @@ pub const Parser = struct {
             const imp = try self.parseImportDecl();
             return .{ .import_decl = imp };
         }
-        if (self.isAttributeStatementStart()) {
+        if (self.isAttributeDeclStart()) {
             const attr = try self.parseAttributeDecl();
             return .{ .attribute = attr };
         }
@@ -1925,7 +1925,15 @@ pub const Parser = struct {
         return .{ .expr = expr };
     }
 
-    fn isAttributeStatementStart(self: *Parser) bool {
+    /// Distinguish attribute declarations (`@name :: Type = value` or
+    /// `@name = value`) from attribute references used as expressions
+    /// (a bare `@name` that resolves to its declared value). Inside
+    /// statement contexts both forms can appear, but only the
+    /// declaration syntax — `@name` followed by `::` or `=` — should
+    /// be treated as a top-of-stmt attribute decl. A bare `@name` must
+    /// fall through to expression parsing so attr-ref substitution can
+    /// reach it later.
+    fn isAttributeDeclStart(self: *Parser) bool {
         if (!self.check(.at_sign)) return false;
 
         const saved = self.saveLexerState();
@@ -1935,7 +1943,7 @@ pub const Parser = struct {
             return false;
         }
         _ = self.advance();
-        const result = !self.check(.left_paren);
+        const result = self.check(.double_colon) or self.check(.equal);
         self.restoreLexerState(saved);
         return result;
     }

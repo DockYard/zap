@@ -1276,10 +1276,30 @@ fn expandAndDesugarStagedStruct(
 ) CompileError!ast.Program {
     const error_baseline = diag_engine.errorCount();
 
+    // Substitute @attr references with their values before macro
+    // expansion. This mirrors `compileForCtfe`'s pipeline (substitute
+    // → macro expand → desugar) so attribute values reach later
+    // passes regardless of which compilation path runs.
+    var subst_errors: std.ArrayListUnmanaged(zap.attr_substitute.SubstitutionError) = .empty;
+    const substituted = zap.attr_substitute.substituteAttributes(
+        alloc,
+        &struct_program.program,
+        &collector.graph,
+        interner,
+        &subst_errors,
+    ) catch {
+        diag_engine.err("Error during attribute substitution", .{ .start = 0, .end = 0 }) catch {};
+        return error.DesugarFailed;
+    };
+    for (subst_errors.items) |subst_err| {
+        diag_engine.err(subst_err.message, subst_err.span) catch {};
+    }
+    if (diag_engine.errorCount() > error_baseline) return error.DesugarFailed;
+
     var macro_engine = zap.MacroEngine.init(alloc, interner, &collector.graph);
     defer macro_engine.deinit();
     macro_engine.setCompiledExecutor(compiled_executor);
-    const expanded = macro_engine.expandProgram(&struct_program.program) catch {
+    const expanded = macro_engine.expandProgram(&substituted) catch {
         for (macro_engine.errors.items) |macro_err| {
             diag_engine.err(macro_err.message, macro_err.span) catch {};
         }
@@ -2166,23 +2186,34 @@ pub fn validateOneStructPerFile(
         return null;
     };
 
-    // Count top-level declarations (struct, protocol, or impl)
-    var struct_count: u32 = 0;
-    var struct_name_parts: ?[]const ast.StringId = null;
+    // The file's "primary" struct names the file. A struct with items
+    // (methods, macros, attributes) takes precedence as the primary.
+    // If a file has no method-bearing struct it must have exactly one
+    // field-only data struct, which then becomes the primary. Field-
+    // only data structs are allowed to coexist alongside a primary.
+    var primary_count: u32 = 0;
+    var data_struct_count: u32 = 0;
+    var primary_name_parts: ?[]const ast.StringId = null;
+    var data_name_parts: ?[]const ast.StringId = null;
     var has_protocol_or_impl_or_union = false;
     for (program.top_items) |item| {
         switch (item) {
             .struct_decl => |mod| {
-                // Only count struct-like structs (with items), not field-only data structs
                 if (mod.items.len > 0) {
-                    struct_count += 1;
-                    struct_name_parts = mod.name.parts;
+                    primary_count += 1;
+                    primary_name_parts = mod.name.parts;
+                } else {
+                    data_struct_count += 1;
+                    data_name_parts = mod.name.parts;
                 }
             },
             .priv_struct_decl => |mod| {
                 if (mod.items.len > 0) {
-                    struct_count += 1;
-                    struct_name_parts = mod.name.parts;
+                    primary_count += 1;
+                    primary_name_parts = mod.name.parts;
+                } else {
+                    data_struct_count += 1;
+                    data_name_parts = mod.name.parts;
                 }
             },
             .protocol, .priv_protocol => {
@@ -2202,28 +2233,40 @@ pub fn validateOneStructPerFile(
             else => {},
         }
     }
-    // Also count from program.structs (the parser populates both)
-    if (struct_count == 0) {
+    // Fall back to program.structs when top_items wasn't populated
+    // (e.g., parser variants that only fill the structs slice).
+    if (primary_count == 0 and data_struct_count == 0) {
         for (program.structs) |mod| {
             if (mod.items.len > 0) {
-                struct_count += 1;
-                struct_name_parts = mod.name.parts;
+                primary_count += 1;
+                primary_name_parts = mod.name.parts;
+            } else {
+                data_struct_count += 1;
+                data_name_parts = mod.name.parts;
             }
         }
     }
 
     // Protocol, impl, and union files don't need a struct declaration
-    if (has_protocol_or_impl_or_union and struct_count == 0) {
+    if (has_protocol_or_impl_or_union and primary_count == 0 and data_struct_count == 0) {
         return null;
     }
 
-    if (struct_count == 0) {
-        return std.fmt.allocPrint(alloc, "File `{s}` must contain exactly one struct declaration, found none", .{file_path}) catch "file has no struct";
+    if (primary_count > 1) {
+        return std.fmt.allocPrint(alloc, "File `{s}` must contain exactly one struct declaration, found {d}", .{ file_path, primary_count }) catch "file has multiple structs";
     }
 
-    if (struct_count > 1) {
-        return std.fmt.allocPrint(alloc, "File `{s}` must contain exactly one struct declaration, found {d}", .{ file_path, struct_count }) catch "file has multiple structs";
+    // No primary: exactly one data struct stands in as the primary.
+    // More than one data struct (with no primary to anchor the file)
+    // is ambiguous and rejected.
+    if (primary_count == 0 and data_struct_count == 0) {
+        return std.fmt.allocPrint(alloc, "File `{s}` must contain exactly one struct declaration, found none", .{file_path}) catch "file has no struct";
     }
+    if (primary_count == 0 and data_struct_count > 1) {
+        return std.fmt.allocPrint(alloc, "File `{s}` must contain exactly one struct declaration, found {d}", .{ file_path, data_struct_count }) catch "file has multiple structs";
+    }
+
+    const struct_name_parts: ?[]const ast.StringId = primary_name_parts orelse data_name_parts;
 
     // Build the actual struct name from the AST
     const parts = struct_name_parts orelse return null;
@@ -3509,14 +3552,12 @@ test "validateOneStructPerFile: valid private struct" {
     try std.testing.expectEqual(null, result);
 }
 
-test "validateOneStructPerFile: field-only struct does not count as struct" {
+test "validateOneStructPerFile: field-only struct is a valid struct" {
     const alloc = std.testing.allocator;
     const source = "pub struct Point {\n  x :: i64\n}\n";
     const result = validateOneStructPerFile(alloc, source, "point.zap");
-    // Field-only structs don't count as struct declarations
-    // An empty file or one with only data structs has no struct
-    try std.testing.expect(result != null);
-    alloc.free(result.?);
+    // Field-only data structs are valid struct declarations.
+    try std.testing.expect(result == null);
 }
 
 test "validateOneStructPerFile: multiple structs is error" {
@@ -3534,6 +3575,29 @@ test "validateOneStructPerFile: name mismatch is error" {
     const result = validateOneStructPerFile(alloc, source, "config.zap");
     try std.testing.expect(result != null);
     try std.testing.expect(std.mem.find(u8, result.?, "does not match") != null);
+    alloc.free(result.?);
+}
+
+test "validateOneStructPerFile: data structs alongside primary struct" {
+    const alloc = std.testing.allocator;
+    const source =
+        "pub struct Point {\n  x :: i64\n  y :: i64\n}\n" ++
+        "pub struct Config {\n  name :: String\n}\n" ++
+        "pub struct StructTest {\n  pub fn run() -> String {\n    \"ok\"\n  }\n}\n";
+    const result = validateOneStructPerFile(alloc, source, "struct_test.zap");
+    // The single method-bearing struct names the file; field-only
+    // data structs ride along as supporting declarations.
+    try std.testing.expect(result == null);
+}
+
+test "validateOneStructPerFile: multiple data structs without primary is error" {
+    const alloc = std.testing.allocator;
+    const source =
+        "pub struct Point {\n  x :: i64\n}\n" ++
+        "pub struct Config {\n  name :: String\n}\n";
+    const result = validateOneStructPerFile(alloc, source, "data.zap");
+    try std.testing.expect(result != null);
+    try std.testing.expect(std.mem.find(u8, result.?, "found 2") != null);
     alloc.free(result.?);
 }
 

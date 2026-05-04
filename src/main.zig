@@ -571,6 +571,28 @@ fn buildTarget(
         if (std.Io.Dir.cwd().access(global_io, test_dir, .{})) |_| {
             try source_roots.append(alloc, .{ .name = "project", .path = test_dir });
         } else |_| {}
+        // `tools/` is the conventional home for project-internal source
+        // (the Zap project itself uses it for the doc-runner that drives
+        // `zap doc`). Treating it as a source root lets struct-name
+        // validation strip the prefix the same way `lib/`/`test/` do, so
+        // a file at `tools/zap/doc/runner.zap` is allowed to declare
+        // `pub struct Zap.Doc.Runner`. Sub-directories are added too so
+        // impl files alongside the primary follow the same rule.
+        const tools_dir = try std.fs.path.join(alloc, &.{ project_root, "tools" });
+        if (std.Io.Dir.cwd().access(global_io, tools_dir, .{})) |_| {
+            try source_roots.append(alloc, .{ .name = "project", .path = tools_dir });
+            if (std.Io.Dir.cwd().openDir(global_io, tools_dir, .{ .iterate = true })) |dir_handle| {
+                var dir = dir_handle;
+                defer dir.close(global_io);
+                var it = dir.iterate();
+                while (it.next(global_io) catch null) |entry| {
+                    if (entry.kind == .directory) {
+                        const subdir = try std.fs.path.join(alloc, &.{ tools_dir, entry.name });
+                        try source_roots.append(alloc, .{ .name = "project", .path = subdir });
+                    }
+                }
+            } else |_| {}
+        } else |_| {}
         try source_roots.append(alloc, .{ .name = "project", .path = project_root });
     }
 

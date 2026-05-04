@@ -1,12 +1,19 @@
-# Geometry struct --- uses types from types.zap via cross-file resolution.
-# Demonstrates automatic union synthesis across file boundaries.
+@doc = """
+  Geometry helpers that pattern-dispatch over `Circle`, `Rectangle`,
+  and `Color`. Demonstrates that Zap can resolve cross-file types
+  without explicit imports — every sibling `*.zap` is part of the
+  project graph.
+  """
 
 pub struct Geometry {
-  pub fn area(%{radius: r} :: Circle) -> f64 {
-    3.14159 * r * r
+  pub fn circle_area(circle :: Circle) -> f64 {
+    r = circle.radius
+    Math.pi() * r * r
   }
 
-  pub fn area(%{width: w, height: h} :: Rectangle) -> f64 {
+  pub fn rectangle_area(rectangle :: Rectangle) -> f64 {
+    w = rectangle.width
+    h = rectangle.height
     w * h
   }
 
