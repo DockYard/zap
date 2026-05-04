@@ -45,19 +45,38 @@ pub struct Markdown {
       if String.starts_with?(String.trim(line), "```") {
         render_lines(rest, :start, "", acc <> "</code></pre>\n")
       } else {
-        render_lines(rest, :code, code_lang, acc <> escape_html(line))
+        render_lines(rest, :code, code_lang, acc <> render_code_line(line, code_lang))
       }
     } else {
       if mode == :code {
         if String.starts_with?(String.trim(line), "```") {
           render_lines(rest, :start, "", acc <> "</code></pre>\n")
         } else {
-          render_lines(rest, :code, code_lang, acc <> "\n" <> escape_html(line))
+          render_lines(rest, :code, code_lang, acc <> "\n" <> render_code_line(line, code_lang))
         }
       } else {
         classify_line(line, rest, mode, acc)
       }
     }
+  }
+
+  @doc = """
+    Render a single line of code, applying Zap syntax highlighting
+    when the surrounding fenced block is tagged `language-zap`,
+    `zap`, `elixir`, or has no tag (the doc generator's default).
+    Other languages emit only HTML-escaped text so the surrounding
+    `<pre><code>` reflects the source verbatim.
+    """
+  pub fn render_code_line(line :: String, code_lang :: String) -> String {
+    if zap_lang?(code_lang) {
+      highlight_zap_line(line)
+    } else {
+      escape_html(line)
+    }
+  }
+
+  pub fn zap_lang?(code_lang :: String) -> Bool {
+    code_lang == "zap" or code_lang == "elixir"
   }
 
   @doc = """
@@ -75,13 +94,13 @@ pub struct Markdown {
       } else {
         if mode == :indent_code {
           if is_indented_code_line?(line) {
-            render_lines(rest, :indent_code, "", acc <> "\n" <> escape_html(strip_indent4(line)))
+            render_lines(rest, :indent_code, "", acc <> "\n" <> highlight_zap_line(strip_indent4(line)))
           } else {
             classify_after_close(line, rest, :start, close_block(:indent_code, acc))
           }
         } else {
           if mode == :start and is_indented_code_line?(line) {
-            render_lines(rest, :indent_code, "", acc <> "<pre><code class=\"language-zap\">" <> escape_html(strip_indent4(line)))
+            render_lines(rest, :indent_code, "zap", acc <> "<pre><code class=\"language-zap\">" <> highlight_zap_line(strip_indent4(line)))
           } else {
             classify_after_close(line, rest, mode, acc)
           }
@@ -354,6 +373,269 @@ pub struct Markdown {
             ch
           }
         }
+      }
+    }
+  }
+
+  @doc = """
+    Highlight one line of Zap source as HTML, wrapping classified
+    tokens in `<span class="hl-...">` so the bundled stylesheet can
+    color them. Recognises `#`-line comments, double-quoted strings
+    (including triple-quoted heredoc fragments), `:atom` literals,
+    numeric literals, the canonical keyword set, and the operator
+    set the legacy generator highlighted (`->`, `::`, `|>`, `~>`,
+    `<>`, `<-`, `==`, `!=`, `>=`, `<=`, `=`, `+`, `-`, `*`, `/`,
+    `>`, `<`, `|`). Unrecognised text passes through HTML-escaped
+    so non-Zap fragments still render correctly.
+    """
+  pub fn highlight_zap_line(line :: String) -> String {
+    highlight_walk(line, 0, String.length(line), "")
+  }
+
+  pub fn highlight_walk(line :: String, index :: i64, end_index :: i64, acc :: String) -> String {
+    if index >= end_index {
+      acc
+    } else {
+      ch = String.byte_at(line, index)
+      if ch == "#" {
+        rest_of_line = String.slice(line, index, end_index)
+        acc <> "<span class=\"hl-comment\">" <> escape_html(rest_of_line) <> "</span>"
+      } else {
+        if ch == "\"" {
+          highlight_string(line, index, end_index, acc)
+        } else {
+          if ch == ":" and index + 1 < end_index and is_atom_start_byte?(String.byte_at(line, index + 1)) {
+            highlight_atom(line, index, end_index, acc)
+          } else {
+            highlight_after_atom_check(line, index, end_index, acc, ch)
+          }
+        }
+      }
+    }
+  }
+
+  pub fn highlight_after_atom_check(line :: String, index :: i64, end_index :: i64, acc :: String, ch :: String) -> String {
+    if is_digit_byte?(ch) {
+      highlight_number(line, index, end_index, acc)
+    } else {
+      if is_alpha_byte?(ch) or ch == "_" {
+        highlight_word(line, index, end_index, acc)
+      } else {
+        highlight_op_or_passthrough(line, index, end_index, acc)
+      }
+    }
+  }
+
+  pub fn highlight_op_or_passthrough(line :: String, index :: i64, end_index :: i64, acc :: String) -> String {
+    if index + 1 < end_index and two_char_op?(String.byte_at(line, index), String.byte_at(line, index + 1)) {
+      op_chars = String.slice(line, index, index + 2)
+      highlight_walk(line, index + 2, end_index, acc <> "<span class=\"hl-op\">" <> escape_html(op_chars) <> "</span>")
+    } else {
+      ch = String.byte_at(line, index)
+      if single_char_op?(ch) {
+        highlight_walk(line, index + 1, end_index, acc <> "<span class=\"hl-op\">" <> escape_one(ch) <> "</span>")
+      } else {
+        highlight_walk(line, index + 1, end_index, acc <> escape_one(ch))
+      }
+    }
+  }
+
+  pub fn highlight_string(line :: String, index :: i64, end_index :: i64, acc :: String) -> String {
+    string_end = find_string_end(line, index + 1, end_index)
+    chunk = String.slice(line, index, string_end)
+    highlight_walk(line, string_end, end_index, acc <> "<span class=\"hl-string\">" <> escape_html(chunk) <> "</span>")
+  }
+
+  pub fn find_string_end(line :: String, index :: i64, end_index :: i64) -> i64 {
+    if index >= end_index {
+      end_index
+    } else {
+      ch = String.byte_at(line, index)
+      if ch == "\"" {
+        index + 1
+      } else {
+        if ch == "\\" and index + 1 < end_index {
+          find_string_end(line, index + 2, end_index)
+        } else {
+          find_string_end(line, index + 1, end_index)
+        }
+      }
+    }
+  }
+
+  pub fn highlight_atom(line :: String, index :: i64, end_index :: i64, acc :: String) -> String {
+    atom_end = scan_atom_end(line, index + 1, end_index)
+    chunk = String.slice(line, index, atom_end)
+    highlight_walk(line, atom_end, end_index, acc <> "<span class=\"hl-atom\">" <> escape_html(chunk) <> "</span>")
+  }
+
+  pub fn scan_atom_end(line :: String, index :: i64, end_index :: i64) -> i64 {
+    if index >= end_index {
+      end_index
+    } else {
+      ch = String.byte_at(line, index)
+      if is_ident_continue?(ch) or ch == "?" or ch == "!" {
+        scan_atom_end(line, index + 1, end_index)
+      } else {
+        index
+      }
+    }
+  }
+
+  pub fn highlight_number(line :: String, index :: i64, end_index :: i64, acc :: String) -> String {
+    num_end = scan_number_end(line, index + 1, end_index)
+    chunk = String.slice(line, index, num_end)
+    highlight_walk(line, num_end, end_index, acc <> "<span class=\"hl-number\">" <> escape_html(chunk) <> "</span>")
+  }
+
+  pub fn scan_number_end(line :: String, index :: i64, end_index :: i64) -> i64 {
+    if index >= end_index {
+      end_index
+    } else {
+      ch = String.byte_at(line, index)
+      if is_digit_byte?(ch) or ch == "." or ch == "_" {
+        scan_number_end(line, index + 1, end_index)
+      } else {
+        index
+      }
+    }
+  }
+
+  pub fn highlight_word(line :: String, index :: i64, end_index :: i64, acc :: String) -> String {
+    word_end = scan_word_end(line, index, end_index)
+    word = String.slice(line, index, word_end)
+    if is_zap_keyword?(word) {
+      highlight_walk(line, word_end, end_index, acc <> "<span class=\"hl-keyword\">" <> escape_html(word) <> "</span>")
+    } else {
+      highlight_walk(line, word_end, end_index, acc <> escape_html(word))
+    }
+  }
+
+  pub fn scan_word_end(line :: String, index :: i64, end_index :: i64) -> i64 {
+    if index >= end_index {
+      end_index
+    } else {
+      ch = String.byte_at(line, index)
+      if is_ident_continue?(ch) or ch == "?" or ch == "!" {
+        scan_word_end(line, index + 1, end_index)
+      } else {
+        index
+      }
+    }
+  }
+
+  pub fn is_digit_byte?(ch :: String) -> Bool {
+    ch == "0" or ch == "1" or ch == "2" or ch == "3" or ch == "4" or ch == "5" or ch == "6" or ch == "7" or ch == "8" or ch == "9"
+  }
+
+  pub fn is_atom_start_byte?(ch :: String) -> Bool {
+    is_lower_byte?(ch) or ch == "_"
+  }
+
+  pub fn is_lower_byte?(ch :: String) -> Bool {
+    ch >= "a" and ch <= "z"
+  }
+
+  pub fn is_upper_byte?(ch :: String) -> Bool {
+    ch >= "A" and ch <= "Z"
+  }
+
+  pub fn is_alpha_byte?(ch :: String) -> Bool {
+    is_lower_byte?(ch) or is_upper_byte?(ch)
+  }
+
+  pub fn is_ident_continue?(ch :: String) -> Bool {
+    is_alpha_byte?(ch) or is_digit_byte?(ch) or ch == "_"
+  }
+
+  pub fn two_char_op?(c1 :: String, c2 :: String) -> Bool {
+    if c1 == "-" and c2 == ">" {
+      true
+    } else {
+      if c1 == ":" and c2 == ":" {
+        true
+      } else {
+        if c1 == "|" and c2 == ">" {
+          true
+        } else {
+          two_char_op_more?(c1, c2)
+        }
+      }
+    }
+  }
+
+  pub fn two_char_op_more?(c1 :: String, c2 :: String) -> Bool {
+    if c1 == "~" and c2 == ">" {
+      true
+    } else {
+      if c1 == "<" and c2 == ">" {
+        true
+      } else {
+        if c1 == "<" and c2 == "-" {
+          true
+        } else {
+          two_char_op_compare?(c1, c2)
+        }
+      }
+    }
+  }
+
+  pub fn two_char_op_compare?(c1 :: String, c2 :: String) -> Bool {
+    if c1 == "=" and c2 == "=" {
+      true
+    } else {
+      if c1 == "!" and c2 == "=" {
+        true
+      } else {
+        if c1 == ">" and c2 == "=" {
+          true
+        } else {
+          if c1 == "<" and c2 == "=" {
+            true
+          } else {
+            false
+          }
+        }
+      }
+    }
+  }
+
+  pub fn single_char_op?(ch :: String) -> Bool {
+    ch == "=" or ch == "+" or ch == "*" or ch == "/" or ch == ">" or ch == "<" or ch == "|"
+  }
+
+  pub fn is_zap_keyword?(word :: String) -> Bool {
+    if word == "pub" or word == "fn" or word == "macro" or word == "struct" or word == "case" {
+      true
+    } else {
+      if word == "if" or word == "else" or word == "use" or word == "union" or word == "when" {
+        true
+      } else {
+        is_zap_keyword_more?(word)
+      }
+    }
+  }
+
+  pub fn is_zap_keyword_more?(word :: String) -> Bool {
+    if word == "for" or word == "in" or word == "cond" or word == "do" or word == "end" {
+      true
+    } else {
+      if word == "unless" or word == "and" or word == "or" or word == "not" or word == "import" {
+        true
+      } else {
+        is_zap_keyword_misc?(word)
+      }
+    }
+  }
+
+  pub fn is_zap_keyword_misc?(word :: String) -> Bool {
+    if word == "alias" or word == "quote" or word == "unquote" or word == "panic" or word == "extends" {
+      true
+    } else {
+      if word == "describe" or word == "test" or word == "assert" or word == "reject" or word == "impl" {
+        true
+      } else {
+        false
       }
     }
   }
