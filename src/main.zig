@@ -202,7 +202,7 @@ fn cmdDoc(allocator: std.mem.Allocator, args: []const []const u8) !void {
     defer allocator.free(project_root);
 
     // Build the target as a regular binary and run its `main/1`. The
-    // doc pipeline lives in Zap source — `Zap.DocsRunner` (or any
+    // doc pipeline lives in Zap source — `Zap.Doc.Runner` (or any
     // user-defined doc-runner referenced from `build.zap`) calls
     // `Zap.Doc.Builder`'s `write_docs_to/1` to render and write
     // pages. The Zig CLI is just a thin shell around build+run, so

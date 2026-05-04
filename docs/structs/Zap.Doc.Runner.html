@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Zap.DocsRunner — Zap</title>
+<title>Zap.Doc.Runner — Zap</title>
 <link rel="stylesheet" href="../style.css">
 <meta name="zap-docs-base" content="../">
 </head>
@@ -70,7 +70,7 @@
 <li><a href="../structs/Zap.Dep.html">Zap.Dep</a></li>
 <li><a href="../structs/Zap.Doc.html">Zap.Doc</a></li>
 <li><a href="../structs/Zap.Doc.Builder.html">Zap.Doc.Builder</a></li>
-<li class="active"><a href="../structs/Zap.DocsRunner.html">Zap.DocsRunner</a></li>
+<li class="active"><a href="../structs/Zap.Doc.Runner.html">Zap.Doc.Runner</a></li>
 <li><a href="../structs/Zap.Env.html">Zap.Env</a></li>
 <li><a href="../structs/Zap.Manifest.html">Zap.Manifest</a></li>
 <li><a href="../structs/Zest.html">Zest</a></li>
@@ -101,13 +101,13 @@
 <nav class="breadcrumb" aria-label="Breadcrumb">
 <span>Structs</span>
 <span>/</span>
-<span class="breadcrumb-current">Zap.DocsRunner</span>
+<span class="breadcrumb-current">Zap.Doc.Runner</span>
 </nav>
-<h1 class="page-title">Zap.DocsRunner</h1>
+<h1 class="page-title">Zap.Doc.Runner</h1>
 <p class="tagline">Top-level entry point for `zap doc` against Zap's own stdlib.</p>
 <div class="structdoc">
 <p>Top-level entry point for <code>zap doc</code> against Zap's own stdlib.</p>
-<p><code>Zap.DocsRunner</code> reflects on every <code>.zap</code> file under <code>lib/</code> at
+<p><code>Zap.Doc.Runner</code> reflects on every <code>.zap</code> file under <code>lib/</code> at
 compile time via <code>Zap.Doc.Builder</code>, bakes the manifest data
 needed to render reference pages, and writes the output to
 <code>docs/</code> when its <code>main/1</code> is invoked. The <code>zap doc</code> CLI command
@@ -134,7 +134,7 @@ their <code>build.zap</code> manifest.</p>
 <div class="function-doc">
 <p>Render every reflected module to <code>docs/&lt;name&gt;.html</code> and write <code>style.css</code> + <code>app.js</code>.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/docs_runner.zap#L22">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zap/doc/runner.zap#L22">Source</a>
 </div>
 </main>
 <aside class="toc">

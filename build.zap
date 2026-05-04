@@ -15,7 +15,7 @@ pub struct Zap.Builder {
           name: "zap_docs",
           version: "0.1.0",
           kind: :bin,
-          root: "Zap.DocsRunner.main/1",
+          root: "Zap.Doc.Runner.main/1",
           paths: ["lib/**/*.zap"],
           source_url: "https://github.com/DockYard/zap",
           landing_page: "README.md",

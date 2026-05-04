@@ -1,7 +1,7 @@
 @doc = """
   Top-level entry point for `zap doc` against Zap's own stdlib.
 
-  `Zap.DocsRunner` reflects on every `.zap` file under `lib/` at
+  `Zap.Doc.Runner` reflects on every `.zap` file under `lib/` at
   compile time via `Zap.Doc.Builder`, bakes the manifest data
   needed to render reference pages, and writes the output to
   `docs/` when its `main/1` is invoked. The `zap doc` CLI command
@@ -14,7 +14,7 @@
   their `build.zap` manifest.
   """
 
-pub struct Zap.DocsRunner {
+pub struct Zap.Doc.Runner {
   use Zap.Doc.Builder, paths: ["lib/**/*.zap"]
 
   @doc = "Render every reflected module to `docs/<name>.html` and write `style.css` + `app.js`."

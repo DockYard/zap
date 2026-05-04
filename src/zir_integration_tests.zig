@@ -423,11 +423,11 @@ test "CLI: zap run doc-runner target generates documentation via Zap-side pipeli
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    tmp_dir.dir.createDirPath(getTestIo(), "lib") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(getTestIo(), "lib/doc") catch return error.Unexpected;
 
     // The doc pipeline lives entirely in Zap source: `Zap.Doc.Builder`'s
     // compile-time `__using__` macro reflects on the supplied paths and
-    // bakes manifest functions; the user's `DocsRunner.main/1` body then
+    // bakes manifest functions; the user's `Doc.Runner.main/1` body then
     // calls `write_docs_to/4` to render and persist HTML pages. The CLI
     // is just a thin shell that builds the binary and runs it.
     const build_source =
@@ -439,7 +439,7 @@ test "CLI: zap run doc-runner target generates documentation via Zap-side pipeli
         \\          name: "doc_example",
         \\          version: "0.1.0",
         \\          kind: :bin,
-        \\          root: "DocExample.DocsRunner.main/1",
+        \\          root: "DocExample.Doc.Runner.main/1",
         \\          paths: ["lib/**/*.zap"],
         \\          deps: [{:zap_stdlib, {:path, "lib"}}]
         \\        }
@@ -471,8 +471,8 @@ test "CLI: zap run doc-runner target generates documentation via Zap-side pipeli
         \\}
     ;
 
-    const docs_runner_source =
-        \\pub struct DocExample.DocsRunner {
+    const doc_runner_source =
+        \\pub struct DocExample.Doc.Runner {
         \\  use Zap.Doc.Builder, paths: ["lib/**/*.zap"]
         \\
         \\  pub fn main(_args :: [String]) -> String {
@@ -486,7 +486,7 @@ test "CLI: zap run doc-runner target generates documentation via Zap-side pipeli
         return error.Unexpected;
     tmp_dir.dir.writeFile(getTestIo(), .{ .sub_path = "lib/doc_example.zap", .data = lib_source }) catch
         return error.Unexpected;
-    tmp_dir.dir.writeFile(getTestIo(), .{ .sub_path = "lib/docs_runner.zap", .data = docs_runner_source }) catch
+    tmp_dir.dir.writeFile(getTestIo(), .{ .sub_path = "lib/doc/runner.zap", .data = doc_runner_source }) catch
         return error.Unexpected;
 
     const tmp_dir_path = tmp_dir.dir.realPathFileAlloc(getTestIo(), ".", allocator) catch
